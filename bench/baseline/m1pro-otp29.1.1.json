@@ -1,0 +1,4131 @@
+{
+  "schema": 1,
+  "timestamp_utc": "2026-09-25T07:25:30.319171+00:00",
+  "machine": {
+    "system": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "logical_cores": 10,
+    "go": "go version go1.25.7 darwin/arm64",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+    "hyperfine": "hyperfine 1.20.0",
+    "erts": "OTP 29 ERTS 17.1",
+    "cpu": "Apple M1 Pro (machine specification)",
+    "macos": "26.6.2",
+    "rss_tool": "gtime -f %M"
+  },
+  "settings": {
+    "runtimes": [
+      "rust",
+      "go",
+      "erts"
+    ],
+    "benchmarks": [
+      "fib",
+      "trees",
+      "nbody",
+      "idle",
+      "tasks_100k",
+      "tasks_1m",
+      "ring",
+      "pingpong",
+      "bigmsg",
+      "map_update",
+      "map_update_small",
+      "binary_parse",
+      "ets",
+      "fanin",
+      "fanout"
+    ],
+    "runs": 5,
+    "warmup": 1,
+    "cooldown_seconds": 0.0,
+    "quick": false
+  },
+  "benchmarks": {
+    "fib": {
+      "arguments": [
+        35
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "fib",
+            "35"
+          ],
+          "result": 9227465,
+          "probe_stdout": "9227465\nfib 29.764ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench fib 35",
+            "mean": 0.0353929501,
+            "stddev": 0.002895222550800576,
+            "median": 0.036253608300000004,
+            "user": 0.030925620000000004,
+            "system": 0.0016675800000000005,
+            "min": 0.032437858300000004,
+            "max": 0.0391128173,
+            "times": [
+              0.0366894423,
+              0.0391128173,
+              0.036253608300000004,
+              0.032437858300000004,
+              0.0324710243
+            ],
+            "memory_usage_byte": [
+              1982464,
+              1982464,
+              1982464,
+              1982464,
+              1982464
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.0366894423,
+            0.0391128173,
+            0.036253608300000004,
+            0.032437858300000004,
+            0.0324710243
+          ],
+          "rss_runs": [
+            {
+              "result": 9227465,
+              "kernel_ms": 30.956,
+              "peak_rss_bytes": 1703936,
+              "stdout": "9227465\nfib 30.956ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 34.729,
+              "peak_rss_bytes": 1703936,
+              "stdout": "9227465\nfib 34.729ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 29.77,
+              "peak_rss_bytes": 1703936,
+              "stdout": "9227465\nfib 29.770ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 31.883,
+              "peak_rss_bytes": 1703936,
+              "stdout": "9227465\nfib 31.883ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 30.355,
+              "peak_rss_bytes": 1703936,
+              "stdout": "9227465\nfib 30.355ms\n"
+            }
+          ],
+          "wall_median_ms": 36.2536083,
+          "wall_stddev_ms": 2.895222550800576,
+          "kernel_median_ms": 30.956,
+          "peak_rss_median_bytes": 1703936,
+          "wall_cv": 0.08180223865544839
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "fib",
+            "35"
+          ],
+          "result": 9227465,
+          "probe_stdout": "9227465\nfib 35.445ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob fib 35",
+            "mean": 0.034093670199999995,
+            "stddev": 0.004071338645883954,
+            "median": 0.032243995000000004,
+            "user": 0.033606199999999996,
+            "system": 0.0018277999999999999,
+            "min": 0.030258828,
+            "max": 0.040382662,
+            "times": [
+              0.035845912,
+              0.040382662,
+              0.030258828,
+              0.031736954000000005,
+              0.032243995000000004
+            ],
+            "memory_usage_byte": [
+              3964928,
+              3964928,
+              3964928,
+              3964928,
+              3964928
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.035845912,
+            0.040382662,
+            0.030258828,
+            0.031736954000000005,
+            0.032243995000000004
+          ],
+          "rss_runs": [
+            {
+              "result": 9227465,
+              "kernel_ms": 33.777,
+              "peak_rss_bytes": 3932160,
+              "stdout": "9227465\nfib 33.777ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 33.261,
+              "peak_rss_bytes": 3833856,
+              "stdout": "9227465\nfib 33.261ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 33.836,
+              "peak_rss_bytes": 3883008,
+              "stdout": "9227465\nfib 33.836ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 34.239,
+              "peak_rss_bytes": 3850240,
+              "stdout": "9227465\nfib 34.239ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 32.374,
+              "peak_rss_bytes": 3702784,
+              "stdout": "9227465\nfib 32.374ms\n"
+            }
+          ],
+          "wall_median_ms": 32.243995000000005,
+          "wall_stddev_ms": 4.071338645883954,
+          "kernel_median_ms": 33.777,
+          "peak_rss_median_bytes": 3850240,
+          "wall_cv": 0.11941626178703264
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "fib",
+            "35"
+          ],
+          "result": 9227465,
+          "probe_stdout": "9227465\nfib 75.742ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main fib 35",
+            "mean": 0.28094844248,
+            "stddev": 0.01126065195254402,
+            "median": 0.27427369248,
+            "user": 0.19656223999999997,
+            "system": 0.0984481,
+            "min": 0.27118115048,
+            "max": 0.29541277548,
+            "times": [
+              0.29541277548,
+              0.29077144248000003,
+              0.27427369248,
+              0.27118115048,
+              0.27310315148000003
+            ],
+            "memory_usage_byte": [
+              89784320,
+              89784320,
+              90570752,
+              90570752,
+              90570752
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.29541277548,
+            0.29077144248000003,
+            0.27427369248,
+            0.27118115048,
+            0.27310315148000003
+          ],
+          "rss_runs": [
+            {
+              "result": 9227465,
+              "kernel_ms": 73.662,
+              "peak_rss_bytes": 89407488,
+              "stdout": "9227465\nfib 73.662ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 73.547,
+              "peak_rss_bytes": 89686016,
+              "stdout": "9227465\nfib 73.547ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 142.492,
+              "peak_rss_bytes": 89374720,
+              "stdout": "9227465\nfib 142.492ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 73.837,
+              "peak_rss_bytes": 89456640,
+              "stdout": "9227465\nfib 73.837ms\n"
+            },
+            {
+              "result": 9227465,
+              "kernel_ms": 74.02,
+              "peak_rss_bytes": 89522176,
+              "stdout": "9227465\nfib 74.020ms\n"
+            }
+          ],
+          "wall_median_ms": 274.27369248,
+          "wall_stddev_ms": 11.26065195254402,
+          "kernel_median_ms": 73.837,
+          "peak_rss_median_bytes": 89456640,
+          "wall_cv": 0.04008084847576842
+        }
+      }
+    },
+    "trees": {
+      "arguments": [
+        18
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "trees",
+            "18"
+          ],
+          "result": 66759344,
+          "probe_stdout": "66759344\ntrees 1725.157ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench trees 18",
+            "mean": 1.75011259958,
+            "stddev": 0.016250926142806592,
+            "median": 1.75994020798,
+            "user": 1.7298812400000003,
+            "system": 0.010157059999999999,
+            "min": 1.72997983298,
+            "max": 1.7642814579800001,
+            "times": [
+              1.72997983298,
+              1.73502324998,
+              1.75994020798,
+              1.7642814579800001,
+              1.76133824898
+            ],
+            "memory_usage_byte": [
+              10223616,
+              10223616,
+              10223616,
+              10223616,
+              10223616
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            1.72997983298,
+            1.73502324998,
+            1.75994020798,
+            1.7642814579800001,
+            1.76133824898
+          ],
+          "rss_runs": [
+            {
+              "result": 66759344,
+              "kernel_ms": 1751.149,
+              "peak_rss_bytes": 10223616,
+              "stdout": "66759344\ntrees 1751.149ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1736.886,
+              "peak_rss_bytes": 10223616,
+              "stdout": "66759344\ntrees 1736.886ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1736.463,
+              "peak_rss_bytes": 10190848,
+              "stdout": "66759344\ntrees 1736.463ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1773.802,
+              "peak_rss_bytes": 10223616,
+              "stdout": "66759344\ntrees 1773.802ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1758.861,
+              "peak_rss_bytes": 10174464,
+              "stdout": "66759344\ntrees 1758.861ms\n"
+            }
+          ],
+          "wall_median_ms": 1759.94020798,
+          "wall_stddev_ms": 16.250926142806595,
+          "kernel_median_ms": 1751.149,
+          "peak_rss_median_bytes": 10223616,
+          "wall_cv": 0.009285646047406644
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "trees",
+            "18"
+          ],
+          "result": 66759344,
+          "probe_stdout": "66759344\ntrees 1419.903ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob trees 18",
+            "mean": 1.1583603848800001,
+            "stddev": 0.008190395188279905,
+            "median": 1.16096397668,
+            "user": 1.49934314,
+            "system": 0.06026528,
+            "min": 1.14587989268,
+            "max": 1.16647110168,
+            "times": [
+              1.16096397668,
+              1.15485910168,
+              1.14587989268,
+              1.16647110168,
+              1.16362785168
+            ],
+            "memory_usage_byte": [
+              26787840,
+              26787840,
+              26787840,
+              26787840,
+              26787840
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            1.16096397668,
+            1.15485910168,
+            1.14587989268,
+            1.16647110168,
+            1.16362785168
+          ],
+          "rss_runs": [
+            {
+              "result": 66759344,
+              "kernel_ms": 1160.49,
+              "peak_rss_bytes": 24281088,
+              "stdout": "66759344\ntrees 1160.490ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1181.698,
+              "peak_rss_bytes": 28033024,
+              "stdout": "66759344\ntrees 1181.698ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1201.819,
+              "peak_rss_bytes": 27983872,
+              "stdout": "66759344\ntrees 1201.819ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1158.884,
+              "peak_rss_bytes": 26378240,
+              "stdout": "66759344\ntrees 1158.884ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 1130.294,
+              "peak_rss_bytes": 26738688,
+              "stdout": "66759344\ntrees 1130.294ms\n"
+            }
+          ],
+          "wall_median_ms": 1160.9639766799999,
+          "wall_stddev_ms": 8.190395188279908,
+          "kernel_median_ms": 1160.49,
+          "peak_rss_median_bytes": 26738688,
+          "wall_cv": 0.007070679639245768
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "trees",
+            "18"
+          ],
+          "result": 66759344,
+          "probe_stdout": "66759344\ntrees 472.347ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main trees 18",
+            "mean": 0.6695734844200001,
+            "stddev": 0.0021755335489707403,
+            "median": 0.66985230082,
+            "user": 0.5822826,
+            "system": 0.10188680000000001,
+            "min": 0.6662132178200001,
+            "max": 0.6722167598200001,
+            "times": [
+              0.6722167598200001,
+              0.67028234282,
+              0.6662132178200001,
+              0.66985230082,
+              0.66930280082
+            ],
+            "memory_usage_byte": [
+              139804672,
+              139804672,
+              139804672,
+              139804672,
+              139804672
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.6722167598200001,
+            0.67028234282,
+            0.6662132178200001,
+            0.66985230082,
+            0.66930280082
+          ],
+          "rss_runs": [
+            {
+              "result": 66759344,
+              "kernel_ms": 509.253,
+              "peak_rss_bytes": 138657792,
+              "stdout": "66759344\ntrees 509.253ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 480.918,
+              "peak_rss_bytes": 135774208,
+              "stdout": "66759344\ntrees 480.918ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 546.066,
+              "peak_rss_bytes": 138117120,
+              "stdout": "66759344\ntrees 546.066ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 478.572,
+              "peak_rss_bytes": 139902976,
+              "stdout": "66759344\ntrees 478.572ms\n"
+            },
+            {
+              "result": 66759344,
+              "kernel_ms": 476.702,
+              "peak_rss_bytes": 139165696,
+              "stdout": "66759344\ntrees 476.702ms\n"
+            }
+          ],
+          "wall_median_ms": 669.85230082,
+          "wall_stddev_ms": 2.17553354897074,
+          "kernel_median_ms": 480.918,
+          "peak_rss_median_bytes": 138657792,
+          "wall_cv": 0.003249133365630865
+        }
+      }
+    },
+    "nbody": {
+      "arguments": [
+        2000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "nbody",
+            "2000000"
+          ],
+          "result": 7.53128916457433,
+          "probe_stdout": "7.53128916457433\nnbody 82.035ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench nbody 2000000",
+            "mean": 0.08617912154,
+            "stddev": 0.00018954876466967613,
+            "median": 0.08617862094,
+            "user": 0.08223675999999999,
+            "system": 0.00214572,
+            "min": 0.08601466294000001,
+            "max": 0.08648674694000001,
+            "times": [
+              0.08617862094,
+              0.08618478794000001,
+              0.08603078894,
+              0.08601466294000001,
+              0.08648674694000001
+            ],
+            "memory_usage_byte": [
+              1966080,
+              1966080,
+              1966080,
+              1966080,
+              1966080
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.08617862094,
+            0.08618478794000001,
+            0.08603078894,
+            0.08601466294000001,
+            0.08648674694000001
+          ],
+          "rss_runs": [
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 82.181,
+              "peak_rss_bytes": 1736704,
+              "stdout": "7.53128916457433\nnbody 82.181ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 81.739,
+              "peak_rss_bytes": 1736704,
+              "stdout": "7.53128916457433\nnbody 81.739ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 82.227,
+              "peak_rss_bytes": 1736704,
+              "stdout": "7.53128916457433\nnbody 82.227ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 81.936,
+              "peak_rss_bytes": 1736704,
+              "stdout": "7.53128916457433\nnbody 81.936ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 82.346,
+              "peak_rss_bytes": 1736704,
+              "stdout": "7.53128916457433\nnbody 82.346ms\n"
+            }
+          ],
+          "wall_median_ms": 86.17862094,
+          "wall_stddev_ms": 0.18954876466967613,
+          "kernel_median_ms": 82.181,
+          "peak_rss_median_bytes": 1736704,
+          "wall_cv": 0.0021994743190982416
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "nbody",
+            "2000000"
+          ],
+          "result": 7.531289164532433,
+          "probe_stdout": "7.531289164532433\nnbody 299.857ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob nbody 2000000",
+            "mean": 0.30719340426,
+            "stddev": 0.0015462122025274284,
+            "median": 0.30730951246000004,
+            "user": 0.30079698,
+            "system": 0.0037627600000000004,
+            "min": 0.30538630446000004,
+            "max": 0.30953672146000005,
+            "times": [
+              0.30740580346,
+              0.30538630446000004,
+              0.30730951246000004,
+              0.30953672146000005,
+              0.30632867946000003
+            ],
+            "memory_usage_byte": [
+              3751936,
+              3817472,
+              3883008,
+              3883008,
+              3883008
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.30740580346,
+            0.30538630446000004,
+            0.30730951246000004,
+            0.30953672146000005,
+            0.30632867946000003
+          ],
+          "rss_runs": [
+            {
+              "result": 7.531289164532433,
+              "kernel_ms": 303.834,
+              "peak_rss_bytes": 3735552,
+              "stdout": "7.531289164532433\nnbody 303.834ms\n"
+            },
+            {
+              "result": 7.531289164532433,
+              "kernel_ms": 303.528,
+              "peak_rss_bytes": 3866624,
+              "stdout": "7.531289164532433\nnbody 303.528ms\n"
+            },
+            {
+              "result": 7.531289164532433,
+              "kernel_ms": 302.256,
+              "peak_rss_bytes": 3735552,
+              "stdout": "7.531289164532433\nnbody 302.256ms\n"
+            },
+            {
+              "result": 7.531289164532433,
+              "kernel_ms": 302.34,
+              "peak_rss_bytes": 3735552,
+              "stdout": "7.531289164532433\nnbody 302.340ms\n"
+            },
+            {
+              "result": 7.531289164532433,
+              "kernel_ms": 302.867,
+              "peak_rss_bytes": 3866624,
+              "stdout": "7.531289164532433\nnbody 302.867ms\n"
+            }
+          ],
+          "wall_median_ms": 307.30951246000006,
+          "wall_stddev_ms": 1.5462122025274283,
+          "kernel_median_ms": 302.867,
+          "peak_rss_median_bytes": 3735552,
+          "wall_cv": 0.005033350915369123
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "nbody",
+            "2000000"
+          ],
+          "result": 7.53128916457433,
+          "probe_stdout": "7.53128916457433\nnbody 1818.652ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main nbody 2000000",
+            "mean": 2.01917380958,
+            "stddev": 0.018178521898611955,
+            "median": 2.02001270998,
+            "user": 1.9179545599999996,
+            "system": 0.10113459999999999,
+            "min": 1.9977047929800003,
+            "max": 2.0400082929799996,
+            "times": [
+              2.00447512598,
+              2.03366812598,
+              2.0400082929799996,
+              1.9977047929800003,
+              2.02001270998
+            ],
+            "memory_usage_byte": [
+              90046464,
+              90046464,
+              90046464,
+              90046464,
+              90046464
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            2.00447512598,
+            2.03366812598,
+            2.0400082929799996,
+            1.9977047929800003,
+            2.02001270998
+          ],
+          "rss_runs": [
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 1815.588,
+              "peak_rss_bytes": 89079808,
+              "stdout": "7.53128916457433\nnbody 1815.588ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 1802.26,
+              "peak_rss_bytes": 89391104,
+              "stdout": "7.53128916457433\nnbody 1802.260ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 1854.241,
+              "peak_rss_bytes": 89686016,
+              "stdout": "7.53128916457433\nnbody 1854.241ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 1830.596,
+              "peak_rss_bytes": 89194496,
+              "stdout": "7.53128916457433\nnbody 1830.596ms\n"
+            },
+            {
+              "result": 7.53128916457433,
+              "kernel_ms": 1821.975,
+              "peak_rss_bytes": 89145344,
+              "stdout": "7.53128916457433\nnbody 1821.975ms\n"
+            }
+          ],
+          "wall_median_ms": 2020.01270998,
+          "wall_stddev_ms": 18.178521898611955,
+          "kernel_median_ms": 1821.975,
+          "peak_rss_median_bytes": 89194496,
+          "wall_cv": 0.00900295051984316
+        }
+      }
+    },
+    "idle": {
+      "arguments": [
+        0
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "idle",
+            "0"
+          ],
+          "result": 0,
+          "probe_stdout": "0\nidle 0.000ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench idle 0",
+            "mean": 0.003045017300000001,
+            "stddev": 0.0006298177990080148,
+            "median": 0.003095417700000001,
+            "user": 0.0011239000000000004,
+            "system": 0.0009110199999999999,
+            "min": 0.002187208700000001,
+            "max": 0.0037328757000000016,
+            "times": [
+              0.002187208700000001,
+              0.003095417700000001,
+              0.0035337507000000002,
+              0.0037328757000000016,
+              0.0026758337000000005
+            ],
+            "memory_usage_byte": [
+              1982464,
+              1982464,
+              1982464,
+              1982464,
+              1982464
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.002187208700000001,
+            0.003095417700000001,
+            0.0035337507000000002,
+            0.0037328757000000016,
+            0.0026758337000000005
+          ],
+          "rss_runs": [
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 1703936,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 1703936,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 1703936,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 1703936,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 1703936,
+              "stdout": "0\nidle 0.000ms\n"
+            }
+          ],
+          "wall_median_ms": 3.095417700000001,
+          "wall_stddev_ms": 0.6298177990080148,
+          "kernel_median_ms": 0.0,
+          "peak_rss_median_bytes": 1703936,
+          "wall_cv": 0.20683554047722966
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "idle",
+            "0"
+          ],
+          "result": 0,
+          "probe_stdout": "0\nidle 0.001ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob idle 0",
+            "mean": 0.00324178804,
+            "stddev": 0.0006889905665678595,
+            "median": 0.002951905040000001,
+            "user": 0.00129376,
+            "system": 0.0013392800000000002,
+            "min": 0.0026311130400000007,
+            "max": 0.00430844604,
+            "times": [
+              0.002951905040000001,
+              0.00430844604,
+              0.0035397380400000004,
+              0.0026311130400000007,
+              0.00277773804
+            ],
+            "memory_usage_byte": [
+              3784704,
+              3784704,
+              3784704,
+              3883008,
+              3883008
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.002951905040000001,
+            0.00430844604,
+            0.0035397380400000004,
+            0.0026311130400000007,
+            0.00277773804
+          ],
+          "rss_runs": [
+            {
+              "result": 0,
+              "kernel_ms": 0.001,
+              "peak_rss_bytes": 3801088,
+              "stdout": "0\nidle 0.001ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.001,
+              "peak_rss_bytes": 3883008,
+              "stdout": "0\nidle 0.001ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 3702784,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.001,
+              "peak_rss_bytes": 3735552,
+              "stdout": "0\nidle 0.001ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.001,
+              "peak_rss_bytes": 3833856,
+              "stdout": "0\nidle 0.001ms\n"
+            }
+          ],
+          "wall_median_ms": 2.951905040000001,
+          "wall_stddev_ms": 0.6889905665678594,
+          "kernel_median_ms": 0.001,
+          "peak_rss_median_bytes": 3801088,
+          "wall_cv": 0.21253411946323894
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "idle",
+            "0"
+          ],
+          "result": 0,
+          "probe_stdout": "0\nidle 0.000ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main idle 0",
+            "mean": 0.20085714826000003,
+            "stddev": 0.0021228249950338116,
+            "median": 0.20163790666,
+            "user": 0.11909871999999999,
+            "system": 0.09205971999999998,
+            "min": 0.19744573966,
+            "max": 0.20295765666,
+            "times": [
+              0.20295765666,
+              0.20033940666000002,
+              0.20190503166,
+              0.20163790666,
+              0.19744573966
+            ],
+            "memory_usage_byte": [
+              89702400,
+              89800704,
+              89800704,
+              89849856,
+              89849856
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.20295765666,
+            0.20033940666000002,
+            0.20190503166,
+            0.20163790666,
+            0.19744573966
+          ],
+          "rss_runs": [
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 89849856,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 89784320,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 89522176,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.0,
+              "peak_rss_bytes": 89374720,
+              "stdout": "0\nidle 0.000ms\n"
+            },
+            {
+              "result": 0,
+              "kernel_ms": 0.001,
+              "peak_rss_bytes": 89489408,
+              "stdout": "0\nidle 0.001ms\n"
+            }
+          ],
+          "wall_median_ms": 201.63790666,
+          "wall_stddev_ms": 2.1228249950338114,
+          "kernel_median_ms": 0.0,
+          "peak_rss_median_bytes": 89522176,
+          "wall_cv": 0.010568829705208777
+        }
+      }
+    },
+    "tasks_100k": {
+      "arguments": [
+        100000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "tasks",
+            "100000"
+          ],
+          "result": 100000,
+          "probe_stdout": "100000\ntasks 46.120ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench tasks 100000",
+            "mean": 0.05851520474000001,
+            "stddev": 0.003651317892368725,
+            "median": 0.05739083774,
+            "user": 0.12243123999999998,
+            "system": 0.04480232,
+            "min": 0.05475162974,
+            "max": 0.06246287974,
+            "times": [
+              0.05475162974,
+              0.06229242174,
+              0.06246287974,
+              0.05739083774,
+              0.05567825474
+            ],
+            "memory_usage_byte": [
+              28704768,
+              28704768,
+              28704768,
+              28737536,
+              28737536
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.05475162974,
+            0.06229242174,
+            0.06246287974,
+            0.05739083774,
+            0.05567825474
+          ],
+          "rss_runs": [
+            {
+              "result": 100000,
+              "kernel_ms": 51.358,
+              "peak_rss_bytes": 28721152,
+              "stdout": "100000\ntasks 51.358ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 52.077,
+              "peak_rss_bytes": 28721152,
+              "stdout": "100000\ntasks 52.077ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 50.674,
+              "peak_rss_bytes": 28704768,
+              "stdout": "100000\ntasks 50.674ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 57.965,
+              "peak_rss_bytes": 28721152,
+              "stdout": "100000\ntasks 57.965ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 56.85,
+              "peak_rss_bytes": 28721152,
+              "stdout": "100000\ntasks 56.850ms\n"
+            }
+          ],
+          "wall_median_ms": 57.39083774,
+          "wall_stddev_ms": 3.6513178923687253,
+          "kernel_median_ms": 52.077,
+          "peak_rss_median_bytes": 28721152,
+          "wall_cv": 0.06239947221568459
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "tasks",
+            "100000"
+          ],
+          "result": 100000,
+          "probe_stdout": "100000\ntasks 101.748ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob tasks 100000",
+            "mean": 0.0973795493,
+            "stddev": 0.0025575287217030817,
+            "median": 0.0977538331,
+            "user": 0.20596744,
+            "system": 0.05980312,
+            "min": 0.0935248741,
+            "max": 0.0998977491,
+            "times": [
+              0.0998977491,
+              0.0963839991,
+              0.0935248741,
+              0.0977538331,
+              0.0993372911
+            ],
+            "memory_usage_byte": [
+              271859712,
+              272023552,
+              272023552,
+              272023552,
+              272023552
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.0998977491,
+            0.0963839991,
+            0.0935248741,
+            0.0977538331,
+            0.0993372911
+          ],
+          "rss_runs": [
+            {
+              "result": 100000,
+              "kernel_ms": 81.544,
+              "peak_rss_bytes": 271728640,
+              "stdout": "100000\ntasks 81.544ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 85.604,
+              "peak_rss_bytes": 271941632,
+              "stdout": "100000\ntasks 85.604ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 85.165,
+              "peak_rss_bytes": 271974400,
+              "stdout": "100000\ntasks 85.165ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 90.587,
+              "peak_rss_bytes": 271859712,
+              "stdout": "100000\ntasks 90.587ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 80.834,
+              "peak_rss_bytes": 272072704,
+              "stdout": "100000\ntasks 80.834ms\n"
+            }
+          ],
+          "wall_median_ms": 97.75383310000001,
+          "wall_stddev_ms": 2.5575287217030818,
+          "kernel_median_ms": 85.165,
+          "peak_rss_median_bytes": 271941632,
+          "wall_cv": 0.02626350953652526
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "tasks",
+            "100000"
+          ],
+          "result": 100000,
+          "probe_stdout": "100000\ntasks 144.891ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main tasks 100000",
+            "mean": 0.33868625584,
+            "stddev": 0.011389705374940627,
+            "median": 0.33889191384,
+            "user": 0.31872354,
+            "system": 0.19174668,
+            "min": 0.32595912284,
+            "max": 0.35541716384,
+            "times": [
+              0.35541716384,
+              0.34241662284,
+              0.33889191384,
+              0.32595912284,
+              0.33074645584
+            ],
+            "memory_usage_byte": [
+              378257408,
+              378257408,
+              380518400,
+              380518400,
+              380518400
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.35541716384,
+            0.34241662284,
+            0.33889191384,
+            0.32595912284,
+            0.33074645584
+          ],
+          "rss_runs": [
+            {
+              "result": 100000,
+              "kernel_ms": 134.979,
+              "peak_rss_bytes": 377126912,
+              "stdout": "100000\ntasks 134.979ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 134.745,
+              "peak_rss_bytes": 377405440,
+              "stdout": "100000\ntasks 134.745ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 149.749,
+              "peak_rss_bytes": 380272640,
+              "stdout": "100000\ntasks 149.749ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 170.051,
+              "peak_rss_bytes": 374489088,
+              "stdout": "100000\ntasks 170.051ms\n"
+            },
+            {
+              "result": 100000,
+              "kernel_ms": 149.054,
+              "peak_rss_bytes": 373063680,
+              "stdout": "100000\ntasks 149.054ms\n"
+            }
+          ],
+          "wall_median_ms": 338.89191384000003,
+          "wall_stddev_ms": 11.389705374940627,
+          "kernel_median_ms": 149.054,
+          "peak_rss_median_bytes": 377126912,
+          "wall_cv": 0.033629074633371836
+        }
+      }
+    },
+    "tasks_1m": {
+      "arguments": [
+        1000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "tasks",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\ntasks 493.912ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench tasks 1000000",
+            "mean": 0.52324472324,
+            "stddev": 0.019027835755799725,
+            "median": 0.5185287066400001,
+            "user": 1.08074174,
+            "system": 0.42240475999999993,
+            "min": 0.50478303964,
+            "max": 0.55158308164,
+            "times": [
+              0.5185287066400001,
+              0.50478303964,
+              0.50907170664,
+              0.55158308164,
+              0.5322570816400001
+            ],
+            "memory_usage_byte": [
+              267419648,
+              267419648,
+              267419648,
+              267419648,
+              267419648
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.5185287066400001,
+            0.50478303964,
+            0.50907170664,
+            0.55158308164,
+            0.5322570816400001
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 504.308,
+              "peak_rss_bytes": 267370496,
+              "stdout": "1000000\ntasks 504.308ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 519.781,
+              "peak_rss_bytes": 267386880,
+              "stdout": "1000000\ntasks 519.781ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 537.488,
+              "peak_rss_bytes": 267403264,
+              "stdout": "1000000\ntasks 537.488ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 503.333,
+              "peak_rss_bytes": 267386880,
+              "stdout": "1000000\ntasks 503.333ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 517.112,
+              "peak_rss_bytes": 267403264,
+              "stdout": "1000000\ntasks 517.112ms\n"
+            }
+          ],
+          "wall_median_ms": 518.5287066400001,
+          "wall_stddev_ms": 19.027835755799725,
+          "kernel_median_ms": 517.112,
+          "peak_rss_median_bytes": 267386880,
+          "wall_cv": 0.03636507911245978
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "tasks",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\ntasks 1750.844ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob tasks 1000000",
+            "mean": 1.15105146498,
+            "stddev": 0.04287009031944293,
+            "median": 1.1662081899799999,
+            "user": 2.7798814599999995,
+            "system": 0.59730686,
+            "min": 1.1023618149799999,
+            "max": 1.19176981498,
+            "times": [
+              1.1662081899799999,
+              1.1023618149799999,
+              1.1866197729799999,
+              1.19176981498,
+              1.10829773198
+            ],
+            "memory_usage_byte": [
+              2692677632,
+              2692677632,
+              2692677632,
+              2692677632,
+              2692677632
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            1.1662081899799999,
+            1.1023618149799999,
+            1.1866197729799999,
+            1.19176981498,
+            1.10829773198
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 1323.149,
+              "peak_rss_bytes": 2691547136,
+              "stdout": "1000000\ntasks 1323.149ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1111.003,
+              "peak_rss_bytes": 2688761856,
+              "stdout": "1000000\ntasks 1111.003ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1393.646,
+              "peak_rss_bytes": 2692153344,
+              "stdout": "1000000\ntasks 1393.646ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1105.213,
+              "peak_rss_bytes": 2691891200,
+              "stdout": "1000000\ntasks 1105.213ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 940.425,
+              "peak_rss_bytes": 2691825664,
+              "stdout": "1000000\ntasks 940.425ms\n"
+            }
+          ],
+          "wall_median_ms": 1166.2081899799998,
+          "wall_stddev_ms": 42.87009031944293,
+          "kernel_median_ms": 1111.003,
+          "peak_rss_median_bytes": 2691825664,
+          "wall_cv": 0.03724428631015888
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "tasks",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\ntasks 1524.408ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main tasks 1000000",
+            "mean": 2.57822551266,
+            "stddev": 0.9736614692505701,
+            "median": 2.12341999586,
+            "user": 2.51924176,
+            "system": 1.42723844,
+            "min": 2.02100807986,
+            "max": 4.30827132886,
+            "times": [
+              4.30827132886,
+              2.1099200798599997,
+              2.02100807986,
+              2.32850807886,
+              2.12341999586
+            ],
+            "memory_usage_byte": [
+              3223584768,
+              3223584768,
+              3223584768,
+              3223584768,
+              3223584768
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            4.30827132886,
+            2.1099200798599997,
+            2.02100807986,
+            2.32850807886,
+            2.12341999586
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 1966.287,
+              "peak_rss_bytes": 2543632384,
+              "stdout": "1000000\ntasks 1966.287ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1814.895,
+              "peak_rss_bytes": 2593210368,
+              "stdout": "1000000\ntasks 1814.895ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1618.439,
+              "peak_rss_bytes": 2730655744,
+              "stdout": "1000000\ntasks 1618.439ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1621.802,
+              "peak_rss_bytes": 2861072384,
+              "stdout": "1000000\ntasks 1621.802ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1638.94,
+              "peak_rss_bytes": 2875719680,
+              "stdout": "1000000\ntasks 1638.940ms\n"
+            }
+          ],
+          "wall_median_ms": 2123.4199958599997,
+          "wall_stddev_ms": 973.6614692505701,
+          "kernel_median_ms": 1638.94,
+          "peak_rss_median_bytes": 2730655744,
+          "wall_cv": 0.3776479072406768
+        }
+      }
+    },
+    "ring": {
+      "arguments": [
+        1000,
+        2000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "ring",
+            "1000",
+            "2000000"
+          ],
+          "result": 2000000,
+          "probe_stdout": "2000000\nring 231.061ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench ring 1000 2000000",
+            "mean": 0.21571635754000001,
+            "stddev": 0.008356135338968602,
+            "median": 0.21319456614,
+            "user": 0.21247347999999996,
+            "system": 0.12179314,
+            "min": 0.20789681614000002,
+            "max": 0.22518327414000003,
+            "times": [
+              0.22518327414000003,
+              0.22395710714000003,
+              0.20835002414,
+              0.20789681614000002,
+              0.21319456614
+            ],
+            "memory_usage_byte": [
+              3620864,
+              3637248,
+              3637248,
+              3637248,
+              3637248
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.22518327414000003,
+            0.22395710714000003,
+            0.20835002414,
+            0.20789681614000002,
+            0.21319456614
+          ],
+          "rss_runs": [
+            {
+              "result": 2000000,
+              "kernel_ms": 208.432,
+              "peak_rss_bytes": 3620864,
+              "stdout": "2000000\nring 208.432ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 213.154,
+              "peak_rss_bytes": 3620864,
+              "stdout": "2000000\nring 213.154ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 212.472,
+              "peak_rss_bytes": 3604480,
+              "stdout": "2000000\nring 212.472ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 202.071,
+              "peak_rss_bytes": 3637248,
+              "stdout": "2000000\nring 202.071ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 214.263,
+              "peak_rss_bytes": 3604480,
+              "stdout": "2000000\nring 214.263ms\n"
+            }
+          ],
+          "wall_median_ms": 213.19456614,
+          "wall_stddev_ms": 8.356135338968603,
+          "kernel_median_ms": 212.472,
+          "peak_rss_median_bytes": 3620864,
+          "wall_cv": 0.038736679194201276
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "ring",
+            "1000",
+            "2000000"
+          ],
+          "result": 2000000,
+          "probe_stdout": "2000000\nring 313.546ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob ring 1000 2000000",
+            "mean": 0.30193811088,
+            "stddev": 0.0028762812114270842,
+            "median": 0.30333069388,
+            "user": 0.28597085999999994,
+            "system": 0.11958287999999999,
+            "min": 0.29874423588000004,
+            "max": 0.30514956888,
+            "times": [
+              0.30333069388,
+              0.30342894488000005,
+              0.30514956888,
+              0.29903711088,
+              0.29874423588000004
+            ],
+            "memory_usage_byte": [
+              7045120,
+              7045120,
+              7045120,
+              7045120,
+              7045120
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.30333069388,
+            0.30342894488000005,
+            0.30514956888,
+            0.29903711088,
+            0.29874423588000004
+          ],
+          "rss_runs": [
+            {
+              "result": 2000000,
+              "kernel_ms": 296.244,
+              "peak_rss_bytes": 6815744,
+              "stdout": "2000000\nring 296.244ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 295.759,
+              "peak_rss_bytes": 6946816,
+              "stdout": "2000000\nring 295.759ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 299.741,
+              "peak_rss_bytes": 6864896,
+              "stdout": "2000000\nring 299.741ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 321.044,
+              "peak_rss_bytes": 6864896,
+              "stdout": "2000000\nring 321.044ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 323.111,
+              "peak_rss_bytes": 6914048,
+              "stdout": "2000000\nring 323.111ms\n"
+            }
+          ],
+          "wall_median_ms": 303.33069388,
+          "wall_stddev_ms": 2.876281211427084,
+          "kernel_median_ms": 299.741,
+          "peak_rss_median_bytes": 6864896,
+          "wall_cv": 0.00952606215573168
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "ring",
+            "1000",
+            "2000000"
+          ],
+          "result": 2000000,
+          "probe_stdout": "2000000\nring 543.563ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main ring 1000 2000000",
+            "mean": 0.78034258512,
+            "stddev": 0.03169590695153415,
+            "median": 0.76728511772,
+            "user": 0.67730758,
+            "system": 0.10750172,
+            "min": 0.74615174372,
+            "max": 0.82165082672,
+            "times": [
+              0.74615174372,
+              0.76728511772,
+              0.76146086872,
+              0.82165082672,
+              0.80516436872
+            ],
+            "memory_usage_byte": [
+              94224384,
+              94224384,
+              94224384,
+              94224384,
+              94224384
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.74615174372,
+            0.76728511772,
+            0.76146086872,
+            0.82165082672,
+            0.80516436872
+          ],
+          "rss_runs": [
+            {
+              "result": 2000000,
+              "kernel_ms": 560.811,
+              "peak_rss_bytes": 91570176,
+              "stdout": "2000000\nring 560.811ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 572.386,
+              "peak_rss_bytes": 93945856,
+              "stdout": "2000000\nring 572.386ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 559.91,
+              "peak_rss_bytes": 94060544,
+              "stdout": "2000000\nring 559.910ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 560.459,
+              "peak_rss_bytes": 93077504,
+              "stdout": "2000000\nring 560.459ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 553.27,
+              "peak_rss_bytes": 91963392,
+              "stdout": "2000000\nring 553.270ms\n"
+            }
+          ],
+          "wall_median_ms": 767.28511772,
+          "wall_stddev_ms": 31.695906951534152,
+          "kernel_median_ms": 560.459,
+          "peak_rss_median_bytes": 93077504,
+          "wall_cv": 0.04061793826958707
+        }
+      }
+    },
+    "pingpong": {
+      "arguments": [
+        1000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "pingpong",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\npingpong 9237.339ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench pingpong 1000000",
+            "mean": 7.187128142500001,
+            "stddev": 0.48188869772515946,
+            "median": 7.3025881095,
+            "user": 2.0148979000000002,
+            "system": 5.718958979999999,
+            "min": 6.5233429425,
+            "max": 7.6362291925,
+            "times": [
+              7.6362291925,
+              7.603012400500001,
+              6.8704680675,
+              6.5233429425,
+              7.3025881095
+            ],
+            "memory_usage_byte": [
+              2195456,
+              2211840,
+              2211840,
+              2211840,
+              2228224
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            7.6362291925,
+            7.603012400500001,
+            6.8704680675,
+            6.5233429425,
+            7.3025881095
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 8335.488,
+              "peak_rss_bytes": 2195456,
+              "stdout": "1000000\npingpong 8335.488ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 7434.787,
+              "peak_rss_bytes": 2211840,
+              "stdout": "1000000\npingpong 7434.787ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 7705.519,
+              "peak_rss_bytes": 2179072,
+              "stdout": "1000000\npingpong 7705.519ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 7585.028,
+              "peak_rss_bytes": 2195456,
+              "stdout": "1000000\npingpong 7585.028ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 8729.452,
+              "peak_rss_bytes": 2211840,
+              "stdout": "1000000\npingpong 8729.452ms\n"
+            }
+          ],
+          "wall_median_ms": 7302.5881095,
+          "wall_stddev_ms": 481.88869772515943,
+          "kernel_median_ms": 7705.519,
+          "peak_rss_median_bytes": 2195456,
+          "wall_cv": 0.06704885291742374
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "pingpong",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\npingpong 296.108ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob pingpong 1000000",
+            "mean": 0.30053671672000004,
+            "stddev": 0.0006780432010984178,
+            "median": 0.30068380012000007,
+            "user": 0.25939216,
+            "system": 0.16030318000000002,
+            "min": 0.29966063412,
+            "max": 0.30118559112,
+            "times": [
+              0.30113605012,
+              0.30068380012000007,
+              0.30118559112,
+              0.29966063412,
+              0.30001750812000005
+            ],
+            "memory_usage_byte": [
+              3932160,
+              3932160,
+              3932160,
+              3932160,
+              3932160
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.30113605012,
+            0.30068380012000007,
+            0.30118559112,
+            0.29966063412,
+            0.30001750812000005
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 297.894,
+              "peak_rss_bytes": 3915776,
+              "stdout": "1000000\npingpong 297.894ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 305.523,
+              "peak_rss_bytes": 3866624,
+              "stdout": "1000000\npingpong 305.523ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 299.662,
+              "peak_rss_bytes": 3801088,
+              "stdout": "1000000\npingpong 299.662ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 298.398,
+              "peak_rss_bytes": 3866624,
+              "stdout": "1000000\npingpong 298.398ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 297.553,
+              "peak_rss_bytes": 3801088,
+              "stdout": "1000000\npingpong 297.553ms\n"
+            }
+          ],
+          "wall_median_ms": 300.68380012000006,
+          "wall_stddev_ms": 0.6780432010984176,
+          "kernel_median_ms": 298.398,
+          "peak_rss_median_bytes": 3866624,
+          "wall_cv": 0.002256107701243465
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "pingpong",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\npingpong 1887.795ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main pingpong 1000000",
+            "mean": 1.18312020308,
+            "stddev": 0.728406249696489,
+            "median": 0.7516245782800001,
+            "user": 0.6338439000000001,
+            "system": 0.19601381999999998,
+            "min": 0.67816582828,
+            "max": 2.3507121612799997,
+            "times": [
+              1.44909278628,
+              0.67816582828,
+              0.6860056612800001,
+              2.3507121612799997,
+              0.7516245782800001
+            ],
+            "memory_usage_byte": [
+              89751552,
+              90079232,
+              90816512,
+              90816512,
+              90816512
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            1.44909278628,
+            0.67816582828,
+            0.6860056612800001,
+            2.3507121612799997,
+            0.7516245782800001
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 2100.813,
+              "peak_rss_bytes": 89538560,
+              "stdout": "1000000\npingpong 2100.813ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1121.288,
+              "peak_rss_bytes": 88932352,
+              "stdout": "1000000\npingpong 1121.288ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 489.433,
+              "peak_rss_bytes": 89571328,
+              "stdout": "1000000\npingpong 489.433ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 1246.75,
+              "peak_rss_bytes": 89620480,
+              "stdout": "1000000\npingpong 1246.750ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 481.052,
+              "peak_rss_bytes": 90062848,
+              "stdout": "1000000\npingpong 481.052ms\n"
+            }
+          ],
+          "wall_median_ms": 751.62457828,
+          "wall_stddev_ms": 728.406249696489,
+          "kernel_median_ms": 1121.288,
+          "peak_rss_median_bytes": 89571328,
+          "wall_cv": 0.6156654647602495
+        }
+      }
+    },
+    "bigmsg": {
+      "arguments": [
+        200
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "bigmsg",
+            "200"
+          ],
+          "result": 301465600,
+          "probe_stdout": "301465600\nbigmsg 17.109ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench bigmsg 200",
+            "mean": 0.015373209500000002,
+            "stddev": 0.0018110101485597206,
+            "median": 0.0144525099,
+            "user": 0.0070830599999999995,
+            "system": 0.0096961,
+            "min": 0.0136288839,
+            "max": 0.0175838429,
+            "times": [
+              0.0144525099,
+              0.0175838429,
+              0.0170561759,
+              0.014144634900000001,
+              0.0136288839
+            ],
+            "memory_usage_byte": [
+              4898816,
+              4898816,
+              4898816,
+              4898816,
+              4898816
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.0144525099,
+            0.0175838429,
+            0.0170561759,
+            0.014144634900000001,
+            0.0136288839
+          ],
+          "rss_runs": [
+            {
+              "result": 301465600,
+              "kernel_ms": 11.369,
+              "peak_rss_bytes": 4882432,
+              "stdout": "301465600\nbigmsg 11.369ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 11.535,
+              "peak_rss_bytes": 4866048,
+              "stdout": "301465600\nbigmsg 11.535ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 11.063,
+              "peak_rss_bytes": 4882432,
+              "stdout": "301465600\nbigmsg 11.063ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 10.526,
+              "peak_rss_bytes": 4898816,
+              "stdout": "301465600\nbigmsg 10.526ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 10.827,
+              "peak_rss_bytes": 4898816,
+              "stdout": "301465600\nbigmsg 10.827ms\n"
+            }
+          ],
+          "wall_median_ms": 14.4525099,
+          "wall_stddev_ms": 1.8110101485597205,
+          "kernel_median_ms": 11.063,
+          "peak_rss_median_bytes": 4882432,
+          "wall_cv": 0.11780299673660992
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "bigmsg",
+            "200"
+          ],
+          "result": 301465600,
+          "probe_stdout": "301465600\nbigmsg 17.681ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob bigmsg 200",
+            "mean": 0.020302712679999998,
+            "stddev": 0.0016137361200858405,
+            "median": 0.02085119648,
+            "user": 0.0169568,
+            "system": 0.013777339999999999,
+            "min": 0.018370279479999998,
+            "max": 0.02227027848,
+            "times": [
+              0.01892927948,
+              0.02085119648,
+              0.018370279479999998,
+              0.02109252948,
+              0.02227027848
+            ],
+            "memory_usage_byte": [
+              10698752,
+              10715136,
+              10715136,
+              10715136,
+              11010048
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.01892927948,
+            0.02085119648,
+            0.018370279479999998,
+            0.02109252948,
+            0.02227027848
+          ],
+          "rss_runs": [
+            {
+              "result": 301465600,
+              "kernel_ms": 17.858,
+              "peak_rss_bytes": 10092544,
+              "stdout": "301465600\nbigmsg 17.858ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 16.037,
+              "peak_rss_bytes": 10665984,
+              "stdout": "301465600\nbigmsg 16.037ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 16.297,
+              "peak_rss_bytes": 10665984,
+              "stdout": "301465600\nbigmsg 16.297ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 16.889,
+              "peak_rss_bytes": 11091968,
+              "stdout": "301465600\nbigmsg 16.889ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 17.879,
+              "peak_rss_bytes": 10911744,
+              "stdout": "301465600\nbigmsg 17.879ms\n"
+            }
+          ],
+          "wall_median_ms": 20.85119648,
+          "wall_stddev_ms": 1.6137361200858404,
+          "kernel_median_ms": 16.889,
+          "peak_rss_median_bytes": 10665984,
+          "wall_cv": 0.07948376877123006
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "bigmsg",
+            "200"
+          ],
+          "result": 301465600,
+          "probe_stdout": "301465600\nbigmsg 161.979ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main bigmsg 200",
+            "mean": 0.37956637266,
+            "stddev": 0.020243342947423443,
+            "median": 0.36617018946,
+            "user": 0.28164429999999996,
+            "system": 0.1505702,
+            "min": 0.36236456446000004,
+            "max": 0.40245106446,
+            "times": [
+              0.40245106446,
+              0.40089235546,
+              0.36595368946,
+              0.36236456446000004,
+              0.36617018946
+            ],
+            "memory_usage_byte": [
+              96862208,
+              97681408,
+              97681408,
+              97681408,
+              97681408
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.40245106446,
+            0.40089235546,
+            0.36595368946,
+            0.36236456446000004,
+            0.36617018946
+          ],
+          "rss_runs": [
+            {
+              "result": 301465600,
+              "kernel_ms": 155.394,
+              "peak_rss_bytes": 96583680,
+              "stdout": "301465600\nbigmsg 155.394ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 154.2,
+              "peak_rss_bytes": 96468992,
+              "stdout": "301465600\nbigmsg 154.200ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 154.809,
+              "peak_rss_bytes": 96714752,
+              "stdout": "301465600\nbigmsg 154.809ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 153.165,
+              "peak_rss_bytes": 96387072,
+              "stdout": "301465600\nbigmsg 153.165ms\n"
+            },
+            {
+              "result": 301465600,
+              "kernel_ms": 157.59,
+              "peak_rss_bytes": 97714176,
+              "stdout": "301465600\nbigmsg 157.590ms\n"
+            }
+          ],
+          "wall_median_ms": 366.17018946,
+          "wall_stddev_ms": 20.243342947423443,
+          "kernel_median_ms": 154.809,
+          "peak_rss_median_bytes": 96583680,
+          "wall_cv": 0.053332814510300676
+        }
+      }
+    },
+    "map_update": {
+      "arguments": [
+        4000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "map_update",
+            "4000000"
+          ],
+          "result": 4001000,
+          "probe_stdout": "4001000\nmap_update 35.141ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench map_update 4000000",
+            "mean": 0.038620978,
+            "stddev": 0.0011600652332292784,
+            "median": 0.0381196446,
+            "user": 0.03610418,
+            "system": 0.0015157600000000005,
+            "min": 0.0378130616,
+            "max": 0.040638061600000004,
+            "times": [
+              0.0378130616,
+              0.040638061600000004,
+              0.0381196446,
+              0.03854972760000001,
+              0.037984394600000006
+            ],
+            "memory_usage_byte": [
+              1966080,
+              1966080,
+              1966080,
+              1966080,
+              1966080
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.0378130616,
+            0.040638061600000004,
+            0.0381196446,
+            0.03854972760000001,
+            0.037984394600000006
+          ],
+          "rss_runs": [
+            {
+              "result": 4001000,
+              "kernel_ms": 34.765,
+              "peak_rss_bytes": 1785856,
+              "stdout": "4001000\nmap_update 34.765ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 35.366,
+              "peak_rss_bytes": 1785856,
+              "stdout": "4001000\nmap_update 35.366ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 34.395,
+              "peak_rss_bytes": 1785856,
+              "stdout": "4001000\nmap_update 34.395ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 35.069,
+              "peak_rss_bytes": 1785856,
+              "stdout": "4001000\nmap_update 35.069ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 34.787,
+              "peak_rss_bytes": 1785856,
+              "stdout": "4001000\nmap_update 34.787ms\n"
+            }
+          ],
+          "wall_median_ms": 38.1196446,
+          "wall_stddev_ms": 1.1600652332292787,
+          "kernel_median_ms": 34.787,
+          "peak_rss_median_bytes": 1785856,
+          "wall_cv": 0.03003717910067628
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "map_update",
+            "4000000"
+          ],
+          "result": 4001000,
+          "probe_stdout": "4001000\nmap_update 24.220ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob map_update 4000000",
+            "mean": 0.02795057502,
+            "stddev": 0.0008054972847271451,
+            "median": 0.027984416619999997,
+            "user": 0.02565652,
+            "system": 0.0016851799999999992,
+            "min": 0.026900916619999996,
+            "max": 0.02909891662,
+            "times": [
+              0.02759716662,
+              0.028171458620000003,
+              0.02909891662,
+              0.027984416619999997,
+              0.026900916619999996
+            ],
+            "memory_usage_byte": [
+              3801088,
+              3915776,
+              3915776,
+              3915776,
+              3915776
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.02759716662,
+            0.028171458620000003,
+            0.02909891662,
+            0.027984416619999997,
+            0.026900916619999996
+          ],
+          "rss_runs": [
+            {
+              "result": 4001000,
+              "kernel_ms": 24.645,
+              "peak_rss_bytes": 3833856,
+              "stdout": "4001000\nmap_update 24.645ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 24.988,
+              "peak_rss_bytes": 3883008,
+              "stdout": "4001000\nmap_update 24.988ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 24.531,
+              "peak_rss_bytes": 3751936,
+              "stdout": "4001000\nmap_update 24.531ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 24.715,
+              "peak_rss_bytes": 3751936,
+              "stdout": "4001000\nmap_update 24.715ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 25.126,
+              "peak_rss_bytes": 3751936,
+              "stdout": "4001000\nmap_update 25.126ms\n"
+            }
+          ],
+          "wall_median_ms": 27.984416619999998,
+          "wall_stddev_ms": 0.8054972847271451,
+          "kernel_median_ms": 24.715,
+          "peak_rss_median_bytes": 3751936,
+          "wall_cv": 0.02881863017668769
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "map_update",
+            "4000000"
+          ],
+          "result": 4001000,
+          "probe_stdout": "4001000\nmap_update 624.774ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main map_update 4000000",
+            "mean": 0.8309231638800002,
+            "stddev": 0.008616094598835167,
+            "median": 0.8332445968800001,
+            "user": 0.8845797799999999,
+            "system": 0.18451382,
+            "min": 0.82023063888,
+            "max": 0.84260105588,
+            "times": [
+              0.82506330588,
+              0.82023063888,
+              0.83347622188,
+              0.8332445968800001,
+              0.84260105588
+            ],
+            "memory_usage_byte": [
+              95059968,
+              95059968,
+              95059968,
+              95059968,
+              95649792
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.82506330588,
+            0.82023063888,
+            0.83347622188,
+            0.8332445968800001,
+            0.84260105588
+          ],
+          "rss_runs": [
+            {
+              "result": 4001000,
+              "kernel_ms": 622.012,
+              "peak_rss_bytes": 94437376,
+              "stdout": "4001000\nmap_update 622.012ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 648.947,
+              "peak_rss_bytes": 94011392,
+              "stdout": "4001000\nmap_update 648.947ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 801.371,
+              "peak_rss_bytes": 96403456,
+              "stdout": "4001000\nmap_update 801.371ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 651.045,
+              "peak_rss_bytes": 93831168,
+              "stdout": "4001000\nmap_update 651.045ms\n"
+            },
+            {
+              "result": 4001000,
+              "kernel_ms": 710.213,
+              "peak_rss_bytes": 94896128,
+              "stdout": "4001000\nmap_update 710.213ms\n"
+            }
+          ],
+          "wall_median_ms": 833.2445968800001,
+          "wall_stddev_ms": 8.616094598835167,
+          "kernel_median_ms": 651.045,
+          "peak_rss_median_bytes": 94437376,
+          "wall_cv": 0.010369303653303236
+        }
+      }
+    },
+    "map_update_small": {
+      "arguments": [
+        4000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "map_update_small",
+            "4000000"
+          ],
+          "result": 4000032,
+          "probe_stdout": "4000032\nmap_update_small 34.769ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench map_update_small 4000000",
+            "mean": 0.03600428922,
+            "stddev": 0.0015318706338393927,
+            "median": 0.03594730622,
+            "user": 0.03411066,
+            "system": 0.0009162000000000004,
+            "min": 0.03437901422,
+            "max": 0.03844988922,
+            "times": [
+              0.03594730622,
+              0.03844988922,
+              0.03437901422,
+              0.035138139219999996,
+              0.03610709722
+            ],
+            "memory_usage_byte": [
+              1982464,
+              1982464,
+              1982464,
+              1982464,
+              1982464
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.03594730622,
+            0.03844988922,
+            0.03437901422,
+            0.035138139219999996,
+            0.03610709722
+          ],
+          "rss_runs": [
+            {
+              "result": 4000032,
+              "kernel_ms": 32.724,
+              "peak_rss_bytes": 1720320,
+              "stdout": "4000032\nmap_update_small 32.724ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 32.91,
+              "peak_rss_bytes": 1720320,
+              "stdout": "4000032\nmap_update_small 32.910ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 32.857,
+              "peak_rss_bytes": 1720320,
+              "stdout": "4000032\nmap_update_small 32.857ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 36.68,
+              "peak_rss_bytes": 1720320,
+              "stdout": "4000032\nmap_update_small 36.680ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 32.937,
+              "peak_rss_bytes": 1720320,
+              "stdout": "4000032\nmap_update_small 32.937ms\n"
+            }
+          ],
+          "wall_median_ms": 35.94730622,
+          "wall_stddev_ms": 1.5318706338393926,
+          "kernel_median_ms": 32.91,
+          "peak_rss_median_bytes": 1720320,
+          "wall_cv": 0.0425468928015514
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "map_update_small",
+            "4000000"
+          ],
+          "result": 4000032,
+          "probe_stdout": "4000032\nmap_update_small 20.094ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob map_update_small 4000000",
+            "mean": 0.024340521020000006,
+            "stddev": 0.0007866269617796617,
+            "median": 0.024264204220000002,
+            "user": 0.021301539999999997,
+            "system": 0.0013921199999999997,
+            "min": 0.02340182922,
+            "max": 0.025572038220000003,
+            "times": [
+              0.02340182922,
+              0.024264204220000002,
+              0.025572038220000003,
+              0.024077204220000002,
+              0.02438732922
+            ],
+            "memory_usage_byte": [
+              3817472,
+              3817472,
+              3817472,
+              3932160,
+              3932160
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.02340182922,
+            0.024264204220000002,
+            0.025572038220000003,
+            0.024077204220000002,
+            0.02438732922
+          ],
+          "rss_runs": [
+            {
+              "result": 4000032,
+              "kernel_ms": 25.008,
+              "peak_rss_bytes": 3702784,
+              "stdout": "4000032\nmap_update_small 25.008ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 20.302,
+              "peak_rss_bytes": 3735552,
+              "stdout": "4000032\nmap_update_small 20.302ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 20.349,
+              "peak_rss_bytes": 3702784,
+              "stdout": "4000032\nmap_update_small 20.349ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 20.316,
+              "peak_rss_bytes": 3883008,
+              "stdout": "4000032\nmap_update_small 20.316ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 20.229,
+              "peak_rss_bytes": 3702784,
+              "stdout": "4000032\nmap_update_small 20.229ms\n"
+            }
+          ],
+          "wall_median_ms": 24.264204220000003,
+          "wall_stddev_ms": 0.7866269617796616,
+          "kernel_median_ms": 20.316,
+          "peak_rss_median_bytes": 3702784,
+          "wall_cv": 0.03231758930440765
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "map_update_small",
+            "4000000"
+          ],
+          "result": 4000032,
+          "probe_stdout": "4000032\nmap_update_small 522.872ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main map_update_small 4000000",
+            "mean": 0.6867079693400001,
+            "stddev": 0.02303662412352791,
+            "median": 0.6888288193400001,
+            "user": 0.83463504,
+            "system": 0.10279566,
+            "min": 0.66043077734,
+            "max": 0.71097702834,
+            "times": [
+              0.6888288193400001,
+              0.66617281934,
+              0.71097702834,
+              0.70713040234,
+              0.66043077734
+            ],
+            "memory_usage_byte": [
+              92225536,
+              92225536,
+              92225536,
+              94339072,
+              94339072
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.6888288193400001,
+            0.66617281934,
+            0.71097702834,
+            0.70713040234,
+            0.66043077734
+          ],
+          "rss_runs": [
+            {
+              "result": 4000032,
+              "kernel_ms": 499.991,
+              "peak_rss_bytes": 91897856,
+              "stdout": "4000032\nmap_update_small 499.991ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 497.883,
+              "peak_rss_bytes": 91799552,
+              "stdout": "4000032\nmap_update_small 497.883ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 514.017,
+              "peak_rss_bytes": 92946432,
+              "stdout": "4000032\nmap_update_small 514.017ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 477.22,
+              "peak_rss_bytes": 91635712,
+              "stdout": "4000032\nmap_update_small 477.220ms\n"
+            },
+            {
+              "result": 4000032,
+              "kernel_ms": 507.065,
+              "peak_rss_bytes": 91652096,
+              "stdout": "4000032\nmap_update_small 507.065ms\n"
+            }
+          ],
+          "wall_median_ms": 688.8288193400001,
+          "wall_stddev_ms": 23.036624123527908,
+          "kernel_median_ms": 499.991,
+          "peak_rss_median_bytes": 91799552,
+          "wall_cv": 0.03354646392944671
+        }
+      }
+    },
+    "binary_parse": {
+      "arguments": [
+        128
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "binary_parse",
+            "128"
+          ],
+          "result": 136314880,
+          "probe_stdout": "136314880\nbinary_parse 21.645ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench binary_parse 128",
+            "mean": 0.02446509652,
+            "stddev": 0.0006010099699004177,
+            "median": 0.02449817132,
+            "user": 0.0085704,
+            "system": 0.01249452,
+            "min": 0.02356012932,
+            "max": 0.025242796320000004,
+            "times": [
+              0.025242796320000004,
+              0.02442404732,
+              0.02449817132,
+              0.02356012932,
+              0.02460033832
+            ],
+            "memory_usage_byte": [
+              136478720,
+              136478720,
+              136478720,
+              136478720,
+              136478720
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.025242796320000004,
+            0.02442404732,
+            0.02449817132,
+            0.02356012932,
+            0.02460033832
+          ],
+          "rss_runs": [
+            {
+              "result": 136314880,
+              "kernel_ms": 17.957,
+              "peak_rss_bytes": 136478720,
+              "stdout": "136314880\nbinary_parse 17.957ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 17.478,
+              "peak_rss_bytes": 136478720,
+              "stdout": "136314880\nbinary_parse 17.478ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 17.669,
+              "peak_rss_bytes": 136478720,
+              "stdout": "136314880\nbinary_parse 17.669ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 18.129,
+              "peak_rss_bytes": 136478720,
+              "stdout": "136314880\nbinary_parse 18.129ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 18.017,
+              "peak_rss_bytes": 136478720,
+              "stdout": "136314880\nbinary_parse 18.017ms\n"
+            }
+          ],
+          "wall_median_ms": 24.49817132,
+          "wall_stddev_ms": 0.6010099699004177,
+          "kernel_median_ms": 17.957,
+          "peak_rss_median_bytes": 136478720,
+          "wall_cv": 0.024566016709114447
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "binary_parse",
+            "128"
+          ],
+          "result": 136314880,
+          "probe_stdout": "136314880\nbinary_parse 61.842ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob binary_parse 128",
+            "mean": 0.06933346850000001,
+            "stddev": 0.00205865317437122,
+            "median": 0.06841549370000001,
+            "user": 0.06522082,
+            "system": 0.0160604,
+            "min": 0.06741820170000001,
+            "max": 0.07234936870000001,
+            "times": [
+              0.07053228470000002,
+              0.06741820170000001,
+              0.06841549370000001,
+              0.06795199370000002,
+              0.07234936870000001
+            ],
+            "memory_usage_byte": [
+              139214848,
+              139214848,
+              139214848,
+              139214848,
+              139231232
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.07053228470000002,
+            0.06741820170000001,
+            0.06841549370000001,
+            0.06795199370000002,
+            0.07234936870000001
+          ],
+          "rss_runs": [
+            {
+              "result": 136314880,
+              "kernel_ms": 62.003,
+              "peak_rss_bytes": 139182080,
+              "stdout": "136314880\nbinary_parse 62.003ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 61.837,
+              "peak_rss_bytes": 139182080,
+              "stdout": "136314880\nbinary_parse 61.837ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 62.619,
+              "peak_rss_bytes": 139214848,
+              "stdout": "136314880\nbinary_parse 62.619ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 61.422,
+              "peak_rss_bytes": 139182080,
+              "stdout": "136314880\nbinary_parse 61.422ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 63.133,
+              "peak_rss_bytes": 139198464,
+              "stdout": "136314880\nbinary_parse 63.133ms\n"
+            }
+          ],
+          "wall_median_ms": 68.41549370000001,
+          "wall_stddev_ms": 2.0586531743712198,
+          "kernel_median_ms": 62.003,
+          "peak_rss_median_bytes": 139182080,
+          "wall_cv": 0.029692055206659965
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "binary_parse",
+            "128"
+          ],
+          "result": 136314880,
+          "probe_stdout": "136314880\nbinary_parse 512.066ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main binary_parse 128",
+            "mean": 0.7347092607800001,
+            "stddev": 0.01862051166448165,
+            "median": 0.73751352778,
+            "user": 0.6280387000000001,
+            "system": 0.11014743999999999,
+            "min": 0.7108256107800001,
+            "max": 0.7573920267800001,
+            "times": [
+              0.7108256107800001,
+              0.74600731878,
+              0.7218078197800001,
+              0.73751352778,
+              0.7573920267800001
+            ],
+            "memory_usage_byte": [
+              224509952,
+              224886784,
+              224886784,
+              224886784,
+              224886784
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.7108256107800001,
+            0.74600731878,
+            0.7218078197800001,
+            0.73751352778,
+            0.7573920267800001
+          ],
+          "rss_runs": [
+            {
+              "result": 136314880,
+              "kernel_ms": 540.302,
+              "peak_rss_bytes": 224362496,
+              "stdout": "136314880\nbinary_parse 540.302ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 524.835,
+              "peak_rss_bytes": 224100352,
+              "stdout": "136314880\nbinary_parse 524.835ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 503.851,
+              "peak_rss_bytes": 225378304,
+              "stdout": "136314880\nbinary_parse 503.851ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 518.235,
+              "peak_rss_bytes": 224395264,
+              "stdout": "136314880\nbinary_parse 518.235ms\n"
+            },
+            {
+              "result": 136314880,
+              "kernel_ms": 525.269,
+              "peak_rss_bytes": 225017856,
+              "stdout": "136314880\nbinary_parse 525.269ms\n"
+            }
+          ],
+          "wall_median_ms": 737.51352778,
+          "wall_stddev_ms": 18.62051166448165,
+          "kernel_median_ms": 524.835,
+          "peak_rss_median_bytes": 224395264,
+          "wall_cv": 0.02534405466008865
+        }
+      }
+    },
+    "ets": {
+      "arguments": [
+        12000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "ets",
+            "12000000"
+          ],
+          "result": 12000000,
+          "probe_stdout": "12000000\nets 452.767ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench ets 12000000",
+            "mean": 0.73643189058,
+            "stddev": 0.15146625060719113,
+            "median": 0.76711258218,
+            "user": 1.24569716,
+            "system": 0.7029101600000001,
+            "min": 0.47844162418,
+            "max": 0.84703312418,
+            "times": [
+              0.47844162418,
+              0.84703312418,
+              0.84589754018,
+              0.76711258218,
+              0.74367458218
+            ],
+            "memory_usage_byte": [
+              1966080,
+              1966080,
+              1966080,
+              1966080,
+              1966080
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.47844162418,
+            0.84703312418,
+            0.84589754018,
+            0.76711258218,
+            0.74367458218
+          ],
+          "rss_runs": [
+            {
+              "result": 12000000,
+              "kernel_ms": 577.327,
+              "peak_rss_bytes": 1835008,
+              "stdout": "12000000\nets 577.327ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 476.782,
+              "peak_rss_bytes": 1835008,
+              "stdout": "12000000\nets 476.782ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 421.509,
+              "peak_rss_bytes": 1835008,
+              "stdout": "12000000\nets 421.509ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 601.137,
+              "peak_rss_bytes": 1835008,
+              "stdout": "12000000\nets 601.137ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 657.617,
+              "peak_rss_bytes": 1835008,
+              "stdout": "12000000\nets 657.617ms\n"
+            }
+          ],
+          "wall_median_ms": 767.11258218,
+          "wall_stddev_ms": 151.4662506071911,
+          "kernel_median_ms": 577.327,
+          "peak_rss_median_bytes": 1835008,
+          "wall_cv": 0.2056758439506186
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "ets",
+            "12000000"
+          ],
+          "result": 12000000,
+          "probe_stdout": "12000000\nets 235.819ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob ets 12000000",
+            "mean": 0.18692483094,
+            "stddev": 0.009087540862042554,
+            "median": 0.18940131414,
+            "user": 0.67335064,
+            "system": 0.01785604,
+            "min": 0.17415310614,
+            "max": 0.19768031414,
+            "times": [
+              0.19768031414,
+              0.18193564814000002,
+              0.17415310614,
+              0.19145377214,
+              0.18940131414
+            ],
+            "memory_usage_byte": [
+              10502144,
+              10502144,
+              10502144,
+              10502144,
+              10502144
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.19768031414,
+            0.18193564814000002,
+            0.17415310614,
+            0.19145377214,
+            0.18940131414
+          ],
+          "rss_runs": [
+            {
+              "result": 12000000,
+              "kernel_ms": 182.186,
+              "peak_rss_bytes": 10043392,
+              "stdout": "12000000\nets 182.186ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 214.453,
+              "peak_rss_bytes": 10485760,
+              "stdout": "12000000\nets 214.453ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 205.317,
+              "peak_rss_bytes": 10469376,
+              "stdout": "12000000\nets 205.317ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 177.077,
+              "peak_rss_bytes": 10502144,
+              "stdout": "12000000\nets 177.077ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 155.38,
+              "peak_rss_bytes": 10502144,
+              "stdout": "12000000\nets 155.380ms\n"
+            }
+          ],
+          "wall_median_ms": 189.40131414,
+          "wall_stddev_ms": 9.087540862042554,
+          "kernel_median_ms": 182.186,
+          "peak_rss_median_bytes": 10485760,
+          "wall_cv": 0.04861601755284997
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "ets",
+            "12000000"
+          ],
+          "result": 12000000,
+          "probe_stdout": "12000000\nets 278.530ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main ets 12000000",
+            "mean": 0.53193679086,
+            "stddev": 0.019184018466262373,
+            "median": 0.52531469886,
+            "user": 1.31814082,
+            "system": 0.12699381999999998,
+            "min": 0.51564432486,
+            "max": 0.56245774086,
+            "times": [
+              0.52531469886,
+              0.51807494886,
+              0.56245774086,
+              0.5381922408600001,
+              0.51564432486
+            ],
+            "memory_usage_byte": [
+              89948160,
+              89948160,
+              89948160,
+              89948160,
+              90013696
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.52531469886,
+            0.51807494886,
+            0.56245774086,
+            0.5381922408600001,
+            0.51564432486
+          ],
+          "rss_runs": [
+            {
+              "result": 12000000,
+              "kernel_ms": 328.333,
+              "peak_rss_bytes": 89604096,
+              "stdout": "12000000\nets 328.333ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 483.354,
+              "peak_rss_bytes": 89899008,
+              "stdout": "12000000\nets 483.354ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 519.065,
+              "peak_rss_bytes": 89784320,
+              "stdout": "12000000\nets 519.065ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 350.046,
+              "peak_rss_bytes": 89980928,
+              "stdout": "12000000\nets 350.046ms\n"
+            },
+            {
+              "result": 12000000,
+              "kernel_ms": 353.364,
+              "peak_rss_bytes": 89653248,
+              "stdout": "12000000\nets 353.364ms\n"
+            }
+          ],
+          "wall_median_ms": 525.31469886,
+          "wall_stddev_ms": 19.184018466262373,
+          "kernel_median_ms": 353.364,
+          "peak_rss_median_bytes": 89784320,
+          "wall_cv": 0.03606447005714143
+        }
+      }
+    },
+    "fanin": {
+      "arguments": [
+        2000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "fanin",
+            "2000000"
+          ],
+          "result": 2000000,
+          "probe_stdout": "2000000\nfanin 1044.880ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench fanin 2000000",
+            "mean": 1.07724812604,
+            "stddev": 0.03732371019041329,
+            "median": 1.05693420084,
+            "user": 2.22341568,
+            "system": 1.08093582,
+            "min": 1.03888065984,
+            "max": 1.12376436784,
+            "times": [
+              1.05640707584,
+              1.12376436784,
+              1.03888065984,
+              1.05693420084,
+              1.11025432584
+            ],
+            "memory_usage_byte": [
+              2768896,
+              2768896,
+              2768896,
+              2768896,
+              2768896
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            1.05640707584,
+            1.12376436784,
+            1.03888065984,
+            1.05693420084,
+            1.11025432584
+          ],
+          "rss_runs": [
+            {
+              "result": 2000000,
+              "kernel_ms": 1083.079,
+              "peak_rss_bytes": 2785280,
+              "stdout": "2000000\nfanin 1083.079ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 1076.751,
+              "peak_rss_bytes": 2785280,
+              "stdout": "2000000\nfanin 1076.751ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 1070.109,
+              "peak_rss_bytes": 2785280,
+              "stdout": "2000000\nfanin 1070.109ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 1060.783,
+              "peak_rss_bytes": 2768896,
+              "stdout": "2000000\nfanin 1060.783ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 1242.501,
+              "peak_rss_bytes": 2768896,
+              "stdout": "2000000\nfanin 1242.501ms\n"
+            }
+          ],
+          "wall_median_ms": 1056.93420084,
+          "wall_stddev_ms": 37.323710190413294,
+          "kernel_median_ms": 1076.751,
+          "peak_rss_median_bytes": 2785280,
+          "wall_cv": 0.03464727325877697
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "fanin",
+            "2000000"
+          ],
+          "result": 2000000,
+          "probe_stdout": "2000000\nfanin 782.856ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob fanin 2000000",
+            "mean": 0.6296234672800001,
+            "stddev": 0.21822782895780374,
+            "median": 0.72383691788,
+            "user": 0.7866238,
+            "system": 0.4699133,
+            "min": 0.35847383388000004,
+            "max": 0.82636450088,
+            "times": [
+              0.82636450088,
+              0.8057211668800001,
+              0.72383691788,
+              0.43372091688000003,
+              0.35847383388000004
+            ],
+            "memory_usage_byte": [
+              6815744,
+              6815744,
+              6864896,
+              6946816,
+              6946816
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.82636450088,
+            0.8057211668800001,
+            0.72383691788,
+            0.43372091688000003,
+            0.35847383388000004
+          ],
+          "rss_runs": [
+            {
+              "result": 2000000,
+              "kernel_ms": 767.854,
+              "peak_rss_bytes": 6864896,
+              "stdout": "2000000\nfanin 767.854ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 803.668,
+              "peak_rss_bytes": 6848512,
+              "stdout": "2000000\nfanin 803.668ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 813.287,
+              "peak_rss_bytes": 6799360,
+              "stdout": "2000000\nfanin 813.287ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 795.359,
+              "peak_rss_bytes": 6815744,
+              "stdout": "2000000\nfanin 795.359ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 687.558,
+              "peak_rss_bytes": 6864896,
+              "stdout": "2000000\nfanin 687.558ms\n"
+            }
+          ],
+          "wall_median_ms": 723.83691788,
+          "wall_stddev_ms": 218.22782895780375,
+          "kernel_median_ms": 795.359,
+          "peak_rss_median_bytes": 6848512,
+          "wall_cv": 0.34660053237938726
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "fanin",
+            "2000000"
+          ],
+          "result": 2000000,
+          "probe_stdout": "2000000\nfanin 698.877ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main fanin 2000000",
+            "mean": 0.8278329193800001,
+            "stddev": 0.03722751776795645,
+            "median": 0.8344230111800001,
+            "user": 1.9436591,
+            "system": 0.39494458,
+            "min": 0.78341671918,
+            "max": 0.8640820531800001,
+            "times": [
+              0.79536421918,
+              0.8344230111800001,
+              0.78341671918,
+              0.8640820531800001,
+              0.86187859418
+            ],
+            "memory_usage_byte": [
+              232374272,
+              232390656,
+              232390656,
+              233242624,
+              233242624
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.79536421918,
+            0.8344230111800001,
+            0.78341671918,
+            0.8640820531800001,
+            0.86187859418
+          ],
+          "rss_runs": [
+            {
+              "result": 2000000,
+              "kernel_ms": 656.0,
+              "peak_rss_bytes": 232407040,
+              "stdout": "2000000\nfanin 656.000ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 656.103,
+              "peak_rss_bytes": 233439232,
+              "stdout": "2000000\nfanin 656.103ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 659.585,
+              "peak_rss_bytes": 232456192,
+              "stdout": "2000000\nfanin 659.585ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 630.146,
+              "peak_rss_bytes": 229097472,
+              "stdout": "2000000\nfanin 630.146ms\n"
+            },
+            {
+              "result": 2000000,
+              "kernel_ms": 632.611,
+              "peak_rss_bytes": 232259584,
+              "stdout": "2000000\nfanin 632.611ms\n"
+            }
+          ],
+          "wall_median_ms": 834.4230111800001,
+          "wall_stddev_ms": 37.22751776795645,
+          "kernel_median_ms": 656.0,
+          "peak_rss_median_bytes": 232407040,
+          "wall_cv": 0.044969844634636845
+        }
+      }
+    },
+    "fanout": {
+      "arguments": [
+        1000000
+      ],
+      "runtimes": {
+        "rust": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench",
+            "fanout",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\nfanout 174.056ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/rust/target/release/bench fanout 1000000",
+            "mean": 0.18707643734000004,
+            "stddev": 0.027095237425503238,
+            "median": 0.17848373754000002,
+            "user": 0.34578173999999995,
+            "system": 0.1151676,
+            "min": 0.16101307054000003,
+            "max": 0.23025736254,
+            "times": [
+              0.17092819554000002,
+              0.19469982054,
+              0.17848373754000002,
+              0.23025736254,
+              0.16101307054000003
+            ],
+            "memory_usage_byte": [
+              3653632,
+              3653632,
+              3653632,
+              3653632,
+              3653632
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.17092819554000002,
+            0.19469982054,
+            0.17848373754000002,
+            0.23025736254,
+            0.16101307054000003
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 181.984,
+              "peak_rss_bytes": 3604480,
+              "stdout": "1000000\nfanout 181.984ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 229.285,
+              "peak_rss_bytes": 3653632,
+              "stdout": "1000000\nfanout 229.285ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 167.195,
+              "peak_rss_bytes": 3620864,
+              "stdout": "1000000\nfanout 167.195ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 219.797,
+              "peak_rss_bytes": 3653632,
+              "stdout": "1000000\nfanout 219.797ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 253.119,
+              "peak_rss_bytes": 3637248,
+              "stdout": "1000000\nfanout 253.119ms\n"
+            }
+          ],
+          "wall_median_ms": 178.48373754000002,
+          "wall_stddev_ms": 27.09523742550324,
+          "kernel_median_ms": 219.797,
+          "peak_rss_median_bytes": 3637248,
+          "wall_cv": 0.14483511558571802
+        },
+        "go": {
+          "status": "ok",
+          "command": [
+            "$HOME/dev/beam-wt/s0_bench/bench/out/gob",
+            "fanout",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\nfanout 165.546ms\n",
+          "hyperfine": {
+            "command": "$HOME/dev/beam-wt/s0_bench/bench/out/gob fanout 1000000",
+            "mean": 0.14464131692,
+            "stddev": 0.013707693968964723,
+            "median": 0.14025123372,
+            "user": 0.3850052,
+            "system": 0.056121220000000006,
+            "min": 0.13027419172000002,
+            "max": 0.16555660872000003,
+            "times": [
+              0.16555660872000003,
+              0.13027419172000002,
+              0.15012498372000002,
+              0.13699956672000002,
+              0.14025123372
+            ],
+            "memory_usage_byte": [
+              6930432,
+              6930432,
+              7012352,
+              7012352,
+              7012352
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.16555660872000003,
+            0.13027419172000002,
+            0.15012498372000002,
+            0.13699956672000002,
+            0.14025123372
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 120.867,
+              "peak_rss_bytes": 6881280,
+              "stdout": "1000000\nfanout 120.867ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 124.957,
+              "peak_rss_bytes": 6864896,
+              "stdout": "1000000\nfanout 124.957ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 157.952,
+              "peak_rss_bytes": 7028736,
+              "stdout": "1000000\nfanout 157.952ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 149.558,
+              "peak_rss_bytes": 6897664,
+              "stdout": "1000000\nfanout 149.558ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 175.534,
+              "peak_rss_bytes": 6897664,
+              "stdout": "1000000\nfanout 175.534ms\n"
+            }
+          ],
+          "wall_median_ms": 140.25123372000002,
+          "wall_stddev_ms": 13.707693968964723,
+          "kernel_median_ms": 149.558,
+          "peak_rss_median_bytes": 6897664,
+          "wall_cv": 0.09477025141126405
+        },
+        "erts": {
+          "status": "ok",
+          "command": [
+            "erl",
+            "-noshell",
+            "+S",
+            "4:4",
+            "+P",
+            "2000000",
+            "-pa",
+            "$HOME/dev/beam-wt/s0_bench/bench/out/ebin",
+            "-run",
+            "bench",
+            "main",
+            "fanout",
+            "1000000"
+          ],
+          "result": 1000000,
+          "probe_stdout": "1000000\nfanout 358.947ms\n",
+          "hyperfine": {
+            "command": "erl -noshell +S 4:4 +P 2000000 -pa $HOME/dev/beam-wt/s0_bench/bench/out/ebin -run bench main fanout 1000000",
+            "mean": 0.8010902528400001,
+            "stddev": 0.04249113434007365,
+            "median": 0.7978384282400001,
+            "user": 0.8449140400000001,
+            "system": 0.7094106800000001,
+            "min": 0.74688096924,
+            "max": 0.86609192824,
+            "times": [
+              0.86609192824,
+              0.7978384282400001,
+              0.74688096924,
+              0.8004116772400001,
+              0.79422826124
+            ],
+            "memory_usage_byte": [
+              94568448,
+              104366080,
+              104366080,
+              104366080,
+              104366080
+            ],
+            "exit_codes": [
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "wall_seconds": [
+            0.86609192824,
+            0.7978384282400001,
+            0.74688096924,
+            0.8004116772400001,
+            0.79422826124
+          ],
+          "rss_runs": [
+            {
+              "result": 1000000,
+              "kernel_ms": 679.667,
+              "peak_rss_bytes": 92831744,
+              "stdout": "1000000\nfanout 679.667ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 569.182,
+              "peak_rss_bytes": 93765632,
+              "stdout": "1000000\nfanout 569.182ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 594.743,
+              "peak_rss_bytes": 95666176,
+              "stdout": "1000000\nfanout 594.743ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 728.552,
+              "peak_rss_bytes": 92864512,
+              "stdout": "1000000\nfanout 728.552ms\n"
+            },
+            {
+              "result": 1000000,
+              "kernel_ms": 683.685,
+              "peak_rss_bytes": 93208576,
+              "stdout": "1000000\nfanout 683.685ms\n"
+            }
+          ],
+          "wall_median_ms": 797.8384282400001,
+          "wall_stddev_ms": 42.49113434007366,
+          "kernel_median_ms": 679.667,
+          "peak_rss_median_bytes": 93208576,
+          "wall_cv": 0.05304163193776908
+        }
+      }
+    }
+  },
+  "result_mismatch": false
+}

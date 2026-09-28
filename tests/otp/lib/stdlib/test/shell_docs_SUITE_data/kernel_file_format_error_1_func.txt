@@ -1,0 +1,12 @@
+%% %CopyrightBegin%
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2021-2025. All Rights Reserved.
+%%
+%% %CopyrightEnd%
+
+[;1m  format_error(Reason)[0m
+
+  Given the error reason returned by any function in this module,
+  returns a descriptive string of the error in English.

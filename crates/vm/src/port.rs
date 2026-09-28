@@ -1,0 +1,2023 @@
+//! Local OS ports backed by child processes.
+use crate::process::Message;
+use crate::{Process, Vm, VmError};
+use arinsal_etf::OwnedTerm;
+use arinsal_sched::{Pid, RunCtx, Scheduler};
+use arinsal_term::{
+    ProcessHeap, Term, TermBuilder, TermKind, copy_term, from_owned, global_atoms, to_owned,
+};
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+// Port of erts/emulator/beam/erl_bif_port.c:824 (open_port defaults), OTP-29.1.1.
+const DEFAULT_HIGH: usize = 8192;
+const DEFAULT_LOW: usize = 4096;
+
+thread_local! {
+    /// Set when `port_command` must suspend the caller and retry the call.
+    static BUSY_SUSPEND: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True once, when the running BIF asked to suspend on a busy port.
+pub(crate) fn take_busy_suspend() -> bool {
+    BUSY_SUSPEND.with(|flag| flag.replace(false))
+}
+
+/// Output-queue and message-queue busy limits from `open_port` options.
+#[derive(Clone, Copy)]
+struct BusyLimits {
+    port_low: usize,
+    port_high: usize,
+    port_enabled: bool,
+    msgq_low: usize,
+    msgq_high: usize,
+    msgq_enabled: bool,
+}
+
+struct PortState {
+    outq: VecDeque<u8>,
+    /// Bytes scheduled ahead of the driver when `{parallelism, true}`.
+    msgq: usize,
+    pending: VecDeque<Vec<u8>>,
+    busy_port: bool,
+    busy_msgq: bool,
+    suspended: Vec<Pid>,
+    closed: bool,
+    broken: bool,
+    in_output: bool,
+    profile_active: bool,
+}
+
+/// State retained for a live child or fd port.
+pub(crate) struct PortHandle {
+    id: u64,
+    out: Mutex<Option<OwnedFd>>,
+    wake_r: Mutex<Option<OwnedFd>>,
+    wake_w: OwnedFd,
+    wake_needed: AtomicBool,
+    framing: Option<(u8, usize)>,
+    owner: Mutex<Pid>,
+    links: Mutex<HashSet<Pid>>,
+    monitors: Mutex<HashMap<u64, Pid>>,
+    os_pid: u32,
+    name: String,
+    parallelism: bool,
+    limits: BusyLimits,
+    state: Mutex<PortState>,
+    scheduler: Arc<Scheduler<Process>>,
+    /// `port_set_data/2` term. `undefined` until the first store.
+    data: Mutex<OwnedTerm>,
+    /// `tcp_inet` / `tcp_inet6` port. I/O is owned by `inet_drv`, not a stdio worker.
+    inet: bool,
+}
+
+/// Inspect or move the next local port id for `erts_debug` table tests.
+/// Port of erts/emulator/beam/erl_ptab.c:1356-1460 (`erts_ptab_test_next_id`), OTP-29.1.1.
+pub(crate) fn test_next_port_id(
+    runtime: &crate::process::Runtime,
+    set: bool,
+    next_id: u64,
+) -> Option<u64> {
+    const MAX_PORT_ID: u64 = u32::MAX as u64;
+    let ports = runtime.ports.lock().unwrap();
+    let start = if set {
+        next_id.checked_add(1)?
+    } else {
+        runtime.next_port.load(Ordering::Relaxed)
+    };
+    let candidate = (start..=MAX_PORT_ID).find(|id| !ports.contains_key(id))?;
+    if set {
+        runtime.next_port.store(candidate, Ordering::Relaxed);
+    }
+    Some(candidate)
+}
+
+impl PortHandle {
+    pub(crate) fn owner_pid(&self) -> Pid {
+        *self.owner.lock().unwrap()
+    }
+    pub(crate) fn scheduler(&self) -> Arc<Scheduler<Process>> {
+        Arc::clone(&self.scheduler)
+    }
+    pub(crate) fn port_name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+fn atom(s: &str) -> Term {
+    Term::atom(global_atoms().intern(s).expect("built-in atom"))
+}
+fn badarg() -> VmError {
+    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+}
+fn list(t: Term) -> Option<Vec<Term>> {
+    let mut out = Vec::new();
+    let mut cur = t;
+    while cur.classify() == TermKind::List {
+        // SAFETY: The source term remains in the live caller heap for this BIF.
+        let (h, tail) = unsafe { cur.cons_ref()? };
+        out.push(h);
+        cur = tail;
+    }
+    (cur == Term::NIL).then_some(out)
+}
+fn bytes(t: Term) -> Option<Vec<u8>> {
+    if let Some(n) = t.as_small() {
+        return (0..=255).contains(&n).then_some(vec![n as u8]);
+    }
+    let mut out = Vec::new();
+    let mut pending = vec![t];
+    while let Some(term) = pending.pop() {
+        if let Some(n) = term.as_small() {
+            if !(0..=255).contains(&n) {
+                return None;
+            }
+            out.push(n as u8);
+        } else if term.classify() == TermKind::List {
+            // SAFETY: The list is traversed before the caller's process heap can move.
+            let (head, tail) = unsafe { term.cons_ref()? };
+            pending.push(tail);
+            pending.push(head);
+        } else if term == Term::NIL {
+        } else {
+            // SAFETY: This view is consumed before the caller's process heap can move.
+            let binary = unsafe { term.binary_ref() }?;
+            out.extend_from_slice(binary.bytes());
+        }
+    }
+    Some(out)
+}
+fn iodata(t: Term) -> Option<Vec<u8>> {
+    fn append(term: Term, tail: bool, out: &mut Vec<u8>) -> Option<()> {
+        if term.classify() == TermKind::List {
+            // SAFETY: The list is traversed before the caller's process heap can move.
+            let (head, rest) = unsafe { term.cons_ref()? };
+            append(head, false, out)?;
+            append(rest, true, out)
+        } else if term == Term::NIL {
+            Some(())
+        // SAFETY: This view is consumed before the caller's process heap can move.
+        } else if let Some(binary) = unsafe { term.binary_ref() } {
+            out.extend_from_slice(binary.bytes());
+            Some(())
+        } else if !tail {
+            let value = term.as_small()?;
+            if !(0..=255).contains(&value) {
+                return None;
+            }
+            out.push(value as u8);
+            Some(())
+        } else {
+            None
+        }
+    }
+    if t.as_small().is_some() {
+        return None;
+    }
+    let mut out = Vec::new();
+    append(t, false, &mut out)?;
+    Some(out)
+}
+fn tuple(t: Term) -> Option<Vec<Term>> {
+    // SAFETY: The borrowed tuple is collected while the caller heap remains live.
+    unsafe { t.tuple_ref() }.map(|v| v.iter().collect())
+}
+struct PortOptions {
+    binary: bool,
+    framing: Option<(u8, usize)>,
+    exit_status: bool,
+    eof: bool,
+    args: Vec<Vec<u8>>,
+    arg0: Option<Vec<u8>>,
+    cwd: Option<Vec<u8>>,
+    env: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    stderr_to_stdout: bool,
+    use_stdio: bool,
+    rw: u8,
+    parallelism: bool,
+    limits: BusyLimits,
+}
+fn options(t: Term) -> Option<PortOptions> {
+    let mut opts = PortOptions {
+        binary: false,
+        framing: None,
+        exit_status: false,
+        eof: false,
+        args: Vec::new(),
+        arg0: None,
+        cwd: None,
+        env: Vec::new(),
+        stderr_to_stdout: false,
+        use_stdio: true,
+        rw: 0,
+        parallelism: false,
+        limits: BusyLimits {
+            port_low: DEFAULT_LOW,
+            port_high: DEFAULT_HIGH,
+            port_enabled: true,
+            msgq_low: DEFAULT_LOW,
+            msgq_high: DEFAULT_HIGH,
+            msgq_enabled: true,
+        },
+    };
+    for item in list(t)? {
+        if item == atom("binary") {
+            opts.binary = true;
+        } else if item == atom("exit_status") {
+            opts.exit_status = true;
+        } else if item == atom("eof") {
+            opts.eof = true;
+        } else if item == atom("stream") || item == atom("hide") || item == atom("overlapped_io") {
+        } else if item == atom("use_stdio") {
+            opts.use_stdio = true;
+        } else if item == atom("nouse_stdio") {
+            opts.use_stdio = false;
+        } else if item == atom("stderr_to_stdout") {
+            opts.stderr_to_stdout = true;
+        } else if item == atom("in") {
+            opts.rw |= 1;
+        } else if item == atom("out") {
+            opts.rw |= 2;
+        } else {
+            let pair = tuple(item)?;
+            if pair.len() == 2
+                && pair[0] == atom("packet")
+                && matches!(pair[1].as_small(), Some(1 | 2 | 4))
+            {
+                // Port of erts/emulator/beam/erl_bif_port.c (open_port packet 1|2|4), OTP-29.1.1.
+                let n = pair[1].as_small().unwrap() as u8;
+                if opts.framing.is_some_and(|(mode, _)| mode == 1) {
+                    return None;
+                }
+                opts.framing = Some((2, n as usize));
+            } else if pair.len() == 2 && pair[0] == atom("line") {
+                let n = pair[1].as_small()?;
+                if n <= 0 {
+                    return None;
+                }
+                if opts.framing.is_some_and(|(mode, _)| mode != 1) {
+                    return None;
+                }
+                opts.framing = Some((1, n as usize));
+            } else if pair.len() == 2 && pair[0] == atom("args") {
+                opts.args = list(pair[1])?
+                    .into_iter()
+                    .map(bytes)
+                    .collect::<Option<Vec<_>>>()?;
+            } else if pair.len() == 2 && pair[0] == atom("arg0") {
+                opts.arg0 = Some(bytes(pair[1])?);
+            } else if pair.len() == 2 && pair[0] == atom("cd") {
+                opts.cwd = Some(bytes(pair[1])?);
+            } else if pair.len() == 2 && pair[0] == atom("env") {
+                opts.env.clear();
+                for entry in list(pair[1])? {
+                    let env = tuple(entry)?;
+                    if env.len() != 2 {
+                        return None;
+                    }
+                    let name = bytes(env[0])?;
+                    if name.is_empty() || name.contains(&b'=') {
+                        return None;
+                    }
+                    let value = if env[1] == atom("false") {
+                        None
+                    } else {
+                        Some(bytes(env[1])?)
+                    };
+                    opts.env.push((name, value));
+                }
+            } else if pair.len() == 2 && pair[0] == atom("parallelism") {
+                // Port of erts/emulator/beam/erl_bif_port.c:913 (open_port parallelism), OTP-29.1.1.
+                if pair[1] == atom("true") {
+                    opts.parallelism = true;
+                } else if pair[1] == atom("false") {
+                    opts.parallelism = false;
+                } else {
+                    return None;
+                }
+            } else if pair.len() == 2
+                && (pair[0] == atom("busy_limits_port") || pair[0] == atom("busy_limits_msgq"))
+            {
+                // Port of erts/emulator/beam/erl_bif_port.c:920 (busy_limits_port / busy_limits_msgq), OTP-29.1.1.
+                let port_limit = pair[0] == atom("busy_limits_port");
+                let (low, high, enabled) = if pair[1] == atom("disabled") {
+                    (0, 0, false)
+                } else {
+                    let limits = tuple(pair[1])?;
+                    if limits.len() != 2 {
+                        return None;
+                    }
+                    let mut low = limits[0].as_small()?;
+                    let high = limits[1].as_small()?;
+                    if low < 1 || high < 1 {
+                        return None;
+                    }
+                    if low > high {
+                        low = high;
+                    }
+                    (low as usize, high as usize, true)
+                };
+                if port_limit {
+                    opts.limits.port_low = low;
+                    opts.limits.port_high = high;
+                    opts.limits.port_enabled = enabled;
+                } else {
+                    opts.limits.msgq_low = low;
+                    opts.limits.msgq_high = high;
+                    opts.limits.msgq_enabled = enabled;
+                }
+            } else {
+                return None;
+            }
+        }
+    }
+    if opts.rw == 0 {
+        opts.rw = 3;
+    }
+    if opts.stderr_to_stdout && !opts.use_stdio {
+        return None;
+    }
+    Some(opts)
+}
+fn term_data(heap: &mut ProcessHeap, bytes: &[u8], binary: bool) -> Result<Term, VmError> {
+    let mut b = TermBuilder::new(heap);
+    if binary {
+        b.binary(bytes)
+    } else {
+        b.list_from_iter(bytes.iter().map(|x| Term::small(*x as i64).unwrap()))
+    }
+    .map_err(|e| VmError::Unsupported(format!("port data allocation: {e:?}")))
+}
+fn publish(scheduler: &Scheduler<Process>, owner: Pid, port: Term, msg: Term) {
+    let Ok(envelope) = Message::copy_from(msg) else {
+        return;
+    };
+    let _ = scheduler.send(owner, owner, envelope);
+    let _ = port;
+}
+fn output_message(
+    scheduler: &Scheduler<Process>,
+    owner: Pid,
+    port_id: u64,
+    bytes: &[u8],
+    binary: bool,
+) {
+    let Some(port) = Term::port(port_id) else {
+        return;
+    };
+    let mut heap = ProcessHeap::with_words(bytes.len() / 4 + 24);
+    let Ok(data) = term_data(&mut heap, bytes, binary) else {
+        return;
+    };
+    let data = TermBuilder::new(&mut heap).tuple(&[atom("data"), data]);
+    let Ok(data) = data else { return };
+    let Ok(msg) = TermBuilder::new(&mut heap).tuple(&[port, data]) else {
+        return;
+    };
+    publish(scheduler, owner, port, msg);
+}
+fn line_message(
+    scheduler: &Scheduler<Process>,
+    owner: Pid,
+    port_id: u64,
+    bytes: &[u8],
+    binary: bool,
+    complete: bool,
+) {
+    let Some(port) = Term::port(port_id) else {
+        return;
+    };
+    let mut heap = ProcessHeap::with_words(bytes.len() / 4 + 32);
+    let Ok(data) = term_data(&mut heap, bytes, binary) else {
+        return;
+    };
+    let kind = if complete { atom("eol") } else { atom("noeol") };
+    let Ok(line) = TermBuilder::new(&mut heap).tuple(&[kind, data]) else {
+        return;
+    };
+    let Ok(data) = TermBuilder::new(&mut heap).tuple(&[atom("data"), line]) else {
+        return;
+    };
+    if let Ok(msg) = TermBuilder::new(&mut heap).tuple(&[port, data]) {
+        publish(scheduler, owner, port, msg);
+    }
+}
+fn event_message(scheduler: &Scheduler<Process>, owner: Pid, port_id: u64, event: Term) {
+    let Some(port) = Term::port(port_id) else {
+        return;
+    };
+    let mut heap = ProcessHeap::with_words(24);
+    if let Ok(msg) = TermBuilder::new(&mut heap).tuple(&[port, event]) {
+        publish(scheduler, owner, port, msg);
+    }
+}
+
+fn start(
+    vm: &mut Vm,
+    process: &Process,
+    ctx: &RunCtx<'_, Message>,
+    spec: Term,
+    opts: Term,
+) -> Result<Term, VmError> {
+    let parsed_opts = options(opts).ok_or_else(badarg)?;
+    let spec = tuple(spec).ok_or_else(badarg)?;
+    if let [kind, input, output] = spec.as_slice() {
+        if *kind != atom("fd") {
+            return Err(badarg());
+        }
+        let input = input.as_small().filter(|fd| *fd >= 0).ok_or_else(badarg)? as RawFd;
+        let output = output.as_small().filter(|fd| *fd >= 0).ok_or_else(badarg)? as RawFd;
+        return start_fd(vm, process, ctx, input, output, &parsed_opts);
+    }
+    let PortOptions {
+        binary,
+        framing,
+        exit_status: want_status,
+        eof: want_eof,
+        args,
+        arg0,
+        cwd,
+        env,
+        stderr_to_stdout,
+        use_stdio,
+        rw,
+        parallelism,
+        limits,
+        ..
+    } = parsed_opts;
+    if let [kind, cmd] = spec.as_slice()
+        && *kind == atom("spawn_driver")
+    {
+        let name = String::from_utf8(bytes(*cmd).ok_or_else(badarg)?).map_err(|_| badarg())?;
+        return start_driver(process, ctx, name);
+    }
+    let (mut command, name, executable) = match spec.as_slice() {
+        [kind, path] if *kind == atom("spawn_executable") => {
+            let path = bytes(*path).ok_or_else(badarg)?;
+            let name = String::from_utf8(path).map_err(|_| badarg())?;
+            (Command::new(name.clone()), name, true)
+        }
+        [kind, cmd] if *kind == atom("spawn") => {
+            let cmd = bytes(*cmd).ok_or_else(badarg)?;
+            let name = String::from_utf8(cmd).map_err(|_| badarg())?;
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c").arg(name.clone());
+            (c, name, false)
+        }
+        _ => return Err(badarg()),
+    };
+    if executable {
+        for arg in args {
+            command.arg(String::from_utf8(arg).map_err(|_| badarg())?);
+        }
+        if let Some(arg0) = arg0 {
+            command.arg0(String::from_utf8(arg0).map_err(|_| badarg())?);
+        }
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(String::from_utf8(cwd).map_err(|_| badarg())?);
+    }
+    // l_env: child ports inherit the VM-owned environment, including os:putenv/2 changes.
+    command.env_clear().envs(crate::natives::env::snapshot());
+    for (key, value) in env {
+        let key = String::from_utf8(key).map_err(|_| badarg())?;
+        if let Some(value) = value {
+            command.env(key, String::from_utf8(value).map_err(|_| badarg())?);
+        } else {
+            command.env_remove(key);
+        }
+    }
+    command
+        .stdin(if rw & 2 != 0 {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if rw & 1 != 0 {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(if stderr_to_stdout {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        });
+    if stderr_to_stdout {
+        // SAFETY: The child has a valid stdout pipe when this closure runs; dup2 only redirects fd 2.
+        unsafe {
+            command.pre_exec(move || {
+                unsafe extern "C" {
+                    fn dup2(oldfd: i32, newfd: i32) -> i32;
+                }
+                if dup2(1, 2) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if !use_stdio && (dup2(0, 3) < 0 || dup2(1, 4) < 0) {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else if !use_stdio {
+        // SAFETY: The child stdio descriptors are prepared by Command before this closure runs.
+        unsafe {
+            command.pre_exec(|| {
+                unsafe extern "C" {
+                    fn dup2(oldfd: i32, newfd: i32) -> i32;
+                }
+                if dup2(0, 3) < 0 || dup2(1, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn().map_err(|_| badarg())?;
+    let os_pid = child.id();
+    let out = child.stdin.take().map(owned_stdio);
+    let read_fd = child
+        .stdout
+        .take()
+        .map(|stdout: ChildStdout| stdout.into_raw_fd());
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let scheduler = runtime.scheduler()?;
+    let port_id = runtime
+        .next_port
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let port = Term::port(port_id).ok_or_else(badarg)?;
+    let handle = make_handle(
+        port_id,
+        out,
+        framing,
+        ctx.pid(),
+        os_pid,
+        name,
+        parallelism,
+        limits,
+        Arc::clone(&scheduler),
+        false,
+    )?;
+    runtime
+        .ports
+        .lock()
+        .unwrap()
+        .insert(port_id, Arc::clone(&handle));
+    let owner = ctx.pid();
+    std::thread::Builder::new()
+        .name(format!("arinsal-port-{port_id}"))
+        .spawn(move || {
+            worker(
+                handle,
+                Some(child),
+                read_fd,
+                scheduler,
+                owner,
+                port_id,
+                binary,
+                framing,
+                want_status,
+                want_eof,
+            );
+        })
+        .map_err(|_| badarg())?;
+    let _ = vm;
+    Ok(port)
+}
+
+// Port of erts/emulator/drivers/common/inet_drv.c:1361 (tcp_inet driver entry), OTP-29.1.1.
+// `tcp_inet6` is the same driver; OPEN carries the address family.
+// g_inet_udp: `udp_inet` is the only datagram driver erts registers.
+// `udp_inet6` and `sctp_inet` are absent, so `open_port` stays `badarg`
+// and `prim_inet` maps that onto `{error, eprotonosupport}`.
+fn start_driver(
+    process: &Process,
+    ctx: &RunCtx<'_, Message>,
+    name: String,
+) -> Result<Term, VmError> {
+    let udp = name == "udp_inet";
+    if name != "tcp_inet" && name != "tcp_inet6" && !udp {
+        return Err(badarg());
+    }
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let scheduler = runtime.scheduler()?;
+    let port_id = runtime
+        .next_port
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let port = Term::port(port_id).ok_or_else(badarg)?;
+    let handle = make_handle(
+        port_id,
+        None,
+        None,
+        ctx.pid(),
+        0,
+        name,
+        false,
+        default_limits(),
+        scheduler,
+        true,
+    )?;
+    runtime
+        .ports
+        .lock()
+        .unwrap()
+        .insert(port_id, Arc::clone(&handle));
+    // g_inet_udp
+    if udp {
+        crate::inet_udp::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
+    } else {
+        crate::inet_drv::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
+    }
+    Ok(port)
+}
+
+fn default_limits() -> BusyLimits {
+    BusyLimits {
+        port_low: DEFAULT_LOW,
+        port_high: DEFAULT_HIGH,
+        port_enabled: true,
+        msgq_low: DEFAULT_LOW,
+        msgq_high: DEFAULT_HIGH,
+        msgq_enabled: true,
+    }
+}
+
+/// Allocate a connected `tcp_inet` port for an accepted socket.
+pub(crate) fn alloc_inet_port(
+    runtime: &crate::process::Runtime,
+    owner: Pid,
+    name: String,
+) -> Result<(u64, Arc<PortHandle>), VmError> {
+    let scheduler = runtime.scheduler()?;
+    let port_id = runtime
+        .next_port
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let handle = make_handle(
+        port_id,
+        None,
+        None,
+        owner,
+        0,
+        name,
+        false,
+        default_limits(),
+        scheduler,
+        true,
+    )?;
+    runtime
+        .ports
+        .lock()
+        .unwrap()
+        .insert(port_id, Arc::clone(&handle));
+    Ok((port_id, handle))
+}
+
+/// Remove an inet port after the peer closes an active socket (`driver_exit`).
+pub(crate) fn abandon_port(runtime: &crate::process::Runtime, id: u64) {
+    let Some(handle) = runtime.ports.lock().unwrap().remove(&id) else {
+        return;
+    };
+    crate::inet_drv::detach(id);
+    // g_inet_udp
+    crate::inet_udp::detach(id);
+    let owner = *handle.owner.lock().unwrap();
+    let scheduler = Arc::clone(&handle.scheduler);
+    release_io(&handle);
+    notify_closed(&handle, id, &scheduler, owner, false);
+}
+
+fn notify_closed(
+    handle: &PortHandle,
+    id: u64,
+    scheduler: &Scheduler<Process>,
+    from: Pid,
+    skip_owner: bool,
+) {
+    let Some(port) = Term::port(id) else {
+        return;
+    };
+    let reason = atom("normal");
+    for linked in handle.links.lock().unwrap().iter().copied() {
+        if skip_owner && linked == from {
+            continue;
+        }
+        if let Ok(message) = Message::copy_from(reason) {
+            let _ = scheduler.signal(from, linked, arinsal_sched::Signal::Exit(message));
+        }
+    }
+    for (reference, pid) in handle.monitors.lock().unwrap().iter() {
+        let mut heap = ProcessHeap::with_words(32);
+        let Ok(reference_term) = TermBuilder::new(&mut heap).local_ref([
+            *reference as u32,
+            (*reference >> 32) as u32,
+            0,
+        ]) else {
+            continue;
+        };
+        let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
+            atom("DOWN"),
+            reference_term,
+            atom("port"),
+            port,
+            reason,
+        ]) else {
+            continue;
+        };
+        if let Ok(message) = Message::copy_from(down) {
+            let _ = scheduler.send(from, *pid, message);
+        }
+    }
+}
+
+fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
+    unsafe extern "C" {
+        fn dup(fd: i32) -> i32;
+    }
+    // SAFETY: dup returns an owned descriptor, which is immediately transferred to OwnedFd.
+    let copy = unsafe { dup(fd) };
+    if copy < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: copy is a fresh descriptor owned by this OwnedFd.
+    Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+}
+
+fn owned_stdio(file: impl IntoRawFd) -> OwnedFd {
+    let fd = file.into_raw_fd();
+    set_nonblock(fd);
+    // SAFETY: into_raw_fd transferred ownership of this descriptor.
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+fn set_nonblock(fd: RawFd) {
+    // SAFETY: fcntl only changes flags on a descriptor this port owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+fn wake_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe initializes both slots with fresh descriptors on success.
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    set_nonblock(fds[0]);
+    set_nonblock(fds[1]);
+    // SAFETY: both descriptors were just created by pipe and are not aliased.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_handle(
+    id: u64,
+    out: Option<OwnedFd>,
+    framing: Option<(u8, usize)>,
+    owner: Pid,
+    os_pid: u32,
+    name: String,
+    parallelism: bool,
+    limits: BusyLimits,
+    scheduler: Arc<Scheduler<Process>>,
+    inet: bool,
+) -> Result<Arc<PortHandle>, VmError> {
+    let (wake_r, wake_w) = wake_pipe().map_err(|_| badarg())?;
+    if let Some(fd) = out.as_ref() {
+        set_nonblock(fd.as_raw_fd());
+    }
+    let handle = Arc::new(PortHandle {
+        id,
+        out: Mutex::new(out),
+        wake_r: Mutex::new(Some(wake_r)),
+        wake_w,
+        wake_needed: AtomicBool::new(true),
+        framing,
+        owner: Mutex::new(owner),
+        links: Mutex::new(HashSet::from([owner])),
+        monitors: Mutex::new(HashMap::new()),
+        os_pid,
+        name,
+        parallelism,
+        limits,
+        state: Mutex::new(PortState {
+            outq: VecDeque::new(),
+            msgq: 0,
+            pending: VecDeque::new(),
+            busy_port: false,
+            busy_msgq: false,
+            suspended: Vec::new(),
+            closed: false,
+            broken: false,
+            in_output: false,
+            profile_active: false,
+        }),
+        scheduler,
+        data: Mutex::new(OwnedTerm::Atom("undefined".into())),
+        inet,
+    });
+    Ok(handle)
+}
+
+fn start_fd(
+    vm: &mut Vm,
+    process: &Process,
+    ctx: &RunCtx<'_, Message>,
+    input_fd: RawFd,
+    output_fd: RawFd,
+    opts: &PortOptions,
+) -> Result<Term, VmError> {
+    let reader = duplicate_fd(input_fd).map_err(|_| badarg())?;
+    let writer = duplicate_fd(output_fd).map_err(|_| badarg())?;
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let scheduler = runtime.scheduler()?;
+    let id = runtime
+        .next_port
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let port = Term::port(id).ok_or_else(badarg)?;
+    let handle = make_handle(
+        id,
+        Some(writer),
+        opts.framing,
+        ctx.pid(),
+        0,
+        format!("fd {input_fd} {output_fd}"),
+        opts.parallelism,
+        opts.limits,
+        Arc::clone(&scheduler),
+        false,
+    )?;
+    runtime
+        .ports
+        .lock()
+        .unwrap()
+        .insert(id, Arc::clone(&handle));
+    let owner = ctx.pid();
+    let read_fd = reader.into_raw_fd();
+    let binary = opts.binary;
+    let framing = opts.framing;
+    let want_eof = opts.eof;
+    std::thread::Builder::new()
+        .name(format!("arinsal-port-{id}"))
+        .spawn(move || {
+            worker(
+                handle,
+                None,
+                Some(read_fd),
+                scheduler,
+                owner,
+                id,
+                binary,
+                framing,
+                false,
+                want_eof,
+            );
+        })
+        .map_err(|_| badarg())?;
+    let _ = vm;
+    Ok(port)
+}
+
+fn output_fd(handle: &PortHandle) -> RawFd {
+    handle
+        .out
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|fd| fd.as_raw_fd())
+        .unwrap_or(-1)
+}
+
+fn nb_write(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
+    if fd < 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    loop {
+        // SAFETY: `buf` is a live slice and `fd` belongs to this port.
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(0);
+        }
+        return Err(err);
+    }
+}
+
+fn poke(handle: &PortHandle) {
+    if handle.wake_needed.swap(false, Ordering::AcqRel) {
+        let fd = handle.wake_w.as_raw_fd();
+        // SAFETY: the wake pipe write end stays open for the life of the handle.
+        unsafe {
+            libc::write(fd, (&1u8 as *const u8).cast(), 1);
+        }
+    }
+}
+
+fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
+    for pid in pids {
+        // UnlinkAck wakes a waiting process without entering its mailbox.
+        let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::UnlinkAck(0));
+    }
+}
+
+fn refresh_busy(st: &mut PortState, limits: &BusyLimits) -> Vec<Pid> {
+    // Port of erts/emulator/sys/unix/sys_drivers.c:1479 (ready_output low watermark), OTP-29.1.1.
+    if limits.port_enabled && st.busy_port && st.outq.len() < limits.port_low {
+        st.busy_port = false;
+    }
+    // Port of erts/emulator/beam/erl_port_task.c:706 (dequeued_proc2port_data), OTP-29.1.1.
+    if limits.msgq_enabled && st.busy_msgq && st.msgq < limits.msgq_low {
+        st.busy_msgq = false;
+    }
+    if !st.busy_port && !st.busy_msgq {
+        std::mem::take(&mut st.suspended)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Accept `data` into the driver output queue. Sets the busy-port flag when the
+/// unwritten queue reaches the high watermark.
+fn accept_output(handle: &PortHandle, st: &mut PortState, data: &[u8]) -> Result<(), ()> {
+    if st.closed || st.broken {
+        return Err(());
+    }
+    // Port of erts/emulator/sys/unix/sys_drivers.c:1140 (output), OTP-29.1.1.
+    if st.outq.is_empty() {
+        match nb_write(output_fd(handle), data) {
+            Ok(n) if n == data.len() => return Ok(()),
+            Ok(n) => st.outq.extend(data[n..].iter().copied()),
+            Err(_) => {
+                st.broken = true;
+                return Err(());
+            }
+        }
+    } else {
+        st.outq.extend(data.iter().copied());
+    }
+    if handle.limits.port_enabled && !st.busy_port && st.outq.len() >= handle.limits.port_high {
+        st.busy_port = true;
+    }
+    Ok(())
+}
+
+fn note_msgq(st: &mut PortState, limits: &BusyLimits, extra: usize) {
+    if !limits.msgq_enabled || extra == 0 {
+        return;
+    }
+    st.msgq = st.msgq.saturating_add(extra);
+    // Port of erts/emulator/beam/erl_port_task.c:744 (enqueue_proc2port_data), OTP-29.1.1.
+    if !st.busy_msgq && st.msgq > limits.msgq_high {
+        st.busy_msgq = true;
+    }
+}
+
+fn flush_output(handle: &PortHandle) -> Vec<Pid> {
+    let mut woken = Vec::new();
+    let mut became_inactive = false;
+    loop {
+        let mut st = handle.state.lock().unwrap();
+        if st.outq.is_empty() {
+            woken.extend(refresh_busy(&mut st, &handle.limits));
+            if st.pending.is_empty() && st.profile_active {
+                st.profile_active = false;
+                became_inactive = true;
+            }
+            break;
+        }
+        let n = st.outq.len().min(16 * 1024);
+        let chunk: Vec<u8> = st.outq.drain(..n).collect();
+        drop(st);
+        match nb_write(output_fd(handle), &chunk) {
+            Ok(0) => {
+                let mut st = handle.state.lock().unwrap();
+                for byte in chunk.into_iter().rev() {
+                    st.outq.push_front(byte);
+                }
+                break;
+            }
+            Ok(wrote) if wrote < chunk.len() => {
+                let mut st = handle.state.lock().unwrap();
+                for byte in chunk[wrote..].iter().rev() {
+                    st.outq.push_front(*byte);
+                }
+                woken.extend(refresh_busy(&mut st, &handle.limits));
+                break;
+            }
+            Ok(_) => {
+                let mut st = handle.state.lock().unwrap();
+                woken.extend(refresh_busy(&mut st, &handle.limits));
+            }
+            Err(_) => {
+                let mut st = handle.state.lock().unwrap();
+                st.broken = true;
+                st.busy_port = false;
+                st.busy_msgq = false;
+                st.outq.clear();
+                became_inactive = std::mem::replace(&mut st.profile_active, false);
+                woken.extend(std::mem::take(&mut st.suspended));
+                break;
+            }
+        }
+    }
+    if became_inactive {
+        crate::natives::misc::profile_port_event(
+            &handle.scheduler,
+            handle.owner_pid(),
+            handle.id,
+            false,
+        );
+    }
+    woken
+}
+
+fn drain_pending(handle: &PortHandle) -> Vec<Pid> {
+    let mut woken = Vec::new();
+    loop {
+        let next = {
+            let mut st = handle.state.lock().unwrap();
+            if st.in_output {
+                return woken;
+            }
+            let Some(data) = st.pending.pop_front() else {
+                return woken;
+            };
+            st.msgq = st.msgq.saturating_sub(data.len());
+            st.in_output = true;
+            data
+        };
+        let failed = {
+            let mut st = handle.state.lock().unwrap();
+            let failed = accept_output(handle, &mut st, &next).is_err();
+            st.in_output = false;
+            woken.extend(refresh_busy(&mut st, &handle.limits));
+            failed
+        };
+        if failed {
+            let mut st = handle.state.lock().unwrap();
+            st.broken = true;
+            woken.extend(std::mem::take(&mut st.suspended));
+            return woken;
+        }
+    }
+}
+
+fn command_bytes(handle: &PortHandle, data: &[u8]) -> Result<(), ()> {
+    let became_active = {
+        let mut st = handle.state.lock().unwrap();
+        if st.closed || st.broken {
+            return Err(());
+        }
+        // Parallel commands that arrive while output is in progress join the
+        // port task queue (busy_limits_msgq) instead of the driver queue.
+        if handle.parallelism && st.in_output {
+            note_msgq(&mut st, &handle.limits, data.len());
+            st.pending.push_back(data.to_vec());
+        } else {
+            st.in_output = true;
+            let failed = accept_output(handle, &mut st, data).is_err();
+            st.in_output = false;
+            if failed {
+                return Err(());
+            }
+        }
+        let runnable = !st.outq.is_empty() || !st.pending.is_empty();
+        let became_active = runnable && !st.profile_active;
+        st.profile_active |= runnable;
+        became_active
+    };
+    if became_active {
+        crate::natives::misc::profile_port_event(
+            &handle.scheduler,
+            handle.owner_pid(),
+            handle.id,
+            true,
+        );
+    }
+    poke(handle);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker(
+    handle: Arc<PortHandle>,
+    mut child: Option<Child>,
+    mut read_fd: Option<RawFd>,
+    scheduler: Arc<Scheduler<Process>>,
+    owner: Pid,
+    id: u64,
+    binary: bool,
+    framing: Option<(u8, usize)>,
+    want_status: bool,
+    want_eof: bool,
+) {
+    let wake_r = handle
+        .wake_r
+        .lock()
+        .unwrap()
+        .take()
+        .map(|fd| fd.into_raw_fd())
+        .unwrap_or(-1);
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut saw_eof = false;
+    loop {
+        let closed = handle.state.lock().unwrap().closed;
+        if closed {
+            break;
+        }
+        let wants_out = !handle.state.lock().unwrap().outq.is_empty()
+            || !handle.state.lock().unwrap().pending.is_empty();
+        handle.wake_needed.store(true, Ordering::Release);
+        let mut fds = Vec::with_capacity(3);
+        if let Some(fd) = read_fd {
+            fds.push((
+                fd,
+                crate::check_io::InterestSet {
+                    readable: true,
+                    writable: false,
+                },
+            ));
+        }
+        if wake_r >= 0 {
+            fds.push((
+                wake_r,
+                crate::check_io::InterestSet {
+                    readable: true,
+                    writable: false,
+                },
+            ));
+        }
+        let write_fd = output_fd(&handle);
+        if wants_out && write_fd >= 0 {
+            fds.push((
+                write_fd,
+                crate::check_io::InterestSet {
+                    readable: false,
+                    writable: true,
+                },
+            ));
+        }
+        if handle.state.lock().unwrap().closed
+            || !handle.state.lock().unwrap().outq.is_empty()
+            || !handle.state.lock().unwrap().pending.is_empty()
+        {
+            handle.wake_needed.store(false, Ordering::Release);
+        }
+        let mut input_ready = false;
+        if !handle.state.lock().unwrap().closed {
+            // Port of `erts_check_io` one-shot readiness delivery; every
+            // operation is re-registered after this worker handles the event.
+            match crate::check_io::wait_any(&fds) {
+                Ok(Some((ready_fd, ready))) => {
+                    input_ready = Some(ready_fd) == read_fd
+                        && (ready.readable || ready.closed || ready.error);
+                }
+                Ok(None) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        handle.wake_needed.store(false, Ordering::Release);
+        if wake_r >= 0 {
+            let mut scratch = [0u8; 64];
+            loop {
+                // SAFETY: scratch is a live buffer and wake_r is the port's self-pipe.
+                let n = unsafe { libc::read(wake_r, scratch.as_mut_ptr().cast(), scratch.len()) };
+                if n > 0 {
+                    continue;
+                }
+                break;
+            }
+        }
+        if handle.state.lock().unwrap().closed {
+            break;
+        }
+        let woken = drain_pending(&handle);
+        wake_suspended(&scheduler, woken);
+        let woken = flush_output(&handle);
+        wake_suspended(&scheduler, woken);
+        if input_ready && let Some(fd) = read_fd {
+            // SAFETY: `buf` is a live buffer and `fd` is the port's input descriptor.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted
+                    || err.kind() == std::io::ErrorKind::WouldBlock
+                {
+                    continue;
+                }
+                saw_eof = true;
+                read_fd = None;
+            } else if n == 0 {
+                saw_eof = true;
+                read_fd = None;
+            } else {
+                let n = n as usize;
+                if framing.is_none() {
+                    output_message(&scheduler, owner, id, &buf[..n], binary);
+                } else {
+                    data.extend_from_slice(&buf[..n]);
+                    decode_frames(&scheduler, owner, id, &mut data, binary, framing);
+                }
+            }
+        }
+        if saw_eof && handle.state.lock().unwrap().outq.is_empty() {
+            break;
+        }
+    }
+    let woken = flush_output(&handle);
+    wake_suspended(&scheduler, woken);
+    if wake_r >= 0 {
+        // SAFETY: this thread owns the wake read end taken from the handle.
+        unsafe { libc::close(wake_r) };
+    }
+    if let Some(fd) = read_fd {
+        // SAFETY: the worker owns the duplicated input descriptor.
+        unsafe { libc::close(fd) };
+    }
+    let closed = handle.state.lock().unwrap().closed;
+    if !closed && saw_eof && !data.is_empty() {
+        if framing.is_some_and(|(mode, _)| mode == 1) {
+            line_message(&scheduler, owner, id, &data, binary, false);
+        } else {
+            output_message(&scheduler, owner, id, &data, binary);
+        }
+    }
+    // Reap in the background: the closer only signals the child and returns.
+    if let Some(mut child) = child.take() {
+        if closed {
+            let _ = child.kill();
+        }
+        let status = child.wait().ok();
+        if !closed && want_status {
+            let code = status.and_then(|status| status.code()).unwrap_or(1);
+            let mut heap = ProcessHeap::with_words(16);
+            if let Ok(event) = TermBuilder::new(&mut heap)
+                .tuple(&[atom("exit_status"), Term::small(code as i64).unwrap()])
+            {
+                event_message(&scheduler, owner, id, event);
+            }
+        }
+    }
+    if !closed && saw_eof && want_eof {
+        event_message(&scheduler, owner, id, atom("eof"));
+    }
+}
+
+fn decode_frames(
+    scheduler: &Scheduler<Process>,
+    owner: Pid,
+    id: u64,
+    data: &mut Vec<u8>,
+    binary: bool,
+    framing: Option<(u8, usize)>,
+) {
+    let Some((mode, size)) = framing else {
+        return;
+    };
+    loop {
+        if mode == 1 {
+            let newline = data.iter().position(|b| *b == b'\n');
+            let chunk_len = newline
+                .map(|n| n + 1)
+                .or_else(|| (size > 0 && data.len() >= size).then_some(size));
+            let Some(n) = chunk_len else { break };
+            let mut body = data[..n].to_vec();
+            let complete = body.last() == Some(&b'\n');
+            if complete {
+                body.pop();
+                if body.last() == Some(&b'\r') {
+                    body.pop();
+                }
+            }
+            line_message(scheduler, owner, id, &body, binary, complete);
+            data.drain(..n);
+            continue;
+        }
+        // mode == 2: length-prefixed packet; `size` is the header width (1, 2, or 4).
+        let hdr = size;
+        if data.len() < hdr {
+            break;
+        }
+        let body_len = match hdr {
+            1 => data[0] as usize,
+            2 => u16::from_be_bytes([data[0], data[1]]) as usize,
+            4 => u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize,
+            _ => break,
+        };
+        let n = hdr + body_len;
+        if data.len() < n {
+            break;
+        }
+        let body = data[hdr..n].to_vec();
+        output_message(scheduler, owner, id, &body, binary);
+        data.drain(..n);
+    }
+}
+
+fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError> {
+    let id = term.as_port().ok_or_else(badarg)?;
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .ok_or_else(badarg)
+}
+
+// Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
+fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
+    let handle = lookup_port(process, port)?;
+    let owned = handle.data.lock().unwrap().clone();
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    from_owned(&owned, &mut heap).map_err(|_| badarg())
+}
+
+// Port of erts/emulator/beam/erl_bif_port.c:687 (port_set_data_2), OTP-29.1.1.
+fn port_set_data(process: &Process, port: Term, data: Term) -> Result<Term, VmError> {
+    let handle = lookup_port(process, port)?;
+    let owned = to_owned(data).map_err(|_| badarg())?;
+    *handle.data.lock().unwrap() = owned;
+    Ok(atom("true"))
+}
+
+pub(crate) fn family(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    module: &str,
+    function: &str,
+    args: &[Term],
+) -> Option<Result<Term, VmError>> {
+    if module != "erts_internal" && module != "erlang" {
+        return None;
+    }
+    let result = match (function, args) {
+        ("open_port", [spec, opts]) if module == "erts_internal" => {
+            start(vm, process, ctx, *spec, *opts)
+        }
+        ("port_command", [port, data, _]) if module == "erts_internal" => {
+            port_command(process, ctx, *port, *data, args)
+        }
+        ("port_close", [port]) if module == "erts_internal" => close(process, ctx, *port),
+        ("port_connect", [port, pid]) if module == "erts_internal" => {
+            connect(process, ctx, *port, *pid, false)
+        }
+        // Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3), OTP-29.1.1.
+        // Spawn and fd ports have no driver control. The internal BIF returns the
+        // atom `badarg`; `erlang:port_control/3` turns that atom into an exception.
+        ("port_control", [port, op, data]) if module == "erts_internal" => {
+            port_control(process, ctx.pid(), *port, *op, *data)
+        }
+        // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
+        // Spawn/fd/inet ports here have no driver call path; return the atom `badarg`.
+        ("port_call", [port, op, data]) if module == "erts_internal" => {
+            port_call(process, *port, *op, *data)
+        }
+        ("port_get_data", [port]) if module == "erlang" => port_get_data(process, *port),
+        ("port_set_data", [port, data]) if module == "erlang" => {
+            port_set_data(process, *port, *data)
+        }
+        ("ports", []) if module == "erlang" => ports(vm, process),
+        ("port_info", [port]) if module == "erts_internal" => port_info(process, *port, None),
+        ("port_info", [port, item]) if module == "erts_internal" => {
+            port_info(process, *port, Some(*item))
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn copied_reason(reason: Term) -> Option<Message> {
+    let mut heap = ProcessHeap::with_words(64);
+    let term = copy_term(reason, &mut heap).ok()?;
+    Message::copy_from(term).ok()
+}
+
+// Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3), OTP-29.1.1.
+// Non-inet ports still return the atom `badarg`. `tcp_inet` returns a byte list.
+fn port_control(
+    process: &mut Process,
+    caller: Pid,
+    port: Term,
+    op: Term,
+    data: Term,
+) -> Result<Term, VmError> {
+    let Some(id) = port.as_port() else {
+        return Ok(atom("badarg"));
+    };
+    let Some(handle) = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+    else {
+        return Ok(atom("badarg"));
+    };
+    if !handle.inet {
+        return Ok(atom("badarg"));
+    }
+    let Some(op) = op.as_small() else {
+        return Ok(atom("badarg"));
+    };
+    let Some(data) = bytes(data) else {
+        return Ok(atom("badarg"));
+    };
+    // g_inet_udp
+    if crate::inet_udp::owns(id) {
+        return crate::inet_udp::control(process, id, caller, op, &data);
+    }
+    crate::inet_drv::control(process, id, caller, op, &data)
+}
+
+// Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
+fn port_call(process: &Process, port: Term, op: Term, _data: Term) -> Result<Term, VmError> {
+    let Some(id) = port.as_port() else {
+        return Ok(atom("badarg"));
+    };
+    if process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .is_none()
+    {
+        return Ok(atom("badarg"));
+    }
+    if op.as_small().filter(|&n| n >= 0).is_none() {
+        return Ok(atom("badarg"));
+    }
+    // No driver currently implements call; match OTP spawn/inet ports on this machine.
+    Ok(atom("badarg"))
+}
+
+fn notsup() -> VmError {
+    VmError::Trap(crate::exceptions::Trap::error(atom("notsup")))
+}
+
+fn port_command(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    port: Term,
+    data: Term,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_bif_port.c:168 (erts_internal_port_command_3), OTP-29.1.1.
+    let id = port.as_port().ok_or_else(badarg)?;
+    let handle = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .ok_or_else(badarg)?;
+    let mut nosuspend = false;
+    if args.len() == 3 {
+        let options = list(args[2]).ok_or_else(badarg)?;
+        for option in options {
+            if option == atom("nosuspend") {
+                nosuspend = true;
+            } else if option == atom("force") {
+                // tcp_inet sets ERL_DRV_FLAG_SOFT_BUSY (inet_drv.c driver flags).
+                // spawn/fd drivers do not, so `force` is `notsup` there.
+                if !handle.inet {
+                    return Err(notsup());
+                }
+            } else {
+                return Err(badarg());
+            }
+        }
+    }
+    let mut framed = iodata(data).ok_or_else(badarg)?;
+    if handle.inet {
+        let st = handle.state.lock().unwrap();
+        if st.closed || st.broken {
+            return Err(badarg());
+        }
+        drop(st);
+        // Port of erts/emulator/drivers/common/inet_drv.c:12629 (tcp_inet_command), OTP-29.1.1.
+        // g_inet_udp: datagram sends use packet_inet_command, not tcp_sendv.
+        if crate::inet_udp::owns(id) {
+            return crate::inet_udp::command(id, ctx.pid(), &framed).map(|()| atom("true"));
+        }
+        return crate::inet_drv::command(id, ctx.pid(), &framed).map(|()| atom("true"));
+    }
+    if let Some((2, hdr)) = handle.framing {
+        match hdr {
+            1 => {
+                if framed.len() > u8::MAX as usize {
+                    return Err(badarg());
+                }
+                framed.insert(0, framed.len() as u8);
+            }
+            2 => {
+                if framed.len() > u16::MAX as usize {
+                    return Err(badarg());
+                }
+                let len = (framed.len() as u16).to_be_bytes();
+                framed.splice(0..0, len);
+            }
+            4 => {
+                if framed.len() > u32::MAX as usize {
+                    return Err(badarg());
+                }
+                let len = (framed.len() as u32).to_be_bytes();
+                framed.splice(0..0, len);
+            }
+            _ => return Err(badarg()),
+        }
+    }
+    {
+        let mut st = handle.state.lock().unwrap();
+        if st.closed || st.broken {
+            return Err(badarg());
+        }
+        // Port of erts/emulator/beam/io.c:1754 (erts_port_output), OTP-29.1.1.
+        if st.busy_port || st.busy_msgq {
+            if nosuspend {
+                return Ok(atom("false"));
+            }
+            let busy_port = st.busy_port;
+            st.suspended.push(ctx.pid());
+            drop(st);
+            if busy_port {
+                crate::natives::erts_debug::notify_busy_port(process, ctx.pid(), id);
+            }
+            BUSY_SUSPEND.with(|flag| flag.set(true));
+            return Err(badarg());
+        }
+    }
+    command_bytes(&handle, &framed).map_err(|()| badarg())?;
+    Ok(atom("true"))
+}
+
+// Port of erts/emulator/sys/unix/sys_drivers.c:1002 (fd_stop), OTP-29.1.1.
+// Stop selecting the port's descriptors. The caller's original fds stay open;
+// the wake pipe unblocks a worker parked in poll.
+fn release_io(handle: &PortHandle) {
+    let waiters = {
+        let mut st = handle.state.lock().unwrap();
+        st.closed = true;
+        st.broken = true;
+        st.busy_port = false;
+        st.busy_msgq = false;
+        std::mem::take(&mut st.suspended)
+    };
+    wake_suspended(&handle.scheduler, waiters);
+    poke(handle);
+    if handle.os_pid > 0 {
+        // SAFETY: os_pid is the child this port spawned. SIGKILL lets the worker reap it.
+        unsafe { libc::kill(handle.os_pid as i32, libc::SIGKILL) };
+    }
+}
+
+fn close(process: &Process, ctx: &mut RunCtx<'_, Message>, term: Term) -> Result<Term, VmError> {
+    let id = term.as_port().ok_or_else(badarg)?;
+    let removed = process
+        .runtime
+        .as_ref()
+        .and_then(|r| r.ports.lock().unwrap().remove(&id));
+    if let Some(handle) = removed {
+        if handle.inet {
+            crate::inet_drv::detach(id);
+            // g_inet_udp
+            crate::inet_udp::detach(id);
+        }
+        release_io(&handle);
+        let reason_term = atom("normal");
+        let port = Term::port(id).ok_or_else(badarg)?;
+        for linked in handle.links.lock().unwrap().iter().copied() {
+            if linked == ctx.pid() && process.trap_exit {
+                let mut heap = ProcessHeap::with_words(24);
+                let exit = TermBuilder::new(&mut heap)
+                    .tuple(&[atom("EXIT"), port, reason_term])
+                    .map_err(|error| VmError::Unsupported(format!("port EXIT tuple: {error:?}")))?;
+                if let Ok(message) = Message::copy_from(exit) {
+                    let _ = ctx.send(linked, message);
+                }
+                continue;
+            }
+            if let Ok(reason) = Message::copy_from(reason_term) {
+                let _ = ctx.signal(linked, arinsal_sched::Signal::Exit(reason));
+            }
+        }
+        for (reference, pid) in handle.monitors.lock().unwrap().iter() {
+            let mut heap = ProcessHeap::with_words(32);
+            let reference_term = TermBuilder::new(&mut heap)
+                .local_ref([*reference as u32, (*reference >> 32) as u32, 0])
+                .map_err(|error| {
+                    VmError::Unsupported(format!("port monitor reference: {error:?}"))
+                })?;
+            let down = TermBuilder::new(&mut heap)
+                .tuple(&[
+                    atom("DOWN"),
+                    reference_term,
+                    atom("port"),
+                    port,
+                    atom("normal"),
+                ])
+                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
+            if let Ok(message) = Message::copy_from(down) {
+                let _ = ctx.send(*pid, message);
+            }
+        }
+        Ok(atom("true"))
+    } else {
+        Err(badarg())
+    }
+}
+
+/// Apply an exit signal to a port and deliver its reason to linked processes.
+pub(crate) fn exit_port(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    port: Term,
+    reason: Term,
+) -> Result<(), VmError> {
+    let id = port.as_port().ok_or_else(badarg)?;
+    let removed = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().remove(&id))
+        .ok_or_else(badarg)?;
+    if removed.inet {
+        crate::inet_drv::detach(id);
+    }
+    release_io(&removed);
+
+    let refs = removed.monitors.lock().unwrap().clone();
+    for (reference, pid) in refs {
+        if pid == ctx.pid() {
+            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let reference_term = TermBuilder::new(&mut heap)
+                .local_ref([reference as u32, (reference >> 32) as u32, 0])
+                .map_err(|error| {
+                    VmError::Unsupported(format!("port monitor reference: {error:?}"))
+                })?;
+            let down = TermBuilder::new(&mut heap)
+                .tuple(&[atom("DOWN"), reference_term, atom("port"), port, reason])
+                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
+            process.inbox.push_back(down);
+        } else {
+            let mut heap = ProcessHeap::with_words(32);
+            let reference_term = TermBuilder::new(&mut heap)
+                .local_ref([reference as u32, (reference >> 32) as u32, 0])
+                .map_err(|error| {
+                    VmError::Unsupported(format!("port monitor reference: {error:?}"))
+                })?;
+            let down = TermBuilder::new(&mut heap)
+                .tuple(&[atom("DOWN"), reference_term, atom("port"), port, reason])
+                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
+            if let Ok(message) = Message::copy_from(down) {
+                let _ = ctx.send(pid, message);
+            }
+        }
+    }
+    for linked in removed.links.lock().unwrap().iter().copied() {
+        if linked == ctx.pid() && process.trap_exit {
+            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let exit = TermBuilder::new(&mut heap)
+                .tuple(&[atom("EXIT"), port, reason])
+                .map_err(|error| VmError::Unsupported(format!("port EXIT tuple: {error:?}")))?;
+            process.inbox.push_back(exit);
+            continue;
+        }
+        if let Ok(message) = Message::copy_from(reason) {
+            let _ = ctx.signal(linked, arinsal_sched::Signal::Exit(message));
+        }
+    }
+    Ok(())
+}
+
+fn connect(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    port: Term,
+    pid: Term,
+    notify: bool,
+) -> Result<Term, VmError> {
+    let id = port.as_port().ok_or_else(badarg)?;
+    let pid = Pid::from_term(pid).ok_or_else(badarg)?;
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let handle = runtime
+        .ports
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(badarg)?;
+    if !runtime.scheduler()?.lookup(pid) {
+        return Err(badarg());
+    }
+    handle.links.lock().unwrap().insert(pid);
+    *handle.owner.lock().unwrap() = pid;
+    let scheduler = runtime.scheduler()?;
+    if notify {
+        event_message(&scheduler, ctx.pid(), id, atom("connected"));
+    }
+    Ok(atom("true"))
+}
+
+/// Close ports owned by a process when its scheduler task terminates.
+///
+/// Port of erts/emulator/beam/erl_process.c:14084 (erts_proc_exit_handle_link), OTP-29.1.1.
+pub(crate) fn owner_exit(
+    runtime: &crate::process::Runtime,
+    scheduler: &Scheduler<Process>,
+    owner: Pid,
+    reason: Term,
+) {
+    // g_port_fix: synchronous owner-exit hook; the caller is the termination path.
+    let closed = {
+        let mut ports = runtime.ports.lock().unwrap();
+        let ids = ports
+            .iter()
+            .filter_map(|(&id, handle)| (*handle.owner.lock().unwrap() == owner).then_some(id))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| ports.remove(&id).map(|handle| (id, handle)))
+            .collect::<Vec<_>>()
+    };
+    for (port_id, handle) in closed {
+        if handle.inet {
+            crate::inet_drv::detach(port_id);
+            // g_inet_udp
+            crate::inet_udp::detach(port_id);
+        }
+        release_io(&handle);
+        let Some(port) = Term::port(port_id) else {
+            continue;
+        };
+        // Linked processes observe the port, the same shape `port_close` uses.
+        // A non-normal reason also becomes an exit signal so a process that does
+        // not trap exits terminates; `normal` is ignored by that path in erts.
+        let abnormal = reason != atom("normal");
+        for linked in handle.links.lock().unwrap().iter().copied() {
+            if linked == owner {
+                continue;
+            }
+            let mut heap = ProcessHeap::with_words(32);
+            let reason_term = copy_term(reason, &mut heap).unwrap_or_else(|_| atom("normal"));
+            let Ok(exit) = TermBuilder::new(&mut heap).tuple(&[atom("EXIT"), port, reason_term])
+            else {
+                continue;
+            };
+            if let Ok(message) = Message::copy_from(exit) {
+                let _ = scheduler.send(owner, linked, message);
+            }
+            if abnormal && let Some(message) = copied_reason(reason) {
+                let _ = scheduler.signal(owner, linked, arinsal_sched::Signal::Exit(message));
+            }
+        }
+        for (reference, pid) in handle.monitors.lock().unwrap().iter() {
+            let mut heap = ProcessHeap::with_words(32);
+            let reference_term = TermBuilder::new(&mut heap).local_ref([
+                *reference as u32,
+                (*reference >> 32) as u32,
+                0,
+            ]);
+            let Ok(reference_term) = reference_term else {
+                continue;
+            };
+            let reason_term = copy_term(reason, &mut heap).unwrap_or_else(|_| atom("normal"));
+            let down = TermBuilder::new(&mut heap).tuple(&[
+                atom("DOWN"),
+                reference_term,
+                atom("port"),
+                port,
+                reason_term,
+            ]);
+            let Ok(down) = down else { continue };
+            if let Ok(message) = Message::copy_from(down) {
+                let _ = scheduler.send(owner, *pid, message);
+            }
+        }
+    }
+}
+
+/// Add or remove a process from a port's link set.
+pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Result<(), VmError> {
+    let id = port.as_port().ok_or_else(badarg)?;
+    let handle = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .ok_or_else(badarg)?;
+    let mut links = handle.links.lock().unwrap();
+    if linked {
+        links.insert(pid);
+    } else {
+        links.remove(&pid);
+    }
+    Ok(())
+}
+
+/// Register or remove a process monitor on a port.
+pub(crate) fn monitor(
+    process: &Process,
+    port: Term,
+    reference: u64,
+    pid: Pid,
+    monitored: bool,
+) -> Result<(), VmError> {
+    let id = port.as_port().ok_or_else(badarg)?;
+    let handle = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .ok_or_else(badarg)?;
+    let mut monitors = handle.monitors.lock().unwrap();
+    if monitored {
+        monitors.insert(reference, pid);
+    } else {
+        monitors.remove(&reference);
+    }
+    Ok(())
+}
+
+/// Remove a reference from any live port's monitor set.
+pub(crate) fn demonitor(process: &Process, reference: u64) -> bool {
+    let Some(runtime) = &process.runtime else {
+        return false;
+    };
+    let ports = runtime.ports.lock().unwrap();
+    ports
+        .values()
+        .any(|handle| handle.monitors.lock().unwrap().remove(&reference).is_some())
+}
+
+pub(crate) fn send_message(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    port: Term,
+    message: Term,
+) -> Result<(), VmError> {
+    let id = port.as_port().ok_or_else(badarg)?;
+    let parts = tuple(message).ok_or_else(badarg)?;
+    if parts.len() != 2 || parts[0] != ctx.pid().to_term().ok_or_else(badarg)? {
+        return Err(badarg());
+    }
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let handle = runtime
+        .ports
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(badarg)?;
+    if parts[1] == atom("close") {
+        close(process, ctx, port)?;
+        return Ok(());
+    }
+    let command = tuple(parts[1]).ok_or_else(badarg)?;
+    if command.len() == 2 && command[0] == atom("command") {
+        let mut data = iodata(command[1]).ok_or_else(badarg)?;
+        if let Some((2, hdr)) = handle.framing {
+            match hdr {
+                1 => {
+                    if data.len() > u8::MAX as usize {
+                        return Err(badarg());
+                    }
+                    data.insert(0, data.len() as u8);
+                }
+                2 => {
+                    if data.len() > u16::MAX as usize {
+                        return Err(badarg());
+                    }
+                    data.splice(0..0, (data.len() as u16).to_be_bytes());
+                }
+                4 => {
+                    if data.len() > u32::MAX as usize {
+                        return Err(badarg());
+                    }
+                    data.splice(0..0, (data.len() as u32).to_be_bytes());
+                }
+                _ => return Err(badarg()),
+            }
+        }
+        command_bytes(&handle, &data).map_err(|()| badarg())?;
+        return Ok(());
+    }
+    if command.len() == 2 && command[0] == atom("connect") {
+        if *handle.owner.lock().unwrap() != ctx.pid() {
+            return Err(badarg());
+        }
+        connect(process, ctx, port, command[1], true)?;
+        return Ok(());
+    }
+    Err(badarg())
+}
+
+fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/bif.c:4125 (ports/0), OTP-29.1.1.
+    // Standard I/O is a registered port even when no user port is open.
+    let mut values = vec![Term::port(0).expect("standard I/O port tag")];
+    if let Some(runtime) = &process.runtime {
+        values.extend(
+            runtime
+                .ports
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|id| **id != 0)
+                .filter_map(|id| Term::port(*id)),
+        );
+    }
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    TermBuilder::new(&mut heap)
+        .list_from_iter(values)
+        .map_err(|e| VmError::Unsupported(format!("ports list: {e:?}")))
+}
+fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Term, VmError> {
+    let id = port.as_port().ok_or_else(badarg)?;
+    let Some(handle) = process
+        .runtime
+        .as_ref()
+        .and_then(|r| r.ports.lock().unwrap().get(&id).cloned())
+    else {
+        return Ok(atom("undefined"));
+    };
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let name = TermBuilder::new(&mut heap)
+        .string_to_list(&handle.name)
+        .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;
+    let connected = handle.owner.lock().unwrap().to_term().ok_or_else(badarg)?;
+    let links = TermBuilder::new(&mut heap)
+        .list_from_iter(
+            handle
+                .links
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|pid| pid.to_term()),
+        )
+        .map_err(|e| VmError::Unsupported(format!("port info links: {e:?}")))?;
+    let monitored_pids = handle
+        .monitors
+        .lock()
+        .unwrap()
+        .values()
+        .copied()
+        .filter_map(|pid| pid.to_term())
+        .collect::<Vec<_>>();
+    let memory = 48 + monitored_pids.len() * 24;
+    let monitored_by = TermBuilder::new(&mut heap)
+        .list_from_iter(monitored_pids)
+        .map_err(|error| VmError::Unsupported(format!("port monitored_by: {error:?}")))?;
+    let fields = [
+        ("name", name),
+        ("links", links),
+        ("id", Term::small(id as i64).unwrap()),
+        ("connected", connected),
+        ("input", Term::small(0).unwrap()),
+        ("output", Term::small(0).unwrap()),
+        ("os_pid", Term::small(handle.os_pid as i64).unwrap()),
+        ("monitors", Term::NIL),
+        ("monitored_by", monitored_by),
+        ("memory", Term::small(memory as i64).unwrap()),
+        (
+            "queue_size",
+            Term::small(handle.state.lock().unwrap().outq.len() as i64).unwrap(),
+        ),
+        ("locking", atom("port_level")),
+        (
+            "parallelism",
+            atom(if handle.parallelism { "true" } else { "false" }),
+        ),
+    ];
+    if let Some(item) = item {
+        let key = global_atoms()
+            .text(item.as_atom().ok_or_else(badarg)?)
+            .ok_or_else(badarg)?;
+        let value = fields
+            .iter()
+            .find_map(|(name, value)| (*name == key.as_ref()).then_some(*value))
+            .ok_or_else(badarg)?;
+        return TermBuilder::new(&mut heap)
+            .tuple(&[item, value])
+            .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")));
+    }
+    let tuples: Vec<Term> = fields
+        .into_iter()
+        .take(7)
+        .map(|(key, value)| {
+            let key = atom(key);
+            TermBuilder::new(&mut heap)
+                .tuple(&[key, value])
+                .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    TermBuilder::new(&mut heap)
+        .list_from_iter(tuples)
+        .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
+}

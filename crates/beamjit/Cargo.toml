@@ -1,0 +1,19 @@
+[package]
+name = "arinsal-beamjit"
+description = "Function-level BEAM to BeamAsm native compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arinsal-beam.workspace = true
+arinsal-beamops = { path = "../beamops" }
+arinsal-beamasm = { path = "../beamasm" }
+arinsal-a64 = { path = "../a64" }
+thiserror.workspace = true
+
+[dev-dependencies]

@@ -1,0 +1,1051 @@
+//! Local closures, export funs, and dynamic calls.
+
+use crate::process::Message;
+use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, calls, exceptions};
+use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
+use arinsal_loader::{Arg, ImportClass, Instr, Module};
+use arinsal_sched::RunCtx;
+use arinsal_term::{ExportEntry, FunRef, Term, TermBuilder, TermKind, global_atoms};
+use std::sync::Arc;
+
+pub(super) fn set_module_uniq(module: &mut Module, bytes: &[u8]) -> Result<(), VmError> {
+    let uniq = arinsal_loader::module_uniq(bytes).map_err(|e| VmError::Load(e.to_string()))?;
+    for slot in &mut module.funs {
+        if let Some(entry) = Arc::get_mut(&mut slot.entry) {
+            entry.uniq = uniq;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+pub(super) fn make_fun(
+    p: &mut Process,
+    module: &Module,
+    index: u32,
+    dst: Arg,
+    env: u32,
+    code_epoch: u64,
+) -> Result<(), VmError> {
+    let slot = module
+        .funs
+        .iter()
+        .find(|slot| slot.entry.old_index == index)
+        .ok_or_else(|| VmError::Unsupported(format!("lambda index {index}")))?;
+    let sources = module
+        .lists
+        .get(env as usize)
+        .ok_or_else(|| VmError::Unsupported("lambda environment".into()))?;
+    if sources.len() != slot.num_free {
+        return Err(VmError::Unsupported("lambda environment size".into()));
+    }
+    // Port of erts/emulator/beam/emu/instrs.tab:545 (i_make_fun3), OTP-29.1.1.
+    // This opcode allocates directly; its preceding test_heap is the safepoint.
+    let free = sources
+        .iter()
+        .map(|&src| p.read(src))
+        .collect::<Result<Vec<_>, _>>()?;
+    let value = TermBuilder::new(&mut p.heap)
+        .local_fun(Arc::clone(&slot.entry), &free)
+        .map_err(|e| VmError::Unsupported(format!("fun allocation {e:?}")))?;
+    slot.set_dispatch(0, p.module, module.code.as_ptr() as usize, code_epoch);
+    p.write(dst, value)
+}
+
+/// Build the Erlang exception reason before the exception handler formats it.
+pub(super) fn call_error_reason(p: &mut Process, fun: Term, arity: usize) -> Result<Term, VmError> {
+    let is_fun = fun.classify() == TermKind::Fun;
+    p.ensure(6 + arity * 2, arity + 1)?;
+    let fun = p.x[arity];
+    let mut builder = TermBuilder::new(&mut p.heap);
+    let kind = global_atoms()
+        .intern(if is_fun { "badarity" } else { "badfun" })
+        .map_err(|_| VmError::Unsupported("exception atom".into()))?;
+    if !is_fun {
+        return builder
+            .tuple(&[Term::atom(kind), fun])
+            .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")));
+    }
+    let mut args = Term::NIL;
+    for value in p.x[..arity].iter().rev().copied() {
+        args = builder
+            .cons(value, args)
+            .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))?;
+    }
+    let detail = builder
+        .tuple(&[fun, args])
+        .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))?;
+    builder
+        .tuple(&[Term::atom(kind), detail])
+        .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))
+}
+
+#[inline]
+pub(super) fn is_function2(p: &Process, src: Arg, arity: Arg) -> Result<bool, VmError> {
+    let fun = p.read(src)?;
+    let requested = if arity.kind() == Arg::U {
+        i64::try_from(arity.value()).ok()
+    } else {
+        p.read(arity)?.as_small()
+    };
+    if !(Some(0)..=Some(255)).contains(&requested) {
+        return Ok(false);
+    }
+    // SAFETY: The source term remains live in this process or a module literal heap.
+    Ok(match unsafe { fun.fun_ref() } {
+        Some(FunRef::Local { entry, .. }) => Some(i64::from(entry.arity)) == requested,
+        Some(FunRef::Export { entry }) => Some(i64::from(entry.arity)) == requested,
+        None => false,
+    })
+}
+
+fn error_handler_module(process: &Process) -> String {
+    process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.flags.get("error_handler"))
+        .and_then(|term| atom_name(*term))
+        .unwrap_or_else(|| "error_handler".to_owned())
+}
+
+fn atom_name(term: Term) -> Option<String> {
+    global_atoms()
+        .text(term.as_atom()?)
+        .map(|name| name.to_string())
+}
+
+enum ArgumentError {
+    Badarg,
+    SystemLimit,
+}
+
+fn argument_list(mut list: Term) -> Result<Vec<Term>, ArgumentError> {
+    let mut args = Vec::new();
+    while list.classify() == TermKind::List {
+        if args.len() >= 1023 {
+            return Err(ArgumentError::SystemLimit);
+        }
+        // SAFETY: The list is retained by an X register throughout traversal.
+        let (head, tail) = unsafe { list.cons_ref() }.ok_or(ArgumentError::Badarg)?;
+        args.push(head);
+        list = tail;
+    }
+    (list == Term::NIL)
+        .then_some(args)
+        .ok_or(ArgumentError::Badarg)
+}
+
+impl Vm {
+    pub(super) fn eval_erlang_fun_builtin(
+        &mut self,
+        function: &str,
+        args: &[Term],
+    ) -> Option<Result<EvalResult, VmError>> {
+        let arity = args.len();
+        let result = match (function, arity) {
+            ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2) | ("fun_info_mfa", 1) => {
+                // elixir_loop1
+                let mut p = Process::new();
+                let module_id = match self.load_named("erlang") {
+                    Ok(id) => id,
+                    Err(error) => return Some(Err(error)),
+                };
+                p.module = module_id;
+                p.ip = self.modules[module_id]
+                    .export(function, arity as u8)
+                    .unwrap_or(0);
+                p.x[..arity].copy_from_slice(args);
+                p.gc_live = arity;
+                let value = match function {
+                    "apply" => match self.apply_bif(&mut p, arity, true, None) {
+                        Ok(ImportOutcome::Returned(value)) => Ok(value),
+                        Ok(ImportOutcome::Jump(_))
+                        | Ok(ImportOutcome::Advanced)
+                        | Ok(ImportOutcome::Yield) => self.run(&mut p),
+                        Err(error) => Err(error),
+                    },
+                    "make_fun" => self.make_export_fun(&mut p, args),
+                    "fun_info" => self.fun_info(&mut p, arity == 2),
+                    "fun_info_mfa" => self.fun_info_mfa(&mut p), // elixir_loop1
+                    _ => unreachable!(),
+                };
+                // An exception raised here has no BEAM frame to unwind into: turn it
+                // into an uncaught `Raised` while its reason still lives on `p`'s heap.
+                let value = match value {
+                    Err(VmError::Trap(trap)) => {
+                        match exceptions::resume(self, &mut p, None, trap) {
+                            Ok(Some(error)) | Err(error) => Err(error),
+                            Ok(None) => Err(VmError::Unsupported(
+                                "exception resumed without a handler".into(),
+                            )),
+                        }
+                    }
+                    other => other,
+                };
+                value.map(|term| {
+                    p.stats.heap_words = p.heap.capacity_words();
+                    EvalResult {
+                        term,
+                        stats: p.stats.snapshot(),
+                        _process: p,
+                    }
+                })
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    pub(super) fn intercept_fun_import(
+        &mut self,
+        p: &mut Process,
+        index: usize,
+        arity: usize,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<Option<ImportOutcome>, VmError> {
+        let import = self.modules[p.module]
+            .imports
+            .get(index)
+            .ok_or_else(|| VmError::Unsupported(format!("import {index}")))?;
+        if import.module != "erlang" {
+            return Ok(None);
+        }
+        let function = import.function.as_str();
+        if function == "apply" && (arity == 2 || arity == 3) {
+            return self.apply_bif(p, arity, tail, ctx).map(Some);
+        }
+        let value = if function == "make_fun" && arity == 3 {
+            let args = [p.x[0], p.x[1], p.x[2]];
+            self.make_export_fun(p, &args)?
+        } else if function == "fun_info" && (arity == 1 || arity == 2) {
+            self.fun_info(p, arity == 2)?
+        } else if function == "fun_info_mfa" && arity == 1 {
+            self.fun_info_mfa(p)? // elixir_loop1
+        } else {
+            return Ok(None);
+        };
+        p.x[0] = value;
+        if tail {
+            return Ok(Some(match Self::ret(p) {
+                Some(value) => ImportOutcome::Returned(value),
+                None => ImportOutcome::Advanced,
+            }));
+        }
+        p.ip += 1;
+        Ok(Some(ImportOutcome::Advanced))
+    }
+
+    // Port of erts/emulator/beam/beam_common.c:1605 (call_fun), OTP-29.1.1.
+    #[inline]
+    pub(super) fn call_fun_term(
+        &mut self,
+        p: &mut Process,
+        fun: Term,
+        arity: usize,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        if arity >= p.x.len() {
+            return Err(VmError::Unsupported("fun arity exceeds X registers".into()));
+        }
+        p.x[arity] = fun;
+        // SAFETY: The fun is held in an X register while this process is live.
+        let view = unsafe { fun.fun_ref() };
+        let actual = match &view {
+            Some(FunRef::Local { entry, .. }) => Some(entry.arity as usize),
+            Some(FunRef::Export { entry }) => Some(entry.arity as usize),
+            None => None,
+        };
+        if actual != Some(arity) {
+            let reason = call_error_reason(p, fun, arity)?;
+            return Err(VmError::Trap(exceptions::Trap::error(reason)));
+        }
+        match view.unwrap() {
+            FunRef::Local { entry, free_vars } => {
+                // Port of erts/emulator/beam/beam_common.c:1621-1624 (call_fun), OTP-29.1.1.
+                self.sync_code_epoch();
+                let cached = entry.get_dispatch(0).and_then(|(id, target, code, epoch)| {
+                    if self.code_epoch.is_some() && epoch == self.seen_epoch {
+                        return Some((id, target, code));
+                    }
+                    let module = self.modules.get(id)?;
+                    (self.module_live.get(id) == Some(&true)
+                        && module.code.as_ptr() as usize == code)
+                        .then_some((id, target, code))
+                });
+                let (module_id, target, code) = if let Some(cached) = cached {
+                    cached
+                } else {
+                    self.resolve_local_fun(p, entry, arity)?
+                };
+                // The caller module's register file is sized from its own beam.
+                // A closure passes its environment in `x[arity..]`, which can sit
+                // past that size (elixir_erl_compiler's spawn fun). OTP grows the
+                // process X array; shrinking never happens, so the callee keeps it.
+                let need = arity + free_vars.len();
+                if need > 1024 {
+                    return Err(VmError::Unsupported(
+                        "closure environment exceeds X registers".into(),
+                    ));
+                }
+                if need > p.x.len() {
+                    let mut registers = p.x.to_vec();
+                    registers.resize(need, Term::NIL);
+                    p.x = registers.into_boxed_slice();
+                }
+                for (i, &word) in free_vars.iter().enumerate() {
+                    // SAFETY: The fun header bounds the environment and every word is a term.
+                    p.x[arity + i] = unsafe { std::mem::transmute::<u64, Term>(word) };
+                }
+                p.gc_live = arity + free_vars.len();
+                if !tail {
+                    calls::push_continuation(p, p.module, p.ip + 1, p.gc_live)?;
+                }
+                p.module = module_id;
+                p.ip = target;
+                p.tick();
+                Ok(ImportOutcome::Jump(
+                    (code as *const Instr).wrapping_add(target),
+                ))
+            }
+            FunRef::Export { entry } => {
+                let module = atom_name(Term::atom(entry.module))
+                    .ok_or_else(|| VmError::Unsupported("export module atom".into()))?;
+                let function = atom_name(Term::atom(entry.function))
+                    .ok_or_else(|| VmError::Unsupported("export function atom".into()))?;
+                self.call_named_atoms(
+                    p,
+                    entry.module,
+                    entry.function,
+                    &module,
+                    &function,
+                    arity,
+                    tail,
+                    ctx,
+                )
+            }
+        }
+    }
+
+    #[cold]
+    fn resolve_local_fun(
+        &mut self,
+        p: &mut Process,
+        entry: &arinsal_term::FunEntry,
+        arity: usize,
+    ) -> Result<(usize, usize, usize), VmError> {
+        let name = atom_name(Term::atom(entry.module))
+            .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
+        if !self.loaded.contains_key(&name) && !self.old.contains_key(&name) {
+            let _ = self.load_named(&name)?;
+        }
+        let found = [self.loaded.get(&name), self.old.get(&name)]
+            .into_iter()
+            .flatten()
+            .find_map(|&id| {
+                self.modules[id]
+                    .funs
+                    .iter()
+                    .find(|slot| {
+                        slot.entry.index == entry.index
+                            && slot.entry.uniq == entry.uniq
+                            && slot.entry.old_uniq == entry.old_uniq
+                    })
+                    .map(|slot| (id, slot.target))
+            });
+        let Some((module_id, target)) = found else {
+            let reason = badfun_reason(p, arity)?;
+            return Err(VmError::Trap(exceptions::Trap::error(reason)));
+        };
+        entry.set_dispatch(
+            0,
+            module_id,
+            target,
+            self.modules[module_id].code.as_ptr() as usize,
+            self.seen_epoch,
+        );
+        Ok((
+            module_id,
+            target,
+            self.modules[module_id].code.as_ptr() as usize,
+        ))
+    }
+
+    #[inline]
+    pub(super) fn call_named(
+        &mut self,
+        p: &mut Process,
+        module: &str,
+        function: &str,
+        arity: usize,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        self.call_named_resolved(p, None, module, function, arity, tail, ctx)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Preserve the call metadata without rebuilding an MFA tuple.
+    fn call_named_atoms(
+        &mut self,
+        p: &mut Process,
+        module_atom: arinsal_term::Atom,
+        function_atom: arinsal_term::Atom,
+        module: &str,
+        function: &str,
+        arity: usize,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        self.call_named_resolved(
+            p,
+            Some((module_atom, function_atom)),
+            module,
+            function,
+            arity,
+            tail,
+            ctx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // The optional atom identity accompanies the existing MFA fields.
+    fn call_named_resolved(
+        &mut self,
+        p: &mut Process,
+        atoms: Option<(arinsal_term::Atom, arinsal_term::Atom)>,
+        module: &str,
+        function: &str,
+        arity: usize,
+        tail: bool,
+        mut ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        p.gc_live = arity;
+        if arity > u8::MAX as usize {
+            return Err(VmError::Exception {
+                reason: "undef".into(),
+                frame: format!("{module}:{function}/{arity}"),
+            });
+        }
+        // Apply carries atom identities, so resolve the same process-aware BIF
+        // entry as a static import without re-matching its module or function.
+        let mut resolved_entry = false;
+        if let (Some((module_atom, function_atom)), Some(run)) = (atoms, ctx.as_deref_mut()) {
+            let entry = crate::signals::handler_atoms(module_atom, function_atom, arity as u8);
+            if let Some(entry) = entry {
+                resolved_entry = true;
+                if let Some(result) = self.dispatch_resolved_entry(
+                    p,
+                    run,
+                    crate::natives::NativeArgs::Registers(arity),
+                    entry,
+                ) {
+                    p.x[0] = result?;
+                    if tail {
+                        return Ok(match Self::ret(p) {
+                            Some(value) => ImportOutcome::Returned(value),
+                            None => ImportOutcome::Advanced,
+                        });
+                    }
+                    p.ip += 1;
+                    return Ok(ImportOutcome::Advanced);
+                }
+            }
+        }
+        // `!` is an export alias for the process-aware `send/2` BIF.
+        let native_function = if module == "erlang" && function == "!" && arity == 2 {
+            "send"
+        } else {
+            function
+        };
+        if !resolved_entry
+            && let Some(run) = ctx.as_deref_mut()
+            && let Some(result) = self.dispatch_native(
+                p,
+                run,
+                module,
+                native_function,
+                arity,
+                (ImportClass::Dynamic, 0),
+            )
+        {
+            p.x[0] = result?;
+            if tail {
+                return Ok(match Self::ret(p) {
+                    Some(value) => ImportOutcome::Returned(value),
+                    None => ImportOutcome::Advanced,
+                });
+            }
+            p.ip += 1;
+            return Ok(ImportOutcome::Advanced);
+        }
+        // elixir_loop1: apply/3 reaches this path without an import slot.
+        // sys_core_fold:fold_lit_args/4 applies erlang:make_fun/3 the same way.
+        if module == "erlang" && function == "make_fun" && arity == 3 {
+            let args = [p.x[0], p.x[1], p.x[2]];
+            p.x[0] = self.make_export_fun(p, &args)?;
+            if tail {
+                return Ok(match Self::ret(p) {
+                    Some(value) => ImportOutcome::Returned(value),
+                    None => ImportOutcome::Advanced,
+                });
+            }
+            p.ip += 1;
+            return Ok(ImportOutcome::Advanced);
+        }
+        if module == "erlang" && function == "fun_info" && (arity == 1 || arity == 2) {
+            p.x[0] = self.fun_info(p, arity == 2)?;
+            if tail {
+                return Ok(match Self::ret(p) {
+                    Some(value) => ImportOutcome::Returned(value),
+                    None => ImportOutcome::Advanced,
+                });
+            }
+            p.ip += 1;
+            return Ok(ImportOutcome::Advanced);
+        }
+        if module == "erlang" && function == "fun_info_mfa" && arity == 1 {
+            p.x[0] = self.fun_info_mfa(p)?;
+            if tail {
+                return Ok(match Self::ret(p) {
+                    Some(value) => ImportOutcome::Returned(value),
+                    None => ImportOutcome::Advanced,
+                });
+            }
+            p.ip += 1;
+            return Ok(ImportOutcome::Advanced);
+        }
+        // elixir_loop1: dynamic apply must see static NIFs such as re:import/1.
+        if let Some(bif) = arinsal_bifs::lookup(module, function, arity as u8)
+            .or_else(|| crate::natives::static_nif_lookup(module, function, arity as u8))
+        {
+            let (result, bif_reductions) = {
+                let mut heap = FragmentingHeap(&mut p.heap);
+                let mut bif_ctx = Ctx::new(&mut heap);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    bif(&mut bif_ctx, &p.x[..arity])
+                }))
+                .map_err(|_| {
+                    VmError::Unsupported(format!("BIF {module}:{function}/{arity} panicked"))
+                })?;
+                (result, bif_ctx.reductions())
+            };
+            let bif_args = p.x[..arity].to_vec();
+            let result = result.map_err(|error| match error {
+                BifError::Unsupported(reason) => VmError::Unsupported(reason.into()),
+                error => exceptions::bif_error(p, module, function, &bif_args, error),
+            })?;
+            p.x[0] = result;
+            let charge = bif_reductions.saturating_add(1);
+            p.reductions = p
+                .reductions
+                .saturating_sub(charge.min(i32::MAX as u32) as i32);
+            let exhausted = ctx.as_deref_mut().is_some_and(|run| !run.consume(charge));
+            if tail {
+                return Ok(match Self::ret(p) {
+                    Some(value) => ImportOutcome::Returned(value),
+                    None => ImportOutcome::Advanced,
+                });
+            }
+            p.ip += 1;
+            if exhausted {
+                p.reductions = 4000;
+                return Ok(ImportOutcome::Yield);
+            }
+            return Ok(ImportOutcome::Advanced);
+        }
+        if arinsal_spec::bif_lookup(module, function, arity as u8).is_some() {
+            return Err(VmError::Unsupported(format!(
+                "BIF {module}:{function}/{arity}"
+            )));
+        }
+        // Same as `call_import`: a not-yet-loaded `-on_load` module has to go
+        // through `code_server` or its NIF stubs run.
+        if self.unloaded_on_load(p, module) {
+            return self.call_undefined_function_with_ctx(p, module, function, arity, tail, ctx);
+        }
+        let module_id = match self.load_named(module) {
+            Ok(id) => id,
+            Err(_) if self.should_autoload(p, module) => {
+                // mix_loop1: OTP calls error_handler:undefined_function/3, which
+                // code:ensure_loaded's from the code server path. Vm paths do
+                // not include Mix archives added with code:add_pathz/1.
+                if crate::calls::trace_boot_enabled() {
+                    eprintln!("arinsal boot: autoload {module}:{function}/{arity}");
+                }
+                return self
+                    .call_undefined_function_with_ctx(p, module, function, arity, tail, ctx);
+            }
+            Err(_) => {
+                return Err(VmError::Exception {
+                    reason: "undef".into(),
+                    frame: format!("{module}:{function}/{arity}"),
+                });
+            }
+        };
+        let target = self.modules[module_id]
+            .export(function, arity as u8)
+            .ok_or_else(|| VmError::Exception {
+                reason: "undef".into(),
+                frame: format!("{module}:{function}/{arity}"),
+            })?;
+        if !tail {
+            calls::push_continuation(p, p.module, p.ip + 1, arity)?;
+        }
+        p.module = module_id;
+        p.ip = target;
+        p.tick();
+        Ok(ImportOutcome::Jump(
+            self.modules[module_id].code.as_ptr().wrapping_add(target),
+        ))
+    }
+
+    /// `code_server` is up, so a missing module must go through `error_handler`
+    /// instead of becoming `undef` immediately. A `code:delete`d module is
+    /// missing too: Mix purges and deletes a protocol, then the next call
+    /// autoloads the consolidated beam. Port of
+    /// `error_handler:undefined_function/3`, OTP-29.1.1.
+    pub(super) fn should_autoload(&self, p: &Process, module: &str) -> bool {
+        if module == "error_handler" || self.pending_on_load.contains_key(module) {
+            return false;
+        }
+        p.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.names.lock().unwrap().contains_key("code_server"))
+    }
+
+    /// Jump to `error_handler:undefined_function(Module, Function, Args)`.
+    pub(super) fn call_undefined_function(
+        &mut self,
+        p: &mut Process,
+        module: &str,
+        function: &str,
+        arity: usize,
+        tail: bool,
+    ) -> Result<ImportOutcome, VmError> {
+        self.call_undefined_function_with_ctx(p, module, function, arity, tail, None)
+    }
+
+    fn call_undefined_function_with_ctx(
+        &mut self,
+        p: &mut Process,
+        module: &str,
+        function: &str,
+        arity: usize,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        p.ensure(arity.saturating_mul(2).saturating_add(8), arity)?;
+        let args: Vec<Term> = p.x[..arity].to_vec();
+        let list = TermBuilder::new(&mut p.heap)
+            .list_from_iter(args)
+            .map_err(|error| VmError::Unsupported(format!("undef arg list: {error:?}")))?;
+        let module_atom = global_atoms()
+            .intern(module)
+            .map_err(|_| VmError::Unsupported("undef module atom".into()))?;
+        let function_atom = global_atoms()
+            .intern(function)
+            .map_err(|_| VmError::Unsupported("undef function atom".into()))?;
+        p.x[0] = Term::atom(module_atom);
+        p.x[1] = Term::atom(function_atom);
+        p.x[2] = list;
+        // `process_flag(error_handler, Module)` replaces the module the
+        // emulator calls. Elixir's compiler sets `Kernel.ErrorHandler`, which
+        // waits on `Kernel.ParallelCompiler` before the default handler runs.
+        // An unloaded handler raises `undef` for the original call; OTP does
+        // not autoload the handler. Port of erts/emulator/beam/beam_common.c
+        // (`call_error_handler`), OTP-29.1.1.
+        let handler = error_handler_module(p);
+        let ready = self
+            .loaded
+            .get(&handler)
+            .is_some_and(|id| self.modules[*id].export("undefined_function", 3).is_some());
+        if !ready {
+            return Err(VmError::Exception {
+                reason: "undef".into(),
+                frame: format!("{module}:{function}/{arity}"),
+            });
+        }
+        self.call_named(p, &handler, "undefined_function", 3, tail, ctx)
+    }
+
+    #[inline]
+    pub(super) fn apply_fixed(
+        &mut self,
+        p: &mut Process,
+        arity: usize,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        if arity + 1 >= p.x.len() {
+            return Err(self.exception(p, "system_limit"));
+        }
+        let module_atom = p.x[arity]
+            .as_atom()
+            .ok_or_else(|| self.exception(p, "badarg"))?;
+        let function_atom = p.x[arity + 1]
+            .as_atom()
+            .ok_or_else(|| self.exception(p, "badarg"))?;
+        let module =
+            atom_name(Term::atom(module_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
+        let function =
+            atom_name(Term::atom(function_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
+        self.call_named_atoms(
+            p,
+            module_atom,
+            function_atom,
+            &module,
+            &function,
+            arity,
+            tail,
+            ctx,
+        )
+    }
+
+    #[inline]
+    pub(super) fn apply_bif(
+        &mut self,
+        p: &mut Process,
+        arity: usize,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        let original_x = p.x.to_vec();
+        let original_gc_live = p.gc_live;
+        let args = if arity == 2 {
+            argument_list(p.x[1])
+        } else {
+            argument_list(p.x[2])
+        }
+        .map_err(|error| match error {
+            ArgumentError::Badarg => self.exception(p, "badarg"),
+            ArgumentError::SystemLimit => self.exception(p, "system_limit"),
+        })?;
+        let target = if arity == 2 { Some(p.x[0]) } else { None };
+        let named = if arity == 3 {
+            Some((
+                p.x[0]
+                    .as_atom()
+                    .ok_or_else(|| self.exception(p, "badarg"))?,
+                p.x[1]
+                    .as_atom()
+                    .ok_or_else(|| self.exception(p, "badarg"))?,
+            ))
+        } else {
+            None
+        };
+        if args.len() >= p.x.len() {
+            return Err(self.exception(p, "system_limit"));
+        }
+        p.x[..args.len()].copy_from_slice(&args);
+        let result = if let Some(fun) = target {
+            self.call_fun_term(p, fun, args.len(), tail, ctx)
+        } else {
+            let (module_atom, function_atom) = named.unwrap();
+            let module = global_atoms()
+                .text(module_atom)
+                .ok_or_else(|| self.exception(p, "badarg"))?;
+            let function = global_atoms()
+                .text(function_atom)
+                .ok_or_else(|| self.exception(p, "badarg"))?;
+            self.call_named_atoms(
+                p,
+                module_atom,
+                function_atom,
+                &module,
+                &function,
+                args.len(),
+                tail,
+                ctx,
+            )
+        };
+        if matches!(
+            &result,
+            Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)
+        ) {
+            p.x.copy_from_slice(&original_x);
+            p.gc_live = original_gc_live;
+        }
+        result
+    }
+
+    pub(super) fn make_export_fun(
+        &mut self,
+        p: &mut Process,
+        args: &[Term],
+    ) -> Result<Term, VmError> {
+        let module = args[0]
+            .as_atom()
+            .ok_or_else(|| self.exception(p, "badarg"))?;
+        let function = args[1]
+            .as_atom()
+            .ok_or_else(|| self.exception(p, "badarg"))?;
+        let arity = args[2]
+            .as_small()
+            .filter(|n| (0..=255).contains(n))
+            .ok_or_else(|| self.exception(p, "badarg"))? as u8;
+        p.ensure(2, 3)?;
+        TermBuilder::new(&mut p.heap)
+            .export_fun(Arc::new(ExportEntry {
+                module,
+                function,
+                arity,
+            }))
+            .map_err(|e| VmError::Unsupported(format!("export fun allocation {e:?}")))
+    }
+
+    // elixir_loop1: Port of erts/emulator/beam/erl_bif_info.c:4011
+    // (fun_info_mfa_1), OTP-29.1.1.
+    fn fun_info_mfa(&self, p: &mut Process) -> Result<Term, VmError> {
+        p.ensure(4, 1)?;
+        // SAFETY: X0 retains the fun throughout this BIF; tuple construction cannot collect.
+        let view = unsafe { p.x[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
+        let (module, name, arity) = match view {
+            FunRef::Local { entry, .. } => {
+                let module = atom_name(Term::atom(entry.module))
+                    .ok_or_else(|| VmError::Unsupported("fun module".into()))?;
+                let name = self
+                    .loaded
+                    .get(&module)
+                    .and_then(|&id| {
+                        self.modules[id]
+                            .funs
+                            .iter()
+                            .find(|slot| slot.entry.index == entry.index)
+                            .map(|slot| (id, slot.target))
+                    })
+                    .and_then(|(id, target)| self.modules[id].function_at(target))
+                    .map(|(name, _)| name.to_owned());
+                (entry.module, name, entry.arity)
+            }
+            FunRef::Export { entry } => (
+                entry.module,
+                atom_name(Term::atom(entry.function)),
+                entry.arity,
+            ),
+        };
+        let name = match name {
+            Some(name) => Term::atom(
+                global_atoms()
+                    .intern(&name)
+                    .map_err(|_| VmError::Unsupported("fun name atom".into()))?,
+            ),
+            None => Term::NIL,
+        };
+        TermBuilder::new(&mut p.heap)
+            .tuple(&[
+                Term::atom(module),
+                name,
+                Term::small(i64::from(arity)).unwrap(),
+            ])
+            .map_err(|error| VmError::Unsupported(format!("fun_info_mfa tuple: {error:?}")))
+    }
+
+    pub(super) fn fun_info(&self, p: &mut Process, keyed: bool) -> Result<Term, VmError> {
+        // Port of erts/emulator/beam/erl_bif_info.c:3912 (fun_info_2), OTP-29.1.1.
+        p.ensure(1024, usize::from(keyed) + 1)?;
+        let fun = p.x[0];
+        // SAFETY: X0 retains the fun throughout construction; no collection follows.
+        let view = unsafe { fun.fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
+        let requested = if keyed {
+            Some(atom_name(p.x[1]).ok_or_else(|| self.exception(p, "badarg"))?)
+        } else {
+            None
+        };
+        let keys: &[&str] = if let Some(ref key) = requested {
+            &[key]
+        } else if matches!(view, FunRef::Local { .. }) {
+            &[
+                "pid",
+                "module",
+                "new_index",
+                "new_uniq",
+                "index",
+                "uniq",
+                "name",
+                "arity",
+                "env",
+                "type",
+            ]
+        } else {
+            &["module", "name", "arity", "env", "type"]
+        };
+        let mut builder = TermBuilder::new(&mut p.heap);
+        let mut pairs = Vec::with_capacity(keys.len());
+        for &key in keys {
+            let value = match (&view, key) {
+                (FunRef::Local { .. }, "pid") => Term::pid(0, 0).unwrap(),
+                (
+                    FunRef::Export { .. },
+                    "pid" | "index" | "new_index" | "uniq" | "new_uniq" | "refc",
+                ) => Term::atom(
+                    global_atoms()
+                        .intern("undefined")
+                        .map_err(|_| VmError::Unsupported("atom undefined".into()))?,
+                ),
+                (FunRef::Local { entry, .. }, "module") => Term::atom(entry.module),
+                (FunRef::Export { entry }, "module") => Term::atom(entry.module),
+                (FunRef::Local { entry, .. }, "index") => {
+                    Term::small(i64::from(entry.old_index))
+                        .ok_or_else(|| VmError::Unsupported("fun index".into()))?
+                }
+                (FunRef::Local { entry, .. }, "new_index") => {
+                    Term::small(i64::from(entry.index))
+                        .ok_or_else(|| VmError::Unsupported("fun index".into()))?
+                }
+                (FunRef::Local { entry, .. }, "uniq") => Term::small(i64::from(entry.old_uniq))
+                    .ok_or_else(|| VmError::Unsupported("fun uniq".into()))?,
+                (FunRef::Local { entry, .. }, "new_uniq") => builder
+                    .binary(&entry.uniq)
+                    .map_err(|e| VmError::Unsupported(format!("fun uniq allocation {e:?}")))?,
+                (FunRef::Local { entry, .. }, "name") => {
+                    let module = atom_name(Term::atom(entry.module))
+                        .ok_or_else(|| VmError::Unsupported("fun module".into()))?;
+                    let function = self
+                        .loaded
+                        .get(&module)
+                        .and_then(|&id| {
+                            self.modules[id]
+                                .funs
+                                .iter()
+                                .find(|slot| slot.entry.index == entry.index)
+                                .map(|slot| (id, slot.target))
+                        })
+                        .and_then(|(id, target)| {
+                            self.modules[id]
+                                .function_at(target)
+                                .map(|(name, _)| name.to_owned())
+                        });
+                    if let Some(function) = function {
+                        Term::atom(
+                            global_atoms()
+                                .intern(&function)
+                                .map_err(|_| VmError::Unsupported("fun name atom".into()))?,
+                        )
+                    } else {
+                        Term::NIL
+                    }
+                }
+                (FunRef::Export { entry }, "name") => Term::atom(entry.function),
+                (FunRef::Local { entry, .. }, "arity") => {
+                    Term::small(i64::from(entry.arity)).unwrap()
+                }
+                (FunRef::Export { entry }, "arity") => Term::small(i64::from(entry.arity)).unwrap(),
+                (FunRef::Local { free_vars, .. }, "env") => {
+                    let mut list = Term::NIL;
+                    for &word in free_vars.iter().rev() {
+                        // SAFETY: The fun header bounds the captured term words.
+                        let value = unsafe { std::mem::transmute::<u64, Term>(word) };
+                        list = builder.cons(value, list).map_err(|e| {
+                            VmError::Unsupported(format!("fun env allocation {e:?}"))
+                        })?;
+                    }
+                    list
+                }
+                (FunRef::Export { .. }, "env") => Term::NIL,
+                (FunRef::Local { .. }, "type") => Term::atom(
+                    global_atoms()
+                        .intern("local")
+                        .map_err(|_| VmError::Unsupported("atom local".into()))?,
+                ),
+                (FunRef::Export { .. }, "type") => Term::atom(
+                    global_atoms()
+                        .intern("external")
+                        .map_err(|_| VmError::Unsupported("atom external".into()))?,
+                ),
+                (FunRef::Local { .. }, "refc") => Term::small(1).unwrap(),
+                _ => return Err(self.exception(p, "badarg")),
+            };
+            let key_atom = Term::atom(
+                global_atoms()
+                    .intern(key)
+                    .map_err(|_| VmError::Unsupported("fun info key".into()))?,
+            );
+            let pair = builder
+                .tuple(&[key_atom, value])
+                .map_err(|e| VmError::Unsupported(format!("fun info allocation {e:?}")))?;
+            pairs.push(pair);
+        }
+        if keyed {
+            Ok(pairs[0])
+        } else {
+            builder
+                .list_from_iter(pairs)
+                .map_err(|e| VmError::Unsupported(format!("fun info list {e:?}")))
+        }
+    }
+}
+
+/// `{badfun, Fun}` for a fun whose code is no longer loaded.
+fn badfun_reason(p: &mut Process, arity: usize) -> Result<Term, VmError> {
+    p.ensure(3, arity + 1)?;
+    let fun = p.x[arity];
+    let kind = global_atoms()
+        .intern("badfun")
+        .map_err(|_| VmError::Unsupported("exception atom".into()))?;
+    TermBuilder::new(&mut p.heap)
+        .tuple(&[Term::atom(kind), fun])
+        .map_err(|e| VmError::Unsupported(format!("exception allocation {e:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn function_arity_instruction_accepts_unsigned_immediate() {
+        let mut p = Process::new();
+        let module = global_atoms().intern("erlang").unwrap();
+        let function = global_atoms().intern("abs").unwrap();
+        p.x[0] = TermBuilder::new(&mut p.heap)
+            .export_fun(Arc::new(ExportEntry {
+                module,
+                function,
+                arity: 1,
+            }))
+            .unwrap();
+        let fun = Arg::new(Arg::X, 0);
+        assert!(is_function2(&p, fun, Arg::new(Arg::U, 1)).unwrap());
+        assert!(!is_function2(&p, fun, Arg::new(Arg::U, 2)).unwrap());
+    }
+
+    #[test]
+    fn make_fun_keeps_arguments_live_under_gc_stress() {
+        const CHILD: &str = "ARINSAL_MAKE_FUN_GC_STRESS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "funs::tests::make_fun_keeps_arguments_live_under_gc_stress",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ARINSAL_GC_STRESS", "1")
+                .env("ARINSAL_GC_VERIFY", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "GC stress child failed: {status}");
+            return;
+        }
+
+        let reference = arinsal_difftest::RefErl::start()
+            .expect("the regression test requires the reference erl");
+        let beam = reference
+            .compile_named(
+                "vm_make_fun_gc_stress",
+                "-module(vm_make_fun_gc_stress). -export([run/2]). run(A,B) -> F = fun() -> ok end, {A,B,F}.",
+                &[],
+            )
+            .unwrap();
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let args = [Term::small(17).unwrap(), Term::small(29).unwrap()];
+        let result = vm
+            .eval_scheduled("vm_make_fun_gc_stress", "run", &args, 1, None)
+            .unwrap();
+        let arinsal_etf::OwnedTerm::Tuple(items) = &result.term else {
+            panic!("expected {{17, 29, Fun}}, got {:?}", result.term);
+        };
+        assert_eq!(items[0], arinsal_etf::OwnedTerm::Int(17));
+        assert_eq!(items[1], arinsal_etf::OwnedTerm::Int(29));
+    }
+}

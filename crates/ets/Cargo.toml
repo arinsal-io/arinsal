@@ -1,0 +1,22 @@
+[package]
+name = "arinsal-ets"
+description = "VM-independent ETS table and match specification primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap = "1.9.2"
+parking_lot = "0.12.5"
+arinsal-term.workspace = true
+arinsal-etf.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+
+[dev-dependencies]
+arinsal-difftest.workspace = true
+arinsal-etf.workspace = true

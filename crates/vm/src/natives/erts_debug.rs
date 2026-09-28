@@ -1,0 +1,2090 @@
+//! Introspection natives implemented by the emulator debug modules.
+
+use crate::process::Message;
+use crate::{Process, Vm, VmError, exceptions};
+use arinsal_etf::OwnedTerm;
+use arinsal_sched::RunCtx;
+use arinsal_term::{
+    Term, TermBuilder, TermKind, copy_term, flatmap_keys, from_owned, global_atoms,
+    hashmap_node_children, size_object, term_sequence, to_owned,
+};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static INTERNAL_STATE: AtomicBool = AtomicBool::new(false);
+static DEBUGGER_SUPPORT: AtomicBool = AtomicBool::new(false);
+static JIT_ASM_DUMP: AtomicBool = AtomicBool::new(false);
+static TEST_LONG_GC_SLEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UNIQUE_MONOTONIC_INTEGER_STATE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static BINARY_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RE_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(64_000);
+static UNICODE_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(40_000);
+
+const MONITOR_LARGE_HEAP: u8 = 1;
+const MONITOR_LONG_GC: u8 = 2;
+const MONITOR_LONG_SCHEDULE: u8 = 4;
+const MONITOR_LONG_MESSAGE_QUEUE: u8 = 8;
+const MONITOR_BUSY_PORT: u8 = 16;
+
+#[derive(Clone)]
+pub(crate) struct SystemMonitorState {
+    pub(crate) receiver: OwnedTerm,
+    pub(crate) options: HashMap<&'static str, MonitorOption>,
+}
+
+#[derive(Clone)]
+pub(crate) enum MonitorOption {
+    Bool(bool),
+    Limit(u64),
+    Queue(u64, u64),
+}
+
+fn refresh_system_monitor_flags(
+    runtime: &crate::process::Runtime,
+    state: Option<&SystemMonitorState>,
+) {
+    let mut flags = 0;
+    if let Some(state) = state {
+        if matches!(
+            state.options.get("large_heap"),
+            Some(MonitorOption::Limit(_))
+        ) {
+            flags |= MONITOR_LARGE_HEAP;
+        }
+        if matches!(state.options.get("long_gc"), Some(MonitorOption::Limit(_))) {
+            flags |= MONITOR_LONG_GC;
+        }
+        if matches!(
+            state.options.get("long_schedule"),
+            Some(MonitorOption::Limit(_))
+        ) {
+            flags |= MONITOR_LONG_SCHEDULE;
+        }
+        if matches!(
+            state.options.get("long_message_queue"),
+            Some(MonitorOption::Queue(_, _))
+        ) {
+            flags |= MONITOR_LONG_MESSAGE_QUEUE;
+        }
+        if matches!(
+            state.options.get("busy_port"),
+            Some(MonitorOption::Bool(true))
+        ) {
+            flags |= MONITOR_BUSY_PORT;
+        }
+    }
+    runtime.system_monitor_flags.store(flags, Ordering::Relaxed);
+}
+
+/// Emit the monitor events that are observable from the VM's collection hook.
+// Port of erts/emulator/beam/erl_gc.c:904-920 and erl_trace.c:1604-1741, OTP-29.1.1.
+pub(crate) fn after_collection(process: &mut Process, elapsed_nanoseconds: u64) {
+    let Some(runtime) = process.runtime.clone() else {
+        return;
+    };
+    let flags = runtime.system_monitor_flags.load(Ordering::Relaxed);
+    if flags == 0 {
+        return;
+    }
+    let Some(pid) = runtime
+        .processes
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|pid| {
+            pid.to_term()
+                .is_some_and(|term| term.tagged_word() == process.header.self_pid)
+        })
+    else {
+        return;
+    };
+    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
+        return;
+    };
+    let OwnedTerm::Pid {
+        node,
+        id: receiver_id,
+        serial: receiver_generation,
+        creation: 0,
+    } = &state.receiver
+    else {
+        return;
+    };
+    if node != "nonode@nohost" {
+        return;
+    }
+    let receiver = arinsal_sched::Pid {
+        index: *receiver_id,
+        generation: *receiver_generation,
+    };
+    let heap_words = process.heap.capacity_words();
+    let total_heap_words = process.heap.total_heap_size_words();
+    let heap_used = process.heap.used_words();
+    let mut events = Vec::new();
+    if flags & MONITOR_LARGE_HEAP != 0
+        && let Some(MonitorOption::Limit(limit)) = state.options.get("large_heap")
+        && total_heap_words as u64 >= *limit
+    {
+        events.push((
+            "large_heap",
+            vec![
+                ("old_heap_block_size", 0),
+                ("heap_block_size", heap_words),
+                ("mbuf_size", 0),
+                ("stack_size", 0),
+                ("old_heap_size", process.heap.old_used_words()),
+                ("heap_size", heap_used),
+            ],
+        ));
+    }
+    if flags & MONITOR_LONG_GC != 0 {
+        let delay = TEST_LONG_GC_SLEEP.load(Ordering::Relaxed);
+        if delay != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+    let elapsed_ms = elapsed_nanoseconds / 1_000_000
+        + if flags & MONITOR_LONG_GC != 0 {
+            TEST_LONG_GC_SLEEP.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+    if flags & MONITOR_LONG_GC != 0
+        && elapsed_ms > 0
+        && let Some(MonitorOption::Limit(limit)) = state.options.get("long_gc")
+        && elapsed_ms > *limit
+    {
+        events.push((
+            "long_gc",
+            vec![
+                ("timeout", elapsed_ms as usize),
+                ("old_heap_block_size", 0),
+                ("heap_block_size", heap_words),
+                ("mbuf_size", 0),
+                ("stack_size", 0),
+                ("old_heap_size", process.heap.old_used_words()),
+                ("heap_size", heap_used),
+            ],
+        ));
+    }
+    for (kind, values) in events {
+        send_system_monitor_event(process, &runtime, pid, receiver, kind, values);
+    }
+}
+
+fn send_system_monitor_event(
+    process: &mut Process,
+    runtime: &crate::process::Runtime,
+    pid: arinsal_sched::Pid,
+    receiver: arinsal_sched::Pid,
+    kind: &str,
+    values: Vec<(&str, usize)>,
+) {
+    let Ok(scheduler) = runtime.scheduler() else {
+        return;
+    };
+    let fields = values
+        .into_iter()
+        .map(|(name, value)| {
+            OwnedTerm::tuple(vec![OwnedTerm::atom(name), OwnedTerm::Int(value as i64)])
+        })
+        .collect();
+    let event = OwnedTerm::Tuple(vec![
+        OwnedTerm::atom("monitor"),
+        OwnedTerm::Pid {
+            node: "nonode@nohost".into(),
+            id: pid.index,
+            serial: pid.generation,
+            creation: 0,
+        },
+        OwnedTerm::atom(kind),
+        OwnedTerm::list(fields),
+    ]);
+    if let Ok(term) = from_owned(
+        &event,
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    ) && let Ok(message) = Message::copy_from(term)
+    {
+        let _ = scheduler.send(pid, receiver, message);
+    }
+}
+
+/// Emit long-schedule events after a scheduler execution slice.
+// Port of erts/emulator/beam/erl_trace.c:1510-1595, OTP-29.1.1.
+pub(crate) fn after_schedule(process: &mut Process, elapsed_nanoseconds: u64) {
+    let Some(runtime) = process.runtime.clone() else {
+        return;
+    };
+    let flags = runtime.system_monitor_flags.load(Ordering::Relaxed);
+    if flags & MONITOR_LONG_SCHEDULE == 0 {
+        return;
+    }
+    let Some(pid) = runtime
+        .processes
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|pid| {
+            pid.to_term()
+                .is_some_and(|term| term.tagged_word() == process.header.self_pid)
+        })
+    else {
+        return;
+    };
+    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
+        return;
+    };
+    let Some(MonitorOption::Limit(limit)) = state.options.get("long_schedule") else {
+        return;
+    };
+    let elapsed_ms = elapsed_nanoseconds / 1_000_000;
+    if elapsed_ms <= *limit {
+        return;
+    }
+    let OwnedTerm::Pid {
+        node,
+        id: receiver_id,
+        serial: receiver_generation,
+        creation: 0,
+    } = &state.receiver
+    else {
+        return;
+    };
+    if node != "nonode@nohost" {
+        return;
+    }
+    let receiver = arinsal_sched::Pid {
+        index: *receiver_id,
+        generation: *receiver_generation,
+    };
+    let fields = OwnedTerm::list(vec![
+        OwnedTerm::tuple(vec![
+            OwnedTerm::atom("timeout"),
+            OwnedTerm::Int(elapsed_ms as i64),
+        ]),
+        OwnedTerm::tuple(vec![OwnedTerm::atom("in"), OwnedTerm::atom("undefined")]),
+        OwnedTerm::tuple(vec![OwnedTerm::atom("out"), OwnedTerm::atom("undefined")]),
+    ]);
+    let event = OwnedTerm::Tuple(vec![
+        OwnedTerm::atom("monitor"),
+        OwnedTerm::Pid {
+            node: "nonode@nohost".into(),
+            id: pid.index,
+            serial: pid.generation,
+            creation: 0,
+        },
+        OwnedTerm::atom("long_schedule"),
+        fields,
+    ]);
+    if let Ok(term) = from_owned(
+        &event,
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    ) && let Ok(message) = Message::copy_from(term)
+        && let Ok(scheduler) = runtime.scheduler()
+    {
+        let _ = scheduler.send(pid, receiver, message);
+    }
+}
+
+/// Emit long-message-queue events when the mailbox crosses its configured limits.
+// Port of erts/emulator/beam/erl_trace.c:1863-1918, OTP-29.1.1.
+pub(crate) fn after_message_queue_change(process: &mut Process) {
+    let Some(runtime) = process.runtime.clone() else {
+        return;
+    };
+    let flags = runtime.system_monitor_flags.load(Ordering::Relaxed);
+    if flags & MONITOR_LONG_MESSAGE_QUEUE == 0 {
+        return;
+    }
+    let Some(pid) = runtime
+        .processes
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .find(|pid| {
+            pid.to_term()
+                .is_some_and(|term| term.tagged_word() == process.header.self_pid)
+        })
+    else {
+        return;
+    };
+    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
+        return;
+    };
+    let Some(MonitorOption::Queue(off, on)) = state.options.get("long_message_queue") else {
+        return;
+    };
+    let count = process.inbox.len() as u64;
+    let active = runtime.long_message_queues.lock().unwrap().contains(&pid);
+    let value = if !active && count >= *on {
+        runtime.long_message_queues.lock().unwrap().insert(pid);
+        Some(true)
+    } else if active && count <= *off {
+        runtime.long_message_queues.lock().unwrap().remove(&pid);
+        Some(false)
+    } else {
+        None
+    };
+    let Some(value) = value else {
+        return;
+    };
+    let OwnedTerm::Pid {
+        node,
+        id: receiver_id,
+        serial: receiver_generation,
+        creation: 0,
+    } = &state.receiver
+    else {
+        return;
+    };
+    if node != "nonode@nohost" {
+        return;
+    }
+    let receiver = arinsal_sched::Pid {
+        index: *receiver_id,
+        generation: *receiver_generation,
+    };
+    let event = OwnedTerm::Tuple(vec![
+        OwnedTerm::atom("monitor"),
+        OwnedTerm::Pid {
+            node: "nonode@nohost".into(),
+            id: pid.index,
+            serial: pid.generation,
+            creation: 0,
+        },
+        OwnedTerm::atom("long_message_queue"),
+        OwnedTerm::atom(if value { "true" } else { "false" }),
+    ]);
+    if let Ok(term) = from_owned(
+        &event,
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    ) && let Ok(message) = Message::copy_from(term)
+        && let Ok(scheduler) = runtime.scheduler()
+    {
+        let _ = scheduler.send(pid, receiver, message);
+    }
+}
+
+/// Emit the event when a sender is suspended on a busy local port.
+// Port of erts/emulator/beam/erl_process.c:9396-9397 and erl_trace.c:1928-1937, OTP-29.1.1.
+pub(crate) fn notify_busy_port(process: &Process, sender: arinsal_sched::Pid, port_id: u64) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    if runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_BUSY_PORT == 0 {
+        return;
+    }
+    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
+        return;
+    };
+    if !matches!(
+        state.options.get("busy_port"),
+        Some(MonitorOption::Bool(true))
+    ) {
+        return;
+    }
+    let OwnedTerm::Pid {
+        node,
+        id: receiver_id,
+        serial: receiver_generation,
+        creation: 0,
+    } = &state.receiver
+    else {
+        return;
+    };
+    if node != "nonode@nohost" {
+        return;
+    }
+    let receiver = arinsal_sched::Pid {
+        index: *receiver_id,
+        generation: *receiver_generation,
+    };
+    let Some(port) = Term::port(port_id) else {
+        return;
+    };
+    let mut heap = arinsal_term::ProcessHeap::with_words(16);
+    let Ok(event) = TermBuilder::new(&mut heap).tuple(&[
+        atom("monitor"),
+        sender.to_term().unwrap_or(Term::NIL),
+        atom("busy_port"),
+        port,
+    ]) else {
+        return;
+    };
+    if let Ok(message) = Message::copy_from(event)
+        && let Ok(scheduler) = runtime.scheduler()
+    {
+        let _ = scheduler.send(sender, receiver, message);
+    }
+}
+
+/// Implemented `erts_debug` and `erts_internal` debug BIFs.
+pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
+    ("erts_debug", "copy_shared", 2),
+    ("erts_debug", "dirty", 3),
+    ("erts_debug", "dirty_cpu", 2),
+    ("erts_debug", "dirty_io", 2),
+    ("erts_debug", "disassemble", 1),
+    ("erts_debug", "get_internal_state", 1),
+    ("erts_debug", "instructions", 0),
+    ("erts_debug", "interpreter_size", 0),
+    ("erts_debug", "lcnt_clear", 0),
+    ("erts_debug", "lcnt_collect", 0),
+    ("erts_debug", "lcnt_control", 1),
+    ("erts_debug", "lcnt_control", 2),
+    ("erts_debug", "map_info", 1),
+    ("erts_debug", "set_internal_state", 2),
+    ("erts_debug", "size_shared", 1),
+    ("erts_debug", "unaligned_bitstring", 2),
+    ("erts_internal", "gather_alloc_histograms", 1),
+    ("erts_internal", "gather_carrier_info", 1),
+    ("erts_internal", "map_hashmap_children", 1),
+    ("erts_internal", "map_to_tuple_keys", 1),
+    ("erts_internal", "system_check", 1),
+    ("erts_internal", "system_monitor", 1),
+    ("erts_internal", "system_monitor", 3),
+    ("erts_internal", "term_type", 1),
+];
+
+fn atom(name: &str) -> Term {
+    Term::atom(global_atoms().intern(name).expect("built-in atom"))
+}
+
+fn badarg() -> VmError {
+    VmError::Trap(exceptions::Trap::error(atom("badarg")))
+}
+
+fn badmap(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    tuple(process, &[atom("badmap"), value])
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+}
+
+fn undef() -> VmError {
+    VmError::Trap(exceptions::Trap::error(atom("undef")))
+}
+
+fn arg_name(term: Term) -> Option<String> {
+    global_atoms()
+        .text(term.as_atom()?)
+        .map(|text| text.to_string())
+}
+
+fn int(process: &mut Process, value: usize) -> Result<Term, VmError> {
+    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .int_from_i128(value as i128)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+}
+
+fn list(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
+    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .list_from_iter(values.iter().copied())
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+}
+
+fn tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
+    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .tuple(values)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:377 (erts_debug_instructions_0), OTP-29.1.1.
+fn instructions(process: &mut Process) -> Result<Term, VmError> {
+    let mut names = Vec::new();
+    for name in include_str!("erts_debug_instructions.txt").lines() {
+        let bytes = name
+            .bytes()
+            .map(|byte| Term::small(i64::from(byte)).expect("instruction name byte"))
+            .collect::<Vec<_>>();
+        names.push(list(process, &bytes)?);
+    }
+    list(process, &names)
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:1248-1428 (dirty_test), OTP-29.1.1.
+fn dirty_test(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    scheduler: &str,
+    operation: Term,
+    value: Term,
+) -> Result<Term, VmError> {
+    match arg_name(operation).as_deref() {
+        Some("scheduler") if value == atom("type") => Ok(atom(scheduler)),
+        Some("error") => {
+            let reason = match arg_name(value).as_deref() {
+                Some("notsup") => "notsup",
+                Some("undef") => "undef",
+                Some("badarith") => "badarith",
+                Some("noproc") => "noproc",
+                Some("system_limit") => "system_limit",
+                _ => return Err(badarg()),
+            };
+            Err(VmError::Trap(exceptions::Trap::error(atom(reason))))
+        }
+        Some("copy") => {
+            let mut copies = Vec::with_capacity(1000);
+            for _ in 0..1000 {
+                copies.push(
+                    copy_term(value, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                        .map_err(|_| {
+                            VmError::Trap(exceptions::Trap::error(atom("system_limit")))
+                        })?,
+                );
+            }
+            list(process, &copies)
+        }
+        Some("send") => {
+            let message = tuple(
+                process,
+                &[atom("ok"), ctx.pid().to_term().ok_or_else(badarg)?],
+            )?;
+            let _ = process.send_message(ctx, value, message);
+            Ok(atom("ok"))
+        }
+        Some("wait") => {
+            let milliseconds = value.as_small().ok_or_else(badarg)?;
+            if milliseconds > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+            }
+            Ok(atom("ok"))
+        }
+        Some("reschedule") => {
+            let rounds = value
+                .as_small()
+                .filter(|rounds| *rounds >= 0)
+                .ok_or_else(badarg)?;
+            if rounds % 2 != 0 {
+                return Err(badarg());
+            }
+            Ok(atom("ok"))
+        }
+        Some("ready_wait6_done") => {
+            let ready = tuple(
+                process,
+                &[atom("ready"), ctx.pid().to_term().ok_or_else(badarg)?],
+            )?;
+            let _ = process.send_message(ctx, value, ready);
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            let done = tuple(
+                process,
+                &[atom("done"), ctx.pid().to_term().ok_or_else(badarg)?],
+            )?;
+            let _ = process.send_message(ctx, value, done);
+            Ok(atom("ok"))
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:1190 (erts_debug_dirty_3), OTP-29.1.1.
+fn dirty(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    let scheduler = match arg_name(args[0]).as_deref() {
+        Some("normal") => "normal",
+        Some("dirty_cpu") => "dirty_cpu",
+        Some("dirty_io") => "dirty_io",
+        _ => return Err(badarg()),
+    };
+    dirty_test(process, ctx, scheduler, args[1], args[2])
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:86 (erts_debug_size_shared_1), OTP-29.1.1.
+fn size_shared(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    int(process, size_object(value))
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:170 (erts_debug_copy_shared_2), OTP-29.1.1.
+fn copy_shared(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+    if args[1] != atom("true") && args[1] != atom("false") {
+        return Err(badarg());
+    }
+    copy_term(
+        args[0],
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    )
+    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+}
+
+/// Port of erts/emulator/beam/erl_map.c:3301 (erts_debug_map_info_1), OTP-29.1.1.
+fn map_info(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    if value.classify() != TermKind::Map {
+        return Err(VmError::Trap(exceptions::Trap::error(badmap(
+            process, value,
+        )?)));
+    }
+    if !value.is_hashmap() {
+        return Err(badarg());
+    }
+    // Port of erts/emulator/beam/erl_map.c:3425-3590 (hashmap_info), OTP-29.1.1.
+    const LEVELS: usize = 18;
+    let mut leaves = [0usize; LEVELS];
+    let mut bitmaps = [0usize; 16];
+    let mut collisions = [0usize; 16];
+    let mut arrays = 0usize;
+    let mut leaf_count = 0usize;
+    let mut bitmap_count = 0usize;
+    let mut collision_count = 0usize;
+    let mut max_depth = 0usize;
+    let mut stack = vec![(value, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if node.classify() == TermKind::List {
+            leaf_count += 1;
+            leaves[depth] += 1;
+            continue;
+        }
+        let header = node.header().ok_or_else(badarg)?;
+        let kind = ((header >> 6) & 3) as usize;
+        let children = hashmap_node_children(node).ok_or_else(badarg)?;
+        let next_depth = depth + 1;
+        max_depth = max_depth.max(next_depth);
+        match header & 63 {
+            0 => {
+                collision_count += 1;
+                collisions[children.len().min(16) - 1] += 1;
+            }
+            0x2c if kind == 1 => {
+                bitmap_count += 1;
+                bitmaps[children.len() - 1] += 1;
+            }
+            0x2c if kind == 2 => arrays += 1,
+            0x2c if kind == 3 => {
+                bitmap_count += 1;
+                bitmaps[children.len() - 1] += 1;
+            }
+            _ => return Err(badarg()),
+        }
+        if next_depth < LEVELS {
+            stack.extend(children.into_iter().map(|child| (child, next_depth)));
+        }
+    }
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut builder = TermBuilder::new(&mut heap);
+    let (leaf_info, bitmap_info, collision_info) = {
+        let mut small_tuple = |values: &[usize]| {
+            let values = values
+                .iter()
+                .map(|value| {
+                    Term::small(*value as i64).expect("map statistic fits a small integer")
+                })
+                .collect::<Vec<_>>();
+            builder
+                .tuple(&values)
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        };
+        (
+            small_tuple(&leaves)?,
+            small_tuple(&bitmaps)?,
+            small_tuple(&collisions)?,
+        )
+    };
+    let entries = [
+        ("leafs", leaf_count, leaf_info),
+        ("bitmaps", bitmap_count, bitmap_info),
+        ("collisions", collision_count, collision_info),
+    ];
+    let mut result = Term::NIL;
+    for (name, count, info) in entries {
+        let item = builder
+            .tuple(&[atom(name), Term::small(count as i64).unwrap(), info])
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+        result = builder
+            .cons(item, result)
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    }
+    let arrays_item = builder
+        .tuple(&[
+            atom("arrays"),
+            Term::small(arrays as i64).unwrap(),
+            Term::NIL,
+        ])
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    result = builder
+        .cons(arrays_item, result)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    let depth_item = builder
+        .tuple(&[atom("depth"), Term::small(max_depth as i64).unwrap()])
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    builder
+        .cons(depth_item, result)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:101 (erts_debug_unaligned_bitstring_2), OTP-29.1.1.
+fn unaligned_bitstring(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+    let offset = args[1]
+        .as_small()
+        .filter(|offset| (1..8).contains(offset))
+        .ok_or_else(badarg)? as usize;
+    let owned = to_owned(args[0]).map_err(|_| badarg())?;
+    let (bytes, bit_len) = match &owned {
+        OwnedTerm::Binary(bytes) => {
+            let len = bytes.len() * 8;
+            (bytes.as_slice(), len)
+        }
+        OwnedTerm::BitString { bytes, bits } => {
+            let len = bytes
+                .len()
+                .checked_sub(1)
+                .ok_or_else(badarg)?
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(usize::from(*bits)))
+                .ok_or_else(badarg)?;
+            (bytes.as_slice(), len)
+        }
+        _ => return Err(badarg()),
+    };
+    let target_bits = bit_len.saturating_add(offset).max(65);
+    let mut target = vec![0u8; target_bits.div_ceil(8)];
+    for index in 0..bit_len {
+        let bit = (bytes[index / 8] >> (7 - index % 8)) & 1;
+        let target_bit = index + offset;
+        target[target_bit / 8] |= bit << (7 - target_bit % 8);
+    }
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut builder = TermBuilder::new(&mut heap);
+    let binary = builder
+        .binary(&target)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    builder
+        .sub_binary(binary, offset, bit_len)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+}
+
+/// Port of erts/emulator/beam/erl_map.c:3336 (erts_internal_term_type_1), OTP-29.1.1.
+fn term_type(value: Term) -> Term {
+    let name = match value.classify() {
+        TermKind::Number => match value.header().map(|header| header & 63) {
+            Some(0x18) => "hfloat",
+            Some(0x08 | 0x0c) => "bignum",
+            _ => "fixnum",
+        },
+        TermKind::Atom => "atom",
+        TermKind::Ref => match value.header().map(|header| header & 63) {
+            Some(0x10 | 0x3c) => "reference",
+            _ => "external_reference",
+        },
+        TermKind::Fun => {
+            if value.header().is_some_and(|header| (header >> 24) & 1 != 0) {
+                "export"
+            } else {
+                "fun"
+            }
+        }
+        TermKind::Port => {
+            if value.header().is_some() {
+                "external_port"
+            } else {
+                "port"
+            }
+        }
+        TermKind::Pid => {
+            if value.header().is_some() {
+                "external_pid"
+            } else {
+                "pid"
+            }
+        }
+        TermKind::Tuple => "tuple",
+        TermKind::Record => "tuple",
+        TermKind::Map => match value.header().map(|header| (header >> 6) & 3) {
+            Some(0) => "flatmap",
+            Some(1) => "hashmap_node",
+            Some(2 | 3) => "hashmap",
+            _ => "hashmap",
+        },
+        TermKind::Nil => "nil",
+        TermKind::List => "list",
+        TermKind::Bitstring => match value.header().map(|header| header & 63) {
+            Some(0x20) => "heap_binary",
+            Some(0x24) => "sub_binary",
+            _ => "refc_binary",
+        },
+        TermKind::BinRef => "refc_binary",
+        TermKind::Catch => "catch",
+        TermKind::Invalid => "invalid",
+    };
+    atom(name)
+}
+
+fn build(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+    module: &str,
+    function: &str,
+) -> Result<Term, VmError> {
+    let _ = vm;
+    match (module, function, args.len()) {
+        ("erts_debug", "copy_shared", 2) => copy_shared(process, args),
+        ("erts_debug", "size_shared", 1) => size_shared(process, args[0]),
+        ("erts_debug", "interpreter_size", 0) => Ok(Term::small(0).unwrap()),
+        ("erts_debug", "disassemble", 1) => Ok(atom("false")),
+        ("erts_debug", "lcnt_clear", 0) | ("erts_debug", "lcnt_collect", 0) => Ok(atom("error")),
+        ("erts_debug", "lcnt_control", 1 | 2) => Err(badarg()),
+        ("erts_debug", "map_info", 1) => map_info(process, args[0]),
+        ("erts_debug", "get_internal_state", 1) => internal_state_get(process, ctx, args[0]),
+        ("erts_debug", "set_internal_state", 2) => {
+            internal_state_set(process, ctx, args[0], args[1])
+        }
+        ("erts_debug", "instructions", 0) => instructions(process),
+        ("erts_debug", "dirty", 3) => dirty(process, ctx, args),
+        ("erts_debug", "dirty_cpu", 2) => dirty_test(process, ctx, "dirty_cpu", args[0], args[1]),
+        ("erts_debug", "dirty_io", 2) => dirty_test(process, ctx, "dirty_io", args[0], args[1]),
+        ("erts_debug", "unaligned_bitstring", 2) => unaligned_bitstring(process, args),
+        ("erts_internal", "gather_alloc_histograms", 1) => {
+            gather_allocator_info(process, ctx, args[0], false)
+        }
+        ("erts_internal", "gather_carrier_info", 1) => {
+            gather_allocator_info(process, ctx, args[0], true)
+        }
+        ("erts_internal", "map_hashmap_children", 1) => map_hashmap_children(process, args[0]),
+        ("erts_internal", "map_to_tuple_keys", 1) => map_to_tuple_keys(process, args[0]),
+        ("erts_internal", "term_type", 1) => Ok(term_type(args[0])),
+        ("erts_internal", "system_check", 1) => system_check(args[0]),
+        ("erts_internal", "system_monitor", 1) => system_monitor_get(process, args[0]),
+        ("erts_internal", "system_monitor", 3) => system_monitor_set(process, ctx, args),
+        _ => Err(undef()),
+    }
+}
+
+fn map_hashmap_children(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    if value.classify() != TermKind::Map {
+        return Err(VmError::Trap(exceptions::Trap::error(badmap(
+            process, value,
+        )?)));
+    }
+    let children = hashmap_node_children(value).ok_or_else(badarg)?;
+    list(process, &children.into_iter().rev().collect::<Vec<_>>())
+}
+
+fn map_to_tuple_keys(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    if value.classify() != TermKind::Map {
+        return Err(VmError::Trap(exceptions::Trap::error(badmap(
+            process, value,
+        )?)));
+    }
+    let keys = flatmap_keys(value).ok_or_else(badarg)?;
+    tuple(process, &keys)
+}
+
+/// Port of erts/emulator/beam/erl_bif_info.c:5678-5728, OTP-29.1.1.
+fn gather_allocator_info(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    arg: Term,
+    carrier: bool,
+) -> Result<Term, VmError> {
+    const ALLOCATORS: [&str; 10] = [
+        "temp_alloc",
+        "sl_alloc",
+        "std_alloc",
+        "ll_alloc",
+        "eheap_alloc",
+        "ets_alloc",
+        "fix_alloc",
+        "literal_alloc",
+        "binary_alloc",
+        "driver_alloc",
+    ];
+    let owned_arg = to_owned(arg).map_err(|_| badarg())?;
+    let OwnedTerm::Tuple(fields) = &owned_arg else {
+        return Err(badarg());
+    };
+    if fields.len() != 6 {
+        return Err(badarg());
+    }
+    let OwnedTerm::Atom(allocator) = &fields[0] else {
+        return Err(badarg());
+    };
+    if !ALLOCATORS.contains(&allocator.as_str()) {
+        return Err(badarg());
+    }
+    let (Some(aux_id), Some(width), Some(start), Some(_flags)) = (
+        owned_signed(&fields[1]),
+        owned_signed(&fields[2]),
+        owned_signed(&fields[3]),
+        owned_signed(&fields[4]),
+    ) else {
+        return Err(badarg());
+    };
+    if !(0..11).contains(&aux_id) || !(1..=32).contains(&width) || start < 1 {
+        return Err(badarg());
+    }
+    let OwnedTerm::Ref { .. } = &fields[5] else {
+        return Err(badarg());
+    };
+    let reference = from_owned(
+        &fields[5],
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    )
+    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    let message = if carrier {
+        // OTP's default ETS allocator has no carrier records on this host.
+        tuple(process, &[reference, Term::NIL])?
+    } else {
+        tuple(process, &[reference, Term::small(0).unwrap(), Term::NIL])?
+    };
+    if let Some(receiver) = ctx.pid().to_term() {
+        let _ = process.send_message(ctx, receiver, message);
+    }
+    Ok(Term::small(1).unwrap())
+}
+
+fn owned_signed(value: &OwnedTerm) -> Option<i64> {
+    match value {
+        OwnedTerm::Int(value) => Some(*value),
+        OwnedTerm::BigInt(value) => value.to_i64(),
+        _ => None,
+    }
+}
+
+fn internal_state_tuple_get(
+    process: &mut Process,
+    ctx: &RunCtx<'_, Message>,
+    selector: Term,
+) -> Result<Option<Term>, VmError> {
+    if let Some(fields) = term_sequence(selector)
+        && let [name, value] = fields.as_slice()
+        && name
+            .as_atom()
+            .and_then(|name| global_atoms().text(name))
+            .as_deref()
+            == Some("internal_hash")
+    {
+        // Port of erts/emulator/beam/erl_bif_info.c:4834-4835, OTP-29.1.1.
+        let hash = OwnedTerm::BigInt(BigInt::from(arinsal_term::internal_hash(*value)));
+        return from_owned(&hash, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .map(Some)
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+    }
+    let Ok(owned) = to_owned(selector) else {
+        return Ok(None);
+    };
+    let OwnedTerm::Tuple(fields) = &owned else {
+        return Ok(None);
+    };
+    if let [
+        OwnedTerm::Atom(name),
+        OwnedTerm::Atom(correction),
+        OwnedTerm::Atom(mode),
+    ] = fields.as_slice()
+        && name == "check_time_config"
+    {
+        let valid_correction = matches!(correction.as_str(), "true" | "false");
+        let valid_mode = matches!(
+            mode.as_str(),
+            "no_time_warp" | "single_time_warp" | "multi_time_warp"
+        );
+        return Ok((valid_correction && valid_mode).then(|| atom("true")));
+    }
+    if let [OwnedTerm::Atom(name), term, options] = fields.as_slice()
+        && name == "term_to_binary"
+    {
+        let Some(options) = term_binary_options(options) else {
+            return Ok(None);
+        };
+        let bytes = arinsal_etf::encode(term, options);
+        return TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .binary(&bytes)
+            .map(Some)
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+    }
+    if let [OwnedTerm::Atom(name), first, second] = fields.as_slice()
+        && name == "make_unique_integer"
+    {
+        let (Some(first), Some(second)) = (owned_uint(first), owned_uint(second)) else {
+            return Err(badarg());
+        };
+        // The reference host has ten normal, ten dirty CPU, and ten dirty I/O schedulers.
+        let bits = 5_u32;
+        let low = first | second.wrapping_shl(bits);
+        let high = (second >> (64 - bits)) & ((1_u64 << bits) - 1);
+        let result = (BigInt::from(high) << 64) + BigInt::from(low)
+            - BigInt::from(576_460_752_303_423_488_i64);
+        return from_owned(
+            &OwnedTerm::BigInt(result),
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .map(Some)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+    }
+    if let [OwnedTerm::Atom(name), OwnedTerm::Atom(node)] = fields.as_slice()
+        && name == "connection_id"
+    {
+        let tables = crate::node_tables::lock();
+        let Some(entry) = tables.entries.get(node).filter(|entry| entry.connected) else {
+            return Err(badarg());
+        };
+        return int(process, entry.connection_id as usize).map(Some);
+    }
+    let [OwnedTerm::Atom(name), value] = fields.as_slice() else {
+        return Ok(None);
+    };
+    match (name.as_str(), value) {
+        ("internal_hash", value) => {
+            let value = from_owned(value, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            let hash = arinsal_term::internal_hash(value);
+            let result = OwnedTerm::BigInt(hash.into());
+            from_owned(
+                &result,
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            )
+            .map(Some)
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        }
+        ("atom", index) => {
+            let Some(index) = owned_uint(index).and_then(|index| usize::try_from(index).ok())
+            else {
+                return Err(badarg());
+            };
+            if index >= 1_048_576 {
+                return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+            }
+            while global_atoms().len() <= index {
+                let name = format!("am{:x}", global_atoms().len());
+                if global_atoms().intern(&name).is_err() {
+                    return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+                }
+            }
+            let Some(name) = u32::try_from(index)
+                .ok()
+                .and_then(|index| global_atoms().text(arinsal_term::Atom(index)))
+            else {
+                return Ok(None);
+            };
+            Ok(global_atoms().intern(&name).ok().map(Term::atom))
+        }
+        (
+            "process_status",
+            OwnedTerm::Pid {
+                id,
+                serial,
+                creation: 0,
+                node,
+            },
+        ) if node == "nonode@nohost" => {
+            let pid = arinsal_sched::Pid {
+                index: *id,
+                generation: *serial,
+            };
+            if pid == ctx.pid() {
+                return Ok(Some(atom("running")));
+            }
+            let status = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).copied())
+                .map(|published| atom(published.status))
+                .unwrap_or_else(|| atom("undefined"));
+            Ok(Some(status))
+        }
+        (
+            "link_list",
+            OwnedTerm::Pid {
+                id,
+                serial,
+                creation: 0,
+                node,
+            },
+        ) if node == "nonode@nohost" => {
+            let pid = arinsal_sched::Pid {
+                index: *id,
+                generation: *serial,
+            };
+            if pid != ctx.pid() {
+                let exists = process
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
+                return Ok(Some(if exists { Term::NIL } else { atom("undefined") }));
+            }
+            let links = process
+                .cold
+                .as_ref()
+                .map(|cold| {
+                    cold.links
+                        .iter()
+                        .filter_map(|pid| pid.to_term())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            list(process, &links).map(Some)
+        }
+        (
+            "monitor_list",
+            OwnedTerm::Pid {
+                id,
+                serial,
+                creation: 0,
+                node,
+            },
+        ) if node == "nonode@nohost" => {
+            let pid = arinsal_sched::Pid {
+                index: *id,
+                generation: *serial,
+            };
+            if pid != ctx.pid() {
+                let exists = process
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
+                return Ok(Some(if exists { Term::NIL } else { atom("undefined") }));
+            }
+            Ok(Some(Term::NIL))
+        }
+        ("channel_number", OwnedTerm::Atom(node)) if node == "nonode@nohost" => {
+            Ok(Some(Term::small(0).unwrap()))
+        }
+        ("channel_number", OwnedTerm::Atom(node)) => {
+            let tables = crate::node_tables::lock();
+            let channel = tables
+                .entries
+                .get(node)
+                .filter(|entry| entry.connected)
+                .map(|entry| entry.connection_id);
+            match channel {
+                Some(channel) => int(process, channel as usize).map(Some),
+                None => Ok(Some(atom("undefined"))),
+            }
+        }
+        ("channel_number", _) => Ok(Some(atom("undefined"))),
+        ("dist_ctrl", OwnedTerm::Atom(node)) => {
+            let tables = crate::node_tables::lock();
+            let controller = tables.entries.get(node).and_then(|entry| {
+                entry.dist.as_ref().and_then(|state| {
+                    state
+                        .port_id
+                        .and_then(Term::port)
+                        .or_else(|| state.owner.to_term())
+                })
+            });
+            Ok(Some(controller.unwrap_or_else(|| atom("undefined"))))
+        }
+        ("dist_ctrl", _) => Ok(Some(atom("undefined"))),
+        ("reader_groups_map", OwnedTerm::Int(groups))
+            if *groups > 0 && Term::small(*groups).is_some() =>
+        {
+            Ok(Some(Term::NIL))
+        }
+        ("fake_scheduler_bindings", OwnedTerm::Atom(mode))
+            if matches!(
+                mode.as_str(),
+                "default_bind"
+                    | "spread"
+                    | "processor_spread"
+                    | "thread_spread"
+                    | "thread_no_node_processor_spread"
+                    | "no_node_processor_spread"
+                    | "no_node_thread_spread"
+                    | "no_spread"
+                    | "unbound"
+            ) =>
+        {
+            Ok(Some(atom("false")))
+        }
+        ("atom_out_cache_index", OwnedTerm::Atom(name)) => {
+            let Some(index) = global_atoms().get(name).map(|atom| atom.0) else {
+                return Ok(None);
+            };
+            int(process, index as usize).map(Some)
+        }
+        ("binary_info", OwnedTerm::Binary(_) | OwnedTerm::BitString { .. }) => {
+            Ok(Some(atom("heap_binary")))
+        }
+        ("magic_ref", _) => Ok(Some(atom("false"))),
+        _ => Ok(None),
+    }
+}
+
+/// Port of erts/emulator/beam/erl_db.c:5765-5784 (`erts_ets_colliding_names`), OTP-29.1.1.
+fn colliding_names(process: &mut Process, name: &str, count: u64) -> Result<Term, VmError> {
+    const META_NAME_TAB_MASK: u64 = 8191;
+    let Some(atom_index) = global_atoms().get(name).map(|atom| atom.0 as u64) else {
+        return Err(badarg());
+    };
+    let count = usize::try_from(count)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    let mut terms = Vec::new();
+    terms
+        .try_reserve_exact(count)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    let mut index = atom_index & META_NAME_TAB_MASK;
+    while terms.len() < count {
+        if index != atom_index {
+            while global_atoms().len() as u64 <= index {
+                let next = global_atoms().len();
+                let text = format!("am{next:x}");
+                global_atoms()
+                    .intern(&text)
+                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            }
+            let atom = u32::try_from(index)
+                .ok()
+                .map(arinsal_term::Atom)
+                .and_then(|atom| Term::atom(atom).as_atom().map(Term::atom))
+                .ok_or_else(badarg)?;
+            terms.push(atom);
+        }
+        index = index
+            .checked_add(META_NAME_TAB_MASK + 1)
+            .ok_or_else(|| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+    }
+    terms.reverse();
+    list(process, &terms)
+}
+
+fn term_binary_options(options: &OwnedTerm) -> Option<arinsal_etf::EncodeOptions> {
+    let mut encoded = arinsal_etf::EncodeOptions::default();
+    let entries = match options {
+        OwnedTerm::Nil => return Some(encoded),
+        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems,
+        _ => return None,
+    };
+    for option in entries {
+        match option {
+            OwnedTerm::Atom(name) if name == "deterministic" => encoded.deterministic = true,
+            OwnedTerm::Tuple(fields) if fields.len() == 2 => {
+                let OwnedTerm::Atom(name) = &fields[0] else {
+                    return None;
+                };
+                let value = &fields[1];
+                match name.as_str() {
+                    "compressed" => {
+                        let level = match value {
+                            OwnedTerm::Atom(value) if value == "true" => 6,
+                            OwnedTerm::Int(value) => u8::try_from(*value).ok()?,
+                            _ => return None,
+                        };
+                        if level > 9 {
+                            return None;
+                        }
+                        encoded.compressed = Some(level);
+                    }
+                    "minor_version" => {
+                        let version = owned_uint(value)?;
+                        if version > 2 {
+                            return None;
+                        }
+                        encoded.minor_version = Some(version as u8);
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(encoded)
+}
+
+/// Port of erts/emulator/beam/erl_bif_info.c:4339-4947, OTP-29.1.1.
+fn internal_state_get(
+    process: &mut Process,
+    ctx: &RunCtx<'_, Message>,
+    selector: Term,
+) -> Result<Term, VmError> {
+    if !INTERNAL_STATE.load(Ordering::Relaxed) {
+        return Err(undef());
+    }
+    if let Some(result) = internal_state_tuple_get(process, ctx, selector)? {
+        return Ok(result);
+    }
+    match arg_name(selector).as_deref() {
+        Some("reds_left") => int(process, process.reductions.max(0) as usize),
+        Some("available_internal_state") => Ok(atom("true")),
+        Some("force_heap_frags" | "scheduler_dump" | "hashmap_collision_bonanza") => {
+            Ok(atom("false"))
+        }
+        Some("debugger_support") => Ok(atom(if DEBUGGER_SUPPORT.load(Ordering::Relaxed) {
+            "true"
+        } else {
+            "false"
+        })),
+        Some("lc_graph" | "flxctr_memory_usage") => Ok(atom("notsup")),
+        Some("re_yield_coverage") => Ok(atom("undefined")),
+        Some("dirty_gc_limit") => Ok(Term::small(131_072).unwrap()),
+        Some("max_atom_out_cache_index") => Ok(Term::small(2038).unwrap()),
+        Some("process_info_args") => {
+            let names = [
+                "registered_name",
+                "current_function",
+                "initial_call",
+                "status",
+                "messages",
+                "message_queue_len",
+                "links",
+                "monitors",
+                "monitored_by",
+                "dictionary",
+                "trap_exit",
+                "error_handler",
+                "heap_size",
+                "stack_size",
+                "memory",
+                "garbage_collection",
+                "group_leader",
+                "reductions",
+                "priority",
+                "trace",
+                "binary",
+                "sequential_trace_token",
+                "catchlevel",
+                "backtrace",
+                "last_calls",
+                "total_heap_size",
+                "suspending",
+                "min_heap_size",
+                "min_bin_vheap_size",
+                "max_heap_size",
+                "current_location",
+                "current_stacktrace",
+                "message_queue_data",
+                "garbage_collection_info",
+                "magic_ref",
+                "fullsweep_after",
+                "parent",
+                "async_dist",
+                "dictionary",
+                "label",
+                "priority_messages",
+            ];
+            let names = names.iter().map(|name| atom(name)).collect::<Vec<_>>();
+            list(process, &names)
+        }
+        Some("DbTable_words") => tuple(
+            process,
+            &[Term::small(56).unwrap(), Term::small(7).unwrap()],
+        ),
+        Some("check_io_debug") => {
+            let stats = crate::check_io::debug_info();
+            tuple(
+                process,
+                &[
+                    Term::small(0).unwrap(),
+                    Term::small(stats.used_fds as i64).unwrap(),
+                    Term::small(stats.driver_selects as i64).unwrap(),
+                    Term::small(stats.nif_selects as i64).unwrap(),
+                ],
+            )
+        }
+        Some("mmap") => Ok(atom("undefined")),
+        Some("stack_check") => Ok(Term::small(1_026_385).unwrap()),
+        Some("unique_monotonic_integer_state") => {
+            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .int_from_i128(UNIQUE_MONOTONIC_INTEGER_STATE.load(Ordering::Relaxed) as i128)
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        }
+        Some("persistent_term") => {
+            let map = OwnedTerm::Map(vec![(OwnedTerm::atom("table"), OwnedTerm::Int(64))]);
+            from_owned(&map, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        }
+        Some("min_unique_monotonic_integer" | "min_unique_integer") => {
+            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .int_from_i128(-576_460_752_303_423_488)
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        }
+        Some("nbalance") => Ok(Term::small(0).unwrap()),
+        Some("monitoring_nodes") => Ok(Term::NIL),
+        Some("processes") => {
+            let processes = process
+                .runtime
+                .as_ref()
+                .map(|runtime| {
+                    runtime
+                        .processes
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|pid| pid.to_term())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            list(process, &processes)
+        }
+        Some("processes_bif_info") => tuple(
+            process,
+            &[
+                atom("ptab_list_bif_info"),
+                Term::small(40).unwrap(),
+                Term::small(1049).unwrap(),
+                Term::small(1000).unwrap(),
+                Term::small(25).unwrap(),
+                Term::small(1).unwrap(),
+                Term::small(10).unwrap(),
+                Term::small(40).unwrap(),
+                Term::small(75).unwrap(),
+                Term::small(0).unwrap(),
+            ],
+        ),
+        Some("next_pid") => {
+            let next = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.scheduler().ok())
+                .and_then(|scheduler| scheduler.test_next_process_id(false, 0));
+            match next {
+                Some(next) => int(process, next as usize),
+                None => Ok(atom("false")),
+            }
+        }
+        Some("next_port") => {
+            let next = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| crate::port::test_next_port_id(runtime, false, 0));
+            match next {
+                Some(next) => {
+                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                        .int_from_i128(next as i128)
+                        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                }
+                None => Ok(atom("false")),
+            }
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// Port of erts/emulator/beam/erl_bif_info.c:5036-5500, OTP-29.1.1.
+fn internal_state_set(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    selector: Term,
+    value: Term,
+) -> Result<Term, VmError> {
+    if selector == atom("available_internal_state") {
+        if value != atom("true") && value != atom("false") {
+            return Err(badarg());
+        }
+        let previous = INTERNAL_STATE.swap(value == atom("true"), Ordering::Relaxed);
+        return Ok(atom(if previous { "true" } else { "false" }));
+    }
+    if !INTERNAL_STATE.load(Ordering::Relaxed) {
+        return Err(undef());
+    }
+    match arg_name(selector).as_deref() {
+        Some("reds_left") => {
+            let Some(reductions) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
+                return Err(badarg());
+            };
+            if (0..=4000).contains(&reductions) {
+                process.reductions = reductions as i32;
+            }
+            return Ok(atom("true"));
+        }
+        Some("block" | "sleep" | "block_scheduler") => {
+            let Some(milliseconds) = to_owned(value).ok().and_then(|term| owned_signed(&term))
+            else {
+                return Err(badarg());
+            };
+            if milliseconds > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+            }
+            return Ok(atom("true"));
+        }
+        Some("test_long_gc_sleep") => {
+            let Some(milliseconds) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
+                return Err(badarg());
+            };
+            TEST_LONG_GC_SLEEP.store(milliseconds, Ordering::Relaxed);
+            return Ok(atom("true"));
+        }
+        Some("multizero_timeout_in_timeout") => {
+            let Some(timeout) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
+                return Err(badarg());
+            };
+            let runtime = process
+                .runtime
+                .as_ref()
+                .ok_or_else(|| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            let message = Message::copy_from(atom("multizero_timeout_in_timeout_done"))?;
+            runtime
+                .scheduler()?
+                .send_after(ctx.pid(), timeout.max(0) as u64, message)
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            return Ok(atom("ok"));
+        }
+        Some("next_pid") | Some("next_port") => {
+            let Some(next) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
+                return Err(badarg());
+            };
+            let result = match arg_name(selector).as_deref() {
+                Some("next_pid") => u32::try_from(next).ok().and_then(|next| {
+                    process
+                        .runtime
+                        .as_ref()?
+                        .scheduler()
+                        .ok()?
+                        .test_next_process_id(true, next)
+                        .map(i128::from)
+                }),
+                _ => process
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| crate::port::test_next_port_id(runtime, true, next))
+                    .map(i128::from),
+            };
+            return match result {
+                Some(result) => {
+                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                        .int_from_i128(result)
+                        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                }
+                None => Ok(atom("false")),
+            };
+        }
+        Some("force_gc") => {
+            let Some(pid) = arinsal_sched::Pid::from_term(value) else {
+                return Ok(atom("false"));
+            };
+            let found = process
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
+            if !found {
+                return Ok(atom("false"));
+            }
+            process.force_gc()?;
+            return Ok(atom("true"));
+        }
+        Some("unique_monotonic_integer_state") => {
+            let Some(state) = to_owned(value).ok().and_then(|term| {
+                owned_signed(&term)
+                    .map(|value| value as u64)
+                    .or_else(|| owned_uint(&term))
+            }) else {
+                return Err(badarg());
+            };
+            UNIQUE_MONOTONIC_INTEGER_STATE.store(state, Ordering::Relaxed);
+            return Ok(atom("true"));
+        }
+        Some("binary_loop_limit" | "re_loop_limit" | "unicode_loop_limit") => {
+            let (limit, default) = match arg_name(selector).as_deref() {
+                Some("binary_loop_limit") => (&BINARY_LOOP_LIMIT, 0),
+                Some("re_loop_limit") => (&RE_LOOP_LIMIT, 64_000),
+                _ => (&UNICODE_LOOP_LIMIT, 40_000),
+            };
+            let next = if value == atom("default") {
+                default
+            } else {
+                let Some(value) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
+                    return Err(badarg());
+                };
+                value
+            };
+            let previous = limit.swap(next, Ordering::Relaxed);
+            return int(process, previous as usize);
+        }
+        Some("gc_state") if value == atom("true") || value == atom("false") => {
+            let previous = process.set_gc_enabled(value == atom("true"));
+            return Ok(atom(if previous { "true" } else { "false" }));
+        }
+        Some("inconsistent_heap") if value == atom("start") => {
+            process.set_gc_enabled(false);
+            let index = process.heap.used_words();
+            let broken = tuple(process, &[atom("ok")])?;
+            let base = process.heap.heap_bounds().0 as usize;
+            let address = broken.tagged_word() & !7;
+            let Some(word_index) = address
+                .checked_sub(base as u64)
+                .and_then(|offset| usize::try_from(offset / 8).ok())
+            else {
+                return Err(badarg());
+            };
+            if word_index != index
+                || !process.heap.debug_write_heap_word(word_index, 1234 << 6)
+                || !process.heap.debug_write_heap_word(word_index + 1, u64::MAX)
+            {
+                return Err(badarg());
+            }
+            return Ok(broken);
+        }
+        Some("inconsistent_heap") => {
+            let address = value.tagged_word() & !7;
+            let base = process.heap.heap_bounds().0 as usize;
+            let Some(word_index) = address
+                .checked_sub(base as u64)
+                .and_then(|offset| usize::try_from(offset / 8).ok())
+            else {
+                return Err(badarg());
+            };
+            if !process.heap.debug_write_heap_word(word_index, 1 << 6)
+                || !process
+                    .heap
+                    .debug_write_heap_word(word_index + 1, atom("ok").tagged_word())
+            {
+                return Err(badarg());
+            }
+            process.set_gc_enabled(true);
+            return Ok(atom("ok"));
+        }
+        Some("debugger_support") if value == atom("true") => {
+            DEBUGGER_SUPPORT.store(true, Ordering::Relaxed);
+            return Ok(atom("ok"));
+        }
+        Some("debugger_support") => return Ok(atom("badarg")),
+        Some("jit_asm_dump") if value == atom("true") || value == atom("false") => {
+            let previous = JIT_ASM_DUMP.swap(value == atom("true"), Ordering::Relaxed);
+            return Ok(atom(if previous { "true" } else { "false" }));
+        }
+        Some("ets_force_split" | "ets_debug_random_split_join") => {
+            let Ok(owned) = to_owned(value) else {
+                return Err(badarg());
+            };
+            let OwnedTerm::Tuple(parts) = &owned else {
+                return Err(badarg());
+            };
+            let [OwnedTerm::Ref { ids, .. }, on] = parts.as_slice() else {
+                return Err(badarg());
+            };
+            let Some(&[tag, low, high]) = ids.get(..3) else {
+                return Err(badarg());
+            };
+            if tag != 0x4554_5329 {
+                return Err(badarg());
+            }
+            let tid = arinsal_ets::Tid(u64::from(low) | (u64::from(high) << 32));
+            let random = arg_name(selector).as_deref() == Some("ets_debug_random_split_join");
+            let enabled = matches!(on, OwnedTerm::Atom(name) if name == "true");
+            let changed = process.runtime.as_ref().is_some_and(|runtime| {
+                runtime
+                    .ets
+                    .lock()
+                    .unwrap()
+                    .debug_set_catree_mode(tid, random, enabled)
+            });
+            return if changed {
+                Ok(atom("ok"))
+            } else {
+                Err(badarg())
+            };
+        }
+        Some("ets_force_trap") => return Ok(atom("notsup")),
+        Some("proc_sig_buffers") if value == atom("true") => return Ok(atom("false")),
+        Some("proc_sig_buffers") => return Ok(atom("notsup")),
+        Some("abort") => {
+            let reason = to_owned(value).map_err(|_| badarg())?;
+            eprintln!("{reason}");
+            std::process::abort();
+        }
+        Some("broken_halt") => {
+            let reason = to_owned(value).map_err(|_| badarg())?;
+            eprintln!("{reason}");
+            std::process::exit(1);
+        }
+        Some("kill_dist_connection") => return Ok(atom("false")),
+        Some("wait")
+            if [
+                "deallocations",
+                "timer_cancellations",
+                "aux_work",
+                "thread_progress",
+            ]
+            .iter()
+            .any(|name| value == atom(name)) =>
+        {
+            return Ok(atom("ok"));
+        }
+        Some("colliding_names") => {
+            let Ok(owned) = to_owned(value) else {
+                return Err(badarg());
+            };
+            let OwnedTerm::Tuple(parts) = &owned else {
+                return Err(badarg());
+            };
+            let [OwnedTerm::Atom(name), count] = parts.as_slice() else {
+                return Err(badarg());
+            };
+            let Some(count) = owned_uint(count) else {
+                return Err(badarg());
+            };
+            return colliding_names(process, name, count);
+        }
+        Some("fill_heap") => {
+            let Some(fill_fullsweep) = to_owned(value).ok().and_then(|term| match &term {
+                OwnedTerm::Atom(name) if name == "true" => Some(true),
+                OwnedTerm::Atom(name) if name == "false" => Some(false),
+                _ => None,
+            }) else {
+                return Err(badarg());
+            };
+            let left = process.heap.free_words();
+            if left > 1 {
+                let filler = BigInt::from(1_u8) << ((left - 2) * 64);
+                from_owned(&OwnedTerm::BigInt(filler), &mut process.heap)
+                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            }
+            if fill_fullsweep {
+                process.heap.set_fullsweep_after(0);
+            }
+            return Ok(atom("ok"));
+        }
+        Some("mbuf") => {
+            return arinsal_term::copy_term(
+                value,
+                &mut arinsal_term::FragmentAlloc::new(&mut process.heap),
+            )
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+        }
+        Some("make") if value == atom("magic_ref") => {
+            let owner = arinsal_term::MagicRef::new(());
+            let address = std::sync::Arc::as_ptr(&owner) as usize;
+            let reference = TermBuilder::new(&mut process.heap)
+                .magic_ref(owner)
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            let address = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .int_from_i128(address as i128)
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            return tuple(process, &[reference, address]);
+        }
+        Some("binary") => {
+            let Some(size) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
+                return Err(badarg());
+            };
+            let Ok(size) = usize::try_from(size) else {
+                return Ok(atom("false"));
+            };
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(size).is_err() {
+                return Ok(atom("false"));
+            }
+            bytes.resize(size, 0);
+            return TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .binary(&bytes)
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+        }
+        Some("node_tab_delayed_delete") => {
+            let Some(_timeout) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
+                return Err(badarg());
+            };
+            return Ok(atom("ok"));
+        }
+        Some("remove_dflags") => {
+            let Some(flags) = to_owned(value).ok().and_then(|term| owned_uint(&term)) else {
+                return Err(badarg());
+            };
+            if flags & crate::node_tables::DFLAG_DIST_MANDATORY != 0 {
+                return Err(badarg());
+            }
+            crate::node_tables::test_remove_dflags(Some(flags));
+            return Ok(atom("ok"));
+        }
+        Some("code_mod_permission") => {
+            let acquire = match arg_name(value).as_deref() {
+                Some("true") => true,
+                Some("false") => false,
+                _ => return Err(badarg()),
+            };
+            crate::natives::code::test_code_mod_permission(ctx.pid(), acquire);
+            return Ok(atom("true"));
+        }
+        Some("process_uniq_counter") => {
+            let Some(counter) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
+                return Err(badarg());
+            };
+            process.uniq_counter = counter;
+            return Ok(atom("ok"));
+        }
+        Some("proc_sig_block") => {
+            let Ok(owned) = to_owned(value) else {
+                return Err(badarg());
+            };
+            let OwnedTerm::Tuple(parts) = &owned else {
+                return Err(badarg());
+            };
+            let [
+                OwnedTerm::Pid {
+                    node,
+                    id,
+                    serial,
+                    creation: 0,
+                },
+                time,
+            ] = parts.as_slice()
+            else {
+                return Err(badarg());
+            };
+            if node != "nonode@nohost" || owned_signed(time).is_none() {
+                return Err(badarg());
+            }
+            let pid = arinsal_sched::Pid {
+                index: *id,
+                generation: *serial,
+            };
+            let found = process
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
+            return Ok(atom(if found { "true" } else { "false" }));
+        }
+        _ => {}
+    }
+    Err(badarg())
+}
+
+fn system_check(selector: Term) -> Result<Term, VmError> {
+    if selector == atom("schedulers") {
+        Ok(atom("ok"))
+    } else {
+        Err(badarg())
+    }
+}
+
+/// Port of erts/emulator/beam/erl_bif_trace.c:3276-3388, OTP-29.1.1.
+fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmError> {
+    if session == atom("legacy") {
+        let state = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.system_monitor.lock().unwrap().clone());
+        let Some(state) = state else {
+            return Ok(atom("undefined"));
+        };
+        let owned = OwnedTerm::Tuple(vec![
+            state.receiver,
+            OwnedTerm::list(monitor_options(&state.options)),
+        ]);
+        return from_owned(
+            &owned,
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+    }
+    Err(badarg())
+}
+
+fn monitor_options(options: &HashMap<&'static str, MonitorOption>) -> Vec<OwnedTerm> {
+    let mut result = Vec::new();
+    for name in ["busy_dist_port", "busy_port"] {
+        if matches!(options.get(name), Some(MonitorOption::Bool(true))) {
+            result.push(OwnedTerm::atom(name));
+        }
+    }
+    for name in ["large_heap", "long_schedule", "long_gc"] {
+        if let Some(MonitorOption::Limit(value)) = options.get(name) {
+            result.push(OwnedTerm::tuple(vec![
+                OwnedTerm::atom(name),
+                OwnedTerm::Int(*value as i64),
+            ]));
+        }
+    }
+    if let Some(MonitorOption::Queue(off, on)) = options.get("long_message_queue") {
+        result.push(OwnedTerm::tuple(vec![
+            OwnedTerm::atom("long_message_queue"),
+            OwnedTerm::tuple(vec![
+                OwnedTerm::Int(*off as i64),
+                OwnedTerm::Int(*on as i64),
+            ]),
+        ]));
+    }
+    result
+}
+
+fn owned_uint(value: &OwnedTerm) -> Option<u64> {
+    match value {
+        OwnedTerm::Int(value) => u64::try_from(*value).ok(),
+        OwnedTerm::BigInt(value) => value.to_u64(),
+        _ => None,
+    }
+}
+
+fn parse_monitor_options(term: Term) -> Option<HashMap<&'static str, MonitorOption>> {
+    let owned = to_owned(term).ok()?;
+    let entries = match &owned {
+        OwnedTerm::Nil => Vec::new(),
+        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
+        _ => return None,
+    };
+    let mut options = HashMap::new();
+    for entry in &entries {
+        let (name, value) = match entry {
+            OwnedTerm::Atom(name) => (name.as_str(), OwnedTerm::Atom("true".into())),
+            OwnedTerm::Tuple(pair) if pair.len() == 2 => {
+                let OwnedTerm::Atom(name) = &pair[0] else {
+                    return None;
+                };
+                (name.as_str(), pair[1].clone())
+            }
+            _ => return None,
+        };
+        let (key, parsed) = match name {
+            "busy_port" | "busy_dist_port" => {
+                let OwnedTerm::Atom(value) = &value else {
+                    return None;
+                };
+                let enabled = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return None,
+                };
+                (
+                    if name == "busy_port" {
+                        "busy_port"
+                    } else {
+                        "busy_dist_port"
+                    },
+                    MonitorOption::Bool(enabled),
+                )
+            }
+            "long_gc" | "long_schedule" | "large_heap" => {
+                let minimum = if name == "large_heap" { 16_384 } else { 1 };
+                match &value {
+                    OwnedTerm::Atom(value) if value == "false" => continue,
+                    value => {
+                        let value = owned_uint(value)?;
+                        let key = match name {
+                            "long_gc" => "long_gc",
+                            "long_schedule" => "long_schedule",
+                            _ => "large_heap",
+                        };
+                        (key, MonitorOption::Limit(value.max(minimum)))
+                    }
+                }
+            }
+            "long_message_queue" => match &value {
+                OwnedTerm::Atom(value) if value == "false" => continue,
+                OwnedTerm::Tuple(pair) if pair.len() == 2 => {
+                    let (Some(off), Some(on)) = (owned_uint(&pair[0]), owned_uint(&pair[1])) else {
+                        return None;
+                    };
+                    if off >= on || on == 0 {
+                        return None;
+                    }
+                    ("long_message_queue", MonitorOption::Queue(off, on))
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        options.insert(key, parsed);
+    }
+    Some(options)
+}
+
+/// Port of erts/emulator/beam/erl_bif_trace.c:3560-3715, OTP-29.1.1.
+fn system_monitor_set(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    if args[0] != atom("legacy") {
+        return Err(badarg());
+    }
+    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let old = runtime.system_monitor.lock().unwrap().clone();
+    let old_term = if let Some(state) = old {
+        from_owned(
+            &OwnedTerm::Tuple(vec![
+                state.receiver,
+                OwnedTerm::list(monitor_options(&state.options)),
+            ]),
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?
+    } else {
+        atom("undefined")
+    };
+    let options = parse_monitor_options(args[2]).ok_or_else(badarg)?;
+    if args[1] == atom("undefined") || args[2] == Term::NIL {
+        *runtime.system_monitor.lock().unwrap() = None;
+        runtime.long_message_queues.lock().unwrap().clear();
+        refresh_system_monitor_flags(&runtime, None);
+        return Ok(old_term);
+    }
+    let receiver = to_owned(args[1]).map_err(|_| badarg())?;
+    let OwnedTerm::Pid {
+        node, creation: 0, ..
+    } = &receiver
+    else {
+        return Err(badarg());
+    };
+    if node != "nonode@nohost" {
+        return Err(badarg());
+    }
+    let matches_live_pid = process.runtime.as_ref().is_some_and(|runtime| {
+        runtime
+            .processes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|pid| pid.to_term())
+            .filter_map(|pid| to_owned(pid).ok())
+            .any(|pid| pid == receiver)
+    }) || ctx
+        .pid()
+        .to_term()
+        .and_then(|pid| to_owned(pid).ok())
+        .as_ref()
+        == Some(&receiver);
+    if !matches_live_pid {
+        return Err(badarg());
+    }
+    let state = SystemMonitorState { receiver, options };
+    *runtime.system_monitor.lock().unwrap() = Some(state.clone());
+    runtime.long_message_queues.lock().unwrap().clear();
+    refresh_system_monitor_flags(&runtime, Some(&state));
+    Ok(old_term)
+}
+
+/// Native-family dispatcher.
+pub(crate) fn call(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    module: &str,
+    function: &str,
+    args: super::NativeArgs<'_>,
+) -> Option<Result<Term, VmError>> {
+    if !super::listed(IMPLEMENTED, module, function, args.len() as u8) {
+        return None;
+    }
+    Some(args.with_values(process, |process, values| {
+        build(vm, process, ctx, values, module, function)
+    }))
+}
+
+#[allow(dead_code)]
+fn _keep_helpers_visible() {
+    let _ = arg_name as fn(Term) -> Option<String>;
+}
+
+#[cfg(test)]
+mod check_io_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn check_io_debug_counts_live_nif_selection() {
+        let previous = INTERNAL_STATE.swap(true, Ordering::Relaxed);
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let registration = crate::check_io::register(
+            reader.as_raw_fd(),
+            crate::check_io::InterestSet {
+                readable: true,
+                writable: false,
+            },
+            |_, _| {},
+        )
+        .unwrap();
+        // Same counters the `check_io_debug` selector reports as {0, UsedFds, DriverSelects, NifSelects}.
+        let stats = crate::check_io::debug_info();
+        assert_eq!(
+            (stats.used_fds, stats.driver_selects, stats.nif_selects),
+            (1, 0, 1)
+        );
+        crate::check_io::deregister(registration);
+        INTERNAL_STATE.store(previous, Ordering::Relaxed);
+    }
+}

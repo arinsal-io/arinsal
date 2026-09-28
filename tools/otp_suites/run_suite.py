@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Run one vendored OTP suite against OTP and Arinsal and update RESULTS.md."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+TOOLS = ROOT / "tools/otp_suites"
+OTP = ROOT / "tests/otp"
+HELPERS = OTP / "lib/common_test/test_server"
+RESULTS = TOOLS / "RESULTS.md"
+PILOT = "big tuple map binary bs_match_bin bs_match_int bs_match_misc bs_match_tail bs_construct bs_utf fun exception guard receive ref num_bif list_bif float op small hash persistent_term atomics counters unique".split()
+
+
+def run(cmd: list[str], timeout: int, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["timeout", "--signal=KILL", str(timeout), *cmd],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+        **kwargs,
+    )
+
+
+def compile_helpers(build: pathlib.Path) -> None:
+    srcs = sorted(HELPERS.glob("*.erl"))
+    cp = run(["erlc", "-W0", "-I", str(HELPERS), "-o", str(build), *map(str, srcs)], 120)
+    if cp.returncode:
+        raise RuntimeError(f"helper compile failed ({cp.returncode}):\n{cp.stdout[-4000:]}")
+
+
+def otp_root() -> pathlib.Path:
+    proc = run(["erl", "-noshell", "-eval", "io:format(\"~s\",[code:root_dir()]),halt()."], 30)
+    if proc.returncode:
+        raise RuntimeError(f"cannot locate OTP root: {proc.stdout}")
+    return pathlib.Path(proc.stdout.strip())
+
+
+def build_native(name: str, source_dir: pathlib.Path) -> None:
+    data = source_dir / f"{name}_SUITE_data"
+    source = data / "Makefile.src"
+    if not source.is_file():
+        return
+    root = otp_root()
+    ei = next((root / "lib").glob("erl_interface-*/include"), None)
+    ei_lib = next((root / "lib").glob("erl_interface-*/lib"), None)
+    defs = "-DHAVE_ISFINITE"
+    values = {
+        "CC": "clang", "LD": "clang", "SHLIB_LD": "clang",
+        "CFLAGS": "-O2 -fPIC", "SHLIB_CFLAGS": "-O2 -fPIC",
+        "CROSSLDFLAGS": "", "SHLIB_LDFLAGS": "-bundle -undefined dynamic_lookup",
+        "SHLIB_LDLIBS": "", "SHLIB_EXTRA_LDFLAGS": "", "SHLIB_EXTRA_LDLIBS": "",
+        "DEFS": defs, "LIBS": "", "EI_CFLAGS": f"-I{ei}" if ei else "",
+        "EI_LDFLAGS": f"-L{ei_lib}" if ei_lib else "",
+        "erl_include": str(root / "usr/include"),
+        "erl_interface_include": str(ei) if ei else "",
+        "erl_interface_eilib": "-lei" if ei else "",
+        "erl_interface_sock_libs": "", "erl_interface_mk_include": str(ei_lib.parent / "src/eidefs.mk") if ei_lib else "",
+        "dll": ".so", "obj": ".o", "exe": "", "EMULATOR": "beam",
+        "erl_name": "erl",
+        "SHLIB_RULES": ".SUFFIXES: .so .o .c\n.c.so:\n\tclang -bundle -undefined dynamic_lookup -fPIC " + defs + " -I" + str(root / "usr/include") + (" -I" + str(ei) if ei else "") + (" -L" + str(ei_lib) + " -lei" if ei_lib and name == "binary" else "") + " -o $@ $<",
+    }
+    makefile = source.read_text(encoding="utf-8")
+    for key, value in values.items():
+        makefile = makefile.replace(f"@{key}@", value)
+    makefile = re.sub(r"^\s*include\s*$", "", makefile, flags=re.MULTILINE)
+    generated = data / "Makefile"
+    generated.write_text(makefile, encoding="utf-8")
+    proc = run(["make", "-f", "Makefile"], 120, cwd=data)
+    if proc.returncode:
+        raise RuntimeError(f"native build failed for {name}_SUITE ({proc.returncode}):\n{proc.stdout[-4000:]}")
+
+
+def suite_dir(name: str) -> pathlib.Path:
+    for base in (OTP / "erts/emulator/test", OTP / "lib/kernel/test", OTP / "lib/stdlib/test"):
+        if (base / f"{name}_SUITE.erl").is_file():
+            return base
+    raise ValueError(f"suite not found: {name}_SUITE.erl")
+
+
+def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limit: int) -> tuple[int, str]:
+    logdir.mkdir(parents=True, exist_ok=True)
+    original = suite_dir(name)
+    with tempfile.TemporaryDirectory(prefix=f"otp-{name}-source-") as source_temp:
+        directory = pathlib.Path(source_temp) / "test"
+        shutil.copytree(original, directory)
+        build_native(name, directory)
+        expr = (
+            "R=ct:run_test([{dir,\"" + str(directory) + "\"},{suite," + name
+            + "_SUITE},{logdir,\"" + str(logdir) + "\"}]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
+        )
+        cmd = [exe, "-noshell", "-pa", str(build), "-pa", str(directory), "-eval", expr]
+        result = run(cmd, limit)
+        (logdir / "runner-output.log").write_text(result.stdout, encoding="utf-8", errors="replace")
+        return result.returncode, result.stdout
+
+
+def parse_results(logdir: pathlib.Path, suite: str) -> tuple[dict[str, tuple[str, str]], str]:
+    logs = list(logdir.glob("ct_run*/**/suite.log"))
+    if not logs:
+        return {}, "no Common Test suite.log; " + (logdir / "runner-output.log").read_text(errors="replace")[-800:].replace("\n", " ")
+    content = logs[0].read_text(encoding="utf-8", errors="replace")
+    cases: dict[str, tuple[str, str]] = {}
+    current: str | None = None
+    current_module: str | None = None
+    pending: str | None = None
+
+    def save() -> None:
+        nonlocal pending, current, current_module
+        lifecycle = current in {"init_per_suite", "end_per_suite", "init_per_testcase", "end_per_testcase"} or bool(current and re.match(r"(?:init|end)_per_group", current))
+        if current and current_module == suite + "_SUITE" and not lifecycle and pending is not None:
+            m = re.match(r"(ok|passed|failed|skipped|auto_skipped):?\s*(.*)", pending)
+            if m:
+                status, reason = m.groups()
+                cases[current] = ("ok" if status in ("ok", "passed") else status, reason.strip())
+        pending = None
+        current = None
+        current_module = None
+
+    for line in content.splitlines():
+        if line.startswith("=case          "):
+            save()
+            case_ref = line.split(None, 1)[1].strip()
+            current_module, _, current = case_ref.partition(":")
+        elif line.startswith("=result        "):
+            pending = line.split(None, 1)[1].strip()
+        elif pending is not None and line.startswith("="):
+            save()
+        elif pending is not None and line[:1].isspace():
+            pending += " " + line.strip()
+    save()
+    return cases, ""
+
+
+def first_failure(logdir: pathlib.Path) -> str:
+    files = list(logdir.glob("ct_run*/**/suite.log"))
+    if not files:
+        out = (logdir / "runner-output.log").read_text(encoding="utf-8", errors="replace")
+        return next((x.strip() for x in out.splitlines() if "Error" in x or "failed" in x.lower()), "run did not produce a suite log")
+    for line in files[0].read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("=result        ") and not re.search(r"=result\s+(?:ok|passed)", line):
+            return line.split(None, 1)[1].strip()
+    return ""
+
+
+def update_table(name: str, erl: dict[str, tuple[str, str]], arin: dict[str, tuple[str, str]], erl_meta: str, arin_meta: str, erl_rc: int, arin_rc: int, erl_dir: pathlib.Path, arin_dir: pathlib.Path) -> None:
+    entries = []
+    cases = sorted(set(erl) | set(arin))
+    if not cases:
+        entries.append(f"| `{name}_SUITE` | 0 | 0 | 0 | 0 | {arin_rc} | {erl_meta or 'no cases'}; {arin_meta or 'no Arinsal testcase results'} |")
+    else:
+        eok = sum(s == "ok" for s, _ in erl.values())
+        aok = sum(s == "ok" for s, _ in arin.values())
+        mismatch = [c for c in cases if erl.get(c, ("",))[0] == "ok" and arin.get(c, ("missing",))[0] != "ok"]
+        def first_line(value: tuple[str, str]) -> str:
+            status, reason = value
+            summary = re.split(r", \[\{", reason, maxsplit=1)[0].strip()
+            summary = summary[:180] + ("…" if len(summary) > 180 else "")
+            return f"{status} {summary}".strip()
+
+        detail = "; ".join(f"{c}: {first_line(arin.get(c, ('missing', '')))}" for c in mismatch)
+        if not detail:
+            detail = f"first failure: {first_failure(arin_dir)}" if arin_rc else "none"
+        if not arin and cases and not arin_rc:
+            suite_failure = first_failure(arin_dir)
+            if suite_failure:
+                detail = f"{detail}; suite-level: {suite_failure}"
+        entries.append(f"| `{name}_SUITE` | {len(cases)} | {eok}/{len(cases)} | {aok}/{len(cases)} | {len(mismatch)} | {arin_rc} | {detail.replace('|', '&#124;')} |")
+    old = RESULTS.read_text(encoding="utf-8") if RESULTS.exists() else "# OTP 29.1.1 suite pilot results\n\n| Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |\n|---|---:|---:|---:|---:|---:|---|\n"
+    lines = [line for line in old.splitlines() if not line.startswith(f"| `{name}_SUITE` |")]
+    lines.extend(entries)
+    header = lines[:3]
+    rows = sorted(lines[3:], key=lambda line: line.split("|", 2)[1].strip())
+    RESULTS.write_text("\n".join(header + rows) + "\n", encoding="utf-8")
+
+
+def _acquire_global_slot() -> None:
+    # Machine-wide limit on concurrent suite runs (each run keeps erl and Arinsal busy).
+    import fcntl, os, time
+    d = "/tmp/arinsal-suite-slots"
+    os.makedirs(d, exist_ok=True)
+    slots = int(os.environ.get("ARINSAL_SUITE_SLOTS", "2"))
+    while True:
+        for i in range(slots):
+            fd = os.open(f"{d}/slot{i}.lock", os.O_CREAT | os.O_RDWR, 0o666)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                globals()["_SUITE_SLOT_FD"] = fd
+                return
+            except BlockingIOError:
+                os.close(fd)
+        time.sleep(3)
+
+
+def main() -> int:
+    _acquire_global_slot()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("suite", help="suite basename without _SUITE, or all-pilot")
+    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--arinsal", default=str(ROOT / "target/release/arinsal"))
+    args = parser.parse_args()
+    suites = PILOT if args.suite == "all-pilot" else [args.suite.removesuffix("_SUITE")]
+    if not pathlib.Path(args.arinsal).is_file():
+        result = run(["cargo", "build", "--release", "-p", "arinsal-cli"], 1200, cwd=ROOT)
+        if result.returncode:
+            print(result.stdout[-4000:], file=sys.stderr)
+            return result.returncode
+    with tempfile.TemporaryDirectory(prefix="otp-suites-build-") as temp:
+        build = pathlib.Path(temp)
+        compile_helpers(build)
+        for name in suites:
+            try:
+                with tempfile.TemporaryDirectory(prefix=f"otp-{name}-erl-") as ed, tempfile.TemporaryDirectory(prefix=f"otp-{name}-arinsal-") as ad:
+                    erl_dir, arin_dir = pathlib.Path(ed), pathlib.Path(ad)
+                    erc, eout = run_one("erl", name, erl_dir, build, args.timeout)
+                    arc, aout = run_one(args.arinsal, name, arin_dir, build, args.timeout)
+                    ecases, emeta = parse_results(erl_dir, name)
+                    acases, ameta = parse_results(arin_dir, name)
+                    update_table(name, ecases, acases, emeta, ameta, erc, arc, erl_dir, arin_dir)
+                    epass = sum(s == "ok" for s, _ in ecases.values())
+                    apass = sum(s == "ok" for s, _ in acases.values())
+                    print(f"{name}_SUITE: erl={epass}/{len(ecases)} rc={erc}; arinsal={apass}/{len(acases)} rc={arc}", flush=True)
+                    if not ecases:
+                        print("  erl:", (emeta or eout[-600:].replace("\n", " "))[:600], flush=True)
+                    if not acases:
+                        print("  arinsal:", (ameta or aout[-600:].replace("\n", " "))[:600], flush=True)
+            except Exception as exc:
+                print(f"{name}_SUITE: harness error: {exc}", file=sys.stderr, flush=True)
+                with tempfile.TemporaryDirectory(prefix=f"otp-{name}-error-") as error_dir:
+                    error_path = pathlib.Path(error_dir)
+                    update_table(name, {}, {}, str(exc), str(exc), 1, 1, error_path, error_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

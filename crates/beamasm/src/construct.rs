@@ -1,0 +1,500 @@
+//! Inline list, tuple, and heap allocation emitters.
+
+use arinsal_a64::enc::{Cond, Gpr};
+
+use crate::{
+    ProcessHeader, SchedulerRegisters,
+    module::{ArgVal, BeamModuleAssembler, ModuleError},
+};
+
+const E: Gpr = Gpr::x(20);
+const C_P: Gpr = Gpr::x(21);
+const FCALLS: Gpr = Gpr::w(22);
+const HTOP: Gpr = Gpr::x(23);
+const SCHEDULER_REGS: Gpr = Gpr::x(19);
+const XREGS: [Gpr; 6] = [
+    Gpr::x(25),
+    Gpr::x(26),
+    Gpr::x(27),
+    Gpr::x(28),
+    Gpr::x(15),
+    Gpr::x(16),
+];
+const SCRATCH: [Gpr; 6] = [
+    Gpr::x(8),
+    Gpr::x(9),
+    Gpr::x(10),
+    Gpr::x(11),
+    Gpr::x(12),
+    Gpr::x(13),
+];
+const NIL: u64 = 0x3b;
+const TAG_BOXED: u64 = 2;
+const RESERVED_WORDS: u32 = 2;
+
+/// GC callback used by emitted heap checks. It receives the runtime header,
+/// scheduler register area, required heap words, and live X register count.
+pub type GcHook =
+    unsafe extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, usize, usize, i32) -> i32;
+
+impl BeamModuleAssembler {
+    /// Builds a cons cell in the young heap and writes its tagged list pointer.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:707-722, OTP-29.1.1
+    pub fn emit_put_list(
+        &mut self,
+        head: ArgVal,
+        tail: ArgVal,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let h = self.source_reg(head)?;
+        self.code.emit(|e| e.mov_reg(SCRATCH[2], h))?;
+        let t = self.source_reg(tail)?;
+        self.code.emit(|e| e.mov_reg(SCRATCH[3], t))?;
+        self.code.emit(|e| {
+            e.stp_post(SCRATCH[2], SCRATCH[3], HTOP, 16)?;
+            e.sub_imm(SCRATCH[4], HTOP, 15, false)
+        })?;
+        self.store_arg(dst, SCRATCH[4])
+    }
+
+    /// Builds a tuple whose elements are supplied in source order.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:794-872, OTP-29.1.1
+    pub fn emit_put_tuple2(&mut self, dst: ArgVal, elements: &[ArgVal]) -> Result<(), ModuleError> {
+        let arity = u64::try_from(elements.len())
+            .map_err(|_| ModuleError::InvalidOperand("tuple arity overflow"))?;
+        // Tuple headers use the ARITY subtag; TAG_BOXED belongs on the term pointer.
+        self.code.emit(|e| e.mov_const(SCRATCH[4], arity << 6))?;
+        self.code.emit(|e| e.str_post(SCRATCH[4], HTOP, 8))?;
+        for pair in elements.chunks(2) {
+            let first = self.source_reg(pair[0])?;
+            self.code.emit(|e| e.mov_reg(SCRATCH[2], first))?;
+            if let Some(second_arg) = pair.get(1) {
+                let second = self.source_reg(*second_arg)?;
+                self.code.emit(|e| e.mov_reg(SCRATCH[3], second))?;
+                self.code
+                    .emit(|e| e.stp_post(SCRATCH[2], SCRATCH[3], HTOP, 16))?;
+            } else {
+                self.code.emit(|e| e.str_post(SCRATCH[2], HTOP, 8))?;
+            }
+        }
+        let bytes = (arity + 1)
+            .checked_mul(8)
+            .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
+        let tag_offset = bytes - TAG_BOXED;
+        self.emit_pointer_offset(SCRATCH[4], HTOP, tag_offset, true)?;
+        self.store_arg(dst, SCRATCH[4])
+    }
+
+    /// Loads a list head and tail, matching OTP's identical-destination rule.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:274-297, OTP-29.1.1
+    pub fn emit_get_list(
+        &mut self,
+        src: ArgVal,
+        head: ArgVal,
+        tail: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let list = self.source_reg(src)?;
+        self.code.emit(|e| e.and_imm(SCRATCH[0], list, !7))?;
+        if head == tail {
+            let tdst = self.destination_reg(tail)?;
+            self.code.emit(|e| e.ldr_uoff(tdst, SCRATCH[0], 8))?;
+            self.store_arg(tail, tdst)
+        } else {
+            let hdst = match head {
+                ArgVal::X(i) if i < 6 => XREGS[i as usize],
+                _ => SCRATCH[2],
+            };
+            let tdst = match tail {
+                ArgVal::X(i) if i < 6 => XREGS[i as usize],
+                _ => SCRATCH[3],
+            };
+            self.code.emit(|e| e.ldp(hdst, tdst, SCRATCH[0], 0))?;
+            self.store_arg(head, hdst)?;
+            self.store_arg(tail, tdst)
+        }
+    }
+
+    /// Loads the head word from a cons cell.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:299-307, OTP-29.1.1
+    pub fn emit_get_hd(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
+        self.emit_list_field(src, dst, 0)
+    }
+
+    /// Loads the tail word from a cons cell.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:309-317, OTP-29.1.1
+    pub fn emit_get_tl(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
+        self.emit_list_field(src, dst, 8)
+    }
+
+    fn emit_list_field(
+        &mut self,
+        src: ArgVal,
+        dst: ArgVal,
+        offset: u32,
+    ) -> Result<(), ModuleError> {
+        let list = self.source_reg(src)?;
+        self.code.emit(|e| e.and_imm(SCRATCH[0], list, !7))?;
+        let out = self.destination_reg(dst)?;
+        self.code.emit(|e| e.ldr_uoff(out, SCRATCH[0], offset))?;
+        self.store_arg(dst, out)
+    }
+
+    /// Loads an untagged tuple data pointer into ARG1 without clobbering `src`.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:351-355, OTP-29.1.1
+    pub fn emit_load_tuple_ptr(&mut self, src: ArgVal, _dst: ArgVal) -> Result<(), ModuleError> {
+        let tuple = self.source_reg(src)?;
+        // OTP stores the untagged pointer in ARG1 (x0) and keeps the tagged term
+        // in the source register. Overwriting X with an untagged pointer corrupts
+        // later term uses (e.g. returning State after `inet_exit_port/3`).
+        self.code.emit(|e| e.and_imm(Gpr::x(0), tuple, !7))?;
+        Ok(())
+    }
+
+    /// Loads a tuple word at its byte offset from the tuple header.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:378-389, OTP-29.1.1
+    pub fn emit_get_tuple_element(
+        &mut self,
+        src: ArgVal,
+        element: u32,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let tuple = self.source_reg(src)?;
+        self.code.emit(|e| e.and_imm(SCRATCH[0], tuple, !7))?;
+        self.emit_tuple_element_load(SCRATCH[0], element, dst)
+    }
+
+    /// Loads a tuple word at its byte offset from an untagged tuple pointer.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:378-389, OTP-29.1.1
+    pub fn emit_i_get_tuple_element2(
+        &mut self,
+        tuple_ptr: ArgVal,
+        element: u32,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let ptr = self.source_reg(tuple_ptr)?;
+        self.code.emit(|e| e.and_imm(SCRATCH[0], ptr, !7))?;
+        self.emit_tuple_element_load(SCRATCH[0], element, dst)
+    }
+
+    fn emit_tuple_element_load(
+        &mut self,
+        ptr: Gpr,
+        element: u32,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        let out = self.destination_reg(dst)?;
+        self.code.emit(|e| e.ldr_uoff(out, ptr, element))?;
+        self.store_arg(dst, out)
+    }
+
+    /// Replaces a tuple word at its byte offset for legacy OTP bytecode.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1105-1119, OTP-29.1.1
+    pub fn emit_set_tuple_element(
+        &mut self,
+        element: ArgVal,
+        tuple: ArgVal,
+        offset: u32,
+    ) -> Result<(), ModuleError> {
+        let tuple_reg = self.source_reg(tuple)?;
+        self.code.emit(|e| e.and_imm(SCRATCH[0], tuple_reg, !7))?;
+        let value = self.source_reg(element)?;
+        let byte_offset = i16::try_from(offset)
+            .map_err(|_| ModuleError::InvalidOperand("tuple offset exceeds immediate range"))?;
+        self.code.emit(|e| e.stur(value, SCRATCH[0], byte_offset))?;
+        Ok(())
+    }
+
+    /// Copies a tuple and applies one-based field updates inline.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:893-999, OTP-29.1.1
+    pub fn emit_update_record(
+        &mut self,
+        src: ArgVal,
+        dst: ArgVal,
+        arity: u32,
+        updates: &[(u32, ArgVal)],
+    ) -> Result<(), ModuleError> {
+        let tuple = self.source_reg(src)?;
+        self.code.emit(|e| e.and_imm(SCRATCH[0], tuple, !7))?;
+        self.code.emit(|e| e.ldr_post(SCRATCH[1], SCRATCH[0], 8))?;
+        self.code.emit(|e| e.str_post(SCRATCH[1], HTOP, 8))?;
+        for index in 0..arity {
+            let field = index
+                .checked_add(1)
+                .ok_or(ModuleError::InvalidOperand("tuple offset overflow"))?;
+            let update = updates
+                .iter()
+                .find(|(update_index, _)| *update_index == field);
+            if let Some((_, value)) = update {
+                let val = self.source_reg(*value)?;
+                self.code.emit(|e| e.mov_reg(SCRATCH[2], val))?;
+            } else {
+                let offset = index
+                    .checked_mul(8)
+                    .ok_or(ModuleError::InvalidOperand("tuple offset overflow"))?;
+                self.code
+                    .emit(|e| e.ldr_uoff(SCRATCH[2], SCRATCH[0], offset))?;
+            }
+            self.code.emit(|e| e.str_post(SCRATCH[2], HTOP, 8))?;
+        }
+        let tuple_words = arity
+            .checked_add(1)
+            .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
+        let bytes = u64::from(tuple_words) * 8;
+        self.emit_pointer_offset(SCRATCH[4], HTOP, bytes - TAG_BOXED, true)?;
+        self.store_arg(dst, SCRATCH[4])
+    }
+
+    /// Updates tuple fields in place when the heap boundary makes mutation safe.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1000-1096, OTP-29.1.1.
+    pub fn emit_update_record_in_place(
+        &mut self,
+        src: ArgVal,
+        dst: ArgVal,
+        arity: u32,
+        updates: &[(u32, ArgVal)],
+    ) -> Result<(), ModuleError> {
+        if arity < 2 {
+            return Err(ModuleError::InvalidOperand(
+                "in-place tuple update requires arity above one",
+            ));
+        }
+        let mut previous = 0;
+        for (index, _) in updates {
+            if *index <= previous || *index > arity {
+                return Err(ModuleError::InvalidOperand(
+                    "in-place tuple update indices must be ordered and in range",
+                ));
+            }
+            previous = *index;
+        }
+
+        let tuple = self.source_reg(src)?;
+        self.code.emit(|e| e.and_imm(SCRATCH[0], tuple, !7))?;
+
+        // Immediate values cannot retain aliases into another tuple, so OTP
+        // may update those tuples directly. Register and stack values need the
+        // high-water check because they may point into the heap.
+        let all_safe = updates
+            .iter()
+            .all(|(_, value)| matches!(value, ArgVal::Immediate(_) | ArgVal::Literal(_)));
+        if !all_safe && !updates.is_empty() {
+            let update = self.code.new_label();
+            let copy = self.code.new_label();
+            let words = arity
+                .checked_add(1)
+                .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
+            let bytes = u64::from(words)
+                .checked_mul(8)
+                .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
+            self.code.emit(|e| {
+                e.ldr_uoff(
+                    SCRATCH[4],
+                    C_P,
+                    std::mem::offset_of!(ProcessHeader, high_water) as u32,
+                )?;
+                e.cmp_reg(SCRATCH[0], HTOP, arinsal_a64::enc::Shift::Lsl, 0)
+            })?;
+            self.code.b_cond(Cond::Cs, update)?;
+            self.code
+                .emit(|e| e.cmp_reg(SCRATCH[0], SCRATCH[4], arinsal_a64::enc::Shift::Lsl, 0))?;
+            self.code.b_cond(Cond::Cs, update)?;
+            self.code.bind(copy)?;
+            self.code
+                .emit(|e| e.mov_const(SCRATCH[5], u64::from(words)))?;
+            let copy_loop = self.code.new_label();
+            self.code.bind(copy_loop)?;
+            self.code.emit(|e| {
+                e.ldr_post(SCRATCH[2], SCRATCH[0], 8)?;
+                e.str_post(SCRATCH[2], HTOP, 8)?;
+                e.subs_imm(SCRATCH[5], SCRATCH[5], 1, false)
+            })?;
+            self.code.b_cond(Cond::Ne, copy_loop)?;
+            self.emit_pointer_offset(SCRATCH[0], HTOP, bytes, true)?;
+            self.code.bind(update)?;
+        }
+
+        for (index, value) in updates {
+            let value = self.source_reg(*value)?;
+            self.code.emit(|e| e.mov_reg(SCRATCH[2], value))?;
+            let offset = u64::from(*index)
+                .checked_mul(8)
+                .ok_or(ModuleError::InvalidOperand("tuple offset overflow"))?;
+            self.emit_pointer_offset(SCRATCH[1], SCRATCH[0], offset, false)?;
+            self.code.emit(|e| e.str_uoff(SCRATCH[2], SCRATCH[1], 0))?;
+        }
+        self.code
+            .emit(|e| e.add_imm(SCRATCH[4], SCRATCH[0], TAG_BOXED as u16, false))?;
+        self.store_arg(dst, SCRATCH[4])
+    }
+
+    /// Checks available heap space and calls the GC hook on the slow path.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 and beam_asm_global.cpp:102-140, OTP-29.1.1
+    pub fn emit_test_heap(
+        &mut self,
+        words: u32,
+        live: u32,
+        hook: GcHook,
+    ) -> Result<(), ModuleError> {
+        self.emit_heap_check(0, words, live, hook)
+    }
+
+    /// Checks heap space, allocates heap words inline, and reserves stack words.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:206-218 and beam_asm_global.cpp:102-140, OTP-29.1.1
+    pub fn emit_allocate_heap(
+        &mut self,
+        stack_words: u32,
+        heap_words: u32,
+        live: u32,
+        hook: GcHook,
+    ) -> Result<(), ModuleError> {
+        self.emit_heap_check(stack_words, heap_words, live, hook)?;
+        if stack_words != 0 {
+            let bytes = stack_words
+                .checked_mul(8)
+                .ok_or(ModuleError::InvalidOperand("stack allocation overflow"))?;
+            self.emit_pointer_offset(E, E, u64::from(bytes), true)?;
+        }
+        Ok(())
+    }
+
+    /// Allocates heap and stack space, then initializes each new stack slot to nil.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:206-218 and erts/emulator/beam/emu/instrs.tab:53, OTP-29.1.1
+    pub fn emit_allocate_heap_zero(
+        &mut self,
+        stack_words: u32,
+        heap_words: u32,
+        live: u32,
+        hook: GcHook,
+    ) -> Result<(), ModuleError> {
+        self.emit_allocate_heap(stack_words, heap_words, live, hook)?;
+        self.code.emit(|e| e.mov_const(SCRATCH[0], NIL))?;
+        for index in 0..stack_words {
+            let offset = index
+                .checked_mul(8)
+                .ok_or(ModuleError::InvalidOperand("stack offset overflow"))?;
+            self.code.emit(|e| e.str_uoff(SCRATCH[0], E, offset))?;
+        }
+        Ok(())
+    }
+
+    fn emit_heap_check(
+        &mut self,
+        stack_words: u32,
+        heap_words: u32,
+        live: u32,
+        hook: GcHook,
+    ) -> Result<(), ModuleError> {
+        if live > 6 {
+            return Err(ModuleError::InvalidOperand(
+                "live X count must not exceed six",
+            ));
+        }
+        let requested_words = stack_words
+            .checked_add(heap_words)
+            .ok_or(ModuleError::InvalidOperand("heap check size overflow"))?;
+        let need = requested_words
+            .checked_add(RESERVED_WORDS)
+            .ok_or(ModuleError::InvalidOperand("heap check size overflow"))?;
+        let bytes = need
+            .checked_mul(8)
+            .ok_or(ModuleError::InvalidOperand("heap check size overflow"))?;
+        let done = self.code.new_label();
+        let error_label = self.error_label;
+        self.emit_pointer_offset(SCRATCH[0], HTOP, u64::from(bytes), false)?;
+        self.code
+            .emit(|e| e.cmp_reg(SCRATCH[0], E, arinsal_a64::enc::Shift::Lsl, 0))?;
+        self.code.b_cond(Cond::Ls, done)?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:99-129, OTP-29.1.1.
+        let update = crate::Update::HEAP_ALLOC.union(crate::Update::X_REGS);
+        crate::emit_enter_runtime(&mut self.code, live as usize, update)?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::x(30), C_P, 72)?;
+            e.mov_reg(Gpr::x(0), C_P)?;
+            e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
+            e.mov_const(Gpr::x(2), requested_words as u64)?;
+            e.mov_const(Gpr::x(3), live as u64)?;
+            e.mov_reg(Gpr::w(4), FCALLS)?;
+            e.mov_const(Gpr::x(17), hook as usize as u64)?;
+            e.blr(Gpr::x(17))
+        })?;
+        crate::emit_leave_runtime(&mut self.code, live as usize, update)?;
+        self.code.emit(|e| {
+            e.sub_reg(FCALLS, FCALLS, Gpr::w(0), arinsal_a64::enc::Shift::Lsl, 0)?;
+            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
+            e.ldr_uoff(Gpr::x(9), C_P, 40)
+        })?;
+        self.code.cbnz(Gpr::x(9), error_label)?;
+        self.code.bind(done)?;
+        Ok(())
+    }
+
+    pub(super) fn emit_stack_check(
+        &mut self,
+        stack_words: u32,
+        live: u32,
+        hook: GcHook,
+    ) -> Result<(), ModuleError> {
+        self.emit_heap_check(stack_words, 0, live, hook)
+    }
+
+    fn destination_reg(&self, dst: ArgVal) -> Result<Gpr, ModuleError> {
+        match dst {
+            ArgVal::X(i) if i < 6 => Ok(XREGS[i as usize]),
+            _ => Ok(SCRATCH[5]),
+        }
+    }
+
+    fn emit_pointer_offset(
+        &mut self,
+        dst: Gpr,
+        base: Gpr,
+        bytes: u64,
+        subtract: bool,
+    ) -> Result<(), ModuleError> {
+        if bytes == 0 {
+            self.code.emit(|e| e.mov_reg(dst, base))?;
+        } else if bytes <= 4095 {
+            let imm = bytes as u16;
+            self.code.emit(|e| {
+                if subtract {
+                    e.sub_imm(dst, base, imm, false)
+                } else {
+                    e.add_imm(dst, base, imm, false)
+                }
+            })?;
+        } else if bytes.is_multiple_of(4096) && bytes / 4096 <= 4095 {
+            let imm = (bytes / 4096) as u16;
+            self.code.emit(|e| {
+                if subtract {
+                    e.sub_imm(dst, base, imm, true)
+                } else {
+                    e.add_imm(dst, base, imm, true)
+                }
+            })?;
+        } else {
+            self.code.emit(|e| {
+                e.mov_const(SCRATCH[1], bytes)?;
+                if subtract {
+                    e.sub_reg(dst, base, SCRATCH[1], arinsal_a64::enc::Shift::Lsl, 0)
+                } else {
+                    e.add_reg(dst, base, SCRATCH[1], arinsal_a64::enc::Shift::Lsl, 0)
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn store_arg(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
+        match dst {
+            ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(XREGS[i as usize], src))?,
+            ArgVal::Y(i) => {
+                let offset = i
+                    .checked_mul(8)
+                    .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
+                self.code.emit(|e| e.str_uoff(src, E, offset))?;
+            }
+            _ => return Err(ModuleError::InvalidOperand("destination must be X or Y")),
+        }
+        Ok(())
+    }
+}

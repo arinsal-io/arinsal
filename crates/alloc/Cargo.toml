@@ -1,0 +1,16 @@
+[package]
+name = "arinsal-alloc"
+description = "ERTS memory mapping and segment allocation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+proptest.workspace = true

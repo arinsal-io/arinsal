@@ -1,0 +1,7 @@
+Arinsal
+Copyright 2026 The Arinsal authors
+
+This product is a reimplementation of the Erlang/OTP runtime system (ERTS).
+Parts of its logic are ported from Erlang/OTP, Copyright Ericsson AB 1996-2026,
+licensed under the Apache License, Version 2.0. Files under spec/otp-29.1.1/
+are copied verbatim from Erlang/OTP 29.1.1 (see spec/otp-29.1.1/OTP-LICENSE.txt).

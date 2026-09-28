@@ -1,0 +1,15 @@
+  1120  <arinsal_ets::Table>::info
+   407  arinsal_term::ops::exact_eq
+   290  _xzm_free
+   131  <arinsal_term::atom::AtomTable>::text
+   126  _xzm_xzone_malloc
+   103  _malloc_zone_malloc
+    90  <deduplicated_symbol>
+    83  _free
+    78  _platform_memset
+    69  <alloc::raw_vec::RawVecInner>::finish_grow
+    47  __findenv_locked
+    30  <alloc::raw_vec::RawVec<alloc::sync::Arc<alloc::vec::Vec<u8>>>>::grow_one
+    30  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+    25  <arinsal_vm::Vm>::run_slice_inner
+    21  DYLD-STUB$$malloc

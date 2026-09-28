@@ -1,0 +1,98 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/a64",
+    "crates/alloc",
+    "crates/beamasm",
+    "crates/beamops",
+    "crates/beamjit",
+    "crates/spec",
+    "crates/etf",
+    "crates/beam",
+    "crates/float",
+    "crates/term",
+    "crates/difftest",
+    "crates/arith",
+    "crates/maps",
+    "crates/bits",
+    "crates/bifs",
+    "crates/packet",
+    "crates/nif-file",
+    "crates/nif-buffer",
+    "crates/nif-tty",
+    "crates/nif-socket",
+    "crates/re",
+    "crates/nif-zlib",
+    "crates/nif",
+    "crates/loader",
+    "crates/jit",
+    "crates/opt", # opt_ir
+    "crates/vm",
+    "crates/sched",
+    "crates/ets",
+    "crates/pterm",
+    "crates/cli",
+    "crates/args",
+    "tools/difftest_runner",
+    "tools/nif_spike",
+    "tools/gap_report",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.98"
+
+[workspace.dependencies]
+arinsal-spec = { path = "crates/spec" }
+arinsal-etf = { path = "crates/etf" }
+arinsal-beam = { path = "crates/beam" }
+arinsal-float = { path = "crates/float" }
+arinsal-term = { path = "crates/term" }
+arinsal-difftest = { path = "crates/difftest" }
+arinsal-arith = { path = "crates/arith" }
+arinsal-maps = { path = "crates/maps" }
+arinsal-bits = { path = "crates/bits" }
+arinsal-bifs = { path = "crates/bifs" }
+arinsal-packet = { path = "crates/packet" }
+arinsal-nif-file = { path = "crates/nif-file" }
+arinsal-nif-buffer = { path = "crates/nif-buffer" }
+arinsal-nif-tty = { path = "crates/nif-tty" }
+arinsal-nif-socket = { path = "crates/nif-socket" }
+arinsal-re = { path = "crates/re" }
+arinsal-nif-zlib = { path = "crates/nif-zlib" }
+arinsal-nif = { path = "crates/nif" }
+arinsal-loader = { path = "crates/loader" }
+arinsal-jit = { path = "crates/jit" }
+arinsal-opt = { path = "crates/opt" } # opt_ir
+arinsal-vm = { path = "crates/vm" }
+arinsal-sched = { path = "crates/sched" }
+arinsal-args = { path = "crates/args" }
+arinsal-ets = { path = "crates/ets" }
+arinsal-pterm = { path = "crates/pterm" }
+
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+# Stock zlib (libz-sys) so compressed output is byte-identical to erts.
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+thiserror = "2"
+ryu = "1"
+proptest = "1"
+insta = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "warn"
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "thin"
+
+[profile.dev.package."*"]
+opt-level = 2

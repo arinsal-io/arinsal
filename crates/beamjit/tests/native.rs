@@ -1,0 +1,566 @@
+use arinsal_a64::enc::Gpr;
+use arinsal_beam::BeamFile;
+use arinsal_beamasm::{
+    ExitReason, ProcessHeader, SchedulerRegisters, module::BeamModuleAssembler, rt::read_heap_word,
+};
+use arinsal_beamjit::{ModuleEnv, compile_module_with_env, compile_module_with_env_and_funcs};
+use std::{
+    fs,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
+
+static MAP_LOOKUP_RESULT: AtomicU64 = AtomicU64::new(0);
+static MAP_LOOKUP_KEY: AtomicU64 = AtomicU64::new(0);
+
+struct TestEnv;
+
+impl ModuleEnv for TestEnv {
+    fn atom(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
+        beam.atom(index)
+            .map(|_| (u64::from(index) << 6) | 0x0b)
+            .ok_or_else(|| format!("atom index {index} is out of range"))
+    }
+
+    fn literal(&self, beam: &BeamFile, index: u32) -> Result<u64, String> {
+        beam.literal(index)
+            .map(|_| 0)
+            .map_err(|error| error.to_string())
+    }
+
+    fn import(&self, beam: &BeamFile, index: u32) -> Result<u32, String> {
+        beam.imports
+            .get(index as usize)
+            .map(|_| index)
+            .ok_or_else(|| format!("import index {index} is out of range"))
+    }
+
+    fn arithmetic_helper(&self) -> arinsal_beamasm::arith::ArithHelper {
+        arithmetic_helper
+    }
+
+    fn guard_helper(&self) -> arinsal_beamasm::guard::GuardHelper {
+        guard_helper
+    }
+
+    fn guard_helper3(&self) -> arinsal_beamasm::guard::GuardHelper3 {
+        guard_helper3
+    }
+
+    fn gc_hook(&self) -> arinsal_beamasm::construct::GcHook {
+        gc_hook
+    }
+
+    fn map_lookup_helper(&self) -> arinsal_beamjit::MapLookupHelper {
+        map_lookup_helper
+    }
+
+    fn bif_mfa_helper(&self) -> arinsal_beamjit::BifMfaHelper {
+        bif_mfa_helper
+    }
+
+    fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper {
+        bs_match_helper
+    }
+
+    fn map_runtime(&self) -> arinsal_beamasm::map::MapRuntime {
+        arinsal_beamasm::map::MapRuntime {
+            get: map_get_helper,
+            get_elements: map_get_elements_helper,
+            new_map: map_update_helper,
+            update_assoc: map_update_helper,
+            update_exact: map_update_helper,
+        }
+    }
+
+    fn bs_construct_helpers(
+        &self,
+    ) -> (
+        arinsal_beamasm::bs_construct::BsConstructHelper,
+        arinsal_beamasm::bs_construct::BsConstructErrorHelper,
+    ) {
+        (bs_construct_helper, bs_construct_error_helper)
+    }
+
+    fn exception_resolver(&self) -> arinsal_beamasm::catch::ExceptionResolver {
+        exception_resolver
+    }
+
+    fn fun_resolver(&self) -> arinsal_beamasm::fun::FunResolver {
+        fun_resolver
+    }
+}
+
+extern "C" fn bs_match_helper(
+    _process: *mut ProcessHeader,
+    _op: u32,
+    _context: u64,
+    _value: u64,
+    _unit: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn map_get_helper(
+    _process: *mut ProcessHeader,
+    _map: u64,
+    _key: u64,
+    _hash: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn map_get_elements_helper(
+    _process: *mut ProcessHeader,
+    _map: u64,
+    _registers: u64,
+    _live: u64,
+    _count: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn map_update_helper(
+    _process: *mut ProcessHeader,
+    _map: u64,
+    _registers: u64,
+    _live: u64,
+    _count: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_construct_helper(
+    _process: *mut ProcessHeader,
+    _operation: u64,
+    _value: u64,
+    _size: u64,
+    _unit: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn bs_construct_error_helper(
+    _process: *mut ProcessHeader,
+    _info: u32,
+    _value: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn exception_resolver(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _stack: *mut u64,
+) -> usize {
+    0
+}
+
+extern "C" fn fun_resolver(_process: *mut ProcessHeader, _fun: u64, _arity: u32) -> usize {
+    0
+}
+
+extern "C" fn map_lookup_helper(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _map: u64,
+    key: u64,
+    _hash: u64,
+    _hashed: u64,
+) -> u64 {
+    MAP_LOOKUP_KEY.store(key, Ordering::SeqCst);
+    MAP_LOOKUP_RESULT.load(Ordering::SeqCst)
+}
+
+extern "C" fn bif_mfa_helper(
+    _process: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _module: u64,
+    _function: u64,
+    _arity: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn arithmetic_helper(
+    _process: *mut ProcessHeader,
+    _op: u32,
+    _lhs: u64,
+    _rhs: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn guard_helper(
+    _process: *mut ProcessHeader,
+    _op: u32,
+    _first: u64,
+    _second: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn guard_helper3(
+    _process: *mut ProcessHeader,
+    _op: u32,
+    _first: u64,
+    _second: u64,
+    _third: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn gc_hook(
+    _header: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _words: usize,
+    _live: usize,
+    _fcalls: i32,
+) -> i32 {
+    0
+}
+
+#[test]
+fn erlc_add_function_runs_through_native_bridge() {
+    if !cfg!(target_arch = "aarch64") {
+        eprintln!("native bridge test requires AArch64");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("beamjit-native-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("native_add.erl");
+    fs::write(
+        &source,
+        "-module(native_add).\n-export([add/2]).\nadd(A, B) -> A + B.\n",
+    )
+    .unwrap();
+    let output = Command::new("erlc")
+        .args(["-o", root.to_str().unwrap(), source.to_str().unwrap()])
+        .output()
+        .expect("erlc must be installed for the BEAM integration test");
+    assert!(
+        output.status.success(),
+        "erlc failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(root.join("native_add.beam")).unwrap();
+    let module = compile_module_with_env(&bytes, &TestEnv).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "add")
+        .unwrap_or_else(|| {
+            panic!(
+                "add/2 did not compile natively; unported: {:?}",
+                module.unported
+            )
+        });
+
+    let mut stack = [0_u64; 64];
+    let mut heap = [0_u64; 64];
+    let mut header = ProcessHeader {
+        htop: heap.as_mut_ptr(),
+        stop: stack.as_mut_ptr().wrapping_add(stack.len()),
+        heap: heap.as_mut_ptr(),
+        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+        fcalls: 100,
+        ..ProcessHeader::default()
+    };
+    let mut registers = SchedulerRegisters::default();
+    registers.x_reg_array[0] = tagged_small(19);
+    registers.x_reg_array[1] = tagged_small(23);
+    let target = module.native.entries[&function.label] as usize;
+    let caller = caller_module(target, 0xffff_fffe);
+    let caller_entry = caller.entry(0xffff_fffe).unwrap();
+    let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &caller_entry);
+    assert_eq!(result, ExitReason::Returned);
+    assert_eq!(registers.x_reg_array[0], tagged_small(42));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn erlc_list_tuple_guards_run_natively() {
+    if !cfg!(target_arch = "aarch64") {
+        eprintln!("native bridge test requires AArch64");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("beamjit-collections-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("native_collections.erl");
+    fs::write(
+        &source,
+        "-module(native_collections).\n-export([first_integer/2, tuple_list/2]).\nfirst_integer(_Ignored, [Value|_]) when is_integer(Value) -> Value.\ntuple_list(_Ignored, {Value, _}) when is_integer(Value) -> [Value].\n",
+    )
+    .unwrap();
+    let output = Command::new("erlc")
+        .args(["-o", root.to_str().unwrap(), source.to_str().unwrap()])
+        .output()
+        .expect("erlc must be installed for the BEAM integration test");
+    assert!(
+        output.status.success(),
+        "erlc failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = fs::read(root.join("native_collections.beam")).unwrap();
+    let module = compile_module_with_env(&bytes, &TestEnv).unwrap();
+    let tuple_list = module
+        .functions
+        .iter()
+        .find(|function| function.name == "tuple_list")
+        .unwrap_or_else(|| panic!("tuple_list/2 not native: {:?}", module.unported));
+    let first_integer = module
+        .functions
+        .iter()
+        .find(|function| function.name == "first_integer")
+        .unwrap_or_else(|| panic!("first_integer/2 not native: {:?}", module.unported));
+
+    let mut stack = [0_u64; 64];
+    let mut heap = [0_u64; 64];
+    heap[0] = tagged_small(77);
+    heap[1] = 0x3b;
+    let mut header = ProcessHeader {
+        htop: heap.as_mut_ptr().wrapping_add(2),
+        stop: stack.as_mut_ptr().wrapping_add(stack.len()),
+        heap: heap.as_mut_ptr(),
+        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+        fcalls: 100,
+        ..ProcessHeader::default()
+    };
+    let mut registers = SchedulerRegisters::default();
+    registers.x_reg_array[0] = tagged_small(0);
+    registers.x_reg_array[1] = heap.as_mut_ptr() as u64 + 1;
+    let list_target = module.native.entries[&first_integer.label] as usize;
+    let list_caller = caller_module(list_target, 0xffff_fffe);
+    let list_entry = list_caller.entry(0xffff_fffe).unwrap();
+    let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &list_entry);
+    assert_eq!(result, ExitReason::Returned);
+    assert_eq!(registers.x_reg_array[0], tagged_small(77));
+
+    heap[0] = 2 << 6;
+    heap[1] = tagged_small(99);
+    heap[2] = tagged_small(1);
+    header.htop = heap.as_mut_ptr().wrapping_add(3);
+    registers.x_reg_array[0] = tagged_small(0);
+    registers.x_reg_array[1] = heap.as_mut_ptr() as u64 + 2;
+    let tuple_target = module.native.entries[&tuple_list.label] as usize;
+    let tuple_caller = caller_module(tuple_target, 0xffff_fffe);
+    let tuple_entry = tuple_caller.entry(0xffff_fffe).unwrap();
+    let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &tuple_entry);
+    assert_eq!(result, ExitReason::Returned);
+    assert_eq!(registers.x_reg_array[0], heap.as_mut_ptr() as u64 + 25);
+    assert_eq!(heap[3], tagged_small(99));
+    assert_eq!(heap[4], 0x3b);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn recursive_sum_and_fib_run_natively() {
+    if !cfg!(target_arch = "aarch64") {
+        eprintln!("native recursive benchmark requires AArch64");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("beamjit-recursive-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("native_recursive.erl");
+    fs::write(
+        &source,
+        "-module(native_recursive).\n-export([sum/2, fib/1]).\nsum(0, Acc) -> Acc;\nsum(N, Acc) -> sum(N - 1, Acc + N).\nfib(N) -> fib_loop(N, 0, 1).\nfib_loop(0, A, _B) -> A;\nfib_loop(N, A, B) -> fib_loop(N - 1, B, A + B).\n",
+    )
+    .unwrap();
+    let output = Command::new("erlc")
+        .args(["-o", root.to_str().unwrap(), source.to_str().unwrap()])
+        .output()
+        .expect("erlc must be installed for the BEAM integration test");
+    assert!(
+        output.status.success(),
+        "erlc failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let beam = fs::read(root.join("native_recursive.beam")).unwrap();
+    let module = compile_module_with_env(&beam, &TestEnv).unwrap();
+    let sum = module
+        .functions
+        .iter()
+        .find(|function| function.name == "sum")
+        .unwrap_or_else(|| panic!("sum/2 did not compile natively: {:?}", module.unported));
+    let fib = module
+        .functions
+        .iter()
+        .find(|function| function.name == "fib")
+        .unwrap_or_else(|| panic!("fib/1 did not compile natively: {:?}", module.unported));
+
+    let expected = Command::new("erl")
+        .args([
+            "-noshell",
+            "-noinput",
+            "-pa",
+            root.to_str().unwrap(),
+            "-eval",
+            "io:format(\"~p ~p~n\", [native_recursive:sum(10000000, 0), native_recursive:fib(25)]), halt().",
+        ])
+        .output()
+        .expect("erl must be installed for the differential test");
+    assert!(
+        expected.status.success(),
+        "erl failed: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    let values: Vec<i64> = String::from_utf8(expected.stdout)
+        .unwrap()
+        .split_whitespace()
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(values.len(), 2, "unexpected erts output: {values:?}");
+
+    let mut stack = [0_u64; 64];
+    let mut heap = [0_u64; 64];
+    let stack_end = stack.as_mut_ptr().wrapping_add(stack.len());
+    let mut header = ProcessHeader {
+        htop: heap.as_mut_ptr(),
+        stop: stack_end,
+        heap: heap.as_mut_ptr(),
+        hend: heap.as_mut_ptr().wrapping_add(heap.len()),
+        fcalls: 100_000,
+        ..ProcessHeader::default()
+    };
+    let mut registers = SchedulerRegisters::default();
+    registers.x_reg_array[0] = tagged_small(10_000_000);
+    registers.x_reg_array[1] = tagged_small(0);
+    let target = module.native.entries[&sum.label] as usize;
+    let caller = caller_module(target, 0xffff_fffe);
+    let entry = caller.entry(0xffff_fffe).unwrap();
+    let started = Instant::now();
+    let mut yields = 0_u32;
+    loop {
+        match arinsal_beamasm::enter_native(&mut header, &mut registers, &entry) {
+            ExitReason::Returned => break,
+            ExitReason::Yield => {
+                yields += 1;
+                assert!(yields < 10_000, "sum/2 yielded too many times");
+                header.fcalls = 100_000;
+                header.stop = stack_end;
+            }
+            other => panic!("unexpected native sum exit: {other:?}"),
+        }
+    }
+    let sum_elapsed = started.elapsed().as_nanos();
+    assert_eq!(registers.x_reg_array[0], tagged_small(values[0] as u64));
+    println!("sum_10m_native_ok {}", sum_elapsed);
+
+    registers.x_reg_array[0] = tagged_small(25);
+    registers.x_reg_array[1] = 0;
+    let target = module.native.entries[&fib.label] as usize;
+    let caller = caller_module(target, 0xffff_fffd);
+    let entry = caller.entry(0xffff_fffd).unwrap();
+    let started = Instant::now();
+    let mut yields = 0_u32;
+    loop {
+        match arinsal_beamasm::enter_native(&mut header, &mut registers, &entry) {
+            ExitReason::Returned => break,
+            ExitReason::Yield => {
+                yields += 1;
+                assert!(yields < 10_000, "fib/1 yielded too many times");
+                header.fcalls = 100_000;
+                header.stop = stack_end;
+            }
+            other => panic!("unexpected native fib exit: {other:?}"),
+        }
+    }
+    let fib_elapsed = started.elapsed().as_micros();
+    assert_eq!(registers.x_reg_array[0], tagged_small(values[1] as u64));
+    println!("fib25_native_ok {fib_elapsed}us yields={yields}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn otp_logger_reply_return_returns_the_reply_map() {
+    if !cfg!(target_arch = "aarch64") {
+        return;
+    }
+    let path = Command::new("erl")
+        .args([
+            "-noshell",
+            "-eval",
+            "io:format(\"~s\",[code:which(logger_olp)]),halt().",
+        ])
+        .output()
+        .expect("erl must be installed for the OTP BeamAsm regression test");
+    assert!(path.status.success());
+    let bytes = fs::read(String::from_utf8(path.stdout).unwrap()).unwrap();
+    let beam = arinsal_beam::parse(&bytes).unwrap();
+    let atom = |name: &str| {
+        let index = beam
+            .atoms
+            .iter()
+            .position(|candidate| candidate == name)
+            .unwrap() as u32
+            + 1;
+        (u64::from(index) << 6) | 0x0b
+    };
+    let module =
+        compile_module_with_env_and_funcs(&bytes, &TestEnv, Some("reply_return/2")).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "reply_return" && function.arity == 2)
+        .unwrap_or_else(|| panic!("reply_return/2 was not compiled: {:?}", module.unported));
+
+    let mut heap = [0_u64; 128];
+    let heap_start = heap.as_mut_ptr();
+    heap[0] = 1 << 6;
+    heap[1] = atom("idle");
+    heap[2] = 0x2c;
+    heap[3] = 1;
+    heap[4] = heap_start as u64 | 2;
+    heap[5] = atom("true");
+    let state = heap_start.wrapping_add(2) as u64 | 2;
+    let htop = heap_start.wrapping_add(6);
+    let stop = heap_start.wrapping_add(heap.len());
+    let heap_end = stop;
+    let mut header = ProcessHeader {
+        htop,
+        stop,
+        heap: heap_start,
+        hend: heap_end,
+        fcalls: 100,
+        ..ProcessHeader::default()
+    };
+    let reply = tagged_small(77);
+    MAP_LOOKUP_RESULT.store(atom("true"), Ordering::SeqCst);
+    MAP_LOOKUP_KEY.store(0, Ordering::SeqCst);
+    let mut registers = SchedulerRegisters::default();
+    registers.x_reg_array[0] = reply;
+    registers.x_reg_array[1] = state;
+    let exit = arinsal_beamjit::enter_native(&module, function, &mut header, &mut registers);
+    assert_eq!(
+        exit,
+        ExitReason::Returned,
+        "fcalls={} i={:?}",
+        header.fcalls,
+        header.i
+    );
+    let result = registers.x_reg_array[0];
+    assert_eq!(MAP_LOOKUP_KEY.load(Ordering::SeqCst), atom("idle"));
+    assert_eq!(read_heap_word(result, 0), 3 << 6);
+    assert_eq!(read_heap_word(result, 1), atom("reply"));
+    assert_eq!(read_heap_word(result, 2), reply);
+    assert_eq!(read_heap_word(result, 3), state);
+    MAP_LOOKUP_RESULT.store(0, Ordering::SeqCst);
+}
+
+fn caller_module(target: usize, label: u32) -> arinsal_beamasm::module::FinalizedModule {
+    let mut assembler = BeamModuleAssembler::new();
+    assembler.emit_i_func_label(label).unwrap();
+    assembler
+        .emit_raw(|encoder| {
+            encoder.mov_const(Gpr::x(17), target as u64)?;
+            encoder.br(Gpr::x(17))
+        })
+        .unwrap();
+    assembler.finalize().unwrap()
+}
+
+const fn tagged_small(value: u64) -> u64 {
+    (value << 4) | 0xf
+}

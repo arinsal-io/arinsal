@@ -1,0 +1,17 @@
+[package]
+name = "arinsal-beam"
+description = ".beam file reader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arinsal-spec.workspace = true
+arinsal-etf.workspace = true
+num-bigint.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
