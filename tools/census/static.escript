@@ -4,7 +4,7 @@
 main(_) ->
     Root = filename:dirname(filename:dirname(filename:dirname(escript:script_name()))),
     Otp = code:root_dir(),
-    Elixir = os:getenv("CENSUS_ELIXIR_ROOT", "$HOME/.asdf/installs/elixir/1.20.4-otp-29"),
+    Elixir = os:getenv("ARINSAL_ELIXIR_ROOT", discover_elixir_root()),
     Files = lists:sort(filelib:wildcard(filename:join([Otp, "lib", "*", "ebin", "*.beam"])) ++
                        filelib:wildcard(filename:join([Elixir, "lib", "*", "ebin", "*.beam"]))),
     Spec = spec(filename:join([Root, "spec", "otp-29.1.1", "bif.tab"])),
@@ -196,3 +196,10 @@ boot_static(Otp,Files,Output,Spec,Nifs) ->
     Candidate = lists:usort([Key || {_,{M,F,A}=Key} <- Imports,
                                    erlang:is_builtin(M,F,A) orelse maps:is_key(Key,Spec)]),
     length(Candidate).
+
+discover_elixir_root() ->
+    Ebin = string:trim(os:cmd("elixir -e 'IO.write(:code.lib_dir(:elixir))' 2>/dev/null")),
+    case Ebin of
+        [] -> "";
+        _ -> filename:dirname(filename:dirname(Ebin))
+    end.

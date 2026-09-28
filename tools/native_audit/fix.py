@@ -10,7 +10,7 @@ new_acc = """## Acceptance
 - Candidates from the earlier agent verified: PASS. Each was matched properly as Class B or Class C.
 - Gate script: PASS
   ```
-  $ bash $HOME/dev/beam/.agents/gates/native_audit.sh
+  $ bash .agents/gates/native_audit.sh
   GATE PASS
   ```
 

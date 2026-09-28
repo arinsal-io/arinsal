@@ -756,11 +756,24 @@ fn collect(path: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
 
 fn check_all(dirs: &[String]) -> Result<(), String> {
     let dirs: Vec<String> = if dirs.is_empty() {
-        vec![
-            "$HOME/.asdf/installs/erlang/29.1.1/lib".into(),
-            "$HOME/.asdf/installs/erlang/29.1.1/erts-17.1".into(),
-            "$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib".into(),
-        ]
+        let mut roots = Vec::new();
+        if let Some(otp) = runtime_path("erl", "io:format(\"~s\",[code:root_dir()]),halt().") {
+            roots.push(otp.join("lib").display().to_string());
+            if let Ok(entries) = fs::read_dir(&otp) {
+                roots.extend(
+                    entries
+                        .flatten()
+                        .filter(|entry| entry.file_name().to_string_lossy().starts_with("erts-"))
+                        .map(|entry| entry.path().display().to_string()),
+                );
+            }
+        }
+        if let Some(elixir_ebin) = runtime_path("elixir", "IO.write(:code.lib_dir(:elixir))")
+            && let Some(lib) = elixir_ebin.parent().and_then(Path::parent)
+        {
+            roots.push(lib.display().to_string());
+        }
+        roots
     } else {
         dirs.to_vec()
     };
@@ -842,4 +855,22 @@ fn check_all(dirs: &[String]) -> Result<(), String> {
     }
     fs::remove_dir_all(work).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn runtime_path(program: &str, expression: &str) -> Option<PathBuf> {
+    let output = if program == "elixir" {
+        std::process::Command::new(program)
+            .args(["-e", expression])
+            .output()
+            .ok()?
+    } else {
+        std::process::Command::new(program)
+            .args(["-noshell", "-eval", expression])
+            .output()
+            .ok()?
+    };
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok().map(PathBuf::from)
 }

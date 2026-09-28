@@ -65,7 +65,7 @@ before running the task. Function-entry counts do not include loop backedges.
 
 ## Numbers
 
-M1 Pro, Rust 1.98.1, Cranelift 0.136.1. Five-run medians unless stated.
+Apple Silicon, Rust 1.98.1, Cranelift 0.136.1. Five-run medians unless stated.
 The host is shared; small differences are not decision-grade.
 
 | Probe | Result |

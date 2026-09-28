@@ -182,7 +182,11 @@ fn is_implemented(call: &Call, _kind: &str) -> bool {
 
 /// Every `bif.tab` entry (not only the ones the scenarios call) that no Arinsal table implements.
 fn bif_tab_missing(root: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(erts_root().join("beam/bif.tab"))?;
+    let Some(source) = std::env::var_os("ARINSAL_OTP_SRC").map(PathBuf::from) else {
+        eprintln!("Skipping bif.tab lookup: set ARINSAL_OTP_SRC to the OTP source tree");
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(source.join("erts/emulator/beam/bif.tab"))?;
     let mut missing = Vec::new();
     for line in text.lines().map(str::trim) {
         let mut parts = line.split_whitespace();
@@ -481,12 +485,21 @@ struct ErtsIndex {
     available: bool,
 }
 
-fn erts_root() -> PathBuf {
-    PathBuf::from("$HOME/dev/beam/ref/otp-29/erts/emulator")
+fn erts_root() -> Option<PathBuf> {
+    std::env::var_os("ARINSAL_OTP_SRC")
+        .map(PathBuf::from)
+        .map(|root| root.join("erts/emulator"))
 }
 
 fn erts_index() -> ErtsIndex {
-    let root = erts_root();
+    let Some(root) = erts_root().filter(|root| root.is_dir()) else {
+        eprintln!("Skipping erts source lookup: set ARINSAL_OTP_SRC to the OTP source tree");
+        return ErtsIndex {
+            functions: HashMap::new(),
+            nifs: Vec::new(),
+            available: false,
+        };
+    };
     let beam = root.join("beam");
     let nifs = root.join("nifs");
     let mut files = Vec::new();
@@ -643,7 +656,7 @@ fn default_c_name(module: &str, name: &str, arity: u8) -> String {
 }
 
 fn bif_alias(module: &str, name: &str, arity: u8) -> Option<String> {
-    let tab = erts_root().join("beam/bif.tab");
+    let tab = erts_root()?.join("beam/bif.tab");
     let text = std::fs::read_to_string(tab).ok()?;
     for line in text.lines() {
         let line = line.trim();

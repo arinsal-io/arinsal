@@ -70,7 +70,29 @@ fn installed_crypto_load_callback_succeeds() {
         eprintln!("skipping installed crypto test: macOS fixture");
         return;
     }
-    let root = PathBuf::from("$HOME/.asdf/installs/erlang/29.1.1/lib");
+    let root = std::env::var_os("ARINSAL_OTP_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let output = Command::new("erl")
+                .args([
+                    "-noshell",
+                    "-eval",
+                    "io:format(\"~s\",[code:root_dir()]),halt().",
+                ])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8(output.stdout).ok())
+                .flatten()
+                .map(PathBuf::from)
+        })
+        .map(|root| root.join("lib"));
+    let Some(root) = root else {
+        eprintln!("skipping installed crypto test: OTP root unavailable");
+        return;
+    };
     let Ok(versions) = std::fs::read_dir(root) else {
         eprintln!("skipping installed crypto test: OTP 29.1.1 missing");
         return;

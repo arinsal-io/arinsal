@@ -134,7 +134,7 @@ def machine_info():
     if platform.system() == "Darwin":
         info["cpu"] = version(["sysctl", "-n", "machdep.cpu.brand_string"])
         if info["cpu"] == "unavailable":
-            info["cpu"] = "Apple M1 Pro (machine specification)"
+            info["cpu"] = "Apple Silicon (machine specification)"
         info["macos"] = version(["sw_vers", "-productVersion"])
     else:
         info["cpu"] = platform.processor()
@@ -409,7 +409,7 @@ def main():
     parser.add_argument("--cooldown", type=float, default=2)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--machine", default="m1pro")
+    parser.add_argument("--machine", default="arm64")
     parser.add_argument("--no-history", action="store_true")
     parser.add_argument("--scoreboard", action="store_true")
     args = parser.parse_args()

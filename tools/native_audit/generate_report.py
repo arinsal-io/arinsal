@@ -132,7 +132,7 @@ with open("tools/native_audit/REPORT.md", "w") as f:
     
     f.write("## Acceptance\n\n")
     f.write("- Extracted all `IMPLEMENTED` declarations and match arms: PASS (evidence: grep / extract script output).\n")
-    f.write("- Classified each function against `bif.tab` and `ref/otp-29`: PASS (evidence: Table below).\n")
+    f.write("- Classified each function against `bif.tab` and OTP 29 source: PASS (evidence: Table below).\n")
     f.write("- Sorted table with Class C first: PASS.\n")
     f.write("- Handled candidates from the earlier agent: PASS (all verified, e.g. `code:which/1`, `ets:all/0`, `application:get_env/2` correctly categorized as Class C pure Erlang, `apply/2,3` as B).\n\n")
     
@@ -154,4 +154,3 @@ with open("tools/native_audit/REPORT.md", "w") as f:
     f.write("| --- | --- | --- | --- |\n")
     for r in records:
         f.write(f"| `{r[0]}` | {r[1]} | {r[2]} | `{r[3]}` |\n")
-

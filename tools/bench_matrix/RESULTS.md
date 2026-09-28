@@ -3,7 +3,7 @@
 - **Date**: 2026-09-28 (Mon Sep 28 03:45:03 CEST 2026)
 - **Git Commit**: `010cc68`
 - **Machine**:
-  - `hw.model`: `MacBookPro18,3` (Apple M1 Pro)
+  - `hw.model`: `Apple Silicon`
   - Cores: 10 cores (`hw.ncpu: 10`, 8 performance + 2 efficiency)
 - **Load Note**:
   - `uptime` before run: `03:45  up 19 days, 17:31, 3 users, load averages: 9.24 5.62 5.41`
@@ -94,7 +94,7 @@ By individual configuration row:
 - **Date**: 2026-09-27 (Sun Sep 27 16:31:54 CEST 2026)
 - **Git Commit**: `9c838cc`
 - **Machine**:
-  - `hw.model`: `MacBookPro18,3` (Apple M1 Pro)
+  - `hw.model`: `Apple Silicon`
   - Cores: 10 cores (`hw.ncpu: 10`, 8 performance + 2 efficiency)
 - **Load Note**:
   - `uptime` before run: `16:31  up 19 days,  6:17, 3 users, load averages: 2.34 1.88 2.18`

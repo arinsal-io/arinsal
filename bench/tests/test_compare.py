@@ -63,7 +63,7 @@ class HistoryTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
             (root / "tracked").write_text("clean\n")
             subprocess.run(["git", "add", "tracked"], cwd=root, check=True)
-            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@invalid",
                             "commit", "-qm", "seed"], cwd=root, check=True)
             clean_sha = compare.git_sha(root)
             (root / "tracked").write_text("dirty\n")

@@ -2,7 +2,7 @@
 
 ## Overview and Methodology
 
-- **Platform:** macOS arm64 (Apple M1 Pro), Erlang/OTP 29.1.1 bytecode.
+- **Platform:** macOS arm64 (Apple Silicon), Erlang/OTP 29.1.1 bytecode.
 - **Runtime:** Arinsal `release` build (`target/release/arinsal +S 1 -noshell`).
 - **Execution Mode:** Full OTP boot (not bare `eval`).
 - **Profiling Protocol:** For each kernel in `tools/bench_matrix/kernels.erl`, an endless loop driver is spawned with `arinsal +S 1 -noshell -pa <ebin> -eval 'bench_driver:loop(<kernel>).'`. After a 4 s warmup period to ensure steady-state execution, macOS `/usr/bin/sample <pid> 4` collects execution stacks at 1 ms intervals for 4 s (yielding ~3,000 total samples per kernel thread).

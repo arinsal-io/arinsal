@@ -21,7 +21,7 @@ This investigation identified and fixed the root causes in `make_ref/0`'s implem
 
 ## Benchmark Setup & Commands
 
-- **Hardware**: Apple M1 Pro (arm64, 8P + 2E cores), macOS 15.
+- **Hardware**: Apple Silicon (arm64, 8P + 2E cores), macOS 15.
 - **Reference**: Erlang/OTP 29.1.1, ERTS 17.1.
 - **Compiler**: Rust 1.98.1 (edition 2024), `release` profile.
 - **Benchmark Kernel**: `experiments/perf/a_make_ref/bench.erl`

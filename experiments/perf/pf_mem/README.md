@@ -25,7 +25,7 @@ and runs every Arinsal invocation under `timeout 300`. It compiles
 The Rust harness uses five internal repetitions and reports the median for
 each component. Run it multiple times when the machine is busy.
 
-Measured on M1 Pro, OTP 29.1.1, Rust 1.98.1, 2026-09-26, this worktree:
+Measured on Apple Silicon, OTP 29.1.1, Rust 1.98.1, 2026-09-26, this worktree:
 
 | BEAM kernel | erts ns/op | Arinsal ns/op |
 |---|---:|---:|

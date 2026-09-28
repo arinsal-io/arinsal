@@ -8,7 +8,7 @@ fn environment() -> BTreeMap<String, String> {
         ("ROOTDIR".into(), "/otp/from-wrapper".into()),
         ("BINDIR".into(), "/otp/from-wrapper/erts-17.1/bin".into()),
         ("PROGNAME".into(), "erl".into()),
-        ("HOME".into(), "/home/test".into()),
+        ("HOME".into(), "/tmp/arinsal-test-home".into()),
     ])
 }
 

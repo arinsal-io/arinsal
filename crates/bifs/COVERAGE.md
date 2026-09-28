@@ -17,7 +17,7 @@ Filename and printable-range results use the default OTP 29.1.1 emulator flags o
 
 The malformed random test excludes ETF internal atom references (`I` and `K` tags): they encode VM-local atom indexes, and the two VMs boot with different atom tables. Those tags are accepted when the index exists in Arinsal's table.
 
-On the Apple M1 Pro, a release test over 200 calls on a 1,035,238-byte tuple of 1,000 integer/binary pairs measured Arinsal at a median of 82.9 µs encode and 225.1 µs decode over three runs. The same term in OTP 29.1.1 measured a median of 60.0 µs encode and 132.1 µs decode over three 200-call runs. Arinsal is below the task's supplied 1,067/769 µs baseline for a different mixed term, but does not beat OTP on this identical workload.
+On Apple Silicon, a release test over 200 calls on a 1,035,238-byte tuple of 1,000 integer/binary pairs measured Arinsal at a median of 82.9 µs encode and 225.1 µs decode over three runs. The same term in OTP 29.1.1 measured a median of 60.0 µs encode and 132.1 µs decode over three 200-call runs. Arinsal is below the task's supplied 1,067/769 µs baseline for a different mixed term, but does not beat OTP on this identical workload.
 
 ## Implemented
 

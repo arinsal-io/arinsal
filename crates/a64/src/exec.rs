@@ -1,6 +1,6 @@
 //! Executable memory: MAP_JIT, W^X toggling and instruction-cache flush.
 //!
-//! Port of `ref/otp-29/erts/emulator/beam/jit/beam_jit_main.cpp` allocator setup,
+//! Port of OTP 29.1.1 `erts/emulator/beam/jit/beam_jit_main.cpp` allocator setup,
 //! macOS single-mapping path (task 3 of `docs/arch/beamasm-port.md`).
 
 use core::fmt;

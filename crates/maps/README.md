@@ -61,7 +61,7 @@ crosses the term heap, interpreter/JIT, process messaging, ETS, and GC. Until
 those invariants are enforced and differentially tested, persistent copying is
 the sound fallback.
 
-On this worktree's Apple M1 Pro, with 200,000 existing-key updates (five consecutive release-example runs):
+On Apple Silicon, with 200,000 existing-key updates (five consecutive release-example runs):
 
 | Implementation | Keys | Median time | ns/update |
 | --- | ---: | ---: | ---: |

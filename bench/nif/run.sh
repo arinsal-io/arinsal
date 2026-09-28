@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Вартість мосту Erlang <-> NIF: порожній виклик, add, dirty, бінарні дані, список.
+# Erlang-to-NIF bridge cost: empty call, add, dirty, binary data, and list.
 set -e
 cd "$(dirname "$0")"
 INC=$(erl -noshell -eval 'io:format("~s/usr/include",[code:root_dir()]), halt().')

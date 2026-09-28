@@ -3,13 +3,19 @@
 import re
 import statistics
 import subprocess
+import os
+import sys
 import tempfile
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 TEMP = ROOT / "tmp/jit_backend_adr"
-PRELOADED = ROOT / "ref/otp-29/erts/preloaded/ebin"
+OTP_SRC = Path(os.environ["ARINSAL_OTP_SRC"]) if os.environ.get("ARINSAL_OTP_SRC") else None
+if OTP_SRC is None or not (OTP_SRC / "erts/preloaded/ebin").is_dir():
+    print("Skipping OTP boot scan: set ARINSAL_OTP_SRC to the OTP source tree", file=sys.stderr)
+    raise SystemExit(0)
+PRELOADED = OTP_SRC / "erts/preloaded/ebin"
 SCAN = ROOT / "experiments/perf/jit_backend_adr/target/release/jit-backend-adr"
 
 

@@ -384,7 +384,20 @@ impl Vm {
         paths.push(PathBuf::from("bench/out/ebin"));
         let otp = std::env::var_os("ARINSAL_OTP_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("$HOME/.asdf/installs/erlang/29.1.1"));
+            .or_else(|| {
+                std::process::Command::new("erl")
+                    .args([
+                        "-noshell",
+                        "-eval",
+                        "io:format(\"~s\",[code:root_dir()]),halt().",
+                    ])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_default();
         if let Ok(entries) = std::fs::read_dir(otp.join("lib")) {
             let mut dirs: Vec<_> = entries
                 .filter_map(Result::ok)

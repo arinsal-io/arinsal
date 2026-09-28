@@ -8,7 +8,26 @@ use arinsal_etf::OwnedTerm;
 use arinsal_vm::Vm;
 
 fn otp_include() -> PathBuf {
-    PathBuf::from("$HOME/.asdf/installs/erlang/29.1.1/usr/include")
+    let root = std::env::var_os("ARINSAL_OTP_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let output = Command::new("erl")
+                .args([
+                    "-noshell",
+                    "-eval",
+                    "io:format(\"~s\",[code:root_dir()]),halt().",
+                ])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8(output.stdout).ok())
+                .flatten()
+                .map(PathBuf::from)
+        })
+        .expect("OTP root: set ARINSAL_OTP_ROOT or put erl on PATH");
+    root.join("usr/include")
 }
 
 fn work_dir(name: &str) -> PathBuf {

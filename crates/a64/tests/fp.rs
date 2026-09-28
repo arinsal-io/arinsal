@@ -79,7 +79,7 @@ fn clang_assembled_fp_and_d_memory_golden_words() {
 
 #[test]
 fn every_fp_simd_mnemonic_found_in_beamasm_sources_is_encodable() {
-    // Inventory from `rg -o '\ba\.[A-Za-z_][A-Za-z_0-9]*\\s*\\(' ref/otp-29/erts/emulator/beam/jit/arm -g '*.cpp' -g '*.hpp'`.
+    // Inventory from OTP's ARM64 assembler instruction sources.
     // The source uses ldr/str/ldp/stp for GP and SIMD registers, so exercise SIMD forms here.
     let source_mnemonics = [
         "fabs", "fcmp", "fcmpe", "fmov", "fneg", "scvtf", "cnt", "addv", "movi", "ldr", "str",

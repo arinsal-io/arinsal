@@ -12,7 +12,7 @@ for i in $(seq 1 21); do timeout 30 experiments/perf/safety_research/target/rele
 xcrun llvm-objdump --disassemble --demangle experiments/perf/safety_research/target/release/safety-research
 ```
 
-Apple M1 Pro arm64, Rust 1.98.1 `--release`, 21 independent processes, each with one warmup and eight timed repetitions. Medians below are medians of the 21 per-process medians; range is across processes. One operation is one tuple-plus-cons pair, one register update, or one byte. The heap workloads use 8,000 operations; register and byte workloads use 1,638,400 and 3,276,800 operations per timed repetition respectively. Other agents were active on the shared machine; interpret differences smaller than the process range cautiously.
+Apple Silicon arm64, Rust 1.98.1 `--release`, 21 independent processes, each with one warmup and eight timed repetitions. Medians below are medians of the 21 per-process medians; range is across processes. One operation is one tuple-plus-cons pair, one register update, or one byte. The heap workloads use 8,000 operations; register and byte workloads use 1,638,400 and 3,276,800 operations per timed repetition respectively. Other agents were active on the shared machine; interpret differences smaller than the process range cautiously.
 
 | Case | Median ns/op | Process range ns/op | Statically counted steady-loop instructions/op |
 | --- | ---: | ---: | ---: |

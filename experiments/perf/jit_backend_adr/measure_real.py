@@ -7,8 +7,14 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-OTP = Path("$HOME/.asdf/installs/erlang/29.1.1/lib")
-ELIXIR = Path("$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib")
+OTP_ROOT = Path(os.environ.get("ARINSAL_OTP_ROOT") or subprocess.check_output(
+    ["erl", "-noshell", "-eval", 'io:format("~s",[code:root_dir()]),halt().'], text=True
+))
+ELIXIR_ROOT = Path(os.environ.get("ARINSAL_ELIXIR_ROOT") or subprocess.check_output(
+    ["elixir", "-e", "IO.write(Path.dirname(Path.dirname(:code.lib_dir(:elixir))))"], text=True
+))
+OTP = OTP_ROOT / "lib"
+ELIXIR = ELIXIR_ROOT / "lib"
 CORPUS = sorted(
     list(OTP.glob("kernel-*/ebin/*.beam"))
     + list(OTP.glob("stdlib-*/ebin/*.beam"))

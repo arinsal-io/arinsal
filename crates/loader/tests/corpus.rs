@@ -19,14 +19,19 @@ fn otp_and_elixir_corpus_loads() {
     let roots = [
         std::env::var_os("ARINSAL_OTP_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("$HOME/.asdf/installs/erlang/29.1.1")),
+            .or_else(|| discover("erl", "io:format(\"~s\",[code:root_dir()]),halt().")),
         std::env::var_os("ARINSAL_ELIXIR_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("$HOME/.asdf/installs/elixir/1.20.4-otp-29")),
+            .or_else(|| {
+                discover(
+                    "elixir",
+                    "IO.write(Path.dirname(Path.dirname(:code.lib_dir(:elixir))))",
+                )
+            }),
     ];
     let mut files = Vec::new();
-    for root in &roots {
-        beams(root, &mut files);
+    for root in roots.into_iter().flatten() {
+        beams(&root, &mut files);
     }
     if files.is_empty() {
         eprintln!("OTP and Elixir BEAM corpus absent; skipping");
@@ -50,4 +55,24 @@ fn otp_and_elixir_corpus_loads() {
         start.elapsed().as_secs_f64(),
         unsupported
     );
+}
+
+fn discover(program: &str, expression: &str) -> Option<PathBuf> {
+    let output = if program == "elixir" {
+        std::process::Command::new(program)
+            .args(["-e", expression])
+            .output()
+            .ok()?
+    } else {
+        std::process::Command::new(program)
+            .args(["-noshell", "-eval", expression])
+            .output()
+            .ok()?
+    };
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+        .map(PathBuf::from)
 }

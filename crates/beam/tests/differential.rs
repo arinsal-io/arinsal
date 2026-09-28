@@ -4,6 +4,8 @@ use std::{
     process::Command,
 };
 
+mod support;
+
 fn collect(path: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(path) else {
         return;
@@ -21,14 +23,12 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn sample_matches_beam_lib_and_disasm() {
     let mut paths = Vec::new();
-    collect(
-        Path::new("$HOME/.asdf/installs/erlang/29.1.1/lib"),
-        &mut paths,
-    );
-    collect(
-        Path::new("$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib"),
-        &mut paths,
-    );
+    if let Some(otp) = support::otp_root() {
+        collect(&otp.join("lib"), &mut paths);
+    }
+    if let Some(elixir) = support::elixir_lib() {
+        collect(&elixir, &mut paths);
+    }
     if paths.is_empty() {
         eprintln!("installed OTP/Elixir absent; skipping");
         return;

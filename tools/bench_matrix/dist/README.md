@@ -41,7 +41,7 @@ nested_tuple_20 | erpc |         32 |        440 |      31364 |      82847
 
 ### arinsal <-> arinsal
 
-Measured on Apple M1 Pro via `dist_net` gate (2000 pid echo RTTs + `erpc:call`):
+Measured on Apple Silicon via `dist_net` gate (2000 pid echo RTTs + `erpc:call`):
 
 Payload         | Mode |    RTT Med |    RTT p99 |       Tp 1 |      Tp 16
 ----------------------------------------------------------------------

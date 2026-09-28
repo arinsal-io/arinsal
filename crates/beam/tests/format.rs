@@ -4,8 +4,10 @@ use flate2::{
 };
 use std::{fs, io::Write};
 
+mod support;
+
 fn lists() -> Option<Vec<u8>> {
-    let path = "$HOME/.asdf/installs/erlang/29.1.1/lib/stdlib-8.1/ebin/lists.beam";
+    let path = support::otp_root()?.join("lib/stdlib-8.1/ebin/lists.beam");
     match fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(_) => {

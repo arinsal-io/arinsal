@@ -16,7 +16,9 @@ the full Arinsal VM.
 python3 experiments/perf/pf_exec/measure.py --runs 5
 CARGO_TARGET_DIR=target cargo run --manifest-path experiments/perf/pf_exec/Cargo.toml --release --bin pf-exec-probe -- 200000
 CARGO_TARGET_DIR=target cargo run --manifest-path experiments/perf/pf_exec/Cargo.toml --release --bin pf-exec-probe -- --compile-scale
-CARGO_TARGET_DIR=target cargo run --manifest-path experiments/perf/pf_exec/Cargo.toml --release --bin coverage -- $HOME/.asdf/installs/erlang/29.1.1/lib $HOME/.asdf/installs/elixir/1.20.4-otp-29
+OTP_LIB="${ARINSAL_OTP_ROOT:-$(erl -noshell -eval 'io:format("~s",[code:root_dir()]),halt().')}/lib"
+ELIXIR_LIB="${ARINSAL_ELIXIR_ROOT:-$(elixir -e 'IO.write(Path.dirname(Path.dirname(:code.lib_dir(:elixir))))')}/lib"
+CARGO_TARGET_DIR=target cargo run --manifest-path experiments/perf/pf_exec/Cargo.toml --release --bin coverage -- "$OTP_LIB" "$ELIXIR_LIB"
 ```
 
 Build `target/release/arinsal` with `cargo build --release -p arinsal-cli`
@@ -42,7 +44,7 @@ experimental backend and is **not** wired into Arinsal.
 
 ## Results
 
-M1 Pro, Rust 1.98.1, OTP 29.1.1. Below are representative medians from three
+Apple Silicon, Rust 1.98.1, OTP 29.1.1. Below are representative medians from three
 back-to-back runs at N=200,000; fib uses fib(22). Unit means one recursive
 fib call, one list element, or one tail/tuple/binary loop step. The binary
 model processes 4N bytes. Timings exclude compilation and input cloning.

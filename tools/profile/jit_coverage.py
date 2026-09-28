@@ -329,7 +329,16 @@ def code_paths() -> list[str]:
     ebin = DEMO / "_build/bench/lib/arinsal_demo/ebin"
     if not ebin.is_dir():
         raise SystemExit(f"missing {ebin}; run compare or mix compile MIX_ENV=bench first")
-    elixir = Path("$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib")
+    configured = os.environ.get("ARINSAL_ELIXIR_ROOT")
+    if configured:
+        elixir = Path(configured)
+        if elixir.name != "lib":
+            elixir = elixir / "lib"
+    else:
+        ebin = subprocess.check_output(
+            ["elixir", "-e", "IO.write(:code.lib_dir(:elixir))"], text=True
+        )
+        elixir = Path(ebin).parent.parent
     dirs = [ebin, OUT]
     if elixir.is_dir():
         dirs.extend(path / "ebin" for path in sorted(elixir.iterdir()) if (path / "ebin").is_dir())

@@ -110,7 +110,7 @@ ARINSAL_JIT=0 timeout 120 target/release/arinsal -noshell -pa experiments/perf/a
 
 ## 3. Results Table: ns / sort (1,000 Integers)
 
-Measured on Apple M1 Pro (macOS):
+Measured on Apple Silicon (macOS):
 
 | Input Shape | ERTS (29.1.1) | Arinsal Default JIT | Arinsal JIT Off (`ARINSAL_JIT=0`) | Slowdown (Default vs ERTS) |
 |---|---|---|---|---|

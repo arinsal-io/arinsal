@@ -30,7 +30,33 @@ fn otp29_jit_specific_op_names_and_argument_types() {
         .collect::<Vec<_>>();
     let dir = std::env::temp_dir().join(format!("arinsal-beamops-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let elixir = "$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib/elixir/ebin";
+    let elixir = std::env::var_os("ARINSAL_ELIXIR_ROOT")
+        .map(std::path::PathBuf::from)
+        .map(|root| {
+            if root.ends_with("ebin") {
+                root
+            } else if root.ends_with("lib") {
+                root.join("elixir/ebin")
+            } else {
+                root.join("lib/elixir/ebin")
+            }
+        })
+        .or_else(|| {
+            let output = Command::new("elixir")
+                .args(["-e", "IO.write(:code.lib_dir(:elixir))"])
+                .output()
+                .ok()?;
+            output
+                .status
+                .success()
+                .then(|| String::from_utf8(output.stdout).ok())
+                .flatten()
+                .map(std::path::PathBuf::from)
+        });
+    let Some(elixir) = elixir.filter(|path| path.exists()) else {
+        eprintln!("Elixir unavailable; skipping beamops differential test");
+        return;
+    };
     let atoms = modules
         .iter()
         .map(|m| format!("'{}'", m))
@@ -40,8 +66,9 @@ fn otp29_jit_specific_op_names_and_argument_types() {
         "Ms=[{atoms}], lists:foreach(fun(M) -> code:ensure_loaded(M) end, Ms), lists:foreach(fun(M) -> io:format(\"BEAM|~s|~s~n\", [M, code:which(M)]) end, Ms), halt()."
     );
     let status = Command::new("erl")
-        .args(["+JDdump", "true", "-noshell", "-pa", elixir, "-eval", &eval])
-        .env("PATH", format!("$HOME/.asdf/installs/erlang/29.1.1/bin:$HOME/.asdf/installs/elixir/1.20.4-otp-29/bin:{}", std::env::var("PATH").unwrap_or_default()))
+        .args(["+JDdump", "true", "-noshell", "-pa"])
+        .arg(&elixir)
+        .args(["-eval", &eval])
         .current_dir(&dir)
         .output()
         .unwrap();

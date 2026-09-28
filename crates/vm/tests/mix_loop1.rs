@@ -109,8 +109,7 @@ fn code_path_autoload_matches_otp() {
         "-module(mix_loop1_autoload). -export([run/0]). run() -> loaded.\n",
     )
     .unwrap();
-    let otp_bin = "$HOME/.asdf/installs/erlang/29.1.1/bin";
-    let compiled = std::process::Command::new(format!("{otp_bin}/erlc"))
+    let compiled = std::process::Command::new("erlc")
         .arg("-o")
         .arg(&dir)
         .arg(&source)
@@ -128,7 +127,7 @@ fn code_path_autoload_matches_otp() {
         dir.display(),
         expected_out.display()
     );
-    let erl = std::process::Command::new(format!("{otp_bin}/erl"))
+    let erl = std::process::Command::new("erl")
         .args(["-noshell", "-eval", &expected_expr])
         .status()
         .expect("erl");

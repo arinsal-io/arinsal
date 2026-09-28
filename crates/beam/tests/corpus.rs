@@ -4,6 +4,8 @@ use std::{
     time::Instant,
 };
 
+mod support;
+
 fn files(path: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(path) else {
         return;
@@ -21,18 +23,20 @@ fn files(path: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn parse_installed_beams() {
     let mut paths = Vec::new();
-    files(
-        Path::new("$HOME/.asdf/installs/erlang/29.1.1/lib"),
-        &mut paths,
-    );
-    files(
-        Path::new("$HOME/.asdf/installs/erlang/29.1.1/erts-17.1"),
-        &mut paths,
-    );
-    files(
-        Path::new("$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib"),
-        &mut paths,
-    );
+    if let Some(otp) = support::otp_root() {
+        files(&otp.join("lib"), &mut paths);
+        if let Ok(entries) = fs::read_dir(&otp) {
+            for entry in entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("erts-"))
+            {
+                files(&entry.path(), &mut paths);
+            }
+        }
+    }
+    if let Some(elixir) = support::elixir_lib() {
+        files(&elixir, &mut paths);
+    }
     if paths.is_empty() {
         eprintln!("installed OTP/Elixir corpus absent; skipping");
         return;
@@ -60,7 +64,11 @@ fn parse_installed_beams() {
 
 #[test]
 fn malformed_inputs_do_not_panic() {
-    let path = "$HOME/.asdf/installs/erlang/29.1.1/lib/stdlib-8.1/ebin/lists.beam";
+    let Some(path) = support::otp_root().map(|root| root.join("lib/stdlib-8.1/ebin/lists.beam"))
+    else {
+        eprintln!("OTP unavailable; skipping malformed-input corpus test");
+        return;
+    };
     let Ok(bytes) = fs::read(path) else {
         eprintln!("lists.beam absent; skipping");
         return;
@@ -85,14 +93,12 @@ fn malformed_inputs_do_not_panic() {
 #[test]
 fn decode_all_installed_literals() {
     let mut paths = Vec::new();
-    files(
-        Path::new("$HOME/.asdf/installs/erlang/29.1.1/lib"),
-        &mut paths,
-    );
-    files(
-        Path::new("$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib"),
-        &mut paths,
-    );
+    if let Some(otp) = support::otp_root() {
+        files(&otp.join("lib"), &mut paths);
+    }
+    if let Some(elixir) = support::elixir_lib() {
+        files(&elixir, &mut paths);
+    }
     for path in paths {
         let bytes = fs::read(path).unwrap();
         let beam = arinsal_beam::parse(&bytes).unwrap();

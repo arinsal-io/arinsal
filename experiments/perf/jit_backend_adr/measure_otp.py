@@ -8,12 +8,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 TEMP = ROOT / "tmp/jit_backend_adr"
-OTP = Path("$HOME/.asdf/installs/erlang/29.1.1")
-ELIXIR = Path("$HOME/.asdf/installs/elixir/1.20.4-otp-29")
+OTP = Path(os.environ.get("ARINSAL_OTP_ROOT") or subprocess.check_output(
+    ["erl", "-noshell", "-eval", 'io:format("~s",[code:root_dir()]),halt().'], text=True
+))
+ELIXIR = Path(os.environ.get("ARINSAL_ELIXIR_ROOT") or subprocess.check_output(
+    ["elixir", "-e", "IO.write(Path.dirname(Path.dirname(:code.lib_dir(:elixir))))"], text=True
+))
 MODULES = [
-    ("compile", OTP / "lib/compiler-10.0.6/ebin"),
-    ("beam_ssa_opt", OTP / "lib/compiler-10.0.6/ebin"),
-    ("beam_ssa_codegen", OTP / "lib/compiler-10.0.6/ebin"),
+    ("compile", next((OTP / "lib").glob("compiler-*/ebin"))),
+    ("beam_ssa_opt", next((OTP / "lib").glob("compiler-*/ebin"))),
+    ("beam_ssa_codegen", next((OTP / "lib").glob("compiler-*/ebin"))),
     ("elixir_expand", ELIXIR / "lib/elixir/ebin"),
 ]
 

@@ -324,8 +324,10 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
     let root_dir = root_override
         .clone()
         .or_else(|| env.get("ROOTDIR"))
+        .or_else(|| env.get("ARINSAL_OTP_ROOT"))
         .or_else(|| infer_root(argv.first().copied().unwrap_or("")))
-        .unwrap_or_else(|| "$HOME/.asdf/installs/erlang/29.1.1".into());
+        .or_else(discover_otp_root)
+        .unwrap_or_default();
     let bin_dir = root_override
         .map(|root| format!("{root}/erts-17.1/bin"))
         .or_else(|| env.get("BINDIR"))
@@ -506,6 +508,21 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
         set_env,
         boot_args,
     })
+}
+
+fn discover_otp_root() -> Option<String> {
+    let output = std::process::Command::new("erl")
+        .args([
+            "-noshell",
+            "-eval",
+            "io:format(\"~s\",[code:root_dir()]),halt().",
+        ])
+        .output()
+        .ok()?;
+    (output.status.success())
+        .then(|| String::from_utf8(output.stdout).ok())
+        .flatten()
+        .filter(|root| !root.is_empty())
 }
 
 fn infer_root(executable: &str) -> Option<String> {

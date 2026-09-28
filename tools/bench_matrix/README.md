@@ -132,9 +132,9 @@ Each kernel is implemented with equivalent semantics across Erlang and Go:
       - Go: `GOMAXPROCS=1` (single OS thread executing goroutines).
       - Arinsal: `+S 1` / `--schedulers 1` flag on `arinsal eval` (configures 1 scheduler worker in `arinsal-sched`).
     - **Default schedulers (`default`)**:
-      - ERTS: default 10 schedulers on Apple M1 Pro (10 logical cores).
-      - Go: default `GOMAXPROCS=10` on Apple M1 Pro.
-      - Arinsal: default worker count (`available_parallelism().saturating_sub(2).max(1)` = 8 on Apple M1 Pro).
+      - ERTS: default 10 schedulers on Apple Silicon (10 logical cores).
+      - Go: default `GOMAXPROCS=10` on Apple Silicon.
+      - Arinsal: default worker count (`available_parallelism().saturating_sub(2).max(1)` = 8 on Apple Silicon).
 - **Reporting**: Reports median and `min..max` spread for each runtime in nanoseconds per operation (`ns/op`), plus relative performance ratios against ERTS under the matching scheduler configuration. The table includes a dedicated `sched` column.
 - **Correctness Verification**: Every runtime's return value is verified against an expected checksum. If any runtime produces an incorrect checksum, `MISMATCH` is reported.
 - **Dead-Code Elimination**: Go results are accumulated into an exported sink (`Sink`) and asserted against expected values.
@@ -201,7 +201,7 @@ target/release/arinsal eval -pa tmp/bench_matrix/ebin spawn_probe run
 target/release/arinsal eval +S 1 -pa tmp/bench_matrix/ebin spawn_probe run
 ```
 
-### Probe Results (Apple M1 Pro, median of 5 repeats, in-process timer:tc)
+### Probe Results (Apple Silicon, median of 5 repeats, in-process timer:tc)
 
 | Variant | Description | ERTS (+S 1:1) | ERTS (default) | Arinsal full boot (+S 1) | Arinsal full boot (default) | Arinsal bare eval (no OTP boot) (+S 1) | Arinsal bare eval (no OTP boot) (default) |
 |---|---|---|---|---|---|---|---|
@@ -222,7 +222,7 @@ target/release/arinsal eval +S 1 -pa tmp/bench_matrix/ebin spawn_probe run
 
 ## Spawn Breakdown: Where Does Arinsal's Spawn Time Go?
 
-To break down where Arinsal's spawn overhead originates compared to ERTS, probe `tools/bench_matrix/probes/spawn_breakdown.erl` measures isolated constituent variants across 100,000 operations (`N = 100,000`), using median in-process `timer:tc` across 5 repetitions under both single-scheduler (`+S 1` / `+S 1:1`) and default multi-core scheduler configurations on macOS Apple M1 Pro.
+To break down where Arinsal's spawn overhead originates compared to ERTS, probe `tools/bench_matrix/probes/spawn_breakdown.erl` measures isolated constituent variants across 100,000 operations (`N = 100,000`), using median in-process `timer:tc` across 5 repetitions under both single-scheduler (`+S 1` / `+S 1:1`) and default multi-core scheduler configurations on macOS Apple Silicon.
 
 ### Breakdown Variants
 
@@ -235,9 +235,9 @@ To break down where Arinsal's spawn overhead originates compared to ERTS, probe 
 7. **(f) exit to DOWN**: Pre-spawns 100k monitored blocked processes; measures time from `exit(P, kill)` to receiving all 100k `{'DOWN', ...}` messages.
 8. **(g) processes() length**: Pre-spawns 100k live blocked processes; measures time to execute `length(erlang:processes())` (sanity check: verified 100,043 on ERTS and 100,001 on Arinsal).
 
-### Measurement Results (Apple M1 Pro, median of 5 repeats, in-process timer:tc)
+### Measurement Results (Apple Silicon, median of 5 repeats, in-process timer:tc)
 
-### Measurement Results (Apple M1 Pro, median of 5 repeats, in-process timer:tc)
+### Measurement Results (Apple Silicon, median of 5 repeats, in-process timer:tc)
 
 | Variant | Description | ERTS (+S 1:1) | ERTS (default) | Arinsal full boot (+S 1) | Arinsal full boot (default) | Arinsal bare eval (no OTP boot) (+S 1) | Arinsal bare eval (no OTP boot) (default) |
 |---|---|---|---|---|---|---|---|

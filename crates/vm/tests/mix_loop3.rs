@@ -14,9 +14,8 @@ fn deleted_module_autoloads_replacement() {
         |body: &str| format!("-module(mix_loop3_reload). -export([run/0]). run() -> {body}.\n");
     std::fs::write(first.join("mix_loop3_reload.erl"), source("1")).unwrap();
     std::fs::write(second.join("mix_loop3_reload.erl"), source("2")).unwrap();
-    let otp_bin = "$HOME/.asdf/installs/erlang/29.1.1/bin";
     for dir in [&first, &second] {
-        let compiled = std::process::Command::new(format!("{otp_bin}/erlc"))
+        let compiled = std::process::Command::new("erlc")
             .arg("-o")
             .arg(dir)
             .arg(dir.join("mix_loop3_reload.erl"))
@@ -30,7 +29,7 @@ fn deleted_module_autoloads_replacement() {
         "-module(native_code_load). -export([value/0]). value() -> loaded.\n",
     )
     .unwrap();
-    let loader_compiled = std::process::Command::new(format!("{otp_bin}/erlc"))
+    let loader_compiled = std::process::Command::new("erlc")
         .arg("-o")
         .arg(&first)
         .arg(&loader_source)
@@ -43,7 +42,7 @@ fn deleted_module_autoloads_replacement() {
         "-module(native_code_load2). -export([value/0]). value() -> loaded.\n",
     )
     .unwrap();
-    let loader2_compiled = std::process::Command::new(format!("{otp_bin}/erlc"))
+    let loader2_compiled = std::process::Command::new("erlc")
         .arg("-o")
         .arg(&first)
         .arg(&loader2_source)
@@ -62,7 +61,7 @@ fn deleted_module_autoloads_replacement() {
     };
     let expected_out = root.join("expected");
     let actual_out = root.join("actual");
-    let erl = std::process::Command::new(format!("{otp_bin}/erl"))
+    let erl = std::process::Command::new("erl")
         .args(["-noshell", "-eval", &expr(&expected_out)])
         .status()
         .expect("erl");

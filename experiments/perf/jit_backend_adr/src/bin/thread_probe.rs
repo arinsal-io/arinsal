@@ -53,18 +53,26 @@ fn median(mut samples: Vec<f64>) -> f64 {
 
 fn main() {
     let mut files = Vec::new();
-    let otp = Path::new("$HOME/.asdf/installs/erlang/29.1.1/lib");
-    for pattern in [
-        "kernel-11.0.4/ebin",
-        "stdlib-8.1/ebin",
-        "compiler-10.0.6/ebin",
-    ] {
-        collect(&otp.join(pattern), &mut files);
+    let otp = std::env::var_os("ARINSAL_OTP_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| discover("erl", "io:format(\"~s\",[code:root_dir()]),halt()."));
+    let Some(otp) = otp else {
+        eprintln!("Skipping thread probe: erl is unavailable and ARINSAL_OTP_ROOT is unset");
+        return;
+    };
+    let otp_lib = otp.join("lib");
+    for app in ["kernel", "stdlib", "compiler"] {
+        if let Some(ebin) = std::fs::read_dir(&otp_lib).ok().into_iter().flatten()
+            .flatten().map(|entry| entry.path())
+            .find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(&format!("{app}-"))))
+            .map(|path| path.join("ebin"))
+        {
+            collect(&ebin, &mut files);
+        }
     }
-    collect(
-        Path::new("$HOME/.asdf/installs/elixir/1.20.4-otp-29/lib/elixir/ebin"),
-        &mut files,
-    );
+    if let Some(ebin) = discover("elixir", "IO.write(:code.lib_dir(:elixir))") {
+        collect(&ebin, &mut files);
+    }
     files.sort();
     for workers in [1, 2] {
         let mut queued = Vec::new();
@@ -98,4 +106,13 @@ fn main() {
             walls.iter().copied().reduce(f64::max).unwrap(),
         );
     }
+}
+
+fn discover(program: &str, expression: &str) -> Option<PathBuf> {
+    let output = if program == "elixir" {
+        std::process::Command::new(program).args(["-e", expression]).output().ok()?
+    } else {
+        std::process::Command::new(program).args(["-noshell", "-eval", expression]).output().ok()?
+    };
+    output.status.success().then(|| String::from_utf8(output.stdout).ok()).flatten().map(PathBuf::from)
 }

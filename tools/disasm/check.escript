@@ -3,6 +3,17 @@
 %% Compare parsed Erlang terms, reporting the first operand-level difference.
 
 main([Manifest, DumpDir, RenderDir]) ->
+    case os:getenv("ARINSAL_OTP_SRC") of
+        false ->
+            io:format(standard_error, "Skipping raw disassembler check: set ARINSAL_OTP_SRC to the OTP source tree~n", []),
+            halt(0);
+        _ -> ok
+    end,
+    SourceDir = filename:join([os:getenv("ARINSAL_OTP_SRC"), "lib", "compiler", "src"]),
+    case filelib:is_dir(SourceDir) of
+        false -> io:format(standard_error, "Skipping raw disassembler check: OTP compiler source not found under ARINSAL_OTP_SRC~n", []), halt(0);
+        true -> ok
+    end,
     ok = load_raw_type_index_disassembler(DumpDir),
     {ok, Bytes} = file:read_file(Manifest),
     Paths = [binary_to_list(P) || P <- binary:split(Bytes, <<"\n">>, [global]), P =/= <<>>],
@@ -83,7 +94,7 @@ compare_instrs(Is, Js, _, N) -> {instruction_count, N, length(Is), length(Js)}.
 %% A temporary copy with that single substitution removed checks the exact
 %% encoded indices without changing the reference implementation on disk.
 load_raw_type_index_disassembler(WorkDir) ->
-    SourceDir = "$HOME/dev/beam/ref/otp-29/lib/compiler/src",
+    SourceDir = filename:join([os:getenv("ARINSAL_OTP_SRC"), "lib", "compiler", "src"]),
     Source = filename:join(SourceDir, "beam_disasm.erl"),
     {ok, Bytes} = file:read_file(Source),
     M1 = binary:replace(Bytes, <<"-module(beam_disasm).">>, <<"-module(beam_disasm_raw).">>),
@@ -98,7 +109,7 @@ load_raw_type_index_disassembler(WorkDir) ->
     true = M3 =/= M2,
     Copy = filename:join(WorkDir, "beam_disasm_raw.erl"),
     ok = file:write_file(Copy, M3),
-    Installed = "$HOME/.asdf/installs/erlang/29.1.1/lib/compiler-10.0.6/src",
+    Installed = code:lib_dir(compiler, src),
     {ok, beam_disasm_raw, Binary} = compile:file(Copy, [binary, {i, SourceDir}, {i, Installed}]),
     {module, beam_disasm_raw} = code:load_binary(beam_disasm_raw, Copy, Binary),
     ok.

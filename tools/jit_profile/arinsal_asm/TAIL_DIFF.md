@@ -16,11 +16,11 @@ Both immediate arithmetic hot paths now match OTP's `adds/subs`, tag check, `ccm
 
 ## Implementation evidence
 
-- Exact equality and inequality against a tagged small integer or atom immediate emit a direct compare and failure branch without entering the Rust guard helper. The implementation is in `crates/beamasm/src/guard.rs`; OTP's exact-comparison immediate path is `ref/otp-29/erts/emulator/beam/jit/arm/instr_common.cpp:1844-1856`.
-- Relative `is_lt` and `is_ge` guards compare directly when one operand is a small-integer immediate and the other is a small at runtime; non-small terms use the shared guard helper. OTP's corresponding immediate comparison path is in `ref/otp-29/erts/emulator/beam/jit/arm/instr_common.cpp:2179-2355`.
-- Immediate `i_plus`, `i_minus` and `i_increment` compute directly on tagged values. `ccmp` selects the fast path only when the source is a small integer and the signed operation did not overflow. Non-small operands and overflow enter the existing arithmetic helper. The implementation is in `crates/beamasm/src/arith.rs`; OTP's implementation is in `ref/otp-29/erts/emulator/beam/jit/arm/instr_arith.cpp:145-204,334-392`.
+- Exact equality and inequality against a tagged small integer or atom immediate emit a direct compare and failure branch without entering the Rust guard helper. The implementation is in `crates/beamasm/src/guard.rs`; OTP's exact-comparison immediate path is in `erts/emulator/beam/jit/arm/instr_common.cpp:1844-1856`.
+- Relative `is_lt` and `is_ge` guards compare directly when one operand is a small-integer immediate and the other is a small at runtime; non-small terms use the shared guard helper. OTP's corresponding immediate comparison path is in `erts/emulator/beam/jit/arm/instr_common.cpp:2179-2355`.
+- Immediate `i_plus`, `i_minus` and `i_increment` compute directly on tagged values. `ccmp` selects the fast path only when the source is a small integer and the signed operation did not overflow. Non-small operands and overflow enter the existing arithmetic helper. The implementation is in `crates/beamasm/src/arith.rs`; OTP's implementation is in `erts/emulator/beam/jit/arm/instr_arith.cpp:145-204,334-392`.
 - `tools/jit_profile/arinsal_asm/kernels.asm` was regenerated with `ARINSAL_BEAMASM_DUMP` using OTP 29.1.1's gate `kernels.erl`.
 
 ## Remaining difference
 
-`i_call_only` executes one additional conditional reduction branch in Arinsal. OTP pops the Erlang frame and branches directly to `tail_loop/2`; Arinsal decrements reductions and checks for yielding there even though the callee checks reductions at entry. This emitter is in `crates/beamasm/src/module.rs`, outside this task's ownership. OTP source: `ref/otp-29/erts/emulator/beam/jit/arm/instr_call.cpp:117-121`.
+`i_call_only` executes one additional conditional reduction branch in Arinsal. OTP pops the Erlang frame and branches directly to `tail_loop/2`; Arinsal decrements reductions and checks for yielding there even though the callee checks reductions at entry. This emitter is in `crates/beamasm/src/module.rs`, outside this task's ownership. OTP source: `erts/emulator/beam/jit/arm/instr_call.cpp:117-121`.
