@@ -288,6 +288,11 @@ impl Term {
         // SAFETY: TermBuilder creates boxed terms from allocated, aligned words.
         Some(unsafe { *self.raw_ptr() })
     }
+    /// Whether a boxed term is an internal magic reference.
+    #[inline]
+    pub fn is_magic_ref(self) -> bool {
+        self.header().is_some_and(|header| header & 63 == MAGIC_REF)
+    }
     /// Access a raw heap pointer. Caller must ensure its owner is live and
     /// prevent concurrent mutation or movement for the duration of access.
     ///

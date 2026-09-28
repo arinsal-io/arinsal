@@ -10,8 +10,11 @@ const SOURCE: &str = r#"
          internal_state_get_tuples/0, internal_state_more_get_tuples/0,
          internal_state_ets_and_magic_ref/0,
          internal_state_set_remaining/0,
+         internal_state_get_ported/0, internal_state_get_ported_tuples/0,
+         internal_state_set_ported/0, internal_state_multizero_timer/0,
          internal_state_fill_heap/0,
          internal_state_get_remaining_tuples/0,
+         internal_state_proc_sig_block/0,
          internal_state_inconsistent/0, internal_state_abort/0, internal_state_broken_halt/0,
          monitor_long_schedule/0, monitor_long_gc/0, monitor_long_message_queue/0,
          allocator_info/0]).
@@ -119,9 +122,10 @@ internal_state_set_remaining() ->
      erts_debug:set_internal_state(force_gc, make_ref()),
      erts_debug:set_internal_state(mbuf, {a, b}),
      erts_debug:set_internal_state(remove_dflags, 0),
-     erts_debug:set_internal_state(node_tab_delayed_delete, -1),
+     erts_debug:set_internal_state(node_tab_delayed_delete, 0),
      erts_debug:set_internal_state(code_mod_permission, true),
      erts_debug:set_internal_state(code_mod_permission, false),
+     erts_debug:set_internal_state(node_tab_delayed_delete, -1),
      erts_debug:set_internal_state(multizero_timeout_in_timeout, 0),
      erts_debug:set_internal_state(process_uniq_counter, 17),
      erts_debug:set_internal_state(wait, deallocations),
@@ -151,12 +155,67 @@ internal_state_get_remaining_tuples() ->
     Probe ! stop,
     Result.
 
+internal_state_get_ported() ->
+    erts_debug:set_internal_state(available_internal_state, true),
+    Memory = erts_debug:get_internal_state(memory),
+    Processes = erts_debug:get_internal_state(processes),
+    Nodes = erts_debug:get_internal_state(monitoring_nodes),
+    References = erts_debug:get_internal_state(node_and_dist_references),
+    {lists:sort([K || {K, _} <- Memory]),
+     lists:member(self(), Processes), is_list(Nodes), References}.
+
+internal_state_get_ported_tuples() ->
+    erts_debug:set_internal_state(available_internal_state, true),
+    Binary = binary:copy(<<7>>, 128),
+    Refc = erts_debug:get_internal_state({binary_info, Binary}),
+    _ = erlang:system_flag(multi_scheduling, block),
+    BlockedReferences = try
+        erts_debug:get_internal_state({node_and_dist_references, blocked})
+    after
+        erlang:system_flag(multi_scheduling, unblock)
+    end,
+    {{erts_debug:get_internal_state({process_status, self()}),
+      is_list(erts_debug:get_internal_state({link_list, self()})),
+      is_list(erts_debug:get_internal_state({monitor_list, self()})),
+      erts_debug:get_internal_state({dist_ctrl, nonode@nohost})},
+     {element(1, Refc), element(2, Refc), element(3, Refc), element(4, Refc)},
+     caught(fun() -> erts_debug:get_internal_state({node_and_dist_references, blocked}) end),
+     BlockedReferences}.
+
+internal_state_set_ported() ->
+    erts_debug:set_internal_state(available_internal_state, true),
+    Parent = self(),
+    Probe = spawn(fun() -> Parent ! ready, receive stop -> ok end end),
+    receive ready -> ok end,
+    Gc = erts_debug:set_internal_state(force_gc, Probe),
+    Probe ! stop,
+    Gc.
+
+internal_state_multizero_timer() ->
+    erts_debug:set_internal_state(available_internal_state, true),
+    ok = erts_debug:set_internal_state(multizero_timeout_in_timeout, 0),
+    receive multizero_timeout_in_timeout_done -> ok
+    after 1000 -> timeout
+    end.
+
+internal_state_proc_sig_block() ->
+    erts_debug:set_internal_state(available_internal_state, true),
+    Parent = self(),
+    {Probe, Monitor} = spawn_monitor(fun() -> Parent ! ready, receive stop -> ok end end),
+    receive ready -> ok end,
+    Accepted = erts_debug:set_internal_state(proc_sig_block, {Probe, 50}),
+    Probe ! stop,
+    {Accepted, receive {'DOWN', Monitor, process, Probe, _} -> done after 1000 -> timeout end}.
+
 internal_state_sets() ->
     erts_debug:set_internal_state(available_internal_state, true),
     Result = {erts_debug:set_internal_state(reds_left, 1000),
               erts_debug:set_internal_state(block, -1),
+              erts_debug:set_internal_state(block, 1),
               erts_debug:set_internal_state(sleep, 0),
+              erts_debug:set_internal_state(sleep, 1),
               erts_debug:set_internal_state(block_scheduler, 0),
+              erts_debug:set_internal_state(block_scheduler, 1),
               erts_debug:set_internal_state(test_long_gc_sleep, 0),
               erts_debug:set_internal_state(jit_asm_dump, false),
               erts_debug:set_internal_state(proc_sig_buffers, true),
@@ -416,6 +475,41 @@ fn internal_state_remaining_tuple_dispatch_matches_otp() {
         return;
     };
     let (expected, actual) = run(&reference, "internal_state_more_get_tuples");
+    assert_reference(expected, actual);
+}
+
+#[test]
+fn internal_state_get_ported_dispatch_matches_otp() {
+    let reference = RefErl::start().expect("reference Erlang runtime");
+    let (expected, actual) = run(&reference, "internal_state_get_ported");
+    assert_reference(expected, actual);
+}
+
+#[test]
+fn internal_state_get_ported_tuples_match_otp() {
+    let reference = RefErl::start().expect("reference Erlang runtime");
+    let (expected, actual) = run(&reference, "internal_state_get_ported_tuples");
+    assert_reference(expected, actual);
+}
+
+#[test]
+fn internal_state_set_ported_dispatch_matches_otp() {
+    let reference = RefErl::start().expect("reference Erlang runtime");
+    let (expected, actual) = run(&reference, "internal_state_set_ported");
+    assert_reference(expected, actual);
+}
+
+#[test]
+fn internal_state_multizero_timer_callbacks_match_otp() {
+    let reference = RefErl::start().expect("reference Erlang runtime");
+    let (expected, actual) = run(&reference, "internal_state_multizero_timer");
+    assert_reference(expected, actual);
+}
+
+#[test]
+fn internal_state_proc_sig_block_runs_on_target() {
+    let reference = RefErl::start().expect("reference Erlang runtime");
+    let (expected, actual) = run(&reference, "internal_state_proc_sig_block");
     assert_reference(expected, actual);
 }
 

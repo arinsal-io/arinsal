@@ -3,8 +3,9 @@
 use arinsal_etf::{AtomCache, OwnedTerm};
 use arinsal_sched::Pid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 /// Connection lifecycle for one [`NodeEntry`].
 ///
@@ -203,6 +204,7 @@ pub(crate) struct NodeTables {
     pub(crate) alive: bool,
     pub(crate) entries: BTreeMap<String, NodeEntry>,
     pub(crate) monitors: Vec<NodeMonitor>,
+    pending_delete: HashMap<String, Instant>,
 }
 
 impl Default for NodeTables {
@@ -229,22 +231,46 @@ impl Default for NodeTables {
             alive: false,
             entries,
             monitors: Vec::new(),
+            pending_delete: HashMap::new(),
+        }
+    }
+}
+
+impl NodeTables {
+    fn prune_deleted(&mut self) {
+        let now = Instant::now();
+        let expired = self
+            .pending_delete
+            .iter()
+            .filter_map(|(node, deadline)| (*deadline <= now).then_some(node.clone()))
+            .collect::<Vec<_>>();
+        for node in expired {
+            self.pending_delete.remove(&node);
+            if node != self.local_name
+                && !self.entries.get(&node).is_some_and(|entry| entry.connected)
+                && !self.monitors.iter().any(|monitor| monitor.node == node)
+            {
+                self.entries.remove(&node);
+            }
         }
     }
 }
 
 static TABLES: OnceLock<Mutex<NodeTables>> = OnceLock::new();
 static NEXT_ENTRY_REF: AtomicU64 = AtomicU64::new(1);
+static NODE_TAB_DELETE_DELAY_MS: AtomicI64 = AtomicI64::new(-1);
 static NEXT_CONN_SEED: AtomicU32 = AtomicU32::new(1);
 
 /// Ports currently acting as distribution controllers (`port_id` → node name).
 static DIST_PORTS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
 
 pub(crate) fn lock() -> MutexGuard<'static, NodeTables> {
-    TABLES
+    let mut tables = TABLES
         .get_or_init(|| Mutex::new(NodeTables::default()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tables.prune_deleted();
+    tables
 }
 
 fn dist_ports() -> MutexGuard<'static, HashMap<u64, String>> {
@@ -319,6 +345,7 @@ impl NodeTables {
             return false;
         }
         let creation = creation.max(4);
+        self.pending_delete.remove(&self.local_name);
         self.entries.remove(&self.local_name);
         self.local_name = name.clone();
         self.local_creation = creation;
@@ -348,6 +375,7 @@ impl NodeTables {
         if !is_node_name(node) || node == self.local_name {
             return None;
         }
+        self.pending_delete.remove(node);
         let entry = self
             .entries
             .entry(node.to_string())
@@ -405,6 +433,7 @@ impl NodeTables {
         connection_id: u32,
         visible: bool,
     ) {
+        self.pending_delete.remove(&name);
         let entry_ref = self
             .entries
             .get(&name)
@@ -446,6 +475,7 @@ impl NodeTables {
             }
             return false;
         }
+        self.pending_delete.remove(&node);
         if let Some(monitor) = self
             .monitors
             .iter_mut()
@@ -478,6 +508,14 @@ impl NodeTables {
             {
                 drop(unregister_dist_port(port_id));
             }
+        }
+        let delay = NODE_TAB_DELETE_DELAY_MS.load(Ordering::Acquire);
+        if delay < 0 {
+            self.pending_delete.remove(node);
+        } else if let Some(deadline) =
+            Instant::now().checked_add(std::time::Duration::from_millis(delay as u64))
+        {
+            self.pending_delete.insert(node.to_owned(), deadline);
         }
         self.monitors
             .iter()
@@ -513,6 +551,15 @@ pub(crate) fn test_remove_dflags(value: Option<u64>) -> u64 {
         TEST_REMOVE_DFLAGS.store(value, Ordering::Release);
     }
     TEST_REMOVE_DFLAGS.load(Ordering::Acquire)
+}
+
+/// Set the delayed node table deletion interval used by the internal-state test BIF.
+/// Port of erts/emulator/beam/erl_node_tables.c:2571-2579, OTP-29.1.1.
+pub(crate) fn test_node_tab_delayed_delete(milliseconds: i64) {
+    NODE_TAB_DELETE_DELAY_MS.store(
+        if milliseconds < 0 { -1 } else { milliseconds },
+        Ordering::Release,
+    );
 }
 
 #[cfg(test)]

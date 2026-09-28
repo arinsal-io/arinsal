@@ -711,7 +711,7 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
     cons_list(process, &areas)
 }
 
-fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
+pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
     let (processes, processes_used, binary) = arinsal_pterm::global_store().process_memory_totals();
     let (atom, atom_used) = atom_bytes();
     let code = code_bytes(vm);
@@ -736,7 +736,7 @@ fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
     ]
 }
 
-fn snapshot_process(process: &mut Process, _live_x: usize) {
+pub(crate) fn snapshot_process(process: &mut Process, _live_x: usize) {
     let word = std::mem::size_of::<usize>();
     let extra = std::mem::size_of::<Process>() + process.x.len() * word + process.fr.len() * word;
     let capacity = process
@@ -935,6 +935,10 @@ pub(crate) fn gc_spawn_defaults() -> GcSpawnDefaults {
         fullsweep_after: flags.fullsweep_after,
         max_heap_size: flags.max_heap,
     })
+}
+
+pub(crate) fn multi_scheduling_blocked() -> bool {
+    with_flags(|flags| matches!(flags.multi, "blocked" | "blocked_normal"))
 }
 
 pub(crate) fn normalize_spawn_heap_minimum(requested: Option<usize>, binary: bool) -> usize {
@@ -1584,7 +1588,7 @@ fn atom_name(term: Term) -> Option<std::sync::Arc<str>> {
     global_atoms().text(term.as_atom()?)
 }
 
-fn non_neg(process: &mut Process, value: u64) -> Result<Term, VmError> {
+pub(crate) fn non_neg(process: &mut Process, value: u64) -> Result<Term, VmError> {
     if let Ok(value) = i64::try_from(value)
         && let Some(term) = Term::small(value)
     {

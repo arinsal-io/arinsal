@@ -1637,6 +1637,16 @@ fn close(process: &Process, ctx: &mut RunCtx<'_, Message>, term: Term) -> Result
     }
 }
 
+/// Close a runtime port selected by its internal id.
+pub(crate) fn close_by_id(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    id: u64,
+) -> Result<bool, VmError> {
+    let term = Term::port(id).ok_or_else(badarg)?;
+    close(process, ctx, term).map(|result| result == atom("true"))
+}
+
 /// Apply an exit signal to a port and deliver its reason to linked processes.
 pub(crate) fn exit_port(
     process: &mut Process,

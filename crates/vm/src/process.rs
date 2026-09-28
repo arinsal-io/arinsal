@@ -497,12 +497,15 @@ pub(crate) struct Runtime {
 /// Status another process can read while this one is not running.
 ///
 /// g_proc_sched
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Published {
     /// `process_info(P, status)` atom, unless a suspend count overrides it.
     pub status: &'static str,
     /// Hibernating processes report `{erlang, hibernate, 3}`.
     pub hibernating: bool,
+    pub links: Vec<Pid>,
+    pub monitors: Vec<(u64, Pid, Option<arinsal_etf::OwnedTerm>)>,
+    pub monitored_by: Vec<(u64, Pid)>,
 }
 
 /// Saved `apply(M, F, A)` arguments for a hibernating process.
@@ -1615,6 +1618,9 @@ impl Runtime {
         let slot = published.entry(pid).or_insert(Published {
             status,
             hibernating: false,
+            links: Vec::new(),
+            monitors: Vec::new(),
+            monitored_by: Vec::new(),
         });
         if suspended {
             slot.status = "suspended";
@@ -1631,6 +1637,9 @@ impl Runtime {
         let slot = published.entry(pid).or_insert(Published {
             status: "waiting",
             hibernating: on,
+            links: Vec::new(),
+            monitors: Vec::new(),
+            monitored_by: Vec::new(),
         });
         slot.hibernating = on;
         if !suspended {
@@ -1654,6 +1663,40 @@ impl Runtime {
                 }
             })
             .unwrap_or("runnable")
+    }
+
+    fn note_relations(&self, pid: Pid, cold: Option<&crate::proc_create::ProcessCold>) {
+        let mut published = self.published.lock().unwrap();
+        let slot = published.entry(pid).or_insert(Published {
+            status: "runnable",
+            hibernating: false,
+            links: Vec::new(),
+            monitors: Vec::new(),
+            monitored_by: Vec::new(),
+        });
+        if let Some(cold) = cold {
+            slot.links = cold.links.iter().copied().collect();
+            slot.monitors = cold
+                .monitors
+                .iter()
+                .map(|(&reference, &target)| {
+                    (
+                        reference,
+                        target,
+                        cold.monitor_tags.get(&reference).cloned(),
+                    )
+                })
+                .collect();
+            slot.monitored_by = cold
+                .monitored_by
+                .iter()
+                .map(|(&reference, &origin)| (reference, origin))
+                .collect();
+        } else {
+            slot.links.clear();
+            slot.monitors.clear();
+            slot.monitored_by.clear();
+        }
     }
 
     pub(crate) fn is_hibernating(&self, pid: Pid) -> bool {
@@ -1994,6 +2037,41 @@ impl Process {
         }
     }
 
+    // Port of erts/emulator/beam/erl_bif_info.c:4976-4995, OTP-29.1.1.
+    fn handle_multizero_timeout_callback(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        term: Term,
+    ) -> Result<bool, VmError> {
+        let callback = term
+            .as_atom()
+            .and_then(|name| arinsal_term::global_atoms().text(name));
+        let next = match callback.as_deref() {
+            Some("multizero_timeout_in_timeout_step1") => {
+                Some("multizero_timeout_in_timeout_step2")
+            }
+            Some("multizero_timeout_in_timeout_step2") => {
+                Some("multizero_timeout_in_timeout_step3")
+            }
+            Some("multizero_timeout_in_timeout_step3") => {
+                self.inbox
+                    .push_back(crate::signals::atom("multizero_timeout_in_timeout_done"));
+                return Ok(true);
+            }
+            _ => None,
+        };
+        if let Some(next) = next {
+            ctx.send_after(0, Message::copy_from(crate::signals::atom(next))?)
+                .map_err(|_| {
+                    VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
+                        "system_limit",
+                    )))
+                })?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6032 (private queue fetch), OTP-29.1.1.
         ctx.fetch_pending();
@@ -2001,6 +2079,23 @@ impl Process {
         while let Some(Event { from, payload }) = ctx.receive_fetched() {
             match payload {
                 Payload::Message(message) => {
+                    let multizero_callback = message
+                        .term
+                        .as_atom()
+                        .and_then(|name| arinsal_term::global_atoms().text(name))
+                        .is_some_and(|name| {
+                            matches!(
+                                name.as_ref(),
+                                "multizero_timeout_in_timeout_step1"
+                                    | "multizero_timeout_in_timeout_step2"
+                                    | "multizero_timeout_in_timeout_step3"
+                            )
+                        });
+                    if multizero_callback {
+                        let term = message.into_receiver(self)?;
+                        self.handle_multizero_timeout_callback(ctx, term)?;
+                        continue;
+                    }
                     let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
@@ -2014,6 +2109,12 @@ impl Process {
                 }
                 Payload::Signal(arinsal_sched::Signal::Link) => {
                     self.cold_mut().links.insert(from);
+                }
+                // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
+                Payload::Signal(arinsal_sched::Signal::ProcSigBlock(milliseconds)) => {
+                    if milliseconds > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+                    }
                 }
                 Payload::Signal(arinsal_sched::Signal::Unlink(_)) => {
                     if let Some(cold) = self.cold.as_mut() {
@@ -2067,6 +2168,9 @@ impl Process {
                 }
                 Payload::Timer { reference, message } => {
                     let term = message.into_receiver(self)?;
+                    if self.handle_multizero_timeout_callback(ctx, term)? {
+                        continue;
+                    }
                     let runtime = self
                         .runtime
                         .as_ref()
@@ -2097,6 +2201,9 @@ impl Process {
                 Payload::Signal(arinsal_sched::Signal::Alias(_))
                 | Payload::Signal(arinsal_sched::Signal::Unalias(_)) => {
                     return Err(VmError::Unsupported("process aliases".into()));
+                }
+                Payload::Signal(arinsal_sched::Signal::GarbageCollect) => {
+                    self.force_gc()?;
                 }
             }
         }
@@ -2345,6 +2452,7 @@ impl Process {
             }
             return RunOutcome::Exit(1);
         }
+        runtime.note_relations(ctx.pid(), self.cold.as_deref());
         match result {
             Ok(RunState::Yield) => {
                 runtime.note_status(ctx.pid(), "runnable");

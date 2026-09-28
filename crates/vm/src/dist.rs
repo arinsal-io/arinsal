@@ -814,7 +814,37 @@ pub(crate) fn port_connection_closed(
         return Ok(());
     };
     let watchers = node_tables::lock().disconnect(&node);
-    let node_atom = atom(&node);
+    notify_node_watchers(runtime, &node, watchers)
+}
+
+/// Kill a connected distribution entry that has no port controller.
+/// Port of erts/emulator/beam/dist.c:4788-4811 (`erts_kill_dist_connection`), OTP-29.1.1.
+pub(crate) fn kill_connection(
+    runtime: &crate::process::Runtime,
+    node: &str,
+    connection_id: u32,
+) -> Result<bool, VmError> {
+    let watchers = {
+        let mut tables = node_tables::lock();
+        let connected = tables
+            .entries
+            .get(node)
+            .is_some_and(|entry| entry.connected && entry.connection_id == connection_id);
+        if !connected {
+            return Ok(false);
+        }
+        tables.disconnect(node)
+    };
+    notify_node_watchers(runtime, node, watchers)?;
+    Ok(true)
+}
+
+fn notify_node_watchers(
+    runtime: &crate::process::Runtime,
+    node: &str,
+    watchers: Vec<node_tables::NodeMonitor>,
+) -> Result<(), VmError> {
+    let node_atom = atom(node);
     let sched = runtime.scheduler()?;
     for watcher in watchers {
         let mut heap = arinsal_term::ProcessHeap::with_words(16);

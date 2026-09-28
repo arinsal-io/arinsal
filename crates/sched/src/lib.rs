@@ -71,7 +71,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use timer::{CanceledTimer, TimerCommand, TimerPayload, Wheel};
@@ -157,6 +157,10 @@ pub enum Signal<M> {
     Alias(u64),
     /// Alias deactivation.
     Unalias(u64),
+    /// Ask a process to collect its heap at its next signal safe point.
+    GarbageCollect,
+    /// Execute the process-signal blocking callback on the target process.
+    ProcSigBlock(i64),
 }
 
 /// Ordered contents of a process mailbox.
@@ -528,6 +532,72 @@ struct SimState<T: Task> {
     rng: Box<dyn Rng>,
 }
 
+#[derive(Default)]
+struct ProgressState {
+    active: usize,
+    blocked: bool,
+}
+
+#[derive(Default)]
+struct ThreadProgress {
+    state: Mutex<ProgressState>,
+    changed: Condvar,
+}
+
+struct ProgressGuard {
+    progress: Arc<ThreadProgress>,
+    active: bool,
+}
+
+impl ThreadProgress {
+    fn enter(progress: Arc<Self>) -> ProgressGuard {
+        let mut state = progress.state.lock().unwrap();
+        while state.blocked {
+            state = progress.changed.wait(state).unwrap();
+        }
+        state.active += 1;
+        ProgressGuard {
+            progress: Arc::clone(&progress),
+            active: true,
+        }
+    }
+}
+
+impl ProgressGuard {
+    fn block_for(&mut self, duration: Duration) {
+        let mut state = self.progress.state.lock().unwrap();
+        state.active -= usize::from(self.active);
+        self.active = false;
+        self.progress.changed.notify_all();
+        while state.blocked {
+            state = self.progress.changed.wait(state).unwrap();
+        }
+        state.blocked = true;
+        while state.active != 0 {
+            state = self.progress.changed.wait(state).unwrap();
+        }
+        drop(state);
+        if !duration.is_zero() {
+            thread::sleep(duration);
+        }
+        let mut state = self.progress.state.lock().unwrap();
+        state.blocked = false;
+        state.active += 1;
+        self.active = true;
+        self.progress.changed.notify_all();
+    }
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.progress.state.lock().unwrap();
+            state.active -= 1;
+            self.progress.changed.notify_all();
+        }
+    }
+}
+
 struct Inner<T: Task> {
     config: Config,
     table: ProcessTable<T>,
@@ -551,6 +621,7 @@ struct Inner<T: Task> {
     fanin_stats: bool,
     fanin_delivered: AtomicU64,
     fanin_peak_backlog: AtomicUsize,
+    progress: Arc<ThreadProgress>,
 }
 
 impl<T: Task> Inner<T> {
@@ -1150,6 +1221,7 @@ pub struct RunCtx<'a, M: Send + 'static> {
     backlog: &'a AtomicUsize,
     remaining: u32,
     private_wake: bool,
+    progress: Option<ProgressGuard>,
 }
 
 trait ContextOps<M> {
@@ -1295,6 +1367,16 @@ impl<M: Send + 'static> RunCtx<'_, M> {
         self.inner.flush(self.remaining);
         self.inner.start_timer(self.pid, ms, msg, false)
     }
+    /// Port of erts/emulator/beam/erl_bif_info.c:5079-5091, OTP-29.1.1.
+    /// Pause other running tasks until the callback returns.
+    pub fn block_thread_progress(&mut self, duration: Duration) {
+        self.inner.flush(self.remaining);
+        if let Some(progress) = &mut self.progress {
+            progress.block_for(duration);
+        } else if !duration.is_zero() {
+            thread::sleep(duration);
+        }
+    }
 }
 
 /// Messages, exits, and DOWNs require the receiver to run. Link, monitor, and
@@ -1304,7 +1386,11 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
     match payload {
         Payload::Message(_) | Payload::Timer { .. } => true,
         Payload::Signal(signal) => match signal {
-            Signal::Exit(_) | Signal::MonitorDown { .. } | Signal::MonitorNoproc(_) => true,
+            Signal::Exit(_)
+            | Signal::MonitorDown { .. }
+            | Signal::MonitorNoproc(_)
+            | Signal::GarbageCollect
+            | Signal::ProcSigBlock(_) => true,
             Signal::UnlinkAck(id) => *id != 0,
             Signal::Link
             | Signal::Unlink(_)
@@ -1801,6 +1887,7 @@ impl<T: Task> Scheduler<T> {
             fanin_stats: std::env::var_os("ARINSAL_FANIN_STATS").is_some(),
             fanin_delivered: AtomicU64::new(0),
             fanin_peak_backlog: AtomicUsize::new(0),
+            progress: Arc::new(ThreadProgress::default()),
         });
         let mut threads = Vec::new();
         if !simulated {
@@ -2082,6 +2169,7 @@ mod msgq_stage_microbench {
             backlog: &backlog,
             remaining: 1_000,
             private_wake: false,
+            progress: None,
         };
         let started = Instant::now();
         assert!(context.fetch_pending());
@@ -2262,6 +2350,7 @@ fn run_one<'a, T: Task>(
         .inherited
         .filter(|&n| n > 0)
         .unwrap_or(inner.config.reductions);
+    let progress = ThreadProgress::enter(Arc::clone(&inner.progress));
     let mut cell = process.cell.lock().unwrap();
     let (outcome, remaining, private_pending) = {
         let mut runner = Runner {
@@ -2282,6 +2371,7 @@ fn run_one<'a, T: Task>(
                 backlog: &process.backlog,
                 remaining: budget,
                 private_wake: true,
+                progress: Some(progress),
             };
             let outcome = task.run(&mut ctx, budget);
             (

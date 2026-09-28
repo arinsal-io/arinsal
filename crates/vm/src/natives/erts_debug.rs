@@ -832,7 +832,7 @@ fn build(
         ("erts_debug", "lcnt_clear", 0) | ("erts_debug", "lcnt_collect", 0) => Ok(atom("error")),
         ("erts_debug", "lcnt_control", 1 | 2) => Err(badarg()),
         ("erts_debug", "map_info", 1) => map_info(process, args[0]),
-        ("erts_debug", "get_internal_state", 1) => internal_state_get(process, ctx, args[0]),
+        ("erts_debug", "get_internal_state", 1) => internal_state_get(vm, process, ctx, args[0]),
         ("erts_debug", "set_internal_state", 2) => {
             internal_state_set(process, ctx, args[0], args[1])
         }
@@ -950,7 +950,7 @@ fn owned_signed(value: &OwnedTerm) -> Option<i64> {
 
 fn internal_state_tuple_get(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     selector: Term,
 ) -> Result<Option<Term>, VmError> {
     if let Some(fields) = term_sequence(selector)
@@ -1027,9 +1027,29 @@ fn internal_state_tuple_get(
         };
         return int(process, entry.connection_id as usize).map(Some);
     }
+    if let [OwnedTerm::Atom(name), _] = fields.as_slice()
+        && name == "native_record_def"
+    {
+        return Ok(arinsal_term::term_sequence(selector)
+            .and_then(|parts| parts.get(1).copied())
+            .and_then(Term::record_snapshot)
+            .map(|record| record.definition));
+    }
+    if let [OwnedTerm::Atom(name), OwnedTerm::Atom(mode)] = fields.as_slice()
+        && name == "node_and_dist_references"
+        && mode == "blocked"
+    {
+        if !crate::natives::sys::multi_scheduling_blocked() {
+            return Err(badarg());
+        }
+        ctx.block_thread_progress(std::time::Duration::ZERO);
+        return node_and_dist_references(process).map(Some);
+    }
     let [OwnedTerm::Atom(name), value] = fields.as_slice() else {
         return Ok(None);
     };
+    let selector_value =
+        arinsal_term::term_sequence(selector).and_then(|parts| parts.get(1).copied());
     match (name.as_str(), value) {
         ("internal_hash", value) => {
             let value = from_owned(value, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
@@ -1084,8 +1104,18 @@ fn internal_state_tuple_get(
             let status = process
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).copied())
+                .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).cloned())
                 .map(|published| atom(published.status))
+                .or_else(|| {
+                    process.runtime.as_ref().and_then(|runtime| {
+                        runtime
+                            .processes
+                            .lock()
+                            .unwrap()
+                            .contains(&pid)
+                            .then(|| atom("runnable"))
+                    })
+                })
                 .unwrap_or_else(|| atom("undefined"));
             Ok(Some(status))
         }
@@ -1103,23 +1133,16 @@ fn internal_state_tuple_get(
                 generation: *serial,
             };
             if pid != ctx.pid() {
-                let exists = process
+                let published = process
                     .runtime
                     .as_ref()
-                    .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
-                return Ok(Some(if exists { Term::NIL } else { atom("undefined") }));
+                    .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).cloned());
+                return match published {
+                    Some(published) => internal_link_list_from(process, &published.links).map(Some),
+                    None => Ok(Some(atom("undefined"))),
+                };
             }
-            let links = process
-                .cold
-                .as_ref()
-                .map(|cold| {
-                    cold.links
-                        .iter()
-                        .filter_map(|pid| pid.to_term())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            list(process, &links).map(Some)
+            internal_link_list(process).map(Some)
         }
         (
             "monitor_list",
@@ -1135,13 +1158,21 @@ fn internal_state_tuple_get(
                 generation: *serial,
             };
             if pid != ctx.pid() {
-                let exists = process
+                let published = process
                     .runtime
                     .as_ref()
-                    .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
-                return Ok(Some(if exists { Term::NIL } else { atom("undefined") }));
+                    .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).cloned());
+                return match published {
+                    Some(published) => internal_monitor_list_from(
+                        process,
+                        &published.monitors,
+                        &published.monitored_by,
+                    )
+                    .map(Some),
+                    None => Ok(Some(atom("undefined"))),
+                };
             }
-            Ok(Some(Term::NIL))
+            internal_monitor_list(process).map(Some)
         }
         ("channel_number", OwnedTerm::Atom(node)) if node == "nonode@nohost" => {
             Ok(Some(Term::small(0).unwrap()))
@@ -1161,14 +1192,18 @@ fn internal_state_tuple_get(
         ("channel_number", _) => Ok(Some(atom("undefined"))),
         ("dist_ctrl", OwnedTerm::Atom(node)) => {
             let tables = crate::node_tables::lock();
-            let controller = tables.entries.get(node).and_then(|entry| {
-                entry.dist.as_ref().and_then(|state| {
-                    state
-                        .port_id
-                        .and_then(Term::port)
-                        .or_else(|| state.owner.to_term())
-                })
-            });
+            let controller = tables
+                .entries
+                .get(node)
+                .filter(|entry| entry.connected)
+                .and_then(|entry| {
+                    entry.dist.as_ref().and_then(|state| {
+                        state
+                            .port_id
+                            .and_then(Term::port)
+                            .or_else(|| state.owner.to_term())
+                    })
+                });
             Ok(Some(controller.unwrap_or_else(|| atom("undefined"))))
         }
         ("dist_ctrl", _) => Ok(Some(atom("undefined"))),
@@ -1199,10 +1234,34 @@ fn internal_state_tuple_get(
             };
             int(process, index as usize).map(Some)
         }
+        ("binary_info", OwnedTerm::Binary(bytes))
+            if selector_value.is_some_and(|term| {
+                term.classify() == arinsal_term::TermKind::Bitstring && bytes.len() > 64
+            }) =>
+        {
+            let size = int(process, bytes.len())?;
+            let binary_info = tuple(process, &[atom("binary"), size])?;
+            tuple(
+                process,
+                &[
+                    atom("refc_binary"),
+                    size,
+                    binary_info,
+                    Term::small(0).unwrap(),
+                ],
+            )
+            .map(Some)
+        }
         ("binary_info", OwnedTerm::Binary(_) | OwnedTerm::BitString { .. }) => {
             Ok(Some(atom("heap_binary")))
         }
-        ("magic_ref", _) => Ok(Some(atom("false"))),
+        ("magic_ref", _) => Ok(Some(atom(
+            if selector_value.is_some_and(Term::is_magic_ref) {
+                "true"
+            } else {
+                "false"
+            },
+        ))),
         _ => Ok(None),
     }
 }
@@ -1287,10 +1346,148 @@ fn term_binary_options(options: &OwnedTerm) -> Option<arinsal_etf::EncodeOptions
     Some(encoded)
 }
 
+/// Port of erts_get_node_and_dist_references called by erl_bif_info.c:4354, OTP-29.1.1.
+fn node_and_dist_references(process: &mut Process) -> Result<Term, VmError> {
+    let local_node = atom("nonode@nohost");
+    let system = atom("system");
+    let undefined = atom("undefined");
+    let system_reference = tuple(process, &[system, Term::small(1).unwrap()])?;
+    let system_owner = tuple(process, &[system, undefined])?;
+    let system_references = list(process, &[system_reference])?;
+    let system_entry = tuple(process, &[system_owner, system_references])?;
+    let local_reference = tuple(process, &[local_node, Term::small(0).unwrap()])?;
+    let local_owners = list(process, &[system_entry])?;
+    let node_ref_entry = tuple(
+        process,
+        &[local_reference, Term::small(1).unwrap(), local_owners],
+    )?;
+    let node_references = list(process, &[node_ref_entry])?;
+    let node_owner = tuple(process, &[atom("node"), local_reference])?;
+    let node_reference = tuple(process, &[atom("node"), Term::small(1).unwrap()])?;
+    let node_owners = list(process, &[node_reference])?;
+    let node_entry = tuple(process, &[node_owner, node_owners])?;
+    let dist_references = list(process, &[system_entry, node_entry])?;
+    let dist_entry = tuple(
+        process,
+        &[local_node, Term::small(2).unwrap(), dist_references],
+    )?;
+    let dist_entries = list(process, &[dist_entry])?;
+    let node_pair = tuple(process, &[atom("node_references"), node_references])?;
+    let dist_pair = tuple(process, &[atom("dist_references"), dist_entries])?;
+    tuple(process, &[node_pair, dist_pair])
+}
+
+/// Port of erl_bif_info.c:make_link_list for the current process, OTP-29.1.1.
+fn internal_link_list(process: &mut Process) -> Result<Term, VmError> {
+    let links = process
+        .cold
+        .as_ref()
+        .map(|cold| cold.links.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    internal_link_list_from(process, &links)
+}
+
+fn internal_link_list_from(
+    process: &mut Process,
+    links: &[arinsal_sched::Pid],
+) -> Result<Term, VmError> {
+    let mut records = Vec::with_capacity(links.len());
+    for &pid in links {
+        let Some(pid_term) = pid.to_term() else {
+            continue;
+        };
+        let id = int(process, pid.index as usize)?;
+        records.push(tuple(
+            process,
+            &[
+                atom("erl_link"),
+                atom("process"),
+                pid_term,
+                atom("linked"),
+                id,
+            ],
+        )?);
+    }
+    list(process, &records)
+}
+
+/// Port of erl_bif_info.c:make_monitor_list for the current process, OTP-29.1.1.
+fn internal_monitor_list(process: &mut Process) -> Result<Term, VmError> {
+    let Some(cold) = process.cold.as_ref() else {
+        return Ok(Term::NIL);
+    };
+    let origins = cold
+        .monitors
+        .iter()
+        .map(|(&id, &pid)| {
+            let tag = cold.monitor_tags.get(&id).cloned();
+            (id, pid, tag)
+        })
+        .collect::<Vec<_>>();
+    let targets = cold
+        .monitored_by
+        .iter()
+        .map(|(&id, &pid)| (id, pid))
+        .collect::<Vec<_>>();
+    internal_monitor_list_from(process, &origins, &targets)
+}
+
+fn internal_monitor_list_from(
+    process: &mut Process,
+    origins: &[(u64, arinsal_sched::Pid, Option<OwnedTerm>)],
+    targets: &[(u64, arinsal_sched::Pid)],
+) -> Result<Term, VmError> {
+    let mut records = Vec::with_capacity(origins.len() + targets.len());
+    for &(id, pid, ref tag) in origins {
+        let Some(pid) = pid.to_term() else {
+            continue;
+        };
+        let reference = crate::signals::reference(process, id)?;
+        let tag = tag
+            .as_ref()
+            .map(|tag| {
+                from_owned(tag, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+            })
+            .transpose()?
+            .unwrap_or(Term::NIL);
+        records.push(tuple(
+            process,
+            &[
+                atom("erl_monitor"),
+                atom("process"),
+                atom("origin"),
+                reference,
+                pid,
+                tag,
+            ],
+        )?);
+    }
+    for (id, pid) in targets {
+        let Some(pid) = pid.to_term() else {
+            continue;
+        };
+        let reference = crate::signals::reference(process, *id)?;
+        records.push(tuple(
+            process,
+            &[
+                atom("erl_monitor"),
+                atom("process"),
+                atom("target"),
+                reference,
+                pid,
+                Term::NIL,
+            ],
+        )?);
+    }
+    list(process, &records)
+}
+
 /// Port of erts/emulator/beam/erl_bif_info.c:4339-4947, OTP-29.1.1.
 fn internal_state_get(
+    vm: &Vm,
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     selector: Term,
 ) -> Result<Term, VmError> {
     if !INTERNAL_STATE.load(Ordering::Relaxed) {
@@ -1395,17 +1592,57 @@ fn internal_state_get(
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
         }
         Some("nbalance") => Ok(Term::small(0).unwrap()),
-        Some("monitoring_nodes") => Ok(Term::NIL),
+        Some("monitoring_nodes") => {
+            let Some(runtime) = &process.runtime else {
+                return Ok(Term::NIL);
+            };
+            let pids = runtime.processes.lock().unwrap().clone();
+            let mut by_pid = pids
+                .into_iter()
+                .map(|pid| (pid, Vec::<Term>::new()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let tables = crate::node_tables::lock();
+            for monitor in &tables.monitors {
+                if let Some(nodes) = by_pid.get_mut(&monitor.pid)
+                    && let Ok(node) = global_atoms().intern(&monitor.node)
+                {
+                    let node = Term::atom(node);
+                    if !nodes.contains(&node) {
+                        nodes.push(node);
+                    }
+                }
+            }
+            let mut entries = Vec::with_capacity(by_pid.len());
+            for (pid, nodes) in by_pid {
+                let Some(pid) = pid.to_term() else { continue };
+                let nodes = list(process, &nodes)?;
+                entries.push(tuple(process, &[pid, nodes])?);
+            }
+            list(process, &entries)
+        }
+        Some("node_and_dist_references") => {
+            ctx.block_thread_progress(std::time::Duration::ZERO);
+            node_and_dist_references(process)
+        }
+        Some("memory") => {
+            ctx.block_thread_progress(std::time::Duration::ZERO);
+            crate::natives::sys::snapshot_process(process, process.gc_live);
+            let values = crate::natives::sys::memory_values(vm, process);
+            let mut entries = Vec::with_capacity(values.len());
+            for (name, value) in values {
+                let value = int(process, value as usize)?;
+                entries.push(tuple(process, &[atom(name), value])?);
+            }
+            list(process, &entries)
+        }
         Some("processes") => {
             let processes = process
                 .runtime
                 .as_ref()
                 .map(|runtime| {
-                    runtime
-                        .processes
-                        .lock()
-                        .unwrap()
-                        .iter()
+                    let mut pids = runtime.processes.lock().unwrap().clone();
+                    pids.extend(runtime.system_processes.lock().unwrap().iter().copied());
+                    pids.iter()
                         .filter_map(|pid| pid.to_term())
                         .collect::<Vec<_>>()
                 })
@@ -1489,7 +1726,12 @@ fn internal_state_set(
                 return Err(badarg());
             };
             if milliseconds > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+                let duration = std::time::Duration::from_millis(milliseconds as u64);
+                if arg_name(selector).as_deref() == Some("block") {
+                    ctx.block_thread_progress(duration);
+                } else {
+                    std::thread::sleep(duration);
+                }
             }
             return Ok(atom("true"));
         }
@@ -1504,14 +1746,11 @@ fn internal_state_set(
             let Some(timeout) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
                 return Err(badarg());
             };
-            let runtime = process
-                .runtime
-                .as_ref()
-                .ok_or_else(|| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-            let message = Message::copy_from(atom("multizero_timeout_in_timeout_done"))?;
-            runtime
-                .scheduler()?
-                .send_after(ctx.pid(), timeout.max(0) as u64, message)
+            if process.runtime.is_none() {
+                return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+            }
+            let message = Message::copy_from(atom("multizero_timeout_in_timeout_step1"))?;
+            ctx.send_after(timeout.max(0) as u64, message)
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
             return Ok(atom("ok"));
         }
@@ -1555,7 +1794,12 @@ fn internal_state_set(
             if !found {
                 return Ok(atom("false"));
             }
-            process.force_gc()?;
+            if pid == ctx.pid() {
+                process.force_gc()?;
+            } else {
+                ctx.signal(pid, arinsal_sched::Signal::GarbageCollect)
+                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            }
             return Ok(atom("true"));
         }
         Some("unique_monotonic_integer_state") => {
@@ -1683,7 +1927,38 @@ fn internal_state_set(
             eprintln!("{reason}");
             std::process::exit(1);
         }
-        Some("kill_dist_connection") => return Ok(atom("false")),
+        Some("kill_dist_connection") => {
+            let Some(node) = arg_name(value) else {
+                return Ok(atom("false"));
+            };
+            let Some(runtime) = process.runtime.as_ref() else {
+                return Ok(atom("false"));
+            };
+            let (port_id, connection_id) = {
+                let tables = crate::node_tables::lock();
+                let Some(entry) = tables.entries.get(&node).filter(|entry| entry.connected) else {
+                    return Ok(atom("false"));
+                };
+                (
+                    entry.dist.as_ref().and_then(|state| state.port_id),
+                    entry.connection_id,
+                )
+            };
+            if let Some(port_id) = port_id {
+                if !crate::port::close_by_id(process, ctx, port_id)? {
+                    return Ok(atom("false"));
+                }
+                crate::dist::port_connection_closed(runtime, port_id)?;
+                return Ok(atom("true"));
+            }
+            return Ok(atom(
+                if crate::dist::kill_connection(runtime, &node, connection_id)? {
+                    "true"
+                } else {
+                    "false"
+                },
+            ));
+        }
         Some("wait")
             if [
                 "deallocations",
@@ -1694,6 +1969,9 @@ fn internal_state_set(
             .iter()
             .any(|name| value == atom(name)) =>
         {
+            if value == atom("thread_progress") {
+                ctx.block_thread_progress(std::time::Duration::ZERO);
+            }
             return Ok(atom("ok"));
         }
         Some("colliding_names") => {
@@ -1765,9 +2043,11 @@ fn internal_state_set(
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
         }
         Some("node_tab_delayed_delete") => {
-            let Some(_timeout) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
+            let Some(timeout) = to_owned(value).ok().and_then(|term| owned_signed(&term)) else {
                 return Err(badarg());
             };
+            ctx.block_thread_progress(std::time::Duration::ZERO);
+            crate::node_tables::test_node_tab_delayed_delete(timeout);
             return Ok(atom("ok"));
         }
         Some("remove_dflags") => {
@@ -1815,18 +2095,32 @@ fn internal_state_set(
             else {
                 return Err(badarg());
             };
-            if node != "nonode@nohost" || owned_signed(time).is_none() {
+            let Some(milliseconds) = owned_signed(time) else {
+                return Err(badarg());
+            };
+            if node != "nonode@nohost" {
                 return Err(badarg());
             }
             let pid = arinsal_sched::Pid {
                 index: *id,
                 generation: *serial,
             };
-            let found = process
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
-            return Ok(atom(if found { "true" } else { "false" }));
+            let Some(runtime) = process.runtime.as_ref() else {
+                return Ok(atom("false"));
+            };
+            if !runtime.processes.lock().unwrap().contains(&pid) {
+                return Ok(atom("false"));
+            }
+            return Ok(atom(
+                if ctx
+                    .signal(pid, arinsal_sched::Signal::ProcSigBlock(milliseconds))
+                    .is_ok()
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            ));
         }
         _ => {}
     }
