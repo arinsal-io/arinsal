@@ -2224,9 +2224,7 @@ impl Process {
     /// Force a collection of the running process before the current BIF returns.
     /// Port of erts/emulator/beam/erl_gc.h:152 (`ERTS_FORCE_GC`), OTP-29.1.1.
     pub(crate) fn force_gc(&mut self) -> Result<(), VmError> {
-        let gc = self.collect_heap_roots(self.x.len(), &mut [], 0)?;
-        self.stats.gc.collections += gc.collections;
-        self.stats.gc.nanoseconds += gc.nanoseconds;
+        self.collect_heap_roots(self.x.len(), &mut [], 0)?;
         Ok(())
     }
 
@@ -2245,6 +2243,8 @@ impl Process {
             .heap
             .collect(&mut self.x[..live_x], &mut roots, min_free)
             .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
+        self.stats.gc.collections += stats.collections;
+        self.stats.gc.nanoseconds += stats.nanoseconds;
         self.inbox.update_gc_roots(&indices, &roots[..mailbox_len]);
         extra.copy_from_slice(&roots[mailbox_len..]);
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
@@ -2328,6 +2328,10 @@ impl Process {
 
 impl Task for Process {
     type Message = Message;
+
+    fn gc_nanoseconds(&self) -> u64 {
+        self.stats.gc.nanoseconds
+    }
 
     fn run(&mut self, ctx: &mut RunCtx<'_, Message>, budget: u32) -> RunOutcome {
         abort_on_worker_panic(|| self.run_task(ctx, budget))
@@ -2617,6 +2621,9 @@ impl Vm {
             Some(seed) => Scheduler::simulation(config, seed),
             None => Scheduler::new(config),
         });
+        let (online, blocked) = crate::natives::sys::scheduler_online_default();
+        let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
+        scheduler.set_scheduling_blocked(blocked);
         *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
         if module == "erl_init" && function == "start" {
             // Port of erts/emulator/beam/erl_init.c:2550 (erl_system_process_otp

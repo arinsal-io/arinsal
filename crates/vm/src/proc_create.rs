@@ -310,8 +310,6 @@ impl Process {
         if clear_dead {
             self.x[live..].fill(Term::NIL);
         }
-        self.stats.gc.collections += gc.collections;
-        self.stats.gc.nanoseconds += gc.nanoseconds;
         natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
         if self.heap.free_words() < words {
             return Err(VmError::Unsupported("heap exhausted after GC".into()));

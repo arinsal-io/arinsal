@@ -215,9 +215,13 @@ fn port_call(
     function: &str,
     args: NativeArgs<'_>,
 ) -> Option<Result<Term, VmError>> {
-    args.with_values(process, |process, values| {
+    // Port of erts/emulator/beam/erl_port_task.c:1731 (port execution state), OTP-29.1.1.
+    ctx.set_msacc_state(arinsal_sched::MsaccState::Port);
+    let result = args.with_values(process, |process, values| {
         crate::port::family(vm, process, ctx, module, function, values)
-    })
+    });
+    ctx.set_msacc_state(arinsal_sched::MsaccState::Emulator);
+    result
 }
 
 /// Every process-aware native the VM families and `signals` dispatch, deduplicated.

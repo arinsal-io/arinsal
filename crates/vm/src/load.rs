@@ -379,6 +379,7 @@ impl Vm {
 
     /// Construct a VM. Explicit paths precede the current directory and OTP libraries.
     pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        crate::natives::sys::initialize_statistics_origins();
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
         paths.push(PathBuf::from("."));
         paths.push(PathBuf::from("bench/out/ebin"));

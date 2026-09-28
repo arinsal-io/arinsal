@@ -1,10 +1,6 @@
 //! VM-facing system native bindings: statistics and literal retirement.
 //!
-//! Return shapes follow `statistics_1` in `erts/emulator/beam/erl_bif_info.c`
-//! (OTP-29.1.1). Reduction totals are completed scheduler quanta plus the
-//! current slice. `microstate_accounting` stays `undefined` until
-//! `system_flag(microstate_accounting, true)`, matching the documented erts
-//! default.
+//! Return shapes follow OTP-29.1.1's `statistics_1` and `system_info_1`.
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
@@ -29,10 +25,9 @@ const RECORD: u64 = 0x1c;
 const SUB_BITS: u64 = 0x24;
 const MAP: u64 = 0x2c;
 
-static COMPLETED_REDUCTIONS: AtomicU64 = AtomicU64::new(0);
 static LAST_REDUCTIONS: AtomicU64 = AtomicU64::new(0);
 static LAST_EXACT_REDUCTIONS: AtomicU64 = AtomicU64::new(0);
-static CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
+static LAST_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static GC_COUNT: AtomicU64 = AtomicU64::new(0);
 static GC_WORDS: AtomicU64 = AtomicU64::new(0);
 static LAST_RUNTIME_MS: AtomicU64 = AtomicU64::new(0);
@@ -40,19 +35,21 @@ static LAST_WALL_MS: AtomicU64 = AtomicU64::new(0);
 static CPU_ORIGIN_NS: OnceLock<u64> = OnceLock::new();
 static WALL_ORIGIN: OnceLock<Instant> = OnceLock::new();
 static MICROSTATE: AtomicBool = AtomicBool::new(false);
+type MicrostateBaseline = (Instant, Vec<[u64; 7]>, [u64; 2]);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SchedBase {
     started: Instant,
-    cpu_ns: u64,
+    active_ns: Vec<u64>,
 }
 static SCHED_WALL: Mutex<Option<SchedBase>> = Mutex::new(None);
+static MICROSTATE_BASE: Mutex<Option<MicrostateBaseline>> = Mutex::new(None);
 static SYSTEM_LOGGER: OnceLock<Mutex<Term>> = OnceLock::new();
 
-/// Count one finished reduction quantum. Called once per yield, not per opcode.
-pub(crate) fn note_quantum(reductions: u32) {
-    COMPLETED_REDUCTIONS.fetch_add(u64::from(reductions), Ordering::Relaxed);
-    CONTEXT_SWITCHES.fetch_add(1, Ordering::Relaxed);
+/// Initialize statistics origins when the VM is created, as erts does at boot.
+pub(crate) fn initialize_statistics_origins() {
+    CPU_ORIGIN_NS.get_or_init(cpu_ns);
+    WALL_ORIGIN.get_or_init(Instant::now);
 }
 
 /// Record a collection and acknowledge persistent-term literals this process may hold.
@@ -186,27 +183,28 @@ fn call_garbage_collect(
     _ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_msacc.c:436 (GC state transition), OTP-29.1.1.
     garbage_collect(process, args[0])
 }
 
 fn call_system_flag(
     vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    system_flag(vm, process, args)
+    system_flag(vm, process, ctx, args)
 }
 
 fn call_scheduler_wall_time(
     _vm: &mut Vm,
-    _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:5306 (erts_internal_scheduler_wall_time_1), OTP-29.1.1.
     // Any term other than `true` disables accounting. The previous flag is returned.
-    set_scheduler_wall_enabled(atom_name(args[0]).as_deref() == Some("true"))
+    set_scheduler_wall_enabled(process, ctx, atom_name(args[0]).as_deref() == Some("true"))
 }
 
 fn call_dt_spread_tag(
@@ -314,7 +312,7 @@ fn call_values(
             _ => Err(badarg()),
         }),
         ("erlang", "system_info", 1) => alloc_info::system_info(vm, process, ctx, args[0])
-            .or_else(|| system_info(vm, process, args[0])),
+            .or_else(|| system_info(vm, process, Some(ctx), args[0])),
         _ => None,
     }
 }
@@ -546,7 +544,12 @@ fn display_string(args: &[Term]) -> Result<Term, VmError> {
 }
 
 // boot_loop1: init:has_small_memory/0 probes this before loading kernel modules.
-fn system_info(vm: &Vm, process: &mut Process, selector: Term) -> Option<Result<Term, VmError>> {
+fn system_info(
+    vm: &Vm,
+    process: &mut Process,
+    _ctx: Option<&RunCtx<'_, Message>>,
+    selector: Term,
+) -> Option<Result<Term, VmError>> {
     let owned_selector = arinsal_term::to_owned(selector).ok();
     if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
         && let [
@@ -571,8 +574,17 @@ fn system_info(vm: &Vm, process: &mut Process, selector: Term) -> Option<Result<
         Some("schedulers_online") => Some(with_flags(|flags| {
             non_neg(process, flags.schedulers_online as u64)
         })),
+        Some("schedulers") => Some(with_flags(|flags| {
+            non_neg(process, flags.schedulers_total as u64)
+        })),
+        Some("dirty_cpu_schedulers") => Some(with_flags(|flags| {
+            non_neg(process, flags.dirty_cpu_total as u64)
+        })),
         Some("dirty_cpu_schedulers_online") => Some(with_flags(|flags| {
             non_neg(process, flags.dirty_cpu_online as u64)
+        })),
+        Some("dirty_io_schedulers") => Some(with_flags(|flags| {
+            non_neg(process, flags.dirty_io_total as u64)
         })),
         Some("fullsweep_after") => Some(with_flags(|flags| {
             tagged(process, "fullsweep_after", u64::from(flags.fullsweep_after))
@@ -799,7 +811,7 @@ fn atom_bytes() -> (u64, u64) {
 fn statistics(
     _vm: &Vm,
     process: &mut Process,
-    ctx: Option<&RunCtx<'_, Message>>,
+    ctx: Option<&mut RunCtx<'_, Message>>,
     key: Term,
 ) -> Result<Term, VmError> {
     let Some(name) = atom_name(key) else {
@@ -815,14 +827,19 @@ fn statistics(
             pair(process, total, delta)
         }
         "reductions" => {
-            let (total, delta) = since(reduction_total(ctx), &LAST_REDUCTIONS);
+            let (total, delta) = since(reduction_total(ctx.as_deref()), &LAST_REDUCTIONS);
             pair(process, total, delta)
         }
         "exact_reductions" => {
-            let (total, delta) = since(reduction_total(ctx), &LAST_EXACT_REDUCTIONS);
+            let (total, delta) = since(reduction_total(ctx.as_deref()), &LAST_EXACT_REDUCTIONS);
             pair(process, total, delta)
         }
-        "context_switches" => pair(process, CONTEXT_SWITCHES.load(Ordering::Relaxed), 0),
+        "context_switches" => {
+            let total =
+                scheduler_stats(process, ctx.as_deref()).map_or(0, |stats| stats.context_switches);
+            let (_, delta) = since(total, &LAST_CONTEXT_SWITCHES);
+            pair(process, total, delta)
+        }
         "garbage_collection" => triple(
             process,
             GC_COUNT.load(Ordering::Relaxed),
@@ -830,32 +847,60 @@ fn statistics(
             0,
         ),
         "io" => io_counters(process),
-        "run_queue" => non_neg(process, run_queue(process)),
+        "run_queue" => non_neg(
+            process,
+            queue_counts(process, ctx.as_deref(), false, false)
+                .iter()
+                .sum(),
+        ),
         "total_run_queue_lengths" | "total_run_queue_lengths_all" => {
-            non_neg(process, run_queue(process))
+            let all = name.as_ref() == "total_run_queue_lengths_all";
+            non_neg(
+                process,
+                queue_counts(process, ctx.as_deref(), false, all)
+                    .iter()
+                    .sum(),
+            )
         }
-        "run_queue_lengths" => int_list(process, &queue_slots(1, run_queue(process))),
-        "run_queue_lengths_all" => int_list(process, &queue_slots(2, run_queue(process))),
-        "active_tasks" => int_list(process, &queue_slots(1, active_tasks(process))),
-        "active_tasks_all" => int_list(process, &queue_slots(2, active_tasks(process))),
-        "total_active_tasks" | "total_active_tasks_all" => non_neg(process, active_tasks(process)),
-        "run_queues" => int_tuple(process, &queue_slots(2, run_queue(process))),
-        "scheduler_wall_time" => scheduler_wall(process, false),
-        "scheduler_wall_time_all" => scheduler_wall(process, true),
-        "microstate_accounting" => microstate(process),
+        "run_queue_lengths" | "run_queue_lengths_all" => {
+            let all = name.as_ref() == "run_queue_lengths_all";
+            int_list(process, &queue_counts(process, ctx.as_deref(), false, all))
+        }
+        "active_tasks" | "active_tasks_all" => {
+            let all = name.as_ref() == "active_tasks_all";
+            int_list(process, &queue_counts(process, ctx.as_deref(), true, all))
+        }
+        "total_active_tasks" | "total_active_tasks_all" => {
+            let all = name.as_ref() == "total_active_tasks_all";
+            non_neg(
+                process,
+                queue_counts(process, ctx.as_deref(), true, all)
+                    .iter()
+                    .sum(),
+            )
+        }
+        "run_queues" => int_tuple(process, &queue_counts(process, ctx.as_deref(), false, true)),
+        "scheduler_wall_time" => scheduler_wall(process, ctx.as_deref(), false),
+        "scheduler_wall_time_all" => scheduler_wall(process, ctx.as_deref(), true),
+        "microstate_accounting" => microstate(process, ctx),
         _ => Err(badarg()),
     }
 }
 
-fn system_flag(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+fn system_flag(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4972 (system_flag_2), OTP-29.1.1.
     let Some(name) = atom_name(args[0]) else {
         return Err(badarg());
     };
     match name.as_ref() {
-        "multi_scheduling" => multi_scheduling(args[1]),
-        "schedulers_online" => schedulers_online(args[1], false),
-        "dirty_cpu_schedulers_online" => schedulers_online(args[1], true),
+        "multi_scheduling" => multi_scheduling(process, args[1]),
+        "schedulers_online" => schedulers_online(process, args[1], false),
+        "dirty_cpu_schedulers_online" => schedulers_online(process, args[1], true),
         "fullsweep_after" => fullsweep_after(args[1]),
         "min_heap_size" => heap_minimum(args[1], true),
         "min_bin_vheap_size" => heap_minimum(args[1], false),
@@ -868,8 +913,8 @@ fn system_flag(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term
             crate::seq_trace::clear_all();
             Ok(atom("true"))
         }
-        "scheduler_wall_time" => set_scheduler_wall(args[1]),
-        "microstate_accounting" => set_microstate(args[1]),
+        "scheduler_wall_time" => set_scheduler_wall(process, ctx, args[1]),
+        "microstate_accounting" => set_microstate(process, ctx, args[1]),
         "outstanding_system_requests_limit" => outstanding_limit(args[1]),
         "scheduling_statistics" => scheduling_statistics(args[1]),
         "time_offset" if atom_name(args[1]).as_deref() == Some("finalize") => Ok(atom("final")),
@@ -888,29 +933,59 @@ pub(crate) fn set_system_logger(value: Term) -> Result<Term, VmError> {
     Ok(std::mem::replace(&mut *current, value))
 }
 
-fn set_scheduler_wall(value: Term) -> Result<Term, VmError> {
+fn set_scheduler_wall(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    value: Term,
+) -> Result<Term, VmError> {
     let enable = match atom_name(value).as_deref() {
         Some("true") => true,
         Some("false") => false,
         _ => return Err(badarg()),
     };
-    set_scheduler_wall_enabled(enable)
+    set_scheduler_wall_enabled(process, ctx, enable)
 }
 
-fn set_scheduler_wall_enabled(enable: bool) -> Result<Term, VmError> {
+fn set_scheduler_wall_enabled(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    enable: bool,
+) -> Result<Term, VmError> {
     let mut state = SCHED_WALL.lock().expect("scheduler wall time");
     let previous = state.is_some();
-    if enable {
-        if state.is_none() {
-            *state = Some(SchedBase {
-                started: Instant::now(),
-                cpu_ns: cpu_ns(),
-            });
-        }
-    } else {
+    if enable && state.is_none() {
+        *state = Some(SchedBase {
+            started: Instant::now(),
+            active_ns: Vec::new(),
+        });
+    } else if !enable {
         *state = None;
     }
+    drop(state);
+    set_runtime_accounting(process, ctx);
+    if enable && !previous {
+        let active_ns =
+            scheduler_stats(process, Some(ctx)).map_or_else(Vec::new, |stats| stats.active_ns);
+        SCHED_WALL
+            .lock()
+            .expect("scheduler wall time")
+            .as_mut()
+            .unwrap()
+            .active_ns = active_ns;
+    }
     Ok(atom(if previous { "true" } else { "false" }))
+}
+
+fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, Message>) {
+    let enabled = SCHED_WALL.lock().expect("scheduler wall time").is_some();
+    if let Some(scheduler) = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok())
+    {
+        scheduler.set_accounting_enabled(enabled);
+    }
+    ctx.set_wall_accounting_enabled(enabled);
 }
 
 struct SystemFlags {
@@ -919,10 +994,15 @@ struct SystemFlags {
     min_bin_vheap_size: i64,
     max_heap: crate::process::MaxHeap,
     schedulers_online: usize,
+    schedulers_total: usize,
     dirty_cpu_online: usize,
+    dirty_cpu_total: usize,
+    dirty_io_total: usize,
     trace_word: i64,
     outstanding: u64,
     multi: &'static str,
+    multi_blocked: bool,
+    normal_blocked: bool,
 }
 
 pub(crate) struct GcSpawnDefaults {
@@ -961,6 +1041,13 @@ fn with_flags<T>(body: impl FnOnce(&mut SystemFlags) -> T) -> T {
     static FLAGS: OnceLock<Mutex<SystemFlags>> = OnceLock::new();
     let flags = FLAGS.get_or_init(|| {
         let cpus = logical_processors();
+        let (
+            schedulers_total,
+            schedulers_online,
+            dirty_cpu_total,
+            dirty_cpu_online,
+            dirty_io_total,
+        ) = boot_scheduler_counts(cpus);
         Mutex::new(SystemFlags {
             // Port of erl_init.c:1328-1332 (`ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
             fullsweep_after: std::env::var("ERL_FULLSWEEP_AFTER")
@@ -970,14 +1057,105 @@ fn with_flags<T>(body: impl FnOnce(&mut SystemFlags) -> T) -> T {
             min_heap_size: 233,
             min_bin_vheap_size: 46_422,
             max_heap: crate::process::MaxHeap::default(),
-            schedulers_online: cpus,
-            dirty_cpu_online: cpus,
+            schedulers_online,
+            schedulers_total,
+            dirty_cpu_online,
+            dirty_cpu_total,
+            dirty_io_total,
             trace_word: 0,
             outstanding: (cpus as u64).saturating_mul(2),
             multi: "enabled",
+            multi_blocked: false,
+            normal_blocked: false,
         })
     });
     body(&mut flags.lock().expect("system flags"))
+}
+
+pub(crate) fn scheduler_online_default() -> (usize, bool) {
+    with_flags(|flags| (flags.schedulers_online, flags.multi != "enabled"))
+}
+
+fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
+    // Port of erts/emulator/beam/erl_init.c scheduler option defaults, OTP-29.1.1.
+    let args: Vec<String> = std::env::args().collect();
+    let mut schedulers = (cpus, cpus);
+    let mut dirty_cpu = (cpus, cpus);
+    let mut dirty_io = cpus;
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let inline = args.get(index + 1).map(String::as_str);
+        let (name, value, consumed) = match flag {
+            "+S" => (Some("+S"), inline, 2),
+            "+SDcpu" => (Some("+SDcpu"), inline, 2),
+            "+SDio" => (Some("+SDio"), inline, 2),
+            _ if flag.starts_with("+SDcpu") && flag.len() > 6 => {
+                (Some("+SDcpu"), Some(&flag[6..]), 1)
+            }
+            _ => (None, None, 1),
+        };
+        if let (Some(name), Some(value)) = (name, value) {
+            match name {
+                "+S" => {
+                    if let Some(counts) = parse_scheduler_pair(value, cpus) {
+                        schedulers = counts;
+                    }
+                }
+                "+SDcpu" => {
+                    if let Some(counts) = parse_scheduler_pair(value, cpus) {
+                        dirty_cpu = counts;
+                    }
+                }
+                "+SDio" => {
+                    if let Ok(count) = value.parse::<usize>()
+                        && count > 0
+                    {
+                        dirty_io = count;
+                    }
+                }
+                _ => {}
+            }
+            index = index.saturating_add(consumed);
+        } else {
+            index += 1;
+        }
+    }
+    let schedulers = (
+        schedulers.0.max(1),
+        schedulers.1.clamp(1, schedulers.0.max(1)),
+    );
+    let dirty_cpu = (
+        dirty_cpu.0.max(1),
+        dirty_cpu.1.clamp(1, dirty_cpu.0.max(1)).min(schedulers.1),
+    );
+    (
+        schedulers.0,
+        schedulers.1,
+        dirty_cpu.0,
+        dirty_cpu.1,
+        dirty_io.max(1),
+    )
+}
+
+fn parse_scheduler_pair(value: &str, cpus: usize) -> Option<(usize, usize)> {
+    let (total, online) = value
+        .split_once(':')
+        .map_or((value, None), |(a, b)| (a, Some(b)));
+    let resolve = |part: &str, default: usize| {
+        let value = part.parse::<i32>().ok()?;
+        let count = if value < 0 {
+            (cpus as i32).saturating_add(value)
+        } else if value == 0 {
+            default as i32
+        } else {
+            value
+        };
+        usize::try_from(count).ok().filter(|count| *count > 0)
+    };
+    let total = resolve(total, cpus)?;
+    let online = online.map_or(Some(total.min(cpus)), |value| resolve(value, total))?;
+    (online <= total).then_some((total, online))
 }
 
 // Port of erts/emulator/beam/erl_gc.c:265 (heap size table) and :311
@@ -1012,41 +1190,83 @@ fn next_heap_size(size: i64) -> i64 {
     }
 }
 
-fn multi_scheduling(value: Term) -> Result<Term, VmError> {
-    let next = match atom_name(value).as_deref() {
-        Some("block") => "blocked",
-        Some("unblock") => "enabled",
-        Some("block_normal") => "blocked_normal",
-        Some("unblock_normal") => "enabled",
+fn multi_scheduling(process: &Process, value: Term) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling), OTP-29.1.1.
+    let action = match atom_name(value).as_deref() {
+        Some("block") => (Some(true), None),
+        Some("unblock") => (Some(false), None),
+        Some("block_normal") => (None, Some(true)),
+        Some("unblock_normal") => (None, Some(false)),
         _ => return Err(badarg()),
     };
     with_flags(|flags| {
+        if let Some(blocked) = action.0 {
+            flags.multi_blocked = blocked;
+        }
+        if let Some(blocked) = action.1 {
+            flags.normal_blocked = blocked;
+        }
+        let next = if flags.multi_blocked {
+            "blocked"
+        } else if flags.normal_blocked {
+            "blocked_normal"
+        } else {
+            "enabled"
+        };
         flags.multi = next;
+        if let Some(scheduler) = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.scheduler().ok())
+        {
+            scheduler.set_scheduling_blocked(flags.multi_blocked || flags.normal_blocked);
+        }
         Ok(atom(next))
     })
 }
 
-fn schedulers_online(value: Term, dirty: bool) -> Result<Term, VmError> {
+fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_process.c:8228 (erts_set_schedulers_online), OTP-29.1.1.
     let requested = value.as_small().ok_or_else(badarg)?;
-    let cpus = logical_processors() as i64;
-    if requested < 1 || requested > cpus {
-        return Err(badarg());
-    }
     with_flags(|flags| {
         // Port of erts/emulator/beam/bif.c:5015 and :5178
         // (system_flag_2 scheduler controls), OTP-29.1.1.
         // Normal schedulers bound the number of dirty CPU schedulers online.
         let previous = if dirty {
-            if requested as usize > flags.schedulers_online {
+            if requested < 1
+                || requested as usize > flags.dirty_cpu_total
+                || requested as usize > flags.schedulers_online
+            {
                 return Err(badarg());
             }
             let previous = flags.dirty_cpu_online;
             flags.dirty_cpu_online = requested as usize;
             previous
         } else {
+            if requested < 1 || requested as usize > flags.schedulers_total {
+                return Err(badarg());
+            }
             let previous = flags.schedulers_online;
+            if requested as usize != previous
+                && let Some(scheduler) = process
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.scheduler().ok())
+                && requested as usize > scheduler.stats().run_queue_lengths.len()
+            {
+                return Err(badarg());
+            }
             flags.schedulers_online = requested as usize;
             flags.dirty_cpu_online = flags.dirty_cpu_online.min(flags.schedulers_online);
+            if requested as usize != previous
+                && let Some(scheduler) = process
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.scheduler().ok())
+                && !scheduler.set_online_schedulers(flags.schedulers_online)
+            {
+                return Err(badarg());
+            }
             previous
         };
         Term::small(previous as i64).ok_or_else(badarg)
@@ -1190,15 +1410,71 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
         .map_err(|error| VmError::Unsupported(format!("max_heap_size map: {error:?}")))
 }
 
-fn set_microstate(value: Term) -> Result<Term, VmError> {
+// Port of erts/emulator/beam/erl_msacc.c:329 (microstate accounting actions), OTP-29.1.1.
+fn set_microstate(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    value: Term,
+) -> Result<Term, VmError> {
     let previous = MICROSTATE.load(Ordering::Relaxed);
     match atom_name(value).as_deref() {
-        Some("true") => MICROSTATE.store(true, Ordering::Relaxed),
-        Some("false") => MICROSTATE.store(false, Ordering::Relaxed),
-        Some("reset") => {}
+        Some("true") => {
+            MICROSTATE.store(true, Ordering::Relaxed);
+            set_microstate_workers(process, true);
+            ctx.set_msacc_accounting_enabled(true);
+            ctx.set_msacc_state(arinsal_sched::MsaccState::Emulator);
+            if !previous {
+                ctx.set_gc_accounting_baseline(process.stats.gc.nanoseconds);
+                if MICROSTATE_BASE
+                    .lock()
+                    .expect("microstate baseline")
+                    .is_none()
+                {
+                    reset_microstate_baseline(process, ctx);
+                }
+            }
+        }
+        Some("false") => {
+            MICROSTATE.store(false, Ordering::Relaxed);
+            ctx.account_gc_total(process.stats.gc.nanoseconds);
+            ctx.set_msacc_accounting_enabled(false);
+            set_microstate_workers(process, false);
+        }
+        Some("reset") => {
+            set_microstate_workers(process, previous);
+            if previous {
+                ctx.account_gc_total(process.stats.gc.nanoseconds);
+            }
+            ctx.set_gc_accounting_baseline(process.stats.gc.nanoseconds);
+            reset_microstate_baseline(process, ctx);
+        }
         _ => return Err(badarg()),
     }
+    set_runtime_accounting(process, ctx);
     Ok(atom(if previous { "true" } else { "false" }))
+}
+
+// Port of erts/emulator/beam/erl_msacc.c:367 (managed scheduler requests), OTP-29.1.1.
+fn set_microstate_workers(process: &Process, enabled: bool) {
+    crate::check_io::set_msacc_enabled(enabled);
+    if let Some(scheduler) = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok())
+    {
+        scheduler.set_microstate_enabled(enabled);
+    }
+}
+
+// Port of erts/emulator/beam/erl_msacc.c:425 (counter reset), OTP-29.1.1.
+fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, Message>) {
+    let stats = scheduler_stats(process, Some(ctx));
+    let counters = stats
+        .as_ref()
+        .map_or_else(Vec::new, |stats| stats.msacc_ns.clone());
+    let poll_baseline = crate::check_io::msacc_snapshot();
+    *MICROSTATE_BASE.lock().expect("microstate baseline") =
+        Some((Instant::now(), counters, poll_baseline));
 }
 
 fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
@@ -1217,8 +1493,6 @@ fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
         process.heap.set_fullsweep_after(u16::MAX);
     }
     let gc = collected.map_err(|error| VmError::Unsupported(format!("GC {error:?}")))?;
-    process.stats.gc.collections += gc.collections;
-    process.stats.gc.nanoseconds += gc.nanoseconds;
     after_collection(process, live, gc.collections, gc.words_reclaimed);
     Ok(atom("true"))
 }
@@ -1372,10 +1646,7 @@ fn push_children(term: Term, out: &mut Vec<Term>) {
 }
 
 fn reduction_total(ctx: Option<&RunCtx<'_, Message>>) -> u64 {
-    let slice = ctx
-        .map(|ctx| u64::from(QUANTUM.saturating_sub(ctx.remaining())))
-        .unwrap_or(0);
-    COMPLETED_REDUCTIONS.load(Ordering::Relaxed) + slice
+    ctx.map_or(0, |ctx| ctx.total_reductions() + u64::from(ctx.consumed()))
 }
 
 fn since(total: u64, last: &AtomicU64) -> (u64, u64) {
@@ -1411,89 +1682,164 @@ fn logical_processors() -> usize {
     std::thread::available_parallelism().map_or(1, |count| count.get())
 }
 
-fn live_processes(process: &Process) -> usize {
+fn scheduler_stats(
+    process: &Process,
+    ctx: Option<&RunCtx<'_, Message>>,
+) -> Option<arinsal_sched::SchedulerStats> {
+    if let Some(ctx) = ctx {
+        return Some(ctx.scheduler_stats());
+    }
     process
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.scheduler().ok())
-        .map(|scheduler| scheduler.live_count())
-        .unwrap_or(0)
+        .map(|scheduler| scheduler.stats())
 }
 
-fn run_queue(process: &Process) -> u64 {
-    live_processes(process).saturating_sub(1) as u64
-}
-
-fn active_tasks(process: &Process) -> u64 {
-    live_processes(process) as u64
-}
-
-fn queue_slots(extra: usize, head: u64) -> Vec<u64> {
-    let mut slots = vec![0; logical_processors() + extra];
-    if let Some(slot) = slots.first_mut() {
-        *slot = head;
+fn queue_counts(
+    process: &Process,
+    ctx: Option<&RunCtx<'_, Message>>,
+    active: bool,
+    include_dirty_io: bool,
+) -> Vec<u64> {
+    // Port of erts/emulator/beam/erl_process.c:9281 (erts_run_queues_len), OTP-29.1.1.
+    let online = with_flags(|flags| flags.schedulers_online);
+    // erts exposes one aggregated run queue for each dirty scheduler class.
+    let slots = online + 1 + usize::from(include_dirty_io);
+    let mut values = vec![0; slots];
+    if let Some(stats) = scheduler_stats(process, ctx) {
+        let source = if active {
+            &stats.active_tasks
+        } else {
+            &stats.run_queue_lengths
+        };
+        for (target, value) in values.iter_mut().take(online).zip(source) {
+            *target = *value;
+        }
     }
-    slots
+    values
 }
 
-fn scheduler_wall(process: &mut Process, include_dirty_io: bool) -> Result<Term, VmError> {
-    let base = *SCHED_WALL.lock().expect("scheduler wall time");
+fn scheduler_wall(
+    process: &mut Process,
+    ctx: Option<&RunCtx<'_, Message>>,
+    include_dirty_io: bool,
+) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_process.c scheduler active/total time accounting, OTP-29.1.1.
+    let base = SCHED_WALL.lock().expect("scheduler wall time").clone();
     let Some(base) = base else {
         return Ok(atom("undefined"));
     };
     let total_us = u64::try_from(base.started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    let active_us = cpu_ns().saturating_sub(base.cpu_ns) / 1_000;
-    let n = logical_processors() as u64;
+    let stats = scheduler_stats(process, ctx);
+    let (online, dirty_cpu, dirty_io) = with_flags(|flags| {
+        (
+            flags.schedulers_online,
+            flags.dirty_cpu_total,
+            flags.dirty_io_total,
+        )
+    });
     let mut entries = Vec::new();
-    for id in 1..=n {
-        let active = if id == 1 { active_us } else { 0 };
-        entries.push(triple(process, id, active, total_us)?);
+    for id in 0..online {
+        let active = stats
+            .as_ref()
+            .and_then(|s| s.active_ns.get(id))
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(base.active_ns.get(id).copied().unwrap_or(0))
+            / 1_000;
+        entries.push(triple(process, (id + 1) as u64, active, total_us)?);
     }
-    for id in 1..=n {
-        entries.push(triple(process, n + id, 0, total_us)?);
+    for id in 0..dirty_cpu {
+        entries.push(triple(process, (online + id + 1) as u64, 0, total_us)?);
     }
     if include_dirty_io {
-        for id in 1..=n {
-            entries.push(triple(process, 2 * n + id, 0, total_us)?);
+        for id in 0..dirty_io {
+            entries.push(triple(
+                process,
+                (online + dirty_cpu + id + 1) as u64,
+                0,
+                total_us,
+            )?);
         }
     }
     cons_list(process, &entries)
 }
 
-fn microstate(process: &mut Process) -> Result<Term, VmError> {
+fn microstate(
+    process: &mut Process,
+    mut ctx: Option<&mut RunCtx<'_, Message>>,
+) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_msacc.c result layout, OTP-29.1.1.
     if !MICROSTATE.load(Ordering::Relaxed) {
         return Ok(atom("undefined"));
     }
-    let n = logical_processors() as i64;
-    let gc = i64::try_from(GC_COUNT.load(Ordering::Relaxed)).unwrap_or(i64::MAX);
-    let emulator = i64::try_from(runtime_ms().saturating_mul(1_000)).unwrap_or(i64::MAX);
-    let sleep = i64::try_from(
-        wall_ms()
-            .saturating_mul(1_000)
-            .saturating_sub(runtime_ms() * 1_000),
-    )
-    .unwrap_or(0);
-    let mut entries = Vec::new();
-    for id in 1..=n {
-        let active = if id == 1 { emulator } else { 0 };
-        entries.push(msacc_entry(process, id, "scheduler", active, gc, sleep)?);
+    let (started, baseline, poll_baseline) = MICROSTATE_BASE
+        .lock()
+        .expect("microstate baseline")
+        .clone()
+        .unwrap_or_else(|| (Instant::now(), Vec::new(), [0; 2]));
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    if let Some(ctx) = ctx.as_deref_mut() {
+        ctx.account_gc_total(process.stats.gc.nanoseconds);
     }
-    for id in 1..=n {
+    let stats = scheduler_stats(process, ctx.as_deref());
+    let (online, dirty_cpu, dirty_io) = with_flags(|flags| {
+        (
+            flags.schedulers_online,
+            flags.dirty_cpu_total,
+            flags.dirty_io_total,
+        )
+    });
+    let mut entries = Vec::new();
+    for id in 0..online {
+        let mut counters = stats
+            .as_ref()
+            .and_then(|stats| stats.msacc_ns.get(id))
+            .copied()
+            .unwrap_or([0; 7]);
+        for (state, counter) in counters.iter_mut().enumerate() {
+            *counter = counter.saturating_sub(baseline.get(id).map_or(0, |prior| prior[state]));
+        }
         entries.push(msacc_entry(
             process,
-            id,
-            "dirty_cpu_scheduler",
-            0,
-            0,
-            sleep,
+            (id + 1) as i64,
+            "scheduler",
+            counters,
         )?);
     }
-    for id in 1..=n {
-        entries.push(msacc_entry(process, id, "dirty_io_scheduler", 0, 0, sleep)?);
+    for id in 0..dirty_cpu {
+        entries.push(msacc_entry(
+            process,
+            (online + id + 1) as i64,
+            "dirty_cpu_scheduler",
+            [0, 0, 0, 0, 0, 0, elapsed],
+        )?);
     }
-    entries.push(msacc_entry(process, 1, "aux", 0, 0, sleep)?);
-    entries.push(msacc_entry(process, 0, "poll", 0, 0, sleep)?);
-    entries.push(msacc_entry(process, 0, "async", 0, 0, sleep)?);
+    for id in 0..dirty_io {
+        entries.push(msacc_entry(
+            process,
+            (online + dirty_cpu + id + 1) as i64,
+            "dirty_io_scheduler",
+            [0, 0, 0, 0, 0, 0, elapsed],
+        )?);
+    }
+    entries.push(msacc_entry(process, 1, "aux", [0, 0, 0, 0, 0, 0, elapsed])?);
+    let poll_ns = crate::check_io::msacc_snapshot();
+    let poll_check_io_ns = poll_ns[0].saturating_sub(poll_baseline[0]);
+    let poll_sleep_ns = poll_ns[1].saturating_sub(poll_baseline[1]);
+    entries.push(msacc_entry(
+        process,
+        0,
+        "poll",
+        [0, poll_check_io_ns, 0, 0, 0, 0, poll_sleep_ns],
+    )?);
+    entries.push(msacc_entry(
+        process,
+        0,
+        "async",
+        [0, 0, 0, 0, 0, 0, elapsed],
+    )?);
     cons_list(process, &entries)
 }
 
@@ -1501,20 +1847,20 @@ fn msacc_entry(
     process: &mut Process,
     id: i64,
     kind: &str,
-    emulator: i64,
-    gc: i64,
-    sleep: i64,
+    values: [u64; 7],
 ) -> Result<Term, VmError> {
+    // Perf-counter ticks on this host are nanoseconds; msacc:stats/0 performs
+    // the same perf_counter-to-microsecond conversion as OTP.
     let counters = map(
         process,
         &[
-            ("aux", small(0)),
-            ("check_io", small(0)),
-            ("emulator", small(emulator)),
-            ("gc", small(gc)),
-            ("other", small(0)),
-            ("port", small(0)),
-            ("sleep", small(sleep)),
+            ("aux", small(values[0].min(i64::MAX as u64) as i64)),
+            ("check_io", small(values[1].min(i64::MAX as u64) as i64)),
+            ("emulator", small(values[2].min(i64::MAX as u64) as i64)),
+            ("gc", small(values[3].min(i64::MAX as u64) as i64)),
+            ("other", small(values[4].min(i64::MAX as u64) as i64)),
+            ("port", small(values[5].min(i64::MAX as u64) as i64)),
+            ("sleep", small(values[6].min(i64::MAX as u64) as i64)),
         ],
     )?;
     map(
@@ -1669,6 +2015,7 @@ fn badarg() -> VmError {
 mod tests {
     use super::*;
     use arinsal_difftest::{CallResult, RefErl};
+    use arinsal_sched::{Config, RunCtx, RunOutcome, Scheduler, Task};
     #[test]
     fn garbage_collect_result_matches_otp() {
         let Ok(reference) = RefErl::start() else {
@@ -1697,7 +2044,7 @@ mod tests {
             &[OwnedTerm::atom("debug_compiled")],
         );
         let selector = Term::atom(global_atoms().intern("debug_compiled").unwrap());
-        let actual = system_info(&Vm::new([]), &mut Process::new(), selector)
+        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
             .unwrap()
             .unwrap();
         assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
@@ -1712,7 +2059,7 @@ mod tests {
         let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("check_io")]);
         let selector = Term::atom(global_atoms().intern("check_io").unwrap());
         let mut process = Process::new();
-        let actual = system_info(&Vm::new([]), &mut process, selector)
+        let actual = system_info(&Vm::new([]), &mut process, None, selector)
             .unwrap()
             .unwrap();
         let CallResult::Ok(expected) = expected else {
@@ -1778,7 +2125,7 @@ mod tests {
             let mut heap = VecHeap::new();
             let selector_term = from_owned(&selector, &mut heap).unwrap();
             let mut process = Process::new();
-            let actual = system_info(&Vm::new([]), &mut process, selector_term)
+            let actual = system_info(&Vm::new([]), &mut process, None, selector_term)
                 .unwrap()
                 .unwrap();
             assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
@@ -1809,6 +2156,102 @@ mod tests {
     }
     use arinsal_etf::OwnedTerm;
     use arinsal_term::{VecHeap, from_owned, to_owned};
+
+    struct CountedYield;
+    impl Task for CountedYield {
+        type Message = ();
+        fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _budget: u32) -> RunOutcome {
+            assert!(ctx.consume(3));
+            RunOutcome::Yield
+        }
+    }
+
+    #[test]
+    fn sched_acct_scheduler_dispatch_and_reductions_are_exact() {
+        let scheduler = Scheduler::simulation(Config::default(), 9);
+        scheduler.spawn(CountedYield).unwrap();
+        assert!(scheduler.step());
+        let stats = scheduler.stats();
+        assert_eq!(stats.context_switches, 1);
+        assert_eq!(stats.reductions, 3);
+        assert_eq!(stats.run_queue_lengths.iter().sum::<u64>(), 1);
+        assert_eq!(stats.active_tasks.iter().sum::<u64>(), 1);
+    }
+
+    #[test]
+    fn sched_acct_scheduler_flag_parser_matches_otp_count_forms() {
+        assert_eq!(parse_scheduler_pair("8:3", 10), Some((8, 3)));
+        assert_eq!(parse_scheduler_pair("8", 10), Some((8, 8)));
+        assert_eq!(parse_scheduler_pair("-1:-2", 10), Some((9, 8)));
+        assert_eq!(parse_scheduler_pair("0:3", 10), Some((10, 3)));
+        assert_eq!(boot_scheduler_counts(10), (10, 10, 10, 10, 10));
+    }
+
+    #[test]
+    fn sched_acct_system_scheduler_facts_match_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping scheduler facts differential test");
+            return;
+        };
+        for selector in [
+            "schedulers",
+            "schedulers_online",
+            "dirty_cpu_schedulers",
+            "dirty_cpu_schedulers_online",
+            "dirty_io_schedulers",
+        ] {
+            let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom(selector)]);
+            let input = Term::atom(global_atoms().intern(selector).unwrap());
+            let actual = system_info(&Vm::new([]), &mut Process::new(), None, input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                CallResult::Ok(to_owned(actual).unwrap()),
+                expected,
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn sched_acct_queue_statistics_shapes_match_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping queue shape differential test");
+            return;
+        };
+        for selector in [
+            "run_queue_lengths",
+            "run_queue_lengths_all",
+            "active_tasks",
+            "active_tasks_all",
+        ] {
+            let expected = reference.call("erlang", "statistics", &[OwnedTerm::atom(selector)]);
+            let mut heap = VecHeap::new();
+            let input = from_owned(&OwnedTerm::atom(selector), &mut heap).unwrap();
+            let actual = statistics(&Vm::new([]), &mut Process::new(), None, input)
+                .and_then(|term| to_owned(term).map_err(|_| badarg()))
+                .unwrap();
+            match (&actual, &expected) {
+                (
+                    OwnedTerm::List { elems: actual, .. },
+                    CallResult::Ok(OwnedTerm::List {
+                        elems: expected, ..
+                    }),
+                ) => assert_eq!(actual.len(), expected.len(), "{selector}"),
+                _ => panic!("queue statistics should be lists"),
+            }
+        }
+    }
+
+    #[test]
+    fn sched_acct_run_queue_totals_equal_scheduler_slots() {
+        let process = Process::new();
+        let lengths = queue_counts(&process, None, false, false);
+        let all = queue_counts(&process, None, false, true);
+        assert_eq!(lengths.iter().sum::<u64>(), 0);
+        assert_eq!(all.iter().sum::<u64>(), 0);
+        assert!(all.len() > lengths.len());
+    }
 
     #[test]
     fn statistics_shapes_and_badarg_match_otp() {

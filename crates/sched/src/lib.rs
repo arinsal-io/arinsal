@@ -90,6 +90,32 @@ const WAITING: u8 = 2;
 const EXITED: u8 = 3;
 const PID_LIMIT: u32 = 1 << 28;
 const PID_PAGE_SIZE: usize = 1024;
+const QUEUE_COUNT_SHIFT: u32 = 32;
+const QUEUE_COUNT_UNIT: u64 = 1_u64 << QUEUE_COUNT_SHIFT;
+
+/// OTP 29.1.1's default microstate categories for this build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum MsaccState {
+    /// Scheduler auxiliary work.
+    Aux = 0,
+    /// Polling and descriptor checks.
+    CheckIo = 1,
+    /// Erlang process execution.
+    Emulator = 2,
+    /// Garbage collection.
+    Gc = 3,
+    /// Scheduler work outside process execution.
+    Other = 4,
+    /// Port driver work.
+    Port = 5,
+    /// Scheduler sleeping.
+    Sleep = 6,
+}
+
+pub const MSACC_STATE_COUNT: usize = 7;
+const ACCOUNTING_WALL: u8 = 1;
+const ACCOUNTING_MSACC: u8 = 2;
 
 /// Local pid matching the 28-bit index and 32-bit generation in `arinsal-term`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -198,6 +224,10 @@ pub trait Task: Send + 'static {
     type Message: Send + 'static;
     /// Execute cooperatively, consuming at most `budget` reductions.
     fn run(&mut self, ctx: &mut RunCtx<Self::Message>, budget: u32) -> RunOutcome;
+    /// Cumulative time spent collecting this task's heap.
+    fn gc_nanoseconds(&self) -> u64 {
+        0
+    }
     /// Optional VM hook for a worker's transition between running and idle.
     fn scheduler_profile_event(
         &mut self,
@@ -314,6 +344,7 @@ struct Process<T: Task> {
     priority: Priority,
     bound_worker: Option<usize>,
     state: AtomicU8,
+    scheduler_id: AtomicUsize,
     wait_epoch: AtomicU64,
     timer_epoch_used: AtomicBool,
     wait_timer: AtomicU64,
@@ -401,7 +432,8 @@ impl<T: Task> ProcessTable<T> {
             pid,
             priority,
             bound_worker,
-            state: AtomicU8::new(QUEUED),
+            state: AtomicU8::new(WAITING),
+            scheduler_id: AtomicUsize::new(0),
             wait_epoch: AtomicU64::new(0),
             timer_epoch_used: AtomicBool::new(false),
             wait_timer: AtomicU64::new(0),
@@ -507,6 +539,18 @@ struct LocalInit<T: Task> {
     check_time_reds: u32,
     profile_active: bool,
     last_process: Option<Arc<Process<T>>>,
+    metric_deltas: Vec<i64>,
+    dirty_metrics: Vec<usize>,
+    metric_marked: Vec<bool>,
+    context_switches: u64,
+    reductions: u64,
+    active_ns: u64,
+    active_started: Option<Instant>,
+    wall_enabled: bool,
+    msacc_ns: [u64; MSACC_STATE_COUNT],
+    msacc_state: MsaccState,
+    msacc_started: Option<Instant>,
+    msacc_enabled: bool,
 }
 
 impl<T: Task> LocalInit<T> {
@@ -524,6 +568,18 @@ impl<T: Task> LocalInit<T> {
             check_time_reds: self.check_time_reds,
             profile_active: self.profile_active,
             last_process: self.last_process,
+            metric_deltas: self.metric_deltas,
+            dirty_metrics: self.dirty_metrics,
+            metric_marked: self.metric_marked,
+            context_switches: self.context_switches,
+            reductions: self.reductions,
+            active_ns: self.active_ns,
+            active_started: self.active_started,
+            wall_enabled: self.wall_enabled,
+            msacc_ns: self.msacc_ns,
+            msacc_state: self.msacc_state,
+            msacc_started: self.msacc_started,
+            msacc_enabled: self.msacc_enabled,
         }
     }
 }
@@ -614,6 +670,15 @@ struct Inner<T: Task> {
     stopped: AtomicBool,
     searching: AtomicU32,
     active_schedulers: AtomicUsize,
+    worker_stats: Vec<WorkerCounters>,
+    stats_requests: Vec<SegQueue<mpsc::Sender<LocalStatsSnapshot>>>,
+    accounting_flags: AtomicU8,
+    worker_counts: Vec<WorkerQueueCount>,
+    online_schedulers: AtomicUsize,
+    scheduling_blocked: AtomicBool,
+    next_queue: AtomicUsize,
+    started_at: Instant,
+    wall_start_requests: Mutex<Vec<Option<Instant>>>,
     work_epoch: AtomicU64,
     parked: Vec<AtomicBool>,
     sleepers: Vec<OnceLock<thread::Thread>>,
@@ -622,6 +687,25 @@ struct Inner<T: Task> {
     fanin_delivered: AtomicU64,
     fanin_peak_backlog: AtomicUsize,
     progress: Arc<ThreadProgress>,
+}
+
+#[repr(align(64))]
+struct WorkerCounters {
+    context_switches: AtomicU64,
+    reductions: AtomicU64,
+    active_ns: AtomicU64,
+}
+
+#[repr(align(64))]
+struct WorkerQueueCount(AtomicU64);
+
+#[derive(Clone, Default)]
+struct LocalStatsSnapshot {
+    context_switches: u64,
+    reductions: u64,
+    active_ns: u64,
+    msacc_ns: [u64; MSACC_STATE_COUNT],
+    metric_deltas: Vec<i64>,
 }
 
 impl<T: Task> Inner<T> {
@@ -651,7 +735,17 @@ impl<T: Task> Inner<T> {
         }
     }
 
-    fn enqueue(&self, item: Scheduled<T>) {
+    fn enqueue(&self, item: Scheduled<T>, already_active: bool) {
+        let online = self.online_schedulers.load(Ordering::Relaxed).max(1);
+        let scheduler = if already_active {
+            item.process
+                .scheduler_id
+                .load(Ordering::Relaxed)
+                .min(online - 1)
+        } else {
+            self.next_queue.fetch_add(1, Ordering::Relaxed) % online
+        };
+        self.record_queued(&item.process, scheduler, already_active);
         if let Some(sim) = &self.sim {
             sim.lock().unwrap().queue.push_back(item);
         } else if let Some(worker) = item.process.bound_worker {
@@ -663,6 +757,153 @@ impl<T: Task> Inner<T> {
             // Publish the queue change before a parker's final epoch check.
             self.work_epoch.fetch_add(1, Ordering::SeqCst);
             self.wake_one();
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:9281 (erts_run_queues_len), OTP-29.1.1.
+    fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
+        process.scheduler_id.store(worker, Ordering::Relaxed);
+        self.worker_counts[worker].0.fetch_add(
+            QUEUE_COUNT_UNIT + u64::from(!already_active),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_running(&self, process: &Process<T>, worker: usize) {
+        let previous = process
+            .scheduler_id
+            .load(Ordering::Relaxed)
+            .min(self.worker_counts.len() - 1);
+        if previous == worker {
+            self.worker_counts[worker]
+                .0
+                .fetch_sub(QUEUE_COUNT_UNIT, Ordering::Relaxed);
+        } else {
+            self.worker_counts[previous]
+                .0
+                .fetch_sub(QUEUE_COUNT_UNIT + 1, Ordering::Relaxed);
+            self.worker_counts[worker].0.fetch_add(1, Ordering::Relaxed);
+        }
+        process.scheduler_id.store(worker, Ordering::Relaxed);
+    }
+
+    fn record_waiting(&self, process: &Process<T>) {
+        let worker = process
+            .scheduler_id
+            .load(Ordering::Relaxed)
+            .min(self.worker_counts.len() - 1);
+        self.worker_counts[worker].0.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn take_wall_start(&self, worker: usize) -> Option<Instant> {
+        self.wall_start_requests
+            .lock()
+            .expect("wall start requests")
+            .get_mut(worker)
+            .and_then(Option::take)
+    }
+
+    fn flush_local_metrics(&self, _local: &mut Local<T>) {
+        // Worker-owned deltas remain local; statistics readers aggregate them on demand.
+    }
+
+    fn simulation_stats(&self) -> SchedulerStats {
+        let counts: Vec<u64> = self
+            .worker_counts
+            .iter()
+            .map(|value| value.0.load(Ordering::Relaxed))
+            .collect();
+        SchedulerStats {
+            run_queue_lengths: counts
+                .iter()
+                .map(|value| value >> QUEUE_COUNT_SHIFT)
+                .collect(),
+            active_tasks: counts
+                .iter()
+                .map(|value| value & (QUEUE_COUNT_UNIT - 1))
+                .collect(),
+            active_ns: self
+                .worker_stats
+                .iter()
+                .map(|value| value.active_ns.load(Ordering::Relaxed))
+                .collect(),
+            msacc_ns: vec![[0; MSACC_STATE_COUNT]; self.worker_stats.len()],
+            context_switches: self
+                .worker_stats
+                .iter()
+                .map(|value| value.context_switches.load(Ordering::Relaxed))
+                .sum(),
+            reductions: self
+                .worker_stats
+                .iter()
+                .map(|value| value.reductions.load(Ordering::Relaxed))
+                .sum(),
+            active_schedulers: self.active_schedulers.load(Ordering::Relaxed) as u64,
+            elapsed_ns: u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+
+    fn scheduler_stats(
+        &self,
+        current: Option<&Local<T>>,
+        current_reductions: u64,
+    ) -> SchedulerStats {
+        if self.sim.is_some() {
+            return self.simulation_stats();
+        }
+        let accounting_flags = self.accounting_flags.load(Ordering::Relaxed);
+        let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
+        let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
+        let mut snapshots = Vec::with_capacity(self.stats_requests.len());
+        for worker in 0..self.stats_requests.len() {
+            if current.is_some_and(|local| local.worker_id == worker) {
+                snapshots.push(
+                    current
+                        .expect("current worker checked")
+                        .stats_snapshot(msacc_enabled, wall_enabled),
+                );
+                continue;
+            }
+            let (reply, receive) = mpsc::channel();
+            self.stats_requests[worker].push(reply);
+            self.wake_worker(worker);
+            snapshots.push(receive.recv().unwrap_or_default());
+        }
+        let mut counts: Vec<u64> = self
+            .worker_counts
+            .iter()
+            .map(|value| value.0.load(Ordering::Relaxed))
+            .collect();
+        for snapshot in &snapshots {
+            for (count, delta) in counts.iter_mut().zip(&snapshot.metric_deltas) {
+                *count = count.wrapping_add(*delta as u64);
+            }
+        }
+        SchedulerStats {
+            run_queue_lengths: counts
+                .iter()
+                .map(|value| value >> QUEUE_COUNT_SHIFT)
+                .collect(),
+            active_tasks: counts
+                .iter()
+                .map(|value| value & (QUEUE_COUNT_UNIT - 1))
+                .collect(),
+            active_ns: snapshots
+                .iter()
+                .map(|snapshot| snapshot.active_ns)
+                .collect(),
+            msacc_ns: snapshots.iter().map(|snapshot| snapshot.msacc_ns).collect(),
+            context_switches: snapshots
+                .iter()
+                .map(|snapshot| snapshot.context_switches)
+                .sum(),
+            reductions: snapshots
+                .iter()
+                .map(|snapshot| snapshot.reductions)
+                .sum::<u64>()
+                .saturating_add(current_reductions),
+            active_schedulers: self.active_schedulers.load(Ordering::Relaxed) as u64,
+            elapsed_ns: u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
         }
     }
 
@@ -822,14 +1063,15 @@ impl<T: Task> Inner<T> {
     /// than a local ping-pong, so the peer runs here before this worker parks.
     fn place_runnable(&self, item: Scheduled<T>, local: Option<&mut Local<T>>) {
         if item.process.bound_worker.is_some() {
-            self.enqueue(item);
+            self.enqueue(item, false);
             return;
         }
         if let Some(local) = local {
+            local.record_queued(&item.process, local.worker_id, false);
             local.push_next(item);
             return;
         }
-        self.enqueue(item);
+        self.enqueue(item, false);
     }
 
     fn cancel_wait_timer(&self, process: &Process<T>, id: u64) {
@@ -1157,8 +1399,121 @@ struct Local<T: Task> {
     check_time_reds: u32,
     profile_active: bool,
     last_process: Option<Arc<Process<T>>>,
+    metric_deltas: Vec<i64>,
+    dirty_metrics: Vec<usize>,
+    metric_marked: Vec<bool>,
+    context_switches: u64,
+    reductions: u64,
+    active_ns: u64,
+    active_started: Option<Instant>,
+    wall_enabled: bool,
+    msacc_ns: [u64; MSACC_STATE_COUNT],
+    msacc_state: MsaccState,
+    msacc_started: Option<Instant>,
+    msacc_enabled: bool,
 }
 impl<T: Task> Local<T> {
+    fn set_wall_enabled(&mut self, enabled: bool) {
+        self.set_wall_enabled_at(enabled, None);
+    }
+
+    fn set_wall_enabled_at(&mut self, enabled: bool, started_at: Option<Instant>) {
+        if self.wall_enabled == enabled {
+            return;
+        }
+        if let Some(started) = self.active_started.take() {
+            self.active_ns = self
+                .active_ns
+                .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        self.wall_enabled = enabled;
+        if enabled {
+            self.active_started = Some(started_at.unwrap_or_else(Instant::now));
+        }
+    }
+
+    fn set_msacc_enabled(&mut self, enabled: bool) {
+        if self.msacc_enabled != enabled {
+            if self.msacc_enabled {
+                self.set_msacc_state(self.msacc_state);
+                self.msacc_started = None;
+            }
+            self.msacc_enabled = enabled;
+            if enabled {
+                self.msacc_state = MsaccState::Other;
+                self.msacc_started = Some(Instant::now());
+            }
+        }
+    }
+
+    fn stats_snapshot(&self, msacc_enabled: bool, wall_enabled: bool) -> LocalStatsSnapshot {
+        let mut msacc_ns = self.msacc_ns;
+        if msacc_enabled && let Some(started) = self.msacc_started {
+            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            msacc_ns[self.msacc_state as usize] =
+                msacc_ns[self.msacc_state as usize].saturating_add(elapsed);
+        }
+        let active_ns = if wall_enabled {
+            self.active_started.map_or(self.active_ns, |started| {
+                self.active_ns
+                    .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+            })
+        } else {
+            self.active_ns
+        };
+        LocalStatsSnapshot {
+            context_switches: self.context_switches,
+            reductions: self.reductions,
+            active_ns,
+            msacc_ns,
+            metric_deltas: self.metric_deltas.clone(),
+        }
+    }
+
+    fn set_msacc_state(&mut self, state: MsaccState) {
+        if !self.msacc_enabled {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(started) = self.msacc_started.replace(now) {
+            let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let counter = &mut self.msacc_ns[self.msacc_state as usize];
+            *counter = counter.saturating_add(elapsed);
+        }
+        self.msacc_state = state;
+    }
+
+    fn adjust_metric(&mut self, worker: usize, delta: i64) {
+        if !self.metric_marked[worker] {
+            self.metric_marked[worker] = true;
+            self.dirty_metrics.push(worker);
+        }
+        self.metric_deltas[worker] += delta;
+    }
+
+    fn record_queued(&mut self, process: &Process<T>, worker: usize, already_active: bool) {
+        process.scheduler_id.store(worker, Ordering::Relaxed);
+        self.adjust_metric(worker, QUEUE_COUNT_UNIT as i64 + i64::from(!already_active));
+    }
+
+    fn record_running(&mut self, process: &Process<T>, worker: usize) {
+        let previous = process
+            .scheduler_id
+            .load(Ordering::Relaxed)
+            .min(self.metric_deltas.len() - 1);
+        self.adjust_metric(previous, -(QUEUE_COUNT_UNIT as i64 + 1));
+        self.adjust_metric(worker, 1);
+        process.scheduler_id.store(worker, Ordering::Relaxed);
+    }
+
+    fn record_waiting(&mut self, process: &Process<T>) {
+        let worker = process
+            .scheduler_id
+            .load(Ordering::Relaxed)
+            .min(self.metric_deltas.len() - 1);
+        self.adjust_metric(worker, -1);
+    }
+
     fn lookup(&mut self, table: &ProcessTable<T>, pid: Pid) -> Option<Arc<Process<T>>> {
         if self.pid_cache.is_empty() {
             self.pid_cache = (0..1024).map(|_| None).collect();
@@ -1220,8 +1575,12 @@ pub struct RunCtx<'a, M: Send + 'static> {
     private: &'a mut Private<Event<M>>,
     backlog: &'a AtomicUsize,
     remaining: u32,
+    budget: u32,
     private_wake: bool,
     progress: Option<ProgressGuard>,
+    msacc_enabled: bool,
+    wall_enabled: bool,
+    gc_accounted_total: u64,
 }
 
 trait ContextOps<M> {
@@ -1233,6 +1592,12 @@ trait ContextOps<M> {
         remaining: u32,
     ) -> Result<bool, Error>;
     fn flush(&mut self, remaining: u32);
+    fn total_reductions(&self) -> u64;
+    fn scheduler_stats(&self) -> SchedulerStats;
+    fn set_msacc_enabled(&mut self, enabled: bool);
+    fn set_msacc_state(&mut self, state: MsaccState);
+    fn reclassify_gc_ns(&mut self, nanoseconds: u64);
+    fn set_wall_accounting_enabled(&mut self, enabled: bool);
     fn start_timer(&mut self, pid: Pid, ms: u64, msg: M, wrapped: bool) -> Result<TimerRef, Error>;
     fn mark_exited(&mut self, pid: Pid);
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
@@ -1272,6 +1637,61 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Remaining reductions in this quantum.
     pub fn remaining(&self) -> u32 {
         self.remaining
+    }
+    /// Reductions consumed in this process turn so far.
+    pub fn consumed(&self) -> u32 {
+        self.budget.saturating_sub(self.remaining)
+    }
+    /// Scheduler-wide reductions committed before this process turn.
+    pub fn total_reductions(&self) -> u64 {
+        self.inner.total_reductions()
+    }
+    /// Scheduler-owned task and timing snapshot including this turn's pending changes.
+    pub fn scheduler_stats(&self) -> SchedulerStats {
+        let mut stats = self.inner.scheduler_stats();
+        stats.reductions = stats.reductions.saturating_add(u64::from(self.consumed()));
+        stats
+    }
+    /// Change the current scheduler worker's microstate category.
+    pub fn set_msacc_state(&mut self, state: MsaccState) {
+        if !self.msacc_enabled {
+            return;
+        }
+        self.inner.set_msacc_state(state);
+    }
+    /// Change microstate accounting while this task is running.
+    pub fn set_msacc_accounting_enabled(&mut self, enabled: bool) {
+        if self.msacc_enabled != enabled {
+            self.msacc_enabled = enabled;
+            self.inner.set_msacc_enabled(enabled);
+        }
+    }
+    /// Move measured heap collection time out of the enclosing emulator interval.
+    pub fn reclassify_gc_ns(&mut self, nanoseconds: u64) {
+        self.inner.reclassify_gc_ns(nanoseconds);
+    }
+    /// Account newly completed collection time before a live microstate snapshot.
+    // Port of erts/emulator/beam/erl_gc.c:800 (collector state interval), OTP-29.1.1.
+    pub fn account_gc_total(&mut self, total_nanoseconds: u64) {
+        if self.msacc_enabled {
+            let delta = total_nanoseconds.saturating_sub(self.gc_accounted_total);
+            if delta != 0 {
+                self.inner.reclassify_gc_ns(delta);
+            }
+            self.gc_accounted_total = self.gc_accounted_total.max(total_nanoseconds);
+        }
+    }
+    /// Set the GC counter origin when accounting is enabled or reset mid-turn.
+    pub fn set_gc_accounting_baseline(&mut self, total_nanoseconds: u64) {
+        self.gc_accounted_total = total_nanoseconds;
+    }
+    /// Update this worker's active interval when scheduler wall time changes.
+    pub fn set_wall_accounting_enabled(&mut self, enabled: bool) {
+        if self.wall_enabled == enabled {
+            return;
+        }
+        self.wall_enabled = enabled;
+        self.inner.set_wall_accounting_enabled(enabled);
     }
     /// Detach pending input and receive the oldest event.
     pub fn receive(&mut self) -> Option<Event<M>> {
@@ -1574,16 +1994,21 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error> {
         let process = self.lookup(pid).ok_or(Error::NoProcess)?;
+        process
+            .state
+            .compare_exchange(WAITING, QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::NoProcess)?;
         let item = Scheduled {
             process: process.clone(),
             inherited: None,
         };
         if process.bound_worker.is_some() {
-            self.inner.enqueue(item);
+            self.inner.enqueue(item, false);
         } else if let Some(local) = self.local.as_deref_mut() {
+            local.record_queued(&process, local.worker_id, false);
             local.push_next(item);
         } else {
-            self.inner.enqueue(item);
+            self.inner.enqueue(item, false);
         }
         Ok(())
     }
@@ -1766,6 +2191,43 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             }
         }
     }
+    fn total_reductions(&self) -> u64 {
+        if self.inner.sim.is_some() {
+            return self.inner.simulation_stats().reductions;
+        }
+        self.inner
+            .scheduler_stats(self.local.as_deref(), 0)
+            .reductions
+    }
+    fn scheduler_stats(&self) -> SchedulerStats {
+        self.inner.scheduler_stats(self.local.as_deref(), 0)
+    }
+    fn set_msacc_state(&mut self, state: MsaccState) {
+        if let Some(local) = self.local.as_deref_mut() {
+            local.set_msacc_state(state);
+        }
+    }
+    fn set_msacc_enabled(&mut self, enabled: bool) {
+        if let Some(local) = self.local.as_deref_mut() {
+            local.set_msacc_enabled(enabled);
+        }
+    }
+    fn reclassify_gc_ns(&mut self, nanoseconds: u64) {
+        if let Some(local) = self.local.as_deref_mut()
+            && local.msacc_enabled
+        {
+            local.msacc_ns[MsaccState::Emulator as usize] =
+                local.msacc_ns[MsaccState::Emulator as usize].saturating_sub(nanoseconds);
+            local.msacc_ns[MsaccState::Gc as usize] =
+                local.msacc_ns[MsaccState::Gc as usize].saturating_add(nanoseconds);
+        }
+    }
+    fn set_wall_accounting_enabled(&mut self, enabled: bool) {
+        if let Some(local) = self.local.as_deref_mut() {
+            let _ = self.inner.take_wall_start(local.worker_id);
+            local.set_wall_enabled(enabled);
+        }
+    }
     fn mark_exited(&mut self, pid: Pid) {
         if let Some(process) = self.inner.table.lookup(pid) {
             process.state.store(EXITED, Ordering::SeqCst);
@@ -1796,6 +2258,27 @@ pub struct Scheduler<T: Task> {
     inner: Arc<Inner<T>>,
     threads: Vec<JoinHandle<()>>,
     virtual_clock: Option<Arc<VirtualClock>>,
+}
+
+/// A point-in-time snapshot of scheduler work and execution counters.
+#[derive(Clone, Debug)]
+pub struct SchedulerStats {
+    /// Runnable processes assigned to each worker.
+    pub run_queue_lengths: Vec<u64>,
+    /// Runnable or currently running processes assigned to each worker.
+    pub active_tasks: Vec<u64>,
+    /// Nanoseconds spent executing tasks on each worker while accounting was enabled.
+    pub active_ns: Vec<u64>,
+    /// Per-worker microstate nanoseconds in `MsaccState` order.
+    pub msacc_ns: Vec<[u64; MSACC_STATE_COUNT]>,
+    /// Number of task dispatches since scheduler creation.
+    pub context_switches: u64,
+    /// Number of reductions consumed by tasks since scheduler creation.
+    pub reductions: u64,
+    /// Workers currently executing a task.
+    pub active_schedulers: u64,
+    /// Nanoseconds since scheduler creation.
+    pub elapsed_ns: u64,
 }
 
 impl<T: Task> Scheduler<T> {
@@ -1856,6 +2339,18 @@ impl<T: Task> Scheduler<T> {
                 check_time_reds: 0,
                 profile_active: false,
                 last_process: None,
+                metric_deltas: vec![0; workers],
+                dirty_metrics: Vec::new(),
+                metric_marked: vec![false; workers],
+                context_switches: 0,
+                reductions: 0,
+                active_ns: 0,
+                active_started: None,
+                wall_enabled: false,
+                msacc_ns: [0; MSACC_STATE_COUNT],
+                msacc_state: MsaccState::Other,
+                msacc_started: None,
+                msacc_enabled: false,
             });
         }
         let inner = Arc::new(Inner {
@@ -1880,6 +2375,23 @@ impl<T: Task> Scheduler<T> {
             stopped: AtomicBool::new(false),
             searching: AtomicU32::new(0),
             active_schedulers: AtomicUsize::new(0),
+            worker_stats: (0..workers)
+                .map(|_| WorkerCounters {
+                    context_switches: AtomicU64::new(0),
+                    reductions: AtomicU64::new(0),
+                    active_ns: AtomicU64::new(0),
+                })
+                .collect(),
+            stats_requests: (0..workers).map(|_| SegQueue::new()).collect(),
+            accounting_flags: AtomicU8::new(0),
+            worker_counts: (0..workers)
+                .map(|_| WorkerQueueCount(AtomicU64::new(0)))
+                .collect(),
+            online_schedulers: AtomicUsize::new(workers),
+            scheduling_blocked: AtomicBool::new(false),
+            next_queue: AtomicUsize::new(0),
+            started_at: Instant::now(),
+            wall_start_requests: Mutex::new(vec![None; workers]),
             work_epoch: AtomicU64::new(0),
             parked: (0..workers).map(|_| AtomicBool::new(false)).collect(),
             sleepers: (0..workers).map(|_| OnceLock::new()).collect(),
@@ -1932,10 +2444,14 @@ impl<T: Task> Scheduler<T> {
     pub fn spawn_priority(&self, task: T, priority: Priority) -> Result<Pid, Error> {
         let process = self.inner.table.insert(task, priority, None)?;
         let pid = process.pid;
-        self.inner.enqueue(Scheduled {
-            process,
-            inherited: None,
-        });
+        process.state.store(QUEUED, Ordering::Release);
+        self.inner.enqueue(
+            Scheduled {
+                process,
+                inherited: None,
+            },
+            false,
+        );
         Ok(pid)
     }
     /// Queue a message from one logical sender.
@@ -1969,6 +2485,87 @@ impl<T: Task> Scheduler<T> {
     pub fn live_count(&self) -> usize {
         self.inner.table.live_count()
     }
+    /// Return scheduler-owned task counts and cumulative execution counters.
+    pub fn stats(&self) -> SchedulerStats {
+        self.inner.scheduler_stats(None, 0)
+    }
+
+    /// Enable or disable per worker execution time accounting.
+    pub fn set_accounting_enabled(&self, enabled: bool) {
+        if enabled {
+            let previous = self
+                .inner
+                .accounting_flags
+                .fetch_or(ACCOUNTING_WALL, Ordering::Relaxed);
+            if previous & ACCOUNTING_WALL == 0 {
+                let started = Instant::now();
+                let mut requests = self
+                    .inner
+                    .wall_start_requests
+                    .lock()
+                    .expect("wall start requests");
+                for (worker, request) in requests.iter_mut().enumerate() {
+                    *request =
+                        (!self.inner.parked[worker].load(Ordering::Relaxed)).then_some(started);
+                }
+            }
+        } else {
+            self.inner
+                .accounting_flags
+                .fetch_and(!ACCOUNTING_WALL, Ordering::Relaxed);
+            self.inner
+                .wall_start_requests
+                .lock()
+                .expect("wall start requests")
+                .fill(None);
+        }
+        self.wake_all_workers();
+    }
+
+    /// Enable or disable worker microstate counters.
+    pub fn set_microstate_enabled(&self, enabled: bool) {
+        if enabled {
+            self.inner
+                .accounting_flags
+                .fetch_or(ACCOUNTING_MSACC, Ordering::Relaxed);
+        } else {
+            self.inner
+                .accounting_flags
+                .fetch_and(!ACCOUNTING_MSACC, Ordering::Relaxed);
+        }
+        self.wake_all_workers();
+    }
+
+    /// Set the number of worker threads allowed to dispatch tasks.
+    pub fn set_online_schedulers(&self, online: usize) -> bool {
+        if online == 0 || online > self.inner.parked.len() {
+            return false;
+        }
+        self.inner
+            .online_schedulers
+            .store(online, Ordering::Release);
+        self.wake_all_workers();
+        true
+    }
+
+    /// Pause or resume all task dispatch on this scheduler.
+    pub fn set_scheduling_blocked(&self, blocked: bool) {
+        self.inner
+            .scheduling_blocked
+            .store(blocked, Ordering::Release);
+        if !blocked {
+            self.wake_all_workers();
+        }
+    }
+
+    fn wake_all_workers(&self) {
+        for sleeper in &self.inner.sleepers {
+            if let Some(thread) = sleeper.get() {
+                thread.unpark();
+            }
+        }
+    }
+
     /// Inspect or set the next free process table id for internal-state tests.
     ///
     /// Returns `None` when the process table has no available id.
@@ -2168,8 +2765,12 @@ mod msgq_stage_microbench {
             private: &mut receive_private,
             backlog: &backlog,
             remaining: 1_000,
+            budget: 1_000,
             private_wake: false,
             progress: None,
+            msacc_enabled: false,
+            wall_enabled: false,
+            gc_accounted_total: 0,
         };
         let started = Instant::now();
         assert!(context.fetch_pending());
@@ -2346,13 +2947,37 @@ fn run_one<'a, T: Task>(
     {
         return;
     }
+    if let Some(local) = local.as_deref_mut() {
+        local.record_running(&process, local.worker_id);
+    } else {
+        inner.record_running(&process, worker.unwrap_or(0));
+    }
+    let worker_id = worker.unwrap_or(0);
+    if let Some(local) = local.as_deref_mut() {
+        local.context_switches += 1;
+    } else {
+        inner.worker_stats[worker_id]
+            .context_switches
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let budget = item
         .inherited
         .filter(|&n| n > 0)
         .unwrap_or(inner.config.reductions);
     let progress = ThreadProgress::enter(Arc::clone(&inner.progress));
+    let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
+    let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
+    if let Some(local) = local.as_deref_mut() {
+        local.set_msacc_enabled(msacc_enabled);
+        let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
+        let started_at = (wall_enabled && !local.wall_enabled)
+            .then(|| inner.take_wall_start(local.worker_id))
+            .flatten();
+        local.set_wall_enabled_at(wall_enabled, started_at);
+    }
+    let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
     let mut cell = process.cell.lock().unwrap();
-    let (outcome, remaining, private_pending) = {
+    let (outcome, remaining, private_pending, active_ns) = {
         let mut runner = Runner {
             inner,
             local: local.take(),
@@ -2370,14 +2995,33 @@ fn run_one<'a, T: Task>(
                 private,
                 backlog: &process.backlog,
                 remaining: budget,
+                budget,
                 private_wake: true,
                 progress: Some(progress),
+                msacc_enabled,
+                wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
+                gc_accounted_total: if msacc_enabled {
+                    task.gc_nanoseconds()
+                } else {
+                    0
+                },
             };
+            if msacc_enabled {
+                ctx.set_msacc_state(MsaccState::Emulator);
+            }
             let outcome = task.run(&mut ctx, budget);
+            if ctx.msacc_enabled {
+                ctx.set_msacc_state(MsaccState::Other);
+                ctx.account_gc_total(task.gc_nanoseconds());
+            }
+            let active_ns = accounting_started.map_or(0, |started| {
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+            });
             (
                 outcome,
                 ctx.remaining,
                 ctx.private_wake && !ctx.private.is_empty(),
+                active_ns,
             )
         };
         runner.flush(result.1);
@@ -2385,6 +3029,17 @@ fn run_one<'a, T: Task>(
         local = runner.local.take();
         result
     };
+    let consumed = u64::from(budget.saturating_sub(remaining));
+    if let Some(local) = local.as_deref_mut() {
+        local.reductions += consumed;
+    } else {
+        inner.worker_stats[worker_id]
+            .reductions
+            .fetch_add(consumed, Ordering::Relaxed);
+        inner.worker_stats[worker_id]
+            .active_ns
+            .fetch_add(active_ns, Ordering::Relaxed);
+    }
     if let Some(local) = local.as_deref_mut() {
         local.check_time_reds = local
             .check_time_reds
@@ -2398,11 +3053,12 @@ fn run_one<'a, T: Task>(
                 inherited: None,
             };
             if process.bound_worker.is_some() {
-                inner.enqueue(next);
+                inner.enqueue(next, true);
             } else if let Some(local) = local.as_deref_mut() {
+                local.record_queued(&next.process, local.worker_id, true);
                 local.queues[next.process.priority.index()].push(next);
             } else {
-                inner.enqueue(next);
+                inner.enqueue(next, true);
             }
         }
         RunOutcome::Wait { timeout_ms } => {
@@ -2415,6 +3071,11 @@ fn run_one<'a, T: Task>(
                 process.wait_epoch.load(Ordering::Relaxed)
             };
             process.state.store(WAITING, Ordering::SeqCst);
+            if let Some(local) = local.as_deref_mut() {
+                local.record_waiting(&process);
+            } else {
+                inner.record_waiting(&process);
+            }
             if let Some(ms) = timeout_ms {
                 if ms == 0 {
                     if process
@@ -2479,11 +3140,16 @@ fn run_one<'a, T: Task>(
                     process: process.clone(),
                     inherited: Some(remaining),
                 };
-                inner.place_runnable(next, local);
+                inner.place_runnable(next, local.as_deref_mut());
             }
         }
         RunOutcome::Exit(_) => {
             process.state.store(EXITED, Ordering::SeqCst);
+            if let Some(local) = local.as_deref_mut() {
+                local.record_waiting(&process);
+            } else {
+                inner.record_waiting(&process);
+            }
             // Publishers that observed RUNNING still hold `publish_inflight`
             // until their push. Spin until that push is visible, then reap it.
             let mut spins = 0u32;
@@ -2513,6 +3179,9 @@ fn run_one<'a, T: Task>(
             inner.table.remove(process.pid);
         }
     }
+    if let Some(local) = local {
+        inner.flush_local_metrics(local);
+    }
     drop(cell);
 }
 
@@ -2528,8 +3197,33 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
     });
     let mut rng = SeededRng::new(id as u64 + 1);
     while !inner.stopped.load(Ordering::Acquire) {
+        let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
+        local.set_msacc_enabled(accounting_flags & ACCOUNTING_MSACC != 0);
+        let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
+        let started_at = (wall_enabled && !local.wall_enabled)
+            .then(|| inner.take_wall_start(id))
+            .flatten();
+        local.set_wall_enabled_at(wall_enabled, started_at);
+        local.set_msacc_state(MsaccState::Other);
+        while let Some(reply) = inner.stats_requests[id].pop() {
+            let _ = reply.send(local.stats_snapshot(local.msacc_enabled, local.wall_enabled));
+        }
+        if id >= inner.online_schedulers.load(Ordering::Acquire)
+            || inner.scheduling_blocked.load(Ordering::Acquire)
+        {
+            local.set_wall_enabled(false);
+            local.set_msacc_state(MsaccState::Sleep);
+            inner.parked[id].store(true, Ordering::SeqCst);
+            thread::park();
+            inner.parked[id].store(false, Ordering::SeqCst);
+            continue;
+        }
+        // Port of erts/emulator/beam/erl_process.c:2683 (auxiliary work), OTP-29.1.1.
+        local.set_msacc_state(MsaccState::Aux);
         inner.poll_timers(id, Some(&mut local), false);
         inner.poll_pending_waits(&mut local);
+        local.set_msacc_state(MsaccState::Other);
+        inner.flush_local_metrics(&mut local);
         let mut item = inner.pinned_injectors[id].pop();
         if item.is_none() {
             item = local.pop(inner.config.runnext_limit);
@@ -2603,8 +3297,10 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         // the publication or the enqueuer observe our parked flag.
         let observed = inner.work_epoch.load(Ordering::SeqCst);
         inner.parked[id].store(true, Ordering::SeqCst);
+        local.set_msacc_state(MsaccState::Aux);
         inner.poll_pending_waits(&mut local);
         inner.poll_timers(id, Some(&mut local), true);
+        local.set_msacc_state(MsaccState::Other);
         if local.runnext.is_some()
             || local.queues.iter().any(|queue| !queue.is_empty())
             || inner.injectors.iter().any(|queue| !queue.is_empty())
@@ -2629,6 +3325,8 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
                 || !service.canceled.is_empty()
         };
         let wait_ms = inner.nearest_wait_ms(&local);
+        local.set_msacc_state(MsaccState::Sleep);
+        local.set_wall_enabled(false);
         if wheel_armed {
             // The wheel is polled on a 1 ms cadence.
             thread::park_timeout(Duration::from_millis(1));

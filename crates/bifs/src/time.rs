@@ -60,9 +60,11 @@ fn floor_div(numerator: BigInt, denominator: BigInt) -> BigInt {
 
 fn unit(value: Term) -> Result<BigInt, BifError> {
     if let Some(name) = atom_name(value) {
-        // Port of erts/emulator/beam/erl_time_sup.c:2277 (time_unit_conversion), OTP-29.1.1.
+        // Port of erts/emulator/beam/erl_time_sup.c:2607 (perf_counter_unit), OTP-29.1.1.
         return Ok(BigInt::from(match name.as_ref() {
             "native" | "nanosecond" | "nano_seconds" => NATIVE,
+            // The OTP 29.1.1 macOS perf counter is nanosecond-resolution.
+            "perf_counter" => NATIVE,
             "microsecond" | "micro_seconds" => 1_000_000,
             "millisecond" | "milli_seconds" => 1_000,
             "second" | "seconds" => 1,

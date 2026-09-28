@@ -1182,7 +1182,8 @@ fn worker(
         if !handle.state.lock().unwrap().closed {
             // Port of `erts_check_io` one-shot readiness delivery; every
             // operation is re-registered after this worker handles the event.
-            match crate::check_io::wait_any(&fds) {
+            let result = crate::check_io::wait_any(&fds);
+            match result {
                 Ok(Some((ready_fd, ready))) => {
                     input_ready = Some(ready_fd) == read_fd
                         && (ready.readable || ready.closed || ready.error);

@@ -1509,8 +1509,6 @@ impl Vm {
                 p.module = module_id;
                 p.ip = offset;
                 p.reductions = reds;
-                // One add per quantum, not per instruction.
-                natives::sys::note_quantum(budget);
                 return Ok(RunState::Yield);
             }
             consumed += 1;
@@ -2076,7 +2074,6 @@ impl Vm {
                                 p.ip = unsafe { ip.offset_from(base) } as usize;
                                 p.module = module_id;
                                 p.reductions = 4000;
-                                natives::sys::note_quantum(budget);
                                 return Ok(RunState::Yield);
                             }
                             continue;
@@ -2135,7 +2132,6 @@ impl Vm {
                                     p.ip = unsafe { ip.offset_from(base) } as usize;
                                     p.module = module_id;
                                     p.reductions = 4000;
-                                    natives::sys::note_quantum(budget);
                                     return Ok(RunState::Yield);
                                 }
                                 if let Some(resume) = p

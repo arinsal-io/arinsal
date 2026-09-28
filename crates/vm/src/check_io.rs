@@ -14,9 +14,80 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 const WAKE_TOKEN: Token = Token(0);
 const EVENT_CAPACITY: usize = 1024;
+
+#[derive(Clone, Copy)]
+enum PollState {
+    CheckIo,
+    Sleep,
+}
+
+struct PollMsacc {
+    enabled: bool,
+    state: PollState,
+    started: Instant,
+    check_io_ns: u64,
+    sleep_ns: u64,
+}
+
+impl PollMsacc {
+    fn update(&mut self, now: Instant) {
+        if self.enabled {
+            let elapsed = u64::try_from(now.saturating_duration_since(self.started).as_nanos())
+                .unwrap_or(u64::MAX);
+            let counter = match self.state {
+                PollState::CheckIo => &mut self.check_io_ns,
+                PollState::Sleep => &mut self.sleep_ns,
+            };
+            *counter = counter.saturating_add(elapsed);
+        }
+        self.started = now;
+    }
+}
+
+static POLL_MSACC: OnceLock<Mutex<PollMsacc>> = OnceLock::new();
+
+fn poll_msacc() -> &'static Mutex<PollMsacc> {
+    POLL_MSACC.get_or_init(|| {
+        Mutex::new(PollMsacc {
+            enabled: false,
+            state: PollState::Sleep,
+            started: Instant::now(),
+            check_io_ns: 0,
+            sleep_ns: 0,
+        })
+    })
+}
+
+/// Enable or disable accounting for the dedicated poll thread.
+// Port of erts/emulator/sys/common/erl_poll.c:1956-2003, OTP-29.1.1.
+pub(crate) fn set_msacc_enabled(enabled: bool) {
+    let _ = poller();
+    let mut msacc = poll_msacc().lock().expect("poll microstate");
+    let now = Instant::now();
+    msacc.update(now);
+    msacc.enabled = enabled;
+    msacc.started = now;
+}
+
+/// Snapshot the poll thread's check-I/O and sleep counters in nanoseconds.
+// Port of erts/emulator/sys/common/erl_check_io.c:558-649, OTP-29.1.1.
+pub(crate) fn msacc_snapshot() -> [u64; 2] {
+    let mut msacc = poll_msacc().lock().expect("poll microstate");
+    msacc.update(Instant::now());
+    [msacc.check_io_ns, msacc.sleep_ns]
+}
+
+fn set_poll_state(state: PollState) {
+    let mut msacc = poll_msacc().lock().expect("poll microstate");
+    let now = Instant::now();
+    msacc.update(now);
+    msacc.state = state;
+    msacc.started = now;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Ready {
@@ -237,6 +308,7 @@ fn poll_loop(
     let mut active = HashMap::<Token, ActiveRegistration>::new();
     let mut fd_tokens = HashMap::<RawFd, Token>::new();
     loop {
+        set_poll_state(PollState::CheckIo);
         while let Ok(command) = rx.try_recv() {
             match command {
                 Command::Register(request) => {
@@ -262,10 +334,13 @@ fn poll_loop(
                 }
             }
         }
+        set_poll_state(PollState::Sleep);
         if poll.poll(&mut events, None).is_err() {
             thread::sleep(std::time::Duration::from_millis(2));
+            set_poll_state(PollState::CheckIo);
             continue;
         }
+        set_poll_state(PollState::CheckIo);
         for event in &events {
             if event.token() == WAKE_TOKEN {
                 continue;

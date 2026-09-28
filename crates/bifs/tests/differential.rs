@@ -468,6 +468,17 @@ fn wall_clock_bifs_track_otp() {
                 "convert_time_unit {from}->{to} scale"
             );
         }
+        let input = [
+            O::Int(1_000_000_000),
+            atom("perf_counter"),
+            atom("microsecond"),
+        ];
+        let actual = call("erlang", "convert_time_unit", &input);
+        let expected = reference.call("erlang", "convert_time_unit", &input);
+        assert!(
+            equivalent(&actual, &expected),
+            "convert_time_unit perf_counter: {actual:?} != {expected:?}"
+        );
     }
 }
 

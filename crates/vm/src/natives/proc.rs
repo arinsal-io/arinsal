@@ -845,8 +845,7 @@ pub(crate) fn collect_heap(
         process.heap.set_fullsweep_after(0);
     }
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (message queue GC scan), OTP-29.1.1.
-    let gc = process.collect_heap_roots(process.gc_live, keep, 0)?;
-    process.stats.gc.collections += gc.collections;
+    process.collect_heap_roots(process.gc_live, keep, 0)?;
     Ok(())
 }
 

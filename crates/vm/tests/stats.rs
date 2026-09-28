@@ -9,7 +9,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(stats_diff).
--export([shapes/0, errors/0, enabled/0, grow/0, retire/0]).
+-export([shapes/0, errors/0, enabled/0, toggle/0, gc_snapshot/0, grow/0, retire/0]).
 
 shapes() ->
     erlang:system_flag(scheduler_wall_time, false),
@@ -30,8 +30,41 @@ enabled() ->
     erlang:system_flag(scheduler_wall_time, false),
     erlang:system_flag(microstate_accounting, true),
     Micro = erlang:statistics(microstate_accounting),
+    Msacc = msacc:stats(),
     erlang:system_flag(microstate_accounting, false),
-    {Wall, All, Micro}.
+    {Wall, All, Micro, Msacc}.
+
+toggle() ->
+    erlang:system_flag(microstate_accounting, false),
+    erlang:system_flag(microstate_accounting, reset),
+    erlang:system_flag(microstate_accounting, true),
+    receive after 5 -> ok end,
+    First = microstate_total(),
+    erlang:system_flag(microstate_accounting, false),
+    receive after 5 -> ok end,
+    erlang:system_flag(microstate_accounting, true),
+    receive after 5 -> ok end,
+    Second = microstate_total(),
+    erlang:system_flag(microstate_accounting, false),
+    {First, Second}.
+
+gc_snapshot() ->
+    erlang:system_flag(microstate_accounting, false),
+    erlang:system_flag(microstate_accounting, reset),
+    erlang:system_flag(microstate_accounting, true),
+    Before = microstate_gc_total(),
+    true = erts_internal:garbage_collect(major),
+    After = microstate_gc_total(),
+    erlang:system_flag(microstate_accounting, false),
+    {Before, After}.
+
+microstate_gc_total() ->
+    lists:sum([maps:get(gc, maps:get(counters, Entry)) ||
+               Entry <- erlang:statistics(microstate_accounting)]).
+
+microstate_total() ->
+    lists:sum([lists:sum(maps:values(maps:get(counters, Entry))) ||
+               Entry <- erlang:statistics(microstate_accounting)]).
 
 errors() ->
     {catch_call(fun() -> erlang:statistics(nope) end),
@@ -275,7 +308,7 @@ fn memory_pairs(term: &OwnedTerm) -> Vec<(String, i64)> {
 }
 
 #[test]
-fn statistics_and_memory_shapes_match_otp() {
+fn sched_acct_statistics_and_memory_shapes_match_otp() {
     let _guard = guard();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping statistics shape test");
@@ -298,7 +331,7 @@ fn statistics_and_memory_shapes_match_otp() {
 }
 
 #[test]
-fn statistics_and_memory_errors_match_otp() {
+fn sched_acct_statistics_and_memory_errors_match_otp() {
     let _guard = guard();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping statistics error test");
@@ -309,7 +342,7 @@ fn statistics_and_memory_errors_match_otp() {
 }
 
 #[test]
-fn enabled_scheduler_accounting_matches_otp_shape() {
+fn sched_acct_enabled_scheduler_accounting_matches_otp_shape() {
     let _guard = guard();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping enabled statistics test");
@@ -331,10 +364,47 @@ fn enabled_scheduler_accounting_matches_otp_shape() {
         matches!(entry, OwnedTerm::Tuple(fields) if fields.len() == 3 && fields.iter().all(is_int))
     }));
     assert_microstate(&actual[2], &expected[2]);
+    assert_shape(&actual[3], &expected[3]);
 }
 
 #[test]
-fn counters_and_ets_memory_grow_after_work() {
+fn sched_acct_microstate_counters_survive_disable_and_enable() {
+    let _guard = guard();
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping microstate toggle test");
+        return;
+    };
+    let (expected, actual) = run(&reference, "toggle");
+    assert!(
+        matches!(expected, CallResult::Ok(_)),
+        "erl toggle: {expected:?}"
+    );
+    let OwnedTerm::Tuple(values) = &actual else {
+        panic!("toggle tuple: {actual:?}");
+    };
+    assert!(as_int(&values[1]) >= as_int(&values[0]), "{values:?}");
+}
+
+#[test]
+fn sched_acct_gc_is_visible_to_same_turn_microstate_snapshot() {
+    let _guard = guard();
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping GC microstate test");
+        return;
+    };
+    let (expected, actual) = run(&reference, "gc_snapshot");
+    assert!(
+        matches!(expected, CallResult::Ok(_)),
+        "erl GC snapshot: {expected:?}"
+    );
+    let OwnedTerm::Tuple(values) = &actual else {
+        panic!("GC snapshot tuple: {actual:?}");
+    };
+    assert!(as_int(&values[1]) > as_int(&values[0]), "{values:?}");
+}
+
+#[test]
+fn sched_acct_counters_and_ets_memory_grow_after_work() {
     let _guard = guard();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping statistics growth test");
@@ -366,7 +436,7 @@ fn counters_and_ets_memory_grow_after_work() {
 }
 
 #[test]
-fn replaced_persistent_term_is_freed_after_gc() {
+fn sched_acct_replaced_persistent_term_is_freed_after_gc() {
     let _guard = guard();
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping persistent-term retirement test");
