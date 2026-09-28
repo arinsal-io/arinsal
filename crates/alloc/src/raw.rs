@@ -1,7 +1,6 @@
 //! Audited OS memory operations and bounded access to mapped memory.
 
 use std::fmt;
-use std::ptr::NonNull;
 
 /// A system page size in bytes on the current host.
 pub fn page_size() -> usize {
@@ -45,7 +44,9 @@ impl std::error::Error for MapError {}
 /// Owned page aligned mapping with checked byte and machine word access.
 #[derive(Debug)]
 pub struct RawRegion {
-    ptr: NonNull<u8>,
+    // Integer storage keeps the unique mapping owner movable behind a Mutex.
+    // Every dereference remains inside this audited module's existing unsafe blocks.
+    ptr: usize,
     len: usize,
     protection: Protection,
 }
@@ -70,10 +71,11 @@ impl RawRegion {
         if ptr == libc::MAP_FAILED {
             return Err(MapError(std::io::Error::last_os_error()));
         }
-        let ptr = NonNull::new(ptr.cast())
-            .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::Other)))?;
+        if ptr.is_null() {
+            return Err(MapError(std::io::Error::from(std::io::ErrorKind::Other)));
+        }
         Ok(Self {
-            ptr,
+            ptr: ptr as usize,
             len,
             protection: Protection::READ_WRITE,
         })
@@ -102,7 +104,7 @@ impl RawRegion {
         if prefix > 0 {
             // SAFETY: prefix is a page multiple inside the live reservation.
             unsafe {
-                libc::munmap(whole.ptr.as_ptr().cast(), prefix);
+                libc::munmap(whole.base_ptr().cast(), prefix);
             }
         }
         if suffix > 0 {
@@ -113,7 +115,7 @@ impl RawRegion {
         }
         std::mem::forget(whole);
         Ok(Self {
-            ptr: NonNull::new(aligned as *mut u8).expect("aligned mmap pointer is non-null"),
+            ptr: aligned,
             len,
             protection: Protection::READ_WRITE,
         })
@@ -121,7 +123,7 @@ impl RawRegion {
 
     /// Mapping base address.
     pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr.as_ptr()
+        self.base_ptr()
     }
     /// Mapping length in bytes.
     pub fn len(&self) -> usize {
@@ -138,7 +140,7 @@ impl RawRegion {
             return None;
         }
         // SAFETY: offset is in bounds of the mapped region.
-        let address = unsafe { self.ptr.as_ptr().add(offset) };
+        let address = unsafe { self.base_ptr().add(offset) };
         // SAFETY: address was derived from a live mapping at an in-bounds offset.
         Some(unsafe { address.read() })
     }
@@ -149,7 +151,7 @@ impl RawRegion {
             return false;
         }
         // SAFETY: offset is in bounds of the writable mapping.
-        let address = unsafe { self.ptr.as_ptr().add(offset) };
+        let address = unsafe { self.base_ptr().add(offset) };
         // SAFETY: address was derived from a live writable mapping at an in-bounds offset.
         unsafe {
             address.write(value);
@@ -163,7 +165,7 @@ impl RawRegion {
             return None;
         }
         // SAFETY: offset is aligned and the complete word lies inside the mapping.
-        let address = unsafe { self.ptr.as_ptr().add(offset).cast::<usize>() };
+        let address = unsafe { self.base_ptr().add(offset).cast::<usize>() };
         // SAFETY: address points to a fully in-bounds aligned word.
         Some(unsafe { address.read() })
     }
@@ -174,7 +176,7 @@ impl RawRegion {
             return false;
         }
         // SAFETY: offset is aligned and the complete word lies inside the writable mapping.
-        let address = unsafe { self.ptr.as_ptr().add(offset).cast::<usize>() };
+        let address = unsafe { self.base_ptr().add(offset).cast::<usize>() };
         // SAFETY: address points to a fully in-bounds aligned word in a writable mapping.
         unsafe {
             address.write(value);
@@ -195,7 +197,7 @@ impl RawRegion {
             flags |= libc::PROT_EXEC;
         }
         // SAFETY: this object owns a page-aligned address and page-multiple size.
-        let result = unsafe { libc::mprotect(self.ptr.as_ptr().cast(), self.len, flags) };
+        let result = unsafe { libc::mprotect(self.base_ptr().cast(), self.len, flags) };
         if result == 0 {
             self.protection = protection;
             Ok(())
@@ -207,7 +209,7 @@ impl RawRegion {
     /// Advises the OS about the entire mapping.
     pub fn advise(&mut self, advice: i32) -> Result<(), MapError> {
         // SAFETY: this object owns a valid mapped range; kernel validates advice.
-        let result = unsafe { libc::madvise(self.ptr.as_ptr().cast(), self.len, advice) };
+        let result = unsafe { libc::madvise(self.base_ptr().cast(), self.len, advice) };
         if result == 0 {
             Ok(())
         } else {
@@ -235,7 +237,7 @@ impl RawRegion {
         let copy_len = self.len.min(next.len);
         // SAFETY: both mappings are valid and non-overlapping; copy_len is bounded by both extents.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), next.ptr.as_ptr(), copy_len);
+            std::ptr::copy_nonoverlapping(self.base_ptr(), next.base_ptr(), copy_len);
         }
         Ok(next)
     }
@@ -277,8 +279,7 @@ impl RawRegion {
         let protection = self.protection;
         std::mem::forget(self);
         // SAFETY: offset is a page multiple strictly inside the original mapping.
-        let tail_ptr = unsafe { base.as_ptr().add(offset) };
-        let tail = NonNull::new(tail_ptr).expect("non-null mapping base remains non-null");
+        let tail = base + offset;
         Ok((
             Self {
                 ptr: base,
@@ -299,13 +300,17 @@ impl RawRegion {
                 .checked_add(std::mem::size_of::<usize>())
                 .is_some_and(|end| end <= self.len)
     }
+
+    fn base_ptr(&self) -> *mut u8 {
+        self.ptr as *mut u8
+    }
 }
 
 impl Drop for RawRegion {
     fn drop(&mut self) {
         // SAFETY: this object uniquely owns the mapping and passes its original page-multiple extent.
         unsafe {
-            libc::munmap(self.ptr.as_ptr().cast(), self.len);
+            libc::munmap(self.base_ptr().cast(), self.len);
         }
     }
 }

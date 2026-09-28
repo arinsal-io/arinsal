@@ -89,6 +89,16 @@ pub enum Strategy {
     BestFit,
     /// Address-order best fit, choosing the lowest address among equal fits.
     AddressOrderBestFit,
+    /// Address ordered first fit.
+    Aoff,
+    /// Address ordered first fit within best fit carrier ordering.
+    AoffCbf,
+    /// Address ordered first fit within address ordered best fit carrier ordering.
+    AoffCaobf,
+    /// Segregated bucket search with bounded search depth.
+    GoodFit,
+    /// Largest-fit-first free-list policy used for short-lived allocations.
+    Afit,
 }
 
 /// Carrier thresholds and growth options (byte quantities unless noted).
@@ -105,6 +115,8 @@ pub struct AllocUtilOptions {
     pub lmbcs: usize,
     pub smbcs: usize,
     pub mbcgs: usize,
+    /// Maximum free blocks inspected in a GoodFit bucket (`mbsd`).
+    pub max_bucket_search: usize,
 }
 
 impl Default for AllocUtilOptions {
@@ -121,6 +133,7 @@ impl Default for AllocUtilOptions {
             lmbcs: 5 * 1024 * 1024,
             smbcs: 256 * 1024,
             mbcgs: 10,
+            max_bucket_search: 3,
         }
     }
 }
@@ -319,6 +332,8 @@ pub struct AllocUtil {
     carriers: Vec<Option<Carrier>>,
     blocks: HashMap<usize, Block>,
     free_root: usize,
+    goodfit_buckets: Vec<Vec<usize>>,
+    afit_free_list: Vec<usize>,
     allocations: HashMap<u64, usize>,
     next_id: u64,
     stats: AllocStats,
@@ -346,6 +361,8 @@ impl AllocUtil {
             carriers: Vec::new(),
             blocks: HashMap::new(),
             free_root: 0,
+            goodfit_buckets: (0..256).map(|_| Vec::new()).collect(),
+            afit_free_list: Vec::new(),
             allocations: HashMap::new(),
             next_id: 1,
             stats: AllocStats::default(),
@@ -1010,6 +1027,18 @@ impl AllocUtil {
             }
         }
         if free != self.tree_free_blocks()?
+            || (self.strategy == Strategy::GoodFit
+                && (self.goodfit_buckets.iter().flatten().count() != free.len()
+                    || self
+                        .goodfit_buckets
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .collect::<HashSet<_>>()
+                        != free))
+            || (self.strategy == Strategy::Afit
+                && (self.afit_free_list.len() != free.len()
+                    || self.afit_free_list.iter().copied().collect::<HashSet<_>>() != free))
             || count != self.stats.blocks
             || bytes != self.stats.blocks_size
             || self.allocations.len() != count
@@ -1338,6 +1367,16 @@ impl AllocUtil {
     /// Port of `bf_link_free_block` and `aobf_link_free_block`, `erl_bestfit_alloc.c:592-818`, OTP-29.1.1.
     fn link_free(&mut self, node: usize) -> Result<(), AllocError> {
         let size = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.size;
+        if self.strategy == Strategy::GoodFit {
+            self.goodfit_buckets[goodfit_bucket(size, self.options.sbct)].insert(0, node);
+        } else if self.strategy == Strategy::Afit {
+            let insert_after_head = self
+                .afit_free_list
+                .first()
+                .is_some_and(|head| self.blocks.get(head).is_some_and(|block| block.size > size));
+            self.afit_free_list
+                .insert(usize::from(insert_after_head), node);
+        }
         self.set_node_word(node, TREE_FLAGS_WORD, 0)?;
         self.set_node_word(node, TREE_PARENT_WORD, 0)?;
         self.set_node_word(node, TREE_LEFT_WORD, 0)?;
@@ -1396,6 +1435,110 @@ impl AllocUtil {
     /// Finds the smallest fitting size-tree node, retaining OTP's BF list preference.
     /// Port of `bf_get_free_block` and `aobf_get_free_block`, `erl_bestfit_alloc.c:657-865`, OTP-29.1.1.
     fn choose_free(&self, need: usize) -> Result<Option<usize>, AllocError> {
+        // Port of aoff_get_free_block, erl_ao_firstfit_alloc.c:895, OTP-29.1.1;
+        // goodfit_get_free_block, erl_goodfit_alloc.c:393, OTP-29.1.1; and
+        // afit_get_free_block, erl_afit_alloc.c:123, OTP-29.1.1.
+        if self.strategy == Strategy::Afit {
+            return Ok(self.afit_free_list.first().and_then(|node| {
+                self.blocks
+                    .get(node)
+                    .filter(|block| block.size >= need)
+                    .map(|_| *node)
+            }));
+        }
+        if self.strategy == Strategy::GoodFit {
+            let first_bucket = goodfit_bucket(need, self.options.sbct);
+            for bucket in first_bucket..256 {
+                let mut best = None;
+                for node in self.goodfit_buckets[bucket]
+                    .iter()
+                    .take(self.options.max_bucket_search.max(1))
+                {
+                    let size = self.blocks.get(node).ok_or(AllocError::Corrupt)?.size;
+                    if size >= need && best.is_none_or(|(_, best_size)| size < best_size) {
+                        best = Some((*node, size));
+                        if size == need {
+                            break;
+                        }
+                    }
+                }
+                if let Some((node, _)) = best {
+                    return Ok(Some(node));
+                }
+            }
+            return Ok(None);
+        }
+        if !matches!(
+            self.strategy,
+            Strategy::BestFit | Strategy::AddressOrderBestFit
+        ) {
+            let mut candidates = self
+                .blocks
+                .values()
+                .filter(|block| !block.allocated && block.size >= need)
+                .map(|block| {
+                    let carrier = self.carriers[block.carrier]
+                        .as_ref()
+                        .ok_or(AllocError::Corrupt)?;
+                    let address =
+                        carrier.memory.as_ptr() as usize + block.offset - carrier.key_base;
+                    Ok((block.offset, block.carrier, block.size, address))
+                })
+                .collect::<Result<Vec<_>, AllocError>>()?;
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+            match self.strategy {
+                Strategy::Aoff => {
+                    candidates.sort_unstable_by_key(|candidate| candidate.3);
+                }
+                Strategy::AoffCbf => {
+                    candidates.sort_unstable_by_key(|candidate| {
+                        let carrier = self.carriers[candidate.1].as_ref().unwrap();
+                        let largest = carrier
+                            .blocks
+                            .iter()
+                            .filter_map(|offset| self.blocks.get(offset))
+                            .filter(|block| !block.allocated)
+                            .map(|block| block.size)
+                            .max()
+                            .unwrap_or(0);
+                        (largest, candidate.3)
+                    });
+                }
+                Strategy::AoffCaobf => {
+                    candidates.sort_unstable_by_key(|candidate| {
+                        let carrier = self.carriers[candidate.1].as_ref().unwrap();
+                        let largest = carrier
+                            .blocks
+                            .iter()
+                            .filter_map(|offset| self.blocks.get(offset))
+                            .filter(|block| !block.allocated)
+                            .map(|block| block.size)
+                            .max()
+                            .unwrap_or(0);
+                        (largest, carrier.memory.as_ptr() as usize, candidate.3)
+                    });
+                }
+                Strategy::Afit => {
+                    candidates.sort_unstable_by_key(|candidate| {
+                        (std::cmp::Reverse(candidate.2), candidate.3)
+                    });
+                }
+                Strategy::GoodFit => {
+                    candidates.sort_unstable_by_key(|candidate| {
+                        (
+                            goodfit_bucket(candidate.2, self.options.sbct),
+                            candidate.2,
+                            candidate.3,
+                        )
+                    });
+                    candidates.truncate(3);
+                }
+                Strategy::BestFit | Strategy::AddressOrderBestFit => unreachable!(),
+            }
+            return Ok(Some(candidates[0].0));
+        }
         let mut current = self.free_root;
         let mut best = 0;
         while current != 0 {
@@ -1422,6 +1565,22 @@ impl AllocUtil {
     /// Removes a free block from its intrusive tree node or BF size list.
     /// Port of `bf_unlink_free_block` and `tree_delete`, `erl_bestfit_alloc.c:399-433,780-806`, OTP-29.1.1.
     fn unlink_free(&mut self, node: usize) -> Result<(), AllocError> {
+        if self.strategy == Strategy::GoodFit {
+            let size = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.size;
+            let bucket = &mut self.goodfit_buckets[goodfit_bucket(size, self.options.sbct)];
+            let index = bucket
+                .iter()
+                .position(|candidate| *candidate == node)
+                .ok_or(AllocError::Corrupt)?;
+            bucket.remove(index);
+        } else if self.strategy == Strategy::Afit {
+            let index = self
+                .afit_free_list
+                .iter()
+                .position(|candidate| *candidate == node)
+                .ok_or(AllocError::Corrupt)?;
+            self.afit_free_list.remove(index);
+        }
         let flags = self.node_word(node, TREE_FLAGS_WORD)?;
         if self.strategy == Strategy::BestFit && flags & TREE_NODE == 0 {
             let prev = self.node_word(node, TREE_PARENT_WORD)?;
@@ -1998,6 +2157,45 @@ fn min_block_size(strategy: Strategy) -> usize {
     };
     align_const(node_size + FOOTER)
 }
+
+/// Returns OTP goodfit's four linear bucket regions' bucket index.
+/// Port of BKT_IX_, erl_goodfit_alloc.c:101-115, OTP-29.1.1.
+fn goodfit_bucket(size: usize, sbct: usize) -> usize {
+    const MIN_BLOCK: usize = 40;
+    const QUARTER: usize = 64;
+    const A: usize = 8;
+    const B: usize = 128;
+    const C: usize = 768;
+    let max_a = MIN_BLOCK + QUARTER * A - 1;
+    let min_b = max_a + 1;
+    let max_b = min_b + QUARTER * B - 1;
+    let min_c = max_b + 1;
+    let max_c = min_c + QUARTER * C - 1;
+    let min_d = max_c + 1;
+    let interval_d = if sbct > min_d - 1 {
+        let raw = 3usize
+            .saturating_mul(sbct.saturating_sub(min_d + 1))
+            .checked_div(QUARTER - 1)
+            .unwrap_or(usize::MAX)
+            .div_ceil(2);
+        align_const(raw.max(C))
+    } else {
+        C
+    };
+    let max_d = min_d.saturating_add(QUARTER.saturating_mul(interval_d) - 1);
+    if size <= max_a {
+        (size.saturating_sub(MIN_BLOCK)) / A
+    } else if size <= max_b {
+        QUARTER + (size - min_b) / B
+    } else if size <= max_c {
+        2 * QUARTER + (size - min_c) / C
+    } else if size <= max_d {
+        3 * QUARTER + (size - min_d) / interval_d
+    } else {
+        255
+    }
+}
+
 fn call_count(total: u64) -> CallCount {
     CallCount {
         giga: total / 1_000_000_000,
@@ -2033,7 +2231,15 @@ mod tests {
     }
     #[test]
     fn bf_and_aobf_allocate_and_coalesce() {
-        for s in [Strategy::BestFit, Strategy::AddressOrderBestFit] {
+        for s in [
+            Strategy::BestFit,
+            Strategy::AddressOrderBestFit,
+            Strategy::Aoff,
+            Strategy::AoffCbf,
+            Strategy::AoffCaobf,
+            Strategy::GoodFit,
+            Strategy::Afit,
+        ] {
             let mut a = AllocUtil::new(
                 s,
                 AllocUtilOptions {
@@ -2209,6 +2415,58 @@ mod tests {
         address.free(separator).unwrap();
         address.validate().unwrap();
     }
+
+    #[test]
+    fn afit_selects_the_largest_block_at_the_free_list_head() {
+        let options = AllocUtilOptions {
+            sbct: 32 * 1024,
+            smbcs: 16 * 1024,
+            mmbcs: 16 * 1024,
+            lmbcs: 16 * 1024,
+            ..Default::default()
+        };
+        let mut allocator = AllocUtil::new(Strategy::Afit, options);
+        let small = allocator.alloc(128).unwrap();
+        let _separator = allocator.alloc(16).unwrap();
+        let large = allocator.alloc(1024).unwrap();
+        let _separator = allocator.alloc(16).unwrap();
+        let _guard = allocator.alloc(14_400).unwrap();
+        let large_offset = allocator.allocations[&large.id];
+        allocator.free(small).unwrap();
+        allocator.free(large).unwrap();
+        assert_eq!(allocator.afit_free_list[0], large_offset);
+        let reused = allocator.alloc(512).unwrap();
+        assert_eq!(allocator.allocations[&reused.id], large_offset);
+        assert_eq!(allocator.info().mbcs.carriers, 1);
+        allocator.validate().unwrap();
+    }
+
+    #[test]
+    fn goodfit_searches_the_requested_bucket_then_larger_buckets() {
+        let options = AllocUtilOptions {
+            sbct: 32 * 1024,
+            smbcs: 64 * 1024,
+            mmbcs: 64 * 1024,
+            lmbcs: 64 * 1024,
+            ..Default::default()
+        };
+        let mut allocator = AllocUtil::new(Strategy::GoodFit, options);
+        let small = allocator.alloc(128).unwrap();
+        let _separator = allocator.alloc(16).unwrap();
+        let fitting = allocator.alloc(512).unwrap();
+        let _separator = allocator.alloc(16).unwrap();
+        let _guard = allocator.alloc(1024).unwrap();
+        let fitting_offset = allocator.allocations[&fitting.id];
+        allocator.free(small).unwrap();
+        allocator.free(fitting).unwrap();
+        assert_eq!(
+            allocator
+                .choose_free(block_size(400, Strategy::GoodFit).unwrap())
+                .unwrap(),
+            Some(fitting_offset)
+        );
+        allocator.validate().unwrap();
+    }
     #[test]
     fn payload_bounds_and_realloc() {
         let mut a = AllocUtil::new(Strategy::AddressOrderBestFit, AllocUtilOptions::default());
@@ -2281,7 +2539,15 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(96))]
         #[test]
         fn randomized_operations_preserve_allocator_invariants(ops in proptest::collection::vec((0u8..3, 1u16..2048), 1..120)) {
-            for strategy in [Strategy::BestFit, Strategy::AddressOrderBestFit] {
+            for strategy in [
+                Strategy::BestFit,
+                Strategy::AddressOrderBestFit,
+                Strategy::Aoff,
+                Strategy::AoffCbf,
+                Strategy::AoffCaobf,
+                Strategy::GoodFit,
+                Strategy::Afit,
+            ] {
                 let mut allocator = AllocUtil::new(
                     strategy,
                     AllocUtilOptions { sbct: 4096, smbcs: 16 * 1024, mmbcs: 16 * 1024, lmbcs: 64 * 1024, ..Default::default() },
