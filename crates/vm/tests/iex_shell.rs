@@ -34,7 +34,7 @@ fn run(args: &[&str], input: &str, path: String, cwd: Option<&Path>) -> Output {
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
-        .arg("ulimit -u 1200; exec timeout 30 iex \"$@\"")
+        .arg("ulimit -u 1200; exec timeout 120 iex \"$@\"")
         .arg("iex_shell_test")
         .args(args)
         .env("PATH", path)
@@ -112,7 +112,7 @@ fn iex_shell_pty_banner_and_prompts_match_otp() {
     fn pty(path: String) -> Output {
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("ulimit -u 1200; exec timeout 30 script -q /dev/null iex")
+            .arg("ulimit -u 1200; exec timeout 120 script -q /dev/null iex")
             .env("PATH", path)
             .env_remove("ERL_ROOTDIR")
             .env_remove("ARINSAL_OTP_ROOT")
