@@ -1658,17 +1658,22 @@ fn call_resolved(
             }
             was_active |= crate::port::demonitor(process, id);
             if flush {
+                // Port of erts/emulator/beam/bif.c:647 (demonitor flush trap), OTP-29.1.1.
+                // erts_internal:flush_monitor_messages/3 scans from its compiler-bound marker.
                 process.drain(ctx)?;
+                let start = process.receive_marker_position(id).unwrap_or(0);
                 let old_prio_len = process.cold.as_ref().map_or(0, |cold| cold.prio_len);
-                let new_prio_len = process.inbox.retain(old_prio_len, |message| {
-                    // SAFETY: Mailbox terms remain in the receiver's live heap.
-                    unsafe { message.tuple_ref() }.is_none_or(|tuple| {
-                        tuple.len() != 5
-                            || tuple.get(0) != Some(atom("DOWN"))
-                            || tuple.get(1).and_then(ref_id) != Some(id)
-                    })
-                });
+                let (new_prio_len, removed) =
+                    process.inbox.retain_from(start, old_prio_len, |message| {
+                        // SAFETY: Mailbox terms remain in the receiver's live heap.
+                        unsafe { message.tuple_ref() }.is_none_or(|tuple| {
+                            tuple.len() != 5 || tuple.get(1).and_then(ref_id) != Some(id)
+                        })
+                    });
                 process.cold_mut().prio_len = new_prio_len;
+                for (removed_count, original_index) in removed.into_iter().enumerate() {
+                    process.message_removed(original_index - removed_count);
+                }
             }
             Ok(atom(if options.contains(&atom("info")) && !was_active {
                 "false"
@@ -2092,7 +2097,7 @@ fn link_opt(
                 .tuple(&[atom("EXIT"), pid_term, reason])
                 .map_err(|_| system_limit())?;
             if priority {
-                process.push_priority_message(exit);
+                process.push_priority_message(exit)?;
             } else {
                 process.inbox.push_back(exit);
             }

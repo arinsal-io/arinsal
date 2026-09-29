@@ -90,6 +90,7 @@ const WAITING: u8 = 2;
 const EXITED: u8 = 3;
 const PID_LIMIT: u32 = 1 << 28;
 const PID_PAGE_SIZE: usize = 1024;
+const UNBOUND_WORKER: usize = usize::MAX;
 const QUEUE_COUNT_SHIFT: u32 = 32;
 const QUEUE_COUNT_UNIT: u64 = 1_u64 << QUEUE_COUNT_SHIFT;
 
@@ -342,7 +343,7 @@ struct TaskCell<T: Task> {
 struct Process<T: Task> {
     pid: Pid,
     priority: Priority,
-    bound_worker: Option<usize>,
+    bound_worker: AtomicUsize,
     state: AtomicU8,
     scheduler_id: AtomicUsize,
     wait_epoch: AtomicU64,
@@ -355,6 +356,13 @@ struct Process<T: Task> {
     /// Wheel that owns `wait_timer`, so cancel does not guess from the pid.
     wait_timer_worker: AtomicUsize,
     cell: Mutex<TaskCell<T>>,
+}
+
+impl<T: Task> Process<T> {
+    fn bound_worker(&self) -> Option<usize> {
+        let worker = self.bound_worker.load(Ordering::Acquire);
+        (worker != UNBOUND_WORKER).then_some(worker)
+    }
 }
 
 struct ProcessTable<T: Task> {
@@ -431,7 +439,7 @@ impl<T: Task> ProcessTable<T> {
         let process = Arc::new(Process {
             pid,
             priority,
-            bound_worker,
+            bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
             state: AtomicU8::new(WAITING),
             scheduler_id: AtomicUsize::new(0),
             wait_epoch: AtomicU64::new(0),
@@ -748,7 +756,7 @@ impl<T: Task> Inner<T> {
         self.record_queued(&item.process, scheduler, already_active);
         if let Some(sim) = &self.sim {
             sim.lock().unwrap().queue.push_back(item);
-        } else if let Some(worker) = item.process.bound_worker {
+        } else if let Some(worker) = item.process.bound_worker() {
             self.pinned_injectors[worker].push(item);
             self.work_epoch.fetch_add(1, Ordering::SeqCst);
             self.wake_worker(worker);
@@ -1062,7 +1070,7 @@ impl<T: Task> Inner<T> {
     /// Same-worker waiters stay on `runnext`. A cross-thread unpark costs more
     /// than a local ping-pong, so the peer runs here before this worker parks.
     fn place_runnable(&self, item: Scheduled<T>, local: Option<&mut Local<T>>) {
-        if item.process.bound_worker.is_some() {
+        if item.process.bound_worker().is_some() {
             self.enqueue(item, false);
             return;
         }
@@ -1574,6 +1582,9 @@ pub struct RunCtx<'a, M: Send + 'static> {
     input: &'a Incoming<Event<M>>,
     private: &'a mut Private<Event<M>>,
     backlog: &'a AtomicUsize,
+    bound_worker: &'a AtomicUsize,
+    worker: Option<usize>,
+    worker_count: usize,
     remaining: u32,
     budget: u32,
     private_wake: bool,
@@ -1633,6 +1644,24 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     pub fn consume(&mut self, count: u32) -> bool {
         self.remaining = self.remaining.saturating_sub(count);
         self.remaining != 0
+    }
+    /// Number of scheduler workers available to this runtime.
+    pub fn scheduler_count(&self) -> usize {
+        self.worker_count
+    }
+    /// Change the process scheduler binding and return its previous scheduler id.
+    /// Scheduler ids are one-based; zero clears the binding.
+    pub fn bind_scheduler(&mut self, scheduler_id: usize) -> (usize, bool) {
+        let target = scheduler_id.checked_sub(1).unwrap_or(UNBOUND_WORKER);
+        let previous = self.bound_worker.swap(target, Ordering::AcqRel);
+        let previous_id = if previous == UNBOUND_WORKER {
+            0
+        } else {
+            previous + 1
+        };
+        let should_yield =
+            target != UNBOUND_WORKER && self.worker.is_some_and(|worker| worker != target);
+        (previous_id, should_yield)
     }
     /// Remaining reductions in this quantum.
     pub fn remaining(&self) -> u32 {
@@ -1714,7 +1743,8 @@ impl<M: Send + 'static> RunCtx<'_, M> {
         if self.input.has_pending() {
             self.input.drain_into(self.private);
         }
-        !self.private.is_empty()
+        self.private_wake = self.private.has_saved();
+        self.private_wake
     }
     /// Consume one event from a snapshot already fetched by [`Self::fetch_pending`].
     pub fn receive_fetched(&mut self) -> Option<Event<M>> {
@@ -1722,6 +1752,15 @@ impl<M: Send + 'static> RunCtx<'_, M> {
         if event.is_some() {
             self.consumed_event();
         }
+        event
+    }
+    /// Consume the next event at the current selective receive save position.
+    pub fn receive_saved(&mut self) -> Option<Event<M>> {
+        let event = self.private.pop_saved();
+        if event.is_some() {
+            self.consumed_event();
+        }
+        self.private_wake = self.private.has_saved();
         event
     }
     /// Selectively remove an event after the save position.
@@ -1752,6 +1791,10 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Start a selective scan at the bound marker, or at the head if it is absent.
     pub fn recv_marker_use(&mut self, reference: u64) -> bool {
         self.private.marker_use(reference)
+    }
+    /// Whether a fetched event remains before a receive marker.
+    pub fn recv_marker_has_saved_before(&self, marker: ReceiveMarker) -> bool {
+        self.private.marker_has_saved_before(marker)
     }
     /// Clear the marker bound to a VM-provided reference key.
     pub fn recv_marker_clear(&mut self, reference: u64) -> bool {
@@ -2002,7 +2045,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             process: process.clone(),
             inherited: None,
         };
-        if process.bound_worker.is_some() {
+        if process.bound_worker().is_some() {
             self.inner.enqueue(item, false);
         } else if let Some(local) = self.local.as_deref_mut() {
             local.record_queued(&process, local.worker_id, false);
@@ -2758,12 +2801,16 @@ mod msgq_stage_microbench {
         };
         let mut receive_private = Private::default();
         let backlog = AtomicUsize::new(N);
+        let bound_worker = AtomicUsize::new(UNBOUND_WORKER);
         let mut context = RunCtx {
             inner: &mut receive_runner,
             pid: process,
             input: &input,
             private: &mut receive_private,
             backlog: &backlog,
+            bound_worker: &bound_worker,
+            worker: None,
+            worker_count: scheduler.inner.config.workers,
             remaining: 1_000,
             budget: 1_000,
             private_wake: false,
@@ -2994,6 +3041,9 @@ fn run_one<'a, T: Task>(
                 input: &process.input,
                 private,
                 backlog: &process.backlog,
+                bound_worker: &process.bound_worker,
+                worker,
+                worker_count: inner.config.workers,
                 remaining: budget,
                 budget,
                 private_wake: true,
@@ -3052,7 +3102,7 @@ fn run_one<'a, T: Task>(
                 process: process.clone(),
                 inherited: None,
             };
-            if process.bound_worker.is_some() {
+            if process.bound_worker().is_some() {
                 inner.enqueue(next, true);
             } else if let Some(local) = local.as_deref_mut() {
                 local.record_queued(&next.process, local.worker_id, true);

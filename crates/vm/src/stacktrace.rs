@@ -37,7 +37,7 @@ enum StoredTopFrame {
         args: OwnedTerm,
     },
     CurrentArgs(OwnedTerm),
-    CurrentArgsWithInfo(OwnedTerm, Box<OwnedTerm>),
+    CurrentArgsWithInfo(Option<OwnedTerm>, Box<OwnedTerm>),
 }
 
 /// Port of erts/emulator/beam/beam_common.c:781 (gather_stacktrace), OTP-29.1.1.
@@ -72,8 +72,11 @@ pub(super) fn capture(
                     .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
             )),
             TopFrame::CurrentArgsWithInfo(args, info) => Ok(StoredTopFrame::CurrentArgsWithInfo(
-                to_owned(*args)
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
+                args.map(|args| {
+                    to_owned(args)
+                        .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))
+                })
+                .transpose()?,
                 info.clone(),
             )),
         })
@@ -159,6 +162,22 @@ pub(super) fn raw_class(p: &Process, term: Term) -> Option<Class> {
         .and_then(|raw| raw.class)
 }
 
+/// Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise).
+pub(super) fn set_raw_class(p: &mut Process, term: Term, class: Class) -> bool {
+    let Some(index) = raw_index(term) else {
+        return false;
+    };
+    let Some(raw) = p
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.raw_traces.get_mut(index))
+    else {
+        return false;
+    };
+    raw.class = Some(class);
+    true
+}
+
 /// Encode a process-local raw trace handle as an internal catch immediate.
 pub(super) fn raw_tag(index: usize) -> Result<Term, VmError> {
     let index = u32::try_from(index).map_err(|_| VmError::Unsupported("raw trace index".into()))?;
@@ -183,7 +202,7 @@ pub(super) enum TopFrame {
         args: Term,
     },
     CurrentArgs(Term),
-    CurrentArgsWithInfo(Term, Box<OwnedTerm>),
+    CurrentArgsWithInfo(Option<Term>, Box<OwnedTerm>),
 }
 
 pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {
@@ -242,7 +261,7 @@ fn build_frame(
         error_info
     };
     let mut info = Vec::new();
-    if let Some(error_info) = error_info {
+    if bif && let Some(error_info) = error_info {
         info.push(
             builder
                 .tuple(&[atom("error_info")?, error_info])
@@ -264,6 +283,13 @@ fn build_frame(
             builder
                 .tuple(&[line, number])
                 .map_err(|e| VmError::Unsupported(format!("stack line {e:?}")))?,
+        );
+    }
+    if !bif && let Some(error_info) = error_info {
+        info.push(
+            builder
+                .tuple(&[atom("error_info")?, error_info])
+                .map_err(|e| VmError::Unsupported(format!("error info tuple {e:?}")))?,
         );
     }
     let location = builder
@@ -320,8 +346,13 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
                     .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
             )),
             StoredTopFrame::CurrentArgsWithInfo(args, info) => {
-                let args = from_owned(args, &mut FragmentingHeap(&mut p.heap))
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?;
+                let args = args
+                    .as_ref()
+                    .map(|args| {
+                        from_owned(args, &mut FragmentingHeap(&mut p.heap))
+                            .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))
+                    })
+                    .transpose()?;
                 Ok(TopFrame::CurrentArgsWithInfo(args, info.clone()))
             }
         })
@@ -343,8 +374,10 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
         build_frame(p, module, function, *args, None, true, None)?
     } else {
         let top_args = match top {
-            Some(TopFrame::CurrentArgs(args)) | Some(TopFrame::CurrentArgsWithInfo(args, _)) => {
-                *args
+            Some(TopFrame::CurrentArgs(args)) => *args,
+            Some(TopFrame::CurrentArgsWithInfo(Some(args), _)) => *args,
+            Some(TopFrame::CurrentArgsWithInfo(None, _)) => {
+                Term::small(i64::from(arity)).expect("arity is small")
             }
             _ => Term::small(i64::from(arity)).expect("arity is small"),
         };

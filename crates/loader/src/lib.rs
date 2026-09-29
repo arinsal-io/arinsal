@@ -1042,7 +1042,8 @@ pub fn load_with_instrumentations(
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| format!("{}.erl", file.module))
                 };
-                current_line = Some((name, item.line));
+                current_line =
+                    valid_source_location(item.name_index, item.line).then_some((name, item.line));
             }
             continue;
         }
@@ -1333,7 +1334,9 @@ pub fn load_with_instrumentations(
         if command_list.kind() != Arg::LIST
             || lists
                 .get(command_list.value() as usize)
-                .is_none_or(|commands| maps_bits::decode_commands(&[commands.clone()])[0].is_none())
+                .is_none_or(|commands| {
+                    maps_bits::decode_commands(std::slice::from_ref(commands))[0].is_none()
+                })
         {
             return Err(LoadError::BadBitMatch);
         }
@@ -1424,6 +1427,26 @@ pub fn load_with_instrumentations(
         funs,
         _literals: Arc::new(literals),
     })
+}
+
+// Port of erts/emulator/beam/beam_code.h:32-38 (MAKE_LOCATION), OTP-29.1.1.
+// The packed source location reserves 24 bits for the line and one byte for the file.
+fn valid_source_location(name_index: u32, line: u64) -> bool {
+    name_index < 255 && line < ((1 << 24) - 1)
+}
+
+#[cfg(test)]
+mod line_location_tests {
+    use super::valid_source_location;
+
+    #[test]
+    fn ignores_locations_that_do_not_fit_the_erts_packed_form() {
+        assert!(valid_source_location(0, 1));
+        assert!(valid_source_location(254, (1 << 24) - 2));
+        assert!(!valid_source_location(255, 1));
+        assert!(!valid_source_location(0, (1 << 24) - 1));
+        assert!(!valid_source_location(0, 100_000_003));
+    }
 }
 
 fn executable(op: Opcode) -> bool {

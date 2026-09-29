@@ -22,8 +22,10 @@ enum MarkerId {
 struct ReceiveMarker {
     id: MarkerId,
     position: usize,
+    priority_position: Option<usize>,
     inserted: u64,
     passes: u8,
+    scheduler: Option<arinsal_sched::ReceiveMarker>,
 }
 
 /// Bounded receive-marker state corresponding to the erts marker block.
@@ -35,15 +37,26 @@ pub(crate) struct ReceiveMarkers {
 
 impl ReceiveMarkers {
     // Port of erl_proc_sig_queue.c:9358-9454 (priority insertion and save-marker placement), OTP-29.1.1.
-    fn priority_inserted(&mut self, index: usize) {
+    fn priority_inserted(&mut self, index: usize, message: &arinsal_etf::OwnedTerm) {
         for marker in self.slots.iter_mut().flatten() {
             if marker.position >= index {
+                if let MarkerId::Bound(reference) = marker.id
+                    && contains_reference(message, reference)
+                    && marker.priority_position.is_none()
+                {
+                    marker.priority_position = Some(index);
+                }
                 marker.position += 1;
             }
         }
     }
 
-    fn reserve(&mut self, position: usize, id: i64) {
+    fn reserve(
+        &mut self,
+        position: usize,
+        id: i64,
+        scheduler: Option<arinsal_sched::ReceiveMarker>,
+    ) {
         self.inserted = self.inserted.wrapping_add(1);
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4148
         // (recv_marker_reuse), OTP-29.1.1. Prefer an unused marker when full.
@@ -65,8 +78,10 @@ impl ReceiveMarkers {
         self.slots[slot] = Some(ReceiveMarker {
             id: MarkerId::Reserved(id),
             position,
+            priority_position: None,
             inserted: self.inserted,
             passes: 0,
+            scheduler,
         });
     }
 
@@ -102,7 +117,7 @@ impl ReceiveMarkers {
         }
     }
 
-    fn set_save(&mut self, reference: u64) -> Option<usize> {
+    fn set_save(&mut self, reference: u64) -> Option<(usize, Option<usize>)> {
         let selected = self
             .slots
             .iter()
@@ -124,7 +139,15 @@ impl ReceiveMarkers {
                 }
             }
         }
-        Some(selected.position)
+        Some((selected.position, selected.priority_position))
+    }
+
+    fn position(&self, reference: u64) -> Option<usize> {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|marker| marker.id == MarkerId::Bound(reference))
+            .map(|marker| marker.position)
     }
 
     fn passed(&mut self, position: usize) {
@@ -146,6 +169,12 @@ impl ReceiveMarkers {
         for marker in self.slots.iter_mut().flatten() {
             if marker.position > index {
                 marker.position -= 1;
+            }
+            if marker
+                .priority_position
+                .is_some_and(|position| position > index)
+            {
+                marker.priority_position = marker.priority_position.map(|position| position - 1);
             }
         }
         self.clear_leading();
@@ -175,10 +204,62 @@ impl ReceiveMarkers {
     }
 }
 
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:9138-9297, OTP-29.1.1.
+fn contains_reference(term: &arinsal_etf::OwnedTerm, reference: u64) -> bool {
+    use arinsal_etf::OwnedTerm;
+
+    match term {
+        OwnedTerm::Ref {
+            node,
+            creation: 0,
+            ids,
+        } if node == "nonode@nohost"
+            && ids.len() == 3
+            && ids[2] == 0
+            && (ids[0] as u64 | ((ids[1] as u64) << 32)) == reference =>
+        {
+            true
+        }
+        OwnedTerm::List { elems, tail } => {
+            elems.iter().any(|term| contains_reference(term, reference))
+                || contains_reference(tail, reference)
+        }
+        OwnedTerm::Tuple(elements) => elements
+            .iter()
+            .any(|term| contains_reference(term, reference)),
+        OwnedTerm::Map(pairs) => pairs.iter().any(|(key, value)| {
+            contains_reference(key, reference) || contains_reference(value, reference)
+        }),
+        OwnedTerm::Fun { pid, free_vars, .. } => {
+            contains_reference(pid, reference)
+                || free_vars
+                    .iter()
+                    .any(|term| contains_reference(term, reference))
+        }
+        OwnedTerm::Record { fields, .. } => fields
+            .iter()
+            .any(|(_, term)| contains_reference(term, reference)),
+        _ => false,
+    }
+}
+
 impl Process {
+    /// Return the mailbox boundary associated with a live internal reference.
+    pub(crate) fn receive_marker_position(&self, reference: u64) -> Option<usize> {
+        self.cold
+            .as_ref()?
+            .receive_markers
+            .as_ref()?
+            .position(reference)
+    }
+
     /// Preserve the old save boundary while priority entries are scanned first.
     // Port of erl_proc_sig_queue.c:9358-9454 (insert_prepared_prio_msg_attached), OTP-29.1.1.
-    pub(crate) fn priority_item_inserted(&mut self, old_prio_len: usize) {
+    pub(crate) fn priority_item_inserted(
+        &mut self,
+        old_prio_len: usize,
+        message: Term,
+    ) -> Result<(), VmError> {
         let cursor = self.receive_cursor;
         if self
             .cold
@@ -200,8 +281,15 @@ impl Process {
             .as_mut()
             .and_then(|cold| cold.receive_markers.as_mut())
         {
-            markers.priority_inserted(old_prio_len);
+            let message = arinsal_term::to_owned(message).map_err(|error| {
+                VmError::Unsupported(format!(
+                    "priority marker message copy ({:?}): {error:?}",
+                    message.classify()
+                ))
+            })?;
+            markers.priority_inserted(old_prio_len, &message);
         }
+        Ok(())
     }
 
     fn release_empty_marker_block(&mut self) {
@@ -215,9 +303,24 @@ impl Process {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_receive_marker(&mut self) -> Result<Term, VmError> {
+        self.reserve_receive_marker_inner(None)
+    }
+
+    pub(crate) fn reserve_scheduled_receive_marker(
+        &mut self,
+        scheduler: arinsal_sched::ReceiveMarker,
+    ) -> Result<Term, VmError> {
+        self.reserve_receive_marker_inner(Some(scheduler))
+    }
+
+    fn reserve_receive_marker_inner(
+        &mut self,
+        scheduler: Option<arinsal_sched::ReceiveMarker>,
+    ) -> Result<Term, VmError> {
         // An empty queue has no boundary to mark. OTP returns `undefined`.
-        if self.inbox.is_empty() {
+        if self.inbox.is_empty() && scheduler.is_none() {
             return Ok(crate::signals::atom("undefined"));
         }
         let position = self.inbox.len();
@@ -231,20 +334,37 @@ impl Process {
         cold.receive_marker_uniq += 1;
         cold.receive_markers
             .get_or_insert_with(|| Box::new(ReceiveMarkers::default()))
-            .reserve(position, id);
+            .reserve(position, id, scheduler);
         Ok(Term::small(id).expect("checked receive marker id"))
     }
 
-    pub(crate) fn bind_receive_marker(&mut self, marker: Term, reference: Term) {
+    pub(crate) fn bind_receive_marker(
+        &mut self,
+        marker: Term,
+        reference: Term,
+    ) -> Option<arinsal_sched::ReceiveMarker> {
         if let Some(id) = marker.as_small()
             && let Some(cold) = self.cold.as_mut()
             && let Some(markers) = cold.receive_markers.as_mut()
         {
-            markers.bind(id, crate::signals::ref_id(reference));
+            let reference = crate::signals::ref_id(reference);
+            markers.bind(id, reference);
+            return reference.and_then(|reference| {
+                markers
+                    .slots
+                    .iter()
+                    .flatten()
+                    .find(|entry| entry.id == MarkerId::Bound(reference))
+                    .and_then(|entry| entry.scheduler)
+            });
         }
+        None
     }
 
-    pub(crate) fn clear_receive_marker(&mut self, term: Term) {
+    pub(crate) fn clear_receive_marker(
+        &mut self,
+        term: Term,
+    ) -> Option<arinsal_sched::ReceiveMarker> {
         let id = crate::signals::ref_id(term)
             .map(MarkerId::Bound)
             .or_else(|| term.as_small().map(MarkerId::Reserved));
@@ -252,13 +372,21 @@ impl Process {
             && let Some(cold) = self.cold.as_mut()
             && let Some(markers) = cold.receive_markers.as_mut()
         {
+            let scheduler = markers
+                .slots
+                .iter()
+                .flatten()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| entry.scheduler);
             markers.clear(id);
+            return scheduler;
         }
+        None
     }
 
     pub(crate) fn use_receive_marker(&mut self, term: Term) {
         if let Some(reference) = crate::signals::ref_id(term)
-            && let Some(position) = self
+            && let Some((position, priority_position)) = self
                 .cold
                 .as_mut()
                 .and_then(|cold| cold.receive_markers.as_mut())
@@ -266,7 +394,15 @@ impl Process {
         {
             // Port of erts/emulator/beam/erl_proc_sig_queue.h:2281
             // (erts_msgq_recv_marker_set_save), OTP-29.1.1.
-            self.receive_cursor = position;
+            let prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+            if let Some(priority_position) =
+                priority_position.filter(|&position| position < prio_len)
+            {
+                self.receive_cursor = priority_position;
+                self.cold_mut().priority_resume_cursor = Some(position);
+            } else {
+                self.receive_cursor = position;
+            }
         }
     }
 
@@ -356,13 +492,14 @@ impl Process {
         self.cold_mut().prio_len = new_prio_len;
         let (term, token) = removed_message
             .ok_or_else(|| VmError::Unsupported("remove_message without current message".into()))?;
+        let mut ctx = ctx;
         if token.is_some()
-            && let Some(ctx) = ctx
+            && let Some(run_ctx) = ctx.as_deref_mut()
         {
             let message =
                 arinsal_term::to_owned(term).unwrap_or(arinsal_etf::OwnedTerm::atom("undefined"));
-            let pid = ctx.pid();
-            crate::seq_trace::on_receive(vm, self, ctx, pid, token, message);
+            let pid = run_ctx.pid();
+            crate::seq_trace::on_receive(vm, self, run_ctx, pid, token, message);
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2367
         // (erts_msgq_unlink_msg_set_save_first), OTP-29.1.1.
@@ -373,6 +510,9 @@ impl Process {
         }
         self.receive_deadline = None;
         self.receive_deadline_ms = None;
+        if let Some(run_ctx) = ctx {
+            run_ctx.reset_save();
+        }
         Ok(())
     }
 
@@ -405,8 +545,16 @@ impl Process {
                 "timeout_value",
             )))
         };
-        let ms = value.as_small().ok_or_else(timeout_value)?;
+        let Some(ms) = value.as_small() else {
+            // Port of erts/emulator/beam/emu/msg_instrs.tab:342-345
+            // (invalid timer resets the save pointer), OTP-29.1.1.
+            self.timeout();
+            return Err(timeout_value());
+        };
         if ms < 0 {
+            // Port of erts/emulator/beam/emu/msg_instrs.tab:342-345
+            // (invalid timer resets the save pointer), OTP-29.1.1.
+            self.timeout();
             return Err(timeout_value());
         }
         if let Some(runtime) = self.runtime.as_ref()
@@ -481,9 +629,9 @@ mod tests {
         let mut peak = 0;
         for reference in 1..=100_000 {
             let reservation = -i64::try_from(reference).unwrap();
-            markers.reserve(1, reservation);
+            markers.reserve(1, reservation, None);
             markers.bind(reservation, Some(reference));
-            assert_eq!(markers.set_save(reference), Some(1));
+            assert_eq!(markers.set_save(reference), Some((1, None)));
             peak = peak.max(markers.len());
             markers.clear(MarkerId::Bound(reference));
             markers.passed(1);
@@ -497,21 +645,21 @@ mod tests {
     fn marker_reuse_and_message_removal_preserve_boundaries() {
         let mut markers = ReceiveMarkers::default();
         let oldest = -1;
-        markers.reserve(2, oldest);
+        markers.reserve(2, oldest, None);
         markers.bind(oldest, Some(1));
         for reference in 2..=MARKER_SLOTS as u64 {
             let reservation = -i64::try_from(reference).unwrap();
-            markers.reserve(3, reservation);
+            markers.reserve(3, reservation, None);
             markers.bind(reservation, Some(reference));
         }
         let reservation = -9;
-        markers.reserve(4, reservation);
+        markers.reserve(4, reservation, None);
         markers.bind(reservation, Some(9));
         assert_eq!(markers.set_save(1), None);
-        assert_eq!(markers.set_save(9), Some(4));
+        assert_eq!(markers.set_save(9), Some((4, None)));
         assert_eq!(markers.len(), MARKER_SLOTS);
         markers.removed(0);
-        assert_eq!(markers.set_save(9), Some(3));
+        assert_eq!(markers.set_save(9), Some((3, None)));
         markers.removed(0);
         markers.removed(0);
         markers.removed(0);
@@ -522,12 +670,12 @@ mod tests {
     #[test]
     fn using_an_older_marker_passes_newer_markers_at_the_same_boundary() {
         let mut markers = ReceiveMarkers::default();
-        markers.reserve(2, -1);
+        markers.reserve(2, -1, None);
         markers.bind(-1, Some(1));
-        markers.reserve(2, -2);
+        markers.reserve(2, -2, None);
         markers.bind(-2, Some(2));
         for _ in 0..=super::MARKER_PASS_MAX {
-            assert_eq!(markers.set_save(1), Some(2));
+            assert_eq!(markers.set_save(1), Some((2, None)));
         }
         assert_eq!(markers.set_save(2), None);
         assert_eq!(markers.len(), 1);

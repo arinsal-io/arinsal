@@ -234,12 +234,14 @@ pub(super) fn bif_error(
         } = error
         {
             let top = if module == "erlang" && function == "error" && args.len() > 1 {
-                Some(match args.get(2).and_then(error_info_option) {
-                    Some(info) => {
-                        stacktrace::TopFrame::CurrentArgsWithInfo(args[1], Box::new(info))
-                    }
-                    None => stacktrace::TopFrame::CurrentArgs(args[1]),
-                })
+                let frame_args = proper_list(args[1]).then_some(args[1]);
+                match args.get(2).and_then(error_info_option) {
+                    Some(info) => Some(stacktrace::TopFrame::CurrentArgsWithInfo(
+                        frame_args,
+                        Box::new(info),
+                    )),
+                    None => frame_args.map(stacktrace::TopFrame::CurrentArgs),
+                }
             } else {
                 None
             };
@@ -278,6 +280,7 @@ pub(super) fn bif_error(
     }
 }
 
+// Port of erts/emulator/beam/bif.c:1464-1499 (error_3 option validation), OTP-29.1.1.
 fn error_info_option(options: &Term) -> Option<OwnedTerm> {
     let owned = to_owned(*options).ok()?;
     let OwnedTerm::List { elems, tail } = &owned else {
@@ -286,14 +289,30 @@ fn error_info_option(options: &Term) -> Option<OwnedTerm> {
     if **tail != OwnedTerm::Nil {
         return None;
     }
-    elems.iter().find_map(|option| match option {
-        OwnedTerm::Tuple(fields)
-            if fields.len() == 2 && fields[0] == OwnedTerm::atom("error_info") =>
-        {
-            Some(fields[1].clone())
+    if elems.is_empty() {
+        return None;
+    }
+    let mut error_info = None;
+    for option in elems {
+        let OwnedTerm::Tuple(fields) = option else {
+            return None;
+        };
+        if fields.len() != 2 || fields[0] != OwnedTerm::atom("error_info") {
+            return None;
         }
-        _ => None,
-    })
+        let OwnedTerm::Map(_) = &fields[1] else {
+            return None;
+        };
+        error_info = Some(fields[1].clone());
+    }
+    error_info
+}
+
+fn proper_list(term: Term) -> bool {
+    matches!(
+        to_owned(term).as_ref(),
+        Ok(OwnedTerm::List { tail, .. }) if **tail == OwnedTerm::Nil
+    )
 }
 
 /// Detach a direct host-to-BIF failure when there is no BEAM caller frame.
@@ -449,6 +468,14 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
                 }
                 return Err(VmError::Trap(Trap::error(atom("badarg")?)));
             };
+            if op == Opcode::RawRaise {
+                let trace = p.x[2];
+                if !stacktrace::set_raw_class(p, trace, class) {
+                    p.x[0] = atom("badarg")?;
+                    p.ip += 1;
+                    return Ok(());
+                }
+            }
             let (reason, trace) = if op == Opcode::Raise {
                 (source(p, b)?, saved_trace.expect("raise trace"))
             } else {

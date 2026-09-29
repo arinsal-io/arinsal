@@ -3,7 +3,9 @@
 use crate::{Process, RunState, SharedCode, Vm, VmError};
 use arinsal_beam::{BeamFile, Operand};
 use arinsal_beamasm::SchedulerRegisters;
-use arinsal_sched::{Config, Event, Payload, Pid, RunCtx, RunOutcome, Scheduler, Signal, Task};
+use arinsal_sched::{
+    Config, Event, Payload, Pid, ReceiveMarker, RunCtx, RunOutcome, Scheduler, Signal, Task,
+};
 use arinsal_spec::Opcode;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, copy_term, size_object};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -156,20 +158,36 @@ impl MessageQueue {
         self.entries.iter().map(|entry| &entry.term)
     }
 
-    pub(crate) fn retain(&mut self, prio_len: usize, mut keep: impl FnMut(&Term) -> bool) -> usize {
-        let old_prio = prio_len;
-        let mut new_prio = 0;
-        let mut i = 0;
-        self.entries.retain(|entry| {
-            let was_prio = i < old_prio;
-            i += 1;
-            let keep = keep(&entry.term);
-            if keep && was_prio {
-                new_prio += 1;
+    /// Retain matching messages at or after a receive-marker boundary.
+    ///
+    /// Splitting first is intentional: flushing a monitor must not walk the
+    /// mailbox prefix that predates the monitor's marker.
+    pub(crate) fn retain_from(
+        &mut self,
+        start: usize,
+        prio_len: usize,
+        mut keep: impl FnMut(&Term) -> bool,
+    ) -> (usize, Vec<usize>) {
+        let start = start.min(self.entries.len());
+        let mut suffix = self.entries.split_off(start);
+        let mut index = start;
+        let mut new_prio_len = prio_len.min(start);
+        let mut removed = Vec::new();
+        suffix.retain(|entry| {
+            let entry_index = index;
+            index += 1;
+            if keep(&entry.term) {
+                if entry_index < prio_len {
+                    new_prio_len += 1;
+                }
+                true
+            } else {
+                removed.push(entry_index);
+                false
             }
-            keep
         });
-        new_prio
+        self.entries.append(&mut suffix);
+        (new_prio_len, removed)
     }
 
     /// Remove a message, transferring any off-heap fragment into the process heap.
@@ -355,11 +373,11 @@ pub(crate) enum MessageQueueData {
 }
 
 impl Process {
-    pub(crate) fn push_priority_message(&mut self, term: Term) {
+    pub(crate) fn push_priority_message(&mut self, term: Term) -> Result<(), VmError> {
         let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
         let new_prio_len = self.inbox.push_priority(term, old_prio_len);
         self.cold_mut().prio_len = new_prio_len;
-        self.priority_item_inserted(old_prio_len);
+        self.priority_item_inserted(old_prio_len, term)
     }
 
     pub(crate) fn message_queue_data(&self) -> MessageQueueData {
@@ -941,7 +959,7 @@ impl Executor {
                             .map(|(_, arity)| arity)
                             .unwrap_or(0);
                         trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
-                            Term::small(i64::from(arity)).expect("arity is small"),
+                            Some(Term::small(i64::from(arity)).expect("arity is small")),
                             Box::new(info),
                         ));
                         trap
@@ -2095,10 +2113,33 @@ impl Process {
     }
 
     pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
+        self.drain_until_marker(ctx, None)
+    }
+
+    /// Fetch every event before a reserved marker into the VM-owned mailbox.
+    pub(crate) fn drain_before_marker(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        marker: ReceiveMarker,
+    ) -> Result<(), VmError> {
+        self.drain_until_marker(ctx, Some(marker))
+    }
+
+    fn drain_until_marker(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        marker: Option<ReceiveMarker>,
+    ) -> Result<(), VmError> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6032 (private queue fetch), OTP-29.1.1.
         ctx.fetch_pending();
         let mut queue_data = None;
-        while let Some(Event { from, payload }) = ctx.receive_fetched() {
+        loop {
+            if marker.is_some_and(|marker| !ctx.recv_marker_has_saved_before(marker)) {
+                break;
+            }
+            let Some(Event { from, payload }) = ctx.receive_saved() else {
+                break;
+            };
             match payload {
                 Payload::Message(message) => {
                     let multizero_callback = message
@@ -2126,7 +2167,13 @@ impl Process {
                             .push_message(message, data, &mut self.heap, old_prio_len)?;
                     self.cold_mut().prio_len = new_prio_len;
                     if priority {
-                        self.priority_item_inserted(old_prio_len);
+                        let priority_term =
+                            self.inbox.get(old_prio_len).copied().ok_or_else(|| {
+                                VmError::Unsupported(
+                                    "priority message missing after insertion".into(),
+                                )
+                            })?;
+                        self.priority_item_inserted(old_prio_len, priority_term)?;
                     }
                 }
                 Payload::Signal(arinsal_sched::Signal::Link) => {
@@ -2170,7 +2217,7 @@ impl Process {
                         })?;
                         let tuple = self.tuple(&[crate::signals::atom("EXIT"), from, reason])?;
                         if priority {
-                            self.push_priority_message(tuple);
+                            self.push_priority_message(tuple)?;
                         } else {
                             self.inbox.push_back(tuple);
                         }
@@ -2340,7 +2387,7 @@ impl Process {
             reason,
         ])?;
         if priority {
-            self.push_priority_message(tuple);
+            self.push_priority_message(tuple)?;
         } else {
             self.inbox.push_back(tuple);
         }

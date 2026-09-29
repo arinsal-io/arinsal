@@ -16,7 +16,7 @@ struct Node<T> {
 
 enum Chunk<T> {
     Single(T),
-    Block(Vec<T>),
+    Block(VecDeque<T>),
 }
 
 /// Incoming events are detached by the receiver with one atomic exchange.
@@ -178,7 +178,7 @@ impl<T> Incoming<T> {
                     if !boxed.values.is_empty() {
                         private
                             .queue
-                            .push_back(Chunk::Block(std::mem::take(&mut boxed.values)));
+                            .push_back(Chunk::Block(std::mem::take(&mut boxed.values).into()));
                     }
                 }
                 self.recycle(boxed);
@@ -248,6 +248,11 @@ impl<T> Private<T> {
         self.len == 0
     }
 
+    /// Whether an event remains at or after the selective receive save cursor.
+    pub fn has_saved(&self) -> bool {
+        self.save < self.len
+    }
+
     /// Pop the first event, preserving ordinary FIFO receive.
     pub fn pop(&mut self) -> Option<T> {
         let result = match self.queue.front_mut()? {
@@ -256,7 +261,7 @@ impl<T> Private<T> {
                 _ => unreachable!(),
             },
             Chunk::Block(values) => {
-                let value = values.remove(0);
+                let value = values.pop_front()?;
                 if values.is_empty() {
                     self.queue.pop_front();
                 }
@@ -269,6 +274,15 @@ impl<T> Private<T> {
             self.shift_markers(0);
         }
         result
+    }
+
+    /// Remove the first event at the selective receive save position.
+    pub fn pop_saved(&mut self) -> Option<T> {
+        let index = self.save;
+        let result = self.remove(index)?;
+        self.len -= 1;
+        self.shift_markers(index);
+        Some(result)
     }
 
     /// Begin a selective-receive scan at the current save position.
@@ -340,6 +354,14 @@ impl<T> Private<T> {
         }
     }
 
+    /// Whether an event remains between the save cursor and a marker.
+    pub fn marker_has_saved_before(&self, marker: ReceiveMarker) -> bool {
+        self.markers
+            .iter()
+            .find(|entry| entry.handle == marker)
+            .is_some_and(|entry| entry.position > self.save)
+    }
+
     /// Remove the marker associated with a reference key.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:3999 (recv marker release), OTP-29.1.1.
     pub fn marker_clear(&mut self, reference: u64) -> bool {
@@ -364,6 +386,12 @@ impl<T> Private<T> {
     }
 
     fn get(&self, mut index: usize) -> Option<&T> {
+        if self.len == self.queue.len() {
+            return match self.queue.get(index)? {
+                Chunk::Single(value) => Some(value),
+                Chunk::Block(values) => values.front(),
+            };
+        }
         for chunk in &self.queue {
             match chunk {
                 Chunk::Single(value) if index == 0 => return Some(value),
@@ -376,6 +404,18 @@ impl<T> Private<T> {
     }
 
     fn remove(&mut self, mut index: usize) -> Option<T> {
+        if self.len == self.queue.len() {
+            return match self.queue.remove(index)? {
+                Chunk::Single(value) => Some(value),
+                Chunk::Block(mut values) => {
+                    if values.len() == 1 {
+                        values.pop_front()
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
         for chunk_index in 0..self.queue.len() {
             match &mut self.queue[chunk_index] {
                 Chunk::Single(_) if index == 0 => {
@@ -386,7 +426,7 @@ impl<T> Private<T> {
                 }
                 Chunk::Single(_) => index -= 1,
                 Chunk::Block(values) if index < values.len() => {
-                    let value = values.remove(index);
+                    let value = values.remove(index)?;
                     if values.is_empty() {
                         self.queue.remove(chunk_index);
                     }

@@ -390,13 +390,41 @@ fn process_info(
             }
             "current_location" => {
                 let (module_name, function, arity) = resolve_mfa(vm, process)?;
+                let source = process.runtime.as_ref().and_then(|runtime| {
+                    runtime.with_modules(|modules| {
+                        let module = modules.get(process.module)?;
+                        module
+                            .lines
+                            .get(process.ip)
+                            .and_then(Option::as_ref)
+                            .or_else(|| {
+                                process
+                                    .ip
+                                    .checked_sub(1)
+                                    .and_then(|ip| module.lines.get(ip))
+                                    .and_then(Option::as_ref)
+                            })
+                            .cloned()
+                    })
+                });
+                let location = if let Some((file, line)) = source {
+                    let file = charlist(process, &file)?;
+                    let file = make_tuple(process, &[atom("file"), file])?;
+                    let line = make_tuple(
+                        process,
+                        &[atom("line"), Term::small(line as i64).ok_or_else(badarg)?],
+                    )?;
+                    make_list(process, [file, line])?
+                } else {
+                    Term::NIL
+                };
                 make_tuple(
                     process,
                     &[
                         Term::atom(global_atoms().intern(&module_name).map_err(|_| badarg())?),
                         atom(&function),
                         Term::small(arity as i64).unwrap(),
-                        Term::NIL,
+                        location,
                     ],
                 )?
             }
@@ -667,10 +695,56 @@ fn fun_to_list(term: Term) -> Result<String, VmError> {
             let function = global_atoms()
                 .text(entry.function)
                 .ok_or_else(|| VmError::Unsupported("fun name atom".into()))?;
-            format!("fun {module}:{function}/{}", entry.arity)
+            format!(
+                "fun {}:{}/{}",
+                format_fun_atom(&module),
+                format_fun_atom(&function),
+                entry.arity
+            )
         }
     };
     Ok(text)
+}
+
+// Port of erts/emulator/beam/erl_printf_term.c atom printing used by `~p`, OTP-29.1.1.
+fn format_fun_atom(name: &str) -> String {
+    let bare = name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'@'))
+        && !matches!(
+            name,
+            "after"
+                | "begin"
+                | "case"
+                | "try"
+                | "receive"
+                | "when"
+                | "end"
+                | "of"
+                | "catch"
+                | "if"
+                | "maybe"
+                | "else"
+        );
+    if bare {
+        return name.to_owned();
+    }
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('\'');
+    for ch in name.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '\'' => quoted.push_str("\\'"),
+            ch if ch.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(quoted, "\\x{{{:x}}}", ch as u32);
+            }
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Process and dictionary BIF entry points for `erlang` and `erts_internal`.
@@ -1271,6 +1345,20 @@ fn call_values(
                 let name = atom_name(*name).ok_or_else(badarg)?;
                 if name == "max_heap_size" {
                     return max_heap_flag(process, ctx, *value);
+                }
+                if name == "scheduler" {
+                    let scheduler = value
+                        .as_small()
+                        .filter(|&scheduler| {
+                            scheduler >= 0 && scheduler as usize <= ctx.scheduler_count()
+                        })
+                        .ok_or_else(badarg)? as usize;
+                    // Port of erts/emulator/beam/bif.c:2068-2097 (process scheduler binding), OTP-29.1.1.
+                    let (previous, should_yield) = ctx.bind_scheduler(scheduler);
+                    if should_yield {
+                        ctx.consume(ctx.remaining());
+                    }
+                    return Term::small(previous as i64).ok_or_else(badarg);
                 }
                 flag(process, &name, *value)
             }

@@ -589,12 +589,13 @@ pub(super) fn execute(
             };
             let need = match create_bin_size(&initial) {
                 Ok(need) => need,
-                Err(bits_error) => {
+                Err(BitsError::BadArg { segment }) => {
                     if a.kind() == Arg::LABEL && a.value() != u64::from(u32::MAX) {
                         return branch(p, a, frame);
                     }
-                    return Err(error(bits_error, frame));
+                    return Err(construct_fail(&initial, segment, &frame()));
                 }
+                Err(err) => return Err(error(err, frame)),
             };
             let bit_copy_cost = initial
                 .iter()
@@ -849,6 +850,71 @@ pub(super) fn execute(
             op.opcode().name()
         ))),
     }
+}
+
+// Port of erts/emulator/beam/emu/beam_emu.c:734 (erts_prepare_bs_construct_fail_info), OTP-29.1.1.
+fn construct_fail(segments: &[Segment<'_>], index: usize, frame: &str) -> VmError {
+    let Some(segment) = index.checked_sub(1).and_then(|index| segments.get(index)) else {
+        return VmError::Exception {
+            reason: "badarg".into(),
+            frame: frame.into(),
+        };
+    };
+    let (info, value) = match segment.size {
+        SegSize::Term(value) => ("size", value),
+        SegSize::All | SegSize::Units(_) => {
+            let SegmentValue::Term(value) = segment.value else {
+                return VmError::Exception {
+                    reason: "badarg".into(),
+                    frame: frame.into(),
+                };
+            };
+            ("type", value)
+        }
+    };
+    let Ok(value) = to_owned(value) else {
+        return VmError::Exception {
+            reason: "badarg".into(),
+            frame: frame.into(),
+        };
+    };
+    let operation = match segment.ty {
+        SegType::Integer => "integer",
+        SegType::Float => "float",
+        SegType::Binary | SegType::Append | SegType::PrivateAppend => "binary",
+        SegType::String => "string",
+        SegType::Utf8 => "utf8",
+        SegType::Utf16 => "utf16",
+        SegType::Utf32 => "utf32",
+    };
+    let cause = OwnedTerm::Tuple(vec![
+        OwnedTerm::Int(index as i64),
+        OwnedTerm::atom(operation),
+        OwnedTerm::atom(info),
+        value,
+    ]);
+    let info = OwnedTerm::Map(vec![
+        (OwnedTerm::atom("cause"), cause),
+        (
+            OwnedTerm::atom("function"),
+            OwnedTerm::atom("format_bs_fail"),
+        ),
+        (
+            OwnedTerm::atom("module"),
+            OwnedTerm::atom("erl_erts_errors"),
+        ),
+    ]);
+    VmError::Trap(crate::exceptions::Trap {
+        class: arinsal_bifs::Class::Error,
+        reason: crate::signals::atom("badarg"),
+        trace: None,
+        top: Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+            None,
+            Box::new(info),
+        )),
+        raw_rethrow: false,
+        untrappable: false,
+    })
 }
 
 #[cfg(test)]

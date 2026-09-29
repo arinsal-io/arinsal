@@ -64,7 +64,48 @@ scenario(54) -> true=group_leader(self(),self()), L=group_leader(), L=self(), ok
 scenario(55) -> true=erlang:process_display(self(),backtrace), ok;
 scenario(56) -> P=spawn(fun()->ok end), R=monitor(process,P,[{tag,notice}]), receive {notice,R,process,P,noproc} -> ok; {notice,R,process,P,normal} -> ok after 5000 -> timeout end;
 scenario(57) -> try monitor(process,self(),[{bad,true}]) catch error:badarg -> badarg end;
-scenario(58) -> try erlang:send_nosuspend(self(),x,[bad]) catch error:badarg -> badarg end.
+scenario(58) -> try erlang:send_nosuspend(self(),x,[bad]) catch error:badarg -> badarg end;
+scenario(59) -> erlang:fun_to_list(fun 'a-esc':'b-esc'/1);
+scenario(60) -> true=is_integer(erlang:system_info(max_integer)), ok;
+scenario(61) -> 0=process_flag(scheduler,1), 1=process_flag(scheduler,0), ok;
+scenario(62) ->
+    Parent=self(), Pid=spawn(fun() -> receive {From,Ref} -> From ! {Ref,reply} end end),
+    self() ! before_marker, Ref=monitor(process,Pid),
+    self() ! {forged,Ref,a,b,c}, Pid ! {Parent,Ref},
+    receive {Ref,reply} -> true=erlang:demonitor(Ref,[flush]) end,
+    receive before_marker -> ok end,
+    receive {forged,Ref,_,_,_} -> forged_survived after 0 -> ok end;
+scenario(63) ->
+    Pid=spawn(fun() ->
+        receive {_ReplyTo,Ref} -> send_priority_replies(Ref,100) end
+    end),
+    self() ! old, Ref=monitor(process,Pid,[{alias,demonitor}]), Pid ! {self(),Ref},
+    receive_priority_replies(Ref,100,1), true=erlang:demonitor(Ref,[flush]),
+    receive old -> ok end;
+scenario(64) ->
+    Alias=alias([priority]), Srv=spawn(fun priority_echoer/0),
+    self() ! old, repeat_priority_calls(Alias,Srv,50,25),
+    receive old -> ok end.
+send_priority_replies(_Ref,0) -> ok;
+send_priority_replies(Ref,N) ->
+    erlang:send(Ref,{wrapped,Ref,N},[priority]), send_priority_replies(Ref,N-1).
+receive_priority_replies(_Ref,N,Limit) when N < Limit -> ok;
+receive_priority_replies(Ref,N,Limit) ->
+    receive {wrapped,Ref,N} -> receive_priority_replies(Ref,N-1,Limit) end.
+priority_echoer() ->
+    receive {Alias,Ref,Count} -> send_priority_batch(Alias,Ref,Count) end,
+    priority_echoer().
+send_priority_batch(_Alias,_Ref,0) -> ok;
+send_priority_batch(Alias,Ref,Count) ->
+    erlang:send(Alias,{Ref,Count},[priority]), send_priority_batch(Alias,Ref,Count-1).
+repeat_priority_calls(_Alias,_Srv,0,_Count) -> ok;
+repeat_priority_calls(Alias,Srv,Calls,Count) ->
+    Ref=monitor(process,Srv), Srv ! {Alias,Ref,Count},
+    receive_priority_batch(Ref,Count), true=erlang:demonitor(Ref,[flush]),
+    repeat_priority_calls(Alias,Srv,Calls-1,Count).
+receive_priority_batch(_Ref,0) -> ok;
+receive_priority_batch(Ref,Count) ->
+    receive {Ref,Count} -> receive_priority_batch(Ref,Count-1) end.
 "#;
 
 #[test]
@@ -75,7 +116,7 @@ fn process_bif_scenarios_match_otp_29() {
     };
     let beam = reference.compile_named("proc_bifs", SOURCE, &[]).unwrap();
     reference.load("proc_bifs", &beam).unwrap();
-    for scenario in 0..59 {
+    for scenario in 0..65 {
         let expected = reference.call("proc_bifs", "scenario", &[OwnedTerm::Int(scenario)]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();

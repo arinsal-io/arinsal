@@ -560,6 +560,29 @@ fn debug_line_system_limit() -> VmError {
     VmError::Trap(exceptions::Trap::error(Term::atom(atom)))
 }
 
+// Port of erts/emulator/beam/emu/instrs.tab:416 (i_get_tuple_element), OTP-29.1.1.
+fn bad_get_tuple_element(p: &mut Process, tuple: Term, index: u16) -> VmError {
+    let index = Term::small(i64::from(index) + 1).expect("tuple element index is small");
+    let args = {
+        let mut heap = FragmentingHeap(&mut p.heap);
+        TermBuilder::new(&mut heap)
+            .list_from_iter([index, tuple])
+            .expect("fragmenting heap allocates BIF arguments")
+    };
+    VmError::Trap(exceptions::Trap {
+        class: arinsal_bifs::Class::Error,
+        reason: signals::atom("badarg"),
+        trace: None,
+        top: Some(stacktrace::TopFrame::Bif {
+            module: "erlang".into(),
+            function: "element".into(),
+            args,
+        }),
+        raw_rethrow: false,
+        untrappable: false,
+    })
+}
+
 #[cfg(feature = "pf-mem-counters")]
 static PF_SPAWN_CONSTRUCTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "pf-mem-counters")]
@@ -1246,7 +1269,7 @@ impl Vm {
                         .map(|(_, arity)| arity)
                         .unwrap_or(0);
                     trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
-                        Term::small(i64::from(arity)).expect("arity is small"),
+                        Some(Term::small(i64::from(arity)).expect("arity is small")),
                         Box::new(info),
                     ));
                     if let Some(error) = exceptions::resume(self, &mut process, None, trap)? {
@@ -2507,7 +2530,7 @@ impl Vm {
                     let value = tuples::element(tuple, index as usize).ok_or_else(|| {
                         p.module = module_id;
                         p.ip = offset;
-                        self.exception(p, "badarg")
+                        bad_get_tuple_element(p, tuple, index)
                     })?;
                     // SAFETY: Specialization validates the destination X index below 1024.
                     unsafe { *x.add(dst as usize) = value };
@@ -2545,7 +2568,7 @@ impl Vm {
                     let tuple =
                         unsafe { std::mem::transmute::<u64, Term>(*stop.add(src as usize)) };
                     let value = tuples::element(tuple, index as usize)
-                        .ok_or_else(|| self.exception(p, "badarg"))?;
+                        .ok_or_else(|| bad_get_tuple_element(p, tuple, index))?;
                     // SAFETY: Specialization validates the destination X index.
                     unsafe { *x.add(dst as usize) = value };
                 }
@@ -2556,7 +2579,7 @@ impl Vm {
                     // SAFETY: Specialization validates the source X index.
                     let tuple = unsafe { *x.add(src as usize) };
                     let value = tuples::element(tuple, index as usize)
-                        .ok_or_else(|| self.exception(p, "badarg"))?;
+                        .ok_or_else(|| bad_get_tuple_element(p, tuple, index))?;
                     // SAFETY: The destination Y slot is live.
                     unsafe { *stop.add(dst as usize) = value.raw_bits() };
                 }
@@ -3160,7 +3183,15 @@ impl Vm {
                     }
                     (htop, stop) = p.heap.heap_cursor();
                     let value = p.read(time)?;
-                    let remaining = p.wait_timeout(value)?;
+                    let remaining = match p.wait_timeout(value) {
+                        Ok(remaining) => remaining,
+                        Err(error) => {
+                            if let Some(ctx) = ctx.as_deref_mut() {
+                                ctx.reset_save();
+                            }
+                            return Err(error);
+                        }
+                    };
                     if remaining == Some(0) {
                         // SAFETY: The timeout instruction follows wait_timeout.
                         ip = hot_next(ip);
@@ -3174,7 +3205,14 @@ impl Vm {
                         timeout_ms: remaining,
                     });
                 }
-                Instr::Timeout => p.timeout(),
+                Instr::Timeout => {
+                    p.timeout();
+                    if let Some(ctx) = ctx.as_deref_mut() {
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.h:2331
+                        // (`erts_msgq_set_save_first`), OTP-29.1.1.
+                        ctx.reset_save();
+                    }
+                }
                 Instr::IsTaggedTuple {
                     fail,
                     src,
@@ -3290,29 +3328,50 @@ impl Vm {
                     continue;
                 }
                 Instr::RecvMarkerReserve { dst } => {
-                    sync_cursor(p, htop, &mut heap_dirty);
                     let ctx = ctx.as_deref_mut().ok_or_else(|| {
                         VmError::Unsupported("receive marker requires scheduler".into())
                     })?;
                     // Port of erts/emulator/beam/erl_proc_sig_queue.h:2226
                     // (erts_msgq_recv_marker_insert), OTP-29.1.1.
-                    p.drain(ctx)?;
-                    let marker = p.reserve_receive_marker()?;
+                    let scheduler_marker = ctx.recv_marker_reserve();
+                    p.drain_before_marker(ctx, scheduler_marker)?;
+                    let marker = p.reserve_scheduled_receive_marker(scheduler_marker)?;
                     p.write(dst, marker)?;
-                    (htop, stop) = p.heap.heap_cursor();
                 }
                 Instr::RecvMarkerBind { marker, reference } => {
                     let marker = p.read(marker)?;
                     let reference = p.read(reference)?;
-                    p.bind_receive_marker(marker, reference);
+                    if let Some(marker) = p.bind_receive_marker(marker, reference)
+                        && let Some(reference) = crate::signals::ref_id(reference)
+                    {
+                        ctx.as_deref_mut()
+                            .ok_or_else(|| {
+                                VmError::Unsupported("receive marker requires scheduler".into())
+                            })?
+                            .recv_marker_bind(marker, reference);
+                    }
                 }
                 Instr::RecvMarkerClear { reference } => {
                     let reference = p.read(reference)?;
                     p.clear_receive_marker(reference);
+                    if let Some(reference) = crate::signals::ref_id(reference) {
+                        ctx.as_deref_mut()
+                            .ok_or_else(|| {
+                                VmError::Unsupported("receive marker requires scheduler".into())
+                            })?
+                            .recv_marker_clear(reference);
+                    }
                 }
                 Instr::RecvMarkerUse { reference } => {
                     let reference = p.read(reference)?;
                     p.use_receive_marker(reference);
+                    if let Some(reference) = crate::signals::ref_id(reference) {
+                        ctx.as_deref_mut()
+                            .ok_or_else(|| {
+                                VmError::Unsupported("receive marker requires scheduler".into())
+                            })?
+                            .recv_marker_use(reference);
+                    }
                 }
                 Instr::Unsupported(reason) => {
                     if module.unsupported_reasons[reason as usize] == "opcode on_load" {

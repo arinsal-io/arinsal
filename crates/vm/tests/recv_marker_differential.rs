@@ -65,7 +65,13 @@ scenario(7, N) ->
     First = receive {Ref1, X1} -> X1 after 1000 -> timeout end,
     Second = receive {Ref2, X2} -> X2 after 1000 -> timeout end,
     Old = receive {old, X3} -> X3 after 1000 -> timeout end,
-    {First, Second, Old}.
+    {First, Second, Old};
+scenario(8, _) ->
+    self() ! init,
+    Caught = try receive blipp -> wrong after blepp -> wrong end
+             catch _:_ -> caught end,
+    Received = receive init -> ok after 0 -> missing end,
+    {Caught, Received}.
 
 monitor_loop(0, Count) -> Count;
 monitor_loop(N, Count) ->
@@ -106,6 +112,7 @@ fn receive_marker_scenarios_match_otp_29() {
         (5, 13),
         (6, 13),
         (7, 13),
+        (8, 13),
     ] {
         let expected = reference.call(
             "recv_marker_diff",

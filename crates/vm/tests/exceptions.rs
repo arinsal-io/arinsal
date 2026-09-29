@@ -114,7 +114,8 @@ fn exception_smoke_against_otp() {
     };
     let source = r#"
 -module(vm_exc_smoke).
--export([run/1, captured/1, native/1, depth/1, gc_catch/1, failed_clause/1]).
+-export([run/1, captured/1, native/1, depth/1, gc_catch/1, failed_clause/1,
+         error_info_invalid/0, class_change/0, bs_invalid_size/1]).
 run(N) -> try trigger(N) catch C:R:S -> {C,R,S} end.
 captured(N) -> catch trigger(N).
 native(X) -> try helper(X) catch C:R:S -> {C,R,S} end.
@@ -131,7 +132,26 @@ trigger(4) -> erlang:element(10, {});
 trigger(5) -> 1 div 0;
 trigger(6) -> case 5 of 1 -> ok end;
 trigger(7) -> if 1 =:= 2 -> ok end;
-trigger(8) -> failed_clause(1).
+trigger(8) -> failed_clause(1);
+trigger(9) -> element(1, erlang:make_tuple(0, ok)).
+error_info_invalid() ->
+    try erlang:error(reason, [], [{error_info, not_map}])
+    catch error:reason:Stack -> lists:keyfind(error_info, 1, element(4, hd(Stack)))
+    end.
+class_change() ->
+    try
+        try throw(arne)
+        catch throw:InnerReason:Stacktrace ->
+            erlang:raise(error, InnerReason, Stacktrace)
+        end
+    catch error:arne -> ok;
+          CaughtClass:CaughtReason -> {CaughtClass, CaughtReason}
+    after ok
+    end.
+bs_invalid_size(Size) ->
+    try <<0:Size>>
+    catch error:badarg:Stack -> hd(Stack)
+    end.
 "#;
     let beam = reference
         .compile_named("vm_exc_smoke", source, &[])
@@ -140,7 +160,7 @@ trigger(8) -> failed_clause(1).
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     for function in ["run", "captured"] {
-        for n in 1..=8 {
+        for n in 1..=9 {
             let args = [OwnedTerm::Int(n)];
             let expected = trim_result(reference.call("vm_exc_smoke", function, &args));
             let actual = trim_result(vm_call(&mut vm, function, &args, "vm_exc_smoke"));
@@ -174,6 +194,15 @@ trigger(8) -> failed_clause(1).
         compare(&expected, &actual, CompareMode::Exact).is_ok(),
         "gc_catch/1: expected {expected:?}, actual {actual:?}"
     );
+    for function in ["error_info_invalid", "class_change"] {
+        let expected = reference.call("vm_exc_smoke", function, &[]);
+        let actual = vm_call(&mut vm, function, &[], "vm_exc_smoke");
+        assert_eq!(expected, actual, "{function}");
+    }
+    let args = [OwnedTerm::Atom("bad_size".into())];
+    let expected = reference.call("vm_exc_smoke", "bs_invalid_size", &args);
+    let actual = vm_call(&mut vm, "bs_invalid_size", &args, "vm_exc_smoke");
+    assert_eq!(expected, actual, "bs_invalid_size");
 }
 
 #[test]
