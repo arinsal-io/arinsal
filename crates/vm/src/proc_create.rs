@@ -61,6 +61,7 @@ pub struct Process {
     // Last BEAM live operand or call arity for allocation instructions without one.
     pub(crate) gc_live: usize,
     pub(crate) reductions: i32,
+    pub(crate) reductions_used: u64,
     pub(crate) gc_enabled: bool,
     pub(crate) uniq_counter: i64,
     pub(crate) stats: ProcessStats,
@@ -246,6 +247,7 @@ impl Process {
             native_pc: None,
             gc_live: 0,
             reductions: 4000,
+            reductions_used: 0,
             gc_enabled: true,
             uniq_counter: 0,
             stats: ProcessStats::default(),

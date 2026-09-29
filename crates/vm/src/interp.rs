@@ -1216,6 +1216,20 @@ impl Vm {
                         return Err(error);
                     }
                 }
+                Err(VmError::ExceptionInfo { reason, info, .. }) => {
+                    let mut trap = exceptions::from_legacy(&reason)?;
+                    let arity = self.modules[process.module]
+                        .function_at(process.ip)
+                        .map(|(_, arity)| arity)
+                        .unwrap_or(0);
+                    trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+                        Term::small(i64::from(arity)).expect("arity is small"),
+                        Box::new(info),
+                    ));
+                    if let Some(error) = exceptions::resume(self, &mut process, None, trap)? {
+                        return Err(error);
+                    }
+                }
                 Err(error) => return Err(error),
             }
         };
@@ -1524,6 +1538,7 @@ impl Vm {
             p.ip = offset;
             let module = module_handle.as_ref();
             let instr = fetched;
+            p.reductions_used = p.reductions_used.saturating_add(1);
             #[cfg(feature = "instr-count")]
             {
                 p.stats.instructions += 1;
@@ -3306,8 +3321,10 @@ impl Vm {
                     p.module = module_id;
                     p.ip = offset;
                     let op = module.generic[fallback as usize];
-                    let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
-                    let frame = format!("{}:{name}/{arity}", module.name);
+                    let frame = || {
+                        let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
+                        format!("{}:{name}/{arity}", module.name)
+                    };
                     bits::execute(p, module, &op, &frame)?;
                     reds = p.reductions;
                     depth = p.heap.stack_words();
@@ -3344,8 +3361,10 @@ impl Vm {
                     p.module = module_id;
                     p.ip = offset;
                     let op = module.generic[fallback as usize];
-                    let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
-                    let frame = format!("{}:{name}/{arity}", module.name);
+                    let frame = || {
+                        let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
+                        format!("{}:{name}/{arity}", module.name)
+                    };
                     bits::execute(p, module, &op, &frame)?;
                     reds = p.reductions;
                     depth = p.heap.stack_words();
@@ -3493,13 +3512,15 @@ impl Vm {
                     p.module = module_id;
                     p.ip = offset;
                     let op = module.generic[index as usize];
-                    let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
-                    let frame = format!("{}:{name}/{arity}", module.name);
+                    let frame = || {
+                        let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
+                        format!("{}:{name}/{arity}", module.name)
+                    };
                     if matches!(
                         op.opcode(),
                         Opcode::PutMapAssoc | Opcode::PutMapExact | Opcode::HasMapFields
                     ) {
-                        maps::execute(p, module, &op, &frame)?;
+                        maps::execute(p, module, &op, &frame())?;
                     } else if op.opcode() == Opcode::GetMapElements {
                         execute_get_map_elements(p, module, &op)?;
                     } else {

@@ -5,12 +5,12 @@
 | `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
 | `big_SUITE` | 23 | 23/23 | 18/23 | 5 | 0 | big_float_2: failed {{badmatch,0.0}; big_float_3: failed {{badmatch,3.402823669209385e38}; reductions: failed {badarg; system_limit: failed {badarg; toobig: failed {{badmatch, {'EXIT', {system_limit |
 | `binary_SUITE` | 55 | 42/55 | 34/55 | 8 | 0 | bad_terms: failed {'EXIT',error}, unknown_location; copy_terms: failed {'EXIT',error}, unknown_location; error_after_yield: failed {{badmatch,false}; gc_test: failed {{badmatch,{binary,[]}}; local_ext: failed {{badmatch,{error,exbadport}}; otp_5484: failed {'EXIT',error}, unknown_location; t2b_deterministic: failed {{badmatch; terms: failed {'EXIT',error}, unknown_location |
-| `bs_construct_SUITE` | 31 | 30/31 | 26/31 | 4 | 0 | bs_append_offheap: failed "missing binary in erts_bs_private_append"; error_info: failed {{badmatch,false}; in_guard: failed {badarg; reductions: failed {if_clause |
+| `bs_construct_SUITE` | 31 | 30/31 | 30/31 | 0 | 0 | none |
 | `bs_match_bin_SUITE` | 9 | 9/9 | 9/9 | 0 | 0 | none |
 | `bs_match_int_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
-| `bs_match_misc_SUITE` | 20 | 20/20 | 18/20 | 2 | 0 | bad_bs_match: failed {{badmatch,{module,bad_bs_match}}; fp16: failed {badarg |
-| `bs_match_tail_SUITE` | 4 | 4/4 | 0/4 | 4 | 0 | aligned: missing; huge_tail: missing; unaligned: missing; zero_tail: missing; suite-level: failed: 'bs_match_tail_SUITE:all/0 is missing', unknown_location |
-| `bs_utf_SUITE` | 8 | 8/8 | 0/8 | 8 | -9 | bad_construction: missing; utf16_illegal_sequences: missing; utf16_roundtrip: missing; utf32_illegal_sequences: missing; utf32_roundtrip: missing; utf8_big_file: missing; utf8_illegal_sequences: missing; utf8_roundtrip: missing |
+| `bs_match_misc_SUITE` | 20 | 20/20 | 19/20 | 1 | 0 | fp16: failed {badarg |
+| `bs_match_tail_SUITE` | 4 | 4/4 | 4/4 | 0 | 0 | none |
+| `bs_utf_SUITE` | 8 | 8/8 | 3/8 | 5 | -9 | bad_construction: missing; utf16_illegal_sequences: missing; utf32_illegal_sequences: missing; utf8_big_file: missing; utf8_illegal_sequences: missing |
 | `counters_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
 | `exception_SUITE` | 16 | 15/16 | 10/16 | 5 | 0 | change_exception_class: failed {test_case_failed,{wrong_exception_class,throw}}; error_3: failed {{badmatch,false}; line_numbers: failed {{badmatch, {'EXIT', {badarg; stacktrace: failed {{badmatch, {caught2, {error,[#Ref<0.0.0.5756>&#124;<0.222.0>]}; top_of_stacktrace: failed {{badmatch, {'EXIT', {badarg |
 | `float_SUITE` | 15 | 14/15 | 12/15 | 2 | 0 | arith: failed {{badmatch,{{'EXIT',badarith}, [0, 3595386269724631416290548474634087135961411350516899931978349536063145215600570775211791172655337563430809179070287649284686426537789283655369350…; fp_drv: failed {'EXIT',error}, unknown_location |

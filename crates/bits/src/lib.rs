@@ -151,8 +151,60 @@ pub enum BitsError {
     BadArg { segment: usize },
     /// `error:system_limit`; the bit count cannot fit in erts' signed size.
     SystemLimit { segment: usize },
+    /// A construction error with the metadata attached by erts to the stack frame.
+    Detailed {
+        /// One-based failing source segment.
+        segment: usize,
+        /// Exception class reason.
+        reason: &'static str,
+        /// Segment type atom.
+        ty: &'static str,
+        /// Failure category atom.
+        field: &'static str,
+        /// Source term attached to the failure.
+        value: Term,
+    },
     /// GC is required before retrying.
     HeapFull { need_words: usize },
+}
+
+fn segment_name(ty: SegType) -> &'static str {
+    match ty {
+        SegType::Integer => "integer",
+        SegType::Float => "float",
+        SegType::Binary | SegType::Append | SegType::PrivateAppend => "binary",
+        SegType::String => "string",
+        SegType::Utf8 => "utf8",
+        SegType::Utf16 => "utf16",
+        SegType::Utf32 => "utf32",
+    }
+}
+
+fn detailed(segment: &Segment<'_>, field: &'static str, value: Term) -> BitsError {
+    detailed_reason(segment, "badarg", field, value)
+}
+
+fn detailed_reason(
+    segment: &Segment<'_>,
+    reason: &'static str,
+    field: &'static str,
+    value: Term,
+) -> BitsError {
+    BitsError::Detailed {
+        segment: segment.index,
+        reason,
+        ty: segment_name(segment.ty),
+        field,
+        value,
+    }
+}
+
+fn size_term(segment: &Segment<'_>) -> Option<Term> {
+    match segment.size {
+        SegSize::Term(term) => Some(term),
+        SegSize::Units(size) => i64::try_from(size).ok().and_then(Term::small),
+        SegSize::All => None,
+    }
 }
 
 fn term_error(error: TermError, segment: usize, words: usize) -> BitsError {
@@ -174,6 +226,11 @@ fn with_binary<R>(term: Term, f: impl FnOnce(&[u8], usize, usize) -> R) -> Optio
     // this owner while the slice is borrowed, and the slice does not escape `f`.
     let view = unsafe { term.binary_ref() }?;
     Some(f(view.bytes(), view.start_bit(), view.bit_len()))
+}
+
+/// Return the significant bit length of a binary or bitstring term.
+pub fn bit_size(term: Term) -> Option<usize> {
+    with_binary(term, |_, _, bits| bits)
 }
 
 fn owned_number(term: Term) -> Option<OwnedTerm> {
@@ -237,12 +294,11 @@ fn as_float(term: Term) -> Option<f64> {
 }
 
 fn codepoint(segment: &Segment<'_>) -> Result<char, BitsError> {
-    let n = source(segment)?
-        .as_small()
-        .and_then(|n| u32::try_from(n).ok());
-    n.and_then(char::from_u32).ok_or(BitsError::BadArg {
-        segment: segment.index,
-    })
+    let value = source(segment)?;
+    let Some(n) = value.as_small().and_then(|n| u32::try_from(n).ok()) else {
+        return Err(detailed(segment, "type", value));
+    };
+    char::from_u32(n).ok_or_else(|| detailed(segment, "type", value))
 }
 
 fn size_of(segment: &Segment<'_>) -> Result<usize, BitsError> {
@@ -265,27 +321,50 @@ fn size_of(segment: &Segment<'_>) -> Result<usize, BitsError> {
             _ => Err(bad),
         },
         SegType::Binary | SegType::Append | SegType::PrivateAppend => {
+            let requested = if matches!(segment.size, SegSize::All) {
+                None
+            } else {
+                Some(units_bits(segment)?)
+            };
             let t = source(segment)?;
-            let bit_len = with_binary(t, |_, _, bits| bits).ok_or(bad)?;
+            let Some(bit_len) = with_binary(t, |_, _, bits| bits) else {
+                return Err(detailed(segment, "type", t));
+            };
             if matches!(segment.size, SegSize::All) {
                 if segment.unit == 0 || bit_len % usize::from(segment.unit) != 0 {
-                    return Err(bad);
+                    return Err(detailed(segment, "unit", t));
                 }
                 Ok(bit_len)
             } else {
-                let bits = units_bits(segment)?;
-                if bits > bit_len { Err(bad) } else { Ok(bits) }
+                let bits = requested.expect("non-all size was calculated");
+                if bits > bit_len {
+                    Err(detailed(segment, "short", t))
+                } else {
+                    Ok(bits)
+                }
             }
         }
         SegType::Integer | SegType::Float => {
             let bits = units_bits(segment)?;
             let t = source(segment)?;
-            let valid = if segment.ty == SegType::Integer {
-                is_integer(t)
-            } else {
-                as_float(t).is_some() && matches!(bits, 16 | 32 | 64)
-            };
-            if valid { Ok(bits) } else { Err(bad) }
+            if segment.ty == SegType::Integer {
+                if !is_integer(t) {
+                    return Err(detailed(segment, "type", t));
+                }
+            } else if as_float(t).is_none() {
+                return Err(detailed(
+                    segment,
+                    if is_integer(t) { "no_float" } else { "type" },
+                    t,
+                ));
+            } else if !matches!(bits, 16 | 32 | 64) {
+                return Err(detailed(
+                    segment,
+                    "invalid",
+                    size_term(segment).unwrap_or(t),
+                ));
+            }
+            Ok(bits)
         }
     }
 }
@@ -296,22 +375,14 @@ fn units_bits(segment: &Segment<'_>) -> Result<usize, BitsError> {
         SegSize::Units(size) => size,
         SegSize::Term(term) => {
             if let Some(value) = term.as_small() {
-                u64::try_from(value).map_err(|_| BitsError::BadArg {
-                    segment: segment.index,
-                })?
+                u64::try_from(value).map_err(|_| detailed(segment, "size", term))?
             } else {
                 let owned = owned_number(term);
                 match &owned {
                     Some(OwnedTerm::BigInt(value)) if value.sign() != Sign::Minus => {
-                        return Err(BitsError::SystemLimit {
-                            segment: segment.index,
-                        });
+                        return Err(detailed_reason(segment, "system_limit", "size", term));
                     }
-                    _ => {
-                        return Err(BitsError::BadArg {
-                            segment: segment.index,
-                        });
-                    }
+                    _ => return Err(detailed(segment, "size", term)),
                 }
             }
         }
@@ -322,16 +393,25 @@ fn units_bits(segment: &Segment<'_>) -> Result<usize, BitsError> {
         }
     };
     if size > arinsal_term::MAX_SMALL as u64 {
+        if let Some(value) = size_term(segment) {
+            return Err(detailed_reason(segment, "system_limit", "size", value));
+        }
         return Err(BitsError::SystemLimit {
             segment: segment.index,
         });
     }
-    let bits = size
-        .checked_mul(u64::from(segment.unit))
-        .ok_or(BitsError::SystemLimit {
-            segment: segment.index,
-        })?;
+    let bits = size.checked_mul(u64::from(segment.unit)).ok_or_else(|| {
+        size_term(segment).map_or(
+            BitsError::SystemLimit {
+                segment: segment.index,
+            },
+            |value| detailed_reason(segment, "system_limit", "size", value),
+        )
+    })?;
     if bits > isize::MAX as u64 {
+        if let Some(value) = size_term(segment) {
+            return Err(detailed_reason(segment, "system_limit", "size", value));
+        }
         return Err(BitsError::SystemLimit {
             segment: segment.index,
         });
@@ -432,6 +512,46 @@ fn write_int(dst: &mut [u8], pos: usize, bits: usize, value: &BigInt, little: bo
 /// An initial append segment grows a unique writer in place when possible.
 pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Result<Term, BitsError> {
     // Port of erts/emulator/beam/erl_bits.c:1523 (new binary construction), OTP-29.1.1.
+    if let [segment] = segments
+        && matches!(segment.ty, SegType::Utf8 | SegType::Utf16 | SegType::Utf32)
+    {
+        // Port of erts/emulator/beam/erl_bits.c:1162/1222 (single UTF segment), OTP-29.1.1.
+        let ch = codepoint(segment)?;
+        let mut bytes = [0u8; 4];
+        let bits = match segment.ty {
+            SegType::Utf8 => {
+                let encoded = ch.encode_utf8(&mut bytes);
+                encoded.len() * 8
+            }
+            SegType::Utf16 => {
+                let mut words = [0u16; 2];
+                let encoded = ch.encode_utf16(&mut words);
+                for (index, word) in encoded.iter().enumerate() {
+                    let pair = if segment.flags.little() {
+                        word.to_le_bytes()
+                    } else {
+                        word.to_be_bytes()
+                    };
+                    bytes[index * 2..index * 2 + 2].copy_from_slice(&pair);
+                }
+                encoded.len() * 16
+            }
+            SegType::Utf32 => {
+                let bytes = if segment.flags.little() {
+                    (ch as u32).to_le_bytes()
+                } else {
+                    (ch as u32).to_be_bytes()
+                };
+                return TermBuilder::new(heap)
+                    .bitstring(&bytes, 32)
+                    .map_err(|e| term_error(e, segment.index, 8));
+            }
+            _ => unreachable!(),
+        };
+        return TermBuilder::new(heap)
+            .bitstring(&bytes[..bits / 8], bits)
+            .map_err(|e| term_error(e, segment.index, 2 + bits.div_ceil(64)));
+    }
     if let [segment] = segments
         && segment.ty == SegType::Integer
         && let SegmentValue::Term(value) = segment.value

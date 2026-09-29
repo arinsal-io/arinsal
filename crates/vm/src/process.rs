@@ -927,6 +927,25 @@ impl Executor {
                         }
                         trap
                     }
+                    Err(VmError::ExceptionInfo {
+                        reason,
+                        frame,
+                        info,
+                    }) => {
+                        if trace_boot_enabled() {
+                            eprintln!("arinsal boot: exception {reason} at {frame}");
+                        }
+                        let mut trap = crate::exceptions::from_legacy(&reason)?;
+                        let arity = self.vm.modules[process.module]
+                            .function_at(process.ip)
+                            .map(|(_, arity)| arity)
+                            .unwrap_or(0);
+                        trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+                            Term::small(i64::from(arity)).expect("arity is small"),
+                            Box::new(info),
+                        ));
+                        trap
+                    }
                     other => break other,
                 };
                 if trace_boot_enabled() {

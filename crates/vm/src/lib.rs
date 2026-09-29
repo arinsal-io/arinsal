@@ -130,6 +130,15 @@ pub enum VmError {
     Unsupported(String),
     /// Erlang exception reason and current top frame.
     Exception { reason: String, frame: String },
+    /// Erlang exception whose top stack frame carries erts error metadata.
+    ExceptionInfo {
+        /// Exception reason.
+        reason: String,
+        /// Current top frame.
+        frame: String,
+        /// `error_info` map to attach to the top stack frame.
+        info: arinsal_etf::OwnedTerm,
+    },
     /// Exception awaiting BEAM handler dispatch.
     Trap(exceptions::Trap),
     /// Uncaught Erlang exception with a symbolic stack trace.
@@ -142,6 +151,9 @@ impl std::fmt::Display for VmError {
         match self {
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Exception { reason, frame } => {
+                write!(f, "** exception error: {reason}\n  in function {frame}")
+            }
+            Self::ExceptionInfo { reason, frame, .. } => {
                 write!(f, "** exception error: {reason}\n  in function {frame}")
             }
             Self::Trap(_) => write!(f, "unhandled BEAM exception"),

@@ -554,6 +554,9 @@ pub enum LoadError {
     /// Module exceeds an internal limit.
     #[error("module exceeds instruction index limit")]
     Limit,
+    /// A `bs_match` command list contains an unknown or malformed command.
+    #[error("bs_match: invalid sub instruction or operands")]
+    BadBitMatch,
 }
 
 struct Decoder<'a> {
@@ -680,6 +683,42 @@ pub fn call_bif(
 /// Resolve one parsed BEAM module without rejecting unknown executable opcodes.
 pub fn load(file: &BeamFile) -> Result<Module, LoadError> {
     load_with_coverage(file, CoverageMode::None)
+}
+
+/// Reject invalid generic `bs_match` command lists during prepare-loading.
+pub fn validate_bit_matches(file: &BeamFile) -> Result<(), LoadError> {
+    // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1.
+    for instruction in &file.code.instructions {
+        if instruction.op != Opcode::BsMatch {
+            continue;
+        }
+        let commands = instruction.args.iter().find_map(|operand| match operand {
+            Operand::List(items) => Some(items.as_slice()),
+            _ => None,
+        });
+        let Some(commands) = commands else {
+            return Err(LoadError::BadBitMatch);
+        };
+        let mut offset = 0;
+        while offset < commands.len() {
+            let name = match commands[offset] {
+                Operand::Atom(index) => file.atom(index),
+                _ => None,
+            };
+            let width = match name {
+                Some("ensure_at_least") => 3,
+                Some("ensure_exactly" | "skip") => 2,
+                Some("integer" | "binary") => 6,
+                Some("get_tail" | "=:=") => 4,
+                _ => return Err(LoadError::BadBitMatch),
+            };
+            offset = offset.checked_add(width).ok_or(LoadError::BadBitMatch)?;
+            if offset > commands.len() {
+                return Err(LoadError::BadBitMatch);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a module and add coverage probes only when its load-time mode enables them.
@@ -1262,6 +1301,21 @@ pub fn load_with_instrumentations(
     } else {
         None
     };
+    // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1.
+    // OTP rejects unknown bs_match commands when loading the module, before execution.
+    for op in &generic {
+        if op.opcode() != Opcode::BsMatch {
+            continue;
+        }
+        let command_list = op.args[2];
+        if command_list.kind() != Arg::LIST
+            || lists
+                .get(command_list.value() as usize)
+                .is_none_or(|commands| maps_bits::decode_commands(&[commands.clone()])[0].is_none())
+        {
+            return Err(LoadError::BadBitMatch);
+        }
+    }
     let mut bit_commands = maps_bits::decode_commands(&lists);
     // vm_binparse2: drop spare decode capacity before large process binaries arrive.
     generic.shrink_to_fit();

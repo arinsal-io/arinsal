@@ -257,7 +257,7 @@ fn process_info(
                 (std::mem::size_of::<Process>() + process.heap.total_heap_size_words() * 8) as i64,
             )
             .ok_or_else(badarg)?,
-            "reductions" => Term::small(process.stats.instructions.min(i64::MAX as u64) as i64)
+            "reductions" => Term::small(process.reductions_used.min(i64::MAX as u64) as i64)
                 .ok_or_else(badarg)?,
             "status" => {
                 // Suspend count wins over the waiting/runnable/running atom the
@@ -335,7 +335,19 @@ fn process_info(
                     .binary(&[])
                     .map_err(|e| VmError::Unsupported(format!("backtrace binary: {e:?}")))?
             }
-            "binary" => Term::NIL,
+            "binary" => {
+                // Port of erts/emulator/beam/erl_bif_info.c:4762-4795, OTP-29.1.1.
+                let mut entries = Vec::new();
+                for (pointer, bytes, references) in process.heap.off_heap_binary_info() {
+                    let values = [
+                        Term::small(pointer as i64).ok_or_else(badarg)?,
+                        Term::small(bytes as i64).ok_or_else(badarg)?,
+                        Term::small(references as i64).ok_or_else(badarg)?,
+                    ];
+                    entries.push(make_tuple(process, &values)?);
+                }
+                make_list(process, entries)?
+            }
             "catchlevel" => Term::small(0).unwrap(),
             "current_function"
                 if process

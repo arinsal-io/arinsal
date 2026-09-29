@@ -188,7 +188,7 @@ pub enum Operand {
     U(u64),
     /// Signed integer fitting in i64.
     Int(i64),
-    /// Signed integer outside i64.
+    /// Integer outside the compact unsigned and signed 64-bit ranges.
     BigInt(BigInt),
     /// One-based atom index.
     Atom(u32),
@@ -864,7 +864,9 @@ fn operand(
     let (tag, value) = compact(r)?;
     let u = || small_u(value.clone(), r.context, r.pos);
     match tag {
-        0 => Ok(Operand::U(u()?)),
+        0 => Ok(u64::try_from(&value)
+            .ok()
+            .map_or(Operand::BigInt(value), Operand::U)),
         1 => Ok(i64::try_from(&value)
             .ok()
             .map_or_else(|| Operand::BigInt(value), Operand::Int)),

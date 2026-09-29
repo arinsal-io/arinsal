@@ -207,6 +207,11 @@ fn prepare(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     }
+    // Port of erts/emulator/beam/beam_load.c:625-636 (bad_bs_match_1), OTP-29.1.1.
+    if arinsal_loader::validate_bit_matches(&beam).is_err() {
+        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        return Ok(error);
+    }
     let prepared = Prepared {
         has_on_load: has_on_load_opcode(&beam),
         beam,

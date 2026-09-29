@@ -540,6 +540,33 @@ impl ProcessHeap {
     pub fn off_heap_binary_bytes(&self) -> u64 {
         self.off_heap_binary_bytes
     }
+
+    /// Return each retained off-heap binary's identity, byte length, and owner count.
+    pub fn off_heap_binary_info(&self) -> Vec<(usize, usize, usize)> {
+        let mut binaries = std::collections::HashMap::new();
+        for binary in self.owners.off_heap.iter().chain(&self.owners.old_off_heap) {
+            binaries.insert(
+                Arc::as_ptr(binary) as usize,
+                (binary.len(), Arc::strong_count(binary)),
+            );
+        }
+        for binary in self.owners.writable.iter().chain(&self.owners.old_writable) {
+            binaries.insert(
+                Arc::as_ptr(binary) as usize,
+                (binary.len(), Arc::strong_count(binary)),
+            );
+        }
+        for binary in self.owners.external.iter().chain(&self.owners.old_external) {
+            binaries.insert(
+                Arc::as_ptr(binary) as usize,
+                (binary.len(), Arc::strong_count(binary)),
+            );
+        }
+        binaries
+            .into_iter()
+            .map(|(pointer, (bytes, refs))| (pointer, bytes, refs))
+            .collect()
+    }
 }
 impl Default for ProcessHeap {
     fn default() -> Self {

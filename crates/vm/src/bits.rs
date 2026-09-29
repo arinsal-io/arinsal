@@ -129,10 +129,9 @@ pub(super) fn execute_compact(
     Ok(())
 }
 
-fn atom(term: Term) -> Option<String> {
+fn atom(term: Term) -> Option<std::sync::Arc<str>> {
     term.as_atom()
         .and_then(|a| arinsal_term::global_atoms().text(a))
-        .map(|s| s.to_string())
 }
 
 #[inline]
@@ -173,28 +172,83 @@ fn flags(p: &Process, arg: Arg) -> SegFlags {
     }
 }
 
+trait FrameName {
+    fn to_frame_string(&self) -> String;
+}
+
+impl FrameName for str {
+    fn to_frame_string(&self) -> String {
+        self.to_owned()
+    }
+}
+
+impl FrameName for String {
+    fn to_frame_string(&self) -> String {
+        self.clone()
+    }
+}
+
+impl<F: Fn() -> String> FrameName for F {
+    fn to_frame_string(&self) -> String {
+        self()
+    }
+}
+
 #[inline]
-fn branch(p: &mut Process, fail: Arg, frame: &str) -> Result<(), VmError> {
+fn branch(p: &mut Process, fail: Arg, frame: &(impl FrameName + ?Sized)) -> Result<(), VmError> {
     if fail.kind() == Arg::LABEL && fail.value() != u32::MAX as u64 {
         p.ip = fail.value() as usize;
         Ok(())
     } else {
         Err(VmError::Exception {
             reason: "badarg".into(),
-            frame: frame.into(),
+            frame: frame.to_frame_string(),
         })
     }
 }
 
-fn error(error: BitsError, frame: &str) -> VmError {
+fn error(error: BitsError, frame: &(impl FrameName + ?Sized)) -> VmError {
     match error {
+        BitsError::Detailed {
+            segment,
+            reason,
+            ty,
+            field,
+            value,
+        } => {
+            let Some(value) = to_owned(value).ok() else {
+                return VmError::Exception {
+                    reason: reason.into(),
+                    frame: frame.to_frame_string(),
+                };
+            };
+            let atom = |name: &str| OwnedTerm::Atom(name.to_owned());
+            let info = OwnedTerm::Map(vec![
+                (
+                    atom("cause"),
+                    OwnedTerm::Tuple(vec![
+                        OwnedTerm::Int(segment as i64),
+                        atom(ty),
+                        atom(field),
+                        value,
+                    ]),
+                ),
+                (atom("function"), atom("format_bs_fail")),
+                (atom("module"), atom("erl_erts_errors")),
+            ]);
+            VmError::ExceptionInfo {
+                reason: reason.into(),
+                frame: frame.to_frame_string(),
+                info,
+            }
+        }
         BitsError::BadArg { .. } => VmError::Exception {
             reason: "badarg".into(),
-            frame: frame.into(),
+            frame: frame.to_frame_string(),
         },
         BitsError::SystemLimit { .. } => VmError::Exception {
             reason: "system_limit".into(),
-            frame: frame.into(),
+            frame: frame.to_frame_string(),
         },
         BitsError::HeapFull { .. } => VmError::Unsupported("bit syntax heap".into()),
     }
@@ -205,14 +259,15 @@ fn allocated<T>(
     p: &mut Process,
     live: usize,
     mut operation: impl FnMut(&mut Process) -> Result<T, BitsError>,
-    frame: &str,
+    frame: &impl Fn() -> String,
 ) -> Result<T, VmError> {
     match operation(p) {
         Ok(result) => Ok(result),
         Err(BitsError::HeapFull { need_words }) => {
-            retry_after_gc(p, live, need_words, &mut operation, frame)
+            let frame = frame();
+            retry_after_gc(p, live, need_words, &mut operation, &frame)
         }
-        Err(other) => Err(error(other, frame)),
+        Err(other) => Err(error(other, &frame())),
     }
 }
 
@@ -317,7 +372,7 @@ fn segments<'a>(
         };
         out.push(Segment {
             ty,
-            index: index + 1,
+            index: usize::try_from(part[1].value()).unwrap_or(index as usize + 1),
             unit: u8::try_from(part[2].value())
                 .map_err(|_| VmError::Unsupported("bit syntax unit".into()))?,
             flags: flags(p, part[3]),
@@ -336,7 +391,7 @@ fn match_commands(
     p: &mut Process,
     module: &Module,
     op: &GenericOp,
-    frame: &str,
+    frame: &impl Fn() -> String,
 ) -> Result<(), VmError> {
     let [fail, context_arg, commands] = op.args;
     let index = commands.value() as usize;
@@ -351,7 +406,7 @@ fn match_commands(
         } else {
             let name = atom(p.read(args[offset])?)
                 .ok_or_else(|| VmError::Unsupported("bs_match command".into()))?;
-            match name.as_str() {
+            match name.as_ref() {
                 "ensure_at_least" => (BitCommandKind::EnsureAtLeast, 3),
                 "ensure_exactly" => (BitCommandKind::EnsureExactly, 2),
                 "skip" => (BitCommandKind::Skip, 2),
@@ -375,7 +430,7 @@ fn match_commands(
             BitCommandKind::Skip => number(p, part[1])?.is_some_and(|bits| ctx.skip(bits)),
             BitCommandKind::Eq => {
                 let Some(bits) = number(p, part[2])? else {
-                    return branch(p, fail, frame);
+                    return branch(p, fail, &frame());
                 };
                 if bits <= 64 && part[3].kind() == Arg::U {
                     ctx.match_integer(bits, part[3].value())
@@ -415,7 +470,7 @@ fn match_commands(
             }
             BitCommandKind::Integer | BitCommandKind::Binary => {
                 let Some(bits) = field_bits(p, part[3], part[4])? else {
-                    return branch(p, fail, frame);
+                    return branch(p, fail, &frame());
                 };
                 let live = part[1].value() as usize;
                 let result = allocated(
@@ -462,7 +517,7 @@ fn match_commands(
             }
         };
         if !ok {
-            return branch(p, fail, frame);
+            return branch(p, fail, &frame());
         }
         offset += width;
         command_index += 1;
@@ -477,7 +532,7 @@ pub(super) fn execute(
     p: &mut Process,
     module: &Module,
     op: &GenericOp,
-    frame: &str,
+    frame: &impl Fn() -> String,
 ) -> Result<(), VmError> {
     let [a, b, c] = op.args;
     match op.opcode() {
@@ -485,8 +540,51 @@ pub(super) fn execute(
             let list = module.arg(op, 5);
             let live = c.value() as usize;
             let args = &module.lists[list.value() as usize];
-            let initial = segments(p, module, args)?;
-            let need = create_bin_size(&initial).map_err(|e| error(e, frame))?;
+            let initial = match segments(p, module, args) {
+                Ok(segments) => segments,
+                Err(error) => {
+                    if a.kind() == Arg::LABEL && a.value() != u64::from(u32::MAX) {
+                        return branch(p, a, frame);
+                    }
+                    return Err(error);
+                }
+            };
+            let need = match create_bin_size(&initial) {
+                Ok(need) => need,
+                Err(bits_error) => {
+                    if a.kind() == Arg::LABEL && a.value() != u64::from(u32::MAX) {
+                        return branch(p, a, frame);
+                    }
+                    return Err(error(bits_error, frame));
+                }
+            };
+            let bit_copy_cost = initial
+                .iter()
+                .map(|segment| {
+                    let source_bits = match segment.value {
+                        SegmentValue::Term(value) => arinsal_bits::bit_size(value).unwrap_or(0),
+                        SegmentValue::String(_) => 0,
+                    };
+                    let segment_bits = match segment.size {
+                        SegSize::All => source_bits,
+                        SegSize::Units(units) => usize::try_from(units)
+                            .ok()
+                            .and_then(|units| units.checked_mul(usize::from(segment.unit)))
+                            .unwrap_or(0),
+                        SegSize::Term(term) => term
+                            .as_small()
+                            .and_then(|units| usize::try_from(units).ok())
+                            .and_then(|units| units.checked_mul(usize::from(segment.unit)))
+                            .unwrap_or(0),
+                    };
+                    match segment.ty {
+                        SegType::Binary => segment_bits,
+                        SegType::Append | SegType::PrivateAppend => source_bits,
+                        _ => 0,
+                    }
+                })
+                .sum::<usize>()
+                / (8 * 1024);
             p.ensure(need.heap_words + b.value() as usize, live)?;
             let value = allocated(
                 p,
@@ -498,6 +596,10 @@ pub(super) fn execute(
                 },
                 frame,
             )?;
+            p.reductions_used = p.reductions_used.saturating_add(bit_copy_cost as u64);
+            p.reductions = p
+                .reductions
+                .saturating_sub(bit_copy_cost.min(i32::MAX as usize) as i32);
             p.write(module.arg(op, 4), value)?;
             p.ip += 1;
             Ok(())
@@ -569,7 +671,7 @@ pub(super) fn execute(
             if !set_position_term(p.read(a)?, p.read(b)?) {
                 return Err(VmError::Exception {
                     reason: "badarg".into(),
-                    frame: frame.into(),
+                    frame: frame.to_frame_string(),
                 });
             }
             p.ip += 1;
