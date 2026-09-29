@@ -42,6 +42,31 @@ fn tag_roundtrips_and_heap_layouts() {
 }
 
 #[test]
+fn flatmap_update_reuses_keys_and_allocates_header_and_values_only() {
+    let keys = [
+        Term::small(2).unwrap(),
+        Term::small(5).unwrap(),
+        Term::small(9).unwrap(),
+    ];
+    let mut key_heap = VecHeap::new();
+    let key_tuple = TermBuilder::new(&mut key_heap).tuple(&keys).unwrap();
+
+    let mut heap = VecHeap::new();
+    let values = [
+        Term::small(20).unwrap(),
+        Term::small(50).unwrap(),
+        Term::small(90).unwrap(),
+    ];
+    let map = TermBuilder::new(&mut heap)
+        .flatmap_with_key_tuple(key_tuple, &values)
+        .unwrap();
+
+    // Port of erts/emulator/beam/beam_common.c:2260-2274, OTP-29.1.1.
+    assert_eq!(heap.used_words(), 3 + values.len());
+    assert_eq!(map.flatmap_keys_tuple(), Some(key_tuple));
+}
+
+#[test]
 fn process_heap_and_fragment() {
     let mut heap = ProcessHeap::with_words(8);
     assert!(heap.reserve_stack(2));

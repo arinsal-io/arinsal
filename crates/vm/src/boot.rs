@@ -73,7 +73,7 @@ pub fn run_with_debugger_flags(
     }
     let erts_ebin = root.join("lib/erts-17.1/ebin");
     paths.push(erts_ebin.clone());
-    let mut vm = Vm::new(paths);
+    let mut vm = Vm::new_with_otp_root(paths, root.to_path_buf());
 
     // The OTP installation's ebin directory contains the 22 fixed preloaded modules.
     for entry in std::fs::read_dir(&erts_ebin).map_err(|error| {

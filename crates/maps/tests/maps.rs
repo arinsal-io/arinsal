@@ -155,6 +155,27 @@ fn no_op_updates_and_empty_merge_preserve_map_identity() {
 }
 
 #[test]
+fn exact_multi_key_update_reuses_keys_and_allocates_one_flatmap() {
+    let mut source_heap = VecHeap::new();
+    let original = from_pairs(&pairs(3), &mut source_heap).unwrap();
+    let keys = original.flatmap_keys_tuple().unwrap();
+    let updates = [
+        (small(1), small(11)),
+        (small(2), small(22)),
+        (small(3), small(33)),
+    ];
+
+    let mut update_heap = VecHeap::new();
+    let updated = put_many(original, &updates, true, &mut update_heap).unwrap();
+
+    assert_eq!(update_heap.used_words(), 3 + updates.len());
+    assert_eq!(updated.flatmap_keys_tuple(), Some(keys));
+    for (key, value) in updates {
+        assert_eq!(get(updated, key), Ok(Some(value)));
+    }
+}
+
+#[test]
 fn merge_reuses_a_containing_map_or_its_key_tuple() {
     let mut heap = VecHeap::new();
     let left = from_pairs(&[(small(1), small(10)), (small(2), small(20))], &mut heap).unwrap();

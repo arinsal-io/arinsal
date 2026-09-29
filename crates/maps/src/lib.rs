@@ -9,8 +9,8 @@
 //! from 0 to 15 at each depth, independently of insertion order.
 
 use arinsal_term::{
-    ExportEntry, FunEntry, HeapAlloc, Node, Term, TermError, TermKind, WritableBinary, cmp,
-    exact_eq, global_atoms, internal_hash,
+    ExportEntry, FunEntry, HeapAlloc, Node, Term, TermBuilder, TermError, TermKind, WritableBinary,
+    cmp, exact_eq, global_atoms, internal_hash,
 };
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -169,7 +169,7 @@ struct SizingHeap<'a, H: HeapAlloc + ?Sized> {
 }
 impl<H: HeapAlloc + ?Sized> HeapAlloc for SizingHeap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        self.requested_words = words;
+        self.requested_words = self.requested_words.saturating_add(words);
         self.inner.alloc(words)
     }
     fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
@@ -940,6 +940,26 @@ pub fn put_many<H: HeapAlloc + ?Sized>(
     heap: &mut H,
 ) -> MapResult<Term> {
     // Port of erts/emulator/beam/erl_map.c:261-365, OTP-29.1.1.
+    let mut sizing = SizingHeap {
+        inner: heap,
+        requested_words: 0,
+    };
+    let result = put_many_sized(map, pairs, exact, &mut sizing);
+    result.map_err(|error| match error {
+        MapError::HeapFull { .. } => MapError::HeapFull {
+            need_words: sizing.requested_words,
+        },
+        error => error,
+    })
+}
+
+fn put_many_sized<H: HeapAlloc + ?Sized>(
+    map: Term,
+    pairs: &[(Term, Term)],
+    exact: bool,
+    heap: &mut H,
+) -> MapResult<Term> {
+    // Port of erts/emulator/beam/beam_common.c:1960-2328, OTP-29.1.1.
     check(map)?;
     // Port of erts/emulator/beam/emu/ops.tab:1378 (`map_key_sort` for
     // `put_map_exact`), OTP-29.1.1. This order defines the reported missing key.
@@ -972,14 +992,25 @@ pub fn put_many<H: HeapAlloc + ?Sized>(
             .iter()
             .all(|(key, _)| get(map, *key).ok().flatten().is_some())
     {
-        let mut result = map;
+        // Port of erts/emulator/beam/jit/arm/instr_map.cpp:600-636 and
+        // erts/emulator/beam/beam_common.c:2203-2328 (erts_gc_update_map_exact), OTP-29.1.1.
+        let mut entries: Vec<_> = iter(map)?.collect();
         for (key, value) in sorted {
-            let index = iter(result)?
-                .position(|(candidate, _)| exact_eq(candidate, key))
-                .unwrap();
-            result = flat_replace(result, index, value, heap)?;
+            let index = entries
+                .binary_search_by(|(candidate, _)| key_cmp(*candidate, key))
+                .expect("exact map update key was checked above");
+            entries[index].1 = value;
         }
-        return Ok(result);
+        let keys = map.flatmap_keys_tuple().ok_or(MapError::Badmap(map))?;
+        let values: Vec<_> = entries.iter().map(|(_, value)| *value).collect();
+        return TermBuilder::new(heap)
+            .flatmap_with_key_tuple(keys, &values)
+            .map_err(|error| match error {
+                TermError::HeapFull => MapError::HeapFull {
+                    need_words: 3 + values.len(),
+                },
+                _ => MapError::Badmap(map),
+            });
     }
     let mut result = map;
     let mut entries = to_list(result)?;

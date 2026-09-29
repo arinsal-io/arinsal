@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
@@ -326,7 +326,7 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
         .or_else(|| env.get("ROOTDIR"))
         .or_else(|| env.get("ARINSAL_OTP_ROOT"))
         .or_else(|| infer_root(argv.first().copied().unwrap_or("")))
-        .or_else(discover_otp_root)
+        .or_else(|| discover_otp_root(env))
         .unwrap_or_default();
     let bin_dir = root_override
         .map(|root| format!("{root}/erts-17.1/bin"))
@@ -510,19 +510,54 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
     })
 }
 
-fn discover_otp_root() -> Option<String> {
-    let output = std::process::Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\",[code:root_dir()]),halt().",
-        ])
-        .output()
-        .ok()?;
-    (output.status.success())
-        .then(|| String::from_utf8(output.stdout).ok())
-        .flatten()
-        .filter(|root| !root.is_empty())
+/// Discover the OTP root through an `erl` executable other than this process.
+///
+/// A launcher shim may itself be named `erl`; excluding the current executable
+/// prevents root discovery from recursively starting the same emulator.
+// Port of erts/etc/common/erlexec.c:1632-1650, OTP-29.1.1.
+pub fn discover_otp_root(env: &impl Env) -> Option<String> {
+    let path = env.get("PATH")?;
+    let current = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.canonicalize().ok())?;
+    let executable = if cfg!(windows) { "erl.exe" } else { "erl" };
+    let directories: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|directory| {
+            let candidate = directory.join(executable);
+            if !candidate.exists() {
+                return true;
+            }
+            candidate
+                .canonicalize()
+                .is_ok_and(|resolved| resolved != current)
+        })
+        .collect();
+    let candidates: Vec<PathBuf> = directories
+        .iter()
+        .map(|directory| directory.join(executable))
+        .filter(|candidate| candidate.is_file())
+        .collect();
+    let safe_path = std::env::join_paths(&directories).ok()?;
+    for candidate in candidates {
+        let Ok(output) = std::process::Command::new(candidate)
+            .env("PATH", &safe_path)
+            .args([
+                "-noshell",
+                "-eval",
+                "io:format(\"~s\",[code:root_dir()]),halt().",
+            ])
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success()
+            && let Ok(root) = String::from_utf8(output.stdout)
+            && !root.is_empty()
+        {
+            return Some(root);
+        }
+    }
+    None
 }
 
 fn infer_root(executable: &str) -> Option<String> {

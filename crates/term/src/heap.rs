@@ -825,10 +825,10 @@ impl Default for LiteralArea {
 }
 
 /// Build terms in any stable heap. Methods report exhaustion without moving objects.
-pub struct TermBuilder<'a, H: HeapAlloc> {
+pub struct TermBuilder<'a, H: HeapAlloc + ?Sized> {
     pub(crate) heap: &'a mut H,
 }
-impl<'a, H: HeapAlloc> TermBuilder<'a, H> {
+impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Attach a builder to a heap.
     pub fn new(heap: &'a mut H) -> Self {
         Self { heap }
@@ -1074,13 +1074,33 @@ impl<'a, H: HeapAlloc> TermBuilder<'a, H> {
             return crate::hamt::build_hamt_from_unique(&unique, self.heap);
         }
         let keys = self.tuple(&unique.iter().map(|p| p.0).collect::<Vec<_>>())?;
-        let p = self.words(3 + unique.len())?;
+        let values: Vec<Term> = unique.iter().map(|p| p.1).collect();
+        self.flatmap_with_key_tuple(keys, &values)
+    }
+    /// Construct a flatmap that shares a sorted key tuple, allocating its header and values.
+    ///
+    /// Port of erts/emulator/beam/beam_common.c:2203-2283 (`erts_gc_update_map_exact`), OTP-29.1.1.
+    pub fn flatmap_with_key_tuple(
+        &mut self,
+        keys: Term,
+        values: &[Term],
+    ) -> Result<Term, TermError> {
+        // `keys` must be the sorted key tuple of a flatmap with exactly `values.len()` keys (the caller's map).
+        if keys.classify() != crate::TermKind::Tuple
+            || keys
+                .header()
+                .is_none_or(|header| (header >> 6) as usize != values.len())
+            || values.len() > 32
+        {
+            return Err(TermError::BadArg);
+        }
+        let p = self.words(3 + values.len())?;
         // SAFETY: header, size, keys, values are reserved.
         unsafe {
             *p = MAP;
-            *p.add(1) = unique.len() as u64;
+            *p.add(1) = values.len() as u64;
             *p.add(2) = keys.bits();
-            for (i, (_, value)) in unique.iter().enumerate() {
+            for (i, value) in values.iter().enumerate() {
                 *p.add(3 + i) = value.bits();
             }
         }
@@ -1292,7 +1312,7 @@ impl Term {
     }
 }
 
-impl<'a, H: HeapAlloc> TermBuilder<'a, H> {
+impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Box a reference to an opaque owner for NIF resources and future native handles.
     pub fn magic_ref(&mut self, owner: Arc<crate::MagicRef>) -> Result<Term, TermError> {
         if !self.heap.supports_magic() {

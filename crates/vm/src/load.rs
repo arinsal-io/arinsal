@@ -392,26 +392,25 @@ impl Vm {
 
     /// Construct a VM. Explicit paths precede the current directory and OTP libraries.
     pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        let otp = std::env::var_os("ARINSAL_OTP_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("ERL_ROOTDIR").map(PathBuf::from))
+            .or_else(|| {
+                arinsal_args::discover_otp_root(&arinsal_args::ProcessEnv).map(PathBuf::from)
+            })
+            .unwrap_or_default();
+        Self::new_with_otp_root(paths, otp)
+    }
+
+    /// Construct a VM with a known OTP root, without querying the `erl` launcher.
+    pub(crate) fn new_with_otp_root(
+        paths: impl IntoIterator<Item = PathBuf>,
+        otp: PathBuf,
+    ) -> Self {
         crate::natives::sys::initialize_statistics_origins();
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
         paths.push(PathBuf::from("."));
         paths.push(PathBuf::from("bench/out/ebin"));
-        let otp = std::env::var_os("ARINSAL_OTP_ROOT")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::process::Command::new("erl")
-                    .args([
-                        "-noshell",
-                        "-eval",
-                        "io:format(\"~s\",[code:root_dir()]),halt().",
-                    ])
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .and_then(|output| String::from_utf8(output.stdout).ok())
-                    .map(PathBuf::from)
-            })
-            .unwrap_or_default();
         if let Ok(entries) = std::fs::read_dir(otp.join("lib")) {
             let mut dirs: Vec<_> = entries
                 .filter_map(Result::ok)
