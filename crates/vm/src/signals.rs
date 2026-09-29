@@ -1600,6 +1600,17 @@ fn call_resolved(
             }
             Ok(ref_term)
         }
+        (SignalBif::Monitor2, [kind, target]) if *kind == atom("time_offset") => {
+            // Port of erts/emulator/beam/erl_time_sup.c:1964-1968
+            // (erts_monitor_time_offset), OTP-29.1.1. There is no clock warp
+            // source in this runtime, but monitor creation still returns a ref.
+            if *target != atom("clock_service") {
+                return Err(badarg("monitor/2"));
+            }
+            let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
+            let id = runtime.next_ref();
+            reference(process, id)
+        }
         (SignalBif::Monitor2, [kind, target]) if *kind == atom("port") => {
             let id = target.as_port().ok_or_else(|| badarg("monitor/2"))?;
             let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;

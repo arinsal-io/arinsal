@@ -685,6 +685,7 @@ struct Inner<T: Task> {
     worker_counts: Vec<WorkerQueueCount>,
     online_schedulers: AtomicUsize,
     scheduling_blocked: AtomicBool,
+    scheduling_blocker: AtomicUsize,
     next_queue: AtomicUsize,
     started_at: Instant,
     wall_start_requests: Mutex<Vec<Option<Instant>>>,
@@ -771,11 +772,24 @@ impl<T: Task> Inner<T> {
 
     // Port of erts/emulator/beam/erl_process.c:9281 (erts_run_queues_len), OTP-29.1.1.
     fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
+        let previous = process
+            .scheduler_id
+            .load(Ordering::Relaxed)
+            .min(self.worker_counts.len() - 1);
+        if already_active && previous != worker {
+            self.worker_counts[previous]
+                .0
+                .fetch_sub(1, Ordering::Relaxed);
+            self.worker_counts[worker]
+                .0
+                .fetch_add(QUEUE_COUNT_UNIT + 1, Ordering::Relaxed);
+        } else {
+            self.worker_counts[worker].0.fetch_add(
+                QUEUE_COUNT_UNIT + u64::from(!already_active),
+                Ordering::Relaxed,
+            );
+        }
         process.scheduler_id.store(worker, Ordering::Relaxed);
-        self.worker_counts[worker].0.fetch_add(
-            QUEUE_COUNT_UNIT + u64::from(!already_active),
-            Ordering::Relaxed,
-        );
     }
 
     fn record_running(&self, process: &Process<T>, worker: usize) {
@@ -802,6 +816,30 @@ impl<T: Task> Inner<T> {
             .load(Ordering::Relaxed)
             .min(self.worker_counts.len() - 1);
         self.worker_counts[worker].0.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:5476-5510 (change_no_used_runqs), OTP-29.1.1.
+    fn evacuate_offline_local(&self, local: &mut Local<T>) {
+        let online = self.online_schedulers.load(Ordering::Acquire).max(1);
+        let mut moved = false;
+        for priority in 0..local.queues.len() {
+            while let Some(item) = local.queues[priority].pop() {
+                let target = self.next_queue.fetch_add(1, Ordering::Relaxed) % online;
+                local.migrate_queued(&item.process, target);
+                self.injectors[priority].push(item);
+                moved = true;
+            }
+        }
+        if let Some(item) = local.runnext.take() {
+            let priority = item.process.priority.index();
+            let target = self.next_queue.fetch_add(1, Ordering::Relaxed) % online;
+            local.migrate_queued(&item.process, target);
+            self.injectors[priority].push(item);
+            moved = true;
+        }
+        if moved {
+            self.work_epoch.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn take_wall_start(&self, worker: usize) -> Option<Instant> {
@@ -1077,8 +1115,12 @@ impl<T: Task> Inner<T> {
             return;
         }
         if let Some(local) = local {
-            local.record_queued(&item.process, local.worker_id, false);
-            local.push_next(item);
+            if self.online_schedulers.load(Ordering::Acquire) == 1 {
+                self.enqueue(item, false);
+            } else {
+                local.record_queued(&item.process, local.worker_id, false);
+                local.push_next(item);
+            }
             return;
         }
         self.enqueue(item, false);
@@ -1524,6 +1566,16 @@ impl<T: Task> Local<T> {
         self.adjust_metric(worker, -1);
     }
 
+    fn migrate_queued(&mut self, process: &Process<T>, target: usize) {
+        let previous = process
+            .scheduler_id
+            .load(Ordering::Relaxed)
+            .min(self.metric_deltas.len() - 1);
+        self.adjust_metric(previous, -(QUEUE_COUNT_UNIT as i64 + 1));
+        self.adjust_metric(target, QUEUE_COUNT_UNIT as i64 + 1);
+        process.scheduler_id.store(target, Ordering::Relaxed);
+    }
+
     fn lookup(&mut self, table: &ProcessTable<T>, pid: Pid) -> Option<Arc<Process<T>>> {
         if self.pid_cache.is_empty() {
             self.pid_cache = (0..1024).map(|_| None).collect();
@@ -1626,6 +1678,10 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Pid of the running task.
     pub fn pid(&self) -> Pid {
         self.pid
+    }
+    /// Return the scheduler worker currently running this process.
+    pub fn worker_id(&self) -> Option<usize> {
+        self.worker
     }
     /// Reject further mailbox publishes. In-flight publishers still land and
     /// are drained before the pid leaves the process table.
@@ -2434,6 +2490,7 @@ impl<T: Task> Scheduler<T> {
                 .collect(),
             online_schedulers: AtomicUsize::new(workers),
             scheduling_blocked: AtomicBool::new(false),
+            scheduling_blocker: AtomicUsize::new(usize::MAX),
             next_queue: AtomicUsize::new(0),
             started_at: Instant::now(),
             wall_start_requests: Mutex::new(vec![None; workers]),
@@ -2612,7 +2669,15 @@ impl<T: Task> Scheduler<T> {
     }
 
     /// Pause or resume all task dispatch on this scheduler.
-    pub fn set_scheduling_blocked(&self, blocked: bool) {
+    pub fn set_scheduling_blocked(&self, blocked: bool, caller: Option<usize>) {
+        self.inner.scheduling_blocker.store(
+            if blocked {
+                caller.unwrap_or(usize::MAX)
+            } else {
+                usize::MAX
+            },
+            Ordering::Release,
+        );
         self.inner
             .scheduling_blocked
             .store(blocked, Ordering::Release);
@@ -3042,6 +3107,41 @@ mod spawn_request_tests {
     }
 }
 
+#[cfg(test)]
+mod offline_scheduler_tests {
+    use super::*;
+
+    struct YieldForever;
+
+    impl Task for YieldForever {
+        type Message = ();
+
+        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _budget: u32) -> RunOutcome {
+            RunOutcome::Yield
+        }
+    }
+
+    #[test]
+    fn offlining_workers_migrates_runnable_processes() {
+        let scheduler = Scheduler::new(Config {
+            workers: 4,
+            max_processes: 32,
+            ..Config::default()
+        });
+        for _ in 0..10 {
+            scheduler.spawn(YieldForever).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert!(scheduler.set_online_schedulers(1));
+        std::thread::sleep(Duration::from_millis(20));
+
+        let stats = scheduler.stats();
+        assert!(stats.active_tasks[0] >= 10);
+        assert!(stats.run_queue_lengths[0] >= 9);
+    }
+}
+
 impl<T: Task> Drop for Scheduler<T> {
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
@@ -3179,8 +3279,12 @@ fn run_one<'a, T: Task>(
             if process.bound_worker().is_some() {
                 inner.enqueue(next, true);
             } else if let Some(local) = local.as_deref_mut() {
-                local.record_queued(&next.process, local.worker_id, true);
-                local.queues[next.process.priority.index()].push(next);
+                if inner.online_schedulers.load(Ordering::Acquire) == 1 {
+                    inner.enqueue(next, true);
+                } else {
+                    local.record_queued(&next.process, local.worker_id, true);
+                    local.queues[next.process.priority.index()].push(next);
+                }
             } else {
                 inner.enqueue(next, true);
             }
@@ -3333,12 +3437,25 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
             let _ = reply.send(local.stats_snapshot(local.msacc_enabled, local.wall_enabled));
         }
         if id >= inner.online_schedulers.load(Ordering::Acquire)
-            || inner.scheduling_blocked.load(Ordering::Acquire)
+            || (inner.scheduling_blocked.load(Ordering::Acquire)
+                && id != inner.scheduling_blocker.load(Ordering::Acquire))
         {
+            if id >= inner.online_schedulers.load(Ordering::Acquire) {
+                inner.poll_timers(id, Some(&mut local), true);
+                inner.poll_pending_waits(&mut local);
+                inner.evacuate_offline_local(&mut local);
+            }
             local.set_wall_enabled(false);
             local.set_msacc_state(MsaccState::Sleep);
             inner.parked[id].store(true, Ordering::SeqCst);
-            thread::park();
+            let has_local_timers = id >= inner.online_schedulers.load(Ordering::Acquire)
+                && (!local.pending_waits.is_empty()
+                    || local.timer_service.borrow().wheel.has_timers());
+            if has_local_timers {
+                thread::park_timeout(Duration::from_millis(10));
+            } else {
+                thread::park();
+            }
             inner.parked[id].store(false, Ordering::SeqCst);
             continue;
         }

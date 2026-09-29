@@ -2775,7 +2775,7 @@ impl Vm {
         });
         let (online, blocked) = crate::natives::sys::scheduler_online_default();
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
-        scheduler.set_scheduling_blocked(blocked);
+        scheduler.set_scheduling_blocked(blocked, None);
         *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
         if module == "erl_init" && function == "start" {
             // Port of erts/emulator/beam/erl_init.c:2550 (erl_system_process_otp

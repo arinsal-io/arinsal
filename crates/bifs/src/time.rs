@@ -14,7 +14,13 @@ use crate::{BifError, BifFn, Ctx};
 
 const NATIVE: i128 = 1_000_000_000;
 static START: OnceLock<Instant> = OnceLock::new();
+static TIME_OFFSET: OnceLock<i128> = OnceLock::new();
 static LAST_NOW: AtomicI64 = AtomicI64::new(0);
+
+/// Initialize the monotonic clock origin with the VM's other boot statistics.
+pub fn initialize_time_origin() {
+    START.get_or_init(Instant::now);
+}
 
 pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     // `convert_time_unit/3` is an erlang.erl wrapper, absent from bif.tab.
@@ -119,7 +125,21 @@ fn monotonic_time(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     scaled(ctx, mono_nanos(), args)
 }
 fn time_offset(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    scaled(ctx, sys_nanos()? - mono_nanos(), args)
+    scaled(ctx, time_offset_nanos()?, args)
+}
+fn time_offset_nanos() -> Result<i128, BifError> {
+    // Port of erts/emulator/beam/erl_time_sup.c:2542-2551 (time_offset_0/1), OTP-29.1.1.
+    // The clock service publishes an offset snapshot; recomputing it on each
+    // call makes equivalent unit queries disagree while the clocks advance.
+    if let Some(offset) = TIME_OFFSET.get() {
+        return Ok(*offset);
+    }
+    let mono_before = mono_nanos();
+    let system = sys_nanos()?;
+    let mono_after = mono_nanos();
+    let mono_midpoint = mono_before + (mono_after - mono_before) / 2;
+    let _ = TIME_OFFSET.set(system - mono_midpoint);
+    Ok(*TIME_OFFSET.get().expect("time offset initialized"))
 }
 fn small(value: i64) -> Term {
     Term::small(value).expect("calendar component fits small integer")
@@ -156,7 +176,11 @@ fn datetime_tuple(ctx: &mut Ctx<'_>, value: Calendar) -> Term {
     tuple_build(ctx, &[date, time])
 }
 fn timestamp(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    let micros = sys_nanos()? / 1_000;
+    // Port of erts/emulator/beam/erl_time_sup.c:1880-1907 (get_now), OTP-29.1.1.
+    // `timestamp/0` must use the same monotonic sample and offset as
+    // `system_time/0`; sampling the wall clock independently can disagree with
+    // a monotonic-time conversion by more than the permitted midpoint window.
+    let micros = (mono_nanos() + time_offset_nanos()?) / 1_000;
     Ok(timestamp_tuple(ctx, micros))
 }
 fn timestamp_tuple(ctx: &mut Ctx<'_>, micros: i128) -> Term {
@@ -240,12 +264,22 @@ fn parse_datetime(term: Term) -> Result<Calendar, BifError> {
         second: second as u32,
     })
 }
+fn parse_localtime_datetime(term: Term) -> Result<Calendar, BifError> {
+    // Port of erts/emulator/beam/erl_time_sup.c:1735-1810, OTP-29.1.1.
+    // erts/emulator/beam/erl_time_sup.c:1600 defines BASEYEAR as 1902 for
+    // both local conversion BIFs, while POSIX conversions accept earlier years.
+    let value = parse_datetime(term)?;
+    if value.year < 1902 || value.year == i32::MAX {
+        return Err(BifError::BADARG);
+    }
+    Ok(value)
+}
 fn universaltime_to_localtime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let seconds = unix_from_calendar(parse_datetime(args[0])?).ok_or(BifError::BADARG)?;
+    let seconds = unix_from_calendar(parse_localtime_datetime(args[0])?).ok_or(BifError::BADARG)?;
     Ok(datetime_tuple(ctx, local_calendar(seconds)?))
 }
 fn localtime_to_universaltime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let value = parse_datetime(args[0])?;
+    let value = parse_localtime_datetime(args[0])?;
     let is_dst = match atom_name(args[1]).as_deref() {
         Some("true") => Some(true),
         Some("false") => Some(false),

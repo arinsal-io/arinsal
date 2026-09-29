@@ -22,7 +22,6 @@ static UNIQUE_MONOTONIC_INTEGER_STATE: std::sync::atomic::AtomicU64 =
 static BINARY_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RE_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(64_000);
 static UNICODE_LOOP_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(40_000);
-
 const MONITOR_LARGE_HEAP: u8 = 1;
 const MONITOR_LONG_GC: u8 = 2;
 const MONITOR_LONG_SCHEDULE: u8 = 4;

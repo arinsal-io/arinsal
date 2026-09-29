@@ -66,6 +66,8 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             ),
         ),
         "wordsize" => integer(ctx, std::mem::size_of::<usize>() as u64),
+        // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
+        "start_time" => Term::small(-(1_i64 << 59)).ok_or(BifError::SystemLimit),
         "context_reductions" => integer(ctx, 4000),
         "schedulers"
         | "schedulers_online"

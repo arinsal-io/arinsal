@@ -645,6 +645,22 @@ fn calendar_conversions_match_otp() {
             "localtime_to_universaltime {input:?}: {actual:?} != {expected:?}"
         );
     }
+    let before_epoch = O::Tuple(vec![
+        O::Tuple(vec![O::Int(1900), O::Int(7), O::Int(1)]),
+        O::Tuple(vec![O::Int(12), O::Int(0), O::Int(0)]),
+    ]);
+    for name in ["universaltime_to_localtime", "localtime_to_universaltime"] {
+        let mut input = vec![before_epoch.clone()];
+        if name == "localtime_to_universaltime" {
+            input.push(O::Atom("false".into()));
+        }
+        let actual = call("erlang", name, &input);
+        let expected = reference.call("erlang", name, &input);
+        assert!(
+            equivalent(&actual, &expected),
+            "{name}: {actual:?} != {expected:?}"
+        );
+    }
 }
 
 #[test]
@@ -669,6 +685,12 @@ fn clock_and_dst_behavior() {
         let offset_seconds = as_i128(call("erlang", "time_offset", &unit));
         assert!((offset.div_euclid(1_000_000_000) - offset_seconds).abs() <= 1);
     }
+    let offset = call("erlang", "time_offset", &[]);
+    let native_offset = call("erlang", "time_offset", &[atom("native")]);
+    assert_eq!(
+        offset, native_offset,
+        "time_offset unit results must share a snapshot"
+    );
     for (date, hour) in [
         ((2020, 1, 1), 12),
         ((2020, 7, 1), 12),

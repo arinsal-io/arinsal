@@ -49,6 +49,7 @@ static SYSTEM_LOGGER: OnceLock<Mutex<Term>> = OnceLock::new();
 
 /// Initialize statistics origins when the VM is created, as erts does at boot.
 pub(crate) fn initialize_statistics_origins() {
+    arinsal_bifs::initialize_time_origin();
     CPU_ORIGIN_NS.get_or_init(cpu_ns);
     WALL_ORIGIN.get_or_init(Instant::now);
 }
@@ -1827,7 +1828,7 @@ fn system_flag(
         return Err(badarg());
     };
     match name.as_ref() {
-        "multi_scheduling" => multi_scheduling(process, args[1]),
+        "multi_scheduling" => multi_scheduling(process, ctx, args[1]),
         "schedulers_online" => schedulers_online(process, args[1], false),
         "dirty_cpu_schedulers_online" => schedulers_online(process, args[1], true),
         "fullsweep_after" => fullsweep_after(args[1]),
@@ -2407,7 +2408,11 @@ fn next_heap_size(size: i64) -> i64 {
     }
 }
 
-fn multi_scheduling(process: &Process, value: Term) -> Result<Term, VmError> {
+fn multi_scheduling(
+    process: &Process,
+    ctx: &RunCtx<'_, Message>,
+    value: Term,
+) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling), OTP-29.1.1.
     let action = match atom_name(value).as_deref() {
         Some("block") => (Some(true), None),
@@ -2436,7 +2441,10 @@ fn multi_scheduling(process: &Process, value: Term) -> Result<Term, VmError> {
             .as_ref()
             .and_then(|runtime| runtime.scheduler().ok())
         {
-            scheduler.set_scheduling_blocked(flags.multi_blocked || flags.normal_blocked);
+            scheduler.set_scheduling_blocked(
+                flags.multi_blocked || flags.normal_blocked,
+                ctx.worker_id(),
+            );
         }
         Ok(atom(next))
     })
@@ -2914,9 +2922,9 @@ fn queue_counts(
     include_dirty_io: bool,
 ) -> Vec<u64> {
     // Port of erts/emulator/beam/erl_process.c:9281 (erts_run_queues_len), OTP-29.1.1.
-    let online = with_flags(|flags| flags.schedulers_online);
+    let schedulers = with_flags(|flags| flags.schedulers_total);
     // erts exposes one aggregated run queue for each dirty scheduler class.
-    let slots = online + 1 + usize::from(include_dirty_io);
+    let slots = schedulers + 1 + usize::from(include_dirty_io);
     let mut values = vec![0; slots];
     if let Some(stats) = scheduler_stats(process, ctx) {
         let source = if active {
@@ -2924,7 +2932,7 @@ fn queue_counts(
         } else {
             &stats.run_queue_lengths
         };
-        for (target, value) in values.iter_mut().take(online).zip(source) {
+        for (target, value) in values.iter_mut().take(schedulers).zip(source) {
             *target = *value;
         }
     }
@@ -2982,15 +2990,15 @@ fn microstate(
     mut ctx: Option<&mut RunCtx<'_, Message>>,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_msacc.c result layout, OTP-29.1.1.
-    if !MICROSTATE.load(Ordering::Relaxed) {
+    let baseline = MICROSTATE_BASE.lock().expect("microstate baseline").clone();
+    let Some((started, baseline, poll_baseline)) = baseline else {
         return Ok(atom("undefined"));
-    }
-    let (started, baseline, poll_baseline) = MICROSTATE_BASE
-        .lock()
-        .expect("microstate baseline")
-        .clone()
-        .unwrap_or_else(|| (Instant::now(), Vec::new(), [0; 2]));
-    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    };
+    let elapsed = if MICROSTATE.load(Ordering::Relaxed) {
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
     if let Some(ctx) = ctx.as_deref_mut() {
         ctx.account_gc_total(process.stats.gc.nanoseconds);
     }

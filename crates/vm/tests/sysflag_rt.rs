@@ -8,7 +8,8 @@ const SOURCE: &str = r#"
 -module(sysflag_rt).
 -export([online/0, heap_defaults/0, control_flags/0,
          topology/0, bind_type/0, allocator/0, invalid_topology/0,
-         topology_round_trip/0]).
+         topology_round_trip/0, blocked_scheduler_run_queue/0,
+         microstate_after_disable/0]).
 
 online() ->
     Current = erlang:system_info(schedulers_online),
@@ -79,6 +80,28 @@ topology_round_trip() ->
     Restored = erlang:system_flag(cpu_topology, undefined),
     {Previous, Current, Restored, erlang:system_info(cpu_topology)}.
 
+blocked_scheduler_run_queue() ->
+    Previous = erlang:system_flag(multi_scheduling, block),
+    Pid = spawn(fun Hog() -> Hog() end),
+    receive after 20 -> ok end,
+    Queue = erlang:statistics(run_queue),
+    exit(Pid, kill),
+    Enabled = erlang:system_flag(multi_scheduling, unblock),
+    {Previous, Queue > 0, Enabled}.
+
+microstate_after_disable() ->
+    Previous = erlang:system_flag(microstate_accounting, true),
+    WasEnabled = is_list(erlang:statistics(microstate_accounting)),
+    Stopped = erlang:system_flag(microstate_accounting, false),
+    IsRetained = is_list(erlang:statistics(microstate_accounting)),
+    Reset = erlang:system_flag(microstate_accounting, reset),
+    ResetIsZero = lists:all(
+        fun(#{counters := Counters}) ->
+            lists:all(fun(Value) -> Value =:= 0 end, maps:values(Counters))
+        end,
+        erlang:statistics(microstate_accounting)),
+    {Previous, WasEnabled, Stopped, IsRetained, Reset, ResetIsZero}.
+
 outcome(Fun) ->
     try Fun() catch
         Class:Reason:Stack ->
@@ -109,6 +132,11 @@ fn compare(function: &str) {
 #[test]
 fn sysflag_rt_scheduler_and_blocking_round_trip_matches_otp() {
     compare("online");
+}
+
+#[test]
+fn sysflag_rt_microstate_counters_remain_readable_after_disable() {
+    compare("microstate_after_disable");
 }
 
 #[test]
@@ -144,4 +172,9 @@ fn sysflag_rt_invalid_cpu_topology_matches_otp() {
 #[test]
 fn sysflag_rt_user_cpu_topology_round_trip_matches_otp() {
     compare("topology_round_trip");
+}
+
+#[test]
+fn sysflag_rt_blocked_scheduler_keeps_the_caller_runnable() {
+    compare("blocked_scheduler_run_queue");
 }

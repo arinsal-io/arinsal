@@ -431,7 +431,8 @@ fn sched_acct_counters_and_ets_memory_grow_after_work() {
     assert!(g1 > g0, "garbage_collection {g0} -> {g1}");
     assert!(m1 > m0, "memory(ets) {m0} -> {m1}");
     assert!(wall_total(&fields[15]) > wall_total(&fields[14]));
-    assert_eq!(fields[16], OwnedTerm::atom("undefined"));
+    // erl 29.1.1 returns the per-thread counter list even while microstate accounting is disabled.
+    assert!(!list_elems(&fields[16]).is_empty());
     assert!(!list_elems(&fields[17]).is_empty());
 }
 

@@ -29,6 +29,8 @@ mod unicode;
 
 pub use pure::next_ref_id;
 
+pub use time::initialize_time_origin;
+
 /// Exception class, as in `erlang:raise/3`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {

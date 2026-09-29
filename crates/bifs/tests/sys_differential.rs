@@ -31,6 +31,7 @@ fn stable_system_info_matches_otp() {
         "version",
         "wordsize",
         "context_reductions",
+        "start_time",
         "schedulers",
         "schedulers_online",
         "logical_processors",
@@ -60,10 +61,15 @@ fn stable_system_info_matches_otp() {
         let args = [O::atom(key)];
         let expected = reference.call("erlang", "system_info", &args);
         let actual = call("erlang", "system_info", &args);
-        assert!(
-            equivalent(&actual, &expected),
-            "system_info({key}): {actual:?} != {expected:?}"
-        );
+        if key == "start_time" {
+            assert!(matches!(actual, CallResult::Ok(O::Int(_))));
+            assert!(matches!(expected, CallResult::Ok(O::Int(_))));
+        } else {
+            assert!(
+                equivalent(&actual, &expected),
+                "system_info({key}): {actual:?} != {expected:?}"
+            );
+        }
         if matches!(
             key,
             "otp_release"
