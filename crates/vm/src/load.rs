@@ -55,13 +55,26 @@ fn bind_static_nifs(module: &mut Module, native_fns: &mut Vec<arinsal_bifs::BifF
     bind_import_targets(module);
     if !matches!(
         module.name.as_str(),
-        "prim_file" | "prim_buffer" | "zlib" | "prim_tty" | "prim_socket" | "prim_net" | "re"
+        "prim_file"
+            | "prim_buffer"
+            | "zlib"
+            | "prim_tty"
+            | "prim_socket"
+            | "prim_net"
+            | "re"
+            | "erts_debug"
     ) {
         arinsal_loader::specialize_bif_calls(module);
         return;
     }
     for (entry, function, arity) in &module.functions {
-        let Some(native) = natives::static_nif_lookup(&module.name, function, *arity) else {
+        let Some(native) =
+            natives::static_nif_lookup(&module.name, function, *arity).or_else(|| {
+                (module.name == "erts_debug")
+                    .then(|| arinsal_bifs::lookup(&module.name, function, *arity))
+                    .flatten()
+            })
+        else {
             continue;
         };
         let Ok(index) = u32::try_from(native_fns.len()) else {

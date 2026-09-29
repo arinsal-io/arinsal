@@ -590,13 +590,20 @@ pub(super) fn resume(
                 }
             });
             if let Some((return_trace, _)) = special {
-                let width = if return_trace { 5 } else { 2 };
+                let width = if return_trace { 6 } else { 2 };
                 if return_trace
-                    && let (Some(frame_module), Some(entry), Some(session), Some(exception)) = (
+                    && let (
+                        Some(frame_module),
+                        Some(entry),
+                        Some(session_high),
+                        Some(session_low),
+                        Some(exception),
+                    ) = (
                         p.heap.stack_get(index + 1).and_then(Term::as_small),
                         p.heap.stack_get(index + 2).and_then(Term::as_small),
                         p.heap.stack_get(index + 3).and_then(Term::as_small),
                         p.heap.stack_get(index + 4).and_then(Term::as_small),
+                        p.heap.stack_get(index + 5).and_then(Term::as_small),
                     )
                     && exception != 0
                     && let Some(trace_ctx) = ctx.as_deref_mut()
@@ -607,7 +614,7 @@ pub(super) fn resume(
                         vm,
                         p,
                         trace_ctx,
-                        session as u64,
+                        ((session_high as u64) << 32) | session_low as u32 as u64,
                         frame_module as usize,
                         entry as usize,
                         class_reason,

@@ -696,6 +696,7 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
             Ok((tail, Shape::Other))
         }
         FrameKind::Map => {
+            // Port of erts/emulator/beam/external.c:5428, OTP-29.1.1.
             let pairs: Vec<_> = values
                 .as_chunks::<2>()
                 .0
@@ -706,6 +707,9 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
                 let ctx = ctx.as_deref_mut().unwrap();
                 let map =
                     arinsal_maps::from_pairs(&pairs, ctx.heap).map_err(|_| BifError::BADARG)?;
+                if arinsal_maps::size(map).map_err(|_| BifError::BADARG)? != pairs.len() {
+                    return Err(BifError::BADARG);
+                }
                 Ok((map, Shape::Other))
             } else {
                 Ok((Term::NIL, Shape::Other))

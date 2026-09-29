@@ -39,7 +39,9 @@ pub use identity::{Identity, Node};
 pub use internal_hash::{internal_hash, internal_salted_hash};
 pub use magic::MagicRef;
 pub use native_code::{is_native_code_pointer, register_native_code_range};
-pub use ops::{cmp, exact_eq, flat_size, loose_eq, size_object, small_add, small_mul, small_sub};
+pub use ops::{
+    cmp, cmp_exact, exact_eq, flat_size, loose_eq, size_object, small_add, small_mul, small_sub,
+};
 pub use owned::{from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence};
 pub use region::{

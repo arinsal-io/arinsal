@@ -288,7 +288,7 @@ pub(crate) unsafe fn clone_binary_owner(bin_ref: Term) -> (u64, u64) {
 ///
 /// # Safety
 /// `ptr` must come from `clone_binary_owner` with the same kind.
-pub(crate) unsafe fn retain_cloned_binary_owner<H: HeapAlloc>(
+pub(crate) unsafe fn retain_cloned_binary_owner<H: HeapAlloc + ?Sized>(
     heap: &mut H,
     ptr: u64,
     flags: u64,

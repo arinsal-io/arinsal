@@ -14,7 +14,7 @@ enum Job {
 
 /// Copy an Erlang term after sizing its entire reachable object graph.
 /// Sharing of ordinary heap objects is deliberately not retained, as in erts.
-pub fn copy_term<H: HeapAlloc>(root: Term, dst: &mut H) -> Result<Term, TermError> {
+pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term, TermError> {
     if !dst.supports_writable_binary() {
         let mut stack = vec![root];
         while let Some(term) = stack.pop() {

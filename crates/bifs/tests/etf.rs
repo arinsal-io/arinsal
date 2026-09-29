@@ -64,6 +64,21 @@ fn heap_etf_matches_otp_examples() {
 }
 
 #[test]
+fn duplicate_map_keys_in_external_term_are_rejected_like_otp() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let bytes = [
+        131, 116, 0, 0, 0, 3, 100, 0, 1, b'a', 97, 1, 107, 0, 2, b'h', b'i', 107, 0, 5, b'v', b'a',
+        b'l', b'u', b'e', 100, 0, 1, b'a', 97, 2,
+    ];
+    let binary = O::Binary(bytes.to_vec());
+    let ours = call("erlang", "binary_to_term", std::slice::from_ref(&binary));
+    let otp = reference.call("erlang", "binary_to_term", &[binary]);
+    assert!(matches!(&ours, CallResult::Exception { class, .. } if class == "error"));
+    assert!(matches!(&otp, CallResult::Exception { class, .. } if class == "error"));
+    assert!(equivalent(&ours, &otp));
+}
+
+#[test]
 fn deterministic_map_order_compares_numeric_values_before_number_kind() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let term = O::Map(vec![

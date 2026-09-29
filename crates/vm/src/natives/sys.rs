@@ -83,6 +83,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "display", 1),
     ("erlang", "display_string", 2),
     ("erts_internal", "term_to_string", 2),
+    ("erts_internal", "term_to_string", 1),
     ("erlang", "statistics", 1),
     ("erlang", "bump_reductions", 1),
     ("erts_internal", "garbage_collect", 1),
@@ -105,6 +106,7 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
         ("erlang", "display", 1) => Some(call_display),
         ("erlang", "display_string", 2) => Some(call_display_string),
         ("erts_internal", "term_to_string", 2) => Some(call_term_to_string),
+        ("erts_internal", "term_to_string", 1) => Some(call_term_to_string_unlimited),
         ("erlang", "statistics", 1) => Some(call_statistics),
         ("erlang", "bump_reductions", 1) => Some(call_bump_reductions),
         ("erts_internal", "garbage_collect", 1) => Some(call_garbage_collect),
@@ -150,6 +152,16 @@ fn call_term_to_string(
     args: &[Term],
 ) -> Result<Term, VmError> {
     term_to_string(process, args)
+}
+
+fn call_term_to_string_unlimited(
+    _vm: &mut Vm,
+    process: &mut Process,
+    _ctx: &mut RunCtx<'_, Message>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    // Port of erts_internal.erl:1150-1153 (term_to_string/1), OTP-29.1.1.
+    term_to_string(process, &[args[0], atom("undefined")])
 }
 
 fn call_statistics(

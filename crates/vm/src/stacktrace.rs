@@ -122,7 +122,7 @@ pub(super) fn capture(
             && !handler
             && (ip == code.return_trace_ip || ip == code.return_to_trace_ip)
         {
-            index += if ip == code.return_trace_ip { 5 } else { 2 };
+            index += if ip == code.return_trace_ip { 6 } else { 2 };
             continue;
         }
         if handler || previous == Some((module, ip)) {

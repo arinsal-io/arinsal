@@ -970,3 +970,21 @@ fn make_tuple_rejects_arity_above_erts_limit() {
         (actual, expected) => panic!("{actual:?} != {expected:?}"),
     }
 }
+
+#[test]
+fn cmp_term_uses_exact_numeric_order_inside_containers() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    for (left, right) in [
+        (O::list(vec![O::Int(-2)]), O::list(vec![O::Float(-2.0)])),
+        (O::Int(1_i64 << 62), O::Float(1.0)),
+        (
+            O::Tuple(vec![atom("key"), O::Int(5)]),
+            O::Tuple(vec![atom("key"), O::Float(5.0)]),
+        ),
+    ] {
+        let args = [left, right];
+        let actual = call("erts_internal", "cmp_term", &args);
+        let expected = reference.call("erts_internal", "cmp_term", &args);
+        assert_eq!(actual, expected);
+    }
+}

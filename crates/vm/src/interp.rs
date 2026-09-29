@@ -1050,6 +1050,7 @@ pub(crate) enum RunState {
     Wait { timeout_ms: Option<u64> },
 }
 
+// Port of erts/emulator/beam/beam_bp.c:1242-1268, OTP-29.1.1.
 fn push_trace_frames(
     process: &mut Process,
     module_id: usize,
@@ -1078,7 +1079,7 @@ fn push_trace_frames(
         if !action.return_trace && !action.exception_trace {
             continue;
         }
-        if !process.heap.reserve_stack(5) {
+        if !process.heap.reserve_stack(6) {
             return Err(VmError::Unsupported("call trace stack".into()));
         }
         process
@@ -1087,7 +1088,8 @@ fn push_trace_frames(
         for (index, value) in [
             module_id,
             entry_ip,
-            action.session as usize,
+            (action.session >> 32) as usize,
+            action.session as u32 as usize,
             usize::from(action.exception_trace),
         ]
         .into_iter()
@@ -1676,22 +1678,22 @@ impl Vm {
             #[rustfmt::skip]
             traced_instruction_dispatch!(instr;
                 Instr::ReturnTrace => {
-                    let (Some(module), Some(entry), Some(session), Some(exception)) = (
+                    let (Some(module), Some(entry), Some(session_high), Some(session_low), Some(_exception)) = (
                         p.heap.stack_get(0).and_then(Term::as_small),
                         p.heap.stack_get(1).and_then(Term::as_small),
                         p.heap.stack_get(2).and_then(Term::as_small),
                         p.heap.stack_get(3).and_then(Term::as_small),
+                        p.heap.stack_get(4).and_then(Term::as_small),
                     ) else {
                         return Err(VmError::Unsupported("return trace frame".into()));
                     };
-                    if exception == 0
-                        && let Some(trace_ctx) = ctx.as_deref_mut()
-                    {
+                    let session = ((session_high as u64) << 32) | session_low as u32 as u64;
+                    if let Some(trace_ctx) = ctx.as_deref_mut() {
                         crate::trace::return_event(
                             self,
                             p,
                             trace_ctx,
-                            session as u64,
+                            session,
                             module as usize,
                             entry as usize,
                             p.x[0],
@@ -1699,10 +1701,10 @@ impl Vm {
                             None,
                         )?;
                     }
-                    if !p.heap.release_stack(4) {
+                    if !p.heap.release_stack(5) {
                         return Err(VmError::Unsupported("return trace stack".into()));
                     }
-                    depth = depth.saturating_sub(4);
+                    depth = depth.saturating_sub(5);
                     (htop, stop) = p.heap.heap_cursor();
                     heap_dirty = false;
                     return_from_frame!(false);
@@ -4043,5 +4045,34 @@ impl Vm {
             // SAFETY: The loader appends CodeEnd after the final decoded opcode.
             ip = unsafe { ip.add(1) };
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_frame_tests {
+    use super::*;
+
+    #[test]
+    fn return_trace_frame_preserves_wide_session_ids() {
+        let mut process = Process::new();
+        let session = 0x7000_0000_0000_0001;
+        let actions = [crate::trace::CallActions {
+            session,
+            return_trace: true,
+            exception_trace: true,
+            return_to: false,
+        }];
+        push_trace_frames(&mut process, 3, 7, 11, 13, &actions).unwrap();
+        assert_eq!(process.heap.stack_get(1).and_then(Term::as_small), Some(3));
+        assert_eq!(process.heap.stack_get(2).and_then(Term::as_small), Some(7));
+        assert_eq!(
+            process.heap.stack_get(3).and_then(Term::as_small),
+            Some((session >> 32) as i64)
+        );
+        assert_eq!(
+            process.heap.stack_get(4).and_then(Term::as_small),
+            Some(session as u32 as i64)
+        );
+        assert_eq!(process.heap.stack_get(5).and_then(Term::as_small), Some(1));
     }
 }

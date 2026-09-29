@@ -867,14 +867,14 @@ fn map_hashmap_children(process: &mut Process, value: Term) -> Result<Term, VmEr
     list(process, &children.into_iter().rev().collect::<Vec<_>>())
 }
 
+/// Port of erts/emulator/beam/erl_map.c:3318-3324, OTP-29.1.1.
 fn map_to_tuple_keys(process: &mut Process, value: Term) -> Result<Term, VmError> {
     if value.classify() != TermKind::Map {
         return Err(VmError::Trap(exceptions::Trap::error(badmap(
             process, value,
         )?)));
     }
-    let keys = flatmap_keys(value).ok_or_else(badarg)?;
-    tuple(process, &keys)
+    value.flatmap_keys_tuple().ok_or_else(badarg)
 }
 
 /// Port of erts/emulator/beam/erl_bif_info.c:5678-5728, OTP-29.1.1.

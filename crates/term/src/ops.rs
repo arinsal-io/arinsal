@@ -111,6 +111,8 @@ fn number_cmp(a: Term, b: Term, exact: bool) -> Ordering {
             let c = a.total_cmp(&b);
             if !exact && a == b { Ordering::Equal } else { c }
         }
+        (Number::Integer(_), Number::Float(_)) if exact => Ordering::Less,
+        (Number::Float(_), Number::Integer(_)) if exact => Ordering::Greater,
         (Number::Integer(a), Number::Float(b)) => {
             let c = integer_float_cmp(&a, b);
             if exact && c == Ordering::Equal {
@@ -294,6 +296,12 @@ pub fn flat_size(term: Term) -> usize {
 /// OTP-29.1.1, for the implemented term classes.
 pub fn cmp(a: Term, b: Term) -> Ordering {
     cmp_impl(a, b, false)
+}
+/// Compare Erlang terms using exact numeric ordering, including nested terms.
+///
+/// This is the ordering used by `erts_internal:cmp_term/2` and map keys.
+pub fn cmp_exact(a: Term, b: Term) -> Ordering {
+    cmp_impl(a, b, true)
 }
 fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
     if a == b {

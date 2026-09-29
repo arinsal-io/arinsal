@@ -941,16 +941,51 @@ pub fn put_many<H: HeapAlloc + ?Sized>(
 ) -> MapResult<Term> {
     // Port of erts/emulator/beam/erl_map.c:261-365, OTP-29.1.1.
     check(map)?;
+    // Port of erts/emulator/beam/emu/ops.tab:1378 (`map_key_sort` for
+    // `put_map_exact`), OTP-29.1.1. This order defines the reported missing key.
+    let mut sorted = pairs.to_vec();
+    sorted.sort_by(|a, b| key_cmp(a.0, b.0));
     if exact {
-        for &(key, _) in pairs {
+        for &(key, _) in &sorted {
             if get(map, key)?.is_none() {
                 return Err(MapError::Badkey(key));
             }
         }
     }
-    let mut entries = to_list(map)?;
-    entries.extend_from_slice(pairs);
-    from_pairs(&entries, heap)
+    // Map instruction updates commonly retain every key and replace only
+    // values. Preserve the key tuple and the original map when possible;
+    // rebuilding all values through `from_pairs` loses OTP's sharing.
+    let unchanged = sorted.iter().enumerate().all(|(index, &(key, value))| {
+        if sorted[index + 1..]
+            .iter()
+            .any(|&(later_key, _)| exact_eq(key, later_key))
+        {
+            return true;
+        }
+        get(map, key).ok().flatten() == Some(value)
+    });
+    if unchanged {
+        return Ok(map);
+    }
+    if !map.is_hashmap()
+        && sorted
+            .iter()
+            .all(|(key, _)| get(map, *key).ok().flatten().is_some())
+    {
+        let mut result = map;
+        for (key, value) in sorted {
+            let index = iter(result)?
+                .position(|(candidate, _)| exact_eq(candidate, key))
+                .unwrap();
+            result = flat_replace(result, index, value, heap)?;
+        }
+        return Ok(result);
+    }
+    let mut result = map;
+    let mut entries = to_list(result)?;
+    entries.extend_from_slice(&sorted);
+    result = from_pairs(&entries, heap)?;
+    Ok(result)
 }
 /// Build a map from pairs; the last value for a key wins.
 pub fn from_pairs<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
@@ -1031,11 +1066,51 @@ pub fn values(map: Term) -> MapResult<Vec<Term>> {
 }
 /// `maps:merge/2`; right values win.
 pub fn merge<H: HeapAlloc + ?Sized>(left: Term, right: Term, heap: &mut H) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:1558-1848, OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_map.c:1257-1423, OTP-29.1.1.
     check(left)?;
     check(right)?;
+    if left == right {
+        return Ok(left);
+    }
+    if size(left)? == 0 {
+        return Ok(right);
+    }
+    if size(right)? == 0 {
+        return Ok(left);
+    }
+    let right_pairs = to_list(right)?;
+    let mut left_is_subset = true;
+    for (key, _) in iter(left)? {
+        if get(right, key)?.is_none() {
+            left_is_subset = false;
+            break;
+        }
+    }
+    let mut right_is_subset = true;
+    for (key, _) in &right_pairs {
+        if get(left, *key)?.is_none() {
+            right_is_subset = false;
+            break;
+        }
+    }
+    if left_is_subset && right_is_subset {
+        if let (Some(left_keys), Some(right_keys)) =
+            (left.flatmap_keys_tuple(), right.flatmap_keys_tuple())
+            && left_keys.is_literal()
+            && !right_keys.is_literal()
+        {
+            right.flatmap_replace_keys(left_keys);
+        }
+        return Ok(right);
+    }
+    if left_is_subset {
+        return Ok(right);
+    }
+    if right_is_subset {
+        return put_many(left, &right_pairs, false, heap);
+    }
     let mut entries = to_list(left)?;
-    entries.extend(to_list(right)?);
+    entries.extend(right_pairs);
     from_pairs(&entries, heap)
 }
 /// Lookup several keys; absent keys return `None`.

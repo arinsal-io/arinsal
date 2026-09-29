@@ -1,5 +1,5 @@
-use arinsal_maps::{MapError, from_pairs, get, iter, put, remove, size, update};
-use arinsal_term::{Term, VecHeap};
+use arinsal_maps::{MapError, from_pairs, get, iter, merge, put, put_many, remove, size, update};
+use arinsal_term::{LiteralArea, Term, VecHeap};
 use std::process::Command;
 
 fn small(n: i64) -> Term {
@@ -141,6 +141,73 @@ fn mutation_and_heap_full() {
     assert_eq!(tiny.used_words(), 0);
     let nested = from_pairs(&[(large_key, small(1))], &mut heap).unwrap();
     assert_eq!(get(nested, large_key), Ok(Some(small(1))));
+}
+
+#[test]
+fn no_op_updates_and_empty_merge_preserve_map_identity() {
+    let mut heap = VecHeap::new();
+    let map = from_pairs(&pairs(4), &mut heap).unwrap();
+    let empty = from_pairs(&[], &mut heap).unwrap();
+    let unchanged = put_many(map, &[(small(2), small(2))], false, &mut heap).unwrap();
+    assert_eq!(unchanged, map);
+    assert_eq!(merge(empty, map, &mut heap).unwrap(), map);
+    assert_eq!(merge(map, empty, &mut heap).unwrap(), map);
+}
+
+#[test]
+fn merge_reuses_a_containing_map_or_its_key_tuple() {
+    let mut heap = VecHeap::new();
+    let left = from_pairs(&[(small(1), small(10)), (small(2), small(20))], &mut heap).unwrap();
+    let right_subset = from_pairs(&[(small(2), small(22))], &mut heap).unwrap();
+    let merged = merge(left, right_subset, &mut heap).unwrap();
+    assert_eq!(merged.flatmap_keys_tuple(), left.flatmap_keys_tuple());
+    assert_eq!(get(merged, small(2)), Ok(Some(small(22))));
+
+    let right = from_pairs(
+        &[
+            (small(1), small(11)),
+            (small(2), small(21)),
+            (small(3), small(31)),
+        ],
+        &mut heap,
+    )
+    .unwrap();
+    let left_subset = from_pairs(&[(small(2), small(200))], &mut heap).unwrap();
+    assert_eq!(merge(left_subset, right, &mut heap), Ok(right));
+}
+
+#[test]
+fn equal_key_merge_mutates_the_heap_map_to_use_literal_keys() {
+    let source_pairs = [(small(1), small(10)), (small(2), small(20))];
+    let mut source_heap = VecHeap::new();
+    let source = from_pairs(&source_pairs, &mut source_heap).unwrap();
+    let mut literals = LiteralArea::new();
+    let literal_map = literals.copy_from(source).unwrap();
+    let literal_keys = literal_map.flatmap_keys_tuple().unwrap();
+
+    let mut heap = VecHeap::new();
+    let right = from_pairs(&[(small(1), small(11)), (small(2), small(21))], &mut heap).unwrap();
+    assert!(!right.flatmap_keys_tuple().unwrap().is_literal());
+
+    let merged = merge(literal_map, right, &mut heap).unwrap();
+    assert_eq!(merged, right);
+    assert_eq!(merged.flatmap_keys_tuple(), Some(literal_keys));
+}
+
+#[test]
+fn exact_multi_update_reports_the_first_sorted_missing_key() {
+    let mut heap = VecHeap::new();
+    let map = from_pairs(&[], &mut heap).unwrap();
+    let float = arinsal_term::TermBuilder::new(&mut heap)
+        .float(42.0)
+        .unwrap();
+    let result = put_many(
+        map,
+        &[(float, small(1)), (small(42), small(2))],
+        true,
+        &mut heap,
+    );
+    assert_eq!(result, Err(MapError::Badkey(small(42))));
 }
 
 #[test]

@@ -105,6 +105,11 @@ impl FlatMapRef<'_> {
     }
 }
 impl Term {
+    /// Whether this pointer belongs to a loaded module's immutable literal area.
+    pub fn is_literal(self) -> bool {
+        self.is_pointer() && crate::heap::is_literal_pointer((self.bits() & !7) as *const u64)
+    }
+
     /// Borrow a boxed float.
     ///
     /// # Safety
@@ -155,5 +160,43 @@ impl Term {
         // SAFETY: The flatmap allocation contains len values from word three.
         let values = unsafe { std::slice::from_raw_parts(p.add(3), len) };
         Some(FlatMapRef { keys, values })
+    }
+
+    /// Return the tuple that stores a flatmap's keys, preserving its identity.
+    ///
+    /// Hashmaps have no shared key tuple and return `None`.
+    pub fn flatmap_keys_tuple(self) -> Option<Term> {
+        // Port of erts/emulator/beam/erl_map.c:3318-3324, OTP-29.1.1.
+        let header = self.header()?;
+        if header & 63 != MAP || self.is_hashmap() {
+            return None;
+        }
+        // SAFETY: A flatmap stores its size and key tuple in words one and two.
+        let (len, keys) = unsafe {
+            let ptr = self.raw_ptr();
+            (*ptr.add(1) as usize, Term(*ptr.add(2)))
+        };
+        let keys_header = keys.header()?;
+        if keys_header & 63 != ARITY || (keys_header >> 6) as usize != len {
+            return None;
+        }
+        Some(keys)
+    }
+
+    /// Replace a flatmap's key tuple with an equal tuple, preserving map identity.
+    ///
+    /// Returns false unless both tuples contain exactly the same keys.
+    pub fn flatmap_replace_keys(self, keys: Term) -> bool {
+        // Port of erts/emulator/beam/erl_map.c:1357-1368, OTP-29.1.1.
+        let Some(current) = self.flatmap_keys_tuple() else {
+            return false;
+        };
+        if !exact_eq(current, keys) {
+            return false;
+        }
+        // SAFETY: A live flatmap's key pointer is word two, and `keys` is an
+        // equal live tuple retained by the caller's module or process heap.
+        unsafe { *self.raw_ptr().cast_mut().add(2) = keys.bits() };
+        true
     }
 }

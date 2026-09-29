@@ -11,8 +11,9 @@ use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use std::cell::UnsafeCell;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::ops::Index;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) struct WordBlock {
     base: std::ptr::NonNull<UnsafeCell<u64>>,
@@ -20,6 +21,7 @@ pub(crate) struct WordBlock {
 }
 
 const MAPPED_WORDS: usize = 1 << (usize::BITS - 1);
+const LITERAL_HEAP_BIT: usize = MAPPED_WORDS;
 
 // SAFETY: A process owns its word block exclusively; moving it changes no pointers within it.
 unsafe impl Send for WordBlock {}
@@ -606,6 +608,20 @@ pub struct VecHeap {
     total_used: usize,
     chunk_words: usize,
 }
+
+fn literal_ranges() -> &'static Mutex<HashSet<(usize, usize)>> {
+    static RANGES: OnceLock<Mutex<HashSet<(usize, usize)>>> = OnceLock::new();
+    RANGES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn is_literal_pointer(ptr: *const u64) -> bool {
+    let address = ptr as usize;
+    literal_ranges()
+        .lock()
+        .expect("literal range registry poisoned")
+        .iter()
+        .any(|&(start, end)| start <= address && address < end)
+}
 // SAFETY: Reading an allocated literal through a shared heap is safe. Every
 // operation that can write or grow VecHeap requires exclusive `&mut self`.
 unsafe impl Sync for VecHeap {}
@@ -626,10 +642,22 @@ impl VecHeap {
             chunk_words: 1024,
         }
     }
+    /// Create a stable heap for module literal terms.
+    pub fn new_literal() -> Self {
+        let mut heap = Self::new();
+        heap.chunk_words |= LITERAL_HEAP_BIT;
+        heap
+    }
     fn with_chunk_words(words: usize) -> Self {
         let mut heap = Self::new();
         heap.chunk_words = words.max(1);
         heap
+    }
+    fn is_literal_area(&self) -> bool {
+        self.chunk_words & LITERAL_HEAP_BIT != 0
+    }
+    fn next_chunk_words(&self) -> usize {
+        self.chunk_words & !LITERAL_HEAP_BIT
     }
     /// Number of allocated words.
     pub fn used_words(&self) -> usize {
@@ -648,10 +676,18 @@ impl Default for VecHeap {
         Self::new()
     }
 }
-#[cfg(any(feature = "validate-terms", debug_assertions, test))]
 impl Drop for VecHeap {
     fn drop(&mut self) {
         for chunk in &self.chunks {
+            if self.is_literal_area() {
+                let start = chunk.as_ptr() as usize;
+                let end = start + chunk.len() * 8;
+                literal_ranges()
+                    .lock()
+                    .expect("literal range registry poisoned")
+                    .remove(&(start, end));
+            }
+            #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
         }
     }
@@ -659,11 +695,21 @@ impl Drop for VecHeap {
 impl HeapAlloc for VecHeap {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         if self.chunks.is_empty() || self.used.checked_add(words)? > self.chunks.last()?.len() {
-            let size = self.chunk_words.max(words);
+            let size = self.next_chunk_words().max(words);
             self.chunks
                 .push((0..size).map(|_| UnsafeCell::new(0)).collect());
             self.used = 0;
-            self.chunk_words = self.chunk_words.saturating_mul(2);
+            let literal_bit = self.chunk_words & LITERAL_HEAP_BIT;
+            self.chunk_words = self.next_chunk_words().saturating_mul(2) | literal_bit;
+            if self.is_literal_area()
+                && let Some(chunk) = self.chunks.last()
+            {
+                let start = chunk.as_ptr() as usize;
+                literal_ranges()
+                    .lock()
+                    .expect("literal range registry poisoned")
+                    .insert((start, start + chunk.len() * 8));
+            }
             // g_asan: literal areas and other VecHeaps stay address-stable.
             #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             if let Some(chunk) = self.chunks.last() {
@@ -719,7 +765,7 @@ impl LiteralArea {
     /// Create an empty literal area.
     pub fn new() -> Self {
         Self {
-            heap: VecHeap::new(),
+            heap: VecHeap::new_literal(),
         }
     }
     /// Reserve a first chunk sized for a known literal graph.

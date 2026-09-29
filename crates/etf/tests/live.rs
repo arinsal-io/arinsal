@@ -33,6 +33,16 @@ fn terms() -> impl Strategy<Value = OwnedTerm> {
 }
 
 #[test]
+fn malformed_map_with_duplicate_keys_is_rejected_like_otp() {
+    // MAP_EXT with `a` twice is rejected by `binary_to_term/1` on OTP 29.1.1.
+    let bytes = [
+        131, 116, 0, 0, 0, 3, 100, 0, 1, b'a', 97, 1, 107, 0, 2, b'h', b'i', 107, 0, 5, b'v', b'a',
+        b'l', b'u', b'e', 100, 0, 1, b'a', 97, 2,
+    ];
+    assert!(decode(&bytes).is_err());
+}
+
+#[test]
 #[ignore = "10,000 live Erlang port cases; run with --ignored"]
 fn live_port_proptest() {
     if Command::new("erl").arg("-version").output().is_err() {

@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
     ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder, TermError,
-    TermKind, atoms, cmp, exact_eq, flat_size, global_atoms, loose_eq, phash, phash2, phash2_range,
-    writable_bytes_mut, writable_extend_private, writable_finalize,
+    TermKind, atoms, cmp, copy_term, exact_eq, flat_size, global_atoms, loose_eq, phash, phash2,
+    phash2_range, writable_bytes_mut, writable_extend_private, writable_finalize,
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -255,6 +255,7 @@ pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
         ("erlang", "throw", 1) => throw,
         ("erlang", "raise", 3) => raise,
         ("erts_internal", "cmp_term", 2) => cmp_term,
+        ("erts_debug", "copy_shared", 2) => debug_copy_shared,
         ("erts_debug", "flat_size", 1) => debug_flat_size,
         ("erts_debug", "same", 2) => debug_same,
         ("unicode", "bin_is_7bit", 1) => bin_is_7bit,
@@ -1564,29 +1565,23 @@ fn is_record(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     ))
 }
 fn cmp_term(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // erts_internal:cmp_term/2 uses exact map-key order: integers precede floats.
-    // SAFETY: Both source heaps remain live during this call.
-    let first_float = unsafe { args[0].float_ref() }.is_some();
-    // SAFETY: Both source heaps remain live during this call.
-    let second_float = unsafe { args[1].float_ref() }.is_some();
-    let order = if args[0].classify() == TermKind::Number
-        && args[1].classify() == TermKind::Number
-        && first_float != second_float
-    {
-        if first_float {
-            Ordering::Greater
-        } else {
-            Ordering::Less
-        }
-    } else {
-        cmp(args[0], args[1])
-    };
+    // Port of erts/emulator/beam/bif.c:5417-5427 and erl_utils.h:122, OTP-29.1.1.
+    let order = arinsal_term::cmp_exact(args[0], args[1]);
     let n = match order {
         Ordering::Less => -1,
         Ordering::Equal => 0,
         Ordering::Greater => 1,
     };
     Ok(Term::small(n).expect("small comparison"))
+}
+/// Port of erts/emulator/beam/beam_debug.c:170-193 (erts_debug_copy_shared_2), OTP-29.1.1.
+fn debug_copy_shared(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    if args[1] != Term::atom(global_atoms().intern("true").expect("built-in atom"))
+        && args[1] != Term::atom(global_atoms().intern("false").expect("built-in atom"))
+    {
+        return Err(BifError::BADARG);
+    }
+    copy_term(args[0], ctx.heap).map_err(|_| BifError::SystemLimit)
 }
 fn debug_flat_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, flat_size(args[0]))

@@ -262,23 +262,9 @@ pub(crate) fn call_event(
         let mut return_trace = false;
         let mut exception_trace = false;
         if let Some(specification) = pattern.match_spec.as_ref() {
-            let against = [
-                Term::atom(
-                    global_atoms()
-                        .intern(module)
-                        .map_err(|_| VmError::Unsupported("module atom".into()))?,
-                ),
-                Term::atom(
-                    global_atoms()
-                        .intern(function)
-                        .map_err(|_| VmError::Unsupported("function atom".into()))?,
-                ),
-                TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                    .list_from_iter(args.iter().copied())
-                    .map_err(|error| VmError::Unsupported(format!("trace args: {error:?}")))?,
-            ];
+            // Port of erts/emulator/beam/erl_trace.c:1266-1267, OTP-29.1.1.
             let against = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                .list_from_iter(against)
+                .list_from_iter(args.iter().copied())
                 .map_err(|error| VmError::Unsupported(format!("trace subject: {error:?}")))?;
             let specification = from_owned(
                 specification,
@@ -1121,6 +1107,14 @@ mod tests {
     }
 
     #[test]
+    fn trace_pattern_matches_function_arguments_like_otp() {
+        trace_pattern_diff(
+            "trace_t3a_ms_args",
+            "-module(trace_t3a_ms_args). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> f(a), f(#{b=>c}), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_ms_args,f,1}, [{['$1'],[{'==','$1',#{b=>c}}],[{return_trace}]}],[local]), P ! go, receive {trace,P,call,{trace_t3a_ms_args,f,[#{b:=c}]}} -> receive {trace,P,return_from,{trace_t3a_ms_args,f,1},ok} -> ok after 1000 -> missing_return end after 1000 -> missing_call end. f(_) -> ok.",
+        );
+    }
+
+    #[test]
     fn trace_pattern_global_export_call_matches_otp() {
         trace_pattern_diff(
             "trace_t3a_global",
@@ -1141,6 +1135,14 @@ mod tests {
         trace_pattern_diff(
             "trace_t3a_exception",
             "-module(trace_t3a_exception). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> try f() catch error:boom -> ok end, Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_exception,f,0}, [{'_',[],[{exception_trace}]}],[local]), P ! go, receive {trace,P,exception_from,{trace_t3a_exception,f,0},{error,boom}} -> ok after 1000 -> missing end. f() -> erlang:error(boom).",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_exception_trace_includes_successful_return_like_otp() {
+        trace_pattern_diff(
+            "trace_t3a_exception_return",
+            "-module(trace_t3a_exception_return). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> f(), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_exception_return,f,0}, [{'_',[],[{exception_trace}]}],[local]), P ! go, receive {trace,P,return_from,{trace_t3a_exception_return,f,0},ok} -> receive done -> ok after 1000 -> trace_only end after 1000 -> missing end. f() -> ok.",
         );
     }
 

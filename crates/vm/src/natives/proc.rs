@@ -201,6 +201,23 @@ fn process_info(
     };
     let mut pairs = Vec::new();
     for key in keys {
+        if let Some((lookup_key, selector)) = dictionary_lookup(key) {
+            // Port of erts/emulator/beam/erl_bif_info.c:852, OTP-29.1.1.
+            let lookup_key =
+                arinsal_term::from_owned(&lookup_key, &mut process.heap).map_err(|_| badarg())?;
+            let value = process
+                .cold
+                .as_ref()
+                .and_then(|cold| {
+                    cold.dictionary
+                        .iter()
+                        .find(|(candidate, _)| term_equal(*candidate, lookup_key))
+                        .map(|(_, value)| *value)
+                })
+                .unwrap_or_else(|| atom("undefined"));
+            pairs.push(make_tuple(process, &[selector, value])?);
+            continue;
+        }
         let name = atom_name(key).ok_or_else(badarg)?;
         let value = match name.as_str() {
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:6768 (message queue info), OTP-29.1.1.
@@ -750,6 +767,9 @@ fn known_info_item(name: &str) -> bool {
 fn validate_info_item(item: Term) -> Result<(), VmError> {
     if let Some(items) = list(item) {
         for item in items {
+            if dictionary_lookup(item).is_some() {
+                continue;
+            }
             let name = atom_name(item).ok_or_else(badarg)?;
             if !known_info_item(&name) {
                 return Err(badarg());
@@ -763,6 +783,17 @@ fn validate_info_item(item: Term) -> Result<(), VmError> {
     } else {
         Err(badarg())
     }
+}
+
+fn dictionary_lookup(selector: Term) -> Option<(arinsal_etf::OwnedTerm, Term)> {
+    let owned = arinsal_term::to_owned(selector).ok()?;
+    let arinsal_etf::OwnedTerm::Tuple(tuple) = &owned else {
+        return None;
+    };
+    if tuple.len() != 2 || tuple[0] != arinsal_etf::OwnedTerm::Atom("dictionary".into()) {
+        return None;
+    }
+    Some((tuple[1].clone(), selector))
 }
 
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {

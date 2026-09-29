@@ -560,6 +560,7 @@ struct Decoder<'a> {
     file: &'a BeamFile,
     labels: &'a HashMap<u32, usize>,
     literals: &'a mut VecHeap,
+    literal_terms: &'a mut HashMap<u32, Term>,
     lists: &'a mut Vec<Box<[Arg]>>,
     types: &'a mut Vec<(usize, BeamType)>,
 }
@@ -603,12 +604,7 @@ impl Decoder<'_> {
                 Arg::new(Arg::TERM, unsafe { term.raw_bits() })
             }
             Operand::Char(n) => Arg::new(Arg::INT, *n as u64),
-            Operand::Literal(n) => match self
-                .file
-                .literal(*n)
-                .ok()
-                .and_then(|v| from_owned(&v, self.literals).ok())
-            {
+            Operand::Literal(n) => match self.literal_term(*n)? {
                 Some(term) if term.as_small().is_some() => {
                     Arg::new(Arg::INT, term.as_small().unwrap() as u64)
                 }
@@ -650,6 +646,20 @@ impl Decoder<'_> {
                 self.arg(reg, position)?
             }
         })
+    }
+
+    fn literal_term(&mut self, index: u32) -> Result<Option<Term>, LoadError> {
+        // Port of erts/emulator/beam/beam_file.c:1977-1998, OTP-29.1.1.
+        // BEAM literal indices designate stable terms in the module literal area.
+        if let Some(term) = self.literal_terms.get(&index) {
+            return Ok(Some(*term));
+        }
+        let Ok(owned) = self.file.literal(index) else {
+            return Ok(None);
+        };
+        let term = from_owned(&owned, self.literals).map_err(|_| LoadError::Limit)?;
+        self.literal_terms.insert(index, term);
+        Ok(Some(term))
     }
 }
 
@@ -933,7 +943,8 @@ pub fn load_with_instrumentations(
     let mut lists = Vec::new();
     let mut types = Vec::new();
     let mut lines = Vec::new();
-    let mut literals = VecHeap::new();
+    let mut literals = VecHeap::new_literal();
+    let mut literal_terms = HashMap::new();
     let mut current_line = None;
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
@@ -1039,6 +1050,7 @@ pub fn load_with_instrumentations(
             file,
             labels: &labels,
             literals: &mut literals,
+            literal_terms: &mut literal_terms,
             lists: &mut lists,
             types: &mut type_meta,
         };

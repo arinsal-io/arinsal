@@ -361,6 +361,14 @@ impl Frame {
                 while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
                     pairs.push((key, value));
                 }
+                let mut keys: Vec<_> = pairs.iter().map(|(key, _)| key).collect();
+                keys.sort_by(|a, b| erl_cmp(a, b));
+                if keys
+                    .windows(2)
+                    .any(|pair| erl_cmp(pair[0], pair[1]).is_eq())
+                {
+                    return Err(invalid(end, "duplicate map key"));
+                }
                 OwnedTerm::Map(pairs)
             }
             Kind::Export => {
