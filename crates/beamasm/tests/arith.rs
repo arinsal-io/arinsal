@@ -293,6 +293,28 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
+fn guard_arithmetic_emits_fail_label_handling() {
+    let code_size = |with_fail_label| {
+        let mut asm = BeamModuleAssembler::new();
+        asm.emit_i_func_label(1).unwrap();
+        if with_fail_label {
+            asm.emit_i_plus_with_fail(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), 2, runtime_arith)
+                .unwrap();
+        } else {
+            asm.emit_i_plus(ArgVal::X(0), ArgVal::X(1), ArgVal::X(1), runtime_arith)
+                .unwrap();
+        }
+        asm.return_().unwrap();
+        asm.emit_i_func_label(2).unwrap();
+        asm.return_().unwrap();
+        let module = asm.finalize().unwrap();
+        module.entries[&2] as usize - module.entries[&1] as usize
+    };
+    assert!(code_size(true) > code_size(false));
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
 fn immediate_add_sub_cover_small_boundary_overflow_and_non_integer_fallbacks() {
     let add = |lhs, immediate| {
         run_binary(

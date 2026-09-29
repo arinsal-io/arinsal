@@ -5,8 +5,8 @@ use crate::{Process, Vm, VmError, exceptions};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::RunCtx;
 use arinsal_term::{
-    Term, TermBuilder, TermKind, copy_term, flatmap_keys, from_owned, global_atoms,
-    hashmap_node_children, size_object, term_sequence, to_owned,
+    Term, TermBuilder, TermKind, copy_term, from_owned, global_atoms, hashmap_node_children,
+    size_object, term_sequence, to_owned,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;

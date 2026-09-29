@@ -582,6 +582,8 @@ fn system_info(
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         Some("check_io") => Some(check_io_info(process)),
         Some("ethread_info") => Some(ethread_info(process)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3549 (max_integer), OTP-29.1.1.
+        Some("max_integer") => Some(max_integer(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
         Some("schedulers_online") => Some(with_flags(|flags| {
             non_neg(process, flags.schedulers_online as u64)
@@ -618,6 +620,15 @@ fn system_info(
         _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
         _ => None,
     }
+}
+
+fn max_integer(process: &mut Process) -> Result<Term, VmError> {
+    const MAX_BIG_BITS: usize = 65_535 * 64;
+    let value = (num_bigint::BigInt::from(1_u8) << MAX_BIG_BITS) - 1;
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    TermBuilder::new(&mut heap)
+        .int_from_bigint(&value)
+        .map_err(|_| badarg())
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:5487 (erts_get_ethread_info), OTP-29.1.1.
@@ -2056,6 +2067,20 @@ mod tests {
             &[OwnedTerm::atom("debug_compiled")],
         );
         let selector = Term::atom(global_atoms().intern("debug_compiled").unwrap());
+        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
+    }
+
+    #[test]
+    fn max_integer_system_info_matches_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping max_integer differential test");
+            return;
+        };
+        let expected = reference.call("erlang", "system_info", &[OwnedTerm::atom("max_integer")]);
+        let selector = Term::atom(global_atoms().intern("max_integer").unwrap());
         let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
             .unwrap()
             .unwrap();

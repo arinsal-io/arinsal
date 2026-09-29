@@ -51,6 +51,24 @@ fn short_read_leaves_the_cursor() {
 }
 
 #[test]
+fn oversized_integer_match_fails_instead_of_raising_system_limit() {
+    let mut heap = VecHeap::new();
+    let mut bytes = vec![u8::MAX; 524_289];
+    bytes[524_288] = 0x80;
+    let binary = TermBuilder::new(&mut heap).binary(&bytes).unwrap();
+    let ctx = start_match(binary, &mut heap).unwrap().unwrap();
+
+    // erts_bs_get_integer_2 returns THE_NON_VALUE when `bytes_to_big` cannot
+    // represent an extracted field; the enclosing binary pattern then fails.
+    assert!(
+        ctx.get_integer(4_194_305, SegFlags::default(), &mut heap)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(ctx.position(), 4_194_305);
+}
+
+#[test]
 fn unaligned_sub_binary_keeps_bit_offsets() {
     let mut heap = VecHeap::new();
     // MSB-first bits of 0b1011_0110 then 0b1100_0001. From bit 3, eight bits are

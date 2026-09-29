@@ -116,10 +116,59 @@ fn number_float(term: Term) -> Result<f64, ArithError> {
         return Ok(f);
     }
     let i = as_integer(term).ok_or(ArithError::Badarith)?;
-    // Port of erts/emulator/beam/big.c:2412 (big_to_double), OTP-29.1.1.
-    i.to_f64()
-        .filter(|f| f.is_finite())
-        .ok_or(ArithError::Badarith)
+    // Port of erts/emulator/beam/big.c:2412-2525 (big_to_double), OTP-29.1.1.
+    big_to_double(&i).ok_or(ArithError::Badarith)
+}
+
+/// Convert an Erlang integer or float to a finite `f64` using OTP arithmetic rules.
+pub fn number_to_f64(term: Term) -> Result<f64, ArithError> {
+    number_float(term)
+}
+
+fn big_to_double(value: &BigInt) -> Option<f64> {
+    if value.is_zero() {
+        return Some(0.0);
+    }
+    let (sign, digits) = value.to_u64_digits();
+    let most = *digits.last()?;
+    let bit_len = (digits.len() - 1) * 64 + (64 - most.leading_zeros() as usize);
+    if bit_len > 1024 {
+        return None;
+    }
+    let negative = sign == Sign::Minus;
+    if bit_len <= 53 {
+        let magnitude = digits.first().copied().unwrap_or(0) as f64;
+        return Some(if negative { -magnitude } else { magnitude });
+    }
+
+    let guard = bit_len - 54;
+    let top = (value.magnitude() >> guard).to_u64()?;
+    let half_bit = top & 1 != 0;
+    let mut mantissa = top >> 1;
+    let full_digits = guard / 64;
+    let trailing_bits = guard % 64;
+    let lesser_bits = digits[..full_digits].iter().any(|digit| *digit != 0)
+        || (trailing_bits != 0
+            && digits
+                .get(full_digits)
+                .is_some_and(|digit| digit & ((1_u64 << trailing_bits) - 1) != 0));
+    let mut exponent = guard + 1;
+    if half_bit && (mantissa & 1 != 0 || lesser_bits) {
+        mantissa += 1;
+        if mantissa == 1_u64 << 53 {
+            mantissa >>= 1;
+            exponent += 1;
+        }
+    }
+    let biased = exponent.checked_add(52)?.checked_add(1023)?;
+    if biased >= 0x7ff {
+        return None;
+    }
+    let sign_bit = if negative { 1_u64 << 63 } else { 0 };
+    let fraction = mantissa & ((1_u64 << 52) - 1);
+    Some(f64::from_bits(
+        sign_bit | ((biased as u64) << 52) | fraction,
+    ))
 }
 fn binary_arith<H: HeapAlloc + ?Sized>(
     a: Term,
@@ -377,12 +426,7 @@ pub fn to_float<H: HeapAlloc + ?Sized>(a: Term, heap: &mut H) -> ArithResult {
         return Ok(a);
     }
     let i = as_integer(a).ok_or(ArithError::Badarg)?;
-    floating(
-        i.to_f64()
-            .filter(|f| f.is_finite())
-            .ok_or(ArithError::Badarg)?,
-        heap,
-    )
+    floating(big_to_double(&i).ok_or(ArithError::Badarg)?, heap)
 }
 fn float_integer<H: HeapAlloc + ?Sized>(
     a: Term,

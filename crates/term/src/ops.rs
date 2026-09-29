@@ -449,7 +449,10 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
         let atoms = global_atoms();
         return atoms.text(x).cmp(&atoms.text(y));
     }
-    let mut pending = Vec::new();
+    // Most comparisons inspect only one shallow object. Keep those pending
+    // child pairs inline so the common tuple/list ordering path does not
+    // allocate once per relational operation.
+    let mut pending = SmallVec::<[(Term, Term, bool); 16]>::new();
     pending.push((a, b, exact));
     while let Some((a, b, exact)) = pending.pop() {
         if a == b {

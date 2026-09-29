@@ -1133,9 +1133,16 @@ impl Cursor<'_> {
             }
             unsigned
         };
-        let term = TermBuilder::new(heap)
-            .int_from_bigint(&value)
-            .map_err(|e| term_error(e, 0, 1 + bits.div_ceil(64)))?;
+        let term = match TermBuilder::new(heap).int_from_bigint(&value) {
+            Ok(term) => term,
+            // Port of erts/emulator/beam/erl_bits.c:341-346 (oversized bignum
+            // extraction returns THE_NON_VALUE), OTP-29.1.1.
+            Err(TermError::SystemLimit) => {
+                self.position += bits;
+                return Ok(None);
+            }
+            Err(error) => return Err(term_error(error, 0, 1 + bits.div_ceil(64))),
+        };
         self.position += bits;
         Ok(Some(term))
     }

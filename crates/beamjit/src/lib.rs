@@ -2321,29 +2321,36 @@ fn emit_op(
         }
         EmitterKind::Plus => {
             count(5)?;
-            assembler.emit_i_plus(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_plus_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Minus => {
             count(5)?;
-            assembler.emit_i_minus(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_minus_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Times => {
             count(5)?;
-            assembler.emit_i_times(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_times_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::MulAdd => {
             count(6)?;
             // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-588, OTP-29.1.1.
             let destination = value(5)?;
-            assembler.emit_i_times(value(1)?, value(2)?, destination, helper)?;
+            let fail = n(0)?;
+            assembler.emit_i_times_with_fail(value(1)?, value(2)?, destination, fail, helper)?;
             if args.get(3) == args.get(5) {
                 if matches!(args.get(4), Some(SpecificOperand::Other)) {
                     Ok(())
                 } else {
-                    assembler.emit_i_plus(destination, value(4)?, destination, helper)
+                    assembler.emit_i_plus_with_fail(
+                        destination,
+                        value(4)?,
+                        destination,
+                        fail,
+                        helper,
+                    )
                 }
             } else if args.get(4) == args.get(5) {
-                assembler.emit_i_plus(destination, value(3)?, destination, helper)
+                assembler.emit_i_plus_with_fail(destination, value(3)?, destination, fail, helper)
             } else {
                 Err(arinsal_beamasm::module::ModuleError::InvalidOperand(
                     "i_mul_add destination must alias one addend",
@@ -2352,39 +2359,39 @@ fn emit_op(
         }
         EmitterKind::IntDiv => {
             count(5)?;
-            assembler.emit_i_int_div(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_int_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Rem => {
             count(5)?;
-            assembler.emit_i_rem(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_rem_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Band => {
             count(5)?;
-            assembler.emit_i_band(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_band_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bor => {
             count(5)?;
-            assembler.emit_i_bor(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_bor_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bxor => {
             count(5)?;
-            assembler.emit_i_bxor(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_bxor_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bsl => {
             count(5)?;
-            assembler.emit_i_bsl(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_bsl_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bsr => {
             count(5)?;
-            assembler.emit_i_bsr(value(2)?, value(3)?, value(4)?, helper)
+            assembler.emit_i_bsr_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bnot => {
             count(4)?;
-            assembler.emit_i_bnot(value(2)?, value(3)?, helper)
+            assembler.emit_i_bnot_with_fail(value(2)?, value(3)?, n(0)?, helper)
         }
         EmitterKind::UnaryMinus => {
             count(4)?;
-            assembler.emit_i_unary_minus(value(2)?, value(3)?, helper)
+            assembler.emit_i_unary_minus_with_fail(value(2)?, value(3)?, n(0)?, helper)
         }
         EmitterKind::Guard => {
             let fail = n(0)?;
