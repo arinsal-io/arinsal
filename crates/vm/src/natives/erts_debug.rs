@@ -28,6 +28,7 @@ const MONITOR_LONG_GC: u8 = 2;
 const MONITOR_LONG_SCHEDULE: u8 = 4;
 const MONITOR_LONG_MESSAGE_QUEUE: u8 = 8;
 const MONITOR_BUSY_PORT: u8 = 16;
+const MONITOR_BUSY_DIST_PORT: u8 = 32;
 
 #[derive(Clone)]
 pub(crate) struct SystemMonitorState {
@@ -74,6 +75,12 @@ fn refresh_system_monitor_flags(
             Some(MonitorOption::Bool(true))
         ) {
             flags |= MONITOR_BUSY_PORT;
+        }
+        if matches!(
+            state.options.get("busy_dist_port"),
+            Some(MonitorOption::Bool(true))
+        ) {
+            flags |= MONITOR_BUSY_DIST_PORT;
         }
     }
     runtime.system_monitor_flags.store(flags, Ordering::Relaxed);
@@ -418,6 +425,64 @@ pub(crate) fn notify_busy_port(process: &Process, sender: arinsal_sched::Pid, po
         return;
     };
     if let Ok(message) = Message::copy_from(event)
+        && let Ok(scheduler) = runtime.scheduler()
+    {
+        let _ = scheduler.send(sender, receiver, message);
+    }
+}
+
+/// Emit the event when a sender is suspended on a busy distribution port.
+// Port of erts/emulator/beam/erl_trace.c:1942-1948, OTP-29.1.1.
+pub(crate) fn notify_busy_dist_port(process: &Process, sender: arinsal_sched::Pid, port_id: u64) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    if runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_BUSY_DIST_PORT == 0 {
+        return;
+    }
+    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
+        return;
+    };
+    if !matches!(
+        state.options.get("busy_dist_port"),
+        Some(MonitorOption::Bool(true))
+    ) {
+        return;
+    }
+    let OwnedTerm::Pid {
+        node,
+        id: receiver_id,
+        serial: receiver_generation,
+        creation: 0,
+    } = &state.receiver
+    else {
+        return;
+    };
+    if node != "nonode@nohost" {
+        return;
+    }
+    let receiver = arinsal_sched::Pid {
+        index: *receiver_id,
+        generation: *receiver_generation,
+    };
+    let mut heap = arinsal_term::ProcessHeap::with_words(16);
+    let event = OwnedTerm::Tuple(vec![
+        OwnedTerm::atom("monitor"),
+        OwnedTerm::Pid {
+            node: "nonode@nohost".into(),
+            id: sender.index,
+            serial: sender.generation,
+            creation: 0,
+        },
+        OwnedTerm::atom("busy_dist_port"),
+        OwnedTerm::Port {
+            node: "nonode@nohost".into(),
+            id: port_id,
+            creation: 0,
+        },
+    ]);
+    if let Ok(term) = from_owned(&event, &mut arinsal_bifs::FragmentingHeap(&mut heap))
+        && let Ok(message) = Message::copy_from(term)
         && let Ok(scheduler) = runtime.scheduler()
     {
         let _ = scheduler.send(sender, receiver, message);

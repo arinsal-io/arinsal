@@ -649,30 +649,63 @@ impl Executor {
         self.native_registers.f_reg_array[..self.fr.len().min(1024)]
             .copy_from_slice(&process.fr[..self.fr.len().min(1024)]);
         let result = (|| -> Result<RunState, VmError> {
-            loop {
-                // g_proc_sched: a suspended process is not scheduled; a hibernating
-                // one stays waiting until a message arrives, then continues at apply/3.
-                if let Some(wait) = self.sched_preempt(process, ctx)? {
-                    break Ok(wait);
-                }
-                if let Some(code_ptr) = process.native_pc.take() {
-                    crate::beamasm_integration::count_native_call();
-                    process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
-                    let trace_boot = trace_boot_enabled();
-                    let function = trace_boot
-                        .then(|| crate::native_function_at(code_ptr))
-                        .flatten();
-                    if trace_boot {
-                        eprintln!("arinsal boot: enter native {:?} pc={code_ptr:#x}", function);
-                        if function
-                            .as_ref()
-                            .is_some_and(|f| f.module == "prim_file" && f.function == "decode_path")
-                        {
-                            eprintln!("arinsal boot: decode_path input={:?}", process.x.first());
+            'execution: {
+                // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
+                // A spawned MFA may name a BIF directly; execute it as the process entry so
+                // exceptions such as exit/1 retain their BIF class and reason.
+                if let Some((module, function, arity)) = process
+                    .cold
+                    .as_mut()
+                    .and_then(|cold| cold.initial_bif.take())
+                {
+                    let args = process.x[..usize::from(arity)].to_vec();
+                    let bif = arinsal_bifs::lookup(&module, &function, arity)
+                        .expect("spawned BIF entry was resolved before scheduling");
+                    match crate::calls::call_bif(&mut process.heap, bif, &args) {
+                        Ok(value) => break 'execution Ok(RunState::Done(value)),
+                        Err(error) => {
+                            break 'execution Err(crate::exceptions::direct_bif_error(
+                                process, &module, &function, &args, error,
+                            ));
                         }
                     }
-                    let outcome =
-                        match crate::run_native(process, &mut self.native_registers, code_ptr) {
+                }
+                loop {
+                    if process.force_yield {
+                        process.force_yield = false;
+                        break Ok(RunState::Yield);
+                    }
+                    // g_proc_sched: a suspended process is not scheduled; a hibernating
+                    // one stays waiting until a message arrives, then continues at apply/3.
+                    if let Some(wait) = self.sched_preempt(process, ctx)? {
+                        break Ok(wait);
+                    }
+                    crate::dist::continue_fragmented_send(process, ctx)?;
+                    if process.force_yield {
+                        process.force_yield = false;
+                        break Ok(RunState::Yield);
+                    }
+                    if let Some(code_ptr) = process.native_pc.take() {
+                        crate::beamasm_integration::count_native_call();
+                        process.header.self_pid =
+                            ctx.pid().to_term().expect("valid pid").tagged_word();
+                        let function = crate::native_function_at(code_ptr);
+                        if trace_boot_enabled() {
+                            eprintln!("arinsal boot: enter native {:?} pc={code_ptr:#x}", function);
+                            if function.as_ref().is_some_and(|f| {
+                                f.module == "prim_file" && f.function == "decode_path"
+                            }) {
+                                eprintln!(
+                                    "arinsal boot: decode_path input={:?}",
+                                    process.x.first()
+                                );
+                            }
+                        }
+                        let outcome = match crate::run_native(
+                            process,
+                            &mut self.native_registers,
+                            code_ptr,
+                        ) {
                             Ok(outcome) => outcome,
                             Err(VmError::Trap(trap)) => {
                                 if let Some(error) = crate::exceptions::resume(
@@ -694,297 +727,312 @@ impl Executor {
                             }
                             Err(error) => return Err(error),
                         };
-                    if trace_boot
-                        && function
-                            .as_ref()
-                            .is_some_and(|f| f.module == "prim_file" && f.function == "decode_path")
-                    {
-                        eprintln!(
-                            "arinsal boot: decode_path exit={outcome:?} output={:?}",
-                            process.x.first()
-                        );
-                    }
-                    match outcome {
-                        arinsal_beamasm::ExitReason::Yield => {
-                            crate::beamasm_integration::count_native_yield();
-                            break Ok(RunState::Yield);
+                        if trace_boot_enabled()
+                            && function.as_ref().is_some_and(|f| {
+                                f.module == "prim_file" && f.function == "decode_path"
+                            })
+                        {
+                            eprintln!(
+                                "arinsal boot: decode_path exit={outcome:?} output={:?}",
+                                process.x.first()
+                            );
                         }
-                        arinsal_beamasm::ExitReason::CallUnported {
-                            target_pc,
-                            resume_pc: _,
-                        } => {
-                            crate::beamasm_integration::count_call_unported();
-                            if target_pc == arinsal_beamasm::dispatch::SEND_UNPORTED {
-                                let value =
-                                    process.send_message(ctx, process.x[0], process.x[1])?;
-                                process.x[0] = value;
-                                if !resume_after_native_return(process) {
-                                    break Ok(RunState::Done(value));
-                                }
-                                continue;
+                        match outcome {
+                            arinsal_beamasm::ExitReason::Yield => {
+                                crate::beamasm_integration::count_native_yield();
+                                break Ok(RunState::Yield);
                             }
-                            if target_pc == arinsal_beamasm::dispatch::CALL_FUN_UNPORTED {
-                                let arity = usize::from(process.header.arity);
-                                let fun = process.x.get(arity).copied().unwrap_or(Term::NIL);
-                                match self
-                                    .vm
-                                    .call_fun_term(process, fun, arity, true, Some(ctx))?
-                                {
-                                    crate::ImportOutcome::Jump(_)
-                                    | crate::ImportOutcome::Advanced => {}
-                                    crate::ImportOutcome::Yield => {
-                                        break Ok(RunState::Yield);
-                                    }
-                                    crate::ImportOutcome::Returned(value) => {
-                                        process.x[0] = value;
-                                        if process.native_pc.is_none() {
-                                            break Ok(RunState::Done(value));
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-                            let Some(export) =
-                                crate::beamasm_integration::export_dispatch(target_pc)
-                            else {
-                                if let Some(m) = self.vm.modules.get(process.module)
-                                    && target_pc < m.code.len()
-                                {
-                                    process.ip = target_pc;
-                                    process.tick();
-                                    continue;
-                                }
-                                return Err(VmError::Unsupported(format!(
-                                    "unknown native export entry {target_pc:#x}"
-                                )));
-                            };
-                            if trace_boot_enabled() && export.module == "prim_file" {
-                                eprintln!(
-                                    "arinsal boot: export dispatch {}:{}/{} class={:?}",
-                                    export.module, export.function, export.arity, export.class
-                                );
-                            }
-                            process.gc_live = usize::from(export.arity);
-                            if matches!(
-                                export.class,
-                                arinsal_loader::ImportClass::Native
-                                    | arinsal_loader::ImportClass::Dynamic
-                            ) {
-                                let result = self.vm.dispatch_native(
-                                    process,
-                                    ctx,
-                                    &export.module,
-                                    &export.function,
-                                    usize::from(export.arity),
-                                    (export.class, export.native_bits),
-                                );
-                                let result = result.or_else(|| {
-                                    let (bif, arity) =
-                                        crate::beamasm_integration::dispatch_bif(target_pc)?;
-                                    let arity = usize::from(arity);
-                                    let result = crate::calls::call_bif(
-                                        &mut process.heap,
-                                        bif,
-                                        &process.x[..arity],
-                                    );
-                                    Some(match result {
-                                        Ok(value) => Ok(value),
-                                        Err(error) => {
-                                            let arguments = process.x[..arity].to_vec();
-                                            Err(crate::exceptions::bif_error(
-                                                process,
-                                                &export.module,
-                                                &export.function,
-                                                &arguments,
-                                                error,
-                                            ))
-                                        }
-                                    })
-                                });
-                                if let Some(result) = result {
-                                    let value = result?;
+                            arinsal_beamasm::ExitReason::CallUnported {
+                                target_pc,
+                                resume_pc: _,
+                            } => {
+                                crate::beamasm_integration::count_call_unported();
+                                if target_pc == arinsal_beamasm::dispatch::SEND_UNPORTED {
+                                    let value =
+                                        process.send_message(ctx, process.x[0], process.x[1])?;
                                     process.x[0] = value;
                                     if !resume_after_native_return(process) {
                                         break Ok(RunState::Done(value));
                                     }
                                     continue;
                                 }
-                            }
-                            let module_id = match self.vm.loaded.get(&export.module).copied() {
-                                Some(module_id) => module_id,
-                                None => match self.vm.load_named(&export.module) {
-                                    Ok(module_id) => module_id,
-                                    Err(_) => {
-                                        match self.vm.call_undefined_function(
-                                            process,
-                                            &export.module,
-                                            &export.function,
-                                            usize::from(export.arity),
-                                            true,
-                                        )? {
-                                            crate::ImportOutcome::Jump(_)
-                                            | crate::ImportOutcome::Advanced => {}
-                                            crate::ImportOutcome::Yield => {
-                                                break Ok(RunState::Yield);
+                                if target_pc == arinsal_beamasm::dispatch::CALL_FUN_UNPORTED {
+                                    let arity = usize::from(process.header.arity);
+                                    let fun = process.x.get(arity).copied().unwrap_or(Term::NIL);
+                                    match self.vm.call_fun_term(
+                                        process,
+                                        fun,
+                                        arity,
+                                        true,
+                                        Some(ctx),
+                                    )? {
+                                        crate::ImportOutcome::Jump(_)
+                                        | crate::ImportOutcome::Advanced => {}
+                                        crate::ImportOutcome::Yield => {
+                                            break Ok(RunState::Yield);
+                                        }
+                                        crate::ImportOutcome::Returned(value) => {
+                                            process.x[0] = value;
+                                            if process.native_pc.is_none() {
+                                                break Ok(RunState::Done(value));
                                             }
-                                            crate::ImportOutcome::Returned(value) => {
-                                                process.x[0] = value;
-                                                if process.native_pc.is_none() {
-                                                    break Ok(RunState::Done(value));
-                                                }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let Some(export) =
+                                    crate::beamasm_integration::export_dispatch(target_pc)
+                                else {
+                                    if let Some(m) = self.vm.modules.get(process.module)
+                                        && target_pc < m.code.len()
+                                    {
+                                        process.ip = target_pc;
+                                        process.tick();
+                                        continue;
+                                    }
+                                    return Err(VmError::Unsupported(format!(
+                                        "unknown native export entry {target_pc:#x}"
+                                    )));
+                                };
+                                if trace_boot_enabled() && export.module == "prim_file" {
+                                    eprintln!(
+                                        "arinsal boot: export dispatch {}:{}/{} class={:?}",
+                                        export.module, export.function, export.arity, export.class
+                                    );
+                                }
+                                process.gc_live = usize::from(export.arity);
+                                if matches!(
+                                    export.class,
+                                    arinsal_loader::ImportClass::Native
+                                        | arinsal_loader::ImportClass::Dynamic
+                                ) {
+                                    let result = self.vm.dispatch_native(
+                                        process,
+                                        ctx,
+                                        &export.module,
+                                        &export.function,
+                                        usize::from(export.arity),
+                                        (export.class, export.native_bits),
+                                    );
+                                    let result = result.or_else(|| {
+                                        let (bif, arity) =
+                                            crate::beamasm_integration::dispatch_bif(target_pc)?;
+                                        let arity = usize::from(arity);
+                                        let result = crate::calls::call_bif(
+                                            &mut process.heap,
+                                            bif,
+                                            &process.x[..arity],
+                                        );
+                                        Some(match result {
+                                            Ok(value) => Ok(value),
+                                            Err(error) => {
+                                                let arguments = process.x[..arity].to_vec();
+                                                Err(crate::exceptions::bif_error(
+                                                    process,
+                                                    &export.module,
+                                                    &export.function,
+                                                    &arguments,
+                                                    error,
+                                                ))
                                             }
+                                        })
+                                    });
+                                    if let Some(result) = result {
+                                        let value = result?;
+                                        process.x[0] = value;
+                                        if !resume_after_native_return(process) {
+                                            break Ok(RunState::Done(value));
                                         }
                                         continue;
                                     }
-                                },
-                            };
-                            let target_ip = crate::beamasm_integration::interpreted_target(
-                                &export.module,
-                                &export.function,
-                                export.arity,
-                            )
-                            .or_else(|| {
-                                self.vm.modules[module_id]
-                                    .export_slot(&export.function, export.arity)
-                                    .map(arinsal_loader::ExportSlot::target)
-                            });
-                            if let Some(target_ip) = target_ip {
-                                process.gc_live = usize::from(export.arity);
-                                process.module = module_id;
-                                process.ip = target_ip;
-                                process.tick();
-                            } else {
-                                match self.vm.call_undefined_function(
-                                    process,
+                                }
+                                let module_id = match self.vm.loaded.get(&export.module).copied() {
+                                    Some(module_id) => module_id,
+                                    None => match self.vm.load_named(&export.module) {
+                                        Ok(module_id) => module_id,
+                                        Err(_) => {
+                                            match self.vm.call_undefined_function(
+                                                process,
+                                                &export.module,
+                                                &export.function,
+                                                usize::from(export.arity),
+                                                true,
+                                            )? {
+                                                crate::ImportOutcome::Jump(_)
+                                                | crate::ImportOutcome::Advanced => {}
+                                                crate::ImportOutcome::Yield => {
+                                                    break Ok(RunState::Yield);
+                                                }
+                                                crate::ImportOutcome::Returned(value) => {
+                                                    process.x[0] = value;
+                                                    if process.native_pc.is_none() {
+                                                        break Ok(RunState::Done(value));
+                                                    }
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    },
+                                };
+                                let target_ip = crate::beamasm_integration::interpreted_target(
                                     &export.module,
                                     &export.function,
-                                    usize::from(export.arity),
-                                    true,
-                                )? {
-                                    crate::ImportOutcome::Jump(_)
-                                    | crate::ImportOutcome::Advanced => {}
-                                    crate::ImportOutcome::Yield => {
-                                        break Ok(RunState::Yield);
-                                    }
-                                    crate::ImportOutcome::Returned(value) => {
-                                        process.x[0] = value;
-                                        if process.native_pc.is_none() {
-                                            break Ok(RunState::Done(value));
+                                    export.arity,
+                                )
+                                .or_else(|| {
+                                    self.vm.modules[module_id]
+                                        .export_slot(&export.function, export.arity)
+                                        .map(arinsal_loader::ExportSlot::target)
+                                });
+                                if let Some(target_ip) = target_ip {
+                                    process.gc_live = usize::from(export.arity);
+                                    process.module = module_id;
+                                    process.ip = target_ip;
+                                    process.tick();
+                                } else {
+                                    match self.vm.call_undefined_function(
+                                        process,
+                                        &export.module,
+                                        &export.function,
+                                        usize::from(export.arity),
+                                        true,
+                                    )? {
+                                        crate::ImportOutcome::Jump(_)
+                                        | crate::ImportOutcome::Advanced => {}
+                                        crate::ImportOutcome::Yield => {
+                                            break Ok(RunState::Yield);
+                                        }
+                                        crate::ImportOutcome::Returned(value) => {
+                                            process.x[0] = value;
+                                            if process.native_pc.is_none() {
+                                                break Ok(RunState::Done(value));
+                                            }
                                         }
                                     }
                                 }
+                                continue;
                             }
-                            continue;
-                        }
-                        arinsal_beamasm::ExitReason::Returned => {
-                            if !resume_after_native_return(process) {
-                                break Ok(RunState::Done(process.x[0]));
+                            arinsal_beamasm::ExitReason::Returned => {
+                                if !resume_after_native_return(process) {
+                                    break Ok(RunState::Done(process.x[0]));
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        arinsal_beamasm::ExitReason::Unsupported => {
-                            return Err(VmError::Unsupported(
-                                "native execution unavailable".into(),
-                            ));
+                            arinsal_beamasm::ExitReason::Unsupported => {
+                                return Err(VmError::Unsupported(
+                                    "native execution unavailable".into(),
+                                ));
+                            }
                         }
                     }
-                }
-                let result = process
-                    .drain(ctx)
-                    .and_then(|()| self.vm.run_slice(process, Some(ctx), budget));
-                if hibernate_stopped(process, ctx.pid()) {
-                    process.drain(ctx)?;
-                    if process.inbox.is_empty() {
-                        if let Some(runtime) = process.runtime.clone() {
-                            runtime.mark_hibernating(ctx.pid(), true);
+                    let result = process
+                        .drain(ctx)
+                        .and_then(|()| self.vm.run_slice(process, Some(ctx), budget));
+                    if hibernate_stopped(process, ctx.pid()) {
+                        process.drain(ctx)?;
+                        if process.inbox.is_empty() {
+                            if let Some(runtime) = process.runtime.clone() {
+                                runtime.mark_hibernating(ctx.pid(), true);
+                            }
+                            break Ok(RunState::Wait { timeout_ms: None });
                         }
-                        break Ok(RunState::Wait { timeout_ms: None });
+                        self.install_apply(process, ctx)?;
+                        continue;
                     }
-                    self.install_apply(process, ctx)?;
-                    continue;
-                }
-                let trap = match result {
-                    // Port of erts/preloaded/src/erts_internal.erl:152 (await_result), OTP-29.1.1.
-                    // A cross-process BIF parked this process until the reply signal arrives.
-                    Err(VmError::Unsupported(message))
-                        if crate::signals::is_await_message(&message) =>
+                    if matches!(&result, Ok(RunState::Yield))
+                        && process
+                            .runtime
+                            .as_ref()
+                            .is_some_and(|runtime| runtime.suspend_total_of(ctx.pid()) > 0)
                     {
                         break Ok(RunState::Wait { timeout_ms: None });
                     }
-                    Err(VmError::Trap(trap)) => {
-                        // g_port_fix: busy port_command suspends the sender and retries the call.
-                        if crate::port::take_busy_suspend() {
+                    let trap = match result {
+                        // Port of erts/preloaded/src/erts_internal.erl:152 (await_result), OTP-29.1.1.
+                        // A cross-process BIF parked this process until the reply signal arrives.
+                        Err(VmError::Unsupported(message))
+                            if crate::signals::is_await_message(&message) =>
+                        {
                             break Ok(RunState::Wait { timeout_ms: None });
                         }
-                        trap
-                    }
-                    Err(VmError::Exception { reason, frame }) => {
-                        if trace_boot_enabled() {
-                            eprintln!("arinsal boot: exception {reason} at {frame}");
+                        Err(VmError::Trap(trap)) => {
+                            // g_port_fix: busy port_command suspends the sender and retries the call.
+                            if crate::port::take_busy_suspend() {
+                                break Ok(RunState::Wait { timeout_ms: None });
+                            }
+                            trap
                         }
-                        let mut trap = crate::exceptions::from_legacy(&reason)?;
-                        if reason == "undef"
-                            && let Some((mfa, arity)) = frame.rsplit_once('/')
-                            && let Some((module, function)) = mfa.split_once(':')
-                            && let Ok(arity) = arity.parse::<usize>()
-                            && arity <= process.x.len()
-                        {
-                            let arguments = {
-                                let mut heap = crate::FragmentingHeap(&mut process.heap);
-                                TermBuilder::new(&mut heap)
-                                    .list_from_iter(process.x[..arity].iter().copied())
-                                    .map_err(|error| {
-                                        VmError::Unsupported(format!("undef arguments: {error:?}"))
-                                    })?
-                            };
-                            trap.top = Some(crate::stacktrace::TopFrame::Bif {
-                                module: module.to_owned(),
-                                function: function.to_owned(),
-                                args: arguments,
-                            });
+                        Err(VmError::Exception { reason, frame }) => {
+                            if trace_boot_enabled() {
+                                eprintln!("arinsal boot: exception {reason} at {frame}");
+                            }
+                            let mut trap = crate::exceptions::from_legacy(&reason)?;
+                            if reason == "undef"
+                                && let Some((mfa, arity)) = frame.rsplit_once('/')
+                                && let Some((module, function)) = mfa.split_once(':')
+                                && let Ok(arity) = arity.parse::<usize>()
+                                && arity <= process.x.len()
+                            {
+                                let arguments = {
+                                    let mut heap = crate::FragmentingHeap(&mut process.heap);
+                                    TermBuilder::new(&mut heap)
+                                        .list_from_iter(process.x[..arity].iter().copied())
+                                        .map_err(|error| {
+                                            VmError::Unsupported(format!(
+                                                "undef arguments: {error:?}"
+                                            ))
+                                        })?
+                                };
+                                trap.top = Some(crate::stacktrace::TopFrame::Bif {
+                                    module: module.to_owned(),
+                                    function: function.to_owned(),
+                                    args: arguments,
+                                });
+                            }
+                            trap
                         }
-                        trap
-                    }
-                    Err(VmError::ExceptionInfo {
-                        reason,
-                        frame,
-                        info,
-                    }) => {
-                        if trace_boot_enabled() {
-                            eprintln!("arinsal boot: exception {reason} at {frame}");
+                        Err(VmError::ExceptionInfo {
+                            reason,
+                            frame,
+                            info,
+                        }) => {
+                            if trace_boot_enabled() {
+                                eprintln!("arinsal boot: exception {reason} at {frame}");
+                            }
+                            let mut trap = crate::exceptions::from_legacy(&reason)?;
+                            let arity = self.vm.modules[process.module]
+                                .function_at(process.ip)
+                                .map(|(_, arity)| arity)
+                                .unwrap_or(0);
+                            trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+                                Some(Term::small(i64::from(arity)).expect("arity is small")),
+                                Box::new(info),
+                            ));
+                            trap
                         }
-                        let mut trap = crate::exceptions::from_legacy(&reason)?;
-                        let arity = self.vm.modules[process.module]
-                            .function_at(process.ip)
-                            .map(|(_, arity)| arity)
-                            .unwrap_or(0);
-                        trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
-                            Some(Term::small(i64::from(arity)).expect("arity is small")),
-                            Box::new(info),
-                        ));
-                        trap
+                        other => break other,
+                    };
+                    if trace_boot_enabled() {
+                        eprintln!(
+                            "arinsal boot: process {:?} trap in {} at ip {} line {:?} instruction {:?}: {:?} reason {:?}",
+                            ctx.pid(),
+                            self.vm.frame_name(process),
+                            process.ip,
+                            self.vm.modules[process.module].lines.get(process.ip),
+                            self.vm.modules[process.module].code.get(process.ip),
+                            trap.class,
+                            arinsal_term::to_owned(trap.reason)
+                        );
                     }
-                    other => break other,
-                };
-                if trace_boot_enabled() {
-                    eprintln!(
-                        "arinsal boot: process {:?} trap in {} at ip {} line {:?} instruction {:?}: {:?} reason {:?}",
-                        ctx.pid(),
-                        self.vm.frame_name(process),
-                        process.ip,
-                        self.vm.modules[process.module].lines.get(process.ip),
-                        self.vm.modules[process.module].code.get(process.ip),
-                        trap.class,
-                        arinsal_term::to_owned(trap.reason)
-                    );
-                }
-                let resumed = crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap)?;
-                if let Some(error) = resumed {
-                    break Err(error);
-                }
-                // boot_loop2: a caught exit must not survive as a later process exit reason.
-                if let Some(cold) = process.cold.as_mut() {
-                    cold.exit_reason = None;
+                    let resumed =
+                        crate::exceptions::resume(&mut self.vm, process, Some(ctx), trap)?;
+                    if let Some(error) = resumed {
+                        break Err(error);
+                    }
+                    // boot_loop2: a caught exit must not survive as a later process exit reason.
+                    if let Some(cold) = process.cold.as_mut() {
+                        cold.exit_reason = None;
+                    }
                 }
             }
         })();
@@ -1756,14 +1804,23 @@ impl Runtime {
         body(&code.modules)
     }
 
-    /// Spawn `Module:Function(Args)` onto this runtime's scheduler.
-    ///
-    /// Used by the DistCtrlr port ingest path which has no `&mut Vm` / `RunCtx`.
-    pub(crate) fn spawn_mfa(
+    /// Create a distributed spawn child without running it before the spawn reply.
+    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
+    pub(crate) fn spawn_mfa_unscheduled(
         self: &Arc<Self>,
         module: &str,
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
+    ) -> Result<Pid, VmError> {
+        self.spawn_mfa_scheduled(module, function, args, false)
+    }
+
+    fn spawn_mfa_scheduled(
+        self: &Arc<Self>,
+        module: &str,
+        function: &str,
+        args: &[arinsal_etf::OwnedTerm],
+        scheduled: bool,
     ) -> Result<Pid, VmError> {
         let (module_id, ip) = {
             let code = self.code.lock().unwrap();
@@ -1786,17 +1843,32 @@ impl Runtime {
         child.ip = ip;
         child.runtime = Some(Arc::clone(self));
         child.cold_mut().group_leader = None;
+        if let Some(arity) = u8::try_from(args.len()).ok()
+            && arinsal_bifs::lookup(module, function, arity).is_some()
+        {
+            child.cold_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
+        }
         for (index, owned) in args.iter().enumerate() {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
             child.x[index] = arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?;
         }
         let scheduler = self.scheduler()?;
-        let pid = scheduler
-            .spawn(child)
-            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+        let pid = if scheduled {
+            scheduler.spawn(child)
+        } else {
+            scheduler.spawn_unscheduled(child)
+        }
+        .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
         self.processes.lock().unwrap().insert(pid);
         Ok(pid)
+    }
+
+    /// Schedule a distributed child after its spawn reply was queued.
+    pub(crate) fn schedule_spawn(&self, pid: Pid) -> Result<(), VmError> {
+        self.scheduler()?
+            .schedule_unscheduled(pid)
+            .map_err(|error| VmError::Unsupported(format!("spawn schedule: {error}")))
     }
 }
 
@@ -1852,6 +1924,7 @@ impl Process {
         // g_proc_sched: a terminating suspender releases every suspend it acquired.
         // g_port_fix: close owned ports synchronously on the termination path.
         if let Some(runtime) = self.runtime.clone() {
+            crate::node_tables::lock().forget_node_monitors(ctx.pid());
             let wake = runtime.release_suspender(ctx.pid());
             for pid in wake {
                 let _ = ctx.signal(pid, arinsal_sched::Signal::UnlinkAck(u64::MAX));
@@ -1907,6 +1980,11 @@ impl Process {
             return;
         };
         for pid in cold.links {
+            if self.runtime.as_ref().is_some_and(|runtime| {
+                crate::dist::forward_link_exit_if_proxy(runtime, pid, ctx.pid(), reason)
+            }) {
+                continue;
+            }
             if let Ok(message) = Message::copy_from(reason) {
                 let _ = ctx.signal(pid, arinsal_sched::Signal::Exit(message));
             }
@@ -2212,9 +2290,14 @@ impl Process {
                         return Err(VmError::Trap(crate::exceptions::Trap::killed()));
                     }
                     if self.trap_exit {
-                        let from = from.to_term().ok_or_else(|| {
-                            VmError::Unsupported("invalid signal sender pid".into())
-                        })?;
+                        // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
+                        // A scheduler proxy stands in for a remote PID internally, but
+                        // EXIT messages expose the peer's original PID to Erlang code.
+                        let from = crate::dist::remote_pid_term(self, from)?
+                            .or_else(|| from.to_term())
+                            .ok_or_else(|| {
+                                VmError::Unsupported("invalid signal sender pid".into())
+                            })?;
                         let tuple = self.tuple(&[crate::signals::atom("EXIT"), from, reason])?;
                         if priority {
                             self.push_priority_message(tuple)?;
@@ -2376,8 +2459,8 @@ impl Process {
             cold.monitors.remove(&reference);
         }
         let reference = crate::signals::reference(self, reference)?;
-        let from = from
-            .to_term()
+        let from = crate::dist::remote_pid_term(self, from)?
+            .or_else(|| from.to_term())
             .ok_or_else(|| VmError::Unsupported("invalid monitor sender pid".into()))?;
         let tuple = self.tuple(&[
             tag,

@@ -1280,6 +1280,52 @@ pub fn encode_dist_packet_terms(
     out
 }
 
+/// Encode consecutive terms as normal or 64 KiB fragmented distribution packets.
+///
+/// The atom cache is updated once for the complete signal, and only the first
+/// fragment carries its translation table. Fragment ids descend to one.
+/// Port of erts/emulator/beam/external.c:684-704 and :1230-1245,
+/// OTP-29.1.1.
+pub fn encode_dist_packet_terms_fragmented(
+    terms: &[&OwnedTerm],
+    cache: &mut AtomCache,
+    sequence_id: u64,
+    fragment_size: usize,
+) -> Result<Vec<Vec<u8>>, DecodeError> {
+    if fragment_size == 0 {
+        return Err(invalid(0, "zero distribution fragment size"));
+    }
+    let cache_before = cache.clone();
+    let packet = encode_dist_packet_terms(terms, cache, None);
+    let mut decode_cache = cache_before;
+    let decoded = decode_dist_packet(&packet, &mut decode_cache)?;
+    let payload_start = packet.len() - decoded.payload.len();
+    if decoded.payload.len() <= fragment_size {
+        return Ok(vec![packet]);
+    }
+    let fragment_count = decoded.payload.len().div_ceil(fragment_size);
+    let mut fragments = Vec::with_capacity(fragment_count);
+    let mut first = Vec::with_capacity(18 + payload_start + fragment_size);
+    first.extend_from_slice(&[131, 69]);
+    first.extend_from_slice(&sequence_id.to_be_bytes());
+    first.extend_from_slice(&(fragment_count as u64).to_be_bytes());
+    first.extend_from_slice(&packet[2..payload_start]);
+    first.extend_from_slice(&decoded.payload[..fragment_size]);
+    fragments.push(first);
+    for (index, payload) in decoded.payload[fragment_size..]
+        .chunks(fragment_size)
+        .enumerate()
+    {
+        let fragment_id = fragment_count - index - 1;
+        fragments.push(encode_dist_continuation(
+            sequence_id,
+            fragment_id as u64,
+            payload,
+        ));
+    }
+    Ok(fragments)
+}
+
 /// Encode one `DIST_FRAG_CONT` packet.
 pub fn encode_dist_continuation(sequence_id: u64, fragment_id: u64, payload: &[u8]) -> Vec<u8> {
     // Port of erts_encode_ext_dist_header_fragment, external.c:478-489, OTP-29.1.1.

@@ -577,6 +577,23 @@ fn native_record_layout_order_hash_and_copy() {
     let copy = copy_term(first, &mut dst).unwrap();
     assert!(exact_eq(first, copy));
     assert_eq!(size_object(first), dst.used_words());
+    let owned = to_owned(first).unwrap();
+    assert_eq!(
+        owned,
+        OwnedTerm::Record {
+            exported: true,
+            module: "record_module".into(),
+            name: "record_name".into(),
+            fields: vec![
+                ("zeta".into(), OwnedTerm::Int(9)),
+                ("alpha".into(), OwnedTerm::Int(2)),
+                ("beta".into(), OwnedTerm::Int(3)),
+            ],
+        }
+    );
+    let mut rebuilt_heap = VecHeap::new();
+    let rebuilt = from_owned(&owned, &mut rebuilt_heap).unwrap();
+    assert!(exact_eq(first, rebuilt));
 }
 
 #[test]

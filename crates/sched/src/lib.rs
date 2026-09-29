@@ -88,6 +88,7 @@ const WAIT_TIMER_DEFERRED: u64 = u64::MAX;
 const RUNNING: u8 = 1;
 const WAITING: u8 = 2;
 const EXITED: u8 = 3;
+const UNSCHEDULED: u8 = 4;
 const PID_LIMIT: u32 = 1 << 28;
 const PID_PAGE_SIZE: usize = 1024;
 const UNBOUND_WORKER: usize = usize::MAX;
@@ -958,7 +959,8 @@ impl<T: Task> Inner<T> {
         remaining: u32,
     ) -> Result<(), Error> {
         let process = self.table.lookup(to).ok_or(Error::NoProcess)?;
-        let counted = process.state.load(Ordering::Acquire) != WAITING;
+        let state = process.state.load(Ordering::Acquire);
+        let counted = state != WAITING && state != UNSCHEDULED;
         if counted {
             process.backlog.fetch_add(1, Ordering::Relaxed);
         }
@@ -2039,7 +2041,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let process = self.lookup(pid).ok_or(Error::NoProcess)?;
         process
             .state
-            .compare_exchange(WAITING, QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(UNSCHEDULED, QUEUED, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| Error::NoProcess)?;
         let item = Scheduled {
             process: process.clone(),
@@ -2467,10 +2469,9 @@ impl<T: Task> Scheduler<T> {
     /// Insert a child whose caller will publish it with [`RunCtx::schedule_spawn`].
     /// The caller must schedule it exactly once, including after any later error.
     pub fn spawn_unscheduled(&self, task: T) -> Result<Pid, Error> {
-        self.inner
-            .table
-            .insert(task, Priority::Normal, None)
-            .map(|process| process.pid)
+        let process = self.inner.table.insert(task, Priority::Normal, None)?;
+        process.state.store(UNSCHEDULED, Ordering::Release);
+        Ok(process.pid)
     }
     /// Insert a child whose caller publishes it on a one-based scheduler id.
     pub fn spawn_unscheduled_on(&self, task: T, scheduler_id: usize) -> Result<Pid, Error> {
@@ -2478,10 +2479,29 @@ impl<T: Task> Scheduler<T> {
         if worker >= self.inner.config.workers {
             return Err(Error::Capacity);
         }
-        self.inner
+        let process = self
+            .inner
             .table
-            .insert(task, Priority::Normal, Some(worker))
-            .map(|process| process.pid)
+            .insert(task, Priority::Normal, Some(worker))?;
+        process.state.store(UNSCHEDULED, Ordering::Release);
+        Ok(process.pid)
+    }
+    /// Make a task inserted by [`Self::spawn_unscheduled`] runnable.
+    /// The caller must schedule each inserted task exactly once.
+    pub fn schedule_unscheduled(&self, pid: Pid) -> Result<(), Error> {
+        let process = self.inner.table.lookup(pid).ok_or(Error::NoProcess)?;
+        process
+            .state
+            .compare_exchange(UNSCHEDULED, QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::NoProcess)?;
+        self.inner.enqueue(
+            Scheduled {
+                process,
+                inherited: None,
+            },
+            false,
+        );
+        Ok(())
     }
     /// Spawn a task at a chosen scheduler priority.
     pub fn spawn_priority(&self, task: T, priority: Priority) -> Result<Pid, Error> {
@@ -2965,6 +2985,60 @@ mod msgq_stage_microbench {
             })
             .collect::<Vec<_>>();
         assert_eq!(messages, [1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod spawn_request_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct LinkSignalProbe(Arc<AtomicUsize>);
+
+    impl Task for LinkSignalProbe {
+        type Message = ();
+
+        fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _: u32) -> RunOutcome {
+            while let Some(event) = ctx.receive() {
+                if matches!(event.payload, Payload::Signal(Signal::Link)) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            RunOutcome::Wait { timeout_ms: None }
+        }
+    }
+
+    #[test]
+    fn unscheduled_process_signals_do_not_publish_child() {
+        let scheduler = Scheduler::simulation(
+            Config {
+                workers: 1,
+                max_processes: 8,
+                ..Config::default()
+            },
+            1,
+        );
+        let observed = Arc::new(AtomicUsize::new(0));
+        let child = scheduler
+            .spawn_unscheduled(LinkSignalProbe(Arc::clone(&observed)))
+            .unwrap();
+        scheduler
+            .signal(
+                Pid {
+                    index: 7,
+                    generation: 0,
+                },
+                child,
+                Signal::Link,
+            )
+            .unwrap();
+
+        assert!(!scheduler.step(), "setup signal scheduled the child");
+        assert_eq!(observed.load(Ordering::Relaxed), 0);
+
+        scheduler.schedule_unscheduled(child).unwrap();
+        assert!(scheduler.step());
+        assert_eq!(observed.load(Ordering::Relaxed), 1);
     }
 }
 

@@ -752,6 +752,7 @@ fn format_fun_atom(name: &str) -> String {
 /// `spawn_request` and `dist_spawn_request` are the exception: only the
 /// `erts_internal` entries are BIFs, so the `erlang` wrappers stay in BEAM.
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
+    ("erlang", "exit", 1),
     ("erlang", "group_leader", 0),
     ("erts_internal", "group_leader", 2),
     ("erts_internal", "group_leader", 3),
@@ -1269,6 +1270,10 @@ fn call_values(
     }
     let result = (|| -> Result<Term, VmError> {
         match (function, args) {
+            ("exit", [reason]) => {
+                // Port of erts/emulator/beam/bif.c:1536 (exit_1), OTP-29.1.1.
+                Err(VmError::Trap(crate::exceptions::Trap::exit(*reason)))
+            }
             ("group_leader", []) => Ok(process
                 .cold
                 .as_ref()
@@ -1298,10 +1303,21 @@ fn call_values(
                 if pid.classify() != TermKind::Pid {
                     return Err(badarg());
                 }
-                let (index, serial) = pid
-                    .as_pid()
-                    .ok_or_else(|| VmError::Unsupported("pid_to_list for external pid".into()))?;
-                let value = format!("<0.{index}.{serial}>");
+                let Some(Identity::Pid {
+                    node,
+                    index,
+                    serial,
+                    ..
+                }) = pid.identity()
+                else {
+                    return Err(badarg());
+                };
+                let node = if node == arinsal_term::atoms::NONAME {
+                    "0".to_owned()
+                } else {
+                    global_atoms().text(node).ok_or_else(badarg)?.to_string()
+                };
+                let value = format!("<{node}.{index}.{serial}>");
                 let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
                 TermBuilder::new(&mut heap)
                     .string_to_list(&value)
@@ -1328,18 +1344,44 @@ fn call_values(
             ("fun_to_list", [fun]) if module == "erlang" => charlist(process, &fun_to_list(*fun)?),
             ("yield", []) if module == "erlang" => Ok(atom("true")),
             ("process_flag", [name, value]) => {
-                if *name == atom("monitor_nodes") || {
-                    // SAFETY: The flag term remains in the caller's live heap.
-                    unsafe { name.tuple_ref() }.is_some_and(|tuple| {
-                        tuple.len() == 2 && tuple.get(0) == Some(atom("monitor_nodes"))
-                    })
-                } {
-                    if *value != atom("true") && *value != atom("false") {
-                        return Err(badarg());
-                    }
-                    let cold = process.cold_mut();
-                    let previous = cold.monitor_nodes;
-                    cold.monitor_nodes = usize::from(*value == atom("true"));
+                if *name == atom("monitor_nodes") {
+                    let enabled = match *value {
+                        value if value == atom("true") => true,
+                        value if value == atom("false") => false,
+                        _ => return Err(badarg()),
+                    };
+                    let previous = crate::node_tables::lock().monitor_nodes(
+                        ctx.pid(),
+                        crate::node_tables::NodeMonitorOptions::default(),
+                        enabled,
+                    );
+                    let count = process.cold.as_ref().map_or(0, |cold| cold.monitor_nodes);
+                    process.cold_mut().monitor_nodes = if enabled {
+                        count.saturating_add(1)
+                    } else {
+                        count.saturating_sub(1)
+                    };
+                    return Term::small(previous as i64).ok_or_else(badarg);
+                }
+                if let Ok(arinsal_etf::OwnedTerm::Tuple(parts)) = &arinsal_term::to_owned(*name)
+                    && parts.len() == 2
+                    && parts[0] == arinsal_etf::OwnedTerm::atom("monitor_nodes")
+                {
+                    let enabled = match *value {
+                        value if value == atom("true") => true,
+                        value if value == atom("false") => false,
+                        _ => return Err(badarg()),
+                    };
+                    let options = crate::node_tables::parse_nodes_monitor_options(&parts[1])
+                        .map_err(|_| badarg())?;
+                    let previous =
+                        crate::node_tables::lock().monitor_nodes(ctx.pid(), options, enabled);
+                    let count = process.cold.as_ref().map_or(0, |cold| cold.monitor_nodes);
+                    process.cold_mut().monitor_nodes = if enabled {
+                        count.saturating_add(1)
+                    } else {
+                        count.saturating_sub(1)
+                    };
                     return Term::small(previous as i64).ok_or_else(badarg);
                 }
                 let name = atom_name(*name).ok_or_else(badarg)?;

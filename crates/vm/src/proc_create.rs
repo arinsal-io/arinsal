@@ -83,6 +83,8 @@ pub struct Process {
     /// mix_loop1. Port of the freason kept across `i_raise` (beam_emu), OTP-29.1.1.
     pub(crate) exc_class: Option<arinsal_bifs::Class>,
     pub(crate) entry: bool,
+    /// A dist send that suspended must yield even if the queue drains before return.
+    pub(crate) force_yield: bool,
 }
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
@@ -106,6 +108,8 @@ pub(crate) struct ProcessCold {
     /// while the stacktrace is built, so a raw `Term` here would dangle and
     /// monitors would observe a corrupted reason.
     pub(crate) exit_reason: Option<arinsal_etf::OwnedTerm>,
+    /// Spawned MFA entry that resolves to a runtime BIF export.
+    pub(crate) initial_bif: Option<(String, String, u8)>,
     pub(crate) dictionary: Vec<(Term, Term)>,
     pub(crate) dictionary_heap: arinsal_term::VecHeap,
     pub(crate) flags: HashMap<String, Term>,
@@ -262,6 +266,7 @@ impl Process {
             trap_exit: false,
             exc_class: None,
             entry: false,
+            force_yield: false,
         };
         process.sync_header();
         #[cfg(feature = "pf-mem-counters")]

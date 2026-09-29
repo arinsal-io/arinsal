@@ -1566,7 +1566,8 @@ impl Vm {
                 offset < module.code.len(),
                 "instruction pointer out of bounds"
             );
-            if consumed == budget {
+            if consumed == budget || p.force_yield {
+                p.force_yield = false;
                 sync_cursor(p, htop, &mut heap_dirty);
                 p.module = module_id;
                 p.ip = offset;

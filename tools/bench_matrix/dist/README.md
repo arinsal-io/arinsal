@@ -53,7 +53,16 @@ small_atom      | erpc |        180 |        400 |       5500 |      12000
 
 ### erts <-> arinsal
 
-Cross-runtime numbers deferred (erts peer harness); arinsal↔arinsal is live.
+Measured on Apple M1 Pro with the erts client and Arinsal server using the same
+1,000-call warmup, five 2,000-sample RTT runs, and throughput runs as `dist_rtt`.
+The current mixed run covers `small_atom`; the full payload matrix exceeded the
+supervised run limit at `map_100`.
+
+Payload    | Mode | RTT Med | RTT p99 | Tp 1 | Tp 16
+-----------|------|---------|---------|------|------
+small_atom | pid  |     151 |     296 | 6682 | 37226
+small_atom | name |     137 |     573 | 4752 | 32893
+small_atom | erpc |     197 |     361 | 4806 | 15058
 
 ### Microbench: erts
 

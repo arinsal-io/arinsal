@@ -1,11 +1,14 @@
 //! Runtime-wide node names, distribution entries, and node monitors.
 
-use arinsal_etf::{AtomCache, OwnedTerm};
+use arinsal_etf::{AtomCache, DistributionPacket, OwnedTerm};
 use arinsal_sched::Pid;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
+
+pub(crate) const DFLAG_FRAGMENTS: u64 = 0x0080_0000;
+pub(crate) const DFLAG_EXIT_PAYLOAD: u64 = 0x0040_0000;
 
 /// Connection lifecycle for one [`NodeEntry`].
 ///
@@ -46,19 +49,49 @@ pub(crate) struct DistState {
     pub(crate) owner: Pid,
     pub(crate) input_handler: Pid,
     pub(crate) output: VecDeque<Vec<u8>>,
+    /// Number of FIFO head packets prepared for the port scheduler.
+    pub(crate) output_ready_packets: usize,
+    /// Serializes port writes so concurrent schedulers cannot reorder atom-cache headers.
+    pub(crate) flushing_output: bool,
+    /// Encoded fragment tails retained until the sending process continues.
+    pub(crate) fragment_continuations: VecDeque<DistFragmentContinuation>,
     pub(crate) incoming_cache: AtomCache,
+    pub(crate) outgoing_sequence_id: u64,
+    /// Incomplete incoming fragmented signals, keyed by OTP sequence id.
+    pub(crate) incoming_fragments: HashMap<u64, IncomingDistFragment>,
     pub(crate) outgoing_cache: AtomCache,
     pub(crate) get_size: bool,
     pub(crate) notify: bool,
     pub(crate) read: u64,
     pub(crate) written: u64,
     pub(crate) pending_bytes: u64,
+    pub(crate) busy_limit: u64,
+    pub(crate) busy: bool,
+    /// The inet port's own busy state is separate from the dist entry queue.
+    pub(crate) port_busy: bool,
+    pub(crate) suspended_senders: Vec<Pid>,
     pub(crate) flags: u64,
     pub(crate) remote_pids: HashMap<(u32, u32, u32), Pid>,
     /// Reverse map for local proxy pids created by [`Self::remote_pids`].
     pub(crate) proxy_to_remote: HashMap<Pid, OwnedTerm>,
     pub(crate) remote_monitors: BTreeMap<u64, OwnedTerm>,
+    /// Original ETF refs from remote monitor requests, preserving all reference words.
+    pub(crate) remote_monitor_refs: BTreeMap<u64, OwnedTerm>,
     pub(crate) spawn_requests: BTreeMap<u64, SpawnRequest>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DistFragmentContinuation {
+    /// `None` is output from a no-suspend controller/exit path.
+    pub(crate) sender: Option<Pid>,
+    pub(crate) remaining_packets: usize,
+}
+
+/// Reassembly state for an OTP `DIST_FRAG_HEADER` signal.
+#[derive(Clone, Debug)]
+pub(crate) struct IncomingDistFragment {
+    pub(crate) next_fragment_id: u64,
+    pub(crate) packet: DistributionPacket,
 }
 
 /// Outstanding `spawn_request` waiting for `DOP_SPAWN_REPLY`.
@@ -79,37 +112,73 @@ impl DistState {
             owner,
             input_handler: owner,
             output: VecDeque::new(),
+            output_ready_packets: 0,
+            flushing_output: false,
+            fragment_continuations: VecDeque::new(),
             incoming_cache: AtomCache::new(),
+            outgoing_sequence_id: 1,
+            incoming_fragments: HashMap::new(),
             outgoing_cache: AtomCache::new(),
             get_size: false,
             notify: false,
             read: 0,
             written: 0,
             pending_bytes: 0,
+            busy_limit: 1024 * 1024,
+            busy: false,
+            port_busy: false,
+            suspended_senders: Vec::new(),
             flags,
             remote_pids: HashMap::new(),
             proxy_to_remote: HashMap::new(),
             remote_monitors: BTreeMap::new(),
+            remote_monitor_refs: BTreeMap::new(),
             spawn_requests: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn queue_term(&mut self, control: OwnedTerm, message: Option<OwnedTerm>) {
-        let _negotiated_flags = self.flags;
-        let packet = if let Some(message) = message {
-            arinsal_etf::encode_dist_packet_terms(
-                &[&control, &message],
-                &mut self.outgoing_cache,
-                None,
-            )
-        } else {
-            arinsal_etf::encode_dist_packet(&control, &mut self.outgoing_cache, None)
-        };
-        self.pending_bytes = self.pending_bytes.saturating_add(packet.len() as u64);
-        self.output.push_back(packet);
+    pub(crate) fn queue_term(
+        &mut self,
+        control: OwnedTerm,
+        message: Option<OwnedTerm>,
+    ) -> Result<(), arinsal_etf::DecodeError> {
+        let packets = self.encode_packets(&control, message.as_ref())?;
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(packets.iter().map(|packet| packet.len() as u64).sum());
+        self.output.extend(packets);
+        Ok(())
     }
 
-    /// Encode one signal and return the packet bytes (also tracked in pending).
+    fn encode_packets(
+        &mut self,
+        control: &OwnedTerm,
+        message: Option<&OwnedTerm>,
+    ) -> Result<Vec<Vec<u8>>, arinsal_etf::DecodeError> {
+        let sequence_id = self.outgoing_sequence_id;
+        self.outgoing_sequence_id = self.outgoing_sequence_id.wrapping_add(1).max(1);
+        let mut terms = vec![control];
+        if let Some(message) = message {
+            terms.push(message);
+        }
+        let packets = if self.flags & DFLAG_FRAGMENTS != 0 {
+            arinsal_etf::encode_dist_packet_terms_fragmented(
+                &terms,
+                &mut self.outgoing_cache,
+                sequence_id,
+                64 * 1024,
+            )?
+        } else {
+            vec![arinsal_etf::encode_dist_packet_terms(
+                &terms,
+                &mut self.outgoing_cache,
+                None,
+            )]
+        };
+        Ok(packets)
+    }
+
+    /// Encode one signal as ordered framed distribution packets.
     ///
     /// Callers that hold [`lock`] must relabel local identities first — this
     /// method must not take the node-tables lock.
@@ -117,18 +186,12 @@ impl DistState {
         &mut self,
         control: OwnedTerm,
         message: Option<OwnedTerm>,
-    ) -> Vec<u8> {
-        let packet = if let Some(message) = message {
-            arinsal_etf::encode_dist_packet_terms(
-                &[&control, &message],
-                &mut self.outgoing_cache,
-                None,
-            )
-        } else {
-            arinsal_etf::encode_dist_packet(&control, &mut self.outgoing_cache, None)
-        };
-        self.pending_bytes = self.pending_bytes.saturating_add(packet.len() as u64);
-        packet
+    ) -> Result<Vec<Vec<u8>>, arinsal_etf::DecodeError> {
+        let packets = self.encode_packets(&control, message.as_ref())?;
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(packets.iter().map(|packet| packet.len() as u64).sum());
+        Ok(packets)
     }
 }
 
@@ -177,6 +240,12 @@ pub(crate) fn relabel_local_node(mut term: OwnedTerm, local: &str, creation: u32
                 *value = relabel_local_node(taken_v, local, creation);
             }
         }
+        OwnedTerm::Record { fields, .. } => {
+            for (_, value) in fields {
+                let taken = std::mem::replace(value, OwnedTerm::Nil);
+                *value = relabel_local_node(taken, local, creation);
+            }
+        }
         _ => {}
     }
     term
@@ -187,6 +256,76 @@ pub(crate) struct NodeMonitor {
     pub(crate) pid: Pid,
     pub(crate) node: String,
     pub(crate) references: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct NodeMonitorOptions {
+    pub(crate) info_map: bool,
+    pub(crate) list: bool,
+    pub(crate) connection_id: bool,
+    pub(crate) visible: bool,
+    pub(crate) hidden: bool,
+    pub(crate) nodedown_reason: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NodesMonitor {
+    pub(crate) pid: Pid,
+    pub(crate) options: NodeMonitorOptions,
+    pub(crate) references: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NodesMonitorEvent {
+    pub(crate) pid: Pid,
+    pub(crate) message: OwnedTerm,
+}
+
+/// Decode and validate the options accepted by `process_flag({monitor_nodes, Map}, Bool)`.
+/// Port of erts/emulator/beam/dist.c:6732-6790, OTP-29.1.1.
+pub(crate) fn parse_nodes_monitor_options(options: &OwnedTerm) -> Result<NodeMonitorOptions, ()> {
+    let OwnedTerm::Map(entries) = options else {
+        return Err(());
+    };
+    let mut result = NodeMonitorOptions {
+        info_map: true,
+        ..NodeMonitorOptions::default()
+    };
+    for (key, value) in entries {
+        let OwnedTerm::Atom(key) = key else {
+            return Err(());
+        };
+        match key.as_str() {
+            "list" => match value {
+                OwnedTerm::Atom(value) if value == "true" => {
+                    result.list = true;
+                    result.info_map = false;
+                }
+                _ => return Err(()),
+            },
+            "connection_id" => match value {
+                OwnedTerm::Atom(value) if value == "true" => result.connection_id = true,
+                OwnedTerm::Atom(value) if value == "false" => {}
+                _ => return Err(()),
+            },
+            "node_type" => match value {
+                OwnedTerm::Atom(value) if value == "visible" => result.visible = true,
+                OwnedTerm::Atom(value) if value == "hidden" => result.hidden = true,
+                OwnedTerm::Atom(value) if value == "all" => {
+                    result.visible = true;
+                    result.hidden = true;
+                }
+                _ => return Err(()),
+            },
+            "nodedown_reason" => match value {
+                OwnedTerm::Atom(value) if value == "true" => result.nodedown_reason = true,
+                OwnedTerm::Atom(value) if value == "false" => {}
+                _ => return Err(()),
+            },
+            _ => return Err(()),
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,9 +341,11 @@ pub(crate) struct NodeTables {
     pub(crate) local_name: String,
     pub(crate) local_creation: u32,
     pub(crate) alive: bool,
+    pub(crate) distribution_buffer_busy_limit: u64,
     pub(crate) entries: BTreeMap<String, NodeEntry>,
     pub(crate) monitors: Vec<NodeMonitor>,
     pending_delete: HashMap<String, Instant>,
+    pub(crate) nodes_monitors: Vec<NodesMonitor>,
 }
 
 impl Default for NodeTables {
@@ -229,9 +370,11 @@ impl Default for NodeTables {
             local_name: "nonode@nohost".into(),
             local_creation: 0,
             alive: false,
+            distribution_buffer_busy_limit: 1024 * 1024,
             entries,
             monitors: Vec::new(),
             pending_delete: HashMap::new(),
+            nodes_monitors: Vec::new(),
         }
     }
 }
@@ -317,6 +460,12 @@ fn fresh_entry(name: String) -> NodeEntry {
 }
 
 impl NodeTables {
+    pub(crate) fn set_distribution_buffer_busy_limit(&mut self, limit: u64) {
+        if !self.alive {
+            self.distribution_buffer_busy_limit = limit.max(1);
+        }
+    }
+
     pub(crate) fn local_identity(&self) -> (&str, u32) {
         let entry = self
             .entries
@@ -496,6 +645,131 @@ impl NodeTables {
             .entry(node.clone())
             .or_insert_with(|| fresh_entry(node.clone()));
         !self.disconnect(&node).is_empty()
+    }
+
+    /// Register an emulator-level node monitor and return its previous reference count.
+    /// Port of erts/emulator/beam/dist.c:6732-6848 (`erts_monitor_nodes`), OTP-29.1.1.
+    pub(crate) fn monitor_nodes(
+        &mut self,
+        pid: Pid,
+        options: NodeMonitorOptions,
+        enabled: bool,
+    ) -> usize {
+        if let Some(monitor) = self
+            .nodes_monitors
+            .iter_mut()
+            .find(|monitor| monitor.pid == pid && monitor.options == options)
+        {
+            let previous = monitor.references;
+            if enabled {
+                monitor.references += 1;
+            } else if monitor.references > 1 {
+                monitor.references -= 1;
+            } else {
+                self.nodes_monitors
+                    .retain(|monitor| monitor.pid != pid || monitor.options != options);
+            }
+            previous
+        } else if enabled {
+            self.nodes_monitors.push(NodesMonitor {
+                pid,
+                options,
+                references: 1,
+            });
+            0
+        } else {
+            0
+        }
+    }
+
+    /// Forget all node monitor registrations owned by a terminating process.
+    pub(crate) fn forget_node_monitors(&mut self, pid: Pid) {
+        self.monitors.retain(|monitor| monitor.pid != pid);
+        self.nodes_monitors.retain(|monitor| monitor.pid != pid);
+    }
+
+    /// Build nodeup/nodedown notifications for subscriptions matching this connection.
+    /// Port of erts/emulator/beam/dist.c:7040-7090 (`send_nodes_mon_msgs`), OTP-29.1.1.
+    pub(crate) fn nodes_monitor_events(
+        &self,
+        what: &str,
+        node: &str,
+        connection_id: u32,
+        visible: bool,
+        reason: Option<&str>,
+    ) -> Vec<NodesMonitorEvent> {
+        let node_type = if visible { "visible" } else { "hidden" };
+        let node_term = OwnedTerm::Atom(node.to_owned());
+        self.nodes_monitors
+            .iter()
+            .filter(|monitor| {
+                if visible {
+                    !(monitor.options.visible || monitor.options.hidden) || monitor.options.visible
+                } else {
+                    monitor.options.hidden
+                }
+            })
+            .map(|monitor| {
+                let options = monitor.options;
+                let event = if !options.info_map
+                    && !options.list
+                    && !options.connection_id
+                    && !options.visible
+                    && !options.hidden
+                    && !options.nodedown_reason
+                {
+                    OwnedTerm::Tuple(vec![OwnedTerm::atom(what), node_term.clone()])
+                } else {
+                    let mut info = Vec::new();
+                    if options.visible || options.hidden {
+                        info.push((OwnedTerm::atom("node_type"), OwnedTerm::atom(node_type)));
+                    }
+                    if what == "nodedown" && options.nodedown_reason {
+                        info.push((
+                            OwnedTerm::atom("nodedown_reason"),
+                            OwnedTerm::atom(reason.unwrap_or("connection_closed")),
+                        ));
+                    }
+                    let info = if options.info_map {
+                        if options.connection_id {
+                            info.push((
+                                OwnedTerm::atom("connection_id"),
+                                if connection_id == u32::MAX {
+                                    OwnedTerm::atom("undefined")
+                                } else {
+                                    OwnedTerm::Int(i64::from(connection_id))
+                                },
+                            ));
+                        }
+                        OwnedTerm::Map(info)
+                    } else {
+                        if options.connection_id {
+                            info.push((
+                                OwnedTerm::atom("connection_id"),
+                                if connection_id == u32::MAX {
+                                    OwnedTerm::atom("undefined")
+                                } else {
+                                    OwnedTerm::Int(i64::from(connection_id))
+                                },
+                            ));
+                        }
+                        OwnedTerm::List {
+                            elems: info
+                                .into_iter()
+                                .rev()
+                                .map(|(key, value)| OwnedTerm::Tuple(vec![key, value]))
+                                .collect(),
+                            tail: Box::new(OwnedTerm::Nil),
+                        }
+                    };
+                    OwnedTerm::Tuple(vec![OwnedTerm::atom(what), node_term.clone(), info])
+                };
+                NodesMonitorEvent {
+                    pid: monitor.pid,
+                    message: event,
+                }
+            })
+            .collect()
     }
 
     /// Remove a connection and return its subscribed monitors for nodedown delivery.

@@ -11,7 +11,7 @@ pub fn run(
     extra_paths: &[PathBuf],
     workers: usize,
 ) -> Result<ScheduledResult, VmError> {
-    run_with_debugger_flags(root, boot_args, extra_paths, workers, false, true)
+    run_with_debugger_flags(root, boot_args, extra_paths, workers, false, true, None)
 }
 
 /// Start OTP after applying the emulator's debugger startup flags.
@@ -22,6 +22,7 @@ pub fn run_with_debugger_flags(
     workers: usize,
     debugger_support: bool,
     line_breakpoints: bool,
+    distribution_buffer_busy_limit_kb: Option<u64>,
 ) -> Result<ScheduledResult, VmError> {
     crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
     // g_erl_flags: -pa / -pz / -path and ERL_LIBS. boot_loop2 should keep this
@@ -29,6 +30,11 @@ pub fn run_with_debugger_flags(
     // Port of erts/preloaded/src/init.erl:1259 (path_flags) and
     // lib/kernel/src/code_server.erl:127 (get_user_lib_dirs), OTP-29.1.1.
     let code_path = arinsal_args::arguments_from_boot(boot_args).code_path();
+    crate::node_tables::lock().set_distribution_buffer_busy_limit(
+        distribution_buffer_busy_limit_kb
+            .unwrap_or(1024)
+            .saturating_mul(1024),
+    );
     let mut paths = Vec::new();
     if let Some(replace) = code_path.replace {
         paths.extend(replace.into_iter().map(PathBuf::from));

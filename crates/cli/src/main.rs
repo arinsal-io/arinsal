@@ -122,6 +122,7 @@ fn erl_launch(args: &[String]) -> ! {
         workers,
         launch.emulator.debugger_support,
         launch.emulator.debugger_line_breakpoints.unwrap_or(true),
+        launch.emulator.distribution_buffer_busy_limit,
     ) {
         Ok(_) => std::process::exit(0),
         Err(arinsal_vm::VmError::Unsupported(message)) => {

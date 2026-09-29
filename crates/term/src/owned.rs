@@ -15,6 +15,7 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
         List(usize),
         Map(usize),
         Fun(&'a OwnedTerm),
+        Record(&'a OwnedTerm),
     }
     let mut tasks = vec![Task::Visit(input)];
     let mut values = Vec::new();
@@ -129,6 +130,13 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     }
                     tasks.push(Task::Visit(pid));
                 }
+                OwnedTerm::Record { fields, .. } => {
+                    // Port of erts/emulator/beam/external.c:5257, OTP-29.1.1.
+                    tasks.push(Task::Record(value));
+                    for (_, field_value) in fields.iter().rev() {
+                        tasks.push(Task::Visit(field_value));
+                    }
+                }
                 OwnedTerm::Other { .. } => return Err(TermError::Unsupported("ETF other")),
                 _ => return Err(TermError::Unsupported("future ETF variant")),
             },
@@ -165,6 +173,33 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                 values.push(fun);
             }
             Task::Fun(_) => return Err(TermError::BadArg),
+            Task::Record(OwnedTerm::Record {
+                exported,
+                module,
+                name,
+                fields,
+            }) => {
+                let start = values.len() - fields.len();
+                let module = global_atoms()
+                    .intern(module)
+                    .map_err(|_| TermError::SystemLimit)?;
+                let name = global_atoms()
+                    .intern(name)
+                    .map_err(|_| TermError::SystemLimit)?;
+                let mut record_fields = Vec::with_capacity(fields.len());
+                for ((field_name, _), field_value) in
+                    fields.iter().zip(values[start..].iter().copied())
+                {
+                    let field = global_atoms()
+                        .intern(field_name)
+                        .map_err(|_| TermError::SystemLimit)?;
+                    record_fields.push((field, field_value));
+                }
+                let record = builder.native_record(module, name, *exported, &record_fields)?;
+                values.truncate(start);
+                values.push(record);
+            }
+            Task::Record(_) => return Err(TermError::BadArg),
             Task::Tuple(n) => {
                 let start = values.len() - n;
                 let term = builder.tuple(&values[start..])?;
@@ -205,6 +240,12 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
         List(usize),
         Map(usize),
         Fun(FunEntry, usize),
+        Record {
+            module: String,
+            name: String,
+            exported: bool,
+            fields: Vec<String>,
+        },
     }
     let mut tasks = vec![Task::Visit(root)];
     let mut values: Vec<OwnedTerm> = Vec::new();
@@ -323,6 +364,43 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                         }
                     }
                 }
+                TermKind::Record => {
+                    // Port of erts/emulator/beam/external.c:4018, OTP-29.1.1.
+                    let snapshot = term.record_snapshot().ok_or(TermError::BadArg)?;
+                    let module = global_atoms()
+                        .text(snapshot.module)
+                        .ok_or(TermError::BadArg)?
+                        .to_string();
+                    let name = global_atoms()
+                        .text(snapshot.name)
+                        .ok_or(TermError::BadArg)?
+                        .to_string();
+                    let fields = snapshot
+                        .fields
+                        .iter()
+                        .map(|field| {
+                            global_atoms()
+                                .text(*field)
+                                .map(|name| name.to_string())
+                                .ok_or(TermError::BadArg)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut ordered_values = vec![Term::NIL; fields.len()];
+                    let mut order: Vec<_> = snapshot.fields.iter().copied().enumerate().collect();
+                    order.sort_by_key(|(_, field)| field.0);
+                    for (sorted_index, (original_index, _)) in order.into_iter().enumerate() {
+                        ordered_values[original_index] = snapshot.values[sorted_index];
+                    }
+                    tasks.push(Task::Record {
+                        module,
+                        name,
+                        exported: snapshot.is_exported,
+                        fields,
+                    });
+                    for value in ordered_values.into_iter().rev() {
+                        tasks.push(Task::Visit(value));
+                    }
+                }
                 TermKind::Tuple => {
                     // SAFETY: source heap remains stable during traversal.
                     let tuple = unsafe { term.tuple_ref().unwrap() };
@@ -372,6 +450,21 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
                     old_uniq: entry.old_uniq,
                     pid,
                     free_vars: parts,
+                });
+            }
+            Task::Record {
+                module,
+                name,
+                exported,
+                fields,
+            } => {
+                let start = values.len() - fields.len();
+                let field_values = values.split_off(start);
+                values.push(OwnedTerm::Record {
+                    exported,
+                    module,
+                    name,
+                    fields: fields.into_iter().zip(field_values).collect(),
                 });
             }
             Task::Tuple(n) => {

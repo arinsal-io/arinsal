@@ -372,7 +372,7 @@ pub(crate) fn command(id: u64, caller: Pid, data: &[u8]) -> Result<(), VmError> 
 ///
 /// Port of dist.c:3794 (`dist_port_command`) calling `tcp_inet_command` with
 /// `prt->caller = NIL`, so `init_caller` skips the ref header, OTP-29.1.1.
-pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<(), VmError> {
+pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
     let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
         return Err(badarg());
     };
@@ -411,6 +411,26 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<(), VmError> {
         }
     }
     emit_ready(&sock);
+    poke();
+    Ok(sock.inner.lock().unwrap().busy)
+}
+
+/// Close a distribution socket after `erlang:disconnect_node/1`.
+pub(crate) fn disconnect_dist(id: u64) -> Result<(), VmError> {
+    let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
+        return Ok(());
+    };
+    let owner = sock.handle.owner_pid();
+    {
+        let mut inner = sock.inner.lock().unwrap();
+        if inner.peer_closed {
+            return Ok(());
+        }
+        inner.peer_closed = true;
+        inner.fd.take();
+        inner.phase = Phase::Closed;
+    }
+    emit(&sock, Out::TcpClosed { owner });
     poke();
     Ok(())
 }
@@ -2881,6 +2901,8 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     // Passive EOF is remembered; `{active, true}` must still emit `{tcp_closed,S}`.
     deliver_pending_close(sock);
     emit_ready(sock);
+    let busy = sock.inner.lock().unwrap().busy;
+    crate::dist::distribution_port_state_changed(&sock.runtime, sock.id, busy);
 }
 
 fn deliver_pending_close(sock: &Arc<Sock>) {
@@ -3149,7 +3171,7 @@ fn pull(sock: &Arc<Sock>) -> bool {
         pull_accept(sock);
         return false;
     }
-    {
+    let (eof, bytes_read) = {
         let mut inner = sock.inner.lock().unwrap();
         // Port of inet_drv.c:2819 (sock_select only while active or receiving).
         // A passive socket must leave the FIN unread so `{active, true}` still
@@ -3164,10 +3186,12 @@ fn pull(sock: &Arc<Sock>) -> bool {
         let fd = inner.fd.as_ref().unwrap().as_raw_fd();
         let mut buf = vec![0u8; inner.buffer.max(1) as usize];
         let mut eof = false;
+        let mut bytes_read = 0;
         for _ in 0..32 {
             // SAFETY: fd is the connected socket this driver owns.
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
+                bytes_read += n as usize;
                 inner.rbuf.extend_from_slice(&buf[..n as usize]);
             } else if n == 0 {
                 eof = true;
@@ -3182,8 +3206,15 @@ fn pull(sock: &Arc<Sock>) -> bool {
             }
         }
         let _ = flush_send(&mut inner);
-        eof
+        (eof, bytes_read)
+    };
+    if bytes_read > 0
+        && crate::node_tables::is_dist_port(sock.id)
+        && std::env::var_os("ARINSAL_TRACE_DIST").is_some()
+    {
+        eprintln!("DIST_SOCKET_READ port={} bytes={bytes_read}", sock.id);
     }
+    eof
 }
 
 fn pull_accept(sock: &Arc<Sock>) {

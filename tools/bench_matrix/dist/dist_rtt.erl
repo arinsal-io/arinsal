@@ -13,7 +13,11 @@ run([NodePrefix]) ->
     %% start server on remote node
     Pid = erpc:call(Node, erlang, spawn, [?MODULE, server, []]),
     erpc:call(Node, erlang, register, [dist_rtt_server, Pid]),
-    Payloads = [small_atom, tuple_self, bin_1k, bin_64k, map_100, list_1000, nested_tuple_20],
+    AllPayloads = [small_atom, tuple_self, bin_1k, bin_64k, map_100, list_1000, nested_tuple_20],
+    Payloads = case os:getenv("DIST_RTT_PAYLOADS") of
+        false -> AllPayloads;
+        Filter -> [list_to_atom(Filter)]
+    end,
     Modes = [pid, name, erpc],
     
     %% Warmup

@@ -584,6 +584,11 @@ fn system_info(
         Some("ethread_info") => Some(ethread_info(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3549 (max_integer), OTP-29.1.1.
         Some("max_integer") => Some(max_integer(process)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3179 (system_info_1), OTP-29.1.1.
+        Some("creation") => Some(non_neg(
+            process,
+            u64::from(crate::node_tables::lock().local_creation),
+        )),
         // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
         Some("schedulers_online") => Some(with_flags(|flags| {
             non_neg(process, flags.schedulers_online as u64)
