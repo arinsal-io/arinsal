@@ -212,10 +212,7 @@ fn assert_seen(seen: Seen, initial: [u64; 6], header: &ProcessHeader) {
 fn assert_seen_with_frame(seen: Seen, initial: [u64; 6], header: &ProcessHeader) {
     assert_eq!(seen.x, initial);
     assert_eq!(seen.htop, header.htop as usize);
-    assert_eq!(
-        seen.stop + arinsal_term::FrameLayout::WORDS * 8,
-        header.stop as usize
-    );
+    assert_eq!(seen.stop + arinsal_term::CP_WORDS * 8, header.stop as usize);
     assert_eq!(seen.fcalls, FCALLS);
 }
 

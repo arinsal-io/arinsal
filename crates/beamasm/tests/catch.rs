@@ -25,7 +25,7 @@ extern "C" fn unwind_and_route_to_header_handler(
     _: *mut u64,
 ) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| {
-        header.stop = header.stop.wrapping_add(arinsal_term::FrameLayout::WORDS);
+        header.stop = header.stop.wrapping_add(arinsal_term::CP_WORDS);
         header.self_pid as usize
     })
 }

@@ -1390,7 +1390,7 @@ impl Vm {
                     }
                     cp = p.heap.stack_get(0).map_or(0, Term::tagged_word);
                 }
-                if native_function_at(cp as usize).is_some() {
+                if crate::native_bridge::is_native_function_at(cp as usize) {
                     sync_cursor(p, htop, &mut heap_dirty);
                     p.reductions = reds;
                     p.heap.release_stack(1);

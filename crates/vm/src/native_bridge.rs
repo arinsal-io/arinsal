@@ -36,8 +36,15 @@ fn register_bridge_continuation() -> Result<(), &'static str> {
     static REGISTERED: OnceLock<Result<(), &'static str>> = OnceLock::new();
     *REGISTERED.get_or_init(|| {
         let address = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
-        arinsal_term::register_native_code_range(address, address + 4)
+        arinsal_term::register_native_code_range(address, address + 4)?;
+        let trace_return =
+            arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize;
+        arinsal_term::register_native_code_range(trace_return, trace_return + 4)
     })
+}
+
+pub(crate) fn native_trace_return_address() -> usize {
+    arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize
 }
 
 /// Register a native code range for GC continuation recognition and stack traces.
@@ -123,6 +130,18 @@ pub fn native_function_at(address: usize) -> Option<NativeFunction> {
         .cloned()
 }
 
+/// Test native code membership without cloning function metadata.
+pub(crate) fn is_native_function_at(address: usize) -> bool {
+    let Ok(functions) = native_functions().read() else {
+        return false;
+    };
+    let index = functions.partition_point(|function| function.start <= address);
+    let Some(function) = index.checked_sub(1).and_then(|index| functions.get(index)) else {
+        return false;
+    };
+    address < function.end
+}
+
 fn native_arity_at(address: usize) -> Option<u8> {
     let functions = native_functions().read().ok()?;
     let index = functions.partition_point(|function| function.start <= address);
@@ -160,7 +179,9 @@ pub fn run_native(
         VmError::Unsupported(format!("unregistered native entry: {code_address:#x}"))
     })?;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    process.ensure(1 + arinsal_term::FrameLayout::WORDS, arity as usize)?;
+    registers.tmp_mem[5] =
+        crate::native_helpers::arinsal_beamasm_native_trace_return as *const () as usize as u64;
+    process.ensure(1 + arinsal_term::CP_WORDS, arity as usize)?;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     let resuming_continuation = process
         .cold
@@ -200,6 +221,7 @@ pub fn run_native(
     registers.f_reg_array[..float_count].copy_from_slice(&process.fr[..float_count]);
     let saved_ftrace = process.header.ftrace;
     process.header.ftrace = (registers as *mut SchedulerRegisters).cast();
+    registers.tmp_mem[3] = 0;
     if std::env::var_os("ARINSAL_BEAMASM_LIFETIME").as_deref() == Some(std::ffi::OsStr::new("1")) {
         eprintln!(
             "[beamasm-lifetime] enter code={code_address:#x} owner={}",

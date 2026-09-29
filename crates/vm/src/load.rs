@@ -821,6 +821,18 @@ impl Vm {
         };
         let (local, global) =
             crate::trace_bp::breakpoint_kinds(process, &module.name, function, arity);
+        if self
+            .beamasm_targets
+            .function_for_target(module_id, module, entry)
+            .is_some()
+        {
+            crate::beamasm_integration::patch_native_breakpoint(
+                &module.name,
+                function,
+                arity,
+                local,
+            );
+        }
         let needs_local_patch = module.breakpoint_originals.contains_key(&entry) != local;
         let changed = if needs_local_patch {
             Arc::make_mut(module).set_trace_breakpoint(entry, local)

@@ -248,12 +248,33 @@ fn lifetime_trace_enabled() -> bool {
 /// Owns a compiled module version and the heap that backs its embedded literals.
 pub(crate) struct CompiledVersion {
     module: String,
-    _memory: Box<dyn std::any::Any + Send + Sync>,
+    memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
+    trace_breakpoints: Vec<(Mfa, usize, u32)>,
     _literal_heap: Box<VecHeap>,
     native_functions: Vec<crate::NativeFunction>,
     native_targets: Vec<(Mfa, usize)>,
     code_start: usize,
     code_end: usize,
+}
+
+/// Enable or remove native entry breakpoints for a traced function.
+// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250, OTP-29.1.1.
+pub(crate) fn patch_native_breakpoint(module: &str, function: &str, arity: u8, enabled: bool) {
+    let Ok(mut versions) = compiled_versions().write() else {
+        return;
+    };
+    versions.retain(|version| version.strong_count() != 0);
+    for version in versions.iter().filter_map(Weak::upgrade) {
+        for ((owner, name, found_arity), offset, branch) in &version.trace_breakpoints {
+            if owner != module || name != function || *found_arity != arity {
+                continue;
+            }
+            let instruction = if enabled { 0xd503_201f_u32 } else { *branch };
+            if let Ok(mut memory) = version.memory.lock() {
+                let _ = memory.write_bytes(*offset, &instruction.to_le_bytes());
+            }
+        }
+    }
 }
 
 impl CompiledVersion {
@@ -423,6 +444,9 @@ impl ModuleEnv for VmModuleEnv<'_> {
 
     fn light_bif_fragment(&self) -> usize {
         self.light_bif_fragment
+    }
+    fn breakpoint_helper(&self) -> usize {
+        crate::native_helpers::arinsal_beamasm_breakpoint as *const () as usize
     }
 
     fn arithmetic_helper(&self) -> ArithHelper {
@@ -635,9 +659,28 @@ pub(crate) fn compile(
             native_functions.len()
         );
     }
+    let trace_breakpoints = compiled
+        .native
+        .trace_breakpoints
+        .iter()
+        .filter_map(|(&label, &(offset, branch))| {
+            compiled
+                .functions
+                .iter()
+                .find(|function| function.label == label)
+                .map(|function| {
+                    (
+                        (compiled.name.clone(), function.name.clone(), function.arity),
+                        offset,
+                        branch,
+                    )
+                })
+        })
+        .collect();
     let version = Arc::new(CompiledVersion {
         module: compiled.name.clone(),
-        _memory: Box::new(compiled.native.memory),
+        memory: std::sync::Mutex::new(compiled.native.memory),
+        trace_breakpoints,
         _literal_heap: literal_heap,
         native_functions,
         native_targets,

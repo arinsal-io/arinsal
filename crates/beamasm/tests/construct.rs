@@ -252,8 +252,7 @@ fn native_get_list_alias_survives_y_frame_return() {
             ]);
             header.htop = word_ptr(heap, 7);
             header.stop = word_ptr(heap, 126);
-            heap[126] = 0;
-            heap[127] = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as u64;
+            heap[126] = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as u64;
             regs.x_reg_array[0] = base as u64 | 2;
         },
     );
@@ -270,7 +269,7 @@ fn native_get_list_alias_survives_y_frame_return() {
         (base + 3 * 8) as u64 | 1
     );
     assert_eq!(header.htop as usize, base + 16 * 8);
-    assert_eq!(header.stop as usize, base + 128 * 8);
+    assert_eq!(header.stop as usize, base + 127 * 8);
 }
 
 fn native_list_tail_survives_tuple_field_loads() {

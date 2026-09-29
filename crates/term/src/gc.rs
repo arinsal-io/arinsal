@@ -972,10 +972,6 @@ impl ProcessHeap {
 
     #[cfg(debug_assertions)]
     fn verify_frame_chain(&self, code_ranges: &[(usize, usize)]) {
-        let mut frame_pointer = self.frame_pointer;
-        if frame_pointer == 0 {
-            return;
-        }
         let base = self.words.as_ptr() as usize;
         let stack_start = base + self.stop * 8;
         let stack_end = base + self.words.len() * 8;
@@ -984,6 +980,27 @@ impl ProcessHeap {
             old_end: stack_end,
             new_start: stack_start,
         };
+        let mut frame_pointer = self.frame_pointer;
+        if frame_pointer == 0 {
+            for index in 0..self.stack_words() {
+                let word = self
+                    .stack_get(index)
+                    .expect("live stack word is present")
+                    .tagged_word();
+                match classify_stack_word(word, stack_range, code_ranges) {
+                    StackWord::Term(_) => {}
+                    StackWord::ReturnAddr(address) => assert!(
+                        code_ranges
+                            .iter()
+                            .any(|&(start, end)| address >= start && address < end)
+                    ),
+                    StackWord::FramePtr(address) => {
+                        panic!("frame pointer {address:#x} exists without an active frame chain")
+                    }
+                }
+            }
+            return;
+        }
         let max_frames = self.stack_words() / crate::FrameLayout::WORDS;
         for _ in 0..max_frames {
             assert!(frame_pointer >= stack_start && frame_pointer < stack_end);

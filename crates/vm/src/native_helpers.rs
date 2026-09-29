@@ -26,6 +26,115 @@ pub extern "C" fn arinsal_beamasm_call_light_bif_shared(
     invoke_dispatch_bif(header, identity as usize).unwrap_or(0)
 }
 
+/// Handles an enabled BeamAsm function-entry breakpoint.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95, OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_breakpoint(
+    header: *mut ProcessHeader,
+    return_address: u64,
+) -> u64 {
+    let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
+        return 0;
+    };
+    let Some(function) = crate::native_function_at(return_address as usize) else {
+        return 0;
+    };
+    crate::trace_bp::increment(
+        process,
+        &function.module,
+        &function.function,
+        function.arity,
+        true,
+    );
+    let actions = crate::trace::native_call_event(
+        process,
+        &function.module,
+        &function.function,
+        function.arity,
+    );
+    if !actions.is_empty() {
+        let frame_words = 4usize.saturating_add(actions.len().saturating_mul(2));
+        let old_cp = process.heap.stack_get(0);
+        if old_cp.is_none() || !process.heap.reserve_stack(frame_words) {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return 0;
+        }
+        let old_cp = old_cp.expect("checked native continuation");
+        let trace_stub =
+            arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize;
+        let metadata = [
+            crate::proc_create::native_continuation_term(trace_stub),
+            old_cp,
+            Term::small(return_address as i64).unwrap_or(Term::NIL),
+            Term::small(actions.len() as i64).unwrap_or(Term::NIL),
+        ];
+        for (index, value) in metadata.into_iter().enumerate() {
+            process.heap.stack_set(index, value);
+        }
+        for (index, action) in actions.into_iter().enumerate() {
+            let flags = u8::from(action.return_trace) | (u8::from(action.exception_trace) << 1);
+            let session = Term::small(action.session as i64).unwrap_or(Term::NIL);
+            let flags = Term::small(i64::from(flags)).unwrap_or(Term::NIL);
+            process.heap.stack_set(4 + index * 2, session);
+            process.heap.stack_set(5 + index * 2, flags);
+        }
+        process.sync_native_header();
+    }
+    0
+}
+
+/// Completes a traced native return and resumes its saved caller continuation.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195, OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+        return 0;
+    };
+    let Some(saved_caller) = process.heap.stack_get(0) else {
+        return 0;
+    };
+    let Some(function_pc) = process.heap.stack_get(1).and_then(Term::as_small) else {
+        return saved_caller.tagged_word();
+    };
+    let Some(action_count) = process.heap.stack_get(2).and_then(Term::as_small) else {
+        return saved_caller.tagged_word();
+    };
+    let Some(function) = crate::native_function_at(function_pc as usize) else {
+        return saved_caller.tagged_word();
+    };
+    let value = process.x[0];
+    for index in 0..usize::try_from(action_count).unwrap_or(0) {
+        let session = process
+            .heap
+            .stack_get(3 + index * 2)
+            .and_then(Term::as_small);
+        let flags = process
+            .heap
+            .stack_get(4 + index * 2)
+            .and_then(Term::as_small);
+        let (Some(session), Some(flags)) = (session, flags) else {
+            continue;
+        };
+        crate::trace::native_return_event(
+            process,
+            &function,
+            crate::trace::NativeTraceAction {
+                session: session as u64,
+                return_trace: flags & 1 != 0,
+                exception_trace: flags & 2 != 0,
+            },
+            value,
+            false,
+        );
+    }
+    let cleanup = 4usize.saturating_add(usize::try_from(action_count).unwrap_or(0) * 2);
+    process
+        .heap
+        .set_stack_pointer(process.header.stop.wrapping_add(cleanup));
+    process.sync_native_header();
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    saved_caller.tagged_word()
+}
+
 /// Collects from the native heap and stack cursors published by generated code.
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 and beam_asm_global.cpp:102-140, OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_gc_sync(
@@ -49,7 +158,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     // Port of erl_gc.c:1879 and 2072-2080, OTP-29.1.1: collection sizing
     // keeps stack-reserved words in addition to the requested heap allocation.
-    let need_words = need_words.saturating_add(arinsal_term::FrameLayout::WORDS);
+    let need_words = need_words.saturating_add(arinsal_term::CP_WORDS);
     if process.ensure(need_words, live).is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }

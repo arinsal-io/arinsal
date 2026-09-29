@@ -116,7 +116,7 @@ impl Vm {
                     p.heap.release_stack(1);
                     continue;
                 }
-                if crate::native_function_at(word).is_some() {
+                if crate::native_bridge::is_native_function_at(word) {
                     p.heap.release_stack(1);
                     p.cold_mut().native_continuation_resume = true;
                     p.native_pc = Some(word);

@@ -92,8 +92,23 @@ pub(super) fn capture(
             index += 1;
             continue;
         };
-        // SAFETY: The stack slot is a fully initialized 64-bit term or raw CP.
-        let raw_address = unsafe { word.raw_bits() } as usize;
+        let raw_address = word.tagged_word() as usize;
+        if raw_address == crate::native_bridge::native_trace_return_address() {
+            let function_pc = heap
+                .stack_get(index + 2)
+                .and_then(Term::as_small)
+                .unwrap_or(0) as usize;
+            let action_count = heap
+                .stack_get(index + 3)
+                .and_then(Term::as_small)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0);
+            if let Some(function) = native_function_at(function_pc) {
+                raw.continuations.push(Continuation::Native(function));
+            }
+            index += 4usize.saturating_add(action_count.saturating_mul(2));
+            continue;
+        }
         if let Some(function) = native_function_at(raw_address) {
             raw.continuations.push(Continuation::Native(function));
             index += 1;
@@ -152,7 +167,7 @@ pub(super) fn raw_tag(index: usize) -> Result<Term, VmError> {
 
 /// Decode a raw trace handle without treating a BEAM catch tag as one.
 pub(super) fn raw_index(term: Term) -> Option<usize> {
-    if term.classify() != TermKind::Catch {
+    if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
         return None;
     }
     // SAFETY: CATCH is immediate and contains no heap pointer.
@@ -181,7 +196,7 @@ pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {
 }
 
 pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
-    if term.classify() != TermKind::Catch {
+    if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
         return None;
     }
     // SAFETY: CATCH is an immediate and carries no heap pointer.

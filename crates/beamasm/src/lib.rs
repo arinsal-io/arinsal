@@ -79,7 +79,7 @@ pub struct SchedulerRegisters {
     /// Floating point register array.
     pub f_reg_array: [f64; 1024],
     /// Scratch words accessed by runtime fragments.
-    pub tmp_mem: [u64; 5],
+    pub tmp_mem: [u64; 6],
 }
 
 impl Default for SchedulerRegisters {
@@ -87,7 +87,7 @@ impl Default for SchedulerRegisters {
         Self {
             x_reg_array: [0; 1024],
             f_reg_array: [0.0; 1024],
-            tmp_mem: [0; 5],
+            tmp_mem: [0; 6],
         }
     }
 }

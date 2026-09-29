@@ -396,12 +396,7 @@ impl BeamModuleAssembler {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
             e.mov_reg(Gpr::x(1), Gpr::x(13))?;
             if tail {
-                e.ldp_post(
-                    Gpr::x(29),
-                    Gpr::x(30),
-                    E,
-                    (arinsal_term::FrameLayout::WORDS * 8) as i16,
-                )?;
+                e.ldr_post(Gpr::x(30), E, 8)?;
                 e.br(target)
             } else {
                 e.blr(target)
@@ -444,12 +439,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(14), Gpr::x(0))?;
             if tail {
-                e.ldp_post(
-                    Gpr::x(29),
-                    Gpr::x(30),
-                    E,
-                    (arinsal_term::FrameLayout::WORDS * 8) as i16,
-                )?;
+                e.ldr_post(Gpr::x(30), E, 8)?;
                 e.br(Gpr::x(14))
             } else {
                 e.blr(Gpr::x(14))

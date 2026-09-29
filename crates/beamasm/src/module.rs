@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::rt::arinsal_enter_native_return;
+use crate::rt::{arinsal_enter_native_return, arinsal_enter_native_yield};
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer, Label},
     enc::{Cond, Emitter, Gpr},
@@ -78,6 +78,8 @@ pub struct FinalizedModule {
     pub lambda_entries: HashMap<u32, *const u8>,
     /// Native catch handler addresses in this module's `make_catch` order.
     pub catch_table: Vec<*const u8>,
+    /// Patch sites for per-function tracing breakpoints: label to entry word and skip branch.
+    pub trace_breakpoints: HashMap<u32, (usize, u32)>,
 }
 
 impl FinalizedModule {
@@ -104,6 +106,8 @@ pub struct BeamModuleAssembler {
     yield_label: Label,
     pub(super) error_label: Label,
     catch_patches: Vec<(usize, Label)>,
+    trace_breakpoints: HashMap<u32, (usize, Label)>,
+    current_function_label: Option<u32>,
     dump_module: Option<String>,
     dump_functions: Vec<crate::dump::FunctionRecord>,
     dump_recording_function: bool,
@@ -132,6 +136,8 @@ impl BeamModuleAssembler {
             yield_label,
             error_label,
             catch_patches: Vec::new(),
+            trace_breakpoints: HashMap::new(),
+            current_function_label: None,
             dump_module: None,
             dump_functions: Vec::new(),
             dump_recording_function: false,
@@ -246,6 +252,51 @@ impl BeamModuleAssembler {
         }
         let label = self.label(id);
         self.code.bind(label)?;
+        self.current_function_label = Some(id);
+        Ok(())
+    }
+
+    /// Binds the aligned entry label without changing the owning function label.
+    // Port of erts/emulator/beam/jit/arm/ops.tab:925-936, OTP-29.1.1.
+    pub fn emit_i_entry_label(&mut self, id: u32) -> Result<(), ModuleError> {
+        if self.defined.insert(id, ()).is_some() {
+            return Err(ModuleError::DuplicateLabel(id));
+        }
+        let label = self.label(id);
+        self.code.bind(label)?;
+        Ok(())
+    }
+
+    /// Emits the patchable native entry trampoline used by local call tracing.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250, OTP-29.1.1.
+    pub fn emit_i_breakpoint_trampoline(&mut self, helper: usize) -> Result<(), ModuleError> {
+        self.emit_enter_frame()?;
+        let Some(function) = self.current_function_label else {
+            return Err(ModuleError::InvalidOperand(
+                "breakpoint trampoline has no owning function",
+            ));
+        };
+        let patch = self.code.offset();
+        let next = self.code.new_label();
+        self.code.b(next)?;
+        self.code.adr(Gpr::x(10), next)?;
+        self.emit_runtime_fragment_with(
+            helper,
+            &[Gpr::x(10)],
+            6,
+            crate::Update::HEAP_ALLOC
+                .union(crate::Update::STACK)
+                .union(crate::Update::REDUCTIONS)
+                .union(crate::Update::X_REGS),
+        )?;
+        self.code.bind(next)?;
+        if self
+            .trace_breakpoints
+            .insert(function, (patch, next))
+            .is_some()
+        {
+            return Err(ModuleError::DuplicateLabel(function));
+        }
         Ok(())
     }
 
@@ -268,34 +319,22 @@ impl BeamModuleAssembler {
     /// Pushes the BEAM continuation pointer onto the Erlang stack.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:429-433, OTP-29.1.1
     pub fn emit_enter_frame(&mut self) -> Result<(), ModuleError> {
-        let frame_bytes = (arinsal_term::FrameLayout::WORDS * 8) as i16;
-        self.code.emit(|e| {
-            e.stp_pre(Gpr::x(29), Gpr::x(30), E, -frame_bytes)?;
-            e.mov_reg(Gpr::x(29), E)
-        })?;
+        self.code.emit(|e| e.str_pre(Gpr::x(30), E, -8))?;
         Ok(())
     }
 
     /// Pops the BEAM continuation pointer from the Erlang stack.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:429-433, OTP-29.1.1
     pub fn emit_leave_frame(&mut self) -> Result<(), ModuleError> {
-        let frame_bytes = (arinsal_term::FrameLayout::WORDS * 8) as i16;
-        self.code
-            .emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), E, frame_bytes))?;
+        self.code.emit(|e| e.ldr_post(Gpr::x(30), E, 8))?;
         Ok(())
     }
 
     /// Emits a direct local call with an Erlang continuation on the stack.
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:71-74, OTP-29.1.1
     pub fn call(&mut self, target: u32) -> Result<(), ModuleError> {
-        let continuation = self.code.new_label();
-        let veneer = self.code.new_label();
-        self.code.adr(Gpr::x(30), continuation)?;
-        self.code.b(veneer)?;
-        self.code.bind(veneer)?;
         let target_label = self.label(target);
-        self.code.b(target_label)?;
-        self.code.bind(continuation)?;
+        self.code.bl(target_label)?;
         Ok(())
     }
 
@@ -428,6 +467,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             e.mov_const(Gpr::x(1), target_pc as u64)?;
             e.mov_const(Gpr::x(0), 2)?;
+            e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
             e.ret(Gpr::x(30))
         })?;
         self.code.bind(continuation)?;
@@ -439,12 +479,8 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:118-123, OTP-29.1.1
     pub fn call_only(&mut self, target: u32) -> Result<(), ModuleError> {
         self.emit_leave_frame()?;
-        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
         let target = self.label(target);
-        self.code.b_cond(Cond::Pl, target)?;
-        self.code.adr(Gpr::x(8), target)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
-        self.code.b(self.yield_label)?;
+        self.code.b(target)?;
         Ok(())
     }
 
@@ -494,15 +530,12 @@ impl BeamModuleAssembler {
     pub fn return_(&mut self) -> Result<(), ModuleError> {
         self.emit_leave_frame()?;
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(30), C_P, 72))?;
         let returned = self.code.new_label();
         self.code.b_cond(Cond::Pl, returned)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(30), C_P, 72))?;
         self.code.b(self.yield_label)?;
         self.code.bind(returned)?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), Gpr::xzr())?;
-            e.ret(Gpr::x(30))
-        })?;
+        self.code.emit(|e| e.ret(Gpr::x(30)))?;
         Ok(())
     }
 
@@ -826,8 +859,7 @@ impl BeamModuleAssembler {
                 .union(crate::Update::X_REGS),
         )?;
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(0), 1)?;
-            e.ldr_uoff(Gpr::x(30), SCHEDULER_REGS, 16_416)?;
+            e.mov_const(Gpr::x(30), arinsal_enter_native_yield as *const () as u64)?;
             e.ret(Gpr::x(30))
         })?;
         self.code.bind(self.error_label)?;
@@ -837,6 +869,18 @@ impl BeamModuleAssembler {
             e.br(Gpr::x(30))
         })?;
         let (mut words, labels) = self.code.finish_with_labels()?;
+        let trace_breakpoints = self
+            .trace_breakpoints
+            .iter()
+            .filter_map(|(&function, &(offset, next))| {
+                let next_offset = *labels.get(&next)?;
+                let branch_offset = offset;
+                let delta = i64::try_from(next_offset).ok()? - i64::try_from(branch_offset).ok()?;
+                let immediate = u32::try_from(delta / 4).ok()?;
+                let branch = 0x1400_0000 | (immediate & 0x03ff_ffff);
+                Some((function, (offset, branch)))
+            })
+            .collect::<HashMap<_, _>>();
         // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:952-974 (patchCatches), OTP-29.1.1
         let catch_table = self
             .catch_patches
@@ -889,6 +933,7 @@ impl BeamModuleAssembler {
             entry_offsets,
             lambda_entries,
             catch_table,
+            trace_breakpoints,
         })
     }
 }

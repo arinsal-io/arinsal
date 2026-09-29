@@ -120,6 +120,7 @@ fn emit_export_fragment(code: &mut CodeBuffer, helper: usize) -> Result<(), Buff
         encoder.ldr_uoff(Gpr::x(17), Gpr::sp(), 16)?;
         encoder.add_imm(Gpr::sp(), Gpr::sp(), 32, false)?;
         encoder.mov_const(Gpr::x(0), 2)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(17))?;
         encoder.mov_reg(Gpr::x(2), Gpr::xzr())?;
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
@@ -182,6 +183,7 @@ fn emit_helper_fragment(code: &mut CodeBuffer, helper: usize) -> Result<(), Buff
 fn emit_restore_and_exit(code: &mut CodeBuffer) -> Result<(), BufferError> {
     code.emit(|encoder| {
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
         encoder.br(Gpr::x(17))
     })?;
@@ -197,6 +199,7 @@ fn emit_call_fun_unported_fragment(code: &mut CodeBuffer) -> Result<(), BufferEr
         // Preserve the native continuation as a BEAM CP for the interpreter return path.
         encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
         encoder.mov_const(Gpr::x(0), 2)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
         encoder.mov_const(Gpr::x(1), CALL_FUN_UNPORTED as u64)?;
         encoder.mov_reg(Gpr::x(2), Gpr::xzr())?;
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;

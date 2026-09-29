@@ -640,8 +640,11 @@ impl Executor {
                 if let Some(code_ptr) = process.native_pc.take() {
                     crate::beamasm_integration::count_native_call();
                     process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
-                    let function = crate::native_function_at(code_ptr);
-                    if trace_boot_enabled() {
+                    let trace_boot = trace_boot_enabled();
+                    let function = trace_boot
+                        .then(|| crate::native_function_at(code_ptr))
+                        .flatten();
+                    if trace_boot {
                         eprintln!("arinsal boot: enter native {:?} pc={code_ptr:#x}", function);
                         if function
                             .as_ref()
@@ -673,7 +676,7 @@ impl Executor {
                             }
                             Err(error) => return Err(error),
                         };
-                    if trace_boot_enabled()
+                    if trace_boot
                         && function
                             .as_ref()
                             .is_some_and(|f| f.module == "prim_file" && f.function == "decode_path")
@@ -1084,7 +1087,7 @@ fn resume_after_native_return(process: &mut Process) -> bool {
             process.heap.release_stack(1);
             continue;
         }
-        if crate::native_function_at(raw).is_some() {
+        if crate::native_bridge::is_native_function_at(raw) {
             process.heap.release_stack(1);
             process.cold_mut().native_continuation_resume = true;
             process.native_pc = Some(raw);

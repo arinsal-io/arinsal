@@ -183,6 +183,7 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Pl, dest)?;
         self.code.emit(|e| {
             e.mov_const(Gpr::x(0), 1)?;
+            e.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
             e.ret(Gpr::x(30))
         })?;
         Ok(())
@@ -222,6 +223,7 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             e.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_384)?;
             e.mov_const(Gpr::x(0), 1)?;
+            e.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
             e.ret(Gpr::x(30))
         })?;
         Ok(())

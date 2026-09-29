@@ -55,8 +55,7 @@ extern "C" fn relocate_gc_bif(
 ) -> u64 {
     let target = GC_RETURN_TARGET.load(Ordering::Acquire);
     let mut stack = MOVED_STACK.lock().unwrap();
-    stack[0] = 0;
-    stack[1] = target as u64;
+    stack[0] = target as u64;
     let stack_top = stack.as_mut_ptr();
     let mut heap = MOVED_HEAP.lock().unwrap();
     let heap_base = heap.as_mut_ptr();
@@ -192,7 +191,7 @@ fn light_bif_reloads_moved_heap_and_stack_before_returning() {
     let heap = MOVED_HEAP.lock().unwrap();
     assert_eq!(
         registers.x_reg_array[0],
-        stack.as_ptr().wrapping_add(2) as u64
+        stack.as_ptr().wrapping_add(1) as u64
     );
     assert_eq!(
         registers.x_reg_array[1],

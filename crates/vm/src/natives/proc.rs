@@ -2670,28 +2670,6 @@ fn trace_pattern(
             }
             match_spec = Some(owned);
         }
-        if pattern != atom("false") {
-            for (module_id, loaded) in vm
-                .modules
-                .iter()
-                .enumerate()
-                .filter(|(_, loaded)| loaded.name == module)
-            {
-                for (entry, name, function_arity) in &loaded.functions {
-                    if (function == "_" || *name == function)
-                        && arity.is_none_or(|arity| arity == *function_arity)
-                        && vm
-                            .beamasm_targets
-                            .function_for_target(module_id, loaded, *entry)
-                            .is_some()
-                    {
-                        return Err(VmError::Unsupported(format!(
-                            "trace_pattern for {module}:{name}/{function_arity} requires the T3b BeamAsm breakpoint port"
-                        )));
-                    }
-                }
-            }
-        }
         let count_flag = names.iter().any(|name| name == "call_count");
         if count_flag
             && match_spec.is_some()

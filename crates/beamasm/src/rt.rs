@@ -138,6 +138,8 @@ pub unsafe fn enter_native_raw(
 #[cfg(target_arch = "aarch64")]
 unsafe extern "C" {
     pub fn arinsal_enter_native_return();
+    pub fn arinsal_enter_native_yield();
+    pub fn arinsal_enter_native_trace_return();
     fn arinsal_enter_native(
         header: *mut ProcessHeader,
         regs: *mut SchedulerRegisters,
@@ -195,8 +197,55 @@ core::arch::global_asm!(
 
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
+    ".global _arinsal_enter_native_trace_return",
+    "_arinsal_enter_native_trace_return:",
+    // Publish the BEAM cursors and register cache before the Rust trace hook.
+    "str x20, [x21, #8]",
+    "str x23, [x21, #0]",
+    "str w22, [x21, #32]",
+    "stp x25, x26, [x19, #0]",
+    "stp x27, x28, [x19, #16]",
+    "stp x15, x16, [x19, #32]",
+    "add x15, x19, #8192",
+    "stp d8, d9, [x15, #0]",
+    "stp d10, d11, [x15, #16]",
+    "stp d12, d13, [x15, #32]",
+    "stp d14, d15, [x15, #48]",
+    "mov x0, x21",
+    "ldr x16, [x19, #16424]",
+    "blr x16",
+    "mov x14, x0",
+    "ldr x20, [x21, #8]",
+    "ldr x23, [x21, #0]",
+    "ldr w22, [x21, #32]",
+    "ldp x25, x26, [x19, #0]",
+    "ldp x27, x28, [x19, #16]",
+    "ldp x15, x16, [x19, #32]",
+    "add x17, x19, #8192",
+    "ldp d8, d9, [x17, #0]",
+    "ldp d10, d11, [x17, #16]",
+    "ldp d12, d13, [x17, #32]",
+    "ldp d14, d15, [x17, #48]",
+    "br x14",
+);
+
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
     ".global _arinsal_enter_native_return",
     "_arinsal_enter_native_return:",
+    // The marker distinguishes an interpreter handoff without adding work to each BEAM return.
+    "ldr x9, [x19, #16408]",
+    "cbnz x9, 1f",
+    "mov x0, xzr",
+    "b 2f",
+    "1:",
+    "mov x0, x9",
+    "2:",
+    "b 3f",
+    ".global _arinsal_enter_native_yield",
+    "_arinsal_enter_native_yield:",
+    "mov x0, #1",
+    "3:",
     // Spill native process state and all six register-backed X registers.
     "str x29, [x19, #16400]",
     "str x23, [x21, #0]",

@@ -315,6 +315,9 @@ impl FrameLayout {
     /// Number of words in a frame header.
     pub const WORDS: usize = 2;
 }
+
+/// Number of words reserved for a default BeamAsm continuation pointer.
+pub const CP_WORDS: usize = 1;
 #[derive(Default)]
 pub(crate) struct HeapOwners {
     pub(crate) off_heap: Vec<Arc<Vec<u8>>>,

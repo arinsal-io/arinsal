@@ -50,6 +50,10 @@ pub trait ModuleEnv {
     fn light_bif_fragment(&self) -> usize {
         0
     }
+    /// Return the VM's native generic breakpoint helper.
+    fn breakpoint_helper(&self) -> usize {
+        0
+    }
     /// Arithmetic slow path used for bignums and exceptional operands.
     fn arithmetic_helper(&self) -> ArithHelper;
     /// Guard slow path used for term comparisons and guard BIFs.
@@ -2176,11 +2180,11 @@ fn emit_op(
             "func_prologue" => {
                 count(2)?;
                 // Port of erts/emulator/beam/jit/arm/ops.tab:905-906, OTP-29.1.1.
-                assembler.emit_i_func_label(n(0)?)
+                assembler.emit_i_entry_label(n(0)?)
             }
             "aligned_label" => {
                 count(2)?;
-                assembler.emit_i_func_label(n(0)?)
+                assembler.emit_i_entry_label(n(0)?)
             }
             "i_func_info" => {
                 count(4)?;
@@ -2188,7 +2192,7 @@ fn emit_op(
             }
             "i_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:224-237, OTP-29.1.1.
-                assembler.emit_enter_frame()
+                assembler.emit_i_breakpoint_trampoline(env.breakpoint_helper())
             }
             "i_test_yield" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.

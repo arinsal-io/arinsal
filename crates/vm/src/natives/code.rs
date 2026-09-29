@@ -999,15 +999,22 @@ mod tests {
 
     fn loaded_many(vm: &mut Vm, binaries: &[&[u8]]) -> OwnedTerm {
         let mut process = Process::new();
-        let mut prepared = Vec::new();
+        let mut prepared_count = 0usize;
         for bytes in binaries {
             let beam = arinsal_beam::parse(bytes).unwrap();
             let binary = {
                 let mut heap = FragmentingHeap(&mut process.heap);
                 from_owned(&OwnedTerm::Binary(bytes.to_vec()), &mut heap).unwrap()
             };
-            prepared.push(prepare(&mut process, &[atom(&beam.module), binary]).unwrap());
+            let prepared = prepare(&mut process, &[atom(&beam.module), binary]).unwrap();
+            assert!(process.heap.reserve_stack(1));
+            assert!(process.heap.stack_set(0, prepared));
+            prepared_count += 1;
         }
+        let prepared = (0..prepared_count)
+            .rev()
+            .map(|index| process.heap.stack_get(index).unwrap())
+            .collect::<Vec<_>>();
         let list = make_list(&mut process, prepared).unwrap();
         to_owned(finish(vm, &mut process, &[list]).unwrap()).unwrap()
     }
@@ -1756,7 +1763,7 @@ mod boot_loop1_tests {
         };
         let mut process = Process::new();
         let mut input_heap = VecHeap::new();
-        let mut prepared = Vec::new();
+        let mut prepared_count = 0usize;
         let mut paths = Vec::new();
         for module in ["boot_loop1_batch_a", "boot_loop1_batch_b"] {
             let source = format!("-module({module}). -export([run/0]). run() -> ok.");
@@ -1766,7 +1773,10 @@ mod boot_loop1_tests {
             std::fs::write(&path, &beam).unwrap();
             paths.push(path);
             let binary = from_owned(&OwnedTerm::Binary(beam), &mut input_heap).unwrap();
-            prepared.push(prepare(&mut process, &[atom(module), binary]).unwrap());
+            let prepared = prepare(&mut process, &[atom(module), binary]).unwrap();
+            assert!(process.heap.reserve_stack(1));
+            assert!(process.heap.stack_set(0, prepared));
+            prepared_count += 1;
         }
         let expression = format!(
             "begin {{ok,A}}=file:read_file(\"{}\"), {{ok,B}}=file:read_file(\"{}\"), erlang:finish_loading([erlang:prepare_loading(boot_loop1_batch_a,A),erlang:prepare_loading(boot_loop1_batch_b,B)]) end",
@@ -1774,6 +1784,10 @@ mod boot_loop1_tests {
             paths[1].display()
         );
         let expected = reference.eval(&expression).unwrap();
+        let prepared = (0..prepared_count)
+            .rev()
+            .map(|index| process.heap.stack_get(index).unwrap())
+            .collect::<Vec<_>>();
         let list = make_list(&mut process, prepared).unwrap();
         let mut vm = Vm::new([]);
         let actual = finish(&mut vm, &mut process, &[list]).unwrap();

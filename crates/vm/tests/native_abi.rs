@@ -340,6 +340,7 @@ fn mixed_native(helper: usize, preserve_y: bool) -> CodeBuffer {
         e.str_uoff(Gpr::x(14), Gpr::x(20), 0)?;
         e.mov_const(Gpr::x(1), helper as u64)?;
         e.mov_const(Gpr::x(0), 2)?;
+        e.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
         e.ret(Gpr::x(30))
     })
     .unwrap();

@@ -520,8 +520,51 @@ pub(super) fn resume(
     while index < p.heap.stack_words() {
         // Port of beam_common.c:600-614 (`is_CP`/`erts_inspect_frame`), OTP-29.1.1.
         if let Some(word) = p.heap.stack_get(index) {
-            // SAFETY: A live stack slot is initialized and may hold a raw native CP.
-            let address = unsafe { word.raw_bits() } as usize;
+            let address = word.tagged_word() as usize;
+            if address == crate::native_bridge::native_trace_return_address() {
+                let function_pc = p
+                    .heap
+                    .stack_get(index + 2)
+                    .and_then(Term::as_small)
+                    .unwrap_or(0) as usize;
+                let action_count = p
+                    .heap
+                    .stack_get(index + 3)
+                    .and_then(Term::as_small)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .unwrap_or(0);
+                let frame_words = 4usize.saturating_add(action_count.saturating_mul(2));
+                if let Some(function) = crate::native_function_at(function_pc) {
+                    let class_reason = tuple(p, &[class_term(trap.class)?, trap.reason])?;
+                    for action_index in 0..action_count {
+                        let session = p
+                            .heap
+                            .stack_get(index + 4 + action_index * 2)
+                            .and_then(Term::as_small);
+                        let flags = p
+                            .heap
+                            .stack_get(index + 5 + action_index * 2)
+                            .and_then(Term::as_small);
+                        let (Some(session), Some(flags)) = (session, flags) else {
+                            continue;
+                        };
+                        crate::trace::native_return_event(
+                            p,
+                            &function,
+                            crate::trace::NativeTraceAction {
+                                session: session as u64,
+                                return_trace: flags & 1 != 0,
+                                exception_trace: flags & 2 != 0,
+                            },
+                            class_reason,
+                            true,
+                        );
+                    }
+                }
+                frame_start = index + frame_words;
+                index += frame_words;
+                continue;
+            }
             if crate::native_function_at(address).is_some() {
                 frame_start = index + 1;
                 index += 1;
