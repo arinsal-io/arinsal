@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use thiserror::Error;
 
@@ -165,6 +166,36 @@ pub struct IgnoredFlag {
     pub value: Option<String>,
 }
 
+/// Startup allocator switches made available to `system_info/1` in this process.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActiveAllocatorOptions {
+    /// Normal scheduler count selected by `+S`, if specified.
+    pub schedulers: Option<i32>,
+    /// Dirty allocator instance count selected by `+Mdai`, if specified.
+    pub dirty_instances: Option<usize>,
+    /// Valid allocator flags in original order.
+    pub flags: Vec<IgnoredFlag>,
+}
+
+static ACTIVE_ALLOCATOR_OPTIONS: OnceLock<Mutex<ActiveAllocatorOptions>> = OnceLock::new();
+
+/// Set allocator startup options before the VM starts.
+pub fn configure_allocator_options(options: ActiveAllocatorOptions) {
+    *ACTIVE_ALLOCATOR_OPTIONS
+        .get_or_init(|| Mutex::new(ActiveAllocatorOptions::default()))
+        .lock()
+        .expect("allocator options lock poisoned") = options;
+}
+
+/// Return the active allocator startup options.
+pub fn active_allocator_options() -> ActiveAllocatorOptions {
+    ACTIVE_ALLOCATOR_OPTIONS
+        .get_or_init(|| Mutex::new(ActiveAllocatorOptions::default()))
+        .lock()
+        .expect("allocator options lock poisoned")
+        .clone()
+}
+
 /// Parsed emulator options; `None` means the emulator keeps its default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmulatorFlags {
@@ -200,6 +231,8 @@ pub struct EmulatorFlags {
     pub core_pools: Vec<CorePool>,
     /// Recognised options whose implementation belongs to later stages.
     pub ignored: Vec<IgnoredFlag>,
+    /// Validated OTP allocator switches, retained in command-line order.
+    pub allocator_options: Vec<IgnoredFlag>,
 }
 
 impl EmulatorFlags {
@@ -313,6 +346,269 @@ const MBAS_ALGS: &[&str] = &[
     "ageffcbf",
     "ageffcaobf",
 ];
+
+const OTP_29_USAGE: &str = include_str!("otp_29_1_1_usage.txt");
+
+fn allocator_diagnostic(message: String) -> ArgsError {
+    ArgsError::ErlDiagnostic(format!("{message}\r\n{OTP_29_USAGE}"))
+}
+
+// Port of erts/emulator/beam/erl_alloc.c:1088-1554 and :1556-1858, OTP-29.1.1.
+fn validate_allocator_flag(name: &str, value: &str) -> Result<(), ArgsError> {
+    let rest = name.strip_prefix("+M").unwrap_or("");
+    let bad_param = || {
+        let prefix_len = if rest == "ea" || rest.starts_with('u') {
+            3
+        } else {
+            2.min(name.len().saturating_sub(1))
+        };
+        allocator_diagnostic(format!(
+            "bad \"{}\" parameter",
+            &name[1..1 + prefix_len.min(name.len().saturating_sub(1))]
+        ))
+    };
+    let bad_value = || allocator_diagnostic(format!("bad \"{}\" value: {value}", &name[1..]));
+    let is_number = |nonzero: bool| {
+        allocator_signed_prefix(value)
+            .is_some_and(|number| if nonzero { number > 0 } else { number >= 0 })
+    };
+    let is_bool = matches!(value, "true" | "false");
+    if let Some(allocator) = rest.chars().next()
+        && "BIDEFHLRSTZ".contains(allocator)
+    {
+        let switch = &rest[allocator.len_utf8()..];
+        return match switch {
+            "as" => {
+                if MBAS_ALGS.contains(&value) || allocator == 'Z' && value == "chaosff" {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "e" | "t" | "ramv" => {
+                if switch == "e" && value == "false" && matches!(allocator, 'T' | 'I')
+                    || switch == "t" && value == "true" && allocator == 'I'
+                {
+                    return Err(bad_value());
+                }
+                if is_bool { Ok(()) } else { Err(bad_value()) }
+            }
+            "atags" => {
+                if matches!(value, "true" | "false" | "code") {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "acul" | "acful" => {
+                if matches!(allocator, 'T' | 'I') {
+                    return Err(bad_param());
+                }
+                if value == "de"
+                    || allocator_signed_prefix(value)
+                        .is_some_and(|number| (0..=100).contains(&number))
+                {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "acnl" | "acfml" | "asbcst" | "mbcgs" | "mbsd" | "mmmbc" | "mmsbc" => {
+                if is_number(false) {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "sbct" | "smbcs" | "mmbcs" | "lmbcs" => {
+                if is_number(false) {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "rsbcst" | "rsbcmt" | "rmbcmt" => {
+                if is_number(false) {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "cp" => {
+                if matches!(allocator, 'T' | 'I') {
+                    return Err(bad_param());
+                }
+                if matches!(
+                    value,
+                    "B" | "D" | "E" | "F" | "H" | "L" | "R" | "S" | "@" | ":"
+                ) {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            _ => Err(bad_param()),
+        };
+    }
+    if let Some(switch) = rest.strip_prefix('u') {
+        return match switch {
+            "as" => {
+                if MBAS_ALGS.contains(&value) {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "e" | "t" | "ramv" => {
+                if is_bool {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "atags" => {
+                if matches!(value, "true" | "false" | "code") {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "acul" | "acful" => {
+                if value == "de"
+                    || allocator_signed_prefix(value)
+                        .is_some_and(|number| (0..=100).contains(&number))
+                {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "cp" => {
+                if matches!(
+                    value,
+                    "B" | "D" | "E" | "F" | "H" | "L" | "R" | "S" | "@" | ":"
+                ) {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            "acnl" | "acfml" | "asbcst" | "mbcgs" | "mbsd" | "mmmbc" | "mmsbc" | "sbct"
+            | "smbcs" | "mmbcs" | "lmbcs" | "rsbcst" | "rsbcmt" | "rmbcmt" => {
+                if is_number(false) {
+                    Ok(())
+                } else {
+                    Err(bad_value())
+                }
+            }
+            _ => Err(bad_param()),
+        };
+    }
+    match rest {
+        "ea" => {
+            if matches!(value, "min" | "max" | "r9c" | "r10b" | "r11b") {
+                Ok(())
+            } else {
+                Err(bad_param())
+            }
+        }
+        "lpm" => {
+            if matches!(value, "all" | "no") {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "dai" => {
+            if value == "max" || is_number(false) {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "ycs" | "mmc" | "sac" | "madtn" => {
+            if is_bool || is_number(false) {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "Msco" | "Mscrpm" => {
+            if is_bool {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "Mscs" | "Iscs" => {
+            if is_number(false) {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "Mscrfsd" | "Mrmcbf" | "Mmcs" => {
+            if is_number(false) {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "Mamcbf" => {
+            if is_number(false) {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "Mlp" => {
+            if matches!(value, "on" | "off") {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "Ytt" | "Ytp" => {
+            if is_number(false) {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        "Ym" => Ok(()),
+        "Ye" => {
+            if value == "true" {
+                Ok(())
+            } else {
+                Err(bad_value())
+            }
+        }
+        _ => Err(bad_param()),
+    }
+}
+
+fn allocator_signed_prefix(value: &str) -> Option<i64> {
+    let value = value.trim_start();
+    let (negative, digits) = if let Some(rest) = value.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, value.strip_prefix('+').unwrap_or(value))
+    };
+    let digits = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .collect::<Vec<_>>();
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude = digits.iter().try_fold(0_i128, |number, digit| {
+        number
+            .checked_mul(10)?
+            .checked_add(i128::from(digit - b'0'))
+    })?;
+    let signed = if negative { -magnitude } else { magnitude };
+    i64::try_from(signed).ok()
+}
 
 /// Parse launcher `argv` (including `argv[0]`) using only the supplied environment.
 ///
@@ -977,10 +1273,15 @@ fn parse_emulator_flag(
                 // :1100 (bad_value), OTP-29.1.1.
                 let arg = v.as_deref().unwrap_or("");
                 if !MBAS_ALGS.contains(&arg) {
-                    return Err(ArgsError::ErlDiagnostic(format!(
-                        "bad \"MBa\" value: {arg}"
-                    )));
+                    return Err(allocator_diagnostic(format!("bad \"MBa\" value: {arg}")));
                 }
+            }
+            if name.starts_with("+M") {
+                validate_allocator_flag(name, v.as_deref().unwrap_or(""))?;
+                out.allocator_options.push(IgnoredFlag {
+                    name: name.to_owned(),
+                    value: v.clone(),
+                });
             }
             out.ignored.push(IgnoredFlag {
                 name: name.into(),
@@ -1087,6 +1388,9 @@ fn ignored_kind(name: &str) -> Option<bool> {
             || rest.chars().next().is_some_and(|c| ALLOCATORS.contains(c))
                 && ALLOC_SWITCHES.contains(&&rest[1..])
         {
+            return Some(true);
+        }
+        if rest.chars().next().is_some_and(|c| ALLOCATORS.contains(c)) {
             return Some(true);
         }
         return None;

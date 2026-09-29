@@ -1,0 +1,137 @@
+Usage: beam.smp [flags] [ -- [init_args] ]
+The flags are:
+
+-a size        suggest stack size in kilo words for threads
+               in the async-thread pool; valid range is [16-8192]
+-A number      set number of threads in async thread pool;
+               valid range is [1-1024]
+
+-B[c|d|i]      set break (Ctrl+C) behavior; valid letters are:
+                  'c' to have Ctrl+C interrupt the Erlang shell;
+                  'd' (or no extra option) to disable the break handler;
+                  'i' to ignore break signals
+
+-c bool        enable or disable time correction
+-C mode        set time warp mode; valid modes are:
+               no_time_warp | single_time_warp | multi_time_warp
+
+-D             enable debugging support
+-Dibpl bool    enable or disable instrumentation for breakpoints on lines (default true)
+-d             don't write a crash dump for internally detected errors
+               (halt(String) will still produce a crash dump)
+-dcg           set the limit for the number of decentralized counter groups
+
+-fn[u|a|l]     control how filenames are interpreted
+
+-hms size      set minimum heap size in words (default 233)
+-hmbs size     set minimum binary virtual heap size in words (default 32768)
+-hmax size     set maximum heap size in words (default 0)
+-hmaxk bool    enable or disable kill at max heap size (default true)
+-hmaxel bool   enable or disable error_logger report at max heap size (default true)
+-hmaxib bool   enable or disable including off-heap binaries into max heap size (default false)
+-hpds size     set initial process dictionary size (default 8)
+-hmqd  val     set default message queue data flag for processes;
+               valid values are: off_heap | on_heap
+
+-IOp number    set number of pollsets to be used to poll for I/O
+               (this value must be equal or smaller than the
+               number of poll threads; ignored if the current platform
+               does not support concurrent update of pollsets)
+-IOt number    set number of threads to be used to poll for I/O
+-IOPp number   set number of pollsets as a percentage of the
+               number of poll threads
+-IOPt number   set number of threads to be used to poll for I/O
+               as a percentage of the number of schedulers
+-i module      set the boot module (default init)
+
+-JDdump bool   enable or disable dumping of generated assembly code for each module loaded
+-JPcover true|false|line|line_counters|function|function_counters  enable or disable instrumentation for coverage
+-JPperf true|false|dump|map|fp|no_fp   enable or disable support for perf on Linux
+-JPperfdirectory <directory>    set the directory perf files are stored. Default: /tmp
+-JMsingle bool enable the use of single-mapped RWX memory for JIT:ed code
+
+-n[s|a|d]      control behavior of signals to ports (this flag is deprecated)
+
+-M<X> <Y>      set memory allocator switches;
+               see the erts_alloc(3) documentation for more info
+
+-pc <set>      control what characters are considered printable (default latin1)
+-pad bool      set default process async data (default false)
+-P number      set maximum number of processes on this node;
+               valid range is [1024-134217727]
+
+-Q number      set maximum number of ports on this node;
+               valid range is [1024-134217727]
+
+-R number      set compatibility release number;
+               valid range [27-29]
+-r             force ets memory block to be moved on realloc
+-rg amount     set reader groups limit
+
+-sbt type      set scheduler bind type; valid types are:
+               u | ns | ts | ps | s | nnts | nnps| tnnps | db
+-sbwt val      set scheduler busy wait threshold; valid values are:
+               none | very_short | short | medium | long | very_long
+-sbwtdcpu val  set dirty CPU scheduler busy wait threshold; valid values are:
+               none | very_short | short | medium | long | very_long
+-sbwtdio val   set dirty IO scheduler busy wait threshold; valid values are:
+               none | very_short | short | medium | long | very_long
+-scl bool      enable/disable compaction of scheduler load
+-sct cput      set cpu topology
+-ssrct         skip reading cpu topology
+-secio bool    enable or disable eager check I/O scheduling
+-sub bool      enable or disable scheduler utilization balancing
+-sws val       set scheduler wakeup strategy; valid values are:
+               default | legacy
+-swct val      set scheduler wake cleanup threshold; valid values are:
+               very_lazy | lazy | medium | eager | very_eager
+-swt val       set scheduler wakeup threshold; valid values are:
+               very_low | low | medium | high | very_high
+-swtdcpu val   set dirty CPU scheduler wakeup threshold; valid values are:
+               very_low | low | medium | high | very_high
+-swtdio val    set dirty IO scheduler wakeup threshold; valid values are:
+               very_low | low | medium | high | very_high
+-sss size      suggest stack size in kilo words for scheduler threads;
+               valid range is [20-8192] (default 128)
+-sssdcpu size  suggest stack size in kilo words for dirty CPU scheduler
+               threads; valid range is [20-8192] (default 40)
+-sssdio size   suggest stack size in kilo words for dirty IO scheduler
+               threads; valid range is [20-8192] (default 40)
+-spp Bool      set port parallelism scheduling hint
+-S n1:n2       set number of schedulers (n1), and number of
+               schedulers online (n2); maximum for both
+               numbers is 1024
+-SP p1:p2      specify schedulers (p1) and schedulers online (p2)
+               as percentages of logical processors configured and logical
+               processors available, respectively
+-SDcpu n1:n2   set number of dirty CPU schedulers (n1), and number of
+               dirty CPU schedulers online (n2); valid range for both
+               numbers is [1-1024], and n2 must be less than or equal to n1
+-SDPcpu p1:p2  specify dirty CPU schedulers (p1) and dirty CPU schedulers
+               online (p2) as percentages of logical processors configured
+               and logical processors available, respectively
+-SDio n        set number of dirty I/O schedulers; valid range is [1-1024]
+-t size        set the maximum number of atoms the emulator can handle;
+               valid range is [8192-2147483647]
+
+-T number      set modified timing level; valid range is [0-9]
+
+-V             print Erlang version
+-v             turn on chatty mode (GCs will be reported etc)
+
+-W<i|w|e>      set error logger warnings mapping;
+               see error_logger documentation for details
+
+-zdbbl size    set the distribution buffer busy limit in kilobytes;
+               valid range is [1-2097151]
+-zdntgc time   set delayed node table gc in seconds;
+               valid values are infinity or integers in the range [0-100000000]
+-zosrl number  set outstanding requests limit for system processes,
+               valid range [1-134217727]
+-zhft timeout  set halt flush timeout,
+               valid range [0-2147483647] or infinity
+
+Note that if the emulator is started with erlexec (typically
+from the erl script), these flags should be specified with +.
+
+

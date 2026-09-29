@@ -186,6 +186,16 @@ fn flag_families_match_erl_boot_arguments() {
                 "233abc",
                 "+MBas",
                 "ageffcaobf",
+                "+MBatags",
+                "code",
+                "+MMsco",
+                "true",
+                "+Mlpm",
+                "no",
+                "+Mea",
+                "max",
+                "+MEsbct",
+                "512",
             ],
             &env,
         ),
@@ -234,6 +244,13 @@ fn flag_family_rejections_match_erl() {
         &["+hms", "0"],
         &["+hms", "foo"],
         &["+MBas", "no"],
+        &["+MTe", "false"],
+        &["+MIt", "true"],
+        &["+MDfoo", "1"],
+        &["+MMsco", "maybe"],
+        &["+Mlpm", "maybe"],
+        &["+Mea", "unknown"],
+        &["+MEsbct", "-1"],
         &["+SDcpu", "1025"],
         &["+SDcpu", "2:3"],
         &["+SDcpu"],
@@ -249,7 +266,7 @@ fn flag_family_rejections_match_erl() {
             let ArgsError::ErlDiagnostic(text) = parsed.unwrap_err() else {
                 panic!("{args:?}: expected an erl diagnostic, stderr {erl_stderr}");
             };
-            if text.contains("Usage: erl") || text.starts_with("erlexec:") {
+            if text.contains("Usage: beam.smp") || text.starts_with("erlexec:") {
                 let mut expected = text.clone();
                 if !expected.ends_with('\n') {
                     expected.push('\n');

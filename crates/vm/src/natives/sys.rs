@@ -570,17 +570,31 @@ fn system_info(
             arinsal_etf::OwnedTerm::Atom(kind),
         ] = parts.as_slice()
     {
-        return Some(match (name.as_str(), kind.as_str()) {
-            ("wordsize", "internal" | "external") => Ok(Term::small(8).unwrap()),
-            ("cpu_topology", "detected") => Ok(atom("undefined")),
-            ("cpu_topology", "defined" | "used") => cpu_topology_info(process),
-            _ => Err(badarg()),
-        });
+        match (name.as_str(), kind.as_str()) {
+            ("wordsize", "internal" | "external") => return Some(Ok(Term::small(8).unwrap())),
+            ("wordsize", _) => return Some(Err(badarg())),
+            ("cpu_topology", "detected") => return Some(Ok(atom("undefined"))),
+            ("cpu_topology", "defined" | "used") => return Some(cpu_topology_info(process)),
+            ("cpu_topology", _) => return Some(Err(badarg())),
+            // Other two-atom selectors ({allocator, A}, ...) are handled below.
+            _ => {}
+        }
+    }
+    if let Some(arinsal_etf::OwnedTerm::Tuple(parts)) = owned_selector.as_ref()
+        && let [
+            arinsal_etf::OwnedTerm::Atom(operation),
+            arinsal_etf::OwnedTerm::Atom(name),
+        ] = parts.as_slice()
+        && operation == "allocator"
+    {
+        return Some(allocator_system_info(process, name));
     }
     let name = selector
         .as_atom()
         .and_then(|atom| global_atoms().text(atom));
     match name.as_deref() {
+        Some("alloc_util_allocators") => Some(allocator_names(process)),
+        Some("allocator") => Some(all_allocator_options(process)),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         Some("check_io") => Some(check_io_info(process)),
         Some("ethread_info") => Some(ethread_info(process)),
@@ -632,6 +646,886 @@ fn system_info(
         _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
         _ => None,
     }
+}
+
+fn allocator_names(process: &mut Process) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm as O;
+    let names = [
+        "temp_alloc",
+        "sl_alloc",
+        "std_alloc",
+        "ll_alloc",
+        "eheap_alloc",
+        "ets_alloc",
+        "fix_alloc",
+        "literal_alloc",
+        "binary_alloc",
+        "driver_alloc",
+    ];
+    owned_system_info(
+        process,
+        O::List {
+            elems: names.into_iter().map(|name| O::Atom(name.into())).collect(),
+            tail: Box::new(O::Nil),
+        },
+    )
+}
+
+// Port of erts/emulator/beam/erl_alloc.c:1708-1840 (handle_args), OTP-29.1.1.
+fn allocator_global_settings(
+    flags: &[arinsal_args::IgnoredFlag],
+) -> (i64, i64, i64, i64, &'static str, i64, u64, bool) {
+    let (mut amcbf, mut rmcbf, mut mcs, mut mmap_scs) = (4 * 1024 * 1024, 20, 10, 0);
+    let (mut lock_memory, mut ycs, mut mmc, mut sac) = ("no", 1024 * 1024, u64::MAX, true);
+    for flag in flags {
+        let Some(value) = flag.value.as_deref() else {
+            continue;
+        };
+        let Some(amount) = parse_flag_integer(value) else {
+            match flag.name.as_str() {
+                "+Mlpm" => lock_memory = if value == "all" { "all" } else { "no" },
+                "+Musac" => sac = value == "true",
+                _ => {}
+            }
+            continue;
+        };
+        match flag.name.as_str() {
+            "+MMamcbf" => amcbf = amount.saturating_mul(1024).min(i64::MAX as u64) as i64,
+            "+MMrmcbf" => rmcbf = amount.min(i64::MAX as u64) as i64,
+            "+MMmcs" => mcs = amount.min(i64::MAX as u64) as i64,
+            "+MMscs" => mmap_scs = amount.saturating_mul(1024 * 1024).min(i64::MAX as u64) as i64,
+            "+Muycs" => ycs = amount.saturating_mul(1024).min(i64::MAX as u64) as i64,
+            "+Mummc" => mmc = amount,
+            _ => {}
+        }
+    }
+    (amcbf, rmcbf, mcs, mmap_scs, lock_memory, ycs, mmc, sac)
+}
+
+fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm as O;
+    let configured = arinsal_args::active_allocator_options();
+    if name == "sys_alloc" {
+        return owned_system_info(
+            process,
+            O::List {
+                elems: vec![O::Tuple(vec![
+                    O::Atom("instance".into()),
+                    O::Int(0),
+                    O::List {
+                        elems: vec![O::Tuple(vec![
+                            O::Atom("options".into()),
+                            O::List {
+                                elems: vec![
+                                    option("e", O::Atom("true".into())),
+                                    option("m", O::Atom("libc".into())),
+                                ],
+                                tail: Box::new(O::Nil),
+                            },
+                        ])],
+                        tail: Box::new(O::Nil),
+                    },
+                ])],
+                tail: Box::new(O::Nil),
+            },
+        );
+    }
+    if name == "mseg_alloc" {
+        let schedulers = configured
+            .schedulers
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+        let (amcbf, rmcbf, mcs, _, _, _, _, _) = allocator_global_settings(&configured.flags);
+        let count = schedulers + 1;
+        let instances = (0..count)
+            .map(|index| {
+                O::Tuple(vec![
+                    O::Atom("instance".into()),
+                    O::Int(index as i64),
+                    O::List {
+                        elems: vec![
+                            O::Tuple(vec![
+                                O::Atom("version".into()),
+                                O::List {
+                                    elems: "0.9"
+                                        .bytes()
+                                        .map(|byte| O::Int(i64::from(byte)))
+                                        .collect(),
+                                    tail: Box::new(O::Nil),
+                                },
+                            ]),
+                            option(
+                                "options",
+                                O::List {
+                                    elems: vec![
+                                        option("amcbf", O::Int(amcbf)),
+                                        option("rmcbf", O::Int(rmcbf)),
+                                        option("mcs", O::Int(mcs)),
+                                    ],
+                                    tail: Box::new(O::Nil),
+                                },
+                            ),
+                        ],
+                        tail: Box::new(O::Nil),
+                    },
+                ])
+            })
+            .collect();
+        return owned_system_info(
+            process,
+            O::List {
+                elems: instances,
+                tail: Box::new(O::Nil),
+            },
+        );
+    }
+
+    let schedulers = configured
+        .schedulers
+        .and_then(|count| usize::try_from(count).ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let dirty = configured.dirty_instances.unwrap_or(0);
+    let Some(mut spec) = default_allocator(name, schedulers) else {
+        return Err(badarg());
+    };
+    apply_allocator_overrides(&mut spec, name, &configured.flags, schedulers);
+    if !spec.enabled {
+        return owned_system_info(process, O::Atom("false".into()));
+    }
+    let count = if spec.thread_specific {
+        schedulers + dirty + 1
+    } else {
+        1
+    };
+    let instances = (0..count)
+        .map(|index| {
+            let global = index == 0;
+            let mut entries = Vec::new();
+            entries.push(O::Tuple(vec![
+                O::Atom("versions".into()),
+                O::List {
+                    elems: (if (name == "temp_alloc" && global) || spec.shared_profile {
+                        "2.1"
+                    } else {
+                        "0.9"
+                    })
+                    .bytes()
+                    .map(|byte| O::Int(i64::from(byte)))
+                    .collect(),
+                    tail: Box::new(O::Nil),
+                },
+                O::List {
+                    elems: "3.0".bytes().map(|byte| O::Int(i64::from(byte))).collect(),
+                    tail: Box::new(O::Nil),
+                },
+            ]));
+            entries.push(option("options", allocator_options(&spec, global)));
+            O::Tuple(vec![
+                O::Atom("instance".into()),
+                O::Int(index as i64),
+                O::List {
+                    elems: entries,
+                    tail: Box::new(O::Nil),
+                },
+            ])
+        })
+        .collect();
+    owned_system_info(
+        process,
+        O::List {
+            elems: instances,
+            tail: Box::new(O::Nil),
+        },
+    )
+}
+
+fn all_allocator_options(process: &mut Process) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm as O;
+    let active = arinsal_args::active_allocator_options();
+    let (amcbf, rmcbf, mcs, mmap_scs, lock_memory, ycs, mmc, sac) =
+        allocator_global_settings(&active.flags);
+    let schedulers = active
+        .schedulers
+        .and_then(|count| usize::try_from(count).ok())
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let names = [
+        "sys_alloc",
+        "temp_alloc",
+        "sl_alloc",
+        "std_alloc",
+        "ll_alloc",
+        "eheap_alloc",
+        "ets_alloc",
+        "fix_alloc",
+        "literal_alloc",
+        "binary_alloc",
+        "driver_alloc",
+        "mseg_alloc",
+        "sys_aligned_alloc",
+        "literal_mmap",
+    ];
+    let allocators = O::List {
+        elems: names.into_iter().map(|name| O::Atom(name.into())).collect(),
+        tail: Box::new(O::Nil),
+    };
+    let mut configured = vec![O::Tuple(vec![
+        O::Atom("sys_alloc".into()),
+        O::List {
+            elems: vec![
+                option("e", O::Atom("true".into())),
+                option("m", O::Atom("libc".into())),
+            ],
+            tail: Box::new(O::Nil),
+        },
+    ])];
+    for name in [
+        "temp_alloc",
+        "sl_alloc",
+        "std_alloc",
+        "ll_alloc",
+        "eheap_alloc",
+        "ets_alloc",
+        "fix_alloc",
+        "literal_alloc",
+        "binary_alloc",
+        "driver_alloc",
+    ] {
+        let Some(mut spec) = default_allocator(name, schedulers) else {
+            continue;
+        };
+        apply_allocator_overrides(&mut spec, name, &active.flags, schedulers);
+        configured.push(O::Tuple(vec![
+            O::Atom(name.into()),
+            allocator_options(&spec, true),
+        ]));
+    }
+    let mut test = default_allocator("test_alloc", schedulers).unwrap();
+    apply_allocator_overrides(&mut test, "test_alloc", &active.flags, schedulers);
+    configured.push(O::Tuple(vec![
+        O::Atom("test_alloc".into()),
+        if test.enabled {
+            allocator_options(&test, true)
+        } else {
+            O::List {
+                elems: vec![option("e", O::Atom("false".into()))],
+                tail: Box::new(O::Nil),
+            }
+        },
+    ]));
+    configured.push(O::Tuple(vec![
+        O::Atom("mseg_alloc".into()),
+        O::List {
+            elems: vec![
+                option("amcbf", O::Int(amcbf)),
+                option("rmcbf", O::Int(rmcbf)),
+                option("mcs", O::Int(mcs)),
+            ],
+            tail: Box::new(O::Nil),
+        },
+    ]));
+    configured.push(O::Tuple(vec![
+        O::Atom("alloc_util".into()),
+        O::List {
+            elems: vec![
+                option(
+                    "mmc",
+                    if mmc <= i64::MAX as u64 {
+                        O::Int(mmc as i64)
+                    } else {
+                        O::BigInt(num_bigint::BigInt::from(mmc))
+                    },
+                ),
+                option("ycs", O::Int(ycs)),
+                option("sac", O::Atom(if sac { "true" } else { "false" }.into())),
+            ],
+            tail: Box::new(O::Nil),
+        },
+    ]));
+    configured.push(O::Tuple(vec![
+        O::Atom("erts_mmap".into()),
+        O::List {
+            elems: vec![option("scs", O::Int(mmap_scs))],
+            tail: Box::new(O::Nil),
+        },
+    ]));
+    configured.push(O::Tuple(vec![
+        O::Atom("lock_physical_memory".into()),
+        O::Atom(lock_memory.into()),
+    ]));
+    owned_system_info(
+        process,
+        O::Tuple(vec![
+            O::Atom("undefined".into()),
+            O::Nil,
+            allocators,
+            O::List {
+                elems: configured,
+                tail: Box::new(O::Nil),
+            },
+        ]),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct AllocatorSystemInfo {
+    enabled: bool,
+    thread_specific: bool,
+    scheduler_divisor: u64,
+    shared_profile: bool,
+    base_mmbcs: u64,
+    base_lmbcs: u64,
+    base_smbcs: u64,
+    mmbcs_explicit: bool,
+    lmbcs_explicit: bool,
+    smbcs_explicit: bool,
+    atags: u64,
+    ramv: bool,
+    strategy: &'static str,
+    global_strategy: &'static str,
+    sbct: u64,
+    asbcst: u64,
+    rsbcst: u64,
+    rsbcmt: u64,
+    rmbcmt: u64,
+    mmbcs: u64,
+    mmmbc: u64,
+    mmsbc: u64,
+    lmbcs: u64,
+    smbcs: u64,
+    acul: u64,
+    acful: u64,
+    acnl: u64,
+    acfml: u64,
+    mbcgs: u64,
+    mbsd: Option<u64>,
+    cp: &'static str,
+}
+
+// Port of erts/emulator/beam/erl_alloc.c:221-425 (default allocator initializers), OTP-29.1.1.
+fn default_allocator(name: &str, schedulers: usize) -> Option<AllocatorSystemInfo> {
+    let mbc = (128 * 1024 / schedulers.clamp(1, 4)) as u64;
+    let lbc = 5 * 1024 * 1024;
+    let sbc = (1024 * 1024 / schedulers.clamp(1, 4)) as u64;
+    let mut value = AllocatorSystemInfo {
+        enabled: true,
+        thread_specific: true,
+        scheduler_divisor: schedulers.clamp(1, 4) as u64,
+        shared_profile: false,
+        base_mmbcs: 0,
+        base_lmbcs: 0,
+        base_smbcs: 0,
+        mmbcs_explicit: false,
+        lmbcs_explicit: false,
+        smbcs_explicit: false,
+        atags: 0,
+        ramv: false,
+        strategy: "aoffcbf",
+        global_strategy: "aoffcbf",
+        sbct: 512 * 1024,
+        asbcst: 4_145_152,
+        rsbcst: 20,
+        rsbcmt: 80,
+        rmbcmt: 50,
+        mmbcs: mbc,
+        mmmbc: u64::MAX,
+        mmsbc: 256,
+        lmbcs: lbc,
+        smbcs: sbc,
+        acul: 60,
+        acful: 0,
+        acnl: 1000,
+        acfml: 0,
+        mbcgs: 10,
+        mbsd: None,
+        cp: "undefined",
+    };
+    match name {
+        "temp_alloc" => {
+            value.strategy = "af";
+            value.global_strategy = "gf";
+            value.rsbcst = 90;
+            value.rmbcmt = 100;
+            value.mmbcs = 128 * 1024;
+            value.lmbcs = 10 * 1024 * 1024;
+            value.smbcs = 1024 * 1024;
+            value.acul = 0;
+            value.acnl = 0;
+            value.mbsd = Some(3);
+        }
+        "sl_alloc" => {
+            value.rsbcst = 80;
+            value.rmbcmt = 50;
+            value.cp = "S";
+        }
+        "std_alloc" => {
+            value.rsbcst = 20;
+            value.cp = "D";
+        }
+        "ets_alloc" => {
+            value.rsbcst = 20;
+            value.cp = "E";
+        }
+        "fix_alloc" => {
+            value.rsbcst = 20;
+            value.cp = "F";
+        }
+        "ll_alloc" => {
+            value.sbct = u64::MAX;
+            value.asbcst = 0;
+            value.rsbcst = 0;
+            value.rsbcmt = 0;
+            value.rmbcmt = 0;
+            value.mmbcs = 2 * 1024 * 1024 / schedulers.clamp(1, 4) as u64;
+            value.mmsbc = 0;
+            value.acul = 85;
+            value.cp = "L";
+        }
+        "eheap_alloc" => {
+            value.rsbcst = 50;
+            value.mmbcs = 512 * 1024 / schedulers.clamp(1, 4) as u64;
+            value.acul = 45;
+            value.cp = "H";
+        }
+        "literal_alloc" => {
+            value.thread_specific = false;
+            value.strategy = "aobf";
+            value.global_strategy = "aobf";
+            value.sbct = u64::MAX;
+            value.asbcst = 0;
+            value.rsbcst = 0;
+            value.rsbcmt = 0;
+            value.rmbcmt = 0;
+            value.mmbcs = 1024 * 1024;
+            value.mmsbc = 0;
+            value.lmbcs = 10 * 1024 * 1024;
+            value.smbcs = 1024 * 1024;
+            value.acul = 0;
+            value.acnl = 0;
+        }
+        "binary_alloc" | "driver_alloc" => {
+            value.atags = 1;
+            value.rsbcst = 20;
+            value.rmbcmt = 50;
+            value.cp = if name == "binary_alloc" { "B" } else { "R" };
+        }
+        "test_alloc" => {
+            value.enabled = false;
+            value.atags = 1;
+            value.strategy = "aoffcbf";
+            value.global_strategy = "aoffcbf";
+            value.sbct = 16 * 1024;
+            value.mmbcs = 0;
+            value.lmbcs = 8 * 1024;
+            value.smbcs = 4 * 1024;
+            value.rsbcst = 20;
+            value.rsbcmt = 80;
+            value.rmbcmt = 50;
+            value.acul = 60;
+            value.acnl = 1000;
+            value.cp = "Z";
+        }
+        _ => return None,
+    }
+    value.base_mmbcs = value.mmbcs;
+    value.base_lmbcs = value.lmbcs;
+    value.base_smbcs = value.smbcs;
+    Some(value)
+}
+
+// Port of erts/emulator/beam/erl_alloc.c:1283-1554 (handle_au_arg), OTP-29.1.1.
+fn apply_allocator_overrides(
+    spec: &mut AllocatorSystemInfo,
+    name: &str,
+    flags: &[arinsal_args::IgnoredFlag],
+    schedulers: usize,
+) {
+    for flag in flags {
+        let Some(value) = flag.value.as_deref() else {
+            continue;
+        };
+        let Some(rest) = flag.name.strip_prefix("+M") else {
+            continue;
+        };
+        if rest == "ea" {
+            match value {
+                "min" | "max" => {
+                    if matches!(
+                        name,
+                        "binary_alloc"
+                            | "std_alloc"
+                            | "ets_alloc"
+                            | "eheap_alloc"
+                            | "ll_alloc"
+                            | "driver_alloc"
+                            | "fix_alloc"
+                            | "sl_alloc"
+                    ) {
+                        spec.enabled = value == "max";
+                    }
+                }
+                "r9c" | "r10b" | "r11b" => apply_allocator_preset(spec, name, value, schedulers),
+                _ => {}
+            }
+            continue;
+        }
+        let applies = if rest.starts_with('u') {
+            matches!(
+                name,
+                "binary_alloc"
+                    | "std_alloc"
+                    | "ets_alloc"
+                    | "eheap_alloc"
+                    | "ll_alloc"
+                    | "driver_alloc"
+                    | "fix_alloc"
+                    | "sl_alloc"
+            )
+        } else {
+            rest.chars().next().is_some_and(|prefix| match prefix {
+                'T' => name == "temp_alloc",
+                'S' => name == "sl_alloc",
+                'D' => name == "std_alloc",
+                'L' => name == "ll_alloc",
+                'H' => name == "eheap_alloc",
+                'E' => name == "ets_alloc",
+                'F' => name == "fix_alloc",
+                'I' => name == "literal_alloc",
+                'B' => name == "binary_alloc",
+                'R' => name == "driver_alloc",
+                'Z' => name == "test_alloc",
+                _ => false,
+            })
+        };
+        if !applies {
+            continue;
+        }
+        let switch = &rest[1..];
+        match switch {
+            "e" => spec.enabled = value == "true",
+            "t" => {
+                let was_thread_specific = spec.thread_specific;
+                spec.thread_specific = value == "true";
+                if value == "false" && was_thread_specific {
+                    spec.acul = 0;
+                    spec.acful = 0;
+                    spec.acnl = 0;
+                    if matches!(
+                        name,
+                        "sl_alloc"
+                            | "std_alloc"
+                            | "ll_alloc"
+                            | "eheap_alloc"
+                            | "ets_alloc"
+                            | "fix_alloc"
+                            | "binary_alloc"
+                            | "driver_alloc"
+                    ) {
+                        if !spec.mmbcs_explicit {
+                            spec.mmbcs = spec.mmbcs.saturating_mul(spec.scheduler_divisor);
+                        }
+                        if !spec.lmbcs_explicit {
+                            spec.lmbcs = 10 * 1024 * 1024;
+                        }
+                        if !spec.smbcs_explicit {
+                            spec.smbcs = 1024 * 1024;
+                        }
+                        spec.global_strategy = "gf";
+                        spec.mbsd = Some(3);
+                        spec.shared_profile = true;
+                    }
+                } else if value == "true" && !was_thread_specific && spec.shared_profile {
+                    if !spec.mmbcs_explicit {
+                        spec.mmbcs = spec.base_mmbcs;
+                    }
+                    if !spec.lmbcs_explicit {
+                        spec.lmbcs = spec.base_lmbcs;
+                    }
+                    if !spec.smbcs_explicit {
+                        spec.smbcs = spec.base_smbcs;
+                    }
+                }
+            }
+            "ramv" => spec.ramv = value == "true",
+            "atags" => {
+                spec.atags = match value {
+                    "true" => 1,
+                    "code" => 2,
+                    _ => 0,
+                }
+            }
+            "sbct" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.sbct = number.saturating_mul(1024)
+                }
+            }
+            "asbcst" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.asbcst = number.saturating_mul(1024)
+                }
+            }
+            "rsbcst" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.rsbcst = number.min(100)
+                }
+            }
+            "rsbcmt" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.rsbcmt = number.min(100)
+                }
+            }
+            "rmbcmt" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.rmbcmt = number.min(100)
+                }
+            }
+            "mmbcs" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.mmbcs = number.saturating_mul(1024);
+                    spec.mmbcs_explicit = true;
+                }
+            }
+            "mmmbc" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.mmmbc = number
+                }
+            }
+            "mmsbc" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.mmsbc = number
+                }
+            }
+            "lmbcs" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.lmbcs = number.saturating_mul(1024);
+                    spec.lmbcs_explicit = true;
+                }
+            }
+            "smbcs" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.smbcs = number.saturating_mul(1024);
+                    spec.smbcs_explicit = true;
+                }
+            }
+            "acul" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.acul = number.min(100)
+                } else if value == "de" {
+                    spec.acul = match name {
+                        "ll_alloc" => 85,
+                        "eheap_alloc" => 45,
+                        _ => 60,
+                    }
+                }
+            }
+            "acful" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.acful = number.min(100)
+                }
+            }
+            "acnl" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.acnl = number
+                }
+            }
+            "acfml" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.acfml = number
+                }
+            }
+            "mbcgs" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.mbcgs = number
+                }
+            }
+            "mbsd" => {
+                if let Some(number) = parse_flag_integer(value) {
+                    spec.mbsd = Some(number.max(1))
+                }
+            }
+            "cp" => {
+                spec.cp = match value {
+                    "B" => "B",
+                    "D" => "D",
+                    "E" => "E",
+                    "F" => "F",
+                    "H" => "H",
+                    "L" => "L",
+                    "R" => "R",
+                    "S" => "S",
+                    "@" => "@",
+                    ":" => ":",
+                    _ => spec.cp,
+                }
+            }
+            "as" => {
+                let strategy = match value {
+                    "bf" => "bf",
+                    "aobf" => "aobf",
+                    "gf" => "gf",
+                    "af" => "af",
+                    "aoff" => "aoff",
+                    "aoffcbf" => "aoffcbf",
+                    "aoffcaobf" => "aoffcaobf",
+                    "ageffcaoff" => "ageffcaoff",
+                    "ageffcbf" => "ageffcbf",
+                    "ageffcaobf" => "ageffcaobf",
+                    "chaosff" if name == "test_alloc" => "chaosff",
+                    _ => spec.strategy,
+                };
+                spec.strategy = strategy;
+                spec.global_strategy = strategy;
+            }
+            _ => {}
+        }
+    }
+}
+
+// Port of erts/emulator/beam/erl_alloc.c:1749-1772 (handle_args +Mea), OTP-29.1.1.
+fn apply_allocator_preset(
+    spec: &mut AllocatorSystemInfo,
+    name: &str,
+    preset: &str,
+    schedulers: usize,
+) {
+    if !matches!(
+        name,
+        "binary_alloc"
+            | "std_alloc"
+            | "ets_alloc"
+            | "eheap_alloc"
+            | "ll_alloc"
+            | "driver_alloc"
+            | "fix_alloc"
+            | "sl_alloc"
+            | "temp_alloc"
+    ) {
+        return;
+    }
+    let default_name = if name == "fix_alloc" {
+        "driver_alloc"
+    } else {
+        name
+    };
+    if let Some(defaults) = default_allocator(default_name, schedulers) {
+        *spec = defaults;
+    }
+    if name != "temp_alloc" {
+        spec.thread_specific = false;
+        spec.acul = 0;
+        spec.acful = 0;
+        spec.ramv = false;
+        spec.mmbcs = spec.mmbcs.saturating_mul(spec.scheduler_divisor);
+        spec.lmbcs = 5 * 1024 * 1024;
+        spec.shared_profile = true;
+    }
+    if name == "driver_alloc"
+        || preset == "r9c"
+            && matches!(
+                name,
+                "sl_alloc" | "std_alloc" | "binary_alloc" | "ets_alloc"
+            )
+    {
+        spec.enabled = false;
+    }
+}
+
+fn parse_flag_integer(value: &str) -> Option<u64> {
+    let value = value.trim_start();
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let digits = value
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .collect::<Vec<_>>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.iter().try_fold(0_u64, |number, digit| {
+        number.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+    })
+}
+
+fn allocator_options(spec: &AllocatorSystemInfo, global: bool) -> arinsal_etf::OwnedTerm {
+    use arinsal_etf::OwnedTerm as O;
+    let number = |value: u64| {
+        if value <= i64::MAX as u64 {
+            O::Int(value as i64)
+        } else {
+            O::BigInt(num_bigint::BigInt::from(value))
+        }
+    };
+    let bool_atom = |value| O::Atom(if value { "true" } else { "false" }.into());
+    let cp = if global || !spec.thread_specific || spec.shared_profile || spec.cp == "undefined" {
+        "undefined"
+    } else {
+        spec.cp
+    };
+    let mut values = vec![
+        option("e", bool_atom(spec.enabled)),
+        option("t", bool_atom(spec.thread_specific)),
+        option(
+            "atags",
+            if spec.atags > 1 {
+                O::Int(spec.atags as i64)
+            } else {
+                bool_atom(spec.atags == 1)
+            },
+        ),
+        option("ramv", bool_atom(false)),
+        option("sbct", number(spec.sbct)),
+        option("asbcst", number(spec.asbcst)),
+        option("rsbcst", number(spec.rsbcst)),
+        option("rsbcmt", number(spec.rsbcmt)),
+        option("rmbcmt", number(spec.rmbcmt)),
+        option("mmbcs", number(spec.mmbcs)),
+        option("mmmbc", number(spec.mmmbc)),
+        option("mmsbc", number(spec.mmsbc)),
+        option("lmbcs", number(spec.lmbcs)),
+        option("smbcs", number(spec.smbcs)),
+        option("mbcgs", O::Int(10)),
+        option("acful", O::Int(0)),
+        option("acul", number(if global { 0 } else { spec.acul })),
+        option("acnl", number(if global { 0 } else { spec.acnl })),
+        option("acfml", O::Int(0)),
+        option("cp", O::Atom(cp.into())),
+    ];
+    if let Some(mbsd) = spec.mbsd
+        && (global || spec.shared_profile)
+    {
+        values.push(option("mbsd", number(mbsd)));
+    }
+    values.push(option(
+        "as",
+        O::Atom(
+            if global || spec.shared_profile {
+                spec.global_strategy
+            } else {
+                spec.strategy
+            }
+            .into(),
+        ),
+    ));
+    O::List {
+        elems: values,
+        tail: Box::new(O::Nil),
+    }
+}
+
+fn option(name: &str, value: arinsal_etf::OwnedTerm) -> arinsal_etf::OwnedTerm {
+    arinsal_etf::OwnedTerm::Tuple(vec![arinsal_etf::OwnedTerm::Atom(name.into()), value])
+}
+
+fn owned_system_info(
+    process: &mut Process,
+    value: arinsal_etf::OwnedTerm,
+) -> Result<Term, VmError> {
+    arinsal_term::from_owned(
+        &value,
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    )
+    .map_err(|_| badarg())
 }
 
 fn max_integer(process: &mut Process) -> Result<Term, VmError> {
@@ -2542,6 +3436,267 @@ mod tests {
                 "{selector}"
             );
         }
+    }
+
+    #[test]
+    fn alloc_a4_allocator_options_match_otp() {
+        use OwnedTerm as O;
+
+        fn reference_term(arguments: &[&str], eval: &str) -> O {
+            let output = std::process::Command::new("erl")
+                .args(arguments)
+                .args([
+                    "-noshell",
+                    "-eval",
+                    &format!(
+                        "io:put_chars(standard_io,binary:encode_hex(term_to_binary({eval}))),halt()."
+                    ),
+                ])
+                .output()
+                .expect("reference erl process");
+            assert!(
+                output.status.success(),
+                "reference erl failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let encoded = std::str::from_utf8(&output.stdout).unwrap();
+            let bytes = encoded
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>();
+            arinsal_etf::decode(&bytes).unwrap()
+        }
+
+        let default_output = reference_term(
+            &[],
+            "{[erlang:system_info({allocator,A}) || A <- [temp_alloc,sl_alloc,std_alloc,ll_alloc,eheap_alloc,ets_alloc,fix_alloc,literal_alloc,binary_alloc,driver_alloc]],erlang:system_info(allocator),erlang:system_info(alloc_util_allocators)}",
+        );
+        let O::Tuple(default_values) = &default_output else {
+            panic!("OTP default allocator query was not a tuple");
+        };
+        let O::List {
+            elems: default_infos,
+            ..
+        } = &default_values[0]
+        else {
+            panic!("OTP default allocator options were not a list");
+        };
+        arinsal_args::configure_allocator_options(arinsal_args::ActiveAllocatorOptions::default());
+
+        fn project(value: &O) -> O {
+            let O::List { elems, .. } = value else {
+                return value.clone();
+            };
+            O::List {
+                elems: elems
+                    .iter()
+                    .filter_map(|entry| {
+                        let O::Tuple(fields) = entry else {
+                            return None;
+                        };
+                        if fields.len() != 3 {
+                            return None;
+                        }
+                        let O::List { elems, .. } = &fields[2] else {
+                            return None;
+                        };
+                        let selected = elems
+                            .iter()
+                            .filter(|item| matches!(item, O::Tuple(parts) if parts.first().is_some_and(|key| matches!(key, O::Atom(name) if name == "options" || name == "versions"))))
+                            .cloned()
+                            .collect();
+                        Some(O::Tuple(vec![fields[1].clone(), O::List { elems: selected, tail: Box::new(O::Nil) }]))
+                    })
+                    .collect(),
+                tail: Box::new(O::Nil),
+            }
+        }
+
+        for (index, name) in [
+            "temp_alloc",
+            "sl_alloc",
+            "std_alloc",
+            "ll_alloc",
+            "eheap_alloc",
+            "ets_alloc",
+            "fix_alloc",
+            "literal_alloc",
+            "binary_alloc",
+            "driver_alloc",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut process = Process::new();
+            let input = from_owned(
+                &O::Tuple(vec![O::Atom("allocator".into()), O::Atom(name.into())]),
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            )
+            .unwrap();
+            let actual = system_info(&Vm::new([]), &mut process, None, input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                project(&to_owned(actual).unwrap()),
+                project(&default_infos[index]),
+                "{name}"
+            );
+        }
+
+        for (selector, expected) in [
+            (O::Atom("allocator".into()), &default_values[1]),
+            (O::Atom("alloc_util_allocators".into()), &default_values[2]),
+        ] {
+            let mut process = Process::new();
+            let input = from_owned(
+                &selector,
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            )
+            .unwrap();
+            let actual = system_info(&Vm::new([]), &mut process, None, input)
+                .unwrap()
+                .unwrap();
+            assert_eq!(to_owned(actual).unwrap(), *expected, "{selector}");
+        }
+
+        let names = ["eheap_alloc", "sl_alloc", "ets_alloc", "binary_alloc"];
+        let expected = reference_term(
+            &[
+                "+S", "2:2", "+MHsbct", "100", "+MSas", "ageffcbf", "+MEacul", "75", "+MBatags",
+                "true", "+MHt", "false", "+MHt", "true", "+MMmcs", "5",
+            ],
+            "{[erlang:system_info({allocator,A}) || A <- [eheap_alloc,sl_alloc,ets_alloc,binary_alloc]],erlang:system_info({allocator,mseg_alloc}),erlang:system_info(allocator)}",
+        );
+        let mut actual_infos = Vec::new();
+        let active = arinsal_args::ActiveAllocatorOptions {
+            schedulers: Some(2),
+            flags: vec![
+                arinsal_args::IgnoredFlag {
+                    name: "+MHsbct".into(),
+                    value: Some("100".into()),
+                },
+                arinsal_args::IgnoredFlag {
+                    name: "+MHt".into(),
+                    value: Some("false".into()),
+                },
+                arinsal_args::IgnoredFlag {
+                    name: "+MHt".into(),
+                    value: Some("true".into()),
+                },
+                arinsal_args::IgnoredFlag {
+                    name: "+MSas".into(),
+                    value: Some("ageffcbf".into()),
+                },
+                arinsal_args::IgnoredFlag {
+                    name: "+MEacul".into(),
+                    value: Some("75".into()),
+                },
+                arinsal_args::IgnoredFlag {
+                    name: "+MBatags".into(),
+                    value: Some("true".into()),
+                },
+                arinsal_args::IgnoredFlag {
+                    name: "+MMmcs".into(),
+                    value: Some("5".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        arinsal_args::configure_allocator_options(active);
+        for name in names {
+            let mut process = Process::new();
+            let input = from_owned(
+                &O::Tuple(vec![O::Atom("allocator".into()), O::Atom(name.into())]),
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            )
+            .unwrap();
+            actual_infos.push(
+                to_owned(
+                    system_info(&Vm::new([]), &mut process, None, input)
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        let O::Tuple(flagged_expected) = &expected else {
+            panic!("OTP flagged allocator result was not a tuple");
+        };
+        let O::List {
+            elems: expected_infos,
+            ..
+        } = &flagged_expected[0]
+        else {
+            panic!("OTP flagged allocator options were not a list");
+        };
+        assert_eq!(actual_infos.len(), expected_infos.len());
+        for (actual, expected) in actual_infos.iter().zip(expected_infos) {
+            assert_eq!(
+                project(actual),
+                project(expected),
+                "allocator options with +M switches"
+            );
+        }
+        let mut process = Process::new();
+        let input = Term::atom(global_atoms().intern("allocator").unwrap());
+        let actual = system_info(&Vm::new([]), &mut process, None, input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            to_owned(actual).unwrap(),
+            flagged_expected[2],
+            "global allocator configuration with +M switches"
+        );
+        let mut process = Process::new();
+        let input = from_owned(
+            &O::Tuple(vec![
+                O::Atom("allocator".into()),
+                O::Atom("mseg_alloc".into()),
+            ]),
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .unwrap();
+        let actual = system_info(&Vm::new([]), &mut process, None, input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project(&to_owned(actual).unwrap()),
+            project(&flagged_expected[1]),
+            "mseg allocator options with +MM switches"
+        );
+
+        let test_expected = reference_term(
+            &["+MZe", "true"],
+            "erlang:system_info({allocator,test_alloc})",
+        );
+        arinsal_args::configure_allocator_options(arinsal_args::ActiveAllocatorOptions {
+            flags: vec![arinsal_args::IgnoredFlag {
+                name: "+MZe".into(),
+                value: Some("true".into()),
+            }],
+            ..Default::default()
+        });
+        let mut process = Process::new();
+        let input = from_owned(
+            &O::Tuple(vec![
+                O::Atom("allocator".into()),
+                O::Atom("test_alloc".into()),
+            ]),
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .unwrap();
+        let actual = system_info(&Vm::new([]), &mut process, None, input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            project(&to_owned(actual).unwrap()),
+            project(&test_expected),
+            "enabled test allocator options"
+        );
+        arinsal_args::configure_allocator_options(arinsal_args::ActiveAllocatorOptions::default());
     }
 
     #[test]

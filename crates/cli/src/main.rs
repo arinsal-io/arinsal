@@ -99,6 +99,34 @@ fn erl_launch(args: &[String]) -> ! {
             std::process::exit(status);
         }
     };
+    let default_dirty_allocators = launch
+        .emulator
+        .dirty_cpu_schedulers
+        .map(|count| usize::try_from(count.total).unwrap_or(0))
+        .or_else(|| {
+            launch
+                .emulator
+                .schedulers
+                .map(|count| usize::try_from(count.total).unwrap_or(0))
+        })
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    arinsal_args::configure_allocator_options(arinsal_args::ActiveAllocatorOptions {
+        schedulers: launch.emulator.schedulers.map(|count| count.total),
+        dirty_instances: launch
+            .emulator
+            .allocator_options
+            .iter()
+            .find(|flag| flag.name == "+Mdai")
+            .and_then(|flag| flag.value.as_deref())
+            .and_then(|value| {
+                if value == "max" {
+                    Some(default_dirty_allocators)
+                } else {
+                    value.parse().ok()
+                }
+            }),
+        flags: launch.emulator.allocator_options.clone(),
+    });
     if launch.detached {
         // erlexec forks and calls setsid (erlexec.c:1199). Arinsal does not detach.
         eprintln!("arinsal: -detached is not supported");

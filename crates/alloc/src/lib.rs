@@ -1,8 +1,10 @@
 #![deny(unsafe_code)]
 
 pub mod alloc_util;
+pub mod allocator;
 pub mod instances;
 pub mod mmap;
 pub mod mseg;
 #[allow(unsafe_code)]
 pub mod raw;
+pub mod types;

@@ -171,6 +171,27 @@ fn accepted_ignored_flags_are_reported() {
 }
 
 #[test]
+fn alloc_a4_allocator_switches_are_retained_after_validation() {
+    let launch = parse(
+        &[
+            "erl", "+MDmmbcs", "64", "+MMsco", "true", "+Mea", "max", "+Mlpm", "all",
+        ],
+        &environment(),
+    )
+    .unwrap();
+    assert_eq!(launch.emulator.allocator_options.len(), 4);
+    assert_eq!(launch.emulator.allocator_options[0].name, "+MDmmbcs");
+    assert_eq!(
+        launch.emulator.allocator_options[0].value.as_deref(),
+        Some("64")
+    );
+    assert!(matches!(
+        parse(&["erl", "+MMsco", "maybe"], &environment()),
+        Err(ArgsError::ErlDiagnostic(_))
+    ));
+}
+
+#[test]
 fn erlexec_root_override_and_optional_time_correction() {
     let mut env = environment();
     env.insert("ERL_ROOTDIR".into(), "/otp/override".into());

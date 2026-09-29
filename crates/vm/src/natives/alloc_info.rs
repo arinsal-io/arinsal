@@ -36,14 +36,6 @@ pub(super) fn system_info(
     let OwnedTerm::Tuple(parts) = &owned else {
         return None;
     };
-    if let [OwnedTerm::Atom(operation), OwnedTerm::Atom(allocator)] = parts.as_slice()
-        && operation == "allocator"
-        && allocator == "mseg_alloc"
-    {
-        // OTP returns `false` when this optional allocator is not present.
-        // Arinsal does not use the erts mseg allocator.
-        return Some(Ok(atom("false")));
-    }
     if parts.len() != 3 {
         return None;
     }
