@@ -94,7 +94,7 @@ impl Vm {
         ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
         op: GenericOp,
         opcode: Opcode,
-    ) -> Result<(), VmError> {
+    ) -> Result<u32, VmError> {
         let [a, b, c] = op.args;
         let (index, first, arity, dst, fast) = {
             let module = &self.modules[p.module];
@@ -136,16 +136,17 @@ impl Vm {
             if let Some(result) = result {
                 p.write(dst, result)?;
                 p.ip += 1;
-                return Ok(());
+                return Ok(0);
             }
         }
         let class = self.import_class(p.module, index)?;
         let args = &stored[..arity];
-        let result = if class == ImportClass::Pure {
+        let (result, bif_reductions) = if class == ImportClass::Pure {
             let bif = self.modules[p.module].imports[index]
                 .bif_fn()
                 .ok_or_else(|| VmError::Unsupported("pure BIF".into()))?;
-            match calls::call_bif(&mut p.heap, bif, args) {
+            let (result, reductions) = calls::call_bif_metered(&mut p.heap, bif, args);
+            let result = match result {
                 Ok(value) => Ok(value),
                 Err(error) => {
                     let import = &self.modules[p.module].imports[index];
@@ -157,7 +158,8 @@ impl Vm {
                         error,
                     ))
                 }
-            }
+            };
+            (result, reductions)
         } else {
             let caller_module = Arc::clone(&self.modules[p.module]);
             let import = &caller_module.imports[index];
@@ -180,20 +182,26 @@ impl Vm {
                 ctx.and_then(|run| signals::call(self, p, run, module_name, function_name, args))
             };
             if let Some(result) = native {
-                result
+                (result, 0)
             } else if let Some(bif) = bif {
                 match calls::call_bif_catch(&mut p.heap, bif, args) {
-                    Ok(Ok(value)) => Ok(value),
-                    Ok(Err(error)) => Err(exceptions::bif_error(
-                        p,
-                        module_name,
-                        function_name,
-                        args,
-                        error,
-                    )),
-                    Err(()) => Err(VmError::Unsupported(format!(
-                        "BIF {module_name}:{function_name} panicked"
-                    ))),
+                    Ok(Ok(value)) => (Ok(value), 0),
+                    Ok(Err(error)) => (
+                        Err(exceptions::bif_error(
+                            p,
+                            module_name,
+                            function_name,
+                            args,
+                            error,
+                        )),
+                        0,
+                    ),
+                    Err(()) => (
+                        Err(VmError::Unsupported(format!(
+                            "BIF {module_name}:{function_name} panicked"
+                        ))),
+                        0,
+                    ),
                 }
             } else {
                 return Err(VmError::Unsupported(format!(
@@ -201,15 +209,20 @@ impl Vm {
                 )));
             }
         };
+        // Port of erts/emulator/beam/erl_arith.c:56-85, OTP-29.1.1.
+        p.reductions = p
+            .reductions
+            .saturating_sub(bif_reductions.min(i32::MAX as u32) as i32);
+        p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
         match result {
             Ok(value) => {
                 p.write(dst, value)?;
                 p.ip += 1;
-                Ok(())
+                Ok(bif_reductions)
             }
             Err(_) if a.kind() == Arg::LABEL && a.value() != u32::MAX as u64 => {
                 p.ip = a.value() as usize;
-                Ok(())
+                Ok(bif_reductions)
             }
             Err(error) => Err(error),
         }

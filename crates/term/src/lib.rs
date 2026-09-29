@@ -40,7 +40,8 @@ pub use internal_hash::{internal_hash, internal_salted_hash};
 pub use magic::MagicRef;
 pub use native_code::{is_native_code_pointer, register_native_code_range};
 pub use ops::{
-    cmp, cmp_exact, exact_eq, flat_size, loose_eq, size_object, small_add, small_mul, small_sub,
+    cmp, cmp_exact, exact_eq, flat_size, integer_magnitude_cmp, loose_eq, size_object, small_add,
+    small_mul, small_sub,
 };
 pub use owned::{from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence};
@@ -290,6 +291,15 @@ impl Term {
         }
         // SAFETY: TermBuilder creates boxed terms from allocated, aligned words.
         Some(unsafe { *self.raw_ptr() })
+    }
+    /// Return the number of 64-bit digits in a boxed bignum.
+    #[inline]
+    pub fn bignum_digit_count(self) -> Option<usize> {
+        let header = self.header()?;
+        match header & 63 {
+            POS_BIG | NEG_BIG => Some((header >> 6) as usize),
+            _ => None,
+        }
     }
     /// Whether a boxed term is an internal magic reference.
     #[inline]

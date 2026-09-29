@@ -26,6 +26,102 @@ pub enum ArithError {
 /// Result of an arithmetic BIF.
 pub type ArithResult = Result<Term, ArithError>;
 
+/// Estimate OTP's reduction charge for a bignum arithmetic operation.
+///
+/// Port of erts/emulator/beam/erl_arith.c:56-85 and erts/emulator/beam/emu/arith_instrs.tab:520,
+/// OTP-29.1.1. `args` must be the operation's original integer operands.
+pub fn reduction_charge(operation: &str, args: &[Term]) -> u32 {
+    const WORDS_PER_REDUCTION: usize = 16;
+    const MAX_REDUCTIONS: usize = 4_000;
+    let words = |term: Term| {
+        term.as_small()
+            .map(|_| 1)
+            .or_else(|| term.bignum_digit_count())
+    };
+    let linear = |size: usize| {
+        if size >= MAX_REDUCTIONS * WORDS_PER_REDUCTION {
+            MAX_REDUCTIONS as u32
+        } else {
+            (size / WORDS_PER_REDUCTION + 1) as u32
+        }
+    };
+    let quadratic = |left: usize, right: usize| {
+        if left >= MAX_REDUCTIONS * WORDS_PER_REDUCTION
+            || right >= MAX_REDUCTIONS * WORDS_PER_REDUCTION
+        {
+            MAX_REDUCTIONS as u32
+        } else {
+            (left.saturating_mul(right) / WORDS_PER_REDUCTION + 1) as u32
+        }
+    };
+    let (Some(&left), right) = (args.first(), args.get(1)) else {
+        return 0;
+    };
+    let Some(left_words) = words(left) else {
+        return 0;
+    };
+    let Some(right) = right.copied() else {
+        return match operation {
+            "bnot" if left.bignum_digit_count().is_some() => linear(left_words + 2),
+            "-" if left.bignum_digit_count().is_some() => linear(left_words),
+            _ => 0,
+        };
+    };
+    let Some(right_words) = words(right) else {
+        return 0;
+    };
+    let has_bignum = left.bignum_digit_count().is_some() || right.bignum_digit_count().is_some();
+    if matches!(operation, "bsl" | "bsr") {
+        let Some(count) = right.as_small() else {
+            return if left.as_small() == Some(0) {
+                0
+            } else {
+                MAX_REDUCTIONS as u32
+            };
+        };
+        if count == 0 || left.as_small() == Some(0) {
+            return 0;
+        }
+        let shift_left = (count >= 0) == (operation == "bsl");
+        let amount = count.unsigned_abs().min(usize::MAX as u64) as usize;
+        let result_words = if shift_left {
+            left_words.saturating_add(amount / 64)
+        } else if left.bignum_digit_count().is_some() {
+            left_words.saturating_sub(amount / 64).max(3)
+        } else {
+            return 0;
+        };
+        return linear(result_words + 2);
+    }
+    if !has_bignum {
+        return 0;
+    }
+    match operation {
+        "+" if left.as_small() == Some(0) || right.as_small() == Some(0) => 0,
+        "+" => linear(left_words.max(right_words) + 2),
+        "-" if right.as_small() == Some(0) => 0,
+        "-" => linear(left_words.max(right_words) + 1),
+        "*" if left.as_small().is_some_and(|n| n.abs() <= 1)
+            || right.as_small().is_some_and(|n| n.abs() <= 1) =>
+        {
+            0
+        }
+        "*" if left.as_small() == Some(0) || right.as_small() == Some(0) => 0,
+        "*" => quadratic(left_words, right_words),
+        "band" | "bor" | "bxor" => linear(left_words.max(right_words) + 2),
+        "div" | "rem" => {
+            // Port of erts/emulator/beam/erl_arith.c:1208-1213 (big_ucomp branch), OTP-29.1.1.
+            if arinsal_term::integer_magnitude_cmp(left, right) != Some(std::cmp::Ordering::Greater)
+            {
+                0
+            } else {
+                quadratic(left_words.saturating_sub(right_words) + 1, right_words)
+            }
+        }
+        _ => 0,
+    }
+}
+
 // TermBuilder is sized; this proxy preserves the frozen ?Sized heap API.
 struct HeapProxy<'a, H: HeapAlloc + ?Sized>(&'a mut H);
 impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
@@ -571,4 +667,21 @@ pub fn list_to_integer_decimal<H: HeapAlloc + ?Sized>(list: Term, heap: &mut H) 
 /// `binary_to_integer(Bin)` in decimal.
 pub fn binary_to_integer_decimal<H: HeapAlloc + ?Sized>(bin: Term, heap: &mut H) -> ArithResult {
     binary_to_integer(bin, Term::small(10).unwrap(), heap)
+}
+
+#[cfg(test)]
+mod arithmetic_reduction_tests {
+    use super::reduction_charge;
+    use arinsal_term::{Term, TermBuilder, VecHeap};
+    use num_bigint::BigInt;
+
+    #[test]
+    fn arith_red_max_bignum_division_uses_the_context_cap() {
+        let value = (BigInt::from(1_u8) << (65_535 * 64)) - 1;
+        let mut heap = VecHeap::new();
+        let left = TermBuilder::new(&mut heap).int_from_bigint(&value).unwrap();
+        let right = Term::small(7).unwrap();
+        assert_eq!(left.bignum_digit_count(), Some(65_535));
+        assert_eq!(reduction_charge("div", &[left, right]), 4_000);
+    }
 }

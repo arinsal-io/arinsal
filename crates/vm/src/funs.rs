@@ -536,6 +536,7 @@ impl Vm {
             })?;
             p.x[0] = result;
             let charge = bif_reductions.saturating_add(1);
+            p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
             p.reductions = p
                 .reductions
                 .saturating_sub(charge.min(i32::MAX as u32) as i32);

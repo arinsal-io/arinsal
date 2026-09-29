@@ -1078,6 +1078,56 @@ pub fn merge<H: HeapAlloc + ?Sized>(left: Term, right: Term, heap: &mut H) -> Ma
     if size(right)? == 0 {
         return Ok(left);
     }
+    if !left.is_hashmap() && !right.is_hashmap() {
+        // Port of erts/emulator/beam/erl_map.c:1286-1423, OTP-29.1.1.
+        // Flatmap keys are already sorted, so merge them in one pass instead
+        // of probing each map for every key.
+        let left_pairs = to_list(left)?;
+        let right_pairs = to_list(right)?;
+        let mut entries = Vec::with_capacity(left_pairs.len() + right_pairs.len());
+        let (mut i, mut j) = (0, 0);
+        while i < left_pairs.len() && j < right_pairs.len() {
+            match key_cmp(left_pairs[i].0, right_pairs[j].0) {
+                Ordering::Less => {
+                    entries.push(left_pairs[i]);
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    entries.push(right_pairs[j]);
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    entries.push(right_pairs[j]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        entries.extend_from_slice(&left_pairs[i..]);
+        entries.extend_from_slice(&right_pairs[j..]);
+
+        if entries.len() == right_pairs.len() {
+            if left_pairs.len() == right_pairs.len()
+                && let (Some(left_keys), Some(right_keys)) =
+                    (left.flatmap_keys_tuple(), right.flatmap_keys_tuple())
+                && left_keys.is_literal()
+                && !right_keys.is_literal()
+            {
+                right.flatmap_replace_keys(left_keys);
+            }
+            return Ok(right);
+        }
+        if entries.len() <= LIMIT {
+            let result = flat(&entries, heap)?;
+            if entries.len() == left_pairs.len()
+                && let Some(keys) = left.flatmap_keys_tuple()
+            {
+                result.flatmap_replace_keys(keys);
+            }
+            return Ok(result);
+        }
+        return build_hamt(&entries, heap);
+    }
     let right_pairs = to_list(right)?;
     let mut left_is_subset = true;
     for (key, _) in iter(left)? {

@@ -216,6 +216,28 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     };
     let left = from_raw(lhs);
     let right = from_raw(rhs);
+    let operation = match op {
+        0 => Some(("+", &[left, right][..])),
+        1 => Some(("-", &[left, right][..])),
+        2 => Some(("*", &[left, right][..])),
+        3 => Some(("div", &[left, right][..])),
+        4 => Some(("rem", &[left, right][..])),
+        5 => Some(("band", &[left, right][..])),
+        6 => Some(("bor", &[left, right][..])),
+        7 => Some(("bxor", &[left, right][..])),
+        8 => Some(("bnot", &[left][..])),
+        9 => Some(("-", &[left][..])),
+        10 => Some(("bsl", &[left, right][..])),
+        11 => Some(("bsr", &[left, right][..])),
+        _ => None,
+    };
+    if let Some((operation, args)) = operation {
+        let charge = arinsal_arith::reduction_charge(operation, args);
+        process.reductions_used = process.reductions_used.saturating_add(u64::from(charge));
+        process.reductions = process
+            .reductions
+            .saturating_sub(charge.min(i32::MAX as u32) as i32);
+    }
     let result = match op {
         16 => float_value(left)
             .map(f64::to_bits)

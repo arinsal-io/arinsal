@@ -160,31 +160,19 @@ impl Vm {
         }
         Ok(self.modules[module].imports[index].class())
     }
-    /// Export cached for the module id currently in `loaded`.
-    ///
-    /// The cached pointer is used only when it still addresses an export of
-    /// that module with the same name and arity. A reload that replaces the
-    /// module drops the match and the caller resolves again.
+    /// Return the import's cached code destination for the current code epoch.
+    // Port of erts/emulator/beam/emu/macros.tab:175-185, OTP-29.1.1.
     pub(crate) fn cached_import_jump(
         &self,
         caller: usize,
         index: usize,
     ) -> Option<(usize, usize, *const Instr)> {
         let import = self.modules.get(caller)?.imports.get(index)?;
-        let id = self.loaded.get(&import.module).copied()?;
-        let (cached, slot) = import.resolved()?;
-        if cached != id {
+        let (id, epoch, target, code) = import.resolved()?;
+        if epoch != self.seen_epoch || code.is_null() {
             return None;
         }
-        let module = self.modules.get(id)?;
-        let live = module
-            .exports
-            .iter()
-            .find(|export| std::ptr::eq(export.as_ref() as *const _, slot))?;
-        if live.function != import.function || live.arity != import.arity {
-            return None;
-        }
-        Some((id, live.target(), live.code_ptr()))
+        Some((id, target, code))
     }
     /// Pure BIF or static NIF bound into this import slot.
     #[inline(always)]
@@ -216,20 +204,17 @@ impl Vm {
         function: &str,
         arity: u8,
     ) {
-        let export = {
-            let Some(slot) = self
-                .modules
-                .get(target_module)
-                .and_then(|module| module.export_slot(function, arity))
-            else {
-                return;
-            };
-            slot as *const arinsal_loader::ExportSlot
+        let Some(export) = self
+            .modules
+            .get(target_module)
+            .and_then(|module| module.export_slot(function, arity))
+        else {
+            return;
         };
         // SAFETY: `export` points at an `ExportSlot` inside this VM's module
         // table. The slot stays allocated for the life of that module entry.
         unsafe {
-            self.modules[caller].imports[index].resolve(target_module, &*export);
+            self.modules[caller].imports[index].resolve(target_module, self.seen_epoch, export);
         }
     }
     pub(crate) fn jump_import(
@@ -285,6 +270,7 @@ impl Vm {
         // A panic in a pure BIF is a VM bug. Erlang failures still return
         // `BifError` and build the same exception frame.
         let (result, bif_reductions) = calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
+        p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
         let value = match result {
             Ok(value) => value,
             Err(error) => {

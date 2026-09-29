@@ -101,3 +101,14 @@ fn reordered_maps_and_nested_cons_copy() {
     assert!(exact_eq(list, copied));
     assert_eq!(destination.used_words(), size_object(list));
 }
+
+#[test]
+fn arith_red_exact_atom_equality_uses_canonical_atom_ids() {
+    let table = arinsal_term::global_atoms();
+    let first = Term::atom(table.intern("arith_red_atom").unwrap());
+    let same = Term::atom(table.intern("arith_red_atom").unwrap());
+    let different = Term::atom(table.intern("arith_red_other_atom").unwrap());
+
+    assert!(exact_eq(first, same));
+    assert!(!exact_eq(first, different));
+}

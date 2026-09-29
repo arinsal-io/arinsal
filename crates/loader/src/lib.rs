@@ -121,6 +121,9 @@ pub struct Import {
     extra_bif: AtomicUsize,
     export: AtomicPtr<ExportSlot>,
     target_module: AtomicUsize,
+    resolved_epoch: AtomicU64,
+    resolved_target: AtomicUsize,
+    resolved_code: AtomicPtr<Instr>,
 }
 impl Clone for Import {
     fn clone(&self) -> Self {
@@ -136,6 +139,9 @@ impl Clone for Import {
             extra_bif: AtomicUsize::new(self.extra_bif.load(Ordering::Acquire)),
             export: AtomicPtr::new(self.export.load(Ordering::Acquire)),
             target_module: AtomicUsize::new(self.target_module.load(Ordering::Acquire)),
+            resolved_epoch: AtomicU64::new(self.resolved_epoch.load(Ordering::Acquire)),
+            resolved_target: AtomicUsize::new(self.resolved_target.load(Ordering::Acquire)),
+            resolved_code: AtomicPtr::new(self.resolved_code.load(Ordering::Acquire)),
         }
     }
 }
@@ -215,21 +221,32 @@ impl Import {
         // SAFETY: `set_extra_bif` stores only a `BifFn` function pointer.
         Some(unsafe { std::mem::transmute::<usize, BifFn>(extra) })
     }
-    /// Cached export address without dereferencing it. A code purge may have
-    /// retired the allocation before the next caller checks the cache.
-    pub fn resolved(&self) -> Option<(usize, *const ExportSlot)> {
+    /// Cached export destination. Epoch mismatch invalidates the code pointer
+    /// before callers can jump through it after a load or purge.
+    pub fn resolved(&self) -> Option<(usize, u64, usize, *const Instr)> {
         let ptr = self.export.load(Ordering::Acquire);
         if ptr.is_null() {
             return None;
         }
-        Some((self.target_module.load(Ordering::Relaxed), ptr.cast_const()))
+        Some((
+            self.target_module.load(Ordering::Relaxed),
+            self.resolved_epoch.load(Ordering::Acquire),
+            self.resolved_target.load(Ordering::Relaxed),
+            self.resolved_code.load(Ordering::Relaxed).cast_const(),
+        ))
     }
-    /// Cache an export entry once the target module has loaded.
+    /// Cache the resolved call destination until the code epoch changes.
     ///
     /// # Safety
     /// The export's Vec allocation must outlive this import entry.
-    pub unsafe fn resolve(&self, module: usize, export: &ExportSlot) {
+    // Port of erts/emulator/beam/emu/emu_load.c:701-725, OTP-29.1.1.
+    pub unsafe fn resolve(&self, module: usize, epoch: u64, export: &ExportSlot) {
+        self.resolved_target
+            .store(export.target(), Ordering::Relaxed);
+        self.resolved_code
+            .store(export.code_ptr().cast_mut(), Ordering::Relaxed);
         self.target_module.store(module, Ordering::Relaxed);
+        self.resolved_epoch.store(epoch, Ordering::Release);
         self.export.store(
             export as *const ExportSlot as *mut ExportSlot,
             Ordering::Release,
@@ -920,6 +937,9 @@ pub fn load_with_instrumentations(
                 extra_bif: AtomicUsize::new(0),
                 export: AtomicPtr::new(std::ptr::null_mut()),
                 target_module: AtomicUsize::new(0),
+                resolved_epoch: AtomicU64::new(0),
+                resolved_target: AtomicUsize::new(0),
+                resolved_code: AtomicPtr::new(std::ptr::null_mut()),
             })
         })
         .collect::<Result<Vec<_>, LoadError>>()?;
@@ -943,6 +963,9 @@ pub fn load_with_instrumentations(
             extra_bif: AtomicUsize::new(0),
             export: AtomicPtr::new(std::ptr::null_mut()),
             target_module: AtomicUsize::new(0),
+            resolved_epoch: AtomicU64::new(0),
+            resolved_target: AtomicUsize::new(0),
+            resolved_code: AtomicPtr::new(std::ptr::null_mut()),
         });
         Some(index)
     } else {
@@ -961,6 +984,9 @@ pub fn load_with_instrumentations(
         extra_bif: AtomicUsize::new(0),
         export: AtomicPtr::new(std::ptr::null_mut()),
         target_module: AtomicUsize::new(0),
+        resolved_epoch: AtomicU64::new(0),
+        resolved_target: AtomicUsize::new(0),
+        resolved_code: AtomicPtr::new(std::ptr::null_mut()),
     });
     let exports = file
         .exports
@@ -1079,6 +1105,9 @@ pub fn load_with_instrumentations(
                 extra_bif: AtomicUsize::new(0),
                 export: AtomicPtr::new(std::ptr::null_mut()),
                 target_module: AtomicUsize::new(0),
+                resolved_epoch: AtomicU64::new(0),
+                resolved_target: AtomicUsize::new(0),
+                resolved_code: AtomicPtr::new(std::ptr::null_mut()),
             });
             notify_breakpoint_stub = Some((*function_ip, import));
         }

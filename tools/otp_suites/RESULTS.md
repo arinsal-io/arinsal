@@ -3,7 +3,7 @@
 | Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |
 |---|---:|---:|---:|---:|---:|---|
 | `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
-| `big_SUITE` | 23 | 23/23 | 18/23 | 5 | 0 | big_float_2: failed {{badmatch,0.0}; big_float_3: failed {{badmatch,3.402823669209385e38}; reductions: failed {badarg; system_limit: failed {badarg; toobig: failed {{badmatch, {'EXIT', {system_limit |
+| `big_SUITE` | 23 | 23/23 | 23/23 | 0 | 0 | none |
 | `binary_SUITE` | 55 | 42/55 | 34/55 | 8 | 0 | bad_terms: failed {'EXIT',error}, unknown_location; copy_terms: failed {'EXIT',error}, unknown_location; error_after_yield: failed {{badmatch,false}; gc_test: failed {{badmatch,{binary,[]}}; local_ext: failed {{badmatch,{error,exbadport}}; otp_5484: failed {'EXIT',error}, unknown_location; t2b_deterministic: failed {{badmatch; terms: failed {'EXIT',error}, unknown_location |
 | `bs_construct_SUITE` | 31 | 30/31 | 26/31 | 4 | 0 | bs_append_offheap: failed "missing binary in erts_bs_private_append"; error_info: failed {{badmatch,false}; in_guard: failed {badarg; reductions: failed {if_clause |
 | `bs_match_bin_SUITE` | 9 | 9/9 | 9/9 | 0 | 0 | none |
@@ -24,6 +24,6 @@
 | `persistent_term_SUITE` | 22 | 22/22 | 0/22 | 22 | -9 | basic: failed {'EXIT',{badarg,[]}}, unknown_location; collisions: missing; destruction: missing; error_info: missing; gc_binary_orig: missing; get_all_race: missing; get_put_colliding_bucket: missing; get_trapping: missing; info: missing; info_trapping: missing; init_restart: missing; keys: missing; killed_while_trapping: missing; killed_while_trapping_erase: missing; killed_while_trapping_put: missing; non_message_signal: missing; off_heap_values: missing; purging: missing; put_erase_trapping: missing; shared_magic_ref: missing; sharing: missing; whole_message: missing |
 | `receive_SUITE` | 14 | 12/14 | 12/14 | 0 | 0 | none |
 | `ref_SUITE` | 5 | 4/5 | 4/5 | 0 | 0 | none |
-| `small_SUITE` | 13 | 13/13 | 8/13 | 5 | 0 | addition: failed {timetrap_timeout,60000; mul_add: failed {badarith; test_bitwise: failed {timetrap_timeout,60000; test_bsl: failed {timetrap_timeout,60000; test_bsr: failed {timetrap_timeout,60000 |
+| `small_SUITE` | 13 | 13/13 | 9/13 | 4 | 0 | addition: failed {timetrap_timeout,60000; test_bitwise: failed {timetrap_timeout,60000; test_bsl: failed {timetrap_timeout,60000; test_bsr: failed {timetrap_timeout,60000 |
 | `tuple_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
 | `unique_SUITE` | 2 | 1/2 | 1/2 | 0 | 0 | none |

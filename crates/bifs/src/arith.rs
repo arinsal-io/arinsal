@@ -46,22 +46,28 @@ fn map_error(error: ArithError) -> BifError {
 }
 
 macro_rules! binary {
-    ($($name:ident),+ $(,)?) => {$ (
+    ($($name:ident => $op:literal),+ $(,)?) => {$ (
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-            arinsal_arith::$name(args[0], args[1], ctx.heap).map_err(map_error)
+            let charge = arinsal_arith::reduction_charge($op, args);
+            let result = arinsal_arith::$name(args[0], args[1], ctx.heap).map_err(map_error);
+            ctx.charge_reductions(charge as usize);
+            result
         }
     )+ };
 }
-binary!(add, sub, mul, fdiv, int_div, rem, band, bor, bxor, bsl, bsr);
+binary!(add => "+", sub => "-", mul => "*", fdiv => "/", int_div => "div", rem => "rem", band => "band", bor => "bor", bxor => "bxor", bsl => "bsl", bsr => "bsr");
 
 macro_rules! unary {
-    ($($name:ident),+ $(,)?) => {$ (
+    ($($name:ident => $op:literal),+ $(,)?) => {$ (
         fn $name(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-            arinsal_arith::$name(args[0], ctx.heap).map_err(map_error)
+            let charge = arinsal_arith::reduction_charge($op, args);
+            let result = arinsal_arith::$name(args[0], ctx.heap).map_err(map_error);
+            ctx.charge_reductions(charge as usize);
+            result
         }
     )+ };
 }
-unary!(bnot, neg, plus, abs, to_float, trunc, round, ceil, floor);
+unary!(bnot => "bnot", neg => "-", plus => "+", abs => "abs", to_float => "float", trunc => "trunc", round => "round", ceil => "ceil", floor => "floor");
 
 fn integer_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     (if args.len() == 1 {

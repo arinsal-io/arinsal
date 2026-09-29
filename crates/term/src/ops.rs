@@ -128,6 +128,16 @@ fn cmp_magnitude(a: &Integer, b: &Integer) -> Ordering {
     })
 }
 
+/// Compare integer magnitudes without considering signs.
+///
+/// Port of erts/emulator/beam/erl_arith.c:1208 (`big_ucomp`), OTP-29.1.1.
+pub fn integer_magnitude_cmp(a: Term, b: Term) -> Option<Ordering> {
+    match (number(a)?, number(b)?) {
+        (Number::Integer(a), Number::Integer(b)) => Some(cmp_magnitude(&a, &b)),
+        _ => None,
+    }
+}
+
 fn integer_cmp(a: &Integer, b: &Integer) -> Ordering {
     if a.zero() && b.zero() {
         return Ordering::Equal;
@@ -782,9 +792,9 @@ pub fn exact_eq(a: Term, b: Term) -> bool {
                     }
                 }
                 TermKind::Atom => {
-                    if global_atoms().text(a.as_atom().unwrap())
-                        != global_atoms().text(b.as_atom().unwrap())
-                    {
+                    // Port of erts/emulator/beam/utils.c:1728-1737, OTP-29.1.1.
+                    // Atom identities are canonical in the VM's global atom table.
+                    if a.as_atom() != b.as_atom() {
                         return false;
                     }
                 }

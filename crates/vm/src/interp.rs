@@ -1416,6 +1416,19 @@ impl Vm {
                 }
             };
         }
+        macro_rules! charge_bif_work {
+            ($amount:expr) => {{
+                let amount = $amount;
+                if amount != 0 {
+                    p.reductions_used = p.reductions_used.saturating_add(u64::from(amount));
+                    reds = reds.saturating_sub(amount.min(i32::MAX as u32) as i32);
+                    consumed = consumed.saturating_add(amount).min(budget);
+                    if let Some(run) = ctx.as_deref_mut() {
+                        run.consume(amount);
+                    }
+                }
+            }};
+        }
         macro_rules! float_bin {
             ($a:expr, $b:expr, $dst:expr, $op:tt) => {{
                 // SAFETY: Specialization validates all FR indices below 1024.
@@ -2100,6 +2113,9 @@ impl Vm {
                         } else {
                             calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity as usize])
                         };
+                    p.reductions_used = p
+                        .reductions_used
+                        .saturating_add(u64::from(bif_reductions));
                     match result {
                         Ok(value) => {
                             p.x[0] = value;
@@ -2174,6 +2190,9 @@ impl Vm {
                         p.reductions = reds;
                         let (result, bif_reductions) =
                             calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity as usize]);
+                        p.reductions_used = p
+                            .reductions_used
+                            .saturating_add(u64::from(bif_reductions));
                         match result {
                             Ok(value) => {
                                 // SAFETY: `x` is the base of the live X file, which
@@ -2707,12 +2726,14 @@ impl Vm {
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
-                        let result = {
+                        let (result, bif_reductions) = {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, right])
+                            let result = bif(&mut ctx, &[left, right]);
+                            (result, ctx.reductions())
                         };
+                        charge_bif_work!(bif_reductions);
                         match result {
                             Ok(value) => {
                                 (htop, stop) = p.heap.heap_cursor();
@@ -2769,12 +2790,14 @@ impl Vm {
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
-                        let result = {
+                        let (result, bif_reductions) = {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, right])
+                            let result = bif(&mut ctx, &[left, right]);
+                            (result, ctx.reductions())
                         };
+                        charge_bif_work!(bif_reductions);
                         (htop, stop) = p.heap.heap_cursor();
                         match result {
                             Ok(value) => value,
@@ -2826,12 +2849,14 @@ impl Vm {
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
-                        let result = {
+                        let (result, bif_reductions) = {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, value])
+                            let result = bif(&mut ctx, &[left, value]);
+                            (result, ctx.reductions())
                         };
+                        charge_bif_work!(bif_reductions);
                         (htop, stop) = p.heap.heap_cursor();
                         match result {
                             Ok(result) => result,
@@ -2883,12 +2908,14 @@ impl Vm {
                             .bif
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
-                        let result = {
+                        let (result, bif_reductions) = {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, value])
+                            let result = bif(&mut ctx, &[left, value]);
+                            (result, ctx.reductions())
                         };
+                        charge_bif_work!(bif_reductions);
                         (htop, stop) = p.heap.heap_cursor();
                         match result {
                             Ok(result) => result,
@@ -3976,7 +4003,12 @@ impl Vm {
                                 && !execute_guard_bif(p, module, &op, opcode)?
                                 && !execute_small_bif(p, module, &op, opcode)?
                             {
-                                self.exec_bif_op(p, ctx.as_deref_mut(), op, opcode)?;
+                                let bif_reductions =
+                                    self.exec_bif_op(p, ctx.as_deref_mut(), op, opcode)?;
+                                consumed = consumed.saturating_add(bif_reductions).min(budget);
+                                if let Some(run) = ctx.as_deref_mut() {
+                                    run.consume(bif_reductions);
+                                }
                             }
                         }
                         Opcode::Fmove | Opcode::Fconv => {
