@@ -431,9 +431,27 @@ fn add_registration(
             .watchers
             .insert(request.id, (request.interests, request.ready));
     } else {
+        if regular_file_fd(request.fd) {
+            deliver_always_ready(request);
+            return Ok(());
+        }
         let source = SourceFd(&request.fd);
-        poll.registry()
-            .register(&mut { source }, request.id, interest)?;
+        if let Err(error) = poll
+            .registry()
+            .register(&mut { source }, request.id, interest)
+        {
+            // kqueue cannot watch regular files and some character devices such as
+            // /dev/null. They are always ready, so deliver the one-shot event now.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
+            ) && always_ready_fd(request.fd)
+            {
+                deliver_always_ready(request);
+                return Ok(());
+            }
+            return Err(error);
+        }
         fd_tokens.insert(request.fd, request.id);
         active.insert(
             request.id,
@@ -449,6 +467,41 @@ fn add_registration(
         .unwrap()
         .insert(request.id.0, (request.fd, request.kind));
     Ok(())
+}
+
+fn always_ready_fd(fd: RawFd) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let Ok(metadata) = std::fs::metadata(format!("/dev/fd/{fd}")) else {
+        return false;
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_file() || file_type.is_block_device() {
+        return true;
+    }
+    file_type.is_char_device()
+        && std::fs::metadata("/dev/null").is_ok_and(|null| null.rdev() == metadata.rdev())
+}
+
+fn regular_file_fd(fd: RawFd) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    std::fs::metadata(format!("/dev/fd/{fd}")).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_file() || file_type.is_block_device()
+    })
+}
+
+fn deliver_always_ready(request: Request) {
+    (request.ready)(
+        request.fd,
+        Ready {
+            readable: request.interests.readable,
+            writable: request.interests.writable,
+            closed: false,
+            error: false,
+        },
+    );
 }
 
 fn poll_interest(interests: InterestSet) -> Option<Interest> {

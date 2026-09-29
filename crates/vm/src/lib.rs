@@ -219,6 +219,73 @@ pub struct Vm {
     pub(crate) coverage_mode: arinsal_loader::CoverageMode,
 }
 
+#[test]
+fn cli_help_dev_null_is_ready_once() {
+    use std::os::fd::AsRawFd;
+
+    let input = std::fs::File::open("/dev/null").unwrap();
+    let interest = check_io::InterestSet {
+        readable: true,
+        writable: false,
+    };
+    for _ in 0..2 {
+        let (fd, ready) = check_io::wait_any(&[(input.as_raw_fd(), interest)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(fd, input.as_raw_fd());
+        assert!(ready.readable);
+    }
+}
+
+#[test]
+fn cli_help_regular_file_is_ready_through_eof() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let path = std::env::temp_dir().join(format!("arinsal-cli-help-{}", std::process::id()));
+    std::fs::write(&path, b"data").unwrap();
+    let mut input = std::fs::File::open(&path).unwrap();
+    let interest = check_io::InterestSet {
+        readable: true,
+        writable: false,
+    };
+    let mut bytes = [0; 8];
+    for expected in [b"data".as_slice(), b"".as_slice()] {
+        let (fd, ready) = check_io::wait_any(&[(input.as_raw_fd(), interest)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(fd, input.as_raw_fd());
+        assert!(ready.readable);
+        let n = input.read(&mut bytes).unwrap();
+        assert_eq!(&bytes[..n], expected);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn cli_help_non_pollable_registration_fires_once() {
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let input = std::fs::File::open("/dev/null").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let registration = check_io::register(
+        input.as_raw_fd(),
+        check_io::InterestSet {
+            readable: true,
+            writable: false,
+        },
+        move |_, ready| {
+            let _ = tx.send(ready);
+        },
+    )
+    .unwrap();
+    assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().readable);
+    check_io::deregister(registration);
+    assert!(rx.try_recv().is_err());
+}
+
 impl Drop for Vm {
     fn drop(&mut self) {
         beamasm_integration::print_stats();
