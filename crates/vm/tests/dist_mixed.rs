@@ -5,7 +5,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static NEXT_CASE: AtomicUsize = AtomicUsize::new(1);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -39,6 +39,22 @@ fn epmd_names() -> Option<String> {
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
     Some(response)
+}
+
+fn epmd_has_name(node: &str) -> bool {
+    epmd_names().is_some_and(|names| {
+        names
+            .split("name ")
+            .any(|entry| entry.starts_with(&format!("{node} at port ")))
+    })
+}
+
+fn unique_suffix(id: usize) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}{:x}{id:04x}", std::process::id(), nanos)
 }
 
 struct ErlNode {
@@ -92,7 +108,7 @@ fn stop_process_group(child: &mut Child) {
 
 fn start_erl() -> (ErlNode, String, String, String) {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
-    let suffix = format!("{}{:04x}", std::process::id() % 100_000, id);
+    let suffix = unique_suffix(id);
     let node = format!("dm_e{suffix}");
     let cookie = format!("dm_cookie_{suffix}");
     let host = short_hostname();
@@ -123,7 +139,7 @@ fn start_erl() -> (ErlNode, String, String, String) {
     };
     let remote_node = format!("{node}@{host}");
     for _ in 0..100 {
-        if epmd_names().is_some_and(|names| names.contains(&node)) {
+        if epmd_has_name(&node) {
             thread::sleep(Duration::from_secs(4));
             return (child, remote_node, cookie, host);
         }
@@ -143,7 +159,7 @@ fn arinsal_eval_with_dist_buffer(
     busy_limit_kb: Option<&str>,
 ) -> String {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
-    let node = format!("dm_a{}{:04x}", std::process::id() % 100_000, id);
+    let node = format!("dm_a{}", unique_suffix(id));
     let binary = std::env::current_exe()
         .expect("current test executable")
         .parent()
@@ -189,7 +205,7 @@ fn arinsal_eval_with_dist_buffer(
 
 fn start_arinsal_server(cookie: &str, host: &str) -> (ArinsalNode, String) {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
-    let node = format!("dm_s{}{:04x}", std::process::id() % 100_000, id);
+    let node = format!("dm_s{}", unique_suffix(id));
     let binary = std::env::current_exe()
         .expect("current test executable")
         .parent()
@@ -227,7 +243,7 @@ fn start_arinsal_server(cookie: &str, host: &str) -> (ArinsalNode, String) {
     };
     let remote_node = child.node.clone();
     for _ in 0..100 {
-        if epmd_names().is_some_and(|names| names.contains(&node)) {
+        if epmd_has_name(&node) {
             thread::sleep(Duration::from_secs(4));
             return (child, remote_node);
         }
@@ -238,7 +254,7 @@ fn start_arinsal_server(cookie: &str, host: &str) -> (ArinsalNode, String) {
 
 fn otp_eval(cookie: &str, expression: &str) -> String {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
-    let node = format!("dm_o{}{:04x}", std::process::id() % 100_000, id);
+    let node = format!("dm_o{}", unique_suffix(id));
     let output = Command::new("timeout")
         .args([
             "--kill-after=3",

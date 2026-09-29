@@ -282,16 +282,17 @@ fn create_channel(
     }
     let nodeup_events = tables.nodes_monitor_events("nodeup", node, conn_id, visible, None);
     drop(tables);
-    send_nodes_monitor_events(process.runtime.as_ref().ok_or_else(badarg)?, nodeup_events)?;
+    // OTP queues the net_kernel controller notification before node monitor
+    // messages in setup_connection_epiloge_rwunlock.
+    notify_dist_ctrlr(process, ctx, args[1], args[0])?;
     if let Some(port_id) = port_controller {
         flush_port_output(process.runtime.as_deref().ok_or_else(badarg)?, port_id)?;
     }
+    send_nodes_monitor_events(process.runtime.as_ref().ok_or_else(badarg)?, nodeup_events)?;
     if let Some(handler) = flush_notify {
         ctx.send(handler, Message::copy_from(atom("dist_data"))?)
             .map_err(|error| VmError::Unsupported(format!("dist data notification: {error}")))?;
     }
-    // Notify net_kernel: {dist_ctrlr, Ctrlr, Node, SetupPid}.
-    notify_dist_ctrlr(process, ctx, args[1], args[0])?;
     let dhandle = dhandle_term(process, conn_id, entry_ref)?;
     tuple(process, vec![atom("ok"), dhandle])
 }
