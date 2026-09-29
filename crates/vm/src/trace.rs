@@ -735,24 +735,51 @@ pub(crate) fn return_event(
     Ok(())
 }
 
-// Port of erts/emulator/beam/erl_trace.c:1037-1055 (erts_trace_return_to), OTP-29.1.1.
+// Port of erts/emulator/beam/beam_bp.c:1242-1268 and
+// erts/emulator/beam/erl_trace.c:1037-1055 (return-to tracing), OTP-29.1.1.
 pub(crate) fn return_to_event(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
-    module_id: usize,
-    ip: usize,
     session: u64,
 ) -> Result<(), VmError> {
     let flags = flags(process, ctx.pid());
     if flags & RETURN_TO == 0 || flags & SILENT != 0 {
         return Ok(());
     }
-    let target = vm.modules.get(module_id).and_then(|module| {
-        module
+    // The return-to continuation has already transferred control here, leaving
+    // its session word at stack index 0. Match OTP's scan from the end of that
+    // frame: Y slots can precede the next CP, and other trace frames can be
+    // nested between it and the real caller.
+    let mut index = 1usize;
+    let target = loop {
+        let Some(word) = process.heap.stack_get(index) else {
+            break None;
+        };
+        let Some((is_handler, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
+            index += 1;
+            continue;
+        };
+        if is_handler {
+            index += 1;
+            continue;
+        }
+        let Some(module) = vm.modules.get(module_id) else {
+            index += 1;
+            continue;
+        };
+        if ip == module.return_trace_ip {
+            index += 6;
+            continue;
+        }
+        if ip == module.return_to_trace_ip {
+            index += 2;
+            continue;
+        }
+        break module
             .function_at(ip)
-            .map(|(function, arity)| (module.name.clone(), function.to_owned(), arity))
-    });
+            .map(|(function, arity)| (module.name.clone(), function.to_owned(), arity));
+    };
     let mfa = if let Some((module, function, arity)) = target {
         let values = [
             Term::atom(
@@ -1152,6 +1179,23 @@ mod tests {
             "trace_t3a_return_to",
             "-module(trace_t3a_return_to). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> worker(Parent) end), erlang:trace(P,true,[call,return_to]), erlang:trace_pattern({trace_t3a_return_to,f,0},true,[local]), P ! go, receive {trace,P,return_to,{trace_t3a_return_to,worker,1}} -> ok after 1000 -> missing end. worker(Parent) -> receive go -> f(), Parent ! done end. f() -> ok.",
         );
+    }
+
+    #[test]
+    fn return_to_trace_preserves_live_y_registers_like_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping return_to stack differential test");
+            return;
+        };
+        let source = "-module(trace_t3a_return_to_stack). -export([run/0,g/1,h/1]). run() -> [t(Action,FlagMode) || Action <- [none,return_trace,exception_trace], FlagMode <- [call,return_to]]. t(Action,FlagMode) -> Tracer=spawn(fun() -> receive after infinity -> ok end end), OldGL=group_leader(), GL=spawn(fun Loop() -> receive {io_request,From,ReplyAs,_} -> From ! {io_reply,ReplyAs,ok}, Loop(); stop -> ok end end), true=group_leader(GL,self()), Actions=case Action of none -> []; return_trace -> [return_trace]; exception_trace -> [exception_trace] end, Mprog=[{'_',[],Actions}], Flags=case FlagMode of call -> [call]; return_to -> [call,return_to] end, erlang:trace_pattern({trace_t3a_return_to_stack,'_','_'},Mprog,[local]), erlang:trace(self(),true,[{tracer,Tracer}|Flags]), A=g(3), R=try io:format(\"\",[]) of V -> V catch C:E -> {C,E} end, erlang:trace(self(),false,[{tracer,Tracer}|Flags]), erlang:trace_pattern({trace_t3a_return_to_stack,'_','_'},false,[local]), true=group_leader(OldGL,self()), GL ! stop, {A,R}. g(X) -> h(X)+1. h(X) -> X*2.";
+        let module = "trace_t3a_return_to_stack";
+        let beam = reference.compile_named(module, source, &[]).unwrap();
+        reference.load(module, &beam).unwrap();
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let expected = reference.call(module, "run", &[]);
+        let actual = vm.eval_scheduled(module, "run", &[], 1, None).unwrap();
+        assert_eq!(expected, CallResult::Ok(actual.term));
     }
 
     #[test]

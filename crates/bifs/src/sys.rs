@@ -158,6 +158,26 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         }
         "scheduler_bind_type" => Ok(atom("unbound")),
         "thread_support" | "smp_support" | "async_threads" => Ok(atom("true")),
+        // Port of erts/emulator/beam/erl_bif_info.c:2742-2768 (build_snifs_term), OTP-29.1.1.
+        "snifs" => {
+            let mut list = Term::NIL;
+            for bif in arinsal_spec::BIFS.iter() {
+                if !bif.module.contains('.') {
+                    let entry = tuple_build(
+                        ctx,
+                        &[
+                            atom(bif.module),
+                            atom(bif.name),
+                            Term::small(i64::from(bif.arity)).unwrap(),
+                        ],
+                    );
+                    list = TermBuilder::new(&mut Heap(ctx.heap))
+                        .cons(entry, list)
+                        .map_err(|_| BifError::SystemLimit)?;
+                }
+            }
+            Ok(list)
+        }
         _ => Err(BifError::BADARG),
     }
 }

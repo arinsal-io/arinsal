@@ -1,7 +1,7 @@
 mod support;
 
 use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
-use arinsal_difftest::RefErl;
+use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, TermBuilder, to_owned};
 use num_traits::ToPrimitive;
@@ -836,6 +836,73 @@ fn map_bifs_handle_hamt() {
             "n={n}: {actual:?} != {expected:?}"
         );
     }
+}
+
+#[test]
+fn system_info_snifs_matches_otp() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let expected = reference.call("erlang", "system_info", &[atom("snifs")]);
+    let mut heap = ProcessHeap::with_words(16_384);
+    let mut allocator = FragmentingHeap(&mut heap);
+    let selector = arinsal_term::from_owned(&atom("snifs"), &mut allocator).unwrap();
+    let mut ctx = Ctx::new(&mut allocator);
+    let actual = lookup("erlang", "system_info", 1).unwrap()(&mut ctx, &[selector]).unwrap();
+    let actual = CallResult::Ok(to_owned(actual).unwrap());
+    assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
+}
+
+#[test]
+fn binary_to_atom_oversized_name_is_system_limit() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    for mut bytes in [vec![0; 256], vec![0; 512]] {
+        if bytes.len() == 512 {
+            bytes.push(255);
+        }
+        let bytes = O::Binary(bytes);
+        let expected = reference.call("erlang", "binary_to_atom", &[bytes.clone(), atom("utf8")]);
+        let actual = call("erlang", "binary_to_atom", &[bytes, atom("utf8")]);
+        assert!(
+            matches!(actual, CallResult::Exception { reason: O::Atom(ref name), .. } if name == "system_limit"),
+            "actual result: {actual:?}"
+        );
+        assert!(
+            matches!(expected, CallResult::Exception { reason: O::Atom(ref name), .. } if name == "system_limit"),
+            "OTP result: {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn is_builtin_includes_instruction_implemented_exports() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    for (name, arity) in [("apply", 2), ("apply", 3), ("yield", 0)] {
+        let input = [atom("erlang"), atom(name), O::Int(arity)];
+        let expected = reference.call("erlang", "is_builtin", &input);
+        let actual = call("erlang", "is_builtin", &input);
+        assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
+        assert_eq!(actual, CallResult::Ok(atom("true")));
+    }
+}
+
+#[test]
+fn iolist_to_iovec_preserves_large_binary_segments() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let input = O::List {
+        elems: vec![
+            O::Binary(vec![1]),
+            O::Binary(vec![2; 1012]),
+            O::Binary(vec![3; 1012]),
+        ],
+        tail: Box::new(O::Nil),
+    };
+    let expected = reference.call("erlang", "iolist_to_iovec", std::slice::from_ref(&input));
+    let actual = call("erlang", "iolist_to_iovec", &[input]);
+    assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
+    let CallResult::Ok(O::List { elems, tail }) = &actual else {
+        panic!("unexpected iovec result: {actual:?}");
+    };
+    assert_eq!(elems.len(), 3);
+    assert_eq!(tail.as_ref(), &O::Nil);
 }
 
 #[test]

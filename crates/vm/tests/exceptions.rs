@@ -206,6 +206,120 @@ bs_invalid_size(Size) ->
 }
 
 #[test]
+fn tail_apply_exception_stacktrace_matches_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping tail apply exception differential test");
+        return;
+    };
+    let source = r#"
+-module(vm_exc_apply).
+-export([run/1, stack/2, fail/1, export_apply/0, export_apply2/0, fixed_badarg/0,
+         fixed_badargs/0]).
+run(Type) -> stack([], Type).
+stack([_|Rest], Type) -> stack(Rest, Type), ok;
+stack([], Type) -> fail(Type).
+fail(apply_last) -> apply(erlang, error, [oops, [apply_last]]);
+fail(double_apply_last) ->
+    apply(id(erlang), id(apply), [id(erlang), id(error), id([oops, [double_apply_last]])]);
+fail(multi_apply_last) ->
+    apply(id(erlang), id(apply), [id(erlang), id(apply),
+          [id(erlang), id(apply), [id(erlang), id(error), id([oops, [multi_apply_last]])]]]).
+id(Value) -> Value.
+export_apply() ->
+    Apply = fun erlang:apply/3,
+    Apply(erlang, apply, [erlang, error, [oops, [export_apply]]]).
+export_apply2() ->
+    apply(fun erlang:apply/3, [erlang, error, [oops, [export_apply2]]]).
+fixed_badarg() ->
+    Bad = {},
+    try Bad:baz(a,b) catch C:R:S -> {C,R,S} end.
+fixed_badargs() ->
+    Bad = id({}),
+    [(catch Bad:baz(a,b)), (catch baz:Bad(c,d)),
+     (catch apply(Bad,baz,[e,f])), (catch apply(baz,Bad,[g,h]))].
+"#;
+    let beam = reference
+        .compile_named("vm_exc_apply", source, &[])
+        .unwrap();
+    reference.load("vm_exc_apply", &beam).unwrap();
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+
+    for type_name in ["apply_last", "double_apply_last", "multi_apply_last"] {
+        let args = [OwnedTerm::atom(type_name)];
+        let expected = trim_result(reference.call("vm_exc_apply", "run", &args));
+        let actual = trim_result(vm_call(&mut vm, "run", &args, "vm_exc_apply"));
+        assert!(
+            compare(&expected, &actual, CompareMode::Exact).is_ok(),
+            "{type_name}: expected {expected:?}, actual {actual:?}"
+        );
+    }
+
+    let expected = trim_result(reference.call("vm_exc_apply", "fixed_badarg", &[]));
+    let actual = trim_result(vm_call(&mut vm, "fixed_badarg", &[], "vm_exc_apply"));
+    assert!(
+        compare(&expected, &actual, CompareMode::Exact).is_ok(),
+        "fixed_badarg: expected {expected:?}, actual {actual:?}"
+    );
+    let expected = trim_result(reference.call("vm_exc_apply", "fixed_badargs", &[]));
+    let actual = trim_result(vm_call(&mut vm, "fixed_badargs", &[], "vm_exc_apply"));
+    assert!(
+        compare(&expected, &actual, CompareMode::Exact).is_ok(),
+        "fixed_badargs: expected {expected:?}, actual {actual:?}"
+    );
+    for function in ["export_apply", "export_apply2"] {
+        let expected = trim_result(reference.call("vm_exc_apply", function, &[]));
+        let actual = trim_result(vm_call(&mut vm, function, &[], "vm_exc_apply"));
+        assert!(
+            compare(&expected, &actual, CompareMode::Exact).is_ok(),
+            "{function}: expected {expected:?}, actual {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn ets4_return_to_trace_preserves_heap_terms_like_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping ets4 return_to trace differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named("ets4", include_str!("fixtures/ets4.erl"), &[])
+        .unwrap();
+    reference.load("ets4", &beam).unwrap();
+    let expected = reference.call("ets4", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let outcome = vm.eval_scheduled("ets4", "run", &[], 1, None).unwrap();
+    let actual = CallResult::Ok(outcome.term);
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn traced_error_stack_growth_matches_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping traced error stack growth differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named(
+            "trace_error_stack_reserve",
+            include_str!("fixtures/trace_error_stack_reserve.erl"),
+            &[],
+        )
+        .unwrap();
+    reference.load("trace_error_stack_reserve", &beam).unwrap();
+    let expected = reference.call("trace_error_stack_reserve", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("trace_error_stack_reserve", "run", &[], 1, None)
+        .map(|outcome| CallResult::Ok(outcome.term))
+        .unwrap_or_else(|error| CallResult::TransportError(error.to_string()));
+    assert_eq!(expected, actual);
+}
+
+#[test]
 fn lazy_stacktraces_match_otp_at_handler_and_rethrow() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping lazy stacktrace differential test");

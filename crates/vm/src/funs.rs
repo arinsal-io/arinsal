@@ -135,6 +135,61 @@ fn argument_list(mut list: Term) -> Result<Vec<Term>, ArgumentError> {
         .ok_or(ArgumentError::Badarg)
 }
 
+// Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
+fn unwrap_nested_apply(
+    mut module: Term,
+    mut function: Term,
+    mut arguments: Term,
+) -> (Term, Term, Term) {
+    loop {
+        let Some(module_atom) = module.as_atom() else {
+            break;
+        };
+        let Some(function_atom) = function.as_atom() else {
+            break;
+        };
+        if global_atoms().text(module_atom).as_deref() != Some("erlang")
+            || global_atoms().text(function_atom).as_deref() != Some("apply")
+        {
+            break;
+        }
+        let Ok(nested) = argument_list(arguments) else {
+            break;
+        };
+        let [nested_module, nested_function, nested_arguments] = nested.as_slice() else {
+            break;
+        };
+        module = *nested_module;
+        function = *nested_function;
+        arguments = *nested_arguments;
+    }
+    (module, function, arguments)
+}
+
+// Port of erts/emulator/beam/beam_common.c:1345-1427 (apply_bif_error_adjustment), OTP-29.1.1.
+fn push_apply_error_continuation(
+    p: &mut Process,
+    return_ip: usize,
+    stack_offset: usize,
+) -> Result<(), VmError> {
+    let offset = stack_offset.max(1);
+    if !p.heap.reserve_stack(offset + 1) {
+        return Err(VmError::Unsupported("apply continuation stack".into()));
+    }
+    for index in 0..=offset {
+        p.heap.stack_set(index, Term::NIL);
+    }
+    let module = u32::try_from(p.module)
+        .map_err(|_| VmError::Unsupported("apply continuation module".into()))?;
+    let ip = u32::try_from(return_ip)
+        .map_err(|_| VmError::Unsupported("apply continuation ip".into()))?;
+    p.heap.stack_set(
+        offset,
+        Term::catch((u64::from(module) << 32) | u64::from(ip)),
+    );
+    Ok(())
+}
+
 impl Vm {
     pub(super) fn eval_erlang_fun_builtin(
         &mut self,
@@ -157,7 +212,7 @@ impl Vm {
                 p.x[..arity].copy_from_slice(args);
                 p.gc_live = arity;
                 let value = match function {
-                    "apply" => match self.apply_bif(&mut p, arity, true, None) {
+                    "apply" => match self.apply_bif(&mut p, arity, true, 0, None) {
                         Ok(ImportOutcome::Returned(value)) => Ok(value),
                         Ok(ImportOutcome::Jump(_))
                         | Ok(ImportOutcome::Advanced)
@@ -213,7 +268,7 @@ impl Vm {
         }
         let function = import.function.as_str();
         if function == "apply" && (arity == 2 || arity == 3) {
-            return self.apply_bif(p, arity, tail, ctx).map(Some);
+            return self.apply_bif(p, arity, tail, 0, ctx).map(Some);
         }
         let value = if function == "make_fun" && arity == 3 {
             let args = [p.x[0], p.x[1], p.x[2]];
@@ -314,6 +369,9 @@ impl Vm {
                     .ok_or_else(|| VmError::Unsupported("export module atom".into()))?;
                 let function = atom_name(Term::atom(entry.function))
                     .ok_or_else(|| VmError::Unsupported("export function atom".into()))?;
+                if module == "erlang" && function == "apply" && matches!(arity, 2 | 3) {
+                    return self.apply_bif(p, arity, tail, 0, ctx);
+                }
                 self.call_named_atoms(
                     p,
                     entry.module,
@@ -675,21 +733,45 @@ impl Vm {
         p: &mut Process,
         arity: usize,
         tail: bool,
+        dealloc: usize,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
         if arity + 1 >= p.x.len() {
             return Err(self.exception(p, "system_limit"));
         }
-        let module_atom = p.x[arity]
-            .as_atom()
-            .ok_or_else(|| self.exception(p, "badarg"))?;
-        let function_atom = p.x[arity + 1]
-            .as_atom()
-            .ok_or_else(|| self.exception(p, "badarg"))?;
+        if p.x[arity].as_atom().is_none() || p.x[arity + 1].as_atom().is_none() {
+            // Port of erts/emulator/beam/beam_common.c:1543-1550 (fixed_apply), OTP-29.1.1.
+            let words = arity
+                .checked_mul(2)
+                .ok_or_else(|| self.exception(p, "system_limit"))?;
+            p.ensure(words, arity + 2)?;
+            let module_term = p.x[arity];
+            let function_term = p.x[arity + 1];
+            let arguments = TermBuilder::new(&mut p.heap)
+                .list_from_iter(p.x[..arity].iter().copied())
+                .map_err(|error| VmError::Unsupported(format!("apply args {error:?}")))?;
+            return Err(exceptions::bif_error(
+                p,
+                "erlang",
+                "apply",
+                &[module_term, function_term, arguments],
+                BifError::BADARG,
+            ));
+        }
+        let module_term = p.x[arity];
+        let function_term = p.x[arity + 1];
+        let module_atom = module_term.as_atom();
+        let function_atom = function_term.as_atom();
+        let module_atom = module_atom.expect("checked apply module");
+        let function_atom = function_atom.expect("checked apply function");
         let module =
             atom_name(Term::atom(module_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
         let function =
             atom_name(Term::atom(function_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
+        if module == "erlang" && function == "apply" && arity == 3 {
+            // Port of erts/emulator/beam/beam_common.c:1445-1450 (apply), OTP-29.1.1.
+            return self.apply_bif(p, 3, tail, dealloc, ctx);
+        }
         self.call_named_atoms(
             p,
             module_atom,
@@ -703,41 +785,89 @@ impl Vm {
     }
 
     #[inline]
+    // Port of erts/emulator/beam/beam_common.c:1350-1519 (apply and its BIF adjustment), OTP-29.1.1.
     pub(super) fn apply_bif(
         &mut self,
         p: &mut Process,
         arity: usize,
         tail: bool,
+        tail_dealloc: usize,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
         let original_x = p.x.to_vec();
         let original_gc_live = p.gc_live;
-        let args = if arity == 2 {
-            argument_list(p.x[1])
+        let (module_term, function_term, arguments_term, target) = if arity == 2 {
+            (p.x[0], p.x[1], p.x[1], Some(p.x[0]))
         } else {
-            argument_list(p.x[2])
-        }
-        .map_err(|error| match error {
-            ArgumentError::Badarg => self.exception(p, "badarg"),
-            ArgumentError::SystemLimit => self.exception(p, "system_limit"),
-        })?;
-        let target = if arity == 2 { Some(p.x[0]) } else { None };
+            let (module, function, arguments) = unwrap_nested_apply(p.x[0], p.x[1], p.x[2]);
+            (module, function, arguments, None)
+        };
         let named = if arity == 3 {
-            Some((
-                p.x[0]
-                    .as_atom()
-                    .ok_or_else(|| self.exception(p, "badarg"))?,
-                p.x[1]
-                    .as_atom()
-                    .ok_or_else(|| self.exception(p, "badarg"))?,
-            ))
+            match (module_term.as_atom(), function_term.as_atom()) {
+                (Some(module), Some(function)) => Some((module, function)),
+                _ => {
+                    // Port of erts/emulator/beam/beam_common.c:1543-1550 (fixed_apply), OTP-29.1.1.
+                    return Err(exceptions::bif_error(
+                        p,
+                        "erlang",
+                        "apply",
+                        &[module_term, function_term, arguments_term],
+                        BifError::BADARG,
+                    ));
+                }
+            }
         } else {
             None
         };
+        let bif_args = if arity == 2 {
+            vec![module_term, arguments_term]
+        } else {
+            vec![module_term, function_term, arguments_term]
+        };
+        let args = argument_list(arguments_term).map_err(|error| {
+            exceptions::bif_error(
+                p,
+                "erlang",
+                "apply",
+                &bif_args,
+                match error {
+                    ArgumentError::Badarg => BifError::BADARG,
+                    ArgumentError::SystemLimit => BifError::SystemLimit,
+                },
+            )
+        })?;
         if args.len() >= p.x.len() {
-            return Err(self.exception(p, "system_limit"));
+            return Err(exceptions::bif_error(
+                p,
+                "erlang",
+                "apply",
+                &bif_args,
+                BifError::SystemLimit,
+            ));
         }
         p.x[..args.len()].copy_from_slice(&args);
+        if named.is_some_and(|(module, function)| {
+            global_atoms().text(module).as_deref() == Some("erlang")
+                && global_atoms().text(function).as_deref() == Some("apply")
+        }) && args.len() == 2
+        {
+            return self.apply_bif(p, 2, tail, tail_dealloc, ctx);
+        }
+        let tail_applies_exception_bif = named.is_some_and(|(module, function)| {
+            global_atoms().text(module).as_deref() == Some("erlang")
+                && global_atoms()
+                    .text(function)
+                    .is_some_and(|name| matches!(name.as_ref(), "error" | "exit" | "throw"))
+        });
+        if tail && tail_applies_exception_bif {
+            // Port of erts/emulator/beam/beam_common.c:1350-1427 (apply_bif_error_adjustment), OTP-29.1.1.
+            let return_ip =
+                p.ip.checked_add(1)
+                    .ok_or_else(|| VmError::Unsupported("apply continuation".into()))?;
+            // `apply_last` has already deallocated its frame. ERTS restores
+            // the complete stack offset before letting the error BIF unwind.
+            push_apply_error_continuation(p, return_ip, tail_dealloc)?;
+        }
         let result = if let Some(fun) = target {
             self.call_fun_term(p, fun, args.len(), tail, ctx)
         } else {

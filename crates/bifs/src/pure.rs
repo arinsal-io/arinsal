@@ -743,7 +743,7 @@ fn intern(text: &str, existing: bool) -> Result<Term, BifError> {
         table.get(text).ok_or(BADARG)?
     } else {
         table.intern(text).map_err(|error| match error {
-            arinsal_term::AtomError::TooLong => BADARG,
+            arinsal_term::AtomError::TooLong => BifError::SystemLimit,
             arinsal_term::AtomError::SystemLimit => BifError::SystemLimit,
         })?
     };
@@ -806,7 +806,18 @@ fn binary_input<'a>(term: Term) -> Result<std::borrow::Cow<'a, [u8]>, BifError> 
 fn binary_to_atom_inner(args: &[Term], existing: bool) -> Result<Term, BifError> {
     let bytes = binary_bytes(args[0])?;
     let text = match encoding(args[1])? {
-        "utf8" => std::str::from_utf8(&bytes).map_err(|_| BADARG)?.to_owned(),
+        "utf8" => match std::str::from_utf8(&bytes) {
+            Ok(text) => text.to_owned(),
+            Err(error) => {
+                // erts_atom_put reports the character limit before a later malformed byte.
+                if std::str::from_utf8(&bytes[..error.valid_up_to()])
+                    .is_ok_and(|prefix| prefix.chars().count() > 255)
+                {
+                    return Err(BifError::SystemLimit);
+                }
+                return Err(BADARG);
+            }
+        },
         _ => bytes.into_iter().map(char::from).collect(),
     };
     intern(&text, existing)
@@ -964,16 +975,60 @@ fn iolist_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> 
         .expect("infallible BIF heap"))
 }
 fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = iolist_bytes(args[0])?;
-    ctx.charge_reductions(bytes.len());
-    if bytes.is_empty() {
-        return Ok(Term::NIL);
+    // Port of erts/emulator/beam/erl_iolist.c:1116-1180 (iolist_to_iovec_engine), OTP-29.1.1.
+    const COPY_THRESHOLD: usize = 64;
+    let mut work = vec![(args[0], false)];
+    let mut copied = Vec::new();
+    let mut segments = Vec::new();
+    let mut total: usize = 0;
+    while let Some((term, byte_allowed)) = work.pop() {
+        match term.classify() {
+            TermKind::Nil => {}
+            TermKind::List => {
+                let (head, tail) = iolist_cons(term)?;
+                work.push((tail, false));
+                work.push((head, true));
+            }
+            TermKind::Bitstring => {
+                let bytes = binary_bytes(term)?;
+                total = total
+                    .checked_add(bytes.len())
+                    .ok_or(BifError::SystemLimit)?;
+                if bytes.len() > COPY_THRESHOLD {
+                    if !copied.is_empty() {
+                        segments.push(
+                            TermBuilder::new(&mut Heap(ctx.heap))
+                                .binary(&copied)
+                                .expect("infallible BIF heap"),
+                        );
+                        copied.clear();
+                    }
+                    segments.push(term);
+                } else {
+                    copied.extend(bytes);
+                }
+            }
+            TermKind::Number if byte_allowed => {
+                let byte = term
+                    .as_small()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or(BADARG)?;
+                copied.push(byte);
+                total = total.checked_add(1).ok_or(BifError::SystemLimit)?;
+            }
+            _ => return Err(BADARG),
+        }
     }
-    let binary = TermBuilder::new(&mut Heap(ctx.heap))
-        .binary(&bytes)
-        .expect("infallible BIF heap");
+    ctx.charge_reductions(total);
+    if !copied.is_empty() {
+        segments.push(
+            TermBuilder::new(&mut Heap(ctx.heap))
+                .binary(&copied)
+                .expect("infallible BIF heap"),
+        );
+    }
     Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .list_from_iter([binary])
+        .list_from_iter(segments)
         .expect("infallible BIF heap"))
 }
 pub(super) fn iolist_bytes(root: Term) -> Result<Vec<u8>, BifError> {
@@ -1643,11 +1698,16 @@ fn is_builtin(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if arity < 0 {
         return Err(BADARG);
     }
+    // Port of erts/emulator/beam/beam_common.c:2359-2380 (erts_is_builtin), OTP-29.1.1.
+    let instruction_bif = module.as_ref() == "erlang"
+        && ((name.as_ref() == "apply" && matches!(arity, 2 | 3))
+            || (name.as_ref() == "yield" && arity == 0));
     Ok(bool_term(
-        u8::try_from(arity)
-            .ok()
-            .and_then(|n| arinsal_spec::bif_lookup(&module, &name, n))
-            .is_some(),
+        instruction_bif
+            || u8::try_from(arity)
+                .ok()
+                .and_then(|n| arinsal_spec::bif_lookup(&module, &name, n))
+                .is_some(),
     ))
 }
 fn error(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

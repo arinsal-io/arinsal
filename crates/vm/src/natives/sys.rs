@@ -140,11 +140,13 @@ fn call_display(
 
 fn call_display_string(
     _vm: &mut Vm,
-    _process: &mut Process,
+    process: &mut Process,
     _ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    display_string(args)
+    display_string(args).map_err(|error| {
+        crate::exceptions::bif_error(process, "erlang", "display_string", args, error)
+    })
 }
 
 fn call_term_to_string(
@@ -512,10 +514,10 @@ fn print_otp_term(term: &arinsal_etf::OwnedTerm, limit: usize) -> String {
 
 // Port of erts/emulator/beam/bif.c:4192 (display_string_2), OTP-29.1.1.
 // boot_loop1: logger_simple_h writes directly to stdout after a boot failure.
-fn display_string(args: &[Term]) -> Result<Term, VmError> {
+fn display_string(args: &[Term]) -> Result<Term, arinsal_bifs::BifError> {
     use arinsal_etf::OwnedTerm;
 
-    fn append_string(value: &OwnedTerm, bytes: &mut Vec<u8>) -> Result<(), VmError> {
+    fn append_string(value: &OwnedTerm, bytes: &mut Vec<u8>) -> Result<(), arinsal_bifs::BifError> {
         match value {
             OwnedTerm::Nil => Ok(()),
             OwnedTerm::List { elems, tail } => {
@@ -528,7 +530,7 @@ fn display_string(args: &[Term]) -> Result<Term, VmError> {
                 let c = u32::try_from(*codepoint)
                     .ok()
                     .and_then(char::from_u32)
-                    .ok_or_else(badarg)?;
+                    .ok_or(arinsal_bifs::BifError::BADARG)?;
                 let mut buffer = [0; 4];
                 bytes.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
                 Ok(())
@@ -537,23 +539,23 @@ fn display_string(args: &[Term]) -> Result<Term, VmError> {
                 bytes.extend_from_slice(binary);
                 Ok(())
             }
-            _ => Err(badarg()),
+            _ => Err(arinsal_bifs::BifError::BADARG),
         }
     }
 
     let destination = args[0]
         .as_atom()
         .and_then(|atom| global_atoms().text(atom))
-        .ok_or_else(badarg)?;
-    let value = arinsal_term::to_owned(args[1]).map_err(|_| badarg())?;
+        .ok_or(arinsal_bifs::BifError::BADARG)?;
+    let value = arinsal_term::to_owned(args[1]).map_err(|_| arinsal_bifs::BifError::BADARG)?;
     let mut bytes = Vec::new();
     append_string(&value, &mut bytes)?;
     match destination.as_ref() {
         "stdout" => std::io::stdout().lock().write_all(&bytes),
         "stderr" => std::io::stderr().lock().write_all(&bytes),
-        _ => return Err(badarg()),
+        _ => return Err(arinsal_bifs::BifError::BADARG),
     }
-    .map_err(|error| VmError::Unsupported(format!("display_string write: {error}")))?;
+    .map_err(|_| arinsal_bifs::BifError::BADARG)?;
     Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 

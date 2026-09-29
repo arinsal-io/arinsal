@@ -1106,7 +1106,7 @@ fn push_trace_frames(
     actions: &[crate::trace::CallActions],
 ) -> Result<(), VmError> {
     for action in actions.iter().rev().filter(|action| action.return_to) {
-        if !process.heap.reserve_stack(2) {
+        if !reserve_trace_stack(process, 2)? {
             return Err(VmError::Unsupported("return_to trace stack".into()));
         }
         process
@@ -1125,7 +1125,7 @@ fn push_trace_frames(
         if !action.return_trace && !action.exception_trace {
             continue;
         }
-        if !process.heap.reserve_stack(6) {
+        if !reserve_trace_stack(process, 6)? {
             return Err(VmError::Unsupported("call trace stack".into()));
         }
         process
@@ -1154,6 +1154,15 @@ fn push_trace_frames(
     Ok(())
 }
 
+fn reserve_trace_stack(process: &mut Process, words: usize) -> Result<bool, VmError> {
+    if process.heap.free_words() < words {
+        // Port of erts/emulator/beam/erl_gc.c:1879 and :2072-2080, OTP-29.1.1.
+        // GC sizes the new heap with live stack words and the additional request.
+        process.ensure(words, process.gc_live)?;
+    }
+    Ok(process.heap.reserve_stack(words))
+}
+
 fn trace_continuation(module_id: usize, target: usize) -> Result<Term, VmError> {
     let module = u32::try_from(module_id)
         .map_err(|_| VmError::Unsupported("trace continuation module".into()))?;
@@ -1177,6 +1186,7 @@ fn trace_breakpoint_call(
     let Some(ctx) = ctx else {
         return Ok(Vec::new());
     };
+    process.gc_live = usize::from(arity);
     let args = process.x[..usize::from(arity)].to_vec();
     let module_name = vm.modules[module_id].name.clone();
     let actions = crate::trace::call_event(vm, process, ctx, &module_name, function, &args, local)?;
@@ -1646,6 +1656,9 @@ impl Vm {
                                 function,
                                 *arity,
                             );
+                            // The trace call may allocate (trace messages, frames, GC) and the heap cursor is
+                            // reloaded afterwards: publish pending allocations first.
+                            sync_cursor(p, htop, &mut heap_dirty);
                             let actions = trace_breakpoint_call(
                                 self, p, ctx.as_deref_mut(), module_id, entry_ip, function, *arity, true,
                             )?;
@@ -1732,6 +1745,9 @@ impl Vm {
                                 .ok_or_else(|| VmError::Unsupported("export trace target".into()))?;
                             let function = export.function.clone();
                             let arity = export.arity;
+                            // The trace call may allocate (trace messages, frames, GC) and the heap cursor is
+                            // reloaded afterwards: publish pending allocations first.
+                            sync_cursor(p, htop, &mut heap_dirty);
                             let actions = trace_breakpoint_call(
                                 self, p, ctx.as_deref_mut(), module_id, target, &function, arity, false,
                             )?;
@@ -1753,6 +1769,8 @@ impl Vm {
             #[rustfmt::skip]
             traced_instruction_dispatch!(instr;
                 Instr::ReturnTrace => {
+                    // The handler reloads the heap cursor below: publish pending allocations first.
+                    sync_cursor(p, htop, &mut heap_dirty);
                     let (Some(module), Some(entry), Some(session_high), Some(session_low), Some(_exception)) = (
                         p.heap.stack_get(0).and_then(Term::as_small),
                         p.heap.stack_get(1).and_then(Term::as_small),
@@ -1764,6 +1782,8 @@ impl Vm {
                     };
                     let session = ((session_high as u64) << 32) | session_low as u32 as u64;
                     if let Some(trace_ctx) = ctx.as_deref_mut() {
+                        // Port of erts/emulator/beam/emu/trace_instrs.tab:25-70, OTP-29.1.1.
+                        sync_cursor(p, htop, &mut heap_dirty);
                         crate::trace::return_event(
                             self,
                             p,
@@ -1785,21 +1805,15 @@ impl Vm {
                     return_from_frame!(false);
                 }
                 Instr::ReturnToTrace => {
+                    // The handler reloads the heap cursor below: publish pending allocations first.
+                    sync_cursor(p, htop, &mut heap_dirty);
                     let Some(session) = p.heap.stack_get(0).and_then(Term::as_small) else {
                         return Err(VmError::Unsupported("return_to trace frame".into()));
                     };
-                    if let Some(trace_ctx) = ctx.as_deref_mut()
-                        && let Some((false, module, target)) =
-                            p.heap.stack_get(1).and_then(crate::stacktrace::decode_tag)
-                    {
-                        crate::trace::return_to_event(
-                            self,
-                            p,
-                            trace_ctx,
-                            module,
-                            target,
-                            session as u64,
-                        )?;
+                    if let Some(trace_ctx) = ctx.as_deref_mut() {
+                        // Port of erts/emulator/beam/emu/trace_instrs.tab:73-105, OTP-29.1.1.
+                        sync_cursor(p, htop, &mut heap_dirty);
+                        crate::trace::return_to_event(self, p, trace_ctx, session as u64)?;
                     }
                     if !p.heap.release_stack(1) {
                         return Err(VmError::Unsupported("return_to trace stack".into()));
@@ -2106,6 +2120,10 @@ impl Vm {
                     }
                     sync_cursor(p, htop, &mut heap_dirty);
                     p.gc_live = arity as usize;
+                    // Port of erts/emulator/beam/emu/instrs.tab (`call_bif`), OTP-29.1.1.
+                    // Exception capture reads the active call site from the process.
+                    p.module = module_id;
+                    p.ip = instruction_offset(base, ip);
                     p.reductions = reds;
                     let (result, bif_reductions) =
                         if let Some(result) = call_fast_tuple_bif(p, fast_op, arity as usize) {
@@ -2185,6 +2203,10 @@ impl Vm {
                     {
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.gc_live = arity as usize;
+                        // Port of erts/emulator/beam/emu/instrs.tab (`call_ext`), OTP-29.1.1.
+                        // Keep the raising BIF's call site available to stack capture.
+                        p.module = module_id;
+                        p.ip = instruction_offset(base, ip);
                         // Native entry takes its reduction counter from the
                         // process, not the interpreter's cached `reds`.
                         p.reductions = reds;
@@ -3317,7 +3339,13 @@ impl Vm {
                     if dealloc > 0 && !p.heap.release_stack(dealloc as usize) {
                         return Err(VmError::Unsupported("stack underflow".into()));
                     }
-                    let outcome = self.apply_fixed(p, arity as usize, tail, ctx.as_deref_mut())?;
+                    let outcome = self.apply_fixed(
+                        p,
+                        arity as usize,
+                        tail,
+                        dealloc as usize,
+                        ctx.as_deref_mut(),
+                    )?;
                     module_id = p.module;
                     base = self.modules[module_id].code.as_ptr();
                     reds = p.reductions;

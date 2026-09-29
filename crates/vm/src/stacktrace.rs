@@ -85,7 +85,9 @@ pub(super) fn capture(
     raw.ip = ip;
     raw.depth = depth.max(1);
     raw.continuations.clear();
-    let mut previous = None;
+    // OTP starts with the failing instruction as `prev` and compares it with
+    // each continuation after moving that continuation back to its call site.
+    let mut previous = Some((module, ip));
     let mut index = 0;
     while index < heap.stack_words() {
         if raw.continuations.len() + 1 >= raw.depth {
@@ -128,11 +130,12 @@ pub(super) fn capture(
             index += if ip == code.return_trace_ip { 6 } else { 2 };
             continue;
         }
-        if handler || previous == Some((module, ip)) {
+        let call_site = ip.saturating_sub(1);
+        if handler || previous == Some((module, call_site)) {
             index += 1;
             continue;
         }
-        previous = Some((module, ip));
+        previous = Some((module, call_site));
         if let Some(module) = modules.get(module) {
             raw.continuations
                 .push(Continuation::Interpreted(Arc::clone(module), ip));

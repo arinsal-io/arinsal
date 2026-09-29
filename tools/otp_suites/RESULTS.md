@@ -3,6 +3,7 @@
 | Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |
 |---|---:|---:|---:|---:|---:|---|
 | `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `bif_SUITE` | 34 | 29/34 | 28/34 | 1 | 0 | group_leader_prio_dirty: failed {'EXIT', {fw_error, {ct_framework,error_notification, {badarg |
 | `big_SUITE` | 23 | 23/23 | 18/23 | 5 | 0 | big_float_2: failed {{badmatch,0.0}; big_float_3: failed {{badmatch,3.402823669209385e38}; reductions: failed {badarg; system_limit: failed {badarg; toobig: failed {{badmatch, {'EXIT', {system_limit |
 | `binary_SUITE` | 55 | 42/55 | 34/55 | 8 | 0 | bad_terms: failed {'EXIT',error}, unknown_location; copy_terms: failed {'EXIT',error}, unknown_location; error_after_yield: failed {{badmatch,false}; gc_test: failed {{badmatch,{binary,[]}}; local_ext: failed {{badmatch,{error,exbadport}}; otp_5484: failed {'EXIT',error}, unknown_location; t2b_deterministic: failed {{badmatch; terms: failed {'EXIT',error}, unknown_location |
 | `bs_construct_SUITE` | 31 | 30/31 | 26/31 | 4 | 0 | bs_append_offheap: failed "missing binary in erts_bs_private_append"; error_info: failed {{badmatch,false}; in_guard: failed {badarg; reductions: failed {if_clause |
@@ -12,6 +13,7 @@
 | `bs_match_tail_SUITE` | 4 | 4/4 | 0/4 | 4 | 0 | aligned: missing; huge_tail: missing; unaligned: missing; zero_tail: missing; suite-level: failed: 'bs_match_tail_SUITE:all/0 is missing', unknown_location |
 | `bs_utf_SUITE` | 8 | 8/8 | 0/8 | 8 | -9 | bad_construction: missing; utf16_illegal_sequences: missing; utf16_roundtrip: missing; utf32_illegal_sequences: missing; utf32_roundtrip: missing; utf8_big_file: missing; utf8_illegal_sequences: missing; utf8_roundtrip: missing |
 | `counters_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `erts_debug_SUITE` | 8 | 7/8 | 7/8 | 0 | 0 | none |
 | `exception_SUITE` | 16 | 15/16 | 15/16 | 0 | 0 | none |
 | `float_SUITE` | 15 | 14/15 | 13/15 | 1 | 0 | fp_drv: failed {badarg |
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
