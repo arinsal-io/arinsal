@@ -508,6 +508,33 @@ fn write_int(dst: &mut [u8], pos: usize, bits: usize, value: &BigInt, little: bo
     }
 }
 
+/// Build one UTF segment directly in the young heap without constructing a segment vector.
+// Port of erts/emulator/beam/erl_bits.c:1162/1222 (UTF scalar construction), OTP-29.1.1.
+pub fn create_utf_segment<H: HeapAlloc>(
+    value: Term,
+    ty: SegType,
+    flags: SegFlags,
+    heap: &mut H,
+) -> Result<Term, BitsError> {
+    if !matches!(ty, SegType::Utf8 | SegType::Utf16 | SegType::Utf32) {
+        return Err(BitsError::BadArg { segment: 1 });
+    }
+    let segment = Segment {
+        ty,
+        index: 1,
+        unit: 0,
+        flags,
+        value: SegmentValue::Term(value),
+        size: SegSize::Units(0),
+    };
+    let bits = size_of(&segment)?;
+    let mut bytes = [0; 4];
+    write_segments(std::slice::from_ref(&segment), &mut bytes, 0)?;
+    TermBuilder::new(heap)
+        .bitstring(&bytes, bits)
+        .map_err(|error| term_error(error, 1, 3))
+}
+
 /// Construct a bitstring after the caller has reserved `create_bin_size` words.
 /// An initial append segment grows a unique writer in place when possible.
 pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Result<Term, BitsError> {
@@ -972,6 +999,41 @@ impl Cursor<'_> {
     pub fn ensure_exactly(&self, bits: usize) -> bool {
         self.remaining() == bits
     }
+
+    /// Compare a constant bit string without materializing a sub-bitstring.
+    // Port of erts/emulator/beam/erl_bits.c:2293-2375 (erts_cmp_bits__), OTP-29.1.1.
+    fn match_string(&mut self, expected: &[u8], bits: usize) -> bool {
+        if bits > self.remaining() || bits > expected.len().saturating_mul(8) {
+            return false;
+        }
+
+        let byte_offset = self.position / 8;
+        let bit_offset = self.position % 8;
+        let whole_bytes = bits / 8;
+        for (index, expected_byte) in expected.iter().enumerate().take(whole_bytes) {
+            let actual = if bit_offset == 0 {
+                self.bytes[byte_offset + index]
+            } else {
+                (self.bytes[byte_offset + index] << bit_offset)
+                    | (self.bytes[byte_offset + index + 1] >> (8 - bit_offset))
+            };
+            if actual != *expected_byte {
+                return false;
+            }
+        }
+
+        let remaining_bits = bits % 8;
+        let tail_start = whole_bytes * 8;
+        for index in 0..remaining_bits {
+            let wanted = (expected[whole_bytes] >> (7 - index)) & 1;
+            if bit(self.bytes, self.position + tail_start + index) != wanted {
+                return false;
+            }
+        }
+
+        self.position += bits;
+        true
+    }
     /// `bs_test_unit`: remaining bit count is divisible by `unit`.
     #[inline]
     pub fn test_unit(&self, unit: usize) -> bool {
@@ -1289,6 +1351,8 @@ pub trait MatchOps {
     fn skip(&self, bits: usize) -> bool;
     /// Match a literal integer field.
     fn match_integer(&self, bits: usize, value: u64) -> bool;
+    /// Compare a constant bit string at the current cursor, advancing on success.
+    fn match_string(&self, expected: &[u8], bits: usize) -> bool;
     /// Extract an integer field.
     fn get_integer<H: HeapAlloc>(
         &self,
@@ -1354,6 +1418,21 @@ impl MatchOps for Term {
     }
     fn match_integer(&self, bits: usize, value: u64) -> bool {
         self.update(|c| c.match_integer(bits, value))
+    }
+    fn match_string(&self, expected: &[u8], bits: usize) -> bool {
+        if !is_match_context(*self) {
+            return false;
+        }
+        let adjustment = arinsal_term::binary_offset_adjustment(*self) * 8;
+        self.update(|cursor| {
+            let Some(position) =
+                match_position(*self).and_then(|position| position.checked_sub(adjustment))
+            else {
+                return false;
+            };
+            cursor.position = position;
+            cursor.match_string(expected, bits)
+        })
     }
     fn get_integer<H: HeapAlloc>(
         &self,

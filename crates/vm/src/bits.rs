@@ -8,7 +8,7 @@ use arinsal_bits::{
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::{Arg, BitCommandKind, GenericOp, Instr, Module};
 use arinsal_spec::Opcode;
-use arinsal_term::{Term, TermKind, VecHeap, exact_eq, is_match_context, to_owned};
+use arinsal_term::{Term, TermKind, exact_eq, is_match_context, to_owned};
 
 /// Execute a load-time decoded common bit-syntax command.
 pub(super) fn execute_compact(
@@ -32,12 +32,12 @@ pub(super) fn execute_compact(
                     ctx.ensure_at_least(bits as usize, unit as usize)
                 };
             if !ok {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             }
         }
         Instr::BsReadU32 { context, dst, fail } => {
             let Some(value) = arinsal_bits::match_u32_be(p.x[context as usize]) else {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             };
             p.x[dst as usize] = Term::small(i64::from(value)).unwrap();
         }
@@ -55,7 +55,7 @@ pub(super) fn execute_compact(
                 unit as usize,
                 bits as usize,
             ) else {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             };
             p.x[dst as usize] = Term::small(i64::from(value)).unwrap();
         }
@@ -71,10 +71,10 @@ pub(super) fn execute_compact(
                 .and_then(|n| usize::try_from(n).ok())
                 .and_then(|n| n.checked_mul(8))
             else {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             };
             if !is_match_context(p.x[context as usize]) {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             }
             let result = allocated_compact(
                 p,
@@ -83,7 +83,7 @@ pub(super) fn execute_compact(
                 &frame,
             )?;
             let Some(value) = result else {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             };
             p.x[dst as usize] = value;
         }
@@ -110,7 +110,7 @@ pub(super) fn execute_compact(
             fail,
         } => {
             if !is_match_context(p.x[context as usize]) {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             }
             let value = allocated_compact(
                 p,
@@ -119,7 +119,7 @@ pub(super) fn execute_compact(
                 &frame,
             )?;
             let Some(value) = value else {
-                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame());
+                return branch(p, Arg::new(Arg::LABEL, u64::from(fail)), &frame);
             };
             p.x[dst as usize] = value;
         }
@@ -264,10 +264,17 @@ fn allocated<T>(
     match operation(p) {
         Ok(result) => Ok(result),
         Err(BitsError::HeapFull { need_words }) => {
-            let frame = frame();
-            retry_after_gc(p, live, need_words, &mut operation, &frame)
+            retry_after_gc(p, live, need_words, &mut operation, frame)
         }
         Err(other) => Err(error(other, &frame())),
+    }
+}
+
+fn live_with_source(live: usize, source: Arg) -> usize {
+    if source.kind() == Arg::X {
+        live.max(source.value() as usize + 1)
+    } else {
+        live
     }
 }
 
@@ -281,10 +288,9 @@ fn allocated_compact<T>(
     match operation(p) {
         Ok(result) => Ok(result),
         Err(BitsError::HeapFull { need_words }) => {
-            let frame = frame();
-            retry_after_gc(p, live, need_words, &mut operation, &frame)
+            retry_after_gc(p, live, need_words, &mut operation, frame)
         }
-        Err(other) => Err(error(other, &frame())),
+        Err(other) => Err(error(other, frame)),
     }
 }
 
@@ -299,7 +305,7 @@ fn retry_after_gc<T>(
     live: usize,
     mut need_words: usize,
     operation: &mut impl FnMut(&mut Process) -> Result<T, BitsError>,
-    frame: &str,
+    frame: &impl Fn() -> String,
 ) -> Result<T, VmError> {
     for _ in 0..4 {
         let free = p.heap.free_words();
@@ -540,6 +546,38 @@ pub(super) fn execute(
             let list = module.arg(op, 5);
             let live = c.value() as usize;
             let args = &module.lists[list.value() as usize];
+            if let [part] = args.as_chunks::<6>().0
+                && args.len() == 6
+                && let Some(kind) = p.read(part[0])?.as_atom()
+                && let Some(ty) = match kind {
+                    arinsal_term::atoms::UTF8 => Some(SegType::Utf8),
+                    arinsal_term::atoms::UTF16 => Some(SegType::Utf16),
+                    arinsal_term::atoms::UTF32 => Some(SegType::Utf32),
+                    _ => None,
+                }
+            {
+                let source = part[4];
+                let source_live = live_with_source(live, source);
+                let segment_flags = flags(p, part[3]);
+                p.ensure(3 + b.value() as usize, source_live)?;
+                let value = allocated(
+                    p,
+                    source_live,
+                    |p| {
+                        arinsal_bits::create_utf_segment(
+                            p.read(source)
+                                .map_err(|_| BitsError::BadArg { segment: 1 })?,
+                            ty,
+                            segment_flags,
+                            &mut p.heap,
+                        )
+                    },
+                    frame,
+                )?;
+                p.write(module.arg(op, 4), value)?;
+                p.ip += 1;
+                return Ok(());
+            }
             let initial = match segments(p, module, args) {
                 Ok(segments) => segments,
                 Err(error) => {
@@ -611,6 +649,9 @@ pub(super) fn execute(
             } else {
                 (b, c.value() as usize)
             };
+            // bs_start_match4 may report live=0 while its source is still in X0.
+            // A moving collection must retain that source before the retry rereads it.
+            let live = live_with_source(live, source_arg);
             let source = p.read(source_arg)?;
             let result = if is_match_context(source) {
                 Some(source)
@@ -795,29 +836,11 @@ pub(super) fn execute(
                 .strings
                 .get(offset..offset.saturating_add(byte_len))
                 .ok_or_else(|| VmError::Unsupported("string table range".into()))?;
-            let mut scratch = VecHeap::new();
             let context = p.read(b)?;
-            let saved = context.position();
-            let result = context
-                .get_binary(bits, &mut scratch)
-                .map_err(|e| error(e, frame))?;
-            let matches = result.is_some_and(|value| {
-                // SAFETY: The bitstring remains in the live process heap.
-                unsafe { value.binary_ref() }.is_some_and(|view| {
-                    (0..bits).all(|i| {
-                        let got = (view.bytes()[(view.start_bit() + i) / 8]
-                            >> (7 - (view.start_bit() + i) % 8))
-                            & 1;
-                        let want = (expected[i / 8] >> (7 - i % 8)) & 1;
-                        got == want
-                    })
-                })
-            });
-            if matches {
+            if context.match_string(expected, bits) {
                 p.ip += 1;
                 Ok(())
             } else {
-                context.set_position(saved);
                 branch(p, a, frame)
             }
         }

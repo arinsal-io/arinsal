@@ -237,12 +237,14 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
             .and_then(|reference| reference.downcast_ref::<Prepared>())
             .ok_or_else(badarg)?;
         let beam = &prepared.beam;
-        let mut module = arinsal_loader::load_with_instrumentations(
+        let mut module = match arinsal_loader::load_with_instrumentations(
             beam,
             vm.coverage_mode,
             crate::trace_bp::line_breakpoints_instrumented(),
-        )
-        .map_err(|_| badarg())?;
+        ) {
+            Ok(module) => module,
+            Err(_) => return make_tuple(process, &[atom("error"), atom("badfile")]),
+        };
         crate::funs::set_module_uniq(&mut module, &prepared.bytes).map_err(|_| badarg())?;
         let registers = crate::process::register_requirements(beam);
         let meta = CodeMeta::from_beam(beam, Some(&prepared.bytes));
@@ -1594,6 +1596,77 @@ mod tests {
         let args = [ok, bad].map(|bytes| from_owned(&OwnedTerm::Binary(bytes), &mut heap).unwrap());
         let result = vm
             .eval_scheduled("arinsal_onload_control", "run", &args, 2, None)
+            .unwrap();
+        compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
+    }
+
+    #[test]
+    fn unknown_bs_match_subcommand_is_a_badfile_like_erl() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping malformed bit-match differential test");
+            return;
+        };
+        let mut beam = reference
+            .compile_named(
+                "arinsal_bad_bs_match",
+                "-module(arinsal_bad_bs_match). -export([f/1]). f(<<X:16,_/binary>>) -> X.",
+                &[],
+            )
+            .unwrap();
+        let command = b"ensure_at_least";
+        let replacement = b"future_cool_cmd";
+        assert_eq!(command.len(), replacement.len());
+        let offset = beam
+            .windows(command.len())
+            .position(|window| window == command)
+            .expect("compiled binary match contains ensure_at_least");
+        beam[offset..offset + command.len()].copy_from_slice(replacement);
+        let control = reference
+            .compile_named(
+                "arinsal_bad_bs_match_control",
+                "-module(arinsal_bad_bs_match_control). -export([run/1]). run(Bin) -> case erlang:prepare_loading(arinsal_bad_bs_match,Bin) of {error,_}=Error -> Error; Prep -> erlang:finish_loading([Prep]) end.",
+                &[],
+            )
+            .unwrap();
+        reference
+            .load("arinsal_bad_bs_match_control", &control)
+            .unwrap();
+        let expected = reference.call(
+            "arinsal_bad_bs_match_control",
+            "run",
+            &[OwnedTerm::Binary(beam.clone())],
+        );
+
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&control).unwrap();
+        let mut heap = arinsal_term::VecHeap::new();
+        let binary = from_owned(&OwnedTerm::Binary(beam), &mut heap).unwrap();
+        let result = vm
+            .eval_scheduled("arinsal_bad_bs_match_control", "run", &[binary], 1, None)
+            .unwrap();
+        compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
+    }
+
+    #[test]
+    fn unsigned_bit_match_sizes_beyond_u64_match_erl() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping wide bit-size differential test");
+            return;
+        };
+        let source = "-module(arinsal_wide_bs_match). -export([run/1]). run(<<Byte:8, _:18446744073709551616>>) -> Byte; run(_) -> no.";
+        let beam = reference
+            .compile_named("arinsal_wide_bs_match", source, &[])
+            .unwrap();
+        reference.load("arinsal_wide_bs_match", &beam).unwrap();
+        let input = OwnedTerm::Binary(vec![42]);
+        let expected = reference.call("arinsal_wide_bs_match", "run", std::slice::from_ref(&input));
+
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let mut heap = arinsal_term::VecHeap::new();
+        let input = from_owned(&input, &mut heap).unwrap();
+        let result = vm
+            .eval_scheduled("arinsal_wide_bs_match", "run", &[input], 1, None)
             .unwrap();
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }

@@ -4,6 +4,7 @@ use arinsal_beam::{BeamFile, BeamType, Instr as BeamInstr, Operand};
 use arinsal_bifs::BifFn;
 use arinsal_spec::Opcode;
 use arinsal_term::{Atom, Term, TermBuilder, VecHeap, from_owned, global_atoms};
+use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -561,6 +562,9 @@ pub enum LoadError {
     /// Atom table rejected an atom.
     #[error("atom table rejected {0}")]
     Atom(String),
+    /// A bit syntax match list contains an unknown or malformed command.
+    #[error("invalid bit syntax match command list")]
+    InvalidBitMatch,
     /// Module exceeds an internal limit.
     #[error("module exceeds instruction index limit")]
     Limit,
@@ -578,12 +582,21 @@ struct Decoder<'a> {
     types: &'a mut Vec<(usize, BeamType)>,
 }
 impl Decoder<'_> {
+    fn bigint_arg(&mut self, value: &BigInt) -> Result<Arg, LoadError> {
+        let term = TermBuilder::new(self.literals)
+            .int_from_bigint(value)
+            .map_err(|_| LoadError::Limit)?;
+        // SAFETY: The literal area retains this term.
+        Ok(Arg::new(Arg::TERM, unsafe { term.raw_bits() }))
+    }
+
     fn arg(&mut self, operand: &Operand, position: usize) -> Result<Arg, LoadError> {
         Ok(match operand {
             Operand::X(n) => Arg::new(Arg::X, *n as u64),
             Operand::Y(n) => Arg::new(Arg::Y, *n as u64),
             Operand::FR(n) => Arg::new(Arg::FR, *n as u64),
-            Operand::U(n) => Arg::new(Arg::U, *n),
+            Operand::U(n) if *n & !Arg::PAYLOAD_MASK == 0 => Arg::new(Arg::U, *n),
+            Operand::U(n) => self.bigint_arg(&BigInt::from(*n))?,
             Operand::Label(0) => Arg::new(Arg::LABEL, u32::MAX as u64),
             Operand::Label(n) => Arg::new(
                 Arg::LABEL,
@@ -609,13 +622,7 @@ impl Decoder<'_> {
                 // SAFETY: The literal area retains this term.
                 Arg::new(Arg::TERM, unsafe { term.raw_bits() })
             }
-            Operand::BigInt(n) => {
-                let term = TermBuilder::new(self.literals)
-                    .int_from_bigint(n)
-                    .map_err(|_| LoadError::Limit)?;
-                // SAFETY: The literal area retains this term.
-                Arg::new(Arg::TERM, unsafe { term.raw_bits() })
-            }
+            Operand::BigInt(n) => self.bigint_arg(n)?,
             Operand::Char(n) => Arg::new(Arg::INT, *n as u64),
             Operand::Literal(n) => match self.literal_term(*n)? {
                 Some(term) if term.as_small().is_some() => {
@@ -1332,6 +1339,20 @@ pub fn load_with_instrumentations(
         }
     }
     let mut bit_commands = maps_bits::decode_commands(&lists);
+    // Port of erts/emulator/beam/jit/arm/generators.tab:541-577, OTP-29.1.1.
+    // Reject unknown subcommands during loading so they cannot reach execution.
+    for op in &generic {
+        if op.opcode() == Opcode::BsMatch {
+            let commands = op.args[2];
+            if commands.kind() != Arg::LIST
+                || bit_commands
+                    .get(commands.value() as usize)
+                    .is_none_or(Option::is_none)
+            {
+                return Err(LoadError::InvalidBitMatch);
+            }
+        }
+    }
     // vm_binparse2: drop spare decode capacity before large process binaries arrive.
     generic.shrink_to_fit();
     selects.shrink_to_fit();

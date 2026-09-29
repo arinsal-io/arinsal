@@ -3585,6 +3585,10 @@ impl Vm {
                     } else if op.opcode() == Opcode::GetMapElements {
                         execute_get_map_elements(p, module, &op)?;
                     } else {
+                        let frame = || {
+                            let (name, arity) = module.function_at(offset).unwrap_or(("?", 0));
+                            format!("{}:{name}/{arity}", module.name)
+                        };
                         bits::execute(p, module, &op, &frame)?;
                     }
                     reds = p.reductions;

@@ -16,4 +16,5 @@ arinsal-etf.workspace = true
 arinsal-term.workspace = true
 arinsal-bifs.workspace = true
 thiserror.workspace = true
+num-bigint.workspace = true
 md-5 = "0.10.6"

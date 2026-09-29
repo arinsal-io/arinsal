@@ -109,6 +109,43 @@ fn get_integer_all_sizes_signed_unsigned_endian_vs_erl() {
 }
 
 #[test]
+fn match_string_unaligned_and_partial_fields_vs_erl() {
+    let Some(reference) = erl() else { return };
+    let bytes = [0xa5, 0xd3, 0x6c, 0xf0];
+    let mut heap = VecHeap::new();
+
+    for offset in 0..8usize {
+        for bits in 1..=(32 - offset) {
+            let mut expected = 0u64;
+            for index in 0..bits {
+                let position = offset + index;
+                expected =
+                    (expected << 1) | u64::from((bytes[position / 8] >> (7 - position % 8)) & 1);
+            }
+            for candidate in [expected, expected ^ (1 << (bits - 1))] {
+                let source = TermBuilder::new(&mut heap).bitstring(&bytes, 32).unwrap();
+                let context = start_match(source, &mut heap).unwrap().unwrap();
+                assert!(context.skip(offset));
+
+                let actual = context.match_string(&(candidate << (64 - bits)).to_be_bytes(), bits);
+                let expression = format!(
+                    "case <<{},{},{},{}>> of <<_:{offset},{candidate}:{bits},_/bitstring>> -> true; _ -> false end",
+                    bytes[0], bytes[1], bytes[2], bytes[3]
+                );
+                let expected_match =
+                    reference.eval(&expression).unwrap() == OwnedTerm::Atom("true".into());
+                assert_eq!(actual, expected_match, "offset={offset} bits={bits}");
+                assert_eq!(
+                    context.position(),
+                    offset + if expected_match { bits } else { 0 },
+                    "cursor offset={offset} bits={bits} candidate={candidate}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn put_integer_vs_erl() {
     let Some(reference) = erl() else { return };
     let mut heap = VecHeap::new();

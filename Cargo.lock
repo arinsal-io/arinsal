@@ -219,6 +219,7 @@ dependencies = [
  "arinsal-spec",
  "arinsal-term",
  "md-5",
+ "num-bigint",
  "thiserror",
 ]
 
