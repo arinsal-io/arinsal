@@ -1006,7 +1006,7 @@ impl Executor {
                                 .unwrap_or(0);
                             trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
                                 Some(Term::small(i64::from(arity)).expect("arity is small")),
-                                Box::new(info),
+                                info,
                             ));
                             trap
                         }

@@ -1270,7 +1270,7 @@ impl Vm {
                         .unwrap_or(0);
                     trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
                         Some(Term::small(i64::from(arity)).expect("arity is small")),
-                        Box::new(info),
+                        info,
                     ));
                     if let Some(error) = exceptions::resume(self, &mut process, None, trap)? {
                         return Err(error);

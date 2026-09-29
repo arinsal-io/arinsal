@@ -1464,20 +1464,6 @@ fn valid_source_location(name_index: u32, line: u64) -> bool {
     name_index < 255 && line < ((1 << 24) - 1)
 }
 
-#[cfg(test)]
-mod line_location_tests {
-    use super::valid_source_location;
-
-    #[test]
-    fn ignores_locations_that_do_not_fit_the_erts_packed_form() {
-        assert!(valid_source_location(0, 1));
-        assert!(valid_source_location(254, (1 << 24) - 2));
-        assert!(!valid_source_location(255, 1));
-        assert!(!valid_source_location(0, (1 << 24) - 1));
-        assert!(!valid_source_location(0, 100_000_003));
-    }
-}
-
 fn executable(op: Opcode) -> bool {
     // ---- vm_maps_bits ----
     if maps_bits::handles(op) {
@@ -1587,4 +1573,18 @@ fn executable(op: Opcode) -> bool {
             | "if_end"
             | "debug_line"
     )
+}
+
+#[cfg(test)]
+mod line_location_tests {
+    use super::valid_source_location;
+
+    #[test]
+    fn ignores_locations_that_do_not_fit_the_erts_packed_form() {
+        assert!(valid_source_location(0, 1));
+        assert!(valid_source_location(254, (1 << 24) - 2));
+        assert!(!valid_source_location(255, 1));
+        assert!(!valid_source_location(0, (1 << 24) - 1));
+        assert!(!valid_source_location(0, 100_000_003));
+    }
 }

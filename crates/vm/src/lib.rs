@@ -137,7 +137,7 @@ pub enum VmError {
         /// Current top frame.
         frame: String,
         /// `error_info` map to attach to the top stack frame.
-        info: arinsal_etf::OwnedTerm,
+        info: Box<arinsal_etf::OwnedTerm>,
     },
     /// Exception awaiting BEAM handler dispatch.
     Trap(exceptions::Trap),

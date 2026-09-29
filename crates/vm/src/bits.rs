@@ -239,7 +239,7 @@ fn error(error: BitsError, frame: &(impl FrameName + ?Sized)) -> VmError {
             VmError::ExceptionInfo {
                 reason: reason.into(),
                 frame: frame.to_frame_string(),
-                info,
+                info: Box::new(info),
             }
         }
         BitsError::BadArg { .. } => VmError::Exception {
@@ -378,7 +378,7 @@ fn segments<'a>(
         };
         out.push(Segment {
             ty,
-            index: usize::try_from(part[1].value()).unwrap_or(index as usize + 1),
+            index: usize::try_from(part[1].value()).unwrap_or(index + 1),
             unit: u8::try_from(part[2].value())
                 .map_err(|_| VmError::Unsupported("bit syntax unit".into()))?,
             flags: flags(p, part[3]),
