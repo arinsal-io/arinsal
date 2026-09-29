@@ -163,6 +163,7 @@ pub enum Instr {
         a: u16,
         b: u16,
         dst: u16,
+        fail: u32,
         import: u32,
     },
     /// Small-integer arithmetic with a register and constant right operand.
@@ -172,6 +173,7 @@ pub enum Instr {
         from_y: bool,
         value: Term,
         dst: u16,
+        fail: u32,
         import: u32,
     },
     /// Small-integer arithmetic with a constant right operand and Y destination.
@@ -181,6 +183,7 @@ pub enum Instr {
         from_y: bool,
         value: Term,
         dst: u16,
+        fail: u32,
         import: u32,
     },
     /// Boxed float in X to float register.
@@ -772,6 +775,7 @@ pub(crate) fn specialize(
                     a,
                     b,
                     dst,
+                    fail,
                     import,
                 }
             } else if let (Some(src), Some(value), Some(dst)) = (
@@ -785,6 +789,7 @@ pub(crate) fn specialize(
                     from_y: lhs.kind() == Arg::Y,
                     value,
                     dst,
+                    fail,
                     import,
                 }
             } else if let (Some(src), Some(value), Some(dst)) = (
@@ -798,6 +803,7 @@ pub(crate) fn specialize(
                     from_y: lhs.kind() == Arg::Y,
                     value,
                     dst,
+                    fail,
                     import,
                 }
             } else if matches!(kind, FastBif::Add | FastBif::Mul)
@@ -810,6 +816,7 @@ pub(crate) fn specialize(
                     from_y: false,
                     value,
                     dst,
+                    fail,
                     import,
                 }
             } else {

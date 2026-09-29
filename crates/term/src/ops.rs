@@ -2,7 +2,6 @@
 use crate::FunRef;
 use crate::identity::node_order;
 use crate::{EMPTY_TUPLE, FLOAT, Identity, NEG_BIG, POS_BIG, Term, TermKind, global_atoms};
-use num_bigint::{BigInt, Sign};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 
@@ -44,7 +43,7 @@ pub fn small_mul(a: Term, b: Term) -> Option<Term> {
 
 fn number(term: Term) -> Option<Number> {
     if let Some(n) = term.as_small() {
-        return Some(Number::Integer(BigInt::from(n)));
+        return Some(Number::Integer(Integer::Small(n)));
     }
     let h = term.header()?;
     // SAFETY: A live boxed number is laid out according to its header.
@@ -55,27 +54,95 @@ fn number(term: Term) -> Option<Number> {
             Some(Number::Float(f64::from_bits(unsafe { *p.add(1) })))
         }
         POS_BIG | NEG_BIG => {
+            // SAFETY: The header digit count describes initialized magnitude limbs.
             let len = (h >> 6) as usize;
-            let mut bytes = Vec::with_capacity(len * 8);
-            for i in 0..len {
-                // SAFETY: The header digit count describes the allocation.
-                bytes.extend_from_slice(&unsafe { *p.add(i + 1) }.to_le_bytes());
+            let mut digits = SmallVec::with_capacity(len);
+            for index in 0..len {
+                // SAFETY: The header digit count describes initialized magnitude limbs.
+                digits.push(unsafe { *p.add(index + 1) });
             }
-            let sign = if h & 63 == NEG_BIG {
-                Sign::Minus
-            } else {
-                Sign::Plus
-            };
-            Some(Number::Integer(BigInt::from_bytes_le(sign, &bytes)))
+            Some(Number::Integer(Integer::Big {
+                negative: h & 63 == NEG_BIG,
+                digits,
+            }))
         }
         _ => None,
     }
 }
 enum Number {
-    Integer(BigInt),
+    Integer(Integer),
     Float(f64),
 }
-fn integer_float_cmp(n: &BigInt, f: f64) -> Ordering {
+enum Integer {
+    Small(i64),
+    Big {
+        negative: bool,
+        digits: SmallVec<[u64; 4]>,
+    },
+}
+impl Integer {
+    fn negative(&self) -> bool {
+        match self {
+            Self::Small(n) => *n < 0,
+            Self::Big { negative, .. } => *negative,
+        }
+    }
+
+    fn zero(&self) -> bool {
+        match self {
+            Self::Small(n) => *n == 0,
+            Self::Big { digits, .. } => digits.is_empty() || digits.iter().all(|d| *d == 0),
+        }
+    }
+
+    fn magnitude_len(&self) -> usize {
+        match self {
+            Self::Small(n) => usize::from(*n != 0),
+            Self::Big { digits, .. } => digits.len(),
+        }
+    }
+
+    fn magnitude_digit(&self, index: usize) -> u64 {
+        match self {
+            Self::Small(n) => {
+                if index == 0 {
+                    n.unsigned_abs()
+                } else {
+                    0
+                }
+            }
+            Self::Big { digits, .. } => digits.get(index).copied().unwrap_or(0),
+        }
+    }
+}
+
+fn cmp_magnitude(a: &Integer, b: &Integer) -> Ordering {
+    let alen = a.magnitude_len();
+    let blen = b.magnitude_len();
+    alen.cmp(&blen).then_with(|| {
+        (0..alen)
+            .rev()
+            .map(|index| a.magnitude_digit(index).cmp(&b.magnitude_digit(index)))
+            .find(|order| *order != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    })
+}
+
+fn integer_cmp(a: &Integer, b: &Integer) -> Ordering {
+    if a.zero() && b.zero() {
+        return Ordering::Equal;
+    }
+    match (a.negative(), b.negative()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (negative, _) => {
+            let order = cmp_magnitude(a, b);
+            if negative { order.reverse() } else { order }
+        }
+    }
+}
+
+fn integer_float_cmp(n: &Integer, f: f64) -> Ordering {
     if f.is_nan() {
         return Ordering::Less;
     }
@@ -86,27 +153,95 @@ fn integer_float_cmp(n: &BigInt, f: f64) -> Ordering {
             Ordering::Greater
         };
     }
-    // IEEE 754: compare exact integer numerator against the integer scaled by 2^shift.
+    if f == 0.0 {
+        return if n.zero() {
+            Ordering::Equal
+        } else if n.negative() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let n_negative = n.negative();
+    let f_negative = f.is_sign_negative();
+    if n_negative != f_negative {
+        return if n_negative {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+
+    // Compare unsigned limb magnitudes with the exact IEEE-754 significand.
     let bits = f.to_bits();
     let exponent = ((bits >> 52) & 0x7ff) as i32;
     let mantissa = bits & ((1_u64 << 52) - 1);
-    let (mut numerator, shift) = if exponent == 0 {
-        (BigInt::from(mantissa), -1074)
+    let (significand, shift) = if exponent == 0 {
+        (mantissa, -1074)
     } else {
-        (BigInt::from(mantissa | (1_u64 << 52)), exponent - 1023 - 52)
+        (mantissa | (1_u64 << 52), exponent - 1023 - 52)
     };
-    if f.is_sign_negative() {
-        numerator = -numerator;
-    }
-    if shift >= 0 {
-        n.cmp(&(numerator << shift as usize))
+    let magnitude_order = if shift >= 0 {
+        let shift = shift as usize;
+        let base = shift / 64;
+        let offset = shift % 64;
+        let shifted = (significand as u128) << offset;
+        let low = shifted as u64;
+        let high = (shifted >> 64) as u64;
+        let high_index = if high != 0 { base + 1 } else { base };
+        n.magnitude_len().cmp(&(high_index + 1)).then_with(|| {
+            (0..=high_index)
+                .rev()
+                .map(|index| {
+                    let float_digit = if index == base {
+                        low
+                    } else if index == base + 1 {
+                        high
+                    } else {
+                        0
+                    };
+                    n.magnitude_digit(index).cmp(&float_digit)
+                })
+                .find(|order| *order != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        })
     } else {
-        (n << (-shift) as usize).cmp(&numerator)
+        let fractional_bits = (-shift) as usize;
+        let float_exponent =
+            (63 - significand.leading_zeros() as usize) as i32 - fractional_bits as i32;
+        if n.zero() {
+            Ordering::Less
+        } else if float_exponent < 0 {
+            Ordering::Greater
+        } else {
+            let integer_bits = (n.magnitude_len() - 1) * 64
+                + (64 - n.magnitude_digit(n.magnitude_len() - 1).leading_zeros() as usize);
+            let float_bits = float_exponent as usize + 1;
+            integer_bits.cmp(&float_bits).then_with(|| {
+                let floor = significand >> fractional_bits;
+                let floor_order = cmp_magnitude(n, &Integer::Small(floor as i64));
+                if floor_order != Ordering::Equal {
+                    floor_order
+                } else {
+                    let fractional_mask = (1_u64 << fractional_bits) - 1;
+                    if significand & fractional_mask == 0 {
+                        Ordering::Equal
+                    } else {
+                        Ordering::Less
+                    }
+                }
+            })
+        }
+    };
+    if n_negative {
+        magnitude_order.reverse()
+    } else {
+        magnitude_order
     }
 }
 fn number_cmp(a: Term, b: Term, exact: bool) -> Ordering {
     match (number(a).unwrap(), number(b).unwrap()) {
-        (Number::Integer(a), Number::Integer(b)) => a.cmp(&b),
+        (Number::Integer(a), Number::Integer(b)) => integer_cmp(&a, &b),
         (Number::Float(a), Number::Float(b)) => {
             let c = a.total_cmp(&b);
             if !exact && a == b { Ordering::Equal } else { c }

@@ -874,6 +874,55 @@ fn differential_number_equality_truth_table() {
 
 #[test]
 #[cfg(not(miri))]
+fn differential_integer_float_ordering_boundaries() {
+    let expression = "Pairs=[{(1 bsl 53)+1,float((1 bsl 53)+1)},{-(1 bsl 53)-1,float(-(1 bsl 53)-1)},{(1 bsl 100)+1,float(1 bsl 100)},{-(1 bsl 100)-1,float(-(1 bsl 100))},{1,1.5},{2,1.5},{0,-0.0},{1,5.0e-324}],lists:foreach(fun({A,B})->io:format(\"~w \",[if A<B->0; A==B->1; true->2 end]) end,Pairs),halt().";
+    let Some(reference) = erl_values(expression) else {
+        eprintln!("skipping: erl unavailable");
+        return;
+    };
+    let mut heap = VecHeap::new();
+    let mut builder = TermBuilder::new(&mut heap);
+    let float = |builder: &mut TermBuilder<'_, VecHeap>, value: f64| builder.float(value).unwrap();
+    let integer =
+        |builder: &mut TermBuilder<'_, VecHeap>, value: i128| builder.int_from_i128(value).unwrap();
+    let pairs = [
+        (
+            integer(&mut builder, (1_i128 << 53) + 1),
+            float(&mut builder, ((1_i128 << 53) + 1) as f64),
+        ),
+        (
+            integer(&mut builder, -(1_i128 << 53) - 1),
+            float(&mut builder, (-(1_i128 << 53) - 1) as f64),
+        ),
+        (
+            integer(&mut builder, (1_i128 << 100) + 1),
+            float(&mut builder, (1_i128 << 100) as f64),
+        ),
+        (
+            integer(&mut builder, -(1_i128 << 100) - 1),
+            float(&mut builder, (-(1_i128 << 100)) as f64),
+        ),
+        (Term::small(1).unwrap(), float(&mut builder, 1.5)),
+        (Term::small(2).unwrap(), float(&mut builder, 1.5)),
+        (Term::small(0).unwrap(), float(&mut builder, -0.0)),
+        (
+            Term::small(1).unwrap(),
+            float(&mut builder, f64::from_bits(1)),
+        ),
+    ];
+    assert_eq!(reference.len(), pairs.len());
+    for (index, (a, b)) in pairs.iter().enumerate() {
+        let actual = match cmp(*a, *b) {
+            Ordering::Less => 0,
+            Ordering::Equal => 1,
+            Ordering::Greater => 2,
+        };
+        assert_eq!(actual, reference[index], "numeric order case {index}");
+    }
+}
+
+#[test]
+#[cfg(not(miri))]
 fn differential_hashes_ten_thousand_identities_and_funs() {
     let expression = "erts_debug:set_internal_state(available_internal_state,true),F=fun(N)->X=N rem 1000,case N rem 4 of 0->list_to_pid(\"<0.\"++integer_to_list(X)++\".0>\");1->list_to_port(\"#Port<0.\"++integer_to_list(X)++\">\");2->list_to_ref(\"#Ref<0.0.0.\"++integer_to_list(X)++\">\");3->fun erlang:length/1 end end,lists:foreach(fun(N)->T=F(N),io:format(\"~w ~w ~w ~w~n\",[erlang:phash2(T,4294967296),erlang:phash(T,4294967296),erts_debug:get_internal_state({internal_hash,T}),erts_debug:flat_size(T)]) end,lists:seq(0,9999)),halt().";
     let Some(reference) = erl_values_u64(expression) else {

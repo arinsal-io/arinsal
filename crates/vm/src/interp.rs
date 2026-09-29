@@ -351,15 +351,16 @@ fn execute_small_bif(
         read_fast_x(p, module.arg(op, first))?,
         read_fast_x(p, module.arg(op, first + 1))?,
     ];
-    let result = match import.fast {
-        FastBif::Add => small_add(left, right),
-        FastBif::Sub => small_sub(left, right),
-        FastBif::Mul => small_mul(left, right),
-        FastBif::None if import.fast_op == ImportFastOp::Rem => right
-            .as_small()
-            .filter(|right| *right != 0)
-            .and_then(|right| left.as_small().and_then(|left| Term::small(left % right))),
-        FastBif::None => return Ok(false),
+    let result = if import.fast != FastBif::None {
+        arith::small(import.fast, left, right)
+    } else {
+        match import.fast_op {
+            ImportFastOp::Rem => right
+                .as_small()
+                .filter(|right| *right != 0)
+                .and_then(|right| left.as_small().and_then(|left| Term::small(left % right))),
+            _ => return Ok(false),
+        }
     };
     let Some(result) = result else {
         return Ok(false);
@@ -400,6 +401,28 @@ fn execute_guard_bif(
     let Some(import) = module.imports.get(import_index) else {
         return Ok(false);
     };
+    if fail.kind() == Arg::LABEL
+        && fail.value() != u32::MAX as u64
+        && arity == 2
+        && import.fast != FastBif::None
+    {
+        let left = read_fast_x(p, module.arg(op, first_arg))?;
+        let right = read_fast_x(p, module.arg(op, first_arg + 1))?;
+        let Some(bif) = import.bif_fn() else {
+            return Ok(false);
+        };
+        p.gc_live = live;
+        let result = arith::small(import.fast, left, right)
+            .map(Ok)
+            .unwrap_or_else(|| calls::call_bif(&mut p.heap, bif, &[left, right]));
+        if let Ok(value) = result {
+            write_fast_x(p, dst, value)?;
+            p.ip += 1;
+        } else {
+            p.ip = fail.value() as usize;
+        }
+        return Ok(true);
+    }
     if !matches!(
         (import.fast_op, arity),
         (ImportFastOp::IsInteger, 1)
@@ -2644,8 +2667,8 @@ impl Vm {
                     a,
                     b,
                     dst,
+                    fail,
                     import,
-                    ..
                 } => {
                     // SAFETY: `ip` and `base` belong to the current module.
                     let offset = unsafe { ip.offset_from(base) } as usize;
@@ -2664,18 +2687,31 @@ impl Vm {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, right]).map_err(|e| {
-                                exceptions::bif_error(
+                            bif(&mut ctx, &[left, right])
+                        };
+                        match result {
+                            Ok(value) => {
+                                (htop, stop) = p.heap.heap_cursor();
+                                value
+                            }
+                            Err(_) if fail != u32::MAX => {
+                                (htop, stop) = p.heap.heap_cursor();
+                                // Guard arithmetic exceptions select the encoded fail label.
+                                // This matches erts guard evaluation, where an exception makes
+                                // the guard false instead of escaping the function.
+                                ip = base.wrapping_add(fail as usize);
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(exceptions::bif_error(
                                     p,
                                     &module.imports[import as usize].module,
                                     &module.imports[import as usize].function,
                                     &[left, right],
-                                    e,
-                                )
-                            })?
-                        };
-                        (htop, stop) = p.heap.heap_cursor();
-                        result
+                                    error,
+                                ));
+                            }
+                        }
                     };
                     // SAFETY: Specialization validates destination X index below 1024.
                     unsafe { *x.add(dst as usize) = value };
@@ -2685,6 +2721,7 @@ impl Vm {
                     a,
                     b,
                     dst,
+                    fail,
                     import,
                 } => {
                     if a as usize >= depth {
@@ -2712,18 +2749,25 @@ impl Vm {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, right]).map_err(|e| {
-                                exceptions::bif_error(
+                            bif(&mut ctx, &[left, right])
+                        };
+                        (htop, stop) = p.heap.heap_cursor();
+                        match result {
+                            Ok(value) => value,
+                            Err(_) if fail != u32::MAX => {
+                                ip = base.wrapping_add(fail as usize);
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(exceptions::bif_error(
                                     p,
                                     &module.imports[import as usize].module,
                                     &module.imports[import as usize].function,
                                     &[left, right],
-                                    e,
-                                )
-                            })?
-                        };
-                        (htop, stop) = p.heap.heap_cursor();
-                        result
+                                    error,
+                                ));
+                            }
+                        }
                     };
                     // SAFETY: Specialization validates destination X index below 1024.
                     unsafe { *x.add(dst as usize) = value };
@@ -2734,6 +2778,7 @@ impl Vm {
                     from_y,
                     value,
                     dst,
+                    fail,
                     import,
                 } => {
                     // SAFETY: `ip` and `base` belong to the current module.
@@ -2761,18 +2806,25 @@ impl Vm {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, value]).map_err(|e| {
-                                exceptions::bif_error(
+                            bif(&mut ctx, &[left, value])
+                        };
+                        (htop, stop) = p.heap.heap_cursor();
+                        match result {
+                            Ok(result) => result,
+                            Err(_) if fail != u32::MAX => {
+                                ip = base.wrapping_add(fail as usize);
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(exceptions::bif_error(
                                     p,
                                     &module.imports[import as usize].module,
                                     &module.imports[import as usize].function,
                                     &[left, value],
-                                    e,
-                                )
-                            })?
-                        };
-                        (htop, stop) = p.heap.heap_cursor();
-                        result
+                                    error,
+                                ));
+                            }
+                        }
                     };
                     // SAFETY: Specialization validates destination X index below 1024.
                     unsafe { *x.add(dst as usize) = result };
@@ -2783,6 +2835,7 @@ impl Vm {
                     from_y,
                     value,
                     dst,
+                    fail,
                     import,
                 } => {
                     if dst as usize >= depth || (from_y && src as usize >= depth) {
@@ -2810,18 +2863,26 @@ impl Vm {
                             let mut heap = FragmentingHeap(&mut p.heap);
                             let mut ctx = Ctx::new(&mut heap);
                             // ---- vm_exc ----
-                            bif(&mut ctx, &[left, value]).map_err(|e| {
-                                exceptions::bif_error(
+                            bif(&mut ctx, &[left, value])
+                        };
+                        (htop, stop) = p.heap.heap_cursor();
+                        match result {
+                            Ok(result) => result,
+                            Err(_) if fail != u32::MAX => {
+                                // SAFETY: Specialization resolves fail labels in this module.
+                                ip = unsafe { base.add(fail as usize) };
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(exceptions::bif_error(
                                     p,
                                     &module.imports[import as usize].module,
                                     &module.imports[import as usize].function,
                                     &[left, value],
-                                    e,
-                                )
-                            })?
-                        };
-                        (htop, stop) = p.heap.heap_cursor();
-                        result
+                                    error,
+                                ));
+                            }
+                        }
                     };
                     // SAFETY: The destination Y slot is live.
                     unsafe { *stop.add(dst as usize) = result.raw_bits() };

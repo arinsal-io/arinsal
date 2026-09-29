@@ -108,7 +108,11 @@ impl IntOp {
             FastBif::Add => Ok(Self::Add),
             FastBif::Sub => Ok(Self::Sub),
             FastBif::Mul => Ok(Self::Mul),
-            FastBif::None => Err(LowerError::Unsupported {
+            FastBif::Band => Ok(Self::Band),
+            FastBif::Bor => Ok(Self::Bor),
+            FastBif::Bsl => Ok(Self::Bsl),
+            FastBif::Bsr => Ok(Self::Bsr),
+            FastBif::Bxor | FastBif::None => Err(LowerError::Unsupported {
                 pc,
                 reason: "unknown arithmetic BIF",
             }),

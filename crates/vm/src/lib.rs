@@ -58,7 +58,7 @@ use arinsal_loader::{
 use arinsal_spec::Opcode;
 use arinsal_term::{
     GcStats, ProcessHeap, Term, TermBuilder, TermKind, cmp, exact_eq, is_match_context, loose_eq,
-    match_position, small_add, small_mul, small_sub,
+    match_position,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

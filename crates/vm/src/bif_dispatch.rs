@@ -132,12 +132,7 @@ impl Vm {
             stored[i] = p.read(regs[i])?;
         }
         if arity == 2 && fast != FastBif::None {
-            let result = match fast {
-                FastBif::Add => small_add(stored[0], stored[1]),
-                FastBif::Sub => small_sub(stored[0], stored[1]),
-                FastBif::Mul => small_mul(stored[0], stored[1]),
-                FastBif::None => None,
-            };
+            let result = arith::small(fast, stored[0], stored[1]);
             if let Some(result) = result {
                 p.write(dst, result)?;
                 p.ip += 1;

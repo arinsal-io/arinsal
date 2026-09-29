@@ -248,6 +248,16 @@ pub enum FastBif {
     Sub,
     /// `erlang:'*'/2`.
     Mul,
+    /// `erlang:band/2`.
+    Band,
+    /// `erlang:bor/2`.
+    Bor,
+    /// `erlang:bxor/2`.
+    Bxor,
+    /// `erlang:bsl/2`.
+    Bsl,
+    /// `erlang:bsr/2`.
+    Bsr,
 }
 
 /// A replaceable export target for future hot code loading.
@@ -865,6 +875,11 @@ pub fn load_with_instrumentations(
                     ("erlang", "+", 2) => FastBif::Add,
                     ("erlang", "-", 2) => FastBif::Sub,
                     ("erlang", "*", 2) => FastBif::Mul,
+                    ("erlang", "band", 2) => FastBif::Band,
+                    ("erlang", "bor", 2) => FastBif::Bor,
+                    ("erlang", "bxor", 2) => FastBif::Bxor,
+                    ("erlang", "bsl", 2) => FastBif::Bsl,
+                    ("erlang", "bsr", 2) => FastBif::Bsr,
                     _ => FastBif::None,
                 },
                 fast_op: match (module.as_str(), function.as_str(), item.arity) {

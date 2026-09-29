@@ -294,24 +294,6 @@ fn positive_result<H: HeapAlloc + ?Sized>(mut words: Vec<u64>, heap: &mut H) -> 
 }
 fn bitop<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H, op: BitOp) -> ArithResult {
     // Port of erts/emulator/beam/erl_arith.c:164 (band_2/bor_2/bxor_2), OTP-29.1.1.
-    if let (Some(x), Some(y)) = (positive_words(a), positive_words(b)) {
-        let len = match op {
-            BitOp::And => x.len().min(y.len()),
-            _ => x.len().max(y.len()),
-        };
-        let words = (0..len)
-            .map(|i| {
-                let lhs = x.get(i).copied().unwrap_or(0);
-                let rhs = y.get(i).copied().unwrap_or(0);
-                match op {
-                    BitOp::And => lhs & rhs,
-                    BitOp::Or => lhs | rhs,
-                    BitOp::Xor => lhs ^ rhs,
-                }
-            })
-            .collect();
-        return positive_result(words, heap);
-    }
     let x = as_integer(a).ok_or(ArithError::Badarith)?;
     let y = as_integer(b).ok_or(ArithError::Badarith)?;
     integer(
@@ -327,53 +309,16 @@ fn shift<H: HeapAlloc + ?Sized>(a: Term, b: Term, heap: &mut H, right: bool) -> 
     let y = as_integer(b).ok_or(ArithError::Badarith)?;
     // Port of erts/emulator/beam/erl_arith.c:190 (erts_shift), OTP-29.1.1.
     let direction = if right { -y } else { y };
-    if let Some(words) = positive_words(a) {
-        if words.is_empty() || direction.is_zero() {
-            return Ok(a);
-        }
-        if direction.is_negative() {
-            let count = direction.abs().to_usize().unwrap_or(usize::MAX);
-            let bitlen =
-                (words.len() - 1) * 64 + (64 - words.last().unwrap().leading_zeros() as usize);
-            if count >= bitlen {
-                return Ok(Term::small(0).unwrap());
-            }
-            let word_shift = count / 64;
-            let bits = count % 64;
-            let out = (word_shift..words.len())
-                .map(|i| {
-                    if bits == 0 {
-                        words[i]
-                    } else {
-                        (words[i] >> bits) | (words.get(i + 1).copied().unwrap_or(0) << (64 - bits))
-                    }
-                })
-                .collect();
-            return positive_result(out, heap);
-        }
-        let count = direction.to_usize().ok_or(ArithError::SystemLimit)?;
-        let bitlen = (words.len() - 1) * 64 + (64 - words.last().unwrap().leading_zeros() as usize);
-        if bitlen.checked_add(count).is_none_or(|n| n > 65_535 * 64) {
-            return Err(ArithError::SystemLimit);
-        }
-        let word_shift = count / 64;
-        let bits = count % 64;
-        let mut out = vec![0; words.len() + word_shift + 1];
-        for (i, word) in words.iter().copied().enumerate() {
-            out[i + word_shift] |= word << bits;
-            if bits != 0 {
-                out[i + word_shift + 1] |= word >> (64 - bits);
-            }
-        }
-        return positive_result(out, heap);
-    }
     let x = as_integer(a).ok_or(ArithError::Badarith)?;
     if x.is_zero() || direction.is_zero() {
         return Ok(a);
     }
     if direction.is_negative() {
         let count = direction.abs().to_usize().unwrap_or(usize::MAX);
-        return integer(&(x >> count.min(4_194_240)), heap);
+        if count >= x.bits() as usize {
+            return integer(&BigInt::from(if x.is_negative() { -1 } else { 0 }), heap);
+        }
+        return integer(&(x >> count), heap);
     }
     let count = direction.to_usize().ok_or(ArithError::SystemLimit)?;
     if count > 4_194_240 || x.bits().saturating_add(count as u64) > 4_194_240 {
