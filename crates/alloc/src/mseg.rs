@@ -94,6 +94,11 @@ impl Segment {
         self.region.write_word(offset, value)
     }
 
+    /// Advises the OS about a page-aligned range inside this segment.
+    pub fn advise_range(&mut self, offset: usize, len: usize, advice: i32) -> Result<(), MapError> {
+        self.region.advise_range(offset, len, advice)
+    }
+
     /// Resizes this segment while keeping the original alive if mapping fails.
     pub fn resize_preserving(
         &mut self,
@@ -120,7 +125,7 @@ pub struct CallCount {
 }
 
 impl CallCount {
-    fn inc(&mut self) {
+    pub(crate) fn inc(&mut self) {
         if self.count == 999_999_999 {
             self.giga += 1;
             self.count = 0;
@@ -295,6 +300,17 @@ impl MsegAllocator {
             return;
         }
         self.calls.destroy.inc();
+    }
+
+    /// Accounts for a live segment transferred from another scheduler-local owner.
+    pub(crate) fn adopt_existing(&mut self, size: usize) {
+        self.account_alloc(size);
+    }
+
+    /// Removes a transferred segment from this instance without unmapping it.
+    pub(crate) fn release_transferred(&mut self, size: usize) {
+        self.status.segments_current -= 1;
+        self.status.size_current -= size;
     }
 
     /// Resizes a segment while preserving the original prefix.

@@ -208,8 +208,26 @@ impl RawRegion {
 
     /// Advises the OS about the entire mapping.
     pub fn advise(&mut self, advice: i32) -> Result<(), MapError> {
-        // SAFETY: this object owns a valid mapped range; kernel validates advice.
-        let result = unsafe { libc::madvise(self.base_ptr().cast(), self.len, advice) };
+        self.advise_range(0, self.len, advice)
+    }
+
+    /// Advises a page-aligned range within this mapping.
+    pub fn advise_range(&mut self, offset: usize, len: usize, advice: i32) -> Result<(), MapError> {
+        if !offset.is_multiple_of(page_size())
+            || !len.is_multiple_of(page_size())
+            || offset.checked_add(len).is_none_or(|end| end > self.len)
+        {
+            return Err(MapError(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput,
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        // SAFETY: the checked range is page aligned and fully inside this owned mapping.
+        let address = self.base_ptr().wrapping_add(offset).cast();
+        // SAFETY: `address` points to the validated live subrange of this mapping.
+        let result = unsafe { libc::madvise(address, len, advice) };
         if result == 0 {
             Ok(())
         } else {
