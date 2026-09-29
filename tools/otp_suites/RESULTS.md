@@ -13,7 +13,7 @@
 | `bs_utf_SUITE` | 8 | 8/8 | 0/8 | 8 | -9 | bad_construction: missing; utf16_illegal_sequences: missing; utf16_roundtrip: missing; utf32_illegal_sequences: missing; utf32_roundtrip: missing; utf8_big_file: missing; utf8_illegal_sequences: missing; utf8_roundtrip: missing |
 | `counters_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
 | `exception_SUITE` | 16 | 15/16 | 15/16 | 0 | 0 | none |
-| `float_SUITE` | 15 | 14/15 | 12/15 | 2 | 0 | arith: failed {{badmatch,{{'EXIT',badarith}, [0, 3595386269724631416290548474634087135961411350516899931978349536063145215600570775211791172655337563430809179070287649284686426537789283655369350…; fp_drv: failed {'EXIT',error}, unknown_location |
+| `float_SUITE` | 15 | 14/15 | 13/15 | 1 | 0 | fp_drv: failed {badarg |
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
 | `guard_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | bad_arith: failed {badarith; type_tests: failed {badarg |
 | `hash_SUITE` | 29 | 27/29 | 27/29 | 0 | 0 | none |
@@ -26,4 +26,4 @@
 | `ref_SUITE` | 5 | 4/5 | 4/5 | 0 | 0 | none |
 | `small_SUITE` | 13 | 13/13 | 8/13 | 5 | 0 | addition: failed {timetrap_timeout,60000; mul_add: failed {badarith; test_bitwise: failed {timetrap_timeout,60000; test_bsl: failed {timetrap_timeout,60000; test_bsr: failed {timetrap_timeout,60000 |
 | `tuple_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
-| `unique_SUITE` | 2 | 1/2 | 0/2 | 1 | 0 | unique_integer_white_box: failed {badarg |
+| `unique_SUITE` | 2 | 1/2 | 1/2 | 0 | 0 | none |
