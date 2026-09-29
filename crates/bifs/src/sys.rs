@@ -67,9 +67,11 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         ),
         "wordsize" => integer(ctx, std::mem::size_of::<usize>() as u64),
         "context_reductions" => integer(ctx, 4000),
-        "schedulers" | "schedulers_online" | "logical_processors" | "logical_processors_online" => {
-            integer(ctx, cpus)
-        }
+        "schedulers"
+        | "schedulers_online"
+        | "logical_processors"
+        | "logical_processors_available"
+        | "logical_processors_online" => integer(ctx, cpus),
         "dirty_cpu_schedulers" | "dirty_cpu_schedulers_online" => integer(ctx, cpus),
         "dirty_io_schedulers" => integer(ctx, cpus),
         // Port of erts/emulator/beam/erl_bif_info.c:2876 and

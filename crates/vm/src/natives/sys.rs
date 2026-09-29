@@ -36,6 +36,7 @@ static CPU_ORIGIN_NS: OnceLock<u64> = OnceLock::new();
 static WALL_ORIGIN: OnceLock<Instant> = OnceLock::new();
 static MICROSTATE: AtomicBool = AtomicBool::new(false);
 type MicrostateBaseline = (Instant, Vec<[u64; 7]>, [u64; 2]);
+static CPU_TOPOLOGY: OnceLock<Mutex<Option<arinsal_etf::OwnedTerm>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct SchedBase {
@@ -568,10 +569,11 @@ fn system_info(
             arinsal_etf::OwnedTerm::Atom(name),
             arinsal_etf::OwnedTerm::Atom(kind),
         ] = parts.as_slice()
-        && name == "wordsize"
     {
-        return Some(match kind.as_str() {
-            "internal" | "external" => Ok(Term::small(8).unwrap()),
+        return Some(match (name.as_str(), kind.as_str()) {
+            ("wordsize", "internal" | "external") => Ok(Term::small(8).unwrap()),
+            ("cpu_topology", "detected") => Ok(atom("undefined")),
+            ("cpu_topology", "defined" | "used") => cpu_topology_info(process),
             _ => Err(badarg()),
         });
     }
@@ -620,6 +622,11 @@ fn system_info(
         })),
         Some("max_heap_size") => Some(with_flags(|flags| max_heap_map(process, flags.max_heap))),
         Some("multi_scheduling") => Some(with_flags(|flags| Ok(atom(flags.multi)))),
+        Some("cpu_topology") => Some(cpu_topology_info(process)),
+        Some("scheduler_bind_type") => Some(Ok(atom("unbound"))),
+        Some("scheduler_bindings") => Some(with_flags(|flags| {
+            tuple(process, &vec![atom("unbound"); flags.schedulers_total])
+        })),
         Some("sequential_tracer") => Some(crate::seq_trace::system_tracer_info(process)),
         Some("allocated_areas") => Some(memory_areas(vm, process)),
         _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
@@ -946,9 +953,297 @@ fn system_flag(
         "outstanding_system_requests_limit" => outstanding_limit(args[1]),
         "scheduling_statistics" => scheduling_statistics(args[1]),
         "time_offset" if atom_name(args[1]).as_deref() == Some("finalize") => Ok(atom("final")),
+        "scheduler_bind_type" => {
+            // Port of erts/emulator/beam/bif.c:5284 and
+            // erts/emulator/beam/erl_cpu_topology.c:714, OTP-29.1.1.
+            warn_deprecated_scheduler_bind(process, ctx);
+            if args[1] == atom("unbound") {
+                Ok(atom("unbound"))
+            } else {
+                Err(bif_error(process, "system_flag", args, "notsup"))
+            }
+        }
+        "cpu_topology" => {
+            // Port of erts/emulator/beam/bif.c:5276 and
+            // erts/emulator/beam/erl_cpu_topology.c:1348, OTP-29.1.1.
+            warn_deprecated_cpu_topology(process, ctx);
+            set_cpu_topology(process, args[1], "set_cpu_topology")
+        }
+        "internal_cpu_topology" => {
+            // Port of erts/emulator/beam/bif.c:5272 and
+            // erts/emulator/beam/erl_cpu_topology.c:1348, OTP-29.1.1.
+            set_cpu_topology(process, args[1], "system_flag")
+        }
+        "erts_alloc" => erts_alloc_flag(process, args[1]),
         "system_logger" => set_system_logger(args[1]),
         _ => Err(badarg()),
     }
+}
+
+// Port of erts/emulator/beam/erl_cpu_topology.c:1348 (`erts_set_cpu_topology`), OTP-29.1.1.
+fn cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
+    let current = CPU_TOPOLOGY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("CPU topology state")
+        .clone();
+    match current {
+        Some(topology) => arinsal_term::from_owned(
+            &topology,
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .map_err(|_| badarg()),
+        None => Ok(atom("undefined")),
+    }
+}
+
+fn set_cpu_topology(
+    process: &mut Process,
+    value: Term,
+    error_function: &str,
+) -> Result<Term, VmError> {
+    let new = if value == atom("undefined") {
+        None
+    } else {
+        let owned = arinsal_term::to_owned(value)
+            .map_err(|_| bif_error_for(process, error_function, &[value], "badarg"))?;
+        if !valid_cpu_topology(&owned) {
+            return Err(bif_error_for(process, error_function, &[value], "badarg"));
+        }
+        Some(owned)
+    };
+    let mut current = CPU_TOPOLOGY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("CPU topology state");
+    let previous = current.clone();
+    *current = new;
+    drop(current);
+    match previous {
+        Some(topology) => arinsal_term::from_owned(
+            &topology,
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .map_err(|_| badarg()),
+        None => Ok(atom("undefined")),
+    }
+}
+
+fn valid_cpu_topology(topology: &arinsal_etf::OwnedTerm) -> bool {
+    use arinsal_etf::OwnedTerm;
+
+    let OwnedTerm::List { elems, tail } = topology else {
+        return false;
+    };
+    if !matches!(tail.as_ref(), OwnedTerm::Nil) || elems.is_empty() {
+        return false;
+    }
+    fn visit(node: &OwnedTerm, parent_rank: i8, logical_ids: &mut HashSet<i64>) -> bool {
+        let OwnedTerm::Tuple(fields) = node else {
+            return false;
+        };
+        let (tag, child) = match fields.as_slice() {
+            [OwnedTerm::Atom(tag), child] | [OwnedTerm::Atom(tag), child, OwnedTerm::Nil] => {
+                (tag.as_str(), child)
+            }
+            _ => return false,
+        };
+        let rank = match tag {
+            "node" => 0,
+            "processor" => 1,
+            "core" => 2,
+            "thread" => 3,
+            "logical" => 4,
+            _ => return false,
+        };
+        if rank <= parent_rank {
+            return false;
+        }
+        if tag == "logical" {
+            let OwnedTerm::Int(id) = child else {
+                return false;
+            };
+            return (0..65_536).contains(id) && logical_ids.insert(*id);
+        }
+        let mut children = Vec::new();
+        match child {
+            OwnedTerm::List { elems, tail } if matches!(tail.as_ref(), OwnedTerm::Nil) => {
+                children.extend(elems);
+            }
+            _ => children.push(child),
+        }
+        !children.is_empty()
+            && children
+                .into_iter()
+                .all(|child| visit(child, rank, logical_ids))
+    }
+    let mut logical_ids = HashSet::new();
+    elems.iter().all(|node| visit(node, -1, &mut logical_ids)) && !logical_ids.is_empty()
+}
+
+// Port of erts/emulator/beam/utils.c:919 (`send_warning_to_logger`) and :802
+// (`do_send_logger_message`), OTP-29.1.1.
+fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>, text: &str) {
+    let logger = process.runtime.as_ref().and_then(|runtime| {
+        let names = runtime.names.lock().expect("registered process names");
+        names
+            .get("logger")
+            .or_else(|| names.get("error_logger"))
+            .copied()
+    });
+    let Some(logger) = logger else {
+        eprintln!("{text}");
+        return;
+    };
+    let pid = ctx.pid().to_term().unwrap_or(Term::NIL);
+    let group_leader = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.group_leader)
+        .and_then(|leader| leader.to_term())
+        .unwrap_or(Term::NIL);
+    let timestamp = WALL_ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(i64::MAX);
+    let event = (|| -> Result<Term, VmError> {
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut builder = TermBuilder::new(&mut heap);
+        let warning = builder.string_to_list(text).map_err(|_| badarg())?;
+        let format = builder.string_to_list("~s~n").map_err(|_| badarg())?;
+        let args = builder.list_from_iter([warning]).map_err(|_| badarg())?;
+        let error_logger = builder
+            .flatmap_from_pairs(&[
+                (atom("emulator"), atom("true")),
+                (atom("tag"), atom("warning_msg")),
+            ])
+            .map_err(|_| badarg())?;
+        let metadata = builder
+            .flatmap_from_pairs(&[
+                (atom("error_logger"), error_logger),
+                (atom("gl"), group_leader),
+                (atom("pid"), pid),
+                (atom("time"), Term::small(timestamp).ok_or_else(badarg)?),
+            ])
+            .map_err(|_| badarg())?;
+        builder
+            .tuple(&[atom("log"), atom("warning"), format, args, metadata])
+            .map_err(|_| badarg())
+    })();
+    if let Ok(event) = event
+        && let Ok(message) = Message::copy_from(event)
+    {
+        let _ = ctx.send(logger, message);
+    }
+}
+
+fn warn_deprecated_scheduler_bind(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+    send_deprecation_warning(
+        process,
+        ctx,
+        "A call to erlang:system_flag(scheduler_bind_type, _) was\nmade. The scheduler_bind_type argument is deprecated and\nscheduled for removal in Erlang/OTP 18. For more\ninformation see the erlang:system_flag/2 documentation.\n",
+    );
+}
+
+fn warn_deprecated_cpu_topology(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+    send_deprecation_warning(
+        process,
+        ctx,
+        "A call to erlang:system_flag(cpu_topology, _) was made.\nThe cpu_topology argument is deprecated and scheduled\nfor removal in Erlang/OTP 18. For more information\nsee the erlang:system_flag/2 documentation.\n",
+    );
+}
+
+fn bif_error_for(process: &mut Process, function: &str, args: &[Term], reason: &str) -> VmError {
+    let args = {
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        TermBuilder::new(&mut heap).list_from_iter(args.iter().copied())
+    };
+    let Ok(args) = args else {
+        return badarg();
+    };
+    let mut trap = crate::exceptions::Trap::error(atom(reason));
+    trap.top = Some(crate::stacktrace::TopFrame::Bif {
+        module: "erlang".into(),
+        function: function.into(),
+        args,
+    });
+    VmError::Trap(trap)
+}
+
+fn bif_error(process: &mut Process, function: &str, args: &[Term], reason: &str) -> VmError {
+    bif_error_for(process, function, args, reason)
+}
+
+// Port of erts/emulator/beam/erl_alloc.c:3445 (`erts_alloc_set_dyn_param`), OTP-29.1.1.
+fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
+    let owned = arinsal_term::to_owned(value).map_err(|_| {
+        bif_error_for(
+            process,
+            "system_flag",
+            &[atom("erts_alloc"), value],
+            "badarg",
+        )
+    })?;
+    let arinsal_etf::OwnedTerm::Tuple(ref items) = owned else {
+        return Err(bif_error_for(
+            process,
+            "system_flag",
+            &[atom("erts_alloc"), value],
+            "badarg",
+        ));
+    };
+    let [
+        arinsal_etf::OwnedTerm::Atom(allocator),
+        arinsal_etf::OwnedTerm::Atom(parameter),
+        integer,
+    ] = items.as_slice()
+    else {
+        return Err(bif_error_for(
+            process,
+            "system_flag",
+            &[atom("erts_alloc"), value],
+            "badarg",
+        ));
+    };
+    let amount = match integer {
+        arinsal_etf::OwnedTerm::Int(amount) => u64::try_from(*amount).ok(),
+        arinsal_etf::OwnedTerm::BigInt(amount) => num_traits::ToPrimitive::to_u64(amount),
+        _ => None,
+    };
+    let Some(amount) = amount else {
+        return Err(bif_error_for(
+            process,
+            "system_flag",
+            &[atom("erts_alloc"), value],
+            "badarg",
+        ));
+    };
+    const ALLOCATORS: &[&str] = &[
+        "temp_alloc",
+        "sl_alloc",
+        "std_alloc",
+        "ll_alloc",
+        "eheap_alloc",
+        "ets_alloc",
+        "fix_alloc",
+        "literal_alloc",
+        "binary_alloc",
+        "driver_alloc",
+        "sys_alloc",
+        "test_alloc",
+    ];
+    if !ALLOCATORS.contains(&allocator.as_str()) {
+        return Err(bif_error_for(
+            process,
+            "system_flag",
+            &[atom("erts_alloc"), value],
+            "badarg",
+        ));
+    }
+    let _ = (parameter, amount);
+    Ok(atom("notsup"))
 }
 
 pub(crate) fn set_system_logger(value: Term) -> Result<Term, VmError> {
@@ -1275,26 +1570,20 @@ fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term
                 return Err(badarg());
             }
             let previous = flags.schedulers_online;
+            // A full stats snapshot rendezvouses with every worker. Calling it
+            // from a running worker waits on that same worker forever; the
+            // scheduler setter validates its configured capacity directly.
             if requested as usize != previous
                 && let Some(scheduler) = process
                     .runtime
                     .as_ref()
                     .and_then(|runtime| runtime.scheduler().ok())
-                && requested as usize > scheduler.stats().run_queue_lengths.len()
+                && !scheduler.set_online_schedulers(requested as usize)
             {
                 return Err(badarg());
             }
             flags.schedulers_online = requested as usize;
             flags.dirty_cpu_online = flags.dirty_cpu_online.min(flags.schedulers_online);
-            if requested as usize != previous
-                && let Some(scheduler) = process
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.scheduler().ok())
-                && !scheduler.set_online_schedulers(flags.schedulers_online)
-            {
-                return Err(badarg());
-            }
             previous
         };
         Term::small(previous as i64).ok_or_else(badarg)
