@@ -205,7 +205,7 @@ pub struct Vm {
     loaded: SharedTable<HashMap<String, usize>>,
     old: SharedTable<HashMap<String, usize>>,
     pending_on_load: SharedTable<HashMap<String, usize>>,
-    purge_prepared: SharedTable<std::collections::HashSet<String>>,
+    purge_state: Arc<crate::natives::code::PurgeState>,
     deleted: SharedTable<std::collections::HashSet<String>>,
     code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
     code_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,

@@ -34,7 +34,7 @@ use crate::{Process, Vm, VmError};
 use arinsal_sched::RunCtx;
 use arinsal_term::Term;
 
-mod code;
+pub(crate) mod code;
 pub(crate) use crate::dist;
 pub(crate) use code::try_code_mod_permission;
 mod ets;

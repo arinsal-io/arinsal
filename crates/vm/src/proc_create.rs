@@ -73,6 +73,8 @@ pub struct Process {
     // ---- processes and messages ----
     pub(crate) runtime: Option<std::sync::Arc<process::Runtime>>,
     pub(crate) self_pid: Option<arinsal_sched::Pid>,
+    /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
+    pub(crate) hibernated: bool,
     pub(crate) inbox: process::MessageQueue,
     pub(crate) receive_cursor: usize,
     pub(crate) receive_deadline: Option<std::time::Instant>,
@@ -333,6 +335,7 @@ impl Process {
             final_exit_reason: None,
             runtime: None,
             self_pid: None,
+            hibernated: false,
             inbox: process::MessageQueue::default(),
             receive_cursor: 0,
             receive_deadline: None,

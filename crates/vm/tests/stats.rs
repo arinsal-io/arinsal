@@ -125,6 +125,9 @@ retire() ->
     Old = persistent_term:get(Key),
     ok = persistent_term:put(Key, {newer, term}),
     true = erts_internal:garbage_collect(major),
+    %% erts GC does not wait for the literal area collector; give the
+    %% collector time to deliver the copy-literals request while Old is live.
+    receive after 200 -> ok end,
     Old.
 "#;
 

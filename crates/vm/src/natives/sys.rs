@@ -114,9 +114,15 @@ pub(crate) fn copy_literal_area(
             how == arinsal_sched::LiteralCopyHow::NeedGc || has_literal_area_roots(process, &area);
         if has_roots {
             let live_x = process.x.len();
+            let hibernated = process.hibernated;
             let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
             process.heap.request_full_sweep();
             process.force_gc_live(process.gc_live)?;
+            if hibernated {
+                // Port of erts/emulator/beam/erl_gc.c:1387 (erts_garbage_collect_literals
+                // restores the hibernated heap), OTP-29.1.1.
+                process.garbage_collect_hibernate(process.gc_live)?;
+            }
             store.acknowledge_copied(&process._persistent_terms, area_id, u64::from(copied));
         } else {
             store.acknowledge_copied(&process._persistent_terms, area_id, 0);
@@ -352,12 +358,10 @@ fn call_garbage_collect(
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_msacc.c:436 (GC state transition), OTP-29.1.1.
     // Port of erl_proc_sig_queue.c:1332 (fetch pending CLA before GC), OTP-29.1.1.
+    // erts never waits for the literal area collector here: literals of an area
+    // being released stay referenced until the process handles its copy-literals
+    // request (erts_garbage_collect_literals).
     process.drain(ctx)?;
-    // A process that predates retirement must allow the collector to publish
-    // and deliver its CLA before this BIF can collect its old heap.
-    if arinsal_pterm::global_store().has_pending_for(&process._persistent_terms) {
-        return Err(VmError::Yield);
-    }
     garbage_collect(process, args[0])
 }
 

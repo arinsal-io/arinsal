@@ -326,11 +326,19 @@ impl Vm {
                         && module.code.as_ptr() as usize == code)
                         .then_some((id, target, code))
                 });
-                let (module_id, target, code) = if let Some(cached) = cached {
-                    cached
-                } else {
-                    self.resolve_local_fun(p, entry, arity)?
+                let resolved = match cached {
+                    Some(cached) if !self.purge_state.pending(cached.0) => Some(cached),
+                    // A cached target in code pending purge is re-resolved: the fun
+                    // entry may also exist in the current instance, where erts
+                    // already dispatches it.
+                    _ => self.resolve_local_fun(p, entry, arity)?,
                 };
+                let Some((module_id, target, code)) = resolved else {
+                    return self.call_lambda_handler(p, entry.module, arity, tail, false, ctx);
+                };
+                if self.purge_state.pending(module_id) {
+                    return self.call_lambda_handler(p, entry.module, arity, tail, true, ctx);
+                }
                 // The caller module's register file is sized from its own beam.
                 // A closure passes its environment in `x[arity..]`, which can sit
                 // past that size (elixir_erl_compiler's spawn fun). OTP grows the
@@ -383,18 +391,75 @@ impl Vm {
         }
     }
 
+    /// Continue a local fun call whose code is not callable in
+    /// `Handler(Module, Fun, Args)`. With `pending_purge` the code is being purged:
+    /// the caller suspends in `erts_code_purger:pending_purge_lambda/3`, which retries
+    /// once the purge completes or aborts. Otherwise no current code exists and
+    /// `error_handler:undefined_lambda/3` tries to load it.
+    /// Port of erts/emulator/beam/beam_common.c:1677-1727 (call_fun), OTP-29.1.1.
+    #[cold]
+    fn call_lambda_handler(
+        &mut self,
+        p: &mut Process,
+        module: arinsal_term::Atom,
+        arity: usize,
+        tail: bool,
+        pending_purge: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        let (handler, function) = if pending_purge {
+            let name = atom_name(Term::atom(module))
+                .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
+            // Port of erts/emulator/beam/beam_bif_load.c:1977
+            // (erts_suspend_process_on_pending_purge_lambda), OTP-29.1.1.
+            if let (Some(runtime), Some(pid)) = (p.runtime.clone(), p.self_pid)
+                && self.purge_state.suspend_on_pending_lambda(&name, pid)
+            {
+                runtime.suspend_internal(pid);
+                // ERTS_VBUMP_ALL_REDS: leave the scheduler at the next instruction.
+                p.force_yield = true;
+            }
+            ("erts_code_purger".to_owned(), "pending_purge_lambda")
+        } else {
+            let handler = error_handler_module(p);
+            let ready = self
+                .loaded
+                .get(&handler)
+                .is_some_and(|id| self.modules[*id].export("undefined_lambda", 3).is_some());
+            if !ready {
+                return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
+                    global_atoms()
+                        .intern("undef")
+                        .map_err(|_| VmError::Unsupported("undef atom".into()))?,
+                ))));
+            }
+            (handler, "undefined_lambda")
+        };
+        p.ensure(arity.saturating_mul(2).saturating_add(4), arity + 1)?;
+        let fun = p.x[arity];
+        let args: Vec<Term> = p.x[..arity].to_vec();
+        let list = TermBuilder::new(&mut p.heap)
+            .list_from_iter(args)
+            .map_err(|error| VmError::Unsupported(format!("lambda arg list: {error:?}")))?;
+        if p.x.len() < 4 {
+            return Err(VmError::Unsupported("lambda handler registers".into()));
+        }
+        p.x[0] = Term::atom(module);
+        p.x[1] = fun;
+        p.x[2] = list;
+        p.x[3] = Term::NIL;
+        self.call_named(p, &handler, function, 3, tail, ctx)
+    }
+
     #[cold]
     fn resolve_local_fun(
         &mut self,
         p: &mut Process,
         entry: &arinsal_term::FunEntry,
         arity: usize,
-    ) -> Result<(usize, usize, usize), VmError> {
+    ) -> Result<Option<(usize, usize, usize)>, VmError> {
         let name = atom_name(Term::atom(entry.module))
             .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
-        if !self.loaded.contains_key(&name) && !self.old.contains_key(&name) {
-            let _ = self.load_named(&name)?;
-        }
         let found = [self.loaded.get(&name), self.old.get(&name)]
             .into_iter()
             .flatten()
@@ -410,8 +475,14 @@ impl Vm {
                     .map(|slot| (id, slot.target))
             });
         let Some((module_id, target)) = found else {
-            let reason = badfun_reason(p, arity)?;
-            return Err(VmError::Trap(exceptions::Trap::error(reason)));
+            // Port of erts/emulator/beam/beam_common.c:1702-1712 (call_fun), OTP-29.1.1:
+            // current code without this fun is `badfun`; no current code goes to
+            // `error_handler:undefined_lambda/3`.
+            if self.loaded.contains_key(&name) {
+                let reason = badfun_reason(p, arity)?;
+                return Err(VmError::Trap(exceptions::Trap::error(reason)));
+            }
+            return Ok(None);
         };
         entry.set_dispatch(
             0,
@@ -420,11 +491,11 @@ impl Vm {
             self.modules[module_id].code.as_ptr() as usize,
             self.seen_epoch,
         );
-        Ok((
+        Ok(Some((
             module_id,
             target,
             self.modules[module_id].code.as_ptr() as usize,
-        ))
+        )))
     }
 
     #[inline]
@@ -1003,21 +1074,7 @@ impl Vm {
         let view = unsafe { p.x[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;
         let (module, name, arity) = match view {
             FunRef::Local { entry, .. } => {
-                let module = atom_name(Term::atom(entry.module))
-                    .ok_or_else(|| VmError::Unsupported("fun module".into()))?;
-                let name = self
-                    .loaded
-                    .get(&module)
-                    .and_then(|&id| {
-                        self.modules[id]
-                            .funs
-                            .iter()
-                            .find(|slot| slot.entry.index == entry.index)
-                            .map(|slot| (id, slot.target))
-                    })
-                    .and_then(|(id, target)| self.modules[id].function_at(target))
-                    .map(|(name, _)| name.to_owned());
-                (entry.module, name, entry.arity)
+                (entry.module, self.fun_function_name(entry), entry.arity)
             }
             FunRef::Export { entry } => (
                 entry.module,
@@ -1040,6 +1097,32 @@ impl Vm {
                 Term::small(i64::from(arity)).unwrap(),
             ])
             .map_err(|error| VmError::Unsupported(format!("fun_info_mfa tuple: {error:?}")))
+    }
+
+    /// Function name of a local fun, or `None` for an unloaded or pending-purge fun.
+    /// Port of erts/emulator/beam/erl_fun.c:37 (erts_get_fun_mfa), OTP-29.1.1.
+    fn fun_function_name(&self, entry: &arinsal_term::FunEntry) -> Option<String> {
+        let module = atom_name(Term::atom(entry.module))?;
+        let (id, target) = [self.loaded.get(&module), self.old.get(&module)]
+            .into_iter()
+            .flatten()
+            .find_map(|&id| {
+                self.modules[id]
+                    .funs
+                    .iter()
+                    .find(|slot| {
+                        slot.entry.index == entry.index
+                            && slot.entry.uniq == entry.uniq
+                            && slot.entry.old_uniq == entry.old_uniq
+                    })
+                    .map(|slot| (id, slot.target))
+            })?;
+        if self.purge_state.pending(id) {
+            return None;
+        }
+        self.modules[id]
+            .function_at(target)
+            .map(|(name, _)| name.to_owned())
     }
 
     pub(super) fn fun_info(&self, p: &mut Process, keyed: bool) -> Result<Term, VmError> {
@@ -1100,24 +1183,7 @@ impl Vm {
                     .binary(&entry.uniq)
                     .map_err(|e| VmError::Unsupported(format!("fun uniq allocation {e:?}")))?,
                 (FunRef::Local { entry, .. }, "name") => {
-                    let module = atom_name(Term::atom(entry.module))
-                        .ok_or_else(|| VmError::Unsupported("fun module".into()))?;
-                    let function = self
-                        .loaded
-                        .get(&module)
-                        .and_then(|&id| {
-                            self.modules[id]
-                                .funs
-                                .iter()
-                                .find(|slot| slot.entry.index == entry.index)
-                                .map(|slot| (id, slot.target))
-                        })
-                        .and_then(|(id, target)| {
-                            self.modules[id]
-                                .function_at(target)
-                                .map(|(name, _)| name.to_owned())
-                        });
-                    if let Some(function) = function {
+                    if let Some(function) = self.fun_function_name(entry) {
                         Term::atom(
                             global_atoms()
                                 .intern(&function)

@@ -728,14 +728,10 @@ pub(crate) struct Published {
     pub monitored_by: Vec<(u64, Pid)>,
 }
 
-/// Saved `apply(M, F, A)` arguments for a hibernating process.
+/// Scheduling state of a hibernating process; `apply(M, F, A)` waits in X0..X2.
 ///
 /// g_proc_sched. Port of erts/emulator/beam/beam_common.c:1568 (`erts_hibernate`), OTP-29.1.1.
 pub(crate) struct HibernateCont {
-    pub module: Term,
-    pub function: Term,
-    pub args: Term,
-    pub heap: arinsal_term::VecHeap,
     /// The BIF has discarded the stack and the executor must leave the slice.
     pub stop: bool,
     /// elixir_loop1: `hibernate/0` resumes at its call site with the stack intact.
@@ -1316,6 +1312,7 @@ impl Executor {
                                                 }
                                                 process.drain(ctx)?;
                                                 if process.inbox.is_empty() {
+                                                    hibernate_collect(process, ctx.pid())?;
                                                     if let Some(runtime) = process.runtime.clone() {
                                                         runtime.mark_hibernating(ctx.pid(), true);
                                                     }
@@ -1418,6 +1415,7 @@ impl Executor {
                     if hibernate_stopped(process, ctx.pid()) {
                         process.drain(ctx)?;
                         if process.inbox.is_empty() {
+                            hibernate_collect(process, ctx.pid())?;
                             if let Some(runtime) = process.runtime.clone() {
                                 runtime.mark_hibernating(ctx.pid(), true);
                             }
@@ -1637,36 +1635,17 @@ impl Executor {
             .runtime
             .clone()
             .ok_or_else(|| VmError::Unsupported("hibernate without a scheduler".into()))?;
-        let cont = runtime
+        runtime
             .hibernating
             .lock()
             .unwrap()
             .remove(&pid)
             .ok_or_else(|| VmError::Unsupported("hibernate continuation missing".into()))?;
         runtime.mark_hibernating(pid, false);
-        // The continuation terms point into `cont.heap`; keep that heap alive.
-        let _keep_heap = &cont.heap;
-        let (module, function, args) = {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-            (
-                copy_term(cont.module, &mut heap).map_err(|error| {
-                    VmError::Unsupported(format!("hibernate module: {error:?}"))
-                })?,
-                copy_term(cont.function, &mut heap).map_err(|error| {
-                    VmError::Unsupported(format!("hibernate function: {error:?}"))
-                })?,
-                copy_term(cont.args, &mut heap)
-                    .map_err(|error| VmError::Unsupported(format!("hibernate args: {error:?}")))?,
-            )
-        };
+        // hibernate/3 left `apply(M, F, A)` in X0..X2.
         if process.x.len() < 3 {
-            let mut registers = process.x.to_vec();
-            registers.resize(3, Term::NIL);
-            process.x = registers.into_boxed_slice();
+            return Err(VmError::Unsupported("hibernate registers".into()));
         }
-        process.x[0] = module;
-        process.x[1] = function;
-        process.x[2] = args;
         let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
         process.module = module_id;
         process.ip = entry;
@@ -1731,6 +1710,16 @@ fn hibernate_resumes_in_place(process: &Process, pid: Pid) -> bool {
             .get(&pid)
             .is_some_and(|cont| cont.resume_in_place)
     })
+}
+
+/// `hibernate/3` with no waiting messages: shrink the heap to the `apply(M, F, A)`
+/// arguments in X0..X2. Run after the BIF has unwound so no caller keeps stale terms.
+// Port of erts/emulator/beam/beam_common.c:1584-1592 (erts_hibernate), OTP-29.1.1.
+fn hibernate_collect(process: &mut Process, pid: Pid) -> Result<(), VmError> {
+    if !process.gc_enabled || hibernate_resumes_in_place(process, pid) {
+        return Ok(());
+    }
+    process.garbage_collect_hibernate(3).map(|_| ())
 }
 
 fn hibernate_stopped(process: &Process, pid: Pid) -> bool {
@@ -2178,6 +2167,47 @@ impl Runtime {
         }
         self.note_status(target, "suspended");
         Ok(true)
+    }
+
+    /// Runtime-internal suspend without a suspend monitor (`erts_suspend`), used for a
+    /// process waiting on a pending-purge lambda.
+    /// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend), OTP-29.1.1.
+    pub(crate) fn suspend_internal(&self, target: Pid) {
+        self.ever_suspended.store(true, Ordering::Release);
+        *self
+            .suspend_total
+            .lock()
+            .unwrap()
+            .entry(target)
+            .or_insert(0) += 1;
+        self.note_status(target, "suspended");
+    }
+
+    /// Undo [`Runtime::suspend_internal`]; true when the target must be rescheduled.
+    /// Port of erts/emulator/beam/erl_process.c:9402 (erts_resume), OTP-29.1.1.
+    pub(crate) fn resume_internal(&self, target: Pid) -> bool {
+        let wake = {
+            let mut totals = self.suspend_total.lock().unwrap();
+            let Some(total) = totals.get_mut(&target) else {
+                return false;
+            };
+            *total = total.saturating_sub(1);
+            let wake = *total == 0;
+            if wake {
+                totals.remove(&target);
+            }
+            wake
+        };
+        if wake {
+            let hibernating = self
+                .published
+                .lock()
+                .unwrap()
+                .get(&target)
+                .is_some_and(|slot| slot.hibernating);
+            self.note_status(target, if hibernating { "waiting" } else { "runnable" });
+        }
+        wake
     }
 
     /// Decrease one suspend acquired by `by`. `None` if that caller is not suspending.
@@ -3317,6 +3347,30 @@ impl Process {
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<arinsal_term::GcStats, VmError> {
+        // Port of erts/emulator/beam/erl_gc.c:934 (garbage_collect clears F_HIBERNATED),
+        // OTP-29.1.1.
+        self.hibernated = false;
+        self.collect_roots(live_x, extra, min_free, false)
+    }
+
+    /// Shrink the heap to the live data of `x[..live_x]` and the mailbox.
+    // Port of erts/emulator/beam/erl_gc.c:1004 (garbage_collect_hibernate), OTP-29.1.1.
+    pub(crate) fn garbage_collect_hibernate(
+        &mut self,
+        live_x: usize,
+    ) -> Result<arinsal_term::GcStats, VmError> {
+        let stats = self.collect_roots(live_x, &mut [], 0, true)?;
+        self.hibernated = true;
+        Ok(stats)
+    }
+
+    fn collect_roots(
+        &mut self,
+        live_x: usize,
+        extra: &mut [Term],
+        min_free: usize,
+        hibernate: bool,
+    ) -> Result<arinsal_term::GcStats, VmError> {
         // Port of erts/emulator/beam/erl_gc.c:3730 (`has_reached_max_heap_size`) call in
         // `garbage_collect`, OTP-29.1.1: the limit is judged on the pre-collection size.
         if self
@@ -3365,10 +3419,14 @@ impl Process {
             };
             self.trace_gc(pid, start_tag, min_free);
         }
-        let stats = self
-            .heap
-            .collect(&mut self.x[..live_x], &mut roots, min_free)
-            .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
+        let stats = if hibernate {
+            self.heap
+                .collect_hibernate(&mut self.x[..live_x], &mut roots)
+        } else {
+            self.heap
+                .collect(&mut self.x[..live_x], &mut roots, min_free)
+        }
+        .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
         if let Some(pid) = traced {
             self.trace_gc(pid, end_tag, stats.words_reclaimed as usize);
         }

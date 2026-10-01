@@ -251,9 +251,7 @@ fn process_info(
                 make_list(process, entries)?
             }
             "trap_exit" => atom(if process.trap_exit { "true" } else { "false" }),
-            "heap_size" => {
-                Term::small(process.heap.heap_size_words().max(64) as i64).ok_or_else(badarg)?
-            }
+            "heap_size" => Term::small(process.heap.heap_size_words() as i64).ok_or_else(badarg)?,
             // Port of erts/emulator/beam/erl_message.c:1006 (message queue data info), OTP-29.1.1.
             "total_heap_size" => {
                 Term::small(process.heap.total_heap_size_words() as i64).ok_or_else(badarg)?
@@ -1730,29 +1728,29 @@ fn hibernate(
         .runtime
         .clone()
         .ok_or_else(|| VmError::Unsupported("hibernate requires a scheduler".into()))?;
-    let mut side = arinsal_term::VecHeap::new();
-    let module = copy_term(module, &mut side)
-        .map_err(|error| VmError::Unsupported(format!("hibernate module: {error:?}")))?;
-    let function = copy_term(function, &mut side)
-        .map_err(|error| VmError::Unsupported(format!("hibernate function: {error:?}")))?;
-    let args = copy_term(args, &mut side)
-        .map_err(|error| VmError::Unsupported(format!("hibernate args: {error:?}")))?;
+    // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the
+    // arguments stay in the argument registers (arity 3) as the only roots and the stack
+    // is discarded; the executor shrinks the heap once the BIF has unwound.
+    if process.x.len() < 3 {
+        let mut registers = process.x.to_vec();
+        registers.resize(3, Term::NIL);
+        process.x = registers.into_boxed_slice();
+    }
     process.heap.release_stack(process.heap.stack_words());
     for register in process.x.iter_mut() {
         *register = Term::NIL;
     }
+    process.x[0] = module;
+    process.x[1] = function;
+    process.x[2] = args;
+    process.gc_live = 3;
     process.receive_cursor = 0;
-    let _ = process.collect_heap_roots(0, &mut [], 0);
     runtime
         .ever_hibernated
         .store(true, std::sync::atomic::Ordering::Release);
     runtime.hibernating.lock().unwrap().insert(
         ctx.pid(),
         crate::process::HibernateCont {
-            module,
-            function,
-            args,
-            heap: side,
             stop: true,
             resume_in_place: false, // elixir_loop1
         },
@@ -1782,10 +1780,6 @@ fn hibernate_zero(process: &mut Process, ctx: &RunCtx<'_, Message>) -> Result<Te
     parked.insert(
         pid,
         crate::process::HibernateCont {
-            module: Term::NIL,
-            function: Term::NIL,
-            args: Term::NIL,
-            heap: arinsal_term::VecHeap::new(),
             stop: true,
             resume_in_place: true,
         },
@@ -3320,79 +3314,46 @@ fn processes_next(
 }
 
 // Port of erts/preloaded/src/erlang.erl:5655-5665, OTP-29.1.1.
+// Port of erts/preloaded/src/erlang.erl:5655 (processes_next/1), OTP-29.1.1: the
+// iterator `{Ref, Batch}` is stepped in place; the remaining batch is shared, not copied.
 fn erlang_processes_next(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     iterator: Term,
 ) -> Result<Term, VmError> {
-    use arinsal_etf::OwnedTerm;
-
-    fn build(process: &mut Process, term: &OwnedTerm) -> Result<Term, VmError> {
-        arinsal_term::from_owned(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-            .map_err(|error| VmError::Unsupported(format!("process iterator term: {error:?}")))
+    fn step(process: &mut Process, reference: Term, batch: Term) -> Result<Term, VmError> {
+        // SAFETY: The batch list is rooted in the caller's iterator for this BIF.
+        let (pid, rest) = unsafe { batch.cons_ref() }.ok_or_else(badarg)?;
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut builder = TermBuilder::new(&mut heap);
+        let next = builder
+            .tuple(&[reference, rest])
+            .map_err(|error| VmError::Unsupported(format!("process iterator: {error:?}")))?;
+        builder
+            .tuple(&[pid, next])
+            .map_err(|error| VmError::Unsupported(format!("process iterator: {error:?}")))
     }
 
-    let owned = arinsal_term::to_owned(iterator).map_err(|_| badarg())?;
-    let OwnedTerm::Tuple(fields) = &owned else {
-        return Err(badarg());
-    };
-    if fields.len() != 2 {
+    let (mut reference, batch) = tuple2(iterator).ok_or_else(badarg)?;
+    if batch.classify() == TermKind::List {
+        return step(process, reference, batch);
+    }
+    if batch != Term::NIL {
         return Err(badarg());
     }
-    let batch = fields[1].clone();
-    let reference = fields[0].clone();
-    match &batch {
-        OwnedTerm::Nil => {
-            let cursor = build(process, &reference)?;
-            let next = processes_next(process, ctx, cursor)?;
-            let next = arinsal_term::to_owned(next).map_err(|_| badarg())?;
-            if next == OwnedTerm::atom("none") {
-                return Ok(atom("none"));
-            }
-            let OwnedTerm::Tuple(next_fields) = &next else {
-                return Err(badarg());
-            };
-            if next_fields.len() != 2 {
-                return Err(badarg());
-            }
-            let batch = &next_fields[1];
-            let next_reference = next_fields[0].clone();
-            let OwnedTerm::List { elems, tail } = batch else {
-                return Err(badarg());
-            };
-            if !matches!(**tail, OwnedTerm::Nil) {
-                return Err(badarg());
-            }
-            let Some((pid, remaining)) = elems.split_first() else {
-                let next_iterator = build(
-                    process,
-                    &OwnedTerm::Tuple(vec![next_reference, OwnedTerm::Nil]),
-                )?;
-                return erlang_processes_next(process, ctx, next_iterator);
-            };
-            let next_iterator = OwnedTerm::tuple(vec![
-                next_reference,
-                OwnedTerm::List {
-                    elems: remaining.to_vec(),
-                    tail: Box::new(OwnedTerm::Nil),
-                },
-            ]);
-            build(process, &OwnedTerm::tuple(vec![pid.clone(), next_iterator]))
+    loop {
+        let next = processes_next(process, ctx, reference)?;
+        if next == atom("none") {
+            return Ok(next);
         }
-        OwnedTerm::List { elems, tail } if matches!(**tail, OwnedTerm::Nil) => {
-            let Some((pid, remaining)) = elems.split_first() else {
-                return Err(badarg());
-            };
-            let next_iterator = OwnedTerm::tuple(vec![
-                reference,
-                OwnedTerm::List {
-                    elems: remaining.to_vec(),
-                    tail: Box::new(OwnedTerm::Nil),
-                },
-            ]);
-            build(process, &OwnedTerm::tuple(vec![pid.clone(), next_iterator]))
+        let (next_reference, batch) = tuple2(next).ok_or_else(badarg)?;
+        if batch.classify() == TermKind::List {
+            return step(process, next_reference, batch);
         }
-        _ => Err(badarg()),
+        if batch != Term::NIL {
+            return Err(badarg());
+        }
+        reference = next_reference;
     }
 }
 

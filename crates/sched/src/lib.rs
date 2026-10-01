@@ -875,36 +875,43 @@ impl DirtyStats {
     }
 
     // Port of erts/emulator/beam/erl_msacc.h:300 (erts_msacc_set_state_m), OTP-29.1.1.
-    fn set_state(&mut self, state: MsaccState) {
+    // Counters only advance while microstate accounting is enabled.
+    fn set_state(&mut self, state: MsaccState, msacc: bool) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.msacc_started).as_nanos();
-        let counter = &mut self.msacc_ns[self.msacc_state as usize];
-        *counter = counter.saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX));
+        if msacc {
+            let elapsed = now.duration_since(self.msacc_started).as_nanos();
+            let counter = &mut self.msacc_ns[self.msacc_state as usize];
+            *counter = counter.saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX));
+        }
         self.msacc_state = state;
         self.msacc_started = now;
     }
 
-    fn begin_active(&mut self) {
-        self.set_state(MsaccState::Emulator);
+    fn begin_active(&mut self, msacc: bool) {
+        self.set_state(MsaccState::Emulator, msacc);
         self.active_started = Some(Instant::now());
     }
 
-    fn end_active(&mut self) {
+    fn end_active(&mut self, msacc: bool) {
         if let Some(started) = self.active_started.take() {
             let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             self.active_ns = self.active_ns.saturating_add(elapsed);
         }
-        self.set_state(MsaccState::Other);
+        self.set_state(MsaccState::Other, msacc);
     }
 
-    fn snapshot(&self) -> (u64, [u64; MSACC_STATE_COUNT]) {
+    fn snapshot(&self, msacc_enabled: bool) -> (u64, [u64; MSACC_STATE_COUNT]) {
         let active = self.active_started.map_or(self.active_ns, |started| {
             self.active_ns
                 .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
         });
         let mut msacc = self.msacc_ns;
-        let current = u64::try_from(self.msacc_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        msacc[self.msacc_state as usize] = msacc[self.msacc_state as usize].saturating_add(current);
+        if msacc_enabled {
+            let current =
+                u64::try_from(self.msacc_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            msacc[self.msacc_state as usize] =
+                msacc[self.msacc_state as usize].saturating_add(current);
+        }
         (active, msacc)
     }
 }
@@ -992,13 +999,19 @@ impl<T: Task> Inner<T> {
         }
     }
 
+    fn msacc_accounting(&self) -> bool {
+        self.accounting_flags.load(Ordering::Relaxed) & ACCOUNTING_MSACC != 0
+    }
+
     fn dirty_stats(&self) -> DirtyStatsSnapshot {
         let mut active = [Vec::new(), Vec::new()];
         let mut msacc = [Vec::new(), Vec::new()];
         let mut lengths = [0; 2];
+        let msacc_enabled = self.msacc_accounting();
         for (index, pool) in self.dirty.iter().enumerate() {
             for thread in &pool.threads {
-                let (thread_active, thread_msacc) = thread.stats.lock().unwrap().snapshot();
+                let (thread_active, thread_msacc) =
+                    thread.stats.lock().unwrap().snapshot(msacc_enabled);
                 active[index].push(thread_active);
                 msacc[index].push(thread_msacc);
             }
@@ -4554,7 +4567,11 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     let thread = &pool.threads[index];
     let slot = pool.first_slot + index;
     let _ = thread.handle.set(thread::current());
-    thread.stats.lock().unwrap().set_state(MsaccState::Sleep);
+    thread
+        .stats
+        .lock()
+        .unwrap()
+        .set_state(MsaccState::Sleep, inner.msacc_accounting());
     loop {
         let process = {
             let mut queue = pool.queue.lock().unwrap();
@@ -4577,7 +4594,11 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                     .0;
             }
         };
-        thread.stats.lock().unwrap().begin_active();
+        thread
+            .stats
+            .lock()
+            .unwrap()
+            .begin_active(inner.msacc_accounting());
         process.dirty_runner.store(slot + 1, Ordering::SeqCst);
         run_one(
             &inner,
@@ -4590,9 +4611,10 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
             Some(kind),
         );
         process.dirty_runner.store(0, Ordering::SeqCst);
+        let msacc = inner.msacc_accounting();
         let mut stats = thread.stats.lock().unwrap();
-        stats.end_active();
-        stats.set_state(MsaccState::Sleep);
+        stats.end_active(msacc);
+        stats.set_state(MsaccState::Sleep, msacc);
     }
 }
 

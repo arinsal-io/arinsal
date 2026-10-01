@@ -1002,6 +1002,31 @@ impl ProcessHeap {
         Ok(stats)
     }
 
+    /// Full sweep that leaves the young heap exactly as large as the live data,
+    /// the stack, and `S_RESERVED`, with no old heap.
+    // Port of erts/emulator/beam/erl_gc.c:1004 (garbage_collect_hibernate), OTP-29.1.1.
+    pub fn collect_hibernate(
+        &mut self,
+        roots: &mut [Term],
+        extra: &mut [Term],
+    ) -> Result<GcStats, TermError> {
+        self.request_full_sweep();
+        let stats = self.collect(roots, extra, 0)?;
+        let exact = self
+            .htop
+            .saturating_add(S_RESERVED)
+            .saturating_add(self.stack_words());
+        if exact != self.words.len() {
+            let code_ranges = crate::native_code::native_code_ranges();
+            let code_ranges = code_ranges
+                .as_deref()
+                .map_or(&[][..], |ranges| ranges.as_slice());
+            self.relocate_young(exact, roots, extra, code_ranges);
+        }
+        self.heap_grow = false;
+        Ok(stats)
+    }
+
     /// Apply the post-copy heap policy used by erts.
     fn adjust_young_heap(
         &mut self,

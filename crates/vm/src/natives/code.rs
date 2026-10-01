@@ -35,10 +35,111 @@ pub(crate) fn try_code_mod_permission(pid: Pid, acquire: bool) -> bool {
     true
 }
 
+/// Port of erts/emulator/beam/beam_bif_load.c:50-66 (`purge_state`), OTP-29.1.1.
+/// One purge may be prepared at a time; funs into the old instance are "pending
+/// purge" until it completes or aborts.
+#[derive(Default)]
+pub(crate) struct PurgeState {
+    /// Old module-instance id + 1 while a purge is prepared, 0 otherwise. Read on
+    /// every local fun call, so it lives outside the mutex.
+    old_id: std::sync::atomic::AtomicUsize,
+    inner: Mutex<PurgeInner>,
+}
+
+#[derive(Default)]
+struct PurgeInner {
+    module: Option<String>,
+    /// `sprocs`: processes suspended in `erts_code_purger:pending_purge_lambda/3`.
+    sprocs: Vec<Pid>,
+    /// `funs` with their `pend_purge_address` (the native dispatch target).
+    funs: Vec<(std::sync::Arc<arinsal_term::FunEntry>, usize)>,
+}
+
+impl PurgeState {
+    /// Whether calls into module instance `id` must wait for the purge.
+    #[inline]
+    pub(crate) fn pending(&self, id: usize) -> bool {
+        let old = self.old_id.load(Ordering::Acquire);
+        old != 0 && old - 1 == id
+    }
+
+    /// Port of erts/emulator/beam/beam_bif_load.c:1977
+    /// (`erts_suspend_process_on_pending_purge_lambda`), OTP-29.1.1.
+    /// Returns true when the caller was registered and must suspend itself.
+    pub(crate) fn suspend_on_pending_lambda(&self, module: &str, pid: Pid) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.module.as_deref() != Some(module) {
+            return false;
+        }
+        inner.sprocs.push(pid);
+        true
+    }
+
+    fn is_prepared(&self) -> bool {
+        self.inner.lock().unwrap().module.is_some()
+    }
+
+    fn is_module(&self, name: &str) -> bool {
+        self.inner.lock().unwrap().module.as_deref() == Some(name)
+    }
+
+    // Port of erts/emulator/beam/erl_fun.c:157-189 (fun_purge_foreach,
+    // erts_fun_purge_prepare), OTP-29.1.1.
+    fn prepare(&self, name: &str, old: usize, module: &arinsal_loader::Module) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.module = Some(name.to_owned());
+        for slot in &module.funs {
+            if let Some(target) = slot.entry.get_dispatch_target(0) {
+                slot.entry.set_dispatch_target(0, 0);
+                inner
+                    .funs
+                    .push((std::sync::Arc::clone(&slot.entry), target));
+            }
+        }
+        self.old_id.store(old + 1, Ordering::Release);
+    }
+
+    /// Port of erts/emulator/beam/erl_fun.c:191 (erts_fun_purge_abort_prepare) and
+    /// beam_bif_load.c:2010 (finalize_purge_operation), OTP-29.1.1. Returns the
+    /// processes to resume.
+    fn finish(&self, aborted: bool) -> Vec<Pid> {
+        let mut inner = self.inner.lock().unwrap();
+        let funs = std::mem::take(&mut inner.funs);
+        if aborted {
+            for (entry, target) in funs {
+                entry.set_dispatch_target(0, target);
+            }
+        }
+        self.old_id.store(0, Ordering::Release);
+        inner.module = None;
+        std::mem::take(&mut inner.sprocs)
+    }
+}
+
+/// Resume processes suspended on pending-purge lambdas.
+/// Port of erts/emulator/beam/beam_bif_load.c:2028-2036 (finalize_purge_operation), OTP-29.1.1.
+fn resume_pending_lambda_callers(
+    process: &Process,
+    ctx: &mut RunCtx<'_, crate::process::Message>,
+    pids: Vec<Pid>,
+) {
+    let Some(runtime) = process.runtime.clone() else {
+        return;
+    };
+    for pid in pids {
+        if runtime.resume_internal(pid) {
+            // The signal only reschedules the target; a dead target needs no wake.
+            let _ = ctx.signal(pid, Signal::UnlinkAck(u64::MAX));
+        }
+    }
+}
+
 struct Prepared {
     beam: BeamFile,
     bytes: Vec<u8>,
     has_on_load: bool,
+    /// Loaded code from `prepare_loading`; taken by the first `finish_loading`.
+    module: Mutex<Option<arinsal_loader::Module>>,
 }
 
 // boot_loop1: preserve the on_load decision made by OTP's loader attributes.
@@ -194,7 +295,7 @@ fn module_name(term: Term) -> Option<String> {
         .map(|name| name.to_string())
 }
 
-fn prepare(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let Some(name) = args.first().and_then(|arg| module_name(*arg)) else {
         return Err(badarg());
     };
@@ -217,10 +318,33 @@ fn prepare(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     }
+    // Port of erts/emulator/beam/jit/asm_load.c:1084-1105 (attribute and compile-info
+    // chunks must be valid external terms), OTP-29.1.1.
+    if [&beam.attributes, &beam.compile_info]
+        .into_iter()
+        .flatten()
+        .any(|chunk| !chunk.is_empty() && arinsal_etf::decode(chunk).is_err())
+    {
+        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        return Ok(error);
+    }
+    // Port of erts/emulator/beam/beam_bif_load.c:150 (prepare_loading_2) and
+    // beam_load.c (erts_prepare_loading), OTP-29.1.1: the code is loaded here, so
+    // a malformed module is `{error, badfile}` before finish_loading.
+    let Ok(mut module) = arinsal_loader::load_with_instrumentations(
+        &beam,
+        vm.coverage_mode,
+        crate::trace_bp::line_breakpoints_instrumented(),
+    ) else {
+        let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
+        return Ok(error);
+    };
+    crate::funs::set_module_uniq(&mut module, bytes).map_err(|_| badarg())?;
     let prepared = Prepared {
         has_on_load: has_on_load_opcode(&beam),
         beam,
         bytes: bytes.clone(),
+        module: Mutex::new(Some(module)),
     };
     // The code server heap is often full when Mix loads the next test beam.
     // `magic_ref` does not grow by itself; a 3-word miss became `system_limit`
@@ -242,15 +366,22 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
             .and_then(|reference| reference.downcast_ref::<Prepared>())
             .ok_or_else(badarg)?;
         let beam = &prepared.beam;
-        let mut module = match arinsal_loader::load_with_instrumentations(
-            beam,
-            vm.coverage_mode,
-            crate::trace_bp::line_breakpoints_instrumented(),
-        ) {
-            Ok(module) => module,
-            Err(_) => return make_tuple(process, &[atom("error"), atom("badfile")]),
+        let staged = prepared.module.lock().unwrap().take();
+        let module = match staged {
+            Some(module) => module,
+            None => {
+                let mut module = match arinsal_loader::load_with_instrumentations(
+                    beam,
+                    vm.coverage_mode,
+                    crate::trace_bp::line_breakpoints_instrumented(),
+                ) {
+                    Ok(module) => module,
+                    Err(_) => return make_tuple(process, &[atom("error"), atom("badfile")]),
+                };
+                crate::funs::set_module_uniq(&mut module, &prepared.bytes).map_err(|_| badarg())?;
+                module
+            }
         };
-        crate::funs::set_module_uniq(&mut module, &prepared.bytes).map_err(|_| badarg())?;
         let registers = crate::process::register_requirements(beam);
         let meta = CodeMeta::from_beam(beam, Some(&prepared.bytes));
         prepared_modules.push((module, registers, meta));
@@ -516,38 +647,43 @@ fn module_id_referenced(
     process.references_code(id, crate::load::native_code_range(code_meta, id))
 }
 
-fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term, VmError> {
+// Port of erts/emulator/beam/beam_bif_load.c:2112-2330 (erts_internal_purge_module_2), OTP-29.1.1.
+fn purge(
+    vm: &mut Vm,
+    process: &Process,
+    ctx: &mut RunCtx<'_, crate::process::Message>,
+    name: &str,
+    phase: &str,
+) -> Result<Term, VmError> {
     vm.sync_code_epoch();
+    let state = std::sync::Arc::clone(&vm.purge_state);
+    match phase {
+        "prepare" | "prepare_on_load" if state.is_prepared() => return Err(badarg()),
+        "abort" | "complete" if !state.is_module(name) => return Err(badarg()),
+        "prepare" | "prepare_on_load" | "abort" | "complete" => {}
+        _ => return Err(badarg()),
+    }
+    let mut resume = Vec::new();
     let result = if let Some(shared) = vm.shared.clone() {
         let mut code = shared.lock().unwrap();
         let result = match phase {
-            "prepare_on_load" => {
-                if let Some(id) = code.pending_on_load.remove(name) {
+            "prepare" | "prepare_on_load" => {
+                if phase == "prepare_on_load"
+                    && let Some(id) = code.pending_on_load.remove(name)
+                {
                     code.old.insert(name.to_owned(), id);
                 }
-                let exists = code.old.contains_key(name);
-                if exists {
-                    code.purge_prepared.insert(name.to_owned());
+                let old = code.old.get(name).copied();
+                if let Some(id) = old {
+                    state.prepare(name, id, &code.modules[id]);
                 }
-                exists
-            }
-            "prepare" => {
-                let exists = code.old.contains_key(name);
-                if exists {
-                    code.purge_prepared.insert(name.to_owned());
-                }
-                exists
+                old.is_some()
             }
             "abort" => {
-                if !code.purge_prepared.remove(name) {
-                    return Err(badarg());
-                }
+                resume = state.finish(true);
                 false
             }
-            "complete" => {
-                if !code.purge_prepared.remove(name) {
-                    return Err(badarg());
-                }
+            _ => {
                 // g_code_fix: drop the old version's slot once nothing references it.
                 let pending = std::mem::take(&mut *code.condemned);
                 let mut keep = Vec::new();
@@ -567,9 +703,9 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                     }
                 }
                 *code.condemned = keep;
+                resume = state.finish(false);
                 removed.is_some()
             }
-            _ => return Err(badarg()),
         };
         code.epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -577,33 +713,23 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
         result
     } else {
         match phase {
-            "prepare_on_load" => {
-                if let Some(id) = vm.pending_on_load.remove(name) {
+            "prepare" | "prepare_on_load" => {
+                if phase == "prepare_on_load"
+                    && let Some(id) = vm.pending_on_load.remove(name)
+                {
                     vm.old.insert(name.to_owned(), id);
                 }
-                let exists = vm.old.contains_key(name);
-                if exists {
-                    vm.purge_prepared.insert(name.to_owned());
+                let old = vm.old.get(name).copied();
+                if let Some(id) = old {
+                    state.prepare(name, id, &vm.modules[id]);
                 }
-                exists
-            }
-            "prepare" => {
-                let exists = vm.old.contains_key(name);
-                if exists {
-                    vm.purge_prepared.insert(name.to_owned());
-                }
-                exists
+                old.is_some()
             }
             "abort" => {
-                if !vm.purge_prepared.remove(name) {
-                    return Err(badarg());
-                }
+                resume = state.finish(true);
                 false
             }
-            "complete" => {
-                if !vm.purge_prepared.remove(name) {
-                    return Err(badarg());
-                }
+            _ => {
                 // g_code_fix: drop the old version's slot once nothing references it.
                 let pending = std::mem::take(&mut *vm.condemned);
                 let mut keep = Vec::new();
@@ -623,11 +749,12 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                     }
                 }
                 *vm.condemned = keep;
+                resume = state.finish(false);
                 removed.is_some()
             }
-            _ => return Err(badarg()),
         }
     };
+    resume_pending_lambda_callers(process, ctx, resume);
     Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
 }
 
@@ -857,7 +984,7 @@ fn call_values(
         ("code", "get_debug_info", 1) => Some(get_debug_info(vm, process, args[0])),
         ("erts_internal", "beamfile_chunk", 2) => Some(beamfile_chunk(process, args)),
         ("erts_internal", "beamfile_module_md5", 1) => Some(beamfile_module_md5(process, args[0])),
-        ("erts_internal", "prepare_loading", 2) => Some(prepare(process, args)),
+        ("erts_internal", "prepare_loading", 2) => Some(prepare(vm, process, args)),
         ("erlang", "has_prepared_code_on_load", 1) => Some(has_prepared_code_on_load(args[0])),
         ("erlang", "finish_loading", 1) => Some(finish(vm, process, args)),
         ("erlang", "module_loaded", 1) => Some((|| {
@@ -943,7 +1070,7 @@ fn call_values(
             }
             let name = module_name(args[0]).ok_or_else(badarg)?;
             let phase = module_name(args[1]).ok_or_else(badarg)?;
-            purge(vm, process, &name, &phase)
+            purge(vm, process, ctx, &name, &phase)
         })()),
         ("erts_internal", "check_process_code", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
@@ -1063,7 +1190,7 @@ mod tests {
                 let mut heap = FragmentingHeap(&mut process.heap);
                 from_owned(&OwnedTerm::Binary(bytes.to_vec()), &mut heap).unwrap()
             };
-            let prepared = prepare(&mut process, &[atom(&beam.module), binary]).unwrap();
+            let prepared = prepare(vm, &mut process, &[atom(&beam.module), binary]).unwrap();
             assert!(process.heap.reserve_stack(1));
             assert!(process.heap.stack_set(0, prepared));
             prepared_count += 1;
@@ -1876,7 +2003,7 @@ mod boot_loop1_tests {
             let name = atom(module);
             let binary = from_owned(&OwnedTerm::Binary(beam), &mut input_heap).unwrap();
             let mut process = Process::new();
-            let prepared = prepare(&mut process, &[name, binary]).unwrap();
+            let prepared = prepare(&Vm::new([]), &mut process, &[name, binary]).unwrap();
             let actual = has_prepared_code_on_load(prepared).unwrap();
             assert_eq!(to_owned(actual).unwrap(), expected, "{module}");
             std::fs::remove_file(path).unwrap();
@@ -1901,7 +2028,7 @@ mod boot_loop1_tests {
             std::fs::write(&path, &beam).unwrap();
             paths.push(path);
             let binary = from_owned(&OwnedTerm::Binary(beam), &mut input_heap).unwrap();
-            let prepared = prepare(&mut process, &[atom(module), binary]).unwrap();
+            let prepared = prepare(&Vm::new([]), &mut process, &[atom(module), binary]).unwrap();
             assert!(process.heap.reserve_stack(1));
             assert!(process.heap.stack_set(0, prepared));
             prepared_count += 1;

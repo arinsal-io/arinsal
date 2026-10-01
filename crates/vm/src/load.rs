@@ -41,7 +41,7 @@ pub(crate) struct SharedCode {
     pub(crate) loaded: SharedTable<HashMap<String, usize>>,
     pub(crate) old: SharedTable<HashMap<String, usize>>,
     pub(crate) pending_on_load: SharedTable<HashMap<String, usize>>,
-    pub(crate) purge_prepared: SharedTable<std::collections::HashSet<String>>,
+    pub(crate) purge_state: Arc<crate::natives::code::PurgeState>,
     pub(crate) deleted: SharedTable<std::collections::HashSet<String>>,
     pub(crate) code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
     pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -343,7 +343,7 @@ impl SharedCode {
             loaded: SharedTable::new(HashMap::new()),
             old: SharedTable::new(HashMap::new()),
             pending_on_load: SharedTable::new(HashMap::new()),
-            purge_prepared: SharedTable::new(std::collections::HashSet::new()),
+            purge_state: Arc::default(),
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(next_epoch_base())),
@@ -476,7 +476,7 @@ impl Vm {
             loaded: SharedTable::new(HashMap::new()),
             old: SharedTable::new(HashMap::new()),
             pending_on_load: SharedTable::new(HashMap::new()),
-            purge_prepared: SharedTable::new(std::collections::HashSet::new()),
+            purge_state: Arc::default(),
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
             code_epoch: None,
@@ -616,7 +616,7 @@ impl Vm {
             loaded: self.loaded.clone(),
             old: self.old.clone(),
             pending_on_load: self.pending_on_load.clone(),
-            purge_prepared: self.purge_prepared.clone(),
+            purge_state: Arc::clone(&self.purge_state),
             deleted: self.deleted.clone(),
             code_meta: self.code_meta.clone(),
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(next_epoch_base())),
@@ -827,7 +827,7 @@ impl Vm {
         self.loaded = shared.loaded.clone();
         self.old = shared.old.clone();
         self.pending_on_load = shared.pending_on_load.clone();
-        self.purge_prepared = shared.purge_prepared.clone();
+        self.purge_state = Arc::clone(&shared.purge_state);
         self.deleted = shared.deleted.clone();
         self.code_meta = shared.code_meta.clone();
         self.exports = shared.exports.clone();
@@ -1008,6 +1008,7 @@ impl Vm {
         false
     }
     pub(crate) fn shared_replica(code: Arc<Mutex<SharedCode>>, paths: &[PathBuf]) -> Self {
+        let purge_state = Arc::clone(&code.lock().unwrap().purge_state);
         let mut vm = Self {
             paths: paths.to_vec(),
             otp_root: None,
@@ -1015,7 +1016,7 @@ impl Vm {
             loaded: SharedTable::new(HashMap::new()),
             old: SharedTable::new(HashMap::new()),
             pending_on_load: SharedTable::new(HashMap::new()),
-            purge_prepared: SharedTable::new(std::collections::HashSet::new()),
+            purge_state,
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
             code_epoch: Some(Arc::clone(&code.lock().unwrap().epoch)),
