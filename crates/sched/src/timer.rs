@@ -639,6 +639,7 @@ impl<M> Wheel<M> {
     }
 
     // Port of erts/emulator/beam/erl_hl_timer.c:2210-2248, OTP-29.1.1.
+    #[cfg(test)]
     pub(crate) fn cancel(&mut self, id: u64) -> Option<(u64, TimerPayload<M>)> {
         self.cancel_at(id, self.now)
     }

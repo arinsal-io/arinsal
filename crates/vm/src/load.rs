@@ -26,6 +26,15 @@ impl<T: Clone> std::ops::DerefMut for SharedTable<T> {
     }
 }
 
+/// First epoch of a new code snapshot. Modules outlive the snapshot that loaded
+/// them (their import caches point into that snapshot's other modules), so
+/// epochs must never repeat across snapshots: a repeat would validate a cache
+/// entry that points into another snapshot's freed or foreign code.
+fn next_epoch_base() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32
+}
+
 pub(crate) struct SharedCode {
     pub(crate) coverage_mode: arinsal_loader::CoverageMode,
     pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
@@ -337,7 +346,7 @@ impl SharedCode {
             purge_prepared: SharedTable::new(std::collections::HashSet::new()),
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
-            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(next_epoch_base())),
             registers: SharedTable::new(Vec::new()),
             native_fns: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
@@ -610,7 +619,7 @@ impl Vm {
             purge_prepared: self.purge_prepared.clone(),
             deleted: self.deleted.clone(),
             code_meta: self.code_meta.clone(),
-            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(next_epoch_base())),
             registers: self.registers.clone(),
             native_fns: self.native_fns.clone(),
             loaded_nifs: self.loaded_nifs.clone(),

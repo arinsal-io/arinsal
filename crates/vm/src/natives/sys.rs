@@ -2860,8 +2860,13 @@ fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term
             {
                 return Err(badarg());
             }
+            // Port of erts/emulator/beam/erl_process.c:8316-8321
+            // (erts_set_schedulers_online), OTP-29.1.1: dirty CPU schedulers
+            // online follow the normal-scheduler change proportionally.
+            let total_pct = flags.dirty_cpu_total * 100 / flags.schedulers_total;
+            let onln_pct = requested as usize * total_pct / previous;
+            flags.dirty_cpu_online = (flags.dirty_cpu_online * onln_pct / 100).max(1);
             flags.schedulers_online = requested as usize;
-            flags.dirty_cpu_online = flags.dirty_cpu_online.min(flags.schedulers_online);
             previous
         };
         Term::small(previous as i64).ok_or_else(badarg)
@@ -3645,8 +3650,13 @@ mod tests {
     use arinsal_difftest::{CallResult, RefErl};
     use arinsal_sched::{Config, RunCtx, RunOutcome, Scheduler, Task};
 
+    /// Tests that change or read the process-global scheduler flags run one
+    /// at a time; the flags are shared by every test in this binary.
+    static SCHEDULER_FLAGS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn changing_online_scheduler_count_matches_otp() {
+        let _flags = SCHEDULER_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping scheduler-count differential test");
             return;
@@ -3875,6 +3885,7 @@ mod tests {
 
     #[test]
     fn sched_acct_system_scheduler_facts_match_otp() {
+        let _flags = SCHEDULER_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping scheduler facts differential test");
             return;

@@ -1660,16 +1660,23 @@ impl<T: Task> Inner<T> {
             self.poll_timers(reference.worker, None, true);
             let remaining = timers
                 .get(reference.worker)
-                .and_then(|wheel| wheel.lock().unwrap().cancel(reference.id))
+                .and_then(|wheel| {
+                    wheel
+                        .lock()
+                        .unwrap()
+                        .cancel_at(reference.id, self.clock.now_ms())
+                })
                 .map(|entry| entry.0);
             callback(remaining);
             return;
         }
         if let Some(service) = self.owner_timer_service(reference.worker) {
+            // The wheel's own `now` lags the clock between advances; remaining
+            // time is measured against the current time like the sync paths.
             let remaining = service
                 .borrow_mut()
                 .wheel
-                .cancel(reference.id)
+                .cancel_at(reference.id, self.clock.now_ms())
                 .map(|(remaining, _)| remaining);
             callback(remaining);
             return;
