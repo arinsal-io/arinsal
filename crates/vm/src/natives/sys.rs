@@ -90,6 +90,13 @@ pub(crate) fn copy_literal_area(
         process
             .inbox
             .copy_literal_area_references(&mut process.heap, &area)?;
+        // Port of beam_bif_load.c:1012 (erts_check_copy_literals_gc_need), OTP-29.1.1:
+        // the heap may be inconsistent while GC is disabled, so do not scan it;
+        // the collection is requested and delayed until GC is enabled.
+        if !process.gc_enabled {
+            reply_literal_area_copy(ctx, request, requester, atom("need_gc"))?;
+            return Ok(());
+        }
         if literal_scan_words(process) > ctx.remaining() as usize * 512 {
             reply_literal_area_copy(ctx, request, requester, atom("check_gc"))?;
             return Ok(());

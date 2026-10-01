@@ -2390,6 +2390,8 @@ impl Runtime {
         child.ip = ip;
         child.runtime = Some(Arc::clone(self));
         child.cold_mut().group_leader = None;
+        child.cold_mut().initial_call =
+            Some((module.to_owned(), function.to_owned(), args.len() as u8));
         if let Some(arity) = u8::try_from(args.len()).ok()
             && arinsal_bifs::lookup(module, function, arity).is_some()
         {
@@ -2874,6 +2876,26 @@ impl Process {
     ) -> Result<(), VmError> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6032 (private queue fetch), OTP-29.1.1.
         ctx.fetch_pending();
+        if self.gc_enabled
+            && self
+                .cold
+                .as_ref()
+                .is_some_and(|cold| !cold.delayed_gc.is_empty())
+        {
+            for task in std::mem::take(&mut self.cold_mut().delayed_gc) {
+                match task {
+                    crate::proc_create::DelayedGc::Collect => self.force_gc()?,
+                    crate::proc_create::DelayedGc::Literal {
+                        area_id,
+                        request,
+                        how,
+                        requester,
+                    } => crate::natives::sys::copy_literal_area(
+                        self, ctx, area_id, request, how, requester,
+                    )?,
+                }
+            }
+        }
         let mut queue_data = None;
         loop {
             if marker.is_some_and(|marker| !ctx.recv_marker_has_saved_before(marker)) {
@@ -3066,7 +3088,13 @@ impl Process {
                     return Err(VmError::Unsupported("process aliases".into()));
                 }
                 Payload::Signal(arinsal_sched::Signal::GarbageCollect) => {
-                    self.force_gc()?;
+                    if self.gc_enabled {
+                        self.force_gc()?;
+                    } else {
+                        self.cold_mut()
+                            .delayed_gc
+                            .push(crate::proc_create::DelayedGc::Collect);
+                    }
                 }
                 Payload::Signal(arinsal_sched::Signal::LiteralAreaCopy {
                     area_id,
@@ -3074,9 +3102,20 @@ impl Process {
                     how,
                     requester,
                 }) => {
-                    crate::natives::sys::copy_literal_area(
-                        self, ctx, area_id, request, how, requester,
-                    )?;
+                    if !self.gc_enabled && how != arinsal_sched::LiteralCopyHow::Init {
+                        self.cold_mut()
+                            .delayed_gc
+                            .push(crate::proc_create::DelayedGc::Literal {
+                                area_id,
+                                request,
+                                how,
+                                requester,
+                            });
+                    } else {
+                        crate::natives::sys::copy_literal_area(
+                            self, ctx, area_id, request, how, requester,
+                        )?;
+                    }
                 }
             }
         }
@@ -3516,6 +3555,7 @@ impl Vm {
         process.module = module_id;
         process.ip = ip;
         process.runtime = Some(Arc::clone(runtime));
+        process.cold_mut().initial_call = Some((module.to_owned(), function.to_owned(), 0));
         let pid = scheduler
             .spawn(process)
             .map_err(|error| VmError::Unsupported(format!("system process {module}: {error}")))?;
@@ -3630,6 +3670,8 @@ impl Vm {
         process.ip = ip;
         process.x[..args.len()].copy_from_slice(args);
         process.runtime = Some(runtime.clone());
+        process.cold_mut().initial_call =
+            Some((module.to_owned(), function.to_owned(), args.len() as u8));
         process.entry = true;
         process.heap.set_min_heap_size(8192);
         let _entry_pid: Pid = scheduler

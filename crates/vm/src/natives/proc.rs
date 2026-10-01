@@ -388,7 +388,22 @@ fn process_info(
                     ],
                 )?
             }
-            "current_function" | "initial_call" => {
+            "initial_call" => {
+                let (module_name, function, arity) = process
+                    .cold
+                    .as_ref()
+                    .and_then(|cold| cold.initial_call.clone())
+                    .map_or_else(|| resolve_mfa(vm, process), Ok)?;
+                make_tuple(
+                    process,
+                    &[
+                        Term::atom(global_atoms().intern(&module_name).map_err(|_| badarg())?),
+                        atom(&function),
+                        Term::small(arity as i64).unwrap(),
+                    ],
+                )?
+            }
+            "current_function" => {
                 let (module_name, function, arity) = resolve_mfa(vm, process)?;
                 make_tuple(
                     process,
@@ -2172,6 +2187,16 @@ fn spawn_apply(
     child.module = module_id;
     child.ip = entry;
     child.runtime = parent.runtime.clone();
+    if let (Some(m), Some(f), Some(arguments)) = (module.as_atom(), function.as_atom(), list(args))
+    {
+        let names = arinsal_term::global_atoms();
+        if let (Some(m), Some(f)) = (names.text(m), names.text(f)) {
+            child.cold_mut().initial_call =
+                Some((m.to_string(), f.to_string(), arguments.len() as u8));
+        }
+    } else {
+        child.cold_mut().initial_call = Some(("erlang".to_owned(), "apply".to_owned(), 2));
+    }
     {
         let flags = &mut child.cold_mut().flags;
         flags.insert(

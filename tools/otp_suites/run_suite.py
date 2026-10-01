@@ -59,6 +59,7 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
     # macOS already declares sys_nerr/sys_errlist with const-qualified types;
     # use the system strerror() instead of port_test.c's legacy fallback.
     defs = "-DHAVE_ISFINITE -DHAVE_STRERROR" if name == "port" else "-DHAVE_ISFINITE"
+    erts_internal = next(root.glob("erts-*/include/internal"), root / "usr/include/internal")
     values = {
         "CC": "clang", "LD": "clang", "SHLIB_LD": "clang",
         "CFLAGS": "-O2 -fPIC", "SHLIB_CFLAGS": "-O2 -fPIC",
@@ -70,9 +71,14 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
         "erl_interface_include": str(ei) if ei else "",
         "erl_interface_eilib": str(ei_lib / "libei.a") if ei_lib and (ei_lib / "libei.a").is_file() else ("-lei" if ei else ""),
         "erl_interface_sock_libs": "", "erl_interface_threadlib": "-lpthread", "erl_interface_mk_include": str(ei_lib.parent / "src/eidefs.mk") if ei_lib else "",
+        "erts_lib_make_ethread": str(erts_internal / "ethread.mk"),
+        "erts_lib_make_internal": str(erts_internal / "erts_internal.mk"),
+        "erts_lib_include_internal": str(erts_internal),
+        "erts_lib_include_internal_generated": str(erts_internal),
+        "WSL": "",
         "dll": ".so", "obj": ".o", "exe": "", "EMULATOR": "beam",
         "erl_name": "erl",
-        "SHLIB_RULES": ".SUFFIXES: .so .o .c\n.c.so:\n\tclang -bundle -undefined dynamic_lookup -fPIC " + defs + " -I" + str(root / "usr/include") + (" -I" + str(ei) if ei else "") + (" -L" + str(ei_lib) + " -lei" if ei_lib and name == "binary" else "") + " -o $@ $<",
+        "SHLIB_RULES": ".SUFFIXES: .so .o .c\n.c.so:\n\tclang -bundle -undefined dynamic_lookup -fPIC " + defs + " -DUSE_THREADS -D_THREAD_SAFE -D_REENTRANT -DPOSIX_THREADS -I" + str(erts_internal) + " -I" + str(root / "usr/include") + (" -I" + str(ei) if ei else "") + (" -L" + str(ei_lib) + " -lei" if ei_lib and name == "binary" else "") + " -o $@ $<",
     }
     makefile = source.read_text(encoding="utf-8")
     for key, value in values.items():

@@ -380,6 +380,16 @@ fn spawn_mfa(
     child.module = module_id;
     child.ip = ip;
     child.runtime = parent.runtime.clone();
+    if let (Some(module_name), Some(function_name)) = (
+        arinsal_term::global_atoms().text(m),
+        arinsal_term::global_atoms().text(f),
+    ) {
+        child.cold_mut().initial_call = Some((
+            module_name.to_string(),
+            function_name.to_string(),
+            args.len() as u8,
+        ));
+    }
     child.cold_mut().group_leader = Some(
         parent
             .cold
@@ -538,6 +548,7 @@ fn spawn_fun(
     child.module = module_id;
     child.ip = target;
     child.runtime = parent.runtime.clone();
+    child.cold_mut().initial_call = Some(("erlang".to_owned(), "apply".to_owned(), 2));
     child.cold_mut().group_leader = Some(
         parent
             .cold

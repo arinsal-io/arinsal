@@ -148,6 +148,12 @@ pub(crate) struct ProcessCold {
     pub(crate) exit_reason: Option<Term>,
     /// Spawned MFA entry that resolves to a runtime BIF export.
     pub(crate) initial_bif: Option<(String, String, u8)>,
+    /// Spawn MFA reported by `process_info(Pid, initial_call)`
+    /// (erts: `ErtsProcess.u.initial`, set by `erts_create_process`).
+    pub(crate) initial_call: Option<(String, String, u8)>,
+    /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
+    /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
+    pub(crate) delayed_gc: Vec<DelayedGc>,
     pub(crate) dictionary: Vec<(Term, Term)>,
     pub(crate) dictionary_heap: arinsal_term::VecHeap,
     pub(crate) flags: HashMap<String, Term>,
@@ -492,4 +498,17 @@ pub(crate) struct NativeBifError {
     /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
     pub(crate) freason: u64,
     pub(crate) fvalue: u64,
+}
+
+/// A garbage-collection request saved while `F_DISABLE_GC` was set.
+pub(crate) enum DelayedGc {
+    /// Plain `garbage_collect` request.
+    Collect,
+    /// Literal-area copy phase that needs a collection.
+    Literal {
+        area_id: u64,
+        request: crate::process::Message,
+        how: arinsal_sched::LiteralCopyHow,
+        requester: arinsal_sched::Pid,
+    },
 }
