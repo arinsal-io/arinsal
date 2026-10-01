@@ -1810,15 +1810,28 @@ fn debug_wait_round(
         }
         completion.store(true, Ordering::Release);
         runtime.debug_wait_active.store(false, Ordering::Release);
-        // The waiter may not have reached WAITING yet; keep trying until it either resumes
-        // (dropping its latch handle) or exits.
-        while std::sync::Arc::strong_count(&completion) > 1
-            && scheduler.lookup(pid)
-            && !scheduler.wake(pid)
-        {
-            std::thread::yield_now();
-        }
+        debug_wait_wake(scheduler, pid, completion.clone());
     }));
+}
+
+/// Wake the waiter once its latch is set. A waiter that is not WAITING is runnable or
+/// running and re-checks the latch at the end of its slice; only the short window in which
+/// another scheduler is still parking it needs a retry, so the retry is bounded instead of
+/// spinning forever on the scheduler that has to run it.
+fn debug_wait_wake(
+    scheduler: std::sync::Arc<arinsal_sched::Scheduler<Process>>,
+    pid: arinsal_sched::Pid,
+    completion: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    for _ in 0..10_000 {
+        if std::sync::Arc::strong_count(&completion) <= 1
+            || !scheduler.lookup(pid)
+            || scheduler.wake(pid)
+        {
+            return;
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// Port of erts/emulator/beam/erl_bif_info.c:5036-5500, OTP-29.1.1.
