@@ -540,6 +540,55 @@ pub(crate) fn gc_stress_enabled() -> bool {
     })
 }
 
+/// Live X register count before `instr` when the process may be switched out there.
+///
+/// erts only schedules a process out where the live count is exact: at call
+/// dispatch (the callee arity, `c_p->arity`), at `i_loop_rec` (0) and on BIF
+/// return (the result in X0). Elsewhere dead X registers may hold stale
+/// pointers, so a GC run from signal handling while the process is out must
+/// not root them. `None` means `instr` is not a switch-out point.
+// Port of erts/emulator/beam/emu/beam_emu.c:404 (context_switch, `c_p->arity`) and
+// erts/emulator/beam/emu/msg_instrs.tab:65 (i_loop_rec yield with arity 0), OTP-29.1.1.
+fn switch_out_live(module: &Module, instr: Instr) -> Option<usize> {
+    let local_arity = |target: u32| {
+        function_index_at(module, target as usize).map(|index| module.functions[index].2 as usize)
+    };
+    match instr {
+        Instr::CallLocal { target }
+        | Instr::CallLast { target, .. }
+        | Instr::CallOnly { target } => local_arity(target),
+        // The fused move reads `src` before the call, so it is live here too.
+        Instr::MoveCallLocal { src, target, .. } => {
+            local_arity(target).map(|arity| arity.max(usize::from(src) + 1))
+        }
+        // The fun operand is read before dispatch; erts yields at the callee
+        // entry, after it has been consumed.
+        Instr::CallFun { arity, src, .. } => Some(if src.kind() == Arg::X {
+            usize::from(arity).max(src.value() as usize + 1)
+        } else {
+            usize::from(arity)
+        }),
+        Instr::CallExternal { arity, .. } | Instr::CallBif { arity, .. } => Some(arity as usize),
+        Instr::Apply { arity, .. } => Some(arity as usize + 2),
+        Instr::ReturnInstr | Instr::DeallocateReturn { .. } => Some(1),
+        Instr::LoopRec { .. } => Some(0),
+        Instr::Generic(index) => {
+            let op = module.generic[index as usize];
+            match op.opcode() {
+                Opcode::Call
+                | Opcode::CallLast
+                | Opcode::CallOnly
+                | Opcode::CallExt
+                | Opcode::CallExtLast
+                | Opcode::CallExtOnly => Some(op.args[0].value() as usize),
+                Opcode::Return => Some(1),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[inline]
 fn function_index_at(module: &Module, ip: usize) -> Option<usize> {
     let index = *module.on_entry_fn.get(ip)?;
@@ -1620,21 +1669,27 @@ impl Vm {
                 offset < module.code.len(),
                 "instruction pointer out of bounds"
             );
-            if consumed == budget || p.force_yield {
+            // An exhausted budget only switches the process out where the live X
+            // count is exact; until then the slice runs on, which stays bounded
+            // because every BEAM loop passes a call, a return or a receive.
+            // SAFETY: The loader resolves branch targets within this allocation
+            // and appends CodeEnd for a fallthrough past the last BEAM opcode.
+            let fetched = unsafe { *ip };
+            if (consumed == budget || p.force_yield)
+                && let Some(live) = switch_out_live(module, fetched)
+            {
                 p.force_yield = false;
+                p.gc_live = live;
                 sync_cursor(p, htop, &mut heap_dirty);
                 p.module = module_id;
                 p.ip = offset;
                 p.reductions = reds;
                 return Ok(RunState::Yield);
             }
-            consumed += 1;
+            consumed = (consumed + 1).min(budget);
             if let Some(ctx) = ctx.as_deref_mut() {
                 ctx.consume(1);
             }
-            // SAFETY: The loader resolves branch targets within this allocation
-            // and appends CodeEnd for a fallthrough past the last BEAM opcode.
-            let fetched = unsafe { *ip };
             p.module = module_id;
             p.ip = offset;
             let module = module_handle.as_ref();
@@ -2214,6 +2269,8 @@ impl Vm {
                                 run.consume(charge);
                             }
                             if reds == 0 || consumed == budget {
+                                // Only the BIF result in X0 is live after the call.
+                                p.gc_live = 1;
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 // SAFETY: `ip` remains inside the current module allocation.
                                 p.ip = unsafe { ip.offset_from(base) } as usize;
@@ -2286,6 +2343,8 @@ impl Vm {
                                     run.consume(charge);
                                 }
                                 if reds == 0 || consumed == budget {
+                                    // Only the BIF result in X0 is live after the call.
+                                    p.gc_live = 1;
                                     sync_cursor(p, htop, &mut heap_dirty);
                                     // SAFETY: `ip` remains inside the current module allocation.
                                     p.ip = unsafe { ip.offset_from(base) } as usize;
@@ -3225,6 +3284,9 @@ impl Vm {
                 }
                 Instr::LoopRec { empty, dst } => {
                     sync_cursor(p, htop, &mut heap_dirty);
+                    // Port of erts/emulator/beam/emu/msg_instrs.tab:84 (i_loop_rec runs
+                    // signal handling with `c_p->arity = 0`), OTP-29.1.1.
+                    p.gc_live = 0;
                     let ctx = ctx.as_deref_mut().ok_or_else(|| {
                         VmError::Unsupported("receive requires a scheduler".into())
                     })?;

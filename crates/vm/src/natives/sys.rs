@@ -113,7 +113,7 @@ pub(crate) fn copy_literal_area(
         let has_roots =
             how == arinsal_sched::LiteralCopyHow::NeedGc || has_literal_area_roots(process, &area);
         if has_roots {
-            let live_x = process.x.len();
+            let live_x = process.gc_live;
             let hibernated = process.hibernated;
             let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
             process.heap.request_full_sweep();
@@ -134,10 +134,12 @@ pub(crate) fn copy_literal_area(
 
 fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
     let heap = process.heap.has_heap_reference(|term| area.contains(term));
-    let roots =
-        process.x.iter().copied().chain(
-            (0..process.heap.stack_words()).filter_map(|index| process.heap.stack_get(index)),
-        );
+    // Only the live X registers are roots; dead ones may hold stale pointers.
+    let live = process.gc_live.min(process.x.len());
+    let roots = process.x[..live]
+        .iter()
+        .copied()
+        .chain((0..process.heap.stack_words()).filter_map(|index| process.heap.stack_get(index)));
     let x_and_stack = references_retired_from_roots(process, roots, std::slice::from_ref(area));
     let inbox = process.inbox.has_literal_area_reference(area);
     let dictionary = process.cold.as_ref().is_some_and(|cold| {

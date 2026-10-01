@@ -3322,9 +3322,11 @@ impl Process {
 
     /// Force a collection of the running process before the current BIF returns.
     /// Port of erts/emulator/beam/erl_gc.h:152 (`ERTS_FORCE_GC`), OTP-29.1.1.
+    ///
+    /// Roots the exact live count recorded at the current call or switch-out point;
+    /// registers above it are dead and may hold stale pointers.
     pub(crate) fn force_gc(&mut self) -> Result<(), VmError> {
-        let live = self.x.len();
-        self.force_gc_live(live)
+        self.force_gc_live(self.gc_live)
     }
 
     /// Force collection with the current BEAM live-register count.

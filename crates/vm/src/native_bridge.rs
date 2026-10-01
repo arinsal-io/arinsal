@@ -763,6 +763,8 @@ pub fn run_native(
                 process.cold_mut().native_continuation_resume = true;
                 // The yield site stored its live X register count in `c_p->arity`.
                 process.cold_mut().native_resume_live = process.header.arity.saturating_add(1);
+                // Signal-time GC while switched out roots exactly these registers.
+                process.gc_live = usize::from(process.header.arity);
                 process.native_pc = Some(if resume == 0 {
                     code_ptr as usize
                 } else {
