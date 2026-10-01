@@ -3220,7 +3220,10 @@ impl Vm {
                     // ingress, so block only when the mailbox has nothing left
                     // at the save cursor. Port of erts/emulator/beam/emu/msg_instrs.tab
                     // (`wait.execute`), OTP-29.1.1.
-                    if !Self::mailbox_ready_to_wait(p, &mut ctx)? {
+                    // A receive with no clauses and no timeout targets this instruction
+                    // itself: queued messages never match, so it must block regardless.
+                    let wait_ip = (ip.addr() - base.addr()) / std::mem::size_of::<Instr>();
+                    if target as usize != wait_ip && !Self::mailbox_ready_to_wait(p, &mut ctx)? {
                         (htop, stop) = p.heap.heap_cursor();
                         // SAFETY: `wait`'s target is the `loop_rec` label in this module.
                         ip = unsafe { base.add(target as usize) };

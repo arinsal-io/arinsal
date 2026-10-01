@@ -77,6 +77,7 @@ use std::time::{Duration, Instant};
 use timer::{CanceledTimer, TimerCommand, TimerPayload, Wheel};
 
 type ErasedTimerService = (usize, Box<dyn Any>);
+type SchedulerAuxWork = Arc<dyn Fn(usize) + Send + Sync + 'static>;
 
 thread_local! {
     static OWNER_TIMER_SERVICES: RefCell<HashMap<usize, ErasedTimerService>> = RefCell::new(HashMap::new());
@@ -220,6 +221,11 @@ pub enum Payload<M> {
         reference: TimerRef,
         message: M,
     },
+    /// An expired `send_after`; the VM retires the timer reference and delivers the message as-is.
+    TimerMessage {
+        reference: TimerRef,
+        message: M,
+    },
 }
 
 /// One message or signal, including its logical sender.
@@ -340,7 +346,12 @@ impl Rng for SeededRng {
 struct RealClock(Instant);
 impl Clock for RealClock {
     fn now_ms(&self) -> u64 {
-        self.0.elapsed().as_millis() as u64
+        let elapsed = self.0.elapsed();
+        let whole_ms = elapsed.as_millis() as u64;
+        // Port of erts/emulator/beam/erl_hl_timer.c:670-679
+        // (get_timeout_pos), OTP-29.1.1: millisecond deadlines round up so
+        // positive timers do not expire before their requested interval.
+        whole_ms.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
     }
 }
 
@@ -719,6 +730,7 @@ struct Inner<T: Task> {
     active_schedulers: AtomicUsize,
     worker_stats: Vec<WorkerCounters>,
     stats_requests: Vec<SegQueue<mpsc::Sender<LocalStatsSnapshot>>>,
+    aux_work: Vec<SegQueue<SchedulerAuxWork>>,
     accounting_flags: AtomicU8,
     worker_counts: Vec<WorkerQueueCount>,
     online_schedulers: AtomicUsize,
@@ -757,6 +769,61 @@ struct LocalStatsSnapshot {
 }
 
 impl<T: Task> Inner<T> {
+    fn request_aux_work_one(&self, worker: usize, work: SchedulerAuxWork) {
+        let Some(queue) = self.aux_work.get(worker) else {
+            return;
+        };
+        queue.push(work);
+        self.wake_worker(worker);
+    }
+
+    fn request_aux_work_all(&self, work: SchedulerAuxWork) {
+        for worker in 0..self.aux_work.len() {
+            self.request_aux_work_one(worker, Arc::clone(&work));
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:2665 (handle_aux_work), OTP-29.1.1.
+    fn handle_aux_work(&self, worker: usize) {
+        while let Some(work) = self.aux_work[worker].pop() {
+            work(worker);
+        }
+    }
+
+    fn handle_local_aux_work(&self, worker: usize, local: &mut Local<T>) {
+        // Port of erts/emulator/beam/erl_process.c:2719 (canceled timers before
+        // debug-wait completion), OTP-29.1.1.
+        self.poll_timers(worker, Some(local), false);
+        self.poll_pending_waits(local);
+        self.handle_aux_work(worker);
+    }
+
+    fn wake_waiting(&self, pid: Pid) -> bool {
+        let Some(process) = self.table.lookup(pid) else {
+            return false;
+        };
+        if process
+            .state
+            .compare_exchange(WAITING, QUEUED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        let wait_timer = process.wait_timer.load(Ordering::Acquire);
+        if wait_timer != 0 {
+            process.wait_epoch.fetch_add(1, Ordering::AcqRel);
+            self.cancel_wait_timer(&process, wait_timer);
+        }
+        self.enqueue(
+            Scheduled {
+                process,
+                inherited: None,
+            },
+            false,
+        );
+        true
+    }
+
     fn fanin_delivery(&self, process: &Process<T>, count: usize) {
         if !self.fanin_stats {
             return;
@@ -1016,10 +1083,21 @@ impl<T: Task> Inner<T> {
     }
 
     fn wake_one(&self) {
+        // Offline (or multi-scheduling-blocked) schedulers do not run processes; waking one of
+        // them would leave the queued work unnoticed.
+        let online = self.online_schedulers.load(Ordering::Acquire).max(1);
+        let blocker = self
+            .scheduling_blocked
+            .load(Ordering::Acquire)
+            .then(|| self.scheduling_blocker.load(Ordering::Acquire))
+            .filter(|blocker| *blocker < online);
         let start =
             self.next_sleeper.fetch_add(1, Ordering::Relaxed) as usize % self.sleepers.len();
         for offset in 0..self.sleepers.len() {
             let index = (start + offset) % self.sleepers.len();
+            if index >= online || blocker.is_some_and(|blocker| blocker != index) {
+                continue;
+            }
             if self.parked[index].load(Ordering::SeqCst)
                 && let Some(worker) = self.sleepers[index].get()
             {
@@ -1223,7 +1301,11 @@ impl<T: Task> Inner<T> {
                 wheel.lock().unwrap().cancel(id);
             }
         } else if let Some(queue) = self.canceled_timers.get(worker) {
-            queue.push(CanceledTimer { id, reply: None });
+            queue.push(CanceledTimer {
+                id,
+                reply: None,
+                callback: None,
+            });
             self.wake_worker(worker);
         }
     }
@@ -1337,8 +1419,25 @@ impl<T: Task> Inner<T> {
                     service.wheel.insert(id, deadline, payload);
                     let _ = reply.send(());
                 }
-                TimerCommand::Read { id, reply } => {
-                    let _ = reply.send(service.wheel.remaining(id));
+                TimerCommand::Read {
+                    id,
+                    reply,
+                    callback,
+                } => {
+                    let remaining = service.wheel.remaining_at(id, self.clock.now_ms());
+                    if let Some(reply) = reply {
+                        let _ = reply.send(remaining);
+                    }
+                    if let Some(callback) = callback {
+                        callback(remaining);
+                    }
+                }
+                TimerCommand::Cancel { id, callback } => {
+                    let remaining = service
+                        .wheel
+                        .cancel_at(id, self.clock.now_ms())
+                        .map(|(remaining, _)| remaining);
+                    callback(remaining);
                 }
             }
         }
@@ -1346,10 +1445,13 @@ impl<T: Task> Inner<T> {
         while let Some(canceled) = canceled_queue.pop() {
             let remaining = service
                 .wheel
-                .cancel(canceled.id)
+                .cancel_at(canceled.id, self.clock.now_ms())
                 .map(|(remaining, _)| remaining);
             if let Some(reply) = canceled.reply {
                 let _ = reply.send(remaining);
+            }
+            if let Some(callback) = canceled.callback {
+                callback(remaining);
             }
         }
     }
@@ -1369,7 +1471,10 @@ impl<T: Task> Inner<T> {
                         message,
                     }
                 } else {
-                    Payload::Message(message)
+                    Payload::TimerMessage {
+                        reference: TimerRef { worker, id },
+                        message,
+                    }
                 };
                 let _ = self.deliver(pid, pid, payload, local, 0);
             }
@@ -1381,6 +1486,22 @@ impl<T: Task> Inner<T> {
                     local,
                 };
                 callback(&mut ctx);
+            }
+            TimerPayload::ResolvedMessage(resolve, message, wrapped) => {
+                if let Some(pid) = resolve() {
+                    let payload = if wrapped {
+                        Payload::Timer {
+                            reference: TimerRef { worker, id },
+                            message,
+                        }
+                    } else {
+                        Payload::TimerMessage {
+                            reference: TimerRef { worker, id },
+                            message,
+                        }
+                    };
+                    let _ = self.deliver(pid, pid, payload, local, 0);
+                }
             }
             TimerPayload::Wake(pid, epoch) => {
                 if let Some(process) = self.table.lookup(pid)
@@ -1402,6 +1523,37 @@ impl<T: Task> Inner<T> {
     }
 
     fn start_timer(
+        &self,
+        pid: Pid,
+        ms: u64,
+        payload: TimerPayload<T::Message>,
+        local: Option<&mut Local<T>>,
+        owner: Option<usize>,
+        wake: bool,
+    ) -> Result<TimerRef, Error> {
+        self.start_timer_payload(pid, ms, payload, local, owner, wake)
+    }
+
+    fn start_resolved_timer(
+        &self,
+        owner: Pid,
+        ms: u64,
+        resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+        message: T::Message,
+        wrapped: bool,
+        local: Option<&mut Local<T>>,
+    ) -> Result<TimerRef, Error> {
+        self.start_timer_payload(
+            owner,
+            ms,
+            TimerPayload::ResolvedMessage(resolve, message, wrapped),
+            local,
+            None,
+            true,
+        )
+    }
+
+    fn start_timer_payload(
         &self,
         pid: Pid,
         ms: u64,
@@ -1475,14 +1627,14 @@ impl<T: Task> Inner<T> {
                 .get(reference.worker)?
                 .lock()
                 .unwrap()
-                .cancel(reference.id)
+                .cancel_at(reference.id, self.clock.now_ms())
                 .map(|x| x.0);
         }
         if let Some(service) = self.owner_timer_service(reference.worker) {
             return service
                 .borrow_mut()
                 .wheel
-                .cancel(reference.id)
+                .cancel_at(reference.id, self.clock.now_ms())
                 .map(|(remaining, _)| remaining);
         }
         let queue = self.canceled_timers.get(reference.worker)?;
@@ -1490,9 +1642,49 @@ impl<T: Task> Inner<T> {
         queue.push(CanceledTimer {
             id: reference.id,
             reply: Some(reply),
+            callback: None,
         });
-        self.wake_worker(reference.worker);
+        // Port of erts/emulator/beam/erl_hl_timer.c (cross-scheduler cancel
+        // request), OTP-29.1.1. The owner drains its cancellation queue before
+        // invoking this scheduling-point callback.
+        self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
         receiver.recv().ok().flatten()
+    }
+
+    fn cancel_timer_async(
+        &self,
+        reference: TimerRef,
+        callback: Box<dyn FnOnce(Option<u64>) + Send>,
+    ) {
+        if let Some(timers) = self.sim_timers.as_ref() {
+            self.poll_timers(reference.worker, None, true);
+            let remaining = timers
+                .get(reference.worker)
+                .and_then(|wheel| wheel.lock().unwrap().cancel(reference.id))
+                .map(|entry| entry.0);
+            callback(remaining);
+            return;
+        }
+        if let Some(service) = self.owner_timer_service(reference.worker) {
+            let remaining = service
+                .borrow_mut()
+                .wheel
+                .cancel(reference.id)
+                .map(|(remaining, _)| remaining);
+            callback(remaining);
+            return;
+        }
+        let Some(commands) = self.timer_commands.get(reference.worker) else {
+            callback(None);
+            return;
+        };
+        commands.push(TimerCommand::Cancel {
+            id: reference.id,
+            callback,
+        });
+        // Port of erts/emulator/beam/erl_hl_timer.c (cross-scheduler async
+        // cancellation), OTP-29.1.1. The owner answers from its next aux point.
+        self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
     }
 
     fn read_timer(&self, reference: TimerRef) -> Option<u64> {
@@ -1502,19 +1694,55 @@ impl<T: Task> Inner<T> {
                 .get(reference.worker)?
                 .lock()
                 .unwrap()
-                .remaining(reference.id);
+                .remaining_at(reference.id, self.clock.now_ms());
         }
         if let Some(service) = self.owner_timer_service(reference.worker) {
-            return service.borrow().wheel.remaining(reference.id);
+            return service
+                .borrow()
+                .wheel
+                .remaining_at(reference.id, self.clock.now_ms());
         }
         let queue = self.timer_commands.get(reference.worker)?;
         let (reply, receiver) = mpsc::sync_channel(0);
         queue.push(TimerCommand::Read {
             id: reference.id,
-            reply,
+            reply: Some(reply),
+            callback: None,
         });
         self.wake_worker(reference.worker);
         receiver.recv().ok().flatten()
+    }
+
+    fn read_timer_async(&self, reference: TimerRef, callback: Box<dyn FnOnce(Option<u64>) + Send>) {
+        if let Some(timers) = self.sim_timers.as_ref() {
+            self.poll_timers(reference.worker, None, true);
+            callback(timers.get(reference.worker).and_then(|wheel| {
+                wheel
+                    .lock()
+                    .unwrap()
+                    .remaining_at(reference.id, self.clock.now_ms())
+            }));
+            return;
+        }
+        if let Some(service) = self.owner_timer_service(reference.worker) {
+            callback(
+                service
+                    .borrow()
+                    .wheel
+                    .remaining_at(reference.id, self.clock.now_ms()),
+            );
+            return;
+        }
+        let Some(commands) = self.timer_commands.get(reference.worker) else {
+            callback(None);
+            return;
+        };
+        commands.push(TimerCommand::Read {
+            id: reference.id,
+            reply: None,
+            callback: Some(callback),
+        });
+        self.wake_worker(reference.worker);
     }
 }
 
@@ -1802,7 +2030,22 @@ trait ContextOps<M> {
     fn set_msacc_state(&mut self, state: MsaccState);
     fn reclassify_gc_ns(&mut self, nanoseconds: u64);
     fn set_wall_accounting_enabled(&mut self, enabled: bool);
-    fn start_timer(&mut self, pid: Pid, ms: u64, msg: M, wrapped: bool) -> Result<TimerRef, Error>;
+    fn start_timer(
+        &mut self,
+        owner: Pid,
+        target: Pid,
+        ms: u64,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<TimerRef, Error>;
+    fn start_resolved_timer(
+        &mut self,
+        owner: Pid,
+        ms: u64,
+        resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<TimerRef, Error>;
     fn start_timer_callback(
         &mut self,
         pid: Pid,
@@ -1812,6 +2055,7 @@ trait ContextOps<M> {
     fn mark_exited(&mut self, pid: Pid);
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool;
+    fn request_aux_work_all(&mut self, work: SchedulerAuxWork);
 }
 
 impl<M: Send + 'static> RunCtx<'_, M> {
@@ -1855,6 +2099,33 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// One-based id of the worker executing this process turn.
     pub fn scheduler_id(&self) -> Option<usize> {
         self.worker.map(|worker| worker + 1)
+    }
+    /// Run one copy of `work` on every scheduler at its next scheduling point.
+    pub fn request_aux_work_all(&mut self, work: impl Fn(usize) + Send + Sync + 'static) {
+        self.inner.request_aux_work_all(Arc::new(work));
+    }
+
+    /// Schedule a message timer on the scheduler currently running this process.
+    pub fn schedule_timer(
+        &mut self,
+        target: Pid,
+        ms: u64,
+        message: M,
+        wrapped: bool,
+    ) -> Result<TimerRef, Error> {
+        self.inner
+            .start_timer(self.pid, target, ms, message, wrapped)
+    }
+    /// Schedule a timer whose registered process name is resolved when it expires.
+    pub fn schedule_resolved_timer(
+        &mut self,
+        ms: u64,
+        message: M,
+        wrapped: bool,
+        resolve: impl Fn() -> Option<Pid> + Send + Sync + 'static,
+    ) -> Result<TimerRef, Error> {
+        self.inner
+            .start_resolved_timer(self.pid, ms, Arc::new(resolve), message, wrapped)
     }
     /// Change the process scheduler binding and return its previous scheduler id.
     /// Scheduler ids are one-based; zero clears the binding.
@@ -2030,12 +2301,12 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Start an Erlang-style timer. The VM may wrap the received envelope as `{timeout, Ref, Msg}`.
     pub fn start_timer(&mut self, ms: u64, msg: M) -> Result<TimerRef, Error> {
         self.inner.flush(self.remaining);
-        self.inner.start_timer(self.pid, ms, msg, true)
+        self.inner.start_timer(self.pid, self.pid, ms, msg, true)
     }
     /// Schedule a plain message without a timer-reference wrapper.
     pub fn send_after(&mut self, ms: u64, msg: M) -> Result<TimerRef, Error> {
         self.inner.flush(self.remaining);
-        self.inner.start_timer(self.pid, ms, msg, false)
+        self.inner.start_timer(self.pid, self.pid, ms, msg, false)
     }
     /// Start a runtime timer callback owned by this process.
     /// Port of erts/emulator/beam/erl_hl_timer.c (erts_start_timer_callback), OTP-29.1.1.
@@ -2064,7 +2335,7 @@ impl<M: Send + 'static> RunCtx<'_, M> {
 /// receiver is scheduled, including on exit.
 fn payload_wakes<M>(payload: &Payload<M>) -> bool {
     match payload {
-        Payload::Message(_) | Payload::Timer { .. } => true,
+        Payload::Message(_) | Payload::Timer { .. } | Payload::TimerMessage { .. } => true,
         Payload::Signal(signal) => match signal {
             Signal::Exit(_)
             | Signal::PortExit { .. }
@@ -2247,6 +2518,22 @@ impl<T: Task> Runner<'_, T> {
 }
 
 impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
+    fn start_resolved_timer(
+        &mut self,
+        owner: Pid,
+        ms: u64,
+        resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+        msg: T::Message,
+        wrapped: bool,
+    ) -> Result<TimerRef, Error> {
+        self.inner
+            .start_resolved_timer(owner, ms, resolve, msg, wrapped, self.local.as_deref_mut())
+    }
+
+    fn request_aux_work_all(&mut self, work: SchedulerAuxWork) {
+        self.inner.request_aux_work_all(work);
+    }
+
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool {
         if self.deferred_monitor.as_ref().is_some_and(|(pid, event)| {
             *pid == to
@@ -2515,7 +2802,8 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
     fn start_timer(
         &mut self,
-        pid: Pid,
+        owner: Pid,
+        target: Pid,
         ms: u64,
         msg: T::Message,
         wrapped: bool,
@@ -2523,9 +2811,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // Message timers may belong to another worker; receive timeouts do not
         // use this path.
         self.inner.start_timer(
-            pid,
+            owner,
             ms,
-            TimerPayload::Message(pid, msg, wrapped),
+            TimerPayload::Message(target, msg, wrapped),
             self.local.as_deref_mut(),
             None,
             true,
@@ -2678,6 +2966,7 @@ impl<T: Task> Scheduler<T> {
                 })
                 .collect(),
             stats_requests: (0..workers).map(|_| SegQueue::new()).collect(),
+            aux_work: (0..workers).map(|_| SegQueue::new()).collect(),
             accounting_flags: AtomicU8::new(0),
             worker_counts: (0..workers)
                 .map(|_| WorkerQueueCount(AtomicU64::new(0)))
@@ -2776,6 +3065,14 @@ impl<T: Task> Scheduler<T> {
     pub fn signal(&self, from: Pid, to: Pid, signal: Signal<T::Message>) -> Result<(), Error> {
         self.inner
             .deliver(from, to, Payload::Signal(signal), None, 0)
+    }
+    /// Run one copy of `work` on every scheduler at its next scheduling point.
+    pub fn request_aux_work_all(&self, work: impl Fn(usize) + Send + Sync + 'static) {
+        self.inner.request_aux_work_all(Arc::new(work));
+    }
+    /// Wake a task that is waiting without a mailbox event.
+    pub fn wake(&self, pid: Pid) -> bool {
+        self.inner.wake_waiting(pid)
     }
     /// Whether a pid currently identifies a live task.
     pub fn lookup(&self, pid: Pid) -> bool {
@@ -2946,9 +3243,25 @@ impl<T: Task> Scheduler<T> {
     pub fn cancel_timer(&self, reference: TimerRef) -> Option<u64> {
         self.inner.cancel_timer(reference)
     }
+    /// Cancel a timer and deliver its remaining time from the owning scheduler.
+    pub fn cancel_timer_async(
+        &self,
+        reference: TimerRef,
+        callback: impl FnOnce(Option<u64>) + Send + 'static,
+    ) {
+        self.inner.cancel_timer_async(reference, Box::new(callback));
+    }
     /// Read remaining milliseconds, or `None` if fired or cancelled.
     pub fn read_timer(&self, reference: TimerRef) -> Option<u64> {
         self.inner.read_timer(reference)
+    }
+    /// Read remaining time and deliver the result from the owning scheduler.
+    pub fn read_timer_async(
+        &self,
+        reference: TimerRef,
+        callback: impl FnOnce(Option<u64>) + Send + 'static,
+    ) {
+        self.inner.read_timer_async(reference, Box::new(callback));
     }
     /// Advance the built-in simulation clock.
     pub fn advance_ms(&self, ms: u64) -> Result<(), Error> {
@@ -2964,6 +3277,7 @@ impl<T: Task> Scheduler<T> {
         let Some(sim) = &self.inner.sim else {
             return false;
         };
+        self.inner.handle_aux_work(0);
         self.inner.poll_timers(0, None, true);
         let item = {
             let mut sim = sim.lock().unwrap();
@@ -3633,6 +3947,9 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         while let Some(reply) = inner.stats_requests[id].pop() {
             let _ = reply.send(local.stats_snapshot(local.msacc_enabled, local.wall_enabled));
         }
+        local.set_msacc_state(MsaccState::Aux);
+        inner.handle_local_aux_work(id, &mut local);
+        local.set_msacc_state(MsaccState::Other);
         if id >= inner.online_schedulers.load(Ordering::Acquire)
             || (inner.scheduling_blocked.load(Ordering::Acquire)
                 && id != inner.scheduling_blocker.load(Ordering::Acquire))

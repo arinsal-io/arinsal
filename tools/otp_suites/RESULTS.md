@@ -4,7 +4,7 @@
 |---|---:|---:|---:|---:|---:|---|
 | `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
 | `bif_SUITE` | 34 | 29/34 | 28/34 | 1 | 0 | group_leader_prio_dirty: failed {'EXIT', {fw_error, {ct_framework,error_notification, {badarg |
-| `big_SUITE` | 23 | 23/23 | 18/23 | 5 | 0 | big_float_2: failed {{badmatch,0.0}; big_float_3: failed {{badmatch,3.402823669209385e38}; reductions: failed {badarg; system_limit: failed {badarg; toobig: failed {{badmatch, {'EXIT', {system_limit |
+| `big_SUITE` | 23 | 23/23 | 23/23 | 0 | 0 | none |
 | `binary_SUITE` | 55 | 42/55 | 34/55 | 8 | 0 | bad_terms: failed {'EXIT',error}, unknown_location; copy_terms: failed {'EXIT',error}, unknown_location; error_after_yield: failed {{badmatch,false}; gc_test: failed {{badmatch,{binary,[]}}; local_ext: failed {{badmatch,{error,exbadport}}; otp_5484: failed {'EXIT',error}, unknown_location; t2b_deterministic: failed {{badmatch; terms: failed {'EXIT',error}, unknown_location |
 | `bs_construct_SUITE` | 31 | 30/31 | 26/31 | 4 | 0 | bs_append_offheap: failed "missing binary in erts_bs_private_append"; error_info: failed {{badmatch,false}; in_guard: failed {badarg; reductions: failed {if_clause |
 | `bs_match_bin_SUITE` | 9 | 9/9 | 9/9 | 0 | 0 | none |
@@ -18,7 +18,7 @@
 | `float_SUITE` | 15 | 14/15 | 13/15 | 1 | 0 | fp_drv: failed {badarg |
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
 | `guard_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | bad_arith: failed {badarith; type_tests: failed {badarg |
-| `hash_SUITE` | 29 | 27/29 | 26/29 | 1 | 0 | test_phash2_10MB_plus_bin: failed {function_clause |
+| `hash_SUITE` | 29 | 27/29 | 27/29 | 0 | 0 | none |
 | `list_bif_SUITE` | 9 | 8/9 | 8/9 | 0 | 0 | none |
 | `map_SUITE` | 64 | 63/64 | 55/64 | 8 | 0 | t_bif_map_merge: failed {{badmatch,false}; t_map_compare: failed {{badmatch,true}; t_map_display: failed {undefined; t_map_encode_decode: failed {{badmatch,#{a => 2,"hi" => "value"}}; t_tracing: failed {badarg; t_update_assoc_sharing: failed {{badmatch,false}; t_update_exact: failed {{badmatch, {'EXIT', {{badkey,42.0}; t_update_exact_large: failed {{badmatch, {'EXIT', {{badkey,42.0} |
 | `num_bif_SUITE` | 11 | 11/11 | 11/11 | 0 | 0 | none |
@@ -27,8 +27,9 @@
 | `port_SUITE` | 74 | 70/74 | 46/74 | 24 | 0 | dropped_commands: failed {badarg; mix_up_ports: failed {badarg; mon_port_driver_die: failed {badarg; otp_5112: failed {badarg; otp_5119: failed {badarg; otp_6224: failed {badarg; parallelism_option: failed {badarg; port_exit_call_request_race: failed {badarg; port_exit_close_race: failed {badarg; port_exit_close_request_race: failed {badarg; port_exit_command_race: failed {badarg; port_exit_command_request_race: failed {badarg; port_exit_connect_race: failed {badarg; port_exit_connect_request_race: failed {badarg; port_exit_control_request_race: failed {badarg; port_exit_demonitor_race: failed {badarg; port_exit_exit_race: failed {badarg; port_exit_info_request_race: failed {badarg; port_exit_link_race: failed {badarg; port_exit_monitor_race: failed {badarg; port_exit_unlink_race: failed {badarg; port_setget_data: failed {badarg; ports: failed {badarg; spawn_driver: failed {badarg |
 | `receive_SUITE` | 14 | 12/14 | 12/14 | 0 | 0 | none |
 | `ref_SUITE` | 5 | 4/5 | 4/5 | 0 | 0 | none |
-| `small_SUITE` | 13 | 13/13 | 8/13 | 5 | 0 | addition: failed {timetrap_timeout,60000; mul_add: failed {badarith; test_bitwise: failed {timetrap_timeout,60000; test_bsl: failed {timetrap_timeout,60000; test_bsr: failed {timetrap_timeout,60000 |
+| `small_SUITE` | 13 | 13/13 | 9/13 | 4 | 0 | addition: failed {timetrap_timeout,60000; test_bitwise: failed {timetrap_timeout,60000; test_bsl: failed {timetrap_timeout,60000; test_bsr: failed {timetrap_timeout,60000 |
 | `statistics_SUITE` | 18 | 18/18 | 16/18 | 2 | 0 | scheduler_wall_time: failed {badarg; scheduler_wall_time_all: failed {badarg |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | 0 | none |
+| `timer_bif_SUITE` | 23 | 20/23 | 20/23 | 0 | 0 | none |
 | `tuple_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
 | `unique_SUITE` | 2 | 1/2 | 1/2 | 0 | 0 | none |

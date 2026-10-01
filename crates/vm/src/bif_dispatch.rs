@@ -209,6 +209,16 @@ impl Vm {
                 )));
             }
         };
+        if p.cold
+            .as_ref()
+            .and_then(|cold| cold.debug_wait_completion.as_ref())
+            .is_some_and(|completed| !completed.load(std::sync::atomic::Ordering::Acquire))
+        {
+            // The BIF continuation remains at this instruction until every
+            // scheduler has reached its auxiliary-work scheduling point.
+            p.force_yield = true;
+            return Ok(0);
+        }
         // Port of erts/emulator/beam/erl_arith.c:56-85, OTP-29.1.1.
         p.reductions = p
             .reductions

@@ -60,6 +60,9 @@ pub struct Message {
     /// When set, the receiver inserts this into the priority section of its
     /// private message queue (OTP 28+ priority messages).
     priority: bool,
+    /// The VM reference id of a `start_timer` timeout, so an in-flight expiry keeps its
+    /// reference even after the timer was cancelled.
+    timer_id: Option<u64>,
 }
 
 struct MessageFragment {
@@ -364,6 +367,14 @@ impl MessageQueue {
 }
 
 impl Message {
+    /// Build a scheduler-safe message from a self-contained term snapshot.
+    pub(crate) fn from_owned(term: &arinsal_etf::OwnedTerm) -> Result<Self, VmError> {
+        let mut heap = ProcessHeap::with_words(4096);
+        let term = arinsal_term::from_owned(term, &mut heap)
+            .map_err(|error| VmError::Unsupported(format!("owned message term: {error:?}")))?;
+        Self::copy_from(term)
+    }
+
     /// Copy the reachable object graph into an envelope owned by the receiver.
     pub fn copy_from(term: Term) -> Result<Self, VmError> {
         if !term.is_pointer() {
@@ -371,6 +382,7 @@ impl Message {
                 term,
                 fragment: None,
                 priority: false,
+                timer_id: None,
             });
         }
         // Port of erts/emulator/beam/erl_message.c:824 (erts_send_message),
@@ -382,6 +394,7 @@ impl Message {
                 term,
                 fragment: None,
                 priority: false,
+                timer_id: None,
             });
         }
         let mut fragment = ProcessHeap::with_words(words);
@@ -394,6 +407,7 @@ impl Message {
                 seq_token: None,
             })),
             priority: false,
+            timer_id: None,
         })
     }
 
@@ -428,6 +442,7 @@ impl Message {
                 seq_token: None,
             })),
             priority: false,
+            timer_id: None,
         })
     }
 
@@ -450,6 +465,11 @@ impl Message {
     /// Mark this envelope for priority insertion at the receiver.
     pub(crate) fn with_priority(mut self) -> Self {
         self.priority = true;
+        self
+    }
+
+    pub(crate) fn with_timer_id(mut self, id: u64) -> Self {
+        self.timer_id = Some(id);
         self
     }
 
@@ -639,6 +659,7 @@ pub(crate) struct Runtime {
     pub(crate) port_names: Mutex<HashMap<String, u64>>,
     aliases: AliasTable,
     pub(crate) timers: Mutex<HashMap<u64, arinsal_sched::TimerRef>>,
+    pub(crate) timer_owners: Mutex<HashMap<u64, Pid>>,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
     pub(crate) system_monitor_flags: AtomicU8,
@@ -657,6 +678,39 @@ pub(crate) struct Runtime {
     pub(crate) ever_hibernated: AtomicBool,
     pub(crate) max_heaps: Mutex<HashMap<Pid, MaxHeap>>,
     pub(crate) ever_max_heap: AtomicBool,
+    pub(crate) debug_wait_active: AtomicBool,
+}
+
+impl Runtime {
+    pub(crate) fn cancel_owned_timers(&self, owner: Pid) {
+        let ids = {
+            let mut owners = self.timer_owners.lock().unwrap();
+            let ids = owners
+                .iter()
+                .filter_map(|(&id, &timer_owner)| (timer_owner == owner).then_some(id))
+                .collect::<Vec<_>>();
+            for id in &ids {
+                owners.remove(id);
+            }
+            ids
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let timers = {
+            let mut timers = self.timers.lock().unwrap();
+            ids.iter()
+                .filter_map(|id| timers.remove(id))
+                .collect::<Vec<_>>()
+        };
+        if let Ok(scheduler) = self.scheduler() {
+            for timer in timers {
+                // Port of erts/emulator/beam/erl_hl_timer.c (erts_cancel_bif_timers), OTP-29.1.1:
+                // the owning scheduler's wheel is asked asynchronously.
+                scheduler.cancel_timer_async(timer, |_| {});
+            }
+        }
+    }
 }
 
 /// Status another process can read while this one is not running.
@@ -2406,6 +2460,19 @@ impl Process {
             .map_err(|error| VmError::Unsupported(format!("signal tuple: {error:?}")))
     }
 
+    fn retire_timer_reference(&self, reference: arinsal_sched::TimerRef) -> Option<u64> {
+        let runtime = self.runtime.as_ref()?;
+        let mut timers = runtime.timers.lock().unwrap();
+        let id = timers
+            .iter()
+            .find_map(|(&id, &timer)| (timer == reference).then_some(id));
+        if let Some(id) = id {
+            timers.remove(&id);
+            runtime.timer_owners.lock().unwrap().remove(&id);
+        }
+        id
+    }
+
     fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.final_exit_reason = Some(reason);
         crate::trace::emit(
@@ -2425,6 +2492,7 @@ impl Process {
         // g_proc_sched: a terminating suspender releases every suspend it acquired.
         // g_port_fix: close owned ports synchronously on the termination path.
         if let Some(runtime) = self.runtime.clone() {
+            runtime.cancel_owned_timers(ctx.pid());
             crate::node_tables::lock().forget_node_monitors(ctx.pid());
             let wake = runtime.release_suspender(ctx.pid());
             for pid in wake {
@@ -2768,6 +2836,25 @@ impl Process {
                         self.priority_item_inserted(old_prio_len, priority_term)?;
                     }
                 }
+                Payload::TimerMessage { reference, message } => {
+                    self.retire_timer_reference(reference);
+                    let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
+                    let priority = message.is_priority();
+                    let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+                    let new_prio_len =
+                        self.inbox
+                            .push_message(message, data, &mut self.heap, old_prio_len)?;
+                    self.cold_mut().prio_len = new_prio_len;
+                    if priority {
+                        let priority_term =
+                            self.inbox.get(old_prio_len).copied().ok_or_else(|| {
+                                VmError::Unsupported(
+                                    "priority message missing after insertion".into(),
+                                )
+                            })?;
+                        self.priority_item_inserted(old_prio_len, priority_term)?;
+                    }
+                }
                 Payload::Signal(arinsal_sched::Signal::Link) => {
                     self.cold_mut().links.insert(from);
                 }
@@ -2850,21 +2937,10 @@ impl Process {
                     self.deliver_monitor_down(from, reference, reason)?;
                 }
                 Payload::Timer { reference, message } => {
+                    let timer_id = message.timer_id;
                     let term = message.into_receiver(self)?;
-                    let runtime = self
-                        .runtime
-                        .as_ref()
-                        .ok_or_else(|| VmError::Unsupported("timer without runtime".into()))?;
-                    let id = {
-                        let mut timers = runtime.timers.lock().unwrap();
-                        let id = timers
-                            .iter()
-                            .find_map(|(&id, &timer)| (timer == reference).then_some(id));
-                        if let Some(id) = id {
-                            timers.remove(&id);
-                        }
-                        id.unwrap_or(reference.id())
-                    };
+                    let retired = self.retire_timer_reference(reference);
+                    let id = timer_id.or(retired).unwrap_or(reference.id());
                     let reference = crate::signals::reference(self, id)?;
                     let tuple = self.tuple(&[crate::signals::atom("timeout"), reference, term])?;
                     self.inbox.push_back(tuple);
@@ -3196,6 +3272,16 @@ impl Process {
                 .1
                 .run(self, ctx, budget)
         });
+        let result = if self
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.debug_wait_completion.as_ref())
+            .is_some_and(|completed| !completed.load(Ordering::Acquire))
+        {
+            Ok(RunState::Wait { timeout_ms: None })
+        } else {
+            result
+        };
         if matches!(&result, Ok(RunState::Wait { .. } | RunState::Done(_)))
             && self.cold_mut().profile_active
         {
@@ -3359,6 +3445,7 @@ impl Vm {
             port_names: Mutex::new(HashMap::new()),
             aliases: AliasTable::new(),
             timers: Mutex::new(HashMap::new()),
+            timer_owners: Mutex::new(HashMap::new()),
             ports: Mutex::new(HashMap::new()),
             system_monitor: Mutex::new(None),
             system_monitor_flags: AtomicU8::new(0),
@@ -3376,6 +3463,7 @@ impl Vm {
             ever_hibernated: AtomicBool::new(false),
             max_heaps: Mutex::new(HashMap::new()),
             ever_max_heap: AtomicBool::new(false),
+            debug_wait_active: AtomicBool::new(false),
         });
         let config = Config {
             workers,

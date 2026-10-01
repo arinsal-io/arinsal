@@ -109,6 +109,10 @@ fn scaled(ctx: &mut Ctx<'_>, value: i128, args: &[Term]) -> Result<Term, BifErro
         .map_err(|_| BifError::SystemLimit)
 }
 
+pub fn monotonic_time_milliseconds() -> i128 {
+    mono_nanos().div_euclid(1_000_000)
+}
+
 fn mono_nanos() -> i128 {
     let start = START.get_or_init(Instant::now);
     -(1_i128 << 59) + start.elapsed().as_nanos() as i128

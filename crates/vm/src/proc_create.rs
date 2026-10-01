@@ -93,6 +93,8 @@ unsafe impl Send for Process {}
 const _: () = assert!(std::mem::offset_of!(Process, header) == 0);
 #[derive(Default)]
 pub(crate) struct ProcessCold {
+    /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
+    pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this process currently has a runnable profile activation.
     pub(crate) profile_active: bool,
     /// Number of priority messages at the front of the private mailbox.

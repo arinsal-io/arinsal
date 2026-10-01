@@ -28,6 +28,7 @@ mod time;
 mod unicode;
 
 pub use pure::next_ref_id;
+pub use time::monotonic_time_milliseconds;
 
 pub use time::initialize_time_origin;
 

@@ -1764,6 +1764,58 @@ fn internal_state_get(
     }
 }
 
+/// One scheduler-wide round of `erts_debug:set_internal_state(wait, _)`.
+///
+/// Port of erts/emulator/beam/erl_process.c:2372-2530 (init_thr_debug_wait_completed,
+/// later_thr_debug_wait_completed, setup_thr_debug_wait_completed, thr_debug_wait_completed),
+/// OTP-29.1.1. erts flushes later-ops on every scheduler, waits for thread progress, sets up
+/// the wait flags on every scheduler and finally lets each scheduler run the flagged work (which
+/// drains its delayed deallocations and canceled timers first); the last scheduler resumes the
+/// waiter. Each phase needs every scheduler to reach its aux-work point, so a phase is one round.
+fn debug_wait_round(
+    owner: std::sync::Weak<crate::process::Runtime>,
+    schedulers: usize,
+    pid: arinsal_sched::Pid,
+    completion: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rounds_left: u32,
+    request: &mut dyn FnMut(Box<dyn Fn(usize) + Send + Sync>),
+) {
+    let remaining = std::sync::atomic::AtomicUsize::new(schedulers);
+    request(Box::new(move |_worker| {
+        if remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let Some(runtime) = owner.upgrade() else {
+            return;
+        };
+        let Ok(scheduler) = runtime.scheduler() else {
+            return;
+        };
+        if rounds_left > 1 {
+            let next = scheduler.clone();
+            debug_wait_round(
+                owner.clone(),
+                schedulers,
+                pid,
+                completion.clone(),
+                rounds_left - 1,
+                &mut |work| next.request_aux_work_all(work),
+            );
+            return;
+        }
+        completion.store(true, Ordering::Release);
+        runtime.debug_wait_active.store(false, Ordering::Release);
+        // The waiter may not have reached WAITING yet; keep trying until it either resumes
+        // (dropping its latch handle) or exits.
+        while std::sync::Arc::strong_count(&completion) > 1
+            && scheduler.lookup(pid)
+            && !scheduler.wake(pid)
+        {
+            std::thread::yield_now();
+        }
+    }));
+}
+
 /// Port of erts/emulator/beam/erl_bif_info.c:5036-5500, OTP-29.1.1.
 fn internal_state_set(
     process: &mut Process,
@@ -1780,6 +1832,47 @@ fn internal_state_set(
     }
     if !INTERNAL_STATE.load(Ordering::Relaxed) {
         return Err(undef());
+    }
+    if arg_name(selector).as_deref() == Some("wait") {
+        let kind = arg_name(value).ok_or_else(badarg)?;
+        if !matches!(
+            kind.as_str(),
+            "deallocations" | "timer_cancellations" | "aux_work" | "thread_progress"
+        ) {
+            return Err(badarg());
+        }
+        let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
+        if let Some(completion) = process.cold_mut().debug_wait_completion.clone() {
+            if completion.load(Ordering::Acquire) {
+                process.cold_mut().debug_wait_completion = None;
+                runtime.debug_wait_active.store(false, Ordering::Release);
+                return Ok(atom("ok"));
+            }
+            process.force_yield = true;
+            return Ok(atom("ok"));
+        }
+        // Port of erts/emulator/beam/erl_process.c:2499 (erts_debug_wait_completed): only one
+        // process at a time can wait.
+        if runtime
+            .debug_wait_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+        }
+        let completion = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        process.cold_mut().debug_wait_completion = Some(completion.clone());
+        let rounds = if kind == "aux_work" { 1 } else { 4 };
+        debug_wait_round(
+            std::sync::Arc::downgrade(&runtime),
+            ctx.scheduler_count(),
+            ctx.pid(),
+            completion,
+            rounds,
+            &mut |work| ctx.request_aux_work_all(work),
+        );
+        process.force_yield = true;
+        return Ok(atom("ok"));
     }
     match arg_name(selector).as_deref() {
         Some("reds_left") => {

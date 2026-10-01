@@ -1,6 +1,7 @@
 //! Scheduler-local timer wheel and long timer index.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::SyncSender;
 
@@ -395,6 +396,11 @@ pub struct TimerRef {
 }
 
 impl TimerRef {
+    /// One-based scheduler that owns this timer's wheel.
+    pub fn worker_id(self) -> usize {
+        self.worker + 1
+    }
+
     /// Stable numeric identity for the VM's reference representation.
     pub fn id(self) -> u64 {
         self.id
@@ -404,6 +410,7 @@ impl TimerRef {
 /// Work emitted when a timer expires.
 pub(crate) enum TimerPayload<M> {
     Message(Pid, M, bool),
+    ResolvedMessage(Arc<dyn Fn() -> Option<Pid> + Send + Sync>, M, bool),
     Wake(Pid, u64),
     /// Runtime callback owned by a process (erts `erts_start_timer_callback`).
     Callback(Pid, crate::TimerCallback<M>),
@@ -418,13 +425,19 @@ pub(crate) enum TimerCommand<M> {
     },
     Read {
         id: u64,
-        reply: SyncSender<Option<u64>>,
+        reply: Option<SyncSender<Option<u64>>>,
+        callback: Option<Box<dyn FnOnce(Option<u64>) + Send>>,
+    },
+    Cancel {
+        id: u64,
+        callback: Box<dyn FnOnce(Option<u64>) + Send>,
     },
 }
 
 pub(crate) struct CanceledTimer {
     pub(crate) id: u64,
     pub(crate) reply: Option<SyncSender<Option<u64>>>,
+    pub(crate) callback: Option<Box<dyn FnOnce(Option<u64>) + Send>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -627,6 +640,10 @@ impl<M> Wheel<M> {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:2210-2248, OTP-29.1.1.
     pub(crate) fn cancel(&mut self, id: u64) -> Option<(u64, TimerPayload<M>)> {
+        self.cancel_at(id, self.now)
+    }
+
+    pub(crate) fn cancel_at(&mut self, id: u64, now: u64) -> Option<(u64, TimerPayload<M>)> {
         // Port of erts/emulator/beam/time.c:1311-1324, OTP-29.1.1.
         let entry = self.detach(id)?;
         if entry
@@ -641,15 +658,19 @@ impl<M> Wheel<M> {
         {
             return None;
         }
-        Some((entry.deadline.saturating_sub(self.now), entry.payload))
+        Some((entry.deadline.saturating_sub(now), entry.payload))
     }
 
-    // Port of erts/emulator/beam/erl_hl_timer.c:2013-2050, OTP-29.1.1.
+    #[cfg(test)]
     pub(crate) fn remaining(&self, id: u64) -> Option<u64> {
+        self.remaining_at(id, self.now)
+    }
+
+    pub(crate) fn remaining_at(&self, id: u64, now: u64) -> Option<u64> {
         // Port of erts/emulator/beam/erl_hl_timer.c:2013-2042, OTP-29.1.1.
         self.entries
             .get(&id)
-            .map(|entry| entry.deadline.saturating_sub(self.now))
+            .map(|entry| entry.deadline.saturating_sub(now))
     }
 
     // Port of erts/emulator/beam/time.c:1270-1291, OTP-29.1.1.

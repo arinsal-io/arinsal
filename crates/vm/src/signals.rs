@@ -2,6 +2,7 @@
 
 use crate::process::{Message, Runtime};
 use crate::{Process, Vm, VmError};
+use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx, Signal};
 use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, copy_term, global_atoms, to_owned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -565,7 +566,8 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
     Ok(opts)
 }
 
-fn timer_start_options(term: Term) -> Result<(), VmError> {
+fn timer_start_options(term: Term) -> Result<bool, VmError> {
+    let mut absolute = false;
     for option in list(term).ok_or_else(|| badarg("timer options"))? {
         // SAFETY: The option term remains in the caller's live heap.
         let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg("timer options"))?;
@@ -574,13 +576,11 @@ fn timer_start_options(term: Term) -> Result<(), VmError> {
         }
         match tuple.get(1) {
             Some(value) if value == atom("false") => {}
-            Some(value) if value == atom("true") => {
-                return Err(VmError::Unsupported("absolute timers".into()));
-            }
+            Some(value) if value == atom("true") => absolute = true,
             _ => return Err(badarg("timer options")),
         }
     }
-    Ok(())
+    Ok(absolute)
 }
 
 #[derive(Clone, Copy)]
@@ -1810,25 +1810,74 @@ fn call_resolved(
         | (SignalBif::SendAfter4, [time, target, message, _])
         | (SignalBif::StartTimer3, [time, target, message])
         | (SignalBif::StartTimer4, [time, target, message, _]) => {
-            if let Some(options) = args.get(3) {
-                timer_start_options(*options)?;
-            }
-            let ms = time
-                .as_small()
-                .filter(|&time| time >= 0)
-                .ok_or_else(|| badarg("timer/3"))? as u64;
-            let pid = Pid::from_term(*target).ok_or_else(|| badarg("timer/3"))?;
+            let absolute = args
+                .get(3)
+                .map(|options| timer_start_options(*options))
+                .transpose()?
+                .unwrap_or(false);
+            let time = time.as_small().ok_or_else(|| badarg("timer/3"))?;
+            let ms = if absolute {
+                let now = arinsal_bifs::monotonic_time_milliseconds();
+                (i128::from(time) - now).clamp(0, i128::from(u64::MAX)) as u64
+            } else {
+                u64::try_from(time).map_err(|_| badarg("timer/3"))?
+            };
+            let pid = Pid::from_term(*target);
+            let registered_name = if pid.is_none() {
+                Some(
+                    atom_name(*target)
+                        .ok_or_else(|| badarg("timer/3"))?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
             let rt = process.runtime.clone().ok_or_else(|| badarg("timer/3"))?;
             let id = rt.next_ref();
-            let message = Message::copy_from(*message)?;
-            let scheduler = rt.scheduler()?;
+            let mut message = Message::copy_from(*message)?;
+            if matches!(entry, SignalBif::StartTimer3 | SignalBif::StartTimer4) {
+                message = message.with_timer_id(id);
+            }
+            // Port of erts/emulator/beam/erl_hl_timer.c (setup_bif_timer), OTP-29.1.1: a timer for a
+            // process that does not exist is never created.
+            if let Some(pid) = pid
+                && !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid))
+            {
+                return reference(process, id);
+            }
             let timer = if matches!(entry, SignalBif::SendAfter3 | SignalBif::SendAfter4) {
-                scheduler.send_after(pid, ms, message)
+                if let Some(pid) = pid {
+                    ctx.schedule_timer(pid, ms, message, false)
+                } else {
+                    let runtime = rt.clone();
+                    let name = registered_name.expect("resolved timer name");
+                    ctx.schedule_resolved_timer(ms, message, false, move || {
+                        runtime.names.lock().unwrap().get(&name).copied()
+                    })
+                }
             } else {
-                scheduler.start_timer(pid, ms, message)
+                if let Some(pid) = pid {
+                    ctx.schedule_timer(pid, ms, message, true)
+                } else {
+                    let runtime = rt.clone();
+                    let name = registered_name.expect("resolved timer name");
+                    ctx.schedule_resolved_timer(ms, message, true, move || {
+                        runtime.names.lock().unwrap().get(&name).copied()
+                    })
+                }
             }
             .map_err(|error| VmError::Unsupported(format!("timer: {error}")))?;
             rt.timers.lock().unwrap().insert(id, timer);
+            // The timer belongs to its receiving process (erts keeps it in the receiver's
+            // bif-timer tree) and is cancelled when that process exits; name-addressed timers
+            // have no owner.
+            if let Some(pid) = pid {
+                rt.timer_owners.lock().unwrap().insert(id, pid);
+                if !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid)) {
+                    // The receiver exited meanwhile; its exit may already have swept its timers.
+                    rt.cancel_owned_timers(pid);
+                }
+            }
             reference(process, id)
         }
         (SignalBif::CancelTimer1, [reference]) | (SignalBif::CancelTimer2, [reference, _]) => {
@@ -1842,6 +1891,63 @@ fn call_resolved(
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("cancel_timer/1"))?;
             let rt = runtime(process)?;
+            if options.asynchronous {
+                let timer = rt.timers.lock().unwrap().get(&id).copied();
+                if options.info {
+                    let reference = arinsal_term::to_owned(*reference).map_err(|error| {
+                        VmError::Unsupported(format!("timer reference snapshot: {error:?}"))
+                    })?;
+                    if let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) {
+                        let target = ctx.pid();
+                        let reply_scheduler = scheduler.clone();
+                        let runtime = process.runtime.as_ref().unwrap().clone();
+                        scheduler.cancel_timer_async(timer, move |remaining| {
+                            runtime.timer_owners.lock().unwrap().remove(&id);
+                            runtime.timers.lock().unwrap().remove(&id);
+                            let value = remaining.map_or_else(
+                                || OwnedTerm::atom("false"),
+                                |ms| {
+                                    if let Ok(value) = i64::try_from(ms) {
+                                        OwnedTerm::Int(value)
+                                    } else {
+                                        OwnedTerm::BigInt(num_bigint::BigInt::from(ms))
+                                    }
+                                },
+                            );
+                            let term = OwnedTerm::Tuple(vec![
+                                OwnedTerm::atom("cancel_timer"),
+                                reference,
+                                value,
+                            ]);
+                            if let Ok(message) = Message::from_owned(&term) {
+                                let _ = reply_scheduler.send(target, target, message);
+                            }
+                        });
+                    } else {
+                        rt.timer_owners.lock().unwrap().remove(&id);
+                        rt.timers.lock().unwrap().remove(&id);
+                        let term = OwnedTerm::Tuple(vec![
+                            OwnedTerm::atom("cancel_timer"),
+                            reference,
+                            OwnedTerm::atom("false"),
+                        ]);
+                        if let Ok(message) = Message::from_owned(&term) {
+                            let _ = ctx.send(ctx.pid(), message);
+                        }
+                    }
+                } else if let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) {
+                    let runtime = process.runtime.as_ref().unwrap().clone();
+                    scheduler.cancel_timer_async(timer, move |_| {
+                        runtime.timer_owners.lock().unwrap().remove(&id);
+                        runtime.timers.lock().unwrap().remove(&id);
+                    });
+                } else {
+                    rt.timer_owners.lock().unwrap().remove(&id);
+                    rt.timers.lock().unwrap().remove(&id);
+                }
+                return Ok(atom("ok"));
+            }
+            rt.timer_owners.lock().unwrap().remove(&id);
             let timer = rt.timers.lock().unwrap().remove(&id);
             let remaining = timer.and_then(|timer| rt.scheduler().ok()?.cancel_timer(timer));
             timer_query_result(process, ctx, *reference, remaining, true, options)
@@ -1858,6 +1964,42 @@ fn call_resolved(
             let id = ref_id(*reference).ok_or_else(|| badarg("read_timer/1"))?;
             let rt = runtime(process)?;
             let timer = rt.timers.lock().unwrap().get(&id).copied();
+            if options.asynchronous {
+                let reference = arinsal_term::to_owned(*reference).map_err(|error| {
+                    VmError::Unsupported(format!("timer reference snapshot: {error:?}"))
+                })?;
+                if let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) {
+                    let target = ctx.pid();
+                    let reply_scheduler = scheduler.clone();
+                    scheduler.read_timer_async(timer, move |remaining| {
+                        let value = remaining.map_or_else(
+                            || OwnedTerm::atom("false"),
+                            |ms| {
+                                if let Ok(value) = i64::try_from(ms) {
+                                    OwnedTerm::Int(value)
+                                } else {
+                                    OwnedTerm::BigInt(num_bigint::BigInt::from(ms))
+                                }
+                            },
+                        );
+                        let term =
+                            OwnedTerm::Tuple(vec![OwnedTerm::atom("read_timer"), reference, value]);
+                        if let Ok(message) = Message::from_owned(&term) {
+                            let _ = reply_scheduler.send(target, target, message);
+                        }
+                    });
+                } else {
+                    let term = OwnedTerm::Tuple(vec![
+                        OwnedTerm::atom("read_timer"),
+                        reference,
+                        OwnedTerm::atom("false"),
+                    ]);
+                    if let Ok(message) = Message::from_owned(&term) {
+                        let _ = ctx.send(ctx.pid(), message);
+                    }
+                }
+                return Ok(atom("ok"));
+            }
             let remaining = timer.and_then(|timer| rt.scheduler().ok()?.read_timer(timer));
             timer_query_result(process, ctx, *reference, remaining, false, options)
         }

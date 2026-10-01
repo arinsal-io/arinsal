@@ -213,6 +213,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("persistent_term", "erase", 1),
     ("persistent_term", "info", 0),
     ("erts_internal", "erase_persistent_terms", 0),
+    ("erts_internal", "no_aux_work_threads", 0),
     ("erlang", "nodes", 0),
     ("erlang", "display", 1),
     ("erlang", "display_string", 2),
@@ -244,12 +245,23 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
         ("erlang", "statistics", 1) => Some(call_statistics),
         ("erlang", "bump_reductions", 1) => Some(call_bump_reductions),
         ("erts_internal", "garbage_collect", 1) => Some(call_garbage_collect),
+        ("erts_internal", "no_aux_work_threads", 0) => Some(call_no_aux_work_threads),
         ("erlang", "system_flag", 2) => Some(call_system_flag),
         ("erts_internal", "scheduler_wall_time", 1) => Some(call_scheduler_wall_time),
         ("erlang", "dt_spread_tag", 1) => Some(call_dt_spread_tag),
         ("erlang", "dt_restore_tag", 1) => Some(call_dt_restore_tag),
         _ => None,
     }
+}
+
+/// Port of erts/emulator/beam/erl_process.c:9234 (no_aux_work_threads/0), OTP-29.1.1.
+fn call_no_aux_work_threads(
+    _vm: &mut Vm,
+    _process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    _args: &[Term],
+) -> Result<Term, VmError> {
+    non_neg(_process, ctx.scheduler_count().saturating_add(1) as u64)
 }
 
 fn call_nodes0(
