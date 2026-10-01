@@ -190,7 +190,7 @@ fn safe_fixtable_iteration() {
         let item = object(&mut heap, key, key);
         registry.get_mut(tid).unwrap().insert(&[item]).unwrap();
     }
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     table.safe_fixtable(true).unwrap();
     for key in 0..16 {
         let key = Term::small(key).unwrap();

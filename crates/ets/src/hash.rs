@@ -158,10 +158,11 @@ pub(super) struct HashStorage {
 impl HashStorage {
     /// Port of erts/emulator/beam/erl_db_hash.c:1007-1018, OTP-29.1.1.
     pub(super) fn new(write_concurrency: WriteConcurrency) -> Self {
-        let locks = if write_concurrency == WriteConcurrency::Disabled {
-            1
-        } else {
-            64
+        let locks = match write_concurrency {
+            WriteConcurrency::Disabled => 1,
+            WriteConcurrency::Enabled => 64,
+            WriteConcurrency::Auto => 64,
+            WriteConcurrency::Fixed(count) => count,
         };
         Self {
             segments: vec![Box::new(Segment::first())],
@@ -392,6 +393,24 @@ impl HashStorage {
         count
     }
 
+    /// Replace live objects in place, keeping their bucket position and insertion order.
+    pub(super) fn replace_each(
+        &mut self,
+        mut replace: impl FnMut(&StoredTerm) -> Result<Option<StoredTerm>, EtsError>,
+    ) -> Result<usize, EtsError> {
+        let mut count = 0;
+        for object in self.values_mut() {
+            if let Some(mut replacement) = replace(object)? {
+                replacement.order = object.order;
+                replacement.group_order = object.group_order;
+                replacement.hvalue = object.hvalue;
+                *object = replacement;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     fn values_mut(&mut self) -> impl Iterator<Item = &mut StoredTerm> {
         self.segments
             .iter_mut()
@@ -449,10 +468,37 @@ impl HashStorage {
         objects
     }
 
-    pub(super) fn ordered_with_deleted(&self, keypos: usize) -> Vec<&StoredTerm> {
-        let mut objects: Vec<_> = self.values().chain(&self.deleted).collect();
-        self.sort_ordered(&mut objects, keypos);
+    /// Objects of one slot in traversal order, optionally with fixed-table pseudo-deleted ones.
+    ///
+    /// Port of erts/emulator/beam/erl_db_hash.c:4196-4231 (db_next_hash), OTP-29.1.1: a
+    /// traversal step only walks the key's own bucket and the following buckets, never the
+    /// whole table.
+    pub(super) fn slot_ordered(&self, slot: usize, with_deleted: bool) -> Vec<&StoredTerm> {
+        let mut objects: Vec<&StoredTerm> = HashIter {
+            next: self.segment_bucket(slot).head.as_deref(),
+        }
+        .map(|node| &node.object)
+        .collect();
+        if with_deleted {
+            objects.extend(
+                self.deleted
+                    .iter()
+                    .filter(|object| self.slot_index(object.hvalue) == slot),
+            );
+        }
+        objects.sort_unstable_by_key(|object| (object.group_order, u64::MAX - object.order));
         objects
+    }
+
+    /// First live object of the first non-empty slot at or after `slot`, in traversal order.
+    pub(super) fn first_from_slot(&self, slot: usize) -> Option<&StoredTerm> {
+        (slot..self.nactive).find_map(|slot| {
+            HashIter {
+                next: self.segment_bucket(slot).head.as_deref(),
+            }
+            .map(|node| &node.object)
+            .min_by_key(|object| (object.group_order, u64::MAX - object.order))
+        })
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:1990-2010, OTP-29.1.1.
@@ -705,6 +751,7 @@ impl ConcurrentHashStorage {
             WriteConcurrency::Disabled => 1,
             WriteConcurrency::Enabled => LOCK_COUNT,
             WriteConcurrency::Auto => AUTO_MIN_LOCK_COUNT,
+            WriteConcurrency::Fixed(count) => count,
         };
         Self {
             locks: if write_concurrency == WriteConcurrency::Auto {

@@ -9,8 +9,8 @@ use tree::Node;
 
 use arinsal_term::{
     Atom, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, Identity, Node as TermNode, Term,
-    TermBuilder, TermError, VecHeap, WritableBinary, cmp, copy_term, exact_eq, global_atoms,
-    internal_hash, term_sequence,
+    TermBuilder, TermError, TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq,
+    global_atoms, internal_hash, term_sequence,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -54,13 +54,8 @@ impl Tid {
 
     /// Decode a handle produced by `to_term`.
     pub fn from_term(term: Term) -> Option<Self> {
-        if term.header().is_none_or(|header| header & 63 != 16) {
-            return None;
-        }
-        match term.identity()? {
-            Identity::Ref { ids, .. } if ids.len() == 3 && ids[0] == 0x4554_5329 => {
-                Some(Self(ids[1] as u64 | ((ids[2] as u64) << 32)))
-            }
+        match term.local_ref_numbers()? {
+            [0x4554_5329, low, high] => Some(Self(low as u64 | ((high as u64) << 32))),
             _ => None,
         }
     }
@@ -99,6 +94,8 @@ pub enum WriteConcurrency {
     Enabled,
     /// OTP `auto` tuning requested.
     Auto,
+    /// OTP debug-only fixed hash lock count.
+    Fixed(usize),
 }
 
 /// Heir data held until the VM transfers a table on owner death.
@@ -108,6 +105,9 @@ pub struct Heir {
     pub pid: Term,
     /// Data copied by the VM when ownership changes.
     pub data: Term,
+    /// `{heir, Pid, Data}` sends `'ETS-TRANSFER'`; `{heir, Pid}` keeps erts'
+    /// non-value heir data and transfers silently (erl_db.c:2670-2686, :4919-4929).
+    pub transfer: bool,
 }
 
 /// Validated table creation options.
@@ -142,6 +142,9 @@ pub struct TableOptions {
 pub enum EtsError {
     /// Invalid argument, object, key, or option.
     BadArg,
+    /// `badarg` with extended error information: the `cause` erts stores in
+    /// `p->fvalue` (`EXI_*` in erts/emulator/beam/erl_db.c:53-63, OTP-29.1.1).
+    BadArgCause(&'static str),
     /// No table has this identity.
     NoTable,
     /// The name is already registered.
@@ -654,6 +657,8 @@ fn ets_external_atoms(bytes: &[u8], compress: bool) -> Result<Vec<u8>, EtsError>
                         .try_into()
                         .map_err(|_| EtsError::BadArg)?,
                 ) as usize;
+                // NEW_FUN_EXT carries the creator PID before its free variables.
+                walk(bytes, pos, out, compress)?;
                 for _ in 0..free_count {
                     walk(bytes, pos, out, compress)?;
                 }
@@ -845,7 +850,10 @@ impl StoredTerm {
             let tuple = term_sequence(term).ok_or(EtsError::BadArg)?;
             let mut elements = Vec::with_capacity(tuple.len());
             for (index, element) in tuple.into_iter().enumerate() {
-                if index != keypos - 1 && element.is_pointer() {
+                if index != keypos - 1
+                    && element.is_pointer()
+                    && element.classify() != TermKind::Bitstring
+                {
                     let owned = arinsal_term::to_owned(element)?;
                     let ext = arinsal_etf::encode(&owned, arinsal_etf::EncodeOptions::default());
                     let mut ext = ets_external_atoms(&ext, true)?;
@@ -854,6 +862,9 @@ impl StoredTerm {
                     compressed_elements.push(Some(ext));
                     elements.push(Term::NIL);
                 } else {
+                    // Port of erts/emulator/beam/erl_db_util.c:3490-3501,
+                    // OTP-29.1.1: ETS external encoding keeps binary refs on
+                    // the object's off-heap chain.
                     compressed_elements.push(None);
                     elements.push(copy_term(element, &mut heap)?);
                 }
@@ -918,6 +929,13 @@ impl StoredTerm {
         }
     }
 
+    fn arity(&self) -> usize {
+        self.inline_pair.map_or_else(
+            || term_sequence(self.term).map_or(0, |tuple| tuple.len()),
+            |_| 2,
+        )
+    }
+
     pub(crate) fn key(&self, keypos: usize) -> Term {
         if let Some(pair) = self.inline_pair {
             return pair[keypos - 1];
@@ -934,7 +952,11 @@ impl StoredTerm {
         unsafe { self.term.tuple_ref() }.and_then(|tuple| tuple.get(index))
     }
 
-    fn copy_element_out<H: HeapAlloc>(&self, index: usize, dst: &mut H) -> Result<Term, EtsError> {
+    pub(crate) fn copy_element_out<H: HeapAlloc>(
+        &self,
+        index: usize,
+        dst: &mut H,
+    ) -> Result<Term, EtsError> {
         if let Some(bytes) = self.compressed_elements.get(index).and_then(Option::as_ref) {
             let mut ext = Vec::with_capacity(bytes.len() + 1);
             ext.push(131);
@@ -1105,6 +1127,23 @@ impl StoredTerm {
             terms.push(builder.tuple(&[address, size, refc])?);
         }
         Ok(terms)
+    }
+
+    fn binary_refs(&self) -> Vec<(usize, usize)> {
+        let Some(off_heap) = self.heap.off_heap.as_ref() else {
+            return Vec::new();
+        };
+        off_heap
+            .binaries
+            .iter()
+            .map(|binary| (Arc::as_ptr(binary) as usize, binary.len()))
+            .chain(
+                off_heap
+                    .writable
+                    .iter()
+                    .map(|binary| (Arc::as_ptr(binary) as usize, binary.len())),
+            )
+            .collect()
     }
 
     fn term_for_match<H: HeapAlloc>(&self, scratch: &mut H) -> Result<Term, EtsError> {
@@ -1481,15 +1520,14 @@ enum Matched<'a> {
 
 impl Matched<'_> {
     fn tuple_len(&self) -> Option<usize> {
-        if let Self::Borrowed(object) = self
-            && object.inline_pair.is_some()
-        {
+        let object = match self {
+            Self::Borrowed(object) => object,
+            Self::Owned(object) => object,
+        };
+        if object.inline_pair.is_some() {
             return Some(2);
         }
-        match self {
-            Self::Borrowed(object) => term_sequence(object.term).map(|tuple| tuple.len()),
-            Self::Owned(object) => term_sequence(object.term).map(|tuple| tuple.len()),
-        }
+        term_sequence(object.term).map(|tuple| tuple.len())
     }
 
     fn copy_element_out<H: HeapAlloc>(&self, index: usize, dst: &mut H) -> Result<Term, EtsError> {
@@ -1569,6 +1607,7 @@ pub struct Table {
     /// Creation options and owner metadata.
     pub options: TableOptions,
     storage: Storage,
+    max_arity: usize,
     fixed: usize,
     fixed_system_time: Option<StoredTerm>,
     fixed_monotonic_time: Option<StoredTerm>,
@@ -1602,6 +1641,7 @@ impl Table {
             tid,
             options,
             storage,
+            max_arity: 0,
             fixed: 0,
             fixed_system_time: None,
             fixed_monotonic_time: None,
@@ -1780,10 +1820,18 @@ impl Table {
             "node" => Ok(copy_term(node, dst)?),
             "named_table" => Ok(bool_term(self.options.named_table)),
             "read_concurrency" => Ok(bool_term(self.options.read_concurrency)),
+            "write_concurrency" if self.options.protection == Protection::Private => {
+                Ok(atom("false"))
+            }
             "write_concurrency" => Ok(match self.options.write_concurrency {
                 WriteConcurrency::Disabled => atom("false"),
                 WriteConcurrency::Enabled => atom("true"),
                 WriteConcurrency::Auto => atom("auto"),
+                WriteConcurrency::Fixed(count) => {
+                    let count = int_term(count, dst)?;
+                    TermBuilder::new(dst)
+                        .tuple(&[atom("debug_hash_fixed_number_of_locks"), count])?
+                }
             }),
             "decentralized_counters" => Ok(bool_term(self.options.decentralized_counters)),
             "compressed" => Ok(bool_term(self.options.compressed)),
@@ -1959,19 +2007,12 @@ impl Table {
     }
 
     fn put(&mut self, object: StoredTerm) {
-        if let Storage::Ordered(root) = &mut self.storage {
-            *root = Some(Node::insert(root.take(), object, self.options.keypos));
-            return;
-        }
-        if let Storage::CATree(tree) = &self.storage {
-            tree.insert(object);
-            return;
-        }
         let hash = ets_hash(object.key(self.options.keypos));
         self.put_hashed(object, hash, false);
     }
 
     fn put_hashed(&mut self, object: StoredTerm, hash: u64, new_only: bool) {
+        self.max_arity = self.max_arity.max(object.arity());
         let keypos = self.options.keypos;
         match &mut self.storage {
             Storage::Ordered(root) => *root = Some(Node::insert(root.take(), object, keypos)),
@@ -2267,7 +2308,8 @@ impl Table {
         }
         let mut found = self.matching(key)?;
         if found.is_empty() {
-            return Err(EtsError::BadArg);
+            // Port of erts/emulator/beam/erl_db.c:2958-2960 (DB_ERROR_BADKEY), OTP-29.1.1.
+            return Err(EtsError::BadArgCause("badkey"));
         }
         // Hash buckets are traversed newest-first; `lookup/2` reverses that
         // order before returning bag entries, and `lookup_element/3` must do
@@ -2279,6 +2321,45 @@ impl Table {
             .into_iter()
             .map(|object| object.copy_element_out(position - 1, dst))
             .collect()
+    }
+
+    /// Copy one element from a set-like table without building an object list.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:2935-2969, OTP-29.1.1.
+    pub fn lookup_element_one<H: HeapAlloc>(
+        &self,
+        key: Term,
+        position: usize,
+        dst: &mut H,
+    ) -> Result<Term, EtsError> {
+        if position == 0 {
+            return Err(EtsError::BadArg);
+        }
+        if position > self.max_arity {
+            return Err(if self.member(key) {
+                EtsError::BadArg
+            } else {
+                EtsError::BadArgCause("badkey")
+            });
+        }
+        match &self.storage {
+            Storage::Hash(storage) => {
+                let hash = ets_hash(key);
+                storage
+                    .objects_hash(hash)
+                    .find(|object| {
+                        object.hvalue == hash >> 1
+                            && exact_eq(object.object.key(self.options.keypos), key)
+                    })
+                    .ok_or(EtsError::BadArgCause("badkey"))?
+                    .object
+                    .copy_element_out(position - 1, dst)
+            }
+            Storage::Ordered(root) => Node::get(root, key, self.options.keypos)
+                .ok_or(EtsError::BadArgCause("badkey"))?
+                .copy_element_out(position - 1, dst),
+            Storage::CATree(tree) => tree.lookup_element(key, position - 1, dst),
+        }
     }
 
     /// Copy tuple element(s), or return a copied default when the key is absent.
@@ -2486,6 +2567,54 @@ impl Table {
         Ok(binaries)
     }
 
+    /// Return ref-counted binary information for every object in the table.
+    ///
+    /// Port of the `ets_info_binary_iter` traversal in `erts/preloaded/src/erts_internal.erl`
+    /// and `erts/emulator/beam/erl_db.c:4648`, OTP-29.1.1.
+    pub fn all_binary_info<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
+        let mut records = Vec::new();
+        if let Storage::Hash(storage) = &self.storage {
+            for object in storage.values() {
+                records.extend(object.binary_refs());
+            }
+            for object in &storage.deleted {
+                records.extend(object.binary_refs());
+            }
+        } else {
+            let mut key = self.raw_first(dst)?;
+            while let Some(current) = key {
+                match &self.storage {
+                    Storage::Ordered(root) => {
+                        if let Some(object) = Node::get(root, current, self.options.keypos) {
+                            records.extend(object.binary_refs());
+                        }
+                    }
+                    Storage::CATree(tree) => {
+                        for object in tree.matching(current)? {
+                            records.extend(object.binary_refs());
+                        }
+                    }
+                    Storage::Hash(_) => unreachable!(),
+                }
+                key = self.raw_next(current, dst)?;
+            }
+        }
+        let mut counts = HashMap::new();
+        for (address, _) in &records {
+            *counts.entry(*address).or_insert(0usize) += 1;
+        }
+        let mut result = Vec::with_capacity(records.len());
+        for (address, size) in records {
+            let count = counts[&address] + 1;
+            let mut builder = TermBuilder::new(dst);
+            let address = builder.int_from_i128(address as i128)?;
+            let size = builder.int_from_i128(size as i128)?;
+            let count = builder.int_from_i128(count as i128)?;
+            result.push(builder.tuple(&[address, size, count])?);
+        }
+        Ok(result)
+    }
+
     /// Return and remove all objects at a key.
     pub fn take<H: HeapAlloc>(&mut self, key: Term, dst: &mut H) -> Result<Vec<Term>, EtsError> {
         let result = self.lookup(key, dst)?;
@@ -2557,9 +2686,8 @@ impl Table {
                     return Ok(None);
                 }
                 let objects = storage
-                    .ordered(self.options.keypos)
+                    .slot_ordered(index, false)
                     .into_iter()
-                    .filter(|object| storage.slot_for_key(object.key(self.options.keypos)) == index)
                     .rev()
                     .map(|object| object.copy_out(dst))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2594,24 +2722,26 @@ impl Table {
         let Storage::Hash(storage) = &self.storage else {
             unreachable!();
         };
-        let ordered = storage.ordered_with_deleted(self.options.keypos);
-        let Some(position) = ordered
+        let keypos = self.options.keypos;
+        let slot = storage.slot_for_key(key);
+        let bucket = storage.slot_ordered(slot, true);
+        let Some(position) = bucket
             .iter()
-            .position(|object| exact_eq(object.key(self.options.keypos), key))
+            .position(|object| exact_eq(object.key(keypos), key))
         else {
             return Err(EtsError::BadArg);
         };
-        ordered
-            .iter()
-            .skip(position + 1)
-            .find(|object| {
-                !exact_eq(object.key(self.options.keypos), key)
-                    && !storage
-                        .deleted
-                        .iter()
-                        .any(|deleted| std::ptr::eq(**object, deleted))
-            })
-            .map(|object| Ok(copy_term(object.key(self.options.keypos), dst)?))
+        let in_bucket = bucket.iter().skip(position + 1).find(|object| {
+            !exact_eq(object.key(keypos), key)
+                && !storage
+                    .deleted
+                    .iter()
+                    .any(|deleted| std::ptr::eq(**object, deleted))
+        });
+        in_bucket
+            .copied()
+            .or_else(|| storage.first_from_slot(slot + 1))
+            .map(|object| Ok(copy_term(object.key(keypos), dst)?))
             .transpose()
     }
 
@@ -2647,8 +2777,7 @@ impl Table {
                 unreachable!();
             };
             return storage
-                .ordered(self.options.keypos)
-                .first()
+                .first_from_slot(0)
                 .map(|object| Ok(copy_term(object.key(self.options.keypos), dst)?))
                 .transpose();
         };
@@ -2712,6 +2841,18 @@ impl Table {
             .into_iter()
             .map(|object| object.copy_out(dst))
             .collect()
+    }
+
+    /// Drop all fixations `pid` holds on this table.
+    pub fn release_fixations(&mut self, pid: Term) {
+        let count = self
+            .fixed_processes
+            .iter()
+            .find(|(owner, _)| exact_eq(owner.raw_term().unwrap(), pid))
+            .map_or(0, |(_, count)| *count);
+        for _ in 0..count {
+            let _ = self.safe_fixtable_for_at(pid, false, Term::NIL, Term::NIL);
+        }
     }
 
     /// Fix or unfix this table on behalf of its owner.
@@ -2821,32 +2962,47 @@ impl Table {
         self.fixed
     }
 
-    /// Apply one or more tuple element replacements to an existing set object.
+    /// Apply tuple element replacements to a set object, or to `default` (with the
+    /// requested key) when the key is absent. A `None` entry is a malformed
+    /// `{Pos, Value}` or list tail. Returns `false` for a missing key without default.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:1370-1458 (do_update_element), OTP-29.1.1.
     pub fn update_element(
         &mut self,
         key: Term,
-        updates: &[(usize, Term)],
+        updates: &[Option<(usize, Term)>],
+        default: Option<Term>,
     ) -> Result<bool, EtsError> {
         if !matches!(
             self.options.table_type,
             TableType::Set | TableType::OrderedSet
         ) {
-            return Err(EtsError::BadArg);
-        }
-        let Some(found) = self.matching(key)?.into_iter().next() else {
-            return Ok(false);
-        };
-        let tuple_len = found.tuple_len().ok_or(EtsError::BadArg)?;
-        if updates.iter().any(|&(position, _)| {
-            position == 0 || position > tuple_len || position == self.options.keypos
-        }) {
+            // DB_ERROR_BADPARAM reaches the plain `BIF_ERROR(p, BADARG)` here.
             return Err(EtsError::BadArg);
         }
         let mut heap = VecHeap::new();
-        let mut values = (0..tuple_len)
-            .map(|index| found.copy_element_out(index, &mut heap))
-            .collect::<Result<Vec<_>, _>>()?;
-        for &(position, value) in updates {
+        let mut values = if let Some(found) = self.matching(key)?.into_iter().next() {
+            let tuple_len = found.tuple_len().ok_or(EtsError::BadArg)?;
+            (0..tuple_len)
+                .map(|index| found.copy_element_out(index, &mut heap))
+                .collect::<Result<Vec<_>, _>>()?
+        } else if let Some(default) = default {
+            self.default_object(key, default, &mut heap)?
+        } else {
+            return Ok(false);
+        };
+        for update in updates {
+            let Some((position, _)) = *update else {
+                return Err(EtsError::BadArg);
+            };
+            if position == self.options.keypos {
+                return Err(EtsError::BadArgCause("keypos"));
+            }
+            if position == 0 || position > values.len() {
+                return Err(EtsError::BadArgCause("position"));
+            }
+        }
+        for &(position, value) in updates.iter().flatten() {
             values[position - 1] = copy_term(value, &mut heap)?;
         }
         let result = TermBuilder::new(&mut heap).tuple(&values)?;
@@ -2854,43 +3010,25 @@ impl Table {
         Ok(true)
     }
 
-    /// Apply replacements, inserting `default` with the requested key if absent.
-    pub fn update_element_default(
-        &mut self,
+    /// The elements of `default` with the key element replaced, as
+    /// `db_lookup_dbterm` inserts it (erl_db_hash.c, erl_db_tree.c), OTP-29.1.1.
+    fn default_object(
+        &self,
         key: Term,
-        updates: &[(usize, Term)],
         default: Term,
-    ) -> Result<bool, EtsError> {
-        if !matches!(
-            self.options.table_type,
-            TableType::Set | TableType::OrderedSet
-        ) {
-            return Err(EtsError::BadArg);
-        }
-        if !self.matching(key)?.is_empty() {
-            return self.update_element(key, updates);
-        }
+        heap: &mut VecHeap,
+    ) -> Result<Vec<Term>, EtsError> {
         // SAFETY: the caller holds the default term heap through insertion.
-        let tuple = unsafe { default.tuple_ref() }.ok_or(EtsError::BadArg)?;
-        if tuple.len() < self.options.keypos
-            || updates.iter().any(|&(position, _)| {
-                position == 0 || position > tuple.len() || position == self.options.keypos
-            })
-        {
-            return Err(EtsError::BadArg);
+        let tuple = unsafe { default.tuple_ref() }.ok_or(EtsError::BadArgCause("default"))?;
+        if tuple.len() < self.options.keypos {
+            return Err(EtsError::BadArgCause("default"));
         }
-        let mut heap = VecHeap::new();
         let mut values = tuple
             .iter()
-            .map(|value| copy_term(value, &mut heap))
+            .map(|value| copy_term(value, heap))
             .collect::<Result<Vec<_>, _>>()?;
-        values[self.options.keypos - 1] = copy_term(key, &mut heap)?;
-        for &(position, value) in updates {
-            values[position - 1] = copy_term(value, &mut heap)?;
-        }
-        let object = TermBuilder::new(&mut heap).tuple(&values)?;
-        self.insert(&[object])?;
-        Ok(true)
+        values[self.options.keypos - 1] = copy_term(key, heap)?;
+        Ok(values)
     }
 
     /// Atomically apply counter operations to a set tuple. The VM chooses the return shape.
@@ -2902,58 +3040,65 @@ impl Table {
     ) -> Result<Vec<Term>, EtsError> {
         let operations = operations
             .iter()
-            .map(|operation| BigCounterOp {
-                position: operation.position,
-                increment: BigInt::from(operation.increment),
-                threshold: operation
-                    .threshold
-                    .map(|(threshold, reset)| (BigInt::from(threshold), BigInt::from(reset))),
+            .map(|operation| {
+                Some(BigCounterOp {
+                    position: operation.position,
+                    increment: BigInt::from(operation.increment),
+                    threshold: operation
+                        .threshold
+                        .map(|(threshold, reset)| (BigInt::from(threshold), BigInt::from(reset))),
+                })
             })
             .collect::<Vec<_>>();
         self.update_counter_big(key, &operations, default)
     }
 
-    /// Atomically apply arbitrary precision counter operations.
+    /// Atomically apply arbitrary precision counter operations. A `None` entry is a
+    /// malformed operation or list tail; it fails without extended error information.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:1492-1690 (do_update_counter), OTP-29.1.1.
     pub fn update_counter_big(
         &mut self,
         key: Term,
-        operations: &[BigCounterOp],
+        operations: &[Option<BigCounterOp>],
         default: Option<Term>,
     ) -> Result<Vec<Term>, EtsError> {
         if !matches!(
             self.options.table_type,
             TableType::Set | TableType::OrderedSet
-        ) || operations.is_empty()
-        {
-            return Err(EtsError::BadArg);
+        ) {
+            return Err(EtsError::BadArgCause("table_type"));
         }
         let mut heap = VecHeap::new();
-        let current = if let Some(found) = self.matching(key)?.first() {
-            found.copy_out(&mut heap)?
+        let mut values = if let Some(found) = self.matching(key)?.first() {
+            let current = found.copy_out(&mut heap)?;
+            // SAFETY: current is owned by the local heap until the insertion ends.
+            unsafe { current.tuple_ref() }
+                .ok_or(EtsError::BadArg)?
+                .iter()
+                .collect::<Vec<_>>()
         } else if let Some(default) = default {
-            let default = copy_term(default, &mut heap)?;
-            // SAFETY: the copied default remains in the local heap.
-            let tuple = unsafe { default.tuple_ref() }.ok_or(EtsError::BadArg)?;
-            if tuple.len() < self.options.keypos {
-                return Err(EtsError::BadArg);
-            }
-            let mut values = tuple.iter().collect::<Vec<_>>();
-            values[self.options.keypos - 1] = copy_term(key, &mut heap)?;
-            TermBuilder::new(&mut heap).tuple(&values)?
+            self.default_object(key, default, &mut heap)?
         } else {
-            return Err(EtsError::BadArg);
+            return Err(EtsError::BadArgCause("badkey"));
         };
-        // SAFETY: current is owned by the local heap until the insertion ends.
-        let tuple = unsafe { current.tuple_ref().unwrap() };
-        let mut values: Vec<Term> = tuple.iter().collect();
-        let mut results = Vec::with_capacity(operations.len());
+        // Validate everything first: erts never rolls back a partial update.
         for operation in operations {
-            if operation.position == 0
-                || operation.position > values.len()
-                || operation.position == self.options.keypos
-            {
+            let Some(operation) = operation else {
+                return Err(EtsError::BadArg);
+            };
+            if operation.position == self.options.keypos {
+                return Err(EtsError::BadArgCause("keypos"));
+            }
+            if operation.position == 0 || operation.position > values.len() {
+                return Err(EtsError::BadArgCause("position"));
+            }
+            if integer_value(values[operation.position - 1]).is_none() {
                 return Err(EtsError::BadArg);
             }
+        }
+        let mut results = Vec::with_capacity(operations.len());
+        for operation in operations.iter().flatten() {
             let old = integer_value(values[operation.position - 1]).ok_or(EtsError::BadArg)?;
             let mut next = old + &operation.increment;
             if let Some((threshold, set_value)) = &operation.threshold
@@ -3213,12 +3358,8 @@ impl Table {
                     return Err(EtsError::BadArg);
                 }
                 let mut next_slot = continuation.slot;
-                let objects = storage.ordered(self.options.keypos);
                 while match_list.len() < limit && next_slot < storage.nactive {
-                    let slot = next_slot;
-                    for object in objects.iter().copied().filter(|object| {
-                        storage.slot_for_key(object.key(self.options.keypos)) == slot
-                    }) {
+                    for object in storage.slot_ordered(next_slot, false) {
                         let term = object.copy_out(&mut continuation._heap)?;
                         if let Some(result) =
                             program.run_with_context(term, &mut continuation._heap, context)?
@@ -3425,12 +3566,8 @@ impl Table {
                 if continuation.slot >= storage.nactive {
                     return Err(EtsError::BadArg);
                 }
-                let objects = storage.ordered(self.options.keypos);
                 while continuation.slot < storage.nactive {
-                    let slot = continuation.slot;
-                    for object in objects.iter().copied().filter(|object| {
-                        storage.slot_for_key(object.key(self.options.keypos)) == slot
-                    }) {
+                    for object in storage.slot_ordered(continuation.slot, false) {
                         if program
                             .run(object.copy_out(&mut scratch)?, &mut scratch)?
                             .is_some_and(|value| exact_eq(value, true_atom))
@@ -3484,45 +3621,50 @@ impl Table {
         Ok(count)
     }
 
-    /// Replace selected set objects after validating every result and its key.
+    /// Replace each selected object in place; the match specification must keep keys.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:4185-4230 (ets_select_replace_2) and
+    /// erl_db_hash.c:2817-2890 (select_replace_on_match_res), OTP-29.1.1.
     pub fn select_replace(
         &mut self,
         program: &match_spec::MatchProgram,
     ) -> Result<usize, EtsError> {
-        if !matches!(
-            self.options.table_type,
-            TableType::Set | TableType::OrderedSet
-        ) {
+        if self.options.table_type == TableType::Bag {
+            return Err(EtsError::BadArgCause("table_type"));
+        }
+        // `analyze_pattern` rejects specifications whose result may change the key
+        // (db_match_keeps_key), so replacement never moves an object.
+        if !program.keeps_key(self.options.keypos) {
             return Err(EtsError::BadArg);
+        }
+        let keypos = self.options.keypos;
+        let compressed = self.options.compressed;
+        if let Storage::Hash(storage) = &mut self.storage {
+            let mut max_arity = self.max_arity;
+            let count = storage.replace_each(|object| {
+                let mut heap = VecHeap::new();
+                let current = object.copy_out(&mut heap)?;
+                let Some(replacement) = program.run(current, &mut heap)? else {
+                    return Ok(None);
+                };
+                let replacement = StoredTerm::copy_for_table(replacement, compressed, keypos, 2)?;
+                max_arity = max_arity.max(replacement.arity());
+                Ok(Some(replacement))
+            })?;
+            self.max_arity = max_arity;
+            return Ok(count);
         }
         let mut heap = VecHeap::new();
         let mut replacements = Vec::new();
-        let keeps_key = program.keeps_key(self.options.keypos);
         for object in self.tab2list(&mut heap)? {
             let Some(replacement) = program.run(object, &mut heap)? else {
                 continue;
             };
-            if !keeps_key {
-                let old_key = key_of(object, self.options.keypos)?;
-                let new_key = key_of(replacement, self.options.keypos)?;
-                let same_key = if self.options.table_type == TableType::OrderedSet {
-                    cmp(old_key, new_key) == Ordering::Equal
-                } else {
-                    exact_eq(old_key, new_key)
-                };
-                if !same_key {
-                    return Err(EtsError::BadArg);
-                }
-            }
             replacements.push(StoredTerm::copy_for_table(
                 replacement,
-                self.options.compressed,
-                self.options.keypos,
-                if self.options.table_type == TableType::OrderedSet {
-                    3
-                } else {
-                    2
-                },
+                compressed,
+                keypos,
+                3,
             )?);
         }
         let count = replacements.len();
@@ -3539,13 +3681,22 @@ pub struct Registry {
     free_slots: Vec<usize>,
     names: HashMap<Atom, Tid>,
     owned_tables: HashMap<Term, HashSet<Tid>>,
+    /// Tables each process has fixed (erts `ERTS_P_FIXED_TABLES`).
+    fixed_tables: HashMap<Term, HashSet<Tid>>,
     match_programs: HashMap<u64, match_spec::MatchProgram>,
 }
 
 struct TableSlot {
     generation: u32,
-    table: Option<Table>,
+    table: Option<SharedTable>,
 }
+
+/// A table behind its own lock, so operations on different tables never serialize.
+///
+/// Port of erts/emulator/beam/erl_db.c:446-500 (db_lock/db_unlock), OTP-29.1.1: each table
+/// carries its own `rwlock`; reads take it shared and writes exclusive. The registry lock
+/// only guards the identity and name maps (erts `meta_main_tab` and `meta_name_tab`).
+pub type SharedTable = Arc<parking_lot::RwLock<Table>>;
 
 impl Registry {
     /// Start an empty registry.
@@ -3558,6 +3709,7 @@ impl Registry {
             free_slots: Vec::new(),
             names: HashMap::new(),
             owned_tables: HashMap::new(),
+            fixed_tables: HashMap::new(),
             match_programs: HashMap::new(),
         }
     }
@@ -3591,7 +3743,7 @@ impl Registry {
                 table: None,
             });
         }
-        self.tables[index].table = Some(table);
+        self.tables[index].table = Some(Arc::new(parking_lot::RwLock::new(table)));
         self.owned_tables
             .entry(options.owner)
             .or_default()
@@ -3599,8 +3751,8 @@ impl Registry {
         Ok(tid)
     }
 
-    /// Borrow a table by identity.
-    pub fn get(&self, tid: Tid) -> Result<&Table, EtsError> {
+    /// The shared handle of a live table.
+    pub fn shared(&self, tid: Tid) -> Result<&SharedTable, EtsError> {
         let index = tid.slot().ok_or(EtsError::NoTable)?;
         let slot = self
             .tables
@@ -3610,15 +3762,14 @@ impl Registry {
         slot.table.as_ref().ok_or(EtsError::NoTable)
     }
 
-    /// Mutably borrow a table by identity.
-    pub fn get_mut(&mut self, tid: Tid) -> Result<&mut Table, EtsError> {
-        let index = tid.slot().ok_or(EtsError::NoTable)?;
-        let slot = self
-            .tables
-            .get_mut(index)
-            .filter(|slot| slot.generation == tid.generation())
-            .ok_or(EtsError::NoTable)?;
-        slot.table.as_mut().ok_or(EtsError::NoTable)
+    /// Lock a table for reading.
+    pub fn get(&self, tid: Tid) -> Result<parking_lot::RwLockReadGuard<'_, Table>, EtsError> {
+        Ok(self.shared(tid)?.read())
+    }
+
+    /// Lock a table for writing.
+    pub fn get_mut(&self, tid: Tid) -> Result<parking_lot::RwLockWriteGuard<'_, Table>, EtsError> {
+        Ok(self.shared(tid)?.write())
     }
 
     /// Set CA-tree internal state for a table identity.
@@ -3641,7 +3792,7 @@ impl Registry {
     pub fn all(&self) -> Vec<Tid> {
         self.tables
             .iter()
-            .filter_map(|slot| slot.table.as_ref().map(|table| table.tid))
+            .filter_map(|slot| slot.table.as_ref().map(|table| table.read().tid))
             .collect()
     }
 
@@ -3664,9 +3815,10 @@ impl Registry {
             .get_mut(index)
             .filter(|slot| slot.generation == tid.generation())
             .ok_or(EtsError::NoTable)?;
-        let table = slot.table.take().ok_or(EtsError::NoTable)?;
+        let shared = slot.table.take().ok_or(EtsError::NoTable)?;
         slot.generation = slot.generation.wrapping_add(1).max(1);
         self.free_slots.push(index);
+        let table = shared.read();
         self.remove_owned_table(table.options.owner, tid);
         if table.options.named_table {
             self.names.remove(&table.options.name);
@@ -3707,35 +3859,45 @@ impl Registry {
             .table
             .as_ref()
             .ok_or(EtsError::NoTable)?
+            .read()
             .options
             .named_table;
         if named {
-            if self
-                .names
-                .get(&name)
-                .is_some_and(|&existing| existing != tid)
-            {
+            // Port of erts/emulator/beam/erl_db.c:2516 (insert_named_tab), OTP-29.1.1:
+            // any registered name fails, including the table's own.
+            if self.names.contains_key(&name) {
                 return Err(EtsError::NameTaken);
             }
-            let old = self
-                .tables
-                .get(index)
-                .filter(|slot| slot.generation == tid.generation())
-                .and_then(|slot| slot.table.as_ref())
-                .ok_or(EtsError::NoTable)?
-                .options
-                .name;
+            let old = self.get(tid)?.options.name;
             self.names.remove(&old);
             self.names.insert(name, tid);
         }
-        self.tables
-            .get_mut(index)
-            .filter(|slot| slot.generation == tid.generation())
-            .and_then(|slot| slot.table.as_mut())
-            .ok_or(EtsError::NoTable)?
-            .options
-            .name = name;
+        self.get_mut(tid)?.options.name = name;
         Ok(())
+    }
+
+    /// Remember that `pid` fixed `tid`, so its exit can release the fixation.
+    pub fn note_fixation(&mut self, pid: Term, tid: Tid) {
+        self.fixed_tables.entry(pid).or_default().insert(tid);
+    }
+
+    /// Whether `pid` has fixed any table.
+    pub fn has_fixations(&self, pid: Term) -> bool {
+        self.fixed_tables.contains_key(&pid)
+    }
+
+    /// Release every fixation held by an exiting process.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:5236-5262 (free_fixations_op), OTP-29.1.1.
+    pub fn release_fixations(&mut self, pid: Term) {
+        let Some(tables) = self.fixed_tables.remove(&pid) else {
+            return;
+        };
+        for tid in tables {
+            if let Ok(mut table) = self.get_mut(tid) {
+                table.release_fixations(pid);
+            }
+        }
     }
 
     /// Record the new owner after the VM sends its transfer message.

@@ -51,7 +51,7 @@ fn reference() -> Option<RefErl> {
 fn run_local(ops: &[OwnedTerm]) -> Vec<OwnedTerm> {
     let mut registry = Registry::new();
     let tid = registry.create(options()).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut results = Vec::new();
     for operation in ops {
         let OwnedTerm::Tuple(parts) = operation else {
@@ -112,7 +112,7 @@ fn assert_reference(ops: Vec<OwnedTerm>) {
 fn avl_balance_invariant() {
     let mut registry = Registry::new();
     let tid = registry.create(options()).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut seed = 0x7a3d_19b6_d201_4f85_u64;
     let mut heap = VecHeap::new();
     for index in 0..100_000 {
@@ -181,7 +181,7 @@ fn select_partly_bound_vs_erl() {
 fn slot_vs_erl() {
     let mut registry = Registry::new();
     let tid = registry.create(options()).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut heap = VecHeap::new();
     for key in (1..=1000).rev() {
         if key % 128 == 0 {
@@ -218,7 +218,7 @@ fn slot_vs_erl() {
 fn delete_rebalance() {
     let mut registry = Registry::new();
     let tid = registry.create(options()).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut heap = VecHeap::new();
     for key in 0..30_000 {
         if key % 1024 == 0 {

@@ -1,10 +1,13 @@
 //! Symbolic stack traces from BEAM continuations.
 
-use crate::{NativeFunction, Process, VmError, native_function_at};
+use crate::{NativeFunction, Process, VmError};
 use arinsal_bifs::{Class, FragmentingHeap};
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::Module;
-use arinsal_term::{ProcessHeap, Term, TermBuilder, TermKind, from_owned, global_atoms, to_owned};
+use arinsal_term::{
+    Atom, HeapAlloc, ProcessHeap, Term, TermBuilder, TermKind, from_owned, global_atoms, to_owned,
+};
+use arinsal_term::{ExportEntry, ExternalBinary, FunEntry, MagicRef, Node, WritableBinary};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // Reserve the last encodable handler module index for private trace handles.
@@ -16,6 +19,113 @@ fn interpreted_catch_ids() -> &'static Mutex<std::collections::HashMap<(usize, u
     IDS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Allocator for stack trace terms.
+///
+/// Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1: the
+/// whole trace is sized first and allocated as one block (`HAlloc`, falling back to a
+/// single heap fragment), instead of one heap fragment per term.
+struct TraceHeap<'a> {
+    heap: &'a mut ProcessHeap,
+    block: *mut u64,
+    capacity: usize,
+    used: usize,
+    /// Heap top right after the block when it was taken from the young heap.
+    block_end: Option<usize>,
+}
+
+impl<'a> TraceHeap<'a> {
+    fn new(heap: &'a mut ProcessHeap) -> Self {
+        Self {
+            heap,
+            block: std::ptr::null_mut(),
+            capacity: 0,
+            used: 0,
+            block_end: None,
+        }
+    }
+
+    /// Reserves one block that later allocations are carved from.
+    fn with_block(heap: &'a mut ProcessHeap, words: usize) -> Self {
+        let mut trace = Self::new(heap);
+        trace.capacity = words;
+        if let Some(block) = HeapAlloc::alloc(trace.heap, words) {
+            trace.block = block;
+            trace.block_end = Some(trace.heap.used_words());
+        } else {
+            trace.block = trace.heap.gc_fragment(words);
+        }
+        trace
+    }
+}
+
+impl Drop for TraceHeap<'_> {
+    fn drop(&mut self) {
+        // Give the unused tail of the block back when nothing was allocated after it.
+        if let Some(end) = self.block_end
+            && self.heap.used_words() == end
+        {
+            self.heap.set_heap_top(self.block.wrapping_add(self.used));
+        }
+    }
+}
+
+impl HeapAlloc for TraceHeap<'_> {
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        if words <= self.capacity - self.used {
+            let ptr = self.block.wrapping_add(self.used);
+            self.used += words;
+            return Some(ptr);
+        }
+        HeapAlloc::alloc(self.heap, words).or_else(|| Some(self.heap.gc_fragment(words)))
+    }
+
+    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+        HeapAlloc::retain_binary(self.heap, binary);
+    }
+
+    fn retain_writable_binary(
+        &mut self,
+        binary: Arc<WritableBinary>,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::retain_writable_binary(self.heap, binary)
+    }
+
+    fn supports_writable_binary(&self) -> bool {
+        true
+    }
+
+    fn retain_external_binary(
+        &mut self,
+        binary: Arc<ExternalBinary>,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::retain_external_binary(self.heap, binary)
+    }
+
+    fn supports_external_binary(&self) -> bool {
+        true
+    }
+
+    fn retain_node(&mut self, node: Arc<Node>) {
+        HeapAlloc::retain_node(self.heap, node);
+    }
+
+    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
+        HeapAlloc::retain_fun(self.heap, entry);
+    }
+
+    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
+        HeapAlloc::retain_export(self.heap, entry);
+    }
+
+    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
+        HeapAlloc::retain_magic(self.heap, owner);
+    }
+
+    fn supports_magic(&self) -> bool {
+        true
+    }
+}
+
 /// Continuation addresses saved before exception unwinding.
 #[derive(Default)]
 pub(super) struct RawTrace {
@@ -24,22 +134,80 @@ pub(super) struct RawTrace {
     top: Option<StoredTopFrame>,
     module: Option<Arc<Module>>,
     ip: usize,
-    continuations: Vec<Continuation>,
-    depth: usize,
     /// Native function and pc that raised the exception, when it came from native code.
     native_top: Option<(NativeFunction, usize)>,
+    continuations: Vec<Continuation>,
+    frames: Vec<Term>,
+    depth: usize,
+    pub(super) available: bool,
 }
 
 enum Continuation {
     Interpreted(Arc<Module>, usize),
-    Native(NativeFunction, usize),
+    Native(crate::native_bridge::NativeStackFrame, usize),
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum BifArgs {
+    Inline { values: [Term; 4], len: u8 },
+    Owned(Box<OwnedTerm>),
+}
+
+impl BifArgs {
+    pub(super) fn from_terms(args: &[Term]) -> Result<Self, VmError> {
+        if args.len() <= 4 {
+            let mut values = [Term::NIL; 4];
+            values[..args.len()].copy_from_slice(args);
+            return Ok(Self::Inline {
+                values,
+                len: args.len() as u8,
+            });
+        }
+        let elems = args
+            .iter()
+            .map(|term| {
+                to_owned(*term)
+                    .map_err(|error| VmError::Unsupported(format!("exception arg {error:?}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::Owned(Box::new(OwnedTerm::List {
+            elems,
+            tail: Box::new(OwnedTerm::Nil),
+        })))
+    }
+
+    pub(super) fn root_terms(&self, roots: &mut Vec<Term>) -> Option<(usize, usize)> {
+        let Self::Inline { values, len } = self else {
+            return None;
+        };
+        let start = roots.len();
+        roots.extend_from_slice(&values[..usize::from(*len)]);
+        Some((start, usize::from(*len)))
+    }
+
+    pub(super) fn update_root_terms(&mut self, roots: &[Term], start: usize, len: usize) {
+        if let Self::Inline { values, .. } = self {
+            values[..len].copy_from_slice(&roots[start..start + len]);
+        }
+    }
+
+    fn to_term(&self, heap: &mut TraceHeap) -> Result<Term, VmError> {
+        match self {
+            Self::Inline { values, len } => TermBuilder::new(heap)
+                .list_from_slice(&values[..usize::from(*len)])
+                .map_err(|error| VmError::Unsupported(format!("exception args {error:?}"))),
+            Self::Owned(args) => from_owned(args, heap)
+                .map_err(|error| VmError::Unsupported(format!("exception args {error:?}"))),
+        }
+    }
 }
 
 enum StoredTopFrame {
     Bif {
-        module: String,
-        function: String,
-        args: OwnedTerm,
+        module: Atom,
+        function: Atom,
+        args: BifArgs,
+        info: BifErrorInfo,
     },
     CurrentArgs(OwnedTerm),
     CurrentArgsWithInfo(Option<OwnedTerm>, Box<OwnedTerm>),
@@ -66,11 +234,12 @@ pub(super) fn capture(
                 module,
                 function,
                 args,
+                info,
             } => Ok(StoredTopFrame::Bif {
-                module: module.clone(),
-                function: function.clone(),
-                args: to_owned(*args)
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
+                module: *module,
+                function: *function,
+                args: args.clone(),
+                info: *info,
             }),
             TopFrame::CurrentArgs(args) => Ok(StoredTopFrame::CurrentArgs(
                 to_owned(*args)
@@ -117,7 +286,9 @@ pub(super) fn capture(
             index += 4usize.saturating_add(action_count.saturating_mul(2));
             continue;
         }
-        if let Some(function) = native_function_at(raw_address) {
+        if raw_address & 3 == 0
+            && let Some(function) = crate::native_bridge::native_stack_frame_at(raw_address)
+        {
             // Port of erts/emulator/beam/beam_common.c:815-835 (save_stacktrace), OTP-29.1.1:
             // only non-duplicate return addresses are recorded, each looked up one byte back,
             // inside its call instruction.
@@ -228,19 +399,76 @@ pub(super) fn raw_index(term: Term) -> Option<usize> {
     (payload >> 32 == RAW_TRACE_PREFIX).then_some(payload as u32 as usize)
 }
 
+/// What `save_stacktrace` puts in a BIF frame's `error_info`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BifErrorInfo {
+    /// Not a BIF failure (`undef`): no `error_info`.
+    None,
+    /// `#{module => FormatModule}`.
+    Plain,
+    /// `EXF_HAS_EXT_INFO`: `#{cause => c_p->fvalue, module => FormatModule}`.
+    Cause(Atom),
+}
+
 #[derive(Debug)]
 pub(super) enum TopFrame {
+    /// A failing BIF, or the MFA of an `undef` call.
     Bif {
-        module: String,
-        function: String,
-        args: Term,
+        module: Atom,
+        function: Atom,
+        args: BifArgs,
+        info: BifErrorInfo,
     },
     CurrentArgs(Term),
     CurrentArgsWithInfo(Option<Term>, Box<OwnedTerm>),
 }
 
 pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {
+    // Per-thread cache in front of the shared table: erts keeps the handler's code pointer in
+    // the stack slot, so `catch` must not take a lock or hash with SipHash.
+    thread_local! {
+        static CACHE: std::cell::RefCell<std::collections::HashMap<(usize, usize), u32, CodeKeyHasher>> =
+            std::cell::RefCell::new(std::collections::HashMap::default());
+    }
     let key = (module, ip);
+    if let Some(index) = CACHE.with(|cache| cache.borrow().get(&key).copied()) {
+        return Ok(Term::catch(u64::from(index)));
+    }
+    let index = handler_tag_shared(key)?;
+    CACHE.with(|cache| cache.borrow_mut().insert(key, index));
+    Ok(Term::catch(u64::from(index)))
+}
+
+/// Multiplicative hasher for `(module, ip)` keys; they are small dense integers.
+#[derive(Default)]
+struct CodeKeyHasher(u64);
+
+impl std::hash::Hasher for CodeKeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+impl std::hash::BuildHasher for CodeKeyHasher {
+    type Hasher = CodeKeyHasher;
+    fn build_hasher(&self) -> CodeKeyHasher {
+        CodeKeyHasher(0)
+    }
+}
+
+fn handler_tag_shared(key: (usize, usize)) -> Result<u32, VmError> {
+    let (module, ip) = key;
     let mut ids = interpreted_catch_ids()
         .lock()
         .map_err(|_| VmError::Unsupported("catch table lock".into()))?;
@@ -253,7 +481,7 @@ pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {
         ids.insert(key, base);
         base
     };
-    Ok(Term::catch(u64::from(index)))
+    Ok(index)
 }
 
 /// Encodes an interpreter continuation without colliding with catch-table indices.
@@ -299,63 +527,121 @@ fn atom(name: &str) -> Result<Term, VmError> {
         .map_err(|_| VmError::Unsupported(format!("atom {name}")))
 }
 
+struct TraceAtoms {
+    file: Atom,
+    line: Atom,
+    module: Atom,
+    cause: Atom,
+    /// BIF module to `format_error` module, as in beam_common.c:937-990.
+    format_modules: [(Atom, Atom); 14],
+    error_info: Atom,
+    unknown: Atom,
+}
+
+fn trace_atoms() -> &'static TraceAtoms {
+    static ATOMS: OnceLock<TraceAtoms> = OnceLock::new();
+    ATOMS.get_or_init(|| {
+        let table = global_atoms();
+        let intern = |name| table.intern(name).expect("stacktrace atom is valid");
+        TraceAtoms {
+            file: intern("file"),
+            line: intern("line"),
+            module: intern("module"),
+            cause: intern("cause"),
+            format_modules: [
+                ("atomics", "erl_erts_errors"),
+                ("counters", "erl_erts_errors"),
+                ("erlang", "erl_erts_errors"),
+                ("erts_internal", "erl_erts_errors"),
+                ("persistent_term", "erl_erts_errors"),
+                ("code", "erl_kernel_errors"),
+                ("os", "erl_kernel_errors"),
+                ("binary", "erl_stdlib_errors"),
+                ("ets", "erl_stdlib_errors"),
+                ("lists", "erl_stdlib_errors"),
+                ("maps", "erl_stdlib_errors"),
+                ("math", "erl_stdlib_errors"),
+                ("re", "erl_stdlib_errors"),
+                ("unicode", "erl_stdlib_errors"),
+            ]
+            .map(|(bif, format)| (intern(bif), intern(format))),
+            error_info: intern("error_info"),
+            unknown: intern("?"),
+        }
+    })
+}
+
+/// The `error_info` map of a failing BIF frame.
+// Port of erts/emulator/beam/beam_common.c:932-998 (save_stacktrace), OTP-29.1.1.
+fn bif_error_info(
+    heap: &mut TraceHeap,
+    module: Atom,
+    info: BifErrorInfo,
+) -> Result<Option<Term>, VmError> {
+    let cause = match info {
+        BifErrorInfo::None => return Ok(None),
+        BifErrorInfo::Plain => None,
+        BifErrorInfo::Cause(cause) => Some(cause),
+    };
+    let atoms = trace_atoms();
+    let Some(&(_, format_module)) = atoms.format_modules.iter().find(|(bif, _)| *bif == module)
+    else {
+        return Ok(None);
+    };
+    let module_pair = (Term::atom(atoms.module), Term::atom(format_module));
+    let mut builder = TermBuilder::new(heap);
+    let map = match cause {
+        Some(cause) => {
+            builder.flatmap_from_pairs(&[(Term::atom(atoms.cause), Term::atom(cause)), module_pair])
+        }
+        None => builder.flatmap_from_pairs(&[module_pair]),
+    }
+    .map_err(|e| VmError::Unsupported(format!("BIF error info {e:?}")))?;
+    Ok(Some(map))
+}
+
 fn build_frame(
-    p: &mut Process,
-    module: &str,
-    function: &str,
+    heap: &mut TraceHeap,
+    module: Atom,
+    function: Atom,
     arity_or_args: Term,
-    location: Option<&(String, u64)>,
+    location: Option<(Term, u64)>,
     bif: bool,
     error_info: Option<Term>,
 ) -> Result<Term, VmError> {
-    let module = atom(module)?;
-    let function = atom(function)?;
-    let file = atom("file")?;
-    let line = atom("line")?;
-    let mut heap = FragmentingHeap(&mut p.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    let error_info = if bif {
-        let map = builder
-            .flatmap_from_pairs(&[(atom("module")?, atom("erl_erts_errors")?)])
-            .map_err(|e| VmError::Unsupported(format!("BIF error info {e:?}")))?;
-        Some(map)
-    } else {
-        error_info
-    };
-    let mut info = Vec::new();
+    let module = Term::atom(module);
+    let function = Term::atom(function);
+    let file = Term::atom(trace_atoms().file);
+    let line = Term::atom(trace_atoms().line);
+    let mut builder = TermBuilder::new(heap);
+    let mut info = [Term::NIL; 3];
+    let mut info_len = 0;
     if bif && let Some(error_info) = error_info {
-        info.push(
-            builder
-                .tuple(&[atom("error_info")?, error_info])
-                .map_err(|e| VmError::Unsupported(format!("error info tuple {e:?}")))?,
-        );
+        info[info_len] = builder
+            .tuple(&[Term::atom(trace_atoms().error_info), error_info])
+            .map_err(|e| VmError::Unsupported(format!("error info tuple {e:?}")))?;
+        info_len += 1;
     }
     if !bif && let Some((name, number)) = location {
-        let name = builder
-            .string_to_list(name)
-            .map_err(|e| VmError::Unsupported(format!("stack file {e:?}")))?;
-        let number = Term::small(*number as i64)
+        let number = Term::small(number as i64)
             .ok_or_else(|| VmError::Unsupported("source line number".into()))?;
-        info.push(
-            builder
-                .tuple(&[file, name])
-                .map_err(|e| VmError::Unsupported(format!("stack file {e:?}")))?,
-        );
-        info.push(
-            builder
-                .tuple(&[line, number])
-                .map_err(|e| VmError::Unsupported(format!("stack line {e:?}")))?,
-        );
+        info[info_len] = builder
+            .tuple(&[file, name])
+            .map_err(|e| VmError::Unsupported(format!("stack file {e:?}")))?;
+        info_len += 1;
+        info[info_len] = builder
+            .tuple(&[line, number])
+            .map_err(|e| VmError::Unsupported(format!("stack line {e:?}")))?;
+        info_len += 1;
     }
     if !bif && let Some(error_info) = error_info {
-        info.push(
-            builder
-                .tuple(&[atom("error_info")?, error_info])
-                .map_err(|e| VmError::Unsupported(format!("error info tuple {e:?}")))?,
-        );
+        info[info_len] = builder
+            .tuple(&[Term::atom(trace_atoms().error_info), error_info])
+            .map_err(|e| VmError::Unsupported(format!("error info tuple {e:?}")))?;
+        info_len += 1;
     }
     let location = builder
-        .list_from_iter(info)
+        .list_from_slice(&info[..info_len])
         .map_err(|e| VmError::Unsupported(format!("stack frame info {e:?}")))?;
     builder
         .tuple(&[module, function, arity_or_args, location])
@@ -380,11 +666,11 @@ pub(super) fn build(
         &p.heap,
         depth,
     )?;
-    build_saved(p, &raw)
+    build_saved(p, &mut raw)
 }
 
 /// Port of erts/emulator/beam/beam_common.c:1205 (build_stacktrace), OTP-29.1.1.
-pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmError> {
+pub(super) fn build_saved(p: &mut Process, raw: &mut RawTrace) -> Result<Term, VmError> {
     if let Some(explicit) = &raw.explicit {
         return from_owned(explicit, &mut FragmentingHeap(&mut p.heap))
             .map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")));
@@ -397,11 +683,12 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
                 module,
                 function,
                 args,
+                info,
             } => Ok(TopFrame::Bif {
-                module: module.clone(),
-                function: function.clone(),
-                args: from_owned(args, &mut FragmentingHeap(&mut p.heap))
-                    .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
+                module: *module,
+                function: *function,
+                args: args.clone(),
+                info: *info,
             }),
             StoredTopFrame::CurrentArgs(args) => Ok(TopFrame::CurrentArgs(
                 from_owned(args, &mut FragmentingHeap(&mut p.heap))
@@ -420,43 +707,69 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
         })
         .transpose()?;
     let top = top.as_ref();
-    let mut frames = Vec::with_capacity(raw.depth);
+    raw.frames.clear();
+    // Upper bound per frame: 4-tuple, 3-element info list, file/line/error_info tuples
+    // and the one-pair error_info map; plus the result list and BIF argument list.
+    let bif_args = match top {
+        Some(TopFrame::Bif { args, .. }) => match args {
+            BifArgs::Inline { len, .. } => usize::from(*len),
+            BifArgs::Owned(_) => 0,
+        },
+        _ => 0,
+    };
+    let block_words = (raw.depth + 2) * 30 + 2 * bif_args;
+    let mut heap = TraceHeap::with_block(&mut p.heap, block_words);
     let current = raw
         .module
         .as_ref()
         .ok_or_else(|| VmError::Unsupported("stacktrace module".into()))?;
-    let (name, arity) = current.function_at(raw.ip).unwrap_or(("?", 0));
-    let native_location;
-    let (module_name, name, arity, location) = if let Some((function, pc)) = &raw.native_top {
-        native_location = function
+    let (frame_module, function, arity, location) = if let Some((native, pc)) = &raw.native_top {
+        let location = native
             .line_at(*pc)
-            .map(|(file, line)| (file.to_owned(), u64::from(line)))
+            .and_then(|(file, line)| {
+                current
+                    .line_file_terms
+                    .get(file)
+                    .copied()
+                    .map(|file| (file, u64::from(line)))
+            })
             .or_else(|| {
-                function
-                    .line
-                    .map(|line| (function.file.clone().unwrap_or_default(), u64::from(line)))
+                native.file.as_deref().and_then(|file| {
+                    let line = native.line?;
+                    current
+                        .line_file_terms
+                        .get(file)
+                        .copied()
+                        .map(|file| (file, u64::from(line)))
+                })
             });
         (
-            function.module.as_str(),
-            function.function.as_str(),
-            function.arity,
-            native_location.as_ref(),
+            native.module_atom,
+            native.function_atom,
+            native.arity,
+            location,
         )
     } else {
+        let (function, arity) = current
+            .function_atom_at(raw.ip)
+            .unwrap_or((trace_atoms().unknown, 0));
         (
-            current.name.as_str(),
-            name,
+            current.name_atom,
+            function,
             arity,
-            current.lines.get(raw.ip).and_then(Option::as_ref),
+            current.line_term_at(raw.ip),
         )
     };
     let top_frame = if let Some(TopFrame::Bif {
         module,
         function,
         args,
+        info,
     }) = top
     {
-        build_frame(p, module, function, *args, None, true, None)?
+        let args = args.to_term(&mut heap)?;
+        let error_info = bif_error_info(&mut heap, *module, *info)?;
+        build_frame(&mut heap, *module, *function, args, None, true, error_info)?
     } else {
         let top_args = match top {
             Some(TopFrame::CurrentArgs(args)) => *args,
@@ -468,19 +781,27 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
         };
         let error_info = match top {
             Some(TopFrame::CurrentArgsWithInfo(_, info)) => Some(
-                from_owned(info.as_ref(), &mut FragmentingHeap(&mut p.heap))
+                from_owned(info.as_ref(), &mut heap)
                     .map_err(|e| VmError::Unsupported(format!("exception info {e:?}")))?,
             ),
             _ => None,
         };
-        build_frame(p, module_name, name, top_args, location, false, error_info)?
+        build_frame(
+            &mut heap,
+            frame_module,
+            function,
+            top_args,
+            location,
+            false,
+            error_info,
+        )?
     };
-    frames.push(top_frame);
-    if matches!(top, Some(TopFrame::Bif { .. })) && frames.len() < raw.depth {
-        frames.push(build_frame(
-            p,
-            module_name,
-            name,
+    raw.frames.push(top_frame);
+    if matches!(top, Some(TopFrame::Bif { .. })) && raw.frames.len() < raw.depth {
+        raw.frames.push(build_frame(
+            &mut heap,
+            frame_module,
+            function,
             Term::small(i64::from(arity)).expect("arity is small"),
             location,
             false,
@@ -488,24 +809,27 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
         )?);
     }
     for continuation in &raw.continuations {
-        if frames.len() >= raw.depth {
+        if raw.frames.len() >= raw.depth {
             break;
         }
-        if let Continuation::Native(function, address) = continuation {
-            let location = function
-                .line_at(*address)
-                .map(|(file, line)| (file.to_owned(), u64::from(line)))
-                .or_else(|| {
-                    function
-                        .line
-                        .map(|line| (function.file.clone().unwrap_or_default(), u64::from(line)))
-                });
-            frames.push(build_frame(
-                p,
-                &function.module,
-                &function.function,
+        if let Continuation::Native(function, _address) = continuation {
+            let location = function.line.and_then(|line| {
+                function
+                    .file_term
+                    .or_else(|| {
+                        function
+                            .file
+                            .as_deref()
+                            .and_then(|file| current.line_file_terms.get(file).copied())
+                    })
+                    .map(|file| (file, u64::from(line)))
+            });
+            raw.frames.push(build_frame(
+                &mut heap,
+                function.module_atom,
+                function.function_atom,
                 Term::small(i64::from(function.arity)).expect("arity is small"),
-                location.as_ref(),
+                location,
                 false,
                 None,
             )?);
@@ -515,25 +839,44 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
             unreachable!()
         };
         let call_site = ip.saturating_sub(1);
-        let Some((name, arity)) = module.function_at(call_site) else {
+        let Some((function, arity)) = module.function_atom_at(call_site) else {
             continue;
         };
-        frames.push(build_frame(
-            p,
-            &module.name,
-            name,
+        raw.frames.push(build_frame(
+            &mut heap,
+            module.name_atom,
+            function,
             Term::small(i64::from(arity)).expect("arity is small"),
-            module.lines.get(call_site).and_then(Option::as_ref),
+            module.line_term_at(call_site),
             false,
             None,
         )?);
     }
-    let mut heap = FragmentingHeap(&mut p.heap);
     TermBuilder::new(&mut heap)
-        .list_from_iter(frames)
+        .list_from_slice(&raw.frames)
         .map_err(|e| VmError::Unsupported(format!("stacktrace {e:?}")))
 }
 
 pub(super) fn atom_term(name: &str) -> Result<Term, VmError> {
     atom(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bif_arguments_keep_pointer_terms_inline_and_rewrite_gc_roots() {
+        let mut heap = ProcessHeap::new();
+        let pointer = TermBuilder::new(&mut heap).tuple(&[]).unwrap();
+        assert!(pointer.is_pointer());
+        let mut args = BifArgs::from_terms(&[pointer, Term::small(3).unwrap()]).unwrap();
+        assert!(matches!(&args, BifArgs::Inline { .. }));
+        let mut roots = Vec::new();
+        let (start, len) = args.root_terms(&mut roots).unwrap();
+        let replacement = Term::small(7).unwrap();
+        roots[start] = replacement;
+        args.update_root_terms(&roots, start, len);
+        assert!(matches!(args, BifArgs::Inline { values, .. } if values[0] == replacement));
+    }
 }

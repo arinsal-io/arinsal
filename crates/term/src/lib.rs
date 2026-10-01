@@ -42,7 +42,8 @@ pub use identity::{Identity, Node};
 pub use internal_hash::{internal_hash, internal_salted_hash};
 pub use magic::MagicRef;
 pub use native_code::{
-    is_native_code_pointer, register_native_code_range, unregister_native_code_range,
+    is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
+    unregister_native_code_range,
 };
 pub use ops::{
     cmp, cmp_exact, exact_eq, flat_size, integer_magnitude_cmp, loose_eq, size_object,

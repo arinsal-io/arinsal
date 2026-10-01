@@ -85,6 +85,8 @@ struct DispatchTarget {
     slot: Arc<arinsal_beamasm::bif::ExportEntry>,
     module: String,
     function: String,
+    module_atom: arinsal_term::Atom,
+    function_atom: arinsal_term::Atom,
     arity: u8,
     bif: Option<arinsal_bifs::BifFn>,
     class: arinsal_loader::ImportClass,
@@ -146,6 +148,8 @@ fn import_entries(module: &arinsal_loader::Module) -> Option<Vec<usize>> {
                         slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(trampoline)),
                         module: import.module.clone(),
                         function: import.function.clone(),
+                        module_atom: import.module_atom,
+                        function_atom: import.function_atom,
                         arity: import.arity,
                         bif: import.bif_fn(),
                         class,
@@ -165,6 +169,8 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     let trampoline = fragments()?.export_trampoline();
     let mut registry = dispatch_registry().write().ok()?;
     let key = (module.to_owned(), function.to_owned(), arity);
+    let module_atom = global_atoms().get(module)?;
+    let function_atom = global_atoms().get(function)?;
     let entry = Arc::clone(registry.bif_mfas.entry(key).or_insert_with(|| {
         let bif = arinsal_bifs::lookup(module, function, arity);
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
@@ -172,6 +178,8 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(trampoline)),
             module: module.to_owned(),
             function: function.to_owned(),
+            module_atom,
+            function_atom,
             arity,
             bif,
             class,
@@ -239,6 +247,8 @@ fn unpublish_module(native: &[(Mfa, usize)]) {
 pub(crate) struct ExportDispatch {
     pub module: String,
     pub function: String,
+    pub module_atom: arinsal_term::Atom,
+    pub function_atom: arinsal_term::Atom,
     pub arity: u8,
     pub class: arinsal_loader::ImportClass,
     pub native_bits: usize,
@@ -250,6 +260,8 @@ pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
     Some(ExportDispatch {
         module: target.module.clone(),
         function: target.function.clone(),
+        module_atom: target.module_atom,
+        function_atom: target.function_atom,
         arity: target.arity,
         class: target.class,
         native_bits: target.native_bits,
@@ -922,7 +934,9 @@ pub(crate) fn compile(
             start,
             end,
             module: compiled.name.clone(),
+            module_atom: global_atoms().get(&compiled.name)?,
             function: function.name.clone(),
+            function_atom: global_atoms().get(&function.name)?,
             arity: function.arity,
             line: None,
             file: None,
@@ -944,7 +958,8 @@ pub(crate) fn compile(
                     .take_while(|(address, _)| *address < end)
                     .map(|(address, entry)| crate::NativeLine {
                         address: address.max(start),
-                        file: entry.file.clone(),
+                        file: Arc::from(entry.file.as_str()),
+                        file_term: module.line_file_terms.get(&entry.file).copied(),
                         // Port of erts/emulator/beam/beam_code.h:32-38 (MAKE_LOCATION),
                         // OTP-29.1.1: a line that does not fit in 24 bits has no location.
                         line: if u64::from(entry.line) < (1 << 24) - 1 {
@@ -955,6 +970,7 @@ pub(crate) fn compile(
                     })
                     .collect()
             },
+            file_term: None,
         });
     }
     if lifetime_trace_enabled() {

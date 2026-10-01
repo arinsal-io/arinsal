@@ -113,9 +113,15 @@ pub fn monotonic_time_milliseconds() -> i128 {
     mono_nanos().div_euclid(1_000_000)
 }
 
-fn mono_nanos() -> i128 {
+/// Return the same clock value as `erts_get_monotonic_time`, used by
+/// `erlang:monotonic_time/0` in `erts/emulator/beam/erl_time_sup.c`, OTP-29.1.1.
+pub fn monotonic_time_nanos() -> i128 {
     let start = START.get_or_init(Instant::now);
     -(1_i128 << 59) + start.elapsed().as_nanos() as i128
+}
+
+fn mono_nanos() -> i128 {
+    monotonic_time_nanos()
 }
 
 fn sys_nanos() -> Result<i128, BifError> {

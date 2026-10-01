@@ -2099,7 +2099,7 @@ fn internal_state_set(
             let changed = process.runtime.as_ref().is_some_and(|runtime| {
                 runtime
                     .ets
-                    .lock()
+                    .read()
                     .unwrap()
                     .debug_set_catree_mode(tid, random, enabled)
             });

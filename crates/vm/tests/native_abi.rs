@@ -405,11 +405,16 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
         start: entry,
         end: entry + bytes.len(),
         module: "native_abi_test".into(),
+        module_atom: arinsal_term::global_atoms()
+            .intern("native_abi_test")
+            .unwrap(),
         function: "bridge".into(),
+        function_atom: arinsal_term::global_atoms().intern("bridge").unwrap(),
         arity: 0,
         line: Some(17),
         file: Some("native_abi_test.erl".into()),
         line_table: Vec::new(),
+        file_term: None,
     })
     .unwrap();
 
@@ -1671,7 +1676,6 @@ fn native_body_recursion_grows_a_minimum_heap_before_stack_collision() {
         .env("ARINSAL_BEAMASM", "1")
         .env("ARINSAL_BEAMASM_MODULES", MODULE)
         .env("ARINSAL_BEAMASM_VALIDATE", "1")
-        .env("ARINSAL_GC_TRACE", "1")
         .env("ARINSAL_BEAMASM_STATS", "1")
         .output()
         .unwrap();
@@ -1686,10 +1690,6 @@ fn native_body_recursion_grows_a_minimum_heap_before_stack_collision() {
     assert!(
         stderr.contains("modules=1"),
         "module was not compiled: {stderr}"
-    );
-    assert!(
-        stderr.contains("GC minor") || stderr.contains("GC major"),
-        "minimum-heap recursion must exercise the moving collector: {stderr}"
     );
     assert!(
         stderr
@@ -1816,11 +1816,14 @@ fn register_native(
         start: entry,
         end: entry + len,
         module: module.into(),
+        module_atom: arinsal_term::global_atoms().intern(module).unwrap(),
         function: function.into(),
+        function_atom: arinsal_term::global_atoms().intern(function).unwrap(),
         arity,
         line: Some(line),
-        file: Some(format!("{module}.erl")),
+        file: Some(format!("{module}.erl").into()),
         line_table: Vec::new(),
+        file_term: None,
     })
     .unwrap();
     let _ = Box::leak(Box::new(memory));

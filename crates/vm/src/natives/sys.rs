@@ -968,6 +968,8 @@ fn system_info(
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         // Port of erts/emulator/beam/erl_bif_info.c:3370-3376, OTP-29.1.1.
         Some("lock_checking") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
+        // Port of erts/emulator/beam/erl_bif_info.c:2888-2889, OTP-29.1.1.
+        Some("ets_always_compress") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         Some("check_io") => Some(check_io_info(process)),
         Some("ethread_info") => Some(ethread_info(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3549 (max_integer), OTP-29.1.1.
@@ -2090,7 +2092,7 @@ fn ets_bytes(process: &Process) -> u64 {
     let Some(runtime) = &process.runtime else {
         return 0;
     };
-    let registry = runtime.ets.lock().expect("ets registry");
+    let registry = runtime.ets.read().expect("ets registry");
     let words: usize = registry
         .all()
         .into_iter()
@@ -2427,19 +2429,16 @@ fn warn_deprecated_cpu_topology(process: &mut Process, ctx: &mut RunCtx<'_, Mess
     );
 }
 
-fn bif_error_for(process: &mut Process, function: &str, args: &[Term], reason: &str) -> VmError {
-    let args = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        TermBuilder::new(&mut heap).list_from_iter(args.iter().copied())
-    };
-    let Ok(args) = args else {
-        return badarg();
-    };
+fn bif_error_for(_process: &mut Process, function: &str, args: &[Term], reason: &str) -> VmError {
     let mut trap = crate::exceptions::Trap::error(atom(reason));
     trap.top = Some(crate::stacktrace::TopFrame::Bif {
-        module: "erlang".into(),
-        function: function.into(),
-        args,
+        module: global_atoms().intern("erlang").expect("built-in atom"),
+        function: global_atoms().intern(function).expect("system BIF atom"),
+        args: match crate::stacktrace::BifArgs::from_terms(args) {
+            Ok(args) => args,
+            Err(error) => return error,
+        },
+        info: crate::stacktrace::BifErrorInfo::Plain,
     });
     VmError::Trap(trap)
 }
@@ -3699,6 +3698,24 @@ mod tests {
             &[OwnedTerm::atom("debug_compiled")],
         );
         let selector = Term::atom(global_atoms().intern("debug_compiled").unwrap());
+        let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
+    }
+
+    #[test]
+    fn ets_always_compress_system_info_matches_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping ETS compression system_info differential test");
+            return;
+        };
+        let expected = reference.call(
+            "erlang",
+            "system_info",
+            &[OwnedTerm::atom("ets_always_compress")],
+        );
+        let selector = Term::atom(global_atoms().intern("ets_always_compress").unwrap());
         let actual = system_info(&Vm::new([]), &mut Process::new(), None, selector)
             .unwrap()
             .unwrap();

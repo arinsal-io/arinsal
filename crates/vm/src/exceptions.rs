@@ -5,7 +5,7 @@ use arinsal_bifs::{BifError, Class, FragmentingHeap};
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::{Arg, Module};
 use arinsal_spec::Opcode;
-use arinsal_term::{Term, TermBuilder, to_owned};
+use arinsal_term::{Atom, Term, TermBuilder, global_atoms, to_owned};
 use std::fmt;
 
 /// A BEAM exception before handler dispatch.
@@ -165,7 +165,22 @@ pub(super) fn native_trap(class: u64, reason: u64) -> Result<Trap, VmError> {
 }
 
 fn atom(name: &str) -> Result<Term, VmError> {
-    stacktrace::atom_term(name)
+    static COMMON: std::sync::OnceLock<[Atom; 5]> = std::sync::OnceLock::new();
+    let common = COMMON.get_or_init(|| {
+        let atoms = global_atoms();
+        ["badarg", "badarith", "system_limit", "error", "exit"]
+            .map(|name| atoms.intern(name).expect("built-in exception atom"))
+    });
+    let atom = match name {
+        "badarg" => Some(common[0]),
+        "badarith" => Some(common[1]),
+        "system_limit" => Some(common[2]),
+        "error" => Some(common[3]),
+        "exit" => Some(common[4]),
+        _ => None,
+    };
+    atom.map(Term::atom)
+        .map_or_else(|| stacktrace::atom_term(name), Ok)
 }
 
 pub(super) fn tuple(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
@@ -223,6 +238,24 @@ pub(super) fn bif_error(
     args: &[Term],
     error: BifError,
 ) -> VmError {
+    let Ok(module_atom) = global_atoms().intern(module) else {
+        return VmError::Unsupported(format!("exception module atom {module}"));
+    };
+    let Ok(function_atom) = global_atoms().intern(function) else {
+        return VmError::Unsupported(format!("exception function atom {function}"));
+    };
+    bif_error_with_atoms(p, module, function, module_atom, function_atom, args, error)
+}
+
+pub(super) fn bif_error_with_atoms(
+    p: &mut Process,
+    module: &str,
+    function: &str,
+    module_atom: Atom,
+    function_atom: Atom,
+    args: &[Term],
+    error: BifError,
+) -> VmError {
     // A raised BIF exception abandons the suspended call before catch/after
     // code runs, so its process-local continuation must not survive unwind.
     if let Some(pending) = p.cold_mut().bif_trap.take() {
@@ -259,6 +292,13 @@ pub(super) fn bif_error(
                 untrappable: false,
             });
         }
+        let info = match error {
+            BifError::Badarg { cause: Some(cause) } => cause.as_atom().map_or(
+                stacktrace::BifErrorInfo::Plain,
+                stacktrace::BifErrorInfo::Cause,
+            ),
+            _ => stacktrace::BifErrorInfo::Plain,
+        };
         let reason = match error {
             BifError::Badarg { .. } => atom("badarg")?,
             BifError::Badarith => atom("badarith")?,
@@ -271,9 +311,10 @@ pub(super) fn bif_error(
             reason,
             trace: None,
             top: Some(stacktrace::TopFrame::Bif {
-                module: module.to_owned(),
-                function: function.to_owned(),
-                args: list(p, args)?,
+                module: module_atom,
+                function: function_atom,
+                args: stacktrace::BifArgs::from_terms(args)?,
+                info,
             }),
             raw_rethrow: false,
             untrappable: false,
@@ -605,7 +646,8 @@ pub(super) fn resume(
                 index += frame_words;
                 continue;
             }
-            if crate::native_function_at(address).is_some() {
+            // Only CP words (low tag bits 00, erts is_CP) can be native return addresses.
+            if address & 3 == 0 && crate::native_bridge::is_native_function_at(address) {
                 frame_start = index + 1;
                 index += 1;
                 continue;
@@ -769,22 +811,25 @@ fn save_explicit(p: &mut Process, trace: Term, class: Class) -> Result<Term, VmE
 }
 
 fn available_trace_slot(p: &mut Process) -> usize {
-    let slot_count = p.cold.as_ref().map_or(0, |cold| cold.raw_traces.len());
-    let slot = (0..slot_count).find(|&slot| {
-        // X(2) is replaced by the new trace before handler code resumes.
-        let live_x = p.gc_live.max(4).min(p.x.len());
-        !p.x[..live_x]
-            .iter()
-            .enumerate()
-            .any(|(index, &term)| index != 2 && stacktrace::raw_index(term) == Some(slot))
-            && !(0..p.heap.stack_words())
-                .any(|index| p.heap.stack_get(index).and_then(stacktrace::raw_index) == Some(slot))
-    });
-    slot.unwrap_or_else(|| {
-        let traces = &mut p.cold_mut().raw_traces;
-        traces.push(stacktrace::RawTrace::default());
-        traces.len() - 1
-    })
+    let cold = p.cold_mut();
+    if let Some(slot) = cold.free_raw_trace_slots.pop() {
+        cold.raw_traces[slot].available = false;
+        return slot;
+    }
+    let slot = cold.raw_traces.len();
+    cold.raw_traces.push(stacktrace::RawTrace::default());
+    slot
+}
+
+fn release_trace_slot(p: &mut Process, slot: usize) {
+    let cold = p.cold_mut();
+    let Some(trace) = cold.raw_traces.get_mut(slot) else {
+        return;
+    };
+    if !trace.available {
+        trace.available = true;
+        cold.free_raw_trace_slots.push(slot);
+    }
 }
 
 pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError> {
@@ -794,24 +839,27 @@ pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError>
     let Some(index) = stacktrace::raw_index(trace) else {
         return Ok(trace);
     };
-    let raw = {
-        let traces = &mut p
+    let mut raw = {
+        let cold = p
             .cold
             .as_mut()
-            .ok_or_else(|| VmError::Unsupported("raw stacktrace storage".into()))?
-            .raw_traces;
-        let slot = traces
+            .ok_or_else(|| VmError::Unsupported("raw stacktrace storage".into()))?;
+        let raw = cold
+            .raw_traces
             .get_mut(index)
             .ok_or_else(|| VmError::Unsupported("raw stacktrace index".into()))?;
-        std::mem::take(slot)
+        std::mem::take(raw)
     };
-    let result = stacktrace::build_saved(p, &raw);
+    let result = stacktrace::build_saved(p, &mut raw);
     let slot = p
         .cold_mut()
         .raw_traces
         .get_mut(index)
         .ok_or_else(|| VmError::Unsupported("raw stacktrace index".into()))?;
     *slot = raw;
+    if result.is_ok() {
+        release_trace_slot(p, index);
+    }
     result
 }
 

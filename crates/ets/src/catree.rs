@@ -289,6 +289,34 @@ impl CATree {
         }
     }
 
+    /// Copy one object element while holding the base read lock.
+    ///
+    /// Port of erts/emulator/beam/erl_db_catree.c:2040 (`db_get_element_catree`), OTP-29.1.1.
+    pub(crate) fn lookup_element<H: HeapAlloc>(
+        &self,
+        key: Term,
+        index: usize,
+        dst: &mut H,
+    ) -> Result<Term, EtsError> {
+        loop {
+            let routes = self.routes.load();
+            let base = routes.find_base(key);
+            let root = base.read();
+            if !base.is_valid.load(AtomicOrdering::Acquire) {
+                drop(root);
+                drop(routes);
+                std::thread::yield_now();
+                continue;
+            }
+            let result = Node::get(&root, key, self.keypos)
+                .ok_or(EtsError::BadArgCause("badkey"))?
+                .copy_element_out(index, dst);
+            drop(root);
+            self.random_join();
+            return result;
+        }
+    }
+
     /// Port of erts/emulator/beam/erl_db_catree.c:1746 (db_get_catree), OTP-29.1.1.
     pub(crate) fn matching(&self, key: Term) -> Result<Vec<StoredTerm>, EtsError> {
         loop {
@@ -490,32 +518,51 @@ impl CATree {
         reverse: bool,
         dst: &mut H,
     ) -> Result<Option<Term>, EtsError> {
-        let routes = self.routes.load();
-        let mut candidate = None;
-        for route in routes.iter() {
-            let root = route.base.read();
-            let mut objects = Vec::new();
-            Node::walk(&root, &mut objects);
-            for object in objects {
-                let order = cmp(object.key(self.keypos), key);
-                if if reverse {
-                    order == Ordering::Less
-                } else {
-                    order == Ordering::Greater
-                } && candidate.is_none_or(|old: Term| {
-                    if reverse {
-                        cmp(object.key(self.keypos), old) == Ordering::Greater
-                    } else {
-                        cmp(object.key(self.keypos), old) == Ordering::Less
+        // Port of erts/emulator/beam/erl_db_catree.c:1792-1846 (db_next_catree /
+        // db_prev_catree), OTP-29.1.1: search the base node that routes the key, then
+        // the following (or preceding) base nodes, instead of scanning every object.
+        'retry: loop {
+            let routes = self.routes.load();
+            let entries = &routes.entries;
+            let start = entries
+                .partition_point(|entry| {
+                    entry
+                        .first_key
+                        .as_ref()
+                        .is_none_or(|first| cmp(first.key(1), key) != Ordering::Greater)
+                })
+                .saturating_sub(1);
+            let mut index = start;
+            loop {
+                let base = &entries[index].base;
+                let root = base.read();
+                if !base.is_valid.load(AtomicOrdering::Acquire) {
+                    drop(root);
+                    drop(routes);
+                    std::thread::yield_now();
+                    continue 'retry;
+                }
+                let mut found = None;
+                Node::scan_after(&root, Some(key), reverse, self.keypos, &mut |object| {
+                    found = Some(arinsal_term::copy_term(object.key(self.keypos), dst)?);
+                    Ok(true)
+                })?;
+                if found.is_some() {
+                    return Ok(found);
+                }
+                if reverse {
+                    if index == 0 {
+                        return Ok(None);
                     }
-                }) {
-                    candidate = Some(object.key(self.keypos));
+                    index -= 1;
+                } else {
+                    index += 1;
+                    if index == entries.len() {
+                        return Ok(None);
+                    }
                 }
             }
         }
-        candidate
-            .map(|term| arinsal_term::copy_term(term, dst).map_err(EtsError::Term))
-            .transpose()
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c:2085 (db_select_catree), OTP-29.1.1.

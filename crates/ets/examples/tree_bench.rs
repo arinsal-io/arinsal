@@ -22,7 +22,7 @@ fn run_once() -> [f64; 3] {
             compressed: false,
         })
         .unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut heap = VecHeap::new();
 
     let start = Instant::now();

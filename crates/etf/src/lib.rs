@@ -966,7 +966,9 @@ fn encode_terms_into(
     while let Some(item) = work.pop() {
         let t = match item {
             Work::PatchFun(pos) => {
-                let size = (out.len() - pos) as u32;
+                // Port of erts/emulator/beam/external.c:3974-3990, OTP-29.1.1.
+                // NEW_FUN_EXT size excludes its own four-byte size field.
+                let size = (out.len() - pos - 4) as u32;
                 out[pos..pos + 4].copy_from_slice(&size.to_be_bytes());
                 continue;
             }

@@ -689,12 +689,18 @@ fn invoke_dispatch_bif(header: *mut ProcessHeader, identity: usize) -> Option<u6
     {
         *destination = crate::native_hooks::from_raw(raw);
     }
-    let args = registers.x_reg_array[..arity]
+    let mut args = registers.x_reg_array[..arity]
         .iter()
         .copied()
         .map(crate::native_hooks::from_raw)
         .collect::<Vec<_>>();
-    let result = crate::calls::call_bif(&mut process.heap, bif, &args);
+    let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
+    if crate::calls::gc_after_bif(process, &mut args, &mut result).is_err() {
+        crate::native_hooks::set_error(process, "system_limit");
+        publish_dispatch_x(process, registers);
+        process.sync_native_header();
+        return Some(0);
+    }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     match result {
         Ok(value) => {

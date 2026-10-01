@@ -241,6 +241,8 @@ pub struct ProcessHeap {
     pub(crate) heap_grow: bool,
     pub(crate) native_allocation: bool,
     pub(crate) fragments: Vec<Fragment>,
+    /// Total word capacity in process heap fragments (`mbuf_sz` in erts).
+    pub(crate) fragment_words: usize,
     pub(crate) owners: LazyOwners,
 }
 
@@ -350,6 +352,7 @@ impl ProcessHeap {
             heap_grow: false,
             native_allocation: false,
             fragments: Vec::new(),
+            fragment_words: 0,
             owners: LazyOwners::default(),
         }
     }
@@ -472,6 +475,7 @@ impl ProcessHeap {
     }
     /// Allocate a side fragment when a BIF cannot collect at this point.
     pub fn heap_fragment(&mut self, words: usize) -> *mut u64 {
+        self.fragment_words = self.fragment_words.saturating_add(words);
         self.fragments.push(Fragment::Block(WordBlock::new(
             words,
             ErtsAlcType::HEAP_FRAG,
@@ -494,6 +498,8 @@ impl ProcessHeap {
             return Err(AdoptError::NotStandalone);
         }
         // The block moves with its terms; no word is copied.
+        let adopted_words = source.words.len().saturating_add(source.fragment_words);
+        self.fragment_words = self.fragment_words.saturating_add(adopted_words);
         self.fragments
             .push(Fragment::Block(std::mem::take(&mut source.words)));
         self.fragments.append(&mut source.fragments);
@@ -912,6 +918,14 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         let mut tail = Term::NIL;
         for value in values.into_iter().rev() {
             tail = self.cons(value, tail)?;
+        }
+        Ok(tail)
+    }
+    /// Build a list from a slice without staging the elements.
+    pub fn list_from_slice(&mut self, values: &[Term]) -> Result<Term, TermError> {
+        let mut tail = Term::NIL;
+        for value in values.iter().rev() {
+            tail = self.cons(*value, tail)?;
         }
         Ok(tail)
     }

@@ -7,7 +7,6 @@
 
 use crate::bits::{binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
-use crate::heap::Fragment;
 use crate::{
     ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, ExternalBinary, FUN,
     FunEntry, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, MagicRef, Node, ProcessHeap, RECORD,
@@ -504,7 +503,7 @@ impl ProcessHeap {
         self.htop
             .saturating_add(self.stack_words())
             .saturating_add(self.old_htop)
-            .saturating_add(self.fragments.iter().map(Fragment::len).sum::<usize>())
+            .saturating_add(self.fragments.iter().map(|f| f.len()).sum::<usize>())
     }
 
     /// Return whether initialized process storage contains a direct pointer into an area.
@@ -630,13 +629,7 @@ impl ProcessHeap {
 
     /// Young heap, old heap, and fragment capacity in words.
     pub fn total_heap_size_words(&self) -> usize {
-        self.words.len()
-            + self.old_words.len()
-            + self
-                .fragments
-                .iter()
-                .map(|fragment| fragment.len())
-                .sum::<usize>()
+        self.words.len() + self.old_words.len() + self.fragment_words
     }
 
     /// Old generation capacity in words.
@@ -685,7 +678,7 @@ impl ProcessHeap {
     /// Whether heap fragments exceed the free young-generation area.
     /// Port of erl_gc.h:132-139 (`ERTS_IS_GC_DESIRED`), OTP-29.1.1.
     pub fn gc_desired(&self) -> bool {
-        self.free_words() < self.fragments.iter().map(Fragment::len).sum::<usize>()
+        self.free_words() < self.fragment_words
     }
 
     /// Whether a term points into the old generation.
@@ -797,15 +790,7 @@ impl ProcessHeap {
         min_free: usize,
     ) -> Result<GcStats, TermError> {
         let start = Instant::now();
-        let fragments = self.fragments.iter().map(|f| f.len()).sum::<usize>();
-        let trace_before = (
-            self.htop,
-            self.words.len(),
-            self.old_htop,
-            self.old_words.len(),
-            self.high_water,
-            fragments,
-        );
+        let fragments = self.fragment_words;
         let mut fragment_ranges = self
             .fragments
             .iter()
@@ -955,23 +940,6 @@ impl ProcessHeap {
         self.adjust_young_heap(major, min_free, roots, extra, code_ranges)?;
         #[cfg(debug_assertions)]
         self.verify_frame_chain(code_ranges);
-        if std::env::var_os("ARINSAL_GC_TRACE").is_some() {
-            eprintln!(
-                "GC {} start heap={}/{} old={}/{} recent={} mbuf={} need={} end heap={}/{} old={}/{}",
-                if major { "major" } else { "minor" },
-                trace_before.0,
-                trace_before.1,
-                trace_before.2,
-                trace_before.3,
-                trace_before.4,
-                trace_before.5,
-                min_free,
-                self.htop,
-                self.words.len(),
-                self.old_htop,
-                self.old_words.len(),
-            );
-        }
         // Verify all roots after collection so stale pointers fail where they enter.
         #[cfg(debug_assertions)]
         crate::validate::verify_roots_after_collection(self, roots, extra);
@@ -1385,6 +1353,22 @@ mod tests {
 
         assert!(heap.has_heap_reference(|term| term == literal));
         assert!(!heap.has_heap_reference(|_| false));
+    }
+
+    #[test]
+    fn fragment_pressure_tracks_allocated_and_adopted_fragment_words() {
+        let mut heap = ProcessHeap::with_words(128);
+        heap.gc_fragment(64);
+        assert_eq!(heap.fragment_words, 64);
+        assert!(!heap.gc_desired());
+        heap.gc_fragment(65);
+        assert_eq!(heap.fragment_words, 129);
+        assert!(heap.gc_desired());
+
+        let mut message_heap = ProcessHeap::with_words(32);
+        message_heap.gc_fragment(7);
+        heap.adopt_message_fragment(message_heap).unwrap();
+        assert_eq!(heap.fragment_words, 168);
     }
 
     #[test]

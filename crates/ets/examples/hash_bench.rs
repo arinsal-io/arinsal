@@ -47,7 +47,7 @@ fn main() {
         let mut registry = Registry::new();
         let table = registry.create(options()).unwrap();
 
-        let table = registry.get_mut(table).unwrap();
+        let mut table = registry.get_mut(table).unwrap();
         let mut heap = VecHeap::new();
         let start = Instant::now();
         for i in 0..N {

@@ -46,21 +46,21 @@ fn force_split(table: &Table, key: i64) {
 
 #[test]
 fn split_under_contention() {
-    let (mut registry, tid) = table(WriteConcurrency::Enabled);
-    let stored = registry.get_mut(tid).unwrap();
-    insert_range(stored, 0, 512);
+    let (registry, tid) = table(WriteConcurrency::Enabled);
+    let mut stored = registry.get_mut(tid).unwrap();
+    insert_range(&mut stored, 0, 512);
     assert_eq!(stored.catree_debug_base_count(), Some(1));
-    force_split(stored, 0);
+    force_split(&stored, 0);
     assert!(stored.avl_invariants_hold());
     assert_eq!(stored.len(), 512);
 }
 
 #[test]
 fn join_when_quiet() {
-    let (mut registry, tid) = table(WriteConcurrency::Enabled);
-    let stored = registry.get_mut(tid).unwrap();
-    insert_range(stored, 0, 512);
-    force_split(stored, 0);
+    let (registry, tid) = table(WriteConcurrency::Enabled);
+    let mut stored = registry.get_mut(tid).unwrap();
+    insert_range(&mut stored, 0, 512);
+    force_split(&stored, 0);
     assert!(stored.catree_debug_adjust_contention(Term::small(0).unwrap(), -1500));
     assert_eq!(stored.catree_debug_base_count(), Some(1));
     assert!(stored.avl_invariants_hold());
@@ -84,10 +84,10 @@ fn reference() -> Option<RefErl> {
 
 #[test]
 fn range_select_across_bases_vs_erl() {
-    let (mut registry, tid) = table(WriteConcurrency::Enabled);
-    let stored = registry.get_mut(tid).unwrap();
-    insert_range(stored, 0, 1000);
-    force_split(stored, 0);
+    let (registry, tid) = table(WriteConcurrency::Enabled);
+    let mut stored = registry.get_mut(tid).unwrap();
+    insert_range(&mut stored, 0, 1000);
+    force_split(&stored, 0);
 
     let spec = OwnedTerm::list(vec![OwnedTerm::Tuple(vec![
         OwnedTerm::Tuple(vec![
@@ -159,10 +159,10 @@ fn concurrent_mixed_ops_8_threads() {
 
 #[test]
 fn order_matches_avl() {
-    let (mut avl_registry, avl_tid) = table(WriteConcurrency::Disabled);
-    let (mut ca_registry, ca_tid) = table(WriteConcurrency::Enabled);
-    let avl = avl_registry.get_mut(avl_tid).unwrap();
-    let ca = ca_registry.get_mut(ca_tid).unwrap();
+    let (avl_registry, avl_tid) = table(WriteConcurrency::Disabled);
+    let (ca_registry, ca_tid) = table(WriteConcurrency::Enabled);
+    let mut avl = avl_registry.get_mut(avl_tid).unwrap();
+    let mut ca = ca_registry.get_mut(ca_tid).unwrap();
     let mut heap = VecHeap::new();
     for key in (0..4096).rev() {
         if key % 128 == 0 {
@@ -173,7 +173,7 @@ fn order_matches_avl() {
         avl.insert(&[object]).unwrap();
         ca.insert(&[object]).unwrap();
     }
-    force_split(ca, 0);
+    force_split(&ca, 0);
     for key in (0..4096).step_by(3) {
         let key = Term::small(key).unwrap();
         avl.delete_key(key);

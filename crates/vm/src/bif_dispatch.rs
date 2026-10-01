@@ -17,14 +17,30 @@ impl Vm {
                 "native arity {arity} exceeds register file"
             ))));
         }
-        self.dispatch_native_source(
+        let mut inline_arguments = [Term::NIL; 8];
+        let mut overflow_arguments =
+            (arity > inline_arguments.len()).then(|| p.x[..arity].to_vec());
+        let arguments = if let Some(arguments) = overflow_arguments.as_mut() {
+            arguments.as_mut_slice()
+        } else {
+            inline_arguments[..arity].copy_from_slice(&p.x[..arity]);
+            &mut inline_arguments[..arity]
+        };
+        let mut result = self.dispatch_native_source(
             p,
             ctx,
             module,
             function,
             resolved,
             natives::NativeArgs::Registers(arity),
-        )
+        );
+        if let Some(result) = result.as_mut() {
+            if let Err(error) = calls::gc_after_native(p, arguments, result) {
+                return Some(Err(error));
+            }
+            p.x[..arity].copy_from_slice(arguments);
+        }
+        result
     }
     pub(crate) fn dispatch_native_args(
         &mut self,
@@ -166,10 +182,12 @@ impl Vm {
                 Ok(value) => Ok(value),
                 Err(error) => {
                     let import = &self.modules[p.module].imports[index];
-                    Err(exceptions::bif_error(
+                    Err(exceptions::bif_error_with_atoms(
                         p,
                         &import.module,
                         &import.function,
+                        import.module_atom,
+                        import.function_atom,
                         args,
                         error,
                     ))
@@ -203,10 +221,12 @@ impl Vm {
                 match calls::call_bif_catch(&mut p.heap, bif, args) {
                     Ok(Ok(value)) => (Ok(value), 0),
                     Ok(Err(error)) => (
-                        Err(exceptions::bif_error(
+                        Err(exceptions::bif_error_with_atoms(
                             p,
                             module_name,
                             function_name,
+                            import.module_atom,
+                            import.function_atom,
                             args,
                             error,
                         )),

@@ -20,6 +20,10 @@ fn list(values: Vec<OwnedTerm>) -> OwnedTerm {
     OwnedTerm::list(values)
 }
 
+fn string(value: &str) -> OwnedTerm {
+    list(value.bytes().map(|byte| int(i64::from(byte))).collect())
+}
+
 fn ref_erl() -> Option<RefErl> {
     match RefErl::start() {
         Ok(erl) => Some(erl),
@@ -49,7 +53,7 @@ fn options(table_type: TableType) -> TableOptions {
 fn local_select(table_type: TableType, spec: &OwnedTerm) -> OwnedTerm {
     let mut registry = Registry::new();
     let tid = registry.create(options(table_type)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut heap = VecHeap::new();
     for (key, value) in [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")] {
         let object = from_owned(&tuple(vec![int(key), atom(value)]), &mut heap).unwrap();
@@ -134,6 +138,109 @@ fn test_ms_results_vs_erl() {
             result => panic!("unexpected OTP result for seed {seed}: {result:?}"),
         }
     }
+}
+
+#[test]
+fn tuple_construction_evaluates_nested_matchspec_expressions_like_otp() {
+    let Some(erl) = ref_erl() else { return };
+    let factor = 0x0fff_ffff;
+    let beam = erl
+        .compile_named(
+            "ms_tuple_expression_fixture",
+            r#"
+                -module(ms_tuple_expression_fixture).
+                -export([run/0]).
+                run() ->
+                  Values = [{1},{2},{3}],
+                  Spec = [{{'$1'},[{'>','$1',1}],[{{{'*','$1',268435455}}}]}],
+                  ets:match_spec_run(Values,ets:match_spec_compile(Spec)).
+            "#,
+            &[],
+        )
+        .unwrap();
+    erl.load("ms_tuple_expression_fixture", &beam).unwrap();
+    let expected = erl.call("ms_tuple_expression_fixture", "run", &[]);
+
+    let expression = tuple(vec![atom("*"), atom("$1"), int(factor)]);
+    let tuple_expression = tuple(vec![tuple(vec![expression])]);
+    let spec = list(vec![tuple(vec![
+        tuple(vec![atom("$1")]),
+        list(vec![tuple(vec![atom(">"), atom("$1"), int(1)])]),
+        list(vec![tuple_expression]),
+    ])]);
+    let objects = [int(1), int(2), int(3)]
+        .into_iter()
+        .map(|value| tuple(vec![value]))
+        .collect::<Vec<_>>();
+    let mut heap = VecHeap::new();
+    let program = MatchProgram::compile(from_owned(&spec, &mut heap).unwrap()).unwrap();
+    let input = objects
+        .iter()
+        .map(|object| from_owned(object, &mut heap).unwrap())
+        .collect::<Vec<_>>();
+    let mut output = VecHeap::new();
+    let actual = program
+        .run_many(&input, &mut output)
+        .unwrap()
+        .into_iter()
+        .map(|term| to_owned(term).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(expected, CallResult::Ok(list(actual)));
+}
+
+#[test]
+fn tuple_construction_in_guard_matches_otp() {
+    let Some(erl) = ref_erl() else { return };
+    let beam = erl
+        .compile_named(
+            "ms_guard_tuple_fixture",
+            r#"
+                -module(ms_guard_tuple_fixture).
+                -export([run/0]).
+                run() ->
+                  Term = atom,
+                  Objects = [{[{second,Term},'and',"tail"],Term,['and',"tail"]}],
+                  Spec = [{{'$1','$2','$3'},
+                    [{'=:=','$1',[{{second,'$2'}}|'$3']}],
+                    [{{"Building guard"}}]}],
+                  ets:match_spec_run(Objects,ets:match_spec_compile(Spec)).
+            "#,
+            &[],
+        )
+        .unwrap();
+    erl.load("ms_guard_tuple_fixture", &beam).unwrap();
+    let expected = erl.call("ms_guard_tuple_fixture", "run", &[]);
+
+    let term = atom("atom");
+    let string_tail = string("tail");
+    let object = tuple(vec![
+        list(vec![
+            tuple(vec![atom("second"), term.clone()]),
+            atom("and"),
+            string_tail.clone(),
+        ]),
+        term,
+        list(vec![atom("and"), string_tail]),
+    ]);
+    let tuple_expression = tuple(vec![tuple(vec![atom("second"), atom("$2")])]);
+    let guard_list = OwnedTerm::List {
+        elems: vec![tuple_expression],
+        tail: Box::new(atom("$3")),
+    };
+    let spec = list(vec![tuple(vec![
+        tuple(vec![atom("$1"), atom("$2"), atom("$3")]),
+        list(vec![tuple(vec![atom("=:="), atom("$1"), guard_list])]),
+        list(vec![tuple(vec![tuple(vec![string("Building guard")])])]),
+    ])]);
+    let mut heap = VecHeap::new();
+    let program = MatchProgram::compile(from_owned(&spec, &mut heap).unwrap()).unwrap();
+    let object = from_owned(&object, &mut heap).unwrap();
+    let mut output = VecHeap::new();
+    let actual = program
+        .run(object, &mut output)
+        .unwrap()
+        .map(|term| to_owned(term).unwrap());
+    assert_eq!(expected, CallResult::Ok(list(actual.into_iter().collect())));
 }
 
 #[test]
@@ -227,7 +334,7 @@ fn select_replace_vs_erl() {
     let expected = erl.call("ms_replace_fixture", "replace", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::OrderedSet)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut heap = VecHeap::new();
     for (key, value) in [(1, "a"), (2, "b"), (3, "c")] {
         let object = from_owned(&tuple(vec![int(key), atom(value)]), &mut heap).unwrap();

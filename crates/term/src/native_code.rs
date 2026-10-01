@@ -1,6 +1,18 @@
 //! Native code ranges used to distinguish BeamAsm continuation pointers from terms.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
+
+/// Conservative hull of every range ever registered; lets stack scans reject most words
+/// without taking the registry lock.
+static HULL_START: AtomicUsize = AtomicUsize::new(usize::MAX);
+static HULL_END: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `address` may lie in a registered native code range (lock-free, no false negatives).
+#[inline]
+pub fn may_be_native_code_pointer(address: usize) -> bool {
+    address >= HULL_START.load(Ordering::Acquire) && address < HULL_END.load(Ordering::Acquire)
+}
 
 fn ranges() -> &'static RwLock<Vec<(usize, usize)>> {
     static RANGES: OnceLock<RwLock<Vec<(usize, usize)>>> = OnceLock::new();
@@ -22,6 +34,8 @@ pub fn register_native_code_range(start: usize, end: usize) -> Result<(), &'stat
         return Err("native code ranges must not overlap");
     }
     ranges.push((start, end));
+    HULL_START.fetch_min(start, Ordering::AcqRel);
+    HULL_END.fetch_max(end, Ordering::AcqRel);
     ranges.sort_unstable_by_key(|range| range.0);
     Ok(())
 }
@@ -37,6 +51,9 @@ pub fn unregister_native_code_range(start: usize, end: usize) {
 /// Whether an address lies in a registered native code range.
 // Port of erts/emulator/beam/erl_term.h:1375-1379 (`is_CP`), OTP-29.1.1.
 pub fn is_native_code_pointer(address: usize) -> bool {
+    if !may_be_native_code_pointer(address) {
+        return false;
+    }
     let Ok(ranges) = ranges().read() else {
         return false;
     };

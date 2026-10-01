@@ -561,22 +561,27 @@ fn debug_line_system_limit() -> VmError {
 }
 
 // Port of erts/emulator/beam/emu/instrs.tab:416 (i_get_tuple_element), OTP-29.1.1.
-fn bad_get_tuple_element(p: &mut Process, tuple: Term, index: u16) -> VmError {
+fn bad_get_tuple_element(_p: &mut Process, tuple: Term, index: u16) -> VmError {
+    static MFA: std::sync::OnceLock<(arinsal_term::Atom, arinsal_term::Atom)> =
+        std::sync::OnceLock::new();
+    let (module, function) = *MFA.get_or_init(|| {
+        let atoms = arinsal_term::global_atoms();
+        (
+            atoms.intern("erlang").expect("built-in atom"),
+            atoms.intern("element").expect("built-in atom"),
+        )
+    });
     let index = Term::small(i64::from(index) + 1).expect("tuple element index is small");
-    let args = {
-        let mut heap = FragmentingHeap(&mut p.heap);
-        TermBuilder::new(&mut heap)
-            .list_from_iter([index, tuple])
-            .expect("fragmenting heap allocates BIF arguments")
-    };
     VmError::Trap(exceptions::Trap {
         class: arinsal_bifs::Class::Error,
         reason: signals::atom("badarg"),
         trace: None,
         top: Some(stacktrace::TopFrame::Bif {
-            module: "erlang".into(),
-            function: "element".into(),
-            args,
+            module,
+            function,
+            args: stacktrace::BifArgs::from_terms(&[index, tuple])
+                .expect("integer and tuple BIF arguments are representable"),
+            info: stacktrace::BifErrorInfo::Plain,
         }),
         raw_rethrow: false,
         untrappable: false,
@@ -1901,14 +1906,22 @@ impl Vm {
                         Ok(value) => value,
                         Err(error) => {
                             // SAFETY: The native body is executing inside this module's code.
+                            let function_offset = unsafe { ip.offset_from(base) } as usize;
                             let (function, _) = self.modules[module_id]
-                                .function_at(unsafe { ip.offset_from(base) } as usize)
+                                .function_at(function_offset)
                                 .unwrap_or(("?", arity as u8));
                             let arguments = p.x[..arity].to_vec();
-                            return Err(exceptions::bif_error(
+                            let current_module = &self.modules[module_id];
+                            let function_atom = current_module
+                                .function_atom_at(function_offset)
+                                .map(|(atom, _)| atom)
+                                .unwrap_or_else(|| arinsal_term::global_atoms().intern("?").expect("fallback atom"));
+                            return Err(exceptions::bif_error_with_atoms(
                                 p,
-                                &self.modules[module_id].name,
+                                &current_module.name,
                                 function,
+                                current_module.name_atom,
+                                function_atom,
                                 &arguments,
                                 error,
                             ));
@@ -2816,10 +2829,13 @@ impl Vm {
                                 continue;
                             }
                             Err(error) => {
-                                return Err(exceptions::bif_error(
+                                let import = &module.imports[import as usize];
+                                return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &module.imports[import as usize].module,
-                                    &module.imports[import as usize].function,
+                                    &import.module,
+                                    &import.function,
+                                    import.module_atom,
+                                    import.function_atom,
                                     &[left, right],
                                     error,
                                 ));
@@ -2874,10 +2890,13 @@ impl Vm {
                                 continue;
                             }
                             Err(error) => {
-                                return Err(exceptions::bif_error(
+                                let import = &module.imports[import as usize];
+                                return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &module.imports[import as usize].module,
-                                    &module.imports[import as usize].function,
+                                    &import.module,
+                                    &import.function,
+                                    import.module_atom,
+                                    import.function_atom,
                                     &[left, right],
                                     error,
                                 ));
@@ -2933,10 +2952,13 @@ impl Vm {
                                 continue;
                             }
                             Err(error) => {
-                                return Err(exceptions::bif_error(
+                                let import = &module.imports[import as usize];
+                                return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &module.imports[import as usize].module,
-                                    &module.imports[import as usize].function,
+                                    &import.module,
+                                    &import.function,
+                                    import.module_atom,
+                                    import.function_atom,
                                     &[left, value],
                                     error,
                                 ));
@@ -2993,10 +3015,13 @@ impl Vm {
                                 continue;
                             }
                             Err(error) => {
-                                return Err(exceptions::bif_error(
+                                let import = &module.imports[import as usize];
+                                return Err(exceptions::bif_error_with_atoms(
                                     p,
-                                    &module.imports[import as usize].module,
-                                    &module.imports[import as usize].function,
+                                    &import.module,
+                                    &import.function,
+                                    import.module_atom,
+                                    import.function_atom,
                                     &[left, value],
                                     error,
                                 ));

@@ -31,7 +31,7 @@ fn main() {
             compressed: false,
         })
         .unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     let start = Instant::now();
     for index in 1..=count {

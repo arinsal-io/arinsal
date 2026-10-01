@@ -45,6 +45,32 @@ fn otp_and_elixir_corpus_loads() {
             arinsal_beam::parse(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let module =
             arinsal_loader::load(&beam).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(
+            arinsal_term::global_atoms()
+                .text(module.name_atom)
+                .as_deref(),
+            Some(module.name.as_str()),
+            "cached module atom for {}",
+            path.display()
+        );
+        for (index, (_, name, _)) in module.functions.iter().enumerate() {
+            assert_eq!(
+                arinsal_term::global_atoms()
+                    .text(module.function_atoms[index])
+                    .as_deref(),
+                Some(name.as_str()),
+                "cached function atom for {}",
+                path.display()
+            );
+        }
+        for (ip, line) in module.lines.iter().enumerate() {
+            assert_eq!(
+                module.line_term_at(ip).is_some(),
+                line.is_some(),
+                "cached line filename term for {} at {ip}",
+                path.display()
+            );
+        }
         for (op, count) in module.unsupported {
             *unsupported.entry(op).or_default() += count;
         }

@@ -4,6 +4,25 @@ use crate::{Process, VmError};
 use arinsal_term::{Term, TermKind};
 use std::sync::LazyLock;
 
+enum BifErrorRoots {
+    BadargCause(usize),
+    Reason(usize),
+    Raise(usize, Option<usize>),
+}
+
+enum NativeErrorRoots {
+    Trap {
+        reason: usize,
+        trace: Option<usize>,
+        top: Option<NativeTopRoots>,
+    },
+}
+
+enum NativeTopRoots {
+    BifArgs { start: usize, len: usize },
+    CurrentArgs(usize),
+}
+
 static TRACE_BOOT_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("ARINSAL_TRACE_BOOT").is_some());
 
@@ -62,6 +81,155 @@ pub(super) fn call_bif_metered(
     let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
     let result = target(&mut ctx, args);
     (result, ctx.reductions())
+}
+
+/// Collect after a BIF when message-buffer fragments occupy more space than
+/// the process can keep free on its heap.
+// Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
+pub(super) fn gc_after_bif(
+    process: &mut Process,
+    arguments: &mut [Term],
+    result: &mut Result<Term, arinsal_bifs::BifError>,
+) -> Result<(), VmError> {
+    if !process.gc_enabled || !process.heap.gc_desired() {
+        return Ok(());
+    }
+    let mut roots = arguments.to_vec();
+    let result_index = if let Ok(value) = result {
+        roots.push(*value);
+        (Some(roots.len() - 1), None)
+    } else if let Err(error) = result {
+        let error_roots = match error {
+            arinsal_bifs::BifError::Badarg { cause: Some(cause) } => {
+                let index = roots.len();
+                roots.push(*cause);
+                Some(BifErrorRoots::BadargCause(index))
+            }
+            arinsal_bifs::BifError::Error(reason) => {
+                let index = roots.len();
+                roots.push(*reason);
+                Some(BifErrorRoots::Reason(index))
+            }
+            arinsal_bifs::BifError::Raise {
+                reason, stacktrace, ..
+            } => {
+                let reason_index = roots.len();
+                roots.push(*reason);
+                let trace_index = stacktrace.map(|trace| {
+                    roots.push(trace);
+                    roots.len() - 1
+                });
+                Some(BifErrorRoots::Raise(reason_index, trace_index))
+            }
+            _ => None,
+        };
+        (None, error_roots)
+    } else {
+        (None, None)
+    };
+    process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
+    arguments.copy_from_slice(&roots[..arguments.len()]);
+    if let Some(index) = result_index.0 {
+        if let Ok(value) = result {
+            *value = roots[index];
+        }
+    } else if let Some(error_roots) = result_index.1
+        && let Err(error) = result
+    {
+        match (error_roots, error) {
+            (BifErrorRoots::BadargCause(index), arinsal_bifs::BifError::Badarg { cause }) => {
+                *cause = Some(roots[index]);
+            }
+            (BifErrorRoots::Reason(index), arinsal_bifs::BifError::Error(reason)) => {
+                *reason = roots[index];
+            }
+            (
+                BifErrorRoots::Raise(reason_index, trace_index),
+                arinsal_bifs::BifError::Raise {
+                    reason, stacktrace, ..
+                },
+            ) => {
+                *reason = roots[reason_index];
+                *stacktrace = trace_index.map(|index| roots[index]);
+            }
+            _ => unreachable!("the error variant is stable across collection"),
+        }
+    }
+    Ok(())
+}
+
+/// Apply the native BIF epilogue with the process argument registers as roots.
+// Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
+pub(super) fn gc_after_native(
+    process: &mut Process,
+    arguments: &mut [Term],
+    result: &mut Result<Term, VmError>,
+) -> Result<(), VmError> {
+    if !process.gc_enabled || !process.heap.gc_desired() {
+        return Ok(());
+    }
+    let mut roots = arguments.to_vec();
+    let result_index = if let Ok(value) = result {
+        roots.push(*value);
+        (Some(roots.len() - 1), None)
+    } else if let Err(VmError::Trap(trap)) = result {
+        let reason = roots.len();
+        roots.push(trap.reason);
+        let trace = trap.trace.map(|value| {
+            roots.push(value);
+            roots.len() - 1
+        });
+        let top = trap.top.as_ref().and_then(|top| match top {
+            crate::stacktrace::TopFrame::Bif { args, .. } => args
+                .root_terms(&mut roots)
+                .map(|(start, len)| NativeTopRoots::BifArgs { start, len }),
+            crate::stacktrace::TopFrame::CurrentArgs(args) => {
+                roots.push(*args);
+                Some(NativeTopRoots::CurrentArgs(roots.len() - 1))
+            }
+            crate::stacktrace::TopFrame::CurrentArgsWithInfo(Some(args), _) => {
+                roots.push(*args);
+                Some(NativeTopRoots::CurrentArgs(roots.len() - 1))
+            }
+            crate::stacktrace::TopFrame::CurrentArgsWithInfo(None, _) => None,
+        });
+        (None, Some(NativeErrorRoots::Trap { reason, trace, top }))
+    } else {
+        (None, None)
+    };
+    process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
+    arguments.copy_from_slice(&roots[..arguments.len()]);
+    if let Some(index) = result_index.0 {
+        if let Ok(value) = result {
+            *value = roots[index];
+        }
+    } else if let Some(NativeErrorRoots::Trap { reason, trace, top }) = result_index.1
+        && let Err(VmError::Trap(trap)) = result
+    {
+        trap.reason = roots[reason];
+        trap.trace = trace.map(|index| roots[index]);
+        if let Some(top_roots) = top {
+            match trap.top.as_mut() {
+                Some(crate::stacktrace::TopFrame::Bif { args, .. }) => {
+                    if let NativeTopRoots::BifArgs { start, len } = top_roots {
+                        args.update_root_terms(&roots, start, len);
+                    }
+                }
+                Some(crate::stacktrace::TopFrame::CurrentArgs(args))
+                    if let NativeTopRoots::CurrentArgs(index) = top_roots =>
+                {
+                    *args = roots[index]
+                }
+                Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(Some(args), _))
+                    if let NativeTopRoots::CurrentArgs(index) = top_roots =>
+                {
+                    *args = roots[index]
+                }
+                _ => unreachable!("trapped top-frame metadata remains stable across GC"),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`call_bif`] with the panic landing the interpreter already used.
@@ -332,7 +500,15 @@ impl Vm {
     ) -> VmError {
         let args = p.x[..arity].to_vec();
         let import = &self.modules[module].imports[index];
-        exceptions::bif_error(p, &import.module, &import.function, &args, error)
+        exceptions::bif_error_with_atoms(
+            p,
+            &import.module,
+            &import.function,
+            import.module_atom,
+            import.function_atom,
+            &args,
+            error,
+        )
     }
     pub(crate) fn remember_export(
         &self,
@@ -415,10 +591,12 @@ impl Vm {
             Err(error) => {
                 let args = p.x[..arity].to_vec();
                 let import = &self.modules[p.module].imports[index];
-                return Err(exceptions::bif_error(
+                return Err(exceptions::bif_error_with_atoms(
                     p,
                     &import.module,
                     &import.function,
+                    import.module_atom,
+                    import.function_atom,
                     &args,
                     error,
                 ));
@@ -684,6 +862,20 @@ impl Vm {
 mod tests {
     use super::*;
     use arinsal_term::{ProcessHeap, TermBuilder};
+
+    #[test]
+    fn bif_epilogue_collects_when_heap_fragments_exceed_free_heap() {
+        let mut process = Process::with_registers(4, 0);
+        process.heap.gc_fragment(process.heap.free_words() + 1);
+        let mut arguments = [Term::NIL];
+        let mut result = Ok(Term::atom(arinsal_term::atoms::TRUE));
+
+        gc_after_bif(&mut process, &mut arguments, &mut result).unwrap();
+
+        assert!(!process.heap.gc_desired());
+        assert!(process.stats.gc.collections > 0);
+        assert_eq!(result.unwrap().as_atom(), Some(arinsal_term::atoms::TRUE));
+    }
 
     #[test]
     fn continuation_gc_keeps_only_callee_arguments() {

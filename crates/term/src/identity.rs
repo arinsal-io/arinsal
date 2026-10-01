@@ -40,6 +40,19 @@ pub enum Identity {
     },
 }
 impl Term {
+    /// Numbers of a local ordinary reference without allocating, as `identity` reads them.
+    pub fn local_ref_numbers(self) -> Option<[u32; 3]> {
+        if self.header()? & 63 != REF {
+            return None;
+        }
+        // SAFETY: an ordinary reference has marker and three packed numbers.
+        let (one, two) = unsafe {
+            let p = self.raw_ptr();
+            (*p.add(1), *p.add(2))
+        };
+        Some([(one >> 32) as u32, two as u32, (two >> 32) as u32])
+    }
+
     /// Read an identity as owned numeric fields.
     pub fn identity(self) -> Option<Identity> {
         if let Some((index, serial)) = self.as_pid() {
@@ -70,15 +83,11 @@ impl Term {
                     ids: vec![id as u32, (id >> 32) as u32, u32::MAX],
                 })
             }
-            REF => {
-                // SAFETY: ordinary reference has marker and three packed numbers.
-                let (one, two) = unsafe { (*p.add(1), *p.add(2)) };
-                Some(Identity::Ref {
-                    node: atoms::NONAME,
-                    creation: 0,
-                    ids: vec![(one >> 32) as u32, two as u32, (two >> 32) as u32],
-                })
-            }
+            REF => Some(Identity::Ref {
+                node: atoms::NONAME,
+                creation: 0,
+                ids: self.local_ref_numbers()?.to_vec(),
+            }),
             EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
                 // SAFETY: external thing stores a retained Node pointer at word one.
                 let node = unsafe { &*(*p.add(1) as *const Node) };

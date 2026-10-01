@@ -235,13 +235,13 @@ fn tuple(term: Term) -> Result<Vec<Term>, EtsError> {
 }
 
 fn variable(term: Term) -> Option<usize> {
-    // Port of erts/emulator/beam/erl_db_util.c:4643, OTP-29.1.1 (dmc_variable).
+    // Port of erts/emulator/beam/erl_db_util.c:3896-3914, OTP-29.1.1 (db_is_variable).
     let text = atom_name(term)?;
     let digits = text.strip_prefix('$')?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse::<usize>().ok().filter(|&n| n > 0)
+    digits.parse::<usize>().ok()
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:4047, OTP-29.1.1 (dmc_one_term).
@@ -313,7 +313,7 @@ fn owned_unbound_variable(term: &OwnedTerm, bound: &HashSet<usize>) -> Option<us
     match term {
         OwnedTerm::Atom(name) => {
             let index = name.strip_prefix('$')?.parse::<usize>().ok()?;
-            (!bound.contains(&index) && index > 0).then_some(index)
+            (!bound.contains(&index)).then_some(index)
         }
         OwnedTerm::Tuple(parts) => {
             if matches!(parts.first(), Some(OwnedTerm::Atom(name)) if name == "const") {
@@ -451,7 +451,7 @@ fn validate_expr(
     if elements.is_empty() {
         return Err(EtsError::BadArg);
     }
-    if !guard && elements.len() == 1 && elements[0].classify() == TermKind::Tuple {
+    if elements.len() == 1 && elements[0].classify() == TermKind::Tuple {
         // Port of erts/emulator/beam/erl_db_util.c:4384, OTP-29.1.1 (dmc_tuple).
         return validate_construct(elements[0], bound, trace, depth);
     }
@@ -515,8 +515,10 @@ fn validate_construct(
         return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
     }
     if term.classify() == TermKind::Tuple {
+        // Port of erts/emulator/beam/erl_db_util.c:4308-4334 (dmc_tuple), OTP-29.1.1: each
+        // element of a constructed tuple is an expression of its own.
         for element in tuple(term)? {
-            validate_construct(element, bound, trace, depth + 1)?;
+            validate_expr(element, false, bound, trace, depth + 1)?;
         }
     } else {
         validate_expr(term, false, bound, trace, depth)?;
@@ -865,64 +867,75 @@ fn key_at(term: Term, keypos: usize) -> Result<Term, EtsError> {
 }
 
 fn match_eq_body(match_term: Term, body_term: Term, constant: bool) -> bool {
-    if constant && (variable(match_term).is_some() || variable(body_term).is_some()) {
+    let (Ok(match_owned), Ok(body_owned)) = (to_owned(match_term), to_owned(body_term)) else {
         return false;
-    }
-    if match_term.classify() == TermKind::List && body_term.classify() == TermKind::List {
-        let (Ok(match_owned), Ok(body_owned)) = (to_owned(match_term), to_owned(body_term)) else {
-            return false;
-        };
-        return match_owned == body_owned && (!constant || !owned_contains_variable(&body_owned));
-    }
-    if match_term.classify() == TermKind::Tuple && body_term.classify() == TermKind::Tuple {
-        let Ok(match_parts) = tuple(match_term) else {
-            return false;
-        };
-        let Ok(mut body_parts) = tuple(body_term) else {
-            return false;
-        };
-        if !constant && body_parts.len() == 1 && body_parts[0].classify() == TermKind::Tuple {
-            body_parts = tuple(body_parts[0]).unwrap_or_default();
-        } else if !constant
-            && body_parts.len() == 2
-            && atom_name(body_parts[0]).as_deref() == Some("const")
-        {
-            return false;
-        }
-        return match_parts.len() == body_parts.len()
-            && match_parts
-                .into_iter()
-                .zip(body_parts)
-                .all(|(left, right)| match_eq_body(left, right, constant));
-    }
-    if match_term.classify() == TermKind::Map || body_term.classify() == TermKind::Map {
-        return false;
-    }
-    exact_eq(match_term, body_term)
-        && !matches!(
-            atom_name(match_term).as_deref(),
-            Some("_") | Some("$_") | Some("$$")
-        )
+    };
+    owned_match_eq_body(&match_owned, &body_owned, constant)
 }
 
-fn owned_contains_variable(term: &OwnedTerm) -> bool {
-    match term {
+/// Whether the body term rebuilds exactly the matched term.
+// Port of erts/emulator/beam/erl_db_util.c:1333-1419 (db_match_eq_body), OTP-29.1.1.
+fn owned_match_eq_body(a: &OwnedTerm, b: &OwnedTerm, constant: bool) -> bool {
+    match b {
+        OwnedTerm::List { .. } => {
+            let (Some((a_head, a_tail)), Some((b_head, b_tail))) = (uncons(a), uncons(b)) else {
+                return false;
+            };
+            owned_match_eq_body(a_head, b_head, constant)
+                && owned_match_eq_body(&a_tail, &b_tail, constant)
+        }
+        OwnedTerm::Tuple(body) => {
+            let mut body = body.as_slice();
+            if !constant {
+                match body {
+                    [OwnedTerm::Tuple(inner)] => body = inner.as_slice(),
+                    [OwnedTerm::Atom(name), value] if name == "const" => {
+                        return owned_match_eq_body(a, value, true);
+                    }
+                    _ => return false,
+                }
+            }
+            let OwnedTerm::Tuple(head) = a else {
+                return false;
+            };
+            head.len() == body.len()
+                && head
+                    .iter()
+                    .zip(body)
+                    .all(|(left, right)| owned_match_eq_body(left, right, constant))
+        }
+        OwnedTerm::Map(_) => false,
         OwnedTerm::Atom(name) => {
-            name.strip_prefix('$').is_some_and(|digits| {
-                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-            }) || name == "_"
-                || name == "$_"
-                || name == "$$"
+            a == b
+                && !matches!(name.as_str(), "_" | "$$" | "$_")
+                && !(constant && owned_is_variable(name))
         }
-        OwnedTerm::Tuple(parts) => parts.iter().any(owned_contains_variable),
-        OwnedTerm::List { elems, tail } => {
-            elems.iter().any(owned_contains_variable) || owned_contains_variable(tail)
-        }
-        OwnedTerm::Map(pairs) => pairs
-            .iter()
-            .any(|(key, value)| owned_contains_variable(key) || owned_contains_variable(value)),
-        _ => false,
+        _ => a == b,
     }
+}
+
+/// `db_is_variable(a) >= 0`: an atom `'$N'`.
+fn owned_is_variable(name: &str) -> bool {
+    name.strip_prefix('$').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// Split a list into its first cell's head and tail.
+fn uncons(term: &OwnedTerm) -> Option<(&OwnedTerm, OwnedTerm)> {
+    let OwnedTerm::List { elems, tail } = term else {
+        return None;
+    };
+    let (head, rest) = elems.split_first()?;
+    let rest = if rest.is_empty() {
+        (**tail).clone()
+    } else {
+        OwnedTerm::List {
+            elems: rest.to_vec(),
+            tail: tail.clone(),
+        }
+    };
+    Some((head, rest))
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:2172, OTP-29.1.1 (db_prog_match).
@@ -1088,11 +1101,7 @@ fn eval<C: MatchContext>(
         Some("$_") => return Ok(object),
         // Port of erts/emulator/beam/erl_db_util.c:2638, OTP-29.1.1 (matchPushExpr).
         Some("$$") => {
-            let values = bindings
-                .iter()
-                .skip(1)
-                .filter_map(|v| *v)
-                .collect::<Vec<_>>();
+            let values = bindings.iter().filter_map(|v| *v).collect::<Vec<_>>();
             return Ok(TermBuilder::new(scratch).list_from_iter(values)?);
         }
         _ => {}
@@ -1479,8 +1488,10 @@ fn eval_construct<C: MatchContext>(
         return eval(term, object, bindings, scratch, context);
     }
     let mut values = Vec::new();
+    // Port of erts/emulator/beam/erl_db_util.c:4308-4334 and :5592-5649,
+    // OTP-29.1.1: dmc_tuple compiles each child as a dmc_expr.
     for part in tuple(term)? {
-        values.push(eval_construct(part, object, bindings, scratch, context)?);
+        values.push(eval(part, object, bindings, scratch, context)?);
     }
     Ok(TermBuilder::new(scratch).tuple(&values)?)
 }

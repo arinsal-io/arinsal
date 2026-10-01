@@ -3,7 +3,8 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_vm_diff).
--export([basic/0, private_access/0, heir/0, owner_exit/0, giveaway/0, errors/0]).
+-export([basic/0, private_access/0, heir/0, owner_exit/0, giveaway/0, errors/0, fixed_locks/0, private_fixed_concurrency/0, compressed_fun/0, select_chunk_ends/0, match_zero_variable/0, fix_time/0, binary_info/0, compressed_binary_info/0]).
+id(X) -> X.
 basic() ->
   T=ets:new(vm_table,[named_table,set,public,{keypos,1}]),
   true=ets:insert(T,[{a,1},{b,2}]),
@@ -43,6 +44,52 @@ errors() ->
   B=try ets:lookup_element(T,key,3), unexpected catch error:badarg -> badarg end,
   C=try ets:insert_new(T,{key,other}), unexpected catch error:badarg -> badarg end,
   {A,B,C}.
+fixed_locks() ->
+  T=ets:new(fixed_locks,[set,{write_concurrency,{debug_hash_fixed_number_of_locks,2049}}]),
+  true=ets:insert(T,{key,value}),
+  {{debug_hash_fixed_number_of_locks,2048},true,[{key,value}]} =
+    {ets:info(T,write_concurrency),ets:info(T,decentralized_counters),ets:lookup(T,key)}.
+private_fixed_concurrency() ->
+  T=ets:new(private_fixed_concurrency,[private,{write_concurrency,{debug_hash_fixed_number_of_locks,1024}}]),
+  ets:info(T,write_concurrency).
+compressed_fun() ->
+  T=ets:new(compressed_fun,[{keypos,2},compressed,set]),
+  F=fun(X) -> {T,1,X} end,
+  true=ets:insert(T,{F,1}),
+  {ets:info(T,size),ets:info(T,compressed)}.
+select_chunk_ends() ->
+  T=ets:new(select_chunk_ends,[set]),
+  true=ets:insert(T,{a,1}),
+  A=list_to_atom("$1"), B=list_to_atom("$2"), S=list_to_atom("$_"),
+  MS=[{{A,B},[],[S]}],
+  One=ets:select(T,MS,100),
+  true=ets:delete_all_objects(T),
+  Empty=ets:select(T,MS,100),
+  {One,Empty}.
+match_zero_variable() ->
+  T=ets:new(match_zero_variable,[set]),
+  true=ets:insert(T,[{{one,4},4},{{one,5},5}]),
+  U=list_to_atom("_"), Z=list_to_atom("$0"),
+  lists:sort(ets:match(T,{{one,U},Z})).
+fix_time() ->
+  T=ets:new(fix_time,[set]), Before=erlang:monotonic_time(),
+  true=ets:safe_fixtable(T,true), After=erlang:monotonic_time(),
+  {Fixed,[{_,1}]}=ets:info(T,safe_fixed_monotonic_time),
+  true=ets:safe_fixtable(T,false),
+  {Before =< Fixed, Fixed =< After, ets:info(T,safe_fixed_monotonic_time)}.
+binary_info() ->
+  T=ets:new(binary_info,[set]), B=list_to_binary(lists:seq(1,100)),
+  true=ets:insert(T,[{key1,B},{key2,B}]), Before=ets:info(T,binary),
+  true=ets:safe_fixtable(T,true), true=ets:delete(T,key2), During=ets:info(T,binary),
+  true=ets:safe_fixtable(T,false),
+  Keep=byte_size(id(B)),
+  Shape=fun(Items) -> {length(Items),lists:sort([element(2,I) || I <- Items]),
+                       lists:sort([element(3,I) || I <- Items])} end,
+  {Shape(Before),Shape(During),Shape(ets:info(T,binary)),Keep}.
+compressed_binary_info() ->
+  T=ets:new(compressed_binary_info,[set,compressed]),
+  B=list_to_binary(lists:seq(1,100)), true=ets:insert(T,{B,key}),
+  Info=ets:info(T,binary), {length(Info),element(2,hd(Info)),byte_size(id(B))}.
 "#;
 
 #[test]
@@ -60,6 +107,14 @@ fn ets_process_semantics_match_otp_29() {
         "owner_exit",
         "giveaway",
         "errors",
+        "fixed_locks",
+        "private_fixed_concurrency",
+        "compressed_fun",
+        "select_chunk_ends",
+        "match_zero_variable",
+        "fix_time",
+        "binary_info",
+        "compressed_binary_info",
     ] {
         let expected = reference.call("ets_vm_diff", function, &[]);
         let mut vm = Vm::new([]);

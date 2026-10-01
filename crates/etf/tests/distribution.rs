@@ -121,6 +121,30 @@ fn distribution_atom_cache_resolves_atom_positions_in_identity_and_code_terms() 
     assert_eq!(decode_dist_payload(&decoded).unwrap(), vec![term]);
 }
 
+#[test]
+fn new_fun_size_excludes_its_size_word_like_otp() {
+    let term = OwnedTerm::Fun {
+        arity: 1,
+        uniq: [9; 16],
+        index: 4,
+        module: "sample_mod".into(),
+        old_index: 5,
+        old_uniq: 6,
+        pid: Box::new(OwnedTerm::Pid {
+            node: "node@host".into(),
+            id: 7,
+            serial: 2,
+            creation: 4,
+        }),
+        free_vars: vec![OwnedTerm::atom("captured")],
+    };
+    let bytes = arinsal_etf::encode(&term, Default::default());
+    assert_eq!(bytes[1], 112);
+    let declared = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+    assert_eq!(declared, bytes.len() - 6);
+    assert_eq!(arinsal_etf::decode(&bytes).unwrap(), term);
+}
+
 proptest! {
     #[test]
     fn dist_encode_decode_property(atoms in prop::collection::vec("[a-z]{1,16}", 1..20), value in any::<i64>()) {

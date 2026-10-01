@@ -37,7 +37,7 @@ fn main() {
     };
     let mut registry = Registry::new();
     let tid = registry.create(options).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     for key in 0..100_000 {
         let object = from_owned(&tuple(vec![int(key), int(key % 1000)]), &mut input).unwrap();

@@ -10,7 +10,7 @@ use arinsal_sched::{
 use arinsal_spec::Opcode;
 use arinsal_term::{
     ProcessHeap, SharedCopyCache, Term, TermBuilder, copy_term,
-    copy_term_preserving_sharing_with_cache, size_object,
+    copy_term_preserving_sharing_with_cache, global_atoms, size_object,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -29,16 +29,15 @@ fn legacy_exception_trap(
         && let Ok(arity) = arity.parse::<usize>()
         && arity <= process.x.len()
     {
-        let arguments = {
-            let mut heap = crate::FragmentingHeap(&mut process.heap);
-            TermBuilder::new(&mut heap)
-                .list_from_iter(process.x[..arity].iter().copied())
-                .map_err(|error| VmError::Unsupported(format!("undef arguments: {error:?}")))?
-        };
         trap.top = Some(crate::stacktrace::TopFrame::Bif {
-            module: module.to_owned(),
-            function: function.to_owned(),
-            args: arguments,
+            module: global_atoms()
+                .intern(module)
+                .map_err(|_| VmError::Unsupported("undef module atom".into()))?,
+            function: global_atoms()
+                .intern(function)
+                .map_err(|_| VmError::Unsupported("undef function atom".into()))?,
+            args: crate::stacktrace::BifArgs::from_terms(&process.x[..arity])?,
+            info: crate::stacktrace::BifErrorInfo::None,
         });
     }
     Ok(trap)
@@ -669,7 +668,7 @@ pub(crate) struct Runtime {
     pub(crate) next_port: AtomicU64,
     pub(crate) simulated: bool,
     pub(crate) virtual_ms: AtomicU64,
-    pub(crate) ets: Mutex<arinsal_ets::Registry>,
+    pub(crate) ets: std::sync::RwLock<arinsal_ets::Registry>,
     result: mpsc::Sender<Result<ScheduledResult, VmError>>,
     // g_proc_sched: suspend counts and the status other processes can observe.
     pub(crate) suspend_counts: Mutex<HashMap<(Pid, Pid), u32>>,
@@ -867,10 +866,12 @@ impl Executor {
                     .as_mut()
                     .and_then(|cold| cold.initial_bif.take())
                 {
-                    let args = process.x[..usize::from(arity)].to_vec();
+                    let mut args = process.x[..usize::from(arity)].to_vec();
                     let bif = arinsal_bifs::lookup(&module, &function, arity)
                         .expect("spawned BIF entry was resolved before scheduling");
-                    match crate::calls::call_bif(&mut process.heap, bif, &args) {
+                    let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
+                    crate::calls::gc_after_bif(process, &mut args, &mut result)?;
+                    match result {
                         Ok(value) => break 'execution Ok(RunState::Done(value)),
                         Err(error) => {
                             break 'execution Err(crate::exceptions::direct_bif_error(
@@ -1216,10 +1217,12 @@ impl Executor {
                                             Ok(value) => Ok(value),
                                             Err(error) => {
                                                 let arguments = process.x[..arity].to_vec();
-                                                Err(crate::exceptions::bif_error(
+                                                Err(crate::exceptions::bif_error_with_atoms(
                                                     process,
                                                     &export.module,
                                                     &export.function,
+                                                    export.module_atom,
+                                                    export.function_atom,
                                                     &arguments,
                                                     error,
                                                 ))
@@ -1248,22 +1251,14 @@ impl Executor {
                                                     && trap.top.is_none()
                                                     && trap.trace.is_none()
                                                 {
-                                                    let args = arinsal_term::TermBuilder::new(
-                                                        &mut crate::FragmentingHeap(
-                                                            &mut process.heap,
-                                                        ),
-                                                    )
-                                                    .list_from_iter(saved_arguments.iter().copied())
-                                                    .map_err(|error| {
-                                                        VmError::Unsupported(format!(
-                                                            "BIF frame arguments: {error:?}"
-                                                        ))
-                                                    })?;
                                                     trap.top =
                                                         Some(crate::stacktrace::TopFrame::Bif {
-                                                            module: export.module.clone(),
-                                                            function: export.function.clone(),
-                                                            args,
+                                                            module: export.module_atom,
+                                                            function: export.function_atom,
+                                                            args: crate::stacktrace::BifArgs::from_terms(
+                                                                &saved_arguments,
+                                                            )?,
+                                                            info: crate::stacktrace::BifErrorInfo::Plain,
                                                         });
                                                 }
                                                 process.cold_mut().native_error_pc = call_site_pc;
@@ -1465,20 +1460,19 @@ impl Executor {
                                 && let Ok(arity) = arity.parse::<usize>()
                                 && arity <= process.x.len()
                             {
-                                let arguments = {
-                                    let mut heap = crate::FragmentingHeap(&mut process.heap);
-                                    TermBuilder::new(&mut heap)
-                                        .list_from_iter(process.x[..arity].iter().copied())
-                                        .map_err(|error| {
-                                            VmError::Unsupported(format!(
-                                                "undef arguments: {error:?}"
-                                            ))
-                                        })?
-                                };
                                 trap.top = Some(crate::stacktrace::TopFrame::Bif {
-                                    module: module.to_owned(),
-                                    function: function.to_owned(),
-                                    args: arguments,
+                                    module: arinsal_term::global_atoms().intern(module).map_err(
+                                        |_| VmError::Unsupported("undef module atom".into()),
+                                    )?,
+                                    function: arinsal_term::global_atoms()
+                                        .intern(function)
+                                        .map_err(|_| {
+                                            VmError::Unsupported("undef function atom".into())
+                                        })?,
+                                    args: crate::stacktrace::BifArgs::from_terms(
+                                        &process.x[..arity],
+                                    )?,
+                                    info: crate::stacktrace::BifErrorInfo::None,
                                 });
                             }
                             trap
@@ -2541,23 +2535,55 @@ impl Process {
         }
         if let (Some(runtime), Some(owner)) = (&self.runtime, ctx.pid().to_term()) {
             // Port of erts/emulator/beam/erl_db.c:5031 (erts_db_process_exiting), OTP-29.1.1.
+            if runtime.ets.read().unwrap().has_fixations(owner) {
+                runtime.ets.write().unwrap().release_fixations(owner);
+            }
             let owned = {
-                let registry = runtime.ets.lock().unwrap();
+                let registry = runtime.ets.read().unwrap();
                 registry
                     .owned_by(owner)
                     .into_iter()
                     .filter_map(|tid| {
                         let table = registry.get(tid).ok()?;
-                        Some((tid, table.options.heir))
+                        let name = table.options.named_table.then_some(table.options.name);
+                        Some((tid, name, table.options.heir))
                     })
                     .collect::<Vec<_>>()
             };
-            for (tid, heir) in owned {
+            for (tid, name, heir) in owned {
+                // Port of erts/emulator/beam/erl_db.c:4898-4900 (give_table_to_heir),
+                // OTP-29.1.1: an owner that is its own heir keeps, and so deletes, the table.
+                let heir = heir.filter(|heir| heir.pid != owner);
                 if let Some(heir) = heir
+                    && let Some(pid) = Pid::from_term(heir.pid)
+                    && !heir.transfer
+                {
+                    // Port of erts/emulator/beam/erl_db.c:4910-4930 (give_table_to_heir),
+                    // OTP-29.1.1: `{heir, Pid}` hands the table over without a message.
+                    let alive = runtime
+                        .scheduler()
+                        .is_ok_and(|scheduler| scheduler.lookup(pid));
+                    if alive
+                        && runtime
+                            .ets
+                            .write()
+                            .unwrap()
+                            .give_away(tid, heir.pid)
+                            .is_ok()
+                    {
+                        continue;
+                    }
+                } else if let Some(heir) = heir
                     && let Some(pid) = Pid::from_term(heir.pid)
                 {
                     let mut heap = arinsal_term::VecHeap::new();
-                    let message_term = tid.to_term(&mut heap).and_then(|tab| {
+                    // Port of erts/emulator/beam/erl_db.c:4959-4962
+                    // (send_ets_transfer_message), OTP-29.1.1.
+                    let tab = match name {
+                        Some(name) => Ok(Term::atom(name)),
+                        None => tid.to_term(&mut heap),
+                    };
+                    let message_term = tab.and_then(|tab| {
                         let from = ctx.pid().to_term().ok_or(arinsal_term::TermError::BadArg)?;
                         arinsal_term::TermBuilder::new(&mut heap).tuple(&[
                             crate::signals::atom("ETS-TRANSFER"),
@@ -2569,7 +2595,7 @@ impl Process {
                     if let Ok(message_term) = message_term
                         && let Ok(message) = Message::copy_from(message_term)
                     {
-                        let mut registry = runtime.ets.lock().unwrap();
+                        let mut registry = runtime.ets.write().unwrap();
                         if registry.give_away(tid, heir.pid).is_ok() {
                             drop(registry);
                             if ctx.send(pid, message).is_ok() {
@@ -2578,7 +2604,7 @@ impl Process {
                         }
                     }
                 }
-                let _ = runtime.ets.lock().unwrap().delete(tid);
+                let _ = runtime.ets.write().unwrap().delete(tid);
             }
         }
         let Some(cold) = self.cold.take() else {
@@ -3736,7 +3762,7 @@ impl Vm {
             next_port: AtomicU64::new(16),
             simulated: simulation_seed.is_some(),
             virtual_ms: AtomicU64::new(0),
-            ets: Mutex::new(arinsal_ets::Registry::new()),
+            ets: std::sync::RwLock::new(arinsal_ets::Registry::new()),
             result: sender,
             suspend_counts: Mutex::new(HashMap::new()),
             suspend_total: Mutex::new(HashMap::new()),

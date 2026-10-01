@@ -1985,6 +1985,14 @@ mod tests {
     }
 
     #[test]
+    fn trace_pattern_message_action_keeps_heap_terms_alive_like_otp() {
+        trace_pattern_diff(
+            "trace_t3a_ms_message",
+            "-module(trace_t3a_ms_message). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> f({payload,42}), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_ms_message,f,1}, [{['$1'],[],[{message,['$1']}]}],[local]), P ! go, receive {trace,P,call,{trace_t3a_ms_message,f,[{payload,42}]},[{payload,42}]} -> receive done -> ok after 1000 -> no_done end; Other -> Other after 1000 -> missing end. f(_) -> ok.",
+        );
+    }
+
+    #[test]
     fn trace_pattern_matches_function_arguments_like_otp() {
         trace_pattern_diff(
             "trace_t3a_ms_args",

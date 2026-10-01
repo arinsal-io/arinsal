@@ -144,6 +144,8 @@ pub(crate) struct ProcessCold {
     pub(crate) apply_roots: Vec<Term>,
     // Saved continuation addresses for traces still referenced by handler code.
     pub(crate) raw_traces: Vec<stacktrace::RawTrace>,
+    /// Reusable slots for raw traces that have been materialized.
+    pub(crate) free_raw_trace_slots: Vec<usize>,
     /// Explicit `exit/1` reason, owned off-heap. The process heap is collected
     /// while the stacktrace is built, so a raw `Term` here would dangle and
     /// monitors would observe a corrupted reason.

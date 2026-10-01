@@ -5,7 +5,9 @@
 //! are exposed through `allocated_areas`; per-allocator carrier statistics
 //! are empty because Arinsal does not use erts_alloc.
 
-use super::{Process, RunCtx, Vm, VmError, atom, badarg, memory_values, snapshot_process};
+use super::{
+    Process, RunCtx, Vm, VmError, atom, badarg, cons_list, memory_values, snapshot_process, tuple,
+};
 use crate::process::Message;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::Term;
@@ -37,6 +39,21 @@ pub(super) fn system_info(
     let OwnedTerm::Tuple(parts) = &owned else {
         return None;
     };
+    if let [OwnedTerm::Atom(operation), allocators] = parts.as_slice()
+        && operation == "allocator_sizes"
+    {
+        // Port of erts/emulator/beam/erl_bif_info.c:2508-2513 (info_1_tuple), OTP-29.1.1.
+        // Arinsal has no erts_alloc instances, so each requested allocator is absent.
+        return Some(allocator_sizes(process, allocators));
+    }
+    if let [OwnedTerm::Atom(operation), OwnedTerm::Atom(allocator)] = parts.as_slice()
+        && operation == "allocator"
+        && allocator == "mseg_alloc"
+    {
+        // OTP returns `false` when this optional allocator is not present.
+        // Arinsal does not use the erts mseg allocator.
+        return Some(Ok(atom("false")));
+    }
     if parts.len() != 3 {
         return None;
     }
@@ -55,6 +72,26 @@ pub(super) fn system_info(
         _ => return None,
     };
     Some(supported)
+}
+
+fn allocator_sizes(process: &mut Process, allocators: &OwnedTerm) -> Result<Term, VmError> {
+    let OwnedTerm::List { elems, tail } = allocators else {
+        return Err(badarg());
+    };
+    if **tail != OwnedTerm::Nil {
+        return Err(badarg());
+    }
+    let mut entries = Vec::with_capacity(elems.len());
+    for entry in elems {
+        let OwnedTerm::Atom(name) = entry else {
+            return Err(badarg());
+        };
+        if !ALLOCATORS.contains(&name.as_str()) {
+            return Err(badarg());
+        }
+        entries.push(tuple(process, &[atom(name), atom("false")])?);
+    }
+    cons_list(process, &entries)
 }
 
 fn request_allocators(
@@ -210,5 +247,50 @@ fn owned_list(elements: Vec<OwnedTerm>) -> OwnedTerm {
     OwnedTerm::List {
         elems: elements,
         tail: Box::new(OwnedTerm::Nil),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocator_sizes_matches_supported_otp_allocator_names() {
+        let Ok(reference) = arinsal_difftest::RefErl::start() else {
+            eprintln!("erl unavailable; skipping allocator name differential test");
+            return;
+        };
+        let names = reference.call(
+            "erlang",
+            "system_info",
+            &[OwnedTerm::atom("alloc_util_allocators")],
+        );
+        let arinsal_difftest::CallResult::Ok(OwnedTerm::List { elems, tail }) = &names else {
+            panic!("OTP system_info(alloc_util_allocators) failed: {names:?}");
+        };
+        assert_eq!(**tail, OwnedTerm::Nil);
+
+        let allocators = OwnedTerm::List {
+            elems: elems.clone(),
+            tail: Box::new(OwnedTerm::Nil),
+        };
+        let mut process = Process::new();
+        let result = allocator_sizes(&mut process, &allocators).unwrap();
+        let result = arinsal_term::to_owned(result).unwrap();
+        let OwnedTerm::List {
+            elems: result,
+            tail,
+        } = &result
+        else {
+            panic!("allocator_sizes did not return a proper list");
+        };
+        assert_eq!(**tail, OwnedTerm::Nil);
+        assert_eq!(result.len(), elems.len());
+        for (requested, returned) in elems.iter().zip(result) {
+            assert_eq!(
+                returned,
+                &OwnedTerm::tuple(vec![requested.clone(), OwnedTerm::atom("false")])
+            );
+        }
     }
 }

@@ -106,6 +106,10 @@ pub struct Import {
     pub module: String,
     /// Function name.
     pub function: String,
+    /// Module atom resolved while loading the BEAM import.
+    pub module_atom: Atom,
+    /// Function atom resolved while loading the BEAM import.
+    pub function_atom: Atom,
     /// Arity.
     pub arity: u8,
     /// Bound BIF function when implemented.
@@ -130,6 +134,8 @@ impl Clone for Import {
         Self {
             module: self.module.clone(),
             function: self.function.clone(),
+            module_atom: self.module_atom,
+            function_atom: self.function_atom,
             arity: self.arity,
             bif: self.bif,
             fast: self.fast,
@@ -330,6 +336,8 @@ impl ExportSlot {
 pub struct Module {
     /// Module atom text.
     pub name: String,
+    /// Module atom resolved while loading this code.
+    pub name_atom: Atom,
     /// Native record definitions decoded from this module's `Recs` chunk.
     pub records: Vec<arinsal_beam::NativeRecord>,
     /// Compact code.
@@ -358,12 +366,18 @@ pub struct Module {
     pub types: Vec<Vec<(usize, BeamType)>>,
     /// Source line for each instruction.
     pub lines: Vec<Option<(String, u64)>>,
+    /// Literal file-name lists indexed by source filename.
+    pub line_file_terms: HashMap<String, Term>,
+    /// Per-instruction cached filename terms for exception stack traces.
+    pub line_terms: Vec<Option<(Term, u64)>>,
     /// Opcodes not yet executable, with occurrence counts.
     pub unsupported: HashMap<String, usize>,
     /// Reason for each explicit unsupported opcode.
     pub unsupported_reasons: Vec<String>,
     /// Function names and arities at their `func_info` instruction offsets.
     pub functions: Vec<(usize, String, u8)>,
+    /// Function atoms parallel to `functions`.
+    pub function_atoms: Vec<Atom>,
     /// Owning function for `JitHook::on_entry`, or `u32::MAX` when none applies.
     ///
     /// Slot `ip` holds the last function whose `func_info` offset is strictly
@@ -400,6 +414,7 @@ impl Clone for Module {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
+            name_atom: self.name_atom,
             records: self.records.clone(),
             code: self.code.clone(),
             generic: self.generic.clone(),
@@ -413,9 +428,12 @@ impl Clone for Module {
             strings: self.strings.clone(),
             types: self.types.clone(),
             lines: self.lines.clone(),
+            line_file_terms: self.line_file_terms.clone(),
+            line_terms: self.line_terms.clone(),
             unsupported: self.unsupported.clone(),
             unsupported_reasons: self.unsupported_reasons.clone(),
             functions: self.functions.clone(),
+            function_atoms: self.function_atoms.clone(),
             on_entry_fn: self.on_entry_fn.clone(),
             entry_arity: self.entry_arity.clone(),
             breakpoint_originals: self.breakpoint_originals.clone(),
@@ -587,6 +605,16 @@ impl Module {
             .rev()
             .find(|(start, _, _)| *start <= ip)
             .map(|(_, name, arity)| (name.as_str(), *arity))
+    }
+    /// Atom and arity of the function containing a code offset.
+    pub fn function_atom_at(&self, ip: usize) -> Option<(Atom, u8)> {
+        let index = self.functions.partition_point(|(start, _, _)| *start <= ip);
+        let index = index.checked_sub(1)?;
+        Some((*self.function_atoms.get(index)?, self.functions[index].2))
+    }
+    /// Cached literal filename list and line for a code offset.
+    pub fn line_term_at(&self, ip: usize) -> Option<(Term, u64)> {
+        self.line_terms.get(ip).copied().flatten()
     }
 }
 
@@ -796,6 +824,12 @@ pub fn load_with_instrumentations(
             .intern(atom)
             .map_err(|_| LoadError::Atom(atom.clone()))?;
     }
+    let name_atom = global_atoms()
+        .get(&file.module)
+        .ok_or_else(|| LoadError::Atom(file.module.clone()))?;
+    let unknown_function_atom = global_atoms()
+        .intern("?")
+        .map_err(|_| LoadError::Atom("?".into()))?;
     // Port of erts/emulator/beam/jit/asm_load.c:79-95, OTP-29.1.1.
     let coverage_mode = match (file.lines.as_ref(), requested_mode) {
         (Some(lines), _) if lines.flags & 2 != 0 => CoverageMode::LineCounters,
@@ -915,6 +949,12 @@ pub fn load_with_instrumentations(
                 .to_owned();
             Ok(Import {
                 bif: arinsal_bifs::lookup(&module, &function, item.arity as u8),
+                module_atom: global_atoms()
+                    .get(&module)
+                    .ok_or_else(|| LoadError::Atom(module.clone()))?,
+                function_atom: global_atoms()
+                    .get(&function)
+                    .ok_or_else(|| LoadError::Atom(function.clone()))?,
                 fast: match (module.as_str(), function.as_str(), item.arity) {
                     ("erlang", "+", 2) => FastBif::Add,
                     ("erlang", "-", 2) => FastBif::Sub,
@@ -977,6 +1017,12 @@ pub fn load_with_instrumentations(
             fast_op: ImportFastOp::None,
             module: "erts_internal".into(),
             function: "breakpoint".into(),
+            module_atom: global_atoms()
+                .intern("erts_internal")
+                .map_err(|_| LoadError::Atom("erts_internal".into()))?,
+            function_atom: global_atoms()
+                .intern("breakpoint")
+                .map_err(|_| LoadError::Atom("breakpoint".into()))?,
             arity: 4,
             class: AtomicU8::new(ImportClass::Fresh as u8),
             native: AtomicUsize::new(0),
@@ -998,6 +1044,12 @@ pub fn load_with_instrumentations(
         fast_op: ImportFastOp::None,
         module: "error_handler".into(),
         function: "breakpoint".into(),
+        module_atom: global_atoms()
+            .intern("error_handler")
+            .map_err(|_| LoadError::Atom("error_handler".into()))?,
+        function_atom: global_atoms()
+            .intern("breakpoint")
+            .map_err(|_| LoadError::Atom("breakpoint".into()))?,
         arity: 3,
         class: AtomicU8::new(ImportClass::Fresh as u8),
         native: AtomicUsize::new(0),
@@ -1056,6 +1108,7 @@ pub fn load_with_instrumentations(
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
     let mut functions = Vec::new();
+    let mut function_atoms = Vec::new();
     let mut debug_line_points = Vec::new();
     let mut notify_breakpoint_stub = None;
     let mut coverage_probes = Vec::new();
@@ -1119,6 +1172,12 @@ pub fn load_with_instrumentations(
                 fast_op: ImportFastOp::None,
                 module: "erts_internal".into(),
                 function: "notify_breakpoint_hit".into(),
+                module_atom: global_atoms()
+                    .intern("erts_internal")
+                    .map_err(|_| LoadError::Atom("erts_internal".into()))?,
+                function_atom: global_atoms()
+                    .intern("notify_breakpoint_hit")
+                    .map_err(|_| LoadError::Atom("notify_breakpoint_hit".into()))?,
                 arity: 3,
                 class: AtomicU8::new(ImportClass::Fresh as u8),
                 native: AtomicUsize::new(0),
@@ -1200,13 +1259,13 @@ pub fn load_with_instrumentations(
             index
         };
         if instruction.op == Opcode::FuncInfo {
-            let name = args[1]
-                .term()
-                .as_atom()
-                .and_then(|atom| global_atoms().text(atom))
+            let function_atom = args[1].term().as_atom().unwrap_or(unknown_function_atom);
+            let name = global_atoms()
+                .text(function_atom)
                 .map(|name| name.to_string())
                 .unwrap_or_else(|| "?".into());
             functions.push((code.len(), name, args[2].value() as u8));
+            function_atoms.push(function_atom);
         }
         let raw = GenericOp::execute(instruction.op, args, extra)?;
         let debug_line = if instruction.op == Opcode::DebugLine {
@@ -1415,6 +1474,26 @@ pub fn load_with_instrumentations(
     types.shrink_to_fit();
     lines.resize(code.len(), None);
     lines.shrink_to_fit();
+    let mut line_file_terms = HashMap::new();
+    for (file, _) in lines.iter().flatten() {
+        if !line_file_terms.contains_key(file) {
+            let term = TermBuilder::new(&mut literals)
+                .string_to_list(file)
+                .map_err(|_| LoadError::Limit)?;
+            line_file_terms.insert(file.clone(), term);
+        }
+    }
+    let line_terms = lines
+        .iter()
+        .map(|line| {
+            line.as_ref().and_then(|(file, number)| {
+                line_file_terms
+                    .get(file)
+                    .copied()
+                    .map(|term| (term, *number))
+            })
+        })
+        .collect();
     functions.shrink_to_fit();
     unsupported_reasons.shrink_to_fit();
     bit_commands.shrink_to_fit();
@@ -1443,6 +1522,7 @@ pub fn load_with_instrumentations(
     }
     Ok(Module {
         name: file.module.clone(),
+        name_atom,
         records: file.records.clone(),
         code,
         generic,
@@ -1457,9 +1537,12 @@ pub fn load_with_instrumentations(
         strings: file.strings.clone().into_boxed_slice(),
         types,
         lines,
+        line_file_terms,
+        line_terms,
         unsupported,
         unsupported_reasons,
         functions,
+        function_atoms,
         on_entry_fn,
         entry_arity,
         breakpoint_originals,

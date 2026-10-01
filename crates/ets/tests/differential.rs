@@ -209,7 +209,7 @@ fn five_thousand_short_sequences_per_type_against_otp_29() {
 fn run_local(kind: TableType, operations: &[OwnedTerm]) -> Vec<OwnedTerm> {
     let mut registry = Registry::new();
     let tid = registry.create(options(kind)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut results = Vec::new();
     for op in operations {
         let OwnedTerm::Tuple(parts) = op else {
@@ -280,7 +280,9 @@ fn run_local(kind: TableType, operations: &[OwnedTerm]) -> Vec<OwnedTerm> {
                 match table.slot(index, &mut output) {
                     Ok(Some(value)) => to_owned(value).unwrap(),
                     Ok(None) => atom("$end_of_table"),
-                    Err(arinsal_ets::EtsError::BadArg) => atom("badarg"),
+                    Err(arinsal_ets::EtsError::BadArg | arinsal_ets::EtsError::BadArgCause(_)) => {
+                        atom("badarg")
+                    }
                     Err(error) => panic!("slot failed: {error:?}"),
                 }
             }
@@ -292,7 +294,9 @@ fn run_local(kind: TableType, operations: &[OwnedTerm]) -> Vec<OwnedTerm> {
             "next" => match table.next(argument, &mut output) {
                 Ok(Some(value)) => to_owned(value).unwrap(),
                 Ok(None) => atom("$end_of_table"),
-                Err(arinsal_ets::EtsError::BadArg) => atom("badarg"),
+                Err(arinsal_ets::EtsError::BadArg | arinsal_ets::EtsError::BadArgCause(_)) => {
+                    atom("badarg")
+                }
                 Err(error) => panic!("next failed: {error:?}"),
             },
             "info_size" => unsigned(table.info().size),
@@ -318,7 +322,9 @@ fn run_local(kind: TableType, operations: &[OwnedTerm]) -> Vec<OwnedTerm> {
                         .map(|value| to_owned(value).unwrap())
                         .collect(),
                 ),
-                Err(arinsal_ets::EtsError::BadArg) => atom("badarg"),
+                Err(arinsal_ets::EtsError::BadArg | arinsal_ets::EtsError::BadArgCause(_)) => {
+                    atom("badarg")
+                }
                 Err(error) => panic!("match spec compile failed: {error:?}"),
             },
             "select_chunks" => {
@@ -338,9 +344,9 @@ fn run_local(kind: TableType, operations: &[OwnedTerm]) -> Vec<OwnedTerm> {
                     let Some(continuation) = batch.continuation else {
                         break;
                     };
-                    let encoded = continuation.to_term(table, &mut output).unwrap();
+                    let encoded = continuation.to_term(&table, &mut output).unwrap();
                     let decoded =
-                        arinsal_ets::SelectContinuation::from_term(table, &program, encoded)
+                        arinsal_ets::SelectContinuation::from_term(&table, &program, encoded)
                             .unwrap();
                     batch = table
                         .select_chunk_continue(&program, decoded, &mut output)
@@ -384,14 +390,18 @@ fn run_local(kind: TableType, operations: &[OwnedTerm]) -> Vec<OwnedTerm> {
                             .collect(),
                     ),
                     Ok(values) => to_owned(values[0]).unwrap(),
-                    Err(arinsal_ets::EtsError::BadArg) => atom("badarg"),
+                    Err(arinsal_ets::EtsError::BadArg | arinsal_ets::EtsError::BadArgCause(_)) => {
+                        atom("badarg")
+                    }
                     Err(error) => panic!("counter failed: {error:?}"),
                 }
             }
             "update_element" => {
-                match table.update_element(argument, &[(2, Term::small(7).unwrap())]) {
+                match table.update_element(argument, &[Some((2, Term::small(7).unwrap()))], None) {
                     Ok(changed) => atom(if changed { "true" } else { "false" }),
-                    Err(arinsal_ets::EtsError::BadArg) => atom("badarg"),
+                    Err(arinsal_ets::EtsError::BadArg | arinsal_ets::EtsError::BadArgCause(_)) => {
+                        atom("badarg")
+                    }
                     Err(error) => panic!("update_element failed: {error:?}"),
                 }
             }
@@ -630,7 +640,7 @@ fn match_context_supplies_self() {
     assert_eq!(result, Term::pid(7, 0));
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let object = arinsal_term::TermBuilder::new(&mut source)
         .tuple(&[Term::small(1).unwrap()])
         .unwrap();
@@ -715,7 +725,7 @@ fn ordered_slots_and_guard_ranges_against_otp_29() {
     };
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::OrderedSet)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     for index in 1..=1000 {
         let object = from_owned(&tuple(vec![int(index), int(index * 2)]), &mut input).unwrap();
@@ -815,7 +825,7 @@ fn lookup_element_preserves_bag_insertion_order_against_otp_29() {
         ("duplicate_bag", TableType::DuplicateBag),
     ] {
         let tid = registry.create(options(kind)).unwrap();
-        let table = registry.get_mut(tid).unwrap();
+        let mut table = registry.get_mut(tid).unwrap();
         let objects = [first, second].map(|value| {
             arinsal_term::TermBuilder::new(&mut source)
                 .tuple(&[key, value])
@@ -833,6 +843,7 @@ fn lookup_element_preserves_bag_insertion_order_against_otp_29() {
         let expected = erl.call("ets_ops", "run_lookup_element", &[atom(name)]);
         assert_eq!(expected, CallResult::Ok(actual.clone()));
         assert_eq!(actual, list(vec![atom("first"), atom("second")]));
+        drop(table);
         registry.delete(tid).unwrap();
     }
 }
@@ -844,7 +855,7 @@ fn counter_variants_against_otp_29() {
     };
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut seed = 0x8f15_75aa_0083_d78d_u64;
     let mut queries = Vec::new();
     let mut local = Vec::new();
@@ -917,7 +928,7 @@ fn count_and_delete_only_true_results() {
     let expected = erl.call("ets_ops", "run_count_delete", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::OrderedSet)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut source = VecHeap::new();
     for key in 1..=10 {
         let object = from_owned(&tuple(vec![int(key), int(key * 2)]), &mut source).unwrap();
@@ -964,7 +975,7 @@ fn select_replace_against_otp_29() {
     let expected = erl.call("ets_ops", "run_replace", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::OrderedSet)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut source = VecHeap::new();
     for key in 1..=10 {
         let object = from_owned(&tuple(vec![int(key), atom("old")]), &mut source).unwrap();
@@ -999,7 +1010,7 @@ fn match_and_match_object_against_otp_29() {
     let expected = erl.call("ets_ops", "run_match", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::OrderedSet)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut source = VecHeap::new();
     for key in 1..=10 {
         let object = from_owned(&tuple(vec![int(key), int(key % 3)]), &mut source).unwrap();
@@ -1040,7 +1051,7 @@ fn hash_traversal_against_otp_29() {
             let expected = erl.call("ets_ops", "run_hash_traversal", &[atom(name), int(count)]);
             let mut registry = Registry::new();
             let tid = registry.create(options(kind)).unwrap();
-            let table = registry.get_mut(tid).unwrap();
+            let mut table = registry.get_mut(tid).unwrap();
             let mut source = VecHeap::new();
             for key in 1..=count {
                 let object = from_owned(&tuple(vec![int(key), int(key)]), &mut source).unwrap();
@@ -1106,7 +1117,7 @@ fn fixed_hash_deleted_key_against_otp_29() {
     let expected = erl.call("ets_ops", "run_fixed", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut source = VecHeap::new();
     for key in 1..=255 {
         let object = from_owned(&tuple(vec![int(key), int(key)]), &mut source).unwrap();
@@ -1158,7 +1169,7 @@ fn hash_bag_history_against_otp_29() {
         );
         let mut registry = Registry::new();
         let tid = registry.create(options(kind)).unwrap();
-        let table = registry.get_mut(tid).unwrap();
+        let mut table = registry.get_mut(tid).unwrap();
         let mut source = VecHeap::new();
         for object in &objects {
             let value = from_owned(object, &mut source).unwrap();
@@ -1473,7 +1484,7 @@ fn bignum_counters_against_otp_29() {
     let expected = erl.call("ets_ops", "run_big_counters", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     let key = from_owned(&atom("k"), &mut input).unwrap();
     let big = arinsal_term::TermBuilder::new(&mut input)
@@ -1539,7 +1550,7 @@ fn bignum_counter_operands_and_default_key_against_otp_29() {
     let expected = erl.call("ets_ops", "run_big_counter_operands", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     let wanted = from_owned(&atom("wanted"), &mut input).unwrap();
     let other = from_owned(&atom("other"), &mut input).unwrap();
@@ -1550,22 +1561,22 @@ fn bignum_counter_operands_and_default_key_against_otp_29() {
     let first = table
         .update_counter_big(
             wanted,
-            &[BigCounterOp {
+            &[Some(BigCounterOp {
                 position: 2,
                 increment: big.clone(),
                 threshold: None,
-            }],
+            })],
             Some(default),
         )
         .unwrap();
     let second = table
         .update_counter_big(
             wanted,
-            &[BigCounterOp {
+            &[Some(BigCounterOp {
                 position: 2,
                 increment: -big,
                 threshold: None,
-            }],
+            })],
             None,
         )
         .unwrap();
@@ -1650,7 +1661,7 @@ fn large_hash_shrink_against_otp_29() {
     let expected = erl.call("ets_ops", "run_shrink", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     for key in 1..=5000 {
         let value = Term::small(key).unwrap();
@@ -1776,7 +1787,7 @@ fn deterministic_info_keys_against_otp_29() {
 fn fixed_info_uses_vm_time_and_per_process_counts() {
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let owner = Term::pid(1, 0).unwrap();
     let other = Term::pid(2, 0).unwrap();
     let mut input = VecHeap::new();
@@ -1860,7 +1871,7 @@ fn fixed_info_against_otp_29() {
     settings.owner = pid;
     let mut registry = Registry::new();
     let tid = registry.create(settings).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let node = Term::atom(global_atoms().intern("nonode@nohost").unwrap());
     let mut output = VecHeap::new();
     table
@@ -1900,7 +1911,7 @@ fn update_element_default_against_otp_29() {
     let expected = erl.call("ets_ops", "run_element_default", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     let key = from_owned(&atom("wanted"), &mut input).unwrap();
     let other = from_owned(&atom("other"), &mut input).unwrap();
@@ -1908,10 +1919,10 @@ fn update_element_default_against_otp_29() {
         .tuple(&[other, Term::small(0).unwrap()])
         .unwrap();
     let first = table
-        .update_element_default(key, &[(2, Term::small(9).unwrap())], default)
+        .update_element(key, &[Some((2, Term::small(9).unwrap()))], Some(default))
         .unwrap();
     let second = table
-        .update_element_default(key, &[(2, Term::small(11).unwrap())], default)
+        .update_element(key, &[Some((2, Term::small(11).unwrap()))], Some(default))
         .unwrap();
     let mut output = VecHeap::new();
     let wanted = table
@@ -2143,7 +2154,7 @@ fn trace_operations_are_validated_and_dispatched() {
 fn miri_heap_paths() {
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Set)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     let binary = arinsal_term::TermBuilder::new(&mut input)
         .binary(&[1, 2, 3])
@@ -2164,8 +2175,8 @@ fn miri_heap_paths() {
     let page = table.select_chunk(&program, false, 1, &mut output).unwrap();
     assert_eq!(to_owned(page.rows[0]).unwrap(), int(3));
     if let Some(continuation) = page.continuation {
-        let term = continuation.to_term(table, &mut output).unwrap();
-        let decoded = arinsal_ets::SelectContinuation::from_term(table, &program, term).unwrap();
+        let term = continuation.to_term(&table, &mut output).unwrap();
+        let decoded = arinsal_ets::SelectContinuation::from_term(&table, &program, term).unwrap();
         let next = table
             .select_chunk_continue(&program, decoded, &mut output)
             .unwrap();
@@ -2196,7 +2207,7 @@ fn continuations_across_mutation_against_otp_29() {
             );
             let mut registry = Registry::new();
             let tid = registry.create(options(kind)).unwrap();
-            let table = registry.get_mut(tid).unwrap();
+            let mut table = registry.get_mut(tid).unwrap();
             let mut input = VecHeap::new();
             for key in 1..=50 {
                 let value = Term::small(key).unwrap();
@@ -2234,9 +2245,9 @@ fn continuations_across_mutation_against_otp_29() {
                 let Some(continuation) = batch.continuation else {
                     break;
                 };
-                let term = continuation.to_term(table, &mut output).unwrap();
+                let term = continuation.to_term(&table, &mut output).unwrap();
                 let continuation =
-                    arinsal_ets::SelectContinuation::from_term(table, &program, term).unwrap();
+                    arinsal_ets::SelectContinuation::from_term(&table, &program, term).unwrap();
                 batch = table
                     .select_chunk_continue(&program, continuation, &mut output)
                     .unwrap();
@@ -2265,7 +2276,7 @@ fn select_count_continuations_against_otp_29() {
         let expected = erl.call("ets_ops", "run_count_simple", &[atom(name)]);
         let mut registry = Registry::new();
         let tid = registry.create(options(kind)).unwrap();
-        let table = registry.get_mut(tid).unwrap();
+        let mut table = registry.get_mut(tid).unwrap();
         let mut input = VecHeap::new();
         for key in 1..=100 {
             let value = Term::small(key).unwrap();
@@ -2284,8 +2295,9 @@ fn select_count_continuations_against_otp_29() {
         let mut batch = table.select_count_chunk(&program, 7).unwrap();
         let mut output = VecHeap::new();
         while let Some(continuation) = batch.continuation {
-            let term = continuation.to_term(table, &mut output).unwrap();
-            let decoded = arinsal_ets::CountContinuation::from_term(table, &program, term).unwrap();
+            let term = continuation.to_term(&table, &mut output).unwrap();
+            let decoded =
+                arinsal_ets::CountContinuation::from_term(&table, &program, term).unwrap();
             batch = table.select_count_continue(&program, decoded, 7).unwrap();
         }
         assert_eq!(
@@ -2304,7 +2316,7 @@ fn hash_terminal_continuation_slot_against_otp_29() {
     let expected = erl.call("ets_ops", "run_continuation_slot", &[]);
     let mut registry = Registry::new();
     let tid = registry.create(options(TableType::Bag)).unwrap();
-    let table = registry.get_mut(tid).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
     let mut input = VecHeap::new();
     for value in 1..=5 {
         let object = arinsal_term::TermBuilder::new(&mut input)
@@ -2324,7 +2336,7 @@ fn hash_terminal_continuation_slot_against_otp_29() {
     let encoded = page
         .continuation
         .unwrap()
-        .to_term(table, &mut output)
+        .to_term(&table, &mut output)
         .unwrap();
     // SAFETY: output retains the continuation tuple.
     let slot = unsafe { encoded.tuple_ref() }.unwrap().get(1).unwrap();

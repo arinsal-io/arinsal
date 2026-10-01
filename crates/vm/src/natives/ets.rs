@@ -14,6 +14,7 @@ use num_bigint::BigInt;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock::new(|| {
     [
@@ -29,9 +30,14 @@ static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock
         "protected",
         "public",
         "compressed",
+        "binary",
+        "fixed",
+        "safe_fixed",
+        "safe_fixed_monotonic_time",
         "keypos",
         "read_concurrency",
         "write_concurrency",
+        "debug_hash_fixed_number_of_locks",
         "auto",
         "heir",
         "none",
@@ -84,10 +90,58 @@ fn atom(name: &'static str) -> Term {
     })
 }
 fn badarg() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::BADARG,
+    )))
 }
+thread_local! {
+    /// The extended error information of the failing ETS BIF, as erts keeps it in
+    /// `p->fvalue` next to `BADARG | EXF_HAS_EXT_INFO` (erl_db.c:53-63), OTP-29.1.1.
+    static BIF_CAUSE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// `badarg` with an erts `EXI_*` cause for the BIF frame's `error_info`.
+fn badarg_cause(cause: &'static str) -> VmError {
+    BIF_CAUSE.with(|slot| slot.set(Some(cause)));
+    badarg()
+}
+
+/// Attach the failing BIF as the top stack frame, as erts does for every ETS BIF.
+// Port of erts/emulator/beam/beam_common.c:900-998 (save_stacktrace), OTP-29.1.1.
+fn bif_frame(
+    module: &str,
+    function: &str,
+    args: &[Term],
+    result: Result<Term, VmError>,
+) -> Result<Term, VmError> {
+    let cause = BIF_CAUSE.with(std::cell::Cell::take);
+    let Err(VmError::Trap(mut trap)) = result else {
+        return result;
+    };
+    if trap.class == arinsal_bifs::Class::Error && trap.top.is_none() && trap.trace.is_none() {
+        let atoms = arinsal_term::global_atoms();
+        let intern = |name: &str| {
+            atoms
+                .intern(name)
+                .map_err(|_| VmError::Unsupported(format!("BIF frame atom {name}")))
+        };
+        trap.top = Some(crate::stacktrace::TopFrame::Bif {
+            module: intern(module)?,
+            function: intern(function)?,
+            args: crate::stacktrace::BifArgs::from_terms(args)?,
+            info: match cause {
+                Some(cause) => crate::stacktrace::BifErrorInfo::Cause(intern(cause)?),
+                None => crate::stacktrace::BifErrorInfo::Plain,
+            },
+        });
+    }
+    Err(VmError::Trap(trap))
+}
+
 fn system_limit() -> VmError {
-    VmError::Trap(crate::exceptions::Trap::error(atom("system_limit")))
+    VmError::Trap(crate::exceptions::Trap::error(Term::atom(
+        arinsal_term::atoms::SYSTEM_LIMIT,
+    )))
 }
 fn binary_info_err(error: EtsError) -> VmError {
     match error {
@@ -127,6 +181,10 @@ fn info_item_name(term: Term) -> Option<&'static str> {
         "write_concurrency",
         "decentralized_counters",
         "compressed",
+        "binary",
+        "fixed",
+        "safe_fixed",
+        "safe_fixed_monotonic_time",
     ]
     .into_iter()
     .find(|name| ETS_ATOMS.get(name).copied() == Some(atom))
@@ -150,7 +208,9 @@ fn integer(term: Term) -> Option<BigInt> {
 }
 fn err(error: EtsError) -> VmError {
     match error {
-        EtsError::NoTable | EtsError::BadArg | EtsError::NameTaken => badarg(),
+        EtsError::NoTable => badarg_cause("id"),
+        EtsError::BadArgCause(cause) => badarg_cause(cause),
+        EtsError::BadArg | EtsError::NameTaken => badarg(),
         EtsError::Unsupported(_) => badarg(),
         EtsError::Term(_) => badarg(),
     }
@@ -160,6 +220,34 @@ enum ResolveFail {
     BadType,
     /// Atom or table reference that does not name a live table.
     Missing,
+}
+
+/// The registry lock held by one ETS BIF.
+enum RegistryAccess<'a> {
+    Shared(std::sync::RwLockReadGuard<'a, arinsal_ets::Registry>),
+    Exclusive(std::sync::RwLockWriteGuard<'a, arinsal_ets::Registry>),
+}
+
+impl std::ops::Deref for RegistryAccess<'_> {
+    type Target = arinsal_ets::Registry;
+
+    fn deref(&self) -> &arinsal_ets::Registry {
+        match self {
+            Self::Shared(registry) => registry,
+            Self::Exclusive(registry) => registry,
+        }
+    }
+}
+
+impl RegistryAccess<'_> {
+    fn exclusive(&mut self) -> Result<&mut arinsal_ets::Registry, VmError> {
+        match self {
+            Self::Exclusive(registry) => Ok(registry),
+            Self::Shared(_) => Err(VmError::Unsupported(
+                "ETS registry change under a shared lock".into(),
+            )),
+        }
+    }
 }
 
 fn resolve(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, ResolveFail> {
@@ -176,8 +264,13 @@ fn resolve(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, ResolveF
     Err(ResolveFail::BadType)
 }
 
+// Port of erts/emulator/beam/erl_db.c:280-306 (tid2tab) and :805-910
+// (db_get_table_aux), OTP-29.1.1.
 fn handle(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, VmError> {
-    resolve(registry, term).map_err(|_| badarg())
+    resolve(registry, term).map_err(|fail| match fail {
+        ResolveFail::BadType => badarg_cause("type"),
+        ResolveFail::Missing => badarg_cause("id"),
+    })
 }
 
 /// `erlang:system_info(schedulers)`. `ets:all/0` receives exactly this many replies.
@@ -206,14 +299,70 @@ fn live_table_terms<H: HeapAlloc>(
 fn allowed(table: &arinsal_ets::Table, caller: Term, write: bool) -> bool {
     // Port of erts/emulator/beam/erl_db.c:800 (db_get_table_aux), OTP-29.1.1.
     // Access depends on stored flags, not the table-wide statistics in info().
-    ETS_SUPER_USERS.lock().unwrap().contains(&caller)
-        || caller == table.options.owner
+    // The cheap owner and protection tests come first; the global super-user set is the
+    // last resort so ordinary calls never take its lock.
+    caller == table.options.owner
         || match table.options.protection {
             Protection::Private => false,
             Protection::Protected => !write,
             Protection::Public => true,
         }
+        || ETS_SUPER_USERS.lock().unwrap().contains(&caller)
 }
+/// A one-based element position as erts reads `signed_val(Pos)`; positions below 1
+/// become 0 so the table reports `position`.
+fn position(term: Term) -> Option<usize> {
+    let value = term.as_small()?;
+    Some(usize::try_from(value).unwrap_or(0))
+}
+
+/// Parse `Op | [Op]` for update_element/update_counter. A malformed entry or an
+/// improper tail ends the list with `None`, as the erts verification loop stops there.
+fn update_list<T>(spec: Term, mut parse: impl FnMut(Term) -> Option<T>) -> Vec<Option<T>> {
+    if spec.classify() == TermKind::Tuple {
+        return vec![parse(spec)];
+    }
+    let mut parsed = Vec::new();
+    let mut rest = spec;
+    while rest != Term::NIL {
+        // SAFETY: list cells are rooted in the caller's process heap.
+        let Some((head, tail)) = (unsafe { rest.cons_ref() }) else {
+            parsed.push(None);
+            break;
+        };
+        let entry = parse(head);
+        let malformed = entry.is_none();
+        parsed.push(entry);
+        if malformed {
+            break;
+        }
+        rest = tail;
+    }
+    parsed
+}
+
+/// Check the `Default` argument of update_element/4 and update_counter/4.
+// Port of erts/emulator/beam/erl_db.c:1480-1488 and :1718-1726, OTP-29.1.1.
+fn default_object(
+    table: &arinsal_ets::Table,
+    default: Option<Term>,
+) -> Result<Option<Term>, VmError> {
+    let Some(default) = default else {
+        return Ok(None);
+    };
+    match tuple_items(default) {
+        Some(items) if items.len() >= table.options.keypos => Ok(Some(default)),
+        _ => Err(badarg_cause("default")),
+    }
+}
+
+/// The elements of a tuple argument.
+fn tuple_items(term: Term) -> Option<Vec<Term>> {
+    // SAFETY: BIF arguments are rooted in the caller's process heap.
+    let tuple = unsafe { term.tuple_ref() }?;
+    Some(tuple.iter().collect())
+}
+
 fn output_list<H: HeapAlloc>(heap: &mut H, items: Vec<Term>) -> Result<Term, VmError> {
     TermBuilder::new(heap)
         .list_from_iter(items)
@@ -229,11 +378,11 @@ fn insert_args(
 ) -> Result<Term, VmError> {
     let caller = ctx.pid().to_term().ok_or_else(badarg)?;
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let mut registry = rt.ets.lock().unwrap();
+    let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
-    let table = registry.get_mut(tid).map_err(err)?;
-    if !allowed(table, caller, true) {
-        return Err(badarg());
+    let mut table = registry.get_mut(tid).map_err(err)?;
+    if !allowed(&table, caller, true) {
+        return Err(badarg_cause("access"));
     }
     // SAFETY: object terms remain in the caller's live process heap for this BIF.
     let single = unsafe { objects.tuple_ref() }.is_some();
@@ -269,11 +418,11 @@ fn lookup_args(
 ) -> Result<Term, VmError> {
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let caller = ctx.pid().to_term().ok_or_else(badarg)?;
-    let registry = rt.ets.lock().unwrap();
+    let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
     let table = registry.get(tid).map_err(err)?;
-    if !allowed(table, caller, false) {
-        return Err(badarg());
+    if !allowed(&table, caller, false) {
+        return Err(badarg_cause("access"));
     }
     if member {
         Ok(boolean_term(table.member(key)))
@@ -345,7 +494,26 @@ fn call_inner(
         return Err(badarg());
     }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let mut registry = rt.ets.lock().unwrap();
+    // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock), OTP-29.1.1: table operations
+    // lock only their table; the registry is exclusive only while its maps change.
+    let exclusive = matches!(
+        (function, args.len()),
+        (EtsBif::New, _)
+            | (EtsBif::Rename, _)
+            | (EtsBif::Delete, 1)
+            | (EtsBif::GiveAway, _)
+            | (EtsBif::SafeFixtable, _)
+            | (EtsBif::MatchSpecCompile, _)
+            | (
+                EtsBif::Select | EtsBif::SelectReverse | EtsBif::Match | EtsBif::MatchObject,
+                3
+            )
+    );
+    let mut registry = if exclusive {
+        RegistryAccess::Exclusive(rt.ets.write().unwrap())
+    } else {
+        RegistryAccess::Shared(rt.ets.read().unwrap())
+    };
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     match (function, args) {
         (EtsBif::New, [name, options]) => {
@@ -404,10 +572,23 @@ fn call_inner(
                             == Some(arinsal_term::atoms::TRUE)
                         {
                             WriteConcurrency::Enabled
-                        } else if Some(value.as_atom().ok_or_else(badarg)?)
-                            == ETS_ATOMS.get("auto").copied()
-                        {
+                        } else if value.as_atom() == ETS_ATOMS.get("auto").copied() {
                             WriteConcurrency::Auto
+                        } else if let Ok(arinsal_etf::OwnedTerm::Tuple(ref parts)) =
+                            arinsal_term::to_owned(value)
+                            && let [
+                                arinsal_etf::OwnedTerm::Atom(name),
+                                arinsal_etf::OwnedTerm::Int(count),
+                            ] = parts.as_slice()
+                            && name == "debug_hash_fixed_number_of_locks"
+                            && (1..=32_768).contains(count)
+                        {
+                            // Port of erts/emulator/beam/erl_db.c:2642-2649, OTP-29.1.1.
+                            opts.decentralized_counters = true;
+                            let count = *count as usize;
+                            // Port of erts/emulator/beam/erl_db_hash.c:1044-1048:
+                            // lock arrays round down to the nearest power of two.
+                            WriteConcurrency::Fixed(1 << (usize::BITS - 1 - count.leading_zeros()))
                         } else if value.as_atom() == Some(arinsal_term::atoms::FALSE) {
                             WriteConcurrency::Disabled
                         } else {
@@ -427,17 +608,20 @@ fn call_inner(
                         let pid = value;
                         if pid != atom("none") {
                             let heir_pid = Pid::from_term(pid).ok_or_else(badarg)?;
-                            if !rt.scheduler().map_err(|_| badarg())?.lookup(heir_pid) {
-                                return Err(badarg());
-                            }
-                            opts.heir = Some(Heir {
+                            // Port of erts/emulator/beam/erl_db.c:5319-5337 (set_heir),
+                            // OTP-29.1.1: a dead heir leaves the table without one.
+                            opts.heir = None;
+                            if rt.scheduler().map_err(|_| badarg())?.lookup(heir_pid) {
+                                opts.heir = Some(Heir {
                                 pid,
                                 data: if pair.len() == 3 {
                                     pair.get(2).unwrap()
                                 } else {
                                     atom("undefined")
                                 },
+                                transfer: pair.len() == 3,
                             });
+                            }
                         } else if pair.len() != 2 {
                             return Err(badarg());
                         }
@@ -455,7 +639,14 @@ fn call_inner(
             opts.decentralized_counters = decentralized_counters_option
                 .unwrap_or(opts.decentralized_counters)
                 && opts.write_concurrency != WriteConcurrency::Disabled;
-            let tid = registry.create(opts).map_err(err)?;
+            // Port of erts/emulator/beam/erl_db.c:2810-2831 (ets_new_2), OTP-29.1.1.
+            let tid = registry
+                .exclusive()?
+                .create(opts)
+                .map_err(|error| match error {
+                    EtsError::NameTaken => badarg_cause("already_exists"),
+                    error => err(error),
+                })?;
             if registry.get(tid).map_err(err)?.options.named_table {
                 Ok(Term::atom(name.as_atom().unwrap()))
             } else {
@@ -469,10 +660,18 @@ fn call_inner(
             .map_err(|_| badarg())?
             .unwrap_or(atom("undefined"))),
         (EtsBif::Rename, [target, name]) => {
+            // Port of erts/emulator/beam/erl_db.c:2444-2503 (ets_rename_2), OTP-29.1.1:
+            // the table needs write access, and is looked up even for a bad name.
             let tid = handle(&registry, *target)?;
+            let named = {
+                let table = registry.get(tid).map_err(err)?;
+                if !allowed(&table, caller, true) {
+                    return Err(badarg_cause("access"));
+                }
+                table.options.named_table
+            };
             let new_name = name.as_atom().ok_or_else(badarg)?;
-            let named = registry.get(tid).map_err(err)?.options.named_table;
-            registry.rename(tid, new_name).map_err(err)?;
+            registry.exclusive()?.rename(tid, new_name).map_err(err)?;
             // Unnamed tables keep their id; only the displayed name changes.
             // Port of erts/emulator/beam/erl_db.c:2523 (ets_rename_2), OTP-29.1.1.
             if named { Ok(*name) } else { Ok(*target) }
@@ -483,7 +682,7 @@ fn call_inner(
             let tid = match resolve(&registry, *target) {
                 Ok(tid) => tid,
                 Err(ResolveFail::Missing) => return Ok(atom("undefined")),
-                Err(ResolveFail::BadType) => return Err(badarg()),
+                Err(ResolveFail::BadType) => return Err(badarg_cause("type")),
             };
             let table = registry.get(tid).map_err(err)?;
             if args.len() == 1 {
@@ -492,6 +691,12 @@ fn call_inner(
                     .map_err(err)
             } else {
                 let key = info_item_name(args[1]).ok_or_else(badarg)?;
+                if key == "binary" {
+                    let values = table.all_binary_info(&mut heap).map_err(err)?;
+                    return TermBuilder::new(&mut heap)
+                        .list_from_iter(values)
+                        .map_err(|_| system_limit());
+                }
                 table
                     .info_item(key, atom("nonode@nohost"), &mut heap)
                     .map_err(err)
@@ -499,18 +704,17 @@ fn call_inner(
         }
         (EtsBif::Delete, [target]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, true) {
+            if !allowed(&*registry.get(tid).map_err(err)?, caller, true) {
                 return Err(badarg());
             }
-            registry.delete(tid).map_err(err)?;
+            registry.exclusive()?.delete(tid).map_err(err)?;
             Ok(atom("true"))
         }
         (EtsBif::Delete, [target, key]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, true) {
-                return Err(badarg());
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
             }
             table.delete_key(*key);
             Ok(atom("true"))
@@ -519,8 +723,8 @@ fn call_inner(
         // OTP-29.1.1. Table deletion is synchronous under this VM's registry lock.
         (EtsBif::InternalDeleteAll, [target, holder]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, true) || *holder != atom("undefined") {
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, true) || *holder != atom("undefined") {
                 return Err(badarg());
             }
             let count = table.len();
@@ -534,8 +738,8 @@ fn call_inner(
         (EtsBif::LookupBinaryInfo, [target, key]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             let binaries = table
                 .lookup_binary_info(*key, &mut heap)
@@ -548,7 +752,7 @@ fn call_inner(
         // OTP-29.1.1.
         (EtsBif::SetOpts, [target, options]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
+            let mut table = registry.get_mut(tid).map_err(err)?;
             if table.options.owner != caller {
                 return Err(badarg());
             }
@@ -609,6 +813,7 @@ fn call_inner(
                         heir = Some(live.then_some(Heir {
                             pid: pid_term,
                             data,
+                            transfer: fields.len() == 3,
                         }));
                     } else {
                         return Err(badarg());
@@ -630,8 +835,8 @@ fn call_inner(
         (EtsBif::RawFirst, [target]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             Ok(table
                 .raw_first(&mut heap)
@@ -643,8 +848,8 @@ fn call_inner(
         (EtsBif::RawNext, [target, key]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             Ok(table
                 .raw_next(*key, &mut heap)
@@ -653,9 +858,9 @@ fn call_inner(
         }
         (EtsBif::Take, [target, key]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, true) {
-                return Err(badarg());
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
             }
             let values = table.take(*key, &mut heap).map_err(err)?;
             output_list(&mut heap, values)
@@ -663,8 +868,8 @@ fn call_inner(
         (EtsBif::Slot, [target, index]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             let slot =
                 usize::try_from(index.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
@@ -676,8 +881,8 @@ fn call_inner(
         (EtsBif::First | EtsBif::Last, [target]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             Ok(table
                 .edge(function == EtsBif::Last, &mut heap)
@@ -692,8 +897,8 @@ fn call_inner(
             }
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             Ok((if function == EtsBif::Next {
                 table.next(*key, &mut heap)
@@ -710,8 +915,8 @@ fn call_inner(
         (EtsBif::FirstLookup | EtsBif::LastLookup, [target]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             match table
                 .edge_lookup(function == EtsBif::LastLookup, &mut heap)
@@ -727,8 +932,8 @@ fn call_inner(
             }
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             match table
                 .adjacent_lookup(*key, function == EtsBif::PrevLookup, &mut heap)
@@ -740,38 +945,79 @@ fn call_inner(
         }
         (EtsBif::SafeFixtable, [target, fixed]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
-            table
-                .safe_fixtable_for(caller, boolean(*fixed)?)
-                .map_err(err)?;
+            let fixed = boolean(*fixed)?;
+            if fixed {
+                // Port of erts/emulator/beam/erl_db.c:5148-5161 (fix_table_locked), OTP-29.1.1.
+                let micros = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| badarg())?
+                    .as_micros();
+                let system_time = TermBuilder::new(&mut heap)
+                    .tuple(&[
+                        Term::small((micros / 1_000_000_000_000) as i64).ok_or_else(badarg)?,
+                        Term::small(((micros / 1_000_000) % 1_000_000) as i64)
+                            .ok_or_else(badarg)?,
+                        Term::small((micros % 1_000_000) as i64).ok_or_else(badarg)?,
+                    ])
+                    .map_err(|_| system_limit())?;
+                let monotonic_time = TermBuilder::new(&mut heap)
+                    .int_from_i128(arinsal_bifs::monotonic_time_nanos())
+                    .map_err(|_| system_limit())?;
+                table
+                    .safe_fixtable_for_at(caller, true, system_time, monotonic_time)
+                    .map_err(err)?;
+                drop(table);
+                registry.exclusive()?.note_fixation(caller, tid);
+            } else {
+                table.safe_fixtable_for(caller, false).map_err(err)?;
+            }
             Ok(atom("true"))
         }
         (EtsBif::DeleteObject, [target, object]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, true) {
-                return Err(badarg());
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
             }
             table.delete_object(*object).map_err(err)?;
             Ok(atom("true"))
         }
         (EtsBif::GiveAway, [target, new_owner, data]) => {
+            // Port of erts/emulator/beam/erl_db.c:3087-3124 (ets_give_away_3), OTP-29.1.1:
+            // table errors come first, then the receiver, then ownership.
             let tid = handle(&registry, *target)?;
+            {
+                let table = registry.get(tid).map_err(err)?;
+                if !allowed(&table, caller, true) {
+                    return Err(badarg_cause("access"));
+                }
+            }
             let pid = Pid::from_term(*new_owner).ok_or_else(badarg)?;
-            if *new_owner == caller || !rt.scheduler().map_err(|_| badarg())?.lookup(pid) {
+            if *new_owner != caller && !rt.scheduler().map_err(|_| badarg())?.lookup(pid) {
                 return Err(badarg());
             }
-            if registry.get(tid).map_err(err)?.options.owner != caller {
-                return Err(badarg());
+            let options = registry.get(tid).map_err(err)?.options;
+            if options.owner != caller {
+                return Err(badarg_cause("not_owner"));
             }
-            let tab = tid.to_term(&mut heap).map_err(|_| badarg())?;
+            if *new_owner == caller {
+                return Err(badarg_cause("owner"));
+            }
+            // Port of erts/emulator/beam/erl_db.c:4959-4962 (send_ets_transfer_message),
+            // OTP-29.1.1: a named table is identified by its name.
+            let tab = if options.named_table {
+                Term::atom(options.name)
+            } else {
+                tid.to_term(&mut heap).map_err(|_| badarg())?
+            };
             let transfer = TermBuilder::new(&mut heap)
                 .tuple(&[atom("ETS-TRANSFER"), tab, caller, *data])
                 .map_err(|_| badarg())?;
-            registry.give_away(tid, *new_owner).map_err(err)?;
+            registry.exclusive()?.give_away(tid, *new_owner).map_err(err)?;
             ctx.send(pid, Message::copy_from(transfer)?)
                 .map_err(|_| badarg())?;
             Ok(atom("true"))
@@ -781,8 +1027,8 @@ fn call_inner(
         | (EtsBif::MatchObject, [target, spec]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             if matches!(function, EtsBif::Select | EtsBif::SelectReverse)
                 && *spec == Term::NIL
@@ -815,8 +1061,8 @@ fn call_inner(
             let tid = handle(&registry, *target)?;
             let (program, result, retain) = {
                 let table = registry.get(tid).map_err(err)?;
-                if !allowed(table, caller, false) {
-                    return Err(badarg());
+                if !allowed(&table, caller, false) {
+                    return Err(badarg_cause("access"));
                 }
                 // Chunk size is strictly greater than 0. Port of erl_db.c:3828, OTP-29.1.1.
                 if limit == 0 {
@@ -845,31 +1091,47 @@ fn call_inner(
                 let rows = TermBuilder::new(&mut heap)
                     .list_from_iter(page.rows)
                     .map_err(|_| badarg())?;
-                let retain = page.continuation.is_some();
-                let result = if let Some(continuation) = page.continuation {
-                    let next = continuation.to_term(table, &mut heap).map_err(err)?;
-                    TermBuilder::new(&mut heap)
-                        .tuple(&[rows, next])
-                        .map_err(|_| badarg())?
+                let (result, retain) = if let Some(continuation) = page.continuation {
+                    let next = continuation.to_term(&table, &mut heap).map_err(err)?;
+                    (
+                        TermBuilder::new(&mut heap)
+                            .tuple(&[rows, next])
+                            .map_err(|_| badarg())?,
+                        true,
+                    )
+                } else if rows == Term::NIL {
+                    // Port of erts/emulator/beam/erl_db_hash.c:2189-2246,
+                    // OTP-29.1.1: exhaustion is an end marker, with the final
+                    // non-empty chunk paired with the same marker.
+                    (atom("$end_of_table"), false)
                 } else {
-                    rows
+                    (
+                        TermBuilder::new(&mut heap)
+                            .tuple(&[rows, atom("$end_of_table")])
+                            .map_err(|_| badarg())?,
+                        false,
+                    )
                 };
                 (program, result, retain)
             };
             if retain {
-                registry.retain_match_program(program);
+                registry.exclusive()?.retain_match_program(program);
             }
             Ok(result)
         }
         (EtsBif::Select | EtsBif::SelectReverse, [continuation])
         | (EtsBif::Match, [continuation])
         | (EtsBif::MatchObject, [continuation]) => {
+            // Port of erts/emulator/beam/erl_db.c:3955-3960 (ets_select1), OTP-29.1.1.
+            if end_of_table(*continuation) {
+                return Ok(atom("$end_of_table"));
+            }
             // SAFETY: the continuation is rooted in the caller's process heap.
             let tuple = unsafe { continuation.tuple_ref() }.ok_or_else(badarg)?;
             let tid = Tid::from_term(tuple.get(0).ok_or_else(badarg)?).ok_or_else(badarg)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             let program_pos = if table.options.table_type == TableType::OrderedSet {
                 4
@@ -879,7 +1141,7 @@ fn call_inner(
             let reference = tuple.get(program_pos).ok_or_else(badarg)?;
             let program = registry.match_program(reference).ok_or_else(badarg)?;
             let state =
-                SelectContinuation::from_term(table, program, *continuation).map_err(err)?;
+                SelectContinuation::from_term(&table, program, *continuation).map_err(err)?;
             let page = table
                 .select_chunk_continue(program, state, &mut heap)
                 .map_err(err)?;
@@ -887,18 +1149,24 @@ fn call_inner(
                 .list_from_iter(page.rows)
                 .map_err(|_| badarg())?;
             if let Some(next) = page.continuation {
-                let next = next.to_term(table, &mut heap).map_err(err)?;
+                let next = next.to_term(&table, &mut heap).map_err(err)?;
                 TermBuilder::new(&mut heap)
                     .tuple(&[rows, next])
                     .map_err(|_| badarg())
+            } else if rows == Term::NIL {
+                // Port of erts/emulator/beam/erl_db_hash.c:2389-2399
+                // (select_chunk_continue_on_loop_ended), OTP-29.1.1.
+                Ok(atom("$end_of_table"))
             } else {
-                Ok(rows)
+                TermBuilder::new(&mut heap)
+                    .tuple(&[rows, atom("$end_of_table")])
+                    .map_err(|_| badarg())
             }
         }
         (EtsBif::MatchSpecCompile, [spec]) => {
             let program = MatchProgram::compile(*spec).map_err(err)?;
             let reference = program.reference(&mut heap).map_err(err)?;
-            registry.retain_match_program(program);
+            registry.exclusive()?.retain_match_program(program);
             Ok(reference)
         }
         (EtsBif::IsCompiledMs, [value]) => {
@@ -959,9 +1227,13 @@ fn call_inner(
         | (EtsBif::InternalSelectDelete, [target, spec])
         | (EtsBif::SelectReplace, [target, spec]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, function != EtsBif::SelectCount) {
-                return Err(badarg());
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, function != EtsBif::SelectCount) {
+                return Err(badarg_cause("access"));
+            }
+            // Port of erts/emulator/beam/erl_db.c:4195-4202 (ets_select_replace_2), OTP-29.1.1.
+            if function == EtsBif::SelectReplace && table.options.table_type == TableType::Bag {
+                return Err(badarg_cause("table_type"));
             }
             if *spec == Term::NIL {
                 return Term::small(0).ok_or_else(badarg);
@@ -982,11 +1254,21 @@ fn call_inner(
         | (EtsBif::LookupElement, [target, key, position, _]) => {
             let tid = handle(&registry, *target)?;
             let table = registry.get(tid).map_err(err)?;
-            if !allowed(table, caller, false) {
-                return Err(badarg());
+            if !allowed(&table, caller, false) {
+                return Err(badarg_cause("access"));
             }
             let pos =
                 usize::try_from(position.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
+            if args.len() == 3
+                && !matches!(
+                    table.options.table_type,
+                    TableType::Bag | TableType::DuplicateBag
+                )
+            {
+                return table
+                    .lookup_element_one(*key, pos, &mut heap)
+                    .map_err(err);
+            }
             let values = if args.len() == 4 {
                 match table
                     .lookup_element_default(*key, pos, args[3], &mut heap)
@@ -1012,86 +1294,58 @@ fn call_inner(
         (EtsBif::UpdateElement, [target, key, updates])
         | (EtsBif::UpdateElement, [target, key, updates, _]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, true) {
-                return Err(badarg());
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
             }
-            // SAFETY: update specifications remain in the caller's live process heap.
-            let entries = if unsafe { updates.tuple_ref() }.is_some() {
-                vec![*updates]
-            } else {
-                list(*updates).ok_or_else(badarg)?
-            };
-            let parsed = entries
-                .into_iter()
-                .map(|entry| {
-                    // SAFETY: each update term is rooted in the caller's process heap.
-                    let tuple = unsafe { entry.tuple_ref() }.ok_or_else(badarg)?;
-                    if tuple.len() != 2 {
-                        return Err(badarg());
-                    }
-                    let position =
-                        usize::try_from(tuple.get(0).unwrap().as_small().ok_or_else(badarg)?)
-                            .map_err(|_| badarg())?;
-                    Ok((position, tuple.get(1).unwrap()))
-                })
-                .collect::<Result<Vec<_>, VmError>>()?;
-            let updated = if args.len() == 4 {
-                table.update_element_default(*key, &parsed, args[3])
-            } else {
-                table.update_element(*key, &parsed)
-            }
-            .map_err(err)?;
+            let default = default_object(&table, args.get(3).copied())?;
+            // Port of erts/emulator/beam/erl_db.c:1386-1414 (do_update_element), OTP-29.1.1:
+            // a malformed `{Pos, Value}` fails only after the key lookup.
+            let parsed = update_list(*updates, |entry| match tuple_items(entry)?.as_slice() {
+                [position_term, value] => Some((position(*position_term)?, *value)),
+                _ => None,
+            });
+            let updated = table
+                .update_element(*key, &parsed, default)
+                .map_err(err)?;
             Ok(boolean_term(updated))
         }
         (EtsBif::UpdateCounter, [target, key, operation])
         | (EtsBif::UpdateCounter, [target, key, operation, _]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(table, caller, true) {
-                return Err(badarg());
+            let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
             }
-            // SAFETY: operation is rooted in the caller's process heap.
-            let entries =
-                if operation.as_small().is_some() || unsafe { operation.tuple_ref() }.is_some() {
-                    vec![*operation]
-                } else {
-                    list(*operation).ok_or_else(badarg)?
+            let default = default_object(&table, args.get(3).copied())?;
+            // Port of erts/emulator/beam/erl_db.c:1505-1603 (do_update_counter), OTP-29.1.1.
+            // An integer increments the element after the key; a list returns a list.
+            let parse = |entry: Term| -> Option<BigCounterOp> {
+                let (position_term, increment, threshold) = match tuple_items(entry)?.as_slice() {
+                    [position_term, increment] => (*position_term, *increment, None),
+                    [position_term, increment, threshold, warp] => (
+                        *position_term,
+                        *increment,
+                        Some((integer(*threshold)?, integer(*warp)?)),
+                    ),
+                    _ => return None,
                 };
-            let operations = entries
-                .into_iter()
-                .map(|entry| {
-                    if let Some(increment) = entry.as_small() {
-                        return Ok(BigCounterOp {
-                            position: 2,
-                            increment: BigInt::from(increment),
-                            threshold: None,
-                        });
-                    }
-                    // SAFETY: each counter operation is rooted in the caller's process heap.
-                    let tuple = unsafe { entry.tuple_ref() }.ok_or_else(badarg)?;
-                    if !(2..=4).contains(&tuple.len()) {
-                        return Err(badarg());
-                    }
-                    let number =
-                        |index: usize| integer(tuple.get(index).unwrap()).ok_or_else(badarg);
-                    let position =
-                        usize::try_from(tuple.get(0).unwrap().as_small().ok_or_else(badarg)?)
-                            .map_err(|_| badarg())?;
-                    let increment = number(1)?;
-                    let threshold = if tuple.len() == 4 {
-                        Some((number(2)?, number(3)?))
-                    } else {
-                        None
-                    };
-                    Ok(BigCounterOp {
-                        position,
-                        increment,
-                        threshold,
-                    })
+                Some(BigCounterOp {
+                    position: position(position_term)?,
+                    increment: integer(increment)?,
+                    threshold,
                 })
-                .collect::<Result<Vec<_>, VmError>>()?;
-            let default = if args.len() == 4 { Some(args[3]) } else { None };
+            };
+            let single = integer(*operation).is_some() || operation.classify() == TermKind::Tuple;
+            let operations = if let Some(increment) = integer(*operation) {
+                vec![Some(BigCounterOp {
+                    position: table.options.keypos + 1,
+                    increment,
+                    threshold: None,
+                })]
+            } else {
+                update_list(*operation, parse)
+            };
             let values = table
                 .update_counter_big(*key, &operations, default)
                 .map_err(err)?;
@@ -1099,8 +1353,8 @@ fn call_inner(
                 .into_iter()
                 .map(|value| copy_term(value, &mut heap).map_err(|_| badarg()))
                 .collect::<Result<Vec<_>, _>>()?;
-            if copied.len() == 1 {
-                Ok(copied[0])
+            if single {
+                copied.first().copied().ok_or_else(badarg)
             } else {
                 TermBuilder::new(&mut heap)
                     .list_from_iter(copied)
@@ -1223,7 +1477,7 @@ enum EtsBif {
 }
 
 macro_rules! ets_entry {
-    ($entry:ident, $id:ident, $arity:literal) => {
+    ($entry:ident, $id:ident, $arity:literal, $module:literal, $function:literal) => {
         fn $entry(
             vm: &mut Vm,
             process: &mut Process,
@@ -1235,7 +1489,8 @@ macro_rules! ets_entry {
             }
             let _ = vm;
             Some(args.with_values(process, |process, values| {
-                call_inner(process, ctx, EtsBif::$id, values)
+                let result = call_inner(process, ctx, EtsBif::$id, values);
+                bif_frame($module, $function, values, result)
             }))
         }
     };
@@ -1253,7 +1508,8 @@ fn entry_insert(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    Some(insert_args(process, ctx, false, target, objects))
+    let result = insert_args(process, ctx, false, target, objects);
+    Some(bif_frame("ets", "insert", &[target, objects], result))
 }
 
 fn entry_insert_new(
@@ -1268,7 +1524,8 @@ fn entry_insert_new(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    Some(insert_args(process, ctx, true, target, objects))
+    let result = insert_args(process, ctx, true, target, objects);
+    Some(bif_frame("ets", "insert_new", &[target, objects], result))
 }
 
 fn entry_lookup(
@@ -1283,7 +1540,8 @@ fn entry_lookup(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    Some(lookup_args(process, ctx, false, target, key))
+    let result = lookup_args(process, ctx, false, target, key);
+    Some(bif_frame("ets", "lookup", &[target, key], result))
 }
 
 fn entry_member(
@@ -1298,61 +1556,182 @@ fn entry_member(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    Some(lookup_args(process, ctx, true, target, key))
+    let result = lookup_args(process, ctx, true, target, key);
+    Some(bif_frame("ets", "member", &[target, key], result))
 }
 
-ets_entry!(entry_new, New, 2);
-ets_entry!(entry_match_spec_test, MatchSpecTest, 3);
-ets_entry!(entry_lookup_binary_info, LookupBinaryInfo, 2);
-ets_entry!(entry_raw_first, RawFirst, 1);
-ets_entry!(entry_raw_next, RawNext, 2);
-ets_entry!(entry_super_user, SuperUser, 1);
-ets_entry!(entry_internal_delete_all, InternalDeleteAll, 2);
-ets_entry!(entry_setopts, SetOpts, 2);
-ets_entry!(entry_whereis, Whereis, 1);
-ets_entry!(entry_rename, Rename, 2);
-ets_entry!(entry_info_1, Info, 1);
-ets_entry!(entry_info_2, Info, 2);
-ets_entry!(entry_delete_1, Delete, 1);
-ets_entry!(entry_delete_2, Delete, 2);
-ets_entry!(entry_take, Take, 2);
-ets_entry!(entry_slot, Slot, 2);
-ets_entry!(entry_first, First, 1);
-ets_entry!(entry_first_lookup, FirstLookup, 1);
-ets_entry!(entry_last, Last, 1);
-ets_entry!(entry_last_lookup, LastLookup, 1);
-ets_entry!(entry_next, Next, 2);
-ets_entry!(entry_next_lookup, NextLookup, 2);
-ets_entry!(entry_prev, Prev, 2);
-ets_entry!(entry_prev_lookup, PrevLookup, 2);
-ets_entry!(entry_safe_fixtable, SafeFixtable, 2);
-ets_entry!(entry_delete_object, DeleteObject, 2);
-ets_entry!(entry_give_away, GiveAway, 3);
-ets_entry!(entry_select_1, Select, 1);
-ets_entry!(entry_select_2, Select, 2);
-ets_entry!(entry_select_3, Select, 3);
-ets_entry!(entry_select_reverse_1, SelectReverse, 1);
-ets_entry!(entry_select_reverse_2, SelectReverse, 2);
-ets_entry!(entry_select_reverse_3, SelectReverse, 3);
-ets_entry!(entry_match_1, Match, 1);
-ets_entry!(entry_match_2, Match, 2);
-ets_entry!(entry_match_3, Match, 3);
-ets_entry!(entry_match_object_1, MatchObject, 1);
-ets_entry!(entry_match_object_2, MatchObject, 2);
-ets_entry!(entry_match_object_3, MatchObject, 3);
-ets_entry!(entry_match_spec_compile, MatchSpecCompile, 1);
-ets_entry!(entry_is_compiled_ms, IsCompiledMs, 1);
-ets_entry!(entry_internal_request_all, InternalRequestAll, 0);
-ets_entry!(entry_match_spec_run_r, MatchSpecRunR, 3);
-ets_entry!(entry_select_count, SelectCount, 2);
-ets_entry!(entry_internal_select_delete, InternalSelectDelete, 2);
-ets_entry!(entry_select_replace, SelectReplace, 2);
-ets_entry!(entry_lookup_element_3, LookupElement, 3);
-ets_entry!(entry_lookup_element_4, LookupElement, 4);
-ets_entry!(entry_update_element_3, UpdateElement, 3);
-ets_entry!(entry_update_element_4, UpdateElement, 4);
-ets_entry!(entry_update_counter_3, UpdateCounter, 3);
-ets_entry!(entry_update_counter_4, UpdateCounter, 4);
+ets_entry!(entry_new, New, 2, "ets", "new");
+ets_entry!(
+    entry_match_spec_test,
+    MatchSpecTest,
+    3,
+    "erlang",
+    "match_spec_test"
+);
+ets_entry!(
+    entry_lookup_binary_info,
+    LookupBinaryInfo,
+    2,
+    "erts_internal",
+    "ets_lookup_binary_info"
+);
+ets_entry!(
+    entry_raw_first,
+    RawFirst,
+    1,
+    "erts_internal",
+    "ets_raw_first"
+);
+ets_entry!(entry_raw_next, RawNext, 2, "erts_internal", "ets_raw_next");
+ets_entry!(
+    entry_super_user,
+    SuperUser,
+    1,
+    "erts_internal",
+    "ets_super_user"
+);
+ets_entry!(
+    entry_internal_delete_all,
+    InternalDeleteAll,
+    2,
+    "ets",
+    "internal_delete_all"
+);
+ets_entry!(entry_setopts, SetOpts, 2, "ets", "setopts");
+ets_entry!(entry_whereis, Whereis, 1, "ets", "whereis");
+ets_entry!(entry_rename, Rename, 2, "ets", "rename");
+ets_entry!(entry_info_1, Info, 1, "ets", "info");
+ets_entry!(entry_info_2, Info, 2, "ets", "info");
+ets_entry!(entry_delete_1, Delete, 1, "ets", "delete");
+ets_entry!(entry_delete_2, Delete, 2, "ets", "delete");
+ets_entry!(entry_take, Take, 2, "ets", "take");
+ets_entry!(entry_slot, Slot, 2, "ets", "slot");
+ets_entry!(entry_first, First, 1, "ets", "first");
+ets_entry!(entry_first_lookup, FirstLookup, 1, "ets", "first_lookup");
+ets_entry!(entry_last, Last, 1, "ets", "last");
+ets_entry!(entry_last_lookup, LastLookup, 1, "ets", "last_lookup");
+ets_entry!(entry_next, Next, 2, "ets", "next");
+ets_entry!(entry_next_lookup, NextLookup, 2, "ets", "next_lookup");
+ets_entry!(entry_prev, Prev, 2, "ets", "prev");
+ets_entry!(entry_prev_lookup, PrevLookup, 2, "ets", "prev_lookup");
+ets_entry!(entry_safe_fixtable, SafeFixtable, 2, "ets", "safe_fixtable");
+ets_entry!(entry_delete_object, DeleteObject, 2, "ets", "delete_object");
+ets_entry!(entry_give_away, GiveAway, 3, "ets", "give_away");
+ets_entry!(entry_select_1, Select, 1, "ets", "select");
+ets_entry!(entry_select_2, Select, 2, "ets", "select");
+ets_entry!(entry_select_3, Select, 3, "ets", "select");
+ets_entry!(
+    entry_select_reverse_1,
+    SelectReverse,
+    1,
+    "ets",
+    "select_reverse"
+);
+ets_entry!(
+    entry_select_reverse_2,
+    SelectReverse,
+    2,
+    "ets",
+    "select_reverse"
+);
+ets_entry!(
+    entry_select_reverse_3,
+    SelectReverse,
+    3,
+    "ets",
+    "select_reverse"
+);
+ets_entry!(entry_match_1, Match, 1, "ets", "match");
+ets_entry!(entry_match_2, Match, 2, "ets", "match");
+ets_entry!(entry_match_3, Match, 3, "ets", "match");
+ets_entry!(entry_match_object_1, MatchObject, 1, "ets", "match_object");
+ets_entry!(entry_match_object_2, MatchObject, 2, "ets", "match_object");
+ets_entry!(entry_match_object_3, MatchObject, 3, "ets", "match_object");
+ets_entry!(
+    entry_match_spec_compile,
+    MatchSpecCompile,
+    1,
+    "ets",
+    "match_spec_compile"
+);
+ets_entry!(
+    entry_is_compiled_ms,
+    IsCompiledMs,
+    1,
+    "ets",
+    "is_compiled_ms"
+);
+ets_entry!(
+    entry_internal_request_all,
+    InternalRequestAll,
+    0,
+    "ets",
+    "internal_request_all"
+);
+ets_entry!(
+    entry_match_spec_run_r,
+    MatchSpecRunR,
+    3,
+    "ets",
+    "match_spec_run_r"
+);
+ets_entry!(entry_select_count, SelectCount, 2, "ets", "select_count");
+ets_entry!(
+    entry_internal_select_delete,
+    InternalSelectDelete,
+    2,
+    "ets",
+    "internal_select_delete"
+);
+ets_entry!(
+    entry_select_replace,
+    SelectReplace,
+    2,
+    "ets",
+    "select_replace"
+);
+ets_entry!(
+    entry_lookup_element_3,
+    LookupElement,
+    3,
+    "ets",
+    "lookup_element"
+);
+ets_entry!(
+    entry_lookup_element_4,
+    LookupElement,
+    4,
+    "ets",
+    "lookup_element"
+);
+ets_entry!(
+    entry_update_element_3,
+    UpdateElement,
+    3,
+    "ets",
+    "update_element"
+);
+ets_entry!(
+    entry_update_element_4,
+    UpdateElement,
+    4,
+    "ets",
+    "update_element"
+);
+ets_entry!(
+    entry_update_counter_3,
+    UpdateCounter,
+    3,
+    "ets",
+    "update_counter"
+);
+ets_entry!(
+    entry_update_counter_4,
+    UpdateCounter,
+    4,
+    "ets",
+    "update_counter"
+);
 
 pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<super::ResolvedNative> {
     match (module, function, arity) {

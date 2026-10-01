@@ -1,6 +1,7 @@
 //! Native execution bridge and registered code metadata.
 
 use super::*;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Symbolic information attached to one executable native code range.
@@ -12,14 +13,20 @@ pub struct NativeFunction {
     pub end: usize,
     /// Erlang module name.
     pub module: String,
+    /// Module atom resolved when the native function was registered.
+    pub module_atom: arinsal_term::Atom,
     /// Erlang function name.
     pub function: String,
+    /// Function atom resolved when the native function was registered.
+    pub function_atom: arinsal_term::Atom,
     /// Erlang function arity.
     pub arity: u8,
     /// Source line, when known.
     pub line: Option<u32>,
     /// Source file, when known.
-    pub file: Option<String>,
+    pub file: Option<Arc<str>>,
+    /// Cached literal filename list, when source location metadata is available.
+    pub file_term: Option<Term>,
     /// Native PCs and their source locations, sorted by address.
     pub line_table: Vec<NativeLine>,
 }
@@ -30,7 +37,9 @@ pub struct NativeLine {
     /// Native address at which this source line becomes current.
     pub address: usize,
     /// Source filename.
-    pub file: String,
+    pub file: Arc<str>,
+    /// Cached literal filename list from the owning BEAM module.
+    pub file_term: Option<Term>,
     /// One-based source line.
     pub line: u32,
 }
@@ -46,8 +55,18 @@ impl NativeFunction {
         self.line_table
             .get(index)
             .filter(|entry| entry.line != 0)
-            .map(|entry| (entry.file.as_str(), entry.line))
+            .map(|entry| (entry.file.as_ref(), entry.line))
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeStackFrame {
+    pub module_atom: arinsal_term::Atom,
+    pub function_atom: arinsal_term::Atom,
+    pub arity: u8,
+    pub line: Option<u32>,
+    pub file_term: Option<Term>,
+    pub file: Option<Arc<str>>,
 }
 
 fn native_functions() -> &'static RwLock<Vec<NativeFunction>> {
@@ -309,6 +328,9 @@ pub unsafe extern "C" fn arinsal_native_raise(header: *mut ProcessHeader, class:
 
 /// Find metadata for a native instruction or continuation address.
 pub fn native_function_at(address: usize) -> Option<NativeFunction> {
+    if !arinsal_term::may_be_native_code_pointer(address) {
+        return None;
+    }
     let functions = native_functions().read().ok()?;
     let index = functions.partition_point(|function| function.start <= address);
     functions
@@ -319,6 +341,9 @@ pub fn native_function_at(address: usize) -> Option<NativeFunction> {
 
 /// Test native code membership without cloning function metadata.
 pub(crate) fn is_native_function_at(address: usize) -> bool {
+    if !arinsal_term::may_be_native_code_pointer(address) {
+        return false;
+    }
     let Ok(functions) = native_functions().read() else {
         return false;
     };
@@ -327,6 +352,35 @@ pub(crate) fn is_native_function_at(address: usize) -> bool {
         return false;
     };
     address < function.end
+}
+
+pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> {
+    if !arinsal_term::may_be_native_code_pointer(address) {
+        return None;
+    }
+    let functions = native_functions().read().ok()?;
+    let index = functions.partition_point(|function| function.start <= address);
+    let function = functions
+        .get(index.checked_sub(1)?)
+        .filter(|function| address < function.end)?;
+    let line = function
+        .line_table
+        .partition_point(|entry| entry.address <= address)
+        .checked_sub(1)
+        .and_then(|index| function.line_table.get(index))
+        .filter(|entry| entry.line != 0);
+    Some(NativeStackFrame {
+        module_atom: function.module_atom,
+        function_atom: function.function_atom,
+        arity: function.arity,
+        line: line.map(|entry| entry.line).or(function.line),
+        file_term: line
+            .and_then(|entry| entry.file_term)
+            .or(function.file_term),
+        file: line
+            .map(|entry| Arc::clone(&entry.file))
+            .or_else(|| function.file.clone()),
+    })
 }
 
 fn native_arity_at(address: usize) -> Option<u8> {
