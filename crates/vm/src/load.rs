@@ -833,45 +833,54 @@ impl Vm {
         }
     }
 
-    pub(crate) fn patch_trace_function(
+    /// Patch the breakpoints of several functions of one module, cloning and publishing the
+    /// module once: a per-function clone and code epoch bump made `return_to` (which touches
+    /// every loaded function) take minutes.
+    pub(crate) fn patch_trace_functions(
         &mut self,
         module_id: usize,
-        entry: usize,
-        function: &str,
-        arity: u8,
+        targets: &[(usize, String, u8)],
         process: &Process,
     ) {
-        let Some(module) = self.modules.get_mut(module_id) else {
+        let Some(module) = self.modules.get(module_id) else {
             return;
         };
-        let (local, global) =
-            crate::trace_bp::breakpoint_kinds(process, &module.name, function, arity);
-        if self
-            .beamasm_targets
-            .function_for_target(module_id, module, entry)
-            .is_some()
-        {
-            crate::beamasm_integration::patch_native_breakpoint(
-                &module.name,
-                function,
-                arity,
-                local,
-            );
+        let mut local_patches = Vec::new();
+        let mut global_patches = Vec::new();
+        for (entry, function, arity) in targets {
+            let (local, global) =
+                crate::trace_bp::breakpoint_kinds(process, &module.name, function, *arity);
+            if self
+                .beamasm_targets
+                .function_for_target(module_id, module, *entry)
+                .is_some()
+            {
+                crate::beamasm_integration::patch_native_breakpoint(
+                    &module.name,
+                    function,
+                    *arity,
+                    local,
+                );
+            }
+            if module.breakpoint_originals.contains_key(entry) != local {
+                local_patches.push((*entry, local));
+            }
+            global_patches.push((function.as_str(), *arity, global));
         }
-        let needs_local_patch = module.breakpoint_originals.contains_key(&entry) != local;
-        let changed = if needs_local_patch {
-            Arc::make_mut(module).set_trace_breakpoint(entry, local)
-        } else {
-            false
-        };
-        if let Some(module) = self.modules.get(module_id) {
-            for (index, export) in module.exports.iter().enumerate() {
+        for (index, export) in module.exports.iter().enumerate() {
+            for &(function, arity, global) in &global_patches {
                 if export.function == function && export.arity == arity {
                     module.set_global_trace_breakpoint(index, global);
                 }
             }
         }
-        if !changed {
+        if local_patches.is_empty() {
+            return;
+        }
+        let Some(module) = self.modules.get_mut(module_id) else {
+            return;
+        };
+        if !Arc::make_mut(module).set_trace_breakpoints(&local_patches) {
             return;
         }
         let Some(module) = self.modules.get(module_id) else {
@@ -902,19 +911,21 @@ impl Vm {
             .iter()
             .enumerate()
             .filter(|(_, module)| module.name == module_name)
-            .flat_map(|(module_id, module)| {
-                module
+            .map(|(module_id, module)| {
+                let functions = module
                     .functions
                     .iter()
-                    .filter_map(move |(start, function, function_arity)| {
-                        ((function_name == "_" || function == function_name)
-                            && arity.is_none_or(|arity| arity == *function_arity))
-                        .then_some((module_id, start + 1, function.clone(), *function_arity))
+                    .filter(|(_, function, function_arity)| {
+                        (function_name == "_" || function == function_name)
+                            && arity.is_none_or(|arity| arity == *function_arity)
                     })
+                    .map(|(start, function, arity)| (start + 1, function.clone(), *arity))
+                    .collect::<Vec<_>>();
+                (module_id, functions)
             })
             .collect::<Vec<_>>();
-        for (module_id, entry, function, arity) in targets {
-            self.patch_trace_function(module_id, entry, &function, arity, process);
+        for (module_id, functions) in targets {
+            self.patch_trace_functions(module_id, &functions, process);
         }
     }
 
@@ -923,17 +934,17 @@ impl Vm {
             .modules
             .iter()
             .enumerate()
-            .flat_map(|(module_id, module)| {
-                module
+            .map(|(module_id, module)| {
+                let functions = module
                     .functions
                     .iter()
-                    .map(move |(start, function, arity)| {
-                        (module_id, start + 1, function.clone(), *arity)
-                    })
+                    .map(|(start, function, arity)| (start + 1, function.clone(), *arity))
+                    .collect::<Vec<_>>();
+                (module_id, functions)
             })
             .collect::<Vec<_>>();
-        for (module_id, entry, function, arity) in targets {
-            self.patch_trace_function(module_id, entry, &function, arity, process);
+        for (module_id, functions) in targets {
+            self.patch_trace_functions(module_id, &functions, process);
         }
     }
 

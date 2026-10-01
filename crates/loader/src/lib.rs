@@ -493,6 +493,24 @@ pub struct CoverageProbe {
 impl Module {
     /// Patch one interpreted function entry, preserving the instruction to run after tracing.
     pub fn set_trace_breakpoint(&mut self, entry: usize, enabled: bool) -> bool {
+        self.set_trace_breakpoints(&[(entry, enabled)])
+    }
+
+    /// Patch several entries and rebind the exports once; true when any entry changed.
+    pub fn set_trace_breakpoints(&mut self, entries: &[(usize, bool)]) -> bool {
+        let mut changed = false;
+        for &(entry, enabled) in entries {
+            changed |= self.patch_breakpoint_entry(entry, enabled);
+        }
+        if changed {
+            for export in &self.exports {
+                export.bind_code(self.code.as_ptr(), self.code.len());
+            }
+        }
+        changed
+    }
+
+    fn patch_breakpoint_entry(&mut self, entry: usize, enabled: bool) -> bool {
         if enabled {
             if self.breakpoint_originals.contains_key(&entry) {
                 return false;
@@ -512,9 +530,6 @@ impl Module {
             *instruction = original;
         } else {
             return false;
-        }
-        for export in &self.exports {
-            export.bind_code(self.code.as_ptr(), self.code.len());
         }
         true
     }
