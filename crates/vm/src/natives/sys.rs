@@ -3392,6 +3392,15 @@ fn microstate(
     mut ctx: Option<&mut RunCtx<'_, Message>>,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_msacc.c result layout, OTP-29.1.1.
+    // erts keeps msacc counters from boot, so the list exists even if accounting was never on.
+    if MICROSTATE_BASE
+        .lock()
+        .expect("microstate baseline")
+        .is_none()
+        && let Some(ctx) = ctx.as_deref()
+    {
+        reset_microstate_baseline(process, ctx);
+    }
     let baseline = MICROSTATE_BASE.lock().expect("microstate baseline").clone();
     let Some((started, baseline, poll_baseline)) = baseline else {
         return Ok(atom("undefined"));
