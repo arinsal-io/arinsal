@@ -99,6 +99,13 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
         directory = pathlib.Path(source_temp) / "test"
         shutil.copytree(original, directory)
         build_native(name, directory)
+        # Precompile with erlc so both runtimes load the same .beam files; otherwise ct
+        # compiles the suite inside the runtime under test (minutes in the interpreter).
+        sources = sorted(str(p) for p in directory.glob("*.erl") if p.name == f"{name}_SUITE.erl" or not p.name.endswith("_SUITE.erl"))
+        if sources:
+            cp = run(["erlc", "-W0", "+debug_info", "-I", str(directory), "-I", str(HELPERS), "-pa", str(build), "-o", str(directory), *sources], 600)
+            if cp.returncode:
+                print(f"erlc warning for {name}: {cp.stdout[-800:]}", file=sys.stderr, flush=True)
         expr = (
             "R=ct:run_test([{dir,\"" + str(directory) + "\"},{suite," + name
             + "_SUITE},{logdir,\"" + str(logdir) + "\"}" + extra + "]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
