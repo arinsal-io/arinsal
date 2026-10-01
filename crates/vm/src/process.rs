@@ -397,7 +397,8 @@ impl Message {
                 timer_id: None,
             });
         }
-        let mut fragment = ProcessHeap::with_words(words);
+        let mut fragment =
+            ProcessHeap::with_words_for_type(words, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
         let term = copy_term(term, &mut fragment)
             .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?;
         Ok(Self {

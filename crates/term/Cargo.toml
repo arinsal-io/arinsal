@@ -13,6 +13,7 @@ workspace = true
 validate-terms = []
 
 [dependencies]
+arinsal-alloc = { path = "../alloc" }
 arinsal-etf.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true

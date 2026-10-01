@@ -41,6 +41,7 @@ name = "arinsal-alloc"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "parking_lot",
  "proptest",
 ]
 
@@ -381,6 +382,7 @@ version = "0.0.1"
 name = "arinsal-term"
 version = "0.0.1"
 dependencies = [
+ "arinsal-alloc",
  "arinsal-etf",
  "num-bigint",
  "num-traits",
@@ -393,6 +395,7 @@ name = "arinsal-vm"
 version = "0.0.1"
 dependencies = [
  "arinsal-a64",
+ "arinsal-alloc",
  "arinsal-args",
  "arinsal-arith",
  "arinsal-beam",

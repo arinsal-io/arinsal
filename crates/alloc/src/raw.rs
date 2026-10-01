@@ -2,6 +2,53 @@
 
 use std::fmt;
 
+const WORD_BYTES: usize = std::mem::size_of::<usize>();
+
+/// Pointer and extent for a typed allocator block.
+pub(crate) struct WordView {
+    ptr: usize,
+    len: usize,
+}
+
+// SAFETY: The owning typed block controls the allocation lifetime, and access remains borrowed.
+unsafe impl Send for WordView {}
+
+impl WordView {
+    pub(crate) fn new(ptr: *mut u64, len: usize) -> Self {
+        Self {
+            ptr: ptr as usize,
+            len,
+        }
+    }
+
+    pub(crate) fn reset(&mut self, ptr: *mut u64, len: usize) {
+        self.ptr = ptr as usize;
+        self.len = len;
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u64 {
+        self.ptr as *const u64
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u64 {
+        self.ptr as *mut u64
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u64] {
+        // SAFETY: typed-block ownership keeps the aligned payload allocated for this borrow.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u64, self.len) }
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u64] {
+        // SAFETY: &mut self gives exclusive access to the live typed-block payload.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u64, self.len) }
+    }
+}
+
 /// A system page size in bytes on the current host.
 pub fn page_size() -> usize {
     // SAFETY: sysconf is a pure query and requires no pointer arguments.
@@ -134,54 +181,69 @@ impl RawRegion {
         self.len == 0
     }
 
-    /// Reads one byte at a checked offset.
-    pub fn read_byte(&self, offset: usize) -> Option<u8> {
-        if offset >= self.len || !self.protection.read {
+    /// The whole mapping as bytes, or `None` when it is not readable.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        if !self.protection.read {
             return None;
         }
-        // SAFETY: offset is in bounds of the mapped region.
-        let address = unsafe { self.base_ptr().add(offset) };
-        // SAFETY: address was derived from a live mapping at an in-bounds offset.
-        Some(unsafe { address.read() })
+        // SAFETY: this object owns `len` readable bytes at `ptr` for the lifetime of the borrow.
+        Some(unsafe { std::slice::from_raw_parts(self.base_ptr(), self.len) })
+    }
+
+    /// The whole mapping as mutable bytes, or `None` when it is not readable and writable.
+    pub fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        if !self.protection.read || !self.protection.write {
+            return None;
+        }
+        // SAFETY: this object uniquely owns `len` writable bytes at `ptr`; `&mut self` makes the borrow exclusive.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.base_ptr(), self.len) })
+    }
+
+    /// Reads one byte at a checked offset.
+    pub fn read_byte(&self, offset: usize) -> Option<u8> {
+        self.bytes()?.get(offset).copied()
     }
 
     /// Writes one byte at a checked offset.
     pub fn write_byte(&mut self, offset: usize, value: u8) -> bool {
-        if offset >= self.len || !self.protection.write {
-            return false;
+        match self.bytes_mut().and_then(|bytes| bytes.get_mut(offset)) {
+            Some(byte) => {
+                *byte = value;
+                true
+            }
+            None => false,
         }
-        // SAFETY: offset is in bounds of the writable mapping.
-        let address = unsafe { self.base_ptr().add(offset) };
-        // SAFETY: address was derived from a live writable mapping at an in-bounds offset.
-        unsafe {
-            address.write(value);
-        }
-        true
     }
 
     /// Reads a native machine word at an aligned, checked byte offset.
+    #[inline]
     pub fn read_word(&self, offset: usize) -> Option<usize> {
-        if !self.protection.read || !self.word_offset_valid(offset) {
+        if !offset.is_multiple_of(WORD_BYTES) {
             return None;
         }
-        // SAFETY: offset is aligned and the complete word lies inside the mapping.
-        let address = unsafe { self.base_ptr().add(offset).cast::<usize>() };
-        // SAFETY: address points to a fully in-bounds aligned word.
-        Some(unsafe { address.read() })
+        let bytes = self.bytes()?.get(offset..offset.checked_add(WORD_BYTES)?)?;
+        Some(usize::from_ne_bytes(bytes.try_into().ok()?))
     }
 
     /// Writes a native machine word at an aligned, checked byte offset.
+    #[inline]
     pub fn write_word(&mut self, offset: usize, value: usize) -> bool {
-        if !self.protection.write || !self.word_offset_valid(offset) {
+        if !offset.is_multiple_of(WORD_BYTES) {
             return false;
         }
-        // SAFETY: offset is aligned and the complete word lies inside the writable mapping.
-        let address = unsafe { self.base_ptr().add(offset).cast::<usize>() };
-        // SAFETY: address points to a fully in-bounds aligned word in a writable mapping.
-        unsafe {
-            address.write(value);
+        let Some(end) = offset.checked_add(WORD_BYTES) else {
+            return false;
+        };
+        match self
+            .bytes_mut()
+            .and_then(|bytes| bytes.get_mut(offset..end))
+        {
+            Some(word) => {
+                word.copy_from_slice(&value.to_ne_bytes());
+                true
+            }
+            None => false,
         }
-        true
     }
 
     /// Changes protection on the entire page aligned mapping.
@@ -252,11 +314,15 @@ impl RawRegion {
         } else {
             Self::map(new_len)?
         };
+        let mut next = next;
         let copy_len = self.len.min(next.len);
-        // SAFETY: both mappings are valid and non-overlapping; copy_len is bounded by both extents.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.base_ptr(), next.base_ptr(), copy_len);
-        }
+        let source = self
+            .bytes()
+            .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::PermissionDenied)))?;
+        next.bytes_mut()
+            .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::PermissionDenied)))?
+            [..copy_len]
+            .copy_from_slice(&source[..copy_len]);
         Ok(next)
     }
 
@@ -273,16 +339,13 @@ impl RawRegion {
             Self::map(new_len)?
         };
         let copy_len = self.len.min(next.len);
-        for offset in 0..copy_len {
-            let byte = self
-                .read_byte(offset)
-                .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::InvalidData)))?;
-            if !next.write_byte(offset, byte) {
-                return Err(MapError(std::io::Error::from(
-                    std::io::ErrorKind::InvalidData,
-                )));
-            }
-        }
+        let source = self
+            .bytes()
+            .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::InvalidData)))?;
+        next.bytes_mut()
+            .ok_or_else(|| MapError(std::io::Error::from(std::io::ErrorKind::InvalidData)))?
+            [..copy_len]
+            .copy_from_slice(&source[..copy_len]);
         *self = next;
         Ok(())
     }
@@ -310,13 +373,6 @@ impl RawRegion {
                 protection,
             },
         ))
-    }
-
-    fn word_offset_valid(&self, offset: usize) -> bool {
-        offset.is_multiple_of(std::mem::align_of::<usize>())
-            && offset
-                .checked_add(std::mem::size_of::<usize>())
-                .is_some_and(|end| end <= self.len)
     }
 
     fn base_ptr(&self) -> *mut u8 {

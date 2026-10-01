@@ -7,6 +7,7 @@ use crate::{
     FLOAT, FunEntry, HEAP_BITS, MAP, MAX_SMALL, MIN_SMALL, NEG_BIG, Node, POS_BIG, RECORD, REF,
     SUB_BITS, Term, TermError, TermKind, cmp, exact_eq,
 };
+use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use std::cell::UnsafeCell;
@@ -16,106 +17,70 @@ use std::ops::Index;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) struct WordBlock {
-    base: std::ptr::NonNull<UnsafeCell<u64>>,
-    tagged_words: usize,
+    memory: Box<AllocBlock>,
 }
 
-const MAPPED_WORDS: usize = 1 << (usize::BITS - 1);
 const LITERAL_HEAP_BIT: usize = MAPPED_WORDS;
+const MAPPED_WORDS: usize = 1 << (usize::BITS - 1);
 
 // SAFETY: A process owns its word block exclusively; moving it changes no pointers within it.
 unsafe impl Send for WordBlock {}
 
 /// A heap fragment: a BIF-allocated side buffer or an adopted message heap.
 pub(crate) enum Fragment {
-    Boxed(Box<[u64]>),
     Block(WordBlock),
 }
 
 impl Fragment {
     pub(crate) fn as_ptr(&self) -> *const u64 {
-        match self {
-            Self::Boxed(words) => words.as_ptr(),
-            Self::Block(block) => block.as_ptr().cast(),
-        }
+        self.as_block().as_ptr().cast()
     }
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u64 {
-        match self {
-            Self::Boxed(words) => words.as_mut_ptr(),
-            // UnsafeCell<u64> has u64's layout; writes go through the cell.
-            Self::Block(block) => UnsafeCell::raw_get(block.as_ptr()),
-        }
+        self.as_block_mut().as_mut_ptr().cast()
     }
     pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Boxed(words) => words.len(),
-            Self::Block(block) => block.len(),
-        }
+        self.as_block().len()
+    }
+
+    fn as_block(&self) -> &WordBlock {
+        let Self::Block(block) = self;
+        block
+    }
+
+    fn as_block_mut(&mut self) -> &mut WordBlock {
+        let Self::Block(block) = self;
+        block
     }
 }
 
 impl WordBlock {
-    fn new(words: usize) -> Self {
-        assert!(words < MAPPED_WORDS, "process heap capacity overflow");
-        #[cfg(all(any(target_os = "macos", target_os = "linux"), not(miri)))]
-        if words > 8192 {
-            let bytes = words
-                .checked_mul(8)
-                .expect("process heap capacity overflow");
-            unsafe extern "C" {
-                fn mmap(
-                    address: *mut std::ffi::c_void,
-                    length: usize,
-                    protection: i32,
-                    flags: i32,
-                    fd: i32,
-                    offset: i64,
-                ) -> *mut std::ffi::c_void;
-            }
-            #[cfg(target_os = "macos")]
-            const MAP_ANON: i32 = 0x1000;
-            #[cfg(target_os = "linux")]
-            const MAP_ANON: i32 = 0x20;
-            // SAFETY: A private anonymous mapping starts zeroed and remains
-            // exclusively owned by this block until its Drop implementation.
-            let address = unsafe { mmap(std::ptr::null_mut(), bytes, 3, 2 | MAP_ANON, -1, 0) };
-            if address as isize != -1 {
-                let base = std::ptr::NonNull::new(address.cast::<UnsafeCell<u64>>())
-                    .expect("mmap returned a null mapping");
-                return Self {
-                    base,
-                    tagged_words: words | MAPPED_WORDS,
-                };
-            }
-        }
-        if words == 0 {
-            return Self {
-                base: std::ptr::NonNull::dangling(),
-                tagged_words: 0,
-            };
-        }
-        let layout = std::alloc::Layout::array::<UnsafeCell<u64>>(words)
-            .expect("process heap capacity overflow");
-        // SAFETY: Zero is a valid word value; Drop uses the identical layout.
-        let base = unsafe { std::alloc::alloc_zeroed(layout).cast::<UnsafeCell<u64>>() };
-        let base =
-            std::ptr::NonNull::new(base).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+    fn new(words: usize, allocation_type: ErtsAlcType) -> Self {
+        let mut memory =
+            AllocBlock::new(allocation_type, words).expect("ERTS heap block allocation failed");
+        memory.as_mut_slice().fill(0);
         Self {
-            base,
-            tagged_words: words,
+            memory: Box::new(memory),
         }
+    }
+
+    fn empty(allocation_type: ErtsAlcType) -> Self {
+        Self::new(0, allocation_type)
     }
 
     pub(crate) fn as_ptr(&self) -> *const UnsafeCell<u64> {
-        self.base.as_ptr()
+        self.memory.as_ptr().cast()
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut UnsafeCell<u64> {
+        self.memory.as_mut_ptr().cast()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.tagged_words & !MAPPED_WORDS
+        self.memory.len()
     }
 
     pub(crate) fn contains_initialized(&self, address: usize, words: usize) -> bool {
-        let start = self.base.as_ptr() as usize;
+        let start = self.as_ptr() as usize;
         address >= start && address < start.saturating_add(words.saturating_mul(8))
     }
 
@@ -127,14 +92,15 @@ impl WordBlock {
         if index >= self.len() {
             return None;
         }
-        // SAFETY: The bounds check keeps the reference in this live block.
-        Some(unsafe { &*self.as_ptr().add(index) })
+        let word = self.memory.as_slice().get(index)?;
+        // SAFETY: The allocator supplies aligned word storage; UnsafeCell has u64's layout.
+        Some(unsafe { &*std::ptr::from_ref(word).cast::<UnsafeCell<u64>>() })
     }
 }
 
 impl Default for WordBlock {
     fn default() -> Self {
-        Self::new(0)
+        Self::empty(ErtsAlcType::OLD_HEAP)
     }
 }
 
@@ -143,29 +109,6 @@ impl Index<usize> for WordBlock {
 
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index).expect("word index out of bounds")
-    }
-}
-
-impl Drop for WordBlock {
-    fn drop(&mut self) {
-        let words = self.len();
-        if self.tagged_words & MAPPED_WORDS != 0 {
-            #[cfg(all(any(target_os = "macos", target_os = "linux"), not(miri)))]
-            {
-                unsafe extern "C" {
-                    fn munmap(address: *mut std::ffi::c_void, length: usize) -> i32;
-                }
-                // SAFETY: This block owns the exact anonymous mapping being released.
-                unsafe {
-                    let _ = munmap(self.base.as_ptr().cast(), words * 8);
-                }
-            }
-        } else if words > 0 {
-            let layout = std::alloc::Layout::array::<UnsafeCell<u64>>(words)
-                .expect("allocated word block has a valid layout");
-            // SAFETY: The block was allocated by the global allocator with this layout.
-            unsafe { std::alloc::dealloc(self.base.as_ptr().cast::<u8>(), layout) };
-        }
     }
 }
 
@@ -387,8 +330,13 @@ impl ProcessHeap {
     }
     /// Create a heap of the specified word capacity.
     pub fn with_words(words: usize) -> Self {
+        Self::with_words_for_type(words, ErtsAlcType::HEAP)
+    }
+
+    /// Create a heap fragment block with the requested typed allocator.
+    pub fn with_words_for_type(words: usize, allocation_type: ErtsAlcType) -> Self {
         Self {
-            words: WordBlock::new(words),
+            words: WordBlock::new(words, allocation_type),
             htop: 0,
             stop: words,
             frame_pointer: 0,
@@ -524,8 +472,10 @@ impl ProcessHeap {
     }
     /// Allocate a side fragment when a BIF cannot collect at this point.
     pub fn heap_fragment(&mut self, words: usize) -> *mut u64 {
-        self.fragments
-            .push(Fragment::Boxed(vec![0; words].into_boxed_slice()));
+        self.fragments.push(Fragment::Block(WordBlock::new(
+            words,
+            ErtsAlcType::HEAP_FRAG,
+        )));
         self.fragments
             .last_mut()
             .expect("fragment inserted")

@@ -2,7 +2,35 @@
 
 use crate::mseg::{CacheConfig, CallCount, MsegAllocator, MsegOptions, Segment, SegmentFlags};
 use crate::raw::{MapError, RawRegion, page_size};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Multiplicative hasher for the integer keys of the allocator model; SipHash dominated the hot path.
+#[derive(Default)]
+pub(crate) struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+
+pub(crate) type HashMap<K, V> = StdHashMap<K, V, BuildHasherDefault<FastHasher>>;
+pub(crate) type HashSet<K> = StdHashSet<K, BuildHasherDefault<FastHasher>>;
 
 const WORD: usize = std::mem::size_of::<usize>();
 const ALIGN: usize = 8;
@@ -28,6 +56,10 @@ const AOFF_PARENT_WORD: usize = 2;
 const AOFF_LEFT_WORD: usize = 3;
 const AOFF_RIGHT_WORD: usize = 4;
 const AOFF_FLAGS_WORD: usize = 5;
+// GFFreeBlock_t / AFFreeBlock_t `prev` and `next` follow the free block header and carrier words.
+// Port of erts/emulator/beam/erl_goodfit_alloc.c:139 (GFFreeBlock_t) and erl_afit_alloc.c:43, OTP-29.1.1.
+const LIST_PREV_WORD: usize = 2;
+const LIST_NEXT_WORD: usize = 3;
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -275,7 +307,7 @@ pub struct CarrierPoolStats {
     pub fail_pooled: CallCount,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Block {
     carrier: usize,
     offset: usize,
@@ -295,7 +327,6 @@ struct Carrier {
     key_base: usize,
     start: usize,
     size: usize,
-    blocks: Vec<usize>,
 }
 
 pub(crate) struct CarrierTransfer {
@@ -375,28 +406,30 @@ impl CarrierMemory {
             Self::Segmented(segment) => segment.as_ptr(),
         }
     }
+    #[inline]
     fn read_word(&self, offset: usize) -> Option<usize> {
         match self {
             Self::Mapped(region) => region.read_word(offset),
             Self::Segmented(segment) => segment.read_word(offset),
         }
     }
+    #[inline]
     fn write_word(&mut self, offset: usize, value: usize) -> bool {
         match self {
             Self::Mapped(region) => region.write_word(offset, value),
             Self::Segmented(segment) => segment.write_word(offset, value),
         }
     }
-    fn read_byte(&self, offset: usize) -> Option<u8> {
+    fn bytes(&self) -> Option<&[u8]> {
         match self {
-            Self::Mapped(region) => region.read_byte(offset),
-            Self::Segmented(segment) => segment.read_byte(offset),
+            Self::Mapped(region) => region.bytes(),
+            Self::Segmented(segment) => segment.bytes(),
         }
     }
-    fn write_byte(&mut self, offset: usize, value: u8) -> bool {
+    fn bytes_mut(&mut self) -> Option<&mut [u8]> {
         match self {
-            Self::Mapped(region) => region.write_byte(offset, value),
-            Self::Segmented(segment) => segment.write_byte(offset, value),
+            Self::Mapped(region) => region.bytes_mut(),
+            Self::Segmented(segment) => segment.bytes_mut(),
         }
     }
     fn advise_range(&mut self, offset: usize, len: usize, advice: i32) -> Result<(), MapError> {
@@ -405,6 +438,13 @@ impl CarrierMemory {
             Self::Segmented(segment) => segment.advise_range(offset, len, advice),
         }
     }
+}
+
+/// Intrusive GoodFit bucket or AFit free list whose links live in the free blocks.
+#[derive(Clone, Copy)]
+enum FreeListId {
+    Bucket(usize),
+    Afit,
 }
 
 /// One safe, single-threaded alloc_util instance.
@@ -417,14 +457,26 @@ pub struct AllocUtil {
     instance_index: usize,
     pool_managed: bool,
     carriers: Vec<Option<Carrier>>,
-    blocks: HashMap<usize, Block>,
+    /// Vacated `carriers` slots, reused so churn does not grow the table.
+    free_carrier_slots: Vec<usize>,
+    /// Number of live multiblock carriers.
+    mbc_count: usize,
+    /// `(start, end, index)` of every live carrier sorted by address: block address to carrier,
+    /// standing in for erts' carrier pointer arithmetic (erl_alloc_util.h:430 FBLK_TO_MBC/ABLK_TO_MBC).
+    carrier_ranges: Vec<(usize, usize, usize)>,
+    /// Last `carrier_ranges` hit; consecutive header accesses nearly always stay in one carrier.
+    last_carrier: std::cell::Cell<(usize, usize, usize)>,
     free_root: usize,
     aoff_roots: Vec<usize>,
     aoff_carrier_root: usize,
-    goodfit_buckets: Vec<Vec<usize>>,
-    afit_free_list: Vec<usize>,
-    allocations: HashMap<u64, usize>,
-    next_id: u64,
+    /// Bucket list heads (`buckets` in erl_goodfit_alloc.c); 0 is an empty bucket.
+    goodfit_heads: Vec<usize>,
+    /// Bit per non-empty goodfit bucket, like `bucket_mask` in erl_goodfit_alloc.c.
+    goodfit_mask: [u64; 4],
+    /// `bkt_intrvl_d` of erl_goodfit_alloc.c, derived from `sbct`.
+    goodfit_interval_d: usize,
+    /// `free_list` head of erl_afit_alloc.c; 0 is empty.
+    afit_head: usize,
     stats: AllocStats,
     class_stats: [ClassStats; 2],
     mseg: MsegAllocator,
@@ -469,14 +521,17 @@ impl AllocUtil {
             instance_index,
             pool_managed,
             carriers: Vec::new(),
-            blocks: HashMap::new(),
+            free_carrier_slots: Vec::new(),
+            mbc_count: 0,
+            carrier_ranges: Vec::new(),
+            last_carrier: std::cell::Cell::new((0, 0, 0)),
             free_root: 0,
             aoff_roots: Vec::new(),
             aoff_carrier_root: 0,
-            goodfit_buckets: (0..256).map(|_| Vec::new()).collect(),
-            afit_free_list: Vec::new(),
-            allocations: HashMap::new(),
-            next_id: 1,
+            goodfit_heads: vec![0; 256],
+            goodfit_mask: [0; 4],
+            goodfit_interval_d: goodfit_interval_d(options.sbct),
+            afit_head: 0,
             stats: AllocStats::default(),
             class_stats: [ClassStats::default(); 2],
             mseg: MsegAllocator::new(0, CacheConfig::default()),
@@ -490,135 +545,326 @@ impl AllocUtil {
         self.stats.alloc_calls += 1;
         let block_size = block_size(size, self.strategy)?;
         if block_size >= self.options.sbct {
-            let id = self.add_sbc(block_size)?;
-            let offset = self.allocations[&id];
-            let actual = self.blocks[&offset].size;
+            let start = self.add_sbc(block_size)?;
             self.stats.blocks += 1;
-            self.stats.blocks_size += actual;
-            self.block_added(true, actual);
+            self.stats.blocks_size += block_size;
+            self.block_added(true, block_size);
             self.update_block_peak();
-            return Ok(Allocation { id, size });
+            return Ok(Allocation {
+                id: start as u64,
+                size,
+            });
         }
         let offset = if let Some(block) = self.choose_free(block_size)? {
-            self.unlink_free(block)?;
             block
         } else {
             let ci = self.add_mbc(block_size)?;
-            let block = self.carriers[ci].as_ref().unwrap().blocks[0];
-            self.unlink_free(block)?;
-            block
+            self.carriers[ci].as_ref().ok_or(AllocError::Corrupt)?.start
         };
-        let old = self.blocks[&offset].clone();
+        // Port of mbc_alloc_finalize, erl_alloc_util.c:1913, OTP-29.1.1.
+        let old = self.blk(offset)?;
+        self.unlink_free_inner(offset, old.size)?;
         let actual = old.size;
-        let carrier = old.carrier;
-        let id = self.next_id;
-        self.next_id += 1;
-        self.allocations.insert(id, offset);
         let split = actual.saturating_sub(block_size) >= min_block_size(self.strategy);
         let used = if split { block_size } else { actual };
-        self.blocks.get_mut(&offset).unwrap().allocated = true;
-        self.blocks.get_mut(&offset).unwrap().size = used;
-        self.write_block(offset)?;
+        self.write_block(&Block {
+            size: used,
+            allocated: true,
+            last: old.last && !split,
+            ..old
+        })?;
         if split {
-            let tail = offset + block_size;
-            let tb = Block {
-                carrier,
-                offset: tail,
+            let tail = Block {
+                carrier: old.carrier,
+                offset: offset + block_size,
                 size: actual - block_size,
                 allocated: false,
                 prev_free: false,
                 last: old.last,
             };
-            self.blocks.insert(tail, tb);
-            let prev = self.blocks.get_mut(&offset).unwrap();
-            prev.last = false;
-            self.write_block(offset)?;
-            let c = self.carriers[carrier].as_mut().unwrap();
-            c.blocks.push(tail);
-            c.blocks.sort_unstable();
-            self.write_block(tail)?;
-            if !old.last {
-                self.set_next_prev_free(tail, true)?;
+            self.write_block(&tail)?;
+            if !tail.last {
+                self.set_next_prev_free(&tail, true)?;
             }
-            self.link_free(tail)?;
+            self.link_free_inner(tail.offset, tail.size)?;
         } else {
-            self.set_next_prev_free(offset, false)?;
+            self.set_next_prev_free(&Block { size: used, ..old }, false)?;
         }
         self.stats.blocks += 1;
         self.stats.blocks_size += used;
         self.block_added(false, used);
         self.update_block_peak();
-        Ok(Allocation { id, size })
+        Ok(Allocation {
+            id: offset as u64,
+            size,
+        })
     }
 
     /// Frees a live allocation and merges adjacent free MBC blocks.
     /// Port of `erts_alcu_free`, `erl_alloc_util.c:2820`, OTP-29.1.1.
     pub fn free(&mut self, allocation: Allocation) -> Result<(), AllocError> {
         self.stats.free_calls += 1;
-        let offset = self
-            .allocations
-            .remove(&allocation.id)
-            .ok_or(AllocError::InvalidAllocation)?;
-        let b = self
-            .blocks
-            .get(&offset)
-            .ok_or(AllocError::InvalidAllocation)?
-            .clone();
+        let b = self.live_block(allocation.id as usize)?;
+        let offset = b.offset;
         self.stats.blocks -= 1;
         self.stats.blocks_size -= b.size;
-        let sbc = self.carriers[b.carrier].as_ref().unwrap().sbc;
+        let sbc = self.carriers[b.carrier]
+            .as_ref()
+            .ok_or(AllocError::Corrupt)?
+            .sbc;
         self.block_removed(sbc, b.size);
         if sbc {
             self.remove_carrier(b.carrier)?;
             return Ok(());
         }
-        self.blocks.get_mut(&offset).unwrap().allocated = false;
-        let mut merged = offset;
-        if b.prev_free
-            && let Some(prev) = self.previous_block(offset)
-        {
-            let p = self.blocks[&prev].clone();
+        // Port of mbc_free, erl_alloc_util.c:2045, OTP-29.1.1.
+        let mut merged = Block {
+            allocated: false,
+            ..b
+        };
+        if b.prev_free {
+            let prev = self.previous_block(offset)?;
+            let p = self.blk_in(b.carrier, prev)?;
             if !p.allocated {
-                self.unlink_free(prev)?;
-                merged = prev;
-                self.blocks.get_mut(&prev).unwrap().size += b.size;
-                self.blocks.get_mut(&prev).unwrap().last = b.last;
-                self.blocks.remove(&offset);
-                self.carriers[p.carrier]
-                    .as_mut()
-                    .unwrap()
-                    .blocks
-                    .retain(|block| *block != offset);
+                self.unlink_free_inner(prev, p.size)?;
+                merged = Block {
+                    offset: prev,
+                    size: p.size + b.size,
+                    prev_free: p.prev_free,
+                    ..merged
+                };
             }
         }
-        let current = self.blocks[&merged].clone();
-        if !current.last {
-            let next = merged + current.size;
-            if self.blocks.get(&next).is_some_and(|n| !n.allocated) {
-                self.unlink_free(next)?;
-                let n = self.blocks.remove(&next).unwrap();
-                let c = self.carriers[current.carrier].as_mut().unwrap();
-                c.blocks.retain(|o| *o != next);
-                let m = self.blocks.get_mut(&merged).unwrap();
-                m.size += n.size;
-                m.last = n.last;
+        if !merged.last {
+            let next = merged.offset + merged.size;
+            let n = self.blk_in(merged.carrier, next)?;
+            if !n.allocated {
+                self.unlink_free_inner(next, n.size)?;
+                merged.size += n.size;
+                merged.last = n.last;
             }
         }
-        let last = self.blocks[&merged].last;
-        self.write_block(merged)?;
-        if !last {
-            self.set_next_prev_free(merged, true)?;
+        self.write_block(&merged)?;
+        if !merged.last {
+            self.set_next_prev_free(&merged, true)?;
         }
-        let c = self.carriers[current.carrier].as_ref().unwrap();
-        if c.blocks.len() == 1 && self.blocks[&merged].size == c.size - (c.start - c.key_base) {
-            self.remove_carrier(current.carrier)?;
+        let c = self.carriers[merged.carrier]
+            .as_ref()
+            .ok_or(AllocError::Corrupt)?;
+        // Port of erl_alloc_util.c:2791 (dealloc_block), OTP-29.1.1: the main carrier is never destroyed.
+        if merged.offset == c.start && merged.last && !c.main {
+            self.remove_carrier(merged.carrier)?;
         } else {
-            self.link_free(merged)?;
-            self.check_abandon_carrier(current.carrier)?;
+            self.link_free_inner(merged.offset, merged.size)?;
+            self.check_abandon_carrier(merged.carrier)?;
         }
         Ok(())
     }
 
+    /// Returns the stable payload address while `allocation` remains allocated.
+    pub fn allocation_ptr(&self, allocation: Allocation) -> Result<*mut u64, AllocError> {
+        self.live_block(allocation.id as usize)?;
+        self.payload_ptr(allocation)
+    }
+
+    /// Payload address of an allocation this instance just returned (no liveness check).
+    #[inline]
+    pub(crate) fn payload_ptr(&self, allocation: Allocation) -> Result<*mut u64, AllocError> {
+        let key = allocation.id as usize;
+        let carrier = self
+            .carrier_of(key)
+            .and_then(|index| self.carriers[index].as_ref())
+            .ok_or(AllocError::Corrupt)?;
+        let byte_offset = key - carrier.key_base + BLOCK_HEADER;
+        Ok(carrier.memory.as_ptr().wrapping_add(byte_offset).cast())
+    }
+
+    /// Carrier index containing the address `key`.
+    #[inline]
+    fn carrier_of(&self, key: usize) -> Option<usize> {
+        let (start, end, carrier) = self.last_carrier.get();
+        if key >= start && key < end {
+            return Some(carrier);
+        }
+        self.carrier_of_slow(key)
+    }
+
+    fn carrier_of_slow(&self, key: usize) -> Option<usize> {
+        let index = self
+            .carrier_ranges
+            .partition_point(|&(start, _, _)| start <= key)
+            .checked_sub(1)?;
+        let range @ (start, end, carrier) = self.carrier_ranges[index];
+        if key >= start && key < end {
+            self.last_carrier.set(range);
+            Some(carrier)
+        } else {
+            None
+        }
+    }
+
+    fn index_carrier(&mut self, index: usize) {
+        let Some(carrier) = self.carriers[index].as_ref() else {
+            return;
+        };
+        let range = (
+            carrier.key_base,
+            carrier.key_base + carrier.memory.len(),
+            index,
+        );
+        let at = self
+            .carrier_ranges
+            .partition_point(|&(start, _, _)| start < range.0);
+        self.carrier_ranges.insert(at, range);
+    }
+
+    fn unindex_carrier(&mut self, index: usize) {
+        self.carrier_ranges
+            .retain(|&(_, _, carrier)| carrier != index);
+        if self.last_carrier.get().2 == index {
+            self.last_carrier.set((0, 0, 0));
+        }
+    }
+
+    /// Reads word `word` of the block or carrier node at address `key`.
+    #[inline]
+    fn word_at(&self, key: usize, word: usize) -> Result<usize, AllocError> {
+        let carrier = self
+            .carrier_of(key)
+            .and_then(|index| self.carriers[index].as_ref())
+            .ok_or(AllocError::Corrupt)?;
+        carrier
+            .memory
+            .read_word(key - carrier.key_base + word * WORD)
+            .ok_or(AllocError::Corrupt)
+    }
+
+    #[inline]
+    fn set_word_at(&mut self, key: usize, word: usize, value: usize) -> Result<(), AllocError> {
+        let index = self.carrier_of(key).ok_or(AllocError::Corrupt)?;
+        let carrier = self.carriers[index].as_mut().ok_or(AllocError::Corrupt)?;
+        let offset = key - carrier.key_base + word * WORD;
+        if carrier.memory.write_word(offset, value) {
+            Ok(())
+        } else {
+            Err(AllocError::Corrupt)
+        }
+    }
+
+    /// Decodes the block header at `key`; SBC blocks carry all three flags like erts' SBC_BLK_HDR.
+    #[inline]
+    fn blk(&self, key: usize) -> Result<Block, AllocError> {
+        let index = self.carrier_of(key).ok_or(AllocError::Corrupt)?;
+        self.blk_in(index, key)
+    }
+
+    /// Like `blk` for a block known to live in carrier `index` (a neighbour of a known block).
+    #[inline]
+    fn blk_in(&self, index: usize, key: usize) -> Result<Block, AllocError> {
+        let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
+        let header = carrier
+            .memory
+            .read_word(key - carrier.key_base)
+            .ok_or(AllocError::Corrupt)?;
+        let size = header & !BLOCK_FLAGS;
+        if carrier.sbc {
+            return Ok(Block {
+                carrier: index,
+                offset: key,
+                size,
+                allocated: true,
+                prev_free: true,
+                last: true,
+            });
+        }
+        Ok(Block {
+            carrier: index,
+            offset: key,
+            size,
+            allocated: header & FREE == 0,
+            prev_free: header & PREV_FREE != 0,
+            last: header & LAST != 0,
+        })
+    }
+
+    /// Validates a caller-supplied allocation address.
+    #[inline]
+    fn live_block(&self, key: usize) -> Result<Block, AllocError> {
+        let index = self.carrier_of(key).ok_or(AllocError::InvalidAllocation)?;
+        let carrier = self.carriers[index]
+            .as_ref()
+            .ok_or(AllocError::InvalidAllocation)?;
+        if key < carrier.start || (carrier.sbc && key != carrier.start) {
+            return Err(AllocError::InvalidAllocation);
+        }
+        let block = self.blk_in(index, key)?;
+        if !block.allocated || block.size == 0 {
+            return Err(AllocError::InvalidAllocation);
+        }
+        Ok(block)
+    }
+
+    /// Blocks of one carrier in address order, walked through their headers.
+    fn carrier_blocks(&self, index: usize) -> Result<Vec<Block>, AllocError> {
+        let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
+        let end = carrier.key_base + carrier.size;
+        let mut blocks = Vec::new();
+        let mut pos = carrier.start;
+        loop {
+            let block = self.blk(pos)?;
+            if block.size == 0 || pos + block.size > end {
+                return Err(AllocError::Corrupt);
+            }
+            let last = block.last;
+            pos += block.size;
+            blocks.push(block);
+            if last {
+                return Ok(blocks);
+            }
+        }
+    }
+
+    /// Copies `len` payload bytes between two live blocks, possibly in different carriers.
+    fn copy_payload(&mut self, from: usize, to: usize, len: usize) -> Result<(), AllocError> {
+        let source_index = self.carrier_of(from).ok_or(AllocError::Corrupt)?;
+        let target_index = self.carrier_of(to).ok_or(AllocError::Corrupt)?;
+        if source_index == target_index {
+            let carrier = self.carriers[source_index]
+                .as_mut()
+                .ok_or(AllocError::Corrupt)?;
+            let source = from - carrier.key_base + BLOCK_HEADER;
+            let target = to - carrier.key_base + BLOCK_HEADER;
+            let bytes = carrier.memory.bytes_mut().ok_or(AllocError::Corrupt)?;
+            if source.max(target) + len > bytes.len() {
+                return Err(AllocError::Corrupt);
+            }
+            bytes.copy_within(source..source + len, target);
+            return Ok(());
+        }
+        let [Some(source), Some(target)] = self
+            .carriers
+            .get_disjoint_mut([source_index, target_index])
+            .map_err(|_| AllocError::Corrupt)?
+        else {
+            return Err(AllocError::Corrupt);
+        };
+        let source_offset = from - source.key_base + BLOCK_HEADER;
+        let target_offset = to - target.key_base + BLOCK_HEADER;
+        let source_bytes = source
+            .memory
+            .bytes()
+            .and_then(|bytes| bytes.get(source_offset..source_offset + len))
+            .ok_or(AllocError::Corrupt)?;
+        target
+            .memory
+            .bytes_mut()
+            .and_then(|bytes| bytes.get_mut(target_offset..target_offset + len))
+            .ok_or(AllocError::Corrupt)?
+            .copy_from_slice(source_bytes);
+        Ok(())
+    }
+
+    #[inline]
     fn check_abandon_carrier(&mut self, carrier_index: usize) -> Result<(), AllocError> {
         if self.options.acul == 0
             || self.options.acnl == 0
@@ -636,17 +882,14 @@ impl AllocUtil {
             return Ok(());
         }
         let carrier_size = carrier.size;
-        let allocated_size = carrier
-            .blocks
+        let blocks = self.carrier_blocks(carrier_index)?;
+        let allocated_size = blocks
             .iter()
-            .filter_map(|offset| self.blocks.get(offset))
             .filter(|block| block.allocated)
             .map(|block| block.size)
             .sum::<usize>();
-        let largest_free = carrier
-            .blocks
+        let largest_free = blocks
             .iter()
-            .filter_map(|offset| self.blocks.get(offset))
             .filter(|block| !block.allocated)
             .map(|block| block.size)
             .max()
@@ -675,13 +918,12 @@ impl AllocUtil {
         if self.options.acful == 0 {
             return Ok(());
         }
+        let blocks = self.carrier_blocks(carrier_index)?;
         let carrier = self.carriers[carrier_index]
             .as_ref()
             .ok_or(AllocError::Corrupt)?;
-        let allocated_size = carrier
-            .blocks
+        let allocated_size = blocks
             .iter()
-            .filter_map(|offset| self.blocks.get(offset))
             .filter(|block| block.allocated)
             .map(|block| block.size)
             .sum::<usize>();
@@ -690,17 +932,11 @@ impl AllocUtil {
         }
         let base = carrier.key_base;
         let memory_base = carrier.memory.as_ptr() as usize;
-        let blocks = carrier
-            .blocks
-            .iter()
-            .filter_map(|offset| self.blocks.get(offset))
-            .filter(|block| !block.allocated)
-            .map(|block| (block.offset, block.size))
-            .collect::<Vec<_>>();
         let page = page_size();
-        for (offset, size) in blocks {
-            let payload = memory_base + offset - base + BLOCK_HEADER;
-            let end = memory_base + offset - base + size - FOOTER;
+        for block in blocks.iter().filter(|block| !block.allocated) {
+            // Free-list links (header, carrier and tree words) stay intact: only whole pages after them go.
+            let payload = memory_base + block.offset - base + BF_NODE_SIZE;
+            let end = memory_base + block.offset - base + block.size - FOOTER;
             let discard_start = payload.div_ceil(page) * page;
             let discard_end = end / page * page;
             if discard_end > discard_start {
@@ -726,48 +962,30 @@ impl AllocUtil {
         if carrier.sbc || carrier.main {
             return Err(AllocError::Corrupt);
         }
-        let offsets = carrier.blocks.clone();
-        let transfer_blocks = offsets
+        let transfer_blocks = self.carrier_blocks(carrier_index)?;
+        let transfer_allocations = transfer_blocks
             .iter()
-            .map(|offset| self.blocks.get(offset).cloned().ok_or(AllocError::Corrupt))
-            .collect::<Result<Vec<_>, _>>()?;
-        let allocated = offsets
-            .iter()
-            .filter_map(|offset| self.blocks.get(offset))
             .filter(|block| block.allocated)
-            .map(|block| (block.offset, block.size))
-            .collect::<Vec<_>>();
-        let transfer_allocations = allocated
-            .iter()
-            .map(|(offset, size)| {
-                let id = self
-                    .allocations
-                    .iter()
-                    .find_map(|(id, location)| (location == offset).then_some(*id))
-                    .ok_or(AllocError::Corrupt)?;
-                Ok((Allocation { id, size: *size }, *offset))
-            })
-            .collect::<Result<Vec<_>, AllocError>>()?;
-        let free_offsets = offsets
-            .iter()
-            .copied()
-            .filter(|offset| {
-                self.blocks
-                    .get(offset)
-                    .is_some_and(|block| !block.allocated)
+            .map(|block| {
+                (
+                    Allocation {
+                        id: block.offset as u64,
+                        size: block.size,
+                    },
+                    block.offset,
+                )
             })
             .collect::<Vec<_>>();
-        for offset in free_offsets {
-            self.unlink_free(offset)?;
+        for block in transfer_blocks.iter().filter(|block| !block.allocated) {
+            self.unlink_free(block.offset)?;
         }
-        for (offset, size) in &allocated {
+        for block in transfer_blocks.iter().filter(|block| block.allocated) {
             self.stats.blocks -= 1;
-            self.stats.blocks_size -= size;
-            self.block_removed(false, *size);
-            self.allocations.retain(|_, location| location != offset);
+            self.stats.blocks_size -= block.size;
+            self.block_removed(false, block.size);
         }
-        let carrier = self.carriers[carrier_index]
-            .take()
+        let carrier = self
+            .vacate_carrier(carrier_index)
             .ok_or(AllocError::Corrupt)?;
         if carrier.mseg {
             self.mseg.release_transferred(carrier.size);
@@ -782,9 +1000,6 @@ impl AllocUtil {
             self.stats.sys_alloc_carriers -= 1;
             self.stats.sys_alloc_carriers_size -= carrier.size;
         }
-        for offset in &offsets {
-            self.blocks.remove(offset);
-        }
         self.aoff_roots[carrier_index] = 0;
         self.pending_carriers.push(CarrierTransfer {
             origin_instance: carrier.origin_instance,
@@ -793,6 +1008,11 @@ impl AllocUtil {
             allocations: transfer_allocations,
         });
         Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_carriers(&self) -> bool {
+        !self.pending_carriers.is_empty()
     }
 
     pub(crate) fn take_pending_carriers(&mut self) -> Vec<CarrierTransfer> {
@@ -832,44 +1052,24 @@ impl AllocUtil {
         if !is_aoff(self.strategy) || transfer.carrier.sbc {
             return Err(AllocError::Corrupt);
         }
-        let carrier_index = self.carriers.len();
         transfer.carrier.in_aoff_tree = false;
         transfer.carrier.main = false;
-        transfer.carrier.blocks = transfer.blocks.iter().map(|block| block.offset).collect();
-        self.carriers.push(Some(transfer.carrier));
-        self.aoff_roots.push(0);
+        let carrier_index = self.insert_carrier(transfer.carrier);
         self.write_carrier(carrier_index)?;
-        for mut block in transfer.blocks {
-            block.carrier = carrier_index;
-            self.blocks.insert(block.offset, block);
-        }
+        // Blocks keep their addresses with the carrier memory, so allocations keep their identity.
         let mut remapped = Vec::with_capacity(transfer.allocations.len());
         for (old, offset) in transfer.allocations {
-            let new = Allocation {
-                id: self.next_id,
-                size: old.size,
-            };
-            self.next_id += 1;
-            self.allocations.insert(new.id, offset);
+            let size = self.blk(offset)?.size;
             self.stats.blocks += 1;
-            self.stats.blocks_size += self.blocks[&offset].size;
-            self.block_added(false, self.blocks[&offset].size);
-            remapped.push((old, new));
+            self.stats.blocks_size += size;
+            self.block_added(false, size);
+            remapped.push((old, old));
         }
-        for offset in self.carriers[carrier_index]
-            .as_ref()
-            .ok_or(AllocError::Corrupt)?
-            .blocks
-            .clone()
-        {
-            self.write_block(offset)?;
-            if !self
-                .blocks
-                .get(&offset)
-                .ok_or(AllocError::Corrupt)?
-                .allocated
-            {
-                self.link_free(offset)?;
+        for block in transfer.blocks {
+            let block = self.blk(block.offset)?;
+            self.write_block(&block)?;
+            if !block.allocated {
+                self.link_free(block.offset)?;
             }
         }
         let carrier = self.carriers[carrier_index]
@@ -903,18 +1103,22 @@ impl AllocUtil {
         size: usize,
     ) -> Result<Allocation, AllocError> {
         self.stats.realloc_calls += 1;
-        let old_offset = *self
-            .allocations
-            .get(&allocation.id)
-            .ok_or(AllocError::InvalidAllocation)?;
-        let old = self.blocks[&old_offset].clone();
+        let old = self.live_block(allocation.id as usize)?;
+        let old_offset = old.offset;
+        let same = Allocation {
+            id: allocation.id,
+            size,
+        };
         let needed = block_size(size, self.strategy)?;
-        let old_sbc = self.carriers[old.carrier].as_ref().unwrap().sbc;
+        let old_sbc = self.carriers[old.carrier]
+            .as_ref()
+            .ok_or(AllocError::Corrupt)?
+            .sbc;
         if old_sbc && needed >= self.options.sbct {
-            match self.resize_sbc(allocation.id, old_offset, needed) {
-                Ok(()) => {
+            match self.resize_sbc(old_offset, needed) {
+                Ok(moved) => {
                     return Ok(Allocation {
-                        id: allocation.id,
+                        id: moved as u64,
                         size,
                     });
                 }
@@ -932,10 +1136,10 @@ impl AllocUtil {
                 .ok_or(AllocError::Overflow)?;
             let slack = carrier.size.saturating_sub(used);
             if (slack as u128) * 100 < (self.options.rsbcmt as u128) * (carrier.size as u128) {
-                match self.resize_sbc(allocation.id, old_offset, needed) {
-                    Ok(()) => {
+                match self.resize_sbc(old_offset, needed) {
+                    Ok(moved) => {
                         return Ok(Allocation {
-                            id: allocation.id,
+                            id: moved as u64,
                             size,
                         });
                     }
@@ -944,21 +1148,19 @@ impl AllocUtil {
                 }
             }
         }
-        let tiny_shrink_can_merge = !old.last
-            && self
-                .blocks
-                .get(&(old_offset + old.size))
-                .is_some_and(|block| !block.allocated);
+        let next_free = if old_sbc || old.last {
+            None
+        } else {
+            Some(self.blk(old_offset + old.size)?).filter(|block| !block.allocated)
+        };
+        let tiny_shrink_can_merge = next_free.is_some();
         if !old_sbc && needed == old.size
             || (!old_sbc
                 && needed < old.size
                 && old.size - needed < min_block_size(self.strategy)
                 && !tiny_shrink_can_merge)
         {
-            return Ok(Allocation {
-                id: allocation.id,
-                size,
-            });
+            return Ok(same);
         }
         let large_shrink = !old_sbc
             && needed < old.size
@@ -968,32 +1170,26 @@ impl AllocUtil {
             let mut candidate_start = old_offset;
             let mut candidate_size = old.size;
             if old.prev_free {
-                candidate_start = self.previous_block(old_offset).ok_or(AllocError::Corrupt)?;
-                candidate_size += self.blocks[&candidate_start].size;
+                candidate_start = self.previous_block(old_offset)?;
+                candidate_size += self.blk(candidate_start)?.size;
             }
-            if !old.last {
-                let next = old_offset + old.size;
-                if self.blocks.get(&next).is_some_and(|block| !block.allocated) {
-                    candidate_size += self.blocks[&next].size;
+            if let Some(next) = next_free {
+                candidate_size += next.size;
+            }
+            let tree_better = match self.choose_free(needed)? {
+                Some(candidate) => {
+                    let candidate_block_size = self.blk(candidate)?.size;
+                    candidate_block_size < candidate_size
+                        || (self.strategy == Strategy::AddressOrderBestFit
+                            && candidate_block_size == candidate_size
+                            && candidate < candidate_start)
                 }
-            }
-            let tree_better = self.choose_free(needed)?.is_some_and(|candidate| {
-                let candidate_block_size = self.blocks[&candidate].size;
-                candidate_block_size < candidate_size
-                    || (self.strategy == Strategy::AddressOrderBestFit
-                        && candidate_block_size == candidate_size
-                        && candidate < candidate_start)
-            });
+                None => false,
+            };
             if large_shrink && tree_better {
                 let replacement = self.alloc(size)?;
-                let new_offset = self.allocations[&replacement.id];
                 let copy = size.min(old.size.saturating_sub(BLOCK_HEADER));
-                for index in 0..copy {
-                    let byte = self
-                        .read_payload_byte(old_offset, index)
-                        .ok_or(AllocError::Corrupt)?;
-                    self.write_payload_byte(new_offset, index, byte)?;
-                }
+                self.copy_payload(old_offset, replacement.id as usize, copy)?;
                 self.free(allocation)?;
                 self.stats.alloc_calls = self.stats.alloc_calls.saturating_sub(1);
                 self.stats.free_calls = self.stats.free_calls.saturating_sub(1);
@@ -1004,206 +1200,132 @@ impl AllocUtil {
             && needed < old.size
             && (old.size - needed >= min_block_size(self.strategy) || tiny_shrink_can_merge)
         {
-            let tail_offset = old_offset + needed;
-            let mut tail_size = old.size - needed;
-            let mut tail_last = old.last;
-            if !old.last {
-                let next = old_offset + old.size;
-                if self.blocks.get(&next).is_some_and(|block| !block.allocated) {
-                    let next_block = self.blocks[&next].clone();
-                    self.unlink_free(next)?;
-                    self.blocks.remove(&next);
-                    self.carriers[old.carrier]
-                        .as_mut()
-                        .unwrap()
-                        .blocks
-                        .retain(|offset| *offset != next);
-                    tail_size += next_block.size;
-                    tail_last = next_block.last;
-                }
+            let mut tail = Block {
+                carrier: old.carrier,
+                offset: old_offset + needed,
+                size: old.size - needed,
+                allocated: false,
+                prev_free: false,
+                last: old.last,
+            };
+            if let Some(next) = next_free {
+                self.unlink_free(next.offset)?;
+                tail.size += next.size;
+                tail.last = next.last;
             }
-            let block = self.blocks.get_mut(&old_offset).unwrap();
-            block.size = needed;
-            block.last = false;
-            self.blocks.insert(
-                tail_offset,
-                Block {
-                    carrier: old.carrier,
-                    offset: tail_offset,
-                    size: tail_size,
-                    allocated: false,
-                    prev_free: false,
-                    last: tail_last,
-                },
-            );
-            let carrier = self.carriers[old.carrier].as_mut().unwrap();
-            carrier.blocks.push(tail_offset);
-            carrier.blocks.sort_unstable();
-            self.write_block(old_offset)?;
-            self.write_block(tail_offset)?;
-            if !tail_last {
-                self.set_next_prev_free(tail_offset, true)?;
+            self.write_block(&Block {
+                size: needed,
+                last: false,
+                ..old
+            })?;
+            self.write_block(&tail)?;
+            if !tail.last {
+                self.set_next_prev_free(&tail, true)?;
             }
-            self.link_free(tail_offset)?;
+            self.link_free(tail.offset)?;
             self.stats.blocks_size -= old.size - needed;
             self.block_resized(false, old.size, needed);
-            return Ok(Allocation {
-                id: allocation.id,
-                size,
-            });
+            return Ok(same);
         }
-        if !old_sbc && needed > old.size && !old.last {
-            let next = old_offset + old.size;
-            if self.blocks.get(&next).is_some_and(|b| !b.allocated)
-                && old.size + self.blocks[&next].size >= needed
-            {
-                self.unlink_free(next)?;
-                let n = self.blocks[&next].clone();
-                self.blocks.remove(&next);
-                self.carriers[old.carrier]
-                    .as_mut()
-                    .unwrap()
-                    .blocks
-                    .retain(|o| *o != next);
-                let total = old.size + n.size;
-                if total - needed >= min_block_size(self.strategy) {
-                    let tail = old_offset + needed;
-                    self.blocks.get_mut(&old_offset).unwrap().size = needed;
-                    self.blocks.get_mut(&old_offset).unwrap().last = false;
-                    self.blocks.insert(
-                        tail,
-                        Block {
-                            carrier: old.carrier,
-                            offset: tail,
-                            size: total - needed,
-                            allocated: false,
-                            prev_free: false,
-                            last: n.last,
-                        },
-                    );
-                    self.carriers[old.carrier]
-                        .as_mut()
-                        .unwrap()
-                        .blocks
-                        .push(tail);
-                    self.carriers[old.carrier]
-                        .as_mut()
-                        .unwrap()
-                        .blocks
-                        .sort_unstable();
-                    self.write_block(old_offset)?;
-                    self.write_block(tail)?;
-                    if !n.last {
-                        self.set_next_prev_free(tail, true)?;
-                    }
-                    self.link_free(tail)?;
-                } else {
-                    let b = self.blocks.get_mut(&old_offset).unwrap();
-                    b.size = total;
-                    b.last = n.last;
-                    self.write_block(old_offset)?;
-                    if !n.last {
-                        self.set_next_prev_free(old_offset, false)?;
-                    }
+        if !old_sbc
+            && needed > old.size
+            && let Some(next) = next_free
+            && old.size + next.size >= needed
+        {
+            self.unlink_free(next.offset)?;
+            let total = old.size + next.size;
+            let grown = if total - needed >= min_block_size(self.strategy) {
+                let grown = Block {
+                    size: needed,
+                    last: false,
+                    ..old
+                };
+                let tail = Block {
+                    carrier: old.carrier,
+                    offset: old_offset + needed,
+                    size: total - needed,
+                    allocated: false,
+                    prev_free: false,
+                    last: next.last,
+                };
+                self.write_block(&grown)?;
+                self.write_block(&tail)?;
+                if !tail.last {
+                    self.set_next_prev_free(&tail, true)?;
                 }
-                self.stats.blocks_size =
-                    self.stats.blocks_size - old.size + self.blocks[&old_offset].size;
-                self.block_resized(false, old.size, self.blocks[&old_offset].size);
-                return Ok(Allocation {
-                    id: allocation.id,
-                    size,
-                });
-            }
+                self.link_free(tail.offset)?;
+                grown
+            } else {
+                let grown = Block {
+                    size: total,
+                    last: next.last,
+                    ..old
+                };
+                self.write_block(&grown)?;
+                if !grown.last {
+                    self.set_next_prev_free(&grown, false)?;
+                }
+                grown
+            };
+            self.stats.blocks_size = self.stats.blocks_size - old.size + grown.size;
+            self.block_resized(false, old.size, grown.size);
+            return Ok(same);
         }
         if !old_sbc && old.prev_free && (needed > old.size || large_shrink) {
-            let previous = self.previous_block(old_offset).ok_or(AllocError::Corrupt)?;
-            let prev = self.blocks[&previous].clone();
-            let mut candidate_size = prev.size + old.size;
-            let mut next_free = None;
-            if !old.last {
-                let next = old_offset + old.size;
-                if self.blocks.get(&next).is_some_and(|block| !block.allocated) {
-                    next_free = Some(next);
-                    candidate_size += self.blocks[&next].size;
-                }
-            }
+            let previous = self.previous_block(old_offset)?;
+            let prev = self.blk(previous)?;
+            let candidate_size = prev.size + old.size + next_free.map_or(0, |next| next.size);
             if candidate_size >= needed {
-                let best = self.choose_free(needed)?;
-                let external_is_better = best.is_some_and(|block| {
-                    let block_size = self.blocks[&block].size;
-                    block_size < candidate_size
-                        || (self.strategy == Strategy::AddressOrderBestFit
-                            && block_size == candidate_size
-                            && block < previous)
-                });
-                if !external_is_better {
-                    let mut payload = Vec::with_capacity(size.min(old.size - BLOCK_HEADER));
-                    for index in 0..size.min(old.size - BLOCK_HEADER) {
-                        payload.push(
-                            self.read_payload_byte(old_offset, index)
-                                .ok_or(AllocError::Corrupt)?,
-                        );
+                let external_is_better = match self.choose_free(needed)? {
+                    Some(block) => {
+                        let block_size = self.blk(block)?.size;
+                        block_size < candidate_size
+                            || (self.strategy == Strategy::AddressOrderBestFit
+                                && block_size == candidate_size
+                                && block < previous)
                     }
+                    None => false,
+                };
+                if !external_is_better {
                     self.unlink_free(previous)?;
                     if let Some(next) = next_free {
-                        self.unlink_free(next)?;
+                        self.unlink_free(next.offset)?;
                     }
-                    let carrier_index = old.carrier;
-                    let last = next_free.map_or(old.last, |next| self.blocks[&next].last);
-                    self.blocks.remove(&old_offset);
-                    if let Some(next) = next_free {
-                        self.blocks.remove(&next);
-                        self.carriers[carrier_index]
-                            .as_mut()
-                            .unwrap()
-                            .blocks
-                            .retain(|offset| *offset != next);
-                    }
+                    let last = next_free.map_or(old.last, |next| next.last);
                     let remainder = candidate_size - needed;
                     let split = remainder >= min_block_size(self.strategy);
                     let used = if split { needed } else { candidate_size };
-                    let block = self.blocks.get_mut(&previous).ok_or(AllocError::Corrupt)?;
-                    block.size = used;
-                    block.allocated = true;
-                    block.last = last && !split;
-                    self.allocations.insert(allocation.id, previous);
-                    self.carriers[carrier_index]
-                        .as_mut()
-                        .unwrap()
-                        .blocks
-                        .retain(|offset| *offset != old_offset);
-                    for (index, byte) in payload.into_iter().enumerate() {
-                        self.write_payload_byte(previous, index, byte)?;
-                    }
-                    self.write_block(previous)?;
+                    // The payload moves down into the previous block; regions may overlap.
+                    let copy = size.min(old.size - BLOCK_HEADER);
+                    self.copy_payload(old_offset, previous, copy)?;
+                    let moved = Block {
+                        size: used,
+                        allocated: true,
+                        last: last && !split,
+                        ..prev
+                    };
+                    self.write_block(&moved)?;
                     if split {
-                        let tail = previous + needed;
-                        self.blocks.insert(
-                            tail,
-                            Block {
-                                carrier: carrier_index,
-                                offset: tail,
-                                size: remainder,
-                                allocated: false,
-                                prev_free: false,
-                                last,
-                            },
-                        );
-                        let carrier = self.carriers[carrier_index].as_mut().unwrap();
-                        carrier.blocks.push(tail);
-                        carrier.blocks.sort_unstable();
-                        self.write_block(tail)?;
+                        let tail = Block {
+                            carrier: prev.carrier,
+                            offset: previous + needed,
+                            size: remainder,
+                            allocated: false,
+                            prev_free: false,
+                            last,
+                        };
+                        self.write_block(&tail)?;
                         if !last {
-                            self.set_next_prev_free(tail, true)?;
+                            self.set_next_prev_free(&tail, true)?;
                         }
-                        self.link_free(tail)?;
+                        self.link_free(tail.offset)?;
                     } else if !last {
-                        self.set_next_prev_free(previous, false)?;
+                        self.set_next_prev_free(&moved, false)?;
                     }
                     self.stats.blocks_size = self.stats.blocks_size - old.size + used;
                     self.block_resized(false, old.size, used);
                     return Ok(Allocation {
-                        id: allocation.id,
+                        id: previous as u64,
                         size,
                     });
                 }
@@ -1216,14 +1338,8 @@ impl AllocUtil {
                 return Err(error);
             }
         };
-        let new_offset = self.allocations[&replacement.id];
         let copy = old.size.saturating_sub(BLOCK_HEADER).min(size);
-        for i in 0..copy {
-            let byte = self
-                .read_payload_byte(old_offset, i)
-                .ok_or(AllocError::Corrupt)?;
-            self.write_payload_byte(new_offset, i, byte)?;
-        }
+        self.copy_payload(old_offset, replacement.id as usize, copy)?;
         self.free(allocation)?;
         self.stats.alloc_calls = self.stats.alloc_calls.saturating_sub(1);
         self.stats.free_calls = self.stats.free_calls.saturating_sub(1);
@@ -1239,14 +1355,15 @@ impl AllocUtil {
     pub fn info(&self) -> AllocatorInfo {
         let mut mbcs = AllocatorClassInfo::default();
         let mut sbcs = AllocatorClassInfo::default();
-        for block in self.blocks.values().filter(|block| block.allocated) {
-            let class = if self.carriers[block.carrier].as_ref().unwrap().sbc {
-                &mut sbcs
-            } else {
-                &mut mbcs
-            };
-            class.blocks += 1;
-            class.blocks_size += block.size;
+        for (index, carrier) in self.carriers.iter().enumerate() {
+            let Some(carrier) = carrier else { continue };
+            let class = if carrier.sbc { &mut sbcs } else { &mut mbcs };
+            for block in self.carrier_blocks(index).unwrap_or_default() {
+                if block.allocated {
+                    class.blocks += 1;
+                    class.blocks_size += block.size;
+                }
+            }
         }
         for carrier in self.carriers.iter().flatten() {
             let class = if carrier.sbc { &mut sbcs } else { &mut mbcs };
@@ -1312,20 +1429,21 @@ impl AllocUtil {
         offset: usize,
         bytes: &[u8],
     ) -> Result<(), AllocError> {
-        let block = self
-            .allocations
-            .get(&allocation.id)
-            .copied()
-            .ok_or(AllocError::InvalidAllocation)?;
-        if offset
+        let block = self.live_block(allocation.id as usize)?;
+        let end = offset
             .checked_add(bytes.len())
-            .is_none_or(|end| end > allocation.size)
-        {
-            return Err(AllocError::OutOfBounds);
-        }
-        for (i, byte) in bytes.iter().enumerate() {
-            self.write_payload_byte(block, offset + i, *byte)?;
-        }
+            .filter(|end| *end <= allocation.size)
+            .ok_or(AllocError::OutOfBounds)?;
+        let carrier = self.carriers[block.carrier]
+            .as_mut()
+            .ok_or(AllocError::Corrupt)?;
+        let start = block.offset - carrier.key_base + BLOCK_HEADER;
+        carrier
+            .memory
+            .bytes_mut()
+            .and_then(|memory| memory.get_mut(start + offset..start + end))
+            .ok_or(AllocError::Corrupt)?
+            .copy_from_slice(bytes);
         Ok(())
     }
 
@@ -1336,28 +1454,28 @@ impl AllocUtil {
         offset: usize,
         out: &mut [u8],
     ) -> Result<(), AllocError> {
-        let block = self
-            .allocations
-            .get(&allocation.id)
-            .copied()
-            .ok_or(AllocError::InvalidAllocation)?;
-        if offset
+        let block = self.live_block(allocation.id as usize)?;
+        let end = offset
             .checked_add(out.len())
-            .is_none_or(|end| end > allocation.size)
-        {
-            return Err(AllocError::OutOfBounds);
-        }
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = self
-                .read_payload_byte(block, offset + i)
-                .ok_or(AllocError::Corrupt)?;
-        }
+            .filter(|end| *end <= allocation.size)
+            .ok_or(AllocError::OutOfBounds)?;
+        let carrier = self.carriers[block.carrier]
+            .as_ref()
+            .ok_or(AllocError::Corrupt)?;
+        let start = block.offset - carrier.key_base + BLOCK_HEADER;
+        out.copy_from_slice(
+            carrier
+                .memory
+                .bytes()
+                .and_then(|memory| memory.get(start + offset..start + end))
+                .ok_or(AllocError::Corrupt)?,
+        );
         Ok(())
     }
 
     /// Checks block chains, footer/header agreement, allocation ownership, and free index.
     pub fn validate(&self) -> Result<(), AllocError> {
-        let mut free = HashSet::new();
+        let mut free = HashSet::default();
         let mut count = 0;
         let mut bytes = 0;
         for (ci, c) in self
@@ -1382,8 +1500,9 @@ impl AllocUtil {
             {
                 return Err(AllocError::Corrupt);
             }
+            let mut previous_free = false;
             while pos < end {
-                let b = self.blocks.get(&pos).ok_or(AllocError::Corrupt)?;
+                let b = self.blk(pos)?;
                 if b.carrier != ci
                     || b.offset != pos
                     || b.size < min_block_size(self.strategy)
@@ -1393,14 +1512,13 @@ impl AllocUtil {
                 }
                 let rel = pos - c.key_base;
                 let h = c.memory.read_word(rel).ok_or(AllocError::Corrupt)?;
-                if (h & !BLOCK_FLAGS) != b.size
-                    || (!c.sbc && ((h & FREE) != 0) == b.allocated)
-                    || (c.sbc && h & (FREE | PREV_FREE | LAST) != FREE | PREV_FREE | LAST)
-                    || ((h & PREV_FREE) != 0) != b.prev_free
-                    || ((h & LAST) != 0) != b.last
+                if (c.sbc && h & (FREE | PREV_FREE | LAST) != FREE | PREV_FREE | LAST)
+                    || (!c.sbc && b.prev_free != previous_free)
+                    || (!c.sbc && previous_free && !b.allocated)
                 {
                     return Err(AllocError::Corrupt);
                 }
+                previous_free = !b.allocated;
                 if !b.allocated && !c.sbc {
                     free.insert(pos);
                     if c.memory.read_word(rel + b.size - WORD) != Some(b.size) {
@@ -1423,21 +1541,8 @@ impl AllocUtil {
             }
         }
         if free != self.tree_free_blocks()?
-            || (self.strategy == Strategy::GoodFit
-                && (self.goodfit_buckets.iter().flatten().count() != free.len()
-                    || self
-                        .goodfit_buckets
-                        .iter()
-                        .flatten()
-                        .copied()
-                        .collect::<HashSet<_>>()
-                        != free))
-            || (self.strategy == Strategy::Afit
-                && (self.afit_free_list.len() != free.len()
-                    || self.afit_free_list.iter().copied().collect::<HashSet<_>>() != free))
             || count != self.stats.blocks
             || bytes != self.stats.blocks_size
-            || self.allocations.len() != count
         {
             return Err(AllocError::Corrupt);
         }
@@ -1527,15 +1632,10 @@ impl AllocUtil {
 
     fn resize_sbc(
         &mut self,
-        id: u64,
         old_offset: usize,
         new_block_size: usize,
-    ) -> Result<(), AllocError> {
-        let old = self
-            .blocks
-            .get(&old_offset)
-            .ok_or(AllocError::Corrupt)?
-            .clone();
+    ) -> Result<usize, AllocError> {
+        let old = self.blk(old_offset)?;
         let (old_carrier_size, is_mseg) = self.carriers[old.carrier]
             .as_ref()
             .map(|carrier| (carrier.size, carrier.mseg))
@@ -1543,7 +1643,9 @@ impl AllocUtil {
         let requested_size = SBC_HEADER
             .checked_add(new_block_size)
             .ok_or(AllocError::Overflow)?;
-        {
+        // The carrier may move; it is re-indexed by its new address below, also on failure.
+        self.unindex_carrier(old.carrier);
+        let resized = {
             let carrier = self.carriers[old.carrier]
                 .as_mut()
                 .ok_or(AllocError::Corrupt)?;
@@ -1563,7 +1665,7 @@ impl AllocUtil {
                             ..MsegOptions::default()
                         },
                     )
-                    .map_err(AllocError::Map)?;
+                    .map_err(AllocError::Map)
             } else {
                 self.stats.sys_realloc_calls += 1;
                 let CarrierMemory::Mapped(region) = &mut carrier.memory else {
@@ -1571,9 +1673,11 @@ impl AllocUtil {
                 };
                 region
                     .resize_preserving(requested_size, page_size())
-                    .map_err(AllocError::Map)?;
+                    .map_err(AllocError::Map)
             }
-        }
+        };
+        self.index_carrier(old.carrier);
+        resized?;
         let (new_base, new_carrier_size) = self.carriers[old.carrier]
             .as_ref()
             .map(|carrier| (carrier.memory.as_ptr() as usize, carrier.memory.len()))
@@ -1586,21 +1690,9 @@ impl AllocUtil {
             carrier.key_base = new_base;
             carrier.start = new_offset;
             carrier.size = new_carrier_size;
-            carrier.blocks = vec![new_offset];
         }
-        self.blocks.remove(&old_offset);
-        self.blocks.insert(
-            new_offset,
-            Block {
-                carrier: old.carrier,
-                offset: new_offset,
-                size: new_block_size,
-                allocated: true,
-                prev_free: true,
-                last: true,
-            },
-        );
-        self.allocations.insert(id, new_offset);
+        self.unindex_carrier(old.carrier);
+        self.index_carrier(old.carrier);
         self.stats.blocks_size = self.stats.blocks_size - old.size + new_block_size;
         self.block_resized(true, old.size, new_block_size);
         self.stats.carriers_size = self.stats.carriers_size - old_carrier_size + new_carrier_size;
@@ -1613,13 +1705,20 @@ impl AllocUtil {
                 self.stats.sys_alloc_carriers_size - old_carrier_size + new_carrier_size;
         }
         self.write_carrier(old.carrier)?;
-        self.write_block(new_offset)?;
+        self.write_block(&Block {
+            carrier: old.carrier,
+            offset: new_offset,
+            size: new_block_size,
+            allocated: true,
+            prev_free: true,
+            last: true,
+        })?;
         self.update_block_peak();
         self.update_carrier_peak();
-        Ok(())
+        Ok(new_offset)
     }
 
-    fn add_sbc(&mut self, size: usize) -> Result<u64, AllocError> {
+    fn add_sbc(&mut self, size: usize) -> Result<usize, AllocError> {
         let total = align_up(SBC_HEADER + size)?;
         let (memory, mseg) = self.allocate_carrier(
             total,
@@ -1627,10 +1726,9 @@ impl AllocUtil {
             SegmentFlags::PageAligned,
         )?;
         let total = memory.len();
-        let ci = self.carriers.len();
         let key_base = memory.as_ptr() as usize;
         let start = key_base + SBC_HEADER;
-        self.carriers.push(Some(Carrier {
+        let ci = self.insert_carrier(Carrier {
             memory,
             sbc: true,
             mseg,
@@ -1640,23 +1738,16 @@ impl AllocUtil {
             key_base,
             start,
             size: total,
-            blocks: vec![start],
-        }));
-        self.aoff_roots.push(0);
+        });
         self.write_carrier(ci)?;
-        let b = Block {
+        self.write_block(&Block {
             carrier: ci,
             offset: start,
             size,
             allocated: true,
             prev_free: true,
             last: true,
-        };
-        self.blocks.insert(start, b.clone());
-        self.write_block(start)?;
-        let id = self.next_id;
-        self.next_id += 1;
-        self.allocations.insert(id, start);
+        })?;
         self.stats.carriers += 1;
         self.stats.carriers_size += total;
         self.carrier_added(true, mseg, total);
@@ -1668,15 +1759,38 @@ impl AllocUtil {
             self.stats.sys_alloc_carriers_size += total;
         }
         self.update_carrier_peak();
-        Ok(id)
+        Ok(start)
     }
+    fn insert_carrier(&mut self, carrier: Carrier) -> usize {
+        if !carrier.sbc {
+            self.mbc_count += 1;
+        }
+        let index = if let Some(index) = self.free_carrier_slots.pop() {
+            self.aoff_roots[index] = 0;
+            self.carriers[index] = Some(carrier);
+            index
+        } else {
+            self.carriers.push(Some(carrier));
+            self.aoff_roots.push(0);
+            self.carriers.len() - 1
+        };
+        self.index_carrier(index);
+        index
+    }
+
+    fn vacate_carrier(&mut self, index: usize) -> Option<Carrier> {
+        self.carriers[index].as_ref()?;
+        self.unindex_carrier(index);
+        let carrier = self.carriers[index].take()?;
+        if !carrier.sbc {
+            self.mbc_count -= 1;
+        }
+        self.free_carrier_slots.push(index);
+        Some(carrier)
+    }
+
     fn add_mbc(&mut self, needed: usize) -> Result<usize, AllocError> {
-        let mbc_count = self
-            .carriers
-            .iter()
-            .flatten()
-            .filter(|carrier| !carrier.sbc)
-            .count();
+        let mbc_count = self.mbc_count;
         let is_main = mbc_count == 0;
         let mut size = if is_main {
             self.options.mmbcs.max(self.mbc_header_size() + needed)
@@ -1703,10 +1817,9 @@ impl AllocUtil {
             SegmentFlags::PowerOfTwo,
         )?;
         let size = memory.len();
-        let ci = self.carriers.len();
         let key_base = memory.as_ptr() as usize;
         let start = key_base + self.mbc_header_size();
-        self.carriers.push(Some(Carrier {
+        let ci = self.insert_carrier(Carrier {
             memory,
             sbc: false,
             mseg,
@@ -1716,20 +1829,16 @@ impl AllocUtil {
             key_base,
             start,
             size,
-            blocks: vec![start],
-        }));
-        self.aoff_roots.push(0);
+        });
         self.write_carrier(ci)?;
-        let b = Block {
+        self.write_block(&Block {
             carrier: ci,
             offset: start,
             size: size - (start - key_base),
             allocated: false,
             prev_free: false,
             last: true,
-        };
-        self.blocks.insert(start, b);
-        self.write_block(start)?;
+        })?;
         self.link_free(start)?;
         self.stats.carriers += 1;
         self.stats.carriers_size += size;
@@ -1789,8 +1898,10 @@ impl AllocUtil {
             Err(error) => Err(AllocError::Map(error)),
         }
     }
-    fn write_block(&mut self, offset: usize) -> Result<(), AllocError> {
-        let b = self.blocks.get(&offset).ok_or(AllocError::Corrupt)?.clone();
+    /// Writes a block header, plus the carrier word and size footer of a free MBC block.
+    /// Port of SET_MBC_FBLK_HDR/SET_BLK_SZ_FTR, erl_alloc_util.c:225-262, OTP-29.1.1.
+    #[inline]
+    fn write_block(&mut self, b: &Block) -> Result<(), AllocError> {
         let c = self.carriers[b.carrier]
             .as_mut()
             .ok_or(AllocError::Corrupt)?;
@@ -1801,7 +1912,7 @@ impl AllocUtil {
                 | (if b.prev_free { PREV_FREE } else { 0 })
                 | (if b.last { LAST } else { 0 })
         };
-        let rel = offset - c.key_base;
+        let rel = b.offset - c.key_base;
         if !c.memory.write_word(rel, b.size | flags) {
             return Err(AllocError::Corrupt);
         }
@@ -1813,93 +1924,76 @@ impl AllocUtil {
         }
         Ok(())
     }
-    fn set_next_prev_free(&mut self, offset: usize, value: bool) -> Result<(), AllocError> {
-        let b = self.blocks.get(&offset).ok_or(AllocError::Corrupt)?;
+
+    /// Sets or clears PREV_FREE on the block following `b`.
+    #[inline]
+    /// Port of SET_PREV_BLK_FREE/SET_PREV_BLK_ALLOCED, erl_alloc_util.c:237-250, OTP-29.1.1:
+    /// one read-modify-write of the next header in the same carrier.
+    fn set_next_prev_free(&mut self, b: &Block, value: bool) -> Result<(), AllocError> {
         if b.last {
             return Ok(());
         }
-        let next = offset + b.size;
-        let n = self.blocks.get_mut(&next).ok_or(AllocError::Corrupt)?;
-        n.prev_free = value;
-        self.write_block(next)
-    }
-    fn node_word(&self, node: usize, word: usize) -> Result<usize, AllocError> {
-        let (base, memory) = if let Some(index) = self.aoff_carrier_index(node) {
-            let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
-            (carrier.key_base, &carrier.memory)
-        } else {
-            let block = self.blocks.get(&node).ok_or(AllocError::Corrupt)?;
-            let carrier = self.carriers[block.carrier]
-                .as_ref()
-                .ok_or(AllocError::Corrupt)?;
-            (carrier.key_base, &carrier.memory)
-        };
-        let word = if is_aoff(self.strategy) {
-            match word {
-                TREE_PARENT_WORD => AOFF_PARENT_WORD,
-                TREE_LEFT_WORD => AOFF_LEFT_WORD,
-                TREE_RIGHT_WORD => AOFF_RIGHT_WORD,
-                TREE_FLAGS_WORD => AOFF_FLAGS_WORD,
-                other => other,
-            }
-        } else {
-            word
-        };
-        memory
-            .read_word(node - base + word * WORD)
-            .ok_or(AllocError::Corrupt)
-    }
-
-    fn set_node_word(&mut self, node: usize, word: usize, value: usize) -> Result<(), AllocError> {
-        let carrier_index = self
-            .aoff_carrier_index(node)
-            .or_else(|| self.blocks.get(&node).map(|block| block.carrier))
-            .ok_or(AllocError::Corrupt)?;
-        let carrier = self.carriers[carrier_index]
+        let carrier = self.carriers[b.carrier]
             .as_mut()
             .ok_or(AllocError::Corrupt)?;
-        let word = if is_aoff(self.strategy) {
-            match word {
-                TREE_PARENT_WORD => AOFF_PARENT_WORD,
-                TREE_LEFT_WORD => AOFF_LEFT_WORD,
-                TREE_RIGHT_WORD => AOFF_RIGHT_WORD,
-                TREE_FLAGS_WORD => AOFF_FLAGS_WORD,
-                other => other,
-            }
+        let rel = b.offset + b.size - carrier.key_base;
+        let header = carrier.memory.read_word(rel).ok_or(AllocError::Corrupt)?;
+        let header = if value {
+            header | PREV_FREE
         } else {
-            word
+            header & !PREV_FREE
         };
-        let value = if is_aoff(self.strategy) && word == AOFF_FLAGS_WORD {
-            let old = carrier
-                .memory
-                .read_word(node - carrier.key_base + word * WORD)
-                .ok_or(AllocError::Corrupt)?;
-            (old & !u32::MAX as usize) | (value & u32::MAX as usize)
-        } else {
-            value
-        };
-        if carrier
-            .memory
-            .write_word(node - carrier.key_base + word * WORD, value)
-        {
+        if carrier.memory.write_word(rel, header) {
             Ok(())
         } else {
             Err(AllocError::Corrupt)
         }
     }
 
-    fn tree_root(&self, node: usize) -> Result<usize, AllocError> {
-        if self.aoff_carrier_index(node).is_some() {
-            return Ok(self.aoff_carrier_root);
-        }
-        let carrier = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.carrier;
+    #[inline]
+    fn tree_word(&self, word: usize) -> usize {
         if is_aoff(self.strategy) {
-            self.aoff_roots
-                .get(carrier)
-                .copied()
-                .ok_or(AllocError::Corrupt)
+            match word {
+                TREE_PARENT_WORD => AOFF_PARENT_WORD,
+                TREE_LEFT_WORD => AOFF_LEFT_WORD,
+                TREE_RIGHT_WORD => AOFF_RIGHT_WORD,
+                TREE_FLAGS_WORD => AOFF_FLAGS_WORD,
+                other => other,
+            }
         } else {
-            Ok(self.free_root)
+            word
+        }
+    }
+
+    fn node_word(&self, node: usize, word: usize) -> Result<usize, AllocError> {
+        self.word_at(node, self.tree_word(word))
+    }
+
+    fn set_node_word(&mut self, node: usize, word: usize, value: usize) -> Result<(), AllocError> {
+        let word = self.tree_word(word);
+        let value = if is_aoff(self.strategy) && word == AOFF_FLAGS_WORD {
+            let old = self.word_at(node, word)?;
+            (old & !u32::MAX as usize) | (value & u32::MAX as usize)
+        } else {
+            value
+        };
+        self.set_word_at(node, word, value)
+    }
+
+    /// Carrier whose free-block tree holds `node`, or `None` for an aoff carrier-tree node.
+    fn node_carrier(&self, node: usize) -> Result<Option<usize>, AllocError> {
+        let index = self.carrier_of(node).ok_or(AllocError::Corrupt)?;
+        if self.aoff_carrier_index(node).is_some() {
+            Ok(None)
+        } else {
+            Ok(Some(index))
+        }
+    }
+
+    fn tree_root(&self, node: usize) -> Result<usize, AllocError> {
+        match self.node_carrier(node)? {
+            None => Ok(self.aoff_carrier_root),
+            Some(carrier) => self.root_for_carrier(carrier),
         }
     }
 
@@ -1915,76 +2009,43 @@ impl AllocUtil {
     }
 
     fn set_tree_root(&mut self, node: usize, root: usize) -> Result<(), AllocError> {
-        if self.aoff_carrier_index(node).is_some() {
-            self.aoff_carrier_root = root;
-            return Ok(());
-        }
-        let carrier = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.carrier;
-        if is_aoff(self.strategy) {
-            *self
-                .aoff_roots
-                .get_mut(carrier)
-                .ok_or(AllocError::Corrupt)? = root;
-        } else {
-            self.free_root = root;
+        match self.node_carrier(node)? {
+            None => self.aoff_carrier_root = root,
+            Some(carrier) if is_aoff(self.strategy) => {
+                *self
+                    .aoff_roots
+                    .get_mut(carrier)
+                    .ok_or(AllocError::Corrupt)? = root;
+            }
+            Some(_) => self.free_root = root,
         }
         Ok(())
     }
 
+    /// The carrier whose aoff carrier-tree node (`crr.cpool`-adjacent node) is `node`.
+    #[inline]
     fn aoff_carrier_index(&self, node: usize) -> Option<usize> {
         if !is_aoff(self.strategy) {
             return None;
         }
-        self.carriers
-            .iter()
-            .enumerate()
-            .find_map(|(index, carrier)| {
-                carrier.as_ref().and_then(|carrier| {
-                    (!carrier.sbc && node == carrier.key_base + MBC_HEADER).then_some(index)
-                })
-            })
+        let index = self.carrier_of(node)?;
+        let carrier = self.carriers[index].as_ref()?;
+        (!carrier.sbc && node == carrier.key_base + MBC_HEADER).then_some(index)
     }
 
     fn tree_node_size(&self, node: usize) -> Result<usize, AllocError> {
-        if let Some(index) = self.aoff_carrier_index(node) {
-            let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
-            carrier
-                .memory
-                .read_word(node - carrier.key_base)
-                .ok_or(AllocError::Corrupt)
+        let word = self.word_at(node, 0)?;
+        if self.aoff_carrier_index(node).is_some() {
+            Ok(word)
         } else {
-            self.blocks
-                .get(&node)
-                .map(|block| block.size)
-                .ok_or(AllocError::Corrupt)
+            Ok(word & !BLOCK_FLAGS)
         }
     }
 
     fn set_tree_node_max_size(&mut self, node: usize, max_size: usize) -> Result<(), AllocError> {
-        let (carrier_index, base) = if let Some(index) = self.aoff_carrier_index(node) {
-            let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
-            (index, carrier.key_base)
-        } else {
-            let block = self.blocks.get(&node).ok_or(AllocError::Corrupt)?;
-            let carrier = self.carriers[block.carrier]
-                .as_ref()
-                .ok_or(AllocError::Corrupt)?;
-            (block.carrier, carrier.key_base)
-        };
-        let carrier = self.carriers[carrier_index]
-            .as_mut()
-            .ok_or(AllocError::Corrupt)?;
-        let offset = node - base + AOFF_FLAGS_WORD * WORD;
-        let word = carrier
-            .memory
-            .read_word(offset)
-            .ok_or(AllocError::Corrupt)?;
+        let word = self.word_at(node, AOFF_FLAGS_WORD)?;
         let value = (word & u32::MAX as usize) | (((max_size as u32) as usize) << 32);
-        if carrier.memory.write_word(offset, value) {
-            Ok(())
-        } else {
-            Err(AllocError::Corrupt)
-        }
+        self.set_word_at(node, AOFF_FLAGS_WORD, value)
     }
 
     fn recompute_tree_max(&mut self, node: usize) -> Result<usize, AllocError> {
@@ -2082,20 +2143,108 @@ impl AllocUtil {
     /// Inserts the free block into the OTP intrusive bestfit tree/list.
     /// Port of `bf_link_free_block` and `aobf_link_free_block`, `erl_bestfit_alloc.c:592-818`, OTP-29.1.1.
     fn link_free(&mut self, node: usize) -> Result<(), AllocError> {
-        let size = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.size;
+        let size = self.blk(node)?.size;
+        self.link_free_inner(node, size)
+    }
+
+    fn unlink_free(&mut self, node: usize) -> Result<(), AllocError> {
+        let size = self.blk(node)?.size;
+        self.unlink_free_inner(node, size)
+    }
+
+    #[inline]
+    fn list_head(&self, list: FreeListId) -> usize {
+        match list {
+            FreeListId::Bucket(index) => self.goodfit_heads[index],
+            FreeListId::Afit => self.afit_head,
+        }
+    }
+
+    #[inline]
+    fn set_list_head(&mut self, list: FreeListId, node: usize) {
+        match list {
+            FreeListId::Bucket(index) => self.goodfit_heads[index] = node,
+            FreeListId::Afit => self.afit_head = node,
+        }
+    }
+
+    /// Port of link_free_block, erl_goodfit_alloc.c:440 and erl_afit_alloc.c:150, OTP-29.1.1.
+    #[inline]
+    fn list_push_front(&mut self, list: FreeListId, node: usize) -> Result<(), AllocError> {
+        let head = self.list_head(list);
+        self.set_word_at(node, LIST_PREV_WORD, 0)?;
+        self.set_word_at(node, LIST_NEXT_WORD, head)?;
+        if head != 0 {
+            self.set_word_at(head, LIST_PREV_WORD, node)?;
+        }
+        self.set_list_head(list, node);
+        Ok(())
+    }
+
+    fn list_insert_after_head(&mut self, list: FreeListId, node: usize) -> Result<(), AllocError> {
+        let head = self.list_head(list);
+        if head == 0 {
+            return self.list_push_front(list, node);
+        }
+        let next = self.word_at(head, LIST_NEXT_WORD)?;
+        self.set_word_at(node, LIST_PREV_WORD, head)?;
+        self.set_word_at(node, LIST_NEXT_WORD, next)?;
+        if next != 0 {
+            self.set_word_at(next, LIST_PREV_WORD, node)?;
+        }
+        self.set_word_at(head, LIST_NEXT_WORD, node)
+    }
+
+    /// Port of unlink_free_block, erl_goodfit_alloc.c:461 and erl_afit_alloc.c:166, OTP-29.1.1.
+    #[inline]
+    fn list_remove(&mut self, list: FreeListId, node: usize) -> Result<(), AllocError> {
+        let prev = self.word_at(node, LIST_PREV_WORD)?;
+        let next = self.word_at(node, LIST_NEXT_WORD)?;
+        if prev == 0 {
+            if self.list_head(list) != node {
+                return Err(AllocError::Corrupt);
+            }
+            self.set_list_head(list, next);
+        } else {
+            self.set_word_at(prev, LIST_NEXT_WORD, next)?;
+        }
+        if next != 0 {
+            self.set_word_at(next, LIST_PREV_WORD, prev)?;
+        }
+        Ok(())
+    }
+
+    fn list_nodes(&self, list: FreeListId) -> Result<Vec<usize>, AllocError> {
+        let mut nodes = Vec::new();
+        let mut node = self.list_head(list);
+        while node != 0 {
+            nodes.push(node);
+            node = self.word_at(node, LIST_NEXT_WORD)?;
+        }
+        Ok(nodes)
+    }
+
+    #[inline]
+    fn link_free_inner(&mut self, node: usize, size: usize) -> Result<(), AllocError> {
         if self.strategy == Strategy::GoodFit {
-            self.goodfit_buckets[goodfit_bucket(size, self.options.sbct)].insert(0, node);
+            let bucket = goodfit_bucket(size, self.goodfit_interval_d);
+            self.list_push_front(FreeListId::Bucket(bucket), node)?;
+            self.goodfit_mask[bucket / 64] |= 1 << (bucket % 64);
         } else if self.strategy == Strategy::Afit {
-            let insert_after_head = self
-                .afit_free_list
-                .first()
-                .is_some_and(|head| self.blocks.get(head).is_some_and(|block| block.size > size));
-            self.afit_free_list
-                .insert(usize::from(insert_after_head), node);
+            let head = self.afit_head;
+            if head != 0 && self.blk(head)?.size > size {
+                self.list_insert_after_head(FreeListId::Afit, node)?;
+            } else {
+                self.list_push_front(FreeListId::Afit, node)?;
+            }
+        }
+        if matches!(self.strategy, Strategy::GoodFit | Strategy::Afit) {
+            // erl_goodfit_alloc.c and erl_afit_alloc.c index free blocks by lists only, no tree.
+            return Ok(());
         }
         self.insert_tree_node(node, size)?;
         if is_aoff(self.strategy) {
-            let carrier = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.carrier;
+            let carrier = self.carrier_of(node).ok_or(AllocError::Corrupt)?;
             self.update_aoff_carrier_node(carrier)?;
         }
         Ok(())
@@ -2107,7 +2256,8 @@ impl AllocUtil {
         self.set_node_word(node, TREE_PARENT_WORD, 0)?;
         self.set_node_word(node, TREE_LEFT_WORD, 0)?;
         self.set_node_word(node, TREE_RIGHT_WORD, 0)?;
-        if self.strategy == Strategy::BestFit && self.blocks.contains_key(&node) {
+        let block_node = self.aoff_carrier_index(node).is_none();
+        if self.strategy == Strategy::BestFit && block_node {
             self.set_node_word(node, BF_NEXT_WORD, 0)?;
         }
         let mut parent = 0;
@@ -2115,10 +2265,7 @@ impl AllocUtil {
         while current != 0 {
             parent = current;
             let current_size = self.tree_node_size(current)?;
-            if self.strategy == Strategy::BestFit
-                && self.blocks.contains_key(&node)
-                && size == current_size
-            {
+            if self.strategy == Strategy::BestFit && block_node && size == current_size {
                 let head_next = self.node_word(current, BF_NEXT_WORD)?;
                 self.set_node_word(node, TREE_PARENT_WORD, current)?;
                 self.set_node_word(node, BF_NEXT_WORD, head_next)?;
@@ -2187,35 +2334,55 @@ impl AllocUtil {
         }
     }
 
+    /// First non-empty goodfit bucket at or above `from`, via `bucket_mask` like erl_goodfit_alloc.c.
+    #[inline]
+    fn next_goodfit_bucket(&self, from: usize) -> Option<usize> {
+        let mut word = from / 64;
+        if word >= self.goodfit_mask.len() {
+            return None;
+        }
+        let mut bits = self.goodfit_mask[word] & (!0u64 << (from % 64));
+        loop {
+            if bits != 0 {
+                return Some(word * 64 + bits.trailing_zeros() as usize);
+            }
+            word += 1;
+            bits = *self.goodfit_mask.get(word)?;
+        }
+    }
+
     /// Finds the smallest fitting size-tree node, retaining OTP's BF list preference.
     /// Port of `bf_get_free_block` and `aobf_get_free_block`, `erl_bestfit_alloc.c:657-865`, OTP-29.1.1.
+    #[inline]
     fn choose_free(&self, need: usize) -> Result<Option<usize>, AllocError> {
         // Port of aoff_get_free_block, erl_ao_firstfit_alloc.c:895, OTP-29.1.1;
         // goodfit_get_free_block, erl_goodfit_alloc.c:393, OTP-29.1.1; and
         // afit_get_free_block, erl_afit_alloc.c:123, OTP-29.1.1.
         if self.strategy == Strategy::Afit {
-            return Ok(self.afit_free_list.first().and_then(|node| {
-                self.blocks
-                    .get(node)
-                    .filter(|block| block.size >= need)
-                    .map(|_| *node)
-            }));
+            let head = self.afit_head;
+            if head == 0 || self.blk(head)?.size < need {
+                return Ok(None);
+            }
+            return Ok(Some(head));
         }
         if self.strategy == Strategy::GoodFit {
-            let first_bucket = goodfit_bucket(need, self.options.sbct);
-            for bucket in first_bucket..256 {
+            let first_bucket = goodfit_bucket(need, self.goodfit_interval_d);
+            let mut next_bucket = first_bucket;
+            while let Some(bucket) = self.next_goodfit_bucket(next_bucket) {
+                next_bucket = bucket + 1;
                 let mut best = None;
-                for node in self.goodfit_buckets[bucket]
-                    .iter()
-                    .take(self.options.max_bucket_search.max(1))
-                {
-                    let size = self.blocks.get(node).ok_or(AllocError::Corrupt)?.size;
+                let mut node = self.goodfit_heads[bucket];
+                let mut searched = 0;
+                while node != 0 && searched < self.options.max_bucket_search.max(1) {
+                    let size = self.blk(node)?.size;
                     if size >= need && best.is_none_or(|(_, best_size)| size < best_size) {
-                        best = Some((*node, size));
+                        best = Some((node, size));
                         if size == need {
                             break;
                         }
                     }
+                    searched += 1;
+                    node = self.word_at(node, LIST_NEXT_WORD)?;
                 }
                 if let Some((node, _)) = best {
                     return Ok(Some(node));
@@ -2232,81 +2399,10 @@ impl AllocUtil {
                 .ok_or(AllocError::Corrupt)?;
             return self.aoff_search(self.aoff_roots[carrier_index], need);
         }
-        if !matches!(
-            self.strategy,
-            Strategy::BestFit | Strategy::AddressOrderBestFit
-        ) {
-            let mut candidates = self
-                .blocks
-                .values()
-                .filter(|block| !block.allocated && block.size >= need)
-                .map(|block| {
-                    let carrier = self.carriers[block.carrier]
-                        .as_ref()
-                        .ok_or(AllocError::Corrupt)?;
-                    let address =
-                        carrier.memory.as_ptr() as usize + block.offset - carrier.key_base;
-                    Ok((block.offset, block.carrier, block.size, address))
-                })
-                .collect::<Result<Vec<_>, AllocError>>()?;
-            if candidates.is_empty() {
-                return Ok(None);
-            }
-            match self.strategy {
-                Strategy::Aoff => {
-                    candidates.sort_unstable_by_key(|candidate| candidate.3);
-                }
-                Strategy::AoffCbf => {
-                    candidates.sort_unstable_by_key(|candidate| {
-                        let carrier = self.carriers[candidate.1].as_ref().unwrap();
-                        let largest = carrier
-                            .blocks
-                            .iter()
-                            .filter_map(|offset| self.blocks.get(offset))
-                            .filter(|block| !block.allocated)
-                            .map(|block| block.size)
-                            .max()
-                            .unwrap_or(0);
-                        (largest, candidate.3)
-                    });
-                }
-                Strategy::AoffCaobf => {
-                    candidates.sort_unstable_by_key(|candidate| {
-                        let carrier = self.carriers[candidate.1].as_ref().unwrap();
-                        let largest = carrier
-                            .blocks
-                            .iter()
-                            .filter_map(|offset| self.blocks.get(offset))
-                            .filter(|block| !block.allocated)
-                            .map(|block| block.size)
-                            .max()
-                            .unwrap_or(0);
-                        (largest, carrier.memory.as_ptr() as usize, candidate.3)
-                    });
-                }
-                Strategy::Afit => {
-                    candidates.sort_unstable_by_key(|candidate| {
-                        (std::cmp::Reverse(candidate.2), candidate.3)
-                    });
-                }
-                Strategy::GoodFit => {
-                    candidates.sort_unstable_by_key(|candidate| {
-                        (
-                            goodfit_bucket(candidate.2, self.options.sbct),
-                            candidate.2,
-                            candidate.3,
-                        )
-                    });
-                    candidates.truncate(3);
-                }
-                Strategy::BestFit | Strategy::AddressOrderBestFit => unreachable!(),
-            }
-            return Ok(Some(candidates[0].0));
-        }
         let mut current = self.free_root;
         let mut best = 0;
         while current != 0 {
-            let size = self.blocks.get(&current).ok_or(AllocError::Corrupt)?.size;
+            let size = self.blk(current)?.size;
             if size < need {
                 current = self.node_word(current, TREE_RIGHT_WORD)?;
             } else {
@@ -2328,22 +2424,19 @@ impl AllocUtil {
 
     /// Removes a free block from its intrusive tree node or BF size list.
     /// Port of `bf_unlink_free_block` and `tree_delete`, `erl_bestfit_alloc.c:399-433,780-806`, OTP-29.1.1.
-    fn unlink_free(&mut self, node: usize) -> Result<(), AllocError> {
+    #[inline]
+    fn unlink_free_inner(&mut self, node: usize, size: usize) -> Result<(), AllocError> {
         if self.strategy == Strategy::GoodFit {
-            let size = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.size;
-            let bucket = &mut self.goodfit_buckets[goodfit_bucket(size, self.options.sbct)];
-            let index = bucket
-                .iter()
-                .position(|candidate| *candidate == node)
-                .ok_or(AllocError::Corrupt)?;
-            bucket.remove(index);
+            let index = goodfit_bucket(size, self.goodfit_interval_d);
+            self.list_remove(FreeListId::Bucket(index), node)?;
+            if self.goodfit_heads[index] == 0 {
+                self.goodfit_mask[index / 64] &= !(1 << (index % 64));
+            }
         } else if self.strategy == Strategy::Afit {
-            let index = self
-                .afit_free_list
-                .iter()
-                .position(|candidate| *candidate == node)
-                .ok_or(AllocError::Corrupt)?;
-            self.afit_free_list.remove(index);
+            self.list_remove(FreeListId::Afit, node)?;
+        }
+        if matches!(self.strategy, Strategy::GoodFit | Strategy::Afit) {
+            return Ok(());
         }
         let flags = self.node_word(node, TREE_FLAGS_WORD)?;
         if self.strategy == Strategy::BestFit && flags & TREE_NODE == 0 {
@@ -2366,8 +2459,9 @@ impl AllocUtil {
             }
         }
         self.delete_tree_node(node)?;
-        if is_aoff(self.strategy) && self.blocks.contains_key(&node) {
-            let carrier = self.blocks.get(&node).ok_or(AllocError::Corrupt)?.carrier;
+        if is_aoff(self.strategy)
+            && let Some(carrier) = self.node_carrier(node)?
+        {
             self.update_aoff_carrier_node(carrier)?;
         }
         Ok(())
@@ -2536,12 +2630,9 @@ impl AllocUtil {
     }
 
     fn delete_tree_node(&mut self, node: usize) -> Result<(), AllocError> {
-        let carrier_node = self.aoff_carrier_index(node).is_some();
-        let carrier = if carrier_node {
-            0
-        } else {
-            self.blocks.get(&node).ok_or(AllocError::Corrupt)?.carrier
-        };
+        let block_carrier = self.node_carrier(node)?;
+        let carrier_node = block_carrier.is_none();
+        let carrier = block_carrier.unwrap_or(0);
         let mut replacement = node;
         let mut replacement_was_red = self.is_red(replacement)?;
         let left = self.node_word(node, TREE_LEFT_WORD)?;
@@ -2709,7 +2800,7 @@ impl AllocUtil {
             if !seen.insert(node) {
                 return Err(AllocError::Corrupt);
             }
-            let block = allocator.blocks.get(&node).ok_or(AllocError::Corrupt)?;
+            let block = allocator.blk(node)?;
             if block.allocated
                 || allocator.node_word(node, TREE_PARENT_WORD)? != parent
                 || allocator.node_word(node, TREE_FLAGS_WORD)? & TREE_NODE == 0
@@ -2738,9 +2829,8 @@ impl AllocUtil {
                 while list != 0 {
                     if !seen.insert(list)
                         || allocator
-                            .blocks
-                            .get(&list)
-                            .is_none_or(|b| b.allocated || b.size != block.size)
+                            .blk(list)
+                            .map_or(true, |b| b.allocated || b.size != block.size)
                         || allocator.node_word(list, TREE_FLAGS_WORD)? & TREE_NODE != 0
                         || allocator.node_word(list, TREE_PARENT_WORD)? != previous
                     {
@@ -2757,7 +2847,29 @@ impl AllocUtil {
             }
             Ok(left_height + usize::from(!red))
         }
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
+        match self.strategy {
+            Strategy::GoodFit => {
+                let mut nodes = HashSet::default();
+                for bucket in 0..self.goodfit_heads.len() {
+                    for node in self.list_nodes(FreeListId::Bucket(bucket))? {
+                        if !nodes.insert(node) {
+                            return Err(AllocError::Corrupt);
+                        }
+                    }
+                }
+                return Ok(nodes);
+            }
+            Strategy::Afit => {
+                let nodes = self.list_nodes(FreeListId::Afit)?;
+                let set = nodes.iter().copied().collect::<HashSet<_>>();
+                if set.len() != nodes.len() {
+                    return Err(AllocError::Corrupt);
+                }
+                return Ok(set);
+            }
+            _ => {}
+        }
         let roots: Vec<usize> = if is_aoff(self.strategy) {
             self.aoff_roots.clone()
         } else {
@@ -2771,28 +2883,26 @@ impl AllocUtil {
         }
         Ok(seen)
     }
-    fn previous_block(&self, offset: usize) -> Option<usize> {
-        let c = self.carriers[self.blocks[&offset].carrier].as_ref()?;
-        c.blocks.iter().copied().take_while(|o| *o < offset).last()
-    }
-    fn remove_carrier(&mut self, ci: usize) -> Result<(), AllocError> {
-        let indexed = self.tree_free_blocks()?;
-        if let Some(c) = self.carriers[ci].as_ref() {
-            let free_blocks = c
-                .blocks
-                .iter()
-                .copied()
-                .filter(|offset| indexed.contains(offset))
-                .collect::<Vec<_>>();
-            for offset in free_blocks {
-                self.unlink_free(offset)?;
-            }
+    /// Start of the free block preceding `offset`, from its size footer.
+    /// Port of PREV_BLK_SZ, erl_alloc_util.c:223, OTP-29.1.1.
+    #[inline]
+    fn previous_block(&self, offset: usize) -> Result<usize, AllocError> {
+        let size = self.word_at(offset - WORD, 0)?;
+        let previous = offset.checked_sub(size).ok_or(AllocError::Corrupt)?;
+        let carrier = self
+            .carrier_of(offset)
+            .and_then(|index| self.carriers[index].as_ref())
+            .ok_or(AllocError::Corrupt)?;
+        if size == 0 || previous < carrier.start {
+            return Err(AllocError::Corrupt);
         }
-        if let Some(c) = self.carriers[ci].take() {
+        Ok(previous)
+    }
+
+    /// Destroys a carrier whose only block was just freed and never linked into a free index.
+    fn remove_carrier(&mut self, ci: usize) -> Result<(), AllocError> {
+        if let Some(c) = self.vacate_carrier(ci) {
             self.carrier_removed(c.sbc, c.mseg, c.size);
-            for o in &c.blocks {
-                self.blocks.remove(o);
-            }
             self.stats.carriers -= 1;
             self.stats.carriers_size -= c.size;
             if c.mseg {
@@ -2810,25 +2920,14 @@ impl AllocUtil {
         }
         Ok(())
     }
-    fn read_payload_byte(&self, offset: usize, n: usize) -> Option<u8> {
-        let b = &self.blocks[&offset];
-        let c = self.carriers[b.carrier].as_ref()?;
-        c.memory.read_byte(offset - c.key_base + BLOCK_HEADER + n)
-    }
-    fn write_payload_byte(&mut self, offset: usize, n: usize, v: u8) -> Result<(), AllocError> {
-        let b = self.blocks.get(&offset).ok_or(AllocError::Corrupt)?;
-        let c = self.carriers[b.carrier]
-            .as_mut()
-            .ok_or(AllocError::Corrupt)?;
-        if c.memory
-            .write_byte(offset - c.key_base + BLOCK_HEADER + n, v)
-        {
-            Ok(())
-        } else {
-            Err(AllocError::Corrupt)
-        }
-    }
+    #[inline]
     fn update_block_peak(&mut self) {
+        // Maxima can only move when a current value passes them (erl_alloc_util.c:726 STAT_MBC_BLK_ALLOC).
+        if self.stats.blocks <= self.stats.max_blocks
+            && self.stats.blocks_size <= self.stats.max_blocks_size
+        {
+            return;
+        }
         self.stats.max_blocks = self.stats.max_blocks.max(self.stats.blocks);
         self.stats.max_blocks_size = self.stats.max_blocks_size.max(self.stats.blocks_size);
         self.stats.max_ever_blocks = self.stats.max_ever_blocks.max(self.stats.max_blocks);
@@ -2875,10 +2974,14 @@ impl AllocUtil {
             .max_ever_sys_alloc_carriers_size
             .max(self.stats.sys_alloc_carriers_size);
     }
+    #[inline]
     fn update_series(series: &mut ValueSeries) {
-        series.max = series.max.max(series.current);
-        series.max_ever = series.max_ever.max(series.max);
+        if series.current > series.max {
+            series.max = series.current;
+            series.max_ever = series.max_ever.max(series.max);
+        }
     }
+    #[inline]
     fn block_added(&mut self, sbc: bool, size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
         class.blocks.current += 1;
@@ -2886,6 +2989,7 @@ impl AllocUtil {
         Self::update_series(&mut class.blocks);
         Self::update_series(&mut class.blocks_size);
     }
+    #[inline]
     fn block_removed(&mut self, sbc: bool, size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
         class.blocks.current -= 1;
@@ -2973,19 +3077,25 @@ fn is_aoff(strategy: Strategy) -> bool {
 
 /// Returns OTP goodfit's four linear bucket regions' bucket index.
 /// Port of BKT_IX_, erl_goodfit_alloc.c:101-115, OTP-29.1.1.
-fn goodfit_bucket(size: usize, sbct: usize) -> usize {
-    const MIN_BLOCK: usize = 40;
-    const QUARTER: usize = 64;
-    const A: usize = 8;
-    const B: usize = 128;
-    const C: usize = 768;
-    let max_a = MIN_BLOCK + QUARTER * A - 1;
-    let min_b = max_a + 1;
-    let max_b = min_b + QUARTER * B - 1;
-    let min_c = max_b + 1;
-    let max_c = min_c + QUARTER * C - 1;
-    let min_d = max_c + 1;
-    let interval_d = if sbct > min_d - 1 {
+const GF_MIN_BLOCK: usize = 40;
+const GF_QUARTER: usize = 64;
+const GF_A: usize = 8;
+const GF_B: usize = 128;
+const GF_C: usize = 768;
+const GF_MAX_A: usize = GF_MIN_BLOCK + GF_QUARTER * GF_A - 1;
+const GF_MIN_B: usize = GF_MAX_A + 1;
+const GF_MAX_B: usize = GF_MIN_B + GF_QUARTER * GF_B - 1;
+const GF_MIN_C: usize = GF_MAX_B + 1;
+const GF_MAX_C: usize = GF_MIN_C + GF_QUARTER * GF_C - 1;
+const GF_MIN_D: usize = GF_MAX_C + 1;
+
+/// Region D bucket interval for `sbct`, computed once per allocator like `bkt_intrvl_d`.
+/// Port of erts_gfalc_start, erl_goodfit_alloc.c:236-247, OTP-29.1.1.
+fn goodfit_interval_d(sbct: usize) -> usize {
+    const QUARTER: usize = GF_QUARTER;
+    const C: usize = GF_C;
+    let min_d = GF_MIN_D;
+    if sbct > min_d - 1 {
         let raw = 3usize
             .saturating_mul(sbct.saturating_sub(min_d + 1))
             .checked_div(QUARTER - 1)
@@ -2994,16 +3104,20 @@ fn goodfit_bucket(size: usize, sbct: usize) -> usize {
         align_const(raw.max(C))
     } else {
         C
-    };
-    let max_d = min_d.saturating_add(QUARTER.saturating_mul(interval_d) - 1);
-    if size <= max_a {
-        (size.saturating_sub(MIN_BLOCK)) / A
-    } else if size <= max_b {
-        QUARTER + (size - min_b) / B
-    } else if size <= max_c {
-        2 * QUARTER + (size - min_c) / C
+    }
+}
+
+#[inline]
+fn goodfit_bucket(size: usize, interval_d: usize) -> usize {
+    let max_d = GF_MIN_D.saturating_add(GF_QUARTER.saturating_mul(interval_d) - 1);
+    if size <= GF_MAX_A {
+        (size.saturating_sub(GF_MIN_BLOCK)) / GF_A
+    } else if size <= GF_MAX_B {
+        GF_QUARTER + (size - GF_MIN_B) / GF_B
+    } else if size <= GF_MAX_C {
+        2 * GF_QUARTER + (size - GF_MIN_C) / GF_C
     } else if size <= max_d {
-        3 * QUARTER + (size - min_d) / interval_d
+        3 * GF_QUARTER + (size - GF_MIN_D) / interval_d
     } else {
         255
     }
@@ -3144,10 +3258,10 @@ mod tests {
         let large = allocator.alloc(1000).unwrap();
         let hole = allocator.alloc(128).unwrap();
         let _guard = allocator.alloc(1000).unwrap();
-        let old_offset = allocator.allocations[&large.id];
+        let old_offset = large.id;
         allocator.free(hole).unwrap();
         let smaller = allocator.realloc(large, 16).unwrap();
-        assert_ne!(allocator.allocations[&smaller.id], old_offset);
+        assert_ne!(smaller.id, old_offset);
         assert_eq!(allocator.stats().alloc_calls, 3);
         assert_eq!(allocator.stats().free_calls, 1);
         allocator.validate().unwrap();
@@ -3201,11 +3315,11 @@ mod tests {
         let spacer = best.alloc(16).unwrap();
         let small = best.alloc(500).unwrap();
         let _guard = best.alloc(1000).unwrap();
-        let small_address = best.allocations[&small.id];
+        let small_address = small.id;
         best.free(large).unwrap();
         best.free(small).unwrap();
         let chosen = best.alloc(400).unwrap();
-        assert_eq!(best.allocations[&chosen.id], small_address);
+        assert_eq!(chosen.id, small_address);
         best.free(spacer).unwrap();
 
         let mut address = AllocUtil::new(Strategy::AddressOrderBestFit, options);
@@ -3213,18 +3327,11 @@ mod tests {
         let separator = address.alloc(16).unwrap();
         let higher = address.alloc(500).unwrap();
         let _guard = address.alloc(1000).unwrap();
-        let lower_offset = address.allocations[&lower.id];
-        let lower_carrier = &address.carriers[address.blocks[&lower_offset].carrier];
-        let lower_address = lower_carrier.as_ref().unwrap().memory.as_ptr() as usize + lower_offset
-            - lower_carrier.as_ref().unwrap().key_base;
+        let lower_address = address.allocation_ptr(lower).unwrap() as usize;
         address.free(lower).unwrap();
         address.free(higher).unwrap();
         let chosen = address.alloc(500).unwrap();
-        let chosen_offset = address.allocations[&chosen.id];
-        let chosen_carrier = &address.carriers[address.blocks[&chosen_offset].carrier];
-        let chosen_address = chosen_carrier.as_ref().unwrap().memory.as_ptr() as usize
-            + chosen_offset
-            - chosen_carrier.as_ref().unwrap().key_base;
+        let chosen_address = address.allocation_ptr(chosen).unwrap() as usize;
         assert_eq!(chosen_address, lower_address);
         address.free(separator).unwrap();
         address.validate().unwrap();
@@ -3245,12 +3352,12 @@ mod tests {
         let large = allocator.alloc(1024).unwrap();
         let _separator = allocator.alloc(16).unwrap();
         let _guard = allocator.alloc(14_400).unwrap();
-        let large_offset = allocator.allocations[&large.id];
+        let large_offset = large.id as usize;
         allocator.free(small).unwrap();
         allocator.free(large).unwrap();
-        assert_eq!(allocator.afit_free_list[0], large_offset);
+        assert_eq!(allocator.afit_head, large_offset);
         let reused = allocator.alloc(512).unwrap();
-        assert_eq!(allocator.allocations[&reused.id], large_offset);
+        assert_eq!(reused.id as usize, large_offset);
         assert_eq!(allocator.info().mbcs.carriers, 1);
         allocator.validate().unwrap();
     }
@@ -3270,7 +3377,7 @@ mod tests {
         let fitting = allocator.alloc(512).unwrap();
         let _separator = allocator.alloc(16).unwrap();
         let _guard = allocator.alloc(1024).unwrap();
-        let fitting_offset = allocator.allocations[&fitting.id];
+        let fitting_offset = fitting.id as usize;
         allocator.free(small).unwrap();
         allocator.free(fitting).unwrap();
         assert_eq!(
@@ -3313,7 +3420,8 @@ mod tests {
         allocator.free(mbc_block).unwrap();
         allocator.free(sbc_block).unwrap();
         let info = allocator.info();
-        assert_eq!(info.mbcs.carriers, 0);
+        // The main carrier survives being emptied (erl_alloc_util.c:2791).
+        assert_eq!(info.mbcs.carriers, 1);
         assert_eq!(info.sbcs.carriers, 0);
         assert_eq!(info.calls.free_calls, 2);
         assert_eq!(info.mbcs.blocks_max, 1);
@@ -3390,11 +3498,8 @@ mod tests {
                                 let resized = allocator.realloc(allocation, size);
                                 prop_assert!(
                                     resized.is_ok(),
-                                    "realloc failed: strategy={strategy:?}, op_index={operation_index}, size={size}, allocation={allocation:?}, offset={:?}, error={:?}, blocks={:?}, allocations={:?}",
-                                    allocator.allocations.get(&allocation.id),
+                                    "realloc failed: strategy={strategy:?}, op_index={operation_index}, size={size}, allocation={allocation:?}, error={:?}",
                                     resized.as_ref().err(),
-                                    allocator.blocks,
-                                    allocator.allocations
                                 );
                                 live[index] = Some(resized.unwrap());
                             }
@@ -3406,11 +3511,9 @@ mod tests {
                     }
                     prop_assert!(
                         allocator.validate().is_ok(),
-                        "strategy={strategy:?}, op_index={operation_index}, op={op}, size={raw_size}, free_root={}, tree={:?}, blocks={:?}, allocations={:?}",
+                        "strategy={strategy:?}, op_index={operation_index}, op={op}, size={raw_size}, free_root={}, tree={:?}",
                         allocator.free_root,
                         allocator.tree_free_blocks(),
-                        allocator.blocks,
-                        allocator.allocations
                     );
                     prop_assert_eq!(allocator.stats().blocks, live.iter().filter(|a| a.is_some()).count());
                 }

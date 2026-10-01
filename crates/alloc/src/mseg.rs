@@ -74,6 +74,16 @@ impl Segment {
         self.region.is_empty()
     }
 
+    /// The whole segment as bytes, or `None` when it is not readable.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.region.bytes()
+    }
+
+    /// The whole segment as mutable bytes, or `None` when it is not writable.
+    pub fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        self.region.bytes_mut()
+    }
+
     /// Reads a checked byte from the segment.
     pub fn read_byte(&self, offset: usize) -> Option<u8> {
         self.region.read_byte(offset)
@@ -85,11 +95,13 @@ impl Segment {
     }
 
     /// Reads a checked native word from the segment.
+    #[inline]
     pub fn read_word(&self, offset: usize) -> Option<usize> {
         self.region.read_word(offset)
     }
 
     /// Writes a checked native word to the segment.
+    #[inline]
     pub fn write_word(&mut self, offset: usize, value: usize) -> bool {
         self.region.write_word(offset, value)
     }

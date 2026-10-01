@@ -856,7 +856,11 @@ impl ProcessHeap {
                 // Port of erl_gc.c:1471 (`erts_next_heap_size(size_before, 1)`):
                 // the first old heap is one step larger than the mature data.
                 let old_capacity = next_heap_size(source_words, 1, 0)?;
-                next.old_words = ProcessHeap::with_words(old_capacity).words;
+                next.old_words = ProcessHeap::with_words_for_type(
+                    old_capacity,
+                    arinsal_alloc::typed::ErtsAlcType::OLD_HEAP,
+                )
+                .words;
             }
             next.old_htop = self.old_htop;
             next.owners.old_off_heap = std::mem::take(&mut self.owners.old_off_heap);

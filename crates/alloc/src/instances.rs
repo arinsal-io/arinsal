@@ -1,12 +1,25 @@
 //! Scheduler-local allocator instances, delayed frees, and shared MBC carriers.
 
+use crate::alloc_util::HashMap;
 use crate::alloc_util::{
     AllocError, AllocUtil, AllocUtilOptions, Allocation, AllocatorInfo, CarrierPoolStats,
     CarrierTransfer, Strategy,
 };
-use std::collections::{HashMap, VecDeque};
+use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, ThreadId};
+
+static NEXT_INSTANCE_CACHE_ID: AtomicUsize = AtomicUsize::new(1);
+
+const INSTANCE_CACHE_SLOTS: usize = 32;
+
+thread_local! {
+    // One slot per allocator family (cache id modulo slots); a collision only costs the slow path.
+    static LAST_INSTANCE: [Cell<(usize, usize)>; INSTANCE_CACHE_SLOTS] =
+        const { [const { Cell::new((0, 0)) }; INSTANCE_CACHE_SLOTS] };
+}
 
 struct Instance {
     allocator: AllocUtil,
@@ -20,6 +33,13 @@ pub struct InstanceAllocation {
     allocation: Allocation,
 }
 
+impl InstanceAllocation {
+    /// Original allocator instance assigned when the block was created.
+    pub const fn instance(self) -> usize {
+        self.instance
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AllocationRoute {
     Current {
@@ -28,11 +48,9 @@ enum AllocationRoute {
     },
     Pooled {
         pool_id: u64,
-        allocation: Allocation,
     },
     Homecoming {
         homecoming_id: u64,
-        allocation: Allocation,
     },
 }
 
@@ -48,17 +66,29 @@ struct HomecomingCarrier {
 
 /// Owns allocator instances and routes handles as carriers move between them.
 ///
+/// A handle names its block by address and the instance that owned the block's carrier when the
+/// handle was made. Like erts' carrier `allctr` word (erl_alloc_util.c:1736 get_used_allctr), a
+/// carrier that leaves that instance records the new owner of its blocks; only those blocks have an
+/// entry in `routes`, so the common alloc/free path takes no shared lock.
+///
 /// Port of scheduler-specific allocator, delayed-free, and carrier-pool behavior
 /// in `erl_alloc_util.c:2260-2299,3968-4030,4180-4200`, OTP-29.1.1.
 pub struct ThreadSpecificAllocators {
-    instances: Vec<Mutex<Instance>>,
+    // parking_lot: the uncontended lock is one CAS, on every alloc and free.
+    instances: Vec<parking_lot::Mutex<Instance>>,
     thread_instances: Mutex<HashMap<ThreadId, usize>>,
-    routes: Mutex<HashMap<InstanceAllocation, AllocationRoute>>,
+    /// Owner of blocks whose carrier left the instance named in their handle, by block address.
+    routes: Mutex<HashMap<u64, AllocationRoute>>,
+    /// Number of `routes` entries; zero lets handles route to their own instance without locking.
+    routed: AtomicUsize,
     carrier_pool: Mutex<Vec<PooledCarrier>>,
+    /// Number of pooled carriers, read without the pool lock on every allocation.
+    pooled: AtomicUsize,
     homecomings: Mutex<Vec<HomecomingCarrier>>,
     next_pool_id: Mutex<u64>,
     pool_stats: Mutex<CarrierPoolStats>,
     thread_specific: bool,
+    cache_id: usize,
 }
 
 impl ThreadSpecificAllocators {
@@ -69,15 +99,32 @@ impl ThreadSpecificAllocators {
         strategy: Strategy,
         options: AllocUtilOptions,
     ) -> Self {
+        Self::new_for_type(
+            instance_count,
+            thread_specific,
+            strategy,
+            options,
+            "eheap_alloc",
+        )
+    }
+
+    /// Creates instances tagged with the selected ERTS allocator name.
+    pub fn new_for_type(
+        instance_count: usize,
+        thread_specific: bool,
+        strategy: Strategy,
+        options: AllocUtilOptions,
+        allocation_type: &'static str,
+    ) -> Self {
         let count = instance_count.max(1);
         Self {
             instances: (0..count)
                 .map(|instance| {
-                    Mutex::new(Instance {
+                    parking_lot::Mutex::new(Instance {
                         allocator: AllocUtil::new_for_instance(
                             strategy,
                             options,
-                            "eheap_alloc",
+                            allocation_type,
                             instance,
                             true,
                         ),
@@ -85,43 +132,44 @@ impl ThreadSpecificAllocators {
                     })
                 })
                 .collect(),
-            thread_instances: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
+            thread_instances: Mutex::new(HashMap::default()),
+            routes: Mutex::new(HashMap::default()),
+            routed: AtomicUsize::new(0),
             carrier_pool: Mutex::new(Vec::new()),
+            pooled: AtomicUsize::new(0),
             homecomings: Mutex::new(Vec::new()),
             next_pool_id: Mutex::new(1),
             pool_stats: Mutex::new(CarrierPoolStats::default()),
             thread_specific,
+            cache_id: NEXT_INSTANCE_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
     /// Allocates on the instance assigned to the current thread.
     pub fn alloc(&self, size: usize) -> Result<InstanceAllocation, AllocError> {
+        self.alloc_with_ptr(size).map(|(handle, _)| handle)
+    }
+
+    /// Allocates and returns the stable payload pointer.
+    pub fn alloc_with_ptr(
+        &self,
+        size: usize,
+    ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
         let instance = self.current_instance();
         let mut state = self.lock_instance(instance);
-        let drained = Self::drain_locked(&mut state)?;
-        self.clear_routes(drained);
-        self.publish_transfers(instance, &mut state)?;
-        if state.allocator.needs_carrier(size)? {
+        self.drain_and_publish(instance, &mut state)?;
+        if self.pooled.load(Ordering::Acquire) != 0 && state.allocator.needs_carrier(size)? {
             self.fetch_for_size(instance, &mut state, size)?;
         }
         let allocation = state.allocator.alloc(size)?;
-        let handle = InstanceAllocation {
-            instance,
-            allocation,
-        };
-        drop(state);
-        self.routes
-            .lock()
-            .expect("allocation-route lock poisoned")
-            .insert(
-                handle,
-                AllocationRoute::Current {
-                    instance,
-                    allocation,
-                },
-            );
-        Ok(handle)
+        let ptr = state.allocator.payload_ptr(allocation)?;
+        Ok((
+            InstanceAllocation {
+                instance,
+                allocation,
+            },
+            ptr,
+        ))
     }
 
     /// Resizes an allocation on its current carrier-owning instance.
@@ -130,53 +178,44 @@ impl ThreadSpecificAllocators {
         handle: InstanceAllocation,
         size: usize,
     ) -> Result<InstanceAllocation, AllocError> {
-        let route = self.ensure_current_route(handle)?;
-        let AllocationRoute::Current {
-            instance,
-            allocation,
-        } = route
-        else {
-            return Err(AllocError::Corrupt);
-        };
+        self.realloc_with_ptr(handle, size)
+            .map(|(handle, _)| handle)
+    }
+
+    /// Resizes an allocation and returns the handle and payload address it now has.
+    pub fn realloc_with_ptr(
+        &self,
+        handle: InstanceAllocation,
+        size: usize,
+    ) -> Result<(InstanceAllocation, *mut u64), AllocError> {
+        let (instance, allocation) = self.route(handle)?;
         let mut state = self.lock_instance(instance);
-        let drained = Self::drain_locked(&mut state)?;
-        self.clear_routes(drained);
+        self.drain_and_publish(instance, &mut state)?;
         let resized = state.allocator.realloc(allocation, size)?;
+        let ptr = state.allocator.payload_ptr(resized)?;
         self.publish_transfers(instance, &mut state)?;
-        self.routes
-            .lock()
-            .expect("allocation-route lock poisoned")
-            .insert(
-                handle,
-                AllocationRoute::Current {
-                    instance,
-                    allocation: resized,
-                },
-            );
-        Ok(handle)
+        // The new handle names the owning instance directly, so any route entry is stale.
+        self.forget_route(allocation.id());
+        Ok((
+            InstanceAllocation {
+                instance,
+                allocation: resized,
+            },
+            ptr,
+        ))
     }
 
     /// Frees immediately on the current instance or queues the free for its owner.
+    /// Port of erl_alloc_util.c:6216 (erts_alcu_free_thr_pref) delayed-dealloc enqueue, OTP-29.1.1.
     pub fn free(&self, handle: InstanceAllocation) -> Result<(), AllocError> {
-        let route = self.ensure_current_route(handle)?;
-        let AllocationRoute::Current {
-            instance,
-            allocation,
-        } = route
-        else {
-            return Err(AllocError::Corrupt);
-        };
+        let (instance, allocation) = self.route(handle)?;
         let current = self.current_instance();
         let mut state = self.lock_instance(instance);
         if current == instance {
-            let drained = Self::drain_locked(&mut state)?;
-            self.clear_routes(drained);
+            self.drain_and_publish(instance, &mut state)?;
             state.allocator.free(allocation)?;
             self.publish_transfers(instance, &mut state)?;
-            self.routes
-                .lock()
-                .expect("allocation-route lock poisoned")
-                .remove(&handle);
+            self.forget_route(allocation.id());
         } else {
             state.delayed.push_back((handle, allocation));
         }
@@ -190,13 +229,7 @@ impl ThreadSpecificAllocators {
         offset: usize,
         bytes: &[u8],
     ) -> Result<(), AllocError> {
-        let AllocationRoute::Current {
-            instance,
-            allocation,
-        } = self.ensure_current_route(handle)?
-        else {
-            return Err(AllocError::Corrupt);
-        };
+        let (instance, allocation) = self.route(handle)?;
         self.lock_instance(instance)
             .allocator
             .write(allocation, offset, bytes)
@@ -209,16 +242,18 @@ impl ThreadSpecificAllocators {
         offset: usize,
         out: &mut [u8],
     ) -> Result<(), AllocError> {
-        let AllocationRoute::Current {
-            instance,
-            allocation,
-        } = self.ensure_current_route(handle)?
-        else {
-            return Err(AllocError::Corrupt);
-        };
+        let (instance, allocation) = self.route(handle)?;
         self.lock_instance(instance)
             .allocator
             .read(allocation, offset, out)
+    }
+
+    /// Returns the stable payload address while the allocation remains live.
+    pub fn allocation_ptr(&self, handle: InstanceAllocation) -> Result<*mut u64, AllocError> {
+        let (instance, allocation) = self.route(handle)?;
+        self.lock_instance(instance)
+            .allocator
+            .allocation_ptr(allocation)
     }
 
     /// Processes the delayed-free queue for one instance.
@@ -257,16 +292,28 @@ impl ThreadSpecificAllocators {
         if !self.thread_specific {
             return 0;
         }
+        if let Some(instance) = LAST_INSTANCE.with(|cache| {
+            let (cache_id, instance) = cache[self.cache_id % INSTANCE_CACHE_SLOTS].get();
+            (cache_id == self.cache_id).then_some(instance)
+        }) {
+            return instance;
+        }
         let id = thread::current().id();
         let mut assignments = self
             .thread_instances
             .lock()
             .expect("thread-instance lock poisoned");
         if let Some(instance) = assignments.get(&id) {
+            LAST_INSTANCE.with(|cache| {
+                cache[self.cache_id % INSTANCE_CACHE_SLOTS].set((self.cache_id, *instance));
+            });
             return *instance;
         }
         let instance = assignments.len() % self.instances.len();
         assignments.insert(id, instance);
+        LAST_INSTANCE.with(|cache| {
+            cache[self.cache_id % INSTANCE_CACHE_SLOTS].set((self.cache_id, instance));
+        });
         instance
     }
 
@@ -301,16 +348,66 @@ impl ThreadSpecificAllocators {
         stats
     }
 
-    fn lock_instance(&self, instance: usize) -> std::sync::MutexGuard<'_, Instance> {
-        self.instances[instance]
-            .lock()
-            .expect("allocator lock poisoned")
+    #[inline]
+    fn lock_instance(&self, instance: usize) -> parking_lot::MutexGuard<'_, Instance> {
+        self.instances[instance].lock()
+    }
+
+    /// Runs queued cross-thread frees and hands abandoned carriers to the pool.
+    #[inline]
+    fn drain_and_publish(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
+        if !state.delayed.is_empty() {
+            let drained = Self::drain_locked(state)?;
+            self.clear_routes(drained);
+        }
+        self.publish_transfers(instance, state)
+    }
+
+    /// The instance owning `handle`'s block now, and the block's allocation there.
+    #[inline]
+    fn route(&self, handle: InstanceAllocation) -> Result<(usize, Allocation), AllocError> {
+        if self.routed.load(Ordering::Acquire) == 0 {
+            return Ok((handle.instance, handle.allocation));
+        }
+        match self.ensure_current_route(handle)? {
+            AllocationRoute::Current {
+                instance,
+                allocation,
+            } => Ok((instance, allocation)),
+            _ => Err(AllocError::Corrupt),
+        }
+    }
+
+    fn forget_route(&self, id: u64) {
+        if self.routed.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut routes = self.routes.lock().expect("allocation-route lock poisoned");
+        if routes.remove(&id).is_some() {
+            self.routed.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn set_route(
+        &self,
+        routes: &mut HashMap<u64, AllocationRoute>,
+        id: u64,
+        route: AllocationRoute,
+    ) {
+        if routes.insert(id, route).is_none() {
+            self.routed.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     fn clear_routes(&self, handles: Vec<InstanceAllocation>) {
+        if handles.is_empty() || self.routed.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let mut routes = self.routes.lock().expect("allocation-route lock poisoned");
         for handle in handles {
-            routes.remove(&handle);
+            if routes.remove(&handle.allocation.id()).is_some() {
+                self.routed.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -318,13 +415,16 @@ impl ThreadSpecificAllocators {
         &self,
         handle: InstanceAllocation,
     ) -> Result<AllocationRoute, AllocError> {
-        let route = self
-            .routes
-            .lock()
-            .expect("allocation-route lock poisoned")
-            .get(&handle)
-            .copied()
-            .ok_or(AllocError::InvalidAllocation)?;
+        let current_route = |routes: &HashMap<u64, AllocationRoute>| {
+            routes
+                .get(&handle.allocation.id())
+                .copied()
+                .unwrap_or(AllocationRoute::Current {
+                    instance: handle.instance,
+                    allocation: handle.allocation,
+                })
+        };
+        let route = current_route(&self.routes.lock().expect("allocation-route lock poisoned"));
         let (instance, id, homecoming) = match route {
             AllocationRoute::Current { .. } => return Ok(route),
             AllocationRoute::Pooled { pool_id, .. } => (self.current_instance(), pool_id, false),
@@ -354,6 +454,7 @@ impl ThreadSpecificAllocators {
                 .iter()
                 .position(|entry| entry.id == id)
                 .ok_or(AllocError::InvalidAllocation)?;
+            self.pooled.fetch_sub(1, Ordering::AcqRel);
             pool.swap_remove(index).transfer
         };
         let remapped = state.allocator.import_carrier_transfer(transfer)?;
@@ -370,12 +471,9 @@ impl ThreadSpecificAllocators {
             self.update_imported_routes(id, instance, remapped);
         }
         self.publish_transfers(instance, &mut state)?;
-        self.routes
-            .lock()
-            .expect("allocation-route lock poisoned")
-            .get(&handle)
-            .copied()
-            .ok_or(AllocError::InvalidAllocation)
+        Ok(current_route(
+            &self.routes.lock().expect("allocation-route lock poisoned"),
+        ))
     }
 
     fn fetch_for_size(
@@ -409,6 +507,7 @@ impl ThreadSpecificAllocators {
             return Ok(());
         };
         let entry = pool.swap_remove(index);
+        self.pooled.fetch_sub(1, Ordering::AcqRel);
         let pool_id = entry.id;
         let remapped = state.allocator.import_carrier_transfer(entry.transfer)?;
         drop(pool);
@@ -429,9 +528,9 @@ impl ThreadSpecificAllocators {
     ) {
         let mut routes = self.routes.lock().expect("allocation-route lock poisoned");
         for (old, new) in remapped {
-            if let Some(route) = routes.values_mut().find(|route| {
-            matches!(route, AllocationRoute::Pooled { pool_id: id, allocation } if *id == pool_id && allocation.id() == old.id())
-            }) {
+            if let Some(route) = routes.get_mut(&old.id())
+                && matches!(route, AllocationRoute::Pooled { pool_id: id, .. } if *id == pool_id)
+            {
                 *route = AllocationRoute::Current {
                     instance,
                     allocation: new,
@@ -448,9 +547,9 @@ impl ThreadSpecificAllocators {
     ) {
         let mut routes = self.routes.lock().expect("allocation-route lock poisoned");
         for (old, new) in remapped {
-            if let Some(route) = routes.values_mut().find(|route| {
-                matches!(route, AllocationRoute::Homecoming { homecoming_id: id, allocation } if *id == homecoming_id && allocation.id() == old.id())
-            }) {
+            if let Some(route) = routes.get_mut(&old.id())
+                && matches!(route, AllocationRoute::Homecoming { homecoming_id: id, .. } if *id == homecoming_id)
+            {
                 *route = AllocationRoute::Current {
                     instance,
                     allocation: new,
@@ -459,11 +558,12 @@ impl ThreadSpecificAllocators {
         }
     }
 
+    #[inline]
     fn publish_transfers(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
-        let transfers = state.allocator.take_pending_carriers();
-        if transfers.is_empty() {
+        if !state.allocator.has_pending_carriers() {
             return Ok(());
         }
+        let transfers = state.allocator.take_pending_carriers();
         let mut pool = self
             .carrier_pool
             .lock()
@@ -474,9 +574,7 @@ impl ThreadSpecificAllocators {
                 && pool.len() >= state.allocator.carrier_pool_limit()
             {
                 for (old, new) in state.allocator.import_carrier_transfer(transfer)? {
-                    if let Some(route) = routes.values_mut().find(|route| {
-                        matches!(route, AllocationRoute::Current { instance: owner, allocation } if *owner == instance && allocation.id() == old.id())
-                    }) {
+                    if let Some(route) = routes.get_mut(&old.id()) {
                         *route = AllocationRoute::Current {
                             instance,
                             allocation: new,
@@ -493,26 +591,21 @@ impl ThreadSpecificAllocators {
             };
             if transfer.origin_instance() == instance {
                 for (allocation, _) in transfer.allocations() {
-                    if let Some(route) = routes.values_mut().find(|route| {
-                        matches!(route, AllocationRoute::Current { instance: owner, allocation: live } if *owner == instance && live.id() == allocation.id())
-                    }) {
-                        *route = AllocationRoute::Pooled {
-                            pool_id: id,
-                            allocation: *allocation,
-                        };
-                    }
+                    self.set_route(
+                        &mut routes,
+                        allocation.id(),
+                        AllocationRoute::Pooled { pool_id: id },
+                    );
                 }
                 pool.push(PooledCarrier { id, transfer });
+                self.pooled.fetch_add(1, Ordering::AcqRel);
             } else {
                 for (allocation, _) in transfer.allocations() {
-                    if let Some(route) = routes.values_mut().find(|route| {
-                        matches!(route, AllocationRoute::Current { instance: owner, allocation: live } if *owner == instance && live.id() == allocation.id())
-                    }) {
-                        *route = AllocationRoute::Homecoming {
-                            homecoming_id: id,
-                            allocation: *allocation,
-                        };
-                    }
+                    self.set_route(
+                        &mut routes,
+                        allocation.id(),
+                        AllocationRoute::Homecoming { homecoming_id: id },
+                    );
                 }
                 self.homecomings
                     .lock()

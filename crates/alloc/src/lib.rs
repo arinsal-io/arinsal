@@ -7,4 +7,5 @@ pub mod mmap;
 pub mod mseg;
 #[allow(unsafe_code)]
 pub mod raw;
+pub mod typed;
 pub mod types;
