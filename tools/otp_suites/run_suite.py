@@ -291,8 +291,9 @@ def main() -> int:
         if result.returncode:
             print(result.stdout[-4000:], file=sys.stderr)
             return result.returncode
-    elif not pathlib.Path(arinsal).is_file():
-        result = run(["cargo", "build", "--release", "-p", "arinsal-cli"], 1200, cwd=ROOT)
+    elif args.arinsal is None:
+        # Always rebuild (a no-op when current) so a run never tests a stale binary.
+        result = run(["cargo", "build", "--release", "-p", "arinsal-cli"], 1800, cwd=ROOT)
         if result.returncode:
             print(result.stdout[-4000:], file=sys.stderr)
             return result.returncode
