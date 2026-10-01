@@ -110,20 +110,26 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
             let normalized = match name {
                 "fullsweep_after" => n.min(u16::MAX as i64),
                 "min_heap_size" => n.max(233),
-                "min_bin_vheap_size" => n.max(46_422),
+                "min_bin_vheap_size" => {
+                    crate::natives::sys::normalize_spawn_heap_minimum(Some(n as usize), true) as i64
+                }
                 _ => n,
             };
+            let previous_min_bin_vheap = process.heap.min_bin_vheap_size();
             if name == "fullsweep_after" {
                 process.heap.set_fullsweep_after(normalized as u16);
             }
             if name == "min_heap_size" {
                 process.heap.set_min_heap_size(normalized as usize);
             }
+            if name == "min_bin_vheap_size" {
+                process.heap.set_min_bin_vheap_size(normalized as u64);
+            }
             set_flag(process, name, Term::small(normalized).unwrap()).unwrap_or_else(|| {
                 Term::small(match name {
                     "fullsweep_after" => 65_535,
                     "min_heap_size" => 233,
-                    "min_bin_vheap_size" => 46_422,
+                    "min_bin_vheap_size" => previous_min_bin_vheap as i64,
                     _ => 0,
                 })
                 .unwrap()
@@ -467,13 +473,10 @@ fn process_info(
                 // Port of erts/emulator/beam/erl_bif_info.c:2072-2087
                 // (ERTS_PI_IX_GARBAGE_COLLECTION), OTP-29.1.1.
                 let entries = [
+                    ("max_heap_size", limit),
                     (
-                        "minor_gcs",
-                        Term::small(i64::from(process.heap.minor_gcs())).unwrap(),
-                    ),
-                    (
-                        "fullsweep_after",
-                        Term::small(i64::from(process.heap.fullsweep_after())).unwrap(),
+                        "min_bin_vheap_size",
+                        Term::small(process.heap.min_bin_vheap_size() as i64).unwrap(),
                     ),
                     (
                         "min_heap_size",
@@ -481,18 +484,50 @@ fn process_info(
                             .ok_or_else(badarg)?,
                     ),
                     (
-                        "min_bin_vheap_size",
-                        flag_value(process, "min_bin_vheap_size")
-                            .unwrap_or_else(|| Term::small(46_422).unwrap()),
+                        "fullsweep_after",
+                        Term::small(i64::from(process.heap.fullsweep_after())).unwrap(),
                     ),
-                    ("max_heap_size", limit),
+                    (
+                        "minor_gcs",
+                        Term::small(i64::from(process.heap.minor_gcs())).unwrap(),
+                    ),
                 ]
                 .into_iter()
                 .map(|(name, value)| make_tuple(process, &[atom(name), value]))
                 .collect::<Result<Vec<_>, _>>()?;
                 make_list(process, entries)?
             }
-            "garbage_collection_info" => Term::NIL,
+            "garbage_collection_info" => {
+                let entries = [
+                    ("old_heap_block_size", process.heap.old_heap_block_size()),
+                    ("heap_block_size", process.heap.heap_size_words()),
+                    ("mbuf_size", process.heap.fragment_words()),
+                    ("recent_size", process.heap.recent_words()),
+                    ("stack_size", process.heap.stack_words()),
+                    ("old_heap_size", process.heap.old_used_words()),
+                    ("heap_size", process.heap.used_words()),
+                    ("bin_vheap_size", process.heap.bin_vheap_used() as usize),
+                    (
+                        "bin_vheap_block_size",
+                        process.heap.bin_vheap_block_size() as usize,
+                    ),
+                    (
+                        "bin_old_vheap_size",
+                        process.heap.bin_old_vheap_used() as usize,
+                    ),
+                    (
+                        "bin_old_vheap_block_size",
+                        process.heap.bin_old_vheap_block_size() as usize,
+                    ),
+                ];
+                let rows = entries
+                    .into_iter()
+                    .map(|(name, value)| {
+                        make_tuple(process, &[atom(name), Term::small(value as i64).unwrap()])
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                make_list(process, rows)?
+            }
             "last_calls" => atom("false"),
             "sequential_trace_token" => crate::seq_trace::get_token_term(process, pid)?,
             "suspending" => suspending_term(process, pid)?,
@@ -514,8 +549,9 @@ fn process_info(
             "min_heap_size" => {
                 flag_value(process, "min_heap_size").unwrap_or_else(|| Term::small(233).unwrap())
             }
-            "min_bin_vheap_size" => flag_value(process, "min_bin_vheap_size")
-                .unwrap_or_else(|| Term::small(46_422).unwrap()),
+            "min_bin_vheap_size" => {
+                Term::small(process.heap.min_bin_vheap_size() as i64).ok_or_else(badarg)?
+            }
             "max_heap_size" => max_heap_term(process, pid)?,
             "parent" => atom("undefined"),
             _ => return Err(badarg()),
@@ -2178,8 +2214,14 @@ fn spawn_apply(
     let (module_id, entry) = crate::process::erlang_apply_entry(vm)?;
     let defaults = crate::natives::sys::gc_spawn_defaults();
     let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(options.min_heap, false);
-    let min_bin_vheap =
-        crate::natives::sys::normalize_spawn_heap_minimum(options.min_bin_vheap, true);
+    let min_bin_vheap = if options.min_bin_vheap.is_some()
+        && options.min_heap.is_none()
+        && options.max_heap.is_none()
+    {
+        defaults.min_bin_vheap_size as usize
+    } else {
+        crate::natives::sys::normalize_spawn_heap_minimum(options.min_bin_vheap, true)
+    };
     let fullsweep_after = options.fullsweep.unwrap_or(defaults.fullsweep_after);
     let max_heap = options.max_heap.unwrap_or(defaults.max_heap_size);
     let mut child = Process::with_spawn_registers(3, 0);
@@ -2187,6 +2229,7 @@ fn spawn_apply(
         child.heap = arinsal_term::ProcessHeap::with_words(min_heap.max(64));
     }
     child.heap.set_min_heap_size(min_heap);
+    child.heap.set_min_bin_vheap_size(min_bin_vheap as u64);
     child.heap.set_fullsweep_after(fullsweep_after);
     child.module = module_id;
     child.ip = entry;

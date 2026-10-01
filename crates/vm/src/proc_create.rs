@@ -307,6 +307,9 @@ impl Process {
         // Float-heavy BEAM code allocates short-lived boxes between tests.
         // Keeping a modest young generation avoids collecting every few instructions.
         heap.set_min_heap_size(min_heap);
+        heap.set_min_bin_vheap_size(
+            crate::natives::sys::gc_spawn_defaults().min_bin_vheap_size as u64,
+        );
         let mut process = Self {
             header: ProcessHeader::default(),
             x: vec![Term::NIL; x_registers].into_boxed_slice(),
@@ -373,7 +376,9 @@ impl Process {
         }
         self.gc_live = live;
         let words = words + self.heap.allocation_reserve();
-        if self.heap.free_words() >= words && !gc_stress_enabled() {
+        // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
+        if self.heap.free_words() >= words && !self.heap.bin_vheap_gc_due() && !gc_stress_enabled()
+        {
             return Ok(());
         }
         if !self.gc_enabled {

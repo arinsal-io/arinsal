@@ -221,7 +221,9 @@ impl Copier<'_> {
                                 .to
                                 .off_heap_binary_bytes
                                 .saturating_add(owner.len() as u64);
+                            let vheap_words = (owner.len() / 8) as u64;
                             target.push(owner);
+                            self.to.add_vheap(promote, vheap_words);
                         } else {
                             self.error = Some(TermError::BadArg);
                         }
@@ -242,7 +244,10 @@ impl Copier<'_> {
                             .find(|arc| Arc::as_ptr(arc) as usize == key)
                             .cloned();
                         if let Some(owner) = owner {
+                            let capacity = owner.capacity();
                             target.push(owner);
+                            let vheap_words = (capacity / 8) as u64;
+                            self.to.add_vheap(promote, vheap_words);
                             if promote {
                                 self.to.owners.old_writable_refs.push(term);
                             } else {
@@ -258,7 +263,9 @@ impl Copier<'_> {
                     } else {
                         &mut self.to.owners.off_heap
                     };
-                    if !target.iter().any(|arc| Arc::as_ptr(arc) as usize == key) {
+                    // erts keeps one ProcBin per reference in the MSO list (sweep_off_heap),
+                    // so refc binaries are not deduplicated per Binary.
+                    {
                         let owner = self
                             .from
                             .owners
@@ -272,7 +279,9 @@ impl Copier<'_> {
                                 .to
                                 .off_heap_binary_bytes
                                 .saturating_add(owner.len() as u64);
+                            let vheap_words = (owner.len() / 8) as u64;
                             target.push(owner);
+                            self.to.add_vheap(promote, vheap_words);
                         } else {
                             self.error = Some(TermError::BadArg);
                         }
@@ -629,7 +638,7 @@ impl ProcessHeap {
 
     /// Young heap, old heap, and fragment capacity in words.
     pub fn total_heap_size_words(&self) -> usize {
-        self.words.len() + self.old_words.len() + self.fragment_words
+        self.words.len() + self.old_words.len() + self.fragment_words as usize
     }
 
     /// Old generation capacity in words.
@@ -652,9 +661,19 @@ impl ProcessHeap {
         self.old_htop
     }
 
+    /// Capacity of the old heap block.
+    pub fn old_heap_block_size(&self) -> usize {
+        self.old_words.len()
+    }
+
+    /// Words allocated in the young heap at the last collection.
+    pub fn recent_words(&self) -> usize {
+        self.high_water
+    }
+
     /// Minimum young heap size configured for this process.
     pub fn min_heap_size_words(&self) -> usize {
-        self.min_heap_size
+        self.min_heap_size as usize
     }
 
     /// Number of minor collections since the latest full sweep.
@@ -675,10 +694,21 @@ impl ProcessHeap {
             || (!self.old_words.is_empty() && promote_bound > self.old_words.len())
     }
 
+    /// Whether a collection that starts as minor cannot be one and continues as a full sweep.
+    /// Port of erts/emulator/beam/erl_gc.c:1461-1488 and 1540 (`minor_collection` returning -1
+    /// when there is no old heap to tenure into or `bin_old_vheap` reached `bin_old_vheap_sz`),
+    /// OTP-29.1.1. erts traces the failed minor attempt before the major one.
+    pub fn minor_falls_back_to_major(&self) -> bool {
+        !self.collection_is_major()
+            && ((self.old_words.is_empty() && self.high_water == 0)
+                || (!self.old_words.is_empty()
+                    && self.owners.vheap.old_size <= self.owners.vheap.old))
+    }
+
     /// Whether heap fragments exceed the free young-generation area.
     /// Port of erl_gc.h:132-139 (`ERTS_IS_GC_DESIRED`), OTP-29.1.1.
     pub fn gc_desired(&self) -> bool {
-        self.free_words() < self.fragment_words
+        self.free_words() < self.fragment_words as usize
     }
 
     /// Whether a term points into the old generation.
@@ -736,7 +766,7 @@ impl ProcessHeap {
     pub fn set_min_heap_size(&mut self, words: usize) {
         // Port of erl_gc.c:345-349 (`next_heap_size`) and bif.c:2120-2129
         // (`min_heap_size`), OTP-29.1.1.
-        self.min_heap_size = normalize_heap_minimum(words);
+        self.min_heap_size = u32::try_from(normalize_heap_minimum(words)).unwrap_or(u32::MAX);
     }
 
     /// Number of live stack words.
@@ -790,7 +820,7 @@ impl ProcessHeap {
         min_free: usize,
     ) -> Result<GcStats, TermError> {
         let start = Instant::now();
-        let fragments = self.fragment_words;
+        let fragments = self.fragment_words as usize;
         let mut fragment_ranges = self
             .fragments
             .iter()
@@ -800,7 +830,9 @@ impl ProcessHeap {
             })
             .collect::<Vec<_>>();
         fragment_ranges.sort_unstable_by_key(|&(start, _)| start);
-        let major = self.collection_is_major();
+        // `MSO(p).overhead` before the sweep; erl_gc.c:3285 sizes the old virtual heap from it.
+        let young_overhead = self.bin_vheap;
+        let major = self.collection_is_major() || self.minor_falls_back_to_major();
         let stack = self.stack_words();
         let source_words = self
             .htop
@@ -825,14 +857,17 @@ impl ProcessHeap {
         } else {
             size_before.max(min_free.saturating_add(S_RESERVED))
         });
-        let mut capacity = next_heap_size(new_sz, 0, self.min_heap_size)?;
+        let mut capacity = next_heap_size(new_sz, 0, self.min_heap_size as usize)?;
         if major && self.heap_grow && capacity == self.words.len() {
-            capacity = next_heap_size(capacity, 1, self.min_heap_size)?;
+            capacity = next_heap_size(capacity, 1, self.min_heap_size as usize)?;
         }
         let mut next = ProcessHeap::with_words(capacity);
         next.stop = capacity - stack;
         next.frame_pointer = self.frame_pointer;
         next.min_heap_size = self.min_heap_size;
+        next.owners.vheap.min = self.owners.vheap.min;
+        next.bin_vheap_size = self.bin_vheap_size;
+        next.owners.vheap.old_size = self.owners.vheap.old_size;
         next.fullsweep_after = self.fullsweep_after;
         next.heap_grow = self.heap_grow;
         next.native_allocation = self.native_allocation;
@@ -856,6 +891,7 @@ impl ProcessHeap {
                 )
                 .sum()
         };
+        next.owners.vheap.old = if major { 0 } else { self.owners.vheap.old };
         if !major {
             next.old_words = std::mem::take(&mut self.old_words);
             if next.old_words.is_empty() && self.high_water > 0 {
@@ -952,6 +988,17 @@ impl ProcessHeap {
             words_reclaimed: size_before.saturating_sub((copied + promoted) as usize) as u64,
             nanoseconds: start.elapsed().as_nanos() as u64,
         };
+        // Port of erts/emulator/beam/erl_gc.c:3284-3289 (sweep_off_heap), OTP-29.1.1.
+        if major {
+            self.owners.vheap.old = 0;
+            self.owners.vheap.old_size = next_vheap_size(
+                young_overhead,
+                self.owners.vheap.old_size,
+                self.owners.vheap.min,
+            );
+        }
+        self.bin_vheap_size =
+            next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap.min);
         Ok(stats)
     }
 
@@ -976,26 +1023,26 @@ impl ProcessHeap {
             self.heap_grow = false;
             if need_after > capacity {
                 // Port of erl_gc.c:2073 (`adjust_after_fullsweep`).
-                Some(next_heap_size(need_after, 0, self.min_heap_size)?)
+                Some(next_heap_size(need_after, 0, self.min_heap_size as usize)?)
             } else if need_after.saturating_mul(4) > capacity.saturating_mul(3) {
                 // Port of erl_gc.c:2076 (`adjust_after_fullsweep`): defer growth.
                 self.heap_grow = true;
                 None
             } else if need_after.saturating_mul(4) < capacity
-                && capacity > self.min_heap_size.max(233)
+                && capacity > (self.min_heap_size as usize).max(233)
             {
                 // Port of erl_gc.c:2081 (`adjust_after_fullsweep`).
                 Some(next_heap_size(
                     need_after.saturating_mul(2),
                     0,
-                    self.min_heap_size,
+                    self.min_heap_size as usize,
                 )?)
             } else {
                 None
             }
         } else if need_after > capacity {
             // Port of erl_gc.c:1552 (`grow_new_heap`).
-            Some(next_heap_size(need_after, 0, self.min_heap_size)?)
+            Some(next_heap_size(need_after, 0, self.min_heap_size as usize)?)
         } else if capacity > 3000
             && need_after.saturating_mul(4) < capacity
             && (capacity > 8000 || capacity > old_len)
@@ -1006,8 +1053,8 @@ impl ProcessHeap {
             if wanted.saturating_mul(9) < old_len {
                 wanted = wanted.max(old_len / 8);
             }
-            let minimum = wanted.max(self.min_heap_size);
-            let minimum = next_heap_size(minimum, 0, self.min_heap_size)?;
+            let minimum = wanted.max(self.min_heap_size as usize);
+            let minimum = next_heap_size(minimum, 0, self.min_heap_size as usize)?;
             (minimum < capacity).then_some(minimum)
         } else {
             None
@@ -1335,6 +1382,26 @@ fn next_heap_size(minimum: usize, offset: usize, min_heap_size: usize) -> Result
         .copied()
         .map(|size| size.max(min_heap_size))
         .ok_or(TermError::SystemLimit)
+}
+
+// Port of erts/emulator/beam/erl_gc.c:2915-2958 (do_next_vheap_size), OTP-29.1.1.
+fn next_vheap_size(used: u64, current: u64, minimum: u64) -> u64 {
+    let mut size = current;
+    if used / 3 > size / 4 {
+        loop {
+            let grown = ((size as f64) * 1.618) as u64;
+            if grown < size {
+                break;
+            }
+            size = grown;
+            if used / 3 <= size / 4 {
+                break;
+            }
+        }
+    } else if used < size / 4 {
+        size >>= 1;
+    }
+    size.max(minimum)
 }
 
 #[cfg(test)]

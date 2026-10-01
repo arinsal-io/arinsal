@@ -234,15 +234,18 @@ pub struct ProcessHeap {
     pub(crate) old_words: WordBlock,
     pub(crate) old_htop: usize,
     pub(crate) high_water: usize,
-    pub(crate) min_heap_size: usize,
+    pub(crate) min_heap_size: u32,
     pub(crate) fullsweep_after: u16,
     pub(crate) minor_since_major: u16,
     pub(crate) off_heap_binary_bytes: u64,
+    pub(crate) bin_vheap: u64,
+    pub(crate) bin_vheap_size: u64,
     pub(crate) heap_grow: bool,
     pub(crate) native_allocation: bool,
     pub(crate) fragments: Vec<Fragment>,
     /// Total word capacity in process heap fragments (`mbuf_sz` in erts).
-    pub(crate) fragment_words: usize,
+    /// Words in heap fragments (u32 keeps the hot heap struct within 128 bytes).
+    pub(crate) fragment_words: u32,
     pub(crate) owners: LazyOwners,
 }
 
@@ -280,8 +283,26 @@ pub const S_RESERVED: usize = CP_WORDS + S_REDZONE;
 /// Stack words BeamAsm code may borrow below E to address X registers past the register
 /// cache as stack slots. Native heap checks and native-mode runtime allocation keep them free.
 pub const NATIVE_SPILL_WORDS: usize = 72;
+/// Rarely touched virtual binary heap state, kept out of the hot `ProcessHeap`.
+pub(crate) struct VheapCold {
+    pub(crate) old: u64,
+    pub(crate) old_size: u64,
+    pub(crate) min: u64,
+}
+
+impl Default for VheapCold {
+    fn default() -> Self {
+        Self {
+            old: 0,
+            old_size: 46_422,
+            min: 46_422,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct HeapOwners {
+    pub(crate) vheap: VheapCold,
     pub(crate) off_heap: Vec<Arc<Vec<u8>>>,
     pub(crate) writable: Vec<Arc<WritableBinary>>,
     pub(crate) external: Vec<Arc<ExternalBinary>>,
@@ -349,6 +370,8 @@ impl ProcessHeap {
             fullsweep_after: u16::MAX,
             minor_since_major: 0,
             off_heap_binary_bytes: 0,
+            bin_vheap: 0,
+            bin_vheap_size: 46_422,
             heap_grow: false,
             native_allocation: false,
             fragments: Vec::new(),
@@ -475,7 +498,9 @@ impl ProcessHeap {
     }
     /// Allocate a side fragment when a BIF cannot collect at this point.
     pub fn heap_fragment(&mut self, words: usize) -> *mut u64 {
-        self.fragment_words = self.fragment_words.saturating_add(words);
+        self.fragment_words = self
+            .fragment_words
+            .saturating_add(u32::try_from(words).unwrap_or(u32::MAX));
         self.fragments.push(Fragment::Block(WordBlock::new(
             words,
             ErtsAlcType::HEAP_FRAG,
@@ -498,15 +523,23 @@ impl ProcessHeap {
             return Err(AdoptError::NotStandalone);
         }
         // The block moves with its terms; no word is copied.
-        let adopted_words = source.words.len().saturating_add(source.fragment_words);
-        self.fragment_words = self.fragment_words.saturating_add(adopted_words);
+        let adopted_words = source
+            .words
+            .len()
+            .saturating_add(source.fragment_words as usize);
+        self.fragment_words = self
+            .fragment_words
+            .saturating_add(u32::try_from(adopted_words).unwrap_or(u32::MAX));
         self.fragments
             .push(Fragment::Block(std::mem::take(&mut source.words)));
         self.fragments.append(&mut source.fragments);
         if let Some(mut owners) = source.owners.0.take() {
+            let source_old_vheap = owners.vheap.old;
             self.off_heap_binary_bytes = self
                 .off_heap_binary_bytes
                 .saturating_add(source.off_heap_binary_bytes);
+            self.bin_vheap = self.bin_vheap.saturating_add(source.bin_vheap);
+            self.owners.vheap.old = self.owners.vheap.old.saturating_add(source_old_vheap);
             if let Some(target) = self.owners.0.as_mut() {
                 target.off_heap.append(&mut owners.off_heap);
                 target.writable.append(&mut owners.writable);
@@ -543,31 +576,82 @@ impl ProcessHeap {
         self.off_heap_binary_bytes
     }
 
-    /// Return each retained off-heap binary's identity, byte length, and owner count.
+    /// Return one `(identity, byte length, refcount)` per retained refc binary reference.
+    ///
+    /// Port of erts/emulator/beam/erl_bif_info.c:179 (erts_bld_bin_list), OTP-29.1.1: every
+    /// reference in the off-heap list is reported separately, newest first.
     pub fn off_heap_binary_info(&self) -> Vec<(usize, usize, usize)> {
-        let mut binaries = std::collections::HashMap::new();
-        for binary in self.owners.off_heap.iter().chain(&self.owners.old_off_heap) {
-            binaries.insert(
+        let o = &self.owners;
+        let mut out = Vec::new();
+        for binary in o.off_heap.iter().chain(&o.old_off_heap) {
+            out.push((
                 Arc::as_ptr(binary) as usize,
-                (binary.len(), Arc::strong_count(binary)),
-            );
+                binary.len(),
+                Arc::strong_count(binary),
+            ));
         }
-        for binary in self.owners.writable.iter().chain(&self.owners.old_writable) {
-            binaries.insert(
+        for binary in o.writable.iter().chain(&o.old_writable) {
+            out.push((
                 Arc::as_ptr(binary) as usize,
-                (binary.len(), Arc::strong_count(binary)),
-            );
+                binary.len(),
+                Arc::strong_count(binary),
+            ));
         }
-        for binary in self.owners.external.iter().chain(&self.owners.old_external) {
-            binaries.insert(
+        for binary in o.external.iter().chain(&o.old_external) {
+            out.push((
                 Arc::as_ptr(binary) as usize,
-                (binary.len(), Arc::strong_count(binary)),
-            );
+                binary.len(),
+                Arc::strong_count(binary),
+            ));
         }
-        binaries
-            .into_iter()
-            .map(|(pointer, (bytes, refs))| (pointer, bytes, refs))
-            .collect()
+        out.reverse();
+        out
+    }
+
+    /// Minimum virtual binary heap capacity, in machine words.
+    pub fn min_bin_vheap_size(&self) -> u64 {
+        self.owners.vheap.min
+    }
+
+    /// Current young virtual binary heap usage, in machine words.
+    pub fn bin_vheap_used(&self) -> u64 {
+        self.bin_vheap
+    }
+
+    /// Current old virtual binary heap usage, in machine words.
+    pub fn bin_old_vheap_used(&self) -> u64 {
+        self.owners.vheap.old
+    }
+
+    /// Current young virtual binary heap block size, in machine words.
+    pub fn bin_vheap_block_size(&self) -> u64 {
+        self.bin_vheap_size
+    }
+
+    /// Current old virtual binary heap block size, in machine words.
+    pub fn bin_old_vheap_block_size(&self) -> u64 {
+        self.owners.vheap.old_size
+    }
+
+    /// Set the process minimum used by virtual binary heap growth.
+    pub fn set_min_bin_vheap_size(&mut self, words: u64) {
+        self.owners.vheap.min = words.max(46_422);
+        self.bin_vheap_size = self.bin_vheap_size.max(self.owners.vheap.min);
+        self.owners.vheap.old_size = self.owners.vheap.old_size.max(self.owners.vheap.min);
+    }
+
+    /// Account `words` of virtual binary heap to the young or old counter.
+    pub(crate) fn add_vheap(&mut self, promote: bool, words: u64) {
+        if promote {
+            self.owners.vheap.old = self.owners.vheap.old.saturating_add(words);
+        } else {
+            self.bin_vheap = self.bin_vheap.saturating_add(words);
+        }
+    }
+
+    /// Whether off-heap binary overhead has reached the young virtual heap limit.
+    pub fn bin_vheap_gc_due(&self) -> bool {
+        self.bin_vheap > self.bin_vheap_size
     }
 }
 impl Default for ProcessHeap {
@@ -593,12 +677,17 @@ impl HeapAlloc for ProcessHeap {
         Some(ptr)
     }
     fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+        // Port of erts/emulator/beam/erl_message.h:85 (OH_OVERHEAD), OTP-29.1.1.
+        self.bin_vheap = self.bin_vheap.saturating_add((binary.len() / 8) as u64);
         self.off_heap_binary_bytes = self
             .off_heap_binary_bytes
             .saturating_add(binary.len() as u64);
         self.owners.off_heap.push(binary);
     }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+        self.bin_vheap = self
+            .bin_vheap
+            .saturating_add((binary.capacity() / 8) as u64);
         self.owners.writable.push(binary);
         Ok(())
     }

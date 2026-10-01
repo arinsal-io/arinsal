@@ -573,8 +573,10 @@ fn promotion_closes_old_graph_without_young_references() {
         .cons(Term::small(9).unwrap(), Term::NIL)
         .unwrap();
     let mut roots = [TermBuilder::new(&mut heap).tuple(&[leaf, leaf]).unwrap()];
+    // erts runs the first collection of a heap without old heap or mature data as a full
+    // sweep (erl_gc.c:1461-1488); the second one then tenures the data.
     let first = heap.collect(&mut roots, &mut [], 0).unwrap();
-    assert_eq!(first.minor_collections, 1);
+    assert_eq!(first.major_collections, 1);
     assert_eq!(heap.old_used_words(), 0);
     let second = heap.collect(&mut roots, &mut [], 0).unwrap();
     assert!(second.words_promoted >= 5);
@@ -660,6 +662,14 @@ fn trees_like_short_lived_tuples_copy_few_words() {
         .map(|i| Term::small(i).unwrap())
         .collect::<Vec<_>>();
     let mut roots = [TermBuilder::new(&mut heap).tuple(&leaves).unwrap()];
+    // The first collection is a full sweep without an old heap (erl_gc.c:1461-1488);
+    // run it up front so the measured loop only sees minor collections.
+    assert_eq!(
+        heap.collect(&mut roots, &mut [], 0)
+            .unwrap()
+            .major_collections,
+        1
+    );
     let mut minor = 0;
     let mut major = 0;
     let mut copied = 0;

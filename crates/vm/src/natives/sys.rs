@@ -2602,12 +2602,14 @@ struct SystemFlags {
 pub(crate) struct GcSpawnDefaults {
     pub(crate) fullsweep_after: u16,
     pub(crate) max_heap_size: crate::process::MaxHeap,
+    pub(crate) min_bin_vheap_size: i64,
 }
 
 pub(crate) fn gc_spawn_defaults() -> GcSpawnDefaults {
     with_flags(|flags| GcSpawnDefaults {
         fullsweep_after: flags.fullsweep_after,
         max_heap_size: flags.max_heap,
+        min_bin_vheap_size: flags.min_bin_vheap_size,
     })
 }
 

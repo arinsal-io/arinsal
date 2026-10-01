@@ -1371,6 +1371,33 @@ pub fn load_with_instrumentations(
         if entry_points.contains(&(index + 1)) {
             continue;
         }
+        // Port of erts/emulator/beam/jit/arm/ops.tab:868-872 (call_fun + deallocate + return =>
+        // i_call_fun_last), OTP-29.1.1: the caller frame must not stay live during the call.
+        if let (
+            Instr::CallFun {
+                arity,
+                src,
+                dealloc: 0,
+                tail: false,
+            },
+            Some(Instr::Deallocate { slots }),
+            Some(Instr::ReturnInstr),
+        ) = (
+            code[index],
+            code.get(index + 1).copied(),
+            code.get(index + 2).copied(),
+        ) && !entry_points.contains(&(index + 2))
+        {
+            code[index] = Instr::CallFun {
+                arity,
+                src,
+                dealloc: slots,
+                tail: true,
+            };
+            code[index + 1] = Instr::CodeEnd;
+            code[index + 2] = Instr::CodeEnd;
+            continue;
+        }
         let fused = match (code[index], code[index + 1]) {
             (Instr::MoveXX { src, dst }, Instr::CallLocal { target }) => {
                 Some(Instr::MoveCallLocal { src, dst, target })

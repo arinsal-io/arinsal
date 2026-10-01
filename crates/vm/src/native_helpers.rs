@@ -704,8 +704,20 @@ fn invoke_dispatch_bif(header: *mut ProcessHeader, identity: usize) -> Option<u6
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     match result {
         Ok(value) => {
-            let value = crate::native_hooks::raw(value);
+            let mut value = crate::native_hooks::raw(value);
             process.x[0] = value_term(value);
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif,
+            // ERTS_IS_GC_AFTER_BIF_DESIRED), OTP-29.1.1: collect with the result as only root.
+            if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
+                if process.collect_bin_vheap_if_due(0).is_err() {
+                    crate::native_hooks::set_error(process, "system_limit");
+                    publish_dispatch_x(process, registers);
+                    process.sync_native_header();
+                    return Some(0);
+                }
+                registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+                value = crate::native_hooks::raw(process.x[0]);
+            }
             publish_dispatch_x(process, registers);
             process.sync_native_header();
             Some(value)

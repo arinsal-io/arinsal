@@ -1567,6 +1567,9 @@ impl Executor {
         }
         let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
         let running_fields = running.as_slice();
+        if matches!(result, Ok(RunState::Yield | RunState::Wait { .. })) {
+            process.collect_bin_vheap_if_due(process.x.len())?;
+        }
         crate::trace::emit(
             Some(&mut self.vm),
             process,
@@ -3198,7 +3201,9 @@ impl Process {
     /// the BIF result is the only live register.
     #[inline]
     pub(crate) fn gc_after_bif(&mut self, result: Term) -> Result<Term, VmError> {
-        if !self.heap.gc_desired() {
+        // ERTS_IS_GC_AFTER_BIF_DESIRED: heap fragments or a virtual binary heap over its size;
+        // `F_DISABLE_GC` returns before any collection (erl_gc.c:403-415).
+        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.gc_enabled {
             return Ok(result);
         }
         let mut roots = [result];
@@ -3301,7 +3306,14 @@ impl Process {
         let traced = self
             .self_pid
             .filter(|&pid| crate::trace::flags(self, pid) & crate::trace::GC != 0);
-        let end_tag = if self.heap.collection_is_major() {
+        if let Some(pid) = traced
+            && self.heap.minor_falls_back_to_major()
+        {
+            // erts traces the minor attempt that returned -1 before the major collection.
+            self.trace_gc(pid, "gc_minor_start", min_free);
+            self.trace_gc(pid, "gc_minor_end", 0);
+        }
+        let end_tag = if self.heap.collection_is_major() || self.heap.minor_falls_back_to_major() {
             "gc_major_end"
         } else {
             "gc_minor_end"
@@ -3347,6 +3359,25 @@ impl Process {
         }
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
         Ok(stats)
+    }
+
+    /// Collect after a BIF left heap fragments larger than the free area or pushed the
+    /// virtual binary heap over its limit.
+    // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
+    pub(crate) fn collect_bin_vheap_if_due(&mut self, live_x: usize) -> Result<(), VmError> {
+        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.gc_enabled {
+            return Ok(());
+        }
+        let mut result = [self.x[0]];
+        let stats = self.collect_heap_roots(live_x, &mut result, 0)?;
+        self.x[0] = result[0];
+        crate::natives::sys::after_collection(
+            self,
+            live_x,
+            stats.collections,
+            stats.words_reclaimed,
+        );
+        Ok(())
     }
 
     // Port of erts/emulator/beam/beam_bif_load.c:1149 (check_process_code), OTP-29.1.1.
@@ -3456,6 +3487,9 @@ impl Task for Process {
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, budget));
         if matches!(outcome, RunOutcome::Exit(_)) {
             arinsal_pterm::global_store().process_exited(&self._persistent_terms);
+            // Port of erts/emulator/beam/erl_process.c (erts_continue_exit_process): the exited
+            // process frees its heap and off-heap list, dropping its refc binary references.
+            self.heap = ProcessHeap::new();
         }
         outcome
     }

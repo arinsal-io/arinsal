@@ -166,10 +166,14 @@ pub(crate) fn specialize(op: Opcode, [a, b, c]: [Arg; 3], lists: &[Box<[Arg]>]) 
         Opcode::CallFun => Some(Instr::CallFun {
             arity: u16_value(a)?,
             src: Arg::new(Arg::X, a.value()),
+            dealloc: 0,
+            tail: false,
         }),
         Opcode::CallFun2 => Some(Instr::CallFun {
             arity: u16_value(b)?,
             src: c,
+            dealloc: 0,
+            tail: false,
         }),
         Opcode::Apply | Opcode::ApplyLast => Some(Instr::Apply {
             arity: u16_value(a)?,

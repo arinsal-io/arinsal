@@ -375,7 +375,11 @@ fn spawn_mfa(
     let (module_id, ip) = vm.spawn_export(m, f, args.len() as u8)?;
     let mut child = Process::with_spawn_registers(args.len(), 0);
     if let Some(words) = min_heap_size {
+        // Port of erts/emulator/beam/erl_process.c:12594 (erl_create_process, min_heap_size
+        // rounded up by erts_next_heap_size), OTP-29.1.1.
+        let words = crate::natives::sys::normalize_spawn_heap_minimum(Some(words), false);
         child.heap = arinsal_term::ProcessHeap::with_words(words.max(64));
+        child.heap.set_min_heap_size(words);
     }
     child.module = module_id;
     child.ip = ip;
@@ -546,7 +550,11 @@ fn spawn_fun(
     let (target, free_count) = (lambda.target, lambda.num_free);
     let mut child = Process::with_spawn_registers(free_count, 0);
     if let Some(words) = min_heap_size {
+        // Port of erts/emulator/beam/erl_process.c:12594 (erl_create_process, min_heap_size
+        // rounded up by erts_next_heap_size), OTP-29.1.1.
+        let words = crate::natives::sys::normalize_spawn_heap_minimum(Some(words), false);
         child.heap = arinsal_term::ProcessHeap::with_words(words.max(64));
+        child.heap.set_min_heap_size(words);
     }
     child.module = module_id;
     child.ip = target;
@@ -675,6 +683,7 @@ impl SpawnTuning {
         }
         if let Some(words) = self.min_bin_vheap {
             let words = crate::natives::sys::normalize_spawn_heap_minimum(Some(words), true);
+            child.heap.set_min_bin_vheap_size(words as u64);
             child.cold_mut().flags.insert(
                 "min_bin_vheap_size".to_owned(),
                 Term::small(words as i64).unwrap(),
@@ -813,6 +822,11 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
         } else {
             return Err(badarg("erlang:spawn_opt"));
         }
+    }
+    // The child keeps the system default virtual binary heap minimum unless `min_heap_size` or
+    // `max_heap_size` is also given (verified against `erl` 29.1.1).
+    if opts.min_heap_size.is_none() && opts.tuning.max_heap.is_none() {
+        opts.tuning.min_bin_vheap = None;
     }
     let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(opts.min_heap_size, false);
     if opts

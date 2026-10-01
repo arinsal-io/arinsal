@@ -344,7 +344,15 @@ pub enum Instr {
     /// Construct a local closure from a lambda table entry.
     MakeFun { index: u32, dst: Arg, env: u32 },
     /// Invoke a fun with arguments in X registers.
-    CallFun { arity: u16, src: Arg },
+    ///
+    /// `tail` is set when the loader fused `call_fun2 + deallocate + return` (erts
+    /// `i_call_fun_last`), so the caller frame of `dealloc` slots is released first.
+    CallFun {
+        arity: u16,
+        src: Arg,
+        dealloc: u16,
+        tail: bool,
+    },
     /// Invoke an exported function named by X[arity] and X[arity + 1].
     Apply {
         arity: u16,

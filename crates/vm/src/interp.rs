@@ -3354,7 +3354,12 @@ impl Vm {
                         continue;
                     }
                 }
-                Instr::CallFun { arity, src } => {
+                Instr::CallFun {
+                    arity,
+                    src,
+                    dealloc,
+                    tail,
+                } => {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: `ip` and `base` point into this module's code.
                     let offset = unsafe { ip.offset_from(base) } as usize;
@@ -3362,8 +3367,11 @@ impl Vm {
                     p.ip = offset;
                     p.reductions = reds;
                     let fun = p.read(src)?;
+                    if dealloc > 0 && !p.heap.release_stack(dealloc as usize) {
+                        return Err(VmError::Load("stack underflow in call_fun".into()));
+                    }
                     let outcome =
-                        self.call_fun_term(p, fun, arity as usize, false, ctx.as_deref_mut())?;
+                        self.call_fun_term(p, fun, arity as usize, tail, ctx.as_deref_mut())?;
                     // call_fun may grow X to hold the closure environment.
                     x = p.x.as_mut_ptr();
                     module_id = p.module;
