@@ -992,6 +992,10 @@ pub(crate) fn collect_heap(
     major: bool,
     keep: &mut [Term],
 ) -> Result<(), VmError> {
+    if !process.gc_enabled {
+        process.gc_deferred = true;
+        return Ok(());
+    }
     if major {
         process.heap.set_fullsweep_after(0);
     }

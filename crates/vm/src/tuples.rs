@@ -1,6 +1,6 @@
 //! Tuple access on decoded register operands.
 
-use arinsal_term::Term;
+use arinsal_term::{Term, TermKind, term_sequence};
 
 /// Write a pair into three words reserved by the interpreter cursor.
 #[inline(always)]
@@ -16,6 +16,9 @@ pub(super) fn pair(ptr: *mut u64, a: Term, b: Term) -> Term {
 
 #[inline(always)]
 pub(super) fn element(tuple: Term, index: usize) -> Option<Term> {
+    if tuple.classify() == TermKind::Record {
+        return term_sequence(tuple)?.get(index).copied();
+    }
     // SAFETY: The caller retains the tuple's heap throughout this instruction.
     let bits = unsafe { tuple.raw_bits() };
     if bits & 3 != 2 {

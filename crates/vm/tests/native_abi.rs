@@ -716,6 +716,568 @@ fn inet_udp_open_trace_matches_otp_with_native_open() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
+fn unaligned_binary_order_matches_interpreter_and_beamasm() {
+    const CHILD: &str = "ARINSAL_UNALIGNED_ORDER_CHILD";
+    const MODULE: &str = "unaligned_literal_order_vm_test";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let beam = std::fs::read(path).unwrap();
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let result = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        assert_eq!(result.term, OwnedTerm::Atom("ok".into()));
+        println!("RESULT:ok");
+        return;
+    }
+
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let source = r#"-module(unaligned_literal_order_vm_test).
+        -export([run/0]).
+        run() ->
+            B1 = list_to_binary([7,8,9]),
+            {_,B2} = split_binary(list_to_binary([0,1,3,1,2,3,4]),3),
+            B3 = list_to_binary([1,2,3,5]),
+            U = erts_debug:unaligned_bitstring(B2,3),
+            false = B1 == B2,
+            false = B1 =:= B2,
+            true = B1 /= B2,
+            true = B1 =/= B2,
+            true = B1 > B2,
+            true = B2 < B3,
+            true = B2 =< B1,
+            true = B2 =< B3,
+            true = B2 =:= U,
+            true = B2 == U,
+            true = U < B3,
+            true = U =< B3,
+            ExactU = erts_debug:unaligned_bitstring(<<1,2,3,4>>,3),
+            true = ExactU < <<1,2,3,5>>,
+            true = ExactU =< <<1,2,3,5>>,
+            true = B1 > 0,
+            ok.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::Atom("ok".into()))
+    );
+
+    let dir = std::env::temp_dir().join(format!("arinsal-unaligned-order-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let beam_path = dir.join(format!("{MODULE}.beam"));
+    std::fs::write(&beam_path, beam).unwrap();
+    for native in [false, true] {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unaligned_binary_order_matches_interpreter_and_beamasm",
+                "--nocapture",
+            ])
+            .env(CHILD, &beam_path)
+            .env("ARINSAL_BEAMASM", if native { "1" } else { "0" })
+            .env("ARINSAL_BEAMASM_MODULES", MODULE)
+            .env("ARINSAL_BEAMASM_STATS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} run failed: {}",
+            if native { "BeamAsm" } else { "interpreter" },
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("RESULT:ok"),
+            "{} run did not return ok",
+            if native { "BeamAsm" } else { "interpreter" }
+        );
+        if native {
+            let stats = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stats.contains("modules=1"),
+                "BeamAsm did not compile the module: {stats}"
+            );
+            assert!(
+                !stats.contains("native_functions=0"),
+                "BeamAsm did not compile any functions: {stats}"
+            );
+            assert!(
+                !stats.contains("native_calls=0"),
+                "BeamAsm did not execute native code: {stats}"
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_etf_trap_does_not_leak_into_following_bifs() {
+    const MODULE: &str = "malformed_etf_trap_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    let source = r#"-module(malformed_etf_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            B1 = <<7,8,9>>,
+            B2 = <<7,8,8>>,
+            Malformed = <<131,(binary:copy(<<104,1>>,270000))/binary,255>>,
+            _ = erts_debug:set_internal_state(available_internal_state, true),
+            _ = erts_debug:set_internal_state(reds_left, 1),
+            badarg = try binary_to_term(Malformed) of
+                         _ -> unexpected_success
+                     catch
+                         error:badarg -> badarg
+                     end,
+            true = B1 > B2,
+            true = B1 > 0,
+            true = is_binary(B1),
+            {B1 > B2, B1 > 0, is_binary(B1)}.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::Tuple(vec![
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+        ]))
+    );
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
+    assert_eq!(
+        canonical,
+        OwnedTerm::Tuple(vec![
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+        ])
+    );
+}
+
+#[test]
+fn compressed_etf_decode_resumes_across_output_chunks() {
+    const MODULE: &str = "compressed_etf_trap_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(compressed_etf_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            Value = list_to_tuple(lists:duplicate(300000, repeated_atom)),
+            Encoded = term_to_binary(Value, [compressed]),
+            tuple_size(binary_to_term(Encoded)).
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::Int(300000))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(actual.term, OwnedTerm::Int(300000));
+}
+
+#[test]
+fn nested_map_etf_decode_resumes_after_low_reductions() {
+    const MODULE: &str = "nested_map_etf_trap_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(nested_map_etf_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            Small = #{a => 1, b => 2, c => 3},
+            Left = maps:from_list([{list_to_atom(integer_to_list(16#cafe + N*N*N, 36)), N}
+                                   || N <- lists:seq(1, 33)]),
+            Right = maps:from_list([{list_to_atom(integer_to_list(16#dead + N, 36)), N}
+                                    || N <- lists:seq(1, 50)]),
+            Extra = #{Small => a, Left => Right, Right => Left,
+                      [Left, Right] => Left, <<"abc">> => Small,
+                      <<"qrs">> => Left, <<"xyz">> => Right},
+            Term = maps:merge(Left, Extra),
+            Bin = term_to_binary(Term, [deterministic]),
+            Plain = term_to_binary(Term),
+            Minor1 = term_to_binary(Term, [{minor_version, 1}]),
+            Compressed = term_to_binary(Term, [compressed]),
+            Unaligned = erts_debug:unaligned_bitstring(Plain, 3),
+            Extended = <<Plain/binary, 1, 2, 3>>,
+            CompressedUnaligned = erts_debug:unaligned_bitstring(Compressed, 3),
+            CompressedExtended = <<Compressed/binary, 1, 2, 3>>,
+            _ = erts_debug:set_internal_state(available_internal_state, true),
+            {check(Bin, [], Term),
+             check(Plain, [safe], Term),
+             check(Minor1, [], Term),
+             check(Compressed, [], Term),
+             check(Unaligned, [], Term),
+             check(Extended, [], Term),
+             check_used(Plain, Term, byte_size(Plain)),
+             check_used(Extended, Term, byte_size(Plain)),
+             check_used(Unaligned, Term, byte_size(Plain)),
+             check_used(Compressed, Term, byte_size(Compressed)),
+             check_used(CompressedUnaligned, Term, byte_size(Compressed)),
+             check_used(CompressedExtended, Term, byte_size(Compressed)),
+             map_size(Term)}.
+        check(Bin, Options, Term) ->
+            _ = erts_debug:set_internal_state(reds_left, 1),
+            try binary_to_term(Bin, Options) of
+                Term -> true;
+                _ -> false
+            catch error:badarg -> false
+            end.
+        check_used(Bin, Term, Used) ->
+            _ = erts_debug:set_internal_state(reds_left, 1),
+            try binary_to_term(Bin, [used]) of
+                {Term, Used} -> true;
+                _ -> false
+            catch error:badarg -> false
+            end.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::Tuple(vec![
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::Int(40),
+        ]))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(
+        actual.term,
+        OwnedTerm::Tuple(vec![
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::atom("true"),
+            OwnedTerm::Int(40),
+        ])
+    );
+}
+
+#[test]
+fn code_mod_permission_waiter_yields_to_the_lock_owner() {
+    const MODULE: &str = "code_mod_permission_trap_vm_test";
+    let _serial = NATIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(code_mod_permission_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            _ = erts_debug:set_internal_state(available_internal_state, true),
+            true = erts_debug:set_internal_state(code_mod_permission, true),
+            Parent = self(),
+            _Pid = spawn(fun() ->
+                Parent ! attempting,
+                true = erts_debug:set_internal_state(code_mod_permission, true),
+                Parent ! acquired,
+                true = erts_debug:set_internal_state(code_mod_permission, false)
+            end),
+            receive attempting -> ok end,
+            erlang:bump_reductions(100000),
+            true = erts_debug:set_internal_state(code_mod_permission, false),
+            receive acquired -> released_after_yield after 1000 -> timeout end.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::atom("released_after_yield"))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(actual.term, OwnedTerm::atom("released_after_yield"));
+}
+
+#[test]
+fn apply_yield_keeps_completed_bif_result_in_x0() {
+    const MODULE: &str = "apply_yield_result_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(apply_yield_result_vm_test).
+        -export([run/0]).
+        run() -> loop(200000).
+        loop(0) -> true;
+        loop(N) ->
+            true = try apply(erlang, '>', [<<7,8,9>>, N]) of
+                       Value -> Value
+                   catch
+                       _:_ -> x
+                   end,
+            loop(N - 1).
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::atom("true"))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(actual.term, OwnedTerm::atom("true"));
+}
+
+#[test]
+fn deferred_gc_after_applied_binary_to_term_keeps_caller_roots() {
+    const MODULE: &str = "apply_binary_to_term_gc_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(apply_binary_to_term_gc_vm_test).
+        -export([run/0, worker/4]).
+        run() ->
+            Pid = spawn(apply_binary_to_term_gc_vm_test, worker,
+                        [binary_to_term,
+                         fun() -> [term_to_binary(lists:duplicate(2000000, 2000000))] end,
+                         1000, self()]),
+            receive ok -> ok end,
+            Ref = make_ref(),
+            erlang:garbage_collect(Pid, [{async, Ref}]),
+            receive after 1 -> ok end,
+            exit(Pid, kill),
+            receive {garbage_collect, Ref, _} -> ok after 30000 -> timeout end.
+        worker(Bif, ArgFun, N, Parent) ->
+            Args = ArgFun(),
+            Parent ! ok,
+            loop(Bif, Args, N).
+        loop(_, _, 0) -> ok;
+        loop(Bif, Args, N) ->
+            apply(erlang, Bif, Args),
+            loop(Bif, Args, N - 1).
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::atom("ok"))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(actual.term, OwnedTerm::atom("ok"));
+}
+
+#[test]
+fn traced_apply_resumes_trap_without_caller_import() {
+    // The caller neither imports the BIF nor calls it statically, and the running trace
+    // makes every yield observable: a trap that restarted on resume would never finish.
+    const MODULE: &str = "traced_apply_trap_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(traced_apply_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            {M, F} = binary_to_term(<<131,104,2,100,0,6,"erlang",100,0,14,"list_to_binary">>),
+            Self = self(),
+            {Pid, Mon} = spawn_monitor(fun() ->
+                A = [[ok_list(lists:seq(1, 1000000)), oops]],
+                try
+                    erlang:yield(),
+                    erlang:trace(self(), true, [running, {tracer, Self}]),
+                    apply(M, F, [A])
+                catch error:badarg:Stk ->
+                    erlang:trace(self(), false, [running, {tracer, Self}]),
+                    [{M, F, [A], _} | _] = Stk,
+                    exit(normal)
+                end
+            end),
+            normal = receive {'DOWN', Mon, process, Pid, Reason} -> Reason end,
+            Td = erlang:trace_delivered(Pid),
+            receive {trace_delivered, Pid, Td} -> ok end,
+            yields(Pid, 0) > 2.
+        ok_list(L) -> [X rem 256 || X <- L].
+        yields(Pid, N) ->
+            receive
+                {trace, Pid, out, {erts_internal, list_to_bitstring_continue, 1}} ->
+                    yields(Pid, N + 1);
+                {trace, Pid, _, _} -> yields(Pid, N)
+            after 0 -> N
+            end.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::atom("true"))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(actual.term, OwnedTerm::atom("true"));
+}
+
+#[test]
+fn deterministic_etf_map_order_survives_bif_yields() {
+    const MODULE: &str = "deterministic_etf_yield_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(deterministic_etf_yield_vm_test).
+        -export([run/0]).
+        run() ->
+            Left = maps:from_list([{N, N*N} || N <- lists:seq(1, 33)]),
+            Right = maps:from_list([{N, N} || N <- lists:seq(1, 50)]),
+            Small = #{a => 1, b => 2, c => 3},
+            Extra = #{Small => a, Left => Right, Right => Left,
+                      [Left, Right] => Left},
+            Map = maps:merge(maps:merge(#{1 => a, 1.0 => b},
+                                        maps:from_list([{N, N} || N <- lists:seq(1, 10000)])),
+                             Extra),
+            Bin = term_to_binary(Map, [deterministic]),
+            Map = binary_to_term(Bin),
+            Expected = lists:sort(fun(A, B) -> erts_internal:cmp_term(A, B) =< 0 end,
+                                  maps:to_list(Map)),
+            first_difference(Expected, decode_ext_map(Bin)).
+        decode_ext_map(<<131, 116, Size:32, Rest/binary>>) ->
+            decode_ext_pairs(binary_to_term(<<131, 108, (2*Size):32, Rest/binary, 106>>)).
+        decode_ext_pairs([Key, Value | Rest]) ->
+            [{Key, Value} | decode_ext_pairs(Rest)];
+        decode_ext_pairs([]) -> [].
+        first_difference([A | As], [B | Bs]) when A =:= B ->
+            first_difference(As, Bs);
+        first_difference([Expected | _], [Actual | _]) ->
+            {false, Expected, Actual};
+        first_difference([], []) -> true.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::atom("true"))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(
+        actual.term,
+        OwnedTerm::atom("true"),
+        "first deterministic ETF map-order mismatch"
+    );
+}
+
+#[test]
+fn list_to_binary_error_after_yield_keeps_original_bif_frame() {
+    const MODULE: &str = "list_to_binary_error_after_yield_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(list_to_binary_error_after_yield_vm_test).
+        -export([run/0]).
+        run() ->
+            {Pid, Monitor} = spawn_monitor(fun() ->
+                Input = [[mk_list(1000000), oops]],
+                try
+                    erlang:yield(),
+                    apply(erlang, list_to_binary, [Input]),
+                    exit(unexpected_success)
+                catch
+                    error:badarg:Stack ->
+                        [{erlang, list_to_binary, _, _} | _] = Stack
+                end
+            end),
+            receive {'DOWN', Monitor, process, Pid, normal} -> ok end,
+            ok.
+        mk_list(Size) when Size >= 1024*1024 ->
+            Left = (Size - (512*1024+10)) div 2,
+            Right = Size - (512*1024+10) - Left,
+            [mk_list(Left), list_to_binary(mk_list(512*1024+10)), mk_list(Right)];
+        mk_list(Size) -> mk_list(Size, []).
+        mk_list(0, Acc) -> Acc;
+        mk_list(N, Acc) -> mk_list(N - 1, [$A + (N band 63) | Acc]).
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert!(matches!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(_)
+    ));
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(actual.term, OwnedTerm::atom("ok"));
+}
+
+#[test]
+fn malformed_large_etf_trap_keeps_original_binary_to_term_frame() {
+    const MODULE: &str = "malformed_large_etf_trap_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(malformed_large_etf_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            TupleSize = 2000000,
+            <<131, AtomExt/binary>> = term_to_binary(an_atom_we_use_for_this),
+            BadAtomExt = <<100, 65535:16/big, "oops">>,
+            Bin = <<131, 105, TupleSize:32/big,
+                    (binary:copy(AtomExt, TupleSize - 1))/binary, BadAtomExt/binary>>,
+            try
+                binary_to_term(Bin),
+                unexpected_success
+            catch
+                error:badarg:Stack ->
+                    [{erlang, binary_to_term, [Bin], _} | _] = Stack,
+                    badarg
+            end.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    assert_eq!(
+        reference.call(MODULE, "run", &[]),
+        CallResult::Ok(OwnedTerm::atom("badarg"))
+    );
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    assert_eq!(actual.term, OwnedTerm::atom("badarg"));
+}
+
+#[test]
+fn binary_search_bifs_resume_after_budget_exhaustion() {
+    const MODULE: &str = "binary_search_trap_vm_test";
+    let reference = RefErl::start().expect("OTP 29.1.1 is required to compile the test module");
+    let source = r#"-module(binary_search_trap_vm_test).
+        -export([run/0]).
+        run() ->
+            Prefix = binary:copy(<<"x">>, 100000),
+            Subject = <<Prefix/binary, "needle", Prefix/binary, "needle">>,
+            {binary:match(Subject, <<"needle">>),
+             binary:matches(Subject, [<<"needle">>, <<"xneedle">>]),
+             binary:split(Subject, <<"needle">>, [global])}.
+    "#;
+    let beam = reference.compile_named(MODULE, source, &[]).unwrap();
+    reference.load(MODULE, &beam).unwrap();
+    let expected = reference.call(MODULE, "run", &[]);
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
+    assert_eq!(expected, CallResult::Ok(canonical));
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
 fn native_send_matches_interpreter_for_names_ports_and_tracing() {
     const CHILD: &str = "ARINSAL_NATIVE_SEND_CHILD";
     const MODULE: &str = "native_send_vm_test";

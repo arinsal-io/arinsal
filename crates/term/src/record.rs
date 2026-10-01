@@ -183,6 +183,15 @@ pub fn term_sequence(term: Term) -> Option<Vec<Term>> {
     unsafe {
         match term.classify() {
             TermKind::Tuple => Some(term.tuple_ref()?.iter().collect()),
+            TermKind::Record => {
+                let record = term.record_ref()?;
+                let mut values = Vec::with_capacity(record.len() + 1);
+                values.push(Term::atom(record.name()));
+                for index in 0..record.len() {
+                    values.push(record.value(record.sorted_index(index)?)?);
+                }
+                Some(values)
+            }
             TermKind::Nil => Some(Vec::new()),
             TermKind::List => {
                 let mut iter = ListIter::new(term);

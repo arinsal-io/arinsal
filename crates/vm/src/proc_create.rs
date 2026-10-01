@@ -63,6 +63,7 @@ pub struct Process {
     pub(crate) reductions: i32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_enabled: bool,
+    pub(crate) gc_deferred: bool,
     pub(crate) uniq_counter: i64,
     pub(crate) stats: ProcessStats,
     /// Final reason remains on the task until the scheduler reaps late monitors.
@@ -131,12 +132,17 @@ pub(crate) struct ProcessCold {
     /// Result of a published `persistent_term` update, returned when the yielded
     /// updater runs again (erts resumes the suspended updater after `table_updater`).
     pub(crate) persistent_update_result: Option<Term>,
+    /// A process-local BIF trap waiting for its private continuation export.
+    pub(crate) bif_trap: Option<BifTrapPending>,
+    /// Operand registers of `apply` calls in progress. A callee may collect before it
+    /// yields back to re-execute the apply, so these stay GC roots until it returns.
+    pub(crate) apply_roots: Vec<Term>,
     // Saved continuation addresses for traces still referenced by handler code.
     pub(crate) raw_traces: Vec<stacktrace::RawTrace>,
     /// Explicit `exit/1` reason, owned off-heap. The process heap is collected
     /// while the stacktrace is built, so a raw `Term` here would dangle and
     /// monitors would observe a corrupted reason.
-    pub(crate) exit_reason: Option<arinsal_etf::OwnedTerm>,
+    pub(crate) exit_reason: Option<Term>,
     /// Spawned MFA entry that resolves to a runtime BIF export.
     pub(crate) initial_bif: Option<(String, String, u8)>,
     pub(crate) dictionary: Vec<(Term, Term)>,
@@ -165,6 +171,16 @@ pub(crate) struct PersistentGetAll {
     pub(crate) cursor: usize,
     pub(crate) remaining: usize,
     pub(crate) result: Term,
+}
+
+/// The resumable part of an interrupted BIF call.
+pub(crate) struct BifTrapPending {
+    pub(crate) caller_module: usize,
+    pub(crate) caller_ip: usize,
+    pub(crate) import: usize,
+    pub(crate) continuation: &'static str,
+    pub(crate) state: std::sync::Arc<arinsal_term::MagicRef>,
+    pub(crate) gc_was_enabled: bool,
 }
 impl Process {
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.
@@ -246,9 +262,10 @@ impl Process {
 
     /// Remember an explicit exit reason across the GC that builds its stacktrace.
     pub(crate) fn note_exit_reason(&mut self, reason: Term) -> Result<(), VmError> {
-        let owned = arinsal_term::to_owned(reason)
+        let cold = self.cold_mut();
+        let copied = arinsal_term::copy_term(reason, &mut cold.dictionary_heap)
             .map_err(|error| VmError::Unsupported(format!("exit reason: {error:?}")))?;
-        self.cold_mut().exit_reason = Some(owned);
+        cold.exit_reason = Some(copied);
         Ok(())
     }
     /// Construct a process with the erts minimum heap size.
@@ -290,6 +307,7 @@ impl Process {
             reductions: 4000,
             reductions_used: 0,
             gc_enabled: true,
+            gc_deferred: false,
             uniq_counter: 0,
             stats: ProcessStats::default(),
             final_exit_reason: None,

@@ -10,24 +10,29 @@ use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
 use arinsal_spec::Opcode;
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
 use std::sync::atomic::Ordering;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, TryLockError};
 
-static CODE_MOD_PERMISSION: OnceLock<(Mutex<Option<Pid>>, Condvar)> = OnceLock::new();
+static CODE_MOD_PERMISSION: OnceLock<Mutex<Option<Pid>>> = OnceLock::new();
 
 /// Acquire or release the VM-wide code modification permission.
 /// Port of erts/emulator/beam/code_ix.c:378 (`erts_try_seize_code_mod_permission`), OTP-29.1.1.
-pub(crate) fn test_code_mod_permission(pid: Pid, acquire: bool) {
-    let (owner, changed) = CODE_MOD_PERMISSION.get_or_init(|| (Mutex::new(None), Condvar::new()));
-    let mut current = owner.lock().unwrap();
+/// Try the code modification lock without occupying a scheduler thread.
+pub(crate) fn try_code_mod_permission(pid: Pid, acquire: bool) -> bool {
+    let owner = CODE_MOD_PERMISSION.get_or_init(|| Mutex::new(None));
+    let mut current = match owner.try_lock() {
+        Ok(current) => current,
+        Err(TryLockError::WouldBlock) => return false,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+    };
     if acquire {
-        while current.is_some_and(|owner| owner != pid) {
-            current = changed.wait(current).unwrap();
+        if current.is_some_and(|owner| owner != pid) {
+            return false;
         }
         *current = Some(pid);
     } else {
         *current = None;
-        changed.notify_all();
     }
+    true
 }
 
 struct Prepared {

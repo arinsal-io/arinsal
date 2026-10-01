@@ -1004,6 +1004,54 @@ fn emit_filtered_without_ctx(
     }
 }
 
+/// Return the MFA reported by running-status events, including a trapped BIF's continuation.
+pub(crate) fn running_mfa(
+    process: &mut Process,
+    vm: &Vm,
+    subject: Pid,
+) -> Result<Option<Term>, VmError> {
+    if flags(process, subject) & RUNNING == 0 {
+        return Ok(None);
+    }
+    let continuation = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .and_then(|pending| {
+            let (module, rest) = pending.continuation.split_once(':')?;
+            let (function, arity) = rest.rsplit_once('/')?;
+            Some((module, function, arity.parse::<u8>().ok()?))
+        });
+    let (module, function, arity) = if let Some(continuation) = continuation {
+        continuation
+    } else {
+        let Some(module) = vm.modules.get(process.module) else {
+            return Ok(None);
+        };
+        let Some((function, arity)) = module.function_at(process.ip) else {
+            return Ok(None);
+        };
+        (&*module.name, function, arity)
+    };
+    let tuple = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .tuple(&[
+            Term::atom(
+                global_atoms()
+                    .intern(module)
+                    .map_err(|_| VmError::Unsupported("running module atom".into()))?,
+            ),
+            Term::atom(
+                global_atoms()
+                    .intern(function)
+                    .map_err(|_| VmError::Unsupported("running function atom".into()))?,
+            ),
+            Term::small(i64::from(arity))
+                .ok_or_else(|| VmError::Unsupported("running arity".into()))?,
+        ])
+        .map_err(|error| VmError::Unsupported(format!("running MFA: {error:?}")))?;
+    Ok(Some(tuple))
+}
+
 #[allow(clippy::too_many_arguments)] // Trace event identity and routing stay explicit at emission sites.
 fn emit_filtered(
     mut vm: Option<&mut Vm>,

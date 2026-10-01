@@ -506,6 +506,52 @@ impl Vm {
                 }
             }
         }
+        // Trapping BIFs must be intercepted before native dispatch: dynamic
+        // apply may otherwise enter a synchronous fast path for the same MFA.
+        // A trap through `apply` is keyed by the caller's import when it has one, so a
+        // static call and its apply re-execution resume the same continuation.
+        let trap_key = self.modules[p.module]
+            .imports
+            .iter()
+            .position(|import| {
+                import.module == module
+                    && import.function == function
+                    && usize::from(import.arity) == arity
+            })
+            .unwrap_or(crate::bif_traps::APPLY_TRAP_KEY);
+        let trap_args = [
+            p.x.first().copied().unwrap_or(Term::NIL),
+            p.x.get(1).copied().unwrap_or(Term::NIL),
+            p.x.get(2).copied().unwrap_or(Term::NIL),
+        ];
+        if let Some(result) = crate::bif_traps::execute_named(
+            p,
+            module,
+            function,
+            trap_key,
+            arity,
+            trap_args,
+            ctx.as_deref_mut(),
+        ) {
+            return match result? {
+                crate::bif_traps::TrapResult::Done { value, .. } => {
+                    p.x[0] = value;
+                    if tail {
+                        Ok(match Self::ret(p) {
+                            Some(value) => ImportOutcome::Returned(value),
+                            None => ImportOutcome::Advanced,
+                        })
+                    } else {
+                        p.ip += 1;
+                        Ok(ImportOutcome::Advanced)
+                    }
+                }
+                crate::bif_traps::TrapResult::Failed { .. } => {
+                    unreachable!("failed trapping BIFs become VM exceptions")
+                }
+                crate::bif_traps::TrapResult::Yield { .. } => Ok(ImportOutcome::Yield),
+            };
+        }
         // `!` is an export alias for the process-aware `send/2` BIF.
         let native_function = if module == "erlang" && function == "!" && arity == 2 {
             "send"
@@ -791,8 +837,9 @@ impl Vm {
         tail_dealloc: usize,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
-        let original_x = p.x.to_vec();
+        let original_ip = p.ip;
         let original_gc_live = p.gc_live;
+        let original_operands = [p.x[0], p.x[1], p.x[2]];
         let (module_term, function_term, arguments_term, target) = if arity == 2 {
             (p.x[0], p.x[1], p.x[1], Some(p.x[0]))
         } else {
@@ -867,6 +914,14 @@ impl Vm {
             // the complete stack offset before letting the error BIF unwind.
             push_apply_error_continuation(p, return_ip, tail_dealloc)?;
         }
+        // Re-executing this apply needs its own operands; keep them rooted while the callee runs.
+        let roots_base = {
+            let cold = p.cold_mut();
+            let base = cold.apply_roots.len();
+            cold.apply_roots
+                .extend_from_slice(&original_operands[..arity]);
+            base
+        };
         let result = if let Some(fun) = target {
             self.call_fun_term(p, fun, args.len(), tail, ctx)
         } else {
@@ -888,13 +943,26 @@ impl Vm {
                 ctx,
             )
         };
-        if matches!(&result, Err(VmError::Yield))
-            || matches!(
-                &result,
-                Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)
-            )
+        let operands = {
+            let cold = p.cold_mut();
+            let operands = cold.apply_roots[roots_base..].to_vec();
+            cold.apply_roots.truncate(roots_base);
+            operands
+        };
+        let reexec_apply = matches!(&result, Ok(ImportOutcome::Yield)) && p.ip == original_ip;
+        if matches!(
+            &result,
+            Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)
+        ) || reexec_apply
         {
-            p.x.copy_from_slice(&original_x);
+            // Only a yield that re-executes this apply may restore its argument registers; a yield after the
+            // callee returned (reductions exhausted, ip advanced) must keep the result in x0.
+            p.x[..operands.len()].copy_from_slice(&operands);
+            p.gc_live = original_gc_live;
+        } else if result.is_ok() {
+            // The deferred collector runs before the next instruction. A completed callee
+            // has installed its result in X0, while later caller X registers may still
+            // hold values used after apply/3 returns.
             p.gc_live = original_gc_live;
         }
         result

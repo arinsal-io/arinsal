@@ -1448,7 +1448,7 @@ fn subscribe(inner: &Inner, data: &[u8]) -> Vec<u8> {
     ok_bytes(&out)
 }
 
-fn getiflist() -> Vec<u8> {
+pub(crate) fn getiflist() -> Vec<u8> {
     // Port of inet_drv.c:5671 (inet_ctl_getiflist), OTP-29.1.1.
     let Ok(buf) = ifconf_buf() else {
         return err_bytes("einval");
@@ -1528,7 +1528,7 @@ fn ifconf_buf() -> Result<Vec<u8>, i32> {
     result
 }
 
-fn ifget(data: &[u8]) -> Vec<u8> {
+pub(crate) fn ifget(data: &[u8]) -> Vec<u8> {
     // Port of inet_drv.c:5821 (inet_ctl_ifget), OTP-29.1.1.
     if data.is_empty() {
         return err_bytes("einval");
@@ -1718,7 +1718,7 @@ fn link_addr(addr: *const libc::sockaddr) -> Option<Vec<u8>> {
     }
 }
 
-fn getifaddrs_reply() -> Vec<u8> {
+pub(crate) fn getifaddrs_reply() -> Vec<u8> {
     // Port of inet_drv.c:6611 (inet_ctl_getifaddrs), OTP-29.1.1.
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs writes a list we free below.

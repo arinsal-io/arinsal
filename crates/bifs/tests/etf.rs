@@ -3,7 +3,11 @@ mod support;
 use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm as O};
-use arinsal_term::{ProcessHeap, Term, TermBuilder, exact_eq, from_owned, global_atoms, to_owned};
+use arinsal_term::{
+    ProcessHeap, Term, TermBuilder, VecHeap, cmp_exact, exact_eq, from_owned, global_atoms,
+    to_owned,
+};
+use num_bigint::BigInt;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 use support::{call, equivalent};
@@ -36,6 +40,13 @@ fn heap_etf_matches_otp_examples() {
         O::List {
             elems: vec![O::Int(1)],
             tail: Box::new(O::atom("tail")),
+        },
+        O::List {
+            elems: vec![O::Int(42)],
+            tail: Box::new(O::BitString {
+                bytes: vec![0b1010_0000],
+                bits: 3,
+            }),
         },
         O::Binary(Vec::new()),
         O::Binary(vec![7; 1000]),
@@ -79,18 +90,226 @@ fn duplicate_map_keys_in_external_term_are_rejected_like_otp() {
 }
 
 #[test]
+fn nested_maps_with_compound_keys_match_otp() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let small = O::Map(vec![
+        (O::atom("a"), O::Int(1)),
+        (O::atom("b"), O::Int(2)),
+        (O::atom("c"), O::Int(3)),
+    ]);
+    let left = O::Map(
+        (1..=33)
+            .map(|value| (O::Int(value), O::Int(value * value)))
+            .collect(),
+    );
+    let right = O::Map(
+        (1..=50)
+            .map(|value| (O::Int(value + 100), O::Int(value)))
+            .collect(),
+    );
+    let mut pairs = match &left {
+        O::Map(pairs) => pairs.clone(),
+        _ => unreachable!(),
+    };
+    pairs.extend([
+        (small.clone(), O::atom("a")),
+        (left.clone(), right.clone()),
+        (right.clone(), left.clone()),
+        (
+            O::List {
+                elems: vec![left.clone(), right.clone()],
+                tail: Box::new(O::Nil),
+            },
+            left.clone(),
+        ),
+        (O::Binary(b"abc".to_vec()), small.clone()),
+        (O::Binary(b"qrs".to_vec()), left.clone()),
+        (O::Binary(b"xyz".to_vec()), right),
+    ]);
+    let term = O::Map(pairs);
+    let args = [term, O::list(vec![O::atom("deterministic")])];
+    let encoded = call("erlang", "term_to_binary", &args);
+    let expected = reference.call("erlang", "term_to_binary", &args);
+    assert_eq!(encoded, expected);
+    let CallResult::Ok(binary) = expected else {
+        panic!("OTP failed to encode nested map");
+    };
+    let decoded = call("erlang", "binary_to_term", std::slice::from_ref(&binary));
+    let expected = reference.call("erlang", "binary_to_term", &[binary]);
+    assert_decoded_same(&decoded, &expected, "nested maps with compound keys");
+}
+
+#[test]
+fn large_deterministic_map_order_matches_otp() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let mut pairs = (1..=10_000)
+        .map(|value| (O::Int(value), O::Int(value * value)))
+        .collect::<Vec<_>>();
+    pairs.extend([
+        (O::atom("key"), O::Int(1)),
+        (O::Float(0.5), O::Int(2)),
+        (
+            O::Ref {
+                node: "nonode@nohost".into(),
+                creation: 0,
+                ids: vec![1, 2, 3],
+            },
+            O::Int(3),
+        ),
+        (
+            O::List {
+                elems: vec![O::Int(1), O::Int(2)],
+                tail: Box::new(O::Nil),
+            },
+            O::Int(4),
+        ),
+        (O::Tuple(vec![O::atom("tuple"), O::Int(1)]), O::Int(5)),
+        (O::Map(vec![(O::Int(1), O::Int(2))]), O::Int(6)),
+        (O::Binary(vec![0xff]), O::Int(7)),
+    ]);
+    let args = [O::Map(pairs), O::list(vec![O::atom("deterministic")])];
+    assert_eq!(
+        call("erlang", "term_to_binary", &args),
+        reference.call("erlang", "term_to_binary", &args),
+    );
+}
+
+#[test]
 fn deterministic_map_order_compares_numeric_values_before_number_kind() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let term = O::Map(vec![
         (O::Int(3_811_614), O::Int(99)),
         (O::Float(1.0), O::atom("b")),
         (O::Int(1), O::atom("a")),
+        (O::Int(2), O::Int(4)),
+        (O::Float(2.5), O::Int(5)),
     ]);
     let args = [term, O::list(vec![O::atom("deterministic")])];
     assert_eq!(
         call("erlang", "term_to_binary", &args),
         reference.call("erlang", "term_to_binary", &args),
     );
+}
+
+#[test]
+fn deterministic_map_order_compares_nested_tuple_keys() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let term = O::Map(vec![
+        (O::Tuple(vec![O::Nil]), O::Int(1)),
+        (
+            O::Tuple(vec![O::Pid {
+                node: "nonode@nohost".into(),
+                id: 7,
+                serial: 0,
+                creation: 0,
+            }]),
+            O::Int(2),
+        ),
+    ]);
+    let args = [term, O::list(vec![O::atom("deterministic")])];
+    assert_eq!(
+        call("erlang", "term_to_binary", &args),
+        reference.call("erlang", "term_to_binary", &args),
+    );
+}
+
+#[test]
+fn deterministic_map_order_matches_otp_for_nested_map_and_list_keys() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let left = O::Map(
+        (1..=33)
+            .map(|value| (O::Int(value), O::Int(value * value)))
+            .collect(),
+    );
+    let right = O::Map(
+        (1..=50)
+            .map(|value| (O::Int(value), O::Int(value)))
+            .collect(),
+    );
+    let small = O::Map(vec![
+        (O::atom("a"), O::Int(1)),
+        (O::atom("b"), O::Int(2)),
+        (O::atom("c"), O::Int(3)),
+    ]);
+    let term = O::Map(vec![
+        (O::Int(1), O::atom("a")),
+        (O::BigInt(BigInt::from(1_u8) << 80usize), O::Int(99)),
+        (O::Float(1.0), O::atom("b")),
+        (small.clone(), O::atom("a")),
+        (left.clone(), right.clone()),
+        (right.clone(), left.clone()),
+        (
+            O::List {
+                elems: vec![left.clone(), right.clone()],
+                tail: Box::new(O::Nil),
+            },
+            left,
+        ),
+        (O::Binary(b"abc".to_vec()), small),
+        (O::Binary(b"qrs".to_vec()), right),
+    ]);
+    let args = [term, O::list(vec![O::atom("deterministic")])];
+    assert_eq!(
+        call("erlang", "term_to_binary", &args),
+        reference.call("erlang", "term_to_binary", &args),
+    );
+}
+
+#[test]
+fn exact_term_order_matches_otp_for_compound_keys() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let pairs = [
+        (
+            O::Tuple(vec![O::Nil, O::Map(vec![(O::Int(1), O::Int(1))])]),
+            O::Tuple(vec![
+                O::Pid {
+                    node: "nonode@nohost".into(),
+                    id: 7,
+                    serial: 0,
+                    creation: 0,
+                },
+                O::Nil,
+            ]),
+        ),
+        (
+            O::Map(vec![(O::atom("a"), O::Int(1))]),
+            O::Map(vec![(O::atom("a"), O::Int(2))]),
+        ),
+        (
+            O::List {
+                elems: vec![O::Int(1)],
+                tail: Box::new(O::atom("tail")),
+            },
+            O::List {
+                elems: vec![O::Int(1), O::Int(2)],
+                tail: Box::new(O::Nil),
+            },
+        ),
+        (
+            O::BitString {
+                bytes: vec![0b1010_0000],
+                bits: 3,
+            },
+            O::BitString {
+                bytes: vec![0b1010_0000],
+                bits: 4,
+            },
+        ),
+    ];
+    for (left, right) in pairs {
+        let mut heap = VecHeap::new();
+        let left_term = from_owned(&left, &mut heap).unwrap();
+        let right_term = from_owned(&right, &mut heap).unwrap();
+        let actual = match cmp_exact(left_term, right_term) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+        assert_eq!(
+            CallResult::Ok(O::Int(actual)),
+            reference.call("erts_internal", "cmp_term", &[left, right]),
+        );
+    }
 }
 
 #[test]

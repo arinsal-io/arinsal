@@ -2,6 +2,17 @@
 
 use super::*;
 
+fn tuple_arity(term: Term) -> Option<usize> {
+    match term.classify() {
+        TermKind::Tuple => term
+            .header()
+            .filter(|header| header & 63 == 0)
+            .map(|header| (header >> 6) as usize),
+        TermKind::Record => arinsal_term::term_sequence(term).map(|values| values.len()),
+        _ => None,
+    }
+}
+
 /// Port of erts/emulator/beam/erl_record.c:254-343 (native record creation), OTP-29.1.1.
 fn execute_put_record(
     process: &mut Process,
@@ -233,11 +244,7 @@ fn execute_tuple_bif(
                 usize::try_from(index - 1).ok()
             }
         });
-        let arity = if tuple.classify() == TermKind::Tuple {
-            tuple.header().map(|header| (header >> 6) as usize)
-        } else {
-            None
-        };
+        let arity = tuple_arity(tuple);
         match (index, arity) {
             (Some(index), Some(arity)) if index < arity => Some(
                 TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
@@ -296,11 +303,7 @@ fn call_fast_tuple_bif(
             let index = args[0]
                 .as_small()
                 .and_then(|index| usize::try_from(index.checked_sub(1)?).ok());
-            let tuple_arity = (tuple.classify() == TermKind::Tuple)
-                .then(|| tuple.header())
-                .flatten()
-                .filter(|header| header & 63 == 0)
-                .map(|header| (header >> 6) as usize);
+            let tuple_arity = tuple_arity(tuple);
             match (index, tuple_arity) {
                 (Some(index), Some(tuple_arity)) if index < tuple_arity => {
                     TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
@@ -316,10 +319,9 @@ fn call_fast_tuple_bif(
                 _ => Err(arinsal_bifs::BifError::BADARG),
             }
         }
-        ImportFastOp::TupleSize if arity == 1 => args[0]
-            .header()
-            .filter(|header| args[0].classify() == TermKind::Tuple && header & 63 == 0)
-            .and_then(|header| Term::small((header >> 6) as i64))
+        ImportFastOp::TupleSize if arity == 1 => tuple_arity(args[0])
+            .and_then(|arity| i64::try_from(arity).ok())
+            .and_then(Term::small)
             .ok_or(arinsal_bifs::BifError::BADARG),
         _ => return None,
     };
@@ -454,18 +456,16 @@ fn execute_guard_bif(
         ImportFastOp::IsFloat => Some(boolean(is_float_term(args[0]))),
         ImportFastOp::IsNumber => Some(boolean(args[0].classify() == TermKind::Number)),
         ImportFastOp::IsAtom => Some(boolean(args[0].as_atom().is_some())),
-        ImportFastOp::IsTuple => Some(boolean(args[0].classify() == TermKind::Tuple)),
+        ImportFastOp::IsTuple => Some(boolean(tuple_arity(args[0]).is_some())),
         ImportFastOp::IsList => Some(boolean(matches!(
             args[0].classify(),
             TermKind::Nil | TermKind::List
         ))),
         ImportFastOp::IsMap => Some(boolean(args[0].classify() == TermKind::Map)),
         ImportFastOp::IsFunction => Some(boolean(args[0].classify() == TermKind::Fun)),
-        ImportFastOp::TupleSize => (args[0].classify() == TermKind::Tuple)
-            .then(|| args[0].header())
-            .flatten()
-            .filter(|header| header & 63 == 0)
-            .and_then(|header| Term::small((header >> 6) as i64)),
+        ImportFastOp::TupleSize => tuple_arity(args[0])
+            .and_then(|arity| i64::try_from(arity).ok())
+            .and_then(Term::small),
         ImportFastOp::Less => Some(boolean(cmp(args[0], args[1]).is_lt())),
         ImportFastOp::LessEqual => Some(boolean(!cmp(args[0], args[1]).is_gt())),
         ImportFastOp::Greater => Some(boolean(cmp(args[0], args[1]).is_gt())),
@@ -1540,6 +1540,13 @@ impl Vm {
         let mut module_epoch = self.seen_epoch;
         let mut handle_module = module_id;
         loop {
+            if p.gc_enabled && p.gc_deferred {
+                sync_cursor(p, htop, &mut heap_dirty);
+                p.service_deferred_gc()?;
+                (htop, stop) = p.heap.heap_cursor();
+                depth = p.heap.stack_words();
+                x = p.x.as_mut_ptr();
+            }
             if module_epoch != self.seen_epoch || handle_module != module_id {
                 let same_module = handle_module == module_id;
                 let active_offset = if same_module {
@@ -2508,7 +2515,8 @@ impl Vm {
                 }
                 Instr::IsLtXC { a, b, fail } => {
                     // SAFETY: Specialization validates every X index below 1024.
-                    compare_branch!(compare::lt(unsafe { *x.add(a as usize) }, b), fail);
+                    let left = unsafe { *x.add(a as usize) };
+                    compare_branch!(compare::lt(left, b), fail);
                 }
                 Instr::IsLtXCReturn { a, b, fail } => {
                     // SAFETY: Specialization validates the X index.
@@ -2518,7 +2526,8 @@ impl Vm {
                 }
                 Instr::IsLtCX { a, b, fail } => {
                     // SAFETY: Specialization validates every X index below 1024.
-                    compare_branch!(compare::lt(a, unsafe { *x.add(b as usize) }), fail);
+                    let right = unsafe { *x.add(b as usize) };
+                    compare_branch!(compare::lt(a, right), fail);
                 }
                 Instr::IsGeXX { a, b, fail } => {
                     // SAFETY: Specialization validates both X indices below 1024.
@@ -2527,7 +2536,8 @@ impl Vm {
                 }
                 Instr::IsGeXC { a, b, fail } => {
                     // SAFETY: Specialization validates every X index below 1024.
-                    compare_branch!(compare::ge(unsafe { *x.add(a as usize) }, b), fail);
+                    let left = unsafe { *x.add(a as usize) };
+                    compare_branch!(compare::ge(left, b), fail);
                 }
                 Instr::IsGeCX { a, b, fail } => {
                     // SAFETY: Specialization validates every X index below 1024.
@@ -3061,7 +3071,7 @@ impl Vm {
                 Instr::IsTupleX { src, fail } => {
                     // SAFETY: Specialization validates the X index.
                     let term = unsafe { *x.add(src as usize) };
-                    compare_branch!(term.classify() == TermKind::Tuple, fail);
+                    compare_branch!(tuple_arity(term).is_some(), fail);
                 }
                 Instr::IsTupleOfArity {
                     src,
@@ -3071,12 +3081,10 @@ impl Vm {
                 } => {
                     // SAFETY: Specialization validates the X index.
                     let term = unsafe { *x.add(src as usize) };
-                    compare_branch!(term.classify() == TermKind::Tuple, fail_type);
+                    compare_branch!(tuple_arity(term).is_some(), fail_type);
                     count_second!("test_arity");
-                    // SAFETY: The type test proved the term is a live tuple.
-                    let tuple = unsafe { term.tuple_ref() };
                     compare_branch!(
-                        tuple.is_some_and(|tuple| tuple.len() == arity as usize),
+                        tuple_arity(term).is_some_and(|tuple_arity| tuple_arity == arity as usize),
                         fail_arity
                     );
                     // SAFETY: The fused second instruction occupies the next code slot.
@@ -3931,7 +3939,7 @@ impl Vm {
                             let term = p.read(b)?;
                             let kind = term.classify();
                             let ok = match opcode {
-                                Opcode::IsTuple => kind == TermKind::Tuple,
+                                Opcode::IsTuple => tuple_arity(term).is_some(),
                                 Opcode::IsNil => kind == TermKind::Nil,
                                 Opcode::IsNonemptyList => kind == TermKind::List,
                                 Opcode::IsList => matches!(kind, TermKind::Nil | TermKind::List),
@@ -4055,11 +4063,18 @@ impl Vm {
                                 && !execute_guard_bif(p, module, &op, opcode)?
                                 && !execute_small_bif(p, module, &op, opcode)?
                             {
-                                let bif_reductions =
-                                    self.exec_bif_op(p, ctx.as_deref_mut(), op, opcode)?;
-                                consumed = consumed.saturating_add(bif_reductions).min(budget);
-                                if let Some(run) = ctx.as_deref_mut() {
-                                    run.consume(bif_reductions);
+                                match self.exec_bif_op(p, ctx.as_deref_mut(), op, opcode)? {
+                                    crate::bif_dispatch::BifOpOutcome::Done(bif_reductions) => {
+                                        consumed =
+                                            consumed.saturating_add(bif_reductions).min(budget);
+                                        if let Some(run) = ctx.as_deref_mut() {
+                                            run.consume(bif_reductions);
+                                        }
+                                    }
+                                    crate::bif_dispatch::BifOpOutcome::Yield => {
+                                        sync_cursor(p, htop, &mut heap_dirty);
+                                        return Ok(RunState::Yield);
+                                    }
                                 }
                             }
                         }

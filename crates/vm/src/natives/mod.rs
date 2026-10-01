@@ -8,6 +8,7 @@
 pub(crate) mod env;
 pub(crate) mod erl_debugger;
 pub(crate) mod erts_debug;
+pub(crate) use erts_debug::internal_state_enabled;
 pub(crate) mod misc;
 pub(crate) mod sys;
 
@@ -35,6 +36,7 @@ use arinsal_term::Term;
 
 mod code;
 pub(crate) use crate::dist;
+pub(crate) use code::try_code_mod_permission;
 mod ets;
 mod maps;
 pub(crate) mod nif;

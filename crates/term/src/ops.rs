@@ -259,34 +259,44 @@ fn number_cmp(a: Term, b: Term, exact: bool) -> Ordering {
         (Number::Integer(_), Number::Float(_)) if exact => Ordering::Less,
         (Number::Float(_), Number::Integer(_)) if exact => Ordering::Greater,
         (Number::Integer(a), Number::Float(b)) => {
-            let c = integer_float_cmp(&a, b);
-            if exact && c == Ordering::Equal {
-                Ordering::Less
-            } else {
-                c
+            if exact {
+                return Ordering::Less;
             }
+            integer_float_cmp(&a, b)
         }
         (Number::Float(a), Number::Integer(b)) => {
-            let c = integer_float_cmp(&b, a).reverse();
-            if exact && c == Ordering::Equal {
-                Ordering::Greater
-            } else {
-                c
+            if exact {
+                return Ordering::Greater;
             }
+            integer_float_cmp(&b, a).reverse()
         }
     }
 }
 fn bits_cmp(a: Term, b: Term) -> Ordering {
+    // Port of erts/emulator/beam/erl_bits.h:560 and erl_bits.c:2293-2372,
+    // OTP-29.1.1. The offsets belong to the compared bitstrings, including
+    // SUB_BITS views over a byte-aligned literal or reference binary.
     // SAFETY: comparison requires both owning heaps to remain live.
     let a = unsafe { a.binary_ref().unwrap() };
     // SAFETY: comparison requires both owning heaps to remain live.
     let b = unsafe { b.binary_ref().unwrap() };
-    for i in 0..a.bit_len().min(b.bit_len()) {
-        let abit = (a.bytes()[(a.start_bit() + i) / 8] >> (7 - (a.start_bit() + i) % 8)) & 1;
-        let bbit = (b.bytes()[(b.start_bit() + i) / 8] >> (7 - (b.start_bit() + i) % 8)) & 1;
-        match abit.cmp(&bbit) {
-            Ordering::Equal => {}
-            c => return c,
+    let common_bits = a.bit_len().min(b.bit_len());
+    let (a_start, b_start) = (a.start_bit(), b.start_bit());
+    if (a_start | b_start | common_bits).is_multiple_of(8) {
+        let a_bytes = &a.bytes()[a_start / 8..][..common_bits / 8];
+        let b_bytes = &b.bytes()[b_start / 8..][..common_bits / 8];
+        let order = a_bytes.cmp(b_bytes);
+        if order != Ordering::Equal {
+            return order;
+        }
+    } else {
+        for i in 0..common_bits {
+            let a_bit = (a.bytes()[(a_start + i) / 8] >> (7 - (a_start + i) % 8)) & 1;
+            let b_bit = (b.bytes()[(b_start + i) / 8] >> (7 - (b_start + i) % 8)) & 1;
+            match a_bit.cmp(&b_bit) {
+                Ordering::Equal => {}
+                c => return c,
+            }
         }
     }
     a.bit_len().cmp(&b.bit_len())

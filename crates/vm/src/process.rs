@@ -792,6 +792,8 @@ impl Executor {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
         process.self_pid = Some(ctx.pid());
         let schedule_started = std::time::Instant::now();
+        let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
+        let running_fields = running.as_slice();
         crate::trace::emit(
             Some(&mut self.vm),
             process,
@@ -799,7 +801,7 @@ impl Executor {
             ctx.pid(),
             crate::trace::RUNNING,
             "in",
-            &[],
+            running_fields,
         );
         self.vm.sync_module(process.module);
         if process.native_pc.is_some() && process.reductions <= 0 {
@@ -1567,6 +1569,8 @@ impl Executor {
             process.x = Box::new([]);
             process.fr = Box::new([]);
         }
+        let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
+        let running_fields = running.as_slice();
         crate::trace::emit(
             Some(&mut self.vm),
             process,
@@ -1574,7 +1578,7 @@ impl Executor {
             ctx.pid(),
             crate::trace::RUNNING,
             "out",
-            &[],
+            running_fields,
         );
         crate::natives::erts_debug::after_schedule(
             process,
@@ -1751,19 +1755,12 @@ fn hibernate_stopped(process: &Process, pid: Pid) -> bool {
 // Uncaught errors leave `{Reason, Stack}` so links and monitors match erts.
 // boot_loop2: OTP sends that pair; other raised classes send the reason alone.
 fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
-    if let Some(owned) = process
+    if let Some(reason) = process
         .cold
         .as_mut()
         .and_then(|cold| cold.exit_reason.take())
     {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        return match arinsal_term::from_owned(&owned, &mut heap) {
-            Ok(reason) => reason,
-            Err(conversion_error) => {
-                eprintln!("arinsal: exit reason conversion failed: {conversion_error:?}");
-                crate::signals::atom("system_limit")
-            }
-        };
+        return reason;
     }
     // An exit signal that reached a running process (kill becomes killed) ends it with its
     // reason (erts/emulator/beam/erl_proc_sig_queue.c, handle_exit_signal), OTP-29.1.1.
@@ -2997,9 +2994,20 @@ impl Process {
     /// Force collection with the current BEAM live-register count.
     // Port of erts/emulator/beam/erl_gc.c:1136 (`erts_garbage_collect_literals`), OTP-29.1.1.
     pub(crate) fn force_gc_live(&mut self, live: usize) -> Result<(), VmError> {
+        if !self.gc_enabled {
+            self.gc_deferred = true;
+            return Ok(());
+        }
         let live = live.min(self.x.len());
         let gc = self.collect_heap_roots(live, &mut [], 0)?;
         crate::natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
+        Ok(())
+    }
+
+    pub(crate) fn service_deferred_gc(&mut self) -> Result<(), VmError> {
+        if self.gc_enabled && std::mem::take(&mut self.gc_deferred) {
+            self.collect_heap_roots(self.gc_live, &mut [], 0)?;
+        }
         Ok(())
     }
 
@@ -3022,6 +3030,10 @@ impl Process {
             roots.push(result);
         }
         roots.extend_from_slice(extra);
+        let extra_end = roots.len();
+        if let Some(cold) = self.cold.as_ref() {
+            roots.extend_from_slice(&cold.apply_roots);
+        }
         let stats = self
             .heap
             .collect(&mut self.x[..live_x], &mut roots, min_free)
@@ -3037,7 +3049,11 @@ impl Process {
         {
             state.result = roots[mailbox_len];
         }
-        extra.copy_from_slice(&roots[mailbox_len + usize::from(continuation.is_some())..]);
+        let extra_start = mailbox_len + usize::from(continuation.is_some());
+        extra.copy_from_slice(&roots[extra_start..extra_end]);
+        if let Some(cold) = self.cold.as_mut() {
+            cold.apply_roots.copy_from_slice(&roots[extra_end..]);
+        }
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
         Ok(stats)
     }

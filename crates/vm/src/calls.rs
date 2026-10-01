@@ -307,9 +307,31 @@ impl Vm {
         index: usize,
         arity: usize,
         tail: bool,
-        ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+        mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
     ) -> Result<ImportOutcome, VmError> {
         p.gc_live = arity;
+        if let Some(result) = crate::bif_traps::execute(
+            self,
+            p,
+            index,
+            arity,
+            [
+                p.x.first().copied().unwrap_or(Term::NIL),
+                p.x.get(1).copied().unwrap_or(Term::NIL),
+                p.x.get(2).copied().unwrap_or(Term::NIL),
+            ],
+            ctx.as_deref_mut(),
+        ) {
+            return match result? {
+                crate::bif_traps::TrapResult::Done { value, .. } => {
+                    self.finish_native_value(p, tail, value)
+                }
+                crate::bif_traps::TrapResult::Failed { .. } => {
+                    unreachable!("failed trapping BIFs become VM exceptions")
+                }
+                crate::bif_traps::TrapResult::Yield { .. } => Ok(ImportOutcome::Yield),
+            };
+        }
         let class = self.import_class(p.module, index)?;
         // Pure BIF: one tag load and one indirect call. No name copy, no
         // argument Vec, no family scan. Code reload does not retarget a BIF.

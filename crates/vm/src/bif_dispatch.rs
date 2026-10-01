@@ -88,13 +88,14 @@ impl Vm {
             None => natives::call(self, p, ctx, module, function, args),
         }
     }
+    /// Execute a `bif`/`gc_bif` instruction; a trapping BIF may ask the scheduler to yield.
     pub(crate) fn exec_bif_op(
         &mut self,
         p: &mut Process,
-        ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+        mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
         op: GenericOp,
         opcode: Opcode,
-    ) -> Result<u32, VmError> {
+    ) -> Result<BifOpOutcome, VmError> {
         let [a, b, c] = op.args;
         let (index, first, arity, dst, fast) = {
             let module = &self.modules[p.module];
@@ -131,12 +132,27 @@ impl Vm {
         for i in 0..arity {
             stored[i] = p.read(regs[i])?;
         }
+        if let Some(result) =
+            crate::bif_traps::execute(self, p, index, arity, stored, ctx.as_deref_mut())
+        {
+            return match result? {
+                crate::bif_traps::TrapResult::Done { value, .. } => {
+                    p.write(dst, value)?;
+                    p.ip += 1;
+                    Ok(BifOpOutcome::Done(0))
+                }
+                crate::bif_traps::TrapResult::Failed { .. } => {
+                    unreachable!("failed trapping BIFs become VM exceptions")
+                }
+                crate::bif_traps::TrapResult::Yield { .. } => Ok(BifOpOutcome::Yield),
+            };
+        }
         if arity == 2 && fast != FastBif::None {
             let result = arith::small(fast, stored[0], stored[1]);
             if let Some(result) = result {
                 p.write(dst, result)?;
                 p.ip += 1;
-                return Ok(0);
+                return Ok(BifOpOutcome::Done(0));
             }
         }
         let class = self.import_class(p.module, index)?;
@@ -217,7 +233,7 @@ impl Vm {
             // The BIF continuation remains at this instruction until every
             // scheduler has reached its auxiliary-work scheduling point.
             p.force_yield = true;
-            return Ok(0);
+            return Ok(BifOpOutcome::Done(0));
         }
         // Port of erts/emulator/beam/erl_arith.c:56-85, OTP-29.1.1.
         p.reductions = p
@@ -228,13 +244,21 @@ impl Vm {
             Ok(value) => {
                 p.write(dst, value)?;
                 p.ip += 1;
-                Ok(bif_reductions)
+                Ok(BifOpOutcome::Done(bif_reductions))
             }
             Err(_) if a.kind() == Arg::LABEL && a.value() != u32::MAX as u64 => {
                 p.ip = a.value() as usize;
-                Ok(bif_reductions)
+                Ok(BifOpOutcome::Done(bif_reductions))
             }
             Err(error) => Err(error),
         }
     }
+}
+
+/// Result of one `bif`/`gc_bif` instruction.
+pub(crate) enum BifOpOutcome {
+    /// The instruction completed; carries reductions still to charge to the caller.
+    Done(u32),
+    /// A trapping BIF yielded; the instruction is re-executed on resume.
+    Yield,
 }

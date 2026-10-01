@@ -14,6 +14,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static INTERNAL_STATE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn internal_state_enabled() -> bool {
+    INTERNAL_STATE.load(Ordering::Relaxed)
+}
 static DEBUGGER_SUPPORT: AtomicBool = AtomicBool::new(false);
 static JIT_ASM_DUMP: AtomicBool = AtomicBool::new(false);
 static TEST_LONG_GC_SLEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -813,7 +817,8 @@ fn unaligned_bitstring(process: &mut Process, args: &[Term]) -> Result<Term, VmE
         }
         _ => return Err(badarg()),
     };
-    let target_bits = bit_len.saturating_add(offset).max(65);
+    // Port of beam_debug.c:140 (ERL_ONHEAP_BITS_LIMIT + 1), OTP-29.1.1.
+    let target_bits = bit_len.saturating_add(offset).max(64 * 8 + 1);
     let mut target = vec![0u8; target_bits.div_ceil(8)];
     for index in 0..bit_len {
         let bit = (bytes[index / 8] >> (7 - index % 8)) & 1;
@@ -2243,7 +2248,11 @@ fn internal_state_set(
                 Some("false") => false,
                 _ => return Err(badarg()),
             };
-            crate::natives::code::test_code_mod_permission(ctx.pid(), acquire);
+            if !crate::natives::code::try_code_mod_permission(ctx.pid(), acquire) {
+                return Err(VmError::Unsupported(
+                    "code_mod_permission must resume through its BIF continuation".into(),
+                ));
+            }
             return Ok(atom("true"));
         }
         Some("process_uniq_counter") => {

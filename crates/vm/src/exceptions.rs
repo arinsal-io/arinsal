@@ -223,6 +223,11 @@ pub(super) fn bif_error(
     args: &[Term],
     error: BifError,
 ) -> VmError {
+    // A raised BIF exception abandons the suspended call before catch/after
+    // code runs, so its process-local continuation must not survive unwind.
+    if let Some(pending) = p.cold_mut().bif_trap.take() {
+        p.set_gc_enabled(pending.gc_was_enabled);
+    }
     if let BifError::Unsupported(reason) = error {
         return VmError::Unsupported(reason.into());
     }
@@ -515,6 +520,11 @@ pub(super) fn resume(
     mut ctx: Option<&mut arinsal_sched::RunCtx<'_, crate::process::Message>>,
     mut trap: Trap,
 ) -> Result<Option<VmError>, VmError> {
+    // An exception leaves the active BEAM call site. Any trap record belongs
+    // to that abandoned call, even if the error did not originate in its BIF.
+    if let Some(pending) = p.cold_mut().bif_trap.take() {
+        p.set_gc_enabled(pending.gc_was_enabled);
+    }
     if trap.untrappable {
         let reason = to_owned(trap.reason)
             .map_err(|e| VmError::Unsupported(format!("exception reason {e:?}")))?;
@@ -784,13 +794,25 @@ pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError>
     let Some(index) = stacktrace::raw_index(trace) else {
         return Ok(trace);
     };
-    let raw = p
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.raw_traces.get(index))
-        .ok_or_else(|| VmError::Unsupported("raw stacktrace index".into()))?
-        .clone();
-    stacktrace::build_saved(p, &raw)
+    let raw = {
+        let traces = &mut p
+            .cold
+            .as_mut()
+            .ok_or_else(|| VmError::Unsupported("raw stacktrace storage".into()))?
+            .raw_traces;
+        let slot = traces
+            .get_mut(index)
+            .ok_or_else(|| VmError::Unsupported("raw stacktrace index".into()))?;
+        std::mem::take(slot)
+    };
+    let result = stacktrace::build_saved(p, &raw);
+    let slot = p
+        .cold_mut()
+        .raw_traces
+        .get_mut(index)
+        .ok_or_else(|| VmError::Unsupported("raw stacktrace index".into()))?;
+    *slot = raw;
+    result
 }
 
 fn strip_top_location(p: &mut Process, trace: Term) -> Result<Term, VmError> {

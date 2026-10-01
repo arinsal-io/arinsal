@@ -698,6 +698,26 @@ fn unaligned_sub_binary_copy() {
 }
 
 #[test]
+fn unaligned_sub_binary_orders_against_literal_binary() {
+    let mut heap = VecHeap::new();
+    let mut builder = TermBuilder::new(&mut heap);
+    let aligned = builder.binary(&[1, 2, 3, 4]).unwrap();
+    let mut backing = [0_u8; 65];
+    for bit_index in 0..32 {
+        let bit = ([1_u8, 2, 3, 4][bit_index / 8] >> (7 - bit_index % 8)) & 1;
+        let target = bit_index + 3;
+        backing[target / 8] |= bit << (7 - target % 8);
+    }
+    let backing = builder.binary(&backing).unwrap();
+    let unaligned = builder.sub_binary(backing, 3, 32).unwrap();
+    let literal = builder.binary(&[1, 2, 3, 5]).unwrap();
+
+    assert_eq!(unaligned.header().unwrap() & 63, 0x24);
+    assert_eq!(cmp(unaligned, aligned), Ordering::Equal);
+    assert_eq!(cmp(unaligned, literal), Ordering::Less);
+}
+
+#[test]
 #[cfg(not(miri))]
 fn differential_binary_flat_size_for_matching_layouts() {
     let expression = "erts_debug:set_internal_state(available_internal_state,true),L=[iolist_to_binary([1,2,3]),list_to_binary(lists:duplicate(65,1))],lists:foreach(fun(B)->io:format(\"~w~n\",[erts_debug:flat_size(B)]) end,L),halt().";

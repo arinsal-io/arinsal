@@ -38,7 +38,10 @@ const REQ_GETSTAT: i64 = 11;
 const REQ_GETHOSTNAME: i64 = 12;
 const REQ_GETTYPE: i64 = 15;
 const REQ_GETSTATUS: i64 = 16;
+const REQ_GETIFLIST: i64 = 21;
+const REQ_IFGET: i64 = 22;
 const REQ_SUBSCRIBE: i64 = 24;
+const REQ_GETIFADDRS: i64 = 25;
 const PACKET_REQ_RECV: i64 = 60;
 
 const AF_INET_CODE: u8 = 1;
@@ -211,6 +214,11 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             REQ_GETOPTS => (getopts(&inner, data), None),
             REQ_GETSTAT => (getstat(&inner, data), None),
             REQ_GETHOSTNAME => (gethostname(data), None),
+            // Port of inet_drv.c:11067-11086 (common inet_ctl), OTP-29.1.1.
+            REQ_GETIFLIST if inner.open => (inet_drv::getiflist(), None),
+            REQ_IFGET if inner.open => (inet_drv::ifget(data), None),
+            REQ_GETIFADDRS if inner.open => (inet_drv::getifaddrs_reply(), None),
+            REQ_GETIFLIST | REQ_IFGET | REQ_GETIFADDRS => (err_bytes("exbadport"), None),
             REQ_GETTYPE => (gettype(&inner), None),
             REQ_GETSTATUS => (getstatus(&inner), None),
             REQ_SUBSCRIBE => (subscribe(data), None),

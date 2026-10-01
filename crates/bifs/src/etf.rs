@@ -1,15 +1,15 @@
 //! ETF BIFs over live process heap terms.
 // Port of erts/emulator/beam/external.c (external term sizing, encoding, and decoding), OTP-29.1.1.
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::Arc;
 
 use arinsal_term::{
-    ExportEntry, FunEntry, FunRef, Identity, Node, Term, TermBuilder, TermKind, cmp, global_atoms,
+    ExportEntry, FunEntry, FunRef, Identity, Node, Term, TermBuilder, TermKind, cmp_exact,
+    global_atoms,
 };
-use flate2::Compression;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 
@@ -147,325 +147,553 @@ fn bit_bytes(term: Term) -> Result<(Vec<u8>, usize), BifError> {
 }
 
 fn exact_key_cmp(left: Term, right: Term) -> Ordering {
-    // CMP_TERM in external.c:3217 uses erts_cmp(..., exact=1), OTP-29.1.1.
-    let mut pending = vec![(left, right)];
-    while let Some((left, right)) = pending.pop() {
-        if left == right {
-            continue;
-        }
-        let lk = left.classify();
-        let rk = right.classify();
-        let order = lk.cmp(&rk);
-        if order != Ordering::Equal {
-            return order;
-        }
-        match lk {
-            TermKind::Number => {
-                let lf = left.header().is_some_and(|h| h & 63 == 0x18);
-                let rf = right.header().is_some_and(|h| h & 63 == 0x18);
-                let order = lf.cmp(&rf);
-                if order != Ordering::Equal {
-                    return order;
-                }
-                let order = if lf {
-                    // SAFETY: FLOAT headers above identify live boxed floats.
-                    let a = unsafe { left.float_ref() }.unwrap().get();
-                    // SAFETY: FLOAT headers above identify live boxed floats.
-                    let b = unsafe { right.float_ref() }.unwrap().get();
-                    a.total_cmp(&b)
-                } else {
-                    cmp(left, right)
-                };
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-            TermKind::Tuple => {
-                // SAFETY: both tuple heaps remain stable for the BIF call.
-                let a = unsafe { left.tuple_ref() }.unwrap();
-                // SAFETY: both tuple heaps remain stable for the BIF call.
-                let b = unsafe { right.tuple_ref() }.unwrap();
-                let order = a.len().cmp(&b.len());
-                if order != Ordering::Equal {
-                    return order;
-                }
-                for i in (0..a.len()).rev() {
-                    pending.push((a.get(i).unwrap(), b.get(i).unwrap()));
-                }
-            }
-            TermKind::List => {
-                // SAFETY: live cons cells are stable for the BIF call.
-                let (ah, at) = unsafe { left.cons_ref() }.unwrap();
-                // SAFETY: live cons cells are stable for the BIF call.
-                let (bh, bt) = unsafe { right.cons_ref() }.unwrap();
-                pending.push((at, bt));
-                pending.push((ah, bh));
-            }
-            TermKind::Map => {
-                let mut a = arinsal_maps::to_list(left).unwrap_or_default();
-                let mut b = arinsal_maps::to_list(right).unwrap_or_default();
-                let order = a.len().cmp(&b.len());
-                if order != Ordering::Equal {
-                    return order;
-                }
-                a.sort_by(|x, y| exact_key_cmp(x.0, y.0));
-                b.sort_by(|x, y| exact_key_cmp(x.0, y.0));
-                for ((ak, av), (bk, bv)) in a.into_iter().zip(b).rev() {
-                    pending.push((av, bv));
-                    pending.push((ak, bk));
-                }
-            }
-            _ => {
-                let order = cmp(left, right);
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
-        }
-    }
-    Ordering::Equal
+    // Port of erts/emulator/beam/external.c:3217 (CMP_TERM), OTP-29.1.1.
+    cmp_exact(left, right)
 }
 
 enum Work {
     Term(Term),
     PatchFun(usize),
+    ListGather {
+        cursor: Term,
+        heads: Vec<Term>,
+        string_bytes: Vec<u8>,
+        is_string: bool,
+    },
+    ListElements {
+        heads: Arc<Vec<Term>>,
+        next: usize,
+    },
+    StringCopy {
+        bytes: Arc<Vec<u8>>,
+        copied: usize,
+    },
+    BinaryCopy {
+        term: Term,
+        bits: usize,
+        copied: usize,
+        start: usize,
+    },
+    MapGather {
+        entries: arinsal_maps::MapIter,
+        pairs: Vec<(Term, Term)>,
+    },
+    MapSort(MapSort),
+}
+
+struct MapSort {
+    source: Vec<(Term, Term)>,
+    destination: Vec<(Term, Term)>,
+    width: usize,
+    start: usize,
+    left: usize,
+    middle: usize,
+    right: usize,
+    output: usize,
+}
+
+impl MapSort {
+    fn new(source: Vec<(Term, Term)>) -> Self {
+        let len = source.len();
+        Self {
+            source,
+            destination: vec![(Term::NIL, Term::NIL); len],
+            width: 1,
+            start: 0,
+            left: 0,
+            middle: 0,
+            right: 0,
+            output: 0,
+        }
+    }
+
+    fn step(&mut self, budget: usize) -> usize {
+        let len = self.source.len();
+        let mut consumed = 0;
+        while consumed < budget && self.width < len {
+            if self.start >= len {
+                std::mem::swap(&mut self.source, &mut self.destination);
+                self.width = self.width.saturating_mul(2);
+                self.start = 0;
+                self.left = 0;
+                self.middle = 0;
+                self.right = 0;
+                self.output = 0;
+                continue;
+            }
+            if self.middle == self.start && self.output == self.start {
+                self.middle = self.start.saturating_add(self.width).min(len);
+                self.right = self
+                    .start
+                    .saturating_add(self.width.saturating_mul(2))
+                    .min(len);
+                self.left = self.start;
+                self.output = self.start;
+            }
+            if self.output == self.right {
+                self.start = self.right;
+                self.middle = self.start;
+                continue;
+            }
+            let right_index = self.middle + self.output - self.left;
+            let take_left = self.left < self.middle
+                && (right_index >= self.right
+                    || exact_key_cmp(self.source[self.left].0, self.source[right_index].0)
+                        != Ordering::Greater);
+            let selected = if take_left {
+                let pair = self.source[self.left];
+                self.left += 1;
+                pair
+            } else {
+                self.source[right_index]
+            };
+            self.destination[self.output] = selected;
+            self.output += 1;
+            consumed += 1;
+        }
+        consumed
+    }
+
+    fn is_done(&self) -> bool {
+        self.width >= self.source.len()
+    }
+
+    fn finish(self) -> Vec<(Term, Term)> {
+        self.source
+    }
+}
+
+fn push_map_terms(work: &mut Vec<Work>, pairs: Vec<(Term, Term)>) {
+    for (key, value) in pairs.into_iter().rev() {
+        work.push(Work::Term(value));
+        work.push(Work::Term(key));
+    }
 }
 
 type EncodedWithSplits = (Vec<u8>, Vec<(usize, usize)>);
 
-fn encode_plain_with_splits(term: Term, opts: EncodeOpts) -> Result<EncodedWithSplits, BifError> {
-    let mut out = vec![131];
-    if opts.local {
-        // Port of erts/emulator/beam/external.c:3305 (encode LOCAL_EXT), OTP-29.1.1.
-        // The decoder skips the 4-byte hash. Zero matches what the inet driver reads.
-        out.extend_from_slice(&[121, 0, 0, 0, 0]);
-    }
-    let mut splits = Vec::new();
-    let mut work = vec![Work::Term(term)];
-    // A scheduler can yield after a bounded number of popped work items here.
-    while let Some(item) = work.pop() {
-        let term = match item {
-            Work::PatchFun(at) => {
-                let size = u32::try_from(out.len() - at).map_err(|_| BifError::SystemLimit)?;
-                out[at..at + 4].copy_from_slice(&size.to_be_bytes());
-                continue;
-            }
-            Work::Term(term) => term,
-        };
-        match term.classify() {
-            TermKind::Number => {
-                if let Some(n) = term.as_small() {
-                    int_bytes(&mut out, &BigInt::from(n));
-                } else if let Some(header) = term.header() {
-                    if header & 63 == 0x18 {
-                        // SAFETY: a live boxed FLOAT has one initialized data word.
-                        let f = unsafe { term.float_ref() }.ok_or(BifError::BADARG)?.get();
-                        if opts.minor == 0 {
-                            let s = format!("{f:.20e}");
-                            let (mantissa, exponent) = s.split_once('e').unwrap();
-                            let exp: i32 = exponent.parse().unwrap();
-                            let rendered = format!(
-                                "{mantissa}e{}{:02}",
-                                if exp < 0 { '-' } else { '+' },
-                                exp.abs()
-                            );
-                            out.push(99);
-                            out.extend_from_slice(rendered.as_bytes());
-                            out.resize(out.len() + 31 - rendered.len(), 0);
-                        } else {
-                            out.push(70);
-                            out.extend_from_slice(&f.to_bits().to_be_bytes());
-                        }
-                    } else {
-                        // SAFETY: a live boxed integer has initialized magnitude words.
-                        let n = unsafe { term.big_ref() }
-                            .ok_or(BifError::BADARG)?
-                            .to_bigint();
-                        int_bytes(&mut out, &n);
-                    }
-                }
-            }
-            TermKind::Atom => atom_term(&mut out, term, opts.minor)?,
-            TermKind::Nil => out.push(106),
-            TermKind::List => {
-                let mut heads = Vec::new();
-                let mut tail = term;
-                while tail.classify() == TermKind::List {
-                    // SAFETY: source cons cells remain live and stable during encoding.
-                    let (head, next) = unsafe { tail.cons_ref() }.ok_or(BifError::BADARG)?;
-                    heads.push(head);
-                    tail = next;
-                    if heads.len() > u32::MAX as usize {
-                        return Err(BifError::SystemLimit);
-                    }
-                }
-                if tail == Term::NIL
-                    && heads.len() <= u16::MAX as usize
-                    && heads
-                        .iter()
-                        .all(|h| h.as_small().is_some_and(|n| (0..=255).contains(&n)))
-                {
-                    out.push(107);
-                    out.extend_from_slice(&(heads.len() as u16).to_be_bytes());
-                    out.extend(heads.into_iter().map(|h| h.as_small().unwrap() as u8));
-                } else {
-                    out.push(108);
-                    out.extend_from_slice(&(heads.len() as u32).to_be_bytes());
-                    work.push(Work::Term(tail));
-                    work.extend(heads.into_iter().rev().map(Work::Term));
-                }
-            }
-            TermKind::Tuple => {
-                // SAFETY: tuple remains live and stable during encoding.
-                let view = unsafe { term.tuple_ref() }.ok_or(BifError::BADARG)?;
-                if view.len() <= 255 {
-                    out.extend_from_slice(&[104, view.len() as u8]);
-                } else {
-                    out.push(105);
-                    out.extend_from_slice(&(view.len() as u32).to_be_bytes());
-                }
-                let elements: Vec<_> = view.iter().collect();
-                work.extend(elements.into_iter().rev().map(Work::Term));
-            }
-            TermKind::Map => {
-                let mut pairs =
-                    arinsal_maps::term_to_binary_pairs(term).map_err(|_| BifError::BADARG)?;
-                if opts.deterministic {
-                    pairs.sort_by(|a, b| exact_key_cmp(a.0, b.0));
-                }
-                out.push(116);
-                out.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
-                for (key, value) in pairs.into_iter().rev() {
-                    work.push(Work::Term(value));
-                    work.push(Work::Term(key));
-                }
-            }
-            TermKind::Bitstring => {
-                // SAFETY: the binary owner remains live and no append runs during encoding.
-                let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
-                let bits = view.bit_len();
-                let len = bits.div_ceil(8);
-                let n = u32::try_from(len).map_err(|_| BifError::SystemLimit)?;
-                if bits.is_multiple_of(8) {
-                    out.push(109);
-                    out.extend_from_slice(&n.to_be_bytes());
-                } else {
-                    out.push(77);
-                    out.extend_from_slice(&n.to_be_bytes());
-                    out.push((bits % 8) as u8);
-                }
-                let start = out.len();
-                if view.start_bit().is_multiple_of(8) {
-                    let offset = view.start_bit() / 8;
-                    out.extend_from_slice(&view.bytes()[offset..offset + len]);
-                } else {
-                    let offset = view.start_bit();
-                    for i in 0..len {
-                        let at = offset + i * 8;
-                        let first = view.bytes()[at / 8];
-                        let next = view.bytes().get(at / 8 + 1).copied().unwrap_or(0);
-                        out.push((first << (at % 8)) | (next >> (8 - at % 8)));
-                    }
-                }
-                if !bits.is_multiple_of(8) {
-                    *out.last_mut().unwrap() &= 0xff << (8 - bits % 8);
-                }
-                if len > 64 {
-                    splits.push((start, out.len()));
-                }
-            }
-            TermKind::Pid | TermKind::Port | TermKind::Ref => {
-                let identity = term.identity().ok_or(BifError::BADARG)?;
-                match identity {
-                    Identity::Pid {
-                        node,
-                        creation,
-                        index,
-                        serial,
-                    } => {
-                        out.push(88);
-                        // Port of erts/emulator/beam/external.c:3651 (local pid node), OTP-29.1.1.
-                        write_node(&mut out, node, opts)?;
-                        out.extend_from_slice(&index.to_be_bytes());
-                        out.extend_from_slice(&serial.to_be_bytes());
-                        out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
-                    }
-                    Identity::Port { node, creation, id } => {
-                        out.push(120);
-                        write_node(&mut out, node, opts)?;
-                        out.extend_from_slice(&id.to_be_bytes());
-                        out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
-                    }
-                    Identity::Ref {
-                        node,
-                        creation,
-                        ids,
-                    } => {
-                        out.push(90);
-                        out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
-                        write_node(&mut out, node, opts)?;
-                        out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
-                        for id in ids {
-                            out.extend_from_slice(&id.to_be_bytes());
-                        }
-                    }
-                }
-            }
-            TermKind::Fun => {
-                // SAFETY: the live source heap retains the entry and its environment.
-                match unsafe { term.fun_ref() }.ok_or(BifError::BADARG)? {
-                    FunRef::Export { entry } => {
-                        out.push(113);
-                        atom_term(&mut out, Term::atom(entry.module), opts.minor)?;
-                        atom_term(&mut out, Term::atom(entry.function), opts.minor)?;
-                        int_bytes(&mut out, &BigInt::from(entry.arity));
-                    }
-                    FunRef::Local { entry, free_vars } => {
-                        out.push(112);
-                        let at = out.len();
-                        out.extend_from_slice(&[0; 4]);
-                        out.push(entry.arity);
-                        out.extend_from_slice(&entry.uniq);
-                        out.extend_from_slice(&entry.index.to_be_bytes());
-                        out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
-                        atom_term(&mut out, Term::atom(entry.module), opts.minor)?;
-                        int_bytes(&mut out, &BigInt::from(entry.old_index));
-                        int_bytes(&mut out, &BigInt::from(entry.old_uniq));
-                        work.push(Work::PatchFun(at));
-                        // SAFETY: the live source heap retains the fun entry and environment.
-                        let view = unsafe { term.fun_ref() }.unwrap();
-                        for i in (0..view.num_free()).rev() {
-                            work.push(Work::Term(view.free(i).unwrap()));
-                        }
-                        work.push(Work::Term(entry.pid));
-                    }
-                }
-            }
-            TermKind::Record => {
-                // Port of erts/emulator/beam/external.c:4010-4031, OTP-29.1.1.
-                // SAFETY: the live record retains its definition and values.
-                let record = unsafe { term.record_ref() }.ok_or(BifError::BADARG)?;
-                out.push(67);
-                out.extend_from_slice(&(record.len() as u32).to_be_bytes());
-                out.push(u8::from(record.is_exported()));
-                atom_term(&mut out, Term::atom(record.module()), opts.minor)?;
-                atom_term(&mut out, Term::atom(record.name()), opts.minor)?;
-                let mut values = Vec::with_capacity(record.len());
-                for i in 0..record.len() {
-                    let sorted = record.sorted_index(i).ok_or(BifError::BADARG)?;
-                    atom_term(
-                        &mut out,
-                        Term::atom(record.key(sorted).ok_or(BifError::BADARG)?),
-                        opts.minor,
-                    )?;
-                    values.push(record.value(sorted).ok_or(BifError::BADARG)?);
-                }
-                work.extend(values.into_iter().rev().map(Work::Term));
-            }
-            _ => return Err(BifError::Unsupported("ETF representation")),
+/// Incremental ETF encoder used by the VM's trapping `term_to_binary` path.
+pub struct EncodeWalk {
+    opts: EncodeOpts,
+    out: Vec<u8>,
+    splits: Vec<(usize, usize)>,
+    work: Vec<Work>,
+}
+
+impl EncodeWalk {
+    /// Empty state used after the source term has been fully encoded.
+    pub fn completed() -> Self {
+        Self {
+            opts: EncodeOpts::default(),
+            out: Vec::new(),
+            splits: Vec::new(),
+            work: Vec::new(),
         }
     }
-    Ok((out, splits))
+
+    /// Begin encoding a `term_to_binary/1,2` argument vector.
+    pub fn new(args: &[Term]) -> Result<Self, BifError> {
+        let opts = options(args.get(1).copied())?;
+        Ok(Self::start(args[0], opts))
+    }
+
+    fn start(term: Term, opts: EncodeOpts) -> Self {
+        let mut out = vec![131];
+        if opts.local {
+            // Port of erts/emulator/beam/external.c:3305 (encode LOCAL_EXT), OTP-29.1.1.
+            out.extend_from_slice(&[121, 0, 0, 0, 0]);
+        }
+        Self {
+            opts,
+            out,
+            splits: Vec::new(),
+            work: vec![Work::Term(term)],
+        }
+    }
+
+    /// Encode at most `budget` pending terms and patch records.
+    pub fn step(&mut self, budget: usize) -> Result<(bool, usize), BifError> {
+        let opts = self.opts;
+        let mut out = std::mem::take(&mut self.out);
+        let mut splits = std::mem::take(&mut self.splits);
+        let mut work = std::mem::take(&mut self.work);
+        let mut consumed = 0;
+        while consumed < budget {
+            let Some(item) = work.pop() else {
+                break;
+            };
+            let term = match item {
+                Work::PatchFun(at) => {
+                    consumed += 1;
+                    let size = u32::try_from(out.len() - at).map_err(|_| BifError::SystemLimit)?;
+                    out[at..at + 4].copy_from_slice(&size.to_be_bytes());
+                    continue;
+                }
+                Work::Term(term) => {
+                    consumed += 1;
+                    term
+                }
+                Work::ListGather {
+                    cursor,
+                    mut heads,
+                    mut string_bytes,
+                    mut is_string,
+                } => {
+                    consumed += 1;
+                    if cursor.classify() == TermKind::List {
+                        // SAFETY: source list cells remain live while this BIF is suspended.
+                        let (head, tail) = unsafe { cursor.cons_ref() }.ok_or(BifError::BADARG)?;
+                        if heads.len() >= u32::MAX as usize {
+                            return Err(BifError::SystemLimit);
+                        }
+                        if is_string {
+                            if let Some(byte) = head.as_small().filter(|n| (0..=255).contains(n)) {
+                                string_bytes.push(byte as u8);
+                            } else {
+                                is_string = false;
+                                string_bytes.clear();
+                            }
+                        }
+                        heads.push(head);
+                        work.push(Work::ListGather {
+                            cursor: tail,
+                            heads,
+                            string_bytes,
+                            is_string,
+                        });
+                    } else if cursor == Term::NIL && is_string && heads.len() <= u16::MAX as usize {
+                        out.push(107);
+                        out.extend_from_slice(&(heads.len() as u16).to_be_bytes());
+                        work.push(Work::StringCopy {
+                            bytes: Arc::new(string_bytes),
+                            copied: 0,
+                        });
+                    } else {
+                        out.push(108);
+                        out.extend_from_slice(
+                            &u32::try_from(heads.len())
+                                .map_err(|_| BifError::SystemLimit)?
+                                .to_be_bytes(),
+                        );
+                        let heads = Arc::new(heads);
+                        work.push(Work::Term(cursor));
+                        work.push(Work::ListElements { heads, next: 0 });
+                    }
+                    continue;
+                }
+                Work::ListElements { heads, next } => {
+                    consumed += 1;
+                    if next < heads.len() {
+                        work.push(Work::ListElements {
+                            heads: Arc::clone(&heads),
+                            next: next + 1,
+                        });
+                        work.push(Work::Term(heads[next]));
+                    }
+                    continue;
+                }
+                Work::StringCopy { bytes, copied } => {
+                    let amount = bytes
+                        .len()
+                        .saturating_sub(copied)
+                        .min(budget.saturating_sub(consumed).max(1));
+                    out.extend_from_slice(&bytes[copied..copied + amount]);
+                    consumed += amount;
+                    if copied + amount < bytes.len() {
+                        work.push(Work::StringCopy {
+                            bytes,
+                            copied: copied + amount,
+                        });
+                    }
+                    continue;
+                }
+                Work::BinaryCopy {
+                    term,
+                    bits,
+                    copied,
+                    start,
+                } => {
+                    // Port of erts/emulator/beam/external.c:3820-3885 (ENC_BIN_COPY), OTP-29.1.1.
+                    let len = bits.div_ceil(8);
+                    let amount = len
+                        .saturating_sub(copied)
+                        .min(budget.saturating_sub(consumed).max(1));
+                    let mut bytes = vec![0; amount];
+                    let bit_count = (amount * 8).min(bits.saturating_sub(copied * 8));
+                    crate::pure::copy_bitstring_range(term, copied * 8, &mut bytes, bit_count)?;
+                    out.extend_from_slice(&bytes);
+                    consumed += amount;
+                    if copied + amount < len {
+                        work.push(Work::BinaryCopy {
+                            term,
+                            bits,
+                            copied: copied + amount,
+                            start,
+                        });
+                    } else {
+                        if bits % 8 != 0 {
+                            *out.last_mut().ok_or(BifError::BADARG)? &= 0xff << (8 - bits % 8);
+                        }
+                        if len > 64 {
+                            splits.push((start, out.len()));
+                        }
+                    }
+                    continue;
+                }
+                Work::MapGather {
+                    mut entries,
+                    mut pairs,
+                } => {
+                    consumed += 1;
+                    if let Some(pair) = entries.next() {
+                        pairs.push(pair);
+                        work.push(Work::MapGather { entries, pairs });
+                    } else if opts.deterministic {
+                        work.push(Work::MapSort(MapSort::new(pairs)));
+                    } else {
+                        push_map_terms(&mut work, pairs);
+                    }
+                    continue;
+                }
+                Work::MapSort(mut sorting) => {
+                    let work_budget = budget.saturating_sub(consumed).max(1);
+                    consumed += sorting.step(work_budget);
+                    if sorting.is_done() {
+                        push_map_terms(&mut work, sorting.finish());
+                    } else {
+                        work.push(Work::MapSort(sorting));
+                    }
+                    continue;
+                }
+            };
+            match term.classify() {
+                TermKind::Number => {
+                    if let Some(n) = term.as_small() {
+                        int_bytes(&mut out, &BigInt::from(n));
+                    } else if let Some(header) = term.header() {
+                        if header & 63 == 0x18 {
+                            // SAFETY: a live boxed FLOAT has one initialized data word.
+                            let f = unsafe { term.float_ref() }.ok_or(BifError::BADARG)?.get();
+                            if opts.minor == 0 {
+                                let s = format!("{f:.20e}");
+                                let (mantissa, exponent) = s.split_once('e').unwrap();
+                                let exp: i32 = exponent.parse().unwrap();
+                                let rendered = format!(
+                                    "{mantissa}e{}{:02}",
+                                    if exp < 0 { '-' } else { '+' },
+                                    exp.abs()
+                                );
+                                out.push(99);
+                                out.extend_from_slice(rendered.as_bytes());
+                                out.resize(out.len() + 31 - rendered.len(), 0);
+                            } else {
+                                out.push(70);
+                                out.extend_from_slice(&f.to_bits().to_be_bytes());
+                            }
+                        } else {
+                            // SAFETY: a live boxed integer has initialized magnitude words.
+                            let n = unsafe { term.big_ref() }
+                                .ok_or(BifError::BADARG)?
+                                .to_bigint();
+                            int_bytes(&mut out, &n);
+                        }
+                    }
+                }
+                TermKind::Atom => atom_term(&mut out, term, opts.minor)?,
+                TermKind::Nil => out.push(106),
+                TermKind::List => {
+                    work.push(Work::ListGather {
+                        cursor: term,
+                        heads: Vec::new(),
+                        string_bytes: Vec::new(),
+                        is_string: true,
+                    });
+                }
+                TermKind::Tuple => {
+                    // SAFETY: tuple remains live and stable during encoding.
+                    let view = unsafe { term.tuple_ref() }.ok_or(BifError::BADARG)?;
+                    if view.len() <= 255 {
+                        out.extend_from_slice(&[104, view.len() as u8]);
+                    } else {
+                        out.push(105);
+                        out.extend_from_slice(&(view.len() as u32).to_be_bytes());
+                    }
+                    let elements: Vec<_> = view.iter().collect();
+                    work.extend(elements.into_iter().rev().map(Work::Term));
+                }
+                TermKind::Map => {
+                    out.push(116);
+                    let len = arinsal_maps::size(term).map_err(|_| BifError::BADARG)?;
+                    out.extend_from_slice(
+                        &u32::try_from(len)
+                            .map_err(|_| BifError::SystemLimit)?
+                            .to_be_bytes(),
+                    );
+                    if opts.deterministic {
+                        let entries = arinsal_maps::iter(term).map_err(|_| BifError::BADARG)?;
+                        work.push(Work::MapGather {
+                            entries,
+                            pairs: Vec::with_capacity(len),
+                        });
+                    } else {
+                        let pairs = arinsal_maps::term_to_binary_pairs(term)
+                            .map_err(|_| BifError::BADARG)?;
+                        push_map_terms(&mut work, pairs);
+                    }
+                }
+                TermKind::Bitstring => {
+                    // SAFETY: the binary owner remains live and no append runs during encoding.
+                    let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
+                    let bits = view.bit_len();
+                    let len = bits.div_ceil(8);
+                    let n = u32::try_from(len).map_err(|_| BifError::SystemLimit)?;
+                    if bits.is_multiple_of(8) {
+                        out.push(109);
+                        out.extend_from_slice(&n.to_be_bytes());
+                    } else {
+                        out.push(77);
+                        out.extend_from_slice(&n.to_be_bytes());
+                        out.push((bits % 8) as u8);
+                    }
+                    let start = out.len();
+                    if len != 0 {
+                        work.push(Work::BinaryCopy {
+                            term,
+                            bits,
+                            copied: 0,
+                            start,
+                        });
+                    }
+                }
+                TermKind::Pid | TermKind::Port | TermKind::Ref => {
+                    let identity = term.identity().ok_or(BifError::BADARG)?;
+                    match identity {
+                        Identity::Pid {
+                            node,
+                            creation,
+                            index,
+                            serial,
+                        } => {
+                            out.push(88);
+                            // Port of erts/emulator/beam/external.c:3651 (local pid node), OTP-29.1.1.
+                            write_node(&mut out, node, opts)?;
+                            out.extend_from_slice(&index.to_be_bytes());
+                            out.extend_from_slice(&serial.to_be_bytes());
+                            out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
+                        }
+                        Identity::Port { node, creation, id } => {
+                            out.push(120);
+                            write_node(&mut out, node, opts)?;
+                            out.extend_from_slice(&id.to_be_bytes());
+                            out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
+                        }
+                        Identity::Ref {
+                            node,
+                            creation,
+                            ids,
+                        } => {
+                            out.push(90);
+                            out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+                            write_node(&mut out, node, opts)?;
+                            out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
+                            for id in ids {
+                                out.extend_from_slice(&id.to_be_bytes());
+                            }
+                        }
+                    }
+                }
+                TermKind::Fun => {
+                    // SAFETY: the live source heap retains the entry and its environment.
+                    match unsafe { term.fun_ref() }.ok_or(BifError::BADARG)? {
+                        FunRef::Export { entry } => {
+                            out.push(113);
+                            atom_term(&mut out, Term::atom(entry.module), opts.minor)?;
+                            atom_term(&mut out, Term::atom(entry.function), opts.minor)?;
+                            int_bytes(&mut out, &BigInt::from(entry.arity));
+                        }
+                        FunRef::Local { entry, free_vars } => {
+                            out.push(112);
+                            let at = out.len();
+                            out.extend_from_slice(&[0; 4]);
+                            out.push(entry.arity);
+                            out.extend_from_slice(&entry.uniq);
+                            out.extend_from_slice(&entry.index.to_be_bytes());
+                            out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
+                            atom_term(&mut out, Term::atom(entry.module), opts.minor)?;
+                            int_bytes(&mut out, &BigInt::from(entry.old_index));
+                            int_bytes(&mut out, &BigInt::from(entry.old_uniq));
+                            work.push(Work::PatchFun(at));
+                            // SAFETY: the live source heap retains the fun entry and environment.
+                            let view = unsafe { term.fun_ref() }.unwrap();
+                            for i in (0..view.num_free()).rev() {
+                                work.push(Work::Term(view.free(i).unwrap()));
+                            }
+                            work.push(Work::Term(entry.pid));
+                        }
+                    }
+                }
+                TermKind::Record => {
+                    // Port of erts/emulator/beam/external.c:4010-4031, OTP-29.1.1.
+                    // SAFETY: the live record retains its definition and values.
+                    let record = unsafe { term.record_ref() }.ok_or(BifError::BADARG)?;
+                    out.push(67);
+                    out.extend_from_slice(&(record.len() as u32).to_be_bytes());
+                    out.push(u8::from(record.is_exported()));
+                    atom_term(&mut out, Term::atom(record.module()), opts.minor)?;
+                    atom_term(&mut out, Term::atom(record.name()), opts.minor)?;
+                    let mut values = Vec::with_capacity(record.len());
+                    for i in 0..record.len() {
+                        let sorted = record.sorted_index(i).ok_or(BifError::BADARG)?;
+                        atom_term(
+                            &mut out,
+                            Term::atom(record.key(sorted).ok_or(BifError::BADARG)?),
+                            opts.minor,
+                        )?;
+                        values.push(record.value(sorted).ok_or(BifError::BADARG)?);
+                    }
+                    work.extend(values.into_iter().rev().map(Work::Term));
+                }
+                _ => return Err(BifError::Unsupported("ETF representation")),
+            }
+        }
+        let done = work.is_empty();
+        self.out = out;
+        self.splits = splits;
+        self.work = work;
+        Ok((done, consumed))
+    }
+
+    /// Finish compression and return the serialized byte vector.
+    pub fn finish_binary(self) -> Result<Vec<u8>, BifError> {
+        encode_bytes(self.out, self.opts)
+    }
+
+    /// Finish as `term_to_iovec/1,2`, preserving large-binary split boundaries.
+    pub fn finish_iovec(self) -> Result<(Vec<Vec<u8>>, bool), BifError> {
+        if self.opts.compressed.is_some_and(|level| level > 0) {
+            return Ok((vec![encode_bytes(self.out, self.opts)?], true));
+        }
+        let Self { out, splits, .. } = self;
+        let mut at = 0;
+        let mut parts = Vec::new();
+        for (start, end) in splits {
+            if start > at {
+                parts.push(out[at..start].to_vec());
+            }
+            parts.push(out[start..end].to_vec());
+            at = end;
+        }
+        if at < out.len() {
+            parts.push(out[at..].to_vec());
+        }
+        Ok((parts, false))
+    }
+}
+
+fn encode_plain_with_splits(term: Term, opts: EncodeOpts) -> Result<EncodedWithSplits, BifError> {
+    let mut walk = EncodeWalk::start(term, opts);
+    walk.step(usize::MAX)?;
+    Ok((walk.out, walk.splits))
 }
 
 // Port of erts/emulator/beam/external.c:3651 (NIL_EXT node when encoding local), OTP-29.1.1.
@@ -492,6 +720,10 @@ fn encode_plain(term: Term, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
 
 fn encode(term: Term, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
     let plain = encode_plain(term, opts)?;
+    encode_bytes(plain, opts)
+}
+
+fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
     if let Some(level) = opts.compressed.filter(|n| *n > 0) {
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), Compression::new(level as u32));
         z.write_all(&plain[1..])
@@ -577,14 +809,17 @@ fn decode_options(term: Option<Term>) -> Result<DecodeOpts, BifError> {
     Ok(opts)
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
+struct Reader {
+    bytes: Vec<u8>,
     at: usize,
 }
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], BifError> {
+impl Reader {
+    fn take(&mut self, n: usize) -> Result<&[u8], BifError> {
         let end = self.at.checked_add(n).ok_or(BifError::BADARG)?;
-        let part = self.bytes.get(self.at..end).ok_or(BifError::BADARG)?;
+        let part = self
+            .bytes
+            .get(self.at..end)
+            .ok_or(BifError::Unsupported("incomplete ETF input"))?;
         self.at = end;
         Ok(part)
     }
@@ -802,22 +1037,27 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
     }
 }
 
-fn count_ok(count: usize, remaining: usize) -> Result<(), BifError> {
+fn count_ok(count: usize, remaining: usize, input_complete: bool) -> Result<(), BifError> {
     if count > remaining {
-        Err(BifError::BADARG)
+        if input_complete {
+            Err(BifError::BADARG)
+        } else {
+            Err(BifError::Unsupported("incomplete ETF input"))
+        }
     } else {
         Ok(())
     }
 }
 
-fn parse(
-    bytes: &[u8],
+fn parse_step(
+    r: &mut Reader,
+    stack: &mut Vec<Frame>,
     safe: bool,
     mut ctx: Option<&mut Ctx<'_>>,
-) -> Result<(Term, usize), BifError> {
-    let mut r = Reader { bytes, at: 0 };
-    let mut stack: Vec<Frame> = Vec::new();
-    loop {
+    budget: usize,
+    input_complete: bool,
+) -> Result<Option<(Term, usize)>, BifError> {
+    for _ in 0..budget {
         let tag = r.u8()?;
         let result: Option<(Term, Shape)> = match tag {
             97 | 98 => {
@@ -885,7 +1125,7 @@ fn parse(
                 } else {
                     r.u32()? as usize
                 };
-                count_ok(n, r.bytes.len() - r.at)?;
+                count_ok(n, r.bytes.len() - r.at, input_complete)?;
                 if n == 0 {
                     Some((built(&mut ctx, |b| b.tuple(&[]))?, Shape::Other))
                 } else {
@@ -918,7 +1158,7 @@ fn parse(
                     n.checked_mul(2)
                 }
                 .ok_or(BifError::BADARG)?;
-                count_ok(count, r.bytes.len() - r.at)?;
+                count_ok(count, r.bytes.len() - r.at, input_complete)?;
                 if count == 0 {
                     let t = if let Some(ctx) = ctx.as_deref_mut() {
                         arinsal_maps::from_pairs(&[], ctx.heap).map_err(|_| BifError::BADARG)?
@@ -1067,7 +1307,7 @@ fn parse(
                 let uniq = r.take(16)?.try_into().unwrap();
                 let index = r.u32()?;
                 let free = r.u32()? as usize;
-                count_ok(free.saturating_add(4), r.bytes.len() - r.at)?;
+                count_ok(free.saturating_add(4), r.bytes.len() - r.at, input_complete)?;
                 if free > 255 {
                     return Err(BifError::Unsupported(
                         "fun with more than 255 free variables",
@@ -1100,7 +1340,7 @@ fn parse(
                     .checked_mul(2)
                     .and_then(|n| n.checked_add(2))
                     .ok_or(BifError::BADARG)?;
-                count_ok(count, r.bytes.len() - r.at)?;
+                count_ok(count, r.bytes.len() - r.at, input_complete)?;
                 stack.push(Frame {
                     kind: FrameKind::Record { exported, fields },
                     left: count,
@@ -1114,7 +1354,7 @@ fn parse(
         if let Some((mut term, mut shape)) = result {
             loop {
                 let Some(frame) = stack.last_mut() else {
-                    return Ok((term, r.at));
+                    return Ok(Some((term, r.at)));
                 };
                 frame.values.push(term);
                 frame.shapes.push(shape);
@@ -1126,58 +1366,338 @@ fn parse(
             }
         }
     }
+    Ok(None)
+}
+
+fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, usize), BifError> {
+    let mut reader = Reader {
+        bytes: bytes.to_vec(),
+        at: 0,
+    };
+    let mut stack = Vec::new();
+    match parse_step(&mut reader, &mut stack, safe, ctx, usize::MAX, true)? {
+        Some(value) => Ok(value),
+        None => Err(BifError::BADARG),
+    }
+}
+
+/// Incremental ETF validator retained by `binary_to_term_trap/1`.
+pub struct DecodeWalk {
+    reader: Reader,
+    stack: Vec<Frame>,
+    safe: bool,
+    used: bool,
+    compressed: bool,
+    used_prefix: usize,
+    input_size: usize,
+    compressed_input: Vec<u8>,
+    input_offset: usize,
+    expected_plain: usize,
+    decompressor: Option<Decompress>,
+    inflate_done: bool,
+    checked_root: Option<usize>,
+    decoded_root: Option<Term>,
+}
+
+impl DecodeWalk {
+    /// Start decoding an ETF binary and retain its compressed payload if needed.
+    pub fn new(args: &[Term]) -> Result<Self, BifError> {
+        let opts = decode_options(args.get(1).copied())?;
+        // SAFETY: the input binary owner is live and stable during the BIF call.
+        let view = unsafe { args[0].binary_ref() }.ok_or(BifError::BADARG)?;
+        if !view.bit_len().is_multiple_of(8) {
+            return Err(BifError::BADARG);
+        }
+        let bytes = if view.start_bit().is_multiple_of(8) {
+            let start = view.start_bit() / 8;
+            view.bytes()[start..start + view.bit_len() / 8].to_vec()
+        } else {
+            bit_bytes(args[0])?.0
+        };
+        if bytes.first() != Some(&131) {
+            return Err(BifError::BADARG);
+        }
+        let (plain, used_prefix, compressed, compressed_input, expected_plain, decompressor) =
+            if bytes.get(1) == Some(&80) {
+                if bytes.len() < 6 {
+                    return Err(BifError::BADARG);
+                }
+                let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+                (
+                    Vec::new(),
+                    6,
+                    true,
+                    bytes[6..].to_vec(),
+                    size,
+                    Some(Decompress::new(true)),
+                )
+            } else {
+                (bytes[1..].to_vec(), 1, false, Vec::new(), 0, None)
+            };
+        Ok(Self {
+            reader: Reader {
+                bytes: plain,
+                at: 0,
+            },
+            stack: Vec::new(),
+            safe: opts.safe,
+            used: opts.used,
+            compressed,
+            used_prefix,
+            input_size: bytes.len(),
+            compressed_input,
+            input_offset: 0,
+            expected_plain,
+            decompressor,
+            inflate_done: !compressed,
+            checked_root: None,
+            decoded_root: None,
+        })
+    }
+
+    fn inflate_more(&mut self, output_budget: usize) -> Result<usize, BifError> {
+        if self.inflate_done {
+            return Ok(0);
+        }
+        let remaining = self.expected_plain.saturating_sub(self.reader.bytes.len());
+        let capacity = output_budget.max(1).min(remaining.saturating_add(1));
+        let mut output = vec![0; capacity];
+        let input = &self.compressed_input[self.input_offset..];
+        let flush = if input.is_empty() {
+            FlushDecompress::Finish
+        } else {
+            FlushDecompress::None
+        };
+        let inflater = self.decompressor.as_mut().ok_or(BifError::BADARG)?;
+        let before_in = inflater.total_in();
+        let before_out = inflater.total_out();
+        let status = inflater
+            .decompress(input, &mut output, flush)
+            .map_err(|_| BifError::BADARG)?;
+        let consumed =
+            usize::try_from(inflater.total_in() - before_in).map_err(|_| BifError::BADARG)?;
+        let produced =
+            usize::try_from(inflater.total_out() - before_out).map_err(|_| BifError::BADARG)?;
+        self.input_offset = self.input_offset.saturating_add(consumed);
+        if self.reader.bytes.len().saturating_add(produced) > self.expected_plain {
+            return Err(BifError::BADARG);
+        }
+        self.reader.bytes.extend_from_slice(&output[..produced]);
+        if status == Status::StreamEnd {
+            self.inflate_done = true;
+            self.used_prefix = 6 + self.input_offset;
+            if self.reader.bytes.len() != self.expected_plain {
+                return Err(BifError::BADARG);
+            }
+        } else if consumed == 0 && produced == 0 {
+            return Err(BifError::BADARG);
+        }
+        Ok(produced)
+    }
+
+    /// Validate at most `byte_budget` ETF input bytes and report consumed bytes.
+    pub fn step(
+        &mut self,
+        byte_budget: usize,
+    ) -> Result<(Option<usize>, usize), (BifError, usize)> {
+        let mut consumed = 0;
+        if let Some(checked) = self.checked_root {
+            while !self.inflate_done && consumed < byte_budget.max(1) {
+                let produced = self
+                    .inflate_more(byte_budget.saturating_sub(consumed))
+                    .map_err(|error| (error, consumed))?;
+                consumed += produced.max(1);
+            }
+            if self.inflate_done {
+                if checked != self.expected_plain || self.reader.bytes.len() != checked {
+                    return Err((BifError::BADARG, consumed));
+                }
+                return Ok((Some(checked), consumed));
+            }
+            return Ok((None, consumed));
+        }
+        while consumed < byte_budget.max(1) {
+            let before = self.reader.at;
+            match parse_step(
+                &mut self.reader,
+                &mut self.stack,
+                self.safe,
+                None,
+                1,
+                !self.compressed || self.inflate_done,
+            ) {
+                Ok(Some((_, checked))) => {
+                    consumed += self.reader.at - before;
+                    if self.compressed && !self.inflate_done {
+                        self.checked_root = Some(checked);
+                        let produced = self
+                            .inflate_more(byte_budget.saturating_sub(consumed))
+                            .map_err(|error| (error, consumed))?;
+                        consumed += produced.max(1);
+                        continue;
+                    }
+                    if self.compressed && checked != self.reader.bytes.len() {
+                        return Err((BifError::BADARG, consumed));
+                    }
+                    return Ok((Some(checked), consumed));
+                }
+                Ok(None) => consumed += self.reader.at - before,
+                Err(BifError::Unsupported("incomplete ETF input")) => {
+                    self.reader.at = before;
+                    if !self.compressed || self.inflate_done {
+                        return Err((BifError::BADARG, consumed));
+                    }
+                    let produced = self
+                        .inflate_more(byte_budget.saturating_sub(consumed))
+                        .map_err(|error| (error, consumed))?;
+                    consumed += produced.max(1);
+                }
+                Err(error) => return Err((error, consumed + self.reader.at - before)),
+            }
+        }
+        Ok((None, consumed))
+    }
+
+    /// Parse and build a bounded prefix into the supplied live process heap.
+    pub fn step_into(
+        &mut self,
+        byte_budget: usize,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<(Option<Term>, usize), (BifError, usize)> {
+        let mut heap = Heap(&mut *ctx.heap);
+        let mut parser_ctx = Ctx::new(&mut heap);
+        let mut consumed = 0;
+        if let Some(checked) = self.checked_root {
+            while !self.inflate_done && consumed < byte_budget.max(1) {
+                let produced = self
+                    .inflate_more(byte_budget.saturating_sub(consumed))
+                    .map_err(|error| (error, consumed))?;
+                consumed += produced.max(1);
+            }
+            if self.inflate_done {
+                if checked != self.expected_plain || self.reader.bytes.len() != checked {
+                    return Err((BifError::BADARG, consumed));
+                }
+                let term = self
+                    .decoded_root
+                    .take()
+                    .ok_or((BifError::BADARG, consumed))?;
+                return self
+                    .wrap_used(&mut parser_ctx, term, checked)
+                    .map(|value| (Some(value), consumed))
+                    .map_err(|error| (error, consumed));
+            }
+            return Ok((None, consumed));
+        }
+        while consumed < byte_budget.max(1) {
+            let before = self.reader.at;
+            match parse_step(
+                &mut self.reader,
+                &mut self.stack,
+                self.safe,
+                Some(&mut parser_ctx),
+                1,
+                !self.compressed || self.inflate_done,
+            ) {
+                Ok(Some((term, checked))) => {
+                    consumed += self.reader.at - before;
+                    if self.compressed && !self.inflate_done {
+                        self.checked_root = Some(checked);
+                        self.decoded_root = Some(term);
+                        let produced = self
+                            .inflate_more(byte_budget.saturating_sub(consumed))
+                            .map_err(|error| (error, consumed))?;
+                        consumed += produced.max(1);
+                        continue;
+                    }
+                    if self.compressed && checked != self.reader.bytes.len() {
+                        return Err((BifError::BADARG, consumed));
+                    }
+                    let value = self
+                        .wrap_used(&mut parser_ctx, term, checked)
+                        .map_err(|error| (error, consumed))?;
+                    return Ok((Some(value), consumed));
+                }
+                Ok(None) => consumed += self.reader.at - before,
+                Err(BifError::Unsupported("incomplete ETF input")) => {
+                    self.reader.at = before;
+                    if !self.compressed || self.inflate_done {
+                        return Err((BifError::BADARG, consumed));
+                    }
+                    let produced = self
+                        .inflate_more(byte_budget.saturating_sub(consumed))
+                        .map_err(|error| (error, consumed))?;
+                    consumed += produced.max(1);
+                }
+                Err(error) => return Err((error, consumed + self.reader.at - before)),
+            }
+        }
+        Ok((None, consumed))
+    }
+
+    fn wrap_used(&self, ctx: &mut Ctx<'_>, term: Term, checked: usize) -> Result<Term, BifError> {
+        if self.used {
+            let used = if self.compressed {
+                self.used_prefix
+            } else {
+                self.used_prefix + checked
+            };
+            let size = integer(ctx, used)?;
+            Ok(tuple_build(ctx, &[term, size]))
+        } else {
+            Ok(term)
+        }
+    }
+
+    /// Decode the validated prefix into the current process heap.
+    pub fn finish(&self, ctx: &mut Ctx<'_>, checked: usize) -> Result<Term, BifError> {
+        let (term, _) =
+            parse(&self.reader.bytes[..checked], self.safe, Some(ctx)).map_err(decode_error)?;
+        self.wrap_used(ctx, term, checked)
+    }
+
+    /// Return the original ETF byte length for reduction accounting.
+    pub fn input_size(&self) -> usize {
+        self.input_size
+    }
 }
 
 fn binary_to_term(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let opts = decode_options(args.get(1).copied())?;
-    // SAFETY: the input binary owner is live and stable during the BIF call.
-    let view = unsafe { args[0].binary_ref() }.ok_or(BifError::BADARG)?;
-    if !view.bit_len().is_multiple_of(8) {
-        return Err(BifError::BADARG);
+    let mut decoder = DecodeWalk::new(args)?;
+    ctx.charge_reductions(decoder.input_size());
+    let (term, _) = decoder
+        .step_into(usize::MAX, ctx)
+        .map_err(|(error, _)| decode_error(error))?;
+    term.ok_or(BifError::BADARG)
+}
+
+fn decode_error(error: BifError) -> BifError {
+    match error {
+        BifError::Unsupported(_) => BifError::BADARG,
+        other => other,
     }
-    let bytes: Cow<'_, [u8]> = if view.start_bit().is_multiple_of(8) {
-        let start = view.start_bit() / 8;
-        Cow::Borrowed(&view.bytes()[start..start + view.bit_len() / 8])
-    } else {
-        Cow::Owned(bit_bytes(args[0])?.0)
-    };
-    ctx.charge_reductions(bytes.len());
-    if bytes.first() != Some(&131) {
-        return Err(BifError::BADARG);
-    }
-    let (plain, used_prefix, compressed) = if bytes.get(1) == Some(&80) {
-        if bytes.len() < 6 {
-            return Err(BifError::BADARG);
+}
+
+#[cfg(test)]
+mod map_sort_tests {
+    use super::MapSort;
+    use arinsal_term::Term;
+
+    #[test]
+    fn bottom_up_map_sort_runs_across_budget_boundaries() {
+        let input = (0..33)
+            .rev()
+            .map(|key| (Term::small(key).unwrap(), Term::NIL))
+            .collect();
+        let mut sort = MapSort::new(input);
+        while !sort.is_done() {
+            sort.step(1);
         }
-        let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
-        let mut z = flate2::bufread::ZlibDecoder::new(&bytes[6..]);
-        let mut plain = Vec::new();
-        (&mut z)
-            .take(size as u64 + 1)
-            .read_to_end(&mut plain)
-            .map_err(|_| BifError::BADARG)?;
-        if plain.len() != size {
-            return Err(BifError::BADARG);
-        }
-        let used = 6 + z.total_in() as usize;
-        (Cow::Owned(plain), used, true)
-    } else {
-        (Cow::Borrowed(&bytes[1..]), 1, false)
-    };
-    let (_, checked) = parse(&plain, opts.safe, None)?;
-    if compressed && checked != plain.len() {
-        return Err(BifError::BADARG);
-    }
-    let (term, _) = parse(&plain[..checked], opts.safe, Some(ctx))?;
-    if opts.used {
-        let used = if compressed {
-            used_prefix
-        } else {
-            used_prefix + checked
-        };
-        let size = integer(ctx, used)?;
-        Ok(tuple_build(ctx, &[term, size]))
-    } else {
-        Ok(term)
+        let keys: Vec<_> = sort
+            .finish()
+            .into_iter()
+            .map(|(key, _)| key.as_small().unwrap())
+            .collect();
+        assert_eq!(keys, (0..33).collect::<Vec<_>>());
     }
 }

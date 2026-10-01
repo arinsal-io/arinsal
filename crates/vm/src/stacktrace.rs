@@ -17,7 +17,7 @@ fn interpreted_catch_ids() -> &'static Mutex<std::collections::HashMap<(usize, u
 }
 
 /// Continuation addresses saved before exception unwinding.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub(super) struct RawTrace {
     class: Option<Class>,
     explicit: Option<OwnedTerm>,
@@ -30,13 +30,11 @@ pub(super) struct RawTrace {
     native_top: Option<(NativeFunction, usize)>,
 }
 
-#[derive(Clone)]
 enum Continuation {
     Interpreted(Arc<Module>, usize),
     Native(NativeFunction, usize),
 }
 
-#[derive(Clone)]
 enum StoredTopFrame {
     Bif {
         module: String,
