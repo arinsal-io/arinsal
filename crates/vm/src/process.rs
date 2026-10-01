@@ -696,6 +696,8 @@ pub(crate) struct Runtime {
     pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
     otp_root: Option<std::path::PathBuf>,
     pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
+    /// Pid of `erts_literal_area_collector` (an unregistered system process).
+    pub(crate) literal_collector: Mutex<Option<Pid>>,
     paths: Vec<std::path::PathBuf>,
     scheduler: Mutex<Weak<Scheduler<Process>>>,
     pub(crate) names: Mutex<HashMap<String, Pid>>,
@@ -3053,6 +3055,20 @@ impl Process {
         // DOWN. Signals already queued are installed before we notify.
         ctx.begin_exit();
         self.absorb_exit_signals(ctx);
+        // Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1:
+        // delayed literal-copy requests of an exiting process are answered with `ok`.
+        if let Some(cold) = self.cold.as_mut() {
+            for task in std::mem::take(&mut cold.delayed_gc) {
+                if let crate::proc_create::DelayedGc::Literal {
+                    request, requester, ..
+                } = task
+                {
+                    let _ = crate::natives::sys::reply_exiting_literal_area(
+                        self, ctx, request, requester,
+                    );
+                }
+            }
+        }
         // Port of erts/emulator/beam/erl_process.c:14300-14304, OTP-29.1.1.
         // Timers aimed at this process are canceled before its other resources.
         ctx.cancel_target_timers(ctx.pid());
@@ -4524,6 +4540,7 @@ impl Vm {
             system_processes: Mutex::new(std::collections::HashSet::new()),
             otp_root: self.otp_root.clone(),
             dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
+            literal_collector: Mutex::new(None),
             paths: self.paths.clone(),
             scheduler: Mutex::new(Weak::new()),
             names: Mutex::new(HashMap::new()),
@@ -4595,11 +4612,8 @@ impl Vm {
             "erts_literal_area_collector",
             "start",
         )?;
-        runtime
-            .names
-            .lock()
-            .unwrap()
-            .insert("erts_literal_area_collector".into(), literal_collector);
+        // erl 29.1.1 does not register the collector; it is found by initial_call.
+        *runtime.literal_collector.lock().unwrap() = Some(literal_collector);
         let mut process = Process::with_spawn_registers(args.len(), 0);
         process.module = module_id;
         process.ip = ip;

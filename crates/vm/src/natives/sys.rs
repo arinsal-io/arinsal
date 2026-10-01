@@ -583,14 +583,11 @@ pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Mes
     if !store.has_retired() {
         return;
     }
-    let Some(pid) = process.runtime.as_ref().and_then(|runtime| {
-        runtime
-            .names
-            .lock()
-            .unwrap()
-            .get("erts_literal_area_collector")
-            .copied()
-    }) else {
+    let Some(pid) = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| *runtime.literal_collector.lock().unwrap())
+    else {
         return;
     };
     if let Ok(message) = Message::copy_from(atom("copy_literals")) {

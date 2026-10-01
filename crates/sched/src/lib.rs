@@ -2975,7 +2975,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let waiting = process.state.load(Ordering::Acquire) == WAITING;
         let wakes = payload_wakes(&payload);
         let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
-        if waiting || monitor || deferred.is_some() {
+        // A literal-copy request is never buffered: a request lost to an exiting target
+        // would never be answered, so the sender must see `NoProcess` at once. Port of
+        // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
+        if waiting || monitor || deferred.is_some() || force_enqueue {
             self.flush_target(to, remaining);
             if let Some(first) = deferred {
                 let mut events = self

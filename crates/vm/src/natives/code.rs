@@ -827,15 +827,10 @@ fn notsup() -> VmError {
 }
 
 fn literal_collector(vm: &Vm, process: &Process, pid: Pid) -> bool {
-    let registered = process.runtime.as_ref().is_some_and(|runtime| {
-        runtime
-            .names
-            .lock()
-            .unwrap()
-            .get("erts_literal_area_collector")
-            .copied()
-            == Some(pid)
-    });
+    let registered = process
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| *runtime.literal_collector.lock().unwrap() == Some(pid));
     registered
         || vm
             .modules
