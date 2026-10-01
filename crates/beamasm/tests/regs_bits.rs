@@ -1,9 +1,7 @@
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters,
-    bs_construct::{
-        BsConstructErrorHelper, BsConstructHelper, BsInitWritableHelper, BsSegment, BsSegmentKind,
-    },
+    bs_construct::{BsCreateBinHelper, BsInitWritableHelper, BsSegment, BsSegmentKind},
     bs_match::BsMatchHelper,
     enter_native,
     float::{BigToFloat, emit_fconv},
@@ -31,18 +29,8 @@ extern "C" fn writable_hook(_process: *mut ProcessHeader, value: u64) -> u64 {
     1
 }
 
-extern "C" fn segment_hook(
-    _process: *mut ProcessHeader,
-    operation: u64,
-    value: u64,
-    size: u64,
-    unit: u64,
-) -> u64 {
-    SEEN.with(|seen| *seen.borrow_mut() = vec![operation, value, size, unit]);
-    1
-}
-
-extern "C" fn error_hook(_process: *mut ProcessHeader, _info: u32, _value: u64) -> u64 {
+extern "C" fn segment_hook(_process: *mut ProcessHeader, count: u64, live: u64, alloc: u64) -> u64 {
+    SEEN.with(|seen| *seen.borrow_mut() = vec![count, live, alloc]);
     1
 }
 
@@ -122,22 +110,24 @@ fn construction_runtime_keeps_non_destination_x_registers() {
         kind: BsSegmentKind::Integer,
         src: ArgVal::X(0),
         size: ArgVal::X(1),
+        size_is_units: false,
         unit: 1,
         flags: 0,
     };
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_i_bs_create_bin(
-        Some(99),
+        0,
+        3,
+        2,
         ArgVal::X(2),
         &[segment],
-        segment_hook as BsConstructHelper,
-        error_hook as BsConstructErrorHelper,
+        segment_hook as BsCreateBinHelper,
     )
     .unwrap();
     finish(&mut asm);
     let (_, regs) = execute(asm, &[0x123, 0x2f, 0xabc, 4, 5, 6]);
-    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 0x123, 2, 1]));
+    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 2, 3]));
     assert_eq!(&regs.x_reg_array[..2], &[0x123, 0x2f]);
     assert_eq!(&regs.x_reg_array[3..6], &[4, 5, 6]);
 }
@@ -169,13 +159,13 @@ fn match_string_runtime_keeps_the_argument_registers() {
     asm.emit_i_bs_match_string(
         ArgVal::X(0),
         99,
-        ArgVal::Immediate(8),
+        ArgVal::Immediate((8 << 4) | 0xf),
         ArgVal::X(1),
         match_hook as BsMatchHelper,
     )
     .unwrap();
     finish(&mut asm);
     let (_, regs) = execute(asm, &[0x111, 0x222, 3, 4, 5, 6]);
-    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[9, 0x111, 0x222, 0]));
+    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[9, 0x111, 0x222, 8]));
     assert_eq!(&regs.x_reg_array[..6], &[0x111, 0x222, 3, 4, 5, 6]);
 }

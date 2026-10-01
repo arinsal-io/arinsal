@@ -213,6 +213,17 @@ fn break_loop(read_fd: RawFd) {
 /// A remote call records it here as well. The poll thread delivers
 /// `{select, TTY, Ref, ready_input}` to that pid.
 pub(crate) fn note_caller(process: &Process, ctx: &RunCtx<'_, Message>) {
+    note_caller_pid(process, ctx.pid());
+}
+
+pub(crate) fn note_caller_native(process: &Process) {
+    let Some(pid) = process.self_pid.as_ref() else {
+        return;
+    };
+    note_caller_pid(process, *pid);
+}
+
+fn note_caller_pid(process: &Process, pid: Pid) {
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
@@ -221,7 +232,7 @@ pub(crate) fn note_caller(process: &Process, ctx: &RunCtx<'_, Message>) {
     };
     let key = std::ptr::from_ref(&process.heap) as usize;
     let target = Target {
-        pid: ctx.pid(),
+        pid,
         scheduler: Arc::downgrade(&scheduler),
     };
     registry().lock().unwrap().insert(key, target.clone());

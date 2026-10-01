@@ -1992,7 +1992,7 @@ pub(crate) fn native_send3(
         }
     }
     // Local priority delivery needs the process send path (alias + flag).
-    process.send_message_prio(Some(vm), ctx, args[0], args[1], want_priority)?;
+    process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)?;
     Ok(atom("ok"))
 }
 
@@ -2277,7 +2277,7 @@ fn remember_monitor(node: &str, id: u64, target: OwnedTerm) -> Result<(), VmErro
     Ok(())
 }
 
-fn take_monitor(id: u64) -> Option<(String, OwnedTerm)> {
+pub(crate) fn take_monitor(id: u64) -> Option<(String, OwnedTerm)> {
     let mut tables = node_tables::lock();
     for (node, entry) in &mut tables.entries {
         if let Some(target) = entry.pending_monitors.remove(&id) {
@@ -2330,6 +2330,20 @@ fn control(op: i64, mut fields: Vec<OwnedTerm>) -> OwnedTerm {
 /// when `target` is a local destination and the caller should deliver locally.
 ///
 /// Port of erts/emulator/beam/erl_message.c / `erts_send` remote arm, OTP-29.1.1.
+/// Whether `target` names a process, alias or registered name on another node, which only a
+/// send with a scheduler context (the distribution output path) can reach.
+pub(crate) fn is_remote_target(target: Term) -> Result<bool, VmError> {
+    let local = node_tables::lock().local_name.clone();
+    let remote = |node: &str| node != local && node != "nonode@nohost";
+    if let Some((_, node)) = name_node_tuple(target)? {
+        return Ok(remote(&node));
+    }
+    Ok(match &owned(target)? {
+        OwnedTerm::Ref { node, .. } | OwnedTerm::Pid { node, .. } => remote(node),
+        _ => false,
+    })
+}
+
 pub(crate) fn try_remote_send(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -2780,7 +2794,9 @@ fn send_to(
     if try_remote_send(process, ctx, target, message)? {
         return Ok(());
     }
-    process.send_message(ctx, target, message).map(|_| ())
+    process
+        .send_message_prio(None, Some(ctx), target, message, false)
+        .map(|_| ())
 }
 
 fn local_pid(term: &OwnedTerm, local: &str) -> Option<Pid> {

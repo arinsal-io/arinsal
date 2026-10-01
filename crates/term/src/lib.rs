@@ -32,13 +32,15 @@ pub use gc::{FragmentAlloc, GcStats};
 pub use hamt::{boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_node_children};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
 pub use heap::{
-    AdoptError, CP_WORDS, FrameLayout, HeapAlloc, LiteralArea, ProcessHeap, StackWord, TermBuilder,
-    VecHeap,
+    AdoptError, CP_WORDS, FrameLayout, HeapAlloc, LiteralArea, NATIVE_SPILL_WORDS, ProcessHeap,
+    S_REDZONE, S_RESERVED, StackWord, TermBuilder, VecHeap,
 };
 pub use identity::{Identity, Node};
 pub use internal_hash::{internal_hash, internal_salted_hash};
 pub use magic::MagicRef;
-pub use native_code::{is_native_code_pointer, register_native_code_range};
+pub use native_code::{
+    is_native_code_pointer, register_native_code_range, unregister_native_code_range,
+};
 pub use ops::{
     cmp, cmp_exact, exact_eq, flat_size, integer_magnitude_cmp, loose_eq, size_object, small_add,
     small_mul, small_sub,

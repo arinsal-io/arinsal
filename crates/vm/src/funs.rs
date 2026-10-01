@@ -141,10 +141,7 @@ fn unwrap_nested_apply(
     mut function: Term,
     mut arguments: Term,
 ) -> (Term, Term, Term) {
-    loop {
-        let Some(module_atom) = module.as_atom() else {
-            break;
-        };
+    while let Some(module_atom) = module.as_atom() {
         let Some(function_atom) = function.as_atom() else {
             break;
         };
@@ -859,7 +856,9 @@ impl Vm {
                     .text(function)
                     .is_some_and(|name| matches!(name.as_ref(), "error" | "exit" | "throw"))
         });
-        if tail && tail_applies_exception_bif {
+        // A native caller's frame comes from its recorded call site instead.
+        let native_caller = p.cold.as_ref().is_some_and(|cold| cold.native_apply);
+        if tail && tail_applies_exception_bif && !native_caller {
             // Port of erts/emulator/beam/beam_common.c:1350-1427 (apply_bif_error_adjustment), OTP-29.1.1.
             let return_ip =
                 p.ip.checked_add(1)
@@ -926,7 +925,7 @@ impl Vm {
 
     // elixir_loop1: Port of erts/emulator/beam/erl_bif_info.c:4011
     // (fun_info_mfa_1), OTP-29.1.1.
-    fn fun_info_mfa(&self, p: &mut Process) -> Result<Term, VmError> {
+    pub(super) fn fun_info_mfa(&self, p: &mut Process) -> Result<Term, VmError> {
         p.ensure(4, 1)?;
         // SAFETY: X0 retains the fun throughout this BIF; tuple construction cannot collect.
         let view = unsafe { p.x[0].fun_ref() }.ok_or_else(|| self.exception(p, "badarg"))?;

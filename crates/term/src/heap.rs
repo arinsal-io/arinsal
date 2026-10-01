@@ -291,6 +291,7 @@ pub struct ProcessHeap {
     pub(crate) minor_since_major: u16,
     pub(crate) off_heap_binary_bytes: u64,
     pub(crate) heap_grow: bool,
+    pub(crate) native_allocation: bool,
     pub(crate) fragments: Vec<Fragment>,
     pub(crate) owners: LazyOwners,
 }
@@ -320,6 +321,15 @@ impl FrameLayout {
 
 /// Number of words reserved for a default BeamAsm continuation pointer.
 pub const CP_WORDS: usize = 1;
+/// Stack redzone that runtime heap allocators must leave for native calls.
+// Port of erts/emulator/beam/erl_vm.h:108-110, OTP-29.1.1, BEAMAsm AArch64.
+pub const S_REDZONE: usize = CP_WORDS * 3;
+/// Minimum free gap kept between the young heap and Erlang stack.
+// Port of erts/emulator/beam/erl_vm.h:120, OTP-29.1.1.
+pub const S_RESERVED: usize = CP_WORDS + S_REDZONE;
+/// Stack words BeamAsm code may borrow below E to address X registers past the register
+/// cache as stack slots. Native heap checks and native-mode runtime allocation keep them free.
+pub const NATIVE_SPILL_WORDS: usize = 72;
 #[derive(Default)]
 pub(crate) struct HeapOwners {
     pub(crate) off_heap: Vec<Arc<Vec<u8>>>,
@@ -385,6 +395,7 @@ impl ProcessHeap {
             minor_since_major: 0,
             off_heap_binary_bytes: 0,
             heap_grow: false,
+            native_allocation: false,
             fragments: Vec::new(),
             owners: LazyOwners::default(),
         }
@@ -412,6 +423,31 @@ impl ProcessHeap {
     /// Number of words between the heap and stack pointers.
     pub fn free_words(&self) -> usize {
         self.stop - self.htop
+    }
+    /// Young heap allocation boundary, leaving the native stack redzone unused.
+    // Port of erts/emulator/beam/erl_process.h:990-998, OTP-29.1.1.
+    pub fn heap_limit_words(&self) -> usize {
+        self.htop.max(
+            self.stop
+                .saturating_sub(crate::S_REDZONE + NATIVE_SPILL_WORDS),
+        )
+    }
+    /// Whether generated code is running on this heap (set by the native bridge).
+    pub fn native_active(&self) -> bool {
+        self.native_allocation
+    }
+    /// Words an allocation must leave free below the stack: the native redzone and spill
+    /// area while generated code is active, none otherwise.
+    pub fn allocation_reserve(&self) -> usize {
+        if self.native_allocation {
+            crate::S_REDZONE + NATIVE_SPILL_WORDS
+        } else {
+            0
+        }
+    }
+    /// Select the runtime heap limit while generated Erlang code is active.
+    pub fn set_native_allocation(&mut self, active: bool) {
+        self.native_allocation = active;
     }
     /// Return the current heap top and stack boundary for a VM-local bump cursor.
     /// The pointers remain valid until this heap collects or grows.
@@ -454,7 +490,12 @@ impl ProcessHeap {
     pub fn set_heap_top(&mut self, top: *mut u64) {
         let base = self.words.as_ptr() as usize;
         let address = top as usize;
-        assert!(address >= base && address <= base + self.stop * 8);
+        assert!(
+            address >= base && address <= base + self.stop * 8,
+            "heap top={address:#x} base={base:#x} stop={:#x} end={:#x}",
+            base + self.stop * 8,
+            base + self.words.len() * 8,
+        );
         assert_eq!((address - base) % 8, 0);
         self.htop = (address - base) / 8;
     }
@@ -576,7 +617,13 @@ impl Default for ProcessHeap {
 impl HeapAlloc for ProcessHeap {
     #[inline]
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        if words > self.free_words() {
+        let limit = if self.native_allocation {
+            self.heap_limit_words()
+        } else {
+            self.stop
+        };
+        let available = limit.saturating_sub(self.htop);
+        if words > available {
             return None;
         }
         // SAFETY: htop is within the fixed boxed slice and capacity is checked.

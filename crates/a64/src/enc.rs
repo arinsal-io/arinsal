@@ -2321,7 +2321,7 @@ impl Emitter {
     }
     /// UDF with 16-bit immediate.
     pub fn udf(&mut self, imm: u16) {
-        self.emit(imm as u32)
+        self.emit(u32::from(imm) << 5)
     }
     /// Emits a 64-bit data word in little-endian word order.
     pub fn embed_uint64(&mut self, value: u64) {

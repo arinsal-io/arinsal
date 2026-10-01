@@ -5,7 +5,25 @@ use arinsal_beamasm::{
     enter_native,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
 };
+
+extern "C" fn raise_class_for_test(_header: *mut ProcessHeader, trace: u64, _value: u64) -> u64 {
+    trace
+}
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
+
+extern "C" fn gc_stub(
+    _: *mut ProcessHeader,
+    _: *mut SchedulerRegisters,
+    _: usize,
+    _: usize,
+    _: i32,
+) -> i32 {
+    0
+}
+
+extern "C" fn add_stacktrace_stub(_: *mut ProcessHeader, reason: u64, _: u64) -> u64 {
+    reason
+}
 
 extern "C" fn uncaught(_: *mut ProcessHeader, _: *mut SchedulerRegisters, _: *mut u64) -> usize {
     0
@@ -78,13 +96,14 @@ fn native_catch() {
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_catch(ArgVal::Y(0), 2).unwrap();
-    asm.emit_catch_end(ArgVal::Y(0)).unwrap();
+    asm.emit_catch_end(ArgVal::Y(0), gc_stub, add_stacktrace_stub)
+        .unwrap();
     asm.deallocate(3).unwrap();
     finish(&mut asm);
     asm.emit_i_func_label(2).unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert!(header.catches.is_null());
+    assert_eq!(header.catches, 0);
     assert_eq!(make_catch(2), (2 << 6) | 0x1b);
 }
 
@@ -97,7 +116,7 @@ fn native_try_catches_throw_and_returns_catch_value() {
     asm.emit_i_raise(
         ArgVal::Immediate(0x1b),
         ArgVal::Immediate(77),
-        ArgVal::Immediate(0x3b),
+        raise_class_for_test as *const () as usize,
         route_to_header_handler,
     )
     .unwrap();
@@ -124,8 +143,9 @@ fn native_try_catches_throw_and_returns_catch_value() {
         enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
-    assert_eq!(regs.x_reg_array[0], 77);
-    assert!(header.catches.is_null());
+    // try_case leaves the reason in X1 (the harness routes to the handler directly).
+    assert_eq!(regs.x_reg_array[1], 77);
+    assert_eq!(header.catches, 0);
 }
 
 #[test]
@@ -136,7 +156,7 @@ fn native_callee_error_unwinds_to_caller_try() {
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
     asm.call(3).unwrap();
-    asm.emit_try_end_deallocate(ArgVal::Y(0), 3).unwrap();
+    asm.emit_try_end_deallocate(3).unwrap();
     asm.emit_leave_frame().unwrap();
     finish(&mut asm);
     asm.emit_i_func_label(2).unwrap();
@@ -171,7 +191,7 @@ fn native_callee_error_unwinds_to_caller_try() {
         enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
-    assert!(header.catches.is_null());
+    assert_eq!(header.catches, 0);
 }
 
 #[test]
@@ -191,12 +211,13 @@ fn native_catch_returns_exit_tuple_from_handler() {
     asm.emit_i_raise(
         ArgVal::Immediate(0x5b),
         ArgVal::Immediate(9),
-        ArgVal::Immediate(0x3b),
+        raise_class_for_test as *const () as usize,
         route_to_header_handler,
     )
     .unwrap();
     asm.emit_i_func_label(2).unwrap();
-    asm.emit_catch_end(ArgVal::Y(0)).unwrap();
+    asm.emit_catch_end(ArgVal::Y(0), gc_stub, add_stacktrace_stub)
+        .unwrap();
     asm.deallocate(3).unwrap();
     finish(&mut asm);
     let module = asm.finalize().unwrap();
@@ -227,7 +248,8 @@ fn native_catch_end() {
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_catch(ArgVal::Y(0), 2).unwrap();
-    asm.emit_catch_end(ArgVal::Y(0)).unwrap();
+    asm.emit_catch_end(ArgVal::Y(0), gc_stub, add_stacktrace_stub)
+        .unwrap();
     asm.deallocate(3).unwrap();
     finish(&mut asm);
     asm.emit_i_func_label(2).unwrap();
@@ -290,7 +312,9 @@ fn native_try_case_end() {
     asm.emit_i_func_label(2).unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_eq!(header.freason, 0x1b);
+    // erts EXC_TRY_CLAUSE: the runtime wraps the value as {try_clause, 42}.
+    assert_eq!(header.freason, (16 << 10) | 0x50);
+    assert_eq!(header.fvalue, 42);
 }
 
 #[test]
@@ -300,7 +324,7 @@ fn native_i_raise() {
     asm.emit_i_raise(
         ArgVal::Immediate(0x5b),
         ArgVal::Immediate(12),
-        ArgVal::Immediate(0x3b),
+        raise_class_for_test as *const () as usize,
         uncaught,
     )
     .unwrap();
@@ -325,17 +349,39 @@ fn native_raise() {
     assert_eq!(header.freason, 0x5b);
 }
 
+fn atom_word(name: &str) -> u64 {
+    Term::atom(global_atoms().intern(name).unwrap()).tagged_word()
+}
+
 #[test]
 fn native_raw_raise() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
-    asm.move_(ArgVal::Immediate(0x5b), ArgVal::X(0)).unwrap();
+    asm.move_(ArgVal::Immediate(atom_word("exit")), ArgVal::X(0))
+        .unwrap();
     asm.move_(ArgVal::Immediate(12), ArgVal::X(1)).unwrap();
     asm.move_(ArgVal::Immediate(0x3b), ArgVal::X(2)).unwrap();
     asm.emit_raw_raise(uncaught).unwrap();
     finish(&mut asm);
     let (_, header, _, _) = execute(asm, 1);
-    assert_eq!(header.freason, 0x5b);
+    assert_eq!(header.freason, arinsal_beamasm::catch::RAW_RAISE | 2);
+    assert_eq!(header.fvalue, 12);
+    assert_eq!(header.ftrace as u64, 0x3b);
+}
+
+// Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise): an invalid class leaves
+// badarg in X0 and continues.
+#[test]
+fn native_raw_raise_invalid_class_continues_with_badarg() {
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.move_(ArgVal::Immediate(atom_word("nonclass")), ArgVal::X(0))
+        .unwrap();
+    asm.emit_raw_raise(uncaught).unwrap();
+    finish(&mut asm);
+    let (_, header, regs, _) = execute(asm, 1);
+    assert_eq!(header.freason, 0);
+    assert_eq!(regs.x_reg_array[0], atom_word("badarg"));
 }
 
 #[test]
@@ -374,7 +420,7 @@ fn native_try_end_deallocate() {
     asm.emit_i_func_label(1).unwrap();
     asm.allocate(3, 0).unwrap();
     asm.emit_try(ArgVal::Y(0), 2).unwrap();
-    asm.emit_try_end_deallocate(ArgVal::Y(0), 3).unwrap();
+    asm.emit_try_end_deallocate(3).unwrap();
     finish(&mut asm);
     asm.emit_i_func_label(2).unwrap();
     finish(&mut asm);

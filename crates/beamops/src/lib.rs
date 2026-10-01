@@ -30,6 +30,8 @@ pub enum SpecificOperand {
     Unsigned(u64),
     /// Nil operand.
     Nil,
+    /// Integer outside `i64`, as decimal text; the loader turns it into a literal.
+    BigInt(String),
     /// Variable-length operand sequence.
     List(Vec<SpecificOperand>),
     /// Allocation descriptor list.
@@ -73,7 +75,7 @@ fn transform_with_context(instructions: &[Instr], beam: Option<&BeamFile>) -> Ve
         .iter()
         .map(|instruction| Node {
             name: instruction.op.name().to_owned(),
-            args: instruction.args.clone(),
+            args: instruction.args.iter().map(allocation_as_words).collect(),
             offset: instruction.offset,
         })
         .collect::<Vec<_>>();
@@ -563,7 +565,12 @@ fn restriction_matches(
     };
     match restriction {
         Restriction::IsBif => mfa_is_bif(module, function, arity),
-        Restriction::IsNotBif => !mfa_is_bif(module, function, arity),
+        // Port of erts/emulator/utils/beam_makeops:2835-2873 (is_not_bif), OTP-29.1.1:
+        // erlang:apply/2,3 are special and never count as plain functions.
+        Restriction::IsNotBif => {
+            !mfa_is_bif(module, function, arity)
+                && !(module == "erlang" && function == "apply" && matches!(arity, 2 | 3))
+        }
         Restriction::Mfa {
             module: expected_module,
             function: expected_function,
@@ -580,12 +587,14 @@ fn restriction_matches(
             let Some(bif) = arinsal_spec::bif_lookup(module, function, arity as u8) else {
                 return false;
             };
-            function == expected_function
-                || bif.c_name.is_some_and(|c_name| {
-                    c_name
-                        .strip_suffix(&format!("_{arity}"))
-                        .is_some_and(|name| name == expected_function)
-                })
+            // beam_makeops resolves `$bif:` operands through the C function name from bif.tab
+            // (`'div'` is `intdiv_2`, `'/'` is `div_2`); a BIF without one uses its own name.
+            match bif.c_name {
+                Some(c_name) => c_name
+                    .strip_suffix(&format!("_{arity}"))
+                    .is_some_and(|name| name == expected_function),
+                None => function == expected_function,
+            }
         }
     }
 }
@@ -859,14 +868,80 @@ fn apply_rule(
                 });
             }
             "create_bin" => {
+                // Port of erts/emulator/beam/jit/arm/generators.tab:441-530 (gen.create_bin),
+                // OTP-29.1.1.
                 if args.len() != 7 {
                     return None;
                 }
-                let Operand::List(rest) = &args[6] else {
+                let Operand::List(segments) = &args[6] else {
                     return None;
                 };
-                let mut specific_args = args[..6].to_vec();
-                specific_args.extend(rest.clone());
+                if !segments.len().is_multiple_of(6) {
+                    return None;
+                }
+                let atom_index = |name: &str| {
+                    beam.and_then(|beam| beam.atoms.iter().position(|atom| atom == name))
+                        .and_then(|position| u32::try_from(position + 1).ok())
+                };
+                let mut alloc = args[1].clone();
+                let mut specific_args = vec![
+                    args[0].clone(),
+                    args[1].clone(),
+                    args[2].clone(),
+                    args[4].clone(),
+                ];
+                for segment in segments.chunks_exact(6) {
+                    let mut segment = segment.to_vec();
+                    // Translate the flags list to the BSF_* bit mask (ARM is little endian).
+                    let mut flags = 0u64;
+                    if let Operand::Literal(index) = &segment[3]
+                        && let Some(beam) = beam
+                        && let Ok(term) = beam.literal(*index)
+                    {
+                        let mut current = &term;
+                        while let OwnedTerm::List { elems, tail } = current {
+                            for elem in elems {
+                                if let OwnedTerm::Atom(name) = elem
+                                    && matches!(name.as_str(), "little" | "native")
+                                {
+                                    flags |= 2;
+                                }
+                            }
+                            current = tail;
+                        }
+                    }
+                    segment[3] = Operand::U(flags);
+                    // Short string segments become integer segments.
+                    if operand_is_atom(&segment[0], "string", beam)
+                        && let Some(count) = operand_integer(&segment[5])
+                        && (0..=4).contains(&count)
+                        && let Some(index) = operand_integer(&segment[4])
+                        && let Some(beam) = beam
+                        && let Some(integer) = atom_index("integer")
+                        && let Some(bytes) = usize::try_from(index)
+                            .ok()
+                            .and_then(|start| beam.strings.get(start..start + count as usize))
+                    {
+                        let value = bytes
+                            .iter()
+                            .fold(0i64, |acc, byte| acc << 8 | i64::from(*byte));
+                        segment[0] = Operand::Atom(integer);
+                        segment[2] = Operand::U(8);
+                        segment[4] = Operand::Int(value);
+                    }
+                    specific_args.extend(segment);
+                }
+                if operand_is_atom(&segments[0], "private_append", beam)
+                    && operand_integer(&alloc).is_some_and(|words| words != 0)
+                {
+                    produced.push(Node {
+                        name: "test_heap".into(),
+                        args: vec![alloc.clone(), args[2].clone()],
+                        offset: code[at].offset,
+                    });
+                    alloc = Operand::U(0);
+                    specific_args[1] = alloc;
+                }
                 produced.push(Node {
                     name: "i_bs_create_bin".into(),
                     args: specific_args,
@@ -916,7 +991,8 @@ fn apply_rule(
                 let mut specific_args = vec![
                     args[0].clone(),
                     args[1].clone(),
-                    Operand::U(rest.len() as u64 / 2),
+                    // Port of erts/emulator/beam/generators.tab:202-227 (gen.get_map_elements).
+                    Operand::U(3 * (rest.len() as u64 / 2)),
                 ];
                 for pair in rest.chunks_exact(2) {
                     specific_args.push(pair[0].clone());
@@ -1472,6 +1548,24 @@ fn operand_equal(a: &Operand, b: &Operand) -> bool {
     }
 }
 
+/// Sums an allocation list into heap words, as the loader does when it reads the operand.
+// Port of erts/emulator/beam/beam_file.c:2234-2280 (marshal_allocation_list), OTP-29.1.1:
+// floats take FLOAT_SIZE_OBJECT (2) words each and funs ERL_FUN_SIZE (2) words each.
+fn allocation_as_words(value: &Operand) -> Operand {
+    let Operand::Alloc(items) = value else {
+        return value.clone();
+    };
+    let words = items.iter().fold(0_u64, |total, item| {
+        total.saturating_add(match item.kind {
+            arinsal_beam::AllocKind::Words => item.count,
+            arinsal_beam::AllocKind::Floats | arinsal_beam::AllocKind::Funs => {
+                item.count.saturating_mul(2)
+            }
+        })
+    });
+    Operand::U(words)
+}
+
 fn operand(value: &Operand) -> SpecificOperand {
     match value {
         Operand::X(value) => SpecificOperand::X(*value),
@@ -1484,6 +1578,8 @@ fn operand(value: &Operand) -> SpecificOperand {
         Operand::U(value) => i64::try_from(*value)
             .map_or(SpecificOperand::Unsigned(*value), SpecificOperand::SmallInt),
         Operand::Nil => SpecificOperand::Nil,
+        Operand::Char(value) => SpecificOperand::SmallInt(i64::from(*value)),
+        Operand::BigInt(value) => SpecificOperand::BigInt(value.to_string()),
         Operand::TypedReg { reg, .. } => operand(reg),
         Operand::List(values) => SpecificOperand::List(values.iter().map(operand).collect()),
         Operand::Alloc(values) => SpecificOperand::Allocations(
@@ -1499,7 +1595,6 @@ fn operand(value: &Operand) -> SpecificOperand {
                 })
                 .collect(),
         ),
-        _ => SpecificOperand::Other,
     }
 }
 

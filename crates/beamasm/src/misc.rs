@@ -4,23 +4,14 @@ use arinsal_a64::enc::Gpr;
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 
-const XREGS: [Gpr; 6] = [
-    Gpr::x(25),
-    Gpr::x(26),
-    Gpr::x(27),
-    Gpr::x(28),
-    Gpr::x(15),
-    Gpr::x(16),
-];
-
-/// Resolves an MFA apply call to a native function entry; zero means failure.
-pub type ApplyHook = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32) -> usize;
+/// Resolves `apply Arity` to a native entry or the interpreter fragment.
+pub type ApplyHook = extern "C" fn(*mut crate::ProcessHeader, u32) -> usize;
 
 impl BeamModuleAssembler {
     /// Sends through the light-BIF trap path so the executor owns the scheduler context.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624, OTP-29.1.1.
     pub fn emit_send(&mut self, fragment: usize, identity: usize) -> Result<(), ModuleError> {
-        self.dispatch_light_bif(fragment, identity)
+        self.dispatch_send(fragment, identity)
     }
 
     /// Restores the saved bit offset in an `ErlSubBits` match context.
@@ -28,7 +19,7 @@ impl BeamModuleAssembler {
     pub fn emit_bs_set_position(&mut self, ctx: ArgVal, pos: ArgVal) -> Result<(), ModuleError> {
         let ctx = self.source_reg(ctx)?;
         self.code.emit(|e| e.and_imm(Gpr::x(9), ctx, !7))?;
-        let pos = self.source_reg(pos)?;
+        let pos = self.source_reg_into(pos, Gpr::x(17))?;
         self.code.emit(|e| {
             e.asr_imm(Gpr::x(10), pos, 4)?;
             e.str_uoff(Gpr::x(10), Gpr::x(9), 16)
@@ -37,108 +28,97 @@ impl BeamModuleAssembler {
     }
 }
 
-/// Applies the MFA encoded in X0/X1 and calls the returned native target.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:246-249, OTP-29.1.1
-pub fn emit_i_apply(
-    asm: &mut BeamModuleAssembler,
-    hook: ApplyHook,
-    live: u32,
-) -> Result<(), ModuleError> {
-    emit_apply_common(asm, None, hook, live, false, false)
+/// Which apply form an instruction implements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyKind {
+    /// `apply Arity`: arguments in X0.., module and function in `x[Arity]`, `x[Arity+1]`.
+    Fixed(u32),
+    /// `apply/3` (`i_apply`): module, function and argument list in X0..X2.
+    Apply3,
+    /// `apply/2` (`i_apply_fun`): fun and argument list in X0, X1.
+    Apply2,
 }
 
-/// Applies X0/X1 after releasing the current Y frame.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:251-254, OTP-29.1.1
-pub fn emit_i_apply_last(
+/// Runtime entry points used by the apply instructions.
+#[derive(Clone, Copy, Debug)]
+pub struct ApplyRuntime {
+    /// Resolves a fixed-arity apply; returns a native target or the fixed-apply fragment.
+    pub resolver: ApplyHook,
+    /// Fragment handing `apply/2` to the interpreter.
+    pub apply2_fragment: usize,
+    /// Fragment handing `apply/3` to the interpreter.
+    pub apply3_fragment: usize,
+}
+
+/// Calls the target of an apply form.
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:246-249,263-266, OTP-29.1.1
+pub fn emit_apply_call(
     asm: &mut BeamModuleAssembler,
-    hook: ApplyHook,
-    live: u32,
+    kind: ApplyKind,
+    runtime: ApplyRuntime,
+) -> Result<(), ModuleError> {
+    emit_apply_common(asm, kind, runtime, false)
+}
+
+/// Tail-calls the target of an apply form after releasing `deallocate` Y slots.
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:251-260,301-309, OTP-29.1.1
+pub fn emit_apply_tail(
+    asm: &mut BeamModuleAssembler,
+    kind: ApplyKind,
+    runtime: ApplyRuntime,
     deallocate: u32,
 ) -> Result<(), ModuleError> {
     asm.deallocate(deallocate)?;
-    emit_i_apply_only(asm, hook, live)
+    emit_apply_common(asm, kind, runtime, true)
 }
 
-/// Tail-applies the MFA in X0/X1.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-260, OTP-29.1.1
-pub fn emit_i_apply_only(
-    asm: &mut BeamModuleAssembler,
-    hook: ApplyHook,
-    live: u32,
-) -> Result<(), ModuleError> {
-    emit_apply_common(asm, None, hook, live, true, true)
-}
-
-/// Applies the MFA in X0/X1 with a statically known argument count.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-266, OTP-29.1.1
-pub fn emit_apply(
-    asm: &mut BeamModuleAssembler,
-    arity: u32,
-    hook: ApplyHook,
-    live: u32,
-) -> Result<(), ModuleError> {
-    emit_apply_common(asm, Some(arity), hook, live, false, false)
-}
-
-/// Tail-applies a fixed-arity MFA after releasing its Y frame.
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:301-309, OTP-29.1.1
-pub fn emit_apply_last(
-    asm: &mut BeamModuleAssembler,
-    arity: u32,
-    hook: ApplyHook,
-    live: u32,
-    deallocate: u32,
-) -> Result<(), ModuleError> {
-    asm.deallocate(deallocate)?;
-    emit_apply_common(asm, Some(arity), hook, live, true, true)
-}
-
-// Port of erts/emulator/beam/jit/arm/instr_call.cpp:263-320, OTP-29.1.1.
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-320, OTP-29.1.1.
+// `apply/2` and `apply/3` reach the interpreter through a shared fragment, which
+// validates and applies them; a fixed apply first looks for a native target.
 fn emit_apply_common(
     asm: &mut BeamModuleAssembler,
-    arity: Option<u32>,
-    hook: ApplyHook,
-    live: u32,
+    kind: ApplyKind,
+    runtime: ApplyRuntime,
     tail: bool,
-    helper_continuation: bool,
 ) -> Result<(), ModuleError> {
-    if live > 6 || arity.is_some_and(|n| n > 6) {
-        return Err(ModuleError::InvalidOperand(
-            "apply arity or live count exceeds X registers",
-        ));
+    let continuation = asm.code.new_label();
+    if tail {
+        asm.record_call_site()?;
+    } else {
+        asm.record_return_site(continuation)?;
     }
-    asm.code.emit(|e| {
-        e.mov_reg(Gpr::x(10), XREGS[0])?;
-        if let Some(arity) = arity {
-            e.mov_const(Gpr::x(11), u64::from(arity))?;
-        } else {
-            e.mov_reg(Gpr::x(11), XREGS[1])?;
+    let fragment = match kind {
+        ApplyKind::Fixed(arity) => {
+            if arity > 255 {
+                return Err(ModuleError::InvalidOperand("apply arity exceeds 255"));
+            }
+            asm.code
+                .emit(|e| e.mov_const(Gpr::x(9), u64::from(arity)))?;
+            asm.emit_runtime_hook_with(
+                runtime.resolver as usize,
+                &[Gpr::x(9)],
+                6,
+                crate::Update::HEAP_ALLOC
+                    .union(crate::Update::REDUCTIONS)
+                    .union(crate::Update::X_REGS),
+            )?;
+            asm.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(0)))?;
+            None
         }
-        e.mov_const(Gpr::x(12), u64::from(live))
-    })?;
-    asm.emit_runtime_hook(hook as usize, &[Gpr::x(10), Gpr::x(11), Gpr::x(12)])?;
-    let target = asm.code.new_label();
-    asm.code.cbnz(Gpr::x(0), target)?;
-    asm.code.b(asm.error_label)?;
-    asm.code.bind(target)?;
-    if helper_continuation {
-        asm.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(0)))?;
+        ApplyKind::Apply2 => Some(runtime.apply2_fragment),
+        ApplyKind::Apply3 => Some(runtime.apply3_fragment),
+    };
+    if let Some(fragment) = fragment {
+        asm.code
+            .emit(|e| e.mov_const(Gpr::x(17), fragment as u64))?;
     }
     if tail {
         asm.emit_leave_frame()?;
-        let reg = if helper_continuation {
-            Gpr::x(14)
-        } else {
-            Gpr::x(0)
-        };
-        asm.code.emit(|e| e.br(reg))?;
+        asm.code.emit(|e| e.br(Gpr::x(17)))?;
     } else {
-        let reg = if helper_continuation {
-            Gpr::x(14)
-        } else {
-            Gpr::x(0)
-        };
-        asm.code.emit(|e| e.blr(reg))?;
+        asm.code.adr(Gpr::x(30), continuation)?;
+        asm.code.emit(|e| e.br(Gpr::x(17)))?;
+        asm.code.bind(continuation)?;
     }
     Ok(())
 }

@@ -92,6 +92,7 @@ dependencies = [
  "arinsal-beam",
  "arinsal-beamasm",
  "arinsal-beamops",
+ "arinsal-etf",
  "thiserror",
 ]
 

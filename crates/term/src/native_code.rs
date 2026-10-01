@@ -26,6 +26,14 @@ pub fn register_native_code_range(start: usize, end: usize) -> Result<(), &'stat
     Ok(())
 }
 
+/// Remove a native code range registered by [`register_native_code_range`] once its code is
+/// purged and no stack can hold its return addresses.
+pub fn unregister_native_code_range(start: usize, end: usize) {
+    if let Ok(mut ranges) = ranges().write() {
+        ranges.retain(|&range| range != (start, end));
+    }
+}
+
 /// Whether an address lies in a registered native code range.
 // Port of erts/emulator/beam/erl_term.h:1375-1379 (`is_CP`), OTP-29.1.1.
 pub fn is_native_code_pointer(address: usize) -> bool {

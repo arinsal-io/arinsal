@@ -167,7 +167,7 @@ pub(super) fn call(
     handler(module, function, args.len() as u8).map(|handle| handle(vm, process, ctx, args))
 }
 
-fn node(term: Term) -> Result<Term, VmError> {
+pub(crate) fn node(term: Term) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/dist.c:6217 (node/1), OTP-29.1.1.
     let Some(identity) = term.identity() else {
         return Err(badarg());

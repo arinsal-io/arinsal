@@ -190,7 +190,7 @@ pub(crate) fn get_token_term(process: &mut Process, _pid: Pid) -> Result<Term, V
 pub(crate) fn on_send(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: Option<&mut RunCtx<'_, Message>>,
     pid: Pid,
     receiver: Term,
     message: Term,
@@ -248,7 +248,7 @@ pub(crate) fn on_receive(
         emit(
             vm,
             process,
-            ctx,
+            Some(ctx),
             &token,
             SeqEvent {
                 kind: "receive",
@@ -273,7 +273,7 @@ fn term(process: &mut Process, owned: &OwnedTerm) -> Result<Term, VmError> {
 fn emit(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    mut ctx: Option<&mut RunCtx<'_, Message>>,
     token: &Token,
     event: SeqEvent,
 ) {
@@ -369,12 +369,18 @@ fn emit(
     let Ok(event) = TermBuilder::new(&mut process.heap).tuple(&values) else {
         return;
     };
-    if let Some(target_pid) = Pid::from_term(target_term) {
-        if let Ok(message) = Message::copy_from(event) {
+    if let Some(target_pid) = Pid::from_term(target_term)
+        && let Ok(message) = Message::copy_from(event)
+    {
+        if let Some(ctx) = ctx.as_deref_mut() {
             let _ = ctx.send(target_pid, message);
+        } else if let (Some(runtime), Some(sender)) = (&process.runtime, process.self_pid)
+            && let Ok(scheduler) = runtime.scheduler()
+        {
+            let _ = scheduler.send(sender, target_pid, message);
         }
     } else if target_term.as_port().is_some() {
-        let _ = crate::port::send_message(process, ctx, target_term, event);
+        let _ = crate::port::send_message(process, target_term, event);
     } else if let Some(vm) = vm
         && let OwnedTerm::Tuple(parts) = &target
         && parts.len() == 2
@@ -385,8 +391,10 @@ fn emit(
         )
         .ok()
     {
-        crate::natives::nif::refresh_hub(process, ctx);
-        let Some(tracee) = ctx.pid().to_term() else {
+        if let Some(ctx) = ctx {
+            crate::natives::nif::refresh_hub(process, ctx);
+        }
+        let Some(tracee) = process.self_pid.and_then(Pid::to_term) else {
             return;
         };
         let tag = crate::signals::atom("seq_trace");
@@ -620,7 +628,7 @@ fn print(
     emit(
         Some(vm),
         process,
-        ctx,
+        Some(ctx),
         &t,
         SeqEvent {
             kind: "print",

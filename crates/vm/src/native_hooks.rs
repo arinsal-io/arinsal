@@ -3,6 +3,7 @@
 use crate::{Process, VmError};
 use arinsal_arith::{ArithError, ArithResult};
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
+use arinsal_bifs::BifError;
 use arinsal_maps::MapError;
 use arinsal_term::{Term, TermBuilder, TermKind, cmp, exact_eq, global_atoms, loose_eq};
 use num_traits::ToPrimitive;
@@ -89,8 +90,8 @@ pub(crate) fn process_and_registers<'a>(
     let process = unsafe { &mut *header.cast::<Process>() };
     // Rust helpers may allocate or publish the header again, so first commit the
     // native heap and stack cursors that generated code flushed at the call site.
-    process.heap.set_heap_top(process.header.htop);
     process.heap.set_stack_pointer(process.header.stop);
+    process.heap.set_heap_top(process.header.htop);
     let registers = process.header.ftrace.cast::<SchedulerRegisters>();
     if registers.is_null() {
         return None;
@@ -159,43 +160,17 @@ fn ensure_native_frame(
     result
 }
 
-fn with_alloc_retry(
+// Port of erts/emulator/beam/erl_arith.c:358-405 (erts_mixed_plus), OTP-29.1.1.
+fn with_fragment_alloc(
     process: &mut Process,
-    registers: &mut SchedulerRegisters,
     lhs: Term,
     rhs: Term,
-    mut operation: impl FnMut(Term, Term, &mut arinsal_term::ProcessHeap) -> ArithResult,
+    operation: impl FnOnce(Term, Term, &mut arinsal_bifs::FragmentingHeap<'_>) -> ArithResult,
 ) -> Result<Term, ArithError> {
-    let len = process.x.len();
-    if len < NATIVE_X + 2 {
-        return Err(ArithError::SystemLimit);
-    }
-    let saved_live = process.gc_live;
-    let left_root = saved_live.max(NATIVE_X).min(len - 2);
-    let right_root = left_root + 1;
-    let root_count = right_root + 1;
-    process.x[left_root] = lhs;
-    process.x[right_root] = rhs;
-    loop {
-        ensure_native_frame(process, registers, 0, root_count).map_err(|_| {
-            process.gc_live = saved_live;
-            ArithError::SystemLimit
-        })?;
-        let left = process.x[left_root];
-        let right = process.x[right_root];
-        match operation(left, right, &mut process.heap) {
-            Err(ArithError::HeapFull { need_words }) => {
-                if ensure_native_frame(process, registers, need_words, root_count).is_err() {
-                    process.gc_live = saved_live;
-                    return Err(ArithError::SystemLimit);
-                }
-            }
-            result => {
-                process.gc_live = saved_live;
-                return result;
-            }
-        }
-    }
+    // OTP arithmetic slow paths allocate into heap fragments and therefore
+    // cannot move E, HTOP, or the register roots under a reductions-only update.
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    operation(lhs, rhs, &mut heap)
 }
 
 /// Arithmetic and float slow path. Returns an OTP term, except float-register
@@ -214,6 +189,9 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     let Some((process, registers)) = process_and_registers(header) else {
         return 0;
     };
+    // An operation with a failure label branches there instead of raising (QUIET_GUARD).
+    let quiet = op & QUIET_GUARD != 0;
+    let op = op & !QUIET_GUARD;
     let left = from_raw(lhs);
     let right = from_raw(rhs);
     let operation = match op {
@@ -265,13 +243,13 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
                 Err(ArithError::Badarith)
             }
         }
-        17 => with_alloc_retry(process, registers, Term::NIL, Term::NIL, |_, _, heap| {
+        17 => with_fragment_alloc(process, Term::NIL, Term::NIL, |_, _, heap| {
             TermBuilder::new(heap)
                 .float(f64::from_bits(lhs))
                 .map_err(|_| ArithError::HeapFull { need_words: 2 })
         })
         .map(raw),
-        0..=11 => with_alloc_retry(process, registers, left, right, |a, b, heap| match op {
+        0..=12 => with_fragment_alloc(process, left, right, |a, b, heap| match op {
             0 => arinsal_arith::add(a, b, heap),
             1 => arinsal_arith::sub(a, b, heap),
             2 => arinsal_arith::mul(a, b, heap),
@@ -283,6 +261,8 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             8 => arinsal_arith::bnot(a, heap),
             9 => arinsal_arith::neg(a, heap),
             10 => arinsal_arith::bsl(a, b, heap),
+            // Port of erts/emulator/erl_arith.c (erts_mixed_div), OTP-29.1.1.
+            12 => arinsal_arith::fdiv(a, b, heap),
             _ => arinsal_arith::bsr(a, b, heap),
         })
         .map(raw),
@@ -290,18 +270,52 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     };
     let answer = match result {
         Ok(value) => value,
-        Err(ArithError::HeapFull { .. } | ArithError::SystemLimit) => {
-            set_error(process, "system_limit");
-            0
-        }
-        Err(ArithError::Badarith | ArithError::Badarg) => {
-            set_error(process, "badarith");
+        Err(error) => {
+            let error = match error {
+                ArithError::HeapFull { .. } | ArithError::SystemLimit => BifError::SystemLimit,
+                ArithError::Badarith | ArithError::Badarg => BifError::Badarith,
+            };
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp (the arithmetic BIF and its
+            // operands are the top frame of a raised error), OTP-29.1.1.
+            match arith_bif(op) {
+                Some((name, arity)) if !quiet => {
+                    let args = [left, right];
+                    crate::native_helpers::set_native_bif_error(
+                        process,
+                        "erlang",
+                        name,
+                        &args[..arity],
+                        error,
+                    );
+                }
+                _ => set_light_error(process, &error),
+            }
             0
         }
     };
     publish_x(process, registers);
     process.sync_native_header();
     answer
+}
+
+/// The erlang BIF behind a generic arithmetic helper op.
+fn arith_bif(op: u32) -> Option<(&'static str, usize)> {
+    Some(match op {
+        0 => ("+", 2),
+        1 => ("-", 2),
+        2 => ("*", 2),
+        3 => ("div", 2),
+        4 => ("rem", 2),
+        5 => ("band", 2),
+        6 => ("bor", 2),
+        7 => ("bxor", 2),
+        8 => ("bnot", 1),
+        9 => ("-", 1),
+        10 => ("bsl", 2),
+        11 => ("bsr", 2),
+        12 => ("/", 2),
+        _ => return None,
+    })
 }
 
 fn float_value(term: Term) -> Option<f64> {
@@ -311,7 +325,7 @@ fn float_value(term: Term) -> Option<f64> {
         .flatten()
 }
 
-fn integer_float(term: Term) -> Result<f64, ArithError> {
+pub(crate) fn integer_float(term: Term) -> Result<f64, ArithError> {
     if let Some(value) = term.as_small() {
         return Ok(value as f64);
     }
@@ -341,8 +355,22 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
     let Some((process, registers)) = process_and_registers(header) else {
         return 0;
     };
+    // A guard with a failure label passes QUIET_GUARD: the failure branches there instead of
+    // raising, so no BIF frame is recorded for it.
+    let quiet = op & QUIET_GUARD != 0;
+    let op = op & !QUIET_GUARD;
     let a = from_raw(first);
     let b = from_raw(second);
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (emit_raise_badarg), OTP-29.1.1:
+    // a guard BIF raising outside a guard names itself and its arguments as the top frame.
+    let fail = |process: &mut Process, name: &str, args: &[Term], error: BifError| {
+        if quiet {
+            set_light_error(process, &error);
+        } else {
+            crate::native_helpers::set_native_bif_error(process, "erlang", name, args, error);
+        }
+        0
+    };
     let answer = match op {
         19 => u64::from(exact_eq(a, b)),
         20 => u64::from(!exact_eq(a, b)),
@@ -355,100 +383,127 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
                 .as_small()
                 .and_then(|i| i.checked_sub(1))
                 .and_then(|i| usize::try_from(i).ok());
-            index
-                .and_then(|i| {
-                    // SAFETY: tuple_ref validates the tagged term and its live heap header.
-                    unsafe { b.tuple_ref() }.and_then(|tuple| tuple.get(i))
-                })
-                .map(raw)
-                .unwrap_or_else(|| {
-                    set_error(process, "badarg");
-                    0
-                })
+            match index.and_then(|i| {
+                // SAFETY: tuple_ref validates the tagged term and its live heap header.
+                unsafe { b.tuple_ref() }.and_then(|tuple| tuple.get(i))
+            }) {
+                Some(value) => raw(value),
+                None => fail(process, "element", &[a, b], BifError::BADARG),
+            }
         }
         26 | 27 => {
             // SAFETY: cons_ref validates the tagged term before reading its two words.
-            unsafe { a.cons_ref() }
-                .map(|(head, tail)| raw(if op == 26 { head } else { tail }))
-                .unwrap_or_else(|| {
-                    set_error(process, "badarg");
-                    0
-                })
+            match unsafe { a.cons_ref() } {
+                Some((head, tail)) => raw(if op == 26 { head } else { tail }),
+                None => fail(
+                    process,
+                    if op == 26 { "hd" } else { "tl" },
+                    &[a],
+                    BifError::BADARG,
+                ),
+            }
         }
-        28 => tuple_size(a)
-            .and_then(|size| Term::small(size as i64))
-            .map(raw)
-            .unwrap_or_else(|| {
-                set_error(process, "badarg");
-                0
-            }),
-        29 => arinsal_maps::size(a)
+        28 => match tuple_size(a).and_then(|size| Term::small(size as i64)) {
+            Some(size) => raw(size),
+            None => fail(process, "tuple_size", &[a], BifError::BADARG),
+        },
+        29 => match arinsal_maps::size(a)
             .ok()
             .and_then(|size| Term::small(size as i64))
-            .map(raw)
-            .unwrap_or_else(|| {
-                set_error(process, "badmap");
-                0
-            }),
-        30 => u64::from(arinsal_maps::is_key(b, a).unwrap_or(false)),
-        31 => match arinsal_maps::get(b, a) {
-            Ok(Some(value)) => raw(value),
-            Ok(None) => {
-                set_error(process, "badkey");
-                0
-            }
-            Err(MapError::Badmap(_)) => {
-                set_error(process, "badmap");
-                0
-            }
-            Err(_) => {
-                set_error(process, "badarg");
-                0
+        {
+            Some(size) => raw(size),
+            None => {
+                let error = tagged_error(process, "badmap", a);
+                fail(process, "map_size", &[a], error)
             }
         },
-        32 | 33 => binary_size(a, op == 33)
-            .and_then(|size| Term::small(size as i64))
-            .map(raw)
-            .unwrap_or_else(|| {
-                set_error(process, "badarg");
-                0
-            }),
+        30 => match arinsal_maps::is_key(b, a) {
+            Ok(found) => u64::from(found),
+            Err(_) => {
+                let error = tagged_error(process, "badmap", b);
+                fail(process, "is_map_key", &[a, b], error)
+            }
+        },
+        31 => match arinsal_maps::get(b, a) {
+            Ok(Some(value)) => raw(value),
+            Ok(None) | Err(MapError::Badkey(_)) => {
+                let error = tagged_error(process, "badkey", a);
+                fail(process, "map_get", &[a, b], error)
+            }
+            Err(MapError::Badmap(_)) => {
+                let error = tagged_error(process, "badmap", b);
+                fail(process, "map_get", &[a, b], error)
+            }
+            Err(_) => fail(process, "map_get", &[a, b], BifError::BADARG),
+        },
+        32 | 33 => match binary_size(a, op == 33).and_then(|size| Term::small(size as i64)) {
+            Some(size) => raw(size),
+            None => fail(
+                process,
+                if op == 33 { "bit_size" } else { "byte_size" },
+                &[a],
+                BifError::BADARG,
+            ),
+        },
         34 => process.header.self_pid,
-        35 => list_length(a)
-            .and_then(|size| Term::small(size as i64))
-            .map(raw)
-            .unwrap_or_else(|| {
-                set_error(process, "badarg");
-                0
-            }),
-        36 | 37 => raw(if (cmp(a, b) == Ordering::Greater) == (op == 36) {
-            b
-        } else {
-            a
-        }),
-        38 => match with_alloc_retry(process, registers, a, Term::NIL, |value, _, heap| {
+        35 => match list_length(a).and_then(|size| Term::small(size as i64)) {
+            Some(size) => raw(size),
+            None => fail(process, "length", &[a], BifError::BADARG),
+        },
+        // Port of erts/emulator/beam/erl_bif_guard.c (min_2/max_2), OTP-29.1.1: equal
+        // arguments return the first one.
+        36 => raw(if cmp(a, b) == Ordering::Greater { b } else { a }),
+        37 => raw(if cmp(a, b) == Ordering::Less { b } else { a }),
+        38 => match with_fragment_alloc(process, a, Term::NIL, |value, _, heap| {
             arinsal_arith::abs(value, heap)
         }) {
             Ok(value) => raw(value),
             Err(ArithError::HeapFull { .. } | ArithError::SystemLimit) => {
-                set_error(process, "system_limit");
-                0
+                fail(process, "abs", &[a], BifError::SystemLimit)
             }
-            Err(_) => {
-                set_error(process, "badarg");
-                0
-            }
+            Err(_) => fail(process, "abs", &[a], BifError::BADARG),
         },
-        39 => global_atoms()
-            .intern("nonode@nohost")
-            .map(Term::atom)
-            .map(raw)
-            .unwrap_or(0),
+        // Port of erts/emulator/beam/dist.c:6217 (node/1), OTP-29.1.1.
+        39 => match crate::natives::node::node(a) {
+            Ok(node) => raw(node),
+            Err(_) => fail(process, "node", &[a], BifError::BADARG),
+        },
+        40..=42 => {
+            set_error(process, "badarg");
+            0
+        }
         _ => 0,
     };
     publish_x(process, registers);
     process.sync_native_header();
     answer
+}
+
+/// Guard helper op flag: the instruction has a failure label.
+pub const QUIET_GUARD: u32 = 0x100;
+
+/// Sets the exception for a BIF error without recording a BIF frame.
+fn set_light_error(process: &mut Process, error: &BifError) {
+    match error {
+        BifError::Error(reason) => {
+            process.header.freason = 1;
+            process.header.fvalue = raw(*reason);
+        }
+        BifError::SystemLimit => set_error(process, "system_limit"),
+        BifError::Badarith => set_error(process, "badarith"),
+        _ => set_error(process, "badarg"),
+    }
+}
+
+/// Builds `error:{Tag, Value}` for a guard BIF failure.
+fn tagged_error(process: &mut Process, tag: &str, value: Term) -> BifError {
+    let tag = crate::signals::atom(tag);
+    match TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .tuple(&[tag, value])
+    {
+        Ok(reason) => BifError::Error(reason),
+        Err(_) => BifError::SystemLimit,
+    }
 }
 
 fn tuple_size(term: Term) -> Option<usize> {
@@ -501,19 +556,30 @@ pub unsafe extern "C" fn arinsal_beamasm_gc(
     let process = unsafe { &mut *header.cast::<Process>() };
     // SAFETY: The scheduler register pointer is live for the current native call.
     let registers = unsafe { &mut *registers };
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .take(NATIVE_X)
-        .zip(&registers.x_reg_array)
-    {
+    // Exactly the live X registers are GC roots, including those past the six register-backed
+    // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
+    let roots = live.min(registers.x_reg_array.len());
+    if process.x.len() < roots {
+        let mut grown = process.x.to_vec();
+        grown.resize(roots, Term::NIL);
+        process.x = grown.into_boxed_slice();
+    }
+    for (destination, raw) in process.x.iter_mut().take(roots).zip(&registers.x_reg_array) {
         // SAFETY: The register area contains tagged BEAM terms.
         *destination = unsafe { Term::from_raw_bits(*raw) };
     }
     if ensure_native_frame(process, registers, need_words, live).is_err() {
         set_error(process, "system_limit");
     }
-    publish_x(process, registers);
+    for (destination, term) in registers
+        .x_reg_array
+        .iter_mut()
+        .zip(process.x.iter())
+        .take(roots)
+    {
+        // SAFETY: X registers contain tagged BEAM terms.
+        *destination = unsafe { term.raw_bits() };
+    }
     process.sync_native_header();
     0
 }

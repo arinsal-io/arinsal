@@ -282,7 +282,9 @@ fn operand_type(operand: &SpecificOperand) -> char {
         SpecificOperand::Unsigned(_) => 'u',
         SpecificOperand::Nil => 'n',
         SpecificOperand::List(_) => 'o',
-        SpecificOperand::Allocations(_) | SpecificOperand::Other => '?',
+        SpecificOperand::Allocations(_) | SpecificOperand::BigInt(_) | SpecificOperand::Other => {
+            '?'
+        }
     }
 }
 

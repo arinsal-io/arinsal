@@ -29,6 +29,9 @@ extern "C" fn get_elements(
 extern "C" fn update(_p: *mut ProcessHeader, _a: u64, _b: u64, _c: u64, _d: u64) -> u64 {
     RESULT.with(Cell::get)
 }
+extern "C" fn guard_helper(_p: *mut ProcessHeader, _op: u32, _a: u64, _b: u64) -> u64 {
+    0
+}
 
 fn runtime() -> MapRuntime {
     MapRuntime {
@@ -292,9 +295,9 @@ fn native_bool_ops_and_or() {
         let result = run(
             |m| {
                 if op {
-                    m.emit_bif_or(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2))
+                    m.emit_bif_or(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), guard_helper)
                 } else {
-                    m.emit_bif_and(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2))
+                    m.emit_bif_and(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), guard_helper)
                 }
             },
             0x4b,
@@ -307,7 +310,11 @@ fn native_bool_ops_and_or() {
 
 #[test]
 fn native_bool_ops_not() {
-    let result = run(|m| m.emit_bif_not(90, ArgVal::X(0), ArgVal::X(2)), 0x4b, 0);
+    let result = run(
+        |m| m.emit_bif_not(90, ArgVal::X(0), ArgVal::X(2), guard_helper),
+        0x4b,
+        0,
+    );
     assert_eq!(result, 0x0b);
     assert_eq!(erl("not true"), "false");
 }
@@ -315,12 +322,12 @@ fn native_bool_ops_not() {
 #[test]
 fn native_bool_ops_badarg() {
     let and_result = run(
-        |m| m.emit_bif_and(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2)),
+        |m| m.emit_bif_and(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), guard_helper),
         bits(Term::small(1).unwrap()),
         0x4b,
     );
     let not_result = run(
-        |m| m.emit_bif_not(90, ArgVal::X(0), ArgVal::X(2)),
+        |m| m.emit_bif_not(90, ArgVal::X(0), ArgVal::X(2), guard_helper),
         bits(Term::small(1).unwrap()),
         0,
     );

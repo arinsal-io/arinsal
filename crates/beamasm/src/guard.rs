@@ -24,6 +24,22 @@ pub type GuardHelper3 = unsafe extern "C" fn(
     third: u64,
 ) -> u64;
 
+/// BIFs whose inline guard code raises `badarg` with the BIF itself as the top stack frame.
+/// `SchedulerRegisters::tmp_mem[7]` holds `index + 1` of the raising BIF; its arguments are in
+/// X0.. (erts passes the `ErtsCodeMFA` to `raise_exception` the same way).
+pub const BADARG_MFAS: [(&str, &str, u8); 7] = [
+    ("erlang", "element", 2),
+    ("erlang", "hd", 1),
+    ("erlang", "tl", 1),
+    ("erlang", "bit_size", 1),
+    ("erlang", "byte_size", 1),
+    ("erlang", "map_size", 1),
+    ("erlang", "tuple_size", 1),
+];
+/// `freason` of an inline `map_size/1` failure: `{badmap, Value}` (erts `EXC_BADMAP`).
+pub const EXC_BADMAP: u64 = (18 << 10) | 0x50;
+const BADARG_MFA_SLOT: u32 = 16_440;
+
 /// Target mode accepted by the function arity guard adapter.
 pub enum Function2TestTarget {
     /// Branch to a BEAM failure label when the test does not match.
@@ -72,6 +88,9 @@ enum RelativeComparison {
     Less,
     GreaterEqual,
 }
+
+/// Guard helper op flag for an instruction with a failure label (see the VM guard hook).
+const QUIET_GUARD: u32 = 0x100;
 
 impl BeamModuleAssembler {
     fn emit_boolean_result(
@@ -371,7 +390,7 @@ impl BeamModuleAssembler {
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
         let lhs = self.source_reg(first)?;
-        let rhs = self.source_reg(second)?;
+        let rhs = self.source_reg_into(second, Gpr::x(17))?;
         self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
         self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), lhs, rhs])?;
         let fail = self.label(fail);
@@ -388,15 +407,99 @@ impl BeamModuleAssembler {
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
         let lhs = self.source_reg(first)?;
-        let rhs = self.source_reg(second)?;
+        let rhs = self.source_reg_into(second, Gpr::x(17))?;
         self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
         self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), lhs, rhs])?;
         self.store_guard_result(destination, Gpr::x(0))
     }
 
+    /// Like `emit_guard_value_helper`, but a failure branches to `fail` instead of raising when
+    /// the instruction has a failure label.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (guard BIFs with a Fail label:
+    // THE_NON_VALUE branches to Fail), OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_guard_value_helper_fail(
+        &mut self,
+        fail: u32,
+        boolean: bool,
+        op: u32,
+        first: ArgVal,
+        second: ArgVal,
+        destination: ArgVal,
+        helper: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        if fail == 0 && boolean {
+            return self.emit_guard_boolean_value_helper(op, first, second, destination, helper);
+        }
+        if fail == 0 {
+            return self.emit_guard_value_helper(op, first, second, destination, helper);
+        }
+        let lhs = self.source_reg(first)?;
+        let rhs = self.source_reg_into(second, Gpr::x(17))?;
+        // The runtime records no BIF frame for a failure that branches to the label.
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(8), u64::from(op | QUIET_GUARD)))?;
+        let update = Update::HEAP_ALLOC;
+        emit_enter_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            e.mov_reg(Gpr::x(1), Gpr::x(8))?;
+            e.mov_reg(Gpr::x(2), lhs)?;
+            e.mov_reg(Gpr::x(3), rhs)?;
+            e.mov_const(Gpr::x(17), helper as usize as u64)?;
+            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.blr(Gpr::x(17))
+        })?;
+        emit_leave_runtime(&mut self.code, 6, update)?;
+        let ok = self.code.new_label();
+        self.code.emit(|e| {
+            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
+        })?;
+        self.code.cbz(Gpr::x(9), ok)?;
+        self.code.emit(|e| e.str_uoff(Gpr::xzr(), Gpr::x(21), 40))?;
+        let fail = self.label(fail);
+        self.code.b(fail)?;
+        self.code.bind(ok)?;
+        if boolean {
+            self.code.emit(|e| {
+                e.cmp_imm(Gpr::x(0), 0, false)?;
+                e.mov_const(Gpr::x(10), 0x0b)?;
+                e.mov_const(Gpr::x(11), 0x4b)?;
+                e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Ne)
+            })?;
+        }
+        self.store_guard_result(destination, Gpr::x(0))
+    }
+
+    fn emit_guard_boolean_value_helper(
+        &mut self,
+        op: u32,
+        first: ArgVal,
+        second: ArgVal,
+        destination: ArgVal,
+        helper: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        let lhs = self.source_reg(first)?;
+        let rhs = self.source_reg_into(second, Gpr::x(17))?;
+        self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
+        self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), lhs, rhs])?;
+        self.code.emit(|e| {
+            e.cmp_imm(Gpr::x(0), 0, false)?;
+            e.mov_const(Gpr::x(10), 0x0b)?;
+            e.mov_const(Gpr::x(11), 0x4b)?;
+            e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Ne)
+        })?;
+        self.store_guard_result(destination, Gpr::x(0))
+    }
+
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:78-84,818-820,911-913, OTP-29.1.1
-    fn emit_guard_runtime_call(&mut self, target: usize, args: &[Gpr]) -> Result<(), ModuleError> {
-        let update = Update::NONE;
+    pub(super) fn emit_guard_runtime_call(
+        &mut self,
+        target: usize,
+        args: &[Gpr],
+    ) -> Result<(), ModuleError> {
+        let update = Update::HEAP_ALLOC;
         emit_enter_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
@@ -412,7 +515,7 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
             e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
         })?;
-        self.code.cbnz(Gpr::x(9), self.error_label)?;
+        self.error_if_nonzero(Gpr::x(9))?;
         Ok(())
     }
 
@@ -467,7 +570,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(11), left))?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(12), right))?;
         self.code
             .emit(|e| e.cmp_reg(Gpr::x(11), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
@@ -547,7 +650,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(11), left))?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(12), right))?;
         let generic = self.code.new_label();
         self.code.emit(|e| {
@@ -588,7 +691,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         let slow = self.code.new_label();
         let done = self.code.new_label();
         self.code.emit(|e| {
@@ -786,7 +889,7 @@ impl BeamModuleAssembler {
             return Ok(());
         }
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_comparison(19, true, lhs, rhs, fail, helper)
@@ -810,7 +913,7 @@ impl BeamModuleAssembler {
             return Ok(());
         }
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_comparison(20, false, lhs, rhs, fail, helper)
@@ -826,7 +929,7 @@ impl BeamModuleAssembler {
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_comparison(21, true, lhs, rhs, fail, helper)
@@ -842,7 +945,7 @@ impl BeamModuleAssembler {
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_comparison(22, false, lhs, rhs, fail, helper)
@@ -868,7 +971,7 @@ impl BeamModuleAssembler {
             );
         }
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_small_compare(lhs, rhs, Cond::Lt, 23, fail, helper)
@@ -894,7 +997,7 @@ impl BeamModuleAssembler {
             );
         }
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_small_compare(lhs, rhs, Cond::Ge, 24, fail, helper)
@@ -910,13 +1013,18 @@ impl BeamModuleAssembler {
         destination: ArgVal,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_guard_value_helper(op, lhs, rhs, destination, helper)
+        // OTP's comparison BIFs produce tagged atoms even though this VM hook
+        // returns a native boolean condition for branch-oriented guard tests.
+        self.emit_guard_boolean_value_helper(op, lhs, rhs, destination, helper)
     }
 
-    /// Emits the `element/2` guard BIF through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:579-767, OTP-29.1.1
+    /// Emits the `element/2` guard BIF.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:522-543 (emit_bif_element_helper)
+    // and 579-767 (emit_bif_element), OTP-29.1.1: a non-tuple, a non-small or non-positive
+    // position, or a position past the arity fails (branch to `fail`, or badarg).
     pub fn emit_bif_element(
         &mut self,
+        fail: u32,
         index: ArgVal,
         tuple: ArgVal,
         destination: ArgVal,
@@ -924,51 +1032,105 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let index = self.source_reg(index)?;
-        let tuple = self.source_reg(tuple)?;
+        let tuple = self.source_reg_into(tuple, Gpr::x(17))?;
+        let bad = self.code.new_label();
+        let ok = self.code.new_label();
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(12), tuple, 3)?;
+            e.cmp_imm(Gpr::x(12), 2, false)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(10), tuple, !7)?;
+            e.ldur(Gpr::x(13), Gpr::x(10), 0)?;
+            e.tst_imm(Gpr::x(13), 0x3f)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(12), index, 0xf)?;
+            e.cmp_imm(Gpr::x(12), 0xf, false)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
         self.code.emit(|e| {
             e.asr_imm(Gpr::x(12), index, 4)?;
-            e.sub_imm(Gpr::x(12), Gpr::x(12), 1, false)?;
-            e.and_imm(Gpr::x(10), tuple, !7)?;
-            e.add_imm(Gpr::x(10), Gpr::x(10), 8, false)?;
-            e.ldr_regoff(output, Gpr::x(10), Gpr::x(12), 3)
+            e.cmp_imm(Gpr::x(12), 0, false)
         })?;
+        self.code.b_cond(Cond::Le, bad)?;
+        self.code.emit(|e| {
+            e.lsr_imm(Gpr::x(14), Gpr::x(13), 6)?;
+            e.cmp_reg(Gpr::x(12), Gpr::x(14), arinsal_a64::enc::Shift::Lsl, 0)
+        })?;
+        self.code.b_cond(Cond::Hi, bad)?;
+        self.code
+            .emit(|e| e.ldr_regoff(output, Gpr::x(10), Gpr::x(12), 3))?;
+        self.code.b(ok)?;
+        self.code.bind(bad)?;
+        if fail == 0 {
+            // Port of instr_guard_bifs.cpp:572-577 (emit_handle_element_error_shared).
+            self.code.emit(|e| {
+                e.mov_reg(Gpr::x(12), index)?;
+                e.mov_reg(Gpr::x(13), tuple)?;
+                e.mov_reg(Gpr::x(25), Gpr::x(12))?;
+                e.mov_reg(Gpr::x(26), Gpr::x(13))
+            })?;
+            self.set_badarg_mfa(0)?;
+        }
+        self.emit_guard_fail(fail)?;
+        self.code.bind(ok)?;
         self.store_guard_result(destination, output)?;
         Ok(())
     }
 
-    /// Emits `hd/1` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:773-797, OTP-29.1.1
+    fn set_badarg_mfa(&mut self, index: u64) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(9), index + 1)?;
+            e.str_uoff(Gpr::x(9), Gpr::x(19), BADARG_MFA_SLOT)
+        })?;
+        Ok(())
+    }
+
+    /// Emits `hd/1`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:768-797, OTP-29.1.1: anything
+    // but a cons cell raises badarg.
     pub fn emit_bif_hd(
         &mut self,
         list: ArgVal,
         destination: ArgVal,
-        _runtime: GuardHelper,
+        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let output = self.guard_destination(destination)?;
-        let list = self.source_reg(list)?;
-        self.code.emit(|e| {
-            e.tst_imm(list, 3)?;
-            e.and_imm(Gpr::x(10), list, !7)?;
-            e.ldur(output, Gpr::x(10), 0)
-        })?;
-        self.store_guard_result(destination, output)?;
-        Ok(())
+        self.emit_cons_field(list, destination, 0, runtime)
     }
 
-    /// Emits `tl/1` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1266-1290, OTP-29.1.1
+    /// Emits `tl/1`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1261-1290, OTP-29.1.1.
     pub fn emit_bif_tl(
         &mut self,
         list: ArgVal,
         destination: ArgVal,
+        runtime: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        self.emit_cons_field(list, destination, 8, runtime)
+    }
+
+    fn emit_cons_field(
+        &mut self,
+        list: ArgVal,
+        destination: ArgVal,
+        offset: i16,
         _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let list = self.source_reg(list)?;
+        let good = self.code.new_label();
+        // A cons cell has primary tag 0b01; boxed, immediate and header words all have bit 1 set.
+        self.code.tbz(list, 1, good)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(25), list))?;
+        self.set_badarg_mfa(if offset == 0 { 1 } else { 2 })?;
+        self.emit_guard_fail(0)?;
+        self.code.bind(good)?;
         self.code.emit(|e| {
-            e.tst_imm(list, 3)?;
             e.and_imm(Gpr::x(10), list, !7)?;
-            e.ldur(output, Gpr::x(10), 8)
+            e.ldur(output, Gpr::x(10), offset)
         })?;
         self.store_guard_result(destination, output)?;
         Ok(())
@@ -978,18 +1140,41 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1335-1364, OTP-29.1.1
     pub fn emit_bif_tuple_size(
         &mut self,
+        fail: u32,
         tuple: ArgVal,
         destination: ArgVal,
         _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let tuple = self.source_reg(tuple)?;
+        let bad = self.code.new_label();
+        let ok = self.code.new_label();
+        // The argument may be any term: only a boxed tuple has a size.
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(12), tuple, 3)?;
+            e.cmp_imm(Gpr::x(12), 2, false)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
         self.code.emit(|e| {
             e.and_imm(Gpr::x(10), tuple, !7)?;
             e.ldur(Gpr::x(12), Gpr::x(10), 0)?;
+            e.tst_imm(Gpr::x(12), 0x3f)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
+        self.code.emit(|e| {
             e.lsr_imm(output, Gpr::x(12), 2)?;
             e.orr_imm(output, output, 15)
         })?;
+        self.code.b(ok)?;
+        self.code.bind(bad)?;
+        if fail == 0 {
+            // Port of instr_guard_bifs.cpp:1310-1321 (emit_bif_tuple_size_body): badarg with
+            // erlang:tuple_size/1 as the top frame.
+            self.code.emit(|e| e.mov_reg(Gpr::x(25), tuple))?;
+            self.set_badarg_mfa(6)?;
+        }
+        self.emit_guard_fail(fail)?;
+        self.code.bind(ok)?;
         self.store_guard_result(destination, output)?;
         Ok(())
     }
@@ -998,18 +1183,49 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:947-997, OTP-29.1.1
     pub fn emit_bif_map_size(
         &mut self,
+        fail: u32,
         map: ArgVal,
         destination: ArgVal,
         _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let map = self.source_reg(map)?;
+        let bad = self.code.new_label();
+        let ok = self.code.new_label();
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(12), map, 3)?;
+            e.cmp_imm(Gpr::x(12), 2, false)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
         self.code.emit(|e| {
             e.and_imm(Gpr::x(10), map, !7)?;
+            e.ldur(Gpr::x(12), Gpr::x(10), 0)?;
+            e.and_imm(Gpr::x(12), Gpr::x(12), 0x3f)?;
+            e.cmp_imm(Gpr::x(12), 0x2c, false)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
+        self.code.emit(|e| {
             e.ldur(Gpr::x(12), Gpr::x(10), 8)?;
             e.lsl_imm(output, Gpr::x(12), 4)?;
             e.orr_imm(output, output, 15)
         })?;
+        self.code.b(ok)?;
+        self.code.bind(bad)?;
+        if fail == 0 {
+            // Port of instr_guard_bifs.cpp (emit_handle_map_size_error): BADMAP with the map
+            // in `fvalue` and erlang:map_size/1 as the top frame.
+            self.code.emit(|e| {
+                e.mov_reg(Gpr::x(25), map)?;
+                e.mov_const(Gpr::x(9), EXC_BADMAP)?;
+                e.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+                e.str_uoff(Gpr::x(25), Gpr::x(21), 48)
+            })?;
+            self.set_badarg_mfa(5)?;
+            self.branch_error()?;
+        } else {
+            self.emit_guard_fail(fail)?;
+        }
+        self.code.bind(ok)?;
         self.store_guard_result(destination, output)?;
         Ok(())
     }
@@ -1018,93 +1234,73 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-830, OTP-29.1.1
     pub fn emit_bif_is_map_key(
         &mut self,
+        fail: u32,
         key: ArgVal,
         map: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let key_reg = self.source_reg(key)?;
-        let map_reg = self.source_reg(map)?;
-        self.code.emit(|e| {
-            e.cmp_reg(key_reg, map_reg, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.ldr_uoff(Gpr::x(8), map_reg, 8)
-        })?;
-        self.emit_guard_value_helper(30, key, map, destination, helper)
+        self.emit_guard_value_helper_fail(fail, true, 30, key, map, destination, helper)
     }
 
     /// Emits `map_get/2` through the runtime hook.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-936, OTP-29.1.1
     pub fn emit_bif_map_get(
         &mut self,
+        fail: u32,
         key: ArgVal,
         map: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let key_reg = self.source_reg(key)?;
-        let map_reg = self.source_reg(map)?;
-        self.code.emit(|e| {
-            e.cmp_reg(key_reg, map_reg, arinsal_a64::enc::Shift::Lsl, 0)?;
-            e.ldr_uoff(Gpr::x(8), map_reg, 8)
-        })?;
-        self.emit_guard_value_helper(31, key, map, destination, helper)
+        self.emit_guard_value_helper_fail(fail, false, 31, key, map, destination, helper)
     }
 
-    /// Emits `byte_size/1` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:458-520, OTP-29.1.1
+    /// Emits `byte_size/1`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:438-520 (emit_bif_byte_size),
+    // OTP-29.1.1: the bit size is rounded up to whole bytes.
     pub fn emit_bif_byte_size(
         &mut self,
+        fail: u32,
         term: ArgVal,
         destination: ArgVal,
         _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
-        let output = self.guard_destination(destination)?;
-        let term = self.source_reg(term)?;
-        let sub = self.code.new_label();
-        let done = self.code.new_label();
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(10), term, !7)?;
-            e.ldur(Gpr::x(12), Gpr::x(10), 0)?;
-            e.and_imm(Gpr::x(13), Gpr::x(12), 63)?;
-            e.cmp_imm(Gpr::x(13), 0x24, false)
-        })?;
-        self.code.b_cond(Cond::Eq, sub)?;
-        self.code.emit(|e| e.ldur(output, Gpr::x(10), 8))?;
-        self.code.b(done)?;
-        self.code.bind(sub)?;
-        self.code.emit(|e| {
-            e.ldur(Gpr::x(12), Gpr::x(10), 24)?;
-            e.ldur(Gpr::x(13), Gpr::x(10), 16)?;
-            e.sub_reg(
-                output,
-                Gpr::x(12),
-                Gpr::x(13),
-                arinsal_a64::enc::Shift::Lsl,
-                0,
-            )
-        })?;
-        self.code.bind(done)?;
-        self.code.emit(|e| {
-            e.lsr_imm(output, output, 3)?;
-            e.lsl_imm(output, output, 4)?;
-            e.orr_imm(output, output, 15)
-        })?;
-        self.store_guard_result(destination, output)?;
-        Ok(())
+        self.emit_bitstring_size(fail, term, destination, true)
     }
 
-    /// Emits `bit_size/1` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:382-436, OTP-29.1.1
+    /// Emits `bit_size/1`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:382-436 (emit_bif_bit_size),
+    // OTP-29.1.1.
     pub fn emit_bif_bit_size(
         &mut self,
+        fail: u32,
         term: ArgVal,
         destination: ArgVal,
         _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
+        self.emit_bitstring_size(fail, term, destination, false)
+    }
+
+    fn emit_bitstring_size(
+        &mut self,
+        fail: u32,
+        term: ArgVal,
+        destination: ArgVal,
+        bytes: bool,
+    ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
         let term = self.source_reg(term)?;
+        let bad = self.code.new_label();
         let sub = self.code.new_label();
-        let done = self.code.new_label();
+        let size = self.code.new_label();
+        let ok = self.code.new_label();
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(12), term, 3)?;
+            e.cmp_imm(Gpr::x(12), 2, false)
+        })?;
+        self.code.b_cond(Cond::Ne, bad)?;
+        // Heap bits keep their bit size after the header; sub bits keep start and end offsets.
         self.code.emit(|e| {
             e.and_imm(Gpr::x(10), term, !7)?;
             e.ldur(Gpr::x(12), Gpr::x(10), 0)?;
@@ -1112,25 +1308,39 @@ impl BeamModuleAssembler {
             e.cmp_imm(Gpr::x(13), 0x24, false)
         })?;
         self.code.b_cond(Cond::Eq, sub)?;
-        self.code.emit(|e| e.ldur(output, Gpr::x(10), 8))?;
-        self.code.b(done)?;
+        self.code.emit(|e| e.cmp_imm(Gpr::x(13), 0x20, false))?;
+        self.code.b_cond(Cond::Ne, bad)?;
+        self.code.emit(|e| e.ldur(Gpr::x(14), Gpr::x(10), 8))?;
+        self.code.b(size)?;
         self.code.bind(sub)?;
         self.code.emit(|e| {
-            e.ldur(Gpr::x(12), Gpr::x(10), 24)?;
-            e.ldur(Gpr::x(13), Gpr::x(10), 16)?;
+            e.ldur(Gpr::x(12), Gpr::x(10), 16)?;
+            e.ldur(Gpr::x(13), Gpr::x(10), 24)?;
             e.sub_reg(
-                output,
-                Gpr::x(12),
+                Gpr::x(14),
                 Gpr::x(13),
+                Gpr::x(12),
                 arinsal_a64::enc::Shift::Lsl,
                 0,
             )
         })?;
-        self.code.bind(done)?;
+        self.code.bind(size)?;
         self.code.emit(|e| {
-            e.lsl_imm(output, output, 4)?;
-            e.orr_imm(output, output, 15)
+            if bytes {
+                e.add_imm(Gpr::x(14), Gpr::x(14), 7, false)?;
+                e.lsr_imm(Gpr::x(14), Gpr::x(14), 3)?;
+            }
+            e.lsl_imm(Gpr::x(14), Gpr::x(14), 4)?;
+            e.orr_imm(output, Gpr::x(14), 15)
         })?;
+        self.code.b(ok)?;
+        self.code.bind(bad)?;
+        if fail == 0 {
+            self.code.emit(|e| e.mov_reg(Gpr::x(25), term))?;
+            self.set_badarg_mfa(if bytes { 4 } else { 3 })?;
+        }
+        self.emit_guard_fail(fail)?;
+        self.code.bind(ok)?;
         self.store_guard_result(destination, output)?;
         Ok(())
     }
@@ -1152,17 +1362,27 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1089-1170, OTP-29.1.1
     pub fn emit_bif_node(
         &mut self,
+        fail: u32,
         term: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_guard_value_helper(39, term, ArgVal::Immediate(0), destination, helper)
+        self.emit_guard_value_helper_fail(
+            fail,
+            false,
+            39,
+            term,
+            ArgVal::Immediate(0),
+            destination,
+            helper,
+        )
     }
 
     /// Emits `length/1` through the runtime hook.
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-335, OTP-29.1.1
     pub fn emit_bif_length(
         &mut self,
+        fail: u32,
         list: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
@@ -1199,7 +1419,15 @@ impl BeamModuleAssembler {
         let finished = self.code.new_label();
         self.code.b(finished)?;
         self.code.bind(slow)?;
-        self.emit_guard_value_helper(35, list, ArgVal::Immediate(0), destination, helper)?;
+        self.emit_guard_value_helper_fail(
+            fail,
+            false,
+            35,
+            list,
+            ArgVal::Immediate(0),
+            destination,
+            helper,
+        )?;
         self.code.bind(finished)?;
         Ok(())
     }
@@ -1214,7 +1442,7 @@ impl BeamModuleAssembler {
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_min_max(lhs, rhs, Cond::Gt, 36, destination, helper)
@@ -1230,7 +1458,7 @@ impl BeamModuleAssembler {
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.emit_min_max(lhs, rhs, Cond::Lt, 37, destination, helper)
@@ -1240,6 +1468,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:246-333, OTP-29.1.1
     pub fn emit_bif_abs(
         &mut self,
+        fail: u32,
         value: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
@@ -1269,7 +1498,15 @@ impl BeamModuleAssembler {
         self.store_guard_result(destination, output)?;
         self.code.b(done)?;
         self.code.bind(slow)?;
-        self.emit_guard_value_helper(38, value, ArgVal::Immediate(0), destination, helper)?;
+        self.emit_guard_value_helper_fail(
+            fail,
+            false,
+            38,
+            value,
+            ArgVal::Immediate(0),
+            destination,
+            helper,
+        )?;
         self.code.bind(done)?;
         Ok(())
     }

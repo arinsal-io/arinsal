@@ -49,7 +49,7 @@ pub(crate) fn static_nif_lookup(
 ) -> Option<arinsal_bifs::BifFn> {
     nif::lookup(module, function, arity).or_else(|| arinsal_re::lookup(module, function, arity))
 }
-mod node;
+pub(crate) mod node;
 pub(crate) mod proc;
 
 /// Arguments passed to a process-aware native. Register windows stay in X

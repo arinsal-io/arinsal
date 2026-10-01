@@ -69,6 +69,7 @@ pub struct Process {
     pub(crate) final_exit_reason: Option<Term>,
     // ---- processes and messages ----
     pub(crate) runtime: Option<std::sync::Arc<process::Runtime>>,
+    pub(crate) self_pid: Option<arinsal_sched::Pid>,
     pub(crate) inbox: process::MessageQueue,
     pub(crate) receive_cursor: usize,
     pub(crate) receive_deadline: Option<std::time::Instant>,
@@ -100,8 +101,29 @@ pub(crate) struct ProcessCold {
     pub(crate) priority_resume_cursor: Option<usize>,
     /// The next native entry resumes a raw continuation already on the stack.
     pub(crate) native_continuation_resume: bool,
+    /// Live X registers of the resumed native continuation plus one; 0 means the function
+    /// arity (yield resume).
+    pub(crate) native_resume_live: u8,
+    /// A native `wait`/`wait_timeout` asked the scheduler to sleep (timeout in ms, `None` for
+    /// `infinity`); the process resumes at the native `loop_rec` label.
+    pub(crate) native_wait: Option<Option<u64>>,
+    /// Export dispatch to redo after the process wakes from a parked native BIF call.
+    pub(crate) native_retry: Option<usize>,
+    /// Pc of the native instruction that raised the exception being dispatched (0 if none).
+    pub(crate) native_error_pc: usize,
+    /// The current apply comes from native code, whose call site names the caller frame.
+    pub(crate) native_apply: bool,
+    /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
+    pub(crate) native_call_pc: usize,
+    /// `error_info` of the current native exception (erts keeps it with the stack trace).
+    pub(crate) native_error_info: Option<Box<arinsal_etf::OwnedTerm>>,
+    /// Remaining time computed by a native `wait_timeout`, consumed by the following wait.
+    pub(crate) native_wait_timeout: Option<u64>,
     /// Native continuation to install after an interpreted external call returns.
     pub(crate) native_resume_after_call: Option<usize>,
+    /// The BIF failure behind the current native exception, so the scheduler can name the BIF
+    /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
+    pub(crate) native_bif_error: Option<NativeBifError>,
     // Saved continuation addresses for traces still referenced by handler code.
     pub(crate) raw_traces: Vec<stacktrace::RawTrace>,
     /// Explicit `exit/1` reason, owned off-heap. The process heap is collected
@@ -257,6 +279,7 @@ impl Process {
             stats: ProcessStats::default(),
             final_exit_reason: None,
             runtime: None,
+            self_pid: None,
             inbox: process::MessageQueue::default(),
             receive_cursor: 0,
             receive_deadline: None,
@@ -302,6 +325,7 @@ impl Process {
             return Err(VmError::Unsupported("live X register count".into()));
         }
         self.gc_live = live;
+        let words = words + self.heap.allocation_reserve();
         if self.heap.free_words() >= words && !gc_stress_enabled() {
             return Ok(());
         }
@@ -421,4 +445,15 @@ impl Default for Process {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A BIF failure raised from native code, kept until the native exit builds the exception.
+pub(crate) struct NativeBifError {
+    pub(crate) module: String,
+    pub(crate) function: String,
+    pub(crate) args: Vec<Term>,
+    pub(crate) error: arinsal_bifs::BifError,
+    /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
+    pub(crate) freason: u64,
+    pub(crate) fvalue: u64,
 }

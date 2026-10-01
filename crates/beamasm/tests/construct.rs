@@ -14,6 +14,7 @@ use arinsal_beamasm::{
 
 static MOVED_AREAS: OnceLock<Mutex<Vec<Box<[u64]>>>> = OnceLock::new();
 static GC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static LAST_GC_LIVE: AtomicUsize = AtomicUsize::new(0);
 static Y_ROOT_GC_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn arithmetic_fallback(
@@ -32,6 +33,7 @@ extern "C" fn moving_gc(
     live: usize,
     _fcalls: i32,
 ) -> i32 {
+    LAST_GC_LIVE.store(live, Ordering::SeqCst);
     rt::process_header_mut(header_pointer, |header| {
         rt::scheduler_registers_mut(regs_pointer, |regs| {
             let old_heap = header.heap;
@@ -515,6 +517,20 @@ fn native_allocate_heap_zero() {
     let _ = header;
 }
 
+fn native_test_heap_with_more_than_six_live_registers() {
+    let before = GC_CALLS.load(Ordering::SeqCst);
+    let (_, _, _, _) = run_native(
+        |m, hook| m.emit_test_heap(1, 7, hook),
+        |heap, header, _| {
+            header.htop = word_ptr(heap, 2);
+            header.stop = word_ptr(heap, 2);
+            header.hend = word_ptr(heap, 2);
+        },
+    );
+    assert!(GC_CALLS.load(Ordering::SeqCst) > before);
+    assert_eq!(LAST_GC_LIVE.load(Ordering::SeqCst), 7);
+}
+
 fn tagged_small(value: i64) -> u64 {
     ((value as u64) << 4) | 15
 }
@@ -541,4 +557,5 @@ fn native_heap_checks_collect_moving_live_roots() {
     native_test_heap();
     native_allocate_heap();
     native_allocate_heap_zero();
+    native_test_heap_with_more_than_six_live_registers();
 }

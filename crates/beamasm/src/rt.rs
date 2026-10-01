@@ -124,7 +124,9 @@ pub unsafe fn enter_native_raw(
                 target_pc: exit.target,
                 resume_pc: exit.resume,
             },
-            0 if header.fcalls > 0 => ExitReason::Returned,
+            // A return into the bridge is a return even when it used the last reduction;
+            // yields leave through `arinsal_enter_native_yield` (kind 1) with `c_p->i` set.
+            0 => ExitReason::Returned,
             _ => ExitReason::Yield,
         }
     }
@@ -235,6 +237,8 @@ core::arch::global_asm!(
     "_arinsal_enter_native_return:",
     // The marker distinguishes an interpreter handoff without adding work to each BEAM return.
     "ldr x9, [x19, #16408]",
+    // Consume the marker so a later plain return is not taken for a handoff.
+    "str xzr, [x19, #16408]",
     "cbnz x9, 1f",
     "mov x0, xzr",
     "b 2f",

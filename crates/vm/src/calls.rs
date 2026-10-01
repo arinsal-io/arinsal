@@ -33,7 +33,7 @@ pub(super) fn push_continuation(
     if !p.heap.reserve_stack(1) {
         return Err(VmError::Unsupported("continuation stack".into()));
     }
-    let cp = Term::catch((module << 32) | u64::from(ip));
+    let cp = crate::stacktrace::continuation_tag(module as usize, ip as usize)?;
     p.heap.stack_set(0, cp);
     Ok(())
 }
@@ -85,10 +85,11 @@ pub(super) fn return_to(p: &mut Process) -> Option<Term> {
     if cp.classify() != TermKind::Catch {
         return Some(p.x[0]);
     }
-    // SAFETY: CATCH is an immediate and contains no heap address.
-    let bits = unsafe { cp.raw_bits() } >> 6;
-    p.module = (bits >> 32) as usize;
-    p.ip = bits as u32 as usize;
+    let Some((false, module, ip)) = crate::stacktrace::decode_tag(cp) else {
+        return Some(p.x[0]);
+    };
+    p.module = module;
+    p.ip = ip;
     p.heap.release_stack(1);
     None
 }
@@ -119,6 +120,7 @@ impl Vm {
                 if crate::native_bridge::is_native_function_at(word) {
                     p.heap.release_stack(1);
                     p.cold_mut().native_continuation_resume = true;
+                    p.cold_mut().native_resume_live = 2;
                     p.native_pc = Some(word);
                     return None;
                 }

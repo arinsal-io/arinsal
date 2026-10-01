@@ -18,7 +18,7 @@
 | `float_SUITE` | 15 | 14/15 | 13/15 | 1 | 0 | fp_drv: failed {badarg |
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
 | `guard_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | bad_arith: failed {badarith; type_tests: failed {badarg |
-| `hash_SUITE` | 29 | 27/29 | 27/29 | 0 | 0 | none |
+| `hash_SUITE` | 29 | 27/29 | 26/29 | 1 | 0 | test_phash2_10MB_plus_bin: failed {function_clause |
 | `list_bif_SUITE` | 9 | 8/9 | 8/9 | 0 | 0 | none |
 | `map_SUITE` | 64 | 63/64 | 55/64 | 8 | 0 | t_bif_map_merge: failed {{badmatch,false}; t_map_compare: failed {{badmatch,true}; t_map_display: failed {undefined; t_map_encode_decode: failed {{badmatch,#{a => 2,"hi" => "value"}}; t_tracing: failed {badarg; t_update_assoc_sharing: failed {{badmatch,false}; t_update_exact: failed {{badmatch, {'EXIT', {{badkey,42.0}; t_update_exact_large: failed {{badmatch, {'EXIT', {{badkey,42.0} |
 | `num_bif_SUITE` | 11 | 11/11 | 11/11 | 0 | 0 | none |

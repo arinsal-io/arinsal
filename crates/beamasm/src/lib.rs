@@ -51,8 +51,8 @@ pub struct ProcessHeader {
     pub fvalue: u64,
     /// Exception trace pointer.
     pub ftrace: *mut c_void,
-    /// Catch-chain pointer.
-    pub catches: *mut c_void,
+    /// Number of active catch tags in the process stack.
+    pub catches: usize,
     /// Next instruction or native code pointer.
     pub i: *const c_void,
     /// Current function arity.
@@ -78,8 +78,8 @@ pub struct SchedulerRegisters {
     pub x_reg_array: [u64; 1024],
     /// Floating point register array.
     pub f_reg_array: [f64; 1024],
-    /// Scratch words accessed by runtime fragments.
-    pub tmp_mem: [u64; 6],
+    /// Scratch words accessed by runtime fragments; word 6 records the pc of a native error.
+    pub tmp_mem: [u64; 8],
 }
 
 impl Default for SchedulerRegisters {
@@ -87,7 +87,7 @@ impl Default for SchedulerRegisters {
         Self {
             x_reg_array: [0; 1024],
             f_reg_array: [0.0; 1024],
-            tmp_mem: [0; 6],
+            tmp_mem: [0; 8],
         }
     }
 }
@@ -159,6 +159,33 @@ impl Update {
 
 /// Publishes register-backed state before a runtime or scheduler call.
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-536, OTP-29.1.1
+/// Machine registers caching X0..X5.
+const X_REG_CACHE: [u8; 6] = [25, 26, 27, 28, 15, 16];
+
+/// X registers a runtime call saves and restores, paired for `stp`/`ldp`.
+///
+/// X4 and X5 live in the caller-saved x15/x16, so they are kept across every call whatever the
+/// live count: like erts, X registers past `live` must survive untouched (a failure path may
+/// still read an immediate there).
+fn cached_x_regs(live: usize, update: Update) -> Vec<(usize, Option<usize>)> {
+    let mut indexes = Vec::with_capacity(6);
+    if update.contains(Update::X_REGS) {
+        indexes.extend(0..live.min(4));
+    }
+    indexes.extend([4, 5]);
+    let mut pairs = Vec::with_capacity(3);
+    let mut iter = indexes.into_iter().peekable();
+    while let Some(first) = iter.next() {
+        if first % 2 == 0 && iter.peek() == Some(&(first + 1)) {
+            iter.next();
+            pairs.push((first, Some(first + 1)));
+        } else {
+            pairs.push((first, None));
+        }
+    }
+    pairs
+}
+
 pub fn emit_enter_runtime(
     code: &mut CodeBuffer,
     live: usize,
@@ -180,26 +207,16 @@ pub fn emit_enter_runtime(
         if update.contains(Update::REDUCTIONS) {
             e.str_uoff(Gpr::w(22), Gpr::x(21), 32)?;
         }
-        let count = live.min(6);
-        let first = if update.contains(Update::X_REGS) {
-            0
-        } else {
-            4
-        };
-        let regs = [25, 26, 27, 28, 15, 16];
-        let mut i = first;
-        while i < count {
-            if i + 1 < count {
-                e.stp(
-                    Gpr::x(regs[i]),
-                    Gpr::x(regs[i + 1]),
+        for (first, second) in cached_x_regs(live, update) {
+            let offset = (first as u32) * 8;
+            match second {
+                Some(second) => e.stp(
+                    Gpr::x(X_REG_CACHE[first]),
+                    Gpr::x(X_REG_CACHE[second]),
                     Gpr::x(19),
-                    (i as i16) * 8,
-                )?;
-                i += 2;
-            } else {
-                e.str_uoff(Gpr::x(regs[i]), Gpr::x(19), (i as u32) * 8)?;
-                i += 1;
+                    offset as i16,
+                )?,
+                None => e.str_uoff(Gpr::x(X_REG_CACHE[first]), Gpr::x(19), offset)?,
             }
         }
         Ok(())
@@ -229,30 +246,130 @@ pub fn emit_leave_runtime(
         if update.contains(Update::REDUCTIONS) {
             e.ldr_uoff(Gpr::w(22), Gpr::x(21), 32)?;
         }
-        let count = live.min(6);
-        let first = if update.contains(Update::X_REGS) {
-            0
-        } else {
-            4
-        };
-        let regs = [25, 26, 27, 28, 15, 16];
-        let mut i = first;
-        while i < count {
-            if i + 1 < count {
-                e.ldp(
-                    Gpr::x(regs[i]),
-                    Gpr::x(regs[i + 1]),
+        for (first, second) in cached_x_regs(live, update) {
+            let offset = (first as u32) * 8;
+            match second {
+                Some(second) => e.ldp(
+                    Gpr::x(X_REG_CACHE[first]),
+                    Gpr::x(X_REG_CACHE[second]),
                     Gpr::x(19),
-                    (i as i16) * 8,
-                )?;
-                i += 2;
-            } else {
-                e.ldr_uoff(Gpr::x(regs[i]), Gpr::x(19), (i as u32) * 8)?;
-                i += 1;
+                    offset as i16,
+                )?,
+                None => e.ldr_uoff(Gpr::x(X_REG_CACHE[first]), Gpr::x(19), offset)?,
             }
         }
         Ok(())
-    })
+    })?;
+    emit_validate_native_cursor(code)
+}
+
+/// Emits the JIT_HARD_DEBUG heap and stack cursor invariant check when requested.
+// Port of erts/emulator/beam/jit/arm/instr_common.cpp:160-177, OTP-29.1.1.
+pub fn emit_validate_native_cursor(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    if std::env::var_os("ARINSAL_BEAMASM_VALIDATE").is_none() {
+        return Ok(());
+    }
+
+    let failed = code.new_label();
+    let valid = code.new_label();
+    let instruction = (code.offset() / 4) as u16;
+    let trace_instruction = std::env::var("ARINSAL_BEAMASM_VALIDATE_TRACE")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|item| item.trim().parse::<u16>().ok())
+                .collect::<Vec<_>>()
+        });
+    if trace_instruction
+        .as_ref()
+        .is_some_and(|instructions| instructions.contains(&instruction))
+    {
+        code.emit(|e| {
+            e.stp_pre(Gpr::x(0), Gpr::x(1), Gpr::sp(), -80)?;
+            e.stp(Gpr::x(2), Gpr::x(3), Gpr::sp(), 16)?;
+            e.stp(Gpr::x(4), Gpr::x(30), Gpr::sp(), 32)?;
+            e.stp(Gpr::x(5), Gpr::x(6), Gpr::sp(), 48)?;
+            e.stp(Gpr::x(15), Gpr::x(16), Gpr::sp(), 64)?;
+            e.mov_const(Gpr::x(0), u64::from(instruction))?;
+            e.mov_reg(Gpr::x(1), Gpr::x(20))?;
+            e.mov_reg(Gpr::x(2), Gpr::x(23))?;
+            e.mov_reg(Gpr::x(5), Gpr::x(25))?;
+            e.mov_reg(Gpr::x(6), Gpr::x(26))?;
+            e.ldr_uoff(Gpr::x(3), Gpr::x(21), 16)?;
+            e.ldr_uoff(Gpr::x(4), Gpr::x(21), 24)?;
+            e.mov_reg(Gpr::x(7), Gpr::x(30))?;
+            e.mov_const(Gpr::x(17), report_native_cursor as *const () as u64)?;
+            e.blr(Gpr::x(17))?;
+            e.ldp(Gpr::x(15), Gpr::x(16), Gpr::sp(), 64)?;
+            e.ldp(Gpr::x(4), Gpr::x(30), Gpr::sp(), 32)?;
+            e.ldp(Gpr::x(2), Gpr::x(3), Gpr::sp(), 16)?;
+            e.ldp(Gpr::x(5), Gpr::x(6), Gpr::sp(), 48)?;
+            e.ldp_post(Gpr::x(0), Gpr::x(1), Gpr::sp(), 80)
+        })?;
+    }
+    code.emit(|e| e.tst_imm(Gpr::x(20), 7))?;
+    code.b_cond(arinsal_a64::enc::Cond::Ne, failed)?;
+    code.emit(|e| e.cmp_reg(Gpr::x(20), Gpr::x(23), arinsal_a64::enc::Shift::Lsl, 0))?;
+    code.b_cond(arinsal_a64::enc::Cond::Cc, failed)?;
+    code.emit(|e| e.ldr_uoff(Gpr::x(8), Gpr::x(21), 16))?;
+    code.emit(|e| e.cmp_reg(Gpr::x(23), Gpr::x(8), arinsal_a64::enc::Shift::Lsl, 0))?;
+    code.b_cond(arinsal_a64::enc::Cond::Cc, failed)?;
+    code.emit(|e| e.ldr_uoff(Gpr::x(8), Gpr::x(21), 24))?;
+    code.emit(|e| e.cmp_reg(Gpr::x(20), Gpr::x(8), arinsal_a64::enc::Shift::Lsl, 0))?;
+    code.b_cond(arinsal_a64::enc::Cond::Hi, failed)?;
+    code.b(valid)?;
+    code.bind(failed)?;
+    code.emit(|e| {
+        e.mov_const(Gpr::x(0), u64::from(instruction))?;
+        e.mov_reg(Gpr::x(1), Gpr::x(20))?;
+        e.mov_reg(Gpr::x(2), Gpr::x(23))?;
+        e.ldr_uoff(Gpr::x(3), Gpr::x(21), 16)?;
+        e.ldr_uoff(Gpr::x(4), Gpr::x(21), 24)?;
+        e.mov_reg(Gpr::x(5), Gpr::x(25))?;
+        e.mov_reg(Gpr::x(6), Gpr::x(26))?;
+        e.mov_reg(Gpr::x(7), Gpr::x(30))?;
+        e.mov_const(Gpr::x(17), report_native_cursor_failure as *const () as u64)?;
+        e.blr(Gpr::x(17))?;
+        e.udf(instruction);
+        Ok(())
+    })?;
+    code.bind(valid)
+}
+
+extern "C" fn report_native_cursor_failure(
+    instruction: u64,
+    stack: u64,
+    heap_top: u64,
+    heap_start: u64,
+    heap_end: u64,
+    x0: u64,
+    x1: u64,
+    instruction_pc: u64,
+) {
+    eprintln!(
+        "BeamAsm cursor invariant failed at native instruction {instruction} (LR={instruction_pc:#x}): E={stack:#x}, HTOP={heap_top:#x}, heap=[{heap_start:#x}, {heap_end:#x}], X0={x0:#x}, X1={x1:#x}"
+    );
+}
+
+extern "C" fn report_native_cursor(
+    instruction: u64,
+    stack: u64,
+    heap_top: u64,
+    heap_start: u64,
+    heap_end: u64,
+    x0: u64,
+    x1: u64,
+    instruction_pc: u64,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static REPORTS: AtomicUsize = AtomicUsize::new(0);
+    if REPORTS.fetch_add(1, Ordering::Relaxed) >= 24 {
+        return;
+    }
+    eprintln!(
+        "BeamAsm cursor at native instruction {instruction} (LR={instruction_pc:#x}): E={stack:#x}, HTOP={heap_top:#x}, heap=[{heap_start:#x}, {heap_end:#x}], X0={x0:#x}, X1={x1:#x}"
+    );
 }
 
 pub use rt::enter_native_raw;

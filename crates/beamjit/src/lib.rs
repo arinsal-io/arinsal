@@ -29,9 +29,42 @@ pub trait ModuleEnv {
     fn export_entry(&self, _beam: &BeamFile, _index: u32) -> Result<usize, String> {
         Err("module environment has no external dispatch slots".into())
     }
+    /// Build a bignum literal for an integer outside the small range.
+    fn integer_literal(&self, _value: i64) -> Result<u64, String> {
+        Err("module environment cannot build integer literals".into())
+    }
+    /// Build a bignum literal from decimal text (integers outside `i64`).
+    fn bigint_literal(&self, _decimal: &str) -> Result<u64, String> {
+        Err("module environment cannot build bignum literals".into())
+    }
+    /// Build a tuple literal (for example the key tuple of a small map literal) from tagged
+    /// element words and return its tagged word.
+    fn tuple_literal(&self, _elements: &[u64]) -> Result<u64, String> {
+        Err("module environment cannot build tuple literals".into())
+    }
+    /// Order literal map keys (tagged words) as flatmap keys, returning the permutation.
+    fn sort_map_keys(&self, _keys: &[u64]) -> Result<Vec<usize>, String> {
+        Err("module environment cannot order map keys".into())
+    }
     /// Return the retained `FunEntry` pointer for a lambda-table index.
     fn lambda_fun_entry(&self, _beam: &BeamFile, index: u32) -> Result<(usize, u8), String> {
         Err(format!("module environment has no lambda entry {index}"))
+    }
+    /// Return the runtime hook that retains local fun owners on the process heap.
+    fn retain_fun_helper(&self) -> usize {
+        0
+    }
+    /// Return the runtime hook that restores the exception class for `raise/2`.
+    fn raise_class_helper(&self) -> usize {
+        0
+    }
+    /// Return the helper that reads the process-wide local node name.
+    fn local_node_helper(&self) -> usize {
+        0
+    }
+    /// Return the runtime hook that materializes an Erlang stacktrace.
+    fn build_stacktrace_helper(&self) -> Option<arinsal_beamasm::catch::BuildStacktraceHook> {
+        None
     }
     /// Publish a native trampoline while preserving the interpreter dispatch entry.
     fn publish_lambda_target(
@@ -54,6 +87,18 @@ pub trait ModuleEnv {
     fn breakpoint_helper(&self) -> usize {
         0
     }
+    /// Return the two-register shared fragment used by `send/2`.
+    fn send_fragment(&self) -> usize {
+        self.light_bif_fragment()
+    }
+    /// Resolve a loader-patched NIF body to its native runtime trampoline.
+    fn native_body(&self, _name: &str, _arity: u8) -> Option<(usize, usize)> {
+        None
+    }
+    /// Runtime helper that reads the process dictionary with exact key equality.
+    fn process_dictionary_get_helper(&self) -> usize {
+        0
+    }
     /// Arithmetic slow path used for bignums and exceptional operands.
     fn arithmetic_helper(&self) -> ArithHelper;
     /// Guard slow path used for term comparisons and guard BIFs.
@@ -66,23 +111,147 @@ pub trait ModuleEnv {
     fn map_lookup_helper(&self) -> MapLookupHelper;
     /// Dispatches an OTP BIF function body using the current X registers.
     fn bif_mfa_helper(&self) -> BifMfaHelper;
+    /// Return a dispatch slot that calls the BIF itself (never its module's stub body) through
+    /// the export trampoline, for `call_bif_mfa`.
+    fn bif_mfa_entry(&self, _module: &str, _function: &str, _arity: u8) -> Result<usize, String> {
+        Err("module environment has no BIF dispatch slots".into())
+    }
     /// Executes a bit syntax matching slow path.
     fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper;
     /// Runtime callbacks for map creation and updates.
     fn map_runtime(&self) -> arinsal_beamasm::map::MapRuntime;
-    /// Runtime callbacks used by the bitstring constructor.
-    fn bs_construct_helpers(
-        &self,
-    ) -> (
-        arinsal_beamasm::bs_construct::BsConstructHelper,
-        arinsal_beamasm::bs_construct::BsConstructErrorHelper,
-    );
+    /// Runtime hook calling a plain BIF by export identity.
+    fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {
+        unused_bif_identity
+    }
+    /// Export identity of an import that is a plain (pure or heap-allocating) BIF, if it is one.
+    fn plain_bif_identity(&self, _beam: &BeamFile, _index: u32) -> Option<usize> {
+        None
+    }
+    /// Runtime hook for the field-decoding `bs_match` commands.
+    fn bs_match_cmd_helper(&self) -> arinsal_beamasm::bs_match::BsMatchCmdHelper {
+        unused_bs_match_cmd
+    }
+    /// Runtime hook that builds the binary of `bs_create_bin` from staged segments.
+    fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelper;
+    /// Register a string-table constant for `i_bs_match_string` and return its handle.
+    fn match_string(&self, _bytes: &[u8]) -> Result<u64, String> {
+        Err("module environment cannot register match strings".into())
+    }
+    /// Build a binary literal from bytes and return its tagged word.
+    fn binary_literal(&self, _bytes: &[u8]) -> Result<u64, String> {
+        Err("module environment cannot build binary literals".into())
+    }
     /// Resolves native exception records and returns zero for scheduler dispatch.
     fn exception_resolver(&self) -> arinsal_beamasm::catch::ExceptionResolver;
+    /// Runtime callbacks of the receive instructions.
+    fn receive_hooks(&self) -> arinsal_beamasm::receive::ReceiveHooks {
+        arinsal_beamasm::receive::ReceiveHooks {
+            recv_marker_reserve: unused_recv_reserve,
+            recv_marker_bind: unused_recv_bind,
+            recv_marker_clear: unused_recv_one,
+            recv_marker_use: unused_recv_one,
+            loop_rec: unused_loop_rec,
+            remove_message: unused_remove_message,
+            set_save_next: unused_recv_header,
+            wait_unlocked: unused_wait,
+            wait_locked: unused_wait,
+            take_receive_lock: unused_recv_header,
+            wait_timeout: unused_wait_timeout,
+            timeout_locked: unused_recv_header,
+            timeout: unused_recv_header,
+        }
+    }
+    /// Runtime hook creating the writable binary of `bs_init_writable`.
+    fn bs_init_writable_helper(&self) -> arinsal_beamasm::bs_construct::BsInitWritableHelper {
+        unused_bs_init_writable
+    }
+    /// Runtime hook converting a bignum to IEEE-754 bits for `fconv`.
+    fn big_to_float_helper(&self) -> arinsal_beamasm::float::BigToFloat {
+        unused_big_to_float
+    }
+    /// Runtime hook pairing an error reason with its stacktrace for `catch_end`.
+    fn add_stacktrace_helper(&self) -> arinsal_beamasm::catch::AddStacktraceHook {
+        unused_add_stacktrace
+    }
+    /// Runtime entry points for `apply`, `apply/2` and `apply/3`.
+    fn apply_runtime(&self) -> arinsal_beamasm::misc::ApplyRuntime {
+        arinsal_beamasm::misc::ApplyRuntime {
+            resolver: unused_apply_resolver,
+            apply2_fragment: 0,
+            apply3_fragment: 0,
+        }
+    }
     /// Resolves a fun term to a native entry for `i_call_fun` / `i_call_fun2`.
     fn fun_resolver(&self) -> arinsal_beamasm::fun::FunResolver {
         unused_fun_resolver
     }
+}
+
+extern "C" fn unused_add_stacktrace(
+    _process: *mut ProcessHeader,
+    _reason: u64,
+    _trace: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn unused_recv_reserve(_process: *mut ProcessHeader) -> u64 {
+    0
+}
+
+extern "C" fn unused_recv_bind(_process: *mut ProcessHeader, _marker: u64, _reference: u64) {}
+
+extern "C" fn unused_recv_one(_process: *mut ProcessHeader, _reference: u64) {}
+
+extern "C" fn unused_loop_rec(_process: *mut ProcessHeader) -> u64 {
+    0
+}
+
+extern "C" fn unused_remove_message(
+    _process: *mut ProcessHeader,
+    fcalls: i32,
+    _unused: usize,
+) -> i32 {
+    fcalls
+}
+
+extern "C" fn unused_recv_header(_process: *mut ProcessHeader) {}
+
+extern "C" fn unused_wait(_process: *mut ProcessHeader, _resume: usize) {}
+
+extern "C" fn unused_wait_timeout(
+    _process: *mut ProcessHeader,
+    _timeout: u64,
+    _next: usize,
+) -> i32 {
+    0
+}
+
+extern "C" fn unused_bif_identity(
+    _p: *mut ProcessHeader,
+    _i: u64,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn unused_bs_match_cmd(_process: *mut ProcessHeader, _kind: u64, _live: u64) -> u64 {
+    0
+}
+
+extern "C" fn unused_bs_init_writable(_process: *mut ProcessHeader, _size: u64) -> u64 {
+    0
+}
+
+extern "C" fn unused_big_to_float(_process: *mut ProcessHeader, _term: u64) -> u64 {
+    0
+}
+
+extern "C" fn unused_apply_resolver(_process: *mut ProcessHeader, _arity: u32) -> usize {
+    0
 }
 
 extern "C" fn unused_fun_resolver(_process: *mut ProcessHeader, _fun: u64, _arity: u32) -> usize {
@@ -121,6 +290,7 @@ enum EmitterKind {
     Call,
     CallLast,
     CallOnly,
+    ProcessDictionaryGet,
     Plus,
     Minus,
     Times,
@@ -163,6 +333,10 @@ enum EmitterKind {
     BsConstruct,
     Fun,
     Catch,
+    Apply,
+    Float,
+    Receive,
+    Bif,
 }
 
 /// Operations that have an emitter in the current module assembler slice.
@@ -188,11 +362,19 @@ pub static PORTED_OPS: &[PortedOp] = &[
         emitter: EmitterKind::Metadata,
     },
     PortedOp {
+        name: "on_load",
+        emitter: EmitterKind::Metadata,
+    },
+    PortedOp {
         name: "func_line",
         emitter: EmitterKind::Metadata,
     },
     PortedOp {
         name: "empty_func_line",
+        emitter: EmitterKind::Metadata,
+    },
+    PortedOp {
+        name: "nif_start",
         emitter: EmitterKind::Metadata,
     },
     PortedOp {
@@ -266,6 +448,18 @@ pub static PORTED_OPS: &[PortedOp] = &[
     PortedOp {
         name: "i_call_only",
         emitter: EmitterKind::CallOnly,
+    },
+    PortedOp {
+        name: "get",
+        emitter: EmitterKind::ProcessDictionaryGet,
+    },
+    PortedOp {
+        name: "i_get",
+        emitter: EmitterKind::ProcessDictionaryGet,
+    },
+    PortedOp {
+        name: "i_get_hash",
+        emitter: EmitterKind::ProcessDictionaryGet,
     },
     PortedOp {
         name: "i_plus",
@@ -533,6 +727,26 @@ pub static PORTED_OPS: &[PortedOp] = &[
         emitter: EmitterKind::CallExternal,
     },
     PortedOp {
+        name: "i_yield",
+        emitter: EmitterKind::CallExternal,
+    },
+    PortedOp {
+        name: "i_hibernate",
+        emitter: EmitterKind::CallExternal,
+    },
+    PortedOp {
+        name: "i_perf_counter",
+        emitter: EmitterKind::CallExternal,
+    },
+    PortedOp {
+        name: "i_load_nif",
+        emitter: EmitterKind::CallExternal,
+    },
+    PortedOp {
+        name: "i_call_on_load_function",
+        emitter: EmitterKind::CallExternal,
+    },
+    PortedOp {
         name: "i_call_ext_last",
         emitter: EmitterKind::CallExternal,
     },
@@ -645,6 +859,14 @@ pub static PORTED_OPS: &[PortedOp] = &[
         emitter: EmitterKind::Guard,
     },
     PortedOp {
+        name: "is_any_native_record",
+        emitter: EmitterKind::Guard,
+    },
+    PortedOp {
+        name: "is_native_record",
+        emitter: EmitterKind::Guard,
+    },
+    PortedOp {
         name: "is_int_in_range",
         emitter: EmitterKind::Guard,
     },
@@ -685,6 +907,10 @@ pub static PORTED_OPS: &[PortedOp] = &[
         emitter: EmitterKind::MapUpdate,
     },
     PortedOp {
+        name: "new_map",
+        emitter: EmitterKind::MapCreate,
+    },
+    PortedOp {
         name: "i_new_small_map_lit",
         emitter: EmitterKind::MapCreate,
     },
@@ -694,6 +920,10 @@ pub static PORTED_OPS: &[PortedOp] = &[
     },
     PortedOp {
         name: "i_bs_start_match3",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "bs_get_integer2",
         emitter: EmitterKind::BsMatch,
     },
     PortedOp {
@@ -709,8 +939,56 @@ pub static PORTED_OPS: &[PortedOp] = &[
         emitter: EmitterKind::BsMatch,
     },
     PortedOp {
+        name: "i_bs_get_bin_and_tail",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_get_utf8",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_get_utf16",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_get_float2",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "get_float2",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_skip_utf8",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_skip_utf16",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_validate_unicode_retract",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_match_string",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
+        name: "i_bs_skip_bits2",
+        emitter: EmitterKind::BsMatch,
+    },
+    PortedOp {
         name: "i_bs_create_bin",
         emitter: EmitterKind::BsConstruct,
+    },
+    PortedOp {
+        name: "i_rem_div",
+        emitter: EmitterKind::Rem,
+    },
+    PortedOp {
+        name: "i_div_rem",
+        emitter: EmitterKind::Rem,
     },
     PortedOp {
         name: "i_m_div",
@@ -741,6 +1019,18 @@ pub static PORTED_OPS: &[PortedOp] = &[
         emitter: EmitterKind::Catch,
     },
     PortedOp {
+        name: "bs_init_writable",
+        emitter: EmitterKind::BsConstruct,
+    },
+    PortedOp {
+        name: "try_end_move_deallocate",
+        emitter: EmitterKind::Catch,
+    },
+    PortedOp {
+        name: "try_case_end",
+        emitter: EmitterKind::Catch,
+    },
+    PortedOp {
         name: "case_end",
         emitter: EmitterKind::Catch,
     },
@@ -754,6 +1044,22 @@ pub static PORTED_OPS: &[PortedOp] = &[
     },
     PortedOp {
         name: "badrecord",
+        emitter: EmitterKind::Catch,
+    },
+    PortedOp {
+        name: "raise",
+        emitter: EmitterKind::Catch,
+    },
+    PortedOp {
+        name: "raw_raise",
+        emitter: EmitterKind::Catch,
+    },
+    PortedOp {
+        name: "node",
+        emitter: EmitterKind::Catch,
+    },
+    PortedOp {
+        name: "build_stacktrace",
         emitter: EmitterKind::Catch,
     },
     PortedOp {
@@ -783,6 +1089,142 @@ pub static PORTED_OPS: &[PortedOp] = &[
     PortedOp {
         name: "send",
         emitter: EmitterKind::Fun,
+    },
+    PortedOp {
+        name: "apply",
+        emitter: EmitterKind::Apply,
+    },
+    PortedOp {
+        name: "i_bif1",
+        emitter: EmitterKind::Bif,
+    },
+    PortedOp {
+        name: "i_bif2",
+        emitter: EmitterKind::Bif,
+    },
+    PortedOp {
+        name: "i_bif3",
+        emitter: EmitterKind::Bif,
+    },
+    PortedOp {
+        name: "nofail_bif1",
+        emitter: EmitterKind::Bif,
+    },
+    PortedOp {
+        name: "nofail_bif2",
+        emitter: EmitterKind::Bif,
+    },
+    PortedOp {
+        name: "recv_marker_reserve",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "recv_marker_bind",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "recv_marker_clear",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "recv_marker_use",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "i_loop_rec",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "remove_message",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "loop_rec_end",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "wait_unlocked",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "wait_locked",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "wait_timeout_unlocked",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "wait_timeout_locked",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "timeout",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "timeout_locked",
+        emitter: EmitterKind::Receive,
+    },
+    PortedOp {
+        name: "fload",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "fstore",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "fconv",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "i_fadd",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "i_fsub",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "i_fmul",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "i_fdiv",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "i_fnegate",
+        emitter: EmitterKind::Float,
+    },
+    PortedOp {
+        name: "apply_last",
+        emitter: EmitterKind::Apply,
+    },
+    PortedOp {
+        name: "i_apply",
+        emitter: EmitterKind::Apply,
+    },
+    PortedOp {
+        name: "i_apply_last",
+        emitter: EmitterKind::Apply,
+    },
+    PortedOp {
+        name: "i_apply_only",
+        emitter: EmitterKind::Apply,
+    },
+    PortedOp {
+        name: "i_apply_fun",
+        emitter: EmitterKind::Apply,
+    },
+    PortedOp {
+        name: "i_apply_fun_last",
+        emitter: EmitterKind::Apply,
+    },
+    PortedOp {
+        name: "i_apply_fun_only",
+        emitter: EmitterKind::Apply,
     },
     PortedOp {
         name: "i_bs_get_position",
@@ -887,6 +1329,28 @@ pub struct UnportedFunction {
     pub label: u32,
     /// Unique missing specific-op names in bytecode order.
     pub missing_ops: Vec<String>,
+    /// Why BeamAsm could not compile this function.
+    pub reason: FallbackReason,
+}
+
+/// Compilation outcome that caused a function to remain interpreted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// One or more specific ops lack a complete native emitter.
+    UnsupportedInstructions,
+    /// An implemented emitter rejected these operands or its assembler operation failed.
+    EmitterError {
+        instruction: String,
+        details: String,
+    },
+    /// A local native call points to a function that was not itself emitted.
+    MissingNativeTarget { instruction: String, target: u32 },
+    /// The native function entry table did not contain the function's label.
+    MissingEntry,
+    /// This function requires a continuation behavior not yet available to BeamAsm.
+    RuntimeBridge,
+    /// The caller intentionally excluded this function from native compilation.
+    Excluded,
 }
 
 /// Parsed module, native function entries, and function-level interpreter fallback list.
@@ -904,7 +1368,7 @@ pub struct CompiledModule {
 impl CompiledModule {
     /// Returns a safe native entry handle tied to this module's executable mapping.
     pub fn entry(&self, function: &CompiledFunction) -> Option<NativeEntry<'_>> {
-        self.native.entry(function.label)
+        self.native.function_entry(function.label)
     }
 }
 
@@ -930,6 +1394,10 @@ pub fn compile_module_with_env_and_funcs(
     let mut unported = Vec::new();
 
     for ops in specialized {
+        // Ops before the first function label (module preamble) are not a function.
+        if !ops.iter().any(|op| op.name() == "i_func_label") {
+            continue;
+        }
         let (name, arity, label) = function_identity(&ops, &beam);
         if function_allowlist.is_some_and(|list| !function_allowlist_contains(list, &name, arity)) {
             unported.push(UnportedFunction {
@@ -937,15 +1405,7 @@ pub fn compile_module_with_env_and_funcs(
                 arity,
                 label,
                 missing_ops: vec!["excluded by ARINSAL_BEAMASM_FUNCS".to_owned()],
-            });
-            continue;
-        }
-        if beam.module == "init" && name == "get_flag" && arity == 3 {
-            unported.push(UnportedFunction {
-                name,
-                arity,
-                label,
-                missing_ops: vec!["native continuation bridge".to_owned()],
+                reason: FallbackReason::Excluded,
             });
             continue;
         }
@@ -956,6 +1416,7 @@ pub fn compile_module_with_env_and_funcs(
                 arity,
                 label,
                 missing_ops: blockers,
+                reason: FallbackReason::UnsupportedInstructions,
             });
             continue;
         }
@@ -966,16 +1427,38 @@ pub fn compile_module_with_env_and_funcs(
     // restarting the whole module for every blocked function makes OTP loading quadratic.
     let mut emit_failures = Vec::new();
     candidates.retain(|(name, arity, label, ops)| {
+        if let Some((identity, helper)) = env.native_body(name, *arity) {
+            let mut probe = BeamModuleAssembler::new();
+            if let Err(error) = probe.emit_native_body(identity, helper, *arity as usize) {
+                emit_failures.push(UnportedFunction {
+                    name: name.clone(),
+                    arity: *arity,
+                    label: *label,
+                    missing_ops: vec!["nif_start".to_owned()],
+                    reason: FallbackReason::EmitterError {
+                        instruction: "nif_start".to_owned(),
+                        details: format!("{error:?}"),
+                    },
+                });
+                return false;
+            }
+            return true;
+        }
         let mut probe = BeamModuleAssembler::new();
-        if let Some(op) = ops
-            .iter()
-            .find(|op| emit_op(&mut probe, op, &beam, env).is_err())
-        {
+        if let Some((op, error)) = ops.iter().find_map(|op| {
+            emit_op(&mut probe, op, &beam, env)
+                .err()
+                .map(|error| (op, error))
+        }) {
             emit_failures.push(UnportedFunction {
                 name: name.clone(),
                 arity: *arity,
                 label: *label,
                 missing_ops: vec![op.name().to_owned()],
+                reason: FallbackReason::EmitterError {
+                    instruction: op.name().to_owned(),
+                    details: format!("{error}; operands {:?}", op.operands()),
+                },
             });
             false
         } else {
@@ -1002,16 +1485,21 @@ pub fn compile_module_with_env_and_funcs(
         while index < candidates.len() {
             let blocked_call = candidates[index].3.iter().find_map(|op| {
                 call_target(op)
+                    .or_else(|| lambda_call_target(op, &beam))
                     .filter(|target| !native_labels.contains(target))
-                    .map(|_| op.name().to_owned())
+                    .map(|target| (op.name().to_owned(), target))
             });
-            if let Some(op) = blocked_call {
+            if let Some((op, target)) = blocked_call {
                 let (name, arity, label, _) = candidates.remove(index);
                 unported.push(UnportedFunction {
                     name,
                     arity,
                     label,
-                    missing_ops: vec![op],
+                    missing_ops: vec![op.clone()],
+                    reason: FallbackReason::MissingNativeTarget {
+                        instruction: op,
+                        target,
+                    },
                 });
                 removed = true;
             } else {
@@ -1062,12 +1550,33 @@ pub fn compile_module_with_env_and_funcs(
         for (index, (name, arity, label, ops)) in candidates.iter().enumerate() {
             assembler.begin_dump_function(name, *arity);
             let dump_enabled = assembler.dump_enabled();
+            let native_body = env.native_body(name, *arity);
             for op in ops {
                 let start = if dump_enabled {
                     assembler.code_offset()
                 } else {
                     0
                 };
+                if op.name() == "nif_start"
+                    && let Some((identity, helper)) = native_body
+                {
+                    if let Err(error) =
+                        assembler.emit_native_body(identity, helper, *arity as usize)
+                    {
+                        failure_index = Some(index);
+                        failure_reason = Some(("nif_start".to_owned(), format!("{error:?}")));
+                        break;
+                    }
+                    if dump_enabled {
+                        let end = assembler.code_offset();
+                        assembler.record_dump_instruction(
+                            format!("{} {:?}", op.name(), op.operands()),
+                            start,
+                            end,
+                        );
+                    }
+                    break;
+                }
                 if let Err(error) = emit_op(&mut assembler, op, &beam, env) {
                     failure_index = Some(index);
                     failure_reason = Some((
@@ -1092,13 +1601,17 @@ pub fn compile_module_with_env_and_funcs(
         }
 
         if let Some(index) = failure_index {
-            let (op, _reason) = failure_reason.unwrap();
+            let (op, details) = failure_reason.unwrap();
             let (name, arity, label, _) = candidates.remove(index);
             unported.push(UnportedFunction {
                 name,
                 arity,
                 label,
-                missing_ops: vec![op],
+                missing_ops: vec![op.clone()],
+                reason: FallbackReason::EmitterError {
+                    instruction: op,
+                    details,
+                },
             });
             continue;
         }
@@ -1125,6 +1638,7 @@ pub fn compile_module_with_env_and_funcs(
                 arity,
                 label,
                 missing_ops: vec!["i_func_label".to_owned()],
+                reason: FallbackReason::MissingEntry,
             });
         }
     }
@@ -1166,7 +1680,11 @@ pub fn missing_ops(ops: &[SpecificOp]) -> Vec<String> {
 fn supports_extended_x(name: &str) -> bool {
     matches!(
         name,
-        "i_move"
+        "badmatch"
+            | "case_end"
+            | "try_case_end"
+            | "badrecord"
+            | "i_move"
             | "move"
             | "store_two_values"
             | "load_two_xregs"
@@ -1189,6 +1707,18 @@ fn supports_extended_x(name: &str) -> bool {
             | "get_two_tuple_elements"
             | "get_map_elements"
             | "i_bs_match"
+            | "bs_get_integer2"
+            | "new_map"
+            | "update_map_assoc"
+            | "update_map_exact"
+            | "i_new_small_map_lit"
+            | "update_record"
+            | "update_record_in_place"
+            | "i_bif1"
+            | "i_bif2"
+            | "i_bif3"
+            | "nofail_bif1"
+            | "nofail_bif2"
             | "i_m_div"
             | "i_make_fun3"
             | "i_bs_start_match3"
@@ -1197,6 +1727,12 @@ fn supports_extended_x(name: &str) -> bool {
             | "bs_set_position"
             | "bs_get_tail"
             | "i_bs_get_binary2"
+            | "i_bs_get_bin_and_tail"
+            | "i_bs_get_utf8"
+            | "i_bs_get_utf16"
+            | "i_bs_get_float2"
+            | "i_bs_match_string"
+            | "i_bs_skip_bits2"
             | "i_bs_create_bin"
             | "i_length_setup"
             | "i_length"
@@ -1236,16 +1772,135 @@ fn supports_extended_x(name: &str) -> bool {
             | "bif_self"
             | "self"
             | "bif_abs"
+            | "i_select_val_lins"
+            | "i_select_val_bins"
+            | "i_select_val2"
+            | "i_select_tuple_arity"
+            | "i_select_tuple_arity2"
             | "i_get_map_element"
             | "i_get_map_element_hash"
             | "i_get_map_elements"
+            | "node"
+            | "get_tuple_element_swap"
+            | "fconv"
+            | "fload"
+            | "fstore"
+            | "is_any_native_record"
+            | "is_native_record"
+            | "i_bs_skip_utf8"
+            | "i_bs_skip_utf16"
+            | "i_bs_validate_unicode_retract"
+            | "i_rem_div"
+            | "i_div_rem"
+            | "get_float2"
+            | "i_is_tagged_tuple_ff"
+            | "i_is_tuple_of_arity_ff"
+            | "is_ge_ge"
+            | "is_ge_lt"
+            | "i_perf_counter"
+            | "i_call_fun2"
+            | "i_call_fun2_last"
+            | "i_jump_on_val"
+            | "i_jump_on_val_zero"
+            | "get"
+            | "i_get"
+            | "i_get_hash"
     ) || is_inline_guard(name)
+}
+
+/// Stack words native code may borrow below E; must match `arinsal_term::NATIVE_SPILL_WORDS`,
+/// which the runtime keeps free while generated code runs.
+const NATIVE_SPILL_WORDS: u32 = 72;
+
+/// Leaves an operation with more extended X operands than the spill area to the interpreter.
+fn check_spill_count(count: u32) -> Result<(), EmitError> {
+    if count > NATIVE_SPILL_WORDS {
+        return Err(EmitError::Operand(format!(
+            "{count} extended X registers exceed the native spill area"
+        )));
+    }
+    Ok(())
+}
+
+/// The `[]` term word.
+const NIL_TERM: u64 = 0x3b;
+
+/// Extended X registers an emitter-spilled operation only writes (never reads).
+fn spilled_destinations(op: &SpecificOp, beam: &BeamFile) -> BTreeSet<u32> {
+    let operands = op.operands();
+    let mut positions = BTreeSet::new();
+    match op.name() {
+        "i_bs_match" | "i_bs_match_test_heap" => {
+            let mut at = if op.name() == "i_bs_match_test_heap" {
+                4
+            } else {
+                2
+            };
+            while let Some(SpecificOperand::Atom(index)) = operands.get(at) {
+                let name = index
+                    .checked_sub(1)
+                    .and_then(|index| beam.atoms.get(index as usize))
+                    .map(String::as_str);
+                let (width, dst) = match name {
+                    Some("ensure_exactly" | "skip") => (2, None),
+                    Some("ensure_at_least") => (3, None),
+                    Some("integer" | "binary") => (6, Some(at + 5)),
+                    Some("get_tail") => (4, Some(at + 3)),
+                    Some("=:=") => (4, None),
+                    _ => break,
+                };
+                positions.extend(dst);
+                at += width;
+            }
+        }
+        "bs_get_integer2" => {
+            positions.insert(6);
+        }
+        "i_bs_get_binary2" => {
+            positions.insert(5);
+        }
+        "i_bs_start_match3" => {
+            positions.insert(3);
+        }
+        "i_bs_get_position" | "bs_get_tail" => {
+            positions.insert(1);
+        }
+        "i_bif1" | "i_bif2" | "i_bif3" | "nofail_bif1" | "nofail_bif2" => {
+            positions.extend(operands.len().checked_sub(1));
+        }
+        _ => {}
+    }
+    let mut written = BTreeSet::new();
+    let mut read = BTreeSet::new();
+    for (position, operand) in operands.iter().enumerate() {
+        if let SpecificOperand::X(register) = operand {
+            if positions.contains(&position) {
+                written.insert(*register);
+            } else {
+                read.insert(*register);
+            }
+        }
+    }
+    written.retain(|register| !read.contains(register));
+    written
 }
 
 fn uses_emitter_spills(name: &str) -> bool {
     matches!(
         name,
         "i_bs_match"
+            | "bs_get_integer2"
+            | "new_map"
+            | "update_map_assoc"
+            | "update_map_exact"
+            | "i_new_small_map_lit"
+            | "update_record"
+            | "update_record_in_place"
+            | "i_bif1"
+            | "i_bif2"
+            | "i_bif3"
+            | "nofail_bif1"
+            | "nofail_bif2"
             | "i_bs_start_match3"
             | "i_bs_match_test_heap"
             | "i_bs_get_position"
@@ -1254,8 +1909,12 @@ fn uses_emitter_spills(name: &str) -> bool {
             | "i_bs_get_binary2"
             | "i_bs_create_bin"
             | "get_map_elements"
+            | "i_get_map_elements"
             | "i_m_div"
             | "i_make_fun3"
+            | "get"
+            | "i_get"
+            | "i_get_hash"
             | "i_plus"
             | "i_minus"
             | "i_times"
@@ -1291,6 +1950,31 @@ fn uses_emitter_spills(name: &str) -> bool {
             | "bif_length"
             | "bif_self"
             | "self"
+            | "i_length"
+            | "i_bs_skip_bits2"
+            | "i_bs_get_utf8"
+            | "i_bs_get_utf16"
+            | "i_bs_get_float2"
+            | "i_bs_match_string"
+            | "i_bs_get_bin_and_tail"
+            | "node"
+            | "get_tuple_element_swap"
+            | "fconv"
+            | "fload"
+            | "fstore"
+            | "is_any_native_record"
+            | "is_native_record"
+            | "i_bs_skip_utf8"
+            | "i_bs_skip_utf16"
+            | "i_bs_validate_unicode_retract"
+            | "i_rem_div"
+            | "i_div_rem"
+            | "get_float2"
+            | "i_is_tagged_tuple_ff"
+            | "i_is_tuple_of_arity_ff"
+            | "is_ge_ge"
+            | "is_ge_lt"
+            | "i_perf_counter"
             | "bif_abs"
     )
 }
@@ -1472,6 +2156,19 @@ fn call_target(op: &SpecificOp) -> Option<u32> {
     }
 }
 
+fn lambda_call_target(op: &SpecificOp, beam: &BeamFile) -> Option<u32> {
+    if !matches!(op.name(), "i_call_fun2" | "i_call_fun2_last") {
+        return None;
+    }
+    let FunCallTag::Lambda(index) = fun_call_tag(op.operands().first(), beam).ok()? else {
+        return None;
+    };
+    beam.lambdas
+        .iter()
+        .find(|lambda| lambda.index == index)
+        .map(|lambda| lambda.label)
+}
+
 /// Maps `i_call_fun2` Safe operand: atom → Dynamic, lambda index → Lambda(id).
 // Port of erts/emulator/beam/jit/arm/ops.tab:879-880 (`aF`) and instr_fun.cpp:402-423, OTP-29.1.1.
 fn fun_call_tag(value: Option<&SpecificOperand>, beam: &BeamFile) -> Result<FunCallTag, EmitError> {
@@ -1519,12 +2216,29 @@ fn arg(
         SpecificOperand::Atom(index) => env.atom(beam, *index).map(ArgVal::Immediate),
         SpecificOperand::Export(index) => env.import(beam, *index).map(ArgVal::Export),
         SpecificOperand::Literal(index) => env.literal(beam, *index).map(ArgVal::Literal),
-        SpecificOperand::SmallInt(value) => {
+        // Integers outside the 60-bit small range are bignum literals (OTP's loader moves them
+        // into the literal table).
+        SpecificOperand::SmallInt(value) if (-(1_i64 << 59)..(1_i64 << 59)).contains(value) => {
             Ok(ArgVal::Immediate((*value as u64).wrapping_shl(4) | 0xf))
         }
+        SpecificOperand::SmallInt(value) => env.integer_literal(*value).map(ArgVal::Literal),
         SpecificOperand::Unsigned(value) => Ok(ArgVal::Immediate(*value)),
         SpecificOperand::Nil => Ok(ArgVal::Immediate(0x3b)),
+        SpecificOperand::BigInt(decimal) => env.bigint_literal(decimal).map(ArgVal::Literal),
         _ => Err("operand form is not accepted by the module assembler".to_owned()),
+    }
+}
+
+fn select_source_arg(
+    value: Option<&SpecificOperand>,
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+) -> Result<ArgVal, String> {
+    match value {
+        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-259
+        // (getXRef), OTP-29.1.1.
+        Some(SpecificOperand::X(index)) if (6..1024).contains(index) => Ok(ArgVal::XMemory(*index)),
+        _ => arg(value, beam, env),
     }
 }
 
@@ -1921,8 +2635,65 @@ fn emit_extended_list_field(
     Ok(())
 }
 
+/// `Live` of a bit-syntax match command: `nil` when the command cannot allocate.
+fn live_or_nil(value: Option<&SpecificOperand>) -> Result<u32, String> {
+    if matches!(value, Some(SpecificOperand::Nil)) {
+        Ok(0)
+    } else {
+        number(value)
+    }
+}
+
 fn number(value: Option<&SpecificOperand>) -> Result<u32, String> {
     as_u32(value).ok_or_else(|| "expected nonnegative integer operand".to_owned())
+}
+
+/// Operand that is either an untagged unsigned count (tagged small here) or a term.
+fn small_or_arg(
+    value: Option<&SpecificOperand>,
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+) -> Result<ArgVal, EmitError> {
+    match value {
+        Some(SpecificOperand::Unsigned(n)) if *n < (1 << 59) => {
+            Ok(ArgVal::Immediate((n << 4) | 0xf))
+        }
+        Some(SpecificOperand::Unsigned(_)) => Err(EmitError::Operand(
+            "unsigned operand does not fit a small integer".to_owned(),
+        )),
+        other => select_source_arg(other, beam, env).map_err(EmitError::Operand),
+    }
+}
+
+/// Decode a `bs_match` flags operand (a literal list of atoms, or nil) to `BSF_*` bits, tagged.
+fn bs_flags(value: Option<&SpecificOperand>, beam: &BeamFile) -> Result<u64, EmitError> {
+    let mut bits = 0u64;
+    if let Some(SpecificOperand::Unsigned(flags)) = value {
+        bits = *flags;
+    }
+    if let Some(SpecificOperand::SmallInt(flags)) = value {
+        bits = *flags as u64;
+    }
+    if let Some(SpecificOperand::Literal(index)) = value {
+        let term = beam
+            .literal(*index)
+            .map_err(|error| EmitError::Operand(error.to_string()))?;
+        let mut current = &term;
+        while let arinsal_etf::OwnedTerm::List { elems, tail } = current {
+            for elem in elems {
+                if let arinsal_etf::OwnedTerm::Atom(name) = elem {
+                    match name.as_str() {
+                        "little" => bits |= 2,
+                        "signed" => bits |= 4,
+                        "native" => bits |= 16,
+                        _ => {}
+                    }
+                }
+            }
+            current = tail;
+        }
+    }
+    Ok((bits << 4) | 0xf)
 }
 
 fn count_at_least(args: &[SpecificOperand], minimum: usize, name: &str) -> Result<(), EmitError> {
@@ -1944,8 +2715,9 @@ fn allocation_words(value: Option<&SpecificOperand>) -> Result<u32, String> {
         .iter()
         .try_fold(0_u32, |total, (kind, count)| {
             let words = match kind {
-                0 | 2 => *count,
-                1 => count.saturating_mul(2),
+                0 => *count,
+                // FLOAT_SIZE_OBJECT and ERL_FUN_SIZE are both two words.
+                1 | 2 => count.saturating_mul(2),
                 _ => return None,
             };
             total.checked_add(u32::try_from(words).ok()?)
@@ -1993,6 +2765,7 @@ fn emit_op(
             .collect::<BTreeMap<_, _>>();
         let count = u32::try_from(spills.len())
             .map_err(|_| EmitError::Operand("too many spilled X registers".to_owned()))?;
+        check_spill_count(count)?;
         guard_spill_bytes = count
             .checked_mul(8)
             .ok_or_else(|| EmitError::Operand("guard spill size overflow".to_owned()))?;
@@ -2022,20 +2795,43 @@ fn emit_op(
             .collect();
         let count = u32::try_from(emitter_spills.len())
             .map_err(|_| EmitError::Operand("too many spilled X registers".to_owned()))?;
+        check_spill_count(count)?;
         emitter_spill_bytes = count
             .checked_mul(8)
             .ok_or_else(|| EmitError::Operand("emitter spill size overflow".to_owned()))?;
+        // The stack slots are GC roots while the operation runs. A register the operation only
+        // writes is dead on entry and may still hold a word from before an earlier collection,
+        // so its slot starts as NIL instead of a copy.
+        let destinations = spilled_destinations(op, beam);
         assembler.emit_raw(|encoder| {
             use arinsal_a64::enc::Gpr;
             encoder.sub_imm(Gpr::x(20), Gpr::x(20), emitter_spill_bytes as u16, false)?;
             for (index, slot) in &emitter_spills {
-                encoder.ldr_uoff(Gpr::x(8), Gpr::x(19), index * 8)?;
+                if destinations.contains(index) {
+                    encoder.mov_const(Gpr::x(8), NIL_TERM)?;
+                } else {
+                    encoder.ldr_uoff(Gpr::x(8), Gpr::x(19), index * 8)?;
+                }
                 encoder.str_uoff(Gpr::x(8), Gpr::x(20), slot * 8)?;
             }
             Ok(())
         })?;
         for operand in &mut remapped_args {
             remap_spilled_x(operand, &emitter_spills, count);
+        }
+    }
+    // A failure label leaves the instruction without running its epilogue, so branches that
+    // leave a spilled operation go through a stub that releases the spill slots first.
+    let mut restore_stubs: Vec<(u32, u32)> = Vec::new();
+    if guard_spill_bytes != 0 || emitter_spill_bytes != 0 {
+        for operand in &mut remapped_args {
+            if let SpecificOperand::Label(id) = operand
+                && *id != 0
+            {
+                let fresh = assembler.fresh_label_id();
+                restore_stubs.push((*id, fresh));
+                *id = fresh;
+            }
         }
     }
     let args = if guard_spill_bytes == 0 {
@@ -2047,7 +2843,19 @@ fn emit_op(
     } else {
         &remapped_args
     };
-    let value = |index| arg(args.get(index), beam, env).map_err(EmitError::Operand);
+    // Error instructions only read their value operand, so it may live above the register cache.
+    let extended_sources = matches!(
+        op.name(),
+        "badmatch" | "case_end" | "try_case_end" | "badrecord"
+    );
+    let value = |index| {
+        if extended_sources {
+            select_source_arg(args.get(index), beam, env)
+        } else {
+            arg(args.get(index), beam, env)
+        }
+        .map_err(EmitError::Operand)
+    };
     let count = |expected| {
         if args.len() == expected {
             Ok(())
@@ -2061,7 +2869,38 @@ fn emit_op(
     };
     let n = |index| number(args.get(index)).map_err(EmitError::Operand);
     let helper = env.arithmetic_helper();
-    if matches!(op.name(), "i_get_map_elements" | "get_map_elements") {
+    if op.name() == "get_map_elements" {
+        // Port of erts/emulator/beam/generators.tab:230-254 (gen.has_map_fields) followed by
+        // gen.get_map_elements (generators.tab:202-227): `has_map_fields` yields key/scratch
+        // pairs, which become key/destination/hash triples.
+        count_at_least(args, 3, op.name())?;
+        let size = usize::try_from(n(2)?)
+            .map_err(|_| EmitError::Operand("map element size overflows usize".to_owned()))?;
+        if !size.is_multiple_of(2) || args.len() != 3 + size {
+            return Err(EmitError::Operand(
+                "get_map_elements expects key/destination pairs".to_owned(),
+            ));
+        }
+        let mut triples = Vec::with_capacity(size / 2 * 3);
+        for pair in args[3..].as_chunks::<2>().0 {
+            triples.push(arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)?);
+            triples.push(match &pair[1] {
+                SpecificOperand::X(index) if *index >= 6 => ArgVal::XMemory(*index),
+                other => arg(Some(other), beam, env).map_err(EmitError::Operand)?,
+            });
+            triples.push(ArgVal::Immediate(0));
+        }
+        let result =
+            assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
+        return finish_emitter_spills(
+            assembler,
+            &emitter_spills,
+            emitter_spill_bytes,
+            &restore_stubs,
+            result,
+        );
+    }
+    if op.name() == "i_get_map_elements" {
         count_at_least(args, 3, op.name())?;
         let size = usize::try_from(n(2)?)
             .map_err(|_| EmitError::Operand("map element size overflows usize".to_owned()))?;
@@ -2073,11 +2912,24 @@ fn emit_op(
         // Port of erts/emulator/beam/jit/arm/instr_map.cpp:391-490, OTP-29.1.1.
         let triples = args[3..]
             .iter()
-            .map(|operand| arg(Some(operand), beam, env).map_err(EmitError::Operand))
+            .enumerate()
+            .map(|(position, operand)| match operand {
+                // Destinations above the register cache live in the X register array.
+                SpecificOperand::X(index) if position % 3 == 1 && *index >= 6 => {
+                    Ok(ArgVal::XMemory(*index))
+                }
+                _ => arg(Some(operand), beam, env).map_err(EmitError::Operand),
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        return assembler
-            .emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime())
-            .map_err(EmitError::from);
+        let result =
+            assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
+        return finish_emitter_spills(
+            assembler,
+            &emitter_spills,
+            emitter_spill_bytes,
+            &restore_stubs,
+            result,
+        );
     }
     if has_extended_x(args) {
         match op.name() {
@@ -2129,9 +2981,10 @@ fn emit_op(
                 let source = raw_move_arg(args.first(), beam, env)?;
                 assembler.emit_raw(|encoder| {
                     use arinsal_a64::enc::Gpr;
+                    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:351-354, OTP-29.1.1:
+                    // the untagged pointer goes to ARG1; the X register keeps the tagged tuple.
                     raw_load_arg(encoder, source, Gpr::x(8))?;
-                    encoder.and_imm(Gpr::x(9), Gpr::x(8), !7)?;
-                    raw_store_arg(encoder, source, Gpr::x(9))
+                    encoder.and_imm(Gpr::x(0), Gpr::x(8), !7)
                 })?;
                 return Ok(());
             }
@@ -2171,6 +3024,29 @@ fn emit_op(
             _ => {}
         }
     }
+    // Guard-context arithmetic branches to its failure label instead of raising.
+    assembler.set_arith_fail(0);
+    if matches!(
+        ported(op.name()),
+        Some(
+            EmitterKind::Plus
+                | EmitterKind::Minus
+                | EmitterKind::Times
+                | EmitterKind::IntDiv
+                | EmitterKind::Rem
+                | EmitterKind::Band
+                | EmitterKind::Bor
+                | EmitterKind::Bxor
+                | EmitterKind::Bsl
+                | EmitterKind::Bsr
+                | EmitterKind::Bnot
+                | EmitterKind::UnaryMinus
+                | EmitterKind::MulAdd
+        )
+    ) && let Some(fail) = args.first().and_then(|operand| as_u32(Some(operand)))
+    {
+        assembler.set_arith_fail(fail);
+    }
     let result = match ported(op.name()).expect("dispatch only follows capability validation") {
         EmitterKind::Metadata => match op.name() {
             "i_func_label" | "label" => {
@@ -2190,6 +3066,32 @@ fn emit_op(
                 count(4)?;
                 assembler.emit_i_func_info(n(0)?, n(1)?, n(2)?, n(3)?.min(255) as u8)
             }
+            "line" | "func_line" => {
+                // Port of erts/emulator/beam/jit/asm_load.c:642-690 (op_func_line_I adds a line
+                // entry even when it repeats the previous one), OTP-29.1.1.
+                count(1)?;
+                let location = n(0)?;
+                if let Some(item) = beam.lines.as_ref().and_then(|table| {
+                    location
+                        .checked_sub(1)
+                        .and_then(|index| table.items.get(index as usize))
+                }) {
+                    let file = if item.name_index == 0 {
+                        format!("{}.erl", beam.module)
+                    } else {
+                        beam.lines
+                            .as_ref()
+                            .and_then(|table| table.names.get(item.name_index as usize - 1))
+                            .filter(|name| !name.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}.erl", beam.module))
+                    };
+                    let line = u32::try_from(item.line)
+                        .map_err(|_| EmitError::Operand("source line exceeds u32".into()))?;
+                    assembler.record_line(file, line);
+                }
+                Ok(())
+            }
             "i_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:224-237, OTP-29.1.1.
                 assembler.emit_i_breakpoint_trampoline(env.breakpoint_helper())
@@ -2197,6 +3099,11 @@ fn emit_op(
             "i_test_yield" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.
                 assembler.test_yield()
+            }
+            "nif_start" => {
+                // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:627, OTP-29.1.1.
+                count(0)?;
+                Ok(())
             }
             _ => Ok(()),
         },
@@ -2247,14 +3154,13 @@ fn emit_op(
         EmitterKind::Length => {
             count(3)?;
             let live = n(1)?;
-            if live >= 6 {
-                return Err(EmitError::Operand(
-                    "length live-register index exceeds native cache".to_owned(),
-                ));
-            }
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-339, OTP-29.1.1.
-            let _ = live;
-            assembler.emit_bif_length(ArgVal::X(live as u8), value(2)?, env.guard_helper())
+            let source = if live >= 6 {
+                ArgVal::XMemory(live)
+            } else {
+                ArgVal::X(live as u8)
+            };
+            assembler.emit_bif_length(n(0)?, source, value(2)?, env.guard_helper())
         }
         EmitterKind::Allocate => {
             count(2)?;
@@ -2319,6 +3225,21 @@ fn emit_op(
             count(1)?;
             assembler.call_only(n(0)?)
         }
+        EmitterKind::ProcessDictionaryGet => {
+            let destination = if matches!(op.name(), "get" | "i_get") {
+                count(2)?;
+                value(1)?
+            } else {
+                count(3)?;
+                value(2)?
+            };
+            // Port of erts/emulator/beam/jit/arm/instr_common.cpp:319-329, OTP-29.1.1.
+            assembler.emit_process_dictionary_get(
+                value(0)?,
+                destination,
+                env.process_dictionary_get_helper(),
+            )
+        }
         EmitterKind::Plus => {
             count(5)?;
             assembler.emit_i_plus_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
@@ -2337,29 +3258,50 @@ fn emit_op(
             let destination = value(5)?;
             let fail = n(0)?;
             assembler.emit_i_times_with_fail(value(1)?, value(2)?, destination, fail, helper)?;
-            if args.get(3) == args.get(5) {
-                if matches!(args.get(4), Some(SpecificOperand::Other)) {
-                    Ok(())
-                } else {
-                    assembler.emit_i_plus_with_fail(
-                        destination,
-                        value(4)?,
-                        destination,
-                        fail,
-                        helper,
-                    )
-                }
+            // Adding a literal 0 is skipped: the product stays as computed (a -0.0 float
+            // product must not become 0.0), like erts' `is_increment_zero`.
+            let zero = ArgVal::Immediate(0xf);
+            let increment = if args.get(3) == args.get(5) {
+                value(4)?
             } else if args.get(4) == args.get(5) {
-                assembler.emit_i_plus_with_fail(destination, value(3)?, destination, fail, helper)
+                value(3)?
             } else {
-                Err(arinsal_beamasm::module::ModuleError::InvalidOperand(
-                    "i_mul_add destination must alias one addend",
-                ))
+                return Err(EmitError::Assembler(
+                    "i_mul_add destination must alias one addend".to_owned(),
+                ));
+            };
+            if increment == zero {
+                Ok(())
+            } else {
+                assembler.emit_i_plus_with_fail(destination, increment, destination, fail, helper)
             }
+        }
+        EmitterKind::IntDiv if op.name() == "i_m_div" => {
+            count(5)?;
+            assembler.emit_i_m_div(value(2)?, value(3)?, value(4)?, helper)
         }
         EmitterKind::IntDiv => {
             count(5)?;
             assembler.emit_i_int_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
+        }
+        EmitterKind::Rem if op.name() == "i_div_rem" => {
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1; the
+            // quotient register differs from both operands, so it can be written first.
+            count(6)?;
+            if args.get(4) != args.get(5) {
+                assembler.emit_i_int_div(value(2)?, value(3)?, value(4)?, helper)?;
+            }
+            assembler.emit_i_rem(value(2)?, value(3)?, value(5)?, helper)
+        }
+        EmitterKind::Rem if op.name() == "i_rem_div" => {
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1. The
+            // loader guarantees the remainder register differs from both operands, so the
+            // remainder and quotient are computed one after the other from the same sources.
+            count(6)?;
+            if args.get(4) != args.get(5) {
+                assembler.emit_i_rem(value(2)?, value(3)?, value(4)?, helper)?;
+            }
+            assembler.emit_i_int_div(value(2)?, value(3)?, value(5)?, helper)
         }
         EmitterKind::Rem => {
             count(5)?;
@@ -2395,87 +3337,112 @@ fn emit_op(
         }
         EmitterKind::Guard => {
             let fail = n(0)?;
-            let source_index = usize::from(op.name().ends_with("_ff")) + 1;
-            let source = value(source_index)?;
-            if matches!(op.name(), "is_int_in_range" | "is_in_range") {
-                count(4)?;
-                if fail == 0 {
-                    return Err(EmitError::Operand(
-                        "range guard requires a failure label".to_owned(),
-                    ));
+            'body: {
+                if op.name() == "is_in_range" {
+                    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2537-2634, OTP-29.1.1.
+                    count(5)?;
+                    let helper = env.guard_helper();
+                    let source = value(2)?;
+                    assembler.emit_is_ge(source, value(3)?, fail, helper)?;
+                    assembler.emit_is_ge(value(4)?, source, n(1)?, helper)?;
+                    break 'body;
                 }
-                let helper = env.guard_helper();
+                let source_index = usize::from(op.name().ends_with("_ff")) + 1;
+                let source = value(source_index)?;
                 if op.name() == "is_int_in_range" {
-                    assembler.emit_is_integer(source, fail)?;
-                }
-                assembler.emit_is_ge(source, value(2)?, fail, helper)?;
-                assembler.emit_is_ge(value(3)?, source, fail, helper)?;
-                return Ok(());
-            }
-            if op.name() == "i_is_tuple_of_arity_ff" {
-                count(4)?;
-                assembler.emit_is_tuple(source, fail)?;
-                assembler.emit_test_arity(source, value(3)?, n(1)?)?;
-                return Ok(());
-            }
-            if op.name() == "i_is_tagged_tuple_ff" {
-                count(5)?;
-                assembler.emit_is_tuple(source, fail)?;
-                assembler.emit_is_tagged_tuple(source, value(3)?, value(4)?, n(1)?)?;
-                return Ok(());
-            }
-            match op.name() {
-                "is_integer" => assembler.emit_is_integer(source, fail)?,
-                "is_atom" => assembler.emit_is_atom(source, fail)?,
-                "is_float" => assembler.emit_is_float(source, fail)?,
-                "is_boolean" => assembler.emit_is_boolean(source, fail)?,
-                "is_binary" => assembler.emit_is_binary(source, fail)?,
-                "is_bitstring" => assembler.emit_is_bitstring(source, fail)?,
-                "is_number" => assembler.emit_is_number(source, fail)?,
-                "is_pid" => assembler.emit_is_pid(source, fail)?,
-                "is_port" => assembler.emit_is_port(source, fail)?,
-                "is_reference" => assembler.emit_is_reference(source, fail)?,
-                "is_function" => assembler.emit_is_function(source, fail)?,
-                "is_function2" => assembler.emit_is_function2_guard(source, value(2)?, fail)?,
-                "is_list" => assembler.emit_is_list(source, fail)?,
-                "is_nonempty_list" => assembler.emit_is_nonempty_list(source, fail)?,
-                "is_nil" => assembler.emit_is_nil(source, fail)?,
-                "is_map" => assembler.emit_is_map(source, fail)?,
-                "is_tuple" | "i_is_tuple" => assembler.emit_is_tuple(source, fail)?,
-                "test_arity" | "i_test_arity" | "i_is_tuple_of_arity" => {
-                    assembler.emit_test_arity(source, value(2)?, fail)?;
-                }
-                "is_tagged_tuple" | "i_is_tagged_tuple" => {
-                    assembler.emit_is_tagged_tuple(source, value(2)?, value(3)?, fail)?;
-                }
-                "is_eq_exact" | "is_ne_exact" | "is_eq" | "is_ne" | "is_lt" | "is_ge"
-                | "is_int_ge" => {
-                    let lhs = value(1)?;
-                    let rhs = value(2)?;
-                    match op.name() {
-                        "is_eq_exact" => {
-                            assembler.emit_is_eq_exact(lhs, rhs, fail, env.guard_helper())?
-                        }
-                        "is_ne_exact" => {
-                            assembler.emit_is_ne_exact(lhs, rhs, fail, env.guard_helper())?
-                        }
-                        "is_eq" => assembler.emit_is_eq(lhs, rhs, fail, env.guard_helper())?,
-                        "is_ne" => assembler.emit_is_ne(lhs, rhs, fail, env.guard_helper())?,
-                        "is_lt" => assembler.emit_is_lt(lhs, rhs, fail, env.guard_helper())?,
-                        "is_ge" | "is_int_ge" => {
-                            assembler.emit_is_ge(lhs, rhs, fail, env.guard_helper())?
-                        }
-                        _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
+                    count(4)?;
+                    if fail == 0 {
+                        return Err(EmitError::Operand(
+                            "range guard requires a failure label".to_owned(),
+                        ));
                     }
+                    let helper = env.guard_helper();
+                    assembler.emit_is_integer(source, fail)?;
+                    assembler.emit_is_ge(source, value(2)?, fail, helper)?;
+                    assembler.emit_is_ge(value(3)?, source, fail, helper)?;
+                    break 'body;
                 }
-                _ => {
-                    return Err(EmitError::Operand(format!(
-                        "no guard emitter for {}",
-                        op.name()
-                    )));
+                if op.name() == "i_is_tuple_of_arity_ff" {
+                    count(4)?;
+                    assembler.emit_is_tuple(source, fail)?;
+                    assembler.emit_test_arity(source, value(3)?, n(1)?)?;
+                    break 'body;
+                }
+                if op.name() == "i_is_tagged_tuple_ff" {
+                    count(5)?;
+                    assembler.emit_is_tuple(source, fail)?;
+                    assembler.emit_is_tagged_tuple(source, value(3)?, value(4)?, n(1)?)?;
+                    break 'body;
+                }
+                match op.name() {
+                    "is_integer" => assembler.emit_is_integer(source, fail)?,
+                    "is_atom" => assembler.emit_is_atom(source, fail)?,
+                    "is_float" => assembler.emit_is_float(source, fail)?,
+                    "is_boolean" => assembler.emit_is_boolean(source, fail)?,
+                    "is_binary" => assembler.emit_is_binary(source, fail)?,
+                    "is_bitstring" => assembler.emit_is_bitstring(source, fail)?,
+                    "is_number" => assembler.emit_is_number(source, fail)?,
+                    "is_pid" => assembler.emit_is_pid(source, fail)?,
+                    "is_port" => assembler.emit_is_port(source, fail)?,
+                    "is_reference" => assembler.emit_is_reference(source, fail)?,
+                    "is_function" => assembler.emit_is_function(source, fail)?,
+                    "is_function2" => assembler.emit_is_function2_guard(source, value(2)?, fail)?,
+                    "is_any_native_record" => assembler.emit_is_any_native_record(fail, source)?,
+                    "is_native_record" => {
+                        // Port of erts/emulator/beam/jit/arm/instr_records.cpp:29-71, OTP-29.1.1.
+                        count(4)?;
+                        assembler.emit_is_native_record(fail, source, value(2)?, value(3)?)?;
+                    }
+                    "is_list" => assembler.emit_is_list(source, fail)?,
+                    "is_nonempty_list" => assembler.emit_is_nonempty_list(source, fail)?,
+                    "is_nil" => assembler.emit_is_nil(source, fail)?,
+                    "is_map" => assembler.emit_is_map(source, fail)?,
+                    "is_tuple" | "i_is_tuple" => assembler.emit_is_tuple(source, fail)?,
+                    "test_arity" | "i_test_arity" | "i_is_tuple_of_arity" => {
+                        assembler.emit_test_arity(source, value(2)?, fail)?;
+                    }
+                    "is_tagged_tuple" | "i_is_tagged_tuple" => {
+                        assembler.emit_is_tagged_tuple(source, value(2)?, value(3)?, fail)?;
+                    }
+                    "is_eq_exact" | "is_ne_exact" | "is_eq" | "is_ne" | "is_lt" | "is_ge"
+                    | "is_int_ge" => {
+                        let lhs = value(1)?;
+                        let rhs = value(2)?;
+                        match op.name() {
+                            "is_eq_exact" => {
+                                assembler.emit_is_eq_exact(lhs, rhs, fail, env.guard_helper())?
+                            }
+                            "is_ne_exact" => {
+                                assembler.emit_is_ne_exact(lhs, rhs, fail, env.guard_helper())?
+                            }
+                            "is_eq" => assembler.emit_is_eq(lhs, rhs, fail, env.guard_helper())?,
+                            "is_ne" => assembler.emit_is_ne(lhs, rhs, fail, env.guard_helper())?,
+                            "is_lt" => assembler.emit_is_lt(lhs, rhs, fail, env.guard_helper())?,
+                            "is_ge" => assembler.emit_is_ge(lhs, rhs, fail, env.guard_helper())?,
+                            // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_int_ge),
+                            // OTP-29.1.1: fails unless the source is an integer AND >= Min.
+                            "is_int_ge" => {
+                                assembler.emit_is_integer(lhs, fail)?;
+                                assembler.emit_is_ge(lhs, rhs, fail, env.guard_helper())?
+                            }
+                            _ => {
+                                return Err(EmitError::Operand(format!(
+                                    "unknown op {}",
+                                    op.name()
+                                )));
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(EmitError::Operand(format!(
+                            "no guard emitter for {}",
+                            op.name()
+                        )));
+                    }
                 }
             }
             if guard_spill_bytes != 0 {
+                emit_restore_stubs(assembler, &restore_stubs, guard_spill_bytes)?;
                 assembler.emit_raw(|encoder| {
                     encoder.add_imm(
                         arinsal_a64::enc::Gpr::x(20),
@@ -2493,7 +3460,8 @@ fn emit_op(
             let source = value(2)?;
             assembler.emit_is_ge(source, value(3)?, n(0)?, env.guard_helper())?;
             if op.name() == "is_ge_lt" {
-                assembler.emit_is_lt(source, value(4)?, n(1)?, env.guard_helper())?;
+                // `is_ge_lt` is `is_ge Src A` followed by `is_lt B Src` (instr_common.cpp:2713-2716).
+                assembler.emit_is_lt(value(4)?, source, n(1)?, env.guard_helper())?;
             } else {
                 assembler.emit_is_ge(source, value(4)?, n(1)?, env.guard_helper())?;
             }
@@ -2561,21 +3529,64 @@ fn emit_op(
                 )
             }
         }
-        EmitterKind::MapCreate => {
-            count_at_least(args, 4, op.name())?;
-            let value_count = usize::try_from(n(2)?)
-                .map_err(|_| EmitError::Operand("map literal size overflow".to_owned()))?;
-            if args.len() != 4 + value_count {
-                return Err(EmitError::Operand("map literal size mismatch".to_owned()));
+        EmitterKind::MapCreate if op.name() == "new_map" => {
+            // Port of erts/emulator/beam/jit/arm/instr_map.cpp:228-265, OTP-29.1.1.
+            count_at_least(args, 3, op.name())?;
+            let size = usize::try_from(n(2)?)
+                .map_err(|_| EmitError::Operand("map size overflow".to_owned()))?;
+            if size % 2 != 0 || args.len() != 3 + size {
+                return Err(EmitError::Operand("new_map size mismatch".to_owned()));
             }
-            let values = args[4..]
+            let pairs = args[3..]
                 .iter()
                 .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                 .collect::<Result<Vec<_>, _>>()?;
-            assembler.emit_i_new_small_map_lit(value(0)?, value(3)?, &values)
+            assembler.emit_new_map(value(0)?, n(1)?, &pairs, env.map_runtime())
+        }
+        EmitterKind::MapCreate => {
+            // Port of erts/emulator/beam/jit/arm/generators.tab:250-300 (gen.new_small_map_lit)
+            // and instr_map.cpp:258-305, OTP-29.1.1: the sorted literal keys move into one
+            // tuple literal; only the values stay operands.
+            count_at_least(args, 3, op.name())?;
+            let size = usize::try_from(n(2)?)
+                .map_err(|_| EmitError::Operand("map literal size overflow".to_owned()))?;
+            if size % 2 != 0 || args.len() != 3 + size {
+                return Err(EmitError::Operand("map literal size mismatch".to_owned()));
+            }
+            let mut keys = Vec::with_capacity(size / 2);
+            let mut values = Vec::with_capacity(size / 2);
+            for pair in args[3..].as_chunks::<2>().0 {
+                match arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)? {
+                    ArgVal::Immediate(word) | ArgVal::Literal(word) => keys.push(word),
+                    _ => {
+                        return Err(EmitError::Operand(
+                            "small map keys must be literals".to_owned(),
+                        ));
+                    }
+                }
+                values.push(arg(Some(&pair[1]), beam, env).map_err(EmitError::Operand)?);
+            }
+            // Port of erts/emulator/beam/beam_transform_helpers.c:54-110
+            // (beam_load_map_key_sort), OTP-29.1.1: the loader sorts the pairs in flatmap key
+            // order before new_small_map_lit, and atom order depends on runtime atom indices.
+            let order = env.sort_map_keys(&keys).map_err(EmitError::Operand)?;
+            let keys = order.iter().map(|&index| keys[index]).collect::<Vec<_>>();
+            let values = order.iter().map(|&index| values[index]).collect::<Vec<_>>();
+            let keys = env.tuple_literal(&keys).map_err(EmitError::Operand)?;
+            let words = u32::try_from(values.len() + 3)
+                .map_err(|_| EmitError::Operand("map literal size overflow".to_owned()))?;
+            assembler.emit_test_heap(words, n(1)?, env.gc_hook())?;
+            assembler.emit_i_new_small_map_lit(value(0)?, ArgVal::Literal(keys), &values)
+        }
+        EmitterKind::BsConstruct if op.name() == "bs_init_writable" => {
+            count(0)?;
+            // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:985-1000, OTP-29.1.1.
+            assembler.emit_bs_init_writable(ArgVal::X(0), env.bs_init_writable_helper())
         }
         EmitterKind::BsConstruct => {
             use arinsal_beamasm::bs_construct::{BsSegment, BsSegmentKind};
+            // Port of erts/emulator/beam/jit/arm/generators.tab:441-530 and instr_bs.cpp:1442,
+            // OTP-29.1.1: `Fail Alloc Live Dst` followed by six-operand segments.
             count_at_least(args, 4, op.name())?;
             let tail = &args[4..];
             if !tail.len().is_multiple_of(6) {
@@ -2592,26 +3603,228 @@ fn emit_op(
                 .ok_or_else(|| {
                     EmitError::Operand("binary segment kind must be an atom".to_owned())
                 })?;
+                let unit = number(fields.get(2)).map_err(EmitError::Operand)?;
+                let flags = number(fields.get(3)).map_err(EmitError::Operand)?;
+                let size_is_units = matches!(fields.get(5), Some(SpecificOperand::Unsigned(_)));
+                let size = arg(fields.get(5), beam, env).map_err(EmitError::Operand)?;
+                if name == "string" {
+                    // erts_bs_put_string copies the bytes; a binary segment of the same
+                    // bytes builds the same bits.
+                    let start = number(fields.get(4)).map_err(EmitError::Operand)? as usize;
+                    let length = match fields.get(5) {
+                        Some(SpecificOperand::Unsigned(n)) => *n as usize,
+                        Some(SpecificOperand::SmallInt(n)) => *n as usize,
+                        _ => {
+                            return Err(EmitError::Operand("string segment length".to_owned()));
+                        }
+                    };
+                    let bytes = beam
+                        .strings
+                        .get(start..start.saturating_add(length))
+                        .ok_or_else(|| EmitError::Operand("string table range".to_owned()))?;
+                    let literal = env.binary_literal(bytes).map_err(EmitError::Operand)?;
+                    segments.push(BsSegment {
+                        kind: BsSegmentKind::Binary,
+                        src: ArgVal::Literal(literal),
+                        size: ArgVal::Immediate(length as u64),
+                        size_is_units: true,
+                        unit: 8,
+                        flags: 0,
+                    });
+                    continue;
+                }
                 let kind = match name {
                     "integer" => BsSegmentKind::Integer,
-                    "binary" => BsSegmentKind::Binary,
                     "float" => BsSegmentKind::Float,
-                    "utf8" => BsSegmentKind::Utf8,
+                    "binary" => BsSegmentKind::Binary,
                     "append" => BsSegmentKind::Append,
-                    "string" => BsSegmentKind::String,
                     "private_append" => BsSegmentKind::PrivateAppend,
+                    "utf8" => BsSegmentKind::Utf8,
+                    "utf16" => BsSegmentKind::Utf16,
+                    "utf32" => BsSegmentKind::Utf32,
                     _ => return Err(EmitError::Operand(format!("unknown binary segment {name}"))),
                 };
                 segments.push(BsSegment {
                     kind,
                     src: arg(fields.get(4), beam, env).map_err(EmitError::Operand)?,
-                    size: arg(fields.get(5), beam, env).map_err(EmitError::Operand)?,
-                    unit: number(fields.get(2)).map_err(EmitError::Operand)?,
-                    flags: number(fields.get(3)).map_err(EmitError::Operand)?,
+                    size,
+                    size_is_units,
+                    unit,
+                    flags,
                 });
             }
-            let (helper, error_helper) = env.bs_construct_helpers();
-            assembler.emit_i_bs_create_bin(Some(n(0)?), value(3)?, &segments, helper, error_helper)
+            assembler.emit_i_bs_create_bin(
+                n(0)?,
+                n(1)?,
+                n(2)?,
+                value(3)?,
+                &segments,
+                env.bs_create_bin_helper(),
+            )
+        }
+        EmitterKind::Bif => {
+            // Port of erts/emulator/beam/jit/arm/ops.tab:812-836 and instr_bif.cpp:110-200.
+            let (arity, has_fail) = match op.name() {
+                "i_bif1" => (1, true),
+                "i_bif2" => (2, true),
+                "i_bif3" => (3, true),
+                "nofail_bif1" => (1, false),
+                _ => (2, false),
+            };
+            count(arity + 2 + usize::from(has_fail))?;
+            let (fail, bif_at) = if has_fail {
+                (n(arity)?, arity + 1)
+            } else {
+                (0, arity)
+            };
+            let Some(import) = as_u32(args.get(bif_at)) else {
+                return Err(EmitError::Operand(
+                    "BIF operand must be an import".to_owned(),
+                ));
+            };
+            let identity = env
+                .plain_bif_identity(beam, import)
+                .ok_or_else(|| EmitError::Operand("BIF import is not a plain BIF".to_owned()))?;
+            let mut sources = Vec::with_capacity(arity);
+            for index in 0..arity {
+                sources.push(value(index)?);
+            }
+            assembler.emit_bif_by_identity(
+                identity,
+                &sources,
+                fail,
+                value(bif_at + 1)?,
+                env.bif_identity_helper(),
+            )
+        }
+        EmitterKind::Receive => {
+            // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:25-295, OTP-29.1.1.
+            let hooks = env.receive_hooks();
+            match op.name() {
+                "recv_marker_reserve" => {
+                    count(1)?;
+                    assembler.emit_recv_marker_reserve(value(0)?, hooks)
+                }
+                "recv_marker_bind" => {
+                    count(2)?;
+                    assembler.emit_recv_marker_bind(value(0)?, value(1)?, hooks)
+                }
+                "recv_marker_clear" => {
+                    count(1)?;
+                    assembler.emit_recv_marker_clear(value(0)?, hooks)
+                }
+                "recv_marker_use" => {
+                    count(1)?;
+                    assembler.emit_recv_marker_use(value(0)?, hooks)
+                }
+                "i_loop_rec" => {
+                    count(1)?;
+                    assembler.emit_i_loop_rec(n(0)?, hooks)
+                }
+                "remove_message" => {
+                    count(0)?;
+                    assembler.emit_remove_message(hooks)
+                }
+                "loop_rec_end" => {
+                    count(1)?;
+                    assembler.emit_loop_rec_end(n(0)?, hooks)
+                }
+                "wait_unlocked" => {
+                    count(1)?;
+                    assembler.emit_wait_unlocked(n(0)?, hooks)
+                }
+                "wait_locked" => {
+                    count(1)?;
+                    assembler.emit_wait_locked(n(0)?, hooks)
+                }
+                "wait_timeout_unlocked" => {
+                    count(2)?;
+                    assembler.emit_wait_timeout_unlocked(value(0)?, n(1)?, hooks)
+                }
+                "wait_timeout_locked" => {
+                    count(2)?;
+                    assembler.emit_wait_timeout_locked(value(0)?, n(1)?, hooks)
+                }
+                "timeout" => {
+                    count(0)?;
+                    assembler.emit_timeout(hooks)
+                }
+                _ => {
+                    count(0)?;
+                    assembler.emit_timeout_locked(hooks)
+                }
+            }
+        }
+        EmitterKind::Float => {
+            // Port of erts/emulator/beam/jit/arm/instr_float.cpp:55-232, OTP-29.1.1.
+            let fr = |index: usize| -> Result<u8, EmitError> {
+                match args.get(index) {
+                    Some(SpecificOperand::FloatRegister(register)) => u8::try_from(*register)
+                        .map_err(|_| EmitError::Operand("float register out of range".to_owned())),
+                    _ => Err(EmitError::Operand("expected a float register".to_owned())),
+                }
+            };
+            match op.name() {
+                "fload" => {
+                    count(2)?;
+                    assembler.emit_fload_native(value(0)?, fr(1)?)
+                }
+                "fstore" => {
+                    count(2)?;
+                    assembler.emit_fstore_native(fr(0)?, value(1)?)
+                }
+                "fconv" => {
+                    count(2)?;
+                    assembler.emit_fconv_native(value(0)?, fr(1)?, env.big_to_float_helper())
+                }
+                "i_fnegate" => {
+                    count(2)?;
+                    assembler.emit_i_fnegate(fr(0)?, fr(1)?)
+                }
+                name => {
+                    count(3)?;
+                    let float_op = match name {
+                        "i_fadd" => arinsal_beamasm::float::FloatOp::Add,
+                        "i_fsub" => arinsal_beamasm::float::FloatOp::Sub,
+                        "i_fmul" => arinsal_beamasm::float::FloatOp::Mul,
+                        _ => arinsal_beamasm::float::FloatOp::Div,
+                    };
+                    assembler.emit_float_instr(float_op, fr(0)?, fr(1)?, fr(2)?)
+                }
+            }
+            .map_err(EmitError::from)?;
+            Ok(())
+        }
+        EmitterKind::Apply => {
+            use arinsal_beamasm::misc::{ApplyKind, emit_apply_call, emit_apply_tail};
+            let runtime = env.apply_runtime();
+            // Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-320, OTP-29.1.1.
+            let (kind, tail, dealloc) = match op.name() {
+                "apply" => (ApplyKind::Fixed(n(0)?), false, None),
+                "apply_last" => (ApplyKind::Fixed(n(0)?), true, Some(1)),
+                "i_apply" => (ApplyKind::Apply3, false, None),
+                "i_apply_last" => (ApplyKind::Apply3, true, Some(0)),
+                "i_apply_only" => (ApplyKind::Apply3, true, None),
+                "i_apply_fun" => (ApplyKind::Apply2, false, None),
+                "i_apply_fun_last" => (ApplyKind::Apply2, true, Some(0)),
+                _ => (ApplyKind::Apply2, true, None),
+            };
+            count(match op.name() {
+                "apply_last" => 2,
+                "apply" | "i_apply_last" | "i_apply_fun_last" => 1,
+                _ => 0,
+            })?;
+            if tail {
+                let deallocate = match dealloc {
+                    Some(index) => n(index)?,
+                    None => 0,
+                };
+                emit_apply_tail(assembler, kind, runtime, deallocate)
+            } else {
+                emit_apply_call(assembler, kind, runtime)
+            }
+            .map_err(EmitError::from)?;
+            Ok(())
         }
         EmitterKind::Catch => {
             use arinsal_beamasm::catch::ExceptionResolver;
@@ -2623,15 +3836,27 @@ fn emit_op(
                 }
                 "catch_end" => {
                     count(1)?;
-                    assembler.emit_catch_end(value(0)?)
+                    assembler.emit_catch_end(value(0)?, env.gc_hook(), env.add_stacktrace_helper())
                 }
-                "try_case" | "try_end" => {
+                "try_case" => {
                     count(1)?;
                     assembler.emit_try_case(value(0)?)
                 }
+                "try_end" => {
+                    count(1)?;
+                    assembler.emit_try_end(value(0)?)
+                }
                 "try_end_deallocate" => {
-                    count(2)?;
-                    assembler.emit_try_end_deallocate(value(0)?, n(1)?)
+                    count(1)?;
+                    assembler.emit_try_end_deallocate(n(0)?)
+                }
+                "try_end_move_deallocate" => {
+                    count(3)?;
+                    assembler.emit_try_end_move_deallocate(value(0)?, value(1)?, n(2)?)
+                }
+                "try_case_end" => {
+                    count(1)?;
+                    assembler.emit_try_case_end(value(0)?, resolver)
                 }
                 "badmatch" => {
                     count(1)?;
@@ -2648,6 +3873,26 @@ fn emit_op(
                 "badrecord" => {
                     count(1)?;
                     assembler.emit_badrecord(value(0)?, resolver)
+                }
+                "raise" => {
+                    count(2)?;
+                    assembler.emit_i_raise(value(0)?, value(1)?, env.raise_class_helper(), resolver)
+                }
+                "raw_raise" => {
+                    count(0)?;
+                    assembler.emit_raw_raise(resolver)
+                }
+                "node" => {
+                    count(1)?;
+                    assembler.emit_node(value(0)?, env.local_node_helper())
+                }
+                "build_stacktrace" => {
+                    count(0)?;
+                    assembler.emit_build_stacktrace(
+                        env.build_stacktrace_helper().ok_or_else(|| {
+                            EmitError::Operand("missing stacktrace helper".into())
+                        })?,
+                    )
                 }
                 _ => Err(arinsal_beamasm::module::ModuleError::InvalidOperand(
                     "unknown exception op",
@@ -2685,7 +3930,13 @@ fn emit_op(
                         "lambda table arity differs from make_fun3".to_owned(),
                     ));
                 }
-                assembler.emit_i_make_fun3_entry(value(1)?, entry, entry_arity, &environment_values)
+                assembler.emit_i_make_fun3_entry(
+                    value(1)?,
+                    entry,
+                    entry_arity,
+                    &environment_values,
+                    env.retain_fun_helper(),
+                )
             }
             "i_call_fun" => {
                 count(1)?;
@@ -2704,20 +3955,22 @@ fn emit_op(
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:402-423, OTP-29.1.1.
                 let tag = fun_call_tag(args.first(), beam)?;
                 let arity = n(1)?.min(u8::MAX as u32) as u8;
-                assembler.emit_i_call_fun2(tag, arity, value(2)?, env.fun_resolver())
+                let func = select_source_arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
+                assembler.emit_i_call_fun2(tag, arity, func, env.fun_resolver())
             }
             "i_call_fun2_last" => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:425-455, OTP-29.1.1.
                 let tag = fun_call_tag(args.first(), beam)?;
                 let arity = n(1)?.min(u8::MAX as u32) as u8;
-                assembler.emit_i_call_fun2_last(tag, arity, value(2)?, n(3)?, env.fun_resolver())
+                let func = select_source_arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
+                assembler.emit_i_call_fun2_last(tag, arity, func, n(3)?, env.fun_resolver())
             }
             "send" => {
                 count(0)?;
                 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1.
                 assembler.emit_send(
-                    env.light_bif_fragment(),
+                    env.send_fragment(),
                     arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY,
                 )
             }
@@ -2725,7 +3978,20 @@ fn emit_op(
         },
         EmitterKind::BifMfa => {
             count(3)?;
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:819-839, OTP-29.1.1.
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:819-839, OTP-29.1.1:
+            // the stub body tail-calls the BIF through the shared BIF call path.
+            let name = |at: usize| match args.get(at) {
+                Some(SpecificOperand::Atom(index)) => beam.atom(*index),
+                _ => None,
+            };
+            if let (Some(module), Some(function)) = (name(0), name(1))
+                && let Ok(arity) = u8::try_from(n(2)?)
+                && let Ok(entry) = env.bif_mfa_entry(module, function, arity)
+            {
+                return assembler
+                    .dispatch_export(entry, true)
+                    .map_err(EmitError::from);
+            }
             let module = raw_move_arg(args.first(), beam, env)?;
             let function = raw_move_arg(args.get(1), beam, env)?;
             let arity = n(2)?;
@@ -2891,9 +4157,20 @@ fn emit_op(
         EmitterKind::Fused => match op.name() {
             "store_two_values" | "load_two_xregs" => {
                 count(4)?;
-                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:602-630, OTP-29.1.1.
-                emit_extended_move(assembler, args.first(), args.get(1), beam, env)?;
-                emit_extended_move(assembler, args.get(2), args.get(3), beam, env)
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:602-630, OTP-29.1.1: both
+                // sources are loaded before either destination is written, so the pair is a
+                // parallel move (`load_two_xregs x10 x11 x11 x0` must read the old X11).
+                let source1 = raw_move_arg(args.first(), beam, env)?;
+                let destination1 = raw_move_arg(args.get(1), beam, env)?;
+                let source2 = raw_move_arg(args.get(2), beam, env)?;
+                let destination2 = raw_move_arg(args.get(3), beam, env)?;
+                assembler.emit_raw(|encoder| {
+                    use arinsal_a64::enc::Gpr;
+                    raw_load_arg(encoder, source1, Gpr::x(8))?;
+                    raw_load_arg(encoder, source2, Gpr::x(9))?;
+                    raw_store_arg(encoder, destination1, Gpr::x(8))?;
+                    raw_store_arg(encoder, destination2, Gpr::x(9))
+                })
             }
             "move_trim" => {
                 count(3)?;
@@ -2916,8 +4193,90 @@ fn emit_op(
             "move_two_trim" => {
                 count(5)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:521-557, OTP-29.1.1.
-                emit_extended_move(assembler, args.first(), args.get(1), beam, env)?;
-                emit_extended_move(assembler, args.get(2), args.get(3), beam, env)?;
+                use arinsal_a64::enc::Gpr;
+                let MoveArg::Value(ArgVal::Y(source1)) = move_arg(args.first(), beam, env)
+                    .map_err(|_| EmitError::Operand("invalid first move_two_trim source".into()))?
+                else {
+                    return Err(EmitError::Operand(
+                        "move_two_trim sources must be Y registers".into(),
+                    ));
+                };
+                let MoveArg::Value(ArgVal::Y(source2)) =
+                    move_arg(args.get(2), beam, env).map_err(|_| {
+                        EmitError::Operand("invalid second move_two_trim source".into())
+                    })?
+                else {
+                    return Err(EmitError::Operand(
+                        "move_two_trim sources must be Y registers".into(),
+                    ));
+                };
+                let destination1 = move_arg(args.get(1), beam, env).map_err(|_| {
+                    EmitError::Operand("invalid first move_two_trim destination".into())
+                })?;
+                let destination2 = move_arg(args.get(3), beam, env).map_err(|_| {
+                    EmitError::Operand("invalid second move_two_trim destination".into())
+                })?;
+                let source1_offset = source1.checked_mul(8).ok_or_else(|| {
+                    EmitError::Operand("move_two_trim source offset overflow".into())
+                })?;
+                let source2_offset = source2.checked_mul(8).ok_or_else(|| {
+                    EmitError::Operand("move_two_trim source offset overflow".into())
+                })?;
+                let destination_offset = |destination: MoveArg| -> Result<(bool, u32), EmitError> {
+                    match destination {
+                        MoveArg::X(index) if index >= 6 => Ok((false, register_offset(index)?)),
+                        MoveArg::Value(ArgVal::Y(index)) => Ok((
+                            true,
+                            index.checked_mul(8).ok_or_else(|| {
+                                EmitError::Operand(
+                                    "move_two_trim destination offset overflow".into(),
+                                )
+                            })?,
+                        )),
+                        MoveArg::X(_) | MoveArg::Value(ArgVal::X(_)) => Ok((false, u32::MAX)),
+                        _ => Err(EmitError::Operand(
+                            "move_two_trim destination must be a register".into(),
+                        )),
+                    }
+                };
+                let first_offset = destination_offset(destination1)?;
+                let second_offset = destination_offset(destination2)?;
+                assembler.emit_raw(|encoder| {
+                    encoder.ldr_uoff(Gpr::x(8), Gpr::x(20), source1_offset)?;
+                    encoder.ldr_uoff(Gpr::x(10), Gpr::x(20), source2_offset)?;
+                    for (value, destination, (is_y, offset)) in [
+                        (Gpr::x(8), destination1, first_offset),
+                        (Gpr::x(10), destination2, second_offset),
+                    ] {
+                        match destination {
+                            MoveArg::X(index) if index < 6 => {
+                                encoder.mov_reg(
+                                    Gpr::x([25, 26, 27, 28, 15, 16][index as usize]),
+                                    value,
+                                )?;
+                            }
+                            MoveArg::X(_) => encoder.str_uoff(value, Gpr::x(19), offset)?,
+                            MoveArg::Value(ArgVal::Y(_)) if is_y => {
+                                encoder.str_uoff(value, Gpr::x(20), offset)?;
+                            }
+                            MoveArg::Value(ArgVal::X(index)) if index < 6 => {
+                                encoder.mov_reg(
+                                    Gpr::x([25, 26, 27, 28, 15, 16][index as usize]),
+                                    value,
+                                )?;
+                            }
+                            MoveArg::Value(ArgVal::X(_)) => {
+                                encoder.str_uoff(value, Gpr::x(19), offset)?
+                            }
+                            _ => {
+                                return Err(arinsal_a64::enc::EncodeError::InvalidRegister(
+                                    Gpr::x(31),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
                 assembler.trim(n(4)?, 0)
             }
             "move_call_ext_last" => {
@@ -2944,11 +4303,63 @@ fn emit_op(
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
                 assembler.dispatch_export(entry, true)
             }
+            "i_yield"
+            | "i_hibernate"
+            | "i_perf_counter"
+            | "i_load_nif"
+            | "i_call_on_load_function" => {
+                // Port of erts/emulator/beam/jit/arm/ops.tab:660-680, 612-641, OTP-29.1.1: the
+                // loader turns these BIF calls into instructions. They keep their
+                // scheduler-visible behaviour by calling the BIF's export, whose import the
+                // module still carries.
+                count(0)?;
+                let (module, function, arity) = match op.name() {
+                    "i_yield" => ("erlang", "yield", 0),
+                    "i_hibernate" => ("erlang", "hibernate", 0),
+                    "i_perf_counter" => ("os", "perf_counter", 0),
+                    "i_load_nif" => ("erlang", "load_nif", 2),
+                    _ => ("erlang", "call_on_load_function", 1),
+                };
+                // The export of these BIFs names their own stub body in `erlang` (or `os`) once
+                // that module is native, so enter the BIF itself like `call_bif_mfa` does.
+                let entry = match env.bif_mfa_entry(module, function, arity) {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        let import = beam
+                            .imports
+                            .iter()
+                            .position(|import| {
+                                import.arity == u32::from(arity)
+                                    && beam.atom(import.module_atom) == Some(module)
+                                    && beam.atom(import.function_atom) == Some(function)
+                            })
+                            .ok_or_else(|| {
+                                EmitError::Operand(format!(
+                                    "import {module}:{function}/{arity} is missing"
+                                ))
+                            })?;
+                        let import = u32::try_from(import)
+                            .map_err(|_| EmitError::Operand("import index overflow".to_owned()))?;
+                        env.export_entry(beam, import).map_err(EmitError::Operand)?
+                    }
+                };
+                if op.name() == "i_perf_counter" {
+                    // A light BIF (instr_common.cpp:3126-3152 calls the clock function directly).
+                    assembler.dispatch_light_bif(env.light_bif_fragment(), entry, 0)
+                } else {
+                    assembler.dispatch_export(entry, false)
+                }
+            }
             "call_light_bif" => {
                 count(2)?;
                 let import = n(1)?;
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
-                assembler.dispatch_light_bif(env.light_bif_fragment(), entry)
+                let arity = beam
+                    .imports
+                    .get(import as usize)
+                    .and_then(|import| u8::try_from(import.arity).ok())
+                    .ok_or_else(|| EmitError::Operand("light BIF import is missing".to_owned()))?;
+                assembler.dispatch_light_bif(env.light_bif_fragment(), entry, arity)
             }
             "i_call_ext_last" => {
                 count(2)?;
@@ -2960,30 +4371,20 @@ fn emit_op(
             _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
         },
         EmitterKind::GuardBif => {
-            let arith_helper = env.arithmetic_helper();
+            let runtime = env.guard_helper();
             match op.name() {
                 "bif_and" => {
                     count(4)?;
-                    return assembler
-                        .emit_i_band(value(1)?, value(2)?, value(3)?, arith_helper)
-                        .map_err(EmitError::from);
+                    assembler.emit_bif_and(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
                 }
                 "bif_or" => {
                     count(4)?;
-                    return assembler
-                        .emit_i_bor(value(1)?, value(2)?, value(3)?, arith_helper)
-                        .map_err(EmitError::from);
+                    assembler.emit_bif_or(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
                 }
                 "bif_not" => {
                     count(3)?;
-                    return assembler
-                        .emit_i_bnot(value(1)?, value(2)?, arith_helper)
-                        .map_err(EmitError::from);
+                    assembler.emit_bif_not(n(0)?, value(1)?, value(2)?, runtime)
                 }
-                _ => {}
-            }
-            let runtime = env.guard_helper();
-            match op.name() {
                 "bif_hd" | "bif_tl" => {
                     count(2)?;
                     if op.name() == "bif_hd" {
@@ -2994,7 +4395,7 @@ fn emit_op(
                 }
                 "bif_element" => {
                     count(4)?;
-                    assembler.emit_bif_element(value(1)?, value(2)?, value(3)?, runtime)
+                    assembler.emit_bif_element(n(0)?, value(1)?, value(2)?, value(3)?, runtime)
                 }
                 "bif_node" | "bif_bit_size" | "bif_byte_size" | "bif_tuple_size"
                 | "bif_map_size" | "bif_length" | "bif_abs" => {
@@ -3002,17 +4403,23 @@ fn emit_op(
                     let source = value(1)?;
                     let destination = value(2)?;
                     match op.name() {
-                        "bif_node" => assembler.emit_bif_node(source, destination, runtime),
-                        "bif_bit_size" => assembler.emit_bif_bit_size(source, destination, runtime),
+                        "bif_node" => assembler.emit_bif_node(n(0)?, source, destination, runtime),
+                        "bif_bit_size" => {
+                            assembler.emit_bif_bit_size(n(0)?, source, destination, runtime)
+                        }
                         "bif_byte_size" => {
-                            assembler.emit_bif_byte_size(source, destination, runtime)
+                            assembler.emit_bif_byte_size(n(0)?, source, destination, runtime)
                         }
                         "bif_tuple_size" => {
-                            assembler.emit_bif_tuple_size(source, destination, runtime)
+                            assembler.emit_bif_tuple_size(n(0)?, source, destination, runtime)
                         }
-                        "bif_map_size" => assembler.emit_bif_map_size(source, destination, runtime),
-                        "bif_length" => assembler.emit_bif_length(source, destination, runtime),
-                        _ => assembler.emit_bif_abs(source, destination, runtime),
+                        "bif_map_size" => {
+                            assembler.emit_bif_map_size(n(0)?, source, destination, runtime)
+                        }
+                        "bif_length" => {
+                            assembler.emit_bif_length(n(0)?, source, destination, runtime)
+                        }
+                        _ => assembler.emit_bif_abs(n(0)?, source, destination, runtime),
                     }
                 }
                 "bif_map_get" | "bif_is_map_key" => {
@@ -3025,6 +4432,7 @@ fn emit_op(
                     };
                     if op.name() == "bif_map_get" {
                         assembler.emit_bif_map_get(
+                            n(0)?,
                             value(key_at)?,
                             value(map_at)?,
                             value(dest_at)?,
@@ -3032,6 +4440,7 @@ fn emit_op(
                         )
                     } else {
                         assembler.emit_bif_is_map_key(
+                            n(1)?,
                             value(key_at)?,
                             value(map_at)?,
                             value(dest_at)?,
@@ -3046,6 +4455,18 @@ fn emit_op(
                     } else {
                         assembler.emit_bif_min(value(0)?, value(1)?, value(2)?, runtime)
                     }
+                }
+                "bif_is_eq_exact" | "bif_is_ne_exact" | "bif_is_ge" | "bif_is_lt" => {
+                    count(3)?;
+                    // Port of erts/emulator/beam/jit/arm/ops.tab:819-840 and
+                    // instr_guard_bifs.cpp:78-84, OTP-29.1.1.
+                    let operation = match op.name() {
+                        "bif_is_eq_exact" => 19,
+                        "bif_is_ne_exact" => 20,
+                        "bif_is_lt" => 23,
+                        _ => 24,
+                    };
+                    assembler.emit_bif_compare(operation, value(0)?, value(1)?, value(2)?, runtime)
                 }
                 "bif_self" | "self" => {
                     count(1)?;
@@ -3090,8 +4511,10 @@ fn emit_op(
                 .chain(payload.as_chunks::<2>().0.iter().map(|pair| pair[1]))
                 .collect::<Vec<_>>();
             if matches!(ported(op.name()), Some(EmitterKind::SelectVal)) {
+                let source =
+                    select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
                 if op.name() == "i_select_val_lins" {
-                    assembler.emit_i_select_val_lins(value(0)?, value(1)?, size, &pairs)
+                    assembler.emit_i_select_val_lins(source, value(1)?, size, &pairs)
                 } else {
                     // Port of erts/emulator/beam/jit/arm/instr_select.cpp:107-190,
                     // OTP-29.1.1. Atom words are process-local here, so order
@@ -3108,15 +4531,17 @@ fn emit_op(
                         .map(|&index| pairs[index + count])
                         .collect::<Vec<_>>();
                     pairs = values.into_iter().chain(labels).collect();
-                    assembler.emit_i_select_val_bins(value(0)?, value(1)?, size, &pairs)
+                    assembler.emit_i_select_val_bins(source, value(1)?, size, &pairs)
                 }
             } else {
-                assembler.emit_i_select_tuple_arity(value(0)?, value(1)?, size, &pairs)
+                let source =
+                    select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
+                assembler.emit_i_select_tuple_arity(source, value(1)?, size, &pairs)
             }
         }
         EmitterKind::SelectVal2 | EmitterKind::SelectTupleArity2 => {
             count(6)?;
-            let src = value(0)?;
+            let src = select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
             let fail = value(1)?;
             let is_tuple_arity = matches!(ported(op.name()), Some(EmitterKind::SelectTupleArity2));
             let first = if is_tuple_arity {
@@ -3155,8 +4580,19 @@ fn emit_op(
         EmitterKind::JumpOnVal | EmitterKind::JumpOnValZero => {
             let (base, size_at, target_at) = if op.name() == "i_jump_on_val" {
                 count_at_least(args, 5, op.name())?;
+                // The base is a full machine word, so a negative base arrives as its
+                // two's-complement bit pattern.
+                let base = match args.get(2) {
+                    Some(SpecificOperand::Unsigned(word)) => *word,
+                    Some(SpecificOperand::SmallInt(word)) => *word as u64,
+                    _ => {
+                        return Err(EmitError::Operand(
+                            "jump table base must be an integer".to_owned(),
+                        ));
+                    }
+                };
                 (
-                    n(2)? as u64,
+                    base,
                     usize::try_from(n(3)?).map_err(|_| {
                         EmitError::Operand("jump table size overflows usize".to_owned())
                     })?,
@@ -3181,10 +4617,11 @@ fn emit_op(
                 .iter()
                 .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                 .collect::<Result<Vec<_>, _>>()?;
+            let source = select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
             if op.name() == "i_jump_on_val" {
-                assembler.emit_i_jump_on_val(value(0)?, value(1)?, base, size_at, &targets)
+                assembler.emit_i_jump_on_val(source, value(1)?, base, size_at, &targets)
             } else {
-                assembler.emit_i_jump_on_val_zero(value(0)?, value(1)?, size_at, &targets)
+                assembler.emit_i_jump_on_val_zero(source, value(1)?, size_at, &targets)
             }
         }
         EmitterKind::Jump => {
@@ -3206,15 +4643,36 @@ fn emit_op(
                         env.gc_hook(),
                     )
                 }
-                "i_bs_match_test_heap" => {
-                    count_at_least(args, 4, op.name())?;
-                    assembler.emit_i_bs_match_test_heap(value(1)?, n(2)?, n(3)?, n(0)?, helper)
+                "bs_get_integer2" => {
+                    // Fail Ms Live Sz Unit Flags Dst
+                    count(7)?;
+                    let flags = bs_flags(args.get(5), beam)?;
+                    let size = small_or_arg(args.get(3), beam, env)?;
+                    let unit = small_or_arg(args.get(4), beam, env)?;
+                    assembler.emit_bs_match_command(
+                        0,
+                        n(2)?,
+                        &[value(1)?, ArgVal::Immediate(flags), size, unit],
+                        n(0)?,
+                        Some(value(6)?),
+                        env.bs_match_cmd_helper(),
+                    )
                 }
-                "i_bs_match" => {
+                "i_bs_match" | "i_bs_match_test_heap" => {
                     count_at_least(args, 2, op.name())?;
                     let ctx = value(1)?;
                     let fail = n(0)?;
                     let mut at = 2;
+                    if op.name() == "i_bs_match_test_heap" {
+                        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2916-2940 (Need, Live).
+                        count_at_least(args, 4, op.name())?;
+                        let need =
+                            count_or_allocation_words(args.get(2)).map_err(EmitError::Operand)?;
+                        if need != 0 {
+                            assembler.emit_gc_test_preserve(need, n(3)?, ctx, env.gc_hook())?;
+                        }
+                        at = 4;
+                    }
                     while at < args.len() {
                         let Some(SpecificOperand::Atom(index)) = args.get(at) else {
                             return Err(EmitError::Operand(
@@ -3247,6 +4705,54 @@ fn emit_op(
                                 assembler.emit_bs_match_skip(ctx, bits)?;
                                 at += 2;
                             }
+                            "integer" | "binary" => {
+                                // {Name, Live, Flags, Size, Unit, Dst}
+                                let live = live_or_nil(args.get(at + 1))?;
+                                let flags = bs_flags(args.get(at + 2), beam)?;
+                                let size = small_or_arg(args.get(at + 3), beam, env)?;
+                                let unit = small_or_arg(args.get(at + 4), beam, env)?;
+                                let dst = value(at + 5)?;
+                                let kind = u32::from(name == "binary");
+                                assembler.emit_bs_match_command(
+                                    kind,
+                                    live,
+                                    &[ctx, ArgVal::Immediate(flags), size, unit],
+                                    fail,
+                                    Some(dst),
+                                    env.bs_match_cmd_helper(),
+                                )?;
+                                at += 6;
+                            }
+                            "get_tail" => {
+                                // {Name, Live, Unit, Dst}
+                                let live = live_or_nil(args.get(at + 1))?;
+                                let unit = small_or_arg(args.get(at + 2), beam, env)?;
+                                let dst = value(at + 3)?;
+                                assembler.emit_bs_match_command(
+                                    2,
+                                    live,
+                                    &[ctx, unit],
+                                    fail,
+                                    Some(dst),
+                                    env.bs_match_cmd_helper(),
+                                )?;
+                                at += 4;
+                            }
+                            "=:=" => {
+                                // {Name, Live, Bits, Value}
+                                let live = live_or_nil(args.get(at + 1))?;
+                                let bits = small_or_arg(args.get(at + 2), beam, env)?;
+                                let expected = small_or_arg(args.get(at + 3), beam, env)?;
+                                assembler.emit_bs_match_command(
+                                    3,
+                                    live,
+                                    &[ctx, bits, expected],
+                                    fail,
+                                    None,
+                                    env.bs_match_cmd_helper(),
+                                )?;
+                                at += 4;
+                            }
                             other => {
                                 return Err(EmitError::Operand(format!(
                                     "unsupported bitstring match command {other}"
@@ -3266,18 +4772,117 @@ fn emit_op(
                 }
                 "bs_get_tail" => {
                     count(3)?;
-                    assembler.emit_bs_get_tail(value(0)?, value(1)?, n(2)?, helper)
+                    assembler.emit_bs_get_tail(value(0)?, value(1)?, n(2)?, helper, env.gc_hook())
                 }
                 "i_bs_get_binary2" => {
                     count(6)?;
                     assembler.emit_i_bs_get_binary2(
                         value(0)?,
                         n(1)?,
+                        n(2)?,
                         value(3)?,
                         n(4)?,
                         value(5)?,
                         helper,
+                        env.gc_hook(),
                     )
+                }
+                "i_bs_get_bin_and_tail" => {
+                    count(7)?;
+                    // Port of erts/emulator/beam/jit/arm/ops.tab:992-997 and
+                    // instr_bs.cpp:506-577,407-455, OTP-29.1.1.
+                    assembler.emit_i_bs_get_binary2(
+                        value(0)?,
+                        n(1)?,
+                        n(2)?,
+                        value(3)?,
+                        n(4)?,
+                        value(5)?,
+                        helper,
+                        env.gc_hook(),
+                    )?;
+                    assembler.emit_bs_get_tail(value(0)?, value(6)?, n(2)?, helper, env.gc_hook())
+                }
+                "i_bs_get_utf8" => {
+                    count(3)?;
+                    assembler.emit_i_bs_get_utf8(value(0)?, n(1)?, value(2)?, helper)
+                }
+                "i_bs_skip_utf8" => {
+                    count(2)?;
+                    assembler.emit_i_bs_skip_utf8(value(0)?, n(1)?, helper)
+                }
+                "i_bs_skip_utf16" => {
+                    count(3)?;
+                    assembler.emit_i_bs_skip_utf16(value(0)?, n(1)?, value(2)?, helper)
+                }
+                "i_bs_validate_unicode_retract" => {
+                    count(3)?;
+                    assembler.emit_i_bs_validate_unicode_retract(n(0)?, value(1)?, value(2)?)
+                }
+                "i_bs_get_utf16" => {
+                    count(4)?;
+                    assembler.emit_i_bs_get_utf16(value(0)?, n(1)?, value(2)?, value(3)?, helper)
+                }
+                "i_bs_get_float2" => {
+                    count(6)?;
+                    assembler.emit_i_bs_get_float2(
+                        value(0)?,
+                        n(1)?,
+                        n(2)?,
+                        value(3)?,
+                        n(4)?,
+                        value(5)?,
+                        helper,
+                        env.gc_hook(),
+                    )
+                }
+                "get_float2" => {
+                    count(7)?;
+                    // Port of erts/emulator/beam/jit/arm/generators.tab:57-71 (gen.get_float2)
+                    // with $NativeEndian resolved for a little-endian host, OTP-29.1.1.
+                    let flags = bs_flags(args.get(5), beam)? >> 4;
+                    let flags = if flags & 16 != 0 {
+                        (flags & !16) | 2
+                    } else {
+                        flags
+                    };
+                    let unit_and_flags = u32::try_from((u64::from(n(4)?) << 3) | flags)
+                        .map_err(|_| EmitError::Operand("float unit overflow".to_owned()))?;
+                    assembler.emit_i_bs_get_float2(
+                        value(1)?,
+                        n(0)?,
+                        n(2)?,
+                        value(3)?,
+                        unit_and_flags,
+                        value(6)?,
+                        helper,
+                        env.gc_hook(),
+                    )
+                }
+                "i_bs_match_string" => {
+                    count(4)?;
+                    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:191-234, OTP-29.1.1: the
+                    // constant lives in the module's string table; the hook gets it as a
+                    // registered constant.
+                    let bits = n(2)?;
+                    let start = usize::try_from(n(3)?)
+                        .map_err(|_| EmitError::Operand("string offset overflow".to_owned()))?;
+                    let end = start.saturating_add(usize::try_from(bits.div_ceil(8)).unwrap_or(0));
+                    let bytes = beam.strings.get(start..end).ok_or_else(|| {
+                        EmitError::Operand("match string is outside the string table".to_owned())
+                    })?;
+                    let constant = env.match_string(bytes).map_err(EmitError::Operand)?;
+                    assembler.emit_i_bs_match_string(
+                        value(0)?,
+                        n(1)?,
+                        ArgVal::Immediate((u64::from(bits) << 4) | 0xf),
+                        ArgVal::Immediate((constant << 4) | 0xf),
+                        helper,
+                    )
+                }
+                "i_bs_skip_bits2" => {
+                    count(4)?;
+                    assembler.emit_i_bs_skip_bits2(value(0)?, value(1)?, n(3)?, n(2)?)
                 }
                 _ => Err(arinsal_beamasm::module::ModuleError::InvalidOperand(
                     "unknown bit syntax match op",
@@ -3285,14 +4890,60 @@ fn emit_op(
             }
         }
     };
-    if emitter_spill_bytes != 0 && result.is_ok() {
+    finish_emitter_spills(
+        assembler,
+        &emitter_spills,
+        emitter_spill_bytes,
+        &restore_stubs,
+        result,
+    )
+}
+
+/// Emits the out-of-line exits that release `bytes` of spill slots before branching to the
+/// original failure labels, and skips them on the fall-through path.
+fn emit_restore_stubs(
+    assembler: &mut BeamModuleAssembler,
+    stubs: &[(u32, u32)],
+    bytes: u32,
+) -> Result<(), EmitError> {
+    if stubs.is_empty() {
+        return Ok(());
+    }
+    let done = assembler.fresh_label_id();
+    assembler.jump(done)?;
+    for (original, fresh) in stubs {
+        assembler.emit_i_entry_label(*fresh)?;
+        assembler.emit_raw(|encoder| {
+            encoder.add_imm(
+                arinsal_a64::enc::Gpr::x(20),
+                arinsal_a64::enc::Gpr::x(20),
+                bytes as u16,
+                false,
+            )
+        })?;
+        assembler.jump(*original)?;
+    }
+    assembler.emit_i_entry_label(done)?;
+    Ok(())
+}
+
+/// Copies spilled X registers back and releases their stack slots after an emitter ran.
+fn finish_emitter_spills(
+    assembler: &mut BeamModuleAssembler,
+    spills: &BTreeMap<u32, u32>,
+    spill_bytes: u32,
+    stubs: &[(u32, u32)],
+    result: Result<(), arinsal_beamasm::module::ModuleError>,
+) -> Result<(), EmitError> {
+    if spill_bytes != 0 && result.is_ok() {
+        emit_restore_stubs(assembler, stubs, spill_bytes)?;
         assembler.emit_raw(|encoder| {
             use arinsal_a64::enc::Gpr;
-            for (index, slot) in &emitter_spills {
+            for (index, slot) in spills {
                 encoder.ldr_uoff(Gpr::x(8), Gpr::x(20), slot * 8)?;
                 encoder.str_uoff(Gpr::x(8), Gpr::x(19), index * 8)?;
             }
-            encoder.add_imm(Gpr::x(20), Gpr::x(20), emitter_spill_bytes as u16, false)
+            encoder.add_imm(Gpr::x(20), Gpr::x(20), spill_bytes as u16, false)
         })?;
     }
     result.map_err(|error| EmitError::Assembler(format!("{error:?}")))

@@ -132,6 +132,10 @@ fn native_i_make_fun3() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_make_fun3_entry_matches_interpreter_layout() {
+    extern "C" fn retain_owner_for_layout_test(_header: *mut ProcessHeader, _identity: u64) -> u64 {
+        1
+    }
+
     let entry = std::sync::Arc::new(arinsal_term::FunEntry {
         dispatch_target: Default::default(),
         module: arinsal_term::Atom(1),
@@ -153,6 +157,7 @@ fn native_i_make_fun3_entry_matches_interpreter_layout() {
         entry_ptr as usize,
         1,
         &[ArgVal::Immediate(79), ArgVal::Immediate(111)],
+        retain_owner_for_layout_test as *const () as usize,
     )
     .unwrap();
     asm.emit_raw(|e| {

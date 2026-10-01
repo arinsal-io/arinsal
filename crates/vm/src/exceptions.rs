@@ -188,7 +188,7 @@ fn class_term(class: Class) -> Result<Term, VmError> {
     })
 }
 
-fn parse_class(term: Term) -> Option<Class> {
+pub(super) fn parse_class(term: Term) -> Option<Class> {
     let atom = term.as_atom()?;
     let name = arinsal_term::global_atoms().text(atom)?;
     match name.as_ref() {
@@ -209,7 +209,7 @@ fn empty_trace_handle(class: Class) -> Term {
     Term::catch((((1_u64 << 26) - 1) << 32) | u64::from(index))
 }
 
-fn empty_trace_class(term: Term) -> Option<Class> {
+pub(super) fn empty_trace_class(term: Term) -> Option<Class> {
     [Class::Error, Class::Exit, Class::Throw]
         .into_iter()
         .find(|&class| term == empty_trace_handle(class))
@@ -385,10 +385,12 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
             }
             let tag = stacktrace::handler_tag(p.module, b.value() as usize)?;
             p.write(a, tag)?;
+            p.header.catches = p.header.catches.saturating_add(1);
             p.ip += 1;
         }
         Opcode::TryEnd | Opcode::TryCase => {
             p.write(a, Term::NIL)?;
+            p.header.catches = p.header.catches.saturating_sub(1);
             if op == Opcode::TryCase {
                 p.x[0] = p.x[3];
             }
@@ -396,6 +398,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
         }
         Opcode::CatchEnd => {
             p.write(a, Term::NIL)?;
+            p.header.catches = p.header.catches.saturating_sub(1);
             if p.x[0] == Term::catch(0) {
                 let reason = p.x[1];
                 p.x[0] = match parse_class(p.x[3]) {
@@ -602,6 +605,18 @@ pub(super) fn resume(
             index += 1;
             continue;
         };
+        // Port of erts/emulator/beam/beam_common.c:581-680 (next_catch), OTP-29.1.1: the
+        // frames above were unwound here (with their exception trace events); a catch in a
+        // native frame is resumed by the native catch search.
+        if crate::native_bridge::is_native_catch_tag(word)
+            && let Some(handler) =
+                crate::native_bridge::next_catch(p, trap.class, trap.reason, trace)
+        {
+            if let crate::native_bridge::CatchHandler::Native(handler) = handler {
+                p.native_pc = Some(handler);
+            }
+            return Ok(None);
+        }
         let Some((is_handler, module, ip)) = stacktrace::decode_tag(word) else {
             index += 1;
             continue;
@@ -699,6 +714,7 @@ pub(super) fn resume(
     }))))
 }
 
+// Port of erts/emulator/beam/beam_common.c:581-680 (next_catch), OTP-29.1.1.
 /// Port of erts/emulator/beam/beam_common.c:880 (save_stacktrace), OTP-29.1.1.
 fn save_raw(
     vm: &Vm,
@@ -709,6 +725,10 @@ fn save_raw(
 ) -> Result<Term, VmError> {
     let slot = available_trace_slot(p);
     let tag = stacktrace::raw_tag(slot)?;
+    let error_pc = p
+        .cold
+        .as_deref_mut()
+        .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
     let raw = &mut p.cold.as_deref_mut().expect("raw trace storage").raw_traces[slot];
     stacktrace::capture(
         raw,
@@ -719,6 +739,11 @@ fn save_raw(
         &p.heap,
         depth,
     )?;
+    if error_pc != 0
+        && let Some(function) = crate::native_function_at(error_pc)
+    {
+        stacktrace::set_native_top(raw, function, error_pc);
+    }
     Ok(tag)
 }
 
@@ -752,7 +777,7 @@ fn available_trace_slot(p: &mut Process) -> usize {
     })
 }
 
-fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError> {
+pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError> {
     if empty_trace_class(trace).is_some() {
         return Ok(Term::NIL);
     }

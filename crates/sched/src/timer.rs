@@ -405,6 +405,8 @@ impl TimerRef {
 pub(crate) enum TimerPayload<M> {
     Message(Pid, M, bool),
     Wake(Pid, u64),
+    /// Runtime callback owned by a process (erts `erts_start_timer_callback`).
+    Callback(Pid, crate::TimerCallback<M>),
 }
 
 pub(crate) enum TimerCommand<M> {

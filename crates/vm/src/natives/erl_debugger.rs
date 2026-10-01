@@ -718,7 +718,7 @@ fn notify_breakpoint_hit(
         event,
     ]);
     let message = from_owned_term(process, &envelope)?;
-    process.send_message(ctx, registration.pid.to_term().ok_or_else(badarg)?, message)?;
+    process.send_message(registration.pid.to_term().ok_or_else(badarg)?, message)?;
     Ok(atom("ok"))
 }
 

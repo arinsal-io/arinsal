@@ -32,7 +32,35 @@ pub enum FunCallTag {
     Lambda(u32),
 }
 
+/// The register holding the fun of an `i_call_fun`: X registers above the register cache
+/// live in the scheduler's X array.
+fn fun_register(arity: u8) -> ArgVal {
+    if arity < 6 {
+        ArgVal::X(arity)
+    } else {
+        ArgVal::XMemory(u32::from(arity))
+    }
+}
+
 impl BeamModuleAssembler {
+    /// Register that receives a new fun term; Y destinations go through a scratch register.
+    fn fun_destination(&self, dst: ArgVal) -> Result<(Gpr, bool), ModuleError> {
+        match dst {
+            ArgVal::X(index) if index < 6 => Ok((XREGS[index as usize], false)),
+            ArgVal::Y(_) => Ok((Gpr::x(8), true)),
+            _ => Err(ModuleError::InvalidOperand(
+                "fun destination must be an X register below 6 or a Y register",
+            )),
+        }
+    }
+
+    fn finish_fun_destination(&mut self, dst: ArgVal, spill: bool) -> Result<(), ModuleError> {
+        if spill {
+            self.store_register(dst, Gpr::x(8))?;
+        }
+        Ok(())
+    }
+
     /// Allocates a closure whose entry is a trampoline label in this module.
     // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:211-251, OTP-29.1.1.
     pub fn emit_i_make_fun3_label(
@@ -47,7 +75,7 @@ impl BeamModuleAssembler {
                 "invalid fun arity or environment size",
             ));
         }
-        let destination = x_destination(dst)?;
+        let (destination, spill) = self.fun_destination(dst)?;
         let header = FUN_SUBTAG | (u64::from(arity) << 8) | ((env.len() as u64) << 16);
         let entry = self.lambda_label(entry_label);
         self.code.emit(|e| {
@@ -70,7 +98,7 @@ impl BeamModuleAssembler {
                 false,
             )
         })?;
-        Ok(())
+        self.finish_fun_destination(dst, spill)
     }
 
     /// Allocates an OTP local fun using its retained module lambda entry.
@@ -81,13 +109,19 @@ impl BeamModuleAssembler {
         entry: usize,
         arity: u8,
         env: &[ArgVal],
+        retain_helper: usize,
     ) -> Result<(), ModuleError> {
         if env.len() > u8::MAX as usize || arity as usize + env.len() >= 64 {
             return Err(ModuleError::InvalidOperand(
                 "invalid fun arity or environment size",
             ));
         }
-        let destination = x_destination(dst)?;
+        if retain_helper == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "local fun owner retention helper is missing",
+            ));
+        }
+        let (destination, spill) = self.fun_destination(dst)?;
         let header = FUN_SUBTAG | (u64::from(arity) << 8) | ((env.len() as u64) << 16);
         self.code.emit(|e| {
             e.mov_const(Gpr::x(9), header)?;
@@ -109,6 +143,16 @@ impl BeamModuleAssembler {
                 false,
             )
         })?;
+        self.finish_fun_destination(dst, spill)?;
+        self.code.emit(|e| e.mov_const(Gpr::x(13), entry as u64))?;
+        self.emit_runtime_fragment_with(
+            retain_helper,
+            &[Gpr::x(13)],
+            6,
+            Update::HEAP_ALLOC
+                .union(Update::X_REGS)
+                .union(Update::REDUCTIONS),
+        )?;
         Ok(())
     }
 
@@ -126,7 +170,7 @@ impl BeamModuleAssembler {
                 "invalid fun arity or environment size",
             ));
         }
-        let destination = x_destination(dst)?;
+        let (destination, spill) = self.fun_destination(dst)?;
         let header = FUN_SUBTAG | (u64::from(arity) << 8) | ((env.len() as u64) << 16);
         self.code.emit(|e| {
             e.mov_const(Gpr::x(9), header)?;
@@ -148,7 +192,7 @@ impl BeamModuleAssembler {
                 false,
             )
         })?;
-        Ok(())
+        self.finish_fun_destination(dst, spill)
     }
 
     /// Emits an environment-unpacking entry for a statically known lambda.
@@ -160,11 +204,6 @@ impl BeamModuleAssembler {
         total_arity: u8,
         num_free: u8,
     ) -> Result<(), ModuleError> {
-        if usize::from(total_arity) > XREGS.len() {
-            return Err(ModuleError::InvalidOperand(
-                "lambda arity exceeds X register capacity",
-            ));
-        }
         if self.defined_lambdas.insert(lambda, ()).is_some() {
             return Err(ModuleError::DuplicateLabel(lambda));
         }
@@ -176,17 +215,19 @@ impl BeamModuleAssembler {
                 e.add_imm(Gpr::x(9), Gpr::x(9), 16, false)
             })?;
             let start = usize::from(total_arity - num_free);
-            let mut i = 0;
-            while i + 1 < usize::from(num_free) {
-                self.code.emit(|e| {
-                    e.ldr_uoff(XREGS[start + i], Gpr::x(9), (i as u32) * 8)?;
-                    e.ldr_uoff(XREGS[start + i + 1], Gpr::x(9), ((i + 1) as u32) * 8)
-                })?;
-                i += 2;
-            }
-            if i < usize::from(num_free) {
-                self.code
-                    .emit(|e| e.ldr_uoff(XREGS[start + i], Gpr::x(9), (i as u32) * 8))?;
+            for i in 0..usize::from(num_free) {
+                let index = start + i;
+                let offset = (i as u32) * 8;
+                if index < XREGS.len() {
+                    self.code
+                        .emit(|e| e.ldr_uoff(XREGS[index], Gpr::x(9), offset))?;
+                } else {
+                    // X registers above the register cache live in the X register array.
+                    self.code.emit(|e| {
+                        e.ldr_uoff(Gpr::x(10), Gpr::x(9), offset)?;
+                        e.str_uoff(Gpr::x(10), Gpr::x(19), (index as u32) * 8)
+                    })?;
+                }
             }
         }
         let label = self.label(target);
@@ -197,7 +238,7 @@ impl BeamModuleAssembler {
     /// Calls a fun with arity taken from the `i_call_fun` operand.
     // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:457-462, OTP-29.1.1
     pub fn emit_i_call_fun(&mut self, arity: u8, resolver: FunResolver) -> Result<(), ModuleError> {
-        self.emit_i_call_fun2(FunCallTag::Dynamic, arity, ArgVal::X(arity), resolver)
+        self.emit_i_call_fun2(FunCallTag::Dynamic, arity, fun_register(arity), resolver)
     }
 
     /// Tail-calls a fun with arity taken from the `i_call_fun` operand.
@@ -211,7 +252,7 @@ impl BeamModuleAssembler {
         self.emit_i_call_fun2_last(
             FunCallTag::Dynamic,
             arity,
-            ArgVal::X(arity),
+            fun_register(arity),
             deallocate,
             resolver,
         )
@@ -308,6 +349,7 @@ impl BeamModuleAssembler {
                 self.code.bind(resolver_path)?;
                 emit_fun_resolver(self, resolver as usize)?;
                 self.code.bind(call_target)?;
+                crate::emit_validate_native_cursor(&mut self.code)?;
                 if tail {
                     self.deallocate(deallocate)?;
                     self.emit_leave_frame()?;
@@ -316,6 +358,7 @@ impl BeamModuleAssembler {
                     self.code.adr(Gpr::x(30), continuation)?;
                     self.code.emit(|e| e.br(Gpr::x(0)))?;
                     self.code.bind(continuation)?;
+                    crate::emit_validate_native_cursor(&mut self.code)?;
                 }
                 return Ok(());
             }
@@ -345,7 +388,7 @@ fn emit_fun_resolver(asm: &mut BeamModuleAssembler, helper: usize) -> Result<(),
         e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
         e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
     })?;
-    asm.code.cbnz(Gpr::x(9), asm.error_label)?;
+    asm.error_if_nonzero(Gpr::x(9))?;
     Ok(())
 }
 
@@ -358,13 +401,4 @@ pub fn emit_is_function2(
     helper: crate::guard::GuardHelper,
 ) -> Result<(), ModuleError> {
     asm.emit_is_function2(src, arity, helper)
-}
-
-fn x_destination(dst: ArgVal) -> Result<Gpr, ModuleError> {
-    match dst {
-        ArgVal::X(index) if index < 6 => Ok(XREGS[index as usize]),
-        _ => Err(ModuleError::InvalidOperand(
-            "fun destination must be an X register",
-        )),
-    }
 }

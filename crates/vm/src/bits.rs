@@ -207,6 +207,15 @@ fn branch(p: &mut Process, fail: Arg, frame: &(impl FrameName + ?Sized)) -> Resu
     }
 }
 
+/// The exception reason and `error_info` of a failed bit syntax operation in native code.
+pub(crate) fn native_error(error: BitsError) -> (String, Option<Box<arinsal_etf::OwnedTerm>>) {
+    match self::error(error, "") {
+        VmError::ExceptionInfo { reason, info, .. } => (reason, Some(info)),
+        VmError::Exception { reason, .. } => (reason, None),
+        _ => ("badarg".into(), None),
+    }
+}
+
 fn error(error: BitsError, frame: &(impl FrameName + ?Sized)) -> VmError {
     match error {
         BitsError::Detailed {

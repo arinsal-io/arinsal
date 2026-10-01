@@ -1374,9 +1374,9 @@ pub(crate) fn family(
         ("port_command", [port, data, _]) if module == "erts_internal" => {
             port_command(process, ctx, *port, *data, args)
         }
-        ("port_close", [port]) if module == "erts_internal" => close(process, ctx, *port),
+        ("port_close", [port]) if module == "erts_internal" => close(process, *port),
         ("port_connect", [port, pid]) if module == "erts_internal" => {
-            connect(process, ctx, *port, *pid, false)
+            connect(process, *port, *pid, false)
         }
         // Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3), OTP-29.1.1.
         // Spawn and fd ports have no driver control. The internal BIF returns the
@@ -1582,7 +1582,10 @@ fn release_io(handle: &PortHandle) {
     }
 }
 
-fn close(process: &Process, ctx: &mut RunCtx<'_, Message>, term: Term) -> Result<Term, VmError> {
+fn close(process: &Process, term: Term) -> Result<Term, VmError> {
+    let sender = process.self_pid.ok_or_else(badarg)?;
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let scheduler = runtime.scheduler().map_err(|_| badarg())?;
     let id = term.as_port().ok_or_else(badarg)?;
     let removed = process
         .runtime
@@ -1598,18 +1601,18 @@ fn close(process: &Process, ctx: &mut RunCtx<'_, Message>, term: Term) -> Result
         let reason_term = atom("normal");
         let port = Term::port(id).ok_or_else(badarg)?;
         for linked in handle.links.lock().unwrap().iter().copied() {
-            if linked == ctx.pid() && process.trap_exit {
+            if linked == sender && process.trap_exit {
                 let mut heap = ProcessHeap::with_words(24);
                 let exit = TermBuilder::new(&mut heap)
                     .tuple(&[atom("EXIT"), port, reason_term])
                     .map_err(|error| VmError::Unsupported(format!("port EXIT tuple: {error:?}")))?;
                 if let Ok(message) = Message::copy_from(exit) {
-                    let _ = ctx.send(linked, message);
+                    let _ = scheduler.send(sender, linked, message);
                 }
                 continue;
             }
             if let Ok(reason) = Message::copy_from(reason_term) {
-                let _ = ctx.signal(linked, arinsal_sched::Signal::Exit(reason));
+                let _ = scheduler.signal(sender, linked, arinsal_sched::Signal::Exit(reason));
             }
         }
         for (reference, pid) in handle.monitors.lock().unwrap().iter() {
@@ -1629,7 +1632,7 @@ fn close(process: &Process, ctx: &mut RunCtx<'_, Message>, term: Term) -> Result
                 ])
                 .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
             if let Ok(message) = Message::copy_from(down) {
-                let _ = ctx.send(*pid, message);
+                let _ = scheduler.send(sender, *pid, message);
             }
         }
         Ok(atom("true"))
@@ -1641,11 +1644,11 @@ fn close(process: &Process, ctx: &mut RunCtx<'_, Message>, term: Term) -> Result
 /// Close a runtime port selected by its internal id.
 pub(crate) fn close_by_id(
     process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, Message>,
     id: u64,
 ) -> Result<bool, VmError> {
     let term = Term::port(id).ok_or_else(badarg)?;
-    close(process, ctx, term).map(|result| result == atom("true"))
+    close(process, term).map(|result| result == atom("true"))
 }
 
 /// Apply an exit signal to a port and deliver its reason to linked processes.
@@ -1710,13 +1713,7 @@ pub(crate) fn exit_port(
     Ok(())
 }
 
-fn connect(
-    process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
-    port: Term,
-    pid: Term,
-    notify: bool,
-) -> Result<Term, VmError> {
+fn connect(process: &Process, port: Term, pid: Term, notify: bool) -> Result<Term, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let pid = Pid::from_term(pid).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -1734,7 +1731,12 @@ fn connect(
     *handle.owner.lock().unwrap() = pid;
     let scheduler = runtime.scheduler()?;
     if notify {
-        event_message(&scheduler, ctx.pid(), id, atom("connected"));
+        event_message(
+            &scheduler,
+            process.self_pid.ok_or_else(badarg)?,
+            id,
+            atom("connected"),
+        );
     }
     Ok(atom("true"))
 }
@@ -1867,15 +1869,10 @@ pub(crate) fn demonitor(process: &Process, reference: u64) -> bool {
         .any(|handle| handle.monitors.lock().unwrap().remove(&reference).is_some())
 }
 
-pub(crate) fn send_message(
-    process: &Process,
-    ctx: &mut RunCtx<'_, Message>,
-    port: Term,
-    message: Term,
-) -> Result<(), VmError> {
+pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let parts = tuple(message).ok_or_else(badarg)?;
-    if parts.len() != 2 || parts[0] != ctx.pid().to_term().ok_or_else(badarg)? {
+    if parts.len() != 2 || parts[0] != process.self_pid.and_then(Pid::to_term).ok_or_else(badarg)? {
         return Err(badarg());
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -1887,7 +1884,7 @@ pub(crate) fn send_message(
         .cloned()
         .ok_or_else(badarg)?;
     if parts[1] == atom("close") {
-        close(process, ctx, port)?;
+        close(process, port)?;
         return Ok(());
     }
     let command = tuple(parts[1]).ok_or_else(badarg)?;
@@ -1920,10 +1917,10 @@ pub(crate) fn send_message(
         return Ok(());
     }
     if command.len() == 2 && command[0] == atom("connect") {
-        if *handle.owner.lock().unwrap() != ctx.pid() {
+        if Some(*handle.owner.lock().unwrap()) != process.self_pid {
             return Err(badarg());
         }
-        connect(process, ctx, port, command[1], true)?;
+        connect(process, port, command[1], true)?;
         return Ok(());
     }
     Err(badarg())

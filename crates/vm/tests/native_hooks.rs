@@ -201,7 +201,7 @@ fn map_get_on_hashmap_via_hook() {
     registers.x_reg_array[1] = bits(map);
     run(&mut process, &mut registers, |asm| {
         let helper: GuardHelper = arinsal_beamasm_guard;
-        asm.emit_bif_map_get(ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), helper)
+        asm.emit_bif_map_get(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), helper)
             .unwrap();
     });
     assert_eq!(from_bits(registers.x_reg_array[0]).as_small(), Some(37));

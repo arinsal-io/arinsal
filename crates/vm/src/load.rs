@@ -95,6 +95,18 @@ pub(crate) struct CodeMeta {
     pub(crate) beam_bytes: Option<Arc<Vec<u8>>>,
     pub(crate) beamasm: Option<Arc<beamasm_integration::CompiledVersion>>,
 }
+/// Native code range of the module version in slot `id`, when it was compiled by BeamAsm.
+pub(crate) fn native_code_range(
+    code_meta: &[Option<Arc<CodeMeta>>],
+    id: usize,
+) -> Option<(usize, usize)> {
+    code_meta
+        .get(id)?
+        .as_ref()?
+        .beamasm
+        .as_ref()
+        .map(|version| version.code_range())
+}
 impl CodeMeta {
     pub(crate) fn from_beam(beam: &BeamFile, bytes: Option<&[u8]>) -> Self {
         // OTP encodes -on_load as a Code instruction following that function's label.

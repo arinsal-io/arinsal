@@ -197,10 +197,12 @@ fn native_i_bs_get_binary2() {
         a.emit_i_bs_get_binary2(
             ArgVal::X(0),
             99,
+            1,
             ArgVal::Immediate(rt::term_bits(Term::small(8).unwrap())),
             1,
             ArgVal::X(1),
             match_helper,
+            gc_helper,
         )
     });
 }
@@ -218,7 +220,7 @@ fn native_i_bs_match_string() {
         a.emit_i_bs_match_string(
             ArgVal::X(0),
             99,
-            ArgVal::Immediate(8),
+            ArgVal::Immediate((8 << 4) | 0xf),
             ArgVal::Literal(0),
             match_helper,
         )
@@ -228,7 +230,7 @@ fn native_i_bs_match_string() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_bs_get_tail() {
-    run_native(|a| a.emit_bs_get_tail(ArgVal::X(0), ArgVal::X(1), 1, match_helper));
+    run_native(|a| a.emit_bs_get_tail(ArgVal::X(0), ArgVal::X(1), 1, match_helper, gc_helper));
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -258,10 +260,12 @@ fn native_i_bs_get_float2() {
         a.emit_i_bs_get_float2(
             ArgVal::X(0),
             99,
+            1,
             ArgVal::Immediate(rt::term_bits(Term::small(32).unwrap())),
             1,
             ArgVal::X(1),
             match_helper,
+            gc_helper,
         )
     });
 }
@@ -310,10 +314,12 @@ fn native_sub_binary_extraction() {
         asm.emit_i_bs_get_binary2(
             ArgVal::X(0),
             99,
+            1,
             ArgVal::Immediate(rt::term_bits(Term::small(16).unwrap())),
             1,
             ArgVal::X(1),
             match_helper,
+            gc_helper,
         )
     });
     assert_eq!(actual, expected);

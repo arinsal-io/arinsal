@@ -4,7 +4,7 @@ use crate::process::{Message, Runtime};
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, RunCtx, Signal};
 use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, copy_term, global_atoms};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(feature = "pf-mem-counters")]
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
@@ -799,6 +799,7 @@ fn request_system_task(
             if alive && let Some(&old) = vm.old.get(&module) {
                 let op = RemoteOp::CheckProcessCode {
                     module: old,
+                    native: crate::load::native_code_range(&vm.code_meta, old),
                     async_request: Some(request),
                     kill: false,
                 };
@@ -908,7 +909,7 @@ pub(crate) fn native_send(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    process.send_message_with_vm(vm, ctx, args[0], args[1])
+    process.send_message_in(vm, ctx, args[0], args[1])
 }
 
 /// Direct load-time entry for `send/3`.
@@ -927,7 +928,7 @@ pub(crate) fn native_send3(
             return Err(badarg("erlang:send/3"));
         }
     }
-    process.send_message_prio(Some(vm), ctx, args[0], args[1], want_priority)?;
+    process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)?;
     Ok(atom("ok"))
 }
 
@@ -1820,6 +1821,8 @@ pub(crate) enum RemoteOp {
     /// Check whether the target still has a direct reference to old module code.
     CheckProcessCode {
         module: usize,
+        /// Native code range of the old module version, when BeamAsm compiled it.
+        native: Option<(usize, usize)>,
         async_request: Option<Message>,
         kill: bool,
     },
@@ -1862,6 +1865,9 @@ type Slot = (usize, Pid);
 struct Tables {
     requests: BTreeMap<Slot, Vec<Pending>>,
     waiters: BTreeMap<Slot, Waiter>,
+    /// Processes that already answered their final requests but are still registered; a
+    /// request sent to one now would never be served.
+    exited: BTreeSet<Slot>,
 }
 
 fn scope(process: &Process) -> usize {
@@ -1878,6 +1884,7 @@ fn tables() -> &'static Mutex<Tables> {
         Mutex::new(Tables {
             requests: BTreeMap::new(),
             waiters: BTreeMap::new(),
+            exited: BTreeSet::new(),
         })
     })
 }
@@ -1987,6 +1994,11 @@ pub(crate) fn submit_id(
     let slot_of = scope(process);
     {
         let mut tables = tables().lock().unwrap();
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c (signals to an exiting process are
+        // handled by its exit), OTP-29.1.1: the target already ran its exit handling.
+        if tables.exited.contains(&(slot_of, target)) {
+            return Ok(Submit::Dead);
+        }
         tables
             .requests
             .entry((slot_of, target))
@@ -2043,9 +2055,33 @@ pub(crate) fn handle_request(
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
 pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
     let slot = (scope(process), ctx.pid());
+    let scheduler = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok());
+    // Entries of processes the scheduler has since removed are no longer needed: a lookup
+    // already reports them dead. They are checked outside the table lock.
+    let candidates = tables()
+        .lock()
+        .unwrap()
+        .exited
+        .iter()
+        .filter(|(scope, _)| *scope == slot.0)
+        .copied()
+        .collect::<Vec<_>>();
+    let gone = scheduler.map_or_else(Vec::new, |scheduler| {
+        candidates
+            .into_iter()
+            .filter(|&(_, pid)| !scheduler.lookup(pid))
+            .collect::<Vec<_>>()
+    });
     let pending = {
         let mut tables = tables().lock().unwrap();
         tables.waiters.remove(&slot);
+        for entry in &gone {
+            tables.exited.remove(entry);
+        }
+        tables.exited.insert(slot);
         tables.requests.remove(&slot).unwrap_or_default()
     };
     for pending in pending {

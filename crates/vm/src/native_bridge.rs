@@ -20,6 +20,34 @@ pub struct NativeFunction {
     pub line: Option<u32>,
     /// Source file, when known.
     pub file: Option<String>,
+    /// Native PCs and their source locations, sorted by address.
+    pub line_table: Vec<NativeLine>,
+}
+
+/// One native PC to source location mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeLine {
+    /// Native address at which this source line becomes current.
+    pub address: usize,
+    /// Source filename.
+    pub file: String,
+    /// One-based source line.
+    pub line: u32,
+}
+
+impl NativeFunction {
+    /// Resolve a native return PC to the nearest preceding BEAM line marker.
+    pub fn line_at(&self, address: usize) -> Option<(&str, u32)> {
+        let index = self
+            .line_table
+            .partition_point(|entry| entry.address <= address)
+            .checked_sub(1)?;
+        // Line 0 marks a location erts cannot represent (LINE_INVALID_LOCATION).
+        self.line_table
+            .get(index)
+            .filter(|entry| entry.line != 0)
+            .map(|entry| (entry.file.as_str(), entry.line))
+    }
 }
 
 fn native_functions() -> &'static RwLock<Vec<NativeFunction>> {
@@ -30,6 +58,162 @@ fn native_functions() -> &'static RwLock<Vec<NativeFunction>> {
 fn native_generation() -> &'static AtomicU64 {
     static GENERATION: AtomicU64 = AtomicU64::new(0);
     &GENERATION
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CatchTarget {
+    Native(usize),
+    Interpreted { module: usize, ip: usize },
+}
+
+fn catch_table() -> &'static RwLock<std::collections::HashMap<u32, CatchTarget>> {
+    static CATCHES: OnceLock<RwLock<std::collections::HashMap<u32, CatchTarget>>> = OnceLock::new();
+    CATCHES.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Whether a stack word is a catch tag registered by native code (`catch`/`try` in a BeamAsm
+/// frame), whose handler only `next_catch` can resolve.
+pub(crate) fn is_native_catch_tag(word: Term) -> bool {
+    let raw = word.tagged_word();
+    raw & 63 == 0x1b
+        && u32::try_from(raw >> 6).is_ok_and(|index| {
+            catch_table()
+                .read()
+                .is_ok_and(|table| matches!(table.get(&index), Some(CatchTarget::Native(_))))
+        })
+}
+
+pub(crate) fn register_native_catches(base: u32, handlers: &[*const u8]) -> Vec<u32> {
+    let ids = (0..handlers.len())
+        .filter_map(|offset| u32::try_from(offset).ok()?.checked_add(base))
+        .collect::<Vec<_>>();
+    if let Ok(mut catches) = catch_table().write() {
+        for (&id, handler) in ids.iter().zip(handlers) {
+            catches.insert(id, CatchTarget::Native(*handler as usize));
+        }
+    }
+    ids
+}
+
+pub(crate) fn unregister_native_catches(ids: &[u32]) {
+    if let Ok(mut catches) = catch_table().write() {
+        for id in ids {
+            catches.remove(id);
+        }
+    }
+}
+
+pub(crate) fn register_interpreted_catch(index: u32, module: usize, ip: usize) {
+    if let Ok(mut catches) = catch_table().write() {
+        catches.insert(index, CatchTarget::Interpreted { module, ip });
+    }
+}
+
+pub(crate) fn interpreted_catch(index: u32) -> Option<(usize, usize)> {
+    match catch_table().read().ok()?.get(&index).copied()? {
+        CatchTarget::Interpreted { module, ip } => Some((module, ip)),
+        CatchTarget::Native(_) => None,
+    }
+}
+
+pub(crate) enum CatchHandler {
+    Native(usize),
+    Interpreted,
+}
+
+pub(crate) fn next_catch(
+    process: &mut Process,
+    class: arinsal_bifs::Class,
+    reason: Term,
+    trace: Term,
+) -> Option<CatchHandler> {
+    if process.header.catches == 0 {
+        return None;
+    }
+    let mut index = 0usize;
+    let mut previous_cp = 0usize;
+    let mut seen_cp = false;
+    while index < process.heap.stack_words() {
+        let word = process.heap.stack_get(index)?;
+        let raw = word.tagged_word();
+        let address = raw as usize;
+        if address == native_trace_return_address() {
+            let actions = process
+                .heap
+                .stack_get(index + 3)
+                .and_then(Term::as_small)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0);
+            let words = 4usize.saturating_add(actions.saturating_mul(2));
+            // The whole trace frame sits below the catching frame's Y slots.
+            previous_cp = index + words - arinsal_term::CP_WORDS;
+            seen_cp = true;
+            index += words;
+            continue;
+        }
+        if native_function_at(address).is_some() {
+            previous_cp = index;
+            seen_cp = true;
+            index += arinsal_term::CP_WORDS;
+            continue;
+        }
+        if raw & 63 == 0x1b
+            && let Some(catch_index) = u32::try_from(raw >> 6).ok()
+            && let Some(target) = catch_table().read().ok()?.get(&catch_index).copied()
+        {
+            process.heap.stack_set(index, Term::NIL);
+            let base = process.heap.heap_cursor().1;
+            // Both native and interpreted frames keep the caller-pushed CP above their Y slots
+            // (a call pushes the CP, `allocate` then reserves the Y slots below it), so the
+            // resumed E is the first Y slot after the last CP below the catch, or the stack top
+            // when the catching frame is the topmost one.
+            let resume = if seen_cp {
+                previous_cp + arinsal_term::CP_WORDS
+            } else {
+                0
+            };
+            process.heap.set_stack_pointer(base.wrapping_add(resume));
+            if process.x.len() < 4 {
+                let mut registers = process.x.to_vec();
+                registers.resize(4, Term::NIL);
+                process.x = registers.into_boxed_slice();
+            }
+            // Port of erts/emulator/beam/beam_common.c:541-544 (handle_error), OTP-29.1.1:
+            // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
+            process.x[0] = Term::catch(0);
+            let class_atom = match class {
+                arinsal_bifs::Class::Error => crate::signals::atom("error"),
+                arinsal_bifs::Class::Exit => crate::signals::atom("exit"),
+                arinsal_bifs::Class::Throw => crate::signals::atom("throw"),
+            };
+            process.x[1] = reason;
+            process.x[2] = trace;
+            process.x[3] = class_atom;
+            process.exc_class = Some(class);
+            process.header.freason = 0;
+            process.sync_native_header();
+            return match target {
+                CatchTarget::Native(handler) => {
+                    process.cold_mut().native_continuation_resume = true;
+                    process.cold_mut().native_resume_live = 5;
+                    Some(CatchHandler::Native(handler))
+                }
+                CatchTarget::Interpreted { module, ip } => {
+                    process.module = module;
+                    process.ip = ip;
+                    Some(CatchHandler::Interpreted)
+                }
+            };
+        }
+        if crate::stacktrace::decode_tag(word).is_some_and(|(handler, _, _)| !handler) {
+            previous_cp = index;
+            seen_cp = true;
+            index += arinsal_term::CP_WORDS;
+        } else {
+            index += 1;
+        }
+    }
+    None
 }
 
 fn register_bridge_continuation() -> Result<(), &'static str> {
@@ -86,6 +270,9 @@ pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
     };
     let before = functions.len();
     functions.retain(|registered| !entries.contains(registered));
+    for entry in entries {
+        arinsal_term::unregister_native_code_range(entry.start, entry.end);
+    }
     let removed = before - functions.len();
     if removed == 0 {
         return;
@@ -151,6 +338,22 @@ fn native_arity_at(address: usize) -> Option<u8> {
         .map(|function| function.arity)
 }
 
+/// Every registered native function of `module`, keyed by name and arity.
+pub(crate) fn native_functions_of(
+    module: &str,
+) -> std::collections::HashMap<(String, u8), NativeFunction> {
+    native_functions().read().map_or_else(
+        |_| std::collections::HashMap::new(),
+        |functions| {
+            functions
+                .iter()
+                .filter(|entry| entry.module == module)
+                .map(|entry| ((entry.function.clone(), entry.arity), entry.clone()))
+                .collect()
+        },
+    )
+}
+
 pub(crate) fn native_function_for(
     module: &str,
     function: &str,
@@ -178,15 +381,45 @@ pub fn run_native(
     let arity = native_arity_at(code_address).ok_or_else(|| {
         VmError::Unsupported(format!("unregistered native entry: {code_address:#x}"))
     })?;
+    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some()
+        && let Some(function) = native_function_at(code_address)
+    {
+        eprintln!(
+            "[native-before-ensure] {}:{}/{} arity={arity} x0={:#x} E={:#x}",
+            function.module,
+            function.function,
+            function.arity,
+            process.x[0].tagged_word(),
+            process.heap.frame_pointer()
+        );
+    }
+    if let Some(cold) = process.cold.as_mut() {
+        cold.native_error_pc = 0;
+    }
+    registers.tmp_mem[6] = 0;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     registers.tmp_mem[5] =
         crate::native_helpers::arinsal_beamasm_native_trace_return as *const () as usize as u64;
-    process.ensure(1 + arinsal_term::CP_WORDS, arity as usize)?;
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     let resuming_continuation = process
         .cold
         .as_mut()
         .is_some_and(|cold| std::mem::take(&mut cold.native_continuation_resume));
+    // A resumed call return has only x0 live and an exception handler x0..x3, whatever
+    // the arity of the function the native code belongs to.
+    let resume_live = process
+        .cold
+        .as_mut()
+        .map_or(0, |cold| std::mem::take(&mut cold.native_resume_live));
+    let live = if resume_live == 0 {
+        arity as usize
+    } else {
+        resume_live as usize - 1
+    };
+    process.ensure(
+        1 + arinsal_term::S_RESERVED + arinsal_term::NATIVE_SPILL_WORDS,
+        live,
+    )?;
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     if !resuming_continuation && !process.heap.reserve_stack(1) {
         return Err(VmError::Unsupported(
             "native bridge continuation stack is full".into(),
@@ -206,6 +439,19 @@ pub fn run_native(
         }
     }
     let code_ptr = code_address as *const std::ffi::c_void;
+    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some()
+        && let Some(function) = native_function_at(code_address)
+    {
+        eprintln!(
+            "[native-enter] {}:{}/{} pc={code_address:#x} x0={:#x} E={:#x} freason={:#x}",
+            function.module,
+            function.function,
+            function.arity,
+            process.x[0].tagged_word(),
+            process.heap.frame_pointer(),
+            process.header.freason
+        );
+    }
     process.sync_header();
     process.header.i = code_ptr;
     process.header.arity = arity;
@@ -219,9 +465,13 @@ pub fn run_native(
     }
     let float_count = process.fr.len().min(registers.f_reg_array.len());
     registers.f_reg_array[..float_count].copy_from_slice(&process.fr[..float_count]);
+    if let Some(cold) = process.cold.as_mut() {
+        cold.native_bif_error = None;
+    }
     let saved_ftrace = process.header.ftrace;
     process.header.ftrace = (registers as *mut SchedulerRegisters).cast();
     registers.tmp_mem[3] = 0;
+    process.heap.set_native_allocation(true);
     if std::env::var_os("ARINSAL_BEAMASM_LIFETIME").as_deref() == Some(std::ffi::OsStr::new("1")) {
         eprintln!(
             "[beamasm-lifetime] enter code={code_address:#x} owner={}",
@@ -233,13 +483,25 @@ pub fn run_native(
     // SAFETY: The caller supplies a registered executable function using the BeamAsm ABI.
     let exit =
         unsafe { arinsal_beamasm::enter_native_raw(&mut process.header, registers, code_ptr) };
+    process.heap.set_native_allocation(false);
+    let native_ftrace = process.header.ftrace as u64;
     process.header.ftrace = saved_ftrace;
-    if matches!(exit, ExitReason::CallUnported { resume_pc, .. } if resume_pc != 0) {
-        registers.x_reg_array[0] = registers.tmp_mem[0];
-        registers.x_reg_array[1] = registers.tmp_mem[1];
+    if std::env::var_os("ARINSAL_BEAMASM_EXCEPTION_TRACE").is_some() {
+        let (base, end) = process.heap.heap_bounds();
+        let (_, current_stop) = process.heap.heap_cursor();
+        let requested_stop = process.header.stop as usize;
+        if requested_stop < base as usize || requested_stop > end as usize {
+            let module = native_function_at(code_address)
+                .map_or_else(|| "?".to_owned(), |function| function.module);
+            eprintln!(
+                "native return stack pointer out of range module={} pc={code_address:#x} exit={exit:?} base={base:p} end={end:p} current_stop={current_stop:p} requested_stop={:#x} htop={:p}",
+                module, requested_stop, process.header.htop
+            );
+        }
     }
-    process.heap.set_heap_top(process.header.htop);
+    // Native returns may release stack slots and allocate into the newly freed gap.
     process.heap.set_stack_pointer(process.header.stop);
+    process.heap.set_heap_top(process.header.htop);
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
@@ -253,17 +515,181 @@ pub fn run_native(
         // SAFETY: These words were loaded from the process's X register array.
         *destination = unsafe { Term::from_raw_bits(*raw) };
     }
+    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some()
+        && let Some(function) = native_function_at(code_address)
+    {
+        eprintln!(
+            "[native-exit] {}:{}/{} pc={code_address:#x} exit={exit:?} x0={:#x} E={:#x} i={:p} stop={:p}",
+            function.module,
+            function.function,
+            function.arity,
+            process.x[0].tagged_word(),
+            process.heap.frame_pointer(),
+            process.header.i,
+            process.header.stop
+        );
+    }
     process.fr[..float_count].copy_from_slice(&registers.f_reg_array[..float_count]);
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:533-540, OTP-29.1.1.
     // A VM-backed light BIF leaves TRAP for the scheduler when it exits native code.
+    // A call handed to the scheduler keeps its call site too, for a BIF that raises there.
+    if process.header.freason != 0 || matches!(exit, ExitReason::CallUnported { .. }) {
+        process.cold_mut().native_error_pc = registers.tmp_mem[6] as usize;
+    }
+    if process.header.freason != 0
+        && process.header.freason != 1 << 10
+        && std::env::var_os("ARINSAL_BEAMASM_EXCEPTION_TRACE").is_some()
+    {
+        eprintln!(
+            "native exception freason={:#x} fvalue={:?} at {:?}",
+            process.header.freason,
+            arinsal_term::to_owned(crate::native_hooks::from_raw(process.header.fvalue))
+                .map(|term| format!("{term}").chars().take(200).collect::<String>()),
+            native_function_at(registers.tmp_mem[6] as usize).map(|function| format!(
+                "{}:{}/{} +{:#x}",
+                function.module,
+                function.function,
+                function.arity,
+                registers.tmp_mem[6] as usize - function.start
+            ))
+        );
+    }
     let trapped_bif =
         process.header.freason == 1 << 10 && matches!(exit, ExitReason::CallUnported { .. });
     if trapped_bif {
         process.header.freason = 0;
+    } else if process.header.freason == arinsal_beamasm::module::EXC_FUNCTION_CLAUSE {
+        // Port of erts/emulator/beam/beam_common.c (save_stacktrace, EXC_FUNCTION_CLAUSE):
+        // the top frame carries the current function's arguments.
+        process.header.freason = 0;
+        let arity = native_function_at(registers.tmp_mem[6] as usize)
+            .map_or(0, |function| usize::from(function.arity));
+        let args = process.x[..arity.min(process.x.len())].to_vec();
+        if std::env::var_os("ARINSAL_BEAMASM_EXCEPTION_TRACE").is_some() {
+            eprintln!(
+                "native function_clause in {:?} args={:?}",
+                native_function_at(registers.tmp_mem[6] as usize)
+                    .map(|f| format!("{}:{}/{}", f.module, f.function, f.arity)),
+                args.iter()
+                    .map(|arg| format!("{:#x}", arg.tagged_word()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let args = arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+            .list_from_iter(args)
+            .map_err(|error| VmError::Unsupported(format!("function_clause args {error:?}")))?;
+        let mut trap = exceptions::native_trap(1, process.header.fvalue)?;
+        trap.top = Some(crate::stacktrace::TopFrame::CurrentArgs(args));
+        return Err(VmError::Trap(trap));
+    } else if process.header.freason != 0
+        && let Some(failure) = process
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.native_bif_error.take())
+        && failure.freason == process.header.freason
+        && failure.fvalue == process.header.fvalue
+    {
+        process.header.freason = 0;
+        return Err(exceptions::bif_error(
+            process,
+            &failure.module,
+            &failure.function,
+            &failure.args,
+            failure.error,
+        ));
+    } else if process.header.freason != 0 && registers.tmp_mem[7] != 0 {
+        // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (emit_raise_badarg): an inline
+        // BIF failure names the BIF, with its arguments from X0.., as the top frame.
+        let slot = std::mem::take(&mut registers.tmp_mem[7]) as usize;
+        let (module, function, arity) = arinsal_beamasm::guard::BADARG_MFAS[slot - 1];
+        let args = process.x[..usize::from(arity)].to_vec();
+        let error = if process.header.freason == arinsal_beamasm::guard::EXC_BADMAP {
+            let value = crate::native_hooks::from_raw(process.header.fvalue);
+            let reason =
+                arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+                    .tuple(&[crate::signals::atom("badmap"), value])
+                    .map_err(|error| VmError::Unsupported(format!("badmap {error:?}")))?;
+            arinsal_bifs::BifError::Error(reason)
+        } else {
+            arinsal_bifs::BifError::BADARG
+        };
+        process.header.freason = 0;
+        return Err(exceptions::bif_error(
+            process, module, function, &args, error,
+        ));
+    } else if process.header.freason
+        & (arinsal_beamasm::catch::RAW_RAISE | arinsal_beamasm::catch::RERAISE)
+        != 0
+    {
+        // Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise) and the i_raise
+        // instruction, OTP-29.1.1: both re-raise the stacktrace in `c_p->ftrace`.
+        let raw_rethrow = process.header.freason & arinsal_beamasm::catch::RAW_RAISE != 0;
+        let class = match process.header.freason & 3 {
+            1 => arinsal_bifs::Class::Error,
+            2 => arinsal_bifs::Class::Exit,
+            _ => arinsal_bifs::Class::Throw,
+        };
+        process.header.freason = 0;
+        let trace = crate::native_hooks::from_raw(native_ftrace);
+        if raw_rethrow {
+            // raw_raise stores the new class in the stacktrace too, so a later i_raise of
+            // the same trace keeps it. The compiler only passes stacktraces here.
+            crate::stacktrace::set_raw_class(process, trace, class);
+        }
+        return Err(VmError::Trap(exceptions::Trap {
+            class,
+            reason: crate::native_hooks::from_raw(process.header.fvalue),
+            trace: Some(trace),
+            top: None,
+            raw_rethrow,
+            untrappable: false,
+        }));
+    } else if process.header.freason > 3 && process.header.freason & 0x3ff == 0x50 {
+        // Port of erts/emulator/beam/beam_common.c:742-775 (expand_error_value), OTP-29.1.1.
+        let index = process.header.freason >> 10;
+        process.header.freason = 0;
+        let value = crate::native_hooks::from_raw(process.header.fvalue);
+        let tag = match index {
+            5 => "badmatch",
+            7 => "case_clause",
+            8 => "if_clause",
+            16 => "try_clause",
+            20 => "badrecord",
+            _ => {
+                return Err(VmError::Unsupported(format!(
+                    "native exception index {index}"
+                )));
+            }
+        };
+        let tag = crate::signals::atom(tag);
+        let reason = if index == 8 {
+            tag
+        } else {
+            arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+                .tuple(&[tag, value])
+                .map_err(|error| VmError::Unsupported(format!("error value {error:?}")))?
+        };
+        return Err(VmError::Trap(exceptions::native_trap(
+            1,
+            crate::native_hooks::raw(reason),
+        )?));
     } else if process.header.freason != 0 {
         let class = process.header.freason;
         let reason = process.header.fvalue;
-        return Err(VmError::Trap(exceptions::native_trap(class, reason)?));
+        let mut trap = exceptions::native_trap(class, reason)?;
+        if let Some(info) = process
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.native_error_info.take())
+        {
+            let arity = native_function_at(registers.tmp_mem[6] as usize)
+                .map_or(0, |function| i64::from(function.arity));
+            trap.top = Some(crate::stacktrace::TopFrame::CurrentArgsWithInfo(
+                Term::small(arity),
+                info,
+            ));
+        }
+        return Err(VmError::Trap(trap));
     }
     let outcome = match exit {
         ExitReason::CallUnported { .. } => {
@@ -281,6 +707,8 @@ pub fn run_native(
                 ExitReason::Returned
             } else {
                 process.cold_mut().native_continuation_resume = true;
+                // The yield site stored its live X register count in `c_p->arity`.
+                process.cold_mut().native_resume_live = process.header.arity.saturating_add(1);
                 process.native_pc = Some(if resume == 0 {
                     code_ptr as usize
                 } else {

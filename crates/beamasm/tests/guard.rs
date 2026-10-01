@@ -754,7 +754,7 @@ fn native_is_ge() {
 fn native_bif_element() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_element(ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_element(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
         small(1),
         f.tuple,
         bits(f.alpha),
@@ -784,7 +784,7 @@ fn native_bif_tl() {
 fn native_bif_tuple_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_tuple_size(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_tuple_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
         f.tuple,
         small(0),
         bits(small(1)),
@@ -794,7 +794,7 @@ fn native_bif_tuple_size() {
 fn native_bif_map_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_map_size(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_map_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
         f.map,
         small(0),
         bits(small(1)),
@@ -804,7 +804,7 @@ fn native_bif_map_size() {
 fn native_bif_is_map_key() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_is_map_key(ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_is_map_key(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
         f.alpha,
         f.map,
         bits(Term::atom(atoms::TRUE)),
@@ -814,7 +814,7 @@ fn native_bif_is_map_key() {
 fn native_bif_map_get() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_map_get(ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_map_get(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
         f.alpha,
         f.map,
         bits(f.one),
@@ -824,7 +824,7 @@ fn native_bif_map_get() {
 fn native_bif_byte_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_byte_size(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_byte_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
         f.binary,
         small(0),
         bits(small(1)),
@@ -834,7 +834,7 @@ fn native_bif_byte_size() {
 fn native_bif_bit_size() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_bit_size(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_bit_size(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
         f.bitstring,
         small(0),
         bits(small(3)),
@@ -854,7 +854,7 @@ fn native_bif_self() {
 fn native_bif_node() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_node(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_node(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
         f.pid,
         small(0),
         bits(Term::atom(atoms::NONAME)),
@@ -864,7 +864,7 @@ fn native_bif_node() {
 fn native_bif_length() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_length(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_length(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
         f.list,
         small(0),
         bits(small(1)),
@@ -894,7 +894,7 @@ fn native_bif_max() {
 fn native_bif_abs() {
     let _f = terms();
     native_value(
-        |a| a.emit_bif_abs(ArgVal::X(0), ArgVal::X(0), guard_helper),
+        |a| a.emit_bif_abs(0, ArgVal::X(0), ArgVal::X(0), guard_helper),
         small(-9),
         small(0),
         bits(small(9)),

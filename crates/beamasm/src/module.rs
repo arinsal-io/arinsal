@@ -29,6 +29,8 @@ const TMP: Gpr = Gpr::x(9);
 pub enum ArgVal {
     /// Register backed X value, numbered X0 through X5.
     X(u8),
+    /// X value stored in the scheduler register array beyond the hardware cache.
+    XMemory(u32),
     /// Erlang stack Y value, numbered from the current stack pointer.
     Y(u32),
     /// An immediate machine word.
@@ -78,11 +80,37 @@ pub struct FinalizedModule {
     pub lambda_entries: HashMap<u32, *const u8>,
     /// Native catch handler addresses in this module's `make_catch` order.
     pub catch_table: Vec<*const u8>,
+    /// First globally unique catch index assigned to this module.
+    pub catch_base: u32,
+    /// Native code addresses associated with the nearest source line marker.
+    pub line_table: Vec<ModuleLine>,
     /// Patch sites for per-function tracing breakpoints: label to entry word and skip branch.
     pub trace_breakpoints: HashMap<u32, (usize, u32)>,
 }
 
+/// Source location attached to a native `line` instruction address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleLine {
+    /// Byte offset from the start of the finalized code mapping.
+    pub offset: usize,
+    /// Source filename.
+    pub file: String,
+    /// One-based source line.
+    pub line: u32,
+}
+
 impl FinalizedModule {
+    /// Callable entry of the function at `label`: the code after its `i_func_info` slot.
+    pub fn function_entry(&self, label: u32) -> Option<crate::NativeEntry<'_>> {
+        self.entry_offsets
+            .get(&label)
+            .copied()
+            .map(|offset| crate::NativeEntry {
+                memory: &self.memory,
+                offset: offset + FUNC_INFO_BYTES,
+            })
+    }
+
     /// Returns a native entry handle that keeps this module's executable mapping alive.
     pub fn entry(&self, label: u32) -> Option<crate::NativeEntry<'_>> {
         self.entry_offsets
@@ -98,20 +126,39 @@ impl FinalizedModule {
 /// Builds one module's native code and associates BEAM labels with code offsets.
 pub struct BeamModuleAssembler {
     pub(super) code: CodeBuffer,
+    /// Failure label of the arithmetic instruction being emitted (0: raise the error).
+    pub(super) arith_fail: u32,
     labels: HashMap<u32, Label>,
     defined: HashMap<u32, ()>,
     lambda_labels: HashMap<u32, Label>,
     lambda_specs: HashMap<u32, (u32, u8, u8)>,
     pub(super) defined_lambdas: HashMap<u32, ()>,
-    yield_label: Label,
+    pub(crate) yield_label: Label,
+    /// Arity of the function being emitted: the live X registers at its `i_test_yield`.
+    function_arity: u8,
     pub(super) error_label: Label,
     catch_patches: Vec<(usize, Label)>,
+    /// Shared out-of-line `function_clause` raiser, bound in `finalize` when any function uses it.
+    func_clause_stub: Option<Label>,
+    line_table: Vec<ModuleLine>,
     trace_breakpoints: HashMap<u32, (usize, Label)>,
     current_function_label: Option<u32>,
+    next_fresh_label: u32,
     dump_module: Option<String>,
     dump_functions: Vec<crate::dump::FunctionRecord>,
     dump_recording_function: bool,
 }
+
+/// Size of the `i_func_info` slot that precedes every function's call entry (erts places the
+/// `ErtsCodeInfo` before the entry the same way; beam_asm_module.cpp:499-540, OTP-29.1.1).
+pub const FUNC_INFO_BYTES: usize = 4;
+/// `tmp_mem[6]`: the native pc an exception is attributed to.
+const NATIVE_ERROR_PC_SLOT: u32 = 16_432;
+/// Low bit of a recorded native error pc that is a call's return address (code is 4-aligned).
+pub const RETURN_SITE_TAG: usize = 1;
+
+/// erts `EXC_FUNCTION_CLAUSE` (error.h: `(6 << EXC_OFFSET) | EXC_ERROR`), OTP-29.1.1.
+pub const EXC_FUNCTION_CLAUSE: u64 = (6 << 10) | 0x50;
 
 impl Default for BeamModuleAssembler {
     fn default() -> Self {
@@ -120,6 +167,16 @@ impl Default for BeamModuleAssembler {
 }
 
 impl BeamModuleAssembler {
+    /// Loads the current local node name through the VM runtime hook.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:701-705, OTP-29.1.1.
+    pub fn emit_node(&mut self, dst: ArgVal, helper: usize) -> Result<(), ModuleError> {
+        if helper == 0 {
+            return Err(ModuleError::InvalidOperand("node helper is missing"));
+        }
+        self.emit_runtime_fragment_with(helper, &[], 6, crate::Update::X_REGS)?;
+        self.store_register(dst, Gpr::x(0))
+    }
+
     /// Creates an empty module assembler.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:84-104, OTP-29.1.1
     pub fn new() -> Self {
@@ -134,10 +191,15 @@ impl BeamModuleAssembler {
             lambda_specs: HashMap::new(),
             defined_lambdas: HashMap::new(),
             yield_label,
+            function_arity: 0,
             error_label,
             catch_patches: Vec::new(),
+            func_clause_stub: None,
+            line_table: Vec::new(),
+            arith_fail: 0,
             trace_breakpoints: HashMap::new(),
             current_function_label: None,
+            next_fresh_label: 0x7000_0000,
             dump_module: None,
             dump_functions: Vec::new(),
             dump_recording_function: false,
@@ -154,6 +216,16 @@ impl BeamModuleAssembler {
     /// Reports whether this assembler is collecting optional dump metadata.
     pub fn dump_enabled(&self) -> bool {
         self.dump_module.is_some()
+    }
+
+    /// Records the native PC corresponding to a BEAM source line marker.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:612-620, OTP-29.1.1.
+    pub fn record_line(&mut self, file: String, line: u32) {
+        self.line_table.push(ModuleLine {
+            offset: self.code.offset(),
+            file,
+            line,
+        });
     }
 
     /// Starts collecting BEAM operation records for a function.
@@ -210,7 +282,7 @@ impl BeamModuleAssembler {
         if self.lambda_specs.contains_key(&index) {
             return Err(ModuleError::DuplicateLabel(index));
         }
-        if usize::from(total_arity) > 6 || num_free > total_arity {
+        if num_free > total_arity {
             return Err(ModuleError::InvalidOperand("invalid lambda table entry"));
         }
         let trampoline = if num_free == 0 {
@@ -254,6 +326,12 @@ impl BeamModuleAssembler {
         self.code.bind(label)?;
         self.current_function_label = Some(id);
         Ok(())
+    }
+
+    /// Returns a label id that no BEAM label uses, for code the compiler synthesizes.
+    pub fn fresh_label_id(&mut self) -> u32 {
+        self.next_fresh_label += 1;
+        self.next_fresh_label
     }
 
     /// Binds the aligned entry label without changing the owning function label.
@@ -307,12 +385,22 @@ impl BeamModuleAssembler {
         _label: u32,
         _module: u32,
         _function: u32,
-        _arity: u8,
+        arity: u8,
     ) -> Result<(), ModuleError> {
-        self.code.emit(|e| {
-            e.nop();
-            Ok(())
-        })?;
+        self.function_arity = arity;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:499-540 (emit_i_func_info) and
+        // 484-497 (emit_i_func_info_shared), OTP-29.1.1: a failing head match branches here and
+        // raises error:function_clause with the function's arguments as the top frame. Like erts'
+        // `bl`, the link register names the function: the entry right after this slot.
+        let stub = match self.func_clause_stub {
+            Some(stub) => stub,
+            None => {
+                let stub = self.code.new_label();
+                self.func_clause_stub = Some(stub);
+                stub
+            }
+        };
+        self.code.bl(stub)?;
         Ok(())
     }
 
@@ -320,6 +408,7 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:429-433, OTP-29.1.1
     pub fn emit_enter_frame(&mut self) -> Result<(), ModuleError> {
         self.code.emit(|e| e.str_pre(Gpr::x(30), E, -8))?;
+        crate::emit_validate_native_cursor(&mut self.code)?;
         Ok(())
     }
 
@@ -327,12 +416,14 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:429-433, OTP-29.1.1
     pub fn emit_leave_frame(&mut self) -> Result<(), ModuleError> {
         self.code.emit(|e| e.ldr_post(Gpr::x(30), E, 8))?;
+        crate::emit_validate_native_cursor(&mut self.code)?;
         Ok(())
     }
 
     /// Emits a direct local call with an Erlang continuation on the stack.
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:71-74, OTP-29.1.1
     pub fn call(&mut self, target: u32) -> Result<(), ModuleError> {
+        crate::emit_validate_native_cursor(&mut self.code)?;
         let target_label = self.label(target);
         self.code.bl(target_label)?;
         Ok(())
@@ -364,11 +455,40 @@ impl BeamModuleAssembler {
         self.call_last(target, deallocate)
     }
 
+    /// Records this pc as the call site that names the calling function if the callee is a
+    /// BIF that raises (erts keeps it in `c_p->i` for the BIF's stack frame).
+    pub(crate) fn record_call_site(&mut self) -> Result<(), ModuleError> {
+        let call_site = self.code.new_label();
+        self.code.bind(call_site)?;
+        self.code.adr(Gpr::x(9), call_site)?;
+        self.code
+            .emit(|e| e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT))?;
+        Ok(())
+    }
+
+    /// Records the return address `ret` of a non-tail call as its call site, tagged with
+    /// [`RETURN_SITE_TAG`]: erts attributes a raising BIF to the call's return address, which
+    /// also hides that same continuation from the stacktrace (beam_common.c:792-835,
+    /// OTP-29.1.1).
+    pub(crate) fn record_return_site(&mut self, ret: Label) -> Result<(), ModuleError> {
+        self.code.adr(Gpr::x(9), ret)?;
+        self.code.emit(|e| {
+            e.orr_imm(Gpr::x(9), Gpr::x(9), RETURN_SITE_TAG as u64)?;
+            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT)
+        })?;
+        Ok(())
+    }
+
     /// Dispatches through the VM-owned native address word for an export.
     ///
     /// Port of erts/emulator/beam/jit/arm/instr_call.cpp:150-200, OTP-29.1.1.
     pub fn dispatch_export(&mut self, entry: usize, tail: bool) -> Result<(), ModuleError> {
         let continuation = self.code.new_label();
+        if tail {
+            self.record_call_site()?;
+        } else {
+            self.record_return_site(continuation)?;
+        }
         if tail {
             self.emit_leave_frame()?;
         } else {
@@ -400,6 +520,7 @@ impl BeamModuleAssembler {
         &mut self,
         fragment: usize,
         identity: usize,
+        arity: u8,
     ) -> Result<(), ModuleError> {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1.
         let call = self.code.new_label();
@@ -407,8 +528,13 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Gt, call)?;
         self.code.adr(Gpr::x(8), call)?;
         self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
+        self.emit_yield_live(arity)?;
         self.code.b(self.yield_label)?;
         self.code.bind(call)?;
+        // A BIF that raises from the scheduler is attributed to this call site.
+        self.code.adr(Gpr::x(9), call)?;
+        self.code
+            .emit(|e| e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
         self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
@@ -416,9 +542,66 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    /// Calls `send/2` synchronously through its process-aware runtime helper.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624, OTP-29.1.1.
+    pub fn dispatch_send(&mut self, fragment: usize, identity: usize) -> Result<(), ModuleError> {
+        let call = self.code.new_label();
+        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
+        self.code.b_cond(Cond::Gt, call)?;
+        self.code.adr(Gpr::x(8), call)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
+        self.emit_yield_live(2)?;
+        self.code.b(self.yield_label)?;
+        self.code.bind(call)?;
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), C_P)?;
+            e.mov_reg(Gpr::x(1), Gpr::x(13))?;
+            e.mov_const(Gpr::x(17), fragment as u64)?;
+            e.blr(Gpr::x(17))
+        })?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
+        self.error_if_nonzero(Gpr::x(9))?;
+        self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
+        Ok(())
+    }
+
+    /// Reads a process-dictionary value through the process runtime.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:319-329, OTP-29.1.1.
+    pub fn emit_process_dictionary_get(
+        &mut self,
+        source: ArgVal,
+        destination: ArgVal,
+        helper: usize,
+    ) -> Result<(), ModuleError> {
+        let source = self.source_reg(source)?;
+        self.emit_runtime_fragment_with(
+            helper,
+            &[source],
+            6,
+            crate::Update::HEAP_ALLOC
+                .union(crate::Update::REDUCTIONS)
+                .union(crate::Update::X_REGS),
+        )?;
+        self.store_register(destination, Gpr::x(0))
+    }
+
     /// Exits native execution so the scheduler can interpret a fun or apply call.
     pub fn call_fun_or_apply(&mut self, target_pc: usize) -> Result<(), ModuleError> {
         self.call_unported(target_pc)
+    }
+
+    /// Records the live X registers of a yielding continuation in `c_p->arity`, which the
+    /// scheduler keeps across the context switch.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115 (i_test_yield) and
+    // beam_asm_global.cpp (dispatch_bif, context_switch), OTP-29.1.1.
+    pub(crate) fn emit_yield_live(&mut self, live: u8) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(9), u64::from(live))?;
+            e.strb_uoff(Gpr::x(9), C_P, 80)
+        })?;
+        Ok(())
     }
 
     /// Checks reductions and saves the native continuation before yielding.
@@ -428,6 +611,7 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Gt, continuation)?;
         self.code.adr(Gpr::x(8), continuation)?;
         self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
+        self.emit_yield_live(self.function_arity)?;
         self.code.b(self.yield_label)?;
         self.code.bind(continuation)?;
         Ok(())
@@ -478,6 +662,7 @@ impl BeamModuleAssembler {
     /// Emits a local tail call without pushing another continuation.
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:118-123, OTP-29.1.1
     pub fn call_only(&mut self, target: u32) -> Result<(), ModuleError> {
+        crate::emit_validate_native_cursor(&mut self.code)?;
         self.emit_leave_frame()?;
         let target = self.label(target);
         self.code.b(target)?;
@@ -528,11 +713,13 @@ impl BeamModuleAssembler {
     /// Emits the standard BEAM return and reduction accounting fragment.
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:45-68, OTP-29.1.1
     pub fn return_(&mut self) -> Result<(), ModuleError> {
+        crate::emit_validate_native_cursor(&mut self.code)?;
         self.emit_leave_frame()?;
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
         let returned = self.code.new_label();
         self.code.b_cond(Cond::Pl, returned)?;
         self.code.emit(|e| e.str_uoff(Gpr::x(30), C_P, 72))?;
+        self.emit_yield_live(1)?;
         self.code.b(self.yield_label)?;
         self.code.bind(returned)?;
         self.code.emit(|e| e.ret(Gpr::x(30)))?;
@@ -619,12 +806,9 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Removes words from the top of a frame, preserving the remaining Y slots.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:511-513, OTP-29.1.1
-    pub fn trim(&mut self, words: u32, remaining: u32) -> Result<(), ModuleError> {
-        for i in 0..remaining {
-            self.move_(ArgVal::Y(i + words), ArgVal::Y(i))?;
-        }
+    /// Removes words from the top of a frame by advancing the stack cursor.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1061-1073, OTP-29.1.1.
+    pub fn trim(&mut self, words: u32, _remaining: u32) -> Result<(), ModuleError> {
         self.deallocate(words)
     }
 
@@ -680,27 +864,47 @@ impl BeamModuleAssembler {
     }
 
     pub(super) fn source_reg(&mut self, src: ArgVal) -> Result<Gpr, ModuleError> {
+        self.source_reg_into(src, TMP)
+    }
+
+    /// Like [`Self::source_reg`], but materializes memory and immediate operands in `scratch`
+    /// so that two operands can be live at once.
+    pub(super) fn source_reg_into(
+        &mut self,
+        src: ArgVal,
+        scratch: Gpr,
+    ) -> Result<Gpr, ModuleError> {
         match src {
             ArgVal::X(i) if i < 6 => Ok(XREGS[i as usize]),
+            // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-259
+            // (getXRef), OTP-29.1.1.
+            ArgVal::XMemory(i) if i < 1024 => {
+                let offset = i
+                    .checked_mul(8)
+                    .ok_or(ModuleError::InvalidOperand("X register offset overflow"))?;
+                self.code
+                    .emit(|e| e.ldr_uoff(scratch, SCHEDULER_REGS, offset))?;
+                Ok(scratch)
+            }
             ArgVal::Y(i) => {
                 let offset = i
                     .checked_mul(8)
                     .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.ldr_uoff(TMP, E, offset))?;
-                Ok(TMP)
+                self.code.emit(|e| e.ldr_uoff(scratch, E, offset))?;
+                Ok(scratch)
             }
             ArgVal::Immediate(v) | ArgVal::Literal(v) => {
-                self.code.emit(|e| e.mov_const(TMP, v))?;
-                Ok(TMP)
+                self.code.emit(|e| e.mov_const(scratch, v))?;
+                Ok(scratch)
             }
             ArgVal::Export(v) => {
-                self.code.emit(|e| e.mov_const(TMP, u64::from(v)))?;
-                Ok(TMP)
+                self.code.emit(|e| e.mov_const(scratch, u64::from(v)))?;
+                Ok(scratch)
             }
             ArgVal::Label(id) => {
                 let label = self.label(id);
-                self.code.adr(TMP, label)?;
-                Ok(TMP)
+                self.code.adr(scratch, label)?;
+                Ok(scratch)
             }
             _ => Err(ModuleError::InvalidOperand("invalid move source")),
         }
@@ -708,12 +912,57 @@ impl BeamModuleAssembler {
 
     /// Calls a C runtime hook with the process pointer in x0 and published BeamAsm state.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1
-    pub(super) fn emit_runtime_hook(
-        &mut self,
-        helper: usize,
-        args: &[Gpr],
-    ) -> Result<(), ModuleError> {
-        self.emit_runtime_fragment(helper, args)
+    /// Leaves the current instruction through `fail`, or raises `error:badarg` when there is
+    /// no failure label.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp (emit_raise_badarg / fail label), OTP-29.1.1.
+    pub(super) fn emit_guard_fail(&mut self, fail: u32) -> Result<(), ModuleError> {
+        if fail != 0 {
+            let label = self.label(fail);
+            self.code.b(label)?;
+            return Ok(());
+        }
+        let badarg = arinsal_term::Term::atom(
+            arinsal_term::global_atoms()
+                .intern("badarg")
+                .map_err(|_| ModuleError::InvalidOperand("badarg atom"))?,
+        )
+        .tagged_word();
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(9), 1)?;
+            e.str_uoff(Gpr::x(9), C_P, 40)?;
+            e.mov_const(Gpr::x(9), badarg)?;
+            e.str_uoff(Gpr::x(9), C_P, 48)
+        })?;
+        self.branch_error()
+    }
+
+    /// Selects the failure label that arithmetic emitted next branches to instead of raising
+    /// (guard context); 0 restores raising.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp (`Fail.get() != 0` guard variants),
+    // OTP-29.1.1.
+    pub fn set_arith_fail(&mut self, fail: u32) {
+        self.arith_fail = fail;
+    }
+
+    /// Branches to the shared error exit when `reg` is nonzero, recording this pc for the
+    /// stacktrace.
+    pub(super) fn error_if_nonzero(&mut self, reg: Gpr) -> Result<(), ModuleError> {
+        let ok = self.code.new_label();
+        self.code.cbz(reg, ok)?;
+        self.branch_error()?;
+        self.code.bind(ok)?;
+        Ok(())
+    }
+
+    /// Branches to the shared error exit, recording the address of this instruction in LR so
+    /// the raised exception can name its source line.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_raise_exception ARG2 = pc), OTP-29.1.1.
+    pub(super) fn branch_error(&mut self) -> Result<(), ModuleError> {
+        let here = self.code.new_label();
+        self.code.bind(here)?;
+        self.code.adr(Gpr::x(30), here)?;
+        self.code.b(self.error_label)?;
+        Ok(())
     }
 
     pub(super) fn emit_runtime_hook_with(
@@ -753,7 +1002,6 @@ impl BeamModuleAssembler {
                 "runtime hook has too many arguments",
             ));
         }
-        let error_label = self.error_label;
         crate::emit_enter_runtime(&mut self.code, live, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
@@ -769,7 +1017,35 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), C_P, 72)?;
             e.ldr_uoff(Gpr::x(9), C_P, 40)
         })?;
-        self.code.cbnz(Gpr::x(9), error_label)?;
+        self.error_if_nonzero(Gpr::x(9))?;
+        Ok(())
+    }
+
+    /// Calls a loader-patched static NIF body through the process runtime.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900, OTP-29.1.1.
+    pub fn emit_native_body(
+        &mut self,
+        identity: usize,
+        helper: usize,
+        arity: usize,
+    ) -> Result<(), ModuleError> {
+        if arity > 6 {
+            return Err(ModuleError::InvalidOperand(
+                "native body arity exceeds X register ABI",
+            ));
+        }
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
+        self.emit_runtime_fragment_with(
+            helper,
+            &[Gpr::x(13)],
+            6,
+            crate::Update::HEAP_ALLOC
+                .union(crate::Update::REDUCTIONS)
+                .union(crate::Update::X_REGS),
+        )?;
+        self.emit_leave_frame()?;
+        self.code.emit(|e| e.ret(Gpr::x(30)))?;
         Ok(())
     }
 
@@ -812,7 +1088,7 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    fn store_register(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
+    pub(super) fn store_register(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
         match dst {
             ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(XREGS[i as usize], src))?,
             ArgVal::Y(i) => {
@@ -849,6 +1125,33 @@ impl BeamModuleAssembler {
     /// Finalizes veneers and copies the module into executable memory.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:556-610, 796-814, OTP-29.1.1
     pub fn finalize(mut self) -> Result<FinalizedModule, ModuleError> {
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:484-497 (emit_i_func_info_shared),
+        // OTP-29.1.1: freason = EXC_FUNCTION_CLAUSE, then the shared exception exit. The runtime
+        // takes the argument list from the published X registers and the function from the pc.
+        let function_clause = arinsal_term::Term::atom(
+            arinsal_term::global_atoms()
+                .intern("function_clause")
+                .map_err(|_| ModuleError::InvalidOperand("function_clause atom"))?,
+        )
+        .tagged_word();
+        if let Some(stub) = self.func_clause_stub.take() {
+            self.code.bind(stub)?;
+            crate::emit_enter_runtime(
+                &mut self.code,
+                6,
+                crate::Update::HEAP_ALLOC
+                    .union(crate::Update::REDUCTIONS)
+                    .union(crate::Update::X_REGS),
+            )?;
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(8), EXC_FUNCTION_CLAUSE)?;
+                e.str_uoff(Gpr::x(8), Gpr::x(21), 40)?;
+                e.mov_const(Gpr::x(8), function_clause)?;
+                e.str_uoff(Gpr::x(8), Gpr::x(21), 48)
+            })?;
+            // x30 still holds the function entry from the `bl` in `emit_i_func_info`.
+            self.code.b(self.error_label)?;
+        }
         let entry_label = self.yield_label;
         self.code.bind(entry_label)?;
         crate::emit_enter_runtime(
@@ -864,6 +1167,7 @@ impl BeamModuleAssembler {
         })?;
         self.code.bind(self.error_label)?;
         self.code.emit(|e| {
+            e.str_uoff(Gpr::x(30), SCHEDULER_REGS, 16_432)?;
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
             e.ldr_uoff(Gpr::x(30), SCHEDULER_REGS, 16_416)?;
             e.br(Gpr::x(30))
@@ -881,6 +1185,7 @@ impl BeamModuleAssembler {
                 Some((function, (offset, branch)))
             })
             .collect::<HashMap<_, _>>();
+        let catch_base = crate::catch::reserve_catch_indices(self.catch_patches.len())?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:952-974 (patchCatches), OTP-29.1.1
         let catch_table = self
             .catch_patches
@@ -888,7 +1193,8 @@ impl BeamModuleAssembler {
             .enumerate()
             .map(|(index, (offset, handler))| {
                 let handler_offset = *labels.get(handler).expect("catch handler label is bound");
-                let immediate = crate::catch::make_catch(index as u32);
+                let catch_index = catch_base + index as u32;
+                let immediate = crate::catch::make_catch(catch_index);
                 let word = offset / 4;
                 words[word] = 0x5280_0009 | (((immediate & 0xffff) as u32) << 5);
                 words[word + 1] = 0x72a0_0009 | ((((immediate >> 16) & 0xffff) as u32) << 5);
@@ -933,6 +1239,15 @@ impl BeamModuleAssembler {
             entry_offsets,
             lambda_entries,
             catch_table,
+            catch_base,
+            line_table: self
+                .line_table
+                .into_iter()
+                .map(|mut entry| {
+                    entry.offset += offset;
+                    entry
+                })
+                .collect(),
             trace_breakpoints,
         })
     }

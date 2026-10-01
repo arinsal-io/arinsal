@@ -9,6 +9,10 @@ use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 /// BIF target supplied by the runtime.
 pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32) -> u64;
 
+/// Runtime hook calling the BIF named by an export identity. Arguments: process, identity, then
+/// up to three argument terms. Zero means an exception is pending in `freason`.
+pub type BifIdentityHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u64) -> u64;
+
 /// Apply resolver supplied by the runtime; zero means the target could not be resolved.
 pub type ApplyResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32) -> usize;
 
@@ -19,6 +23,11 @@ pub struct ExportEntry {
     /// Native entry addresses indexed by the active code generation.
     pub addresses: [AtomicUsize; 2],
 }
+
+// erts calls `i_bif*` with only `Update::eReductions` (instr_bif.cpp:47-64) because its guard
+// BIFs never allocate on the process heap. This port's BIFs may build terms on the heap, so the
+// call also publishes and reloads HTOP and E.
+const PLAIN_BIF_UPDATE: Update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
 
 impl ExportEntry {
     /// Creates an export entry for a native function.
@@ -99,7 +108,7 @@ impl BeamModuleAssembler {
         bif: BifTarget,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        self.emit_bif_call(bif, &[src1], dst, 1, fail, 6, Update::REDUCTIONS)
+        self.emit_bif_call(bif, &[src1], dst, 1, fail, 6, PLAIN_BIF_UPDATE)
     }
 
     /// Emits `i_bif2` and branches to a supplied BEAM label on a false result.
@@ -112,7 +121,7 @@ impl BeamModuleAssembler {
         bif: BifTarget,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        self.emit_bif_call(bif, &[src1, src2], dst, 2, fail, 6, Update::REDUCTIONS)
+        self.emit_bif_call(bif, &[src1, src2], dst, 2, fail, 6, PLAIN_BIF_UPDATE)
     }
 
     /// Emits `i_bif3` and branches to a supplied BEAM label on a false result.
@@ -126,15 +135,7 @@ impl BeamModuleAssembler {
         bif: BifTarget,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        self.emit_bif_call(
-            bif,
-            &[src1, src2, src3],
-            dst,
-            3,
-            fail,
-            6,
-            Update::REDUCTIONS,
-        )
+        self.emit_bif_call(bif, &[src1, src2, src3], dst, 3, fail, 6, PLAIN_BIF_UPDATE)
     }
 
     /// Emits `i_gc_bif1`, passing the live X-register count to the runtime.
@@ -296,6 +297,62 @@ impl BeamModuleAssembler {
         self.emit_apply(resolver, live, true, true)
     }
 
+    /// Calls a BIF through its export identity (`i_bif1/2/3`, `nofail_bif1/2`).
+    ///
+    /// With a nonzero `fail` label an exception raised by the BIF is discarded and control
+    /// branches to the label instead, like `bif1 Fail Bif ...` in a guard.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-200, OTP-29.1.1
+    pub fn emit_bif_by_identity(
+        &mut self,
+        identity: usize,
+        args: &[ArgVal],
+        fail: u32,
+        dst: ArgVal,
+        helper: BifIdentityHelper,
+    ) -> Result<(), ModuleError> {
+        if args.len() > 3 {
+            return Err(ModuleError::InvalidOperand("BIF arity exceeds three"));
+        }
+        let mut regs = [Gpr::xzr(); 3];
+        for (i, arg) in args.iter().copied().enumerate() {
+            let source = self.source_reg(arg)?;
+            regs[i] = Gpr::x(10 + i as u8);
+            self.code.emit(|e| e.mov_reg(regs[i], source))?;
+        }
+        let update = Update::HEAP_ALLOC
+            .union(Update::REDUCTIONS)
+            .union(Update::X_REGS);
+        emit_enter_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            e.mov_const(Gpr::x(1), identity as u64)?;
+            for (index, reg) in regs.iter().copied().enumerate() {
+                if index < args.len() {
+                    e.mov_reg(Gpr::x(index as u8 + 2), reg)?;
+                }
+            }
+            e.mov_const(Gpr::x(17), helper as usize as u64)?;
+            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.blr(Gpr::x(17))
+        })?;
+        emit_leave_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
+        })?;
+        let ok = self.code.new_label();
+        self.code.cbz(Gpr::x(9), ok)?;
+        if fail != 0 {
+            let label = self.label(fail);
+            self.code.emit(|e| e.str_uoff(Gpr::xzr(), Gpr::x(21), 40))?;
+            self.code.b(label)?;
+        } else {
+            self.branch_error()?;
+        }
+        self.code.bind(ok)?;
+        self.store_bif_result(dst, Gpr::x(0))
+    }
+
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151, OTP-29.1.1
     #[allow(clippy::too_many_arguments)]
     fn emit_bif_call(
@@ -379,7 +436,7 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
             e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
         })?;
-        self.code.cbnz(Gpr::x(9), self.error_label)?;
+        self.error_if_nonzero(Gpr::x(9))?;
         Ok(())
     }
 
@@ -418,6 +475,12 @@ impl BeamModuleAssembler {
                 "apply live count exceeds X registers",
             ));
         }
+        let continuation = self.code.new_label();
+        if tail {
+            self.record_call_site()?;
+        } else {
+            self.record_return_site(continuation)?;
+        }
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(10), XREGS[0])?;
             e.mov_reg(Gpr::x(11), XREGS[1])?;
@@ -434,7 +497,7 @@ impl BeamModuleAssembler {
         )?;
         let resolved = self.code.new_label();
         self.code.cbnz(Gpr::x(0), resolved)?;
-        self.code.b(self.error_label)?;
+        self.branch_error()?;
         self.code.bind(resolved)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(14), Gpr::x(0))?;
@@ -445,6 +508,9 @@ impl BeamModuleAssembler {
                 e.blr(Gpr::x(14))
             }
         })?;
+        if !tail {
+            self.code.bind(continuation)?;
+        }
         Ok(())
     }
 }

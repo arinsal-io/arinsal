@@ -1164,11 +1164,7 @@ fn reserve_trace_stack(process: &mut Process, words: usize) -> Result<bool, VmEr
 }
 
 fn trace_continuation(module_id: usize, target: usize) -> Result<Term, VmError> {
-    let module = u32::try_from(module_id)
-        .map_err(|_| VmError::Unsupported("trace continuation module".into()))?;
-    let target = u32::try_from(target)
-        .map_err(|_| VmError::Unsupported("trace continuation target".into()))?;
-    Ok(Term::catch(((module as u64) << 32) | u64::from(target)))
+    crate::stacktrace::continuation_tag(module_id, target)
 }
 
 #[allow(clippy::too_many_arguments)] // Breakpoint metadata stays explicit at the interpreter boundary.
@@ -1190,6 +1186,18 @@ fn trace_breakpoint_call(
     let args = process.x[..usize::from(arity)].to_vec();
     let module_name = vm.modules[module_id].name.clone();
     let actions = crate::trace::call_event(vm, process, ctx, &module_name, function, &args, local)?;
+    let trace_words = actions
+        .iter()
+        .map(|action| {
+            usize::from(action.return_to) * 2
+                + usize::from(action.return_trace || action.exception_trace) * 5
+        })
+        .sum();
+    if trace_words != 0 {
+        // Port of erts/emulator/beam/erl_trace.c:1159-1260, OTP-29.1.1.
+        // Traced calls need the same stack growth opportunity as ordinary BEAM calls.
+        process.ensure(trace_words, usize::from(arity))?;
+    }
     push_trace_frames(
         process,
         module_id,
@@ -1476,10 +1484,18 @@ impl Vm {
                     cp = p.heap.stack_get(0).map_or(0, Term::tagged_word);
                 }
                 if crate::native_bridge::is_native_function_at(cp as usize) {
+                    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some() {
+                        eprintln!(
+                            "[interp-native-return] CP={cp:#x} x0={:#x} E={:#x}",
+                            p.x[0].tagged_word(),
+                            p.heap.frame_pointer()
+                        );
+                    }
                     sync_cursor(p, htop, &mut heap_dirty);
                     p.reductions = reds;
                     p.heap.release_stack(1);
                     p.cold_mut().native_continuation_resume = true;
+                    p.cold_mut().native_resume_live = 2;
                     p.native_pc = Some(cp as usize);
                     return Ok(RunState::Yield);
                 }
@@ -1493,9 +1509,14 @@ impl Vm {
                     p.reductions = reds;
                     return Ok(RunState::Done(p.x[0]));
                 }
-                let payload = cp >> 6;
-                let target = payload as u32 as usize;
-                module_id = (payload >> 32) as usize;
+                let Some((false, return_module, target)) =
+                    p.heap.stack_get(0).and_then(crate::stacktrace::decode_tag)
+                else {
+                    sync_cursor(p, htop, &mut heap_dirty);
+                    p.reductions = reds;
+                    return Ok(RunState::Done(p.x[0]));
+                };
+                module_id = return_module;
                 // The caller module may have been published after this slice
                 // started, on another scheduler. `base` is replaced immediately.
                 self.sync_module(module_id);
@@ -1921,7 +1942,7 @@ impl Vm {
                     depth += 1;
                     // SAFETY: Reserving one stack word extends the live interval downward.
                     stop = unsafe { stop.sub(1) };
-                    let cp = Term::catch(((module_id as u64) << 32) | ((offset + 2) as u64));
+                    let cp = crate::stacktrace::continuation_tag(module_id, offset + 2)?;
                     // SAFETY: The new stack slot is reserved and contains an immediate.
                     unsafe { *stop = cp.raw_bits() };
                     reds -= 1;
@@ -2012,7 +2033,7 @@ impl Vm {
                     }
                     if !p.heap.stack_set(
                         0,
-                        Term::catch((module_index << 32) | (offset as u64 + 1)),
+                        crate::stacktrace::continuation_tag(module_index as usize, offset + 1)?,
                     ) {
                         return Err(debug_line_system_limit());
                     }
@@ -2363,7 +2384,7 @@ impl Vm {
                     depth += 1;
                     // SAFETY: Reserving one stack word extends the live interval downward.
                     stop = unsafe { stop.sub(1) };
-                    let cp = Term::catch(((module_id as u64) << 32) | ((offset + 1) as u64));
+                    let cp = crate::stacktrace::continuation_tag(module_id, offset + 1)?;
                     // SAFETY: The new stack slot is reserved; CATCH is an immediate
                     // that the collector correctly skips.
                     unsafe { *stop = cp.raw_bits() };
@@ -3150,10 +3171,10 @@ impl Vm {
                     // SAFETY: The current instruction is within this module.
                     p.ip = unsafe { ip.offset_from(base) } as usize;
                     p.module = module_id;
-                    let ctx = ctx
-                        .as_deref_mut()
-                        .ok_or_else(|| VmError::Unsupported("send requires a scheduler".into()))?;
-                    let value = p.send_message_with_vm(self, ctx, p.x[0], p.x[1])?;
+                    let value = match ctx.as_deref_mut() {
+                        Some(ctx) => p.send_message_in(self, ctx, p.x[0], p.x[1])?,
+                        None => p.send_message_with_vm(self, p.x[0], p.x[1])?,
+                    };
                     p.x[0] = value;
                 }
                 Instr::LoopRec { empty, dst } => {

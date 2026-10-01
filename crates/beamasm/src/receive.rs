@@ -76,7 +76,7 @@ impl BeamModuleAssembler {
             hooks.recv_marker_reserve as usize,
             &[],
             6,
-            crate::Update::HEAP,
+            crate::Update::HEAP_ALLOC,
         )?;
         match dst {
             ArgVal::X(index) if index < 6 => {
@@ -109,7 +109,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let marker = self.source_reg(marker)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(12), marker))?;
-        let reference = self.source_reg(reference)?;
+        let reference = self.source_reg_into(reference, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(10), reference))?;
         self.emit_runtime_hook_with(
             hooks.recv_marker_bind as usize,
@@ -181,11 +181,11 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
         let dest = self.label(dest);
         self.code.b_cond(Cond::Pl, dest)?;
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(0), 1)?;
-            e.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
-            e.ret(Gpr::x(30))
-        })?;
+        // Out of reductions: yield and resume at the next receive iteration.
+        self.code.adr(Gpr::x(8), dest)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
+        self.emit_yield_live(0)?;
+        self.code.b(self.yield_label)?;
         Ok(())
     }
 
@@ -205,27 +205,17 @@ impl BeamModuleAssembler {
         self.emit_wait(hooks.wait_locked, dest)
     }
 
+    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:271-295, OTP-29.1.1.
+    // The hook records the wait for the scheduler; the process then leaves native code as
+    // a yield that resumes at `dest` (the `loop_rec` label of the receive).
     fn emit_wait(&mut self, hook: WaitHook, dest: u32) -> Result<(), ModuleError> {
         let dest = self.label(dest);
         self.code.adr(Gpr::x(9), dest)?;
-        // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:271-295, OTP-29.1.1.
-        let update = crate::Update::NONE;
-        crate::emit_enter_runtime(&mut self.code, 0, update)?;
-        self.code.emit(|e| {
-            // The wait helper updates c_p->i, so preserve LR in scheduler scratch.
-            e.str_uoff(Gpr::x(30), Gpr::x(19), 16_384)?;
-            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            e.mov_reg(Gpr::x(1), Gpr::x(9))?;
-            e.mov_const(Gpr::x(17), hook as usize as u64)?;
-            e.blr(Gpr::x(17))
-        })?;
-        crate::emit_leave_runtime(&mut self.code, 0, update)?;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_384)?;
-            e.mov_const(Gpr::x(0), 1)?;
-            e.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
-            e.ret(Gpr::x(30))
-        })?;
+        self.emit_runtime_hook_with(hook as usize, &[Gpr::x(9)], 0, crate::Update::NONE)?;
+        self.code.adr(Gpr::x(8), dest)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
+        self.emit_yield_live(0)?;
+        self.code.b(self.yield_label)?;
         Ok(())
     }
 
@@ -269,7 +259,7 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Eq, wait)?;
         self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
         self.code.b_cond(Cond::Eq, next)?;
-        self.code.b(self.error_label)?;
+        self.branch_error()?;
         self.code.bind(wait)?;
         self.emit_wait_locked(dest, hooks)?;
         self.code.bind(next)?;

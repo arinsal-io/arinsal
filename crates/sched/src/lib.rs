@@ -821,10 +821,19 @@ impl<T: Task> Inner<T> {
     // Port of erts/emulator/beam/erl_process.c:5476-5510 (change_no_used_runqs), OTP-29.1.1.
     fn evacuate_offline_local(&self, local: &mut Local<T>) {
         let online = self.online_schedulers.load(Ordering::Acquire).max(1);
+        // Port of erts/emulator/beam/erl_process.c (erts_block_multi_scheduling), OTP-29.1.1:
+        // while multi-scheduling is blocked, all work moves to the blocking scheduler.
+        let blocker = self
+            .scheduling_blocked
+            .load(Ordering::Acquire)
+            .then(|| self.scheduling_blocker.load(Ordering::Acquire))
+            .filter(|blocker| *blocker < online);
+        let target_of =
+            || blocker.unwrap_or_else(|| self.next_queue.fetch_add(1, Ordering::Relaxed) % online);
         let mut moved = false;
         for priority in 0..local.queues.len() {
             while let Some(item) = local.queues[priority].pop() {
-                let target = self.next_queue.fetch_add(1, Ordering::Relaxed) % online;
+                let target = target_of();
                 local.migrate_queued(&item.process, target);
                 self.injectors[priority].push(item);
                 moved = true;
@@ -832,7 +841,7 @@ impl<T: Task> Inner<T> {
         }
         if let Some(item) = local.runnext.take() {
             let priority = item.process.priority.index();
-            let target = self.next_queue.fetch_add(1, Ordering::Relaxed) % online;
+            let target = target_of();
             local.migrate_queued(&item.process, target);
             self.injectors[priority].push(item);
             moved = true;
@@ -1295,6 +1304,15 @@ impl<T: Task> Inner<T> {
                 };
                 let _ = self.deliver(pid, pid, payload, local, 0);
             }
+            TimerPayload::Callback(pid, callback) => {
+                let mut ctx = CallbackCtx {
+                    inner: self,
+                    pid,
+                    worker,
+                    local,
+                };
+                callback(&mut ctx);
+            }
             TimerPayload::Wake(pid, epoch) => {
                 if let Some(process) = self.table.lookup(pid)
                     && process.wait_epoch.load(Ordering::Acquire) == epoch
@@ -1606,6 +1624,18 @@ impl<T: Task> Local<T> {
             self.normal_runs = 0;
         }
     }
+    /// Highest priority (lowest index) with runnable local work.
+    fn best_priority(&self) -> Option<usize> {
+        let queued = (0..self.queues.len()).find(|&priority| !self.queues[priority].is_empty());
+        let next = self
+            .runnext
+            .as_ref()
+            .map(|item| item.process.priority.index());
+        match (queued, next) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
     fn push_next(&mut self, item: Scheduled<T>) {
         if let Some(displaced) = self.runnext.replace(item) {
             self.queues[displaced.process.priority.index()].push(displaced);
@@ -1630,6 +1660,46 @@ impl<T: Task> Local<T> {
 }
 
 /// Context passed to one invocation of `Task::run`.
+/// A runtime timer callback; it runs on a scheduler thread when the timer expires.
+pub type TimerCallback<M> = Box<dyn FnOnce(&mut dyn TimerCallbackCtx<M>) + Send>;
+
+/// What a [`TimerCallback`] may do for the process that started it.
+pub trait TimerCallbackCtx<M> {
+    /// Start another callback timer for the same process.
+    fn start_timer_callback(&mut self, ms: u64, callback: TimerCallback<M>);
+    /// Queue a plain message to the process.
+    fn send(&mut self, msg: M);
+}
+
+struct CallbackCtx<'a, T: Task> {
+    inner: &'a Inner<T>,
+    pid: Pid,
+    worker: usize,
+    local: Option<&'a mut Local<T>>,
+}
+
+impl<T: Task> TimerCallbackCtx<T::Message> for CallbackCtx<'_, T> {
+    fn start_timer_callback(&mut self, ms: u64, callback: TimerCallback<T::Message>) {
+        let _ = self.inner.start_timer(
+            self.pid,
+            ms,
+            TimerPayload::Callback(self.pid, callback),
+            self.local.as_deref_mut(),
+            Some(self.worker),
+            true,
+        );
+    }
+    fn send(&mut self, msg: T::Message) {
+        let _ = self.inner.deliver(
+            self.pid,
+            self.pid,
+            Payload::Message(msg),
+            self.local.as_deref_mut(),
+            0,
+        );
+    }
+}
+
 pub struct RunCtx<'a, M: Send + 'static> {
     inner: &'a mut dyn ContextOps<M>,
     pid: Pid,
@@ -1664,6 +1734,12 @@ trait ContextOps<M> {
     fn reclassify_gc_ns(&mut self, nanoseconds: u64);
     fn set_wall_accounting_enabled(&mut self, enabled: bool);
     fn start_timer(&mut self, pid: Pid, ms: u64, msg: M, wrapped: bool) -> Result<TimerRef, Error>;
+    fn start_timer_callback(
+        &mut self,
+        pid: Pid,
+        ms: u64,
+        callback: TimerCallback<M>,
+    ) -> Result<TimerRef, Error>;
     fn mark_exited(&mut self, pid: Pid);
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool;
@@ -1887,6 +1963,16 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     pub fn send_after(&mut self, ms: u64, msg: M) -> Result<TimerRef, Error> {
         self.inner.flush(self.remaining);
         self.inner.start_timer(self.pid, ms, msg, false)
+    }
+    /// Start a runtime timer callback owned by this process.
+    /// Port of erts/emulator/beam/erl_hl_timer.c (erts_start_timer_callback), OTP-29.1.1.
+    pub fn start_timer_callback(
+        &mut self,
+        ms: u64,
+        callback: TimerCallback<M>,
+    ) -> Result<TimerRef, Error> {
+        self.inner.flush(self.remaining);
+        self.inner.start_timer_callback(self.pid, ms, callback)
     }
     /// Port of erts/emulator/beam/erl_bif_info.c:5079-5091, OTP-29.1.1.
     /// Pause other running tasks until the callback returns.
@@ -2347,6 +2433,21 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             pid,
             ms,
             TimerPayload::Message(pid, msg, wrapped),
+            self.local.as_deref_mut(),
+            None,
+            true,
+        )
+    }
+    fn start_timer_callback(
+        &mut self,
+        pid: Pid,
+        ms: u64,
+        callback: TimerCallback<T::Message>,
+    ) -> Result<TimerRef, Error> {
+        self.inner.start_timer(
+            pid,
+            ms,
+            TimerPayload::Callback(pid, callback),
             self.local.as_deref_mut(),
             None,
             true,
@@ -3440,17 +3541,16 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
             || (inner.scheduling_blocked.load(Ordering::Acquire)
                 && id != inner.scheduling_blocker.load(Ordering::Acquire))
         {
-            if id >= inner.online_schedulers.load(Ordering::Acquire) {
-                inner.poll_timers(id, Some(&mut local), true);
-                inner.poll_pending_waits(&mut local);
-                inner.evacuate_offline_local(&mut local);
-            }
+            // An offline or blocked scheduler hands its queued work and due timers to the
+            // schedulers still running.
+            inner.poll_timers(id, Some(&mut local), true);
+            inner.poll_pending_waits(&mut local);
+            inner.evacuate_offline_local(&mut local);
             local.set_wall_enabled(false);
             local.set_msacc_state(MsaccState::Sleep);
             inner.parked[id].store(true, Ordering::SeqCst);
-            let has_local_timers = id >= inner.online_schedulers.load(Ordering::Acquire)
-                && (!local.pending_waits.is_empty()
-                    || local.timer_service.borrow().wheel.has_timers());
+            let has_local_timers =
+                !local.pending_waits.is_empty() || local.timer_service.borrow().wheel.has_timers();
             if has_local_timers {
                 thread::park_timeout(Duration::from_millis(10));
             } else {
@@ -3466,6 +3566,22 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         local.set_msacc_state(MsaccState::Other);
         inner.flush_local_metrics(&mut local);
         let mut item = inner.pinned_injectors[id].pop();
+        // Port of erts/emulator/beam/erl_process.c (run queue priorities), OTP-29.1.1: work queued
+        // from elsewhere joins this worker's queue before local work of a lower or equal
+        // priority runs again, so a worker busy with yielding processes cannot starve it.
+        if item.is_none()
+            && let Some(best) = local.best_priority()
+        {
+            for priority in 0..=best {
+                if let Steal::Success(found) =
+                    inner.injectors[priority].steal_batch_and_pop(&local.queues[priority])
+                {
+                    local.picked(priority);
+                    item = Some(found);
+                    break;
+                }
+            }
+        }
         if item.is_none() {
             item = local.pop(inner.config.runnext_limit);
         }

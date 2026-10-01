@@ -30,10 +30,13 @@ const SCRATCH: [Gpr; 6] = [
 ];
 const NIL: u64 = 0x3b;
 const TAG_BOXED: u64 = 2;
-const RESERVED_WORDS: u32 = 2;
+const RESERVED_WORDS: u32 = (arinsal_term::S_RESERVED + arinsal_term::NATIVE_SPILL_WORDS) as u32;
+// Port of erts/emulator/beam/jit/arm/instr_common.cpp:137-149 and erl_vm.h:120, OTP-29.1.1.
+const MAX_LIVE_X_REGS: u32 = 1027;
 
-/// GC callback used by emitted heap checks. It receives the runtime header,
-/// scheduler register area, required heap words, and live X register count.
+/// GC callback used by emitted heap checks. It receives the minimum free-word
+/// gap checked by the emitter, including the stack/heap reserve, and the live
+/// X register count.
 pub type GcHook =
     unsafe extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, usize, usize, i32) -> i32;
 
@@ -48,7 +51,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let h = self.source_reg(head)?;
         self.code.emit(|e| e.mov_reg(SCRATCH[2], h))?;
-        let t = self.source_reg(tail)?;
+        let t = self.source_reg_into(tail, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(SCRATCH[3], t))?;
         self.code.emit(|e| {
             e.stp_post(SCRATCH[2], SCRATCH[3], HTOP, 16)?;
@@ -69,7 +72,7 @@ impl BeamModuleAssembler {
             let first = self.source_reg(pair[0])?;
             self.code.emit(|e| e.mov_reg(SCRATCH[2], first))?;
             if let Some(second_arg) = pair.get(1) {
-                let second = self.source_reg(*second_arg)?;
+                let second = self.source_reg_into(*second_arg, Gpr::x(17))?;
                 self.code.emit(|e| e.mov_reg(SCRATCH[3], second))?;
                 self.code
                     .emit(|e| e.stp_post(SCRATCH[2], SCRATCH[3], HTOP, 16))?;
@@ -197,7 +200,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let tuple_reg = self.source_reg(tuple)?;
         self.code.emit(|e| e.and_imm(SCRATCH[0], tuple_reg, !7))?;
-        let value = self.source_reg(element)?;
+        let value = self.source_reg_into(element, Gpr::x(17))?;
         let byte_offset = i16::try_from(offset)
             .map_err(|_| ModuleError::InvalidOperand("tuple offset exceeds immediate range"))?;
         self.code.emit(|e| e.stur(value, SCRATCH[0], byte_offset))?;
@@ -294,7 +297,9 @@ impl BeamModuleAssembler {
                 )?;
                 e.cmp_reg(SCRATCH[0], HTOP, arinsal_a64::enc::Shift::Lsl, 0)
             })?;
-            self.code.b_cond(Cond::Cs, update)?;
+            // Only a tuple built since the last collection (high_water <= src < HTOP) may be
+            // mutated; anything else (older generation, fragments) is copied first.
+            self.code.b_cond(Cond::Cs, copy)?;
             self.code
                 .emit(|e| e.cmp_reg(SCRATCH[0], SCRATCH[4], arinsal_a64::enc::Shift::Lsl, 0))?;
             self.code.b_cond(Cond::Cs, update)?;
@@ -377,6 +382,7 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-120, OTP-29.1.1.
     fn emit_heap_check(
         &mut self,
         stack_words: u32,
@@ -384,9 +390,9 @@ impl BeamModuleAssembler {
         live: u32,
         hook: GcHook,
     ) -> Result<(), ModuleError> {
-        if live > 6 {
+        if live >= MAX_LIVE_X_REGS {
             return Err(ModuleError::InvalidOperand(
-                "live X count must not exceed six",
+                "live X count exceeds OTP register allocation",
             ));
         }
         let requested_words = stack_words
@@ -399,7 +405,6 @@ impl BeamModuleAssembler {
             .checked_mul(8)
             .ok_or(ModuleError::InvalidOperand("heap check size overflow"))?;
         let done = self.code.new_label();
-        let error_label = self.error_label;
         self.emit_pointer_offset(SCRATCH[0], HTOP, u64::from(bytes), false)?;
         self.code
             .emit(|e| e.cmp_reg(SCRATCH[0], E, arinsal_a64::enc::Shift::Lsl, 0))?;
@@ -411,7 +416,9 @@ impl BeamModuleAssembler {
             e.str_uoff(Gpr::x(30), C_P, 72)?;
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
-            e.mov_const(Gpr::x(2), requested_words as u64)?;
+            // The slow path must see the same minimum as the fast-path check;
+            // otherwise ensure() can skip collection while E is inside the reserve.
+            e.mov_const(Gpr::x(2), need as u64)?;
             e.mov_const(Gpr::x(3), live as u64)?;
             e.mov_reg(Gpr::w(4), FCALLS)?;
             e.mov_const(Gpr::x(17), hook as usize as u64)?;
@@ -423,7 +430,7 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), C_P, 72)?;
             e.ldr_uoff(Gpr::x(9), C_P, 40)
         })?;
-        self.code.cbnz(Gpr::x(9), error_label)?;
+        self.error_if_nonzero(Gpr::x(9))?;
         self.code.bind(done)?;
         Ok(())
     }

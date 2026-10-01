@@ -663,7 +663,7 @@ fn push_continuation(process: &mut Process, module: usize, ip: usize) -> Result<
     if !process.heap.reserve_stack(1) {
         return Err(VmError::Unsupported("continuation stack".into()));
     }
-    let cp = Term::catch((module << 32) | u64::from(ip));
+    let cp = crate::stacktrace::continuation_tag(module as usize, ip as usize)?;
     process.heap.stack_set(0, cp);
     Ok(())
 }
@@ -838,7 +838,7 @@ fn deliver_trace(process: &mut Process, ctx: &mut RunCtx<'_, Message>, args: &[T
         return;
     };
     if Pid::from_term(args[1]).is_some() {
-        let _ = process.send_message(ctx, args[1], message);
+        let _ = process.send_message(args[1], message);
         return;
     }
     if args[1].as_port().is_none() {
@@ -866,7 +866,7 @@ fn deliver_trace(process: &mut Process, ctx: &mut RunCtx<'_, Message>, args: &[T
         Ok(envelope) => envelope,
         Err(_) => return,
     };
-    let _ = crate::port::send_message(process, ctx, args[1], envelope);
+    let _ = crate::port::send_message(process, args[1], envelope);
 }
 
 struct DynHeap<'a>(&'a mut dyn HeapAlloc);
@@ -918,6 +918,17 @@ pub(crate) fn refresh_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
 }
 
 fn install_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
+    install_hub_for(process, ctx.pid());
+}
+
+pub(crate) fn refresh_hub_native(process: &Process) {
+    let Some(pid) = process.self_pid.as_ref() else {
+        return;
+    };
+    install_hub_for(process, *pid);
+}
+
+fn install_hub_for(process: &Process, pid: Pid) {
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
@@ -927,7 +938,7 @@ fn install_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
     HUB.with(|hub| {
         *hub.borrow_mut() = Some(Hub {
             scheduler: Arc::downgrade(&scheduler),
-            pid: ctx.pid(),
+            pid,
         });
     });
     NIF_HUBS
@@ -935,10 +946,10 @@ fn install_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
         .lock()
         .unwrap()
         .insert(
-            ctx.pid(),
+            pid,
             Hub {
                 scheduler: Arc::downgrade(&scheduler),
-                pid: ctx.pid(),
+                pid,
             },
         );
     let reactor = SOCKET_REACTOR.get_or_init(|| {

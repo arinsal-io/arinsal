@@ -8,7 +8,8 @@ use std::process::Command;
 
 const HEADER_FLONUM: u64 = (1 << 6) | 0x18;
 const HEADER_POS_BIG: u64 = (1 << 6) | 0x08;
-const BADARITH: u64 = (4 << 10) | (1 << 6) | (1 << 4);
+/// `freason` of an `error` exception; the reason atom travels in `fvalue`.
+const BADARITH: u64 = 1;
 
 extern "C" fn big_to_float(_: *mut ProcessHeader, _: u64) -> u64 {
     1_152_921_504_606_846_976.0_f64.to_bits()

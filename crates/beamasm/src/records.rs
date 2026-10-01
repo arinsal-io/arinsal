@@ -176,7 +176,7 @@ impl BeamModuleAssembler {
             let next = self.code.new_label();
             self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
             self.code.b_cond(Cond::Ne, next)?;
-            self.code.b(self.error_label)?;
+            self.branch_error()?;
             self.code.bind(next)?;
         }
         self.store_record_result(dst)
@@ -312,7 +312,7 @@ impl BeamModuleAssembler {
         let next = self.code.new_label();
         self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
         self.code.b_cond(Cond::Ne, next)?;
-        self.code.b(self.error_label)?;
+        self.branch_error()?;
         self.code.bind(next)?;
         self.store_record_result(dst)
     }
@@ -384,7 +384,7 @@ fn emit_record_runtime(
         e.ldr_uoff(Gpr::x(30), C_P, 72)?;
         e.ldr_uoff(Gpr::x(9), C_P, 40)
     })?;
-    asm.code.cbnz(Gpr::x(9), asm.error_label)?;
+    asm.error_if_nonzero(Gpr::x(9))?;
     Ok(())
 }
 

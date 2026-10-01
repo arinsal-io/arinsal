@@ -152,6 +152,18 @@ impl BeamModuleAssembler {
         self.emit_integer_binary(BinaryOp::Div, lhs, rhs, dst, helper, fail)
     }
 
+    /// Emits `i_m_div` (`/`): always a runtime call, like erts.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1089-1125 (emit_i_m_div), OTP-29.1.1
+    pub fn emit_i_m_div(
+        &mut self,
+        lhs: ArgVal,
+        rhs: ArgVal,
+        dst: ArgVal,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        self.emit_helper_operation(12, lhs, rhs, dst, helper)
+    }
+
     /// Emits `i_rem` with the Erlang remainder sign rule.
     // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1088, OTP-29.1.1
     pub fn emit_i_rem(
@@ -467,7 +479,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(14), left))?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(17), right))?;
         self.emit_helper(op, Gpr::x(14), Gpr::x(17), helper, None)?;
         self.store_result(dst, Gpr::x(0))
@@ -802,8 +814,14 @@ impl BeamModuleAssembler {
         helper: ArithHelper,
         fail: Option<u32>,
     ) -> Result<(), ModuleError> {
+        // The failure label comes from the instruction (guard arithmetic) or the emitting
+        // context; with one the runtime records no BIF frame (QUIET_GUARD in the VM hook).
+        let fail = fail.or((self.arith_fail != 0).then_some(self.arith_fail));
+        let op = if fail.is_none() { op } else { op | 0x100 };
         self.code.emit(|e| e.mov_const(Gpr::x(8), u64::from(op)))?;
-        let update = Update::REDUCTIONS;
+        // The slow path allocates bignums and floats from the young heap, so it must see (and
+        // publish) the native heap and stack cursors.
+        let update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
         emit_enter_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
@@ -819,20 +837,20 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
             e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
         })?;
-        if let Some(fail) = fail {
-            let no_error = self.code.new_label();
-            let fail_label = self.label(fail);
-            // Integer terms are tagged, so zero is reserved for an arithmetic helper error.
-            self.code.cbz(Gpr::x(0), no_error)?;
-            self.code.emit(|e| {
-                e.str_uoff(Gpr::xzr(), Gpr::x(21), 40)?;
-                e.str_uoff(Gpr::xzr(), Gpr::x(21), 48)
-            })?;
-            self.code.b(fail_label)?;
-            self.code.bind(no_error)?;
-        } else {
-            self.code.cbnz(Gpr::x(9), self.error_label)?;
-        }
+        let Some(fail) = fail else {
+            self.error_if_nonzero(Gpr::x(9))?;
+            return Ok(());
+        };
+        // Guard context: the failure clears the pending exception and falls to the label.
+        let ok = self.code.new_label();
+        self.code.cbz(Gpr::x(9), ok)?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::xzr(), Gpr::x(21), 40)?;
+            e.str_uoff(Gpr::xzr(), Gpr::x(21), 48)
+        })?;
+        let fail = self.label(fail);
+        self.code.b(fail)?;
+        self.code.bind(ok)?;
         Ok(())
     }
 

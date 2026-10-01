@@ -5,11 +5,16 @@ use arinsal_bifs::{Class, FragmentingHeap};
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::Module;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, TermKind, from_owned, global_atoms, to_owned};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
-const HANDLER_BIT: u64 = 1 << 57;
 // Reserve the last encodable handler module index for private trace handles.
 const RAW_TRACE_PREFIX: u64 = (1 << 26) - 1;
+const CONTINUATION_BIT: u64 = 1 << 57;
+
+fn interpreted_catch_ids() -> &'static Mutex<std::collections::HashMap<(usize, usize), u32>> {
+    static IDS: OnceLock<Mutex<std::collections::HashMap<(usize, usize), u32>>> = OnceLock::new();
+    IDS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Continuation addresses saved before exception unwinding.
 #[derive(Default, Clone)]
@@ -21,12 +26,14 @@ pub(super) struct RawTrace {
     ip: usize,
     continuations: Vec<Continuation>,
     depth: usize,
+    /// Native function and pc that raised the exception, when it came from native code.
+    native_top: Option<(NativeFunction, usize)>,
 }
 
 #[derive(Clone)]
 enum Continuation {
     Interpreted(Arc<Module>, usize),
-    Native(NativeFunction),
+    Native(NativeFunction, usize),
 }
 
 #[derive(Clone)]
@@ -85,9 +92,12 @@ pub(super) fn capture(
     raw.ip = ip;
     raw.depth = depth.max(1);
     raw.continuations.clear();
+    raw.native_top = None;
     // OTP starts with the failing instruction as `prev` and compares it with
     // each continuation after moving that continuation back to its call site.
     let mut previous = Some((module, ip));
+    // Native return addresses share erts' single `prev`, so the two trackers reset each other.
+    let mut previous_native: Option<usize> = None;
     let mut index = 0;
     while index < heap.stack_words() {
         if raw.continuations.len() + 1 >= raw.depth {
@@ -99,23 +109,26 @@ pub(super) fn capture(
         };
         let raw_address = word.tagged_word() as usize;
         if raw_address == crate::native_bridge::native_trace_return_address() {
-            let function_pc = heap
-                .stack_get(index + 2)
-                .and_then(Term::as_small)
-                .unwrap_or(0) as usize;
+            // Port of erts/emulator/beam/beam_common.c:803-815 (save_stacktrace), OTP-29.1.1:
+            // trace frames are skipped; the caller's own continuation follows the frame.
             let action_count = heap
                 .stack_get(index + 3)
                 .and_then(Term::as_small)
                 .and_then(|count| usize::try_from(count).ok())
                 .unwrap_or(0);
-            if let Some(function) = native_function_at(function_pc) {
-                raw.continuations.push(Continuation::Native(function));
-            }
             index += 4usize.saturating_add(action_count.saturating_mul(2));
             continue;
         }
         if let Some(function) = native_function_at(raw_address) {
-            raw.continuations.push(Continuation::Native(function));
+            // Port of erts/emulator/beam/beam_common.c:815-835 (save_stacktrace), OTP-29.1.1:
+            // only non-duplicate return addresses are recorded, each looked up one byte back,
+            // inside its call instruction.
+            if previous_native != Some(raw_address) {
+                previous_native = Some(raw_address);
+                previous = None;
+                raw.continuations
+                    .push(Continuation::Native(function, raw_address - 1));
+            }
             index += 1;
             continue;
         }
@@ -136,6 +149,7 @@ pub(super) fn capture(
             continue;
         }
         previous = Some((module, call_site));
+        previous_native = None;
         if let Some(module) = modules.get(module) {
             raw.continuations
                 .push(Continuation::Interpreted(Arc::clone(module), ip));
@@ -143,6 +157,25 @@ pub(super) fn capture(
         index += 1;
     }
     Ok(())
+}
+
+/// Records the native function and pc at which the exception was raised.
+pub(super) fn set_native_top(raw: &mut RawTrace, function: NativeFunction, pc: usize) {
+    let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
+    if pc & tag != 0 {
+        // Port of erts/emulator/beam/beam_common.c:792-835 (save_stacktrace), OTP-29.1.1:
+        // the raising pc is the call's return address, so the identical continuation is not
+        // recorded again; its line is looked up inside the call instruction.
+        let site = (pc & !tag) - 1;
+        if matches!(raw.continuations.first(),
+            Some(Continuation::Native(_, address)) if *address == site)
+        {
+            raw.continuations.remove(0);
+        }
+        raw.native_top = Some((function, site));
+        return;
+    }
+    raw.native_top = Some((function, pc));
 }
 
 /// Preserve an explicit `raise/3` stacktrace with its class across `try/after`.
@@ -209,12 +242,30 @@ pub(super) enum TopFrame {
 }
 
 pub(super) fn handler_tag(module: usize, ip: usize) -> Result<Term, VmError> {
+    let key = (module, ip);
+    let mut ids = interpreted_catch_ids()
+        .lock()
+        .map_err(|_| VmError::Unsupported("catch table lock".into()))?;
+    let index = if let Some(index) = ids.get(&key) {
+        *index
+    } else {
+        let base = arinsal_beamasm::catch::reserve_catch_indices(1)
+            .map_err(|_| VmError::Unsupported("catch table exhausted".into()))?;
+        crate::native_bridge::register_interpreted_catch(base, module, ip);
+        ids.insert(key, base);
+        base
+    };
+    Ok(Term::catch(u64::from(index)))
+}
+
+/// Encodes an interpreter continuation without colliding with catch-table indices.
+pub(crate) fn continuation_tag(module: usize, ip: usize) -> Result<Term, VmError> {
     let module = u64::try_from(module).map_err(|_| VmError::Unsupported("module index".into()))?;
     let ip = u32::try_from(ip).map_err(|_| VmError::Unsupported("code index".into()))?;
-    if module >= (1 << 25) - 1 {
+    if module >= (1 << 25) {
         return Err(VmError::Unsupported("module index".into()));
     }
-    Ok(Term::catch(HANDLER_BIT | module << 32 | u64::from(ip)))
+    Ok(Term::catch(CONTINUATION_BIT | module << 32 | u64::from(ip)))
 }
 
 pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
@@ -226,11 +277,21 @@ pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
     if payload >> 32 == RAW_TRACE_PREFIX {
         return None;
     }
-    Some((
-        payload & HANDLER_BIT != 0,
-        ((payload & !HANDLER_BIT) >> 32) as usize,
-        payload as u32 as usize,
-    ))
+    // Interpreter continuations use an immediate module/IP pair. Catch tags
+    // themselves are process-independent indices into the shared catch table.
+    if payload & CONTINUATION_BIT != 0 {
+        return Some((
+            false,
+            ((payload & !CONTINUATION_BIT) >> 32) as usize,
+            payload as u32 as usize,
+        ));
+    }
+    if payload >> 32 != 0 {
+        return Some((false, (payload >> 32) as usize, payload as u32 as usize));
+    }
+    let index = u32::try_from(payload).ok()?;
+    let (module, ip) = crate::native_bridge::interpreted_catch(index)?;
+    Some((true, module, ip))
 }
 
 fn atom(name: &str) -> Result<Term, VmError> {
@@ -367,7 +428,30 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
         .as_ref()
         .ok_or_else(|| VmError::Unsupported("stacktrace module".into()))?;
     let (name, arity) = current.function_at(raw.ip).unwrap_or(("?", 0));
-    let location = current.lines.get(raw.ip).and_then(Option::as_ref);
+    let native_location;
+    let (module_name, name, arity, location) = if let Some((function, pc)) = &raw.native_top {
+        native_location = function
+            .line_at(*pc)
+            .map(|(file, line)| (file.to_owned(), u64::from(line)))
+            .or_else(|| {
+                function
+                    .line
+                    .map(|line| (function.file.clone().unwrap_or_default(), u64::from(line)))
+            });
+        (
+            function.module.as_str(),
+            function.function.as_str(),
+            function.arity,
+            native_location.as_ref(),
+        )
+    } else {
+        (
+            current.name.as_str(),
+            name,
+            arity,
+            current.lines.get(raw.ip).and_then(Option::as_ref),
+        )
+    };
     let top_frame = if let Some(TopFrame::Bif {
         module,
         function,
@@ -391,21 +475,13 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
             ),
             _ => None,
         };
-        build_frame(
-            p,
-            &current.name,
-            name,
-            top_args,
-            location,
-            false,
-            error_info,
-        )?
+        build_frame(p, module_name, name, top_args, location, false, error_info)?
     };
     frames.push(top_frame);
     if matches!(top, Some(TopFrame::Bif { .. })) && frames.len() < raw.depth {
         frames.push(build_frame(
             p,
-            &current.name,
+            module_name,
             name,
             Term::small(i64::from(arity)).expect("arity is small"),
             location,
@@ -417,10 +493,15 @@ pub(super) fn build_saved(p: &mut Process, raw: &RawTrace) -> Result<Term, VmErr
         if frames.len() >= raw.depth {
             break;
         }
-        if let Continuation::Native(function) = continuation {
+        if let Continuation::Native(function, address) = continuation {
             let location = function
-                .line
-                .map(|line| (function.file.clone().unwrap_or_default(), u64::from(line)));
+                .line_at(*address)
+                .map(|(file, line)| (file.to_owned(), u64::from(line)))
+                .or_else(|| {
+                    function
+                        .line
+                        .map(|line| (function.file.clone().unwrap_or_default(), u64::from(line)))
+                });
             frames.push(build_frame(
                 p,
                 &function.module,

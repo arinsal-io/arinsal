@@ -64,6 +64,11 @@ fn check(map: Term) -> MapResult<()> {
 fn key_cmp(a: Term, b: Term) -> Ordering {
     exact_cmp(a, b, true)
 }
+
+/// Flatmap key order (atoms by atom index), as erts `CMP_TERM` for flatmap keys.
+pub fn flatmap_key_cmp(a: Term, b: Term) -> Ordering {
+    key_cmp(a, b)
+}
 fn exact_cmp(a: Term, b: Term, flat_atom: bool) -> Ordering {
     if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom())
         && flat_atom

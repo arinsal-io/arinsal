@@ -17,6 +17,7 @@ TOOLS = ROOT / "tools/otp_suites"
 OTP = ROOT / "tests/otp"
 HELPERS = OTP / "lib/common_test/test_server"
 RESULTS = TOOLS / "RESULTS.md"
+RESULTS_BEAMASM = TOOLS / "RESULTS_BEAMASM.md"
 PILOT = "big tuple map binary bs_match_bin bs_match_int bs_match_misc bs_match_tail bs_construct bs_utf fun exception guard receive ref num_bif list_bif float op small hash persistent_term atomics counters unique".split()
 
 
@@ -87,7 +88,7 @@ def suite_dir(name: str) -> pathlib.Path:
     raise ValueError(f"suite not found: {name}_SUITE.erl")
 
 
-def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limit: int) -> tuple[int, str]:
+def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limit: int, beamasm: bool = False) -> tuple[int, str]:
     logdir.mkdir(parents=True, exist_ok=True)
     original = suite_dir(name)
     with tempfile.TemporaryDirectory(prefix=f"otp-{name}-source-") as source_temp:
@@ -99,7 +100,10 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
             + "_SUITE},{logdir,\"" + str(logdir) + "\"}]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
         )
         cmd = [exe, "-noshell", "-pa", str(build), "-pa", str(directory), "-eval", expr]
-        result = run(cmd, limit)
+        env = os.environ.copy()
+        if beamasm:
+            env["ARINSAL_BEAMASM"] = "1"
+        result = run(cmd, limit, env=env)
         (logdir / "runner-output.log").write_text(result.stdout, encoding="utf-8", errors="replace")
         return result.returncode, result.stdout
 
@@ -152,7 +156,7 @@ def first_failure(logdir: pathlib.Path) -> str:
     return ""
 
 
-def update_table(name: str, erl: dict[str, tuple[str, str]], arin: dict[str, tuple[str, str]], erl_meta: str, arin_meta: str, erl_rc: int, arin_rc: int, erl_dir: pathlib.Path, arin_dir: pathlib.Path) -> None:
+def update_table(name: str, erl: dict[str, tuple[str, str]], arin: dict[str, tuple[str, str]], erl_meta: str, arin_meta: str, erl_rc: int, arin_rc: int, erl_dir: pathlib.Path, arin_dir: pathlib.Path, results_path: pathlib.Path = RESULTS) -> None:
     entries = []
     cases = sorted(set(erl) | set(arin))
     if not cases:
@@ -175,12 +179,12 @@ def update_table(name: str, erl: dict[str, tuple[str, str]], arin: dict[str, tup
             if suite_failure:
                 detail = f"{detail}; suite-level: {suite_failure}"
         entries.append(f"| `{name}_SUITE` | {len(cases)} | {eok}/{len(cases)} | {aok}/{len(cases)} | {len(mismatch)} | {arin_rc} | {detail.replace('|', '&#124;')} |")
-    old = RESULTS.read_text(encoding="utf-8") if RESULTS.exists() else "# OTP 29.1.1 suite pilot results\n\n| Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |\n|---|---:|---:|---:|---:|---:|---|\n"
+    old = results_path.read_text(encoding="utf-8") if results_path.exists() else "# OTP 29.1.1 suite pilot results\n\n| Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |\n|---|---:|---:|---:|---:|---:|---|\n"
     lines = [line for line in old.splitlines() if not line.startswith(f"| `{name}_SUITE` |")]
     lines.extend(entries)
     header = lines[:3]
     rows = sorted(lines[3:], key=lambda line: line.split("|", 2)[1].strip())
-    RESULTS.write_text("\n".join(header + rows) + "\n", encoding="utf-8")
+    results_path.write_text("\n".join(header + rows) + "\n", encoding="utf-8")
 
 
 def _acquire_global_slot() -> None:
@@ -207,7 +211,9 @@ def main() -> int:
     parser.add_argument("suite", help="suite basename without _SUITE, or all-pilot")
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--arinsal", default=str(ROOT / "target/release/arinsal"))
+    parser.add_argument("--beamasm", action="store_true", help="set ARINSAL_BEAMASM=1 for the Arinsal run and write RESULTS_BEAMASM.md")
     args = parser.parse_args()
+    results_path = RESULTS_BEAMASM if args.beamasm else RESULTS
     suites = PILOT if args.suite == "all-pilot" else [args.suite.removesuffix("_SUITE")]
     if not pathlib.Path(args.arinsal).is_file():
         result = run(["cargo", "build", "--release", "-p", "arinsal-cli"], 1200, cwd=ROOT)
@@ -222,10 +228,10 @@ def main() -> int:
                 with tempfile.TemporaryDirectory(prefix=f"otp-{name}-erl-") as ed, tempfile.TemporaryDirectory(prefix=f"otp-{name}-arinsal-") as ad:
                     erl_dir, arin_dir = pathlib.Path(ed), pathlib.Path(ad)
                     erc, eout = run_one("erl", name, erl_dir, build, args.timeout)
-                    arc, aout = run_one(args.arinsal, name, arin_dir, build, args.timeout)
+                    arc, aout = run_one(args.arinsal, name, arin_dir, build, args.timeout, args.beamasm)
                     ecases, emeta = parse_results(erl_dir, name)
                     acases, ameta = parse_results(arin_dir, name)
-                    update_table(name, ecases, acases, emeta, ameta, erc, arc, erl_dir, arin_dir)
+                    update_table(name, ecases, acases, emeta, ameta, erc, arc, erl_dir, arin_dir, results_path)
                     epass = sum(s == "ok" for s, _ in ecases.values())
                     apass = sum(s == "ok" for s, _ in acases.values())
                     print(f"{name}_SUITE: erl={epass}/{len(ecases)} rc={erc}; arinsal={apass}/{len(acases)} rc={arc}", flush=True)
@@ -237,7 +243,7 @@ def main() -> int:
                 print(f"{name}_SUITE: harness error: {exc}", file=sys.stderr, flush=True)
                 with tempfile.TemporaryDirectory(prefix=f"otp-{name}-error-") as error_dir:
                     error_path = pathlib.Path(error_dir)
-                    update_table(name, {}, {}, str(exc), str(exc), 1, 1, error_path, error_path)
+                    update_table(name, {}, {}, str(exc), str(exc), 1, 1, error_path, error_path, results_path)
     return 0
 
 

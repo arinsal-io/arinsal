@@ -303,7 +303,8 @@ impl Process {
         }
     }
 
-    #[cfg(test)]
+    /// Reserve a marker in the process queue only. Native code runs on messages the bridge
+    /// already fetched, so the scheduler-side marker (which bounds a later fetch) is not needed.
     pub(crate) fn reserve_receive_marker(&mut self) -> Result<Term, VmError> {
         self.reserve_receive_marker_inner(None)
     }

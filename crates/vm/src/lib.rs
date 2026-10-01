@@ -70,7 +70,8 @@ pub(crate) use interp::{RunState, gc_stress_enabled};
 pub(crate) use load::{CodeMeta, ExportIndex, SharedCode};
 pub(crate) use native_bridge::native_function_for;
 pub use native_bridge::{
-    NativeFunction, arinsal_native_raise, native_function_at, register_native_function, run_native,
+    NativeFunction, NativeLine, arinsal_native_raise, native_function_at, register_native_function,
+    run_native,
 };
 pub use proc_create::Process;
 #[cfg(feature = "instr-count")]

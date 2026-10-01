@@ -883,6 +883,127 @@ pub(crate) fn emit(
     emit_filtered(vm, process, ctx, subject, class, name, fields, None);
 }
 
+pub(crate) fn emit_process(
+    vm: Option<&mut Vm>,
+    process: &mut Process,
+    subject: Pid,
+    class: u64,
+    name: &str,
+    fields: &[Term],
+) {
+    emit_filtered_without_ctx(vm, process, subject, class, name, fields);
+}
+
+fn emit_filtered_without_ctx(
+    mut vm: Option<&mut Vm>,
+    process: &mut Process,
+    subject: Pid,
+    class: u64,
+    name: &str,
+    fields: &[Term],
+) {
+    if !enabled().load(Ordering::Relaxed) {
+        return;
+    }
+    let entries = table()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((runtime, _sid, pid), entry)| {
+            *runtime == scope(process) && *pid == subject && entry.flags & class != 0
+        })
+        .map(|(_, entry)| entry.clone())
+        .collect::<Vec<_>>();
+    let Some(subject_term) = subject.to_term() else {
+        return;
+    };
+    for entry in entries {
+        if let Tracer::Module { module, state } = &entry.tracer {
+            let Some(vm) = vm.as_deref_mut() else {
+                continue;
+            };
+            emit_module(
+                vm,
+                process,
+                None,
+                module,
+                state,
+                TraceEvent {
+                    flags: entry.flags,
+                    tracee: subject_term,
+                    name,
+                    fields,
+                },
+            );
+            continue;
+        }
+        let mut values = Vec::with_capacity(3 + fields.len());
+        values.extend([
+            crate::signals::atom(
+                if entry.flags & (TIMESTAMP | MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0
+                {
+                    "trace_ts"
+                } else {
+                    "trace"
+                },
+            ),
+            subject_term,
+            crate::signals::atom(name),
+        ]);
+        values.extend_from_slice(fields);
+        if entry.flags & TIMESTAMP != 0 {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros();
+            values.push(
+                TermBuilder::new(&mut process.heap)
+                    .tuple(&[
+                        Term::small((micros / 1_000_000 / 1_000_000) as i64).unwrap_or(Term::NIL),
+                        Term::small((micros / 1_000_000 % 1_000_000) as i64).unwrap_or(Term::NIL),
+                        Term::small((micros % 1_000_000) as i64).unwrap_or(Term::NIL),
+                    ])
+                    .unwrap_or(Term::NIL),
+            );
+        } else if entry.flags & (MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0 {
+            static START: OnceLock<std::time::Instant> = OnceLock::new();
+            values.push(
+                Term::small(
+                    i64::try_from(
+                        START
+                            .get_or_init(std::time::Instant::now)
+                            .elapsed()
+                            .as_nanos(),
+                    )
+                    .unwrap_or(i64::MAX),
+                )
+                .unwrap_or(Term::NIL),
+            );
+        }
+        let Ok(event) = TermBuilder::new(&mut process.heap).tuple(&values) else {
+            continue;
+        };
+        let Ok(message) = Message::copy_from(event) else {
+            continue;
+        };
+        match entry.tracer {
+            Tracer::Pid(pid) => {
+                if let Some(runtime) = &process.runtime
+                    && let Ok(scheduler) = runtime.scheduler()
+                {
+                    let _ = scheduler.send(subject, pid, message);
+                }
+            }
+            Tracer::Port(id) => {
+                if let Some(port) = Term::port(id) {
+                    let _ = crate::port::send_message(process, port, event);
+                }
+            }
+            Tracer::Module { .. } => unreachable!(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Trace event identity and routing stay explicit at emission sites.
 fn emit_filtered(
     mut vm: Option<&mut Vm>,
@@ -923,7 +1044,7 @@ fn emit_filtered(
             emit_module(
                 vm,
                 process,
-                ctx,
+                Some(ctx),
                 module,
                 state,
                 TraceEvent {
@@ -989,7 +1110,7 @@ fn emit_filtered(
             }
             Tracer::Port(id) => {
                 if let Some(port) = Term::port(id) {
-                    let _ = crate::port::send_message(process, ctx, port, event);
+                    let _ = crate::port::send_message(process, port, event);
                 }
             }
             Tracer::Module { .. } => unreachable!(),
@@ -1000,12 +1121,14 @@ fn emit_filtered(
 fn emit_module(
     vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: Option<&mut RunCtx<'_, Message>>,
     module: &str,
     owned_state: &OwnedTerm,
     event: TraceEvent<'_>,
 ) {
-    crate::natives::nif::refresh_hub(process, ctx);
+    if let Some(ctx) = ctx {
+        crate::natives::nif::refresh_hub(process, ctx);
+    }
     let Some(state) = from_owned(
         owned_state,
         &mut arinsal_bifs::FragmentingHeap(&mut process.heap),

@@ -1,7 +1,8 @@
 use arinsal_term::{
-    ExportEntry, FunEntry, Node, ProcessHeap, Term, TermBuilder, VecHeap, copy_term, exact_eq,
-    global_atoms, make_hash2, match_position, set_match_position, size_object, to_owned,
-    writable_bytes_mut, writable_capacity, writable_extend_private,
+    ExportEntry, FunEntry, NATIVE_SPILL_WORDS, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term,
+    TermBuilder, VecHeap, copy_term, exact_eq, global_atoms, make_hash2, match_position,
+    set_match_position, size_object, to_owned, writable_bytes_mut, writable_capacity,
+    writable_extend_private,
 };
 use arinsal_term::{ExternalBinary, MagicRef};
 use std::sync::Arc;
@@ -12,6 +13,23 @@ impl Drop for DropCounter {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+#[test]
+fn process_heap_allocator_leaves_the_native_stack_redzone() {
+    let reserve = S_REDZONE + NATIVE_SPILL_WORDS;
+    let words = reserve + 16;
+    let mut heap = ProcessHeap::with_words(words);
+    assert_eq!(S_REDZONE, 3);
+    assert_eq!(S_RESERVED, 4);
+    assert_eq!(heap.heap_limit_words(), words - reserve);
+    assert_eq!(heap.allocation_reserve(), 0);
+    assert!(heap.alloc(words).is_some());
+    let mut heap = ProcessHeap::with_words(words);
+    heap.set_native_allocation(true);
+    assert_eq!(heap.allocation_reserve(), reserve);
+    assert!(heap.alloc(words - reserve).is_some());
+    assert!(heap.alloc(1).is_none());
 }
 
 #[test]

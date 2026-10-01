@@ -277,7 +277,7 @@ fn check_process_code(vm: &Vm, process: &Process, name: &str) -> bool {
     let Some(&old) = vm.old.get(name) else {
         return false;
     };
-    process.references_code(old)
+    process.references_code(old, crate::load::native_code_range(&vm.code_meta, old))
 }
 
 // Port of erts/emulator/beam/erl_bif_coverage.c:50-116, OTP-29.1.1.
@@ -503,8 +503,12 @@ fn delete(vm: &mut Vm, name: &str) -> Result<Term, VmError> {
     Ok(atom("true"))
 }
 
-fn module_id_referenced(process: &Process, id: usize) -> bool {
-    process.references_code(id)
+fn module_id_referenced(
+    process: &Process,
+    code_meta: &[Option<std::sync::Arc<crate::load::CodeMeta>>],
+    id: usize,
+) -> bool {
+    process.references_code(id, crate::load::native_code_range(code_meta, id))
 }
 
 fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term, VmError> {
@@ -543,7 +547,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                 let pending = std::mem::take(&mut code.condemned);
                 let mut keep = Vec::new();
                 for id in pending {
-                    if module_id_referenced(process, id) {
+                    if module_id_referenced(process, &code.code_meta, id) {
                         keep.push(id);
                     } else {
                         code.release(id);
@@ -551,7 +555,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                 }
                 let removed = code.old.remove(name);
                 if let Some(id) = removed {
-                    if module_id_referenced(process, id) {
+                    if module_id_referenced(process, &code.code_meta, id) {
                         keep.push(id);
                     } else {
                         code.release(id);
@@ -599,7 +603,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                 let pending = std::mem::take(&mut vm.condemned);
                 let mut keep = Vec::new();
                 for id in pending {
-                    if module_id_referenced(process, id) {
+                    if module_id_referenced(process, &vm.code_meta, id) {
                         keep.push(id);
                     } else {
                         vm.release_module_slot(id);
@@ -607,7 +611,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                 }
                 let removed = vm.old.remove(name);
                 if let Some(id) = removed {
-                    if module_id_referenced(process, id) {
+                    if module_id_referenced(process, &vm.code_meta, id) {
                         keep.push(id);
                     } else {
                         vm.release_module_slot(id);

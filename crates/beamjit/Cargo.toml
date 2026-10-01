@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 arinsal-beam.workspace = true
 arinsal-beamops = { path = "../beamops" }
+arinsal-etf.workspace = true
 arinsal-beamasm = { path = "../beamasm" }
 arinsal-a64 = { path = "../a64" }
 thiserror.workspace = true

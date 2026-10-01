@@ -12,6 +12,34 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 
+/// Turns a legacy interpreter exception into a trap, attaching the `undef` call arguments.
+fn legacy_exception_trap(
+    process: &mut Process,
+    reason: &str,
+    frame: &str,
+) -> Result<crate::exceptions::Trap, VmError> {
+    let mut trap = crate::exceptions::from_legacy(reason)?;
+    if reason == "undef"
+        && let Some((mfa, arity)) = frame.rsplit_once('/')
+        && let Some((module, function)) = mfa.split_once(':')
+        && let Ok(arity) = arity.parse::<usize>()
+        && arity <= process.x.len()
+    {
+        let arguments = {
+            let mut heap = crate::FragmentingHeap(&mut process.heap);
+            TermBuilder::new(&mut heap)
+                .list_from_iter(process.x[..arity].iter().copied())
+                .map_err(|error| VmError::Unsupported(format!("undef arguments: {error:?}")))?
+        };
+        trap.top = Some(crate::stacktrace::TopFrame::Bif {
+            module: module.to_owned(),
+            function: function.to_owned(),
+            args: arguments,
+        });
+    }
+    Ok(trap)
+}
+
 fn trace_boot_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("ARINSAL_TRACE_BOOT").is_some())
@@ -578,6 +606,9 @@ struct Executor {
     /// Native register backing is scheduler-local, as required by x19.
     native_registers: SchedulerRegisters,
 }
+/// Error text of a remote send attempted without a scheduler context (native code).
+pub(crate) const REMOTE_SEND_NEEDS_CONTEXT: &str = "remote send requires a scheduler context";
+
 impl Executor {
     fn run(
         &mut self,
@@ -586,6 +617,7 @@ impl Executor {
         budget: u32,
     ) -> Result<RunState, VmError> {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
+        process.self_pid = Some(ctx.pid());
         let schedule_started = std::time::Instant::now();
         crate::trace::emit(
             Some(&mut self.vm),
@@ -687,10 +719,16 @@ impl Executor {
                     }
                     if let Some(code_ptr) = process.native_pc.take() {
                         crate::beamasm_integration::count_native_call();
+                        // Native receives look at the private queue only; fetch what arrived.
+                        process.drain(ctx)?;
                         process.header.self_pid =
                             ctx.pid().to_term().expect("valid pid").tagged_word();
-                        let function = crate::native_function_at(code_ptr);
-                        if trace_boot_enabled() {
+                        process.self_pid = Some(ctx.pid());
+                        let trace_boot = trace_boot_enabled();
+                        let function = trace_boot
+                            .then(|| crate::native_function_at(code_ptr))
+                            .flatten();
+                        if trace_boot {
                             eprintln!("arinsal boot: enter native {:?} pc={code_ptr:#x}", function);
                             if function.as_ref().is_some_and(|f| {
                                 f.module == "prim_file" && f.function == "decode_path"
@@ -701,33 +739,53 @@ impl Executor {
                                 );
                             }
                         }
-                        let outcome = match crate::run_native(
-                            process,
-                            &mut self.native_registers,
-                            code_ptr,
-                        ) {
-                            Ok(outcome) => outcome,
-                            Err(VmError::Trap(trap)) => {
-                                if let Some(error) = crate::exceptions::resume(
-                                    &mut self.vm,
-                                    process,
-                                    Some(ctx),
-                                    trap,
-                                )? {
+                        // A native call to a BIF that parked the process (cross-process signal
+                        // reply) is redone once the process wakes, like the interpreter re-executes
+                        // the call instruction.
+                        let retry = process
+                            .cold
+                            .as_mut()
+                            .and_then(|cold| cold.native_retry.take());
+                        let outcome = if let Some(target_pc) = retry {
+                            arinsal_beamasm::ExitReason::CallUnported {
+                                target_pc,
+                                resume_pc: 0,
+                            }
+                        } else {
+                            // Port of erts/emulator/beam/erl_process.c (schedule: reductions
+                            // used = CONTEXT_REDS - FCALLS), OTP-29.1.1: native code counts down
+                            // FCALLS; the scheduler charges what it used.
+                            let fcalls_before = process.reductions;
+                            let native =
+                                crate::run_native(process, &mut self.native_registers, code_ptr);
+                            ctx.consume(
+                                u32::try_from(fcalls_before.saturating_sub(process.reductions))
+                                    .unwrap_or(0),
+                            );
+                            match native {
+                                Ok(outcome) => outcome,
+                                Err(VmError::Trap(trap)) => {
+                                    if let Some(error) = crate::exceptions::resume(
+                                        &mut self.vm,
+                                        process,
+                                        Some(ctx),
+                                        trap,
+                                    )? {
+                                        process.header.freason = 0;
+                                        process.header.fvalue = 0;
+                                        break Err(error);
+                                    }
                                     process.header.freason = 0;
                                     process.header.fvalue = 0;
-                                    break Err(error);
+                                    if let Some(cold) = process.cold.as_mut() {
+                                        cold.exit_reason = None;
+                                    }
+                                    continue;
                                 }
-                                process.header.freason = 0;
-                                process.header.fvalue = 0;
-                                if let Some(cold) = process.cold.as_mut() {
-                                    cold.exit_reason = None;
-                                }
-                                continue;
+                                Err(error) => return Err(error),
                             }
-                            Err(error) => return Err(error),
                         };
-                        if trace_boot_enabled()
+                        if trace_boot
                             && function.as_ref().is_some_and(|f| {
                                 f.module == "prim_file" && f.function == "decode_path"
                             })
@@ -740,43 +798,150 @@ impl Executor {
                         match outcome {
                             arinsal_beamasm::ExitReason::Yield => {
                                 crate::beamasm_integration::count_native_yield();
+                                if let Some(timeout_ms) = process
+                                    .cold
+                                    .as_mut()
+                                    .and_then(|cold| cold.native_wait.take())
+                                {
+                                    // A native receive found no matching message. Like the
+                                    // interpreter's `wait`, sleep only if nothing arrived since the
+                                    // slice began; the process resumes at the `loop_rec` label with
+                                    // no live X registers.
+                                    process.gc_live = 0;
+                                    process.cold_mut().native_resume_live = 1;
+                                    if !Vm::mailbox_ready_to_wait(process, &mut Some(&mut *ctx))? {
+                                        continue;
+                                    }
+                                    break Ok(RunState::Wait { timeout_ms });
+                                }
                                 break Ok(RunState::Yield);
                             }
                             arinsal_beamasm::ExitReason::CallUnported {
                                 target_pc,
-                                resume_pc: _,
+                                resume_pc,
                             } => {
                                 crate::beamasm_integration::count_call_unported();
-                                if target_pc == arinsal_beamasm::dispatch::SEND_UNPORTED {
-                                    let value =
-                                        process.send_message(ctx, process.x[0], process.x[1])?;
+                                // The native call site names the caller only if the called BIF
+                                // raises; any other continuation must not inherit it.
+                                let call_site_pc = process
+                                    .cold
+                                    .as_mut()
+                                    .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
+                                if target_pc == arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY {
+                                    let value = process.send_message_prio(
+                                        Some(&mut self.vm),
+                                        Some(ctx),
+                                        process.x[0],
+                                        process.x[1],
+                                        false,
+                                    )?;
                                     process.x[0] = value;
                                     if !resume_after_native_return(process) {
                                         break Ok(RunState::Done(value));
                                     }
                                     continue;
                                 }
-                                if target_pc == arinsal_beamasm::dispatch::CALL_FUN_UNPORTED {
-                                    let arity = usize::from(process.header.arity);
-                                    let fun = process.x.get(arity).copied().unwrap_or(Term::NIL);
-                                    match self.vm.call_fun_term(
-                                        process,
-                                        fun,
-                                        arity,
-                                        true,
-                                        Some(ctx),
-                                    )? {
-                                        crate::ImportOutcome::Jump(_)
-                                        | crate::ImportOutcome::Advanced => {}
-                                        crate::ImportOutcome::Yield => {
-                                            break Ok(RunState::Yield);
+                                if matches!(
+                                    target_pc,
+                                    arinsal_beamasm::dispatch::CALL_FUN_UNPORTED
+                                        | arinsal_beamasm::dispatch::APPLY_FIXED_UNPORTED
+                                        | arinsal_beamasm::dispatch::APPLY2_UNPORTED
+                                        | arinsal_beamasm::dispatch::APPLY3_UNPORTED
+                                ) {
+                                    // The fragment pushed the native continuation as a CP, so the
+                                    // interpreter performs these as tail calls.
+                                    let result = match target_pc {
+                                        arinsal_beamasm::dispatch::CALL_FUN_UNPORTED => {
+                                            let arity = usize::from(process.header.arity);
+                                            let fun =
+                                                process.x.get(arity).copied().unwrap_or(Term::NIL);
+                                            self.vm.call_fun_term(
+                                                process,
+                                                fun,
+                                                arity,
+                                                true,
+                                                Some(ctx),
+                                            )
                                         }
-                                        crate::ImportOutcome::Returned(value) => {
-                                            process.x[0] = value;
-                                            if process.native_pc.is_none() {
-                                                break Ok(RunState::Done(value));
+                                        _ => {
+                                            process.cold_mut().native_apply = true;
+                                            let result = match target_pc {
+                                                arinsal_beamasm::dispatch::APPLY_FIXED_UNPORTED => {
+                                                    let arity = usize::from(process.header.arity);
+                                                    self.vm.apply_fixed(
+                                                        process,
+                                                        arity,
+                                                        true,
+                                                        0,
+                                                        Some(ctx),
+                                                    )
+                                                }
+                                                arinsal_beamasm::dispatch::APPLY2_UNPORTED => self
+                                                    .vm
+                                                    .apply_bif(process, 2, true, 0, Some(ctx)),
+                                                _ => self.vm.apply_bif(
+                                                    process,
+                                                    3,
+                                                    true,
+                                                    0,
+                                                    Some(ctx),
+                                                ),
+                                            };
+                                            process.cold_mut().native_apply = false;
+                                            result
+                                        }
+                                    };
+                                    let trap = match result {
+                                        Ok(outcome) => {
+                                            match outcome {
+                                                crate::ImportOutcome::Jump(_)
+                                                | crate::ImportOutcome::Advanced => {}
+                                                crate::ImportOutcome::Yield => {
+                                                    break Ok(RunState::Yield);
+                                                }
+                                                crate::ImportOutcome::Returned(value) => {
+                                                    process.x[0] = value;
+                                                    if process.native_pc.is_none() {
+                                                        break Ok(RunState::Done(value));
+                                                    }
+                                                }
                                             }
+                                            continue;
                                         }
+                                        Err(VmError::Trap(trap)) => trap,
+                                        Err(VmError::Exception { reason, frame }) => {
+                                            legacy_exception_trap(process, &reason, &frame)?
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
+                                    // Port of erts/emulator/beam/beam_common.c:1345-1427
+                                    // (apply_bif_error_adjustment), OTP-29.1.1: the applied
+                                    // function raised at the apply instruction, which names the
+                                    // calling function; its continuation is not another frame.
+                                    if call_site_pc != 0
+                                        && target_pc != arinsal_beamasm::dispatch::CALL_FUN_UNPORTED
+                                    {
+                                        process.cold_mut().native_error_pc = call_site_pc;
+                                        if process.heap.stack_get(0).is_some_and(|word| {
+                                            word.tagged_word() as usize == resume_pc
+                                        }) {
+                                            process.heap.release_stack(1);
+                                        }
+                                    }
+                                    if let Some(error) = crate::exceptions::resume(
+                                        &mut self.vm,
+                                        process,
+                                        Some(ctx),
+                                        trap,
+                                    )? {
+                                        process.header.freason = 0;
+                                        process.header.fvalue = 0;
+                                        break Err(error);
+                                    }
+                                    process.header.freason = 0;
+                                    process.header.fvalue = 0;
+                                    if let Some(cold) = process.cold.as_mut() {
+                                        cold.exit_reason = None;
                                     }
                                     continue;
                                 }
@@ -801,19 +966,66 @@ impl Executor {
                                     );
                                 }
                                 process.gc_live = usize::from(export.arity);
+                                // Like call_import_general: code loaded by another scheduler must be
+                                // visible to the BIF (function_exported/3, module_loaded/1, ...).
+                                self.vm.sync_code_epoch();
                                 if matches!(
                                     export.class,
                                     arinsal_loader::ImportClass::Native
                                         | arinsal_loader::ImportClass::Dynamic
+                                        | arinsal_loader::ImportClass::Fun
                                 ) {
-                                    let result = self.vm.dispatch_native(
-                                        process,
-                                        ctx,
-                                        &export.module,
-                                        &export.function,
-                                        usize::from(export.arity),
-                                        (export.class, export.native_bits),
-                                    );
+                                    let saved_arguments =
+                                        process.x[..usize::from(export.arity)].to_vec();
+                                    // BIFs such as load_nif/2 identify their caller through
+                                    // `process.module`, which native code does not maintain: the
+                                    // caller is the native function holding the return address.
+                                    let interpreter_module = process.module;
+                                    if let Some(caller) = crate::native_function_at(resume_pc)
+                                        .and_then(|caller| {
+                                            self.vm.loaded.get(&caller.module).copied()
+                                        })
+                                    {
+                                        process.module = caller;
+                                    }
+                                    // erlang:make_fun/3 is implemented by the VM's call path (funs.rs), not
+                                    // by the native BIF table; handle it here like the interpreter does.
+                                    // erlang:make_fun/3 and fun_info/1,2, fun_info_mfa/1 are implemented
+                                    // by the VM's call path (funs.rs), not by the native BIF table.
+                                    let result = if export.class == arinsal_loader::ImportClass::Fun
+                                        && export.module == "erlang"
+                                        && matches!(
+                                            (export.function.as_str(), export.arity),
+                                            ("make_fun", 3)
+                                                | ("fun_info", 1 | 2)
+                                                | ("fun_info_mfa", 1)
+                                        ) {
+                                        Some(match export.function.as_str() {
+                                            "make_fun" => {
+                                                let args =
+                                                    [process.x[0], process.x[1], process.x[2]];
+                                                self.vm.make_export_fun(process, &args)
+                                            }
+                                            "fun_info" => {
+                                                self.vm.fun_info(process, export.arity == 2)
+                                            }
+                                            _ => self.vm.fun_info_mfa(process),
+                                        })
+                                    } else {
+                                        // The BIF runs at the native call site (erts c_p->i).
+                                        process.cold_mut().native_call_pc = call_site_pc;
+                                        let result = self.vm.dispatch_native(
+                                            process,
+                                            ctx,
+                                            &export.module,
+                                            &export.function,
+                                            usize::from(export.arity),
+                                            (export.class, export.native_bits),
+                                        );
+                                        process.cold_mut().native_call_pc = 0;
+                                        result
+                                    };
+                                    process.module = interpreter_module;
                                     let result = result.or_else(|| {
                                         let (bif, arity) =
                                             crate::beamasm_integration::dispatch_bif(target_pc)?;
@@ -837,8 +1049,111 @@ impl Executor {
                                             }
                                         })
                                     });
+                                    // Interpreter-style BIF errors raise like traps, as in
+                                    // the interpreter's own call_ext path.
+                                    let result = match result {
+                                        Some(Err(VmError::Exception { reason, frame })) => {
+                                            Some(Err(VmError::Trap(legacy_exception_trap(
+                                                process, &reason, &frame,
+                                            )?)))
+                                        }
+                                        other => other,
+                                    };
                                     if let Some(result) = result {
-                                        let value = result?;
+                                        let value = match result {
+                                            Ok(value) => value,
+                                            Err(VmError::Trap(mut trap)) => {
+                                                // Port of erts/emulator/beam/beam_common.c
+                                                // (save_stacktrace: a failing BIF is the top
+                                                // frame, the calling function the next one),
+                                                // OTP-29.1.1.
+                                                if trap.class == arinsal_bifs::Class::Error
+                                                    && trap.top.is_none()
+                                                    && trap.trace.is_none()
+                                                {
+                                                    let args = arinsal_term::TermBuilder::new(
+                                                        &mut crate::FragmentingHeap(
+                                                            &mut process.heap,
+                                                        ),
+                                                    )
+                                                    .list_from_iter(saved_arguments.iter().copied())
+                                                    .map_err(|error| {
+                                                        VmError::Unsupported(format!(
+                                                            "BIF frame arguments: {error:?}"
+                                                        ))
+                                                    })?;
+                                                    trap.top =
+                                                        Some(crate::stacktrace::TopFrame::Bif {
+                                                            module: export.module.clone(),
+                                                            function: export.function.clone(),
+                                                            args,
+                                                        });
+                                                }
+                                                process.cold_mut().native_error_pc = call_site_pc;
+                                                // The BIF does not return: drop the native
+                                                // continuation the trap pushed as its CP, which
+                                                // erts never creates for a BIF call.
+                                                if process.heap.stack_get(0).is_some_and(|word| {
+                                                    word.tagged_word() as usize == resume_pc
+                                                }) {
+                                                    process.heap.release_stack(1);
+                                                }
+                                                if let Some(error) = crate::exceptions::resume(
+                                                    &mut self.vm,
+                                                    process,
+                                                    Some(ctx),
+                                                    trap,
+                                                )? {
+                                                    break Err(error);
+                                                }
+                                                process.header.freason = 0;
+                                                process.header.fvalue = 0;
+                                                continue;
+                                            }
+                                            Err(VmError::Unsupported(message))
+                                                if crate::signals::is_await_message(&message) =>
+                                            {
+                                                for (register, value) in
+                                                    process.x.iter_mut().zip(&saved_arguments)
+                                                {
+                                                    *register = *value;
+                                                }
+                                                let cold = process.cold_mut();
+                                                cold.native_retry = Some(target_pc);
+                                                process.native_pc = Some(code_ptr);
+                                                break Ok(RunState::Wait { timeout_ms: None });
+                                            }
+                                            // Port of erts/emulator/beam/beam_common.c:1568
+                                            // (erts_hibernate), OTP-29.1.1: hibernate/3 discarded
+                                            // the stack, so the native caller is gone; the process
+                                            // resumes through apply/3 like the interpreter's path.
+                                            Err(VmError::Unsupported(_))
+                                                if hibernate_stopped(process, ctx.pid()) =>
+                                            {
+                                                // hibernate/0 keeps its stack: after the wakeup the
+                                                // native call is retried and returns `ok` in place.
+                                                if hibernate_resumes_in_place(process, ctx.pid()) {
+                                                    let cold = process.cold_mut();
+                                                    cold.native_retry = Some(target_pc);
+                                                    process.native_pc = Some(code_ptr);
+                                                    break Ok(RunState::Wait { timeout_ms: None });
+                                                }
+                                                process.native_pc = None;
+                                                if let Some(cold) = process.cold.as_mut() {
+                                                    cold.native_continuation_resume = false;
+                                                }
+                                                process.drain(ctx)?;
+                                                if process.inbox.is_empty() {
+                                                    if let Some(runtime) = process.runtime.clone() {
+                                                        runtime.mark_hibernating(ctx.pid(), true);
+                                                    }
+                                                    break Ok(RunState::Wait { timeout_ms: None });
+                                                }
+                                                self.install_apply(process, ctx)?;
+                                                continue;
+                                            }
+                                            Err(error) => return Err(error),
+                                        };
                                         process.x[0] = value;
                                         if !resume_after_native_return(process) {
                                             break Ok(RunState::Done(value));
@@ -1040,6 +1355,28 @@ impl Executor {
         std::mem::swap(&mut process.fr, &mut self.fr);
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. })) {
             let (live_x, live_fr) = self.vm.registers[process.module];
+            // A native continuation keeps the live X registers of its yield site, which the
+            // interpreted module's register count does not bound.
+            let native_live = if process.native_pc.is_some() {
+                process
+                    .cold
+                    .as_ref()
+                    .map_or(0, |cold| usize::from(cold.native_resume_live))
+            } else {
+                0
+            };
+            let live_x = live_x.max(native_live);
+            if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some()
+                && process.native_pc.is_some()
+            {
+                eprintln!(
+                    "[sched-save-native] live_x={live_x} x_len={} x0={:#x} module={} native_pc={:?}",
+                    self.x.len(),
+                    self.x.first().map_or(0, |term| term.tagged_word()),
+                    self.vm.modules[process.module].name,
+                    process.native_pc
+                );
+            }
             let mut saved_x = process.x.to_vec();
             saved_x.resize(live_x, Term::NIL);
             let copy_x = self.x.len().min(live_x);
@@ -1175,6 +1512,7 @@ fn resume_after_native_return(process: &mut Process) -> bool {
         if crate::native_bridge::is_native_function_at(raw) {
             process.heap.release_stack(1);
             process.cold_mut().native_continuation_resume = true;
+            process.cold_mut().native_resume_live = 2;
             process.native_pc = Some(raw);
             return true;
         }
@@ -1205,6 +1543,17 @@ pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError>
 }
 
 // g_proc_sched
+fn hibernate_resumes_in_place(process: &Process, pid: Pid) -> bool {
+    process.runtime.as_ref().is_some_and(|runtime| {
+        runtime
+            .hibernating
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .is_some_and(|cont| cont.resume_in_place)
+    })
+}
+
 fn hibernate_stopped(process: &Process, pid: Pid) -> bool {
     let Some(runtime) = &process.runtime else {
         return false;
@@ -1239,6 +1588,13 @@ fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
                 crate::signals::atom("system_limit")
             }
         };
+    }
+    // An exit signal that reached a running process (kill becomes killed) ends it with its
+    // reason (erts/emulator/beam/erl_proc_sig_queue.c, handle_exit_signal), OTP-29.1.1.
+    if let VmError::Trap(trap) = error
+        && trap.class == arinsal_bifs::Class::Exit
+    {
+        return trap.reason;
     }
     let VmError::Raised(raised) = error else {
         return crate::signals::atom("error");
@@ -2022,33 +2378,38 @@ impl Process {
         });
     }
 
-    pub(crate) fn send_message(
-        &mut self,
-        ctx: &mut RunCtx<'_, Message>,
-        target: Term,
-        value: Term,
-    ) -> Result<Term, VmError> {
-        self.send_message_inner(None, ctx, target, value)
+    pub(crate) fn send_message(&mut self, target: Term, value: Term) -> Result<Term, VmError> {
+        self.send_message_inner(None, target, value)
     }
 
     pub(crate) fn send_message_with_vm(
+        &mut self,
+        vm: &mut Vm,
+        target: Term,
+        value: Term,
+    ) -> Result<Term, VmError> {
+        self.send_message_inner(Some(vm), target, value)
+    }
+
+    fn send_message_inner(
+        &mut self,
+        vm: Option<&mut Vm>,
+        target: Term,
+        value: Term,
+    ) -> Result<Term, VmError> {
+        self.send_message_prio(vm, None, target, value, false)
+    }
+
+    /// Send from a running process: the scheduler context delivers the message (and its
+    /// trace events) on the sender's worker, like erts' `erts_send_message`.
+    pub(crate) fn send_message_in(
         &mut self,
         vm: &mut Vm,
         ctx: &mut RunCtx<'_, Message>,
         target: Term,
         value: Term,
     ) -> Result<Term, VmError> {
-        self.send_message_inner(Some(vm), ctx, target, value)
-    }
-
-    fn send_message_inner(
-        &mut self,
-        vm: Option<&mut Vm>,
-        ctx: &mut RunCtx<'_, Message>,
-        target: Term,
-        value: Term,
-    ) -> Result<Term, VmError> {
-        self.send_message_prio(vm, ctx, target, value, false)
+        self.send_message_prio(Some(vm), Some(ctx), target, value, false)
     }
 
     /// Send with an optional OTP 28+ `[priority]` request.
@@ -2056,22 +2417,33 @@ impl Process {
     pub(crate) fn send_message_prio(
         &mut self,
         mut vm: Option<&mut Vm>,
-        ctx: &mut RunCtx<'_, Message>,
+        mut ctx: Option<&mut RunCtx<'_, Message>>,
         target: Term,
         value: Term,
         want_priority: bool,
     ) -> Result<Term, VmError> {
+        let sender = self
+            .self_pid
+            .ok_or_else(|| VmError::Unsupported("send requires a scheduled process".into()))?;
         if target.as_port().is_some() {
-            crate::port::send_message(self, ctx, target, value)?;
+            crate::port::send_message(self, target, value)?;
             return Ok(value);
         }
         // Port of erts/emulator/beam/erl_message.c (`erts_send` / remote_send), OTP-29.1.1.
-        if crate::dist::try_remote_send(self, ctx, target, value)? {
-            crate::trace::emit(
+        let remote = match ctx.as_deref_mut() {
+            Some(ctx) => crate::dist::try_remote_send(self, ctx, target, value)?,
+            // Native code sends without a scheduler context; a remote send is redone by the
+            // scheduler, which owns the distribution output path.
+            None if crate::dist::is_remote_target(target)? => {
+                return Err(VmError::Unsupported(REMOTE_SEND_NEEDS_CONTEXT.into()));
+            }
+            None => false,
+        };
+        if remote {
+            crate::trace::emit_process(
                 vm.as_deref_mut(),
                 self,
-                ctx,
-                ctx.pid(),
+                sender,
                 crate::trace::SEND,
                 "send",
                 &[value, target],
@@ -2131,63 +2503,48 @@ impl Process {
                 "badarg",
             )))
         })?;
-        crate::trace::emit(
-            vm.as_deref_mut(),
-            self,
-            ctx,
-            ctx.pid(),
-            crate::trace::SEND,
-            "send",
-            &[value, target],
-        );
+        match ctx.as_deref_mut() {
+            Some(ctx) => crate::trace::emit(
+                vm.as_deref_mut(),
+                self,
+                ctx,
+                sender,
+                crate::trace::SEND,
+                "send",
+                &[value, target],
+            ),
+            None => crate::trace::emit_process(
+                vm.as_deref_mut(),
+                self,
+                sender,
+                crate::trace::SEND,
+                "send",
+                &[value, target],
+            ),
+        }
         let mut envelope = Message::copy_from(value)?;
         if via_prio_alias {
             envelope = envelope.with_priority();
         }
         if crate::seq_trace::has_token(self)
-            && let Some(token) = crate::seq_trace::on_send(vm, self, ctx, ctx.pid(), target, value)
+            && let Some(token) =
+                crate::seq_trace::on_send(vm, self, ctx.as_deref_mut(), sender, target, value)
         {
             envelope.attach_seq_token(token);
         }
-        match ctx.send(pid, envelope) {
+        let delivered = match ctx {
+            Some(ctx) => ctx.send(pid, envelope),
+            None => self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| VmError::Unsupported("send requires a scheduler".into()))?
+                .scheduler()?
+                .send(sender, pid, envelope),
+        };
+        match delivered {
             Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(value),
             Err(error) => Err(VmError::Unsupported(format!("send: {error}"))),
         }
-    }
-
-    // Port of erts/emulator/beam/erl_bif_info.c:4976-4995, OTP-29.1.1.
-    fn handle_multizero_timeout_callback(
-        &mut self,
-        ctx: &mut RunCtx<'_, Message>,
-        term: Term,
-    ) -> Result<bool, VmError> {
-        let callback = term
-            .as_atom()
-            .and_then(|name| arinsal_term::global_atoms().text(name));
-        let next = match callback.as_deref() {
-            Some("multizero_timeout_in_timeout_step1") => {
-                Some("multizero_timeout_in_timeout_step2")
-            }
-            Some("multizero_timeout_in_timeout_step2") => {
-                Some("multizero_timeout_in_timeout_step3")
-            }
-            Some("multizero_timeout_in_timeout_step3") => {
-                self.inbox
-                    .push_back(crate::signals::atom("multizero_timeout_in_timeout_done"));
-                return Ok(true);
-            }
-            _ => None,
-        };
-        if let Some(next) = next {
-            ctx.send_after(0, Message::copy_from(crate::signals::atom(next))?)
-                .map_err(|_| {
-                    VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                        "system_limit",
-                    )))
-                })?;
-            return Ok(true);
-        }
-        Ok(false)
     }
 
     pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
@@ -2220,23 +2577,6 @@ impl Process {
             };
             match payload {
                 Payload::Message(message) => {
-                    let multizero_callback = message
-                        .term
-                        .as_atom()
-                        .and_then(|name| arinsal_term::global_atoms().text(name))
-                        .is_some_and(|name| {
-                            matches!(
-                                name.as_ref(),
-                                "multizero_timeout_in_timeout_step1"
-                                    | "multizero_timeout_in_timeout_step2"
-                                    | "multizero_timeout_in_timeout_step3"
-                            )
-                        });
-                    if multizero_callback {
-                        let term = message.into_receiver(self)?;
-                        self.handle_multizero_timeout_callback(ctx, term)?;
-                        continue;
-                    }
                     let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
@@ -2320,9 +2660,6 @@ impl Process {
                 }
                 Payload::Timer { reference, message } => {
                     let term = message.into_receiver(self)?;
-                    if self.handle_multizero_timeout_callback(ctx, term)? {
-                        continue;
-                    }
                     let runtime = self
                         .runtime
                         .as_ref()
@@ -2404,19 +2741,29 @@ impl Process {
     }
 
     // Port of erts/emulator/beam/beam_bif_load.c:1149 (check_process_code), OTP-29.1.1.
-    pub(crate) fn references_code(&self, module: usize) -> bool {
-        if self.module == module {
-            return true;
+    // A process suspended in native code is checked by its native resume address and the
+    // native continuation pointers on its stack; `self.module` is only its interpreter module.
+    pub(crate) fn references_code(&self, module: usize, native: Option<(usize, usize)>) -> bool {
+        let in_native =
+            |address: usize| native.is_some_and(|(start, end)| start <= address && address < end);
+        // While native code runs (a signal handled from a runtime helper), `self.module` is
+        // stale and the running function shows up through the native stack instead.
+        match self.native_pc {
+            Some(pc) if in_native(pc) => return true,
+            None if self.module == module && !self.heap.native_active() => return true,
+            _ => {}
         }
         for index in 0..self.heap.stack_words() {
             let Some(term) = self.heap.stack_get(index) else {
                 continue;
             };
-            if term.classify() == arinsal_term::TermKind::Catch {
-                let bits = term.tagged_word() >> 6;
-                if (bits >> 32) as usize == module {
-                    return true;
-                }
+            if let Some((false, frame_module, _)) = crate::stacktrace::decode_tag(term)
+                && frame_module == module
+            {
+                return true;
+            }
+            if in_native(term.tagged_word() as usize) {
+                return true;
             }
         }
         false
@@ -2440,6 +2787,14 @@ impl Process {
                 eprintln!("PF_MEM down={count} markers={markers}");
             }
         }
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:6355 (ERTS_SIG_Q_OP_MONITOR_DOWN),
+        // OTP-29.1.1: a DOWN whose origin monitor is no longer in the table (a demonitor
+        // raced with the target's exit) is dropped instead of becoming a message.
+        let active = self
+            .cold
+            .as_mut()
+            .is_some_and(|cold| cold.monitors.remove(&reference).is_some())
+            || crate::dist::take_monitor(reference).is_some();
         let tag_owned = self
             .cold
             .as_mut()
@@ -2448,6 +2803,9 @@ impl Process {
             .cold
             .as_mut()
             .is_some_and(|cold| cold.prio_monitors.remove(&reference));
+        if !active {
+            return Ok(());
+        }
         let tag = if let Some(owned) = tag_owned {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut self.heap);
             arinsal_term::from_owned(&owned, &mut heap)
@@ -2621,10 +2979,11 @@ impl Process {
             Ok(RunState::Done(term)) => {
                 if trace_boot_enabled() {
                     eprintln!(
-                        "arinsal boot: process {:?} done module={} ip={} value={term:?}",
+                        "arinsal boot: process {:?} done module={} ip={} value={term:?} {:?}",
                         ctx.pid(),
                         self.module,
-                        self.ip
+                        self.ip,
+                        arinsal_term::to_owned(term).ok()
                     );
                 }
                 #[cfg(feature = "pf-mem-counters")]

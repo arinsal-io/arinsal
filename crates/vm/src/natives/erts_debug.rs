@@ -608,7 +608,7 @@ fn dirty_test(
                 process,
                 &[atom("ok"), ctx.pid().to_term().ok_or_else(badarg)?],
             )?;
-            let _ = process.send_message(ctx, value, message);
+            let _ = process.send_message(value, message);
             Ok(atom("ok"))
         }
         Some("wait") => {
@@ -633,13 +633,13 @@ fn dirty_test(
                 process,
                 &[atom("ready"), ctx.pid().to_term().ok_or_else(badarg)?],
             )?;
-            let _ = process.send_message(ctx, value, ready);
+            let _ = process.send_message(value, ready);
             std::thread::sleep(std::time::Duration::from_secs(6));
             let done = tuple(
                 process,
                 &[atom("done"), ctx.pid().to_term().ok_or_else(badarg)?],
             )?;
-            let _ = process.send_message(ctx, value, done);
+            let _ = process.send_message(value, done);
             Ok(atom("ok"))
         }
         _ => Err(badarg()),
@@ -999,7 +999,7 @@ fn gather_allocator_info(
         tuple(process, &[reference, Term::small(0).unwrap(), Term::NIL])?
     };
     if let Some(receiver) = ctx.pid().to_term() {
-        let _ = process.send_message(ctx, receiver, message);
+        let _ = process.send_message(receiver, message);
     }
     Ok(Term::small(1).unwrap())
 }
@@ -1813,9 +1813,22 @@ fn internal_state_set(
             if process.runtime.is_none() {
                 return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
             }
-            let message = Message::copy_from(atom("multizero_timeout_in_timeout_step1"))?;
-            ctx.send_after(timeout.max(0) as u64, message)
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            // Port of erts/emulator/beam/erl_bif_info.c:4976-4996,5402-5412, OTP-29.1.1: a
+            // timer callback that starts a zero timer callback from within a timer callback.
+            let done = Message::copy_from(atom("multizero_timeout_in_timeout_done"))?;
+            ctx.start_timer_callback(
+                timeout.max(0) as u64,
+                Box::new(move |timers| {
+                    timers.start_timer_callback(
+                        0,
+                        Box::new(move |timers| {
+                            timers
+                                .start_timer_callback(0, Box::new(move |timers| timers.send(done)));
+                        }),
+                    );
+                }),
+            )
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
             return Ok(atom("ok"));
         }
         Some("next_pid") | Some("next_port") => {

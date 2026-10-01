@@ -390,21 +390,28 @@ fn process_info(
             }
             "current_location" => {
                 let (module_name, function, arity) = resolve_mfa(vm, process)?;
-                let source = process.runtime.as_ref().and_then(|runtime| {
-                    runtime.with_modules(|modules| {
-                        let module = modules.get(process.module)?;
-                        module
-                            .lines
-                            .get(process.ip)
-                            .and_then(Option::as_ref)
-                            .or_else(|| {
-                                process
-                                    .ip
-                                    .checked_sub(1)
-                                    .and_then(|ip| module.lines.get(ip))
-                                    .and_then(Option::as_ref)
-                            })
-                            .cloned()
+                let native = native_call_site(process).map(|(function, pc)| {
+                    function
+                        .line_at(pc)
+                        .map(|(file, line)| (file.to_owned(), u64::from(line)))
+                });
+                let source = native.flatten().or_else(|| {
+                    process.runtime.as_ref().and_then(|runtime| {
+                        runtime.with_modules(|modules| {
+                            let module = modules.get(process.module)?;
+                            module
+                                .lines
+                                .get(process.ip)
+                                .and_then(Option::as_ref)
+                                .or_else(|| {
+                                    process
+                                        .ip
+                                        .checked_sub(1)
+                                        .and_then(|ip| module.lines.get(ip))
+                                        .and_then(Option::as_ref)
+                                })
+                                .cloned()
+                        })
                     })
                 });
                 let location = if let Some((file, line)) = source {
@@ -883,7 +890,21 @@ fn dictionary_lookup(selector: Term) -> Option<(arinsal_etf::OwnedTerm, Term)> {
     Some((tuple[1].clone(), selector))
 }
 
+/// The native function and source location a native caller is executing a BIF at.
+fn native_call_site(process: &Process) -> Option<(crate::native_bridge::NativeFunction, usize)> {
+    let pc = process.cold.as_ref()?.native_call_pc;
+    if pc == 0 {
+        return None;
+    }
+    let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
+    let pc = if pc & tag != 0 { (pc & !tag) - 1 } else { pc };
+    crate::native_function_at(pc).map(|function| (function, pc))
+}
+
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
+    if let Some((function, _)) = native_call_site(process) {
+        return Ok((function.module, function.function, function.arity));
+    }
     if let Some(vm) = vm {
         let module = vm.modules.get(process.module).ok_or_else(badarg)?;
         let (function, arity) = module.function_at(process.ip).unwrap_or(("undefined", 0));
@@ -1028,10 +1049,11 @@ pub(crate) fn fulfill_request(
         crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("true")]),
         crate::signals::RemoteOp::CheckProcessCode {
             module,
+            native,
             async_request,
             kill,
         } => {
-            let references = process.references_code(module);
+            let references = process.references_code(module, native);
             if kill && references {
                 let reason = Message::copy_from(atom("kill"))?;
                 ctx.signal(ctx.pid(), Signal::Exit(reason))
@@ -1720,7 +1742,7 @@ fn suspend_process(
         {
             let message = make_tuple(process, &[tag, atom("badarg")])?;
             let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
-            process.send_message(ctx, self_pid, message)?;
+            process.send_message(self_pid, message)?;
             return Ok(atom("true"));
         }
         return Ok(atom("badarg"));
@@ -1734,7 +1756,7 @@ fn suspend_process(
     {
         let message = make_tuple(process, &[tag, atom("suspended")])?;
         let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
-        process.send_message(ctx, self_pid, message)?;
+        process.send_message(self_pid, message)?;
     }
     Ok(atom(if changed { "true" } else { "false" }))
 }
@@ -1839,7 +1861,7 @@ fn spawn_request(
                 &[parsed.tag, reference, atom("error"), atom("badopt")],
             )?;
             let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
-            process.send_message(ctx, self_pid, message)?;
+            process.send_message(self_pid, message)?;
         }
         return Ok(reference);
     }
@@ -1955,7 +1977,7 @@ fn dist_spawn_request(
     if reply_error {
         let message = make_tuple(process, &[tag, reference, atom("error"), reason])?;
         let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
-        process.send_message(ctx, self_pid, message)?;
+        process.send_message(self_pid, message)?;
     }
     Ok(reference)
 }

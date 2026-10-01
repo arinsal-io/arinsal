@@ -10,15 +10,12 @@ use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::heap::Fragment;
 use crate::{
     ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, ExternalBinary, FUN,
-    FunEntry, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, MagicRef, Node, ProcessHeap, RECORD, SUB_BITS,
-    StackWord, Term, TermError, WritableBinary,
+    FunEntry, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, MagicRef, Node, ProcessHeap, RECORD,
+    S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
 };
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
-
-// Port of erl_vm.h:107-117 (`S_RESERVED`), OTP-29.1.1, BEAMAsm arm64.
-const S_RESERVED: usize = 4;
 
 /// Counters for one collection. The caller may add them to process totals.
 #[derive(Clone, Copy, Debug, Default)]
@@ -712,6 +709,7 @@ impl ProcessHeap {
         next.min_heap_size = self.min_heap_size;
         next.fullsweep_after = self.fullsweep_after;
         next.heap_grow = self.heap_grow;
+        next.native_allocation = self.native_allocation;
         next.minor_since_major = if major {
             0
         } else {
@@ -807,7 +805,9 @@ impl ProcessHeap {
         if let Some(error) = error {
             return Err(error);
         }
-        self.adjust_young_heap(major, min_free, roots, extra)?;
+        // The code range guard stays held: a second read acquisition could block behind a
+        // queued writer (a module being registered) while this one is still held.
+        self.adjust_young_heap(major, min_free, roots, extra, code_ranges)?;
         #[cfg(debug_assertions)]
         self.verify_frame_chain(code_ranges);
         if std::env::var_os("ARINSAL_GC_TRACE").is_some() {
@@ -849,6 +849,7 @@ impl ProcessHeap {
         min_free: usize,
         roots: &mut [Term],
         extra: &mut [Term],
+        code_ranges: &[(usize, usize)],
     ) -> Result<(), TermError> {
         let stack = self.stack_words();
         let need_after = self
@@ -901,13 +902,19 @@ impl ProcessHeap {
         if let Some(wanted) = wanted
             && wanted != capacity
         {
-            self.relocate_young(wanted, roots, extra);
+            self.relocate_young(wanted, roots, extra, code_ranges);
         }
         Ok(())
     }
 
     /// Move the young heap to a block of `new_words`, keeping object addresses consistent.
-    fn relocate_young(&mut self, new_words: usize, roots: &mut [Term], extra: &mut [Term]) {
+    fn relocate_young(
+        &mut self,
+        new_words: usize,
+        roots: &mut [Term],
+        extra: &mut [Term],
+        code_ranges: &[(usize, usize)],
+    ) {
         let stack = self.stack_words();
         debug_assert!(new_words >= self.htop.saturating_add(stack));
         let old_start = self.words.as_ptr() as usize;
@@ -923,10 +930,6 @@ impl ProcessHeap {
             old_end: old_stack_end,
             new_start: new_start + new_stop * 8,
         };
-        let code_ranges = crate::native_code::native_code_ranges();
-        let code_ranges = code_ranges
-            .as_deref()
-            .map_or(&[][..], |ranges| ranges.as_slice());
         if self.frame_pointer != 0 {
             self.frame_pointer = rebase_address(self.frame_pointer, stack_move);
         }

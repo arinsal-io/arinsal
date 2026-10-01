@@ -12,7 +12,6 @@ const TAG_IMMED1_SMALL: u16 = 0x0f;
 const HEADER_FLONUM: u64 = (1 << 6) | 0x18;
 const HEADER_POS_BIG: u64 = (1 << 6) | 0x08;
 const HEADER_NEG_BIG: u64 = (1 << 6) | 0x0c;
-const EXC_BADARITH: u64 = (4 << 10) | (1 << 6) | (1 << 4);
 const MAX_FINITE_BITS: u64 = 0x7fefffffffffffff;
 
 /// Runtime conversion hook for a validated bignum term to IEEE-754 bits.
@@ -64,19 +63,28 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), C_P, 72)?;
             e.ldr_uoff(Gpr::x(9), C_P, 40)
         })?;
-        self.code.cbnz(Gpr::x(9), self.error_label)?;
+        self.error_if_nonzero(Gpr::x(9))?;
         Ok(())
     }
 
     fn badarith(&mut self) -> Result<(), ModuleError> {
-        let error = self.error_label;
+        // The VM's native exception convention: `freason = 1` (error) and the reason atom in
+        // `fvalue`, as `set_error` publishes it.
+        let badarith = arinsal_term::Term::atom(
+            arinsal_term::global_atoms()
+                .intern("badarith")
+                .map_err(|_| ModuleError::InvalidOperand("badarith atom"))?,
+        )
+        .tagged_word();
         self.code.emit(|e| {
-            e.mov_const(Gpr::x(9), EXC_BADARITH)?;
+            e.mov_const(Gpr::x(9), 1)?;
             e.str_uoff(Gpr::x(9), C_P, 40)?;
+            e.mov_const(Gpr::x(9), badarith)?;
+            e.str_uoff(Gpr::x(9), C_P, 48)?;
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
             Ok(())
         })?;
-        self.code.b(error)?;
+        self.branch_error()?;
         Ok(())
     }
 
@@ -168,13 +176,13 @@ impl BeamModuleAssembler {
         let flonum = self.code.new_label();
         let bignum = self.code.new_label();
         self.code.emit(|e| {
-            e.and_imm(Gpr::x(9), source, TAG_IMMED1_MASK)?;
-            e.cmp_imm(Gpr::x(9), TAG_IMMED1_SMALL, false)
+            e.and_imm(Gpr::x(12), source, TAG_IMMED1_MASK)?;
+            e.cmp_imm(Gpr::x(12), TAG_IMMED1_SMALL, false)
         })?;
         self.code.b_cond(Cond::Eq, small)?;
         self.code.emit(|e| {
-            e.and_imm(Gpr::x(9), source, 3)?;
-            e.cmp_imm(Gpr::x(9), TAG_PRIMARY_BOXED as u16, false)
+            e.and_imm(Gpr::x(12), source, 3)?;
+            e.cmp_imm(Gpr::x(12), TAG_PRIMARY_BOXED as u16, false)
         })?;
         self.code.b_cond(Cond::Eq, boxed)?;
         self.badarith()?;
@@ -191,11 +199,14 @@ impl BeamModuleAssembler {
             e.cmp_imm(Gpr::x(11), HEADER_FLONUM as u16, false)
         })?;
         self.code.b_cond(Cond::Eq, flonum)?;
-        self.code
-            .emit(|e| e.cmp_imm(Gpr::x(11), HEADER_POS_BIG as u16, false))?;
+        // A bignum header carries its digit count, so only the subtag bits identify it.
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(12), Gpr::x(11), 0x3f)?;
+            e.cmp_imm(Gpr::x(12), HEADER_POS_BIG as u16 & 0x3f, false)
+        })?;
         self.code.b_cond(Cond::Eq, bignum)?;
         self.code
-            .emit(|e| e.cmp_imm(Gpr::x(11), HEADER_NEG_BIG as u16, false))?;
+            .emit(|e| e.cmp_imm(Gpr::x(12), HEADER_NEG_BIG as u16 & 0x3f, false))?;
         self.code.b_cond(Cond::Eq, bignum)?;
         self.badarith()?;
         self.code.bind(flonum)?;

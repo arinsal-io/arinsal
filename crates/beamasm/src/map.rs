@@ -7,6 +7,7 @@ use arinsal_a64::{
 
 use crate::{
     ProcessHeader, Update, emit_enter_runtime, emit_leave_runtime,
+    guard::GuardHelper,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
 };
 
@@ -19,6 +20,9 @@ const X: [Gpr; 6] = [
     logical_xreg(16),
 ];
 const E: Gpr = Gpr::x(20);
+/// Staging area top for `get_map_elements`, which does not allocate and has no live count:
+/// the vector sits just below OTP's scratch X register (1023), away from live X registers.
+const GET_ELEMENTS_STAGING_TOP: u32 = 1020;
 const HTOP: Gpr = Gpr::x(23);
 const ATOM_TAG: u16 = 0x0b;
 
@@ -62,7 +66,7 @@ impl BeamModuleAssembler {
     ) -> Result<(), ModuleError> {
         let map = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
-        let key = self.source_reg(key)?;
+        let key = self.source_reg_into(key, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), key))?;
         self.emit_small_internal_hash(Gpr::x(2))?;
         let fail = self.label(fail);
@@ -102,12 +106,14 @@ impl BeamModuleAssembler {
                 "map get operands must be triplets",
             ));
         }
-        self.stage_map_args(args)?;
+        let base = GET_ELEMENTS_STAGING_TOP - args.len() as u32;
+        // The inline flatmap scan compares key words, which identifies only immediate keys;
+        // a boxed literal key (float, tuple, map, list) is compared by value in the runtime.
+        // Port of erts/emulator/beam/jit/arm/instr_map.cpp (emit_i_get_map_elements), OTP-29.1.1.
         if args.len() < 24
-            && args
-                .iter()
-                .step_by(3)
-                .all(|v| matches!(v, ArgVal::Immediate(_) | ArgVal::Literal(_)))
+            && args.iter().step_by(3).all(
+                |v| matches!(v, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3),
+            )
         {
             let map = self.source_reg(src)?;
             self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
@@ -139,7 +145,7 @@ impl BeamModuleAssembler {
                     .emit(|e| e.cmp_reg(Gpr::x(12), key, arinsal_a64::enc::Shift::Lsl, 0))?;
                 self.code.b_cond(Cond::Ne, loop_label)?;
                 let dst = triplet[1];
-                if !matches!(dst, ArgVal::X(6)) {
+                if !is_scratch_x(dst) {
                     let val = self.destination_register_for(dst)?;
                     self.code
                         .emit(|e| e.add_imm(Gpr::x(13), Gpr::x(8), 16, false))?;
@@ -150,8 +156,10 @@ impl BeamModuleAssembler {
             }
             self.code.b(done)?;
             self.code.bind(generic)?;
+            self.stage_map_args(args, base)?;
             self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(3), E))?;
+            self.code
+                .emit(|e| e.mov_const(Gpr::x(3), u64::from(base)))?;
             self.code
                 .emit(|e| e.mov_const(Gpr::x(4), (args.len() / 3) as u64))?;
             emit_map_runtime(
@@ -164,13 +172,16 @@ impl BeamModuleAssembler {
             self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
             let fail_label = self.label(fail);
             self.code.b_cond(Cond::Eq, fail_label)?;
+            self.store_staged_map_elements(args, base)?;
             self.code.bind(done)?;
             Ok(())
         } else {
+            self.stage_map_args(args, base)?;
             let map = self.source_reg(src)?;
             self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
             self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
-            self.code.emit(|e| e.mov_reg(Gpr::x(3), E))?;
+            self.code
+                .emit(|e| e.mov_const(Gpr::x(3), u64::from(base)))?;
             self.code
                 .emit(|e| e.mov_const(Gpr::x(4), (args.len() / 3) as u64))?;
             emit_map_runtime(
@@ -182,8 +193,27 @@ impl BeamModuleAssembler {
             )?;
             let fail_label = self.label(fail);
             self.code.cbz(Gpr::x(0), fail_label)?;
+            self.store_staged_map_elements(args, base)?;
             Ok(())
         }
+    }
+
+    /// Moves the values the runtime lookup left in the staging area to their destinations.
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:391-490, OTP-29.1.1.
+    fn store_staged_map_elements(&mut self, args: &[ArgVal], base: u32) -> Result<(), ModuleError> {
+        for (index, triplet) in args.as_chunks::<3>().0.iter().enumerate() {
+            let dst = triplet[1];
+            if is_scratch_x(dst) {
+                continue;
+            }
+            let offset = u32::try_from(base as usize + 1 + index * 3)
+                .map_err(|_| ModuleError::InvalidOperand("map argument offset overflow"))?
+                * 8;
+            self.code
+                .emit(|e| e.ldr_uoff(Gpr::x(8), Gpr::x(19), offset))?;
+            self.store_map_result(dst, Gpr::x(8))?;
+        }
+        Ok(())
     }
 
     /// Emits a small literal flatmap in OTP's header, size, keys, values layout.
@@ -199,15 +229,15 @@ impl BeamModuleAssembler {
         let words = count
             .checked_add(3)
             .ok_or(ModuleError::InvalidOperand("map allocation overflow"))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(8), (count << 6) | 0x2c))?;
+        // A flatmap header carries only the MAP subtag; bits 6-7 would mark a hashmap.
+        self.code.emit(|e| e.mov_const(Gpr::x(8), 0x2c))?;
         self.code.emit(|e| e.str_post(Gpr::x(8), HTOP, 8))?;
         self.code.emit(|e| e.mov_const(Gpr::x(8), count))?;
         self.code.emit(|e| e.str_post(Gpr::x(8), HTOP, 8))?;
         let keys = self.source_reg(keys)?;
         self.code.emit(|e| e.str_post(keys, HTOP, 8))?;
         for value in values {
-            let value = self.source_reg(*value)?;
+            let value = self.source_reg_into(*value, Gpr::x(17))?;
             self.code.emit(|e| e.str_post(value, HTOP, 8))?;
         }
         self.code
@@ -229,7 +259,7 @@ impl BeamModuleAssembler {
                 "new map operands must be key/value pairs",
             ));
         }
-        self.stage_map_args(args)?;
+        self.stage_map_args(args, live.max(6))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), Gpr::xzr()))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
         self.code.emit(|e| e.mov_const(Gpr::x(3), live as u64))?;
@@ -262,7 +292,7 @@ impl BeamModuleAssembler {
                 "map update operands must be key/value pairs",
             ));
         }
-        self.stage_map_args(updates)?;
+        self.stage_map_args(updates, live.max(6))?;
         let source = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), source))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
@@ -297,11 +327,14 @@ impl BeamModuleAssembler {
                 "map update operands must be key/value pairs",
             ));
         }
-        self.stage_map_args(updates)?;
+        self.stage_map_args(updates, live.max(6))?;
         let source = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), source))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::x(19)))?;
-        self.code.emit(|e| e.mov_const(Gpr::x(3), live as u64))?;
+        // Bit 32 tells the runtime that a failure label exists: a missing key then fails the
+        // instruction quietly instead of raising `{badkey, Key}`.
+        let live_and_flags = u64::from(live) | (u64::from(fail != 0) << 32);
+        self.code.emit(|e| e.mov_const(Gpr::x(3), live_and_flags))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(4), (updates.len() / 2) as u64))?;
         emit_map_runtime(
@@ -329,8 +362,9 @@ impl BeamModuleAssembler {
         lhs: ArgVal,
         rhs: ArgVal,
         dst: ArgVal,
+        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_boolean_binary(fail, lhs, rhs, dst, false)
+        self.emit_boolean_binary(fail, lhs, rhs, dst, false, runtime)
     }
 
     /// Emits Erlang's strict boolean `or/2` BIF.
@@ -341,13 +375,20 @@ impl BeamModuleAssembler {
         lhs: ArgVal,
         rhs: ArgVal,
         dst: ArgVal,
+        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_boolean_binary(fail, lhs, rhs, dst, true)
+        self.emit_boolean_binary(fail, lhs, rhs, dst, true, runtime)
     }
 
     /// Emits Erlang's strict boolean `not/1` BIF.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1177-1213, OTP-29.1.1.
-    pub fn emit_bif_not(&mut self, fail: u32, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
+    pub fn emit_bif_not(
+        &mut self,
+        fail: u32,
+        src: ArgVal,
+        dst: ArgVal,
+        runtime: GuardHelper,
+    ) -> Result<(), ModuleError> {
         let value = self.source_reg(src)?;
         self.code.emit(|e| e.and_imm(Gpr::x(8), value, !0x40))?;
         self.code.emit(|e| e.cmp_imm(Gpr::x(8), ATOM_TAG, false))?;
@@ -355,9 +396,18 @@ impl BeamModuleAssembler {
             let fail_label = self.label(fail);
             self.code.b_cond(Cond::Ne, fail_label)?;
         } else {
-            return Err(ModuleError::InvalidOperand(
-                "not/1 badarg requires a failure label",
-            ));
+            let badarg = self.code.new_label();
+            let done = self.code.new_label();
+            self.code.b_cond(Cond::Ne, badarg)?;
+            self.code.emit(|e| e.eor_imm(Gpr::x(9), value, 0x40))?;
+            self.store_map_result(dst, Gpr::x(9))?;
+            self.code.b(done)?;
+            self.code.bind(badarg)?;
+            self.code.emit(|e| e.mov_const(Gpr::x(8), 42))?;
+            self.code.emit(|e| e.mov_const(Gpr::x(9), 0))?;
+            self.emit_guard_runtime_call(runtime as usize, &[Gpr::x(8), value, Gpr::x(9)])?;
+            self.code.bind(done)?;
+            return Ok(());
         }
         self.code.emit(|e| e.eor_imm(Gpr::x(9), value, 0x40))?;
         self.store_map_result(dst, Gpr::x(9))
@@ -371,14 +421,44 @@ impl BeamModuleAssembler {
         rhs: ArgVal,
         dst: ArgVal,
         is_or: bool,
+        runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
         let left = self.source_reg(lhs)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(8), left))?;
-        let right = self.source_reg(rhs)?;
+        let right = self.source_reg_into(rhs, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(9), right))?;
         self.code
             .emit(|e| e.and_imm(Gpr::x(10), Gpr::x(8), !0x40))?;
         self.code.emit(|e| e.cmp_imm(Gpr::x(10), ATOM_TAG, false))?;
+        if fail == 0 {
+            let badarg = self.code.new_label();
+            let done = self.code.new_label();
+            self.code.b_cond(Cond::Ne, badarg)?;
+            self.code
+                .emit(|e| e.and_imm(Gpr::x(10), Gpr::x(9), !0x40))?;
+            self.code.emit(|e| e.cmp_imm(Gpr::x(10), ATOM_TAG, false))?;
+            self.code.b_cond(Cond::Ne, badarg)?;
+            let shifted = arinsal_a64::enc::Shifted {
+                reg: Gpr::x(9),
+                shift: arinsal_a64::enc::Shift::Lsl,
+                amount: 0,
+            };
+            self.code.emit(|e| {
+                if is_or {
+                    e.orr_reg(Gpr::x(11), Gpr::x(8), shifted)
+                } else {
+                    e.and_reg(Gpr::x(11), Gpr::x(8), shifted)
+                }
+            })?;
+            self.store_map_result(dst, Gpr::x(11))?;
+            self.code.b(done)?;
+            self.code.bind(badarg)?;
+            self.code
+                .emit(|e| e.mov_const(Gpr::x(10), if is_or { 41 } else { 40 }))?;
+            self.emit_guard_runtime_call(runtime as usize, &[Gpr::x(10), Gpr::x(8), Gpr::x(9)])?;
+            self.code.bind(done)?;
+            return Ok(());
+        }
         let fail_label = self.label(fail);
         self.code.b_cond(Cond::Ne, fail_label)?;
         self.code
@@ -641,21 +721,23 @@ impl BeamModuleAssembler {
     fn destination_register_for(&self, dst: ArgVal) -> Result<Gpr, ModuleError> {
         match dst {
             ArgVal::X(i) if i < 6 => Ok(X[i as usize]),
+            // Y destinations load through a scratch that no fast path uses.
+            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok(Gpr::x(5)),
             _ => Err(ModuleError::InvalidOperand(
-                "map destination must be X register",
+                "map destination must be an X register below 6 or a Y register",
             )),
         }
     }
 
-    fn stage_map_args(&mut self, args: &[ArgVal]) -> Result<(), ModuleError> {
-        if args.len() > 1018 {
+    fn stage_map_args(&mut self, args: &[ArgVal], base: u32) -> Result<(), ModuleError> {
+        if args.len() + base as usize > 1022 {
             return Err(ModuleError::InvalidOperand(
                 "map argument vector exceeds scheduler register capacity",
             ));
         }
         for (index, arg) in args.iter().copied().enumerate() {
             let value = self.source_reg(arg)?;
-            let offset = u32::try_from(index + 6)
+            let offset = u32::try_from(index + base as usize)
                 .map_err(|_| ModuleError::InvalidOperand("map argument offset overflow"))?
                 * 8;
             self.code.emit(|e| e.str_uoff(value, Gpr::x(19), offset))?;
@@ -667,6 +749,7 @@ impl BeamModuleAssembler {
         match dst {
             ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(X[i as usize], src))?,
             ArgVal::Y(i) => self.code.emit(|e| e.str_uoff(src, E, i * 8))?,
+            ArgVal::XMemory(i) => self.code.emit(|e| e.str_uoff(src, Gpr::x(19), i * 8))?,
             _ => {
                 return Err(ModuleError::InvalidOperand(
                     "map destination must be X or Y register",
@@ -675,6 +758,11 @@ impl BeamModuleAssembler {
         }
         Ok(())
     }
+}
+
+/// OTP's `SCRATCH_X_REG` (X1023): a destination whose value is not wanted.
+fn is_scratch_x(dst: ArgVal) -> bool {
+    matches!(dst, ArgVal::XMemory(1023))
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
@@ -705,6 +793,6 @@ fn emit_map_runtime(
         e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
         e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
     })?;
-    asm.code.cbnz(Gpr::x(9), asm.error_label)?;
+    asm.error_if_nonzero(Gpr::x(9))?;
     Ok(())
 }

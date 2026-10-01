@@ -58,12 +58,14 @@ extern "C" fn map_get_elements(
     process: *mut ProcessHeader,
     _: u64,
     registers: u64,
-    _: u64,
+    base: u64,
     _: u64,
 ) -> u64 {
     observe(process);
+    // The lookup leaves each value in its staging slot (key, destination, hash triples start
+    // at X`base`); the emitted code moves it to the destination register.
     rt::scheduler_registers_mut(registers as *mut SchedulerRegisters, |regs| {
-        regs.x_reg_array[0] = REG_OUTPUT;
+        regs.x_reg_array[base as usize + 1] = REG_OUTPUT;
     });
     1
 }
@@ -267,7 +269,12 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
     expected[0] = REG_OUTPUT;
     assert_xregs(after, expected);
 
-    let large_args = [ArgVal::Immediate(0); 24];
+    // Only the first destination is wanted; the rest is OTP's scratch X register.
+    let mut large_args = [ArgVal::Immediate(0); 24];
+    for triplet in large_args.as_chunks_mut::<3>().0 {
+        triplet[1] = ArgVal::XMemory(1023);
+    }
+    large_args[1] = ArgVal::X(0);
     let (seen, after, header) = run(
         |asm| asm.emit_i_get_map_elements(90, ArgVal::X(5), &large_args, map_runtime()),
         initial,
