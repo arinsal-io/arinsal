@@ -179,6 +179,8 @@ pub enum Signal<M> {
     Demonitor(u64),
     /// Exit signal carrying an opaque reason envelope.
     Exit(M),
+    /// Port exit signal preserving the port term used as the signal origin.
+    PortExit { port: M, reason: M },
     /// Monitor DOWN signal carrying an opaque reason envelope.
     MonitorDown { reference: u64, reason: M },
     /// Alias activation.
@@ -746,8 +748,17 @@ impl<T: Task> Inner<T> {
     }
 
     fn enqueue(&self, item: Scheduled<T>, already_active: bool) {
-        let online = self.online_schedulers.load(Ordering::Relaxed).max(1);
-        let scheduler = if already_active {
+        // Port of erts/emulator/beam/erl_process.c:8484-8540 (erts_block_multi_scheduling), OTP-29.1.1.
+        let blocked = self.scheduling_blocked.load(Ordering::Acquire);
+        let blocker = self.scheduling_blocker.load(Ordering::Acquire);
+        let online = if blocked {
+            1
+        } else {
+            self.online_schedulers.load(Ordering::Relaxed).max(1)
+        };
+        let scheduler = if blocked {
+            blocker.min(self.worker_counts.len() - 1)
+        } else if already_active {
             item.process
                 .scheduler_id
                 .load(Ordering::Relaxed)
@@ -766,7 +777,12 @@ impl<T: Task> Inner<T> {
             self.injectors[item.process.priority.index()].push(item);
             // Publish the queue change before a parker's final epoch check.
             self.work_epoch.fetch_add(1, Ordering::SeqCst);
-            self.wake_one();
+            if blocked {
+                // Port of erts/emulator/beam/erl_process.c:8484-8540 (wake the remaining scheduler), OTP-29.1.1.
+                self.wake_worker(scheduler);
+            } else {
+                self.wake_one();
+            }
         }
     }
 
@@ -1783,6 +1799,10 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     pub fn scheduler_count(&self) -> usize {
         self.worker_count
     }
+    /// One-based id of the worker executing this process turn.
+    pub fn scheduler_id(&self) -> Option<usize> {
+        self.worker.map(|worker| worker + 1)
+    }
     /// Change the process scheduler binding and return its previous scheduler id.
     /// Scheduler ids are one-based; zero clears the binding.
     pub fn bind_scheduler(&mut self, scheduler_id: usize) -> (usize, bool) {
@@ -1994,6 +2014,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
         Payload::Message(_) | Payload::Timer { .. } => true,
         Payload::Signal(signal) => match signal {
             Signal::Exit(_)
+            | Signal::PortExit { .. }
             | Signal::MonitorDown { .. }
             | Signal::MonitorNoproc(_)
             | Signal::GarbageCollect

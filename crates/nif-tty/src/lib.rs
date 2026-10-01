@@ -311,8 +311,17 @@ fn make_ref(id: u64) -> O {
     }
 }
 fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
-    // SAFETY: dup creates an independently owned descriptor or returns an error.
-    let copy = unsafe { libc::dup(fd) };
+    // SAFETY: dup creates a fresh descriptor; mark it close-on-exec before it can
+    // be published to another thread or inherited by a concurrently spawned port.
+    let copy = unsafe {
+        let copy = libc::dup(fd);
+        if copy >= 0 && libc::fcntl(copy, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            let error = io::Error::last_os_error();
+            libc::close(copy);
+            return Err(error);
+        }
+        copy
+    };
     if copy < 0 {
         return Err(io::Error::last_os_error());
     }

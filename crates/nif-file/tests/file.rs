@@ -518,6 +518,60 @@ fn differential_permissions_and_timestamps() {
         )
     );
 }
+
+#[test]
+fn differential_set_time_on_execute_only_file() {
+    let Some(reference) = reference() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("execute-only");
+    let erl_file = root.path().join("execute-only-erl");
+    fs::write(&file, b"x").unwrap();
+    fs::write(&erl_file, b"x").unwrap();
+    let mode = O::Int(0o100);
+    assert_eq!(
+        call("set_permissions_nif", &[path(&file), mode.clone()]).unwrap(),
+        expected_module(reference, "file", "change_mode", &[name(&erl_file), mode])
+    );
+    let mut info = expected(
+        reference,
+        "read_file_info",
+        &[
+            name(&erl_file),
+            O::list(vec![O::Tuple(vec![atom("time"), atom("posix")])]),
+        ],
+    );
+    let O::Tuple(ref mut result) = info else {
+        panic!("file_info")
+    };
+    assert_eq!(result[0], atom("ok"));
+    let O::Tuple(ref mut fields) = result[1] else {
+        panic!("file_info record")
+    };
+    fields[5] = O::Int(1_000_000_001);
+    let expected_result = expected_module(
+        reference,
+        "file",
+        "write_file_info",
+        &[
+            name(&erl_file),
+            result[1].clone(),
+            O::list(vec![O::Tuple(vec![atom("time"), atom("posix")])]),
+        ],
+    );
+    assert_eq!(
+        call(
+            "set_time_nif",
+            &[
+                path(&file),
+                O::Int(1_000_000_000),
+                O::Int(1_000_000_001),
+                O::Int(1_000_000_002),
+            ]
+        )
+        .unwrap(),
+        expected_result
+    );
+}
 #[test]
 fn differential_open_and_permission_errors() {
     let Some(reference) = reference() else { return };

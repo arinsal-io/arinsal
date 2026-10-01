@@ -8,15 +8,96 @@ use arinsal_term::{
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Port of erts/emulator/beam/erl_bif_port.c:824 (open_port defaults), OTP-29.1.1.
 const DEFAULT_HIGH: usize = 8192;
 const DEFAULT_LOW: usize = 4096;
+const INLINE_ENV_LIMIT: usize = 128 * 1024;
+static NEXT_CHILD_CONFIG: AtomicU64 = AtomicU64::new(0);
+
+fn write_port_exec_config(
+    program: &OsStr,
+    args: &[OsString],
+    arg0: Option<&OsStr>,
+    cwd: Option<&OsStr>,
+    env: &[(OsString, OsString)],
+) -> std::io::Result<std::path::PathBuf> {
+    fn push_bytes(output: &mut Vec<u8>, value: &[u8]) -> std::io::Result<()> {
+        let len = u32::try_from(value.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "port config field too large",
+            )
+        })?;
+        output.extend_from_slice(&len.to_le_bytes());
+        output.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn push_optional(output: &mut Vec<u8>, value: Option<&OsStr>) -> std::io::Result<()> {
+        match value {
+            Some(value) => {
+                output.push(1);
+                push_bytes(output, value.as_bytes())
+            }
+            None => {
+                output.push(0);
+                Ok(())
+            }
+        }
+    }
+
+    let mut bytes = b"ARPC\x01".to_vec();
+    push_bytes(&mut bytes, program.as_bytes())?;
+    push_optional(&mut bytes, arg0)?;
+    push_optional(&mut bytes, cwd)?;
+    bytes.extend_from_slice(
+        &u32::try_from(args.len())
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many port args")
+            })?
+            .to_le_bytes(),
+    );
+    for arg in args {
+        push_bytes(&mut bytes, arg.as_bytes())?;
+    }
+    bytes.extend_from_slice(
+        &u32::try_from(env.len())
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "too many port env vars")
+            })?
+            .to_le_bytes(),
+    );
+    for (key, value) in env {
+        push_bytes(&mut bytes, key.as_bytes())?;
+        push_bytes(&mut bytes, value.as_bytes())?;
+    }
+
+    let path = std::env::temp_dir().join(format!(
+        "arinsal-port-child-{}-{}.bin",
+        std::process::id(),
+        NEXT_CHILD_CONFIG.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    if let Err(error) = file.write_all(&bytes) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    Ok(path)
+}
 
 thread_local! {
     /// Set when `port_command` must suspend the caller and retry the call.
@@ -46,11 +127,20 @@ struct PortState {
     pending: VecDeque<Vec<u8>>,
     busy_port: bool,
     busy_msgq: bool,
+    graceful_close: bool,
+    send_closed: bool,
+    exit_complete: bool,
     suspended: Vec<Pid>,
     closed: bool,
     broken: bool,
     in_output: bool,
     profile_active: bool,
+}
+
+#[derive(Clone)]
+struct PortMonitor {
+    pid: Pid,
+    object: OwnedTerm,
 }
 
 /// State retained for a live child or fd port.
@@ -63,7 +153,7 @@ pub(crate) struct PortHandle {
     framing: Option<(u8, usize)>,
     owner: Mutex<Pid>,
     links: Mutex<HashSet<Pid>>,
-    monitors: Mutex<HashMap<u64, Pid>>,
+    monitors: Mutex<HashMap<u64, PortMonitor>>,
     os_pid: u32,
     name: String,
     parallelism: bool,
@@ -152,6 +242,15 @@ fn bytes(t: Term) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+fn string_bytes(t: Term) -> Option<Vec<u8>> {
+    // `args` entries are strings or binaries; a byte integer is not a string.
+    // Port of erts/emulator/beam/erl_bif_port.c (open_port args validation), OTP-29.1.1.
+    if t.as_small().is_some() {
+        None
+    } else {
+        bytes(t)
+    }
+}
 fn iodata(t: Term) -> Option<Vec<u8>> {
     fn append(term: Term, tail: bool, out: &mut Vec<u8>) -> Option<()> {
         if term.classify() == TermKind::List {
@@ -232,6 +331,12 @@ fn options(t: Term) -> Option<PortOptions> {
             opts.exit_status = true;
         } else if item == atom("eof") {
             opts.eof = true;
+        } else if item == atom("line") {
+            // Port of erts/emulator/beam/erl_bif_port.c:985, OTP-29.1.1.
+            if opts.framing.is_some_and(|(mode, _)| mode != 1) {
+                return None;
+            }
+            opts.framing = Some((1, 512));
         } else if item == atom("stream") || item == atom("hide") || item == atom("overlapped_io") {
         } else if item == atom("use_stdio") {
             opts.use_stdio = true;
@@ -267,7 +372,7 @@ fn options(t: Term) -> Option<PortOptions> {
             } else if pair.len() == 2 && pair[0] == atom("args") {
                 opts.args = list(pair[1])?
                     .into_iter()
-                    .map(bytes)
+                    .map(string_bytes)
                     .collect::<Option<Vec<_>>>()?;
             } else if pair.len() == 2 && pair[0] == atom("arg0") {
                 opts.arg0 = Some(bytes(pair[1])?);
@@ -336,6 +441,7 @@ fn options(t: Term) -> Option<PortOptions> {
             }
         }
     }
+    // Port of erts/emulator/beam/erl_bif_port.c:1014 (default read_write), OTP-29.1.1.
     if opts.rw == 0 {
         opts.rw = 3;
     }
@@ -370,7 +476,7 @@ fn output_message(
     let Some(port) = Term::port(port_id) else {
         return;
     };
-    let mut heap = ProcessHeap::with_words(bytes.len() / 4 + 24);
+    let mut heap = ProcessHeap::with_words(output_heap_words(bytes.len(), binary, 24));
     let Ok(data) = term_data(&mut heap, bytes, binary) else {
         return;
     };
@@ -392,7 +498,7 @@ fn line_message(
     let Some(port) = Term::port(port_id) else {
         return;
     };
-    let mut heap = ProcessHeap::with_words(bytes.len() / 4 + 32);
+    let mut heap = ProcessHeap::with_words(output_heap_words(bytes.len(), binary, 32));
     let Ok(data) = term_data(&mut heap, bytes, binary) else {
         return;
     };
@@ -405,6 +511,15 @@ fn line_message(
     };
     if let Ok(msg) = TermBuilder::new(&mut heap).tuple(&[port, data]) {
         publish(scheduler, owner, port, msg);
+    }
+}
+
+fn output_heap_words(byte_len: usize, binary: bool, overhead: usize) -> usize {
+    if binary {
+        byte_len / 4 + overhead
+    } else {
+        // A list byte per output byte needs two young-heap words per cons cell.
+        byte_len.saturating_mul(2).saturating_add(overhead)
     }
 }
 fn event_message(scheduler: &Scheduler<Process>, owner: Pid, port_id: u64, event: Term) {
@@ -456,42 +571,115 @@ fn start(
         let name = String::from_utf8(bytes(*cmd).ok_or_else(badarg)?).map_err(|_| badarg())?;
         return start_driver(process, ctx, name);
     }
-    let (mut command, name, executable) = match spec.as_slice() {
+    let (name, executable, child_program, child_args) = match spec.as_slice() {
         [kind, path] if *kind == atom("spawn_executable") => {
             let path = bytes(*path).ok_or_else(badarg)?;
             let name = String::from_utf8(path).map_err(|_| badarg())?;
-            (Command::new(name.clone()), name, true)
+            let args = args
+                .into_iter()
+                .map(|arg| String::from_utf8(arg).map(Into::into).map_err(|_| badarg()))
+                .collect::<Result<Vec<OsString>, _>>()?;
+            let executable_path = if name.contains('/') {
+                OsString::from(&name)
+            } else {
+                OsString::from(format!("./{name}"))
+            };
+            (name, true, executable_path, args)
         }
         [kind, cmd] if *kind == atom("spawn") => {
             let cmd = bytes(*cmd).ok_or_else(badarg)?;
             let name = String::from_utf8(cmd).map_err(|_| badarg())?;
-            let mut c = Command::new("/bin/sh");
-            c.arg("-c").arg(name.clone());
-            (c, name, false)
+            (
+                name.clone(),
+                false,
+                OsString::from("/bin/sh"),
+                vec![OsString::from("-c"), OsString::from(name)],
+            )
         }
         _ => return Err(badarg()),
     };
-    if executable {
-        for arg in args {
-            command.arg(String::from_utf8(arg).map_err(|_| badarg())?);
+    let child_arg0 = if executable {
+        arg0.map(|arg0| {
+            String::from_utf8(arg0)
+                .map(OsString::from)
+                .map_err(|_| badarg())
+        })
+        .transpose()?
+    } else {
+        None
+    };
+    let child_cwd = cwd
+        .map(|cwd| {
+            String::from_utf8(cwd)
+                .map(OsString::from)
+                .map_err(|_| badarg())
+        })
+        .transpose()?;
+    // Port of erts/emulator/beam/erl_bif_port.c:1024 (default child environment), OTP-29.1.1.
+    let mut child_env = crate::natives::env::snapshot();
+    // Keep `erl` child launchers on this VM's selected installation when the port changes cwd.
+    if erl_launcher(&name, executable)
+        && let Some(root) = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.otp_root())
+    {
+        let mut paths = vec![root.join("bin")];
+        if let Some(path) = child_env
+            .iter()
+            .find_map(|(key, value)| (key == "PATH").then_some(value.clone()))
+        {
+            paths.extend(std::env::split_paths(&path));
         }
-        if let Some(arg0) = arg0 {
-            command.arg0(String::from_utf8(arg0).map_err(|_| badarg())?);
+        if let Ok(path) = std::env::join_paths(paths) {
+            child_env.retain(|(key, _)| key != "PATH");
+            child_env.push((OsString::from("PATH"), path));
         }
     }
-    if let Some(cwd) = cwd {
-        command.current_dir(String::from_utf8(cwd).map_err(|_| badarg())?);
-    }
-    // l_env: child ports inherit the VM-owned environment, including os:putenv/2 changes.
-    command.env_clear().envs(crate::natives::env::snapshot());
     for (key, value) in env {
-        let key = String::from_utf8(key).map_err(|_| badarg())?;
+        let key = OsString::from(String::from_utf8(key).map_err(|_| badarg())?);
+        child_env.retain(|(existing, _)| existing != &key);
         if let Some(value) = value {
-            command.env(key, String::from_utf8(value).map_err(|_| badarg())?);
-        } else {
-            command.env_remove(key);
+            child_env.push((
+                key,
+                OsString::from(String::from_utf8(value).map_err(|_| badarg())?),
+            ));
         }
     }
+    let env_size = child_env
+        .iter()
+        .map(|(key, value)| key.as_bytes().len() + value.as_bytes().len() + 2)
+        .sum::<usize>();
+    let mut config_path = None;
+    let mut command = if env_size > INLINE_ENV_LIMIT || child_cwd.is_some() {
+        // Port of erts/emulator/sys/unix/erl_child_setup.c:220-363, OTP-29.1.1.
+        let helper = port_exec_helper().ok_or_else(badarg)?;
+        let path = write_port_exec_config(
+            &child_program,
+            &child_args,
+            child_arg0.as_deref(),
+            child_cwd.as_deref(),
+            &child_env,
+        )
+        .map_err(|_| badarg())?;
+        config_path = Some(path.clone());
+        let mut helper_command = Command::new(helper);
+        helper_command
+            .arg("--port-exec-config")
+            .arg(path)
+            .env_clear();
+        helper_command
+    } else {
+        let mut child_command = Command::new(child_program);
+        child_command.args(child_args).env_clear().envs(child_env);
+        if let Some(arg0) = child_arg0 {
+            child_command.arg0(arg0);
+        }
+        if let Some(cwd) = child_cwd {
+            child_command.current_dir(cwd);
+        }
+        child_command
+    };
     command
         .stdin(if rw & 2 != 0 {
             Stdio::piped()
@@ -518,8 +706,13 @@ fn start(
                 if dup2(1, 2) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if !use_stdio && (dup2(0, 3) < 0 || dup2(1, 4) < 0) {
-                    return Err(std::io::Error::last_os_error());
+                if !use_stdio {
+                    if rw & 2 != 0 && dup2(0, 3) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if rw & 1 != 0 && dup2(1, 4) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -527,18 +720,37 @@ fn start(
     } else if !use_stdio {
         // SAFETY: The child stdio descriptors are prepared by Command before this closure runs.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 unsafe extern "C" {
                     fn dup2(oldfd: i32, newfd: i32) -> i32;
                 }
-                if dup2(0, 3) < 0 || dup2(1, 4) < 0 {
+                if rw & 2 != 0 && dup2(0, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if rw & 1 != 0 && dup2(1, 4) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
     }
-    let mut child = command.spawn().map_err(|_| badarg())?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(path) = config_path {
+                let _ = std::fs::remove_file(path);
+            }
+            if executable {
+                let reason = match error.kind() {
+                    std::io::ErrorKind::NotFound => "enoent",
+                    std::io::ErrorKind::PermissionDenied => "eacces",
+                    _ => return Err(badarg()),
+                };
+                return Err(VmError::Trap(crate::exceptions::Trap::error(atom(reason))));
+            }
+            return Err(badarg());
+        }
+    };
     let os_pid = child.id();
     let out = child.stdin.take().map(owned_stdio);
     let read_fd = child
@@ -647,6 +859,48 @@ fn default_limits() -> BusyLimits {
     }
 }
 
+fn erl_launcher(name: &str, executable: bool) -> bool {
+    let program = if executable {
+        name
+    } else {
+        let command = name.trim_start();
+        command
+            .strip_prefix('"')
+            .unwrap_or(command)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .strip_suffix('"')
+            .unwrap_or_else(|| {
+                command
+                    .strip_prefix('"')
+                    .unwrap_or(command)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+            })
+    };
+    std::path::Path::new(program)
+        .file_name()
+        .is_some_and(|file| file == "erl")
+}
+
+fn port_exec_helper() -> Option<std::path::PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    if executable.file_stem().is_some_and(|name| name == "arinsal") {
+        return Some(executable);
+    }
+    let mut directory = executable.parent();
+    while let Some(parent) = directory {
+        let candidate = parent.join("arinsal");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        directory = parent.parent();
+    }
+    None
+}
+
 /// Allocate a connected `tcp_inet` port for an accepted socket.
 pub(crate) fn alloc_inet_port(
     runtime: &crate::process::Runtime,
@@ -706,40 +960,78 @@ fn notify_closed(
         if skip_owner && linked == from {
             continue;
         }
-        if let Ok(message) = Message::copy_from(reason) {
-            let _ = scheduler.signal(from, linked, arinsal_sched::Signal::Exit(message));
+        if let (Ok(port_message), Ok(reason_message)) =
+            (Message::copy_from(port), Message::copy_from(reason))
+        {
+            let _ = scheduler.signal(
+                from,
+                linked,
+                arinsal_sched::Signal::PortExit {
+                    port: port_message,
+                    reason: reason_message,
+                },
+            );
         }
     }
-    for (reference, pid) in handle.monitors.lock().unwrap().iter() {
+    let monitors = std::mem::take(&mut *handle.monitors.lock().unwrap());
+    for (reference, monitor) in monitors {
         let mut heap = ProcessHeap::with_words(32);
-        let Ok(reference_term) = TermBuilder::new(&mut heap).local_ref([
-            *reference as u32,
-            (*reference >> 32) as u32,
-            0,
-        ]) else {
+        let Ok(reference_term) =
+            TermBuilder::new(&mut heap).local_ref([reference as u32, (reference >> 32) as u32, 0])
+        else {
+            continue;
+        };
+        let Ok(object) = from_owned(&monitor.object, &mut heap) else {
             continue;
         };
         let Ok(down) = TermBuilder::new(&mut heap).tuple(&[
             atom("DOWN"),
             reference_term,
             atom("port"),
-            port,
+            object,
             reason,
         ]) else {
             continue;
         };
         if let Ok(message) = Message::copy_from(down) {
-            let _ = scheduler.send(from, *pid, message);
+            let _ = scheduler.send(from, monitor.pid, message);
         }
     }
+}
+
+fn signal_port_exit(handle: &PortHandle, id: u64, reason: Term) {
+    let Some(port) = Term::port(id) else {
+        return;
+    };
+    let owner = *handle.owner.lock().unwrap();
+    if let (Ok(port), Ok(reason)) = (Message::copy_from(port), Message::copy_from(reason)) {
+        let _ = handle.scheduler.signal(
+            owner,
+            owner,
+            arinsal_sched::Signal::PortExit { port, reason },
+        );
+    }
+}
+
+fn signal_badsig(handle: &PortHandle, id: u64) {
+    signal_port_exit(handle, id, atom("badsig"));
 }
 
 fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
     unsafe extern "C" {
         fn dup(fd: i32) -> i32;
     }
-    // SAFETY: dup returns an owned descriptor, which is immediately transferred to OwnedFd.
-    let copy = unsafe { dup(fd) };
+    // SAFETY: dup returns a fresh descriptor; setting CLOEXEC before it is published
+    // prevents a concurrently spawned port child from inheriting this duplicate.
+    let copy = unsafe {
+        let copy = dup(fd);
+        if copy >= 0 && libc::fcntl(copy, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            let error = std::io::Error::last_os_error();
+            libc::close(copy);
+            return Err(error);
+        }
+        copy
+    };
     if copy < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -766,8 +1058,21 @@ fn set_nonblock(fd: RawFd) {
 
 fn wake_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
-    // SAFETY: pipe initializes both slots with fresh descriptors on success.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    // SAFETY: pipe initializes both slots with fresh descriptors on success; fcntl
+    // marks those owned descriptors close-on-exec before any child can inherit them.
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0
+            && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
+        {
+            let error = std::io::Error::last_os_error();
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            return Err(error);
+        }
+        rc
+    };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -814,6 +1119,9 @@ fn make_handle(
             pending: VecDeque::new(),
             busy_port: false,
             busy_msgq: false,
+            graceful_close: false,
+            send_closed: false,
+            exit_complete: false,
             suspended: Vec::new(),
             closed: false,
             broken: false,
@@ -1135,6 +1443,7 @@ fn worker(
     let mut data = Vec::new();
     let mut buf = [0u8; 4096];
     let mut saw_eof = false;
+    let mut input_closed = false;
     loop {
         let closed = handle.state.lock().unwrap().closed;
         if closed {
@@ -1212,6 +1521,16 @@ fn worker(
         wake_suspended(&scheduler, woken);
         let woken = flush_output(&handle);
         wake_suspended(&scheduler, woken);
+        if !input_closed {
+            let should_close_input = {
+                let st = handle.state.lock().unwrap();
+                st.graceful_close && st.outq.is_empty() && st.pending.is_empty()
+            };
+            if should_close_input {
+                handle.out.lock().unwrap().take();
+                input_closed = true;
+            }
+        }
         if input_ready && let Some(fd) = read_fd {
             // SAFETY: `buf` is a live buffer and `fd` is the port's input descriptor.
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
@@ -1237,9 +1556,14 @@ fn worker(
                 }
             }
         }
-        if saw_eof && handle.state.lock().unwrap().outq.is_empty() {
+        let st = handle.state.lock().unwrap();
+        if saw_eof && st.outq.is_empty() && st.pending.is_empty() {
             break;
         }
+        if input_closed && read_fd.is_none() && st.outq.is_empty() && st.pending.is_empty() {
+            break;
+        }
+        drop(st);
     }
     let woken = flush_output(&handle);
     wake_suspended(&scheduler, woken);
@@ -1275,8 +1599,16 @@ fn worker(
             }
         }
     }
+    handle.state.lock().unwrap().exit_complete = true;
     if !closed && saw_eof && want_eof {
         event_message(&scheduler, owner, id, atom("eof"));
+    }
+    if !closed && handle.state.lock().unwrap().send_closed {
+        event_message(&scheduler, owner, id, atom("closed"));
+    }
+    if !closed {
+        // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
+        notify_closed(&handle, id, &scheduler, owner, false);
     }
 }
 
@@ -1294,7 +1626,14 @@ fn decode_frames(
     loop {
         if mode == 1 {
             let newline = data.iter().position(|b| *b == b'\n');
+            // Port of erts/emulator/beam/io.c:3228-3295 (read_linebuf), OTP-29.1.1.
+            // A newline at the limit completes the line; after a full buffer,
+            // only CRLF may consume one extra byte before completing it.
+            let newline_fits = newline.is_some_and(|n| {
+                n <= size || (n == size + 1 && data.get(n.wrapping_sub(1)) == Some(&b'\r'))
+            });
             let chunk_len = newline
+                .filter(|_| newline_fits)
                 .map(|n| n + 1)
                 .or_else(|| (size > 0 && data.len() >= size).then_some(size));
             let Some(n) = chunk_len else { break };
@@ -1338,6 +1677,14 @@ fn lookup_port(process: &Process, term: Term) -> Result<Arc<PortHandle>, VmError
         .as_ref()
         .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
         .ok_or_else(badarg)
+}
+
+pub(crate) fn is_live(process: &Process, id: u64) -> bool {
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        .is_some_and(|handle| !handle.state.lock().unwrap().exit_complete)
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
@@ -1502,7 +1849,7 @@ fn port_command(
     let mut framed = iodata(data).ok_or_else(badarg)?;
     if handle.inet {
         let st = handle.state.lock().unwrap();
-        if st.closed || st.broken {
+        if st.closed || st.broken || st.graceful_close {
             return Err(badarg());
         }
         drop(st);
@@ -1615,24 +1962,27 @@ fn close(process: &Process, term: Term) -> Result<Term, VmError> {
                 let _ = scheduler.signal(sender, linked, arinsal_sched::Signal::Exit(reason));
             }
         }
-        for (reference, pid) in handle.monitors.lock().unwrap().iter() {
+        let monitors = std::mem::take(&mut *handle.monitors.lock().unwrap());
+        for (reference, monitor) in monitors {
             let mut heap = ProcessHeap::with_words(32);
             let reference_term = TermBuilder::new(&mut heap)
-                .local_ref([*reference as u32, (*reference >> 32) as u32, 0])
+                .local_ref([reference as u32, (reference >> 32) as u32, 0])
                 .map_err(|error| {
                     VmError::Unsupported(format!("port monitor reference: {error:?}"))
                 })?;
+            let object = from_owned(&monitor.object, &mut heap)
+                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
             let down = TermBuilder::new(&mut heap)
                 .tuple(&[
                     atom("DOWN"),
                     reference_term,
                     atom("port"),
-                    port,
+                    object,
                     atom("normal"),
                 ])
                 .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
             if let Ok(message) = Message::copy_from(down) {
-                let _ = scheduler.send(sender, *pid, message);
+                let _ = scheduler.send(sender, monitor.pid, message);
             }
         }
         Ok(atom("true"))
@@ -1669,17 +2019,19 @@ pub(crate) fn exit_port(
     }
     release_io(&removed);
 
-    let refs = removed.monitors.lock().unwrap().clone();
-    for (reference, pid) in refs {
-        if pid == ctx.pid() {
+    let refs = std::mem::take(&mut *removed.monitors.lock().unwrap());
+    for (reference, monitor) in refs {
+        if monitor.pid == ctx.pid() {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
             let reference_term = TermBuilder::new(&mut heap)
                 .local_ref([reference as u32, (reference >> 32) as u32, 0])
                 .map_err(|error| {
                     VmError::Unsupported(format!("port monitor reference: {error:?}"))
                 })?;
+            let object = from_owned(&monitor.object, &mut heap)
+                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
             let down = TermBuilder::new(&mut heap)
-                .tuple(&[atom("DOWN"), reference_term, atom("port"), port, reason])
+                .tuple(&[atom("DOWN"), reference_term, atom("port"), object, reason])
                 .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
             process.inbox.push_back(down);
         } else {
@@ -1689,11 +2041,13 @@ pub(crate) fn exit_port(
                 .map_err(|error| {
                     VmError::Unsupported(format!("port monitor reference: {error:?}"))
                 })?;
+            let object = from_owned(&monitor.object, &mut heap)
+                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
             let down = TermBuilder::new(&mut heap)
-                .tuple(&[atom("DOWN"), reference_term, atom("port"), port, reason])
+                .tuple(&[atom("DOWN"), reference_term, atom("port"), object, reason])
                 .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
             if let Ok(message) = Message::copy_from(down) {
-                let _ = ctx.send(pid, message);
+                let _ = ctx.send(monitor.pid, message);
             }
         }
     }
@@ -1753,9 +2107,21 @@ pub(crate) fn owner_exit(
     // g_port_fix: synchronous owner-exit hook; the caller is the termination path.
     let closed = {
         let mut ports = runtime.ports.lock().unwrap();
+        for handle in ports.values() {
+            handle
+                .monitors
+                .lock()
+                .unwrap()
+                .retain(|_, monitor| monitor.pid != owner);
+        }
+        let abnormal = reason != atom("normal");
         let ids = ports
             .iter()
-            .filter_map(|(&id, handle)| (*handle.owner.lock().unwrap() == owner).then_some(id))
+            .filter_map(|(&id, handle)| {
+                let is_owner = *handle.owner.lock().unwrap() == owner;
+                let linked = handle.links.lock().unwrap().remove(&owner);
+                (is_owner || (abnormal && linked)).then_some(id)
+            })
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| ports.remove(&id).map(|handle| (id, handle)))
@@ -1792,7 +2158,8 @@ pub(crate) fn owner_exit(
                 let _ = scheduler.signal(owner, linked, arinsal_sched::Signal::Exit(message));
             }
         }
-        for (reference, pid) in handle.monitors.lock().unwrap().iter() {
+        let monitors = std::mem::take(&mut *handle.monitors.lock().unwrap());
+        for (reference, monitor) in &monitors {
             let mut heap = ProcessHeap::with_words(32);
             let reference_term = TermBuilder::new(&mut heap).local_ref([
                 *reference as u32,
@@ -1803,16 +2170,17 @@ pub(crate) fn owner_exit(
                 continue;
             };
             let reason_term = copy_term(reason, &mut heap).unwrap_or_else(|_| atom("normal"));
+            let object = arinsal_term::from_owned(&monitor.object, &mut heap).unwrap_or(port);
             let down = TermBuilder::new(&mut heap).tuple(&[
                 atom("DOWN"),
                 reference_term,
                 atom("port"),
-                port,
+                object,
                 reason_term,
             ]);
             let Ok(down) = down else { continue };
             if let Ok(message) = Message::copy_from(down) {
-                let _ = scheduler.send(owner, *pid, message);
+                let _ = scheduler.send(owner, monitor.pid, message);
             }
         }
     }
@@ -1841,21 +2209,49 @@ pub(crate) fn monitor(
     port: Term,
     reference: u64,
     pid: Pid,
+    object: OwnedTerm,
     monitored: bool,
-) -> Result<(), VmError> {
+) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let handle = process
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
         .ok_or_else(badarg)?;
+    let state = handle.state.lock().unwrap();
+    if monitored && state.exit_complete {
+        return Ok(false);
+    }
     let mut monitors = handle.monitors.lock().unwrap();
     if monitored {
-        monitors.insert(reference, pid);
+        monitors.insert(reference, PortMonitor { pid, object });
     } else {
         monitors.remove(&reference);
     }
-    Ok(())
+    Ok(true)
+}
+
+/// Monitor targets reported by `process_info/2` for one process.
+pub(crate) fn monitors_by(process: &Process, pid: Pid) -> Vec<OwnedTerm> {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return Vec::new();
+    };
+    runtime
+        .ports
+        .lock()
+        .unwrap()
+        .values()
+        .flat_map(|handle| {
+            handle
+                .monitors
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|monitor| monitor.pid == pid)
+                .map(|monitor| monitor.object.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Remove a reference from any live port's monitor set.
@@ -1871,10 +2267,6 @@ pub(crate) fn demonitor(process: &Process, reference: u64) -> bool {
 
 pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
-    let parts = tuple(message).ok_or_else(badarg)?;
-    if parts.len() != 2 || parts[0] != process.self_pid.and_then(Pid::to_term).ok_or_else(badarg)? {
-        return Err(badarg());
-    }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let handle = runtime
         .ports
@@ -1883,47 +2275,98 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
         .get(&id)
         .cloned()
         .ok_or_else(badarg)?;
-    if parts[1] == atom("close") {
-        close(process, port)?;
+    let owner_pid = process.self_pid.ok_or_else(badarg)?;
+    let Some(parts) = tuple(message) else {
+        signal_badsig(&handle, id);
+        return Ok(());
+    };
+    if parts.len() != 2 || parts[0] != process.self_pid.and_then(Pid::to_term).ok_or_else(badarg)? {
+        signal_badsig(&handle, id);
         return Ok(());
     }
-    let command = tuple(parts[1]).ok_or_else(badarg)?;
+    if parts[1] == atom("close") {
+        if Some(*handle.owner.lock().unwrap()) != process.self_pid {
+            signal_badsig(&handle, id);
+            return Ok(());
+        }
+        if handle.os_pid == 0 {
+            close(process, port)?;
+            event_message(&handle.scheduler, owner_pid, id, atom("closed"));
+            return Ok(());
+        }
+        let notify_now = {
+            let mut state = handle.state.lock().unwrap();
+            if state.closed || state.graceful_close {
+                return Err(badarg());
+            }
+            state.graceful_close = true;
+            state.send_closed = true;
+            state.exit_complete
+        };
+        runtime.ports.lock().unwrap().remove(&id);
+        if notify_now {
+            event_message(&handle.scheduler, owner_pid, id, atom("closed"));
+        } else {
+            poke(&handle);
+        }
+        return Ok(());
+    }
+    let Some(command) = tuple(parts[1]) else {
+        signal_badsig(&handle, id);
+        return Ok(());
+    };
     if command.len() == 2 && command[0] == atom("command") {
-        let mut data = iodata(command[1]).ok_or_else(badarg)?;
+        let Some(mut data) = iodata(command[1]) else {
+            signal_badsig(&handle, id);
+            return Ok(());
+        };
         if let Some((2, hdr)) = handle.framing {
             match hdr {
                 1 => {
                     if data.len() > u8::MAX as usize {
-                        return Err(badarg());
+                        signal_port_exit(&handle, id, atom("einval"));
+                        return Ok(());
                     }
                     data.insert(0, data.len() as u8);
                 }
                 2 => {
                     if data.len() > u16::MAX as usize {
-                        return Err(badarg());
+                        signal_port_exit(&handle, id, atom("einval"));
+                        return Ok(());
                     }
                     data.splice(0..0, (data.len() as u16).to_be_bytes());
                 }
                 4 => {
                     if data.len() > u32::MAX as usize {
-                        return Err(badarg());
+                        signal_port_exit(&handle, id, atom("einval"));
+                        return Ok(());
                     }
                     data.splice(0..0, (data.len() as u32).to_be_bytes());
                 }
-                _ => return Err(badarg()),
+                _ => {
+                    signal_badsig(&handle, id);
+                    return Ok(());
+                }
             }
         }
-        command_bytes(&handle, &data).map_err(|()| badarg())?;
+        if command_bytes(&handle, &data).is_err() {
+            signal_badsig(&handle, id);
+        }
         return Ok(());
     }
     if command.len() == 2 && command[0] == atom("connect") {
-        if Some(*handle.owner.lock().unwrap()) != process.self_pid {
-            return Err(badarg());
+        if Some(*handle.owner.lock().unwrap()) != process.self_pid || command[1].as_pid().is_none()
+        {
+            signal_badsig(&handle, id);
+            return Ok(());
         }
-        connect(process, port, command[1], true)?;
+        if connect(process, port, command[1], true).is_err() {
+            signal_badsig(&handle, id);
+        }
         return Ok(());
     }
-    Err(badarg())
+    signal_badsig(&handle, id);
+    Ok(())
 }
 
 fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
@@ -1975,8 +2418,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .lock()
         .unwrap()
         .values()
-        .copied()
-        .filter_map(|pid| pid.to_term())
+        .filter_map(|monitor| monitor.pid.to_term())
         .collect::<Vec<_>>();
     let memory = 48 + monitored_pids.len() * 24;
     let monitored_by = TermBuilder::new(&mut heap)

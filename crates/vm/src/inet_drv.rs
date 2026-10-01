@@ -222,8 +222,20 @@ fn poke() {
 // g_inet_udp
 pub(crate) fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
-    // SAFETY: pipe writes two fresh descriptors on success.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    // SAFETY: pipe writes two fresh descriptors; set close-on-exec before publishing either.
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0
+            && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
+        {
+            let error = std::io::Error::last_os_error();
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            return Err(error);
+        }
+        rc
+    };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -617,8 +629,20 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
     if data[2] != 0 && data[2] != 1 {
         return err_bytes("eprotonosupport");
     }
-    // SAFETY: socket returns a fresh descriptor or -1.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+    // SAFETY: socket returns a fresh descriptor; set close-on-exec before publishing it.
+    let (fd, cloexec_error) = unsafe {
+        let fd = libc::socket(domain, libc::SOCK_STREAM, 0);
+        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            let error = last_errno();
+            libc::close(fd);
+            (-1, Some(error))
+        } else {
+            (fd, None)
+        }
+    };
+    if let Some(error) = cloexec_error {
+        return err_bytes(errno_name(error));
+    }
     if fd < 0 {
         return err_bytes(errno_name(last_errno()));
     }
@@ -783,14 +807,24 @@ fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
     let fd = inner.fd.as_ref()?.as_raw_fd();
     let mut storage: libc::sockaddr_storage = zeroed();
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    // SAFETY: fd is a listening socket this driver owns. accept returns a new fd or -1.
-    let got = unsafe {
-        libc::accept(
+    // SAFETY: accept returns a fresh descriptor; set close-on-exec before publishing it.
+    let (got, cloexec_error) = unsafe {
+        let got = libc::accept(
             fd,
             (&mut storage as *mut libc::sockaddr_storage).cast(),
             &mut len,
-        )
+        );
+        if got >= 0 && libc::fcntl(got, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            let error = last_errno();
+            libc::close(got);
+            (-1, Some(error))
+        } else {
+            (got, None)
+        }
     };
+    if let Some(error) = cloexec_error {
+        return Some(Err(error));
+    }
     if got >= 0 {
         set_nonblock(got);
         set_nosigpipe(got);
@@ -1446,8 +1480,20 @@ fn getiflist() -> Vec<u8> {
 }
 
 fn ifconf_buf() -> Result<Vec<u8>, i32> {
-    // SAFETY: a datagram socket is used only as an ioctl target, then closed.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    // SAFETY: a datagram socket is used only as an ioctl target; close-on-exec is
+    // set before another scheduler can spawn a child while this descriptor is open.
+    let fd = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            libc::close(fd);
+            -2
+        } else {
+            fd
+        }
+    };
+    if fd == -2 {
+        return Err(libc::EIO);
+    }
     if fd < 0 {
         return Err(last_errno());
     }
@@ -1566,8 +1612,20 @@ fn ifreq_flags(name: &[u8]) -> Option<i32> {
 }
 
 fn ifreq_ioctl(name: &[u8], req: u64, read: impl FnOnce(libc::ifreq)) -> Option<()> {
-    // SAFETY: a datagram socket is used only as an ioctl target, then closed.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    // SAFETY: a datagram socket is used only as an ioctl target; close-on-exec is
+    // set before another scheduler can spawn a child while this descriptor is open.
+    let fd = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            libc::close(fd);
+            -2
+        } else {
+            fd
+        }
+    };
+    if fd == -2 {
+        return None;
+    }
     if fd < 0 {
         return None;
     }

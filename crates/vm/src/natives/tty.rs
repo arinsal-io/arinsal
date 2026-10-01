@@ -51,9 +51,24 @@ fn hub() -> &'static Hub {
     static HUB: std::sync::OnceLock<Hub> = std::sync::OnceLock::new();
     HUB.get_or_init(|| {
         let mut pipe = [-1; 2];
-        // SAFETY: pipe writes two new descriptors on success.
-        let status = unsafe { libc::pipe(pipe.as_mut_ptr()) };
-        assert_eq!(status, 0, "tty select wake pipe");
+        // SAFETY: pipe writes two new descriptors on success; mark both before
+        // publishing either descriptor to the polling thread.
+        let status = unsafe {
+            let status = libc::pipe(pipe.as_mut_ptr());
+            if status != 0 {
+                Err(std::io::Error::last_os_error())
+            } else if libc::fcntl(pipe[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                || libc::fcntl(pipe[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+            {
+                let error = std::io::Error::last_os_error();
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+                Err(error)
+            } else {
+                Ok(())
+            }
+        };
+        status.expect("tty select wake pipe");
         for fd in pipe {
             // SAFETY: both pipe ends are open descriptors from the successful pipe call.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -118,8 +133,21 @@ fn install_break() {
         return;
     }
     let mut pipe = [-1; 2];
-    // SAFETY: pipe writes two new descriptors on success.
-    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+    // SAFETY: pipe creates two fresh descriptors; mark them close-on-exec before
+    // publishing the write descriptor to the signal handler.
+    let status = unsafe {
+        let status = libc::pipe(pipe.as_mut_ptr());
+        if status == 0
+            && (libc::fcntl(pipe[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                || libc::fcntl(pipe[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
+        {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+            return;
+        }
+        status
+    };
+    if status != 0 {
         return;
     }
     BREAK_WRITE.store(pipe[1], Ordering::Relaxed);

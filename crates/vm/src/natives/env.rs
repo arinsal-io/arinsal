@@ -327,8 +327,23 @@ fn ensure_signal_reader() -> Result<(), VmError> {
         return Ok(());
     }
     let mut fds = [0; 2];
-    // SAFETY: pipe writes two fresh descriptors into `fds` on success.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    // SAFETY: pipe writes two fresh descriptors; mark both close-on-exec before
+    // publishing them so concurrently spawned port children cannot inherit them.
+    let rc = unsafe {
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == 0
+            && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
+        {
+            let error = std::io::Error::last_os_error();
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            return Err(VmError::Unsupported(format!(
+                "signal pipe close-on-exec: {error}"
+            )));
+        }
+        rc
+    };
     if rc != 0 {
         return Err(badarg());
     }

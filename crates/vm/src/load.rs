@@ -435,6 +435,7 @@ impl Vm {
         paths.push(otp.join("lib/erts-17.1/ebin"));
         Self {
             paths,
+            otp_root: Some(otp),
             modules: Vec::new(),
             loaded: HashMap::new(),
             old: HashMap::new(),
@@ -964,6 +965,7 @@ impl Vm {
     pub(crate) fn shared_replica(code: Arc<Mutex<SharedCode>>, paths: &[PathBuf]) -> Self {
         let mut vm = Self {
             paths: paths.to_vec(),
+            otp_root: None,
             modules: Vec::new(),
             loaded: HashMap::new(),
             old: HashMap::new(),

@@ -922,10 +922,22 @@ fn set_time_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             Ok(p) => p,
             Err(e) => return Ok(e),
         };
-        let a = filetime::FileTime::from_unix_time(atime, 0);
-        let m = filetime::FileTime::from_unix_time(mtime, 0);
-        Ok(filetime::set_file_times(path, a, m)
-            .map(|()| ok())
-            .unwrap_or_else(|e| posix(&e)))
+        // Port of erts/emulator/nifs/unix/unix_prim_file.c:844 (efile_set_time), OTP-29.1.1.
+        // utimensat updates metadata without opening the file, as utime does in erts.
+        let times = rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: atime,
+                tv_nsec: 0,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: mtime,
+                tv_nsec: 0,
+            },
+        };
+        Ok(
+            rustix::fs::utimensat(rustix::fs::CWD, &path, &times, rustix::fs::AtFlags::empty())
+                .map(|()| ok())
+                .unwrap_or_else(|e| posix(&e.into())),
+        )
     })
 }

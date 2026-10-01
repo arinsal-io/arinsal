@@ -322,8 +322,17 @@ fn open(args: &[O]) -> Result<O, BifError> {
         if fd < 0 {
             return Ok(error("ebadf"));
         }
-        // SAFETY: dup creates a new descriptor owned solely by this Socket.
-        let copied = unsafe { libc::dup(fd) };
+        // SAFETY: dup creates a fresh descriptor; mark it close-on-exec before
+        // transferring ownership to the Socket.
+        let copied = unsafe {
+            let copied = libc::dup(fd);
+            if copied >= 0 && libc::fcntl(copied, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                let error = io::Error::last_os_error();
+                libc::close(copied);
+                return Ok(fail(&error));
+            }
+            copied
+        };
         if copied < 0 {
             return Ok(last_error());
         }
@@ -660,8 +669,17 @@ fn sendfile(args: &[O]) -> Result<O, BifError> {
             return Ok(pair(atom("error"), pair(atom("invalid"), atom("state"))));
         }
         let fd = integer(&args[4])?;
-        // SAFETY: dup returns a new independently owned descriptor or -1.
-        let owned = unsafe { libc::dup(fd) };
+        // SAFETY: dup creates a fresh descriptor; mark it close-on-exec before
+        // storing it on the socket handle.
+        let owned = unsafe {
+            let owned = libc::dup(fd);
+            if owned >= 0 && libc::fcntl(owned, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                let error = io::Error::last_os_error();
+                libc::close(owned);
+                return Ok(fail(&error));
+            }
+            owned
+        };
         if owned < 0 {
             return Ok(last_error());
         }

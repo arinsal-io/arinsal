@@ -563,7 +563,7 @@ fn display_string(args: &[Term]) -> Result<Term, arinsal_bifs::BifError> {
 fn system_info(
     vm: &Vm,
     process: &mut Process,
-    _ctx: Option<&RunCtx<'_, Message>>,
+    ctx: Option<&RunCtx<'_, Message>>,
     selector: Term,
 ) -> Option<Result<Term, VmError>> {
     let owned_selector = arinsal_term::to_owned(selector).ok();
@@ -615,6 +615,12 @@ fn system_info(
         Some("schedulers") => Some(with_flags(|flags| {
             non_neg(process, flags.schedulers_total as u64)
         })),
+        // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
+        Some("scheduler_id") => Some(
+            ctx.and_then(RunCtx::scheduler_id)
+                .and_then(|id| Term::small(id as i64))
+                .ok_or_else(badarg),
+        ),
         Some("dirty_cpu_schedulers") => Some(with_flags(|flags| {
             non_neg(process, flags.dirty_cpu_total as u64)
         })),

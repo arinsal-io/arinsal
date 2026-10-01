@@ -54,7 +54,9 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
     root = otp_root()
     ei = next((root / "lib").glob("erl_interface-*/include"), None)
     ei_lib = next((root / "lib").glob("erl_interface-*/lib"), None)
-    defs = "-DHAVE_ISFINITE"
+    # macOS already declares sys_nerr/sys_errlist with const-qualified types;
+    # use the system strerror() instead of port_test.c's legacy fallback.
+    defs = "-DHAVE_ISFINITE -DHAVE_STRERROR" if name == "port" else "-DHAVE_ISFINITE"
     values = {
         "CC": "clang", "LD": "clang", "SHLIB_LD": "clang",
         "CFLAGS": "-O2 -fPIC", "SHLIB_CFLAGS": "-O2 -fPIC",

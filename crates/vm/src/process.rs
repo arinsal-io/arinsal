@@ -515,9 +515,11 @@ pub(crate) struct Runtime {
     code: Arc<Mutex<SharedCode>>,
     pub(crate) processes: Mutex<std::collections::HashSet<Pid>>,
     pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
+    otp_root: Option<std::path::PathBuf>,
     paths: Vec<std::path::PathBuf>,
     scheduler: Mutex<Weak<Scheduler<Process>>>,
     pub(crate) names: Mutex<HashMap<String, Pid>>,
+    pub(crate) port_names: Mutex<HashMap<String, u64>>,
     aliases: AliasTable,
     pub(crate) timers: Mutex<HashMap<u64, arinsal_sched::TimerRef>>,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
@@ -1851,6 +1853,22 @@ pub(crate) fn register_requirements(beam: &BeamFile) -> (usize, usize) {
 }
 
 impl Runtime {
+    /// OTP root used by child Arinsal launchers, recovered from the loaded erts path.
+    pub(crate) fn otp_root(&self) -> Option<std::path::PathBuf> {
+        self.otp_root.clone().or_else(|| {
+            self.paths.iter().find_map(|path| {
+                if path.ends_with(std::path::Path::new("lib/erts-17.1/ebin")) {
+                    path.parent()?
+                        .parent()?
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
     #[inline]
     pub(crate) fn next_ref(&self) -> u64 {
         arinsal_bifs::next_ref_id()
@@ -2455,6 +2473,35 @@ impl Process {
         } else {
             target
         };
+        if let Some(name) = target
+            .as_atom()
+            .and_then(|name| arinsal_term::global_atoms().text(name))
+            && let Some(id) = self.runtime.as_ref().and_then(|runtime| {
+                runtime
+                    .port_names
+                    .lock()
+                    .unwrap()
+                    .get(name.as_ref())
+                    .copied()
+            })
+            && crate::port::is_live(self, id)
+        {
+            let port = Term::port(id).ok_or_else(|| {
+                VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
+                    "badarg",
+                )))
+            })?;
+            crate::port::send_message(self, port, value)?;
+            crate::trace::emit_process(
+                vm.as_deref_mut(),
+                self,
+                sender,
+                crate::trace::SEND,
+                "send",
+                &[value, target],
+            );
+            return Ok(value);
+        }
         let mut via_prio_alias = false;
         let pid = if let Some(pid) = Pid::from_term(target) {
             Some(pid)
@@ -2644,6 +2691,23 @@ impl Process {
                         } else {
                             self.inbox.push_back(tuple);
                         }
+                        continue;
+                    }
+                    if reason != Term::atom(arinsal_term::atoms::NORMAL) {
+                        self.note_exit_reason(reason)?;
+                        return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                    }
+                }
+                // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
+                Payload::Signal(arinsal_sched::Signal::PortExit { port, reason }) => {
+                    let port = port.into_receiver(self)?;
+                    let reason = reason.into_receiver(self)?;
+                    if reason == crate::signals::atom("kill") {
+                        return Err(VmError::Trap(crate::exceptions::Trap::killed()));
+                    }
+                    if self.trap_exit {
+                        let tuple = self.tuple(&[crate::signals::atom("EXIT"), port, reason])?;
+                        self.inbox.push_back(tuple);
                         continue;
                     }
                     if reason != Term::atom(arinsal_term::atoms::NORMAL) {
@@ -3100,9 +3164,11 @@ impl Vm {
             code: Arc::clone(&code),
             processes: Mutex::new(std::collections::HashSet::new()),
             system_processes: Mutex::new(std::collections::HashSet::new()),
+            otp_root: self.otp_root.clone(),
             paths: self.paths.clone(),
             scheduler: Mutex::new(Weak::new()),
             names: Mutex::new(HashMap::new()),
+            port_names: Mutex::new(HashMap::new()),
             aliases: AliasTable::new(),
             timers: Mutex::new(HashMap::new()),
             ports: Mutex::new(HashMap::new()),

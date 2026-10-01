@@ -192,6 +192,7 @@ pub struct EvalResult {
 /// Lazy module loader and single-process execution engine.
 pub struct Vm {
     paths: Vec<PathBuf>,
+    pub(crate) otp_root: Option<PathBuf>,
     pub(crate) modules: Vec<Arc<Module>>,
     loaded: HashMap<String, usize>,
     old: HashMap<String, usize>,

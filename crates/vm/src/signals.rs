@@ -3,7 +3,7 @@
 use crate::process::{Message, Runtime};
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, RunCtx, Signal};
-use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, copy_term, global_atoms};
+use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, copy_term, global_atoms, to_owned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(feature = "pf-mem-counters")]
 use std::sync::atomic::Ordering;
@@ -1399,22 +1399,46 @@ fn call_resolved(
             }),
         (SignalBif::Register2, [name, pid]) => {
             let name = atom_name(*name).ok_or_else(|| badarg("register/2"));
-            let pid = Pid::from_term(*pid).ok_or_else(|| badarg("register/2"));
             name.and_then(|name| {
-                let pid = pid?;
                 let rt = runtime(process)?;
-                if !rt.scheduler()?.lookup(pid) {
+                if let Some(pid) = Pid::from_term(*pid) {
+                    if !rt.scheduler()?.lookup(pid) {
+                        return Err(badarg("register/2"));
+                    }
+                    let mut names = rt.names.lock().unwrap();
+                    if names.get(&name).is_some_and(|existing| {
+                        rt.scheduler()
+                            .is_ok_and(|scheduler| scheduler.lookup(*existing))
+                    }) || rt
+                        .port_names
+                        .lock()
+                        .unwrap()
+                        .get(&name)
+                        .is_some_and(|id| crate::port::is_live(process, *id))
+                    {
+                        return Err(badarg("register/2"));
+                    }
+                    names.insert(name.clone(), pid);
+                } else if let Some(id) = pid.as_port() {
+                    if !crate::port::is_live(process, id) {
+                        return Err(badarg("register/2"));
+                    }
+                    let mut names = rt.names.lock().unwrap();
+                    let mut port_names = rt.port_names.lock().unwrap();
+                    if names.get(&name).is_some_and(|existing| {
+                        rt.scheduler()
+                            .is_ok_and(|scheduler| scheduler.lookup(*existing))
+                    }) || port_names
+                        .get(&name)
+                        .is_some_and(|existing| crate::port::is_live(process, *existing))
+                    {
+                        return Err(badarg("register/2"));
+                    }
+                    names.remove(&name);
+                    port_names.insert(name.clone(), id);
+                } else {
                     return Err(badarg("register/2"));
                 }
-                let mut names = rt.names.lock().unwrap();
-                if names.get(&name).is_some_and(|existing| {
-                    rt.scheduler()
-                        .is_ok_and(|scheduler| scheduler.lookup(*existing))
-                }) {
-                    return Err(badarg("register/2"));
-                }
-                names.insert(name.clone(), pid);
-                drop(names);
                 crate::trace::emit(
                     Some(vm),
                     process,
@@ -1430,8 +1454,12 @@ fn call_resolved(
         (SignalBif::Unregister1, [name]) => {
             let name = atom_name(*name).ok_or_else(|| badarg("unregister/1"));
             name.and_then(|name| {
-                let removed = runtime(process)?.names.lock().unwrap().remove(&name);
-                removed.ok_or_else(|| badarg("unregister/1"))?;
+                let rt = runtime(process)?;
+                let removed_pid = rt.names.lock().unwrap().remove(&name);
+                let removed_port = rt.port_names.lock().unwrap().remove(&name);
+                if removed_pid.is_none() && removed_port.is_none() {
+                    return Err(badarg("unregister/1"));
+                }
                 crate::trace::emit(
                     Some(vm),
                     process,
@@ -1456,7 +1484,18 @@ fn call_resolved(
                     Ok(pid.to_term().unwrap_or_else(|| atom("undefined")))
                 } else {
                     names.remove(&name);
-                    Ok(atom("undefined"))
+                    drop(names);
+                    let mut port_names = rt.port_names.lock().unwrap();
+                    match port_names.get(&name).copied() {
+                        Some(id) if crate::port::is_live(process, id) => {
+                            Ok(Term::port(id).unwrap_or_else(|| atom("undefined")))
+                        }
+                        Some(_) => {
+                            port_names.remove(&name);
+                            Ok(atom("undefined"))
+                        }
+                        None => Ok(atom("undefined")),
+                    }
                 }
             })
         }
@@ -1472,6 +1511,14 @@ fn call_resolved(
                         .is_ok_and(|scheduler| scheduler.lookup(**pid))
                 })
                 .map(|(name, _)| atom(name))
+                .chain(
+                    rt.port_names
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, id)| crate::port::is_live(process, **id))
+                        .map(|(name, _)| atom(name)),
+                )
                 .collect();
             let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
             TermBuilder::new(&mut heap)
@@ -1613,21 +1660,64 @@ fn call_resolved(
             reference(process, id)
         }
         (SignalBif::Monitor2, [kind, target]) if *kind == atom("port") => {
-            let id = target.as_port().ok_or_else(|| badarg("monitor/2"))?;
             let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
             let reference_id = runtime.next_ref();
             let reference_term = reference(process, reference_id)?;
-            if runtime.ports.lock().unwrap().contains_key(&id) {
-                crate::port::monitor(process, *target, reference_id, ctx.pid(), true)?;
+            let (port_id, object) = if let Some(id) = target.as_port() {
+                (
+                    Some(id),
+                    to_owned(*target).map_err(|_| badarg("monitor/2"))?,
+                )
+            } else if let Some(name) = atom_name(*target) {
+                let id = runtime.port_names.lock().unwrap().get(&name).copied();
+                let node = crate::node_tables::lock().local_name.clone();
+                (
+                    id,
+                    arinsal_etf::OwnedTerm::Tuple(vec![
+                        arinsal_etf::OwnedTerm::Atom(name),
+                        arinsal_etf::OwnedTerm::Atom(node),
+                    ]),
+                )
+            } else {
+                return Err(badarg("monitor/2"));
+            };
+            if let Some(id) = port_id.filter(|id| runtime.ports.lock().unwrap().contains_key(id)) {
+                let port = Term::port(id).ok_or_else(|| badarg("monitor/2"))?;
+                if !crate::port::monitor(
+                    process,
+                    port,
+                    reference_id,
+                    ctx.pid(),
+                    object.clone(),
+                    true,
+                )? {
+                    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                    let object = arinsal_term::from_owned(&object, &mut heap)
+                        .map_err(|_| badarg("monitor/2"))?;
+                    let down = TermBuilder::new(&mut heap)
+                        .tuple(&[
+                            atom("DOWN"),
+                            reference_term,
+                            atom("port"),
+                            object,
+                            atom("noproc"),
+                        ])
+                        .map_err(|error| {
+                            VmError::Unsupported(format!("port DOWN tuple: {error:?}"))
+                        })?;
+                    process.inbox.push_back(down);
+                }
                 Ok(reference_term)
             } else {
                 let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                let object = arinsal_term::from_owned(&object, &mut heap)
+                    .map_err(|_| badarg("monitor/2"))?;
                 let down = TermBuilder::new(&mut heap)
                     .tuple(&[
                         atom("DOWN"),
                         reference_term,
                         atom("port"),
-                        *target,
+                        object,
                         atom("noproc"),
                     ])
                     .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;

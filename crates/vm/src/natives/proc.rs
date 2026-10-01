@@ -305,6 +305,17 @@ fn process_info(
                     .into_iter()
                     .map(|p| make_tuple(process, &[atom("process"), p]))
                     .collect::<Result<Vec<_>, _>>()?;
+                let port_monitors = crate::port::monitors_by(process, pid);
+                let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                let vals = vals
+                    .into_iter()
+                    .chain(port_monitors.into_iter().filter_map(|object| {
+                        let object = arinsal_term::from_owned(&object, &mut heap).ok()?;
+                        TermBuilder::new(&mut heap)
+                            .tuple(&[atom("port"), object])
+                            .ok()
+                    }))
+                    .collect::<Vec<_>>();
                 make_list(process, vals)?
             }
             "monitored_by" => {
