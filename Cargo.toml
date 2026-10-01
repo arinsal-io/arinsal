@@ -94,5 +94,13 @@ debug = 1
 codegen-units = 1
 lto = "thin"
 
+# Iteration builds for agents (OTP suite runs with --fast): release speed without the
+# single-codegen-unit LTO link. Gates and merges keep using the release profile.
+[profile.fastrel]
+inherits = "release"
+codegen-units = 16
+lto = false
+incremental = true
+
 [profile.dev.package."*"]
 opt-level = 2

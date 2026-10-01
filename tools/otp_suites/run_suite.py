@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import pathlib
 import re
@@ -33,7 +35,7 @@ def run(cmd: list[str], timeout: int, **kwargs: object) -> subprocess.CompletedP
 
 
 def compile_helpers(build: pathlib.Path) -> None:
-    srcs = sorted(HELPERS.glob("*.erl"))
+    srcs = sorted(HELPERS.glob("*.erl")) + [TOOLS / "arinsal_case_timeout_cth.erl"]
     cp = run(["erlc", "-W0", "-I", str(HELPERS), "-o", str(build), *map(str, srcs)], 120)
     if cp.returncode:
         raise RuntimeError(f"helper compile failed ({cp.returncode}):\n{cp.stdout[-4000:]}")
@@ -90,7 +92,7 @@ def suite_dir(name: str) -> pathlib.Path:
     raise ValueError(f"suite not found: {name}_SUITE.erl")
 
 
-def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limit: int, beamasm: bool = False) -> tuple[int, str]:
+def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limit: int, beamasm: bool = False, extra: str = "") -> tuple[int, str]:
     logdir.mkdir(parents=True, exist_ok=True)
     original = suite_dir(name)
     with tempfile.TemporaryDirectory(prefix=f"otp-{name}-source-") as source_temp:
@@ -99,7 +101,7 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
         build_native(name, directory)
         expr = (
             "R=ct:run_test([{dir,\"" + str(directory) + "\"},{suite," + name
-            + "_SUITE},{logdir,\"" + str(logdir) + "\"}]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
+            + "_SUITE},{logdir,\"" + str(logdir) + "\"}" + extra + "]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
         )
         cmd = [exe, "-noshell", "-pa", str(build), "-pa", str(directory), "-eval", expr]
         env = os.environ.copy()
@@ -145,6 +147,65 @@ def parse_results(logdir: pathlib.Path, suite: str) -> tuple[dict[str, tuple[str
             pending += " " + line.strip()
     save()
     return cases, ""
+
+
+def parse_elapsed(logdir: pathlib.Path, suite: str) -> dict[str, float]:
+    """Per-case wall time (seconds) from the Common Test suite.log."""
+    out: dict[str, float] = {}
+    current = None
+    for log in logdir.glob("ct_run*/**/suite.log"):
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("=case          "):
+                module, _, case = line.split(None, 1)[1].strip().partition(":")
+                current = case if module == suite + "_SUITE" else None
+            elif line.startswith("=elapsed       ") and current:
+                try:
+                    out[current] = float(line.split(None, 1)[1].rstrip("s"))
+                except ValueError:
+                    pass
+                current = None
+    return out
+
+
+# The erl reference result only changes with the vendored suite sources, so it is cached
+# outside the repo and keyed by a hash of those sources.
+ERL_CACHE = pathlib.Path(os.environ.get("ARINSAL_ERL_CACHE", pathlib.Path.home() / ".cache/arinsal/otp-suites"))
+
+
+def erl_cache_key(name: str) -> str:
+    h = hashlib.sha256()
+    base = suite_dir(name)
+    files = [base / f"{name}_SUITE.erl", *sorted(HELPERS.glob("*.erl"))]
+    data = base / f"{name}_SUITE_data"
+    if data.is_dir():
+        files += sorted(p for p in data.rglob("*") if p.is_file() and p.name != "Makefile" and p.suffix not in (".o", ".so", ".beam"))
+    for f in files:
+        h.update(str(f.relative_to(OTP)).encode())
+        h.update(f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def erl_reference(name: str, build: pathlib.Path, limit: int, use_cache: bool) -> tuple[int, dict[str, tuple[str, str]], str, dict[str, float]]:
+    path = ERL_CACHE / f"{name}-{erl_cache_key(name)}.json"
+    if use_cache and path.is_file():
+        d = json.loads(path.read_text())
+        return d["rc"], {k: tuple(v) for k, v in d["cases"].items()}, d["meta"], d["elapsed"]
+    with tempfile.TemporaryDirectory(prefix=f"otp-{name}-erl-") as ed:
+        erl_dir = pathlib.Path(ed)
+        erc, eout = run_one("erl", name, erl_dir, build, limit)
+        ecases, emeta = parse_results(erl_dir, name)
+        if not ecases:
+            emeta = emeta or eout[-600:].replace("\n", " ")
+        elapsed = parse_elapsed(erl_dir, name)
+    if ecases and erc == 0:
+        ERL_CACHE.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"rc": erc, "cases": ecases, "meta": emeta, "elapsed": elapsed}))
+    return erc, ecases, emeta, elapsed
+
+
+def timeout_hook(elapsed: dict[str, float], floor: float, factor: float) -> str:
+    limits = ",".join(f"'{c}'=>{int(max(floor, factor * t) * 1000)}" for c, t in sorted(elapsed.items()))
+    return ",{ct_hooks,[{arinsal_case_timeout_cth,[{limits,#{" + limits + "}},{default," + str(int(floor * 1000)) + "}]}]}"
 
 
 def first_failure(logdir: pathlib.Path) -> str:
@@ -212,12 +273,25 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("suite", help="suite basename without _SUITE, or all-pilot")
     parser.add_argument("--timeout", type=int, default=180)
-    parser.add_argument("--arinsal", default=str(ROOT / "target/release/arinsal"))
+    parser.add_argument("--arinsal", default=None, help="Arinsal binary (default target/release/arinsal, or target/fastrel/arinsal with --fast)")
+    parser.add_argument("--fast", action="store_true", help="build and use the fastrel profile (quick incremental builds for iteration; gates use release)")
     parser.add_argument("--beamasm", action="store_true", help="set ARINSAL_BEAMASM=1 for the Arinsal run and write RESULTS_BEAMASM.md")
+    parser.add_argument("--case", default="", help="comma-separated test cases: run only these on Arinsal, compare with cached erl, do not touch RESULTS.md")
+    parser.add_argument("--group", default="", help="run only this group on Arinsal (same reporting as --case)")
+    parser.add_argument("--no-erl-cache", action="store_true", help="rerun the erl reference instead of using the cache")
+    parser.add_argument("--case-floor", type=float, default=20.0, help="minimum per-case limit in seconds")
+    parser.add_argument("--case-factor", type=float, default=10.0, help="per-case limit = max(floor, factor * erl case time)")
     args = parser.parse_args()
     results_path = RESULTS_BEAMASM if args.beamasm else RESULTS
     suites = PILOT if args.suite == "all-pilot" else [args.suite.removesuffix("_SUITE")]
-    if not pathlib.Path(args.arinsal).is_file():
+    partial = bool(args.case or args.group)
+    arinsal = args.arinsal or str(ROOT / ("target/fastrel/arinsal" if args.fast else "target/release/arinsal"))
+    if args.fast:
+        result = run(["cargo", "build", "--profile", "fastrel", "-p", "arinsal-cli"], 1800, cwd=ROOT)
+        if result.returncode:
+            print(result.stdout[-4000:], file=sys.stderr)
+            return result.returncode
+    elif not pathlib.Path(arinsal).is_file():
         result = run(["cargo", "build", "--release", "-p", "arinsal-cli"], 1200, cwd=ROOT)
         if result.returncode:
             print(result.stdout[-4000:], file=sys.stderr)
@@ -227,22 +301,39 @@ def main() -> int:
         compile_helpers(build)
         for name in suites:
             try:
-                with tempfile.TemporaryDirectory(prefix=f"otp-{name}-erl-") as ed, tempfile.TemporaryDirectory(prefix=f"otp-{name}-arinsal-") as ad:
-                    erl_dir, arin_dir = pathlib.Path(ed), pathlib.Path(ad)
-                    erc, eout = run_one("erl", name, erl_dir, build, args.timeout)
-                    arc, aout = run_one(args.arinsal, name, arin_dir, build, args.timeout, args.beamasm)
-                    ecases, emeta = parse_results(erl_dir, name)
+                erc, ecases, emeta, elapsed = erl_reference(name, build, args.timeout, not args.no_erl_cache)
+                extra = timeout_hook(elapsed, args.case_floor, args.case_factor)
+                if args.case:
+                    extra += ",{testcase,[" + ",".join(f"'{c.strip()}'" for c in args.case.split(",") if c.strip()) + "]}"
+                if args.group:
+                    extra += ",{group,'" + args.group + "'}"
+                with tempfile.TemporaryDirectory(prefix=f"otp-{name}-arinsal-") as ad:
+                    arin_dir = pathlib.Path(ad)
+                    arc, aout = run_one(arinsal, name, arin_dir, build, args.timeout, args.beamasm, extra)
                     acases, ameta = parse_results(arin_dir, name)
-                    update_table(name, ecases, acases, emeta, ameta, erc, arc, erl_dir, arin_dir, results_path)
+                    if partial:
+                        for c in sorted(acases):
+                            e, a = ecases.get(c, ("missing", "")), acases[c]
+                            mark = "OK " if a[0] == "ok" or e[0] != "ok" else "BAD"
+                            print(f"{mark} {c}: erl={e[0]} arinsal={a[0]} {a[1][:300]}", flush=True)
+                        apass = sum(s == "ok" for s, _ in acases.values())
+                        print(f"{name}_SUITE partial: arinsal={apass}/{len(acases)} rc={arc}", flush=True)
+                        if not acases:
+                            print("  arinsal:", (ameta or aout[-600:].replace("\n", " "))[:600], flush=True)
+                        continue
+                    with tempfile.TemporaryDirectory(prefix=f"otp-{name}-erl-") as ed:
+                        update_table(name, ecases, acases, emeta, ameta, erc, arc, pathlib.Path(ed), arin_dir, results_path)
                     epass = sum(s == "ok" for s, _ in ecases.values())
                     apass = sum(s == "ok" for s, _ in acases.values())
                     print(f"{name}_SUITE: erl={epass}/{len(ecases)} rc={erc}; arinsal={apass}/{len(acases)} rc={arc}", flush=True)
                     if not ecases:
-                        print("  erl:", (emeta or eout[-600:].replace("\n", " "))[:600], flush=True)
+                        print("  erl:", emeta[:600], flush=True)
                     if not acases:
                         print("  arinsal:", (ameta or aout[-600:].replace("\n", " "))[:600], flush=True)
             except Exception as exc:
                 print(f"{name}_SUITE: harness error: {exc}", file=sys.stderr, flush=True)
+                if partial:
+                    continue
                 with tempfile.TemporaryDirectory(prefix=f"otp-{name}-error-") as error_dir:
                     error_path = pathlib.Path(error_dir)
                     update_table(name, {}, {}, str(exc), str(exc), 1, 1, error_path, error_path, results_path)
