@@ -1526,7 +1526,7 @@ impl Executor {
         std::mem::swap(&mut process.fr, &mut self.fr);
         if matches!(
             result,
-            Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield)
+            Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield | VmError::Dirty(_))
         ) {
             let (live_x, live_fr) = self.vm.registers[process.module];
             // A native continuation keeps the live X registers of its yield site, which the
@@ -3188,6 +3188,45 @@ impl Process {
 }
 
 impl Process {
+    /// Handle incoming signals while this process executes a dirty job.
+    ///
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
+    /// (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1. erts handles them on a
+    /// dirty signal handler process while the job runs; here the job's wait points do it.
+    /// Collections are deferred until the job returns, and an exit signal makes the process
+    /// exiting: pending requests fail now and it terminates on a normal scheduler.
+    pub(crate) fn handle_dirty_signals(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>) {
+        if self.dirty_exiting() {
+            return;
+        }
+        let gc = self.set_gc_enabled(false);
+        let result = self.drain(ctx);
+        self.set_gc_enabled(gc);
+        if let Err(error) = result {
+            // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
+            // an exiting process is terminated while its dirty job keeps running.
+            crate::signals::process_exiting(self, ctx);
+            if let Some(runtime) = self.runtime.clone() {
+                runtime.processes.lock().unwrap().remove(&ctx.pid());
+            }
+            let reason = exit_reason_from(self, &error);
+            self.notify_exit(vm, ctx, reason);
+            if self.entry
+                && let Some(runtime) = self.runtime.as_ref()
+            {
+                let _ = runtime.result.send(Err(error));
+            }
+            self.cold_mut().dirty_exited = true;
+        }
+        // Replies, exit and DOWN signals must not wait for the dirty job to return.
+        ctx.flush_pending();
+    }
+
+    /// Whether this process already exited while executing a dirty job.
+    pub(crate) fn dirty_exiting(&self) -> bool {
+        self.cold.as_ref().is_some_and(|cold| cold.dirty_exited)
+    }
+
     /// Set this process's `F_DISABLE_GC` equivalent and return its previous state.
     /// Port of erts/emulator/beam/erl_process.c:11823 (`erts_set_gc_state`), OTP-29.1.1.
     pub(crate) fn set_gc_enabled(&mut self, enabled: bool) -> bool {
@@ -3590,9 +3629,25 @@ impl Process {
             crate::natives::misc::profile_process_event(self, ctx, true);
             self.cold_mut().profile_active = true;
         }
+        let result = self.run_executor(&runtime, ctx, budget);
+        if self.dirty_exiting() {
+            // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
+            // the process already terminated while the job ran; whatever the job returned,
+            // only the process structure remains to be released.
+            return RunOutcome::Exit(1);
+        }
+        self.finish_run(runtime, ctx, result)
+    }
+
+    fn run_executor(
+        &mut self,
+        runtime: &Arc<Runtime>,
+        ctx: &mut RunCtx<'_, Message>,
+        budget: u32,
+    ) -> Result<RunState, VmError> {
         let result = EXECUTOR.with(|slot| {
             let mut slot = slot.borrow_mut();
-            let key = Arc::as_ptr(&runtime) as usize;
+            let key = Arc::as_ptr(runtime) as usize;
             let replace = slot.as_ref().is_none_or(|(cached_key, executor)| {
                 *cached_key != key || executor.owner.strong_count() == 0
             });
@@ -3600,7 +3655,7 @@ impl Process {
                 *slot = Some((
                     key,
                     Executor {
-                        owner: Arc::downgrade(&runtime),
+                        owner: Arc::downgrade(runtime),
                         vm: Vm::shared_replica(Arc::clone(&runtime.code), &runtime.paths),
                         x: Box::new([]),
                         fr: Box::new([]),
@@ -3613,7 +3668,7 @@ impl Process {
                 .1
                 .run(self, ctx, budget)
         });
-        let result = if self
+        if self
             .cold
             .as_ref()
             .and_then(|cold| cold.debug_wait_completion.as_ref())
@@ -3622,7 +3677,15 @@ impl Process {
             Ok(RunState::Wait { timeout_ms: None })
         } else {
             result
-        };
+        }
+    }
+
+    fn finish_run(
+        &mut self,
+        runtime: Arc<Runtime>,
+        ctx: &mut RunCtx<'_, Message>,
+        result: Result<RunState, VmError>,
+    ) -> RunOutcome {
         if matches!(&result, Ok(RunState::Wait { .. } | RunState::Done(_)))
             && self.cold_mut().profile_active
         {
@@ -3697,6 +3760,10 @@ impl Process {
                 if matches!(error, VmError::Yield) {
                     runtime.note_status(ctx.pid(), "runnable");
                     return RunOutcome::Yield;
+                }
+                if let VmError::Dirty(kind) = error {
+                    runtime.note_status(ctx.pid(), "runnable");
+                    return RunOutcome::Dirty(kind);
                 }
                 crate::signals::process_exiting(self, ctx);
                 runtime.processes.lock().unwrap().remove(&ctx.pid());
@@ -3808,9 +3875,13 @@ impl Vm {
             ever_max_heap: AtomicBool::new(false),
             debug_wait_active: AtomicBool::new(false),
         });
+        let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
+            crate::natives::sys::dirty_scheduler_defaults();
         let config = Config {
             workers,
             reductions: reductions.max(1),
+            dirty_cpu_schedulers,
+            dirty_io_schedulers,
             ..Config::default()
         };
         let scheduler = Arc::new(match simulation_seed {
@@ -3819,6 +3890,7 @@ impl Vm {
         });
         let (online, blocked) = crate::natives::sys::scheduler_online_default();
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
+        let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
         scheduler.set_scheduling_blocked(blocked, None);
         *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
         if module == "erl_init" && function == "start" {

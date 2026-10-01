@@ -498,11 +498,11 @@ impl Vm {
                     if tail {
                         return Ok(match Self::ret(p) {
                             Some(value) => ImportOutcome::Returned(value),
-                            None => ImportOutcome::Advanced,
+                            None => crate::calls::after_dirty(ImportOutcome::Advanced),
                         });
                     }
                     p.ip += 1;
-                    return Ok(ImportOutcome::Advanced);
+                    return Ok(crate::calls::after_dirty(ImportOutcome::Advanced));
                 }
             }
         }
@@ -574,11 +574,11 @@ impl Vm {
             if tail {
                 return Ok(match Self::ret(p) {
                     Some(value) => ImportOutcome::Returned(value),
-                    None => ImportOutcome::Advanced,
+                    None => crate::calls::after_dirty(ImportOutcome::Advanced),
                 });
             }
             p.ip += 1;
-            return Ok(ImportOutcome::Advanced);
+            return Ok(crate::calls::after_dirty(ImportOutcome::Advanced));
         }
         // elixir_loop1: apply/3 reaches this path without an import slot.
         // sys_core_fold:fold_lit_args/4 applies erlang:make_fun/3 the same way.
@@ -954,7 +954,8 @@ impl Vm {
         if matches!(
             &result,
             Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)
-        ) || reexec_apply
+        ) || matches!(&result, Err(VmError::Dirty(_)))
+            || reexec_apply
         {
             // Only a yield that re-executes this apply may restore its argument registers; a yield after the
             // callee returned (reductions exhausted, ip advanced) must keep the result in x0.

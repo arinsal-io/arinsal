@@ -130,6 +130,9 @@ mod boot_loop1_shared_tests {
 pub enum VmError {
     /// The current BIF exhausted its scheduler slice and must resume later.
     Yield,
+    /// The current BIF or NIF must be retried on a dirty scheduler of this kind.
+    /// Port of erts/emulator/beam/erl_nif.c:5000 (schedule_dirty_nif / erts_schedule_bif), OTP-29.1.1.
+    Dirty(arinsal_sched::DirtyKind),
     /// Instruction or external service not implemented yet.
     Unsupported(String),
     /// Erlang exception reason and current top frame.
@@ -154,6 +157,7 @@ impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Yield => f.write_str("scheduler yield"),
+            Self::Dirty(kind) => write!(f, "dirty scheduler migration ({kind:?})"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Exception { reason, frame } => {
                 write!(f, "** exception error: {reason}\n  in function {frame}")

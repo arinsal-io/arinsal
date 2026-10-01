@@ -244,6 +244,69 @@ pub enum RunOutcome {
     Wait { timeout_ms: Option<u64> },
     /// The task has terminated; reason interpretation belongs to the VM.
     Exit(u64),
+    /// The task must continue on a dirty scheduler of this kind. A task that
+    /// returns [`RunOutcome::Yield`] or [`RunOutcome::Wait`] from a dirty
+    /// scheduler moves back to the normal run queues.
+    Dirty(DirtyKind),
+}
+
+/// Dirty scheduler class requested by [`RunOutcome::Dirty`].
+///
+/// Port of erts/emulator/beam/erl_process.h (`ERTS_SCHED_DIRTY_CPU`, `ERTS_SCHED_DIRTY_IO`), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirtyKind {
+    /// Dirty CPU scheduler pool.
+    Cpu,
+    /// Dirty I/O scheduler pool.
+    Io,
+}
+
+impl DirtyKind {
+    fn index(self) -> usize {
+        match self {
+            Self::Cpu => 0,
+            Self::Io => 1,
+        }
+    }
+}
+
+/// Type of the scheduler thread executing the caller.
+///
+/// Port of erts/emulator/beam/erl_process.h:290 (`ErtsSchedType`), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerType {
+    /// A normal scheduler, or a thread that is no scheduler at all.
+    Normal,
+    /// A dirty CPU scheduler.
+    DirtyCpu,
+    /// A dirty I/O scheduler.
+    DirtyIo,
+}
+
+impl SchedulerType {
+    /// Whether this is a dirty scheduler type.
+    pub fn is_dirty(self) -> bool {
+        self != Self::Normal
+    }
+}
+
+impl From<DirtyKind> for SchedulerType {
+    fn from(kind: DirtyKind) -> Self {
+        match kind {
+            DirtyKind::Cpu => Self::DirtyCpu,
+            DirtyKind::Io => Self::DirtyIo,
+        }
+    }
+}
+
+thread_local! {
+    static SCHEDULER_TYPE: std::cell::Cell<SchedulerType> =
+        const { std::cell::Cell::new(SchedulerType::Normal) };
+}
+
+/// Scheduler type of the calling thread, like `erts_get_scheduler_data()->type`.
+pub fn current_scheduler_type() -> SchedulerType {
+    SCHEDULER_TYPE.with(std::cell::Cell::get)
 }
 
 /// A VM process or a benchmark dummy task.
@@ -282,6 +345,10 @@ pub struct Config {
     pub reductions: u32,
     /// Maximum consecutive inherited-budget `runnext` dispatches.
     pub runnext_limit: u8,
+    /// Dirty CPU scheduler threads (`+SDcpu`); erts defaults to one per scheduler.
+    pub dirty_cpu_schedulers: usize,
+    /// Dirty I/O scheduler threads (`+SDio`); erts defaults to ten.
+    pub dirty_io_schedulers: usize,
 }
 
 impl Default for Config {
@@ -292,6 +359,8 @@ impl Default for Config {
             max_processes: 1_048_576,
             reductions: 4_000,
             runnext_limit: 3,
+            dirty_cpu_schedulers: available.max(1),
+            dirty_io_schedulers: 10,
         }
     }
 }
@@ -389,6 +458,12 @@ struct Process<T: Task> {
     publish_inflight: AtomicUsize,
     /// Wheel that owns `wait_timer`, so cancel does not guess from the pid.
     wait_timer_worker: AtomicUsize,
+    /// Dirty run queue that owns this process: 0 normal, 1 dirty CPU, 2 dirty I/O.
+    /// Port of erl_process.h (`ERTS_PSFLG_DIRTY_CPU_PROC`, `ERTS_PSFLG_DIRTY_IO_PROC`), OTP-29.1.1.
+    dirty: AtomicU8,
+    /// One plus the dirty thread slot executing this process, 0 when not executing dirty.
+    /// Port of erl_process.h (`ERTS_PSFLG_DIRTY_RUNNING`), OTP-29.1.1.
+    dirty_runner: AtomicUsize,
     cell: Mutex<TaskCell<T>>,
 }
 
@@ -483,6 +558,8 @@ impl<T: Task> ProcessTable<T> {
             backlog: AtomicUsize::new(0),
             publish_inflight: AtomicUsize::new(0),
             wait_timer_worker: AtomicUsize::new(0),
+            dirty: AtomicU8::new(0),
+            dirty_runner: AtomicUsize::new(0),
             cell: Mutex::new(TaskCell {
                 task,
                 private: Private::default(),
@@ -747,6 +824,109 @@ struct Inner<T: Task> {
     fanin_delivered: AtomicU64,
     fanin_peak_backlog: AtomicUsize,
     progress: Arc<ThreadProgress>,
+    /// Dirty CPU and dirty I/O pools, indexed by [`DirtyKind::index`].
+    dirty: [DirtyPool<T>; 2],
+}
+
+/// One dirty scheduler pool: a single run queue shared by all of its threads.
+///
+/// Port of erts/emulator/beam/erl_process.c:6050 (`ERTS_DIRTY_CPU_RUNQ`,
+/// `ERTS_DIRTY_IO_RUNQ`), OTP-29.1.1.
+struct DirtyPool<T: Task> {
+    queue: Mutex<DirtyQueue<T>>,
+    ready: Condvar,
+    online: AtomicUsize,
+    threads: Vec<DirtyThread>,
+    /// Global dirty slot of this pool's first thread.
+    first_slot: usize,
+}
+
+struct DirtyQueue<T: Task> {
+    by_priority: [VecDeque<Arc<Process<T>>>; 4],
+    len: usize,
+}
+
+/// Active ns, microstate ns, and run queue length per dirty pool (CPU, then I/O).
+type DirtyStatsSnapshot = ([Vec<u64>; 2], [Vec<[u64; MSACC_STATE_COUNT]>; 2], [u64; 2]);
+
+struct DirtyThread {
+    handle: OnceLock<thread::Thread>,
+    stats: Mutex<DirtyStats>,
+}
+
+/// Wall-time and microstate counters measured on one dirty scheduler thread.
+struct DirtyStats {
+    active_ns: u64,
+    active_started: Option<Instant>,
+    msacc_ns: [u64; MSACC_STATE_COUNT],
+    msacc_state: MsaccState,
+    msacc_started: Instant,
+}
+
+impl DirtyStats {
+    fn new() -> Self {
+        Self {
+            active_ns: 0,
+            active_started: None,
+            msacc_ns: [0; MSACC_STATE_COUNT],
+            msacc_state: MsaccState::Other,
+            msacc_started: Instant::now(),
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_msacc.h:300 (erts_msacc_set_state_m), OTP-29.1.1.
+    fn set_state(&mut self, state: MsaccState) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.msacc_started).as_nanos();
+        let counter = &mut self.msacc_ns[self.msacc_state as usize];
+        *counter = counter.saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX));
+        self.msacc_state = state;
+        self.msacc_started = now;
+    }
+
+    fn begin_active(&mut self) {
+        self.set_state(MsaccState::Emulator);
+        self.active_started = Some(Instant::now());
+    }
+
+    fn end_active(&mut self) {
+        if let Some(started) = self.active_started.take() {
+            let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.active_ns = self.active_ns.saturating_add(elapsed);
+        }
+        self.set_state(MsaccState::Other);
+    }
+
+    fn snapshot(&self) -> (u64, [u64; MSACC_STATE_COUNT]) {
+        let active = self.active_started.map_or(self.active_ns, |started| {
+            self.active_ns
+                .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+        });
+        let mut msacc = self.msacc_ns;
+        let current = u64::try_from(self.msacc_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        msacc[self.msacc_state as usize] = msacc[self.msacc_state as usize].saturating_add(current);
+        (active, msacc)
+    }
+}
+
+impl<T: Task> DirtyPool<T> {
+    fn new(threads: usize, first_slot: usize) -> Self {
+        Self {
+            queue: Mutex::new(DirtyQueue {
+                by_priority: std::array::from_fn(|_| VecDeque::new()),
+                len: 0,
+            }),
+            ready: Condvar::new(),
+            online: AtomicUsize::new(threads),
+            threads: (0..threads)
+                .map(|_| DirtyThread {
+                    handle: OnceLock::new(),
+                    stats: Mutex::new(DirtyStats::new()),
+                })
+                .collect(),
+            first_slot,
+        }
+    }
 }
 
 #[repr(align(64))]
@@ -769,6 +949,64 @@ struct LocalStatsSnapshot {
 }
 
 impl<T: Task> Inner<T> {
+    // Port of erts/emulator/beam/erl_process.c:6403 (schedule_dirty / enqueue on the
+    // dirty run queue), OTP-29.1.1.
+    fn enqueue_dirty(&self, process: Arc<Process<T>>, kind: DirtyKind) {
+        process
+            .dirty
+            .store(kind.index() as u8 + 1, Ordering::Release);
+        let pool = &self.dirty[kind.index()];
+        if let Some(sim) = &self.sim {
+            sim.lock().unwrap().queue.push_back(Scheduled {
+                process,
+                inherited: None,
+            });
+            return;
+        }
+        {
+            let mut queue = pool.queue.lock().unwrap();
+            queue.by_priority[process.priority.index()].push_back(process);
+            queue.len += 1;
+        }
+        // Offline dirty CPU threads also wait on this condvar, so wake them all.
+        pool.ready.notify_all();
+    }
+
+    fn dirty_thread(&self, slot: usize) -> Option<&DirtyThread> {
+        let cpu = self.dirty[0].threads.len();
+        if slot < cpu {
+            self.dirty[0].threads.get(slot)
+        } else {
+            self.dirty[1].threads.get(slot - cpu)
+        }
+    }
+
+    /// Wake the dirty thread executing `process`, so a dirty job waiting in
+    /// [`RunCtx::dirty_wait`] can let its signals be handled.
+    fn notify_dirty_runner(&self, process: &Process<T>) {
+        let runner = process.dirty_runner.load(Ordering::SeqCst);
+        if runner != 0
+            && let Some(thread) = self.dirty_thread(runner - 1).and_then(|t| t.handle.get())
+        {
+            thread.unpark();
+        }
+    }
+
+    fn dirty_stats(&self) -> DirtyStatsSnapshot {
+        let mut active = [Vec::new(), Vec::new()];
+        let mut msacc = [Vec::new(), Vec::new()];
+        let mut lengths = [0; 2];
+        for (index, pool) in self.dirty.iter().enumerate() {
+            for thread in &pool.threads {
+                let (thread_active, thread_msacc) = thread.stats.lock().unwrap().snapshot();
+                active[index].push(thread_active);
+                msacc[index].push(thread_msacc);
+            }
+            lengths[index] = pool.queue.lock().unwrap().len as u64;
+        }
+        (active, msacc, lengths)
+    }
+
     fn request_aux_work_one(&self, worker: usize, work: SchedulerAuxWork) {
         let Some(queue) = self.aux_work.get(worker) else {
             return;
@@ -988,6 +1226,7 @@ impl<T: Task> Inner<T> {
             .iter()
             .map(|value| value.0.load(Ordering::Relaxed))
             .collect();
+        let dirty = self.dirty_stats();
         SchedulerStats {
             run_queue_lengths: counts
                 .iter()
@@ -1015,6 +1254,9 @@ impl<T: Task> Inner<T> {
                 .sum(),
             active_schedulers: self.active_schedulers.load(Ordering::Relaxed) as u64,
             elapsed_ns: u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            dirty_active_ns: dirty.0,
+            dirty_msacc_ns: dirty.1,
+            dirty_run_queue_lengths: dirty.2,
         }
     }
 
@@ -1054,6 +1296,7 @@ impl<T: Task> Inner<T> {
                 *count = count.wrapping_add(*delta as u64);
             }
         }
+        let dirty = self.dirty_stats();
         SchedulerStats {
             run_queue_lengths: counts
                 .iter()
@@ -1079,6 +1322,9 @@ impl<T: Task> Inner<T> {
                 .saturating_add(current_reductions),
             active_schedulers: self.active_schedulers.load(Ordering::Relaxed) as u64,
             elapsed_ns: u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            dirty_active_ns: dirty.0,
+            dirty_msacc_ns: dirty.1,
+            dirty_run_queue_lengths: dirty.2,
         }
     }
 
@@ -1245,8 +1491,10 @@ impl<T: Task> Inner<T> {
         if process
             .state
             .compare_exchange(WAITING, QUEUED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+            .is_err()
         {
+            self.notify_dirty_runner(&process);
+        } else {
             if wait_timer != 0 {
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
                 self.cancel_wait_timer(&process, wait_timer);
@@ -2020,6 +2268,7 @@ pub struct RunCtx<'a, M: Send + 'static> {
     msacc_enabled: bool,
     wall_enabled: bool,
     gc_accounted_total: u64,
+    sched_type: SchedulerType,
 }
 
 trait ContextOps<M> {
@@ -2113,6 +2362,30 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// One-based id of the worker executing this process turn.
     pub fn scheduler_id(&self) -> Option<usize> {
         self.worker.map(|worker| worker + 1)
+    }
+    /// Type of the scheduler executing this process turn.
+    pub fn scheduler_type(&self) -> SchedulerType {
+        self.sched_type
+    }
+    /// Publish messages and signals this turn has buffered so far. A long dirty job
+    /// calls this so its sends do not wait for the job to return.
+    pub fn flush_pending(&mut self) {
+        self.inner.flush(self.remaining);
+    }
+    /// Whether events wait in this process's shared input queue.
+    pub fn has_pending_input(&self) -> bool {
+        self.input.has_pending()
+    }
+    /// Block a dirty job for at most `timeout`, returning early when a message or
+    /// signal arrives for this process, so the job can let it be handled.
+    ///
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8893 (dirty process signal
+    /// handling): erts handles those signals on a system process while the dirty job runs.
+    pub fn dirty_wait(&mut self, timeout: Duration) {
+        self.flush_pending();
+        if !self.input.has_pending() {
+            thread::park_timeout(timeout);
+        }
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&mut self, work: impl Fn(usize) + Send + Sync + 'static) {
@@ -2903,6 +3176,12 @@ pub struct SchedulerStats {
     pub active_schedulers: u64,
     /// Nanoseconds since scheduler creation.
     pub elapsed_ns: u64,
+    /// Nanoseconds each dirty CPU (index 0) and dirty I/O (index 1) thread spent executing tasks.
+    pub dirty_active_ns: [Vec<u64>; 2],
+    /// Per dirty CPU (index 0) and dirty I/O (index 1) thread microstate nanoseconds.
+    pub dirty_msacc_ns: [Vec<[u64; MSACC_STATE_COUNT]>; 2],
+    /// Processes waiting in the dirty CPU and dirty I/O run queues.
+    pub dirty_run_queue_lengths: [u64; 2],
 }
 
 impl<T: Task> Scheduler<T> {
@@ -2936,6 +3215,8 @@ impl<T: Task> Scheduler<T> {
         assert!(config.max_processes > 0 && config.max_processes <= PID_LIMIT);
         assert!(config.reductions > 0);
         config.workers = config.workers.max(1);
+        let dirty_cpu = config.dirty_cpu_schedulers.max(1);
+        let dirty_io = config.dirty_io_schedulers.max(1);
         let simulated = rng.is_some();
         let workers = if simulated { 1 } else { config.workers };
         let now = clock.now_ms();
@@ -3026,6 +3307,10 @@ impl<T: Task> Scheduler<T> {
             fanin_delivered: AtomicU64::new(0),
             fanin_peak_backlog: AtomicUsize::new(0),
             progress: Arc::new(ThreadProgress::default()),
+            dirty: [
+                DirtyPool::new(dirty_cpu, 0),
+                DirtyPool::new(dirty_io, dirty_cpu),
+            ],
         });
         let mut threads = Vec::new();
         if !simulated {
@@ -3034,6 +3319,22 @@ impl<T: Task> Scheduler<T> {
                 threads.push(thread::spawn(move || {
                     worker_loop(inner, id, local.into_local())
                 }));
+            }
+            // Port of erts/emulator/beam/erl_process.c:8890 (erts_start_schedulers, dirty
+            // scheduler threads), OTP-29.1.1.
+            for (kind, count) in [(DirtyKind::Cpu, dirty_cpu), (DirtyKind::Io, dirty_io)] {
+                for index in 0..count {
+                    let inner = inner.clone();
+                    let name = match kind {
+                        DirtyKind::Cpu => format!("{}_dirty_cpu_scheduler", index + 1),
+                        DirtyKind::Io => format!("{}_dirty_io_scheduler", index + 1),
+                    };
+                    let handle = thread::Builder::new()
+                        .name(name)
+                        .spawn(move || dirty_scheduler_loop(inner, kind, index))
+                        .expect("spawn dirty scheduler thread");
+                    threads.push(handle);
+                }
             }
         }
         Self {
@@ -3114,6 +3415,35 @@ impl<T: Task> Scheduler<T> {
     /// Wake a task that is waiting without a mailbox event.
     pub fn wake(&self, pid: Pid) -> bool {
         self.inner.wake_waiting(pid)
+    }
+    /// Whether the task is queued on or executing on a dirty scheduler.
+    ///
+    /// Port of erts/emulator/beam/erl_process.h (`ERTS_PROC_IN_DIRTY_STATE`), OTP-29.1.1.
+    pub fn is_executing_dirty(&self, pid: Pid) -> bool {
+        self.inner.table.lookup(pid).is_some_and(|process| {
+            process.dirty.load(Ordering::Acquire) != 0
+                || process.dirty_runner.load(Ordering::Acquire) != 0
+        })
+    }
+    /// Number of dirty CPU and dirty I/O scheduler threads.
+    pub fn dirty_scheduler_counts(&self) -> (usize, usize) {
+        (
+            self.inner.dirty[0].threads.len(),
+            self.inner.dirty[1].threads.len(),
+        )
+    }
+    /// Set how many dirty CPU scheduler threads may execute dirty jobs.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:7266 (erts_set_schedulers_online, dirty CPU
+    /// part), OTP-29.1.1: offline dirty CPU schedulers stop picking jobs from the shared queue.
+    pub fn set_dirty_cpu_online(&self, online: usize) -> bool {
+        let pool = &self.inner.dirty[0];
+        if online == 0 || online > pool.threads.len() {
+            return false;
+        }
+        pool.online.store(online, Ordering::Release);
+        pool.ready.notify_all();
+        true
     }
     /// Whether a pid currently identifies a live task.
     pub fn lookup(&self, pid: Pid) -> bool {
@@ -3338,7 +3668,12 @@ impl<T: Task> Scheduler<T> {
             let index = sim.rng.next_u64() as usize % len;
             sim.queue.remove(index).unwrap()
         };
-        run_one(&self.inner, item, None, None);
+        let dirty = match item.process.dirty.load(Ordering::Acquire) {
+            1 => Some(DirtyKind::Cpu),
+            2 => Some(DirtyKind::Io),
+            _ => None,
+        };
+        run_one(&self.inner, item, None, None, dirty);
         true
     }
 }
@@ -3461,6 +3796,7 @@ mod msgq_stage_microbench {
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
+            sched_type: SchedulerType::Normal,
         };
         let started = Instant::now();
         assert!(context.fetch_pending());
@@ -3705,6 +4041,9 @@ mod offline_scheduler_tests {
 impl<T: Task> Drop for Scheduler<T> {
     fn drop(&mut self) {
         self.inner.stopped.store(true, Ordering::Release);
+        for pool in &self.inner.dirty {
+            pool.ready.notify_all();
+        }
         for handle in &self.threads {
             handle.thread().unpark();
         }
@@ -3720,6 +4059,7 @@ fn run_one<'a, T: Task>(
     item: Scheduled<T>,
     mut local: Option<&'a mut Local<T>>,
     worker: Option<usize>,
+    dirty: Option<DirtyKind>,
 ) {
     let process = item.process;
     if process
@@ -3729,24 +4069,28 @@ fn run_one<'a, T: Task>(
     {
         return;
     }
-    if let Some(local) = local.as_deref_mut() {
-        local.record_running(&process, local.worker_id);
-    } else {
-        inner.record_running(&process, worker.unwrap_or(0));
-    }
     let worker_id = worker.unwrap_or(0);
-    if let Some(local) = local.as_deref_mut() {
-        local.context_switches += 1;
-    } else {
-        inner.worker_stats[worker_id]
-            .context_switches
-            .fetch_add(1, Ordering::Relaxed);
+    // A process on a dirty run queue left the normal run queue accounting when it migrated.
+    if dirty.is_none() {
+        if let Some(local) = local.as_deref_mut() {
+            local.record_running(&process, local.worker_id);
+            local.context_switches += 1;
+        } else {
+            inner.record_running(&process, worker_id);
+            inner.worker_stats[worker_id]
+                .context_switches
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
     let budget = item
         .inherited
         .filter(|&n| n > 0)
         .unwrap_or(inner.config.reductions);
-    let progress = ThreadProgress::enter(Arc::clone(&inner.progress));
+    // Port of erts/emulator/beam/erl_thr_progress.c: dirty schedulers are unmanaged threads
+    // and never delay thread progress, OTP-29.1.1.
+    let progress = dirty
+        .is_none()
+        .then(|| ThreadProgress::enter(Arc::clone(&inner.progress)));
     let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
     let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
     if let Some(local) = local.as_deref_mut() {
@@ -3782,7 +4126,7 @@ fn run_one<'a, T: Task>(
                 remaining: budget,
                 budget,
                 private_wake: true,
-                progress: Some(progress),
+                progress,
                 msacc_enabled,
                 wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
                 gc_accounted_total: if msacc_enabled {
@@ -3790,11 +4134,15 @@ fn run_one<'a, T: Task>(
                 } else {
                     0
                 },
+                sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
             };
             if msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Emulator);
             }
+            // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
+            let thread_type = SCHEDULER_TYPE.with(|current| current.replace(ctx.sched_type));
             let outcome = task.run(&mut ctx, budget);
+            SCHEDULER_TYPE.with(|current| current.set(thread_type));
             if ctx.msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Other);
                 ctx.account_gc_total(task.gc_nanoseconds());
@@ -3815,7 +4163,9 @@ fn run_one<'a, T: Task>(
         result
     };
     let consumed = u64::from(budget.saturating_sub(remaining));
-    if let Some(local) = local.as_deref_mut() {
+    if dirty.is_some() {
+        // Dirty schedulers keep no reduction or normal run queue counters.
+    } else if let Some(local) = local.as_deref_mut() {
         local.reductions += consumed;
     } else {
         inner.worker_stats[worker_id]
@@ -3830,7 +4180,35 @@ fn run_one<'a, T: Task>(
             .check_time_reds
             .saturating_add(budget.saturating_sub(remaining));
     }
+    if dirty.is_some() {
+        process.dirty.store(0, Ordering::Release);
+    }
     match outcome {
+        RunOutcome::Dirty(kind) => {
+            // Port of erts/emulator/beam/erl_process.c:9873 (schedule_out to a dirty run
+            // queue), OTP-29.1.1.
+            if dirty.is_none() {
+                if let Some(local) = local.as_deref_mut() {
+                    local.record_waiting(&process);
+                } else {
+                    inner.record_waiting(&process);
+                }
+            }
+            process.state.store(QUEUED, Ordering::Release);
+            inner.enqueue_dirty(process.clone(), kind);
+        }
+        RunOutcome::Yield if dirty.is_some() => {
+            // Port of erts/emulator/beam/erl_process.c:10190 (a finished dirty job moves the
+            // process back to a normal run queue), OTP-29.1.1.
+            process.state.store(QUEUED, Ordering::Release);
+            inner.enqueue(
+                Scheduled {
+                    process: process.clone(),
+                    inherited: None,
+                },
+                false,
+            );
+        }
         RunOutcome::Yield => {
             process.state.store(QUEUED, Ordering::Release);
             let next = Scheduled {
@@ -3860,7 +4238,9 @@ fn run_one<'a, T: Task>(
                 process.wait_epoch.load(Ordering::Relaxed)
             };
             process.state.store(WAITING, Ordering::SeqCst);
-            if let Some(local) = local.as_deref_mut() {
+            if dirty.is_some() {
+                // Already outside the normal run queue accounting.
+            } else if let Some(local) = local.as_deref_mut() {
                 local.record_waiting(&process);
             } else {
                 inner.record_waiting(&process);
@@ -3934,7 +4314,9 @@ fn run_one<'a, T: Task>(
         }
         RunOutcome::Exit(_) => {
             process.state.store(EXITED, Ordering::SeqCst);
-            if let Some(local) = local.as_deref_mut() {
+            if dirty.is_some() {
+                // Already outside the normal run queue accounting.
+            } else if let Some(local) = local.as_deref_mut() {
                 local.record_waiting(&process);
             } else {
                 inner.record_waiting(&process);
@@ -4108,7 +4490,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
                 profile_scheduler_transition(&inner, &item.process, id, true, count, &mut local);
             }
             local.last_process = Some(item.process.clone());
-            run_one(&inner, item, Some(&mut local), Some(id));
+            run_one(&inner, item, Some(&mut local), Some(id), None);
             continue;
         }
         // A worker advertises parking before its final work check. An enqueuer
@@ -4162,6 +4544,58 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
     });
 }
 
+/// Main loop of one dirty scheduler thread.
+///
+/// Port of erts/emulator/beam/erl_process.c:9600 (erts_schedule for dirty schedulers) and
+/// erl_process.c:3404 (scheduler_wait on a dirty run queue), OTP-29.1.1.
+fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: usize) {
+    SCHEDULER_TYPE.with(|current| current.set(kind.into()));
+    let pool = &inner.dirty[kind.index()];
+    let thread = &pool.threads[index];
+    let slot = pool.first_slot + index;
+    let _ = thread.handle.set(thread::current());
+    thread.stats.lock().unwrap().set_state(MsaccState::Sleep);
+    loop {
+        let process = {
+            let mut queue = pool.queue.lock().unwrap();
+            loop {
+                if inner.stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                if index < pool.online.load(Ordering::Acquire)
+                    && queue.len != 0
+                    && let Some(process) =
+                        queue.by_priority.iter_mut().find_map(VecDeque::pop_front)
+                {
+                    queue.len -= 1;
+                    break process;
+                }
+                queue = pool
+                    .ready
+                    .wait_timeout(queue, Duration::from_millis(100))
+                    .unwrap()
+                    .0;
+            }
+        };
+        thread.stats.lock().unwrap().begin_active();
+        process.dirty_runner.store(slot + 1, Ordering::SeqCst);
+        run_one(
+            &inner,
+            Scheduled {
+                process: process.clone(),
+                inherited: None,
+            },
+            None,
+            None,
+            Some(kind),
+        );
+        process.dirty_runner.store(0, Ordering::SeqCst);
+        let mut stats = thread.stats.lock().unwrap();
+        stats.end_active();
+        stats.set_state(MsaccState::Sleep);
+    }
+}
+
 fn profile_scheduler_transition<T: Task>(
     inner: &Inner<T>,
     process: &Arc<Process<T>>,
@@ -4170,6 +4604,12 @@ fn profile_scheduler_transition<T: Task>(
     active_schedulers: usize,
     local: &mut Local<T>,
 ) {
+    // A process executing a dirty job keeps its task cell for the whole job.
+    if process.dirty.load(Ordering::Acquire) != 0
+        || process.dirty_runner.load(Ordering::Acquire) != 0
+    {
+        return;
+    }
     let Some((target, message)) = process.cell.lock().unwrap().task.scheduler_profile_event(
         process.pid,
         scheduler_id as u32 + 1,

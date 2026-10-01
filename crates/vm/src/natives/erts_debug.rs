@@ -3,7 +3,7 @@
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
 use arinsal_etf::OwnedTerm;
-use arinsal_sched::RunCtx;
+use arinsal_sched::{DirtyKind, RunCtx, SchedulerType};
 use arinsal_term::{
     Term, TermBuilder, TermKind, copy_term, from_owned, global_atoms, hashmap_node_children,
     size_object, term_sequence, to_owned,
@@ -12,6 +12,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 static INTERNAL_STATE: AtomicBool = AtomicBool::new(false);
 
@@ -574,16 +575,72 @@ fn instructions(process: &mut Process) -> Result<Term, VmError> {
     list(process, &names)
 }
 
+/// Retry the calling BIF on a scheduler of `wanted` type unless it already runs on one.
+///
+/// Port of erts/emulator/beam/erl_bif_info.c / bif.c (`erts_schedule_bif` and the static
+/// dirty BIF table `erts_dirty_bif.tab`), OTP-29.1.1.
+fn on_scheduler(ctx: &RunCtx<'_, Message>, wanted: SchedulerType) -> Result<(), VmError> {
+    if ctx.scheduler_type() == wanted {
+        return Ok(());
+    }
+    Err(match wanted {
+        SchedulerType::DirtyCpu => VmError::Dirty(DirtyKind::Cpu),
+        SchedulerType::DirtyIo => VmError::Dirty(DirtyKind::Io),
+        // A dirty job returns to a normal scheduler when it yields.
+        SchedulerType::Normal => VmError::Yield,
+    })
+}
+
+fn scheduler_type_atom(kind: SchedulerType) -> Term {
+    atom(match kind {
+        SchedulerType::Normal => "normal",
+        SchedulerType::DirtyCpu => "dirty_cpu",
+        SchedulerType::DirtyIo => "dirty_io",
+    })
+}
+
+/// Port of erts/emulator/beam/beam_debug.c:1474 (ms_wait), OTP-29.1.1.
+///
+/// Signals arriving meanwhile are handled like the dirty signal handler does in erts.
+fn ms_wait(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    milliseconds: i64,
+    busy: bool,
+) {
+    let deadline = Instant::now() + Duration::from_millis(milliseconds.max(0) as u64);
+    let dirty = ctx.scheduler_type().is_dirty();
+    loop {
+        if dirty {
+            process.handle_dirty_signals(vm, ctx);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if busy {
+            std::thread::yield_now();
+        } else if dirty {
+            ctx.dirty_wait(deadline - now);
+        } else {
+            std::thread::sleep(deadline - now);
+        }
+    }
+}
+
 /// Port of erts/emulator/beam/beam_debug.c:1248-1428 (dirty_test), OTP-29.1.1.
 fn dirty_test(
+    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     scheduler: &str,
     operation: Term,
     value: Term,
 ) -> Result<Term, VmError> {
+    let busy = scheduler == "dirty_cpu";
     match arg_name(operation).as_deref() {
-        Some("scheduler") if value == atom("type") => Ok(atom(scheduler)),
+        Some("scheduler") if value == atom("type") => Ok(scheduler_type_atom(ctx.scheduler_type())),
         Some("error") => {
             let reason = match arg_name(value).as_deref() {
                 Some("notsup") => "notsup",
@@ -617,9 +674,7 @@ fn dirty_test(
         }
         Some("wait") => {
             let milliseconds = value.as_small().ok_or_else(badarg)?;
-            if milliseconds > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
-            }
+            ms_wait(vm, process, ctx, milliseconds, busy);
             Ok(atom("ok"))
         }
         Some("reschedule") => {
@@ -638,7 +693,7 @@ fn dirty_test(
                 &[atom("ready"), ctx.pid().to_term().ok_or_else(badarg)?],
             )?;
             let _ = process.send_message(value, ready);
-            std::thread::sleep(std::time::Duration::from_secs(6));
+            ms_wait(vm, process, ctx, 6_000, false);
             let done = tuple(
                 process,
                 &[atom("done"), ctx.pid().to_term().ok_or_else(badarg)?],
@@ -646,23 +701,65 @@ fn dirty_test(
             let _ = process.send_message(value, done);
             Ok(atom("ok"))
         }
+        Some(op @ ("alive_waitexiting" | "alive_waitexitingonly")) => {
+            let dirty_io = ctx.scheduler_type() == SchedulerType::DirtyIo;
+            process.handle_dirty_signals(vm, ctx);
+            if process.dirty_exiting() {
+                return Err(badarg());
+            }
+            let alive = tuple(
+                process,
+                &[atom("alive"), ctx.pid().to_term().ok_or_else(badarg)?],
+            )?;
+            let _ = process.send_message(value, alive);
+            // Wait until dead.
+            loop {
+                process.handle_dirty_signals(vm, ctx);
+                if process.dirty_exiting() {
+                    break;
+                }
+                if dirty_io {
+                    ms_wait(vm, process, ctx, 100, false);
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            if op == "alive_waitexitingonly" {
+                return Ok(atom("ok"));
+            }
+            ms_wait(vm, process, ctx, 1000, false);
+            // Should still be able to allocate memory: a 9999-digit bignum of 4711 digits.
+            let digit = BigInt::from(4711_u64);
+            let mut big = BigInt::from(0_u64);
+            for _ in 1..10_000 {
+                big = (big << 64) + &digit;
+            }
+            let big = from_owned(
+                &OwnedTerm::BigInt(big),
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            )
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            tuple(process, &[atom("ok"), big])
+        }
         _ => Err(badarg()),
     }
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:1190 (erts_debug_dirty_3), OTP-29.1.1.
 fn dirty(
+    vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let scheduler = match arg_name(args[0]).as_deref() {
-        Some("normal") => "normal",
-        Some("dirty_cpu") => "dirty_cpu",
-        Some("dirty_io") => "dirty_io",
+    let (scheduler, wanted) = match arg_name(args[0]).as_deref() {
+        Some("normal") => ("normal", SchedulerType::Normal),
+        Some("dirty_cpu") => ("dirty_cpu", SchedulerType::DirtyCpu),
+        Some("dirty_io") => ("dirty_io", SchedulerType::DirtyIo),
         _ => return Err(badarg()),
     };
-    dirty_test(process, ctx, scheduler, args[1], args[2])
+    on_scheduler(ctx, wanted)?;
+    dirty_test(vm, process, ctx, scheduler, args[1], args[2])
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:86 (erts_debug_size_shared_1), OTP-29.1.1.
@@ -913,9 +1010,11 @@ fn build(
             internal_state_set(process, ctx, args[0], args[1])
         }
         ("erts_debug", "instructions", 0) => instructions(process),
-        ("erts_debug", "dirty", 3) => dirty(process, ctx, args),
-        ("erts_debug", "dirty_cpu", 2) => dirty_test(process, ctx, "dirty_cpu", args[0], args[1]),
-        ("erts_debug", "dirty_io", 2) => dirty_test(process, ctx, "dirty_io", args[0], args[1]),
+        ("erts_debug", "dirty", 3) => dirty(vm, process, ctx, args),
+        ("erts_debug", "dirty_cpu", 2) => on_scheduler(ctx, SchedulerType::DirtyCpu)
+            .and_then(|()| dirty_test(vm, process, ctx, "dirty_cpu", args[0], args[1])),
+        ("erts_debug", "dirty_io", 2) => on_scheduler(ctx, SchedulerType::DirtyIo)
+            .and_then(|()| dirty_test(vm, process, ctx, "dirty_io", args[0], args[1])),
         ("erts_debug", "unaligned_bitstring", 2) => unaligned_bitstring(process, args),
         ("erts_internal", "gather_alloc_histograms", 1) => {
             gather_allocator_info(process, ctx, args[0], false)

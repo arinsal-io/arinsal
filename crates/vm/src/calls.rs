@@ -742,7 +742,8 @@ impl Vm {
                     p.tick();
                     return Ok(ImportOutcome::Jump(target));
                 }
-                return self.finish_native_value(p, tail, value);
+                let outcome = self.finish_native_value(p, tail, value)?;
+                return Ok(after_dirty(outcome));
             }
         }
         // ---- vm_funs ----
@@ -858,6 +859,20 @@ impl Vm {
             (slot.target(), slot.code_ptr())
         };
         self.jump_import(p, target_module, ip, code, arity, tail)
+    }
+}
+
+/// After a BIF completed on a dirty scheduler, continue on a normal scheduler.
+///
+/// Port of erts/emulator/beam/erl_process.c:10190 (a finished dirty job is scheduled out
+/// to a normal run queue), OTP-29.1.1.
+pub(crate) fn after_dirty(outcome: ImportOutcome) -> ImportOutcome {
+    if arinsal_sched::current_scheduler_type().is_dirty()
+        && matches!(outcome, ImportOutcome::Advanced | ImportOutcome::Jump(_))
+    {
+        ImportOutcome::Yield
+    } else {
+        outcome
     }
 }
 

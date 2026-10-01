@@ -2558,8 +2558,8 @@ fn set_scheduler_wall_enabled(
     drop(state);
     set_runtime_accounting(process, ctx);
     if enable && !previous {
-        let active_ns =
-            scheduler_stats(process, Some(ctx)).map_or_else(Vec::new, |stats| stats.active_ns);
+        let active_ns = scheduler_stats(process, Some(ctx))
+            .map_or_else(Vec::new, |stats| all_active_ns(&stats));
         SCHED_WALL
             .lock()
             .expect("scheduler wall time")
@@ -2668,6 +2668,17 @@ fn with_flags<T>(body: impl FnOnce(&mut SystemFlags) -> T) -> T {
     body(&mut flags.lock().expect("system flags"))
 }
 
+/// Dirty CPU total and online, and dirty I/O scheduler counts chosen at boot.
+pub(crate) fn dirty_scheduler_defaults() -> (usize, usize, usize) {
+    with_flags(|flags| {
+        (
+            flags.dirty_cpu_total,
+            flags.dirty_cpu_online,
+            flags.dirty_io_total,
+        )
+    })
+}
+
 pub(crate) fn scheduler_online_default() -> (usize, bool) {
     with_flags(|flags| (flags.schedulers_online, flags.multi != "enabled"))
 }
@@ -2677,7 +2688,8 @@ fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
     let args: Vec<String> = std::env::args().collect();
     let mut schedulers = (cpus, cpus);
     let mut dirty_cpu = (cpus, cpus);
-    let mut dirty_io = cpus;
+    // Port of erts/emulator/beam/erl_init.c:867 (dirty_io_scheds = 10), OTP-29.1.1.
+    let mut dirty_io = 10;
     let mut index = 1;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -2721,9 +2733,12 @@ fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
         schedulers.0.max(1),
         schedulers.1.clamp(1, schedulers.0.max(1)),
     );
+    // Port of erts/emulator/beam/erl_init.c:1193-1200, OTP-29.1.1: dirty CPU schedulers
+    // never outnumber the normal schedulers.
+    let dirty_total = dirty_cpu.0.clamp(1, schedulers.0);
     let dirty_cpu = (
-        dirty_cpu.0.max(1),
-        dirty_cpu.1.clamp(1, dirty_cpu.0.max(1)).min(schedulers.1),
+        dirty_total,
+        dirty_cpu.1.clamp(1, dirty_total).min(schedulers.1),
     );
     (
         schedulers.0,
@@ -2871,6 +2886,14 @@ fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term
             flags.schedulers_online = requested as usize;
             previous
         };
+        // Port of erts/emulator/beam/erl_process.c:7266 (dirty CPU schedulers online), OTP-29.1.1.
+        if let Some(scheduler) = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.scheduler().ok())
+        {
+            scheduler.set_dirty_cpu_online(flags.dirty_cpu_online);
+        }
         Term::small(previous as i64).ok_or_else(badarg)
     })
 }
@@ -3071,9 +3094,7 @@ fn set_microstate_workers(process: &Process, enabled: bool) {
 // Port of erts/emulator/beam/erl_msacc.c:425 (counter reset), OTP-29.1.1.
 fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, Message>) {
     let stats = scheduler_stats(process, Some(ctx));
-    let counters = stats
-        .as_ref()
-        .map_or_else(Vec::new, |stats| stats.msacc_ns.clone());
+    let counters = stats.as_ref().map_or_else(Vec::new, all_msacc_ns);
     let poll_baseline = crate::check_io::msacc_snapshot();
     *MICROSTATE_BASE.lock().expect("microstate baseline") =
         Some((Instant::now(), counters, poll_baseline));
@@ -3346,6 +3367,22 @@ fn queue_counts(
     values
 }
 
+/// Active nanoseconds of the normal, then dirty CPU, then dirty I/O scheduler threads.
+fn all_active_ns(stats: &arinsal_sched::SchedulerStats) -> Vec<u64> {
+    let mut all = stats.active_ns.clone();
+    all.extend_from_slice(&stats.dirty_active_ns[0]);
+    all.extend_from_slice(&stats.dirty_active_ns[1]);
+    all
+}
+
+/// Microstate counters of the normal, then dirty CPU, then dirty I/O scheduler threads.
+fn all_msacc_ns(stats: &arinsal_sched::SchedulerStats) -> Vec<[u64; 7]> {
+    let mut all = stats.msacc_ns.clone();
+    all.extend_from_slice(&stats.dirty_msacc_ns[0]);
+    all.extend_from_slice(&stats.dirty_msacc_ns[1]);
+    all
+}
+
 fn scheduler_wall(
     process: &mut Process,
     ctx: Option<&RunCtx<'_, Message>>,
@@ -3358,33 +3395,44 @@ fn scheduler_wall(
     };
     let total_us = u64::try_from(base.started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let stats = scheduler_stats(process, ctx);
-    let (online, dirty_cpu, dirty_io) = with_flags(|flags| {
+    let (schedulers, dirty_cpu, dirty_io) = with_flags(|flags| {
         (
-            flags.schedulers_online,
+            flags.schedulers_total,
             flags.dirty_cpu_total,
             flags.dirty_io_total,
         )
     });
-    let mut entries = Vec::new();
-    for id in 0..online {
-        let active = stats
-            .as_ref()
-            .and_then(|s| s.active_ns.get(id))
+    let now = stats.as_ref().map_or_else(Vec::new, all_active_ns);
+    let normal_len = stats.as_ref().map_or(0, |stats| stats.active_ns.len());
+    // Port of erts/emulator/beam/erl_process.c:3044 (erts_sched_wall_time_request): one entry
+    // per normal scheduler, then per dirty CPU and, for `_all`, dirty I/O scheduler.
+    let active_us = |index: usize| {
+        now.get(index)
             .copied()
             .unwrap_or(0)
-            .saturating_sub(base.active_ns.get(id).copied().unwrap_or(0))
-            / 1_000;
-        entries.push(triple(process, (id + 1) as u64, active, total_us)?);
+            .saturating_sub(base.active_ns.get(index).copied().unwrap_or(0))
+            / 1_000
+    };
+    let mut entries = Vec::new();
+    for id in 0..schedulers {
+        entries.push(triple(process, (id + 1) as u64, active_us(id), total_us)?);
     }
     for id in 0..dirty_cpu {
-        entries.push(triple(process, (online + id + 1) as u64, 0, total_us)?);
+        let active = active_us(normal_len + id);
+        entries.push(triple(
+            process,
+            (schedulers + id + 1) as u64,
+            active,
+            total_us,
+        )?);
     }
     if include_dirty_io {
         for id in 0..dirty_io {
+            let active = active_us(normal_len + dirty_cpu + id);
             entries.push(triple(
                 process,
-                (online + dirty_cpu + id + 1) as u64,
-                0,
+                (schedulers + dirty_cpu + id + 1) as u64,
+                active,
                 total_us,
             )?);
         }
@@ -3443,20 +3491,32 @@ fn microstate(
             counters,
         )?);
     }
+    // Port of erts/emulator/beam/erl_msacc.c:211 (dirty scheduler thread counters), OTP-29.1.1.
+    let all = stats.as_ref().map_or_else(Vec::new, all_msacc_ns);
+    let normal_len = stats.as_ref().map_or(0, |stats| stats.msacc_ns.len());
+    let counters_of = |index: usize| {
+        let mut counters = all.get(index).copied().unwrap_or([0; 7]);
+        for (state, counter) in counters.iter_mut().enumerate() {
+            *counter = counter.saturating_sub(baseline.get(index).map_or(0, |prior| prior[state]));
+        }
+        counters
+    };
     for id in 0..dirty_cpu {
+        let counters = counters_of(normal_len + id);
         entries.push(msacc_entry(
             process,
-            (online + id + 1) as i64,
+            (id + 1) as i64,
             "dirty_cpu_scheduler",
-            [0, 0, 0, 0, 0, 0, elapsed],
+            counters,
         )?);
     }
     for id in 0..dirty_io {
+        let counters = counters_of(normal_len + dirty_cpu + id);
         entries.push(msacc_entry(
             process,
-            (online + dirty_cpu + id + 1) as i64,
+            (id + 1) as i64,
             "dirty_io_scheduler",
-            [0, 0, 0, 0, 0, 0, elapsed],
+            counters,
         )?);
     }
     entries.push(msacc_entry(process, 1, "aux", [0, 0, 0, 0, 0, 0, elapsed])?);

@@ -96,6 +96,9 @@ unsafe impl Send for Process {}
 const _: () = assert!(std::mem::offset_of!(Process, header) == 0);
 #[derive(Default)]
 pub(crate) struct ProcessCold {
+    /// The process already exited while its dirty job keeps running.
+    /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
+    pub(crate) dirty_exited: bool,
     /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
     pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this process currently has a runnable profile activation.

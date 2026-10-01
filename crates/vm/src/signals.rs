@@ -941,8 +941,9 @@ fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool 
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
 // (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1.
-// This VM has no dirty schedulers, so a live process is `normal` and handles
-// its own signals. Only the dirty signal-handler processes may call the BIF.
+// A process executing a dirty job has its signals handled at the job's wait
+// points (`Process::handle_dirty_signals`), so the handler processes are never
+// notified and find every live process `normal`. Only they may call the BIF.
 fn dirty_process_handle_signals(
     vm: &Vm,
     process: &Process,
@@ -2084,7 +2085,7 @@ fn call_resolved(
         (SignalBif::IsProcessAlive2, [pid, reference]) => {
             is_process_alive_2(process, ctx, *pid, *reference)
         }
-        (SignalBif::IsProcessExecutingDirty1, [pid]) => is_process_executing_dirty(*pid),
+        (SignalBif::IsProcessExecutingDirty1, [pid]) => is_process_executing_dirty(process, *pid),
         (SignalBif::TraceCleanerCheck0, []) => Ok(atom("false")),
         (SignalBif::TraceCleanerSend1, [to]) => trace_cleaner_send(process, ctx, *to),
         (SignalBif::SendAfter3, [time, target, message])
@@ -2791,12 +2792,12 @@ fn is_process_alive_2(
 
 // Port of erts/emulator/beam/erl_process.c:9216
 // (erts_internal_is_process_executing_dirty_1), OTP-29.1.1.
-// This build has no dirty schedulers, matching OTP 29.1.1 on this machine.
-fn is_process_executing_dirty(pid: Term) -> Result<Term, VmError> {
-    if Pid::from_term(pid).is_none() {
+fn is_process_executing_dirty(process: &Process, pid: Term) -> Result<Term, VmError> {
+    let Some(pid) = Pid::from_term(pid) else {
         return Err(badarg("is_process_executing_dirty/1"));
-    }
-    Ok(atom("false"))
+    };
+    let dirty = runtime(process)?.scheduler()?.is_executing_dirty(pid);
+    Ok(atom(if dirty { "true" } else { "false" }))
 }
 
 // Port of erts/emulator/beam/erl_bif_trace.c:3900 (trace_delivered_1), OTP-29.1.1.
