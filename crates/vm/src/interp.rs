@@ -1536,7 +1536,7 @@ impl Vm {
                     cp = p.heap.stack_get(0).map_or(0, Term::tagged_word);
                 }
                 if crate::native_bridge::is_native_function_at(cp as usize) {
-                    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some() {
+                    if crate::native_bridge::return_trace_enabled() {
                         eprintln!(
                             "[interp-native-return] CP={cp:#x} x0={:#x} E={:#x}",
                             p.x[0].tagged_word(),
@@ -1549,6 +1549,7 @@ impl Vm {
                     p.cold_mut().native_continuation_resume = true;
                     p.cold_mut().native_resume_live = 2;
                     p.native_pc = Some(cp as usize);
+                    p.cold_mut().native_transfer = true;
                     return Ok(RunState::Yield);
                 }
                 if depth == 0 {
@@ -1810,6 +1811,7 @@ impl Vm {
                                         ) {
                                             sync_cursor(p, htop, &mut heap_dirty);
                                             p.native_pc = Some(native.start);
+                                            p.cold_mut().native_transfer = true;
                                             return Ok(RunState::Yield);
                                         }
                                         ip = target;
@@ -2166,6 +2168,7 @@ impl Vm {
                             ) {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.native_pc = Some(native.start);
+                                p.cold_mut().native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
                             ip = target;
@@ -2249,6 +2252,7 @@ impl Vm {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.native_pc = Some(resume);
                                 p.reductions = reds;
+                                p.cold_mut().native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
                             if tail {
@@ -2360,6 +2364,7 @@ impl Vm {
                                     sync_cursor(p, htop, &mut heap_dirty);
                                     p.native_pc = Some(resume);
                                     p.reductions = reds;
+                                    p.cold_mut().native_transfer = true;
                                     return Ok(RunState::Yield);
                                 }
                                 continue;
@@ -2401,10 +2406,13 @@ impl Vm {
                                 p.replace_native_continuation(resume)
                                     .map_err(|error| VmError::Unsupported(error.into()))?;
                             }
-                            ImportOutcome::Advanced | ImportOutcome::Yield => {
+                            outcome @ (ImportOutcome::Advanced | ImportOutcome::Yield) => {
                                 sync_cursor(p, htop, &mut heap_dirty);
                                 p.native_pc = Some(resume);
                                 p.reductions = reds;
+                                if matches!(outcome, ImportOutcome::Advanced) {
+                                    p.cold_mut().native_transfer = true;
+                                }
                                 return Ok(RunState::Yield);
                             }
                             ImportOutcome::Returned(value) => {
@@ -2413,6 +2421,7 @@ impl Vm {
                                 p.x[0] = value;
                                 p.native_pc = Some(resume);
                                 p.reductions = reds;
+                                p.cold_mut().native_transfer = true;
                                 return Ok(RunState::Yield);
                             }
                         }
@@ -2453,6 +2462,7 @@ impl Vm {
                             p.ip = target_ip;
                             p.reductions = reds;
                             p.native_pc = Some(native.start);
+                            p.cold_mut().native_transfer = true;
                             return Ok(RunState::Yield);
                         }
                     }
@@ -2491,6 +2501,7 @@ impl Vm {
                         p.ip = target as usize;
                         p.reductions = reds;
                         p.native_pc = Some(native.start);
+                        p.cold_mut().native_transfer = true;
                         return Ok(RunState::Yield);
                     }
                     reds -= 1;
@@ -2523,6 +2534,7 @@ impl Vm {
                         p.ip = target as usize;
                         p.reductions = reds;
                         p.native_pc = Some(native.start);
+                        p.cold_mut().native_transfer = true;
                         return Ok(RunState::Yield);
                     }
                     reds -= 1;
@@ -4378,6 +4390,7 @@ impl Vm {
                             p.ip = target_ip;
                             p.reductions = reds;
                             p.native_pc = Some(native.start);
+                            p.cold_mut().native_transfer = true;
                             return Ok(RunState::Yield);
                         }
                     }

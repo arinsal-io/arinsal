@@ -2236,7 +2236,7 @@ fn spawn_apply(
     child.heap.set_fullsweep_after(fullsweep_after);
     child.module = module_id;
     child.ip = entry;
-    child.runtime = parent.runtime.clone();
+    child.set_runtime(parent.runtime.clone());
     if let (Some(m), Some(f), Some(arguments)) = (module.as_atom(), function.as_atom(), list(args))
     {
         let names = arinsal_term::global_atoms();

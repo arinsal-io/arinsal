@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
-use arinsal_pterm::global_store;
+use arinsal_pterm::last_retirement_of_any_store;
 use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
@@ -455,7 +455,7 @@ fn sched_acct_replaced_persistent_term_is_freed_after_gc() {
         ]))
     );
     assert_eq!(expected, CallResult::Ok(actual));
-    let trace = global_store().last_retirement();
+    let trace = last_retirement_of_any_store();
     assert!(
         trace.pending_before >= 1,
         "pending_before {}",

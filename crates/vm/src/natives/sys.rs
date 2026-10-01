@@ -77,7 +77,7 @@ pub(crate) fn copy_literal_area(
     how: arinsal_sched::LiteralCopyHow,
     requester: arinsal_sched::Pid,
 ) -> Result<(), VmError> {
-    let store = arinsal_pterm::global_store();
+    let store = process._persistent_terms.store();
     let area = store.retired_area(&process._persistent_terms, area_id);
     let Some(area) = area else {
         reply_literal_area_copy(ctx, request, requester, atom("ok"))?;
@@ -443,7 +443,7 @@ fn call_values(
     if module == "persistent_term" && function == "get" && arity == 0 {
         return Some(get_all_step(process, ctx));
     }
-    if let Some(bif) = arinsal_pterm::lookup(module, function, arity) {
+    if let Some(bif) = arinsal_pterm::lookup_in(module, function, arity) {
         debug_assert!(
             recognizes(module, function, arity),
             "persistent_term {module}:{function}/{arity} is dispatched but not listed"
@@ -454,7 +454,7 @@ fn call_values(
                 | ("persistent_term", "erase", 1)
                 | ("erts_internal", "erase_persistent_terms", 0)
         );
-        let store = arinsal_pterm::global_store();
+        let store = process._persistent_terms.store();
         if updating {
             // Port of erts/emulator/beam/erl_bif_persistent.c:533-539 (an updater resumes
             // after table_updater ran and returns the result it yielded with), OTP-29.1.1.
@@ -472,11 +472,11 @@ fn call_values(
                 return Some(Err(VmError::Yield));
             }
         }
-        let before = PersistentTermUpdate::snapshot();
+        let before = PersistentTermUpdate::snapshot(store);
         let result = {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
             let mut bif_ctx = Ctx::new(&mut heap);
-            bif(&mut bif_ctx, args)
+            bif(store, &mut bif_ctx, args)
         };
         let published = result.is_ok() && before.published();
         if result.is_ok() {
@@ -540,14 +540,15 @@ fn call_values(
 
 /// Persistent-term table counters taken before an updating BIF runs.
 pub(crate) struct PersistentTermUpdate {
+    store: &'static arinsal_pterm::Store,
     updates: u64,
     retired: u64,
 }
 
 impl PersistentTermUpdate {
-    pub(crate) fn snapshot() -> Self {
-        let store = arinsal_pterm::global_store();
+    pub(crate) fn snapshot(store: &'static arinsal_pterm::Store) -> Self {
         Self {
+            store,
             updates: store.table_updates(),
             retired: store.retired_generation(),
         }
@@ -555,12 +556,12 @@ impl PersistentTermUpdate {
 
     /// Whether a table update was published since the snapshot.
     pub(crate) fn published(&self) -> bool {
-        arinsal_pterm::global_store().table_updates() != self.updates
+        self.store.table_updates() != self.updates
     }
 
     /// Complete an update the way erts' updater does once the new table is published.
     pub(crate) fn finish(self, process: &Process, ctx: &mut RunCtx<'_, Message>) {
-        let store = arinsal_pterm::global_store();
+        let store = self.store;
         if store.table_updates() != self.updates {
             // Port of erts/emulator/beam/erl_bif_persistent.c:490,535,737 (table updates go
             // through erts_schedule_thr_prgr_later_op(table_updater) and the updater stays
@@ -578,7 +579,7 @@ impl PersistentTermUpdate {
 
 // Port of erts/emulator/beam/beam_bif_load.c:1916 (wake area-switch wait), OTP-29.1.1.
 pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Message>) {
-    let store = arinsal_pterm::global_store();
+    let store = process._persistent_terms.store();
     if !store.has_retired() {
         return;
     }
@@ -605,7 +606,7 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
         .as_ref()
         .is_none_or(|cold| cold.persistent_get_all.is_none())
     {
-        let snapshot = arinsal_pterm::global_store().snapshot();
+        let snapshot = process._persistent_terms.store().snapshot();
         let remaining = snapshot.len();
         process.cold_mut().persistent_get_all = Some(crate::proc_create::PersistentGetAll {
             snapshot,
@@ -2020,7 +2021,7 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
             .map(|(_, value)| *value)
             .unwrap_or(0)
     };
-    let (_, persistent) = arinsal_pterm::global_store().info();
+    let (_, persistent) = process._persistent_terms.store().info();
     let external_bytes = persistent as u64;
     let external_size = non_neg(process, external_bytes)?;
     let external = tuple(process, &[atom("external_alloc"), external_size])?;
@@ -2038,11 +2039,12 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
 }
 
 pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
-    let (processes, processes_used, binary) = arinsal_pterm::global_store().process_memory_totals();
+    let store = process._persistent_terms.store();
+    let (processes, processes_used, binary) = store.process_memory_totals();
     let (atom, atom_used) = atom_bytes();
     let code = code_bytes(vm);
     let ets = ets_bytes(process);
-    let (_, persistent) = arinsal_pterm::global_store().info();
+    let (_, persistent) = store.info();
     let system = atom
         .saturating_add(binary)
         .saturating_add(code)
@@ -2073,7 +2075,7 @@ pub(crate) fn snapshot_process(process: &mut Process, _live_x: usize) {
     let used_words =
         process.heap.used_words() + process.heap.old_used_words() + process.heap.stack_words();
     let used = used_words.saturating_mul(word).saturating_add(extra) as u64;
-    arinsal_pterm::global_store().set_process_memory(
+    process._persistent_terms.store().set_process_memory(
         &process._persistent_terms,
         capacity,
         used,

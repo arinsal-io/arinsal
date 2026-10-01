@@ -409,6 +409,9 @@ pub struct Module {
     /// Local lambda entries retained by closures.
     pub funs: Vec<FunSlot>,
     _literals: Arc<VecHeap>,
+    /// Module literals by BEAM literal index, in this module's literal area. Native code
+    /// of the module refers to these same terms, like erts' single literal area per module.
+    literal_terms: Arc<HashMap<u32, Term>>,
 }
 impl Clone for Module {
     fn clone(&self) -> Self {
@@ -448,6 +451,7 @@ impl Clone for Module {
             debug_breakpoint_import: self.debug_breakpoint_import,
             funs: self.funs.iter().map(FunSlot::clone).collect(),
             _literals: Arc::clone(&self._literals),
+            literal_terms: Arc::clone(&self.literal_terms),
         }
     }
 }
@@ -512,6 +516,11 @@ impl Module {
     /// Retain this code version's literal heap for process root scanning.
     pub fn literal_area(&self) -> Arc<VecHeap> {
         Arc::clone(&self._literals)
+    }
+
+    /// The literal-area term of BEAM literal `index`, if an instruction of the module uses it.
+    pub fn literal_term(&self, index: u32) -> Option<Term> {
+        self.literal_terms.get(&index).copied()
     }
 
     /// Patch one interpreted function entry, preserving the instruction to run after tracing.
@@ -1585,6 +1594,7 @@ pub fn load_with_instrumentations(
         // ---- vm_funs ----
         funs,
         _literals: Arc::new(literals),
+        literal_terms: Arc::new(literal_terms),
     })
 }
 

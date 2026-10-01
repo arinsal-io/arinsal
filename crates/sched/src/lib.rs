@@ -4450,6 +4450,22 @@ fn run_one<'a, T: Task>(
     drop(cell);
 }
 
+/// Set once `erlang:halt/1,2` begins an orderly halt.
+static HALTING: AtomicBool = AtomicBool::new(false);
+
+/// Begin an orderly emulator halt: from now on no scheduler, normal or dirty, picks a
+/// process to run.
+///
+/// Port of erts/emulator/beam/erl_process.c:15239 (erts_halt: ERTS_RUNQ_FLG_HALTING on all
+/// run queues; "no processes will be scheduled, only ports"), OTP-29.1.1.
+pub fn begin_halt() {
+    HALTING.store(true, Ordering::Release);
+}
+
+fn halting() -> bool {
+    HALTING.load(Ordering::Acquire)
+}
+
 fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
     inner.sleepers[id]
         .set(thread::current())
@@ -4462,6 +4478,11 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
     });
     let mut rng = SeededRng::new(id as u64 + 1);
     while !inner.stopped.load(Ordering::Acquire) {
+        if halting() {
+            // The halting scheduler terminates the OS process; the others stay idle.
+            thread::park();
+            continue;
+        }
         let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
         local.set_msacc_enabled(accounting_flags & ACCOUNTING_MSACC != 0);
         let wall_enabled = accounting_flags & ACCOUNTING_WALL != 0;
@@ -4673,7 +4694,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         let process = {
             let mut queue = pool.queue.lock().unwrap();
             loop {
-                if inner.stopped.load(Ordering::Acquire) {
+                if inner.stopped.load(Ordering::Acquire) || halting() {
                     return;
                 }
                 if index < pool.online.load(Ordering::Acquire)

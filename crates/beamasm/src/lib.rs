@@ -80,6 +80,9 @@ pub struct SchedulerRegisters {
     pub f_reg_array: [f64; 1024],
     /// Scratch words accessed by runtime fragments; word 6 records the pc of a native error.
     pub tmp_mem: [u64; 8],
+    /// Operands of a `bs_match` command for its runtime hook. They are kept out of the X
+    /// register array, whose registers above the command's live count may still be in use.
+    pub match_staging: [u64; 4],
 }
 
 impl Default for SchedulerRegisters {
@@ -88,6 +91,7 @@ impl Default for SchedulerRegisters {
             x_reg_array: [0; 1024],
             f_reg_array: [0.0; 1024],
             tmp_mem: [0; 8],
+            match_staging: [0; 4],
         }
     }
 }
@@ -266,7 +270,8 @@ pub fn emit_leave_runtime(
 /// Emits the JIT_HARD_DEBUG heap and stack cursor invariant check when requested.
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:160-177, OTP-29.1.1.
 pub fn emit_validate_native_cursor(code: &mut CodeBuffer) -> Result<(), BufferError> {
-    if std::env::var_os("ARINSAL_BEAMASM_VALIDATE").is_none() {
+    static VALIDATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*VALIDATE.get_or_init(|| std::env::var_os("ARINSAL_BEAMASM_VALIDATE").is_some()) {
         return Ok(());
     }
 

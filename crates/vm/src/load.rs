@@ -37,6 +37,7 @@ fn next_epoch_base() -> u64 {
 
 pub(crate) struct SharedCode {
     pub(crate) coverage_mode: arinsal_loader::CoverageMode,
+    pub(crate) code_scope: u64,
     pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
     pub(crate) loaded: SharedTable<HashMap<String, usize>>,
     pub(crate) old: SharedTable<HashMap<String, usize>>,
@@ -339,6 +340,7 @@ impl SharedCode {
     pub(crate) fn blank() -> Self {
         Self {
             coverage_mode: arinsal_loader::CoverageMode::None,
+            code_scope: beamasm_integration::new_code_scope(),
             modules: SharedTable::new(Vec::new()),
             loaded: SharedTable::new(HashMap::new()),
             old: SharedTable::new(HashMap::new()),
@@ -382,7 +384,8 @@ impl SharedCode {
 
     pub(crate) fn release(&mut self, id: usize) {
         if self.module_live.get(id).copied() == Some(true) {
-            arinsal_pterm::global_store().retire_module_area(self.modules[id].literal_area());
+            arinsal_pterm::store_for(self.code_scope)
+                .retire_module_area(self.modules[id].literal_area());
         }
         release_slot(
             &mut self.module_live,
@@ -440,6 +443,8 @@ impl Vm {
 
     /// Construct a VM. Explicit paths precede the current directory and OTP libraries.
     pub fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        // Fixes the execution mode, which erlang:system_info(emu_flavor) reports.
+        crate::beamasm_integration::enabled();
         let otp = std::env::var_os("ARINSAL_OTP_ROOT")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("ERL_ROOTDIR").map(PathBuf::from))
@@ -469,6 +474,7 @@ impl Vm {
             paths.extend(dirs);
         }
         paths.push(otp.join("lib/erts-17.1/ebin"));
+        let code_scope = beamasm_integration::new_code_scope();
         Self {
             paths,
             otp_root: Some(otp),
@@ -481,7 +487,8 @@ impl Vm {
             code_meta: SharedTable::new(Vec::new()),
             code_epoch: None,
             seen_epoch: 0,
-            beamasm_targets: beamasm_integration::NativeTargetCache::default(),
+            beamasm_targets: beamasm_integration::NativeTargetCache::new(code_scope),
+            code_scope,
             registers: SharedTable::new(Vec::new()),
             native_fns: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
@@ -560,7 +567,9 @@ impl Vm {
         let previous = self.loaded.get(&name).copied();
         let id = self.alloc_local(module, registers, Some(meta));
         self.loaded.insert(name.clone(), id);
-        if let Some(native) = beamasm_integration::compile(bytes, &self.modules[id]) {
+        if let Some(native) =
+            beamasm_integration::compile(bytes, &self.modules[id], self.code_scope)
+        {
             native.publish(&self.modules[id]);
             if let Some(meta) = self.code_meta[id].as_mut() {
                 Arc::make_mut(meta).beamasm = Some(native);
@@ -576,7 +585,8 @@ impl Vm {
 
     pub(crate) fn release_module_slot(&mut self, id: usize) {
         if self.module_live.get(id).copied() == Some(true) {
-            arinsal_pterm::global_store().retire_module_area(self.modules[id].literal_area());
+            arinsal_pterm::store_for(self.code_scope)
+                .retire_module_area(self.modules[id].literal_area());
         }
         release_slot(
             &mut self.module_live,
@@ -612,6 +622,7 @@ impl Vm {
     pub(crate) fn snapshot_shared(&self) -> SharedCode {
         SharedCode {
             coverage_mode: self.coverage_mode,
+            code_scope: self.code_scope,
             modules: self.modules.clone(),
             loaded: self.loaded.clone(),
             old: self.old.clone(),
@@ -634,6 +645,11 @@ impl Vm {
     /// Load bytes without executing module-level code.
     pub fn load_bytes(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
         self.load_bytes_internal(bytes, true)
+    }
+    /// Load bytes for the interpreter only, without BeamAsm code (native code for its
+    /// functions may be registered separately).
+    pub fn load_bytes_interpreted(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
+        self.load_bytes_internal(bytes, false)
     }
     pub(crate) fn load_bytes_internal(
         &mut self,
@@ -658,7 +674,9 @@ impl Vm {
         if compile_native {
             // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1),
             // compile after the module body and its exported entries are resolved.
-            if let Some(native) = beamasm_integration::compile(bytes, &self.modules[id]) {
+            if let Some(native) =
+                beamasm_integration::compile(bytes, &self.modules[id], self.code_scope)
+            {
                 native.publish(&self.modules[id]);
                 if let Some(meta) = self.code_meta[id].as_mut() {
                     Arc::make_mut(meta).beamasm = Some(native);
@@ -768,7 +786,8 @@ impl Vm {
                 let name = module.name.clone();
                 let pending = meta.on_load.is_some();
                 if let Some(bytes) = meta.beam_bytes.as_deref()
-                    && let Some(native) = beamasm_integration::compile(bytes, &module)
+                    && let Some(native) =
+                        beamasm_integration::compile(bytes, &module, self.code_scope)
                 {
                     native.publish(&module);
                     meta.beamasm = Some(native);
@@ -793,7 +812,8 @@ impl Vm {
                 let name = module.name.clone();
                 let pending = meta.on_load.is_some();
                 if let Some(bytes) = meta.beam_bytes.as_deref()
-                    && let Some(native) = beamasm_integration::compile(bytes, &module)
+                    && let Some(native) =
+                        beamasm_integration::compile(bytes, &module, self.code_scope)
                 {
                     native.publish(&module);
                     meta.beamasm = Some(native);
@@ -849,6 +869,18 @@ impl Vm {
             self.sync_shared(&code);
         }
     }
+    /// Whether `address` lies in the native code of module instance `id`.
+    pub(crate) fn native_code_contains(&self, id: usize, address: usize) -> bool {
+        self.code_meta
+            .get(id)
+            .and_then(|meta| meta.as_ref())
+            .and_then(|meta| meta.beamasm.as_ref())
+            .is_some_and(|version| {
+                let (start, end) = version.code_range();
+                start <= address && address < end
+            })
+    }
+
     pub(crate) fn sync_code_epoch(&mut self) {
         if let Some(epoch) = &self.code_epoch
             && epoch.load(std::sync::atomic::Ordering::Acquire) != self.seen_epoch
@@ -888,6 +920,7 @@ impl Vm {
                 .is_some()
             {
                 crate::beamasm_integration::patch_native_breakpoint(
+                    self.code_scope,
                     &module.name,
                     function,
                     *arity,
@@ -905,6 +938,14 @@ impl Vm {
                 if export.function == function && export.arity == arity {
                     module.set_global_trace_breakpoint(index, global);
                     exports_retargeted = true;
+                    crate::beamasm_integration::set_global_breakpoint(
+                        self.code_scope,
+                        &module.name,
+                        function,
+                        arity,
+                        export.target(),
+                        global,
+                    );
                 }
             }
         }
@@ -1009,6 +1050,7 @@ impl Vm {
     }
     pub(crate) fn shared_replica(code: Arc<Mutex<SharedCode>>, paths: &[PathBuf]) -> Self {
         let purge_state = Arc::clone(&code.lock().unwrap().purge_state);
+        let code_scope = code.lock().unwrap().code_scope;
         let mut vm = Self {
             paths: paths.to_vec(),
             otp_root: None,
@@ -1021,7 +1063,8 @@ impl Vm {
             code_meta: SharedTable::new(Vec::new()),
             code_epoch: Some(Arc::clone(&code.lock().unwrap().epoch)),
             seen_epoch: 0,
-            beamasm_targets: beamasm_integration::NativeTargetCache::default(),
+            beamasm_targets: beamasm_integration::NativeTargetCache::new(code_scope),
+            code_scope,
             registers: SharedTable::new(Vec::new()),
             native_fns: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
@@ -1076,7 +1119,9 @@ impl Vm {
                     Some(CodeMeta::from_beam(&beam, Some(&bytes))),
                 );
                 code.loaded.insert(module_name.clone(), id);
-                if let Some(native) = beamasm_integration::compile(&bytes, &code.modules[id]) {
+                if let Some(native) =
+                    beamasm_integration::compile(&bytes, &code.modules[id], code.code_scope)
+                {
                     native.publish(&code.modules[id]);
                     if let Some(meta) = code.code_meta[id].as_mut() {
                         Arc::make_mut(meta).beamasm = Some(native);

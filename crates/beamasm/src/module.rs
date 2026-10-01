@@ -86,6 +86,9 @@ pub struct FinalizedModule {
     pub line_table: Vec<ModuleLine>,
     /// Patch sites for per-function tracing breakpoints: label to entry word and skip branch.
     pub trace_breakpoints: HashMap<u32, (usize, u32)>,
+    /// NIF load patch sites: function label to the word that skips the call-NIF body
+    /// until `load_nif` replaces it with a NOP.
+    pub nif_patches: HashMap<u32, usize>,
 }
 
 /// Source location attached to a native `line` instruction address.
@@ -142,6 +145,7 @@ pub struct BeamModuleAssembler {
     func_clause_stub: Option<Label>,
     line_table: Vec<ModuleLine>,
     trace_breakpoints: HashMap<u32, (usize, Label)>,
+    nif_patches: HashMap<u32, usize>,
     current_function_label: Option<u32>,
     next_fresh_label: u32,
     dump_module: Option<String>,
@@ -198,6 +202,7 @@ impl BeamModuleAssembler {
             line_table: Vec::new(),
             arith_fail: 0,
             trace_breakpoints: HashMap::new(),
+            nif_patches: HashMap::new(),
             current_function_label: None,
             next_fresh_label: 0x7000_0000,
             dump_module: None,
@@ -347,7 +352,11 @@ impl BeamModuleAssembler {
 
     /// Emits the patchable native entry trampoline used by local call tracing.
     // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250, OTP-29.1.1.
-    pub fn emit_i_breakpoint_trampoline(&mut self, helper: usize) -> Result<(), ModuleError> {
+    pub fn emit_i_breakpoint_trampoline(
+        &mut self,
+        fragment: usize,
+        identity: usize,
+    ) -> Result<(), ModuleError> {
         self.emit_enter_frame()?;
         let Some(function) = self.current_function_label else {
             return Err(ModuleError::InvalidOperand(
@@ -357,22 +366,46 @@ impl BeamModuleAssembler {
         let patch = self.code.offset();
         let next = self.code.new_label();
         self.code.b(next)?;
-        self.code.adr(Gpr::x(10), next)?;
-        self.emit_runtime_fragment_with(
-            helper,
-            &[Gpr::x(10)],
-            6,
-            crate::Update::HEAP_ALLOC
-                .union(crate::Update::STACK)
-                .union(crate::Update::REDUCTIONS)
-                .union(crate::Update::X_REGS),
-        )?;
+        // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95, OTP-29.1.1: erts calls
+        // erts_generic_breakpoint from the fragment. Here the breakpoint traps through the
+        // light-BIF fragment so the executor, which owns the VM and run context, delivers
+        // the events and resumes after this call with every argument register intact.
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
+        self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
         self.code.bind(next)?;
         if self
             .trace_breakpoints
             .insert(function, (patch, next))
             .is_some()
         {
+            return Err(ModuleError::DuplicateLabel(function));
+        }
+        Ok(())
+    }
+
+    /// Emits the call-NIF body of a function that `load_nif` may replace, behind a branch
+    /// that skips it until the NIF is loaded.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250 and erl_nif.c:5124-5196
+    // (load_nif_1st_finisher copies the call_nif sequence behind the function prologue),
+    // OTP-29.1.1: here the sequence is emitted up front and enabled by patching the branch.
+    pub fn emit_nif_patch_site(
+        &mut self,
+        identity: usize,
+        helper: usize,
+        arity: usize,
+    ) -> Result<(), ModuleError> {
+        let Some(function) = self.current_function_label else {
+            return Err(ModuleError::InvalidOperand(
+                "NIF patch site has no owning function",
+            ));
+        };
+        let patch = self.code.offset();
+        let body = self.code.new_label();
+        self.code.b(body)?;
+        self.emit_call_nif_body(identity, helper, arity)?;
+        self.code.bind(body)?;
+        if self.nif_patches.insert(function, patch).is_some() {
             return Err(ModuleError::DuplicateLabel(function));
         }
         Ok(())
@@ -1034,16 +1067,65 @@ impl BeamModuleAssembler {
                 "native body arity exceeds X register ABI",
             ));
         }
+        self.emit_call_nif_body(identity, helper, arity)
+    }
+
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900 (call_nif), OTP-29.1.1: the
+    // arguments above the register cache are already in the X register array.
+    fn emit_call_nif_body(
+        &mut self,
+        identity: usize,
+        helper: usize,
+        _arity: usize,
+    ) -> Result<(), ModuleError> {
+        let update = crate::Update::HEAP_ALLOC
+            .union(crate::Update::REDUCTIONS)
+            .union(crate::Update::X_REGS);
         self.code
             .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
-        self.emit_runtime_fragment_with(
-            helper,
-            &[Gpr::x(13)],
-            6,
-            crate::Update::HEAP_ALLOC
-                .union(crate::Update::REDUCTIONS)
-                .union(crate::Update::X_REGS),
-        )?;
+        // The helper may set c_p->i to a trap target, so the return address is kept on the
+        // machine stack instead of being reloaded from c_p->i.
+        self.code
+            .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
+        crate::emit_enter_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), C_P)?;
+            e.mov_reg(Gpr::x(1), Gpr::x(13))?;
+            e.mov_const(Gpr::x(17), helper as u64)?;
+            e.str_uoff(Gpr::x(30), C_P, 72)?;
+            e.blr(Gpr::x(17))
+        })?;
+        crate::emit_leave_runtime(&mut self.code, 6, update)?;
+        self.code.emit(|e| {
+            e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+            e.ldr_uoff(Gpr::x(9), C_P, 40)
+        })?;
+        // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif), OTP-29.1.1: a dirty NIF
+        // called on a normal scheduler traps to the executor, which runs it on a dirty
+        // scheduler and resumes at `resume` with the result in x0.
+        let not_trap = self.code.new_label();
+        let resume = self.code.new_label();
+        self.code
+            .emit(|e| e.cmp_imm(Gpr::x(9), crate::dispatch::TRAP_REASON, false))?;
+        self.code.b_cond(Cond::Ne, not_trap)?;
+        // Same context switch as a trapping light BIF (instr_bif.cpp:533-540): the resume
+        // point is pushed on E and handed over as the exit's continuation.
+        self.code.adr(Gpr::x(2), resume)?;
+        self.code.emit(|e| {
+            e.str_pre(Gpr::x(2), E, -8)?;
+            e.str_uoff(Gpr::xzr(), C_P, 40)?;
+            e.mov_const(
+                Gpr::x(1),
+                crate::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as u64,
+            )?;
+            e.mov_const(Gpr::x(0), 2)?;
+            e.str_uoff(Gpr::x(0), SCHEDULER_REGS, 16_408)?;
+            e.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
+            e.br(Gpr::x(17))
+        })?;
+        self.code.bind(not_trap)?;
+        self.error_if_nonzero(Gpr::x(9))?;
+        self.code.bind(resume)?;
         self.emit_leave_frame()?;
         self.code.emit(|e| e.ret(Gpr::x(30)))?;
         Ok(())
@@ -1249,6 +1331,7 @@ impl BeamModuleAssembler {
                 })
                 .collect(),
             trace_breakpoints,
+            nif_patches: self.nif_patches,
         })
     }
 }

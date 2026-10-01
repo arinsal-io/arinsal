@@ -80,36 +80,73 @@ fn transform_with_context(instructions: &[Instr], beam: Option<&BeamFile>) -> Ve
         })
         .collect::<Vec<_>>();
     let mut code = inject_function_starts(raw);
+    let max_pattern = rules
+        .values()
+        .flatten()
+        .map(|rule| rule.patterns.len())
+        .max()
+        .unwrap_or(1);
     // OTP rules are ordered, greedy peephole rewrites. Re-scan after a rewrite
     // because a later rule can expose an earlier multi-instruction pattern.
+    // Like erts' loader (beam_load.c, transform_engine), generated instructions are put
+    // back in front of the remaining stream and retried, so a rewrite costs only its
+    // own instructions instead of moving the rest of the module.
     loop {
         let mut changed = false;
+        let mut out = Vec::with_capacity(code.len());
+        let mut front: std::collections::VecDeque<Node> = std::collections::VecDeque::new();
         let mut index = 0;
-        while index < code.len() {
+        while !front.is_empty() || index < code.len() {
+            let window;
+            let (stream, at): (&[Node], usize) = if front.is_empty() {
+                (&code, index)
+            } else {
+                let end = code.len().min(index + max_pattern);
+                window = front
+                    .iter()
+                    .chain(&code[index..end])
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (&window, 0)
+            };
             let mut replacement = None;
-            for rule in rules.get(&code[index].name).into_iter().flatten() {
-                if let Some((consumed, produced)) = apply_rule(rule, &code, index, beam) {
+            for rule in rules.get(&stream[at].name).into_iter().flatten() {
+                if let Some((consumed, produced)) = apply_rule(rule, stream, at, beam) {
                     replacement = Some((consumed, produced));
                     break;
                 }
             }
-            if let Some((consumed, produced)) = replacement {
-                let is_unchanged = consumed == produced.len()
-                    && code[index..index + consumed]
-                        .iter()
-                        .zip(&produced)
-                        .all(|(old, new)| node_equal(old, new));
-                let same_opcode =
-                    consumed == 1 && produced.len() == 1 && code[index].name == produced[0].name;
-                code.splice(index..index + consumed, produced);
-                changed |= !is_unchanged;
-                if same_opcode || is_unchanged {
+            let Some((consumed, produced)) = replacement else {
+                if front.is_empty() {
+                    out.push(std::mem::replace(&mut code[index], Node::empty()));
                     index += 1;
+                } else {
+                    out.extend(front.pop_front());
                 }
-            } else {
-                index += 1;
+                continue;
+            };
+            let is_unchanged = consumed == produced.len()
+                && stream[at..at + consumed]
+                    .iter()
+                    .zip(&produced)
+                    .all(|(old, new)| node_equal(old, new));
+            let same_opcode =
+                consumed == 1 && produced.len() == 1 && stream[at].name == produced[0].name;
+            changed |= !is_unchanged;
+            let from_front = consumed.min(front.len());
+            front.drain(..from_front);
+            index += consumed - from_front;
+            let mut produced = produced.into_iter();
+            if (same_opcode || is_unchanged)
+                && let Some(first) = produced.next()
+            {
+                out.push(first);
+            }
+            for node in produced.rev() {
+                front.push_front(node);
             }
         }
+        code = out;
         if !changed {
             break;
         }
@@ -168,6 +205,17 @@ struct Node {
     name: String,
     args: Vec<Operand>,
     offset: usize,
+}
+
+impl Node {
+    // A moved-out stream slot.
+    fn empty() -> Self {
+        Self {
+            name: String::new(),
+            args: Vec::new(),
+            offset: 0,
+        }
+    }
 }
 
 fn node_equal(a: &Node, b: &Node) -> bool {
@@ -614,24 +662,24 @@ fn apply_rule(
         if pattern.op != instruction.name {
             return None;
         }
-        let mut expanded_args = instruction.args.clone();
+        // Most patterns match the operands as they are; only a rest list without its
+        // length operand needs a rewritten copy.
+        let mut expanded_args = std::borrow::Cow::Borrowed(instruction.args.as_slice());
         let expected = pattern.args.len();
         if expected == expanded_args.len() + 1
             && pattern.args.last().is_some_and(|arg| arg.rest)
-            && matches!(expanded_args.last(), Some(Operand::List(_)))
+            && let Some(Operand::List(rest)) = expanded_args.last()
         {
+            let length = Operand::U(rest.len() as u64);
             let rest_index = expanded_args.len() - 1;
-            let Operand::List(rest) = &expanded_args[rest_index] else {
-                unreachable!()
-            };
-            expanded_args.insert(rest_index, Operand::U(rest.len() as u64));
+            expanded_args.to_mut().insert(rest_index, length);
         }
         let rest = pattern.args.last().is_some_and(|arg| arg.rest);
         let fixed = pattern.args.len() - usize::from(rest);
         if expanded_args.len() < fixed || (!rest && expanded_args.len() != fixed) {
             return None;
         }
-        for (pat, value) in pattern.args.iter().take(fixed).zip(&expanded_args) {
+        for (pat, value) in pattern.args.iter().take(fixed).zip(expanded_args.iter()) {
             let exact_x0 = pat.ty.as_deref() == Some("x")
                 && pat.eq == Some(0)
                 && register_index(value) == Some(('x', 0));

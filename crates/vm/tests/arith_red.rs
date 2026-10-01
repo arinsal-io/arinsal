@@ -234,8 +234,14 @@ fn arith_red_bignum_instruction_and_bif_reductions_meet_otp_minimums() {
     let CallResult::Ok(expected) = expected else {
         panic!("OTP arithmetic reduction fixture failed: {expected:?}");
     };
-    let minimums = [7; 23]
+    // OTP charges size-dependent reductions for runtime bignum arithmetic. The compiler
+    // folds the unary operations on the constant operand, which OTP charges as a plain
+    // call, so each minimum is capped at OTP's own count.
+    let otp_counts = measurement_reductions(&expected);
+    let minimums = [7_i64; 23]
         .into_iter()
+        .zip(&otp_counts)
+        .map(|(minimum, otp)| minimum.min(*otp))
         .chain([3_900, 3_900])
         .collect::<Vec<_>>();
     assert_reduction_minimums(&actual.term, &minimums, "Arinsal");
@@ -243,6 +249,22 @@ fn arith_red_bignum_instruction_and_bif_reductions_meet_otp_minimums() {
         measurement_values(&expected),
         measurement_values(&actual.term)
     );
+}
+
+fn measurement_reductions(result: &OwnedTerm) -> Vec<i64> {
+    let OwnedTerm::List { elems, .. } = result else {
+        panic!("arithmetic fixture returned a non-list result: {result:?}");
+    };
+    elems
+        .iter()
+        .map(|measurement| match measurement {
+            OwnedTerm::Tuple(values) => match values.first() {
+                Some(OwnedTerm::Int(count)) => *count,
+                other => panic!("non-integer reduction count: {other:?}"),
+            },
+            other => panic!("non-tuple measurement: {other:?}"),
+        })
+        .collect()
 }
 
 fn measurement_values(result: &OwnedTerm) -> Vec<OwnedTerm> {

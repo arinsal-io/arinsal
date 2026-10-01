@@ -228,6 +228,10 @@ core::arch::global_asm!(
     "ldp d10, d11, [x17, #16]",
     "ldp d12, d13, [x17, #32]",
     "ldp d14, d15, [x17, #48]",
+    // A hook that hands the return to the scheduler leaves the exit target and resume
+    // address in tmp_mem[0..2] and returns the exit fragment; x1/x2 are free at a return.
+    "ldr x1, [x19, #16384]",
+    "ldr x2, [x19, #16392]",
     "br x14",
 );
 

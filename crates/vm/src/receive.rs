@@ -494,13 +494,16 @@ impl Process {
         let (term, token) = removed_message
             .ok_or_else(|| VmError::Unsupported("remove_message without current message".into()))?;
         let mut ctx = ctx;
+        // Native code removes messages without the run context; the process knows its pid.
         if token.is_some()
-            && let Some(run_ctx) = ctx.as_deref_mut()
+            && let Some(pid) = ctx
+                .as_deref()
+                .map(|run_ctx| run_ctx.pid())
+                .or(self.self_pid)
         {
             let message =
                 arinsal_term::to_owned(term).unwrap_or(arinsal_etf::OwnedTerm::atom("undefined"));
-            let pid = run_ctx.pid();
-            crate::seq_trace::on_receive(vm, self, run_ctx, pid, token, message);
+            crate::seq_trace::on_receive(vm, self, ctx.as_deref_mut(), pid, token, message);
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2367
         // (erts_msgq_unlink_msg_set_save_first), OTP-29.1.1.

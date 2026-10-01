@@ -467,6 +467,14 @@ fn inspect_frames(
     let mut slots = Vec::new();
     let mut stack_index = 0;
     while let Some(word) = process.heap.stack_get(stack_index) {
+        // The interpreter-to-native bridge return address has no erts counterpart: the
+        // interpreted continuation that follows it is the frame's CP.
+        if word.tagged_word() as usize
+            == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize
+        {
+            stack_index += 1;
+            continue;
+        }
         if let Some((handler, next_module, next_ip)) = crate::stacktrace::decode_tag(word) {
             if handler {
                 slots.push(O::Tuple(vec![

@@ -209,9 +209,11 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
         11 => Some(("bsr", &[left, right][..])),
         _ => None,
     };
+    // The call site published FCALLS (Update::REDUCTIONS) and reloads it afterwards.
+    process.reductions = process.header.fcalls;
     if let Some((operation, args)) = operation {
+        // The charge comes off FCALLS, which the scheduler adds to the process's count.
         let charge = arinsal_arith::reduction_charge(operation, args);
-        process.reductions_used = process.reductions_used.saturating_add(u64::from(charge));
         process.reductions = process
             .reductions
             .saturating_sub(charge.min(i32::MAX as u32) as i32);

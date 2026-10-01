@@ -13,7 +13,7 @@ const RUNTIME_UPDATE: Update = Update::HEAP_ALLOC
     .union(Update::REDUCTIONS)
     .union(Update::X_REGS);
 const THE_NON_VALUE: u16 = 0;
-const TRAP_REASON: u16 = 1 << 10;
+pub(crate) const TRAP_REASON: u16 = 1 << 10;
 
 /// Executable fragments shared by every compiled module in one VM process.
 pub struct DispatchFragments {
@@ -37,6 +37,15 @@ pub const APPLY2_UNPORTED: usize = usize::MAX - 0xF3;
 pub const APPLY3_UNPORTED: usize = usize::MAX - 0xF4;
 /// Identity sent through the light-BIF fragment to hand native `send` to the executor.
 pub const SEND_DISPATCH_IDENTITY: usize = usize::MAX - 0xF1;
+/// Identity sent through the light-BIF fragment to hand a native entry breakpoint to the
+/// executor, which owns the VM and run context that tracer modules and meta tracing need.
+pub const BREAKPOINT_DISPATCH_IDENTITY: usize = usize::MAX - 0xF5;
+/// `target_pc` of the exit a traced native return takes so the executor can emit its
+/// `return_to` event; `resume_pc` is the caller continuation.
+pub const RETURN_TO_DISPATCH_IDENTITY: usize = usize::MAX - 0xF6;
+/// `target_pc` of the exit a dirty NIF called on a normal scheduler takes, so the executor
+/// can move the process to a dirty scheduler; `resume_pc` is the NIF body's return point.
+pub const DIRTY_NIF_DISPATCH_IDENTITY: usize = usize::MAX - 0xF7;
 
 impl DispatchFragments {
     /// Emits the export and light-BIF runtime fragments once for the VM.

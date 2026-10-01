@@ -228,7 +228,7 @@ pub(crate) fn on_send(
 pub(crate) fn on_receive(
     vm: Option<&mut Vm>,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    ctx: Option<&mut RunCtx<'_, Message>>,
     pid: Pid,
     token: Option<Box<Token>>,
     message: OwnedTerm,
@@ -248,7 +248,7 @@ pub(crate) fn on_receive(
         emit(
             vm,
             process,
-            Some(ctx),
+            ctx,
             &token,
             SeqEvent {
                 kind: "receive",

@@ -6,12 +6,9 @@ use arinsal_a64::enc::{Cond, Gpr};
 /// Runtime slow path for operations that allocate a term or decode variable-width fields.
 pub type BsMatchHelper = extern "C" fn(*mut crate::ProcessHeader, u32, u64, u64, u64) -> u64;
 /// Runtime hook for the `bs_match` commands that decode fields (integer, binary, tail, `=:=`).
-/// Arguments: the command kind, then the live X register count; the operands are staged in the
-/// X register array from [`MATCH_STAGING_BASE`]. Zero means the match failed.
+/// Arguments: the command kind, then the live X register count; the operands are staged in
+/// [`crate::SchedulerRegisters::match_staging`]. Zero means the match failed.
 pub type BsMatchCmdHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64) -> u64;
-/// First X register array slot used to stage `bs_match` command operands when fewer than six X
-/// registers are live; otherwise staging starts at the live count.
-pub const MATCH_STAGING_BASE: u32 = 6;
 /// Words of a `SUB_BITS` object (erts/emulator/beam/erl_bits.h, ERL_SUB_BITS_SIZE).
 const ERL_SUB_BITS_SIZE: u32 = 5;
 /// Heap words for an extracted bitstring: a sub-bitstring, or an on-heap copy of at most
@@ -41,9 +38,10 @@ impl BeamModuleAssembler {
         dst: Option<ArgVal>,
         helper: BsMatchCmdHelper,
     ) -> Result<(), ModuleError> {
+        let staging = std::mem::offset_of!(crate::SchedulerRegisters, match_staging) as u32;
         for (index, operand) in staged.iter().copied().enumerate() {
             let register = self.source_reg(operand)?;
-            let offset = (MATCH_STAGING_BASE.max(live) + index as u32) * 8;
+            let offset = staging + index as u32 * 8;
             self.code
                 .emit(|e| e.str_uoff(register, Gpr::x(19), offset))?;
         }
@@ -193,7 +191,9 @@ impl BeamModuleAssembler {
             live,
             update,
         )?;
-        if let Some(label) = fail {
+        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:142-163, OTP-29.1.1:
+        // `{f,0}` means the compiler proved this match cannot fail.
+        if let Some(label) = fail.filter(|label| *label != 0) {
             let label = self.label(label);
             self.code.cbz(Gpr::x(0), label)?;
         }

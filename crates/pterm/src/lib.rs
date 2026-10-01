@@ -24,6 +24,40 @@ pub fn global_store() -> &'static Store {
     &GLOBAL
 }
 
+// The most recent retirement of any node's store, for tests that cannot name the node.
+static LAST_TRACE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// The most recent literal-area retirement trace of any node's store.
+pub fn last_retirement_of_any_store() -> RetirementTrace {
+    RetirementTrace {
+        pending_before: LAST_TRACE[0].load(Ordering::Relaxed) as usize,
+        pending_after: LAST_TRACE[1].load(Ordering::Relaxed) as usize,
+        freed: LAST_TRACE[2].load(Ordering::Relaxed),
+        copied_roots: LAST_TRACE[3].load(Ordering::Relaxed),
+    }
+}
+
+/// The store of one node (code scope). Like erts, each node has its own persistent-term
+/// table and literal-area collector queue; scope 0 is the process-wide default store.
+// A node's store lives for the rest of the OS process: processes and native code hold
+// `'static` references into it.
+pub fn store_for(scope: u64) -> &'static Store {
+    static STORES: LazyLock<Mutex<HashMap<u64, &'static Store>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    if scope == 0 {
+        return &GLOBAL;
+    }
+    let mut stores = STORES.lock().unwrap_or_else(|poison| poison.into_inner());
+    stores
+        .entry(scope)
+        .or_insert_with(|| Box::leak(Box::new(Store::new())))
+}
+
 /// A stable table view held across a yielding `persistent_term:get/0` call.
 pub struct Snapshot {
     allocated: usize,
@@ -728,6 +762,7 @@ impl Store {
         self.retired_len.fetch_sub(1, Ordering::AcqRel);
         self.freed.fetch_add(1, Ordering::Relaxed);
         self.last_trace[2].fetch_add(1, Ordering::Relaxed);
+        LAST_TRACE[2].fetch_add(1, Ordering::Relaxed);
     }
     /// Internal identifier for the area currently being copied by the collector.
     pub fn collector_area(&self) -> Option<u64> {
@@ -816,6 +851,9 @@ impl Store {
         self.last_trace[0].store(before as u64, Ordering::Relaxed);
         self.last_trace[1].store(before.saturating_sub(1) as u64, Ordering::Relaxed);
         self.last_trace[3].store(copied_roots, Ordering::Relaxed);
+        LAST_TRACE[0].store(before as u64, Ordering::Relaxed);
+        LAST_TRACE[1].store(before.saturating_sub(1) as u64, Ordering::Relaxed);
+        LAST_TRACE[3].store(copied_roots, Ordering::Relaxed);
         true
     }
     /// Take the global update permission for `process`; `true` when it already holds it.
@@ -926,6 +964,13 @@ pub struct ProcessRegistration<'a> {
     store: &'a Store,
     account: Option<Arc<ProcessAccount>>,
 }
+impl<'a> ProcessRegistration<'a> {
+    /// The node store this process is registered with.
+    pub fn store(&self) -> &'a Store {
+        self.store
+    }
+}
+
 impl Drop for ProcessRegistration<'_> {
     fn drop(&mut self) {
         self.store.release_update_permission(self);
@@ -1018,38 +1063,38 @@ fn number(ctx: &mut Ctx<'_>, number: usize) -> Result<Term, BifError> {
         .int_from_i128(number as i128)
         .map_err(system_limit)
 }
-fn put(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn put_in(store: &Store, _: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_persistent.c:314 (persistent_term_put_2), OTP-29.1.1
-    GLOBAL.put(args[0], args[1]).map_err(system_limit)?;
+    store.put(args[0], args[1]).map_err(system_limit)?;
     Ok(Term::atom(arinsal_term::atoms::OK))
 }
-fn put_new(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn put_new_in(store: &Store, _: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_persistent.c:319 (persistent_term_put_new_2), OTP-29.1.1
-    if !GLOBAL.put_new(args[0], args[1]).map_err(system_limit)? {
+    if !store.put_new(args[0], args[1]).map_err(system_limit)? {
         return Err(BifError::BADARG);
     }
     Ok(Term::atom(arinsal_term::atoms::OK))
 }
-fn get_one(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn get_one_in(store: &Store, _: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_persistent.c:380 (persistent_term_get_1), OTP-29.1.1
-    GLOBAL.get(args[0]).ok_or(BifError::BADARG)
+    store.get(args[0]).ok_or(BifError::BADARG)
 }
-fn get_two(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn get_two_in(store: &Store, _: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_persistent.c:390 (persistent_term_get_2), OTP-29.1.1
-    Ok(GLOBAL.get(args[0]).unwrap_or(args[1]))
+    Ok(store.get(args[0]).unwrap_or(args[1]))
 }
-fn erase(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+fn erase_in(store: &Store, _: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_persistent.c:417 (persistent_term_erase_1), OTP-29.1.1
-    let atom = if GLOBAL.erase(args[0]) {
+    let atom = if store.erase(args[0]) {
         arinsal_term::atoms::TRUE
     } else {
         arinsal_term::atoms::FALSE
     };
     Ok(Term::atom(atom))
 }
-fn info(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn info_in(store: &Store, ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_persistent.c:569 (persistent_term_info_0), OTP-29.1.1
-    let (count, memory) = GLOBAL.info();
+    let (count, memory) = store.info();
     let count = number(ctx, count)?;
     let memory = number(ctx, memory)?;
     let atoms = global_atoms();
@@ -1065,9 +1110,9 @@ fn info(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     )
     .map_err(|_| BifError::SystemLimit)
 }
-fn get_all(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+fn get_all_in(store: &Store, ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     let mut result = Ok(Term::NIL);
-    GLOBAL.for_each(|key, value| {
+    store.for_each(|key, value| {
         if let Ok(tail) = result {
             result = (|| {
                 let key = copy_term(key, &mut DynHeap(ctx.heap)).map_err(system_limit)?;
@@ -1082,10 +1127,52 @@ fn get_all(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     });
     result
 }
-fn erase_all(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    GLOBAL.clear();
+fn erase_all_in(store: &Store, _: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+    store.clear();
     Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
+fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    put_in(&GLOBAL, ctx, args)
+}
+fn put_new(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    put_new_in(&GLOBAL, ctx, args)
+}
+fn get_one(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    get_one_in(&GLOBAL, ctx, args)
+}
+fn get_two(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    get_two_in(&GLOBAL, ctx, args)
+}
+fn erase(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    erase_in(&GLOBAL, ctx, args)
+}
+fn info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    info_in(&GLOBAL, ctx, args)
+}
+fn get_all(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    get_all_in(&GLOBAL, ctx, args)
+}
+fn erase_all(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    erase_all_in(&GLOBAL, ctx, args)
+}
+/// A persistent-term BIF that operates on a given node's store.
+pub type StoreBif = fn(&Store, &mut Ctx<'_>, &[Term]) -> Result<Term, BifError>;
+
+/// Resolve the persistent-term BIFs listed in OTP 29.1.1 `bif.tab` for a node's store.
+pub fn lookup_in(module: &str, name: &str, arity: u8) -> Option<StoreBif> {
+    match (module, name, arity) {
+        ("persistent_term", "put", 2) => Some(put_in),
+        ("persistent_term", "put_new", 2) => Some(put_new_in),
+        ("persistent_term", "get", 1) => Some(get_one_in),
+        ("persistent_term", "get", 2) => Some(get_two_in),
+        ("persistent_term", "get", 0) => Some(get_all_in),
+        ("persistent_term", "erase", 1) => Some(erase_in),
+        ("persistent_term", "info", 0) => Some(info_in),
+        ("erts_internal", "erase_persistent_terms", 0) => Some(erase_all_in),
+        _ => None,
+    }
+}
+
 /// Resolve the persistent-term BIFs listed in OTP 29.1.1 `bif.tab`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     match (module, name, arity) {

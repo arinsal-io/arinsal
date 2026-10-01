@@ -211,6 +211,8 @@ pub struct Vm {
     code_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
     seen_epoch: u64,
     beamasm_targets: beamasm_integration::NativeTargetCache,
+    /// Identity of this node's code (erts' code index state); native registries are per scope.
+    pub(crate) code_scope: u64,
     registers: SharedTable<Vec<(usize, usize)>>,
     native_fns: SharedTable<Vec<arinsal_bifs::BifFn>>,
     loaded_nifs: SharedTable<std::collections::HashSet<String>>,
@@ -299,6 +301,10 @@ fn cli_help_non_pollable_registration_fires_once() {
 impl Drop for Vm {
     fn drop(&mut self) {
         beamasm_integration::print_stats();
+        // Scheduler replicas share their node's scope; the node's own VM owns it.
+        if self.shared.is_none() {
+            beamasm_integration::release_code_scope(self.code_scope);
+        }
     }
 }
 impl Vm {

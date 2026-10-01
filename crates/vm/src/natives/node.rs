@@ -436,6 +436,7 @@ fn halt(process: &mut Process, code: Term, options: Term) -> Result<Term, VmErro
         _ => return Err(badarg()),
     };
 
+    arinsal_sched::begin_halt();
     if flush && flush_timeout == Some(0) && message.is_none() {
         super::nif::execute_on_halt();
         std::process::exit(255);

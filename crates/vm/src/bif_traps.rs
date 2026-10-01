@@ -323,6 +323,13 @@ pub(crate) fn execute(
 
 /// Execute or resume a trapping BIF named by module and function; `key` identifies the call
 /// at the current call site (an import index, or [`APPLY_TRAP_KEY`]).
+/// Whether `module:function/arity` is a BIF that may trap to a continuation.
+pub(crate) fn traps(module: &str, function: &str, arity: u8) -> bool {
+    ENTRIES
+        .iter()
+        .any(|entry| entry.module == module && entry.function == function && entry.arity == arity)
+}
+
 pub(crate) fn execute_named(
     process: &mut Process,
     module_name: &str,
@@ -419,11 +426,14 @@ pub(crate) fn execute_named(
         Err(error) => {
             process.cold_mut().bif_trap = None;
             process.set_gc_enabled(gc_was_enabled);
+            // Re-enabling GC may collect: the X registers, not the copies, hold the live
+            // arguments.
+            let args = live_args(process, &args, arity);
             Err(exceptions::bif_error(
                 process,
                 module_name,
                 function_name,
-                &args[..arity],
+                &args,
                 error,
             ))
         }
@@ -437,11 +447,12 @@ pub(crate) fn execute_named(
             process.cold_mut().bif_trap = None;
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
+            let args = live_args(process, &args, arity);
             Err(exceptions::bif_error(
                 process,
                 module_name,
                 function_name,
-                &args[..arity],
+                &args,
                 error,
             ))
         }
@@ -472,6 +483,14 @@ pub(crate) fn execute_named(
             })
         }
     })
+}
+
+/// The call's arguments as the X registers hold them now; a collection since the copies
+/// were taken has moved boxed arguments.
+fn live_args(process: &Process, copies: &[Term; 3], arity: usize) -> Vec<Term> {
+    (0..arity)
+        .map(|slot| process.x.get(slot).copied().unwrap_or(copies[slot]))
+        .collect()
 }
 
 fn charge(

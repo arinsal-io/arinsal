@@ -72,7 +72,7 @@ pub fn call_bif(
 }
 
 /// Invoke a BIF and return its reported work for scheduler accounting.
-pub(super) fn call_bif_metered(
+pub(crate) fn call_bif_metered(
     heap: &mut arinsal_term::ProcessHeap,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
@@ -565,6 +565,8 @@ impl Vm {
                 Some(value) => ImportOutcome::Returned(value),
                 None => {
                     if p.native_pc.is_some() {
+                        // Returning into a native continuation is not a scheduling point.
+                        p.cold_mut().native_transfer = true;
                         ImportOutcome::Yield
                     } else {
                         ImportOutcome::Advanced

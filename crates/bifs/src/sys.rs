@@ -9,6 +9,12 @@ use crate::pure::{Heap, atom_name, tuple_build};
 use crate::{BifError, BifFn, Ctx};
 
 static PERF_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static EMU_FLAVOR_JIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Records whether the VM runs BeamAsm (`jit`) or the interpreter (`emu`).
+pub fn set_emu_flavor_jit(jit: bool) {
+    EMU_FLAVOR_JIT.store(jit, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     let f = match (module, name, arity) {
@@ -99,7 +105,14 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         }
         "atom_count" | "process_count" | "port_count" => integer(ctx, 0),
         "machine" => string(ctx, "BEAM"),
-        "emu_flavor" => Ok(atom("jit")),
+        // Port of erts/emulator/beam/erl_bif_info.c (system_info emu_flavor), OTP-29.1.1.
+        "emu_flavor" => Ok(atom(
+            if EMU_FLAVOR_JIT.load(std::sync::atomic::Ordering::Relaxed) {
+                "jit"
+            } else {
+                "emu"
+            },
+        )),
         "build_type" | "emu_type" => Ok(atom("opt")),
         "os_type" => Ok(tuple_build(ctx, &[atom("unix"), atom("darwin")])),
         "endian" => Ok(atom(if cfg!(target_endian = "little") {

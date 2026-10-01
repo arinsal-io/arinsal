@@ -110,6 +110,12 @@ fn handles() -> &'static Mutex<HashMap<u64, Arc<Tty>>> {
     HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Whether a `prim_tty` NIF runs on a dirty I/O scheduler.
+// Port of erts/emulator/nifs/common/prim_tty_nif.c:161-163 (ERL_NIF_DIRTY_JOB_IO_BOUND), OTP-29.1.1.
+pub fn dirty_io(name: &str, arity: u8) -> bool {
+    matches!((name, arity), ("write_nif", 2) | ("read_nif", 3))
+}
+
 /// Return the implementation of an OTP 29.1.1 `prim_tty` NIF.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     if module != "prim_tty" {

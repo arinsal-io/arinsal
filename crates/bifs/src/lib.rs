@@ -34,6 +34,7 @@ pub use pure::{
 };
 pub use time::{monotonic_time_milliseconds, monotonic_time_nanos};
 
+pub use sys::set_emu_flavor_jit;
 pub use time::initialize_time_origin;
 
 /// Exception class, as in `erlang:raise/3`.

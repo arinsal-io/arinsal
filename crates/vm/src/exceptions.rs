@@ -648,6 +648,7 @@ pub(super) fn resume(
                                 session: session as u64,
                                 return_trace: flags & 1 != 0,
                                 exception_trace: flags & 2 != 0,
+                                return_to: flags & 4 != 0,
                             },
                             class_reason,
                             true,

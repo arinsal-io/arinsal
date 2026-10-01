@@ -402,6 +402,7 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
     memory.write_bytes(offset, &bytes).unwrap();
     let entry = memory.ptr_at(offset) as usize;
     register_native_function(NativeFunction {
+        scope: 0,
         start: entry,
         end: entry + bytes.len(),
         module: "native_abi_test".into(),
@@ -1813,6 +1814,7 @@ fn register_native(
     line: u32,
 ) {
     register_native_function(NativeFunction {
+        scope: 0,
         start: entry,
         end: entry + len,
         module: module.into(),
@@ -1882,7 +1884,7 @@ fn mixed_call_unported_roundtrip() {
     let (memory, entry, len) = executable(mixed_native(helper, false));
     register_native(module, "native_caller", 1, memory, entry, len, 3);
     let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    vm.load_bytes_interpreted(&beam).unwrap();
     let actual = vm.eval_scheduled(module, "bridge", &[], 1, None).unwrap();
     assert_eq!(actual.term, OwnedTerm::Int(42));
 }
@@ -1903,7 +1905,7 @@ fn gc_during_mixed_frame() {
     let (memory, entry, len) = executable(mixed_native(helper, true));
     register_native(module, "native_caller", 1, memory, entry, len, 3);
     let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    vm.load_bytes_interpreted(&beam).unwrap();
     let actual = vm.eval_scheduled(module, "bridge", &[], 1, None).unwrap();
     assert_eq!(actual.term, OwnedTerm::Atom("saved".into()));
 }
@@ -1931,7 +1933,7 @@ fn native_frame_in_stacktrace() {
     let (memory, entry, len) = executable(mixed_native(helper, false));
     register_native(module, "native_caller", 1, memory, entry, len, 3);
     let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    vm.load_bytes_interpreted(&beam).unwrap();
     let error = match vm.eval_scheduled(module, "bridge", &[], 1, None) {
         Ok(_) => panic!("expected helper exception"),
         Err(error) => error,
@@ -2011,7 +2013,7 @@ fn native_exception_unwinds_to_interpreted_catch() {
     let (memory, entry, len) = executable(code);
     register_native(module, "native_raise", 0, memory, entry, len, 3);
     let mut vm = Vm::new([]);
-    vm.load_bytes(&beam).unwrap();
+    vm.load_bytes_interpreted(&beam).unwrap();
     let result = vm.eval_scheduled(module, "bridge", &[], 1, None).unwrap();
     assert_eq!(
         result.term,

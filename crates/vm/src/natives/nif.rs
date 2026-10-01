@@ -551,6 +551,39 @@ fn install_dynamic(
             .ok_or_else(|| VmError::Unsupported("dynamic NIF trampoline".into()))?;
         let index = push_native(vm, function)?;
         patch_native(&vm.modules[module_id], *entry, index)?;
+        bind_native_code(vm, module_id, *entry, function)?;
+    }
+    Ok(())
+}
+
+/// Makes the module's native code run the NIF too, like the interpreter's patched entry.
+// Port of erts/emulator/beam/erl_nif.c:5050-5106 (patch_call_nif_early), OTP-29.1.1.
+fn bind_native_code(
+    vm: &Vm,
+    module_id: usize,
+    entry: usize,
+    function: BifFn,
+) -> Result<(), VmError> {
+    let Some(version) = vm
+        .code_meta
+        .get(module_id)
+        .and_then(|meta| meta.as_ref())
+        .and_then(|meta| meta.beamasm.clone())
+    else {
+        return Ok(());
+    };
+    let Some((_, name, arity)) = vm.modules[module_id]
+        .functions
+        .iter()
+        .find(|(start, _, _)| *start == entry)
+    else {
+        return Err(VmError::Unsupported("nif entry".into()));
+    };
+    // A function without native code runs in the interpreter, which is patched already.
+    if version.has_native_function(name, *arity) && !version.bind_nif(name, *arity, function) {
+        return Err(VmError::Unsupported(format!(
+            "native code of {name}/{arity} has no NIF patch site"
+        )));
     }
     Ok(())
 }
@@ -570,8 +603,10 @@ fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
     };
     let enabled_index = push_native(vm, tracer_enabled)?;
     patch_native(&vm.modules[module_id], enabled, enabled_index)?;
+    bind_native_code(vm, module_id, enabled, tracer_enabled)?;
     let trace_index = push_native(vm, tracer_trace)?;
     patch_native(&vm.modules[module_id], trace, trace_index)?;
+    bind_native_code(vm, module_id, trace, tracer_trace)?;
     Ok(())
 }
 
@@ -610,6 +645,8 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
         return Err(badarg());
     };
     bytes.extend(b".so");
+    // The caller's code (and its native version) may have been loaded by another scheduler.
+    vm.sync_code_epoch();
     let caller_id = process.module;
     let caller = vm
         .modules

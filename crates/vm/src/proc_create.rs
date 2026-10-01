@@ -59,6 +59,8 @@ pub struct Process {
     pub(crate) ip: usize,
     pub(crate) initial_call: Option<(usize, usize)>,
     pub(crate) native_pc: Option<usize>,
+    /// The entry process has been scheduled once (its native start is decided then).
+    pub(crate) entry_started: bool,
     // Last BEAM live operand or call arity for allocation instructions without one.
     pub(crate) gc_live: usize,
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
@@ -120,6 +122,8 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait: Option<Option<u64>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
     pub(crate) native_retry: Option<usize>,
+    /// Sessions whose `return_to` event a traced native return handed to the executor.
+    pub(crate) native_return_to: Vec<u64>,
     /// Pc of the native instruction that raised the exception being dispatched (0 if none).
     pub(crate) native_error_pc: usize,
     /// The current apply comes from native code, whose call site names the caller frame.
@@ -133,6 +137,15 @@ pub(crate) struct ProcessCold {
     pub(crate) native_error_info: Option<Box<arinsal_etf::OwnedTerm>>,
     /// Remaining time computed by a native `wait_timeout`, consumed by the following wait.
     pub(crate) native_wait_timeout: Option<u64>,
+    /// The pending native wait belongs to a receive without clauses.
+    pub(crate) native_wait_self: bool,
+    /// Static NIF identity and native return point of a dirty NIF call waiting for a dirty
+    /// scheduler.
+    pub(crate) native_dirty_nif: Option<(usize, usize)>,
+    /// Return address and call site of the native call that `native_retry` redoes.
+    pub(crate) native_retry_site: Option<(usize, usize)>,
+    /// The interpreter returned only to hand control to `native_pc`; the slice continues.
+    pub(crate) native_transfer: bool,
     /// Native continuation to install after an interpreted external call returns.
     pub(crate) native_resume_after_call: Option<usize>,
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
@@ -237,6 +250,19 @@ impl Process {
         Ok(())
     }
 
+    /// Attaches the process to its node and registers it with the node's persistent-term
+    /// store (its literal-area collector handshake).
+    pub(crate) fn set_runtime(&mut self, runtime: Option<std::sync::Arc<crate::process::Runtime>>) {
+        let scope = runtime.as_ref().map_or(0, |runtime| runtime.code_scope);
+        self.runtime = runtime;
+        if !std::ptr::eq(
+            self._persistent_terms.store(),
+            arinsal_pterm::store_for(scope),
+        ) {
+            self._persistent_terms = arinsal_pterm::store_for(scope).register_process();
+        }
+    }
+
     /// Select a registered native function as the process's next entry point.
     pub fn set_native_entry(&mut self, address: usize) -> Result<(), &'static str> {
         if native_function_at(address).is_none() {
@@ -326,6 +352,7 @@ impl Process {
             ip: 0,
             initial_call: None,
             native_pc: None,
+            entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
             reductions: 4000,

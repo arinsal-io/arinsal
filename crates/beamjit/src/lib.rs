@@ -83,16 +83,16 @@ pub trait ModuleEnv {
     fn light_bif_fragment(&self) -> usize {
         0
     }
-    /// Return the VM's native generic breakpoint helper.
-    fn breakpoint_helper(&self) -> usize {
-        0
-    }
     /// Return the two-register shared fragment used by `send/2`.
     fn send_fragment(&self) -> usize {
         self.light_bif_fragment()
     }
     /// Resolve a loader-patched NIF body to its native runtime trampoline.
     fn native_body(&self, _name: &str, _arity: u8) -> Option<(usize, usize)> {
+        None
+    }
+    /// Reserve the call-NIF body of a function that a later `load_nif` may replace.
+    fn dynamic_nif_body(&self, _name: &str, _arity: u8) -> Option<(usize, usize)> {
         None
     }
     /// Runtime helper that reads the process dictionary with exact key equality.
@@ -1389,7 +1389,16 @@ pub fn compile_module_with_env_and_funcs(
     function_allowlist: Option<&str>,
 ) -> Result<CompiledModule, CompileError> {
     let beam = beam::parse(beam_bytes).map_err(|error| CompileError::Parse(error.to_string()))?;
-    let specialized = beamops::transform_module(&beam);
+    compile_parsed_module_with_env_and_funcs(&beam, env, function_allowlist)
+}
+
+/// [`compile_module_with_env_and_funcs`] for a module the caller has already parsed.
+pub fn compile_parsed_module_with_env_and_funcs(
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+    function_allowlist: Option<&str>,
+) -> Result<CompiledModule, CompileError> {
+    let specialized = beamops::transform_module(beam);
     let mut candidates = Vec::new();
     let mut unported = Vec::new();
 
@@ -1398,7 +1407,7 @@ pub fn compile_module_with_env_and_funcs(
         if !ops.iter().any(|op| op.name() == "i_func_label") {
             continue;
         }
-        let (name, arity, label) = function_identity(&ops, &beam);
+        let (name, arity, label) = function_identity(&ops, beam);
         if function_allowlist.is_some_and(|list| !function_allowlist_contains(list, &name, arity)) {
             unported.push(UnportedFunction {
                 name,
@@ -1423,10 +1432,9 @@ pub fn compile_module_with_env_and_funcs(
         candidates.push((name, arity, label, ops));
     }
 
-    // Probe each function before laying out the module. Dropping one late emitter error and
-    // restarting the whole module for every blocked function makes OTP loading quadratic.
+    // Probe the NIF bodies before laying out the module.
     let mut emit_failures = Vec::new();
-    candidates.retain(|(name, arity, label, ops)| {
+    candidates.retain(|(name, arity, label, _ops)| {
         if let Some((identity, helper)) = env.native_body(name, *arity) {
             let mut probe = BeamModuleAssembler::new();
             if let Err(error) = probe.emit_native_body(identity, helper, *arity as usize) {
@@ -1444,26 +1452,10 @@ pub fn compile_module_with_env_and_funcs(
             }
             return true;
         }
-        let mut probe = BeamModuleAssembler::new();
-        if let Some((op, error)) = ops.iter().find_map(|op| {
-            emit_op(&mut probe, op, &beam, env)
-                .err()
-                .map(|error| (op, error))
-        }) {
-            emit_failures.push(UnportedFunction {
-                name: name.clone(),
-                arity: *arity,
-                label: *label,
-                missing_ops: vec![op.name().to_owned()],
-                reason: FallbackReason::EmitterError {
-                    instruction: op.name().to_owned(),
-                    details: format!("{error}; operands {:?}", op.operands()),
-                },
-            });
-            false
-        } else {
-            true
-        }
+        // Every other emitter error is rare once a module's instructions are ported; the
+        // layout loop below drops such a function and restarts, instead of emitting every
+        // function twice up front.
+        true
     });
     unported.extend(emit_failures);
 
@@ -1485,7 +1477,7 @@ pub fn compile_module_with_env_and_funcs(
         while index < candidates.len() {
             let blocked_call = candidates[index].3.iter().find_map(|op| {
                 call_target(op)
-                    .or_else(|| lambda_call_target(op, &beam))
+                    .or_else(|| lambda_call_target(op, beam))
                     .filter(|target| !native_labels.contains(target))
                     .map(|target| (op.name().to_owned(), target))
             });
@@ -1545,12 +1537,25 @@ pub fn compile_module_with_env_and_funcs(
         }
         compiled.clear();
         let mut failure_index = None;
+        let may_load_nif = beam.imports.iter().any(|import| {
+            import.arity == 2
+                && beam.atom(import.module_atom) == Some("erlang")
+                && beam.atom(import.function_atom) == Some("load_nif")
+        });
+        let has_nif_start = candidates
+            .iter()
+            .any(|(_, _, _, ops)| ops.iter().any(|op| op.name() == "nif_start"));
         let mut failure_reason = None;
 
         for (index, (name, arity, label, ops)) in candidates.iter().enumerate() {
             assembler.begin_dump_function(name, *arity);
             let dump_enabled = assembler.dump_enabled();
             let native_body = env.native_body(name, *arity);
+            // Port of erts/emulator/beam/jit/arm/generators.tab:403-412 and asm_load.c:185-190
+            // (may_load_nif, are_nifs), OTP-29.1.1: functions a load_nif can replace.
+            let nif_candidate = native_body.is_none()
+                && may_load_nif
+                && (!has_nif_start || ops.iter().any(|op| op.name() == "nif_start"));
             for op in ops {
                 let start = if dump_enabled {
                     assembler.code_offset()
@@ -1577,12 +1582,22 @@ pub fn compile_module_with_env_and_funcs(
                     }
                     break;
                 }
-                if let Err(error) = emit_op(&mut assembler, op, &beam, env) {
+                if let Err(error) = emit_op(&mut assembler, op, beam, env) {
                     failure_index = Some(index);
                     failure_reason = Some((
                         op.name().to_owned(),
                         format!("{error}; operands {:?}", op.operands()),
                     ));
+                    break;
+                }
+                if nif_candidate
+                    && op.name() == "i_breakpoint_trampoline"
+                    && let Some((identity, helper)) = env.dynamic_nif_body(name, *arity)
+                    && let Err(error) =
+                        assembler.emit_nif_patch_site(identity, helper, *arity as usize)
+                {
+                    failure_index = Some(index);
+                    failure_reason = Some(("i_nif_padding".to_owned(), format!("{error:?}")));
                     break;
                 }
                 if dump_enabled {
@@ -1625,7 +1640,7 @@ pub fn compile_module_with_env_and_funcs(
         .finalize()
         .map_err(|error| CompileError::Assemble(format!("{}: {error:?}", beam.module)))?;
     for (&index, &target) in &native.lambda_entries {
-        env.publish_lambda_target(&beam, index, target as usize)
+        env.publish_lambda_target(beam, index, target as usize)
             .map_err(|error| CompileError::Assemble(format!("{}: {error}", beam.module)))?;
     }
     let mut functions = Vec::with_capacity(compiled.len());
@@ -1643,7 +1658,7 @@ pub fn compile_module_with_env_and_funcs(
         }
     }
     Ok(CompiledModule {
-        name: beam.module,
+        name: beam.module.clone(),
         functions,
         unported,
         native,
@@ -3094,7 +3109,10 @@ fn emit_op(
             }
             "i_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:224-237, OTP-29.1.1.
-                assembler.emit_i_breakpoint_trampoline(env.breakpoint_helper())
+                assembler.emit_i_breakpoint_trampoline(
+                    env.light_bif_fragment(),
+                    arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY,
+                )
             }
             "i_test_yield" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.

@@ -196,21 +196,31 @@ impl BeamModuleAssembler {
         dest: u32,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
-        self.emit_wait(hooks.wait_unlocked, dest)
+        let start = self.code.offset();
+        self.emit_wait(hooks.wait_unlocked, dest, start)
     }
 
     /// Waits with the queue lock held, then returns to the scheduler.
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:182-198, OTP-29.1.1
     pub fn emit_wait_locked(&mut self, dest: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
-        self.emit_wait(hooks.wait_locked, dest)
+        let start = self.code.offset();
+        self.emit_wait(hooks.wait_locked, dest, start)
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:271-295, OTP-29.1.1.
     // The hook records the wait for the scheduler; the process then leaves native code as
     // a yield that resumes at `dest` (the `loop_rec` label of the receive).
-    fn emit_wait(&mut self, hook: WaitHook, dest: u32) -> Result<(), ModuleError> {
+    //
+    // A receive without clauses targets the wait itself: its queued messages never match,
+    // so it sleeps until a new message arrives. Bit 0 of the resume address tells the hook.
+    fn emit_wait(&mut self, hook: WaitHook, dest: u32, start: usize) -> Result<(), ModuleError> {
         let dest = self.label(dest);
+        let self_target = self.code.label_offset(dest) == Some(start);
         self.code.adr(Gpr::x(9), dest)?;
+        if self_target {
+            self.code
+                .emit(|e| e.add_imm(Gpr::x(9), Gpr::x(9), 1, false))?;
+        }
         self.emit_runtime_hook_with(hook as usize, &[Gpr::x(9)], 0, crate::Update::NONE)?;
         self.code.adr(Gpr::x(8), dest)?;
         self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
@@ -227,13 +237,14 @@ impl BeamModuleAssembler {
         dest: u32,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
+        let start = self.code.offset();
         self.emit_runtime_hook_with(
             hooks.take_receive_lock as usize,
             &[],
             0,
             crate::Update::NONE,
         )?;
-        self.emit_wait_timeout_locked(timeout, dest, hooks)
+        self.emit_wait_timeout_at(timeout, dest, hooks, start)
     }
 
     /// Waits for a message or timeout while holding the receive lock.
@@ -243,6 +254,17 @@ impl BeamModuleAssembler {
         timeout: ArgVal,
         dest: u32,
         hooks: ReceiveHooks,
+    ) -> Result<(), ModuleError> {
+        let start = self.code.offset();
+        self.emit_wait_timeout_at(timeout, dest, hooks, start)
+    }
+
+    fn emit_wait_timeout_at(
+        &mut self,
+        timeout: ArgVal,
+        dest: u32,
+        hooks: ReceiveHooks,
+        start: usize,
     ) -> Result<(), ModuleError> {
         let timeout = self.source_reg(timeout)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(9), timeout))?;
@@ -261,7 +283,7 @@ impl BeamModuleAssembler {
         self.code.b_cond(Cond::Eq, next)?;
         self.branch_error()?;
         self.code.bind(wait)?;
-        self.emit_wait_locked(dest, hooks)?;
+        self.emit_wait(hooks.wait_locked, dest, start)?;
         self.code.bind(next)?;
         Ok(())
     }

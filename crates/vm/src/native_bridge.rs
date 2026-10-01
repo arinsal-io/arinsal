@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Symbolic information attached to one executable native code range.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeFunction {
+    /// Code scope (node) the code belongs to; 0 registers it for every node.
+    pub scope: u64,
     /// Inclusive first byte of generated code.
     pub start: usize,
     /// Exclusive end of generated code.
@@ -260,15 +262,20 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
     let mut functions = native_functions()
         .write()
         .map_err(|_| "native function registry poisoned")?;
-    if functions
-        .iter()
-        .any(|entry| info.start < entry.end && entry.start < info.end)
-    {
+    // The registry stays sorted by start: only the neighbours can overlap.
+    let index = functions.partition_point(|function| function.start < info.start);
+    let overlaps_previous = index
+        .checked_sub(1)
+        .and_then(|previous| functions.get(previous))
+        .is_some_and(|previous| info.start < previous.end);
+    let overlaps_next = functions
+        .get(index)
+        .is_some_and(|next| next.start < info.end);
+    if overlaps_previous || overlaps_next {
         return Err("native function ranges must not overlap");
     }
-    functions.push(info);
-    functions.sort_unstable_by_key(|function| function.start);
-    if std::env::var_os("ARINSAL_BEAMASM_LIFETIME").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    functions.insert(index, info);
+    if crate::native_bridge::lifetime_trace_enabled() {
         let function = functions
             .iter()
             .find(|function| function.start == start)
@@ -296,7 +303,7 @@ pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
     if removed == 0 {
         return;
     }
-    if std::env::var_os("ARINSAL_BEAMASM_LIFETIME").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if crate::native_bridge::lifetime_trace_enabled() {
         for entry in entries {
             eprintln!(
                 "[beamasm-lifetime] native unregister {}/{}:{} range={:#x}..{:#x}",
@@ -394,6 +401,7 @@ fn native_arity_at(address: usize) -> Option<u8> {
 
 /// Every registered native function of `module`, keyed by name and arity.
 pub(crate) fn native_functions_of(
+    scope: u64,
     module: &str,
 ) -> std::collections::HashMap<(String, u8), NativeFunction> {
     native_functions().read().map_or_else(
@@ -401,7 +409,9 @@ pub(crate) fn native_functions_of(
         |functions| {
             functions
                 .iter()
-                .filter(|entry| entry.module == module)
+                .filter(|entry| {
+                    (entry.scope == scope || entry.scope == 0) && entry.module == module
+                })
                 .map(|entry| ((entry.function.clone(), entry.arity), entry.clone()))
                 .collect()
         },
@@ -409,6 +419,7 @@ pub(crate) fn native_functions_of(
 }
 
 pub(crate) fn native_function_for(
+    scope: u64,
     module: &str,
     function: &str,
     arity: u8,
@@ -417,7 +428,12 @@ pub(crate) fn native_function_for(
         .read()
         .ok()?
         .iter()
-        .find(|entry| entry.module == module && entry.function == function && entry.arity == arity)
+        .find(|entry| {
+            (entry.scope == scope || entry.scope == 0)
+                && entry.module == module
+                && entry.function == function
+                && entry.arity == arity
+        })
         .cloned()
 }
 
@@ -435,7 +451,7 @@ pub fn run_native(
     let arity = native_arity_at(code_address).ok_or_else(|| {
         VmError::Unsupported(format!("unregistered native entry: {code_address:#x}"))
     })?;
-    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some()
+    if crate::native_bridge::return_trace_enabled()
         && let Some(function) = native_function_at(code_address)
     {
         eprintln!(
@@ -493,7 +509,7 @@ pub fn run_native(
         }
     }
     let code_ptr = code_address as *const std::ffi::c_void;
-    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some()
+    if crate::native_bridge::return_trace_enabled()
         && let Some(function) = native_function_at(code_address)
     {
         eprintln!(
@@ -526,7 +542,7 @@ pub fn run_native(
     process.header.ftrace = (registers as *mut SchedulerRegisters).cast();
     registers.tmp_mem[3] = 0;
     process.heap.set_native_allocation(true);
-    if std::env::var_os("ARINSAL_BEAMASM_LIFETIME").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if crate::native_bridge::lifetime_trace_enabled() {
         eprintln!(
             "[beamasm-lifetime] enter code={code_address:#x} owner={}",
             crate::beamasm_integration::owns_native_address(code_address)
@@ -540,7 +556,7 @@ pub fn run_native(
     process.heap.set_native_allocation(false);
     let native_ftrace = process.header.ftrace as u64;
     process.header.ftrace = saved_ftrace;
-    if std::env::var_os("ARINSAL_BEAMASM_EXCEPTION_TRACE").is_some() {
+    if crate::native_bridge::exception_trace_enabled() {
         let (base, end) = process.heap.heap_bounds();
         let (_, current_stop) = process.heap.heap_cursor();
         let requested_stop = process.header.stop as usize;
@@ -569,7 +585,7 @@ pub fn run_native(
         // SAFETY: These words were loaded from the process's X register array.
         *destination = unsafe { Term::from_raw_bits(*raw) };
     }
-    if std::env::var_os("ARINSAL_BEAMASM_RETURN_TRACE").is_some()
+    if crate::native_bridge::return_trace_enabled()
         && let Some(function) = native_function_at(code_address)
     {
         eprintln!(
@@ -592,7 +608,7 @@ pub fn run_native(
     }
     if process.header.freason != 0
         && process.header.freason != 1 << 10
-        && std::env::var_os("ARINSAL_BEAMASM_EXCEPTION_TRACE").is_some()
+        && crate::native_bridge::exception_trace_enabled()
     {
         eprintln!(
             "native exception freason={:#x} fvalue={:?} at {:?}",
@@ -619,7 +635,7 @@ pub fn run_native(
         let arity = native_function_at(registers.tmp_mem[6] as usize)
             .map_or(0, |function| usize::from(function.arity));
         let args = process.x[..arity.min(process.x.len())].to_vec();
-        if std::env::var_os("ARINSAL_BEAMASM_EXCEPTION_TRACE").is_some() {
+        if crate::native_bridge::exception_trace_enabled() {
             eprintln!(
                 "native function_clause in {:?} args={:?}",
                 native_function_at(registers.tmp_mem[6] as usize)
@@ -783,4 +799,26 @@ pub fn run_native(
         }
     };
     Ok(outcome)
+}
+
+fn env_flag(cell: &'static OnceLock<bool>, name: &str, test: fn(&std::ffi::OsStr) -> bool) -> bool {
+    *cell.get_or_init(|| std::env::var_os(name).is_some_and(|value| test(&value)))
+}
+
+/// `ARINSAL_BEAMASM_RETURN_TRACE`: log native entries and exits.
+pub(crate) fn return_trace_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    env_flag(&FLAG, "ARINSAL_BEAMASM_RETURN_TRACE", |_| true)
+}
+
+/// `ARINSAL_BEAMASM_EXCEPTION_TRACE`: log native exceptions.
+pub(crate) fn exception_trace_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    env_flag(&FLAG, "ARINSAL_BEAMASM_EXCEPTION_TRACE", |_| true)
+}
+
+/// `ARINSAL_BEAMASM_LIFETIME=1`: log native code memory lifetimes.
+pub(crate) fn lifetime_trace_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    env_flag(&FLAG, "ARINSAL_BEAMASM_LIFETIME", |value| value == "1")
 }

@@ -429,7 +429,7 @@ fn spawn_mfa_with_priority(
             child.cold_mut().initial_bif = Some((m_name, f_name, arity));
         }
     }
-    child.runtime = parent.runtime.clone();
+    child.set_runtime(parent.runtime.clone());
     if let (Some(module_name), Some(function_name)) = (
         arinsal_term::global_atoms().text(m),
         arinsal_term::global_atoms().text(f),
@@ -647,7 +647,7 @@ fn spawn_fun_with_priority(
     child.module = module_id;
     child.ip = target;
     child.initial_call = Some((apply_module, apply_ip));
-    child.runtime = parent.runtime.clone();
+    child.set_runtime(parent.runtime.clone());
     child.cold_mut().initial_call = Some(("erlang".to_owned(), "apply".to_owned(), 2));
     child.cold_mut().group_leader = Some(
         parent

@@ -27,16 +27,21 @@ pub fn register_native_code_range(start: usize, end: usize) -> Result<(), &'stat
     let mut ranges = ranges()
         .write()
         .map_err(|_| "native code registry poisoned")?;
-    if ranges
-        .iter()
-        .any(|&(registered_start, registered_end)| start < registered_end && registered_start < end)
-    {
+    // The registry stays sorted by start: only the neighbours can overlap.
+    let index = ranges.partition_point(|range| range.0 < start);
+    let overlaps_previous = index
+        .checked_sub(1)
+        .and_then(|previous| ranges.get(previous))
+        .is_some_and(|&(_, previous_end)| start < previous_end);
+    let overlaps_next = ranges
+        .get(index)
+        .is_some_and(|&(next_start, _)| next_start < end);
+    if overlaps_previous || overlaps_next {
         return Err("native code ranges must not overlap");
     }
-    ranges.push((start, end));
+    ranges.insert(index, (start, end));
     HULL_START.fetch_min(start, Ordering::AcqRel);
     HULL_END.fetch_max(end, Ordering::AcqRel);
-    ranges.sort_unstable_by_key(|range| range.0);
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use arinsal_beamasm::{
     guard::{GuardHelper, GuardHelper3},
 };
 use arinsal_beamjit::{
-    BifMfaHelper, MapLookupHelper, ModuleEnv, compile_module_with_env_and_funcs,
+    BifMfaHelper, MapLookupHelper, ModuleEnv, compile_parsed_module_with_env_and_funcs,
 };
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use std::collections::HashMap;
@@ -18,14 +18,23 @@ use std::sync::{OnceLock, RwLock, Weak};
 type Mfa = (String, String, u8);
 
 /// Function-indexed BeamAsm target cache, invalidated when native code is published.
-#[derive(Default)]
 pub(crate) struct NativeTargetCache {
+    scope: u64,
     targets: Vec<Vec<Option<crate::NativeFunction>>>,
     generations: Vec<u64>,
     module_identities: Vec<usize>,
 }
 
 impl NativeTargetCache {
+    pub(crate) fn new(scope: u64) -> Self {
+        Self {
+            scope,
+            targets: Vec::new(),
+            generations: Vec::new(),
+            module_identities: Vec::new(),
+        }
+    }
+
     pub(crate) fn register_module(&mut self, module_id: usize, module: &arinsal_loader::Module) {
         let targets = vec![None; module.functions.len()];
         if module_id == self.targets.len() {
@@ -54,6 +63,11 @@ impl NativeTargetCache {
         module: &arinsal_loader::Module,
         target: usize,
     ) -> Option<crate::NativeFunction> {
+        // Only a function entry enters native code at the function's start; any other
+        // target (an export breakpoint stub, a label inside a function) stays interpreted.
+        if module.entry_arity.get(target).copied().unwrap_or(0) == 0 {
+            return None;
+        }
         let index = *module.on_entry_fn.get(target)?;
         if index == u32::MAX {
             return None;
@@ -66,7 +80,7 @@ impl NativeTargetCache {
         let generation = crate::native_bridge::native_registry_generation();
         if self.generations.get(module_id).copied()? != generation {
             // One registry pass per module: a lookup per function would be quadratic.
-            let mut natives = crate::native_bridge::native_functions_of(&module.name);
+            let mut natives = crate::native_bridge::native_functions_of(self.scope, &module.name);
             let cache = self.targets.get_mut(module_id)?;
             cache.clear();
             cache.extend(
@@ -93,12 +107,24 @@ struct DispatchTarget {
     native_bits: usize,
 }
 
+/// One node's export state, like an erts code index: import slots, interpreted and native
+/// export targets and global call breakpoints.
 #[derive(Default)]
-struct DispatchRegistry {
-    imports: HashMap<(String, u32), Arc<DispatchTarget>>,
-    by_identity: HashMap<usize, Arc<DispatchTarget>>,
+struct ScopeExports {
+    // Keyed by importing module, import index and the imported MFA: a reloaded module whose
+    // import table differs must not reuse another function's slot.
+    imports: HashMap<(String, u32, Mfa), Arc<DispatchTarget>>,
     target_indices: HashMap<Mfa, usize>,
     native_targets: HashMap<Mfa, usize>,
+    // Exports with a global call breakpoint: their callers go through the export
+    // trampoline, whose interpreted export entry is the breakpoint.
+    global_breakpoints: std::collections::HashSet<Mfa>,
+}
+
+#[derive(Default)]
+struct DispatchRegistry {
+    scopes: HashMap<u64, ScopeExports>,
+    by_identity: HashMap<usize, Arc<DispatchTarget>>,
     // Slots for `call_bif_mfa`; unlike imports they always enter the BIF itself.
     bif_mfas: HashMap<Mfa, Arc<DispatchTarget>>,
 }
@@ -106,6 +132,26 @@ struct DispatchRegistry {
 fn dispatch_registry() -> &'static RwLock<DispatchRegistry> {
     static REGISTRY: OnceLock<RwLock<DispatchRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| RwLock::new(DispatchRegistry::default()))
+}
+
+/// Allocates the code scope of a new node.
+pub(crate) fn new_code_scope() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Forgets the export state of a node whose code is gone.
+pub(crate) fn release_code_scope(scope: u64) {
+    let Ok(mut registry) = dispatch_registry().write() else {
+        return;
+    };
+    if let Some(exports) = registry.scopes.remove(&scope) {
+        for entry in exports.imports.values() {
+            registry
+                .by_identity
+                .remove(&(Arc::as_ptr(&entry.slot) as usize));
+        }
+    }
 }
 
 fn fragments() -> Option<&'static DispatchFragments> {
@@ -122,46 +168,44 @@ fn fragments() -> Option<&'static DispatchFragments> {
         .as_ref()
 }
 
-fn import_entries(module: &arinsal_loader::Module) -> Option<Vec<usize>> {
+fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usize>> {
     let trampoline = fragments()?.export_trampoline();
     let mut registry = dispatch_registry().write().ok()?;
-    Some(
-        module
-            .imports
-            .iter()
-            .enumerate()
-            .map(|(index, import)| {
-                let key = (module.name.clone(), index as u32);
-                let entry = Arc::clone(registry.imports.entry(key).or_insert_with(|| {
-                    // A module can be compiled before the VM classified its imports.
-                    let (class, bits) = if import.class() == arinsal_loader::ImportClass::Fresh {
-                        crate::natives::classify(
-                            &import.module,
-                            &import.function,
-                            import.arity,
-                            import.bif_fn().is_some(),
-                        )
-                    } else {
-                        (import.class(), import.native_bits())
-                    };
-                    Arc::new(DispatchTarget {
-                        slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(trampoline)),
-                        module: import.module.clone(),
-                        function: import.function.clone(),
-                        module_atom: import.module_atom,
-                        function_atom: import.function_atom,
-                        arity: import.arity,
-                        bif: import.bif_fn(),
-                        class,
-                        native_bits: bits,
-                    })
-                }));
-                let identity = Arc::as_ptr(&entry.slot) as usize;
-                registry.by_identity.insert(identity, Arc::clone(&entry));
-                identity
+    let mut identities = Vec::with_capacity(module.imports.len());
+    for (index, import) in module.imports.iter().enumerate() {
+        let mfa = (import.module.clone(), import.function.clone(), import.arity);
+        let key = (module.name.clone(), index as u32, mfa.clone());
+        let exports = registry.scopes.entry(scope).or_default();
+        let address = import_slot_address(exports, &mfa, trampoline);
+        let entry = Arc::clone(exports.imports.entry(key).or_insert_with(|| {
+            // A module can be compiled before the VM classified its imports.
+            let (class, bits) = if import.class() == arinsal_loader::ImportClass::Fresh {
+                crate::natives::classify(
+                    &import.module,
+                    &import.function,
+                    import.arity,
+                    import.bif_fn().is_some(),
+                )
+            } else {
+                (import.class(), import.native_bits())
+            };
+            Arc::new(DispatchTarget {
+                slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(address)),
+                module: import.module.clone(),
+                function: import.function.clone(),
+                module_atom: import.module_atom,
+                function_atom: import.function_atom,
+                arity: import.arity,
+                bif: import.bif_fn(),
+                class,
+                native_bits: bits,
             })
-            .collect(),
-    )
+        }));
+        let identity = Arc::as_ptr(&entry.slot) as usize;
+        registry.by_identity.insert(identity, entry);
+        identities.push(identity);
+    }
+    Some(identities)
 }
 
 /// Returns the dispatch slot that runs the BIF `module:function/arity` from its stub body.
@@ -191,55 +235,112 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     Some(identity)
 }
 
-fn publish_module(module: &arinsal_loader::Module, native: &[(Mfa, usize)]) {
+fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, usize)]) {
     let Ok(mut registry) = dispatch_registry().write() else {
         return;
     };
-    registry
+    let exports = registry.scopes.entry(scope).or_default();
+    exports
         .target_indices
         .retain(|(name, _, _), _| name != &module.name);
-    registry
+    exports
         .native_targets
         .retain(|(name, _, _), _| name != &module.name);
     for export in &module.exports {
-        registry.target_indices.insert(
+        exports.target_indices.insert(
             (module.name.clone(), export.function.clone(), export.arity),
             export.target(),
         );
     }
     for (mfa, address) in native {
-        registry.native_targets.insert(mfa.clone(), *address);
+        exports.native_targets.insert(mfa.clone(), *address);
     }
-    let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
-    for entry in registry.imports.values() {
-        let mfa = (entry.module.clone(), entry.function.clone(), entry.arity);
-        let address = registry
-            .native_targets
-            .get(&mfa)
-            .copied()
-            .unwrap_or(trampoline);
-        entry.slot.update(address);
-    }
+    refresh_import_slots(exports);
 }
 
-fn unpublish_module(native: &[(Mfa, usize)]) {
+/// Sends native callers of a deleted module's exports to the export trampoline, whose
+/// interpreted dispatch finds no current module and calls the error handler.
+// Port of erts/emulator/beam/beam_bif_load.c:679-720 (delete_module_1: export addresses
+// point at the error handler stub), OTP-29.1.1.
+pub(crate) fn unpublish_module_exports(scope: u64, name: &str) {
     let Ok(mut registry) = dispatch_registry().write() else {
         return;
     };
+    let Some(exports) = registry.scopes.get_mut(&scope) else {
+        return;
+    };
+    exports
+        .target_indices
+        .retain(|(module, _, _), _| module != name);
+    exports
+        .native_targets
+        .retain(|(module, _, _), _| module != name);
+    refresh_import_slots(exports);
+}
+
+fn unpublish_module(scope: u64, native: &[(Mfa, usize)]) {
+    let Ok(mut registry) = dispatch_registry().write() else {
+        return;
+    };
+    let Some(exports) = registry.scopes.get_mut(&scope) else {
+        return;
+    };
     for (mfa, address) in native {
-        if registry.native_targets.get(mfa) == Some(address) {
-            registry.native_targets.remove(mfa);
+        if exports.native_targets.get(mfa) == Some(address) {
+            exports.native_targets.remove(mfa);
         }
     }
+    refresh_import_slots(exports);
+}
+
+// Port of erts/emulator/beam/beam_bp.c:1180-1230 (erts_set_trace_pattern: a global
+// breakpoint redirects the export's addresses to its trampoline), OTP-29.1.1.
+fn import_slot_address(exports: &ScopeExports, mfa: &Mfa, trampoline: usize) -> usize {
+    if exports.global_breakpoints.contains(mfa) {
+        return trampoline;
+    }
+    exports
+        .native_targets
+        .get(mfa)
+        .copied()
+        .unwrap_or(trampoline)
+}
+
+fn refresh_import_slots(exports: &ScopeExports) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
-    for entry in registry.imports.values() {
+    for entry in exports.imports.values() {
         let mfa = (entry.module.clone(), entry.function.clone(), entry.arity);
-        let address = registry
-            .native_targets
-            .get(&mfa)
-            .copied()
-            .unwrap_or(trampoline);
-        entry.slot.update(address);
+        entry
+            .slot
+            .update(import_slot_address(exports, &mfa, trampoline));
+    }
+}
+
+/// Routes native callers of an export through its interpreted entry, `target`, while a
+/// global call breakpoint is set on it.
+pub(crate) fn set_global_breakpoint(
+    scope: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+    target: usize,
+    enabled: bool,
+) {
+    let Ok(mut registry) = dispatch_registry().write() else {
+        return;
+    };
+    let exports = registry.scopes.entry(scope).or_default();
+    let mfa = (module.to_owned(), function.to_owned(), arity);
+    let changed = if enabled {
+        exports.global_breakpoints.insert(mfa.clone())
+    } else {
+        exports.global_breakpoints.remove(&mfa)
+    };
+    if let Some(index) = exports.target_indices.get_mut(&mfa) {
+        *index = target;
+    }
+    if changed {
+        refresh_import_slots(exports);
     }
 }
 
@@ -269,9 +370,16 @@ pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
 }
 
 /// Returns the published native entry for an MFA, if this module was BeamAsm-compiled.
-pub(crate) fn native_target_for(module: &str, function: &str, arity: u8) -> Option<usize> {
+pub(crate) fn native_target_for(
+    scope: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Option<usize> {
     let registry = dispatch_registry().read().ok()?;
     registry
+        .scopes
+        .get(&scope)?
         .native_targets
         .get(&(module.to_owned(), function.to_owned(), arity))
         .copied()
@@ -283,11 +391,20 @@ pub(crate) fn call_fun_unported_entry() -> usize {
 }
 
 /// Native entry for an exported MFA; local functions must stay unreachable through `apply`.
-pub(crate) fn exported_native_target(module: &str, function: &str, arity: u8) -> Option<usize> {
+pub(crate) fn exported_native_target(
+    scope: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Option<usize> {
     let registry = dispatch_registry().read().ok()?;
+    let exports = registry.scopes.get(&scope)?;
     let key = (module.to_owned(), function.to_owned(), arity);
-    registry.target_indices.contains_key(&key).then_some(())?;
-    registry.native_targets.get(&key).copied()
+    exports.target_indices.contains_key(&key).then_some(())?;
+    if exports.global_breakpoints.contains(&key) {
+        return None;
+    }
+    exports.native_targets.get(&key).copied()
 }
 
 /// Shared fragment that exits native code so the scheduler can interpret `apply Arity`.
@@ -306,10 +423,17 @@ pub(crate) fn dispatch_bif(identity: usize) -> Option<(arinsal_bifs::BifFn, u8)>
     Some((target.bif?, target.arity))
 }
 
-pub(crate) fn interpreted_target(module: &str, function: &str, arity: u8) -> Option<usize> {
+pub(crate) fn interpreted_target(
+    scope: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Option<usize> {
     dispatch_registry()
         .read()
         .ok()?
+        .scopes
+        .get(&scope)?
         .target_indices
         .get(&(module.to_owned(), function.to_owned(), arity))
         .copied()
@@ -325,15 +449,20 @@ static CALL_UNPORTED: AtomicU64 = AtomicU64::new(0);
 static PRINTED: AtomicBool = AtomicBool::new(false);
 
 fn lifetime_trace_enabled() -> bool {
-    std::env::var_os("ARINSAL_BEAMASM_LIFETIME").as_deref() == Some(std::ffi::OsStr::new("1"))
+    crate::native_bridge::lifetime_trace_enabled()
 }
 
 /// Owns a compiled module version and the heap that backs its embedded literals.
 pub(crate) struct CompiledVersion {
     module: String,
+    scope: u64,
     memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
     trace_breakpoints: Vec<(Mfa, usize, u32)>,
+    // Function, arity, call-NIF identity and the patch word that enables its body.
+    nif_patches: Vec<(String, u8, usize, usize)>,
     literal_heap: Option<Box<VecHeap>>,
+    // The module's literal area, which native code refers to directly.
+    _module_literals: Arc<VecHeap>,
     native_functions: Vec<crate::NativeFunction>,
     native_targets: Vec<(Mfa, usize)>,
     code_start: usize,
@@ -344,12 +473,22 @@ pub(crate) struct CompiledVersion {
 
 /// Enable or remove native entry breakpoints for a traced function.
 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250, OTP-29.1.1.
-pub(crate) fn patch_native_breakpoint(module: &str, function: &str, arity: u8, enabled: bool) {
+pub(crate) fn patch_native_breakpoint(
+    scope: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+    enabled: bool,
+) {
     let Ok(mut versions) = compiled_versions().write() else {
         return;
     };
     versions.retain(|version| version.strong_count() != 0);
-    for version in versions.iter().filter_map(Weak::upgrade) {
+    for version in versions
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|version| version.scope == scope)
+    {
         for ((owner, name, found_arity), offset, branch) in &version.trace_breakpoints {
             if owner != module || name != function || *found_arity != arity {
                 continue;
@@ -363,8 +502,37 @@ pub(crate) fn patch_native_breakpoint(module: &str, function: &str, arity: u8, e
 }
 
 impl CompiledVersion {
+    /// Whether this version has native code for `function/arity`.
+    pub(crate) fn has_native_function(&self, function: &str, arity: u8) -> bool {
+        self.native_functions
+            .iter()
+            .any(|native| native.function == function && native.arity == arity)
+    }
+
+    /// Makes native entries of `function/arity` run the NIF `entry` loaded by `load_nif`.
+    // Port of erts/emulator/beam/erl_nif.c:5050-5260 (patch_call_nif_early and the load_nif
+    // finishers), OTP-29.1.1.
+    pub(crate) fn bind_nif(&self, function: &str, arity: u8, entry: arinsal_bifs::BifFn) -> bool {
+        let Some((_, _, identity, offset)) = self
+            .nif_patches
+            .iter()
+            .find(|(name, found, _, _)| name == function && *found == arity)
+        else {
+            return false;
+        };
+        if !crate::native_helpers::bind_nif_slot(*identity, entry) {
+            return false;
+        }
+        let Ok(mut memory) = self.memory.lock() else {
+            return false;
+        };
+        memory
+            .write_bytes(*offset, &0xd503_201f_u32.to_le_bytes())
+            .is_ok()
+    }
+
     pub(crate) fn publish(&self, module: &arinsal_loader::Module) {
-        publish_module(module, &self.native_targets);
+        publish_module(self.scope, module, &self.native_targets);
     }
     /// The half-open address range of this version's native code.
     pub(crate) fn code_range(&self) -> (usize, usize) {
@@ -401,9 +569,12 @@ impl Drop for CompiledVersion {
         {
             retired.push(heap);
         }
+        crate::native_helpers::release_nif_slots(
+            self.nif_patches.iter().map(|(_, _, identity, _)| *identity),
+        );
         crate::native_bridge::unregister_native_functions(&self.native_functions);
         crate::native_bridge::unregister_native_catches(&self.catch_ids);
-        unpublish_module(&self.native_targets);
+        unpublish_module(self.scope, &self.native_targets);
         if lifetime_trace_enabled() {
             eprintln!(
                 "[beamasm-lifetime] CodeMemory drop module={} range={:#x}..{:#x}",
@@ -431,8 +602,21 @@ pub(crate) fn owns_native_address(address: usize) -> bool {
 
 pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
-        std::env::var_os("ARINSAL_BEAMASM").as_deref() == Some(std::ffi::OsStr::new("1"))
+        let enabled = beamasm_enabled(
+            std::env::var_os("ARINSAL_INTERP"),
+            std::env::var_os("ARINSAL_BEAMASM"),
+        );
+        arinsal_bifs::set_emu_flavor_jit(enabled);
+        enabled
     })
+}
+
+fn beamasm_enabled(
+    interp: Option<std::ffi::OsString>,
+    beamasm: Option<std::ffi::OsString>,
+) -> bool {
+    interp.as_deref() != Some(std::ffi::OsStr::new("1"))
+        && beamasm.as_deref() != Some(std::ffi::OsStr::new("0"))
 }
 
 struct VmModuleEnv<'a> {
@@ -445,6 +629,9 @@ struct VmModuleEnv<'a> {
     light_bif_fragment: usize,
     send_fragment: usize,
     native_bodies: HashMap<(String, u8), (usize, usize)>,
+    module_name: String,
+    // Call-NIF bodies reserved for functions a later load_nif may replace.
+    dynamic_nifs: std::cell::RefCell<HashMap<(String, u8), usize>>,
     _lifetime: std::marker::PhantomData<&'a BeamFile>,
 }
 
@@ -458,6 +645,13 @@ impl<'a> VmModuleEnv<'a> {
     ) -> Result<Self, String> {
         let mut literals = Vec::with_capacity(beam.literals.len());
         for index in 0..beam.literals.len() {
+            // Port of erts/emulator/beam/jit/asm_load.c (beamasm_codegen: literals live in the
+            // module's literal area), OTP-29.1.1: native code refers to the same literal terms
+            // as the interpreter's code of this module.
+            if let Some(term) = module.literal_term(index as u32) {
+                literals.push(raw_word(term));
+                continue;
+            }
             let value = beam
                 .literal(index as u32)
                 .map_err(|error| error.to_string())?;
@@ -520,6 +714,8 @@ impl<'a> VmModuleEnv<'a> {
             light_bif_fragment: fragments.call_light_bif(),
             send_fragment: fragments.send(),
             native_bodies,
+            module_name: module.name.clone(),
+            dynamic_nifs: std::cell::RefCell::new(HashMap::new()),
             _lifetime: std::marker::PhantomData,
         })
     }
@@ -646,6 +842,24 @@ impl ModuleEnv for VmModuleEnv<'_> {
         self.native_bodies.get(&(name.to_owned(), arity)).copied()
     }
 
+    fn dynamic_nif_body(&self, name: &str, arity: u8) -> Option<(usize, usize)> {
+        let identity = *self
+            .dynamic_nifs
+            .borrow_mut()
+            .entry((name.to_owned(), arity))
+            .or_insert_with(|| {
+                crate::native_helpers::reserve_nif_slot(
+                    self.module_name.clone(),
+                    name.to_owned(),
+                    arity,
+                )
+            });
+        Some((
+            identity,
+            crate::native_helpers::arinsal_beamasm_static_nif as *const () as usize,
+        ))
+    }
+
     fn publish_lambda_target(
         &self,
         _beam: &BeamFile,
@@ -667,10 +881,6 @@ impl ModuleEnv for VmModuleEnv<'_> {
     fn light_bif_fragment(&self) -> usize {
         self.light_bif_fragment
     }
-    fn breakpoint_helper(&self) -> usize {
-        crate::native_helpers::arinsal_beamasm_breakpoint as *const () as usize
-    }
-
     fn send_fragment(&self) -> usize {
         self.send_fragment
     }
@@ -777,6 +987,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
 pub(crate) fn compile(
     bytes: &[u8],
     module: &arinsal_loader::Module,
+    scope: u64,
 ) -> Option<Arc<CompiledVersion>> {
     if !enabled() {
         return None;
@@ -804,24 +1015,28 @@ pub(crate) fn compile(
     let function_allowlist = std::env::var("ARINSAL_BEAMASM_FUNCS").ok();
     let beam = arinsal_beam::parse(bytes).ok()?;
     let fragments = fragments()?;
-    let export_entries = import_entries(module)?;
-    let mut literal_heap = Box::new(VecHeap::new());
+    let export_entries = import_entries(scope, module)?;
+    // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
+    let mut literal_heap = Box::new(VecHeap::new_literal());
     let env = VmModuleEnv::new(&beam, module, &mut literal_heap, export_entries, fragments).ok()?;
     let trace = crate::calls::trace_boot_enabled();
     if trace {
         eprintln!("arinsal boot: beamasm compiling {}", beam.module);
     }
-    let compiled =
-        match compile_module_with_env_and_funcs(bytes, &env, function_allowlist.as_deref()) {
-            Ok(compiled) => compiled,
-            Err(error) => {
-                eprintln!(
-                    "arinsal boot: beamasm compile failed for {}: {error:?}",
-                    beam.module
-                );
-                return None;
-            }
-        };
+    let compiled = match compile_parsed_module_with_env_and_funcs(
+        &beam,
+        &env,
+        function_allowlist.as_deref(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            eprintln!(
+                "arinsal boot: beamasm compile failed for {}: {error:?}",
+                beam.module
+            );
+            return None;
+        }
+    };
     let runtime_functions = compiled
         .functions
         .iter()
@@ -857,6 +1072,26 @@ pub(crate) fn compile(
     }
     // Fun entries whose dispatch this version may publish; purging the version resets them.
     let lambda_entries = env.lambda_entries.values().cloned().collect::<Vec<_>>();
+    let reserved = env.dynamic_nifs.take();
+    let nif_patches = compiled
+        .native
+        .nif_patches
+        .iter()
+        .filter_map(|(&label, &offset)| {
+            let function = compiled
+                .functions
+                .iter()
+                .find(|function| function.label == label)?;
+            let identity = *reserved.get(&(function.name.clone(), function.arity))?;
+            Some((function.name.clone(), function.arity, identity, offset))
+        })
+        .collect::<Vec<_>>();
+    let unused = reserved
+        .values()
+        .copied()
+        .filter(|identity| !nif_patches.iter().any(|patch| patch.2 == *identity))
+        .collect::<Vec<_>>();
+    crate::native_helpers::release_nif_slots(unused);
     drop(env);
     MODULES.fetch_add(1, Ordering::Relaxed);
     NATIVE.fetch_add(runtime_functions.len() as u64, Ordering::Relaxed);
@@ -931,6 +1166,7 @@ pub(crate) fn compile(
             .find(|entry| *entry > start)
             .unwrap_or(code_end);
         native_functions.push(crate::NativeFunction {
+            scope,
             start,
             end,
             module: compiled.name.clone(),
@@ -1006,9 +1242,12 @@ pub(crate) fn compile(
     );
     let version = Arc::new(CompiledVersion {
         module: compiled.name.clone(),
+        scope,
         memory: std::sync::Mutex::new(compiled.native.memory),
         trace_breakpoints,
+        nif_patches,
         literal_heap: Some(literal_heap),
+        _module_literals: module.literal_area(),
         native_functions,
         native_targets,
         code_start,
@@ -1071,4 +1310,22 @@ pub(crate) fn print_stats() {
         NATIVE_YIELDS.load(Ordering::Relaxed),
         CALL_UNPORTED.load(Ordering::Relaxed)
     );
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::beamasm_enabled;
+    use std::ffi::OsString;
+
+    #[test]
+    fn beamasm_is_the_default_and_interpreter_flags_override_it() {
+        assert!(beamasm_enabled(None, None));
+        assert!(beamasm_enabled(None, Some(OsString::from("1"))));
+        assert!(!beamasm_enabled(Some(OsString::from("1")), None));
+        assert!(!beamasm_enabled(None, Some(OsString::from("0"))));
+        assert!(!beamasm_enabled(
+            Some(OsString::from("1")),
+            Some(OsString::from("1"))
+        ));
+    }
 }
