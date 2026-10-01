@@ -337,7 +337,7 @@ fn call_statistics(
 fn call_bump_reductions(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:5403 (bump_reductions_1), OTP-29.1.1.
@@ -346,7 +346,10 @@ fn call_bump_reductions(
         .as_small()
         .filter(|value| *value >= 0)
         .ok_or_else(badarg)?;
-    process.reductions -= reductions.min(QUANTUM as i64) as i32;
+    let charged = reductions.min(QUANTUM as i64) as u32;
+    process.reductions -= charged as i32;
+    process.reductions_used = process.reductions_used.saturating_add(u64::from(charged));
+    ctx.consume(charged);
     Ok(atom("true"))
 }
 
@@ -382,7 +385,7 @@ fn call_scheduler_wall_time(
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:5306 (erts_internal_scheduler_wall_time_1), OTP-29.1.1.
     // Any term other than `true` disables accounting. The previous flag is returned.
-    set_scheduler_wall_enabled(process, ctx, atom_name(args[0]).as_deref() == Some("true"))
+    set_scheduler_wall_enabled(process, ctx, atom_name(args[0]) == Some("true"))
 }
 
 fn call_dt_spread_tag(
@@ -498,11 +501,7 @@ fn call_values(
         // boot_loop1: rpc and global query peer nodes while this VM is non-distributed.
         // `node::call` handles the general case first; this arm remains for a direct call.
         ("erlang", "nodes", 2)
-            if args[0]
-                .as_atom()
-                .and_then(|atom| global_atoms().text(atom))
-                .as_deref()
-                == Some("visible")
+            if args[0].as_atom().and_then(|atom| global_atoms().text(atom)) == Some("visible")
                 && args[1].classify() == TermKind::Map =>
         {
             Some(Ok(Term::NIL))
@@ -716,7 +715,7 @@ fn display(term: Term) -> Result<Term, VmError> {
 }
 
 fn term_to_string(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    let limit = if atom_name(args[1]).as_deref() == Some("undefined") {
+    let limit = if atom_name(args[1]) == Some("undefined") {
         i32::MAX as usize
     } else {
         usize::try_from(args[1].as_small().ok_or_else(badarg)?)
@@ -921,7 +920,7 @@ fn display_string(args: &[Term]) -> Result<Term, arinsal_bifs::BifError> {
     let value = arinsal_term::to_owned(args[1]).map_err(|_| arinsal_bifs::BifError::BADARG)?;
     let mut bytes = Vec::new();
     append_string(&value, &mut bytes)?;
-    match destination.as_ref() {
+    match destination {
         "stdout" => std::io::stdout().lock().write_all(&bytes),
         "stderr" => std::io::stderr().lock().write_all(&bytes),
         _ => return Err(arinsal_bifs::BifError::BADARG),
@@ -966,7 +965,7 @@ fn system_info(
     let name = selector
         .as_atom()
         .and_then(|atom| global_atoms().text(atom));
-    match name.as_deref() {
+    match name {
         Some("alloc_util_allocators") => Some(allocator_names(process)),
         Some("allocator") => Some(all_allocator_options(process)),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
@@ -2130,7 +2129,7 @@ fn statistics(
     let Some(name) = atom_name(key) else {
         return Err(badarg());
     };
-    match name.as_ref() {
+    match name {
         "runtime" => {
             let (total, delta) = since(runtime_ms(), &LAST_RUNTIME_MS);
             pair(process, total, delta)
@@ -2167,7 +2166,7 @@ fn statistics(
                 .sum(),
         ),
         "total_run_queue_lengths" | "total_run_queue_lengths_all" => {
-            let all = name.as_ref() == "total_run_queue_lengths_all";
+            let all = name == "total_run_queue_lengths_all";
             non_neg(
                 process,
                 queue_counts(process, ctx.as_deref(), false, all)
@@ -2176,15 +2175,15 @@ fn statistics(
             )
         }
         "run_queue_lengths" | "run_queue_lengths_all" => {
-            let all = name.as_ref() == "run_queue_lengths_all";
+            let all = name == "run_queue_lengths_all";
             int_list(process, &queue_counts(process, ctx.as_deref(), false, all))
         }
         "active_tasks" | "active_tasks_all" => {
-            let all = name.as_ref() == "active_tasks_all";
+            let all = name == "active_tasks_all";
             int_list(process, &queue_counts(process, ctx.as_deref(), true, all))
         }
         "total_active_tasks" | "total_active_tasks_all" => {
-            let all = name.as_ref() == "total_active_tasks_all";
+            let all = name == "total_active_tasks_all";
             non_neg(
                 process,
                 queue_counts(process, ctx.as_deref(), true, all)
@@ -2210,7 +2209,7 @@ fn system_flag(
     let Some(name) = atom_name(args[0]) else {
         return Err(badarg());
     };
-    match name.as_ref() {
+    match name {
         "multi_scheduling" => multi_scheduling(process, ctx, args[1]),
         "schedulers_online" => schedulers_online(process, args[1], false),
         "dirty_cpu_schedulers_online" => schedulers_online(process, args[1], true),
@@ -2230,7 +2229,7 @@ fn system_flag(
         "microstate_accounting" => set_microstate(process, ctx, args[1]),
         "outstanding_system_requests_limit" => outstanding_limit(args[1]),
         "scheduling_statistics" => scheduling_statistics(args[1]),
-        "time_offset" if atom_name(args[1]).as_deref() == Some("finalize") => Ok(atom("final")),
+        "time_offset" if atom_name(args[1]) == Some("finalize") => Ok(atom("final")),
         "scheduler_bind_type" => {
             // Port of erts/emulator/beam/bif.c:5284 and
             // erts/emulator/beam/erl_cpu_topology.c:714, OTP-29.1.1.
@@ -2536,7 +2535,7 @@ fn set_scheduler_wall(
     ctx: &mut RunCtx<'_, Message>,
     value: Term,
 ) -> Result<Term, VmError> {
-    let enable = match atom_name(value).as_deref() {
+    let enable = match atom_name(value) {
         Some("true") => true,
         Some("false") => false,
         _ => return Err(badarg()),
@@ -2811,7 +2810,7 @@ fn multi_scheduling(
     value: Term,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling), OTP-29.1.1.
-    let action = match atom_name(value).as_deref() {
+    let action = match atom_name(value) {
         Some("block") => (Some(true), None),
         Some("unblock") => (Some(false), None),
         Some("block_normal") => (None, Some(true)),
@@ -2877,7 +2876,8 @@ fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term
                     .runtime
                     .as_ref()
                     .and_then(|runtime| runtime.scheduler().ok())
-                && !scheduler.set_online_schedulers(requested as usize)
+                && !scheduler
+                    .set_online_schedulers((requested as usize).min(scheduler.worker_count()))
             {
                 return Err(badarg());
             }
@@ -2953,7 +2953,7 @@ fn outstanding_limit(value: Term) -> Result<Term, VmError> {
 }
 
 fn scheduling_statistics(value: Term) -> Result<Term, VmError> {
-    match atom_name(value).as_deref() {
+    match atom_name(value) {
         Some("enable" | "disable" | "clear") => Ok(atom("true")),
         _ => Err(badarg()),
     }
@@ -2972,8 +2972,20 @@ fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
     max_heap_map(process, previous)
 }
 
+/// The current system-wide max_heap_size flags: erts parses every max_heap_size value starting from them
+/// (erts/emulator/beam/erl_process.c erts_max_heap_size: `*max_heap_flags = H_MAX_FLAGS`), OTP-29.1.1.
+pub(crate) fn system_max_heap() -> crate::process::MaxHeap {
+    crate::process::MaxHeap {
+        reported: false,
+        ..with_flags(|flags| flags.max_heap)
+    }
+}
+
 fn parse_system_max_heap(value: Term) -> Result<crate::process::MaxHeap, VmError> {
-    let mut limit = crate::process::MaxHeap::default();
+    let mut limit = crate::process::MaxHeap {
+        size: 0,
+        ..system_max_heap()
+    };
     if let Some(size) = value.as_small() {
         if size < 0 {
             return Err(badarg());
@@ -3046,7 +3058,7 @@ fn set_microstate(
     value: Term,
 ) -> Result<Term, VmError> {
     let previous = MICROSTATE.load(Ordering::Relaxed);
-    match atom_name(value).as_deref() {
+    match atom_name(value) {
         Some("true") => {
             MICROSTATE.store(true, Ordering::Relaxed);
             set_microstate_workers(process, true);
@@ -3105,7 +3117,7 @@ fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, Message>) {
 }
 
 fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
-    let major = match atom_name(arg).as_deref() {
+    let major = match atom_name(arg) {
         Some("major") => true,
         Some("minor") => false,
         _ => return Err(badarg()),
@@ -3629,7 +3641,7 @@ fn atom(name: &str) -> Term {
     Term::atom(global_atoms().intern(name).expect("runtime atom"))
 }
 
-fn atom_name(term: Term) -> Option<std::sync::Arc<str>> {
+fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
 

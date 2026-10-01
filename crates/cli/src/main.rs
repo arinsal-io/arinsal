@@ -245,6 +245,10 @@ fn erl_launch(args: &[String]) -> ! {
     // `Protocol 'inet_tcp': not supported`. A dead epmd is
     // `Protocol 'inet_tcp': register/listen error:` plus `no_reg_reply_from_epmd`
     // (net_kernel.erl:2702). Failing here would reject names erl accepts.
+    // erlexec exports PATH, then applies `-env` assignments (erlexec.c:553-618).
+    let mut seeded = vec![("PATH".to_owned(), launch.path.clone())];
+    seeded.extend(launch.set_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    arinsal_vm::boot::seed_environment(&seeded);
     let root = PathBuf::from(&launch.root_dir);
     let workers = launch.emulator.schedulers.map_or_else(
         || std::thread::available_parallelism().map_or(1, |count| count.get()),

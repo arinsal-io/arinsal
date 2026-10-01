@@ -20,7 +20,7 @@ fn integer(t: Term) -> Option<i128> {
     // SAFETY: caller keeps the term's heap live during inspection.
     unsafe { t.big_ref() }?.to_bigint().to_i128()
 }
-fn atom_text(t: Term) -> Option<std::sync::Arc<str>> {
+fn atom_text(t: Term) -> Option<&'static str> {
     global_atoms().text(t.as_atom()?)
 }
 fn decode(bytes: &[u8], encoding: c_int) -> Option<String> {
@@ -359,7 +359,7 @@ pub extern "C" fn enif_get_atom_length(
     out: *mut c_uint,
     enc: c_int,
 ) -> c_int {
-    let Some(bytes) = atom_text(t).and_then(|s| encode(&s, enc)) else {
+    let Some(bytes) = atom_text(t).and_then(|s| encode(s, enc)) else {
         return 0;
     };
     if !out.is_null() {
@@ -376,7 +376,7 @@ pub extern "C" fn enif_get_atom(
     len: c_uint,
     enc: c_int,
 ) -> c_int {
-    let Some(bytes) = atom_text(t).and_then(|s| encode(&s, enc)) else {
+    let Some(bytes) = atom_text(t).and_then(|s| encode(s, enc)) else {
         return 0;
     };
     if out.is_null() || len as usize <= bytes.len() {
@@ -1101,7 +1101,7 @@ fn render_term(t: Term, out: &mut String, depth: usize) {
         return;
     }
     if let Some(a) = atom_text(t) {
-        out.push_str(&a);
+        out.push_str(a);
         return;
     }
     match t.classify() {

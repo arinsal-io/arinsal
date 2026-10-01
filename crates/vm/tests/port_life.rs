@@ -10,7 +10,7 @@ fn port_lifecycle_matches_otp() {
     let source = r#"
 -module(port_life).
 -export([connect/0, linked/0, monitored/0, demonitor/0, info/0, exit_port/0,
-         bad_connect/0, bad_close/0, bang_connect/0, owner_exit/0,
+         bad_connect/0, bad_close/0, bang_connect/0, owner_exit/0, detached_child_survives/0,
          bad_port_connect/0, bad_port_info/0]).
 connect() ->
     P = open_port({spawn, "cat"}, []),
@@ -106,6 +106,19 @@ owner_exit() ->
             receive {'DOWN', Ref, port, P, normal} -> OsPid after 1000 -> 0 end
     after 1000 -> 0
     end.
+detached_child_survives() ->
+    Path = filename:join("/private/tmp", "port_life_detached_" ++ os:getpid()),
+    P = open_port({spawn_executable, "/bin/sh"},
+                  [{args, ["-c", "sleep 0.2; /usr/bin/touch " ++ Path]}]),
+    true = port_close(P),
+    timer:sleep(500),
+    Exists = port_exit_status("test -f " ++ Path) =:= 0,
+    0 = port_exit_status("rm -f " ++ Path),
+    Exists.
+port_exit_status(Command) ->
+    P = open_port({spawn_executable, "/bin/sh"},
+                  [{args, ["-c", Command]}, exit_status]),
+    receive {P, {exit_status, Status}} -> Status after 2000 -> timeout end.
 bad_port_connect() ->
     try port_connect(self(), self()) catch error:badarg -> badarg end.
 bad_port_info() ->
@@ -125,6 +138,7 @@ bad_port_info() ->
         "bang_connect",
         "bad_port_connect",
         "bad_port_info",
+        "detached_child_survives",
     ] {
         let expected = reference.call("port_life", function, &[]);
         let mut vm = Vm::new([]);

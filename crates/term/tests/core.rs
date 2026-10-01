@@ -194,6 +194,7 @@ fn atoms_concurrent_and_limit() {
                     let name = format!("s1_atom_{thread}_{n}");
                     let a = table.intern(&name).unwrap();
                     assert_eq!(table.get(&name), Some(a));
+                    assert_eq!(table.text(a), Some(name.as_str()));
                 }
             });
         }

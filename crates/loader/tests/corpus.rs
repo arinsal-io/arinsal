@@ -46,18 +46,14 @@ fn otp_and_elixir_corpus_loads() {
         let module =
             arinsal_loader::load(&beam).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_eq!(
-            arinsal_term::global_atoms()
-                .text(module.name_atom)
-                .as_deref(),
+            arinsal_term::global_atoms().text(module.name_atom),
             Some(module.name.as_str()),
             "cached module atom for {}",
             path.display()
         );
         for (index, (_, name, _)) in module.functions.iter().enumerate() {
             assert_eq!(
-                arinsal_term::global_atoms()
-                    .text(module.function_atoms[index])
-                    .as_deref(),
+                arinsal_term::global_atoms().text(module.function_atoms[index]),
                 Some(name.as_str()),
                 "cached function atom for {}",
                 path.display()

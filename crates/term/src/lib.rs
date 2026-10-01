@@ -386,10 +386,7 @@ impl fmt::Debug for Term {
             return write!(
                 f,
                 "{}",
-                global_atoms()
-                    .text(atom)
-                    .as_deref()
-                    .unwrap_or("<unknown atom>")
+                global_atoms().text(atom).unwrap_or("<unknown atom>")
             );
         }
         if *self == Term::NIL {

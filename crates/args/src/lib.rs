@@ -280,6 +280,26 @@ pub struct Launch {
     pub set_env: BTreeMap<String, String>,
     /// Exact binary strings passed as the second argument to `erl_init:start/2`.
     pub boot_args: Vec<String>,
+    /// `PATH` as erlexec leaves it for the emulator and its children.
+    pub path: String,
+}
+
+/// Compute the `PATH` erlexec exports: ERTS bindir first, then `<root>/bin`
+/// when the root is not on `PATH` yet, with later bindir duplicates removed.
+// Port of erts/etc/common/erlexec.c:553-618, OTP-29.1.1.
+pub fn erlexec_path(bin_dir: &str, root_dir: &str, path: Option<&str>) -> String {
+    match path {
+        None => format!("{bin_dir}:{root_dir}/bin"),
+        Some(path) if !path.contains(root_dir) => format!("{bin_dir}:{root_dir}/bin:{path}"),
+        Some(path) => {
+            let mut out = bin_dir.to_owned();
+            for element in path.split(':').filter(|element| *element != bin_dir) {
+                out.push(':');
+                out.push_str(element);
+            }
+            out
+        }
+    }
 }
 
 /// An argument rejected before VM boot.
@@ -790,7 +810,9 @@ pub fn parse<S: AsRef<str>>(argv: &[S], env: &impl Env) -> Result<Launch, ArgsEr
         init.get_argument(name)
             .and_then(|groups| groups.first().and_then(|values| values.first()).cloned())
     };
+    let path = erlexec_path(&bin_dir, &root_dir, env.get("PATH").as_deref());
     Ok(Launch {
+        path,
         boot_script: first("boot"),
         mode: first("mode"),
         noshell: init.get_argument("noshell").is_some(),

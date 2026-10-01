@@ -126,6 +126,18 @@ impl Trap {
         }
     }
 
+    /// An `exit/2` self-signal that erts handles before returning to BEAM code.
+    pub(super) fn untrappable_exit(reason: Term) -> Self {
+        Self {
+            class: Class::Exit,
+            reason,
+            trace: None,
+            top: None,
+            raw_rethrow: false,
+            untrappable: true,
+        }
+    }
+
     /// An exit signal carrying `kill` cannot be caught by the receiving process.
     pub(super) fn killed() -> Self {
         Self {
@@ -206,7 +218,7 @@ pub(super) fn class_term(class: Class) -> Result<Term, VmError> {
 pub(super) fn parse_class(term: Term) -> Option<Class> {
     let atom = term.as_atom()?;
     let name = arinsal_term::global_atoms().text(atom)?;
-    match name.as_ref() {
+    match name {
         "error" => Some(Class::Error),
         "exit" => Some(Class::Exit),
         "throw" => Some(Class::Throw),

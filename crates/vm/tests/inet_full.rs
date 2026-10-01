@@ -27,7 +27,8 @@ run(Case) ->
         reset -> reset();
         send_timeout -> send_timeout();
         debug_on -> debug_on();
-        sched -> sched()
+        sched -> sched();
+        default_ifaces -> default_ifaces()
     end.
 
 listen(Extra) ->
@@ -240,6 +241,9 @@ ifaces() ->
     gen_tcp:close(S),
     {shape(Addrs), Ifs, List}.
 
+default_ifaces() ->
+    {shape(inet:getifaddrs()), inet:getiflist(), inet:getif()}.
+
 shape({ok, Addrs}) ->
     {ok, [iface(A) || A <- Addrs]};
 shape(Other) ->
@@ -383,6 +387,7 @@ fn tcp_inet_matches_erts() {
         "partial",
         "stats",
         "ifaces",
+        "default_ifaces",
         "local",
         "reset",
         "send_timeout",

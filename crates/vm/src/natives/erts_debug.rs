@@ -1130,11 +1130,7 @@ fn internal_state_tuple_get(
 ) -> Result<Option<Term>, VmError> {
     if let Some(fields) = term_sequence(selector)
         && let [name, value] = fields.as_slice()
-        && name
-            .as_atom()
-            .and_then(|name| global_atoms().text(name))
-            .as_deref()
-            == Some("internal_hash")
+        && name.as_atom().and_then(|name| global_atoms().text(name)) == Some("internal_hash")
     {
         // Port of erts/emulator/beam/erl_bif_info.c:4834-4835, OTP-29.1.1.
         let hash = OwnedTerm::BigInt(BigInt::from(arinsal_term::internal_hash(*value)));
@@ -1258,7 +1254,7 @@ fn internal_state_tuple_get(
             else {
                 return Ok(None);
             };
-            Ok(global_atoms().intern(&name).ok().map(Term::atom))
+            Ok(global_atoms().intern(name).ok().map(Term::atom))
         }
         (
             "process_status",

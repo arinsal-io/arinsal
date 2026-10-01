@@ -95,7 +95,7 @@ pub(crate) fn call(
                     Some(arinsal_term::Identity::Pid { node, .. }) => global_atoms().text(node),
                     _ => return Some(Err(badarg())),
                 };
-                let node = identity.as_deref().unwrap_or("nonode@nohost");
+                let node = identity.unwrap_or("nonode@nohost");
                 Ok(atom(if crate::node_tables::lock().pid_unicode_io(node) {
                     "true"
                 } else {
@@ -626,21 +626,35 @@ fn ddll_demonitor(reference: Term) -> Result<Term, VmError> {
 
 fn format_error(process: &mut Process, code: Term) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_ddll.c:813 (erl_ddll_format_error_int_1), OTP-29.1.1.
-    let key = atom_text(code).ok_or_else(badarg)?;
-    let message = match key.as_str() {
-        "inconsistent" => {
-            "Driver name and/or driver options are inconsistent with currently loaded driver"
+    let owned_code = to_owned(code).map_err(|_| badarg())?;
+    let message = match &owned_code {
+        O::Tuple(items)
+            if items.len() == 2
+                && items[0] == O::Atom("open_error".into())
+                && matches!(items[1], O::Int(_)) =>
+        {
+            format!("Driver dynamic loading failed with error code {}", items[1])
         }
-        "linked_in_driver" => "Driver is statically linked and cannot be loaded/unloaded",
-        "permanent" => "DDLL driver is permanent an cannot be unloaded/loaded",
-        "not_loaded" => "DDLL driver is not loaded",
-        "not_loaded_by_this_process" => "DDLL driver was not loaded by this process",
-        "not_pending" => "DDLL load not pending for this driver name",
-        "already_loaded" => "DDLL driver is already loaded successfully",
-        "pending_reload" => "Driver reloading is already pending",
-        "pending_process" => {
-            "Driver is loaded by others when attempting option {reload, pending_driver}"
-        }
+        O::Atom(key) => match key.as_str() {
+            "inconsistent" => {
+                "Driver name and/or driver options are inconsistent with currently loaded driver"
+                    .to_owned()
+            }
+            "linked_in_driver" => {
+                "Driver is statically linked and cannot be loaded/unloaded".to_owned()
+            }
+            "permanent" => "DDLL driver is permanent an cannot be unloaded/loaded".to_owned(),
+            "not_loaded" => "DDLL driver is not loaded".to_owned(),
+            "not_loaded_by_this_process" => "DDLL driver was not loaded by this process".to_owned(),
+            "not_pending" => "DDLL load not pending for this driver name".to_owned(),
+            "already_loaded" => "DDLL driver is already loaded successfully".to_owned(),
+            "pending_reload" => "Driver reloading is already pending".to_owned(),
+            "pending_process" => {
+                "Driver is loaded by others when attempting option {reload, pending_driver}"
+                    .to_owned()
+            }
+            _ => return Err(badarg()),
+        },
         _ => return Err(badarg()),
     };
     let value = O::list(message.bytes().map(|b| O::Int(b as i64)).collect());

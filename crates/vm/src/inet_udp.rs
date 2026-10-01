@@ -223,7 +223,10 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             REQ_GETSTATUS => (getstatus(&inner), None),
             REQ_SUBSCRIBE => (subscribe(data), None),
             PACKET_REQ_RECV => (recv_req(sock, &mut inner, caller, data), None),
-            _ => (err_bytes("exbadport"), None),
+            _ => match inet_drv::interface_control(cmd, data, inner.open) {
+                Some(reply) => (reply, None),
+                None => (err_bytes("exbadport"), None),
+            },
         }
     };
     if let Some((fd, pending)) = closed {

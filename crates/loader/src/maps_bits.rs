@@ -117,12 +117,7 @@ fn arg_number(arg: Arg, expected: u64) -> bool {
 
 fn command_name(arg: Arg, expected: &str) -> bool {
     arg.kind() == Arg::TERM
-        && arg
-            .term()
-            .as_atom()
-            .and_then(|a| global_atoms().text(a))
-            .as_deref()
-            == Some(expected)
+        && arg.term().as_atom().and_then(|a| global_atoms().text(a)) == Some(expected)
 }
 
 fn x_index(arg: Arg) -> Option<u16> {

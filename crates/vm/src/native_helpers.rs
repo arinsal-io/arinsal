@@ -956,18 +956,14 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
                 process.sync_native_header();
                 return 0;
             };
-            if let Some(target) = crate::beamasm_integration::native_target_for(
-                module.as_ref(),
-                function.as_ref(),
-                entry.arity,
-            ) {
+            if let Some(target) =
+                crate::beamasm_integration::native_target_for(module, function, entry.arity)
+            {
                 publish_dispatch_x(process, registers);
                 process.sync_native_header();
                 return target;
             }
-            if let Some(native) =
-                crate::native_function_for(module.as_ref(), function.as_ref(), entry.arity)
-            {
+            if let Some(native) = crate::native_function_for(module, function, entry.arity) {
                 publish_dispatch_x(process, registers);
                 process.sync_native_header();
                 return native.start;
@@ -1016,12 +1012,10 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
         && module
             .as_atom()
             .and_then(|atom| arinsal_term::global_atoms().text(atom))
-            .as_deref()
             == Some("erlang")
         && function
             .as_atom()
             .and_then(|atom| arinsal_term::global_atoms().text(atom))
-            .as_deref()
             == Some("apply")
     {
         let apply3 = crate::beamasm_integration::apply3_unported_entry();
@@ -1034,11 +1028,8 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
             arinsal_term::global_atoms().text(module),
             arinsal_term::global_atoms().text(function),
         )
-        && let Some(target) = crate::beamasm_integration::exported_native_target(
-            module.as_ref(),
-            function.as_ref(),
-            arity as u8,
-        )
+        && let Some(target) =
+            crate::beamasm_integration::exported_native_target(module, function, arity as u8)
     {
         return target;
     }

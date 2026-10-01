@@ -656,6 +656,20 @@ impl ProcessHeap {
         self.fragments.iter().map(|fragment| fragment.len()).sum()
     }
 
+    /// Allocated and block sizes behind `process_info(garbage_collection_info)`.
+    // Port of erts/emulator/beam/erl_gc.c:3650-3728 (erts_process_gc_info), OTP-29.1.1.
+    pub fn gc_info_words(&self) -> GcInfoWords {
+        GcInfoWords {
+            old_heap_block_size: self.old_words.len(),
+            heap_block_size: self.words.len(),
+            mbuf_size: self.fragments.iter().map(|fragment| fragment.len()).sum(),
+            recent_size: self.high_water,
+            stack_size: self.words.len() - self.stop,
+            old_heap_size: self.old_htop,
+            heap_size: self.htop,
+        }
+    }
+
     /// Number of allocated words in the old generation.
     pub fn old_used_words(&self) -> usize {
         self.old_htop
@@ -1494,4 +1508,23 @@ mod tests {
             code_pointer as u64
         );
     }
+}
+
+/// Word counts reported by `process_info(Pid, garbage_collection_info)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcInfoWords {
+    /// Old-generation block size.
+    pub old_heap_block_size: usize,
+    /// Young heap block size.
+    pub heap_block_size: usize,
+    /// Words held in heap fragments.
+    pub mbuf_size: usize,
+    /// Words below the high-water mark.
+    pub recent_size: usize,
+    /// Live stack words.
+    pub stack_size: usize,
+    /// Used old-generation words.
+    pub old_heap_size: usize,
+    /// Used young-heap words.
+    pub heap_size: usize,
 }

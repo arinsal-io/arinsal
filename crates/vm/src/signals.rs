@@ -3,11 +3,9 @@
 use crate::process::{Message, Runtime};
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
-use arinsal_sched::{Pid, RunCtx, Signal};
+use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, copy_term, global_atoms, to_owned};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-#[cfg(feature = "pf-mem-counters")]
-use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "pf-mem-counters")]
@@ -365,6 +363,36 @@ fn spawn_mfa(
     monitor_alias: bool,
     scheduler_id: Option<usize>,
 ) -> Result<Term, VmError> {
+    spawn_mfa_with_priority(
+        vm,
+        parent,
+        ctx,
+        mfa,
+        linked,
+        monitored,
+        min_heap_size,
+        monitor_tag,
+        monitor_alias,
+        scheduler_id,
+        Priority::Normal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // spawn_opt flags stay positional; packing them hides the monitor race.
+// Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
+fn spawn_mfa_with_priority(
+    vm: &mut Vm,
+    parent: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    mfa: (Term, Term, Term),
+    linked: bool,
+    monitored: bool,
+    min_heap_size: Option<usize>,
+    monitor_tag: Option<arinsal_etf::OwnedTerm>,
+    monitor_alias: bool,
+    scheduler_id: Option<usize>,
+    priority: Priority,
+) -> Result<Term, VmError> {
     let (module, function, args) = mfa;
     let m = module.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
     let f = function.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
@@ -381,8 +409,26 @@ fn spawn_mfa(
         child.heap = arinsal_term::ProcessHeap::with_words(words.max(64));
         child.heap.set_min_heap_size(words);
     }
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(min_heap_size, false);
+    child.heap.set_min_heap_size(min_heap);
+    child.cold_mut().flags.insert(
+        "min_heap_size".to_owned(),
+        Term::small(min_heap as i64).unwrap(),
+    );
     child.module = module_id;
     child.ip = ip;
+    child.initial_call = Some((module_id, ip));
+    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1:
+    // a spawned MFA naming a BIF runs the BIF itself, not the erlang.erl stub.
+    if let Ok(arity) = u8::try_from(args.len()) {
+        let (m_name, f_name) = (atom_name(module), atom_name(function));
+        if let (Some(m_name), Some(f_name)) = (m_name, f_name)
+            && (arinsal_bifs::lookup(&m_name, &f_name, arity).is_some()
+                || arinsal_spec::bif_lookup(&m_name, &f_name, arity).is_some())
+        {
+            child.cold_mut().initial_bif = Some((m_name, f_name, arity));
+        }
+    }
     child.runtime = parent.runtime.clone();
     if let (Some(module_name), Some(function_name)) = (
         arinsal_term::global_atoms().text(m),
@@ -419,9 +465,9 @@ fn spawn_mfa(
     tuning.apply_to_child(&mut child);
     let monitor_id = arm_child_link_monitor(&mut child, ctx.pid(), linked, monitored);
     let pid = if let Some(scheduler_id) = scheduler_id {
-        scheduler.spawn_unscheduled_on(child, scheduler_id)
+        scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, priority)
     } else {
-        scheduler.spawn_unscheduled(child)
+        scheduler.spawn_unscheduled_with_priority(child, priority)
     }
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
     rt.processes.lock().unwrap().insert(pid);
@@ -476,13 +522,43 @@ fn spawn_fun(
     monitor_alias: bool,
     scheduler_id: Option<usize>,
 ) -> Result<Term, VmError> {
+    spawn_fun_with_priority(
+        vm,
+        parent,
+        ctx,
+        fun,
+        linked,
+        monitored,
+        min_heap_size,
+        monitor_tag,
+        monitor_alias,
+        scheduler_id,
+        Priority::Normal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // spawn_opt flags stay positional; packing them hides the monitor race.
+// Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
+fn spawn_fun_with_priority(
+    vm: &mut Vm,
+    parent: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    fun: Term,
+    linked: bool,
+    monitored: bool,
+    min_heap_size: Option<usize>,
+    monitor_tag: Option<arinsal_etf::OwnedTerm>,
+    monitor_alias: bool,
+    scheduler_id: Option<usize>,
+    priority: Priority,
+) -> Result<Term, VmError> {
     #[cfg(feature = "pf-mem-counters")]
     let mut phase = std::time::Instant::now();
     if fun.classify() == TermKind::Tuple {
         // SAFETY: The tuple remains in the caller's live heap for this BIF.
         let tuple = unsafe { fun.tuple_ref() }.ok_or_else(|| badarg("spawn/1"))?;
         if tuple.len() == 2 {
-            return spawn_mfa(
+            return spawn_mfa_with_priority(
                 vm,
                 parent,
                 ctx,
@@ -497,6 +573,7 @@ fn spawn_fun(
                 monitor_tag,
                 monitor_alias,
                 scheduler_id,
+                priority,
             );
         }
     }
@@ -519,7 +596,7 @@ fn spawn_fun(
             if arity != 0 {
                 return Err(badarg("spawn/1"));
             }
-            return spawn_mfa(
+            return spawn_mfa_with_priority(
                 vm,
                 parent,
                 ctx,
@@ -530,13 +607,14 @@ fn spawn_fun(
                 monitor_tag,
                 monitor_alias,
                 scheduler_id,
+                priority,
             );
         }
     };
     if arity != 0 {
         return Err(badarg("spawn/1"));
     }
-    let module_id = vm.load_named(&module_name)?;
+    let module_id = vm.load_named(module_name)?;
     #[cfg(feature = "pf-mem-counters")]
     {
         PF_SPAWN_FUN_LOAD_NS.fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -548,6 +626,10 @@ fn spawn_fun(
         .find(|lambda| lambda.entry.index == lambda_index)
         .ok_or_else(|| VmError::Unsupported("spawn lambda target".into()))?;
     let (target, free_count) = (lambda.target, lambda.num_free);
+    let apply_module = vm.load_named("erlang")?;
+    let apply_ip = vm.modules[apply_module]
+        .export("apply", 2)
+        .ok_or_else(|| VmError::Unsupported("erlang:apply/2 is not loaded".into()))?;
     let mut child = Process::with_spawn_registers(free_count, 0);
     if let Some(words) = min_heap_size {
         // Port of erts/emulator/beam/erl_process.c:12594 (erl_create_process, min_heap_size
@@ -556,8 +638,15 @@ fn spawn_fun(
         child.heap = arinsal_term::ProcessHeap::with_words(words.max(64));
         child.heap.set_min_heap_size(words);
     }
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(min_heap_size, false);
+    child.heap.set_min_heap_size(min_heap);
+    child.cold_mut().flags.insert(
+        "min_heap_size".to_owned(),
+        Term::small(min_heap as i64).unwrap(),
+    );
     child.module = module_id;
     child.ip = target;
+    child.initial_call = Some((apply_module, apply_ip));
     child.runtime = parent.runtime.clone();
     child.cold_mut().initial_call = Some(("erlang".to_owned(), "apply".to_owned(), 2));
     child.cold_mut().group_leader = Some(
@@ -596,9 +685,9 @@ fn spawn_fun(
     }
     let scheduler = rt.scheduler()?;
     let pid = if let Some(scheduler_id) = scheduler_id {
-        scheduler.spawn_unscheduled_on(child, scheduler_id)
+        scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, priority)
     } else {
-        scheduler.spawn_unscheduled(child)
+        scheduler.spawn_unscheduled_with_priority(child, priority)
     }
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
     #[cfg(feature = "pf-mem-counters")]
@@ -710,8 +799,10 @@ struct SpawnOpts {
     monitor_alias: bool,
     min_heap_size: Option<usize>,
     scheduler: Option<usize>,
+    priority: Priority,
 }
 
+// Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
 fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
     let mut opts = SpawnOpts {
         tuning: SpawnTuning::default(),
@@ -721,6 +812,7 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
         monitor_alias: false,
         min_heap_size: None,
         scheduler: None,
+        priority: Priority::Normal,
     };
     for option in list(term).ok_or_else(|| badarg("erlang:spawn_opt"))? {
         if option == atom("link") {
@@ -771,10 +863,22 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
                         _ => return Err(badarg("erlang:spawn_opt")),
                     }
                 }
+            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("priority")) {
+                opts.priority =
+                    match atom_name(tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?)
+                        .as_deref()
+                    {
+                        Some("low") => Priority::Low,
+                        Some("normal") => Priority::Normal,
+                        Some("high") => Priority::High,
+                        Some("max") => Priority::Max,
+                        _ => return Err(badarg("erlang:spawn_opt")),
+                    };
             } else if tuple.len() == 2 && tuple.get(0) == Some(atom("max_heap_size")) {
                 opts.tuning.max_heap = Some(
-                    crate::natives::proc::parse_max_heap(
+                    crate::natives::proc::parse_max_heap_from(
                         tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?,
+                        crate::natives::sys::gc_spawn_defaults().max_heap_size,
                     )
                     .map_err(|()| badarg("erlang:spawn_opt"))?,
                 );
@@ -806,9 +910,9 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
                 && tuple
                     .get(0)
                     .and_then(atom_name)
-                    .is_some_and(|name| matches!(name.as_str(), "priority" | "async_dist"))
+                    .is_some_and(|name| matches!(name.as_str(), "async_dist"))
             {
-                // Accepted; priority needs a scheduler spawn entry that takes it.
+                // Accepted; async_dist is applied through process_flag.
             } else if tuple.len() == 2 && tuple.get(0) == Some(atom("scheduler")) {
                 let scheduler = tuple
                     .get(1)
@@ -925,6 +1029,14 @@ fn timer_query_result(
 }
 
 fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool {
+    if names.contains(&"erts_dirty_process_signal_handler")
+        && process
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.dirty_signal_handlers.lock().unwrap().contains(&pid))
+    {
+        return true;
+    }
     let registered = process.runtime.as_ref().is_some_and(|runtime| {
         let table = runtime.names.lock().unwrap();
         names
@@ -1440,8 +1552,8 @@ pub(crate) fn handler_atoms(
                         crate::natives::NativeEntry::Direct(crate::dist::native_demonitor)
                     }
                     _ => crate::natives::NativeEntry::Resolved(handler(
-                        global_atoms().text(module)?.as_ref(),
-                        global_atoms().text(function)?.as_ref(),
+                        global_atoms().text(module)?,
+                        global_atoms().text(function)?,
                         arity,
                     )?),
                 };
@@ -1529,7 +1641,7 @@ fn call_resolved(
             .and_then(|()| spawn_fun(vm, process, ctx, *fun, false, true, None, None, false, None)),
         (SignalBif::SpawnOpt2, [fun, options]) => spawn_options(*options).and_then(|opts| {
             opts.tuning.around(|| {
-                spawn_fun(
+                spawn_fun_with_priority(
                     vm,
                     process,
                     ctx,
@@ -1540,6 +1652,7 @@ fn call_resolved(
                     opts.monitor_tag,
                     opts.monitor_alias,
                     opts.scheduler,
+                    opts.priority,
                 )
             })
         }),
@@ -1628,7 +1741,7 @@ fn call_resolved(
         (SignalBif::SpawnOpt4, [module, function, args, options]) => spawn_options(*options)
             .and_then(|opts| {
                 opts.tuning.around(|| {
-                    spawn_mfa(
+                    spawn_mfa_with_priority(
                         vm,
                         process,
                         ctx,
@@ -1639,13 +1752,14 @@ fn call_resolved(
                         opts.monitor_tag,
                         opts.monitor_alias,
                         opts.scheduler,
+                        opts.priority,
                     )
                 })
             }),
         (SignalBif::SpawnOpt3, [node, fun, options]) => local_node(*node).and_then(|()| {
             spawn_options(*options).and_then(|opts| {
                 opts.tuning.around(|| {
-                    spawn_fun(
+                    spawn_fun_with_priority(
                         vm,
                         process,
                         ctx,
@@ -1656,6 +1770,7 @@ fn call_resolved(
                         opts.monitor_tag,
                         opts.monitor_alias,
                         opts.scheduler,
+                        opts.priority,
                     )
                 })
             })
@@ -1664,7 +1779,7 @@ fn call_resolved(
             .and_then(|()| {
                 spawn_options(*options).and_then(|opts| {
                     opts.tuning.around(|| {
-                        spawn_mfa(
+                        spawn_mfa_with_priority(
                             vm,
                             process,
                             ctx,
@@ -1675,6 +1790,7 @@ fn call_resolved(
                             opts.monitor_tag,
                             opts.monitor_alias,
                             opts.scheduler,
+                            opts.priority,
                         )
                     })
                 })
@@ -1682,6 +1798,10 @@ fn call_resolved(
         (SignalBif::Register2, [name, pid]) => {
             let name = atom_name(*name).ok_or_else(|| badarg("register/2"));
             name.and_then(|name| {
+                // Port of erts/emulator/beam/bif.c (register_2): `undefined` is not a valid name.
+                if name == "undefined" {
+                    return Err(badarg("register/2"));
+                }
                 let rt = runtime(process)?;
                 if let Some(pid) = Pid::from_term(*pid) {
                     if !rt.scheduler()?.lookup(pid) {
@@ -2739,7 +2859,9 @@ fn send_exit_signal_bif(
     let suicide = exit2 && pid == ctx.pid() && (reason == atom("kill") || !process.trap_exit);
     if suicide {
         process.note_exit_reason(reason)?;
-        return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+        return Err(VmError::Trap(crate::exceptions::Trap::untrappable_exit(
+            reason,
+        )));
     }
     let mut message = Message::copy_from(reason)?;
     if via_prio_alias {

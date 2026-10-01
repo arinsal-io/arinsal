@@ -429,7 +429,7 @@ fn coverage_mode_atom(mode: CoverageMode) -> Term {
 
 fn coverage_mode_from(term: Term) -> Option<CoverageMode> {
     let text = global_atoms().text(term.as_atom()?)?;
-    match text.as_ref() {
+    match text {
         "none" => Some(CoverageMode::None),
         "function" => Some(CoverageMode::Function),
         "function_counters" => Some(CoverageMode::FunctionCounters),
@@ -916,14 +916,7 @@ fn dirty_signal_handler(process: &Process, pid: Pid) -> bool {
     let Some(runtime) = process.runtime.as_ref() else {
         return false;
     };
-    let names = runtime.names.lock().unwrap();
-    [
-        "erts_dirty_process_signal_handler",
-        "erts_dirty_process_signal_handler_high",
-        "erts_dirty_process_signal_handler_max",
-    ]
-    .iter()
-    .any(|name| names.get(*name).copied() == Some(pid))
+    runtime.dirty_signal_handlers.lock().unwrap().contains(&pid)
 }
 
 pub(crate) fn call(

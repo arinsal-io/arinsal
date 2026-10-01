@@ -572,9 +572,12 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
             REQ_SETOPTS => setopts(&mut inner, data),
             REQ_GETOPTS => getopts(&inner, data),
             REQ_GETSTAT => getstat(&inner, data),
-            REQ_GETIFLIST => getiflist(),
-            REQ_IFGET => ifget(data),
-            REQ_GETIFADDRS => getifaddrs_reply(),
+            REQ_GETIFLIST | REQ_IFGET | REQ_GETIFADDRS => interface_control(
+                cmd,
+                data,
+                inner.phase != Phase::Closed && inner.fd.is_some(),
+            )
+            .unwrap_or_else(|| err_bytes("exbadport")),
             REQ_SUBSCRIBE => subscribe(&inner, data),
             REQ_GETTYPE => gettype(&inner),
             REQ_GETSTATUS => getstatus(&inner),
@@ -607,6 +610,19 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
         );
     }
     reply
+}
+
+// Port of erts/emulator/drivers/common/inet_drv.c:11067-11100,
+// OTP-29.1.1. Both TCP and UDP inet ports handle these interface requests.
+pub(crate) fn interface_control(cmd: i64, data: &[u8], open: bool) -> Option<Vec<u8>> {
+    let reply = match cmd {
+        REQ_GETIFLIST if open => getiflist(),
+        REQ_IFGET if open => ifget(data),
+        REQ_GETIFADDRS if open => getifaddrs_reply(),
+        REQ_GETIFLIST | REQ_IFGET | REQ_GETIFADDRS => err_bytes("exbadport"),
+        _ => return None,
+    };
+    Some(reply)
 }
 
 fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {

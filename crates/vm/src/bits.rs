@@ -129,7 +129,7 @@ pub(super) fn execute_compact(
     Ok(())
 }
 
-fn atom(term: Term) -> Option<std::sync::Arc<str>> {
+fn atom(term: Term) -> Option<&'static str> {
     term.as_atom()
         .and_then(|a| arinsal_term::global_atoms().text(a))
 }
@@ -154,7 +154,7 @@ fn flags(p: &Process, arg: Arg) -> SegFlags {
             let Some((head, tail)) = (unsafe { current.cons_ref() }) else {
                 break;
             };
-            match atom(head).as_deref() {
+            match atom(head) {
                 Some("little") => parsed.little = true,
                 Some("signed") => parsed.signed = true,
                 Some("native") => parsed.native = true,
@@ -344,7 +344,7 @@ fn segments<'a>(
 ) -> Result<Vec<Segment<'a>>, VmError> {
     let mut out = Vec::with_capacity(args.len() / 6);
     for (index, part) in args.as_chunks::<6>().0.iter().enumerate() {
-        let ty = match atom(p.read(part[0])?).as_deref() {
+        let ty = match atom(p.read(part[0])?) {
             Some("integer") => SegType::Integer,
             Some("float") => SegType::Float,
             Some("binary") => SegType::Binary,
@@ -360,7 +360,7 @@ fn segments<'a>(
             Arg::U => SegSize::Units(part[5].value()),
             _ => {
                 let term = p.read(part[5])?;
-                if atom(term).as_deref() == Some("all") {
+                if atom(term) == Some("all") {
                     SegSize::All
                 } else {
                     SegSize::Term(term)
@@ -421,7 +421,7 @@ fn match_commands(
         } else {
             let name = atom(p.read(args[offset])?)
                 .ok_or_else(|| VmError::Unsupported("bs_match command".into()))?;
-            match name.as_ref() {
+            match name {
                 "ensure_at_least" => (BitCommandKind::EnsureAtLeast, 3),
                 "ensure_exactly" => (BitCommandKind::EnsureExactly, 2),
                 "skip" => (BitCommandKind::Skip, 2),

@@ -63,7 +63,7 @@ fn tracer() -> &'static Mutex<OwnedTerm> {
 fn atom(term: Term, name: &str) -> bool {
     term.as_atom()
         .and_then(|atom| arinsal_term::global_atoms().text(atom))
-        .is_some_and(|s| s.as_ref() == name)
+        .is_some_and(|s| s == name)
 }
 fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
@@ -96,7 +96,7 @@ pub(crate) fn set_system_tracer(
             .as_atom()
             .and_then(|atom| arinsal_term::global_atoms().text(atom))
             .ok_or_else(badarg)?;
-        if !crate::natives::nif::has_tracer_nifs(vm, &module) {
+        if !crate::natives::nif::has_tracer_nifs(vm, module) {
             return Err(badarg());
         }
         true
@@ -492,7 +492,7 @@ fn set_component(
         last: 0,
         epoch: epoch().load(Ordering::Relaxed),
     });
-    let old = match name.as_ref() {
+    let old = match name {
         "label" => {
             let old = current.label.clone();
             current.label = to_owned(value).map_err(|_| badarg())?;
@@ -555,16 +555,16 @@ fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmErr
         .as_atom()
         .and_then(|atom| arinsal_term::global_atoms().text(atom))
         .ok_or_else(badarg)?;
-    let bit = flag_bit(name.as_ref());
-    if bit.is_none() && !matches!(name.as_ref(), "label" | "serial" | "spawn") {
+    let bit = flag_bit(name);
+    if bit.is_none() && !matches!(name, "label" | "serial" | "spawn") {
         return Err(badarg());
     }
     let current = token(process);
-    if current.is_none() && matches!(name.as_ref(), "label" | "serial") {
+    if current.is_none() && matches!(name, "label" | "serial") {
         return Ok(Term::NIL);
     }
     let value = current
-        .map(|t| match name.as_ref() {
+        .map(|t| match name {
             "label" => t.label,
             "serial" => OwnedTerm::tuple(vec![
                 OwnedTerm::Int(t.previous as i64),
@@ -577,7 +577,7 @@ fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmErr
                 "false"
             }),
         })
-        .or_else(|| match name.as_ref() {
+        .or_else(|| match name {
             "label" | "serial" => None,
             "spawn"
             | "send"

@@ -1,6 +1,6 @@
 //! Scheduler-local timer wheel and long timer index.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -432,6 +432,9 @@ pub(crate) enum TimerCommand<M> {
         id: u64,
         callback: Box<dyn FnOnce(Option<u64>) + Send>,
     },
+    CancelTarget {
+        pid: Pid,
+    },
 }
 
 pub(crate) struct CanceledTimer {
@@ -475,6 +478,7 @@ pub(crate) struct Wheel<M> {
     bump_cursor: usize,
     high_level: TimerTree,
     entries: HashMap<u64, Entry<M>>,
+    target_entries: HashMap<Pid, HashSet<u64>>,
 }
 
 impl<M> Wheel<M> {
@@ -491,6 +495,7 @@ impl<M> Wheel<M> {
             bump_cursor: 0,
             high_level: TimerTree::new(),
             entries: HashMap::new(),
+            target_entries: HashMap::new(),
         }
     }
 
@@ -560,6 +565,9 @@ impl<M> Wheel<M> {
     pub(crate) fn insert(&mut self, id: u64, deadline: u64, payload: TimerPayload<M>) {
         let order = self.next_order;
         self.next_order = self.next_order.wrapping_add(1);
+        if let TimerPayload::Message(target, _, _) = &payload {
+            self.target_entries.entry(*target).or_default().insert(id);
+        }
         let entry = Entry {
             deadline,
             order,
@@ -647,7 +655,7 @@ impl<M> Wheel<M> {
     pub(crate) fn cancel_at(&mut self, id: u64, now: u64) -> Option<(u64, TimerPayload<M>)> {
         // Port of erts/emulator/beam/time.c:1311-1324, OTP-29.1.1.
         let entry = self.detach(id)?;
-        if entry
+        let canceled = entry
             .state
             .compare_exchange(
                 TIMER_PENDING,
@@ -655,11 +663,30 @@ impl<M> Wheel<M> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
-        {
-            return None;
+            .is_ok();
+        self.remove_target_entry(id, &entry.payload);
+        canceled.then(|| (entry.deadline.saturating_sub(now), entry.payload))
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:67-68 and erl_process.c:14300-14304,
+    // OTP-29.1.1. Process exit cancels all BIF timers whose destination is the exiting process.
+    pub(crate) fn cancel_target(&mut self, pid: Pid) -> usize {
+        let ids = self.target_entries.remove(&pid).unwrap_or_default();
+        ids.into_iter()
+            .filter(|id| self.cancel_at(*id, self.now).is_some())
+            .count()
+    }
+
+    fn remove_target_entry(&mut self, id: u64, payload: &TimerPayload<M>) {
+        let TimerPayload::Message(target, _, _) = payload else {
+            return;
+        };
+        if let Some(ids) = self.target_entries.get_mut(target) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                self.target_entries.remove(target);
+            }
         }
-        Some((entry.deadline.saturating_sub(now), entry.payload))
     }
 
     #[cfg(test)]
@@ -736,6 +763,7 @@ impl<M> Wheel<M> {
                     )
                     .is_ok()
                 {
+                    self.remove_target_entry(id, &entry.payload);
                     due.push((entry.deadline, entry.order, id, entry.payload));
                 }
             } else {
@@ -787,6 +815,7 @@ impl<M> Wheel<M> {
                     )
                     .is_ok()
                 {
+                    self.remove_target_entry(id, &entry.payload);
                     due.push((entry.deadline, entry.order, id, entry.payload));
                 }
             } else {
@@ -914,6 +943,27 @@ mod tests {
         assert_eq!(wheel.advance(1).len(), 1);
         assert_eq!(wheel.remaining(2), Some(256));
         assert_eq!(wheel.advance(257).len(), 1);
+    }
+
+    #[test]
+    fn process_exit_cancels_timers_targeting_that_process() {
+        let target = Pid {
+            index: 3,
+            generation: 1,
+        };
+        let other = Pid {
+            index: 4,
+            generation: 1,
+        };
+        let mut wheel = Wheel::<u8>::new(0);
+        wheel.insert(1, 10, TimerPayload::Message(target, 1, false));
+        wheel.insert(2, 20, TimerPayload::Message(target, 2, true));
+        wheel.insert(3, 30, TimerPayload::Message(other, 3, false));
+
+        assert_eq!(wheel.cancel_target(target), 2);
+        assert_eq!(wheel.remaining(1), None);
+        assert_eq!(wheel.remaining(2), None);
+        assert_eq!(wheel.remaining(3), Some(30));
     }
 
     #[test]

@@ -204,7 +204,7 @@ pub fn make_hash2(term: Term) -> u32 {
                     match unsafe { term.fun_ref().unwrap() } {
                         crate::FunRef::Local { entry, free_vars } => {
                             let module = global_atoms().text(entry.module).unwrap();
-                            combine(&mut hash, free_vars.len() as u32, atom_hash(&module), H);
+                            combine(&mut hash, free_vars.len() as u32, atom_hash(module), H);
                             combine(&mut hash, entry.index, entry.old_uniq, H);
                             for value in free_vars.iter().rev() {
                                 stack.push(Job::Visit(Term(*value)));
@@ -213,8 +213,8 @@ pub fn make_hash2(term: Term) -> u32 {
                         crate::FunRef::Export { entry } => {
                             let module = global_atoms().text(entry.module).unwrap();
                             let function = global_atoms().text(entry.function).unwrap();
-                            combine(&mut hash, entry.arity as u32, atom_hash(&module), H);
-                            combine(&mut hash, atom_hash(&function), 0, H.wrapping_mul(14));
+                            combine(&mut hash, entry.arity as u32, atom_hash(module), H);
+                            combine(&mut hash, atom_hash(function), 0, H.wrapping_mul(14));
                         }
                     }
                 }
@@ -379,7 +379,7 @@ pub fn make_hash(root: Term) -> u32 {
                 TermKind::Nil => hash = hash.wrapping_mul(F3).wrapping_add(1),
                 TermKind::Atom => {
                     let text = global_atoms().text(term.as_atom().unwrap()).unwrap();
-                    hash = hash.wrapping_mul(F1).wrapping_add(atom_hash(&text));
+                    hash = hash.wrapping_mul(F1).wrapping_add(atom_hash(text));
                 }
                 TermKind::Number => {
                     if let Some(n) = term.as_small() {
@@ -518,7 +518,7 @@ pub fn make_hash(root: Term) -> u32 {
                         crate::FunRef::Local { entry, free_vars } => {
                             hash = hash.wrapping_mul(F10).wrapping_add(free_vars.len() as u32);
                             hash = hash.wrapping_mul(F1).wrapping_add(atom_hash(
-                                &global_atoms().text(entry.module).unwrap(),
+                                global_atoms().text(entry.module).unwrap(),
                             ));
                             hash = hash.wrapping_mul(F2).wrapping_add(entry.index);
                             hash = hash.wrapping_mul(F2).wrapping_add(entry.old_uniq);
@@ -529,10 +529,10 @@ pub fn make_hash(root: Term) -> u32 {
                         crate::FunRef::Export { entry } => {
                             hash = hash.wrapping_mul(F11).wrapping_add(entry.arity as u32);
                             hash = hash.wrapping_mul(F1).wrapping_add(atom_hash(
-                                &global_atoms().text(entry.module).unwrap(),
+                                global_atoms().text(entry.module).unwrap(),
                             ));
                             hash = hash.wrapping_mul(F1).wrapping_add(atom_hash(
-                                &global_atoms().text(entry.function).unwrap(),
+                                global_atoms().text(entry.function).unwrap(),
                             ));
                         }
                     }

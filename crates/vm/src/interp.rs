@@ -37,9 +37,7 @@ fn execute_put_record(
     let definition = module
         .records
         .iter()
-        .find(|record| {
-            arinsal_term::global_atoms().text(record_name).as_deref() == Some(record.name.as_str())
-        })
+        .find(|record| arinsal_term::global_atoms().text(record_name) == Some(record.name.as_str()))
         .ok_or_else(|| VmError::Unsupported("native record definition not found".into()))?;
     let module_atom = arinsal_term::global_atoms()
         .intern(&module.name)

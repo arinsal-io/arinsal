@@ -1,5 +1,5 @@
 use arinsal_sched::{Config, Event, Payload, Pid, RunCtx, RunOutcome, Scheduler, Signal, Task};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -134,6 +134,135 @@ fn million_tasks_ten_workers_no_lost_wakeup() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(counter.load(Ordering::Relaxed), sends);
+}
+
+struct SchedulingProbe {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    release: Arc<AtomicBool>,
+    complete: Arc<AtomicUsize>,
+}
+impl Task for SchedulingProbe {
+    type Message = ();
+    fn run(&mut self, _ctx: &mut RunCtx<()>, _budget: u32) -> RunOutcome {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(active, Ordering::AcqRel);
+        while !self.release.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        self.complete.fetch_add(1, Ordering::Release);
+        RunOutcome::Exit(0)
+    }
+}
+
+struct PriorityCounter {
+    count: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+}
+impl Task for PriorityCounter {
+    type Message = ();
+    fn run(&mut self, _ctx: &mut RunCtx<()>, _budget: u32) -> RunOutcome {
+        if self.stop.load(Ordering::Acquire) {
+            return RunOutcome::Exit(0);
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        RunOutcome::Yield
+    }
+}
+
+#[test]
+fn block_normal_limits_execution_to_one_normal_scheduler() {
+    let scheduler = Scheduler::new(Config {
+        workers: 2,
+        max_processes: 16,
+        ..Config::default()
+    });
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let complete = Arc::new(AtomicUsize::new(0));
+    scheduler.set_normal_scheduling_blocked(true);
+    scheduler
+        .spawn_priority(
+            SchedulingProbe {
+                active: active.clone(),
+                peak: peak.clone(),
+                release: release.clone(),
+                complete: complete.clone(),
+            },
+            arinsal_sched::Priority::Normal,
+        )
+        .unwrap();
+    scheduler
+        .spawn_priority(
+            SchedulingProbe {
+                active: active.clone(),
+                peak: peak.clone(),
+                release: release.clone(),
+                complete: complete.clone(),
+            },
+            arinsal_sched::Priority::High,
+        )
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while active.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(active.load(Ordering::Acquire), 1);
+    std::thread::sleep(Duration::from_millis(25));
+    assert_eq!(peak.load(Ordering::Acquire), 1);
+
+    release.store(true, Ordering::Release);
+    scheduler.set_normal_scheduling_blocked(false);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while complete.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(complete.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn low_priority_gets_one_quantum_per_eight_normal_quanta() {
+    let scheduler = Scheduler::new(Config {
+        workers: 2,
+        max_processes: 16,
+        ..Config::default()
+    });
+    let normal = Arc::new(AtomicUsize::new(0));
+    let low = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    scheduler.set_normal_scheduling_blocked(true);
+    scheduler
+        .spawn_priority(
+            PriorityCounter {
+                count: normal.clone(),
+                stop: stop.clone(),
+            },
+            arinsal_sched::Priority::Normal,
+        )
+        .unwrap();
+    scheduler
+        .spawn_priority(
+            PriorityCounter {
+                count: low.clone(),
+                stop: stop.clone(),
+            },
+            arinsal_sched::Priority::Low,
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    stop.store(true, Ordering::Release);
+    scheduler.set_normal_scheduling_blocked(false);
+
+    let normal = normal.load(Ordering::Relaxed) as f64;
+    let low = low.load(Ordering::Relaxed) as f64;
+    let low_share = low / (normal + low);
+    assert!(
+        low_share > 1.0 / 16.0 && low_share < 1.0 / 4.0,
+        "low_share={low_share}; normal={normal}; low={low}"
+    );
 }
 
 #[test]

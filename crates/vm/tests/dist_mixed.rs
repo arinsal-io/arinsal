@@ -434,7 +434,7 @@ fn dist_mixed_spawn_and_monitor() {
         &cookie,
         &host,
         &format!(
-            "N={n}, pong=net_adm:ping(N), {{Pid,Ref}}=spawn_monitor(N,erlang,exit,[mixed_exit]), receive {{'DOWN',Ref,process,Pid,mixed_exit}} -> ok after 10000 -> exit(no_down) end, process_flag(trap_exit,true), SpawnRef=erlang:spawn_request(N,erlang,exit,[linked_exit],[link,monitor]), LinkedPid=receive {{spawn_reply,SpawnRef,ok,LPid}} when is_pid(LPid) -> LPid after 10000 -> exit(no_spawn_reply) end, receive {{'EXIT',LinkedPid,linked_exit}} -> ok after 10000 -> exit(no_link_exit) end, io:format(\"DIST_MIXED_OK monitor~n\")"
+            "N={n}, pong=net_adm:ping(N), {{Pid,Ref}}=spawn_monitor(N,erlang,exit,[mixed_exit]), receive {{'DOWN',Ref,process,Pid,mixed_exit}} -> ok after 10000 -> exit(no_down) end, true=erlang:disconnect_node(N), ReconnectRef=erlang:spawn_request(N,erlang,exit,[reconnected_exit],[monitor]), ReconnectPid=receive {{spawn_reply,ReconnectRef,ok,RPid}} when is_pid(RPid) -> RPid after 10000 -> exit(no_reconnect_spawn_reply) end, receive {{'DOWN',ReconnectRef,process,ReconnectPid,reconnected_exit}} -> ok after 10000 -> exit(no_reconnect_spawn_down) end, process_flag(trap_exit,true), SpawnRef=erlang:spawn_request(N,erlang,exit,[linked_exit],[link,monitor]), LinkedPid=receive {{spawn_reply,SpawnRef,ok,LPid}} when is_pid(LPid) -> LPid after 10000 -> exit(no_spawn_reply) end, receive {{'EXIT',LinkedPid,linked_exit}} -> ok after 10000 -> exit(no_link_exit) end, io:format(\"DIST_MIXED_OK monitor~n\")"
         ),
     );
 }

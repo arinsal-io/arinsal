@@ -165,41 +165,25 @@ fn process_info(
             vec![item]
         }
     } else {
+        // Port of erts/emulator/beam/erl_bif_info.c:1007-1025 (pi_1_keys), OTP-29.1.1.
         [
+            "registered_name",
             "current_function",
             "initial_call",
             "status",
-            "messages",
             "message_queue_len",
             "links",
             "dictionary",
             "trap_exit",
             "error_handler",
+            "priority",
+            "group_leader",
+            "total_heap_size",
             "heap_size",
             "stack_size",
-            "memory",
-            "garbage_collection",
-            "group_leader",
             "reductions",
-            "priority",
-            "trace",
-            "binary",
-            "sequential_trace_token",
-            "catchlevel",
-            "backtrace",
-            "last_calls",
-            "total_heap_size",
+            "garbage_collection",
             "suspending",
-            "min_heap_size",
-            "min_bin_vheap_size",
-            "max_heap_size",
-            "current_location",
-            "current_stacktrace",
-            "message_queue_data",
-            "garbage_collection_info",
-            "fullsweep_after",
-            "parent",
-            "async_dist",
         ]
         .into_iter()
         .map(atom)
@@ -491,6 +475,9 @@ fn process_info(
                     ),
                 ]
                 .into_iter()
+                // Port of erts/emulator/beam/erl_bif_info.c (garbage_collection): erts conses
+                // the items so the list starts with max_heap_size and ends with minor_gcs.
+                .rev()
                 .map(|(name, value)| make_tuple(process, &[atom(name), value]))
                 .collect::<Result<Vec<_>, _>>()?;
                 make_list(process, entries)?
@@ -552,6 +539,25 @@ fn process_info(
             }
             "max_heap_size" => max_heap_term(process, pid)?,
             "parent" => atom("undefined"),
+            // Port of erts/emulator/beam/erl_bif_info.c:2274-2323 (magic_ref, label,
+            // priority_messages), OTP-29.1.1. No magic references live on this heap.
+            "magic_ref" => Term::NIL,
+            "label" => {
+                let label_key = atom("$process_label");
+                process
+                    .cold
+                    .as_ref()
+                    .and_then(|cold| {
+                        cold.dictionary
+                            .iter()
+                            .find(|(candidate, _)| term_equal(*candidate, label_key))
+                            .map(|(_, value)| *value)
+                    })
+                    .unwrap_or_else(|| atom("undefined"))
+            }
+            "priority_messages" => {
+                flag_value(process, "priority_messages").unwrap_or_else(|| atom("false"))
+            }
             _ => return Err(badarg()),
         };
         if name == "registered_name" && value == Term::NIL && !list_form {
@@ -764,8 +770,8 @@ fn fun_to_list(term: Term) -> Result<String, VmError> {
                 .ok_or_else(|| VmError::Unsupported("fun name atom".into()))?;
             format!(
                 "fun {}:{}/{}",
-                format_fun_atom(&module),
-                format_fun_atom(&function),
+                format_fun_atom(module),
+                format_fun_atom(function),
                 entry.arity
             )
         }
@@ -911,6 +917,9 @@ fn known_info_item(name: &str) -> bool {
             | "fullsweep_after"
             | "parent"
             | "async_dist"
+            | "magic_ref"
+            | "label"
+            | "priority_messages"
             | "monitors"
             | "monitored_by"
             | "registered_name"
@@ -2121,7 +2130,7 @@ fn parse_spawn_options(options: Term) -> Option<LocalSpawn> {
                     _ => parsed.bad = true,
                 }
             } else if key == atom("max_heap_size") {
-                match parse_max_heap(value) {
+                match parse_max_heap_from(value, super::sys::gc_spawn_defaults().max_heap_size) {
                     Ok(limit) => parsed.max_heap = Some(limit),
                     Err(()) => parsed.bad = true,
                 }
@@ -2411,7 +2420,15 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
 }
 
 pub(crate) fn parse_max_heap(value: Term) -> Result<crate::process::MaxHeap, ()> {
-    let mut limit = crate::process::MaxHeap::default();
+    parse_max_heap_from(value, crate::process::MaxHeap::default())
+}
+
+/// Parse a `max_heap_size` value; keys absent from a map keep `base`'s settings.
+pub(crate) fn parse_max_heap_from(
+    value: Term,
+    base: crate::process::MaxHeap,
+) -> Result<crate::process::MaxHeap, ()> {
+    let mut limit = base;
     if let Some(size) = value.as_small() {
         if size < 0 {
             return Err(());

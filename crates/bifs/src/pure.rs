@@ -510,10 +510,10 @@ fn unique_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if let Some(options) = args.first() {
         for option in list(*options)? {
             let name = atom_name(option).ok_or(BADARG)?;
-            if name.as_ref() != "positive" && name.as_ref() != "monotonic" {
+            if name != "positive" && name != "monotonic" {
                 return Err(BADARG);
             }
-            positive |= name.as_ref() == "positive";
+            positive |= name == "positive";
         }
     }
     let value = NEXT_UNIQUE.fetch_add(1, AtomicOrdering::Relaxed);
@@ -528,7 +528,7 @@ fn system_time(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         if let Some(name) = atom_name(*unit) {
             // Port of erts/emulator/beam/erl_time_sup.c:2277 (time_unit_conversion), OTP-29.1.1.
             // Plural atoms (`nano_seconds` and the rest) are aliases of the singular units.
-            BigInt::from(match name.as_ref() {
+            BigInt::from(match name {
                 "native" | "nanosecond" | "nano_seconds" => 1_000_000_000,
                 "microsecond" | "micro_seconds" => 1_000_000,
                 "millisecond" | "milli_seconds" => 1_000,
@@ -715,7 +715,7 @@ fn keysearch(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     })
 }
 
-pub(super) fn atom_name(term: Term) -> Option<std::sync::Arc<str>> {
+pub(super) fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
 fn atom_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -756,7 +756,7 @@ fn list_to_existing_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifErro
     intern(&charlist(args[0])?, true)
 }
 fn encoding(term: Term) -> Result<&'static str, BifError> {
-    match atom_name(term).as_deref() {
+    match atom_name(term) {
         Some("utf8" | "unicode") => Ok("utf8"),
         Some("latin1") => Ok("latin1"),
         _ => Err(BADARG),
@@ -854,7 +854,7 @@ fn float_opts(args: &[Term]) -> Result<arinsal_float::FloatFormatOpts, BifError>
     }
     for entry in list(args[1])? {
         if let Some(name) = atom_name(entry) {
-            match name.as_ref() {
+            match name {
                 "compact" => opts.compact = true,
                 "short" => opts.notation = arinsal_float::FloatNotation::Short,
                 _ => return Err(BADARG),
@@ -868,7 +868,7 @@ fn float_opts(args: &[Term]) -> Result<arinsal_float::FloatFormatOpts, BifError>
                 .as_small()
                 .and_then(|n| u16::try_from(n).ok())
                 .ok_or(BADARG)?;
-            opts.notation = match atom_name(pair[0]).as_deref() {
+            opts.notation = match atom_name(pair[0]) {
                 Some("decimals") => arinsal_float::FloatNotation::Decimals(count),
                 Some("scientific") => arinsal_float::FloatNotation::Scientific(count),
                 _ => return Err(BADARG),
@@ -1515,7 +1515,7 @@ fn patterns(term: Term) -> Result<Vec<Vec<u8>>, BifError> {
             return Err(BADARG);
         }
         let tag = atom_name(compiled[0]).ok_or(BADARG)?;
-        if tag.as_ref() != "bm" && tag.as_ref() != "ac" {
+        if tag != "bm" && tag != "ac" {
             return Err(BADARG);
         }
         compiled[1]
@@ -1559,7 +1559,7 @@ fn match_scope(len: usize, options: Term) -> Result<(usize, usize), BifError> {
 }
 fn scope_option(len: usize, option: Term) -> Result<(usize, usize), BifError> {
     let pair = tuple(option)?;
-    if pair.len() != 2 || atom_name(pair[0]).as_deref() != Some("scope") {
+    if pair.len() != 2 || atom_name(pair[0]) != Some("scope") {
         return Err(BADARG);
     }
     let range = tuple(pair[1])?;
@@ -1715,7 +1715,7 @@ fn split_options(
     let mut trim_all = false;
     let mut scope = (0, len);
     for option in list(options)? {
-        match atom_name(option).as_deref() {
+        match atom_name(option) {
             Some("global") => global = true,
             Some("trim") => trim = true,
             Some("trim_all") => trim_all = true,
@@ -1735,7 +1735,7 @@ fn byte_order(args: &[Term]) -> Result<bool, BifError> {
     if args.len() == 1 {
         return Ok(false);
     }
-    match atom_name(args[1]).as_deref() {
+    match atom_name(args[1]) {
         Some("big") => Ok(false),
         Some("little") => Ok(true),
         _ => Err(BADARG),
@@ -1949,14 +1949,13 @@ fn is_builtin(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Err(BADARG);
     }
     // Port of erts/emulator/beam/beam_common.c:2359-2380 (erts_is_builtin), OTP-29.1.1.
-    let instruction_bif = module.as_ref() == "erlang"
-        && ((name.as_ref() == "apply" && matches!(arity, 2 | 3))
-            || (name.as_ref() == "yield" && arity == 0));
+    let instruction_bif = module == "erlang"
+        && ((name == "apply" && matches!(arity, 2 | 3)) || (name == "yield" && arity == 0));
     Ok(bool_term(
         instruction_bif
             || u8::try_from(arity)
                 .ok()
-                .and_then(|n| arinsal_spec::bif_lookup(&module, &name, n))
+                .and_then(|n| arinsal_spec::bif_lookup(module, name, n))
                 .is_some(),
     ))
 }
@@ -1983,7 +1982,7 @@ fn throw(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 fn raise(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let invalid = || Term::atom(global_atoms().intern("badarg").expect("atom"));
-    let class = match atom_name(args[0]).as_deref() {
+    let class = match atom_name(args[0]) {
         Some("error") => Class::Error,
         Some("exit") => Class::Exit,
         Some("throw") => Class::Throw,

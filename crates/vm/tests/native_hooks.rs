@@ -120,10 +120,7 @@ fn badarith_caught_by_interpreted_try() {
     vm.load_bytes(&beam).unwrap();
     let result = vm.eval("native_hook_try", "caught", &[]).unwrap();
     let atom = result.term.as_atom().unwrap();
-    assert_eq!(
-        arinsal_term::global_atoms().text(atom).as_deref(),
-        Some("caught")
-    );
+    assert_eq!(arinsal_term::global_atoms().text(atom), Some("caught"));
 }
 
 #[test]

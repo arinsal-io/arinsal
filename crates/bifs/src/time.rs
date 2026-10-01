@@ -67,7 +67,7 @@ fn floor_div(numerator: BigInt, denominator: BigInt) -> BigInt {
 fn unit(value: Term) -> Result<BigInt, BifError> {
     if let Some(name) = atom_name(value) {
         // Port of erts/emulator/beam/erl_time_sup.c:2607 (perf_counter_unit), OTP-29.1.1.
-        return Ok(BigInt::from(match name.as_ref() {
+        return Ok(BigInt::from(match name {
             "native" | "nanosecond" | "nano_seconds" => NATIVE,
             // The OTP 29.1.1 macOS perf counter is nanosecond-resolution.
             "perf_counter" => NATIVE,
@@ -89,7 +89,7 @@ fn scaled(ctx: &mut Ctx<'_>, value: i128, args: &[Term]) -> Result<Term, BifErro
         || args
             .first()
             .and_then(|term| atom_name(*term))
-            .is_some_and(|name| matches!(name.as_ref(), "native" | "nanosecond" | "nano_seconds")))
+            .is_some_and(|name| matches!(name, "native" | "nanosecond" | "nano_seconds")))
         && let Ok(small) = i64::try_from(value)
         && let Some(term) = Term::small(small)
     {
@@ -290,7 +290,7 @@ fn universaltime_to_localtime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, 
 }
 fn localtime_to_universaltime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let value = parse_localtime_datetime(args[0])?;
-    let is_dst = match atom_name(args[1]).as_deref() {
+    let is_dst = match atom_name(args[1]) {
         Some("true") => Some(true),
         Some("false") => Some(false),
         Some("undefined") => None,

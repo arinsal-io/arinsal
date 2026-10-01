@@ -75,6 +75,42 @@ fn misc_bifs_ddll_demonitor_cancels_pending_driver_monitor_match_erts() {
 }
 
 #[test]
+fn misc_bifs_ddll_missing_driver_fails_with_formattable_open_error() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping missing-driver differential test");
+        return;
+    };
+    let source = r#"-module(misc_bifs_missing_driver). -export([run/0]).
+        run() -> erl_ddll:try_load("/tmp", "arinsal_missing_driver", [])."#;
+    let beam = reference
+        .compile_named("misc_bifs_missing_driver", source, &[])
+        .unwrap();
+    reference.load("misc_bifs_missing_driver", &beam).unwrap();
+    let expected = reference.call("misc_bifs_missing_driver", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("misc_bifs_missing_driver", "run", &[], 1, Some(47))
+        .unwrap();
+    let canonical = decode(&encode(&actual.term, EncodeOptions::default())).unwrap();
+    assert_eq!(expected, CallResult::Ok(canonical));
+}
+
+#[test]
+fn misc_bifs_ddll_open_error_formats_as_a_string() {
+    compare(
+        r#"-module(misc_bifs_ddll_open_error). -export([run/0]).
+        run() -> S = erl_ddll:format_error_int({open_error, -10}),
+                 true = is_list(S),
+                 true = length(S) > 0,
+                 true = lists:all(fun(C) -> is_integer(C) andalso C >= 0 andalso C =< 255 end, S),
+                 formatted."#,
+        "misc_bifs_ddll_open_error",
+        "run",
+    );
+}
+
+#[test]
 fn misc_bifs_system_profile_and_tags_match_erts() {
     let _guard = PROFILE_TEST_LOCK.lock().unwrap();
     compare(

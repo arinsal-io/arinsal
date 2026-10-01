@@ -1583,10 +1583,12 @@ fn worker(
             output_message(&scheduler, owner, id, &data, binary);
         }
     }
-    // Reap in the background: the closer only signals the child and returns.
+    // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
+    // Close the child's input first; a detached child may keep running after
+    // the port descriptors close, so reap it only after its own exit.
     if let Some(mut child) = child.take() {
         if closed {
-            let _ = child.kill();
+            handle.out.lock().unwrap().take();
         }
         let status = child.wait().ok();
         if !closed && want_status {
@@ -1909,9 +1911,8 @@ fn port_command(
     Ok(atom("true"))
 }
 
-// Port of erts/emulator/sys/unix/sys_drivers.c:1002 (fd_stop), OTP-29.1.1.
-// Stop selecting the port's descriptors. The caller's original fds stay open;
-// the wake pipe unblocks a worker parked in poll.
+// Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
+// Closing a port releases its descriptors; the child may have detached from them.
 fn release_io(handle: &PortHandle) {
     let waiters = {
         let mut st = handle.state.lock().unwrap();
@@ -1923,10 +1924,6 @@ fn release_io(handle: &PortHandle) {
     };
     wake_suspended(&handle.scheduler, waiters);
     poke(handle);
-    if handle.os_pid > 0 {
-        // SAFETY: os_pid is the child this port spawned. SIGKILL lets the worker reap it.
-        unsafe { libc::kill(handle.os_pid as i32, libc::SIGKILL) };
-    }
 }
 
 fn close(process: &Process, term: Term) -> Result<Term, VmError> {
@@ -2451,7 +2448,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
             .ok_or_else(badarg)?;
         let value = fields
             .iter()
-            .find_map(|(name, value)| (*name == key.as_ref()).then_some(*value))
+            .find_map(|(name, value)| (*name == key).then_some(*value))
             .ok_or_else(badarg)?;
         return TermBuilder::new(&mut heap)
             .tuple(&[item, value])

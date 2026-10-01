@@ -794,7 +794,7 @@ struct Inner<T: Task> {
     table: ProcessTable<T>,
     names: Mutex<HashMap<String, Pid>>,
     injectors: [Injector<Scheduled<T>>; 4],
-    pinned_injectors: Vec<SegQueue<Scheduled<T>>>,
+    pinned_injectors: Vec<[SegQueue<Scheduled<T>>; 4]>,
     stealers: Vec<[Stealer<Scheduled<T>>; 4]>,
     sim_timers: Option<Vec<Mutex<Wheel<T::Message>>>>,
     timer_commands: Vec<Arc<SegQueue<TimerCommand<T::Message>>>>,
@@ -1124,7 +1124,7 @@ impl<T: Task> Inner<T> {
         if let Some(sim) = &self.sim {
             sim.lock().unwrap().queue.push_back(item);
         } else if let Some(worker) = item.process.bound_worker() {
-            self.pinned_injectors[worker].push(item);
+            self.pinned_injectors[worker][item.process.priority.index()].push(item);
             self.work_epoch.fetch_add(1, Ordering::SeqCst);
             self.wake_worker(worker);
         } else {
@@ -1142,6 +1142,8 @@ impl<T: Task> Inner<T> {
 
     // Port of erts/emulator/beam/erl_process.c:9281 (erts_run_queues_len), OTP-29.1.1.
     fn record_queued(&self, process: &Process<T>, worker: usize, already_active: bool) {
+        // Simulation runs one worker but keeps the configured scheduler ids.
+        let worker = worker.min(self.worker_counts.len() - 1);
         let previous = process
             .scheduler_id
             .load(Ordering::Relaxed)
@@ -1369,6 +1371,14 @@ impl<T: Task> Inner<T> {
     fn wake_worker(&self, worker: usize) {
         if let Some(thread) = self.sleepers[worker].get() {
             thread.unpark();
+        }
+    }
+
+    fn wake_all_workers(&self) {
+        for sleeper in &self.sleepers {
+            if let Some(thread) = sleeper.get() {
+                thread.unpark();
+            }
         }
     }
 
@@ -1699,6 +1709,9 @@ impl<T: Task> Inner<T> {
                         .cancel_at(id, self.clock.now_ms())
                         .map(|(remaining, _)| remaining);
                     callback(remaining);
+                }
+                TimerCommand::CancelTarget { pid } => {
+                    service.wheel.cancel_target(pid);
                 }
             }
         }
@@ -2183,6 +2196,8 @@ impl<T: Task> Local<T> {
         }
     }
     fn picked(&mut self, priority: usize) {
+        // Port of erts/emulator/beam/erl_process.c:9603, OTP-29.1.1.
+        // Low-priority processes share the normal queue and are rescheduled less often.
         if priority == 2 {
             self.normal_runs = self.normal_runs.saturating_add(1);
         } else if priority == 3 {
@@ -2211,6 +2226,7 @@ impl<T: Task> Local<T> {
             && let Some(next) = self.runnext.take()
         {
             self.streak += 1;
+            self.picked(next.process.priority.index());
             return Some(next);
         }
         self.streak = 0;
@@ -2329,6 +2345,7 @@ trait ContextOps<M> {
         wrapped: bool,
     ) -> Result<TimerRef, Error>;
     fn mark_exited(&mut self, pid: Pid);
+    fn cancel_target_timers(&mut self, pid: Pid);
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool;
     fn request_aux_work_all(&mut self, work: SchedulerAuxWork);
@@ -2352,6 +2369,10 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// are drained before the pid leaves the process table.
     pub fn begin_exit(&mut self) {
         self.inner.mark_exited(self.pid);
+    }
+    /// Cancel pending BIF timers aimed at a terminating process.
+    pub fn cancel_target_timers(&mut self, pid: Pid) {
+        self.inner.cancel_target_timers(pid);
     }
     /// Schedule a child inserted with [`Scheduler::spawn_unscheduled`].
     /// A worker-local child runs before this worker parks.
@@ -2845,6 +2866,33 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         self.inner.request_aux_work_all(work);
     }
 
+    fn cancel_target_timers(&mut self, pid: Pid) {
+        if let Some(timers) = self.inner.sim_timers.as_ref() {
+            for wheel in timers {
+                wheel.lock().unwrap().cancel_target(pid);
+            }
+            return;
+        }
+        let current_worker = self.local.as_deref().map(|local| local.worker_id);
+        if let Some(local) = self.local.as_deref_mut() {
+            local.timer_service.borrow_mut().wheel.cancel_target(pid);
+        }
+        for worker in 0..self.inner.timer_commands.len() {
+            if Some(worker) == current_worker {
+                continue;
+            }
+            if let Some(service) = self.inner.owner_timer_service(worker) {
+                service.borrow_mut().wheel.cancel_target(pid);
+                continue;
+            }
+            let Some(queue) = self.inner.timer_commands.get(worker) else {
+                continue;
+            };
+            queue.push(TimerCommand::CancelTarget { pid });
+            self.inner.wake_worker(worker);
+        }
+    }
+
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool {
         if self.deferred_monitor.as_ref().is_some_and(|(pid, event)| {
             *pid == to
@@ -3276,7 +3324,9 @@ impl<T: Task> Scheduler<T> {
             config,
             names: Mutex::new(HashMap::new()),
             injectors: std::array::from_fn(|_| Injector::new()),
-            pinned_injectors: (0..workers).map(|_| SegQueue::new()).collect(),
+            pinned_injectors: (0..workers)
+                .map(|_| std::array::from_fn(|_| SegQueue::new()))
+                .collect(),
             stealers,
             sim_timers: simulated
                 .then(|| (0..workers).map(|_| Mutex::new(Wheel::new(now))).collect()),
@@ -3364,25 +3414,38 @@ impl<T: Task> Scheduler<T> {
     /// Insert a child whose caller will publish it with [`RunCtx::schedule_spawn`].
     /// The caller must schedule it exactly once, including after any later error.
     pub fn spawn_unscheduled(&self, task: T) -> Result<Pid, Error> {
-        let process = self.inner.table.insert(task, Priority::Normal, None)?;
+        self.spawn_unscheduled_with_priority(task, Priority::Normal)
+    }
+    /// Insert an unscheduled task at a chosen priority.
+    pub fn spawn_unscheduled_with_priority(
+        &self,
+        task: T,
+        priority: Priority,
+    ) -> Result<Pid, Error> {
+        let process = self.inner.table.insert(task, priority, None)?;
         process.state.store(UNSCHEDULED, Ordering::Release);
         Ok(process.pid)
     }
     /// Insert a child whose caller publishes it on a one-based scheduler id.
     pub fn spawn_unscheduled_on(&self, task: T, scheduler_id: usize) -> Result<Pid, Error> {
+        self.spawn_unscheduled_on_with_priority(task, scheduler_id, Priority::Normal)
+    }
+    /// Insert an unscheduled task on a chosen scheduler and at a chosen priority.
+    pub fn spawn_unscheduled_on_with_priority(
+        &self,
+        task: T,
+        scheduler_id: usize,
+        priority: Priority,
+    ) -> Result<Pid, Error> {
         let worker = scheduler_id.checked_sub(1).ok_or(Error::Capacity)?;
         if worker >= self.inner.config.workers {
             return Err(Error::Capacity);
         }
-        let process = self
-            .inner
-            .table
-            .insert(task, Priority::Normal, Some(worker))?;
+        let process = self.inner.table.insert(task, priority, Some(worker))?;
         process.state.store(UNSCHEDULED, Ordering::Release);
         Ok(process.pid)
     }
-    /// Make a task inserted by [`Self::spawn_unscheduled`] runnable.
-    /// The caller must schedule each inserted task exactly once.
+    /// Make an inserted child runnable after its caller publishes it.
     pub fn schedule_unscheduled(&self, pid: Pid) -> Result<(), Error> {
         let process = self.inner.table.lookup(pid).ok_or(Error::NoProcess)?;
         process
@@ -3533,7 +3596,7 @@ impl<T: Task> Scheduler<T> {
 
     /// Set the number of worker threads allowed to dispatch tasks.
     pub fn set_online_schedulers(&self, online: usize) -> bool {
-        if online == 0 || online > self.inner.parked.len() {
+        if online == 0 || online > self.inner.config.workers {
             return false;
         }
         self.inner
@@ -3546,6 +3609,11 @@ impl<T: Task> Scheduler<T> {
     /// Return the number of scheduler workers owned by this runtime.
     pub fn worker_count(&self) -> usize {
         self.inner.parked.len()
+    }
+
+    /// Return the configured number of normal scheduler workers.
+    pub fn scheduler_count(&self) -> usize {
+        self.inner.config.workers
     }
 
     /// Pause or resume all task dispatch on this scheduler.
@@ -3566,12 +3634,13 @@ impl<T: Task> Scheduler<T> {
         }
     }
 
+    /// Pause normal-priority tasks while higher and lower priorities remain runnable.
+    pub fn set_normal_scheduling_blocked(&self, blocked: bool) {
+        self.set_scheduling_blocked(blocked, blocked.then_some(0));
+    }
+
     fn wake_all_workers(&self) {
-        for sleeper in &self.inner.sleepers {
-            if let Some(thread) = sleeper.get() {
-                thread.unpark();
-            }
-        }
+        self.inner.wake_all_workers();
     }
 
     /// Inspect or set the next free process table id for internal-state tests.
@@ -3678,7 +3747,14 @@ impl<T: Task> Scheduler<T> {
             if len == 0 {
                 return false;
             }
-            let index = sim.rng.next_u64() as usize % len;
+            // Port of erts/emulator/beam/erl_process.c:9603 (priority queues), OTP-29.1.1:
+            // max and high run before normal; normal and low share one class here.
+            let class = |item: &Scheduled<T>| item.process.priority.index().min(2);
+            let best = sim.queue.iter().map(class).min().unwrap_or(2);
+            let ready: Vec<usize> = (0..len)
+                .filter(|&index| class(&sim.queue[index]) == best)
+                .collect();
+            let index = ready[sim.rng.next_u64() as usize % ready.len()];
             sim.queue.remove(index).unwrap()
         };
         let dirty = match item.process.dirty.load(Ordering::Acquire) {
@@ -4060,8 +4136,13 @@ impl<T: Task> Drop for Scheduler<T> {
         for handle in &self.threads {
             handle.thread().unpark();
         }
+        // The last handle may drop on a worker (e.g. a process exiting while the owner already
+        // released its handle); that worker cannot join itself and stops on its own.
+        let current = std::thread::current().id();
         for handle in self.threads.drain(..) {
-            let _ = handle.join();
+            if handle.thread().id() != current {
+                let _ = handle.join();
+            }
         }
         self.inner.table.scheduler_shutdown();
     }
@@ -4423,14 +4504,30 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         inner.poll_pending_waits(&mut local);
         local.set_msacc_state(MsaccState::Other);
         inner.flush_local_metrics(&mut local);
-        let mut item = inner.pinned_injectors[id].pop();
+        let mut item = None;
+        for priority in local.order() {
+            item = inner.pinned_injectors[id][priority].pop();
+            if item.is_some() {
+                break;
+            }
+        }
         // Port of erts/emulator/beam/erl_process.c (run queue priorities), OTP-29.1.1: work queued
         // from elsewhere joins this worker's queue before local work of a lower or equal
         // priority runs again, so a worker busy with yielding processes cannot starve it.
         if item.is_none()
             && let Some(best) = local.best_priority()
         {
-            for priority in 0..=best {
+            // A low-priority item may jump ahead of normal work once eight normal quanta ran.
+            let limit = if best == 2 && local.normal_runs >= 8 {
+                3
+            } else {
+                best
+            };
+            for priority in local
+                .order()
+                .into_iter()
+                .filter(|&priority| priority <= limit)
+            {
                 if let Steal::Success(found) =
                     inner.injectors[priority].steal_batch_and_pop(&local.queues[priority])
                 {
@@ -4516,7 +4613,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         inner.poll_pending_waits(&mut local);
         inner.poll_timers(id, Some(&mut local), true);
         local.set_msacc_state(MsaccState::Other);
-        if local.runnext.is_some()
+        if local.runnext.as_ref().is_some()
             || local.queues.iter().any(|queue| !queue.is_empty())
             || inner.injectors.iter().any(|queue| !queue.is_empty())
             || !local.timer_service.borrow().commands.is_empty()

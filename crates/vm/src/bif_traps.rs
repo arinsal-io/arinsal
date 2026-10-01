@@ -355,10 +355,7 @@ pub(crate) fn execute_named(
     }
     if module_name == "erts_debug"
         && function_name == "set_internal_state"
-        && args[0]
-            .as_atom()
-            .and_then(|atom| global_atoms().text(atom))
-            .as_deref()
+        && args[0].as_atom().and_then(|atom| global_atoms().text(atom))
             != Some("code_mod_permission")
     {
         return None;
@@ -511,10 +508,7 @@ fn code_permission(
             "unhandled set_internal_state selector",
         ));
     }
-    let acquire = match global_atoms()
-        .text(args[1].as_atom().ok_or(BifError::BADARG)?)
-        .as_deref()
-    {
+    let acquire = match global_atoms().text(args[1].as_atom().ok_or(BifError::BADARG)?) {
         Some("true") => true,
         Some("false") => false,
         _ => return Err(BifError::BADARG),

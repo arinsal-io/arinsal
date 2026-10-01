@@ -22,6 +22,12 @@ pub mod atoms {
 }
 
 type AtomShard = RwLock<HashMap<Arc<str>, Atom>>;
+
+const ATOM_CHUNK_SIZE: usize = 4096;
+
+type AtomChunk = OnceLock<Box<[OnceLock<AtomEntry>]>>;
+
+#[derive(Clone, Debug)]
 struct AtomEntry {
     text: Arc<str>,
     otp_hash: u32,
@@ -52,6 +58,7 @@ pub(crate) fn otp_atom_hash(text: &str) -> u32 {
 pub struct AtomTable {
     shards: Box<[AtomShard]>,
     names: RwLock<Vec<AtomEntry>>,
+    entries: Box<[AtomChunk]>,
     limit: usize,
 }
 
@@ -59,9 +66,13 @@ impl AtomTable {
     /// Create a table with the given maximum, including predefined atoms.
     pub fn new(limit: usize) -> Self {
         let shards = (0..64).map(|_| RwLock::new(HashMap::new())).collect();
+        let index_limit = limit.min(u32::MAX as usize);
         let table = Self {
             shards,
             names: RwLock::new(Vec::new()),
+            entries: (0..index_limit.div_ceil(ATOM_CHUNK_SIZE))
+                .map(|_| OnceLock::new())
+                .collect(),
             limit,
         };
         for name in atoms::PREDEFINED {
@@ -103,29 +114,43 @@ impl AtomTable {
         }
         let text: Arc<str> = Arc::from(name);
         let atom = Atom(names.len() as u32);
-        names.push(AtomEntry {
+        let entry = AtomEntry {
             otp_hash: otp_atom_hash(name),
-            text: text.clone(),
-        });
+            text: Arc::clone(&text),
+        };
+        names.push(entry.clone());
+        let chunk_index = atom.0 as usize / ATOM_CHUNK_SIZE;
+        let chunk_start = chunk_index * ATOM_CHUNK_SIZE;
+        let chunk_len = (self.limit - chunk_start).min(ATOM_CHUNK_SIZE);
+        let chunk = self.entries[chunk_index]
+            .get_or_init(|| (0..chunk_len).map(|_| OnceLock::new()).collect());
+        chunk[atom.0 as usize % ATOM_CHUNK_SIZE]
+            .set(entry)
+            .expect("atom indices are published once");
         shard.insert(text, atom);
         Ok(atom)
     }
 
-    /// Return atom text for a valid index.
-    pub fn text(&self, atom: Atom) -> Option<Arc<str>> {
-        self.names
-            .read()
-            .unwrap()
-            .get(atom.0 as usize)
-            .map(|entry| entry.text.clone())
+    /// Return immutable atom text for a valid index without taking a lock.
+    // Port of erts/emulator/beam/atom.c:107 (erts_atom_get_name), OTP-29.1.1.
+    pub fn text(&self, atom: Atom) -> Option<&str> {
+        let index = atom.0 as usize;
+        self.entries
+            .get(index / ATOM_CHUNK_SIZE)?
+            .get()?
+            .get(index % ATOM_CHUNK_SIZE)?
+            .get()
+            .map(|entry| entry.text.as_ref())
     }
 
     /// OTP's stable atom hash, computed when the atom is interned.
     pub fn hash(&self, atom: Atom) -> Option<u32> {
-        self.names
-            .read()
-            .unwrap()
-            .get(atom.0 as usize)
+        let index = atom.0 as usize;
+        self.entries
+            .get(index / ATOM_CHUNK_SIZE)?
+            .get()?
+            .get(index % ATOM_CHUNK_SIZE)?
+            .get()
             .map(|entry| entry.otp_hash)
     }
 

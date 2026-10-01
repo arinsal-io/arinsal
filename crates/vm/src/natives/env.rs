@@ -20,6 +20,19 @@ pub(crate) fn snapshot() -> Environment {
     environment().read().unwrap().clone()
 }
 
+/// Set variables in the VM-owned environment before boot (erlexec's `set_env`).
+pub(crate) fn seed(vars: &[(String, String)]) {
+    let mut env = environment().write().unwrap();
+    for (name, value) in vars {
+        let (name, value) = (OsString::from(name), OsString::from(value));
+        if let Some((_, existing)) = env.iter_mut().find(|(key, _)| *key == name) {
+            *existing = value;
+        } else {
+            env.push((name, value));
+        }
+    }
+}
+
 fn atom(name: &str) -> Term {
     Term::atom(global_atoms().intern(name).expect("built-in atom"))
 }
@@ -248,7 +261,6 @@ fn set_signal(
     let Some(name) = signal.as_atom().and_then(|a| global_atoms().text(a)) else {
         return Err(badarg());
     };
-    let name = name.as_ref();
     let signal_num = match name {
         "sighup" => libc::SIGHUP,
         "sigquit" => libc::SIGQUIT,

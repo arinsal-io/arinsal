@@ -424,7 +424,7 @@ impl Vm {
         let module_name = global_atoms()
             .text(module_atom)
             .ok_or_else(|| VmError::Load("invalid module atom".into()))?;
-        let module_id = self.load_named(&module_name)?;
+        let module_id = self.load_named(module_name)?;
         let module = &self.modules[module_id];
         let Some(export) = module.export_slot_atom(function_atom, arity) else {
             return Err(VmError::Trap(crate::exceptions::Trap::error(

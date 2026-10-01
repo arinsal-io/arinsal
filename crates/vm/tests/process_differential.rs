@@ -5,7 +5,49 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(proc_diff).
--export([scenario/2,send_value/2]).
+-export([scenario/2,scenario33_many/1,scenario33_start/0,scenario33_cycle/0,
+         scenario33_stop/0,send_value/2]).
+scenario33_start() ->
+    Parent=self(),
+    Names=[proc_diff_select_1,proc_diff_select_2,proc_diff_select_3,
+           proc_diff_select_4,proc_diff_select_5],
+    Pids=[spawn(fun() ->
+        true=register(Name,self()),
+        Parent!{selector_ready,self()},
+        select_forever()
+    end) || Name <- Names],
+    [receive {selector_ready,Pid} -> ok end || Pid <- Pids],
+    ok.
+scenario33_cycle() -> select_owner_exit_exact(), ok.
+scenario33_stop() ->
+    Names=[proc_diff_select_1,proc_diff_select_2,proc_diff_select_3,
+           proc_diff_select_4,proc_diff_select_5],
+    [case whereis(Name) of undefined -> ok; Pid -> exit(Pid,kill) end || Name <- Names],
+    ok.
+scenario33_many(Count) ->
+    Selectors=[spawn_link(fun select_forever/0) || _ <- lists:seq(1,5)],
+    repeat_owner_exit(Count),
+    [begin unlink(Pid),exit(Pid,kill) end || Pid <- Selectors],
+    ok.
+repeat_owner_exit(0) -> ok;
+repeat_owner_exit(Count) ->
+    select_owner_exit_exact(),
+    repeat_owner_exit(Count-1).
+select_owner_exit_exact() ->
+    Parent=self(), Name=proc_diff_select_name,
+    Owner=spawn_link(fun() ->
+        true=register(Name,self()),
+        Name=ets:new(Name,[named_table,ordered_set]),
+        true=ets:insert(Name,[{I,I} || I <- lists:seq(1,100)]),
+        lists:foreach(fun(_) -> erlang:send_after(1000000,self(),{a,b,c}) end,
+                      lists:seq(1,1000)),
+        Parent!ets_owner_ready,
+        receive die -> ok end
+    end),
+    receive ets_owner_ready -> Owner!die end,
+    wait_for_unregistered(Name),
+    Name=ets:new(Name,[named_table,ordered_set]),
+    true=ets:delete(Name).
 scenario(0,N) ->
     Parent=self(), spawn(fun()->Parent!{value,N} end),
     receive {value,N} -> N end;
@@ -102,7 +144,157 @@ scenario(24,N) ->
     Pid=spawn(fun()->receive after infinity -> ok end end),
     Pid!hej,
     timer:sleep(300),
-    {N,process_info(Pid,[reductions,status])}.
+    {N,process_info(Pid,[reductions,status])};
+scenario(25,N) ->
+    Parent=self(),
+    spawn_opt(fun() ->
+        Controller=self(),
+        Blocked=erlang:system_flag(multi_scheduling,block_normal),
+        spawn_opt(fun() -> Controller ! high_ran end,[{priority,high}]),
+        spawn_opt(fun() -> Controller ! normal_ran end,[{priority,normal}]),
+        receive high_ran -> ok after 2000 -> erlang:system_flag(multi_scheduling,unblock_normal), erlang:error(high_starved) end,
+        Early=receive normal_ran -> true after 0 -> false end,
+        Previous=erlang:system_flag(multi_scheduling,unblock_normal),
+        receive normal_ran -> Parent ! {priority_result,Blocked,Previous,Early} after 2000 -> erlang:error(normal_starved) end
+    end,[{priority,max}]),
+    receive {priority_result,Blocked,Previous,Early} -> {Blocked,Previous,Early,N} after 3000 -> erlang:error(timeout) end;
+scenario(26,N) ->
+    Previous=erlang:system_flag(schedulers_online,1),
+    Online=erlang:system_info(schedulers_online),
+    Restored=erlang:system_flag(schedulers_online,Previous),
+    {Online,Restored,N};
+scenario(27,N) ->
+    OomFun=fun(run) -> grow_until_limit([],100); (Value) -> Value end,
+    {Pid,Ref}=spawn_opt(fun() -> OomFun(run) end,
+                        [monitor,{max_heap_size,2024}]),
+    receive {'DOWN',Ref,process,Pid,killed} -> N end;
+scenario(28,N) ->
+    Pid=spawn_opt(fun() -> receive stop -> ok end end,
+                  [{min_heap_size,987}]),
+    {min_heap_size,987}=process_info(Pid,min_heap_size),
+    Pid ! stop,
+    N;
+scenario(29,N) ->
+    Pid=spawn(fun() -> receive stop -> ok end end),
+    {initial_call,{erlang,apply,2}}=process_info(Pid,initial_call),
+    Pid ! stop,
+    N;
+scenario(30,N) ->
+    Pid=spawn(proc_diff,send_value,[self(),N]),
+    {initial_call,{proc_diff,send_value,2}}=process_info(Pid,initial_call),
+    receive N -> N end;
+scenario(31,N) ->
+    Parent=self(),
+    Previous=erlang:system_flag(max_heap_size,
+                                #{size=>0,kill=>false,error_logger=>false}),
+    {PartialPid,PartialRef}=spawn_opt(
+        fun() -> Parent!{partial_max_heap,process_info(self(),max_heap_size)} end,
+        [monitor,{max_heap_size,#{size=>2024}}]),
+    {InheritedPid,InheritedRef}=spawn_monitor(
+        fun() -> Parent!{inherited_max_heap,process_info(self(),max_heap_size)} end),
+    receive {partial_max_heap,Partial} ->
+        receive {'DOWN',PartialRef,process,PartialPid,normal} -> ok end
+    end,
+    receive {inherited_max_heap,Inherited} ->
+        receive {'DOWN',InheritedRef,process,InheritedPid,normal} -> ok end
+    end,
+    erlang:system_flag(max_heap_size,Previous),
+    {Previous,Partial,Inherited,N};
+scenario(32,N) ->
+    Parent=self(),
+    Previous=erlang:system_flag(max_heap_size,
+        #{size=>2024,kill=>true,error_logger=>false,
+          include_shared_binaries=>true}),
+    {Pid,Ref}=spawn_monitor(fun() -> Parent!{finished,N} end),
+    receive {finished,N} -> ok end,
+    receive {'DOWN',Ref,process,Pid,normal} -> ok end,
+    erlang:system_flag(max_heap_size,Previous),
+    N;
+scenario(33,N) ->
+    Parent=self(),
+    Name=proc_diff_ets_name,
+    spawn(fun() ->
+        true=register(Name,self()),
+        Name=ets:new(Name,[named_table,ordered_set]),
+        lists:foreach(fun(_) -> erlang:send_after(1000000,self(),{a,b,c}) end,
+                       lists:seq(1,1000)),
+        Parent!ets_ready
+    end),
+    receive ets_ready -> ok end,
+    wait_for_unregistered(Name),
+    Name=ets:new(Name,[named_table,ordered_set]),
+    true=ets:delete(Name),
+    N;
+scenario(34,N) ->
+    process_flag(trap_exit,true),
+    Parent=self(), Name=proc_diff_select_name,
+    Selectors=[spawn_link(fun select_forever/0) || _ <- lists:seq(1,5)],
+    select_owner_exit(Parent,Name),
+    [exit(Pid,kill) || Pid <- Selectors],
+    {ok,N};
+scenario(35,N) ->
+    {run_spin(busy),run_spin(yield),run_spin(timer),N};
+scenario(36,N) ->
+    Table=ets:new(proc_diff_config,[bag,{keypos,2}]),
+    true=ets:insert(Table,{ct_conf,key,value,handler,config,allocated,false}),
+    true=ets:insert(Table,{ct_conf,key2,value,handler,config,'_UNDEF',false}),
+    Spec=[{{ct_conf,'$1','_','_','_','$2','_'},
+           [{'=/=','$2','_UNDEF'}],['$_']}],
+    {ets:select(Table,Spec),N};
+scenario(37,N) ->
+    process_flag(trap_exit,true),
+    Pid=spawn_link(fun() -> catch exit(self(),die) end),
+    receive {'EXIT',Pid,die} -> N after 2000 -> timeout end;
+scenario(38,N) ->
+    erlang:garbage_collect(),
+    erlang:yield(),
+    {reductions,R1}=process_info(self(),reductions),
+    true=erlang:bump_reductions(100),
+    {reductions,R2}=process_info(self(),reductions),
+    Diff=R2-R1,
+    {Diff >= 100 andalso Diff =< 110,N}.
+wait_for_unregistered(Name) ->
+    case whereis(Name) of
+        undefined -> ok;
+        _ -> wait_for_unregistered(Name)
+    end.
+select_owner_exit(Parent,Name) ->
+    Owner=spawn_link(fun() ->
+        true=register(Name,self()),
+        Name=ets:new(Name,[named_table,ordered_set]),
+        true=ets:insert(Name,[{I,I} || I <- lists:seq(1,100)]),
+        [erlang:send_after(1000000,self(),{a,b,c}) || _ <- lists:seq(1,1000)],
+        Parent!{ets_owner_ready,self()},
+        receive die -> ok end
+    end),
+    receive {ets_owner_ready,Owner} -> Owner!die end,
+    wait_for_unregistered(Name),
+    Name=ets:new(Name,[named_table,ordered_set]),
+    true=ets:delete(Name),
+    receive {'EXIT',Owner,normal} -> ok end.
+select_forever() ->
+    catch ets:select(proc_diff_select_name,
+                     [{{'$1',does_not_exist},[],['$1']}]),
+    select_forever().
+spin_missing_ets() ->
+    catch ets:lookup(proc_diff_missing_ets,key),
+    spin_missing_ets().
+run_spin(Mode) ->
+    process_flag(trap_exit,true),
+    Pid=spawn_link(fun spin_missing_ets/0),
+    case Mode of
+        busy -> spin_count(3000000);
+        yield -> [erlang:yield() || _ <- lists:seq(1,1000)];
+        timer -> receive after 100 -> ok end
+    end,
+    exit(Pid,kill),
+    receive {'EXIT',Pid,killed} -> true after 2000 -> timeout end.
+spin_count(0) -> ok;
+spin_count(N) -> spin_count(N-1).
+grow_until_limit(_Acc,0) -> done;
+grow_until_limit(Acc,N) ->
+    timer:sleep(5),
+    grow_until_limit([lists:seq(1,1000)|Acc],N-1).
 send_value(P,N) -> P ! N.
 "#;
 
@@ -118,8 +310,12 @@ fn process_scenarios_match_otp_29() {
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(20);
+    let categories = std::env::var("ARINSAL_CASE_ONLY")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .map_or_else(|| (0..39).collect::<Vec<_>>(), |category| vec![category]);
     let mut count = 0;
-    for category in 0..25 {
+    for category in categories {
         for n in 1..=repetitions {
             let expected = reference.call(
                 "proc_diff",
@@ -130,7 +326,17 @@ fn process_scenarios_match_otp_29() {
             vm.load_bytes(&beam).unwrap();
             let args = [Term::small(category).unwrap(), Term::small(n).unwrap()];
             let actual = vm
-                .eval_scheduled("proc_diff", "scenario", &args, 1, Some(17))
+                .eval_scheduled(
+                    "proc_diff",
+                    "scenario",
+                    &args,
+                    if matches!(category, 25 | 33) { 6 } else { 1 },
+                    if matches!(category, 33..=35) {
+                        None
+                    } else {
+                        Some(17)
+                    },
+                )
                 .unwrap_or_else(|error| panic!("category {category} n {n}: {error}"));
             assert_eq!(
                 expected,
@@ -145,6 +351,49 @@ fn process_scenarios_match_otp_29() {
         "only {count} scenarios ran"
     );
     eprintln!("process differential: {count} scenarios, zero mismatches");
+}
+
+#[test]
+fn otp_6237_owner_exit_100_cycles_match_otp_29() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping otp_6237 differential stress scenario");
+        return;
+    };
+    let beam = reference.compile_named("proc_diff", SOURCE, &[]).unwrap();
+    reference.load("proc_diff", &beam).unwrap();
+    let started = std::time::Instant::now();
+    let expected = reference.call("proc_diff", "scenario33_many", &[OwnedTerm::Int(100)]);
+    eprintln!(
+        "OTP otp_6237: 100 owner cycles in {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let _ = vm
+        .eval_scheduled("proc_diff", "scenario33_start", &[], 6, None)
+        .unwrap_or_else(|error| panic!("otp_6237 selector startup: {error}"));
+    let started = std::time::Instant::now();
+    let mut actual = None;
+    for cycle in 1..=100 {
+        if cycle % 10 == 0 {
+            eprintln!("Arinsal otp_6237: starting owner cycle {cycle}");
+        }
+        actual = Some(
+            vm.eval_scheduled("proc_diff", "scenario33_cycle", &[], 6, None)
+                .unwrap_or_else(|error| panic!("otp_6237 owner cycle {cycle}: {error}")),
+        );
+    }
+    let _ = vm
+        .eval_scheduled("proc_diff", "scenario33_stop", &[], 6, None)
+        .unwrap_or_else(|error| panic!("otp_6237 selector cleanup: {error}"));
+    eprintln!(
+        "Arinsal otp_6237: 100 owner cycles in {:.2}s",
+        started.elapsed().as_secs_f64()
+    );
+    assert_eq!(
+        expected,
+        CallResult::Ok(actual.expect("100 cycles ran").term)
+    );
 }
 
 #[test]

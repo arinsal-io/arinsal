@@ -145,8 +145,8 @@ fn unwrap_nested_apply(
         let Some(function_atom) = function.as_atom() else {
             break;
         };
-        if global_atoms().text(module_atom).as_deref() != Some("erlang")
-            || global_atoms().text(function_atom).as_deref() != Some("apply")
+        if global_atoms().text(module_atom) != Some("erlang")
+            || global_atoms().text(function_atom) != Some("apply")
         {
             break;
         }
@@ -963,17 +963,17 @@ impl Vm {
         }
         p.x[..args.len()].copy_from_slice(&args);
         if named.is_some_and(|(module, function)| {
-            global_atoms().text(module).as_deref() == Some("erlang")
-                && global_atoms().text(function).as_deref() == Some("apply")
+            global_atoms().text(module) == Some("erlang")
+                && global_atoms().text(function) == Some("apply")
         }) && args.len() == 2
         {
             return self.apply_bif(p, 2, tail, tail_dealloc, ctx);
         }
         let tail_applies_exception_bif = named.is_some_and(|(module, function)| {
-            global_atoms().text(module).as_deref() == Some("erlang")
+            global_atoms().text(module) == Some("erlang")
                 && global_atoms()
                     .text(function)
-                    .is_some_and(|name| matches!(name.as_ref(), "error" | "exit" | "throw"))
+                    .is_some_and(|name| matches!(name, "error" | "exit" | "throw"))
         });
         // A native caller's frame comes from its recorded call site instead.
         let native_caller = p.cold.as_ref().is_some_and(|cold| cold.native_apply);
@@ -1008,8 +1008,8 @@ impl Vm {
                 p,
                 module_atom,
                 function_atom,
-                &module,
-                &function,
+                module,
+                function,
                 args.len(),
                 tail,
                 ctx,

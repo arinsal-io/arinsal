@@ -253,9 +253,11 @@ fn create_channel(
     entry.state = node_tables::ConnState::Connected;
     let pending = std::mem::take(&mut entry.pending_out);
     let pending_monitors = std::mem::take(&mut entry.pending_monitors);
+    let pending_spawn_requests = std::mem::take(&mut entry.pending_spawn_requests);
     entry.dist = Some(state);
     if let Some(state) = entry.dist.as_mut() {
         state.remote_monitors.extend(pending_monitors);
+        state.spawn_requests.extend(pending_spawn_requests);
     }
     if let Some(port_id) = port_controller {
         node_tables::register_dist_port(port_id, node.clone());
@@ -304,12 +306,8 @@ fn notify_dist_ctrlr(
     node: Term,
 ) -> Result<(), VmError> {
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let Some(net_kernel) = runtime
-        .names
-        .lock()
-        .ok()
-        .and_then(|names| names.get("net_kernel").copied())
-    else {
+    let net_kernel = runtime.names.lock().unwrap().get("net_kernel").copied();
+    let Some(net_kernel) = net_kernel else {
         return Ok(());
     };
     let msg = TermBuilder::new(&mut process.heap)
@@ -736,7 +734,7 @@ fn remote_ref_id(reference: &OwnedTerm) -> Option<u64> {
 
 fn registered_pid(process: &Process, name: &str) -> Option<Pid> {
     let runtime = process.runtime.as_ref()?;
-    runtime.names.lock().ok()?.get(name).copied()
+    runtime.names.lock().unwrap().get(name).copied()
 }
 
 /// Queue one remote signal packet using the destination's negotiated atom cache.
@@ -824,14 +822,13 @@ fn notify_auto_connect(
     entry_ref: u64,
 ) -> Result<(), VmError> {
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let Some(net_kernel) = runtime
-        .names
-        .lock()
-        .ok()
-        .and_then(|names| names.get("net_kernel").copied())
-    else {
+    let Some(net_kernel) = runtime.names.lock().unwrap().get("net_kernel").copied() else {
         let _ = node_tables::lock().abort_pending(node, conn_id, entry_ref);
         return Err(badarg());
+    };
+    let (local_name, local_creation) = {
+        let tables = node_tables::lock();
+        (tables.local_name.clone(), tables.local_creation)
     };
     let msg = OwnedTerm::tuple(vec![
         OwnedTerm::Atom("auto_connect".into()),
@@ -839,8 +836,8 @@ fn notify_auto_connect(
         OwnedTerm::tuple(vec![
             OwnedTerm::Int(i64::from(conn_id)),
             OwnedTerm::Ref {
-                node: "nonode@nohost".into(),
-                creation: 0,
+                node: local_name,
+                creation: local_creation,
                 ids: vec![entry_ref as u32, (entry_ref >> 32) as u32, 0],
             },
         ]),
@@ -1141,8 +1138,9 @@ fn route_incoming_port(
             let target = runtime
                 .names
                 .lock()
-                .ok()
-                .and_then(|names| names.get(name).copied())
+                .unwrap()
+                .get(name)
+                .copied()
                 .ok_or_else(badarg)?;
             for term in terms {
                 let message = owned_to_message(&term)?;
@@ -1178,11 +1176,7 @@ fn route_incoming_port(
         19 | 20 if parts.len() == 4 => {
             let watcher = remote_proxy(handle, &parts[1])?;
             let target = match &parts[2] {
-                OwnedTerm::Atom(name) => runtime
-                    .names
-                    .lock()
-                    .ok()
-                    .and_then(|names| names.get(name).copied()),
+                OwnedTerm::Atom(name) => runtime.names.lock().unwrap().get(name).copied(),
                 other => local_pid(other, local),
             };
             let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
@@ -1265,8 +1259,9 @@ fn route_incoming_port(
                 let target = runtime
                     .names
                     .lock()
-                    .ok()
-                    .and_then(|names| names.get(name).copied())
+                    .unwrap()
+                    .get(name)
+                    .copied()
                     .ok_or_else(badarg)?;
                 for term in terms {
                     let message = owned_to_message(&term)?;
@@ -1400,12 +1395,11 @@ fn dist_spawn_request(
     let Some(node) = atom_name(args[0]) else {
         return fallback_dist_spawn(vm, process, ctx, args);
     };
-    let local = node_tables::lock().local_name.clone();
-    let connected = node_tables::lock()
-        .entries
-        .get(&node)
-        .is_some_and(|entry| entry.connected && entry.dist.is_some());
-    if node == local || node == "nonode@nohost" || !connected {
+    let (local, alive) = {
+        let tables = node_tables::lock();
+        (tables.local_name.clone(), tables.alive)
+    };
+    if node == local || node == "nonode@nohost" || !alive {
         return fallback_dist_spawn(vm, process, ctx, args);
     }
     let mfa = owned(args[1])?;
@@ -1491,21 +1485,18 @@ fn dist_spawn_request(
     );
     queue_outgoing(process, ctx, &node, control, Some(values[2].clone()))?;
     let mut tables = node_tables::lock();
-    tables
-        .entries
-        .get_mut(&node)
-        .and_then(|entry| entry.dist.as_mut())
-        .ok_or_else(badarg)?
-        .spawn_requests
-        .insert(
-            id,
-            node_tables::SpawnRequest {
-                caller: ctx.pid(),
-                tag,
-                monitor,
-                no_success_msg,
-            },
-        );
+    let entry = tables.entries.get_mut(&node).ok_or_else(badarg)?;
+    let request = node_tables::SpawnRequest {
+        caller: ctx.pid(),
+        tag,
+        monitor,
+        no_success_msg,
+    };
+    if let Some(state) = entry.dist.as_mut() {
+        state.spawn_requests.insert(id, request);
+    } else {
+        entry.pending_spawn_requests.insert(id, request);
+    }
     Ok(reference)
 }
 

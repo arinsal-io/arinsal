@@ -14,6 +14,11 @@ pub fn run(
     run_with_debugger_flags(root, boot_args, extra_paths, workers, false, true, None)
 }
 
+/// Seed the VM's OS environment table (erlexec `set_env` for PATH and `-env`).
+pub fn seed_environment(vars: &[(String, String)]) {
+    crate::natives::env::seed(vars);
+}
+
 /// Start OTP after applying the emulator's debugger startup flags.
 pub fn run_with_debugger_flags(
     root: &Path,

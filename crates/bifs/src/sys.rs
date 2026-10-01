@@ -54,7 +54,7 @@ fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
 fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let key = atom_name(args[0]).ok_or(BifError::BADARG)?;
     let cpus = std::thread::available_parallelism().map_or(1, usize::from) as u64;
-    match key.as_ref() {
+    match key {
         "otp_release" => string(ctx, "29"),
         "version" => string(ctx, "17.1"),
         "system_version" => string(

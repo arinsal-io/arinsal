@@ -653,6 +653,7 @@ pub(crate) struct Runtime {
     pub(crate) processes: Mutex<std::collections::HashSet<Pid>>,
     pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
     otp_root: Option<std::path::PathBuf>,
+    pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
     paths: Vec<std::path::PathBuf>,
     scheduler: Mutex<Weak<Scheduler<Process>>>,
     pub(crate) names: Mutex<HashMap<String, Pid>>,
@@ -863,8 +864,26 @@ impl Executor {
                     .and_then(|cold| cold.initial_bif.take())
                 {
                     let mut args = process.x[..usize::from(arity)].to_vec();
-                    let bif = arinsal_bifs::lookup(&module, &function, arity)
-                        .expect("spawned BIF entry was resolved before scheduling");
+                    let Some(bif) = arinsal_bifs::lookup(&module, &function, arity) else {
+                        // A BIF implemented by a VM native (process-aware BIFs such as
+                        // erlang:node/1 or register/2) runs through the native table.
+                        match self.vm.dispatch_native(
+                            process,
+                            ctx,
+                            &module,
+                            &function,
+                            usize::from(arity),
+                            (arinsal_loader::ImportClass::Dynamic, 0),
+                        ) {
+                            Some(Ok(value)) => break 'execution Ok(RunState::Done(value)),
+                            Some(Err(error)) => break 'execution Err(error),
+                            None => {
+                                break 'execution Err(VmError::Unsupported(format!(
+                                    "spawned BIF entry {module}:{function}/{arity} has no native"
+                                )));
+                            }
+                        }
+                    };
                     let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
                     crate::calls::gc_after_bif(process, &mut args, &mut result)?;
                     match result {
@@ -877,6 +896,10 @@ impl Executor {
                     }
                 }
                 loop {
+                    // A caught exception re-enters this loop without replenishing its process slice.
+                    if ctx.remaining() == 0 {
+                        break Ok(RunState::Yield);
+                    }
                     if process.force_yield {
                         process.force_yield = false;
                         break Ok(RunState::Yield);
@@ -1409,9 +1432,10 @@ impl Executor {
                             }
                         }
                     }
+                    let remaining = ctx.remaining().min(budget);
                     let result = process
                         .drain(ctx)
-                        .and_then(|()| self.vm.run_slice(process, Some(ctx), budget));
+                        .and_then(|()| self.vm.run_slice(process, Some(ctx), remaining));
                     if hibernate_stopped(process, ctx.pid()) {
                         process.drain(ctx)?;
                         if process.inbox.is_empty() {
@@ -1817,7 +1841,9 @@ fn off_heap_binary_words(process: &Process) -> usize {
     let mut seen = HashSet::new();
     let mut bytes = HashMap::<usize, usize>::new();
     let mut stack = Vec::new();
-    for term in process.x[..process.gc_live]
+    // Completed processes release their X register array before the scheduler's
+    // final max-heap check, while gc_live still describes the last BEAM frame.
+    for term in process.x[..process.gc_live.min(process.x.len())]
         .iter()
         .copied()
         .chain(process.inbox.iter().copied())
@@ -1891,8 +1917,9 @@ fn off_heap_binary_words(process: &Process) -> usize {
         .fold(0, |sum, len| sum.saturating_add(len.div_ceil(8)))
 }
 
-// g_proc_sched. Port of erl_gc.c:3756 (error_logger report) and
-// utils.c:885 (`send_error_term_to_logger`), OTP-29.1.1.
+// g_proc_sched. Port of erl_gc.c:3756 (error_logger report),
+// utils.c:802 (`do_send_logger_message`) and utils.c:885
+// (`send_error_term_to_logger`), OTP-29.1.1.
 fn report_max_heap(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -2454,7 +2481,8 @@ impl Runtime {
         child.cold_mut().initial_call =
             Some((module.to_owned(), function.to_owned(), args.len() as u8));
         if let Some(arity) = u8::try_from(args.len()).ok()
-            && arinsal_bifs::lookup(module, function, arity).is_some()
+            && (arinsal_bifs::lookup(module, function, arity).is_some()
+                || arinsal_spec::bif_lookup(module, function, arity).is_some())
         {
             child.cold_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
         }
@@ -2552,6 +2580,9 @@ impl Process {
         // DOWN. Signals already queued are installed before we notify.
         ctx.begin_exit();
         self.absorb_exit_signals(ctx);
+        // Port of erts/emulator/beam/erl_process.c:14300-14304, OTP-29.1.1.
+        // Timers aimed at this process are canceled before its other resources.
+        ctx.cancel_target_timers(ctx.pid());
         // g_proc_sched: a terminating suspender releases every suspend it acquired.
         // g_port_fix: close owned ports synchronously on the termination path.
         if let Some(runtime) = self.runtime.clone() {
@@ -2639,6 +2670,15 @@ impl Process {
                 }
                 let _ = runtime.ets.write().unwrap().delete(tid);
             }
+        }
+        if let Some(runtime) = &self.runtime {
+            // Port of erts/emulator/beam/erl_process.c:14421-14464, OTP-29.1.1.
+            // The registered name is the last Erlang resource released, after owned ETS tables.
+            runtime
+                .names
+                .lock()
+                .unwrap()
+                .retain(|_, registered| *registered != ctx.pid());
         }
         let Some(cold) = self.cold.take() else {
             return;
@@ -2796,14 +2836,10 @@ impl Process {
         if let Some(name) = target
             .as_atom()
             .and_then(|name| arinsal_term::global_atoms().text(name))
-            && let Some(id) = self.runtime.as_ref().and_then(|runtime| {
-                runtime
-                    .port_names
-                    .lock()
-                    .unwrap()
-                    .get(name.as_ref())
-                    .copied()
-            })
+            && let Some(id) = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.port_names.lock().unwrap().get(name).copied())
             && crate::port::is_live(self, id)
         {
             let port = Term::port(id).ok_or_else(|| {
@@ -2851,11 +2887,11 @@ impl Process {
                 .as_ref()
                 .ok_or_else(|| VmError::Unsupported("send requires a scheduler".into()))?;
             let mut names = runtime.names.lock().unwrap();
-            let pid = names.get(name.as_ref()).copied();
+            let pid = names.get(name).copied();
             let pid = if let Some(pid) = pid
                 && !runtime.scheduler()?.lookup(pid)
             {
-                names.remove(name.as_ref());
+                names.remove(name);
                 None
             } else {
                 pid
@@ -3573,6 +3609,102 @@ impl Process {
     }
 }
 
+// Port of erts/emulator/beam/beam_common.c:685 (terminate_proc) and
+// erts/emulator/beam/utils.c:802 (do_send_logger_message), OTP-29.1.1.
+fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+    let Some(runtime) = process.runtime.clone() else {
+        return;
+    };
+    let logger = {
+        let names = runtime.names.lock().unwrap();
+        names
+            .get("logger")
+            .or_else(|| names.get("error_logger"))
+            .copied()
+    };
+    let Some(logger) = logger else {
+        return;
+    };
+    let Some(pid) = ctx.pid().to_term() else {
+        return;
+    };
+    let node_name = {
+        let nodes = crate::node_tables::lock();
+        nodes.alive.then(|| nodes.local_identity().0.to_owned())
+    };
+    let built = (|| -> Result<Term, VmError> {
+        let format = if node_name.is_some() {
+            "Error in process ~p on node ~p with exit value:~n~p~n"
+        } else {
+            "Error in process ~p with exit value:~n~p~n"
+        };
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut builder = TermBuilder::new(&mut heap);
+        let format = builder
+            .list_from_iter(
+                format
+                    .bytes()
+                    .map(|byte| Term::small(i64::from(byte)).unwrap()),
+            )
+            .map_err(|error| VmError::Unsupported(format!("process error format: {error:?}")))?;
+        let mut values = vec![pid];
+        if let Some(node_name) = node_name {
+            values.push(Term::atom(
+                arinsal_term::global_atoms()
+                    .intern(&node_name)
+                    .map_err(|error| VmError::Unsupported(format!("node atom: {error:?}")))?,
+            ));
+        }
+        values.push(reason);
+        let args = builder
+            .list_from_iter(values)
+            .map_err(|error| VmError::Unsupported(format!("process error args: {error:?}")))?;
+        let logger_metadata = builder
+            .flatmap_from_pairs(&[
+                (
+                    crate::signals::atom("emulator"),
+                    crate::signals::atom("true"),
+                ),
+                (crate::signals::atom("tag"), crate::signals::atom("error")),
+            ])
+            .map_err(|error| VmError::Unsupported(format!("logger metadata: {error:?}")))?;
+        let group_leader = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.group_leader)
+            .and_then(Pid::to_term)
+            .unwrap_or(Term::NIL);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_micros() as i64)
+            .ok()
+            .and_then(Term::small)
+            .unwrap_or(Term::NIL);
+        let metadata = builder
+            .flatmap_from_pairs(&[
+                (crate::signals::atom("error_logger"), logger_metadata),
+                (crate::signals::atom("gl"), group_leader),
+                (crate::signals::atom("pid"), pid),
+                (crate::signals::atom("time"), time),
+            ])
+            .map_err(|error| VmError::Unsupported(format!("logger event metadata: {error:?}")))?;
+        builder
+            .tuple(&[
+                crate::signals::atom("log"),
+                crate::signals::atom("error"),
+                format,
+                args,
+                metadata,
+            ])
+            .map_err(|error| VmError::Unsupported(format!("logger event: {error:?}")))
+    })();
+    if let Ok(term) = built
+        && let Ok(message) = Message::copy_from(term)
+    {
+        let _ = ctx.send(logger, message);
+    }
+}
+
 impl Task for Process {
     type Message = Message;
 
@@ -3823,12 +3955,16 @@ impl Process {
                     runtime.note_status(ctx.pid(), "runnable");
                     return RunOutcome::Dirty(kind);
                 }
+                let reason = exit_reason_from(self, &error);
+                if matches!(&error, VmError::Raised(raised) if raised.class == arinsal_bifs::Class::Error)
+                {
+                    report_process_error(self, ctx, reason);
+                }
                 crate::signals::process_exiting(self, ctx);
                 runtime.processes.lock().unwrap().remove(&ctx.pid());
                 if trace_boot_enabled() {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
-                let reason = exit_reason_from(self, &error);
                 self.notify_exit_with_executor(ctx, reason);
                 if self.entry {
                     let _ = runtime.result.send(Err(error));
@@ -3855,6 +3991,7 @@ impl Vm {
         let mut process = Process::with_spawn_registers(0, 0);
         process.module = module_id;
         process.ip = ip;
+        process.initial_call = Some((module_id, ip));
         process.runtime = Some(Arc::clone(runtime));
         process.cold_mut().initial_call = Some((module.to_owned(), function.to_owned(), 0));
         let pid = scheduler
@@ -3906,6 +4043,7 @@ impl Vm {
             processes: Mutex::new(std::collections::HashSet::new()),
             system_processes: Mutex::new(std::collections::HashSet::new()),
             otp_root: self.otp_root.clone(),
+            dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
             paths: self.paths.clone(),
             scheduler: Mutex::new(Weak::new()),
             names: Mutex::new(HashMap::new()),
@@ -3957,6 +4095,17 @@ impl Vm {
             // to this registered process; without it the send is badarg and
             // code_server dies during ensure_loaded of an on_load module.
             self.spawn_system_process(&scheduler, &runtime, "erts_code_purger", "start")?;
+            // Port of erts/emulator/beam/erl_init.c:2570-2595, OTP-29.1.1.
+            // The dirty signal handlers exist even when this runtime has no dirty schedulers.
+            for _ in 0..3 {
+                let pid = self.spawn_system_process(
+                    &scheduler,
+                    &runtime,
+                    "erts_dirty_process_signal_handler",
+                    "start",
+                )?;
+                runtime.dirty_signal_handlers.lock().unwrap().insert(pid);
+            }
         }
         // Port of erts/emulator/beam/erl_init.c system-process startup: every
         // runtime needs the preloaded owner of the literal-area release protocol.

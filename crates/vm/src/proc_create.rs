@@ -57,6 +57,7 @@ pub struct Process {
     pub(crate) seq_trace_token: Option<Box<crate::seq_trace::Token>>,
     pub(crate) module: usize,
     pub(crate) ip: usize,
+    pub(crate) initial_call: Option<(usize, usize)>,
     pub(crate) native_pc: Option<usize>,
     // Last BEAM live operand or call arity for allocation instructions without one.
     pub(crate) gc_live: usize,
@@ -323,6 +324,7 @@ impl Process {
             seq_trace_token: None,
             module: 0,
             ip: 0,
+            initial_call: None,
             native_pc: None,
             gc_live: 0,
             max_heap_peak: 0,

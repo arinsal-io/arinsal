@@ -38,6 +38,8 @@ pub(crate) struct NodeEntry {
     pub(crate) pending_out: VecDeque<(OwnedTerm, Option<OwnedTerm>)>,
     /// Remote monitors armed before the distribution channel exists.
     pub(crate) pending_monitors: BTreeMap<u64, OwnedTerm>,
+    /// Distributed spawn requests retained while auto-connect is pending.
+    pub(crate) pending_spawn_requests: BTreeMap<u64, SpawnRequest>,
 }
 
 /// Controller-owned state for one active distribution connection.
@@ -364,6 +366,7 @@ impl Default for NodeTables {
                 dist: None,
                 pending_out: VecDeque::new(),
                 pending_monitors: BTreeMap::new(),
+                pending_spawn_requests: BTreeMap::new(),
             },
         );
         Self {
@@ -456,6 +459,7 @@ fn fresh_entry(name: String) -> NodeEntry {
         dist: None,
         pending_out: VecDeque::new(),
         pending_monitors: BTreeMap::new(),
+        pending_spawn_requests: BTreeMap::new(),
     }
 }
 
@@ -512,6 +516,7 @@ impl NodeTables {
                 dist: None,
                 pending_out: VecDeque::new(),
                 pending_monitors: BTreeMap::new(),
+                pending_spawn_requests: BTreeMap::new(),
             },
         );
         true
@@ -601,6 +606,7 @@ impl NodeTables {
                 dist: None,
                 pending_out: VecDeque::new(),
                 pending_monitors: BTreeMap::new(),
+                pending_spawn_requests: BTreeMap::new(),
             },
         );
     }
