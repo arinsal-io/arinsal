@@ -24,7 +24,8 @@ defmodule ArinsalDemo.MixProject do
     [
       {:benchee, "~> 1.3", only: [:dev, :bench]},
       {:benchee_json, "~> 1.0", only: [:dev, :bench]},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:arinsal, path: "../../packages/arinsal"}
     ]
   end
 end

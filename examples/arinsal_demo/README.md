@@ -2,6 +2,17 @@
 
 A small Elixir OTP application used to compare realistic workloads on erts and Arinsal. It targets Elixir 1.20.4 / Erlang OTP 29.1.1.
 
+Run Mix commands through the local Arinsal integration to build the runtime and
+launch a child Mix process with Arinsal selected:
+
+```sh
+mix arinsal compile
+mix arinsal test
+mix arinsal run -e 'IO.inspect(ArinsalDemo.Pure.module_info(:exports))'
+```
+
+The `arinsal` dependency is a path dependency to `../../packages/arinsal`.
+
 Run its compatibility checks with `mix test`. Run all quick erts suites from the repository root with:
 
 ```sh
