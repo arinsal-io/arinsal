@@ -266,15 +266,41 @@ fn collect_beams(root: &Path, output: &mut Vec<PathBuf>) {
     }
 }
 
+/// Runs `program` and returns its standard output as a path.
+fn command_path(program: &str, args: &[&str]) -> Option<PathBuf> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    (output.status.success() && !text.is_empty()).then(|| PathBuf::from(text))
+}
+
 #[test]
 fn otp_and_elixir_corpus_compiles_with_beamasm() {
     let roots = [
         std::env::var_os("ARINSAL_OTP_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("$HOME/.asdf/installs/erlang/29.1.1")),
+            .or_else(|| {
+                command_path(
+                    "erl",
+                    &[
+                        "-noshell",
+                        "-eval",
+                        "io:format(\"~s\",[code:root_dir()]),halt().",
+                    ],
+                )
+            })
+            .expect("OTP 29.1.1 root: set ARINSAL_OTP_ROOT or put erl on PATH"),
         std::env::var_os("ARINSAL_ELIXIR_ROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("$HOME/.asdf/installs/elixir/1.20.4-otp-29")),
+            .or_else(|| {
+                // `lib/elixir` -> `lib` -> the Elixir root.
+                command_path("elixir", &["-e", "IO.write(:code.lib_dir(:elixir))"])
+                    .and_then(|lib| lib.parent()?.parent().map(PathBuf::from))
+            })
+            .expect("Elixir root: set ARINSAL_ELIXIR_ROOT or put elixir on PATH"),
     ];
     let mut paths = Vec::new();
     for root in &roots {

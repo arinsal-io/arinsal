@@ -24,8 +24,17 @@ fn short_hostname() -> String {
 }
 
 fn otp_root() -> std::ffi::OsString {
-    std::env::var_os("ARINSAL_OTP_ROOT")
-        .unwrap_or_else(|| "$HOME/.asdf/installs/erlang/29.1.1".into())
+    std::env::var_os("ARINSAL_OTP_ROOT").unwrap_or_else(|| {
+        let output = std::process::Command::new("erl")
+            .args([
+                "-noshell",
+                "-eval",
+                "io:format(\"~s\",[code:root_dir()]),halt().",
+            ])
+            .output()
+            .expect("OTP 29.1.1 root: set ARINSAL_OTP_ROOT or put erl on PATH");
+        String::from_utf8_lossy(&output.stdout).trim().into()
+    })
 }
 
 fn epmd_names() -> Option<String> {
