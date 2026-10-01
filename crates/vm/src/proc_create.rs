@@ -124,6 +124,11 @@ pub(crate) struct ProcessCold {
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
     /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
     pub(crate) native_bif_error: Option<NativeBifError>,
+    /// Stable snapshot and cursor for a trapped `persistent_term:get/0` call.
+    pub(crate) persistent_get_all: Option<PersistentGetAll>,
+    /// Result of a published `persistent_term` update, returned when the yielded
+    /// updater runs again (erts resumes the suspended updater after `table_updater`).
+    pub(crate) persistent_update_result: Option<Term>,
     // Saved continuation addresses for traces still referenced by handler code.
     pub(crate) raw_traces: Vec<stacktrace::RawTrace>,
     /// Explicit `exit/1` reason, owned off-heap. The process heap is collected
@@ -150,6 +155,14 @@ pub(crate) struct ProcessCold {
     /// Monitor message tag, owned off-heap. A tuple tag such as
     /// `{'ON_LOAD_DOWN', Mod}` must survive GC until the monitored process exits.
     pub(crate) monitor_tags: std::collections::BTreeMap<u64, arinsal_etf::OwnedTerm>,
+}
+
+pub(crate) struct PersistentGetAll {
+    pub(crate) snapshot: arinsal_pterm::Snapshot,
+    /// Next hash-table bucket to inspect, matching OTP's trapped iterator.
+    pub(crate) cursor: usize,
+    pub(crate) remaining: usize,
+    pub(crate) result: Term,
 }
 impl Process {
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.

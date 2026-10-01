@@ -7,7 +7,10 @@ use crate::{Process, Vm, VmError};
 use arinsal_bifs::Ctx;
 use arinsal_pterm::RetiredArea;
 use arinsal_sched::RunCtx;
-use arinsal_term::{Term, TermBuilder, TermKind, copy_term, global_atoms};
+use arinsal_term::{
+    SharedCopyCache, Term, TermBuilder, TermKind, copy_term,
+    copy_term_preserving_sharing_with_cache, global_atoms,
+};
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,7 +49,6 @@ struct SchedBase {
 static SCHED_WALL: Mutex<Option<SchedBase>> = Mutex::new(None);
 static MICROSTATE_BASE: Mutex<Option<MicrostateBaseline>> = Mutex::new(None);
 static SYSTEM_LOGGER: OnceLock<Mutex<Term>> = OnceLock::new();
-
 /// Initialize statistics origins when the VM is created, as erts does at boot.
 pub(crate) fn initialize_statistics_origins() {
     arinsal_bifs::initialize_time_origin();
@@ -56,15 +58,145 @@ pub(crate) fn initialize_statistics_origins() {
 
 /// Record a collection and acknowledge persistent-term literals this process may hold.
 pub(crate) fn after_collection(
-    process: &mut Process,
-    live_x: usize,
+    _process: &mut Process,
+    _live_x: usize,
     collections: u64,
     words_reclaimed: u64,
 ) {
     GC_COUNT.fetch_add(collections, Ordering::Relaxed);
     GC_WORDS.fetch_add(words_reclaimed, Ordering::Relaxed);
-    if arinsal_pterm::global_store().has_retired() {
-        let _ = salvage_retired(process, live_x);
+}
+
+/// Handle one phase of a literal-copy request after earlier signals have drained.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:8128 (`handle_cla`), OTP-29.1.1.
+pub(crate) fn copy_literal_area(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    area_id: u64,
+    request: Message,
+    how: arinsal_sched::LiteralCopyHow,
+    requester: arinsal_sched::Pid,
+) -> Result<(), VmError> {
+    let store = arinsal_pterm::global_store();
+    let area = store.retired_area(&process._persistent_terms, area_id);
+    let Some(area) = area else {
+        reply_literal_area_copy(ctx, request, requester, atom("ok"))?;
+        return Ok(());
+    };
+
+    if how == arinsal_sched::LiteralCopyHow::Init {
+        // Port of erl_proc_sig_queue.c:8167-8278: earlier queued messages are
+        // made self-contained before process-heap references are considered.
+        process
+            .inbox
+            .copy_literal_area_references(&mut process.heap, &area)?;
+        if literal_scan_words(process) > ctx.remaining() as usize * 512 {
+            reply_literal_area_copy(ctx, request, requester, atom("check_gc"))?;
+            return Ok(());
+        }
+        let has_roots = has_literal_area_roots(process, &area);
+        if has_roots {
+            reply_literal_area_copy(ctx, request, requester, atom("need_gc"))?;
+            return Ok(());
+        }
+        store.acknowledge_copied(&process._persistent_terms, area_id, 0);
+    } else {
+        // `check_gc` repeats the root scan after signal-queue work; `need_gc`
+        // performs the collection requested by the initial signal phase.
+        let has_roots =
+            how == arinsal_sched::LiteralCopyHow::NeedGc || has_literal_area_roots(process, &area);
+        if has_roots {
+            let live_x = process.x.len();
+            let copied = rewrite_roots(process, live_x, std::slice::from_ref(&area))?;
+            process.heap.request_full_sweep();
+            process.force_gc_live(process.gc_live)?;
+            store.acknowledge_copied(&process._persistent_terms, area_id, u64::from(copied));
+        } else {
+            store.acknowledge_copied(&process._persistent_terms, area_id, 0);
+        }
+    }
+    reply_literal_area_copy(ctx, request, requester, atom("ok"))?;
+    Ok(())
+}
+
+fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
+    let heap = process.heap.has_heap_reference(|term| area.contains(term));
+    let roots =
+        process.x.iter().copied().chain(
+            (0..process.heap.stack_words()).filter_map(|index| process.heap.stack_get(index)),
+        );
+    let x_and_stack = references_retired_from_roots(process, roots, std::slice::from_ref(area));
+    let inbox = process.inbox.has_literal_area_reference(area);
+    let dictionary = process.cold.as_ref().is_some_and(|cold| {
+        cold.dictionary
+            .iter()
+            .any(|(key, value)| area.contains(*key) || area.contains(*value))
+    });
+    let continuation = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.persistent_get_all.as_ref())
+        .is_some_and(|state| references_retired(process, state.result, std::slice::from_ref(area)));
+    heap || x_and_stack || inbox || dictionary || continuation
+}
+
+fn literal_scan_words(process: &Process) -> usize {
+    process
+        .heap
+        .literal_scan_words()
+        .saturating_add(process.inbox.literal_scan_words())
+        .saturating_add(process.x.len())
+        .saturating_add(usize::from(
+            process
+                .cold
+                .as_ref()
+                .is_some_and(|cold| cold.persistent_get_all.is_some()),
+        ))
+        .saturating_add(
+            process
+                .cold
+                .as_ref()
+                .map_or(0, |cold| cold.dictionary.len().saturating_mul(2)),
+        )
+}
+
+/// Complete a collector request for a process that has already started exiting.
+pub(crate) fn reply_exiting_literal_area(
+    _process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    request: Message,
+    requester: arinsal_sched::Pid,
+) -> Result<(), VmError> {
+    reply_literal_area_copy(ctx, request, requester, atom("ok"))
+}
+
+/// Complete a request when the target exited before the scheduler accepted its signal.
+pub(crate) fn reply_failed_literal_area_request(
+    _process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    area: Term,
+    how: arinsal_sched::LiteralCopyHow,
+    target: arinsal_sched::Pid,
+) -> Result<(), VmError> {
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:3480-3482
+    // (erts_proc_sig_send_cla_request), OTP-29.1.1: the reply goes back to the requester.
+    let request = Message::literal_copy_request(area, how, target)?;
+    let requester = ctx.pid();
+    reply_literal_area_copy(ctx, request, requester, atom("ok"))
+}
+
+fn reply_literal_area_copy(
+    ctx: &mut RunCtx<'_, Message>,
+    request: Message,
+    requester: arinsal_sched::Pid,
+    result: Term,
+) -> Result<(), VmError> {
+    // A reply to an exited requester is dropped, like any message to a dead process.
+    match ctx.send(requester, request.literal_copy_reply(result)?) {
+        Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
+        Err(error) => Err(VmError::Unsupported(format!(
+            "literal-copy response: {error}"
+        ))),
     }
 }
 
@@ -196,10 +328,17 @@ fn call_bump_reductions(
 fn call_garbage_collect(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_msacc.c:436 (GC state transition), OTP-29.1.1.
+    // Port of erl_proc_sig_queue.c:1332 (fetch pending CLA before GC), OTP-29.1.1.
+    process.drain(ctx)?;
+    // A process that predates retirement must allow the collector to publish
+    // and deliver its CLA before this BIF can collect its old heap.
+    if arinsal_pterm::global_store().has_pending_for(&process._persistent_terms) {
+        return Err(VmError::Yield);
+    }
     garbage_collect(process, args[0])
 }
 
@@ -273,18 +412,60 @@ fn call_values(
     args: &[Term],
 ) -> Option<Result<Term, VmError>> {
     let arity = args.len() as u8;
+    if module == "persistent_term" && function == "get" && arity == 0 {
+        return Some(get_all_step(process, ctx));
+    }
     if let Some(bif) = arinsal_pterm::lookup(module, function, arity) {
         debug_assert!(
             recognizes(module, function, arity),
             "persistent_term {module}:{function}/{arity} is dispatched but not listed"
         );
+        let updating = matches!(
+            (module, function, arity),
+            ("persistent_term", "put" | "put_new", 2)
+                | ("persistent_term", "erase", 1)
+                | ("erts_internal", "erase_persistent_terms", 0)
+        );
+        let store = arinsal_pterm::global_store();
+        if updating {
+            // Port of erts/emulator/beam/erl_bif_persistent.c:533-539 (an updater resumes
+            // after table_updater ran and returns the result it yielded with), OTP-29.1.1.
+            if let Some(result) = process
+                .cold
+                .as_mut()
+                .and_then(|cold| cold.persistent_update_result.take())
+            {
+                store.release_update_permission(&process._persistent_terms);
+                return Some(Ok(result));
+            }
+            // Port of erts/emulator/beam/erl_bif_persistent.c:692-694 (ERTS_BIF_YIELD when
+            // another process holds the update permission), OTP-29.1.1.
+            if !store.try_seize_update_permission(&process._persistent_terms) {
+                return Some(Err(VmError::Yield));
+            }
+        }
+        let before = PersistentTermUpdate::snapshot();
         let result = {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
             let mut bif_ctx = Ctx::new(&mut heap);
             bif(&mut bif_ctx, args)
         };
+        let published = result.is_ok() && before.published();
+        if result.is_ok() {
+            before.finish(process, ctx);
+        }
+        if updating {
+            if let (true, Ok(value)) = (published, &result) {
+                // Port of erts/emulator/beam/erl_bif_persistent.c:537-539 (suspend_updater
+                // and ERTS_BIF_YIELD_RETURN): the updater keeps the permission until it is
+                // scheduled again after thread progress.
+                process.cold_mut().persistent_update_result = Some(*value);
+                return Some(Err(VmError::Yield));
+            }
+            store.release_update_permission(&process._persistent_terms);
+        }
         return Some(result.map_err(|error| {
-            crate::exceptions::direct_bif_error(process, module, function, args, error)
+            crate::exceptions::bif_error(process, module, function, args, error)
         }));
     }
     if let Some(handle) = handler(module, function, arity) {
@@ -330,6 +511,173 @@ fn call_values(
         ("erlang", "system_info", 1) => alloc_info::system_info(vm, process, ctx, args[0])
             .or_else(|| system_info(vm, process, Some(ctx), args[0])),
         _ => None,
+    }
+}
+
+/// Persistent-term table counters taken before an updating BIF runs.
+pub(crate) struct PersistentTermUpdate {
+    updates: u64,
+    retired: u64,
+}
+
+impl PersistentTermUpdate {
+    pub(crate) fn snapshot() -> Self {
+        let store = arinsal_pterm::global_store();
+        Self {
+            updates: store.table_updates(),
+            retired: store.retired_generation(),
+        }
+    }
+
+    /// Whether a table update was published since the snapshot.
+    pub(crate) fn published(&self) -> bool {
+        arinsal_pterm::global_store().table_updates() != self.updates
+    }
+
+    /// Complete an update the way erts' updater does once the new table is published.
+    pub(crate) fn finish(self, process: &Process, ctx: &mut RunCtx<'_, Message>) {
+        let store = arinsal_pterm::global_store();
+        if store.table_updates() != self.updates {
+            // Port of erts/emulator/beam/erl_bif_persistent.c:490,535,737 (table updates go
+            // through erts_schedule_thr_prgr_later_op(table_updater) and the updater stays
+            // suspended until thread progress), OTP-29.1.1. This bounds the update rate the
+            // same way and keeps the collector queue as short as in erts.
+            ctx.block_thread_progress(std::time::Duration::ZERO);
+        }
+        if store.retired_generation() != self.retired {
+            // Port of erts/emulator/beam/beam_bif_load.c:2341 (erts_queue_release_literals),
+            // OTP-29.1.1: every queued area sends `copy_literals` to the collector.
+            wake_literal_collector(process, ctx);
+        }
+    }
+}
+
+// Port of erts/emulator/beam/beam_bif_load.c:1916 (wake area-switch wait), OTP-29.1.1.
+pub(crate) fn wake_literal_collector(process: &Process, ctx: &mut RunCtx<'_, Message>) {
+    let store = arinsal_pterm::global_store();
+    if !store.has_retired() {
+        return;
+    }
+    let Some(pid) = process.runtime.as_ref().and_then(|runtime| {
+        runtime
+            .names
+            .lock()
+            .unwrap()
+            .get("erts_literal_area_collector")
+            .copied()
+    }) else {
+        return;
+    };
+    if let Ok(message) = Message::copy_from(atom("copy_literals")) {
+        let _ = ctx.send(pid, message);
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_persistent.c:324 (persistent_term_get_0)
+// and :831 (do_get_all), OTP-29.1.1.
+fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<Term, VmError> {
+    if process
+        .cold
+        .as_ref()
+        .is_none_or(|cold| cold.persistent_get_all.is_none())
+    {
+        let snapshot = arinsal_pterm::global_store().snapshot();
+        let remaining = snapshot.len();
+        process.cold_mut().persistent_get_all = Some(crate::proc_create::PersistentGetAll {
+            snapshot,
+            cursor: 0,
+            remaining,
+            result: Term::NIL,
+        });
+    }
+
+    // OTP's BIF chunk size is `ERTS_BIF_REDS_LEFT(c_p)`, which is also how
+    // `erts_debug:set_internal_state(reds_left, ...)` steers this operation.
+    // Keep the scheduler quantum as an upper bound for this Rust call.
+    let budget = (process.reductions.max(1) as u32).min(ctx.remaining().max(1)) as usize;
+    let mut copied = 0_usize;
+    loop {
+        let (remaining, next_entry, tail) = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.persistent_get_all.as_ref())
+            .map(|state| {
+                (
+                    state.remaining,
+                    state.snapshot.entry_from(state.cursor),
+                    state.result,
+                )
+            })
+            .ok_or_else(|| VmError::Unsupported("persistent get/0 continuation".into()))?;
+        if remaining == 0 || copied >= budget {
+            break;
+        }
+        let (next_cursor, (key, value)) = next_entry
+            .ok_or_else(|| VmError::Unsupported("persistent get/0 snapshot entry".into()))?;
+        let result = (|| {
+            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let key = copy_term(key, &mut heap).map_err(|_| {
+                VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
+                    "system_limit",
+                )))
+            })?;
+            let pair = TermBuilder::new(&mut heap)
+                .tuple(&[key, value])
+                .map_err(|_| {
+                    VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
+                        "system_limit",
+                    )))
+                })?;
+            TermBuilder::new(&mut heap).cons(pair, tail).map_err(|_| {
+                VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
+                    "system_limit",
+                )))
+            })
+        })();
+        match result {
+            Ok(list) => {
+                process
+                    .cold_mut()
+                    .persistent_get_all
+                    .as_mut()
+                    .expect("persistent get/0 continuation remains live")
+                    .result = list;
+            }
+            Err(error) => {
+                process.cold_mut().persistent_get_all = None;
+                return Err(error);
+            }
+        }
+        process
+            .cold_mut()
+            .persistent_get_all
+            .as_mut()
+            .expect("persistent get/0 continuation remains live")
+            .cursor = next_cursor;
+        process
+            .cold_mut()
+            .persistent_get_all
+            .as_mut()
+            .expect("persistent get/0 continuation remains live")
+            .remaining -= 1;
+        copied += 1;
+    }
+
+    let done = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.persistent_get_all.as_ref())
+        .is_some_and(|state| state.remaining == 0);
+    if done {
+        let state = process
+            .cold_mut()
+            .persistent_get_all
+            .take()
+            .expect("persistent get/0 continuation remains live");
+        Ok(state.result)
+    } else {
+        ctx.consume(copied as u32);
+        Err(VmError::Yield)
     }
 }
 
@@ -2724,28 +3072,17 @@ fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
     Ok(atom("true"))
 }
 
-fn salvage_retired(process: &mut Process, live_x: usize) -> Result<(), VmError> {
-    let store = arinsal_pterm::global_store();
-    let areas = store.retired_areas(&process._persistent_terms);
-    if areas.is_empty() {
-        return Ok(());
-    }
-    let copied = rewrite_roots(process, live_x, &areas)?;
-    drop(areas);
-    store.release_retired(&process._persistent_terms, u64::from(copied));
-    Ok(())
-}
-
 fn rewrite_roots(
     process: &mut Process,
     live_x: usize,
     areas: &[RetiredArea],
 ) -> Result<u32, VmError> {
     let mut copied = 0_u32;
+    let mut shared_copy = SharedCopyCache::default();
     let live = live_x.min(process.x.len());
     for index in 0..live {
         let term = process.x[index];
-        let (term, did) = rewrite_root(process, term, areas)?;
+        let (term, did) = rewrite_root(process, term, areas, &mut shared_copy)?;
         process.x[index] = term;
         copied += u32::from(did);
     }
@@ -2754,15 +3091,39 @@ fn rewrite_roots(
         let Some(term) = process.heap.stack_get(index) else {
             continue;
         };
-        let (term, did) = rewrite_root(process, term, areas)?;
+        let (term, did) = rewrite_root(process, term, areas, &mut shared_copy)?;
         process.heap.stack_set(index, term);
+        copied += u32::from(did);
+    }
+    if let Some(cold) = process.cold.as_mut() {
+        let dictionary = std::mem::take(&mut cold.dictionary);
+        for (key, value) in dictionary {
+            let (key, key_copied) = rewrite_root(process, key, areas, &mut shared_copy)?;
+            let (value, value_copied) = rewrite_root(process, value, areas, &mut shared_copy)?;
+            process.cold_mut().dictionary.push((key, value));
+            copied += u32::from(key_copied) + u32::from(value_copied);
+        }
+    }
+    if let Some(result) = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.persistent_get_all.as_ref())
+        .map(|state| state.result)
+    {
+        let (updated, did) = rewrite_root(process, result, areas, &mut shared_copy)?;
+        process
+            .cold_mut()
+            .persistent_get_all
+            .as_mut()
+            .expect("persistent get/0 continuation remains live")
+            .result = updated;
         copied += u32::from(did);
     }
     // Off-heap message fragments remain owned by the queue and are not roots.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8460 (off-heap queue GC handling), OTP-29.1.1.
     let (indices, mut inbox) = process.inbox.gc_root_snapshot();
     for term in &mut inbox {
-        let (updated, did) = rewrite_root(process, *term, areas)?;
+        let (updated, did) = rewrite_root(process, *term, areas, &mut shared_copy)?;
         *term = updated;
         copied += u32::from(did);
     }
@@ -2774,18 +3135,27 @@ fn rewrite_root(
     process: &mut Process,
     term: Term,
     areas: &[RetiredArea],
+    shared_copy: &mut SharedCopyCache,
 ) -> Result<(Term, bool), VmError> {
-    if !references_retired(term, areas) {
+    if !references_retired(process, term, areas) {
         return Ok((term, false));
     }
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let copied = copy_term(term, &mut heap)
+    let copied = copy_term_preserving_sharing_with_cache(term, &mut heap, shared_copy)
         .map_err(|error| VmError::Unsupported(format!("literal copy {error:?}")))?;
     Ok((copied, true))
 }
 
-fn references_retired(term: Term, areas: &[RetiredArea]) -> bool {
-    let mut stack = vec![term];
+fn references_retired(process: &Process, term: Term, areas: &[RetiredArea]) -> bool {
+    references_retired_from_roots(process, std::iter::once(term), areas)
+}
+
+fn references_retired_from_roots(
+    process: &Process,
+    roots: impl IntoIterator<Item = Term>,
+    areas: &[RetiredArea],
+) -> bool {
+    let mut stack = roots.into_iter().collect::<Vec<_>>();
     let mut seen = HashSet::new();
     while let Some(term) = stack.pop() {
         if !term.is_pointer() {
@@ -2798,6 +3168,9 @@ fn references_retired(term: Term, areas: &[RetiredArea]) -> bool {
         }
         if areas.iter().any(|area| area.contains(term)) {
             return true;
+        }
+        if !process.heap.owns_term(term) {
+            continue;
         }
         push_children(term, &mut stack);
     }

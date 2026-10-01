@@ -478,9 +478,6 @@ fn proc_claims(module: &str, function: &str) -> bool {
     if matches!(function, "spawn_request" | "dist_spawn_request") && module != "erts_internal" {
         return false;
     }
-    if function == "processes_next" && module != "erts_internal" {
-        return false;
-    }
     if function == "fun_info_mfa" && module != "erlang" {
         return false;
     }

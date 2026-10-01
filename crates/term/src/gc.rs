@@ -498,6 +498,121 @@ fn prefetch_term(term: Term) {
 }
 
 impl ProcessHeap {
+    /// Maximum heap, stack, and fragment words inspected by literal GC checks.
+    // Port of erts/emulator/beam/beam_bif_load.c:976 (`erts_check_copy_literals_gc_need_max_reds`), OTP-29.1.1.
+    pub fn literal_scan_words(&self) -> usize {
+        self.htop
+            .saturating_add(self.stack_words())
+            .saturating_add(self.old_htop)
+            .saturating_add(self.fragments.iter().map(Fragment::len).sum::<usize>())
+    }
+
+    /// Return whether initialized process storage contains a direct pointer into an area.
+    /// Port of erts/emulator/beam/beam_bif_load.c:1240 (`any_heap_refs`), OTP-29.1.1.
+    pub fn has_heap_reference(&self, mut is_area_pointer: impl FnMut(Term) -> bool) -> bool {
+        let young = Self::any_heap_reference_words(
+            self.words.as_ptr().cast::<u64>(),
+            0,
+            self.htop,
+            true,
+            &mut is_area_pointer,
+        );
+        if young {
+            return true;
+        }
+        let stack = Self::any_heap_reference_words(
+            self.words.as_ptr().cast::<u64>(),
+            self.stop,
+            self.words.len() - self.stop,
+            false,
+            &mut is_area_pointer,
+        );
+        if stack {
+            return true;
+        }
+        if Self::any_heap_reference_words(
+            self.old_words.as_ptr().cast::<u64>(),
+            0,
+            self.old_htop,
+            true,
+            &mut is_area_pointer,
+        ) {
+            return true;
+        }
+        self.fragments.iter().any(|fragment| {
+            Self::any_heap_reference_words(
+                fragment.as_ptr(),
+                0,
+                fragment.len(),
+                true,
+                &mut is_area_pointer,
+            )
+        })
+    }
+
+    fn any_heap_reference_words(
+        base: *const u64,
+        start: usize,
+        words: usize,
+        heap_objects: bool,
+        is_area_pointer: &mut impl FnMut(Term) -> bool,
+    ) -> bool {
+        let end = start.saturating_add(words);
+        let mut index = start;
+        while index < end {
+            // SAFETY: Heap ranges contain complete initialized objects; stack
+            // ranges contain initialized term or continuation words.
+            let (word, sub_bits_orig, object_words) = unsafe {
+                let word = *base.add(index);
+                if heap_objects && word & 3 == 0 {
+                    let kind = word & 63;
+                    if kind == SUB_BITS {
+                        (
+                            word,
+                            Some(*base.add(index + 4)),
+                            Some(boxed_object_words(word, base.add(index))),
+                        )
+                    } else if kind != ARITY && kind != RECORD {
+                        (word, None, Some(boxed_object_words(word, base.add(index))))
+                    } else {
+                        (word, None, None)
+                    }
+                } else {
+                    (word, None, None)
+                }
+            };
+            if word & 3 == 1 || word & 3 == 2 {
+                let term = Term(word);
+                if is_area_pointer(term) {
+                    return true;
+                }
+            }
+            if sub_bits_orig.is_some_and(|orig| is_area_pointer(Term(orig))) {
+                return true;
+            }
+            if let Some(object_words) = object_words {
+                index += object_words;
+                continue;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// Whether a pointer belongs to this process's initialized heap storage.
+    pub fn owns_term(&self, term: Term) -> bool {
+        if !term.is_pointer() {
+            return false;
+        }
+        let address = (term.bits() & !7) as usize;
+        self.words.contains_initialized(address, self.htop)
+            || self.old_words.contains_initialized(address, self.old_htop)
+            || self.fragments.iter().any(|fragment| {
+                let start = fragment.as_ptr() as usize;
+                address >= start && address < start.saturating_add(fragment.len() * 8)
+            })
+    }
+
     /// Allocate a heap fragment and return its pointer after it enters the owner list.
     pub fn gc_fragment(&mut self, words: usize) -> *mut u64 {
         self.heap_fragment(words)
@@ -611,6 +726,11 @@ impl ProcessHeap {
     /// Number of live stack words.
     pub fn stack_words(&self) -> usize {
         self.words.len() - self.stop
+    }
+
+    /// Make the next collection sweep both generations.
+    pub fn request_full_sweep(&mut self) {
+        self.minor_since_major = self.fullsweep_after;
     }
 
     /// Read a stack word relative to the current stack pointer.
@@ -1227,6 +1347,20 @@ fn next_heap_size(minimum: usize, offset: usize, min_heap_size: usize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_area_scan_finds_raw_heap_references() {
+        let mut heap = ProcessHeap::with_words(16);
+        let mut literals = ProcessHeap::with_words(16);
+        assert!(heap.alloc(1).is_some());
+        let literal = crate::TermBuilder::new(&mut literals)
+            .tuple(&[Term::NIL])
+            .unwrap();
+        assert!(heap.debug_write_heap_word(0, literal.bits()));
+
+        assert!(heap.has_heap_reference(|term| term == literal));
+        assert!(!heap.has_heap_reference(|_| false));
+    }
 
     #[test]
     fn collection_relocates_frame_pointers_in_the_stack() {

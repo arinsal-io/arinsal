@@ -338,6 +338,28 @@ pub(crate) fn children(term: Term) -> Children {
 /// Number of words needed for a deep copy, counting shared objects each time.
 /// Port of `erts/emulator/beam/copy.c:88` (`size_object_x`), OTP-29.1.1.
 pub fn size_object(root: Term) -> usize {
+    size_object_inner(root, false, std::collections::HashSet::new())
+}
+
+/// Number of words needed by a deep copy that preserves object aliases.
+/// Port of erts/emulator/beam/copy.c:1111 (copy_shared_calculate), OTP-29.1.1.
+pub fn size_object_preserving_sharing(root: Term) -> usize {
+    size_object_preserving_sharing_after(root, [])
+}
+
+/// Count words not already visited by a shared-copy operation.
+pub fn size_object_preserving_sharing_after(
+    root: Term,
+    seen: impl IntoIterator<Item = u64>,
+) -> usize {
+    size_object_inner(root, true, seen.into_iter().collect())
+}
+
+fn size_object_inner(
+    root: Term,
+    preserve_sharing: bool,
+    mut visited: std::collections::HashSet<u64>,
+) -> usize {
     let mut size = 0;
     let mut stack = Vec::new();
     let mut current = Some(root);
@@ -349,6 +371,10 @@ pub fn size_object(root: Term) -> usize {
             unsafe {
                 let mut ptr = term.raw_ptr();
                 loop {
+                    if preserve_sharing && !visited.insert(ptr as usize as u64) {
+                        term = Term::NIL;
+                        break;
+                    }
                     size += 2;
                     let head = Term(*ptr);
                     if head.is_pointer() {
@@ -367,6 +393,9 @@ pub fn size_object(root: Term) -> usize {
             continue;
         }
         if let Some(h) = term.header() {
+            if preserve_sharing && !visited.insert(term.bits() & !7) {
+                continue;
+            }
             // SAFETY: term is live and its boxed header describes the allocation.
             let words = unsafe { crate::boxed_object_words(h, term.raw_ptr()) };
             size += words;

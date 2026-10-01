@@ -26,7 +26,10 @@ pub use bits::{
     writable_bytes_mut, writable_capacity, writable_extend_private, writable_finalize,
     writable_gc_visit,
 };
-pub use copy::copy_term;
+pub use copy::{
+    SharedCopyCache, copy_term, copy_term_preserving_sharing,
+    copy_term_preserving_sharing_with_cache,
+};
 pub use fun::{ExportEntry, FunEntry, FunRef};
 pub use gc::{FragmentAlloc, GcStats};
 pub use hamt::{boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_node_children};
@@ -42,8 +45,9 @@ pub use native_code::{
     is_native_code_pointer, register_native_code_range, unregister_native_code_range,
 };
 pub use ops::{
-    cmp, cmp_exact, exact_eq, flat_size, integer_magnitude_cmp, loose_eq, size_object, small_add,
-    small_mul, small_sub,
+    cmp, cmp_exact, exact_eq, flat_size, integer_magnitude_cmp, loose_eq, size_object,
+    size_object_preserving_sharing, size_object_preserving_sharing_after, small_add, small_mul,
+    small_sub,
 };
 pub use owned::{from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence};

@@ -6,7 +6,7 @@ use arinsal_bifs::FragmentingHeap;
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::CoverageMode;
 use arinsal_sched::Pid;
-use arinsal_sched::RunCtx;
+use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
 use arinsal_spec::Opcode;
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
 use std::sync::atomic::Ordering;
@@ -544,7 +544,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                     return Err(badarg());
                 }
                 // g_code_fix: drop the old version's slot once nothing references it.
-                let pending = std::mem::take(&mut code.condemned);
+                let pending = std::mem::take(&mut *code.condemned);
                 let mut keep = Vec::new();
                 for id in pending {
                     if module_id_referenced(process, &code.code_meta, id) {
@@ -561,7 +561,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                         code.release(id);
                     }
                 }
-                code.condemned = keep;
+                *code.condemned = keep;
                 removed.is_some()
             }
             _ => return Err(badarg()),
@@ -600,7 +600,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                     return Err(badarg());
                 }
                 // g_code_fix: drop the old version's slot once nothing references it.
-                let pending = std::mem::take(&mut vm.condemned);
+                let pending = std::mem::take(&mut *vm.condemned);
                 let mut keep = Vec::new();
                 for id in pending {
                     if module_id_referenced(process, &vm.code_meta, id) {
@@ -617,7 +617,7 @@ fn purge(vm: &mut Vm, process: &Process, name: &str, phase: &str) -> Result<Term
                         vm.release_module_slot(id);
                     }
                 }
-                vm.condemned = keep;
+                *vm.condemned = keep;
                 removed.is_some()
             }
             _ => return Err(badarg()),
@@ -712,19 +712,32 @@ fn literal_collector(vm: &Vm, process: &Process, pid: Pid) -> bool {
 
 // Port of erts/emulator/beam/beam_bif_load.c:1794
 // (erts_literal_area_collector_release_area_switch_0), OTP-29.1.1.
-// No code literal area is queued, so the collector is told there is nothing
-// to switch. Any other caller gets `notsup`, matching the process check.
-fn release_area_switch(vm: &Vm, process: &Process, pid: Pid) -> Result<Term, VmError> {
+// Persistent-term and purged-module literal areas share the collector queue.
+fn release_area_switch(
+    vm: &Vm,
+    process: &Process,
+    ctx: &mut RunCtx<'_, crate::process::Message>,
+) -> Result<Term, VmError> {
+    let store = arinsal_pterm::global_store();
+    if store.collector_area_complete() {
+        // Port of beam_bif_load.c:1849-1938, OTP-29.1.1: wait for thread
+        // progress only after all processes have copied the active area.
+        ctx.block_thread_progress(std::time::Duration::ZERO);
+    }
+    let pid = ctx.pid();
     if !literal_collector(vm, process, pid) {
         return Err(notsup());
     }
-    Ok(atom("false"))
+    Ok(atom(if store.collector_switch_area() {
+        "true"
+    } else {
+        "false"
+    }))
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:1750
 // (erts_literal_area_collector_send_copy_request_3), OTP-29.1.1.
-// With no literal area to copy, the request completes immediately and the
-// collector receives `{copy_literals, {Area, How, Pid}, ok}`.
+// The collector owns the area selection; each request names its active area.
 fn send_copy_request(
     vm: &Vm,
     process: &mut Process,
@@ -741,9 +754,29 @@ fn send_copy_request(
     if !matches!(how.as_str(), "init" | "check_gc" | "need_gc") {
         return Err(badarg());
     }
-    let request = make_tuple(process, &[args[1], args[2], args[0]])?;
-    let message = make_tuple(process, &[atom("copy_literals"), request, atom("ok")])?;
-    process.inbox.push_back(message);
+    let how = match how.as_str() {
+        "init" => LiteralCopyHow::Init,
+        "check_gc" => LiteralCopyHow::CheckGc,
+        "need_gc" => LiteralCopyHow::NeedGc,
+        _ => return Err(badarg()),
+    };
+    let Some(area_id) = arinsal_pterm::global_store().collector_area() else {
+        return Err(notsup());
+    };
+    let target = Pid::from_term(args[0]).expect("validated pid");
+    let request = crate::process::Message::literal_copy_request(args[1], how, target)?;
+    let signal_result = ctx.signal(
+        target,
+        Signal::LiteralAreaCopy {
+            area_id,
+            request,
+            how,
+            requester: ctx.pid(),
+        },
+    );
+    if signal_result.is_err() {
+        super::sys::reply_failed_literal_area_request(process, ctx, args[1], how, target)?;
+    }
     Ok(atom("ok"))
 }
 
@@ -769,9 +802,17 @@ pub(crate) fn call(
     function: &str,
     args: super::NativeArgs<'_>,
 ) -> Option<Result<Term, VmError>> {
-    args.with_values(process, |process, values| {
+    let result = args.with_values(process, |process, values| {
         call_values(vm, process, ctx, module, function, values)
-    })
+    });
+    if matches!(
+        (module, function, args.len()),
+        ("erts_internal", "purge_module", 2) | ("erlang", "delete_module", 1)
+    ) && result.as_ref().is_some_and(Result::is_ok)
+    {
+        super::sys::wake_literal_collector(process, ctx);
+    }
+    result
 }
 
 fn call_values(
@@ -975,7 +1016,7 @@ fn call_values(
             Some(Ok(atom("ok")))
         }
         ("erts_literal_area_collector", "release_area_switch", 0) => {
-            Some(release_area_switch(vm, process, ctx.pid()))
+            Some(release_area_switch(vm, process, ctx))
         }
         ("erts_literal_area_collector", "send_copy_request", 3) => {
             Some(send_copy_request(vm, process, ctx, args))

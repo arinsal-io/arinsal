@@ -67,7 +67,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub(crate) use calls::ImportOutcome;
 pub(crate) use interp::{RunState, gc_stress_enabled};
-pub(crate) use load::{CodeMeta, ExportIndex, SharedCode};
+pub(crate) use load::{CodeMeta, ExportIndex, SharedCode, SharedTable};
 pub(crate) use native_bridge::native_function_for;
 pub use native_bridge::{
     NativeFunction, NativeLine, arinsal_native_raise, native_function_at, register_native_function,
@@ -127,6 +127,8 @@ mod boot_loop1_shared_tests {
 /// A VM limitation, Erlang exception, or module loading failure.
 #[derive(Debug)]
 pub enum VmError {
+    /// The current BIF exhausted its scheduler slice and must resume later.
+    Yield,
     /// Instruction or external service not implemented yet.
     Unsupported(String),
     /// Erlang exception reason and current top frame.
@@ -150,6 +152,7 @@ pub enum VmError {
 impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Yield => f.write_str("scheduler yield"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Exception { reason, frame } => {
                 write!(f, "** exception error: {reason}\n  in function {frame}")
@@ -193,30 +196,30 @@ pub struct EvalResult {
 pub struct Vm {
     paths: Vec<PathBuf>,
     pub(crate) otp_root: Option<PathBuf>,
-    pub(crate) modules: Vec<Arc<Module>>,
-    loaded: HashMap<String, usize>,
-    old: HashMap<String, usize>,
-    pending_on_load: HashMap<String, usize>,
-    purge_prepared: std::collections::HashSet<String>,
-    deleted: std::collections::HashSet<String>,
-    code_meta: Vec<Option<Arc<CodeMeta>>>,
+    pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
+    loaded: SharedTable<HashMap<String, usize>>,
+    old: SharedTable<HashMap<String, usize>>,
+    pending_on_load: SharedTable<HashMap<String, usize>>,
+    purge_prepared: SharedTable<std::collections::HashSet<String>>,
+    deleted: SharedTable<std::collections::HashSet<String>>,
+    code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
     code_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
     seen_epoch: u64,
     beamasm_targets: beamasm_integration::NativeTargetCache,
-    registers: Vec<(usize, usize)>,
-    native_fns: Vec<arinsal_bifs::BifFn>,
-    loaded_nifs: std::collections::HashSet<String>,
+    registers: SharedTable<Vec<(usize, usize)>>,
+    native_fns: SharedTable<Vec<arinsal_bifs::BifFn>>,
+    loaded_nifs: SharedTable<std::collections::HashSet<String>>,
     shared: Option<Arc<Mutex<SharedCode>>>,
     // ---- vm_exc ----
     backtrace_depth: usize,
     // g_code_fix: global export index, reclaimable module slots, code-server filenames.
-    exports: ExportIndex,
-    free_ids: Vec<usize>,
-    module_live: Vec<bool>,
-    module_files: HashMap<String, arinsal_etf::OwnedTerm>,
-    condemned: Vec<usize>,
+    exports: SharedTable<ExportIndex>,
+    free_ids: SharedTable<Vec<usize>>,
+    module_live: SharedTable<Vec<bool>>,
+    module_files: SharedTable<HashMap<String, arinsal_etf::OwnedTerm>>,
+    condemned: SharedTable<Vec<usize>>,
     // g_code_fix: a module entry survives purge, so later delete_module stays true.
-    known_modules: HashSet<String>,
+    known_modules: SharedTable<HashSet<String>>,
     // Mode applies to modules loaded after code:set_coverage_mode/1.
     pub(crate) coverage_mode: arinsal_loader::CoverageMode,
 }

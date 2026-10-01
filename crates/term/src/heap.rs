@@ -114,6 +114,11 @@ impl WordBlock {
         self.tagged_words & !MAPPED_WORDS
     }
 
+    pub(crate) fn contains_initialized(&self, address: usize, words: usize) -> bool {
+        let start = self.base.as_ptr() as usize;
+        address >= start && address < start.saturating_add(words.saturating_mul(8))
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -744,6 +749,16 @@ impl VecHeap {
             address >= c.as_ptr() as usize && address < (c.as_ptr() as usize + c.len() * 8)
         })
     }
+    /// Address ranges occupied by initialized or reserved heap chunks.
+    pub fn pointer_ranges(&self) -> Vec<(usize, usize)> {
+        self.chunks
+            .iter()
+            .map(|chunk| {
+                let start = chunk.as_ptr() as usize;
+                (start, start.saturating_add(chunk.len() * 8))
+            })
+            .collect()
+    }
 }
 impl Default for VecHeap {
     fn default() -> Self {
@@ -854,7 +869,7 @@ impl LiteralArea {
     }
     /// Copy a term and all of its children into this unpublished area.
     pub fn copy_from(&mut self, term: Term) -> Result<Term, TermError> {
-        crate::copy_term(term, &mut self.heap)
+        crate::copy_term_preserving_sharing(term, &mut self.heap)
     }
     /// Number of initialized words in this area.
     pub fn used_words(&self) -> usize {
@@ -863,6 +878,10 @@ impl LiteralArea {
     /// Check whether a tagged pointer lies in this area's allocations.
     pub fn is_literal(&self, term: Term) -> bool {
         term.is_pointer() && self.heap.contains((term.bits() & !7) as *const u64)
+    }
+    /// Address ranges used by the literal-reference collector's pointer checks.
+    pub fn pointer_ranges(&self) -> Vec<(usize, usize)> {
+        self.heap.pointer_ranges()
     }
 }
 impl Default for LiteralArea {

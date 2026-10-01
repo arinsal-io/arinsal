@@ -3,27 +3,50 @@
 use super::*;
 use arinsal_term::{Atom, global_atoms};
 
+#[derive(Clone)]
+pub(crate) struct SharedTable<T: Clone>(Arc<T>);
+
+impl<T: Clone> SharedTable<T> {
+    fn new(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl<T: Clone> std::ops::Deref for SharedTable<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for SharedTable<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 pub(crate) struct SharedCode {
     pub(crate) coverage_mode: arinsal_loader::CoverageMode,
-    pub(crate) modules: Vec<Arc<Module>>,
-    pub(crate) loaded: HashMap<String, usize>,
-    pub(crate) old: HashMap<String, usize>,
-    pub(crate) pending_on_load: HashMap<String, usize>,
-    pub(crate) purge_prepared: std::collections::HashSet<String>,
-    pub(crate) deleted: std::collections::HashSet<String>,
-    pub(crate) code_meta: Vec<Option<Arc<CodeMeta>>>,
+    pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
+    pub(crate) loaded: SharedTable<HashMap<String, usize>>,
+    pub(crate) old: SharedTable<HashMap<String, usize>>,
+    pub(crate) pending_on_load: SharedTable<HashMap<String, usize>>,
+    pub(crate) purge_prepared: SharedTable<std::collections::HashSet<String>>,
+    pub(crate) deleted: SharedTable<std::collections::HashSet<String>>,
+    pub(crate) code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
     pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) registers: Vec<(usize, usize)>,
-    pub(crate) native_fns: Vec<arinsal_bifs::BifFn>,
-    pub(crate) loaded_nifs: std::collections::HashSet<String>,
+    pub(crate) registers: SharedTable<Vec<(usize, usize)>>,
+    pub(crate) native_fns: SharedTable<Vec<arinsal_bifs::BifFn>>,
+    pub(crate) loaded_nifs: SharedTable<std::collections::HashSet<String>>,
     // g_code_fix
-    pub(crate) exports: ExportIndex,
-    pub(crate) free_ids: Vec<usize>,
-    pub(crate) module_live: Vec<bool>,
-    pub(crate) module_files: HashMap<String, arinsal_etf::OwnedTerm>,
-    pub(crate) condemned: Vec<usize>,
+    pub(crate) exports: SharedTable<ExportIndex>,
+    pub(crate) free_ids: SharedTable<Vec<usize>>,
+    pub(crate) module_live: SharedTable<Vec<bool>>,
+    pub(crate) module_files: SharedTable<HashMap<String, arinsal_etf::OwnedTerm>>,
+    pub(crate) condemned: SharedTable<Vec<usize>>,
     // g_code_fix
-    pub(crate) known_modules: HashSet<String>,
+    pub(crate) known_modules: SharedTable<HashSet<String>>,
 }
 
 fn bind_import_targets(module: &mut Module) {
@@ -142,6 +165,7 @@ impl CodeMeta {
 
 // g_code_fix: insertion-order export index. module_info(exports) walks it
 // from the start and conses, so the Erlang list is reverse insertion order.
+//
 // Port of erts/emulator/beam/jit/beam_jit_main.cpp:117 (install_bifs),
 // erts/emulator/beam/erl_init.c:314 (erts_init_bif_re then erts_init_unicode),
 // erts/emulator/beam/jit/asm_load.c:1180 (beam_load_finalize_code exports then
@@ -306,23 +330,23 @@ impl SharedCode {
     pub(crate) fn blank() -> Self {
         Self {
             coverage_mode: arinsal_loader::CoverageMode::None,
-            modules: Vec::new(),
-            loaded: HashMap::new(),
-            old: HashMap::new(),
-            pending_on_load: HashMap::new(),
-            purge_prepared: std::collections::HashSet::new(),
-            deleted: std::collections::HashSet::new(),
-            code_meta: Vec::new(),
+            modules: SharedTable::new(Vec::new()),
+            loaded: SharedTable::new(HashMap::new()),
+            old: SharedTable::new(HashMap::new()),
+            pending_on_load: SharedTable::new(HashMap::new()),
+            purge_prepared: SharedTable::new(std::collections::HashSet::new()),
+            deleted: SharedTable::new(std::collections::HashSet::new()),
+            code_meta: SharedTable::new(Vec::new()),
             epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            registers: Vec::new(),
-            native_fns: Vec::new(),
-            loaded_nifs: std::collections::HashSet::new(),
-            exports: ExportIndex::new(),
-            free_ids: Vec::new(),
-            module_live: Vec::new(),
-            module_files: HashMap::new(),
-            condemned: Vec::new(),
-            known_modules: HashSet::new(),
+            registers: SharedTable::new(Vec::new()),
+            native_fns: SharedTable::new(Vec::new()),
+            loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
+            exports: SharedTable::new(ExportIndex::new()),
+            free_ids: SharedTable::new(Vec::new()),
+            module_live: SharedTable::new(Vec::new()),
+            module_files: SharedTable::new(HashMap::new()),
+            condemned: SharedTable::new(Vec::new()),
+            known_modules: SharedTable::new(HashSet::new()),
         }
     }
 
@@ -348,6 +372,9 @@ impl SharedCode {
     }
 
     pub(crate) fn release(&mut self, id: usize) {
+        if self.module_live.get(id).copied() == Some(true) {
+            arinsal_pterm::global_store().retire_module_area(self.modules[id].literal_area());
+        }
         release_slot(
             &mut self.module_live,
             &mut self.code_meta,
@@ -436,29 +463,29 @@ impl Vm {
         Self {
             paths,
             otp_root: Some(otp),
-            modules: Vec::new(),
-            loaded: HashMap::new(),
-            old: HashMap::new(),
-            pending_on_load: HashMap::new(),
-            purge_prepared: std::collections::HashSet::new(),
-            deleted: std::collections::HashSet::new(),
-            code_meta: Vec::new(),
+            modules: SharedTable::new(Vec::new()),
+            loaded: SharedTable::new(HashMap::new()),
+            old: SharedTable::new(HashMap::new()),
+            pending_on_load: SharedTable::new(HashMap::new()),
+            purge_prepared: SharedTable::new(std::collections::HashSet::new()),
+            deleted: SharedTable::new(std::collections::HashSet::new()),
+            code_meta: SharedTable::new(Vec::new()),
             code_epoch: None,
             seen_epoch: 0,
             beamasm_targets: beamasm_integration::NativeTargetCache::default(),
-            registers: Vec::new(),
-            native_fns: Vec::new(),
-            loaded_nifs: std::collections::HashSet::new(),
+            registers: SharedTable::new(Vec::new()),
+            native_fns: SharedTable::new(Vec::new()),
+            loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
             shared: None,
             // ---- vm_exc ----
             backtrace_depth: 8,
             // g_code_fix
-            exports: ExportIndex::new(),
-            free_ids: Vec::new(),
-            module_live: Vec::new(),
-            module_files: HashMap::new(),
-            condemned: Vec::new(),
-            known_modules: HashSet::new(),
+            exports: SharedTable::new(ExportIndex::new()),
+            free_ids: SharedTable::new(Vec::new()),
+            module_live: SharedTable::new(Vec::new()),
+            module_files: SharedTable::new(HashMap::new()),
+            condemned: SharedTable::new(Vec::new()),
+            known_modules: SharedTable::new(HashSet::new()),
             coverage_mode: arinsal_loader::CoverageMode::None,
         }
     }
@@ -539,6 +566,9 @@ impl Vm {
     }
 
     pub(crate) fn release_module_slot(&mut self, id: usize) {
+        if self.module_live.get(id).copied() == Some(true) {
+            arinsal_pterm::global_store().retire_module_area(self.modules[id].literal_area());
+        }
         release_slot(
             &mut self.module_live,
             &mut self.code_meta,
@@ -777,18 +807,11 @@ impl Vm {
         }
         Ok(on_load)
     }
+    // Port of erts/emulator/beam/code_ix.c:142 (erts_commit_staging_code_ix), OTP-29.1.1.
+    // Publish a generation by swapping table handles; readers retain their snapshot Arcs.
     pub(crate) fn sync_shared(&mut self, shared: &SharedCode) {
         self.coverage_mode = shared.coverage_mode;
-        // g_code_fix: a reused module id replaces its slot; only a new id appends.
-        for (id, module) in shared.modules.iter().enumerate() {
-            if id == self.modules.len() {
-                self.modules.push(Arc::clone(module));
-                self.beamasm_targets.register_module(id, module);
-            } else if !Arc::ptr_eq(&self.modules[id], module) {
-                self.modules[id] = Arc::clone(module);
-                self.beamasm_targets.register_module(id, module);
-            }
-        }
+        self.modules = shared.modules.clone();
         self.registers = shared.registers.clone();
         self.native_fns = shared.native_fns.clone();
         self.loaded_nifs = shared.loaded_nifs.clone();
@@ -977,27 +1000,27 @@ impl Vm {
         let mut vm = Self {
             paths: paths.to_vec(),
             otp_root: None,
-            modules: Vec::new(),
-            loaded: HashMap::new(),
-            old: HashMap::new(),
-            pending_on_load: HashMap::new(),
-            purge_prepared: std::collections::HashSet::new(),
-            deleted: std::collections::HashSet::new(),
-            code_meta: Vec::new(),
+            modules: SharedTable::new(Vec::new()),
+            loaded: SharedTable::new(HashMap::new()),
+            old: SharedTable::new(HashMap::new()),
+            pending_on_load: SharedTable::new(HashMap::new()),
+            purge_prepared: SharedTable::new(std::collections::HashSet::new()),
+            deleted: SharedTable::new(std::collections::HashSet::new()),
+            code_meta: SharedTable::new(Vec::new()),
             code_epoch: Some(Arc::clone(&code.lock().unwrap().epoch)),
             seen_epoch: 0,
             beamasm_targets: beamasm_integration::NativeTargetCache::default(),
-            registers: Vec::new(),
-            native_fns: Vec::new(),
-            loaded_nifs: std::collections::HashSet::new(),
+            registers: SharedTable::new(Vec::new()),
+            native_fns: SharedTable::new(Vec::new()),
+            loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
             shared: Some(Arc::clone(&code)),
             backtrace_depth: 8,
-            exports: ExportIndex::new(),
-            free_ids: Vec::new(),
-            module_live: Vec::new(),
-            module_files: HashMap::new(),
-            condemned: Vec::new(),
-            known_modules: HashSet::new(),
+            exports: SharedTable::new(ExportIndex::new()),
+            free_ids: SharedTable::new(Vec::new()),
+            module_live: SharedTable::new(Vec::new()),
+            module_files: SharedTable::new(HashMap::new()),
+            condemned: SharedTable::new(Vec::new()),
+            known_modules: SharedTable::new(HashSet::new()),
             coverage_mode: arinsal_loader::CoverageMode::None,
         };
         vm.sync_shared(&code.lock().unwrap());

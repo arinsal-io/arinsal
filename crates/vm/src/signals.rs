@@ -2144,6 +2144,12 @@ pub(crate) fn handle_request(
 
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
 pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+    // OTP destroys the trapped BIF state together with the exiting process.
+    // Persistent get/0's snapshot retains a table generation and its literals.
+    if let Some(cold) = process.cold.as_mut() {
+        cold.persistent_get_all = None;
+        cold.persistent_update_result = None;
+    }
     let slot = (scope(process), ctx.pid());
     let scheduler = process
         .runtime

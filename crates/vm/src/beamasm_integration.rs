@@ -22,6 +22,7 @@ type Mfa = (String, String, u8);
 pub(crate) struct NativeTargetCache {
     targets: Vec<Vec<Option<crate::NativeFunction>>>,
     generations: Vec<u64>,
+    module_identities: Vec<usize>,
 }
 
 impl NativeTargetCache {
@@ -30,14 +31,20 @@ impl NativeTargetCache {
         if module_id == self.targets.len() {
             self.targets.push(targets);
             self.generations.push(u64::MAX);
+            self.module_identities
+                .push(std::ptr::from_ref(module) as usize);
         } else if module_id < self.targets.len() {
             self.targets[module_id] = targets;
             self.generations[module_id] = u64::MAX;
+            self.module_identities[module_id] = std::ptr::from_ref(module) as usize;
         } else {
             self.targets.resize_with(module_id, Vec::new);
             self.targets.push(targets);
             self.generations.resize(module_id, u64::MAX);
             self.generations.push(u64::MAX);
+            self.module_identities.resize(module_id, 0);
+            self.module_identities
+                .push(std::ptr::from_ref(module) as usize);
         }
     }
 
@@ -52,6 +59,10 @@ impl NativeTargetCache {
             return None;
         }
         let index = index as usize;
+        let identity = std::ptr::from_ref(module) as usize;
+        if self.module_identities.get(module_id).copied() != Some(identity) {
+            self.register_module(module_id, module);
+        }
         let generation = crate::native_bridge::native_registry_generation();
         if self.generations.get(module_id).copied()? != generation {
             // One registry pass per module: a lookup per function would be quadratic.

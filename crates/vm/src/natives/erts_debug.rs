@@ -663,7 +663,14 @@ fn dirty(
 
 /// Port of erts/emulator/beam/beam_debug.c:86 (erts_debug_size_shared_1), OTP-29.1.1.
 fn size_shared(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    int(process, size_object(value))
+    // Port of erts/emulator/beam/copy.c:319 (size_shared), OTP-29.1.1.
+    // Literal graphs are outside the process heap until literal-area GC copies them.
+    let size = if process.heap.owns_term(value) {
+        size_object(value)
+    } else {
+        0
+    };
+    int(process, size)
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:170 (erts_debug_copy_shared_2), OTP-29.1.1.

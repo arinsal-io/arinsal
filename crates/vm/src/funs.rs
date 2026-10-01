@@ -888,10 +888,12 @@ impl Vm {
                 ctx,
             )
         };
-        if matches!(
-            &result,
-            Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)
-        ) {
+        if matches!(&result, Err(VmError::Yield))
+            || matches!(
+                &result,
+                Err(VmError::Unsupported(message)) if crate::signals::is_await_message(message)
+            )
+        {
             p.x.copy_from_slice(&original_x);
             p.gc_live = original_gc_live;
         }

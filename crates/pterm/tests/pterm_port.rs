@@ -92,12 +92,15 @@ fn erase_keeps_old_value_alive_for_readers() {
 
     assert!(store.erase(key));
     assert_eq!(pair(reader_value), (17, 23));
+    assert!(store.collector_switch_area());
     let retired = store.retired_areas(&process);
     assert_eq!(retired.len(), 1);
     assert!(retired[0].contains(reader_value));
     let id = retired[0].id();
     drop(retired);
     assert!(store.acknowledge(&process, id));
+    assert!(store.has_retired());
+    assert!(!store.collector_switch_area());
     assert!(!store.has_retired());
 }
 

@@ -491,6 +491,11 @@ pub struct CoverageProbe {
     pub counter: u32,
 }
 impl Module {
+    /// Retain this code version's literal heap for process root scanning.
+    pub fn literal_area(&self) -> Arc<VecHeap> {
+        Arc::clone(&self._literals)
+    }
+
     /// Patch one interpreted function entry, preserving the instruction to run after tracing.
     pub fn set_trace_breakpoint(&mut self, entry: usize, enabled: bool) -> bool {
         self.set_trace_breakpoints(&[(entry, enabled)])

@@ -1,34 +1,55 @@
 //! Persistent terms and the literal-retirement handshake.
 //!
-//! A process handle is published through a lock-free queue. After a replacement
-//! or erase, the writer snapshots the handles that predate that retirement.
-//! Their next GC scans roots and heap objects, copies references into the
-//! process heap, then acknowledges the area. Dropping a handle means its roots
-//! are gone; it takes the writer lock only while retired areas exist.
+//! A process handle is published through a lock-free queue. The literal-area
+//! collector activates one retired area at a time, snapshots its process
+//! barrier, and publishes that area for concurrent signal handling. Each
+//! process copies live references before atomically acknowledging its barrier.
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_term::{
-    ExportEntry, FunEntry, HeapAlloc, LiteralArea, Node, Term, TermBuilder, TermError, copy_term,
-    exact_eq, global_atoms, internal_hash, size_object,
+    ExportEntry, FunEntry, HeapAlloc, LiteralArea, Node, Term, TermBuilder, TermError, VecHeap,
+    copy_term, exact_eq, global_atoms, internal_hash, size_object,
 };
 use crossbeam_epoch::{Atomic, Owned, pin};
 use crossbeam_queue::SegQueue;
 
 static GLOBAL: LazyLock<Store> = LazyLock::new(Store::new);
-thread_local! {
-    static WRITER_DEPTH: Cell<usize> = const { Cell::new(0) };
-    static DEFERRED_UNREGISTER: RefCell<Vec<(*const Store, u64)>> = const { RefCell::new(Vec::new()) };
-}
 
 /// The table used by BIF calls; the VM registers processes with this store.
 pub fn global_store() -> &'static Store {
     &GLOBAL
+}
+
+/// A stable table view held across a yielding `persistent_term:get/0` call.
+pub struct Snapshot {
+    allocated: usize,
+    num_entries: usize,
+    term: Arc<Vec<Arc<BucketChunk>>>,
+}
+
+impl Snapshot {
+    /// Number of key/value pairs in the captured table.
+    pub fn len(&self) -> usize {
+        self.num_entries
+    }
+
+    /// Whether the captured table was empty.
+    pub fn is_empty(&self) -> bool {
+        self.num_entries == 0
+    }
+
+    /// Find the next occupied bucket from a persistent hash-table cursor.
+    pub fn entry_from(&self, cursor: usize) -> Option<(usize, (Term, Term))> {
+        (cursor..self.allocated).find_map(|index| {
+            self.term[index / BUCKET_CHUNK_SIZE][index % BUCKET_CHUNK_SIZE]
+                .as_ref()
+                .map(|item| (index + 1, (item.key, item.value)))
+        })
+    }
 }
 
 struct Stored {
@@ -56,13 +77,16 @@ fn deref_table<'g>(shared: crossbeam_epoch::Shared<'g, Table>) -> &'g Table {
 // Port of erts/emulator/beam/erl_bif_persistent.c:42 (Parameters for the hash table), OTP-29.1.1
 const INITIAL_SIZE: usize = 8;
 const LOAD_FACTOR: usize = 50;
+const BUCKET_CHUNK_SIZE: usize = 256;
+
+type BucketChunk = Vec<Option<Arc<Stored>>>;
 
 #[derive(Clone)]
 struct Table {
     allocated: usize,
     num_entries: usize,
     // Port of erts/emulator/beam/erl_bif_persistent.c:58 (hash_table), OTP-29.1.1
-    term: Vec<Option<Arc<Stored>>>,
+    term: Arc<Vec<Arc<BucketChunk>>>,
 }
 
 impl Table {
@@ -71,8 +95,39 @@ impl Table {
         Self {
             allocated: INITIAL_SIZE,
             num_entries: 0,
-            term: vec![None; INITIAL_SIZE],
+            term: Self::empty_buckets(INITIAL_SIZE),
         }
+    }
+
+    fn empty_buckets(allocated: usize) -> Arc<Vec<Arc<BucketChunk>>> {
+        let chunks = allocated.div_ceil(BUCKET_CHUNK_SIZE);
+        Arc::new(
+            (0..chunks)
+                .map(|chunk| {
+                    let len = (allocated - chunk * BUCKET_CHUNK_SIZE).min(BUCKET_CHUNK_SIZE);
+                    Arc::new(vec![None; len])
+                })
+                .collect(),
+        )
+    }
+
+    fn bucket(&self, index: usize) -> &Option<Arc<Stored>> {
+        &self.term[index / BUCKET_CHUNK_SIZE][index % BUCKET_CHUNK_SIZE]
+    }
+
+    fn bucket_mut(&mut self, index: usize) -> &mut Option<Arc<Stored>> {
+        let chunks = Arc::make_mut(&mut self.term);
+        Arc::make_mut(&mut chunks[index / BUCKET_CHUNK_SIZE])
+            .get_mut(index % BUCKET_CHUNK_SIZE)
+            .expect("bucket index is within the allocated table")
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (usize, &Arc<Stored>)> {
+        self.term
+            .iter()
+            .flat_map(|chunk| chunk.iter())
+            .enumerate()
+            .filter_map(|(index, item)| item.as_ref().map(|item| (index, item)))
     }
 
     // Port of erts/emulator/beam/erl_bif_persistent.c:46 (MUST_GROW), OTP-29.1.1
@@ -92,7 +147,7 @@ impl Table {
         let mut idx = hash as usize;
         loop {
             let i = idx & mask;
-            let bucket = &self.term[i];
+            let bucket = self.bucket(i);
             match bucket {
                 None => return i,
                 Some(stored) => {
@@ -113,12 +168,26 @@ fn lookup_hash(term: Term) -> u64 {
 }
 
 struct Pending {
-    stored: Arc<Stored>,
-    waiting: HashMap<u64, Weak<ProcessAccount>>,
+    area: RetiredStorage,
+    generation: u64,
+}
+#[derive(Clone)]
+enum RetiredStorage {
+    Persistent(Arc<Stored>),
+    Module(Arc<VecHeap>),
+}
+impl RetiredStorage {
+    fn pointer_ranges(&self) -> Vec<(usize, usize)> {
+        match self {
+            Self::Persistent(stored) => stored.area.pointer_ranges(),
+            Self::Module(area) => area.pointer_ranges(),
+        }
+    }
 }
 struct ProcessAccount {
-    id: u64,
     generation: u64,
+    exited: AtomicBool,
+    waiting_area: AtomicU64,
     capacity: AtomicU64,
     used: AtomicU64,
     binary: AtomicU64,
@@ -138,7 +207,13 @@ pub struct RetirementTrace {
 struct Writer {
     next_area: u64,
     retired: HashMap<u64, Pending>,
-    last_trace: RetirementTrace,
+    retired_order: VecDeque<u64>,
+}
+struct ActiveArea {
+    id: u64,
+    area: RetiredStorage,
+    pointer_ranges: Arc<[(usize, usize)]>,
+    outstanding: AtomicUsize,
 }
 
 /// A process-independent persistent-term table.
@@ -149,69 +224,26 @@ struct Writer {
 pub struct Store {
     table: Atomic<Table>,
     writer: Mutex<Writer>,
+    active_area: RwLock<Option<Arc<ActiveArea>>>,
+    last_trace: [AtomicU64; 4],
     processes: SegQueue<Weak<ProcessAccount>>,
-    next_process: AtomicU64,
     registration_generation: AtomicU64,
     registrations_in_flight: AtomicUsize,
     process_scan: Mutex<()>,
     /// Areas waiting for process GC. Lock-free so collection can skip the scan.
     retired_len: AtomicUsize,
+    retired_generation: AtomicU64,
     /// Areas whose last waiter has acknowledged them.
     freed: AtomicU64,
-}
-struct WriterGuard<'a> {
-    store: &'a Store,
-    guard: MutexGuard<'a, Writer>,
-}
-impl Deref for WriterGuard<'_> {
-    type Target = Writer;
-    fn deref(&self) -> &Writer {
-        &self.guard
-    }
-}
-impl DerefMut for WriterGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Writer {
-        &mut self.guard
-    }
-}
-impl Drop for WriterGuard<'_> {
-    fn drop(&mut self) {
-        let store = self.store;
-        store.drain_deferred(&mut self.guard);
-        // The mutex guard drops after this impl, so the lock is held through the drain.
-        WRITER_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
+    /// Published table updates; a change tells the caller to wait for thread progress.
+    updates: AtomicU64,
+    /// Account of the process holding the update permission (0 when free).
+    updater: AtomicUsize,
 }
 
 impl Store {
-    fn lock_writer(&self) -> WriterGuard<'_> {
-        let guard = self.writer.lock().expect("persistent-term writer poisoned");
-        WRITER_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        WriterGuard { store: self, guard }
-    }
-    fn drain_deferred(&self, writer: &mut Writer) {
-        loop {
-            let mine = self as *const Store;
-            let ids: Vec<u64> = DEFERRED_UNREGISTER.with(|queue| {
-                let mut queue = queue.borrow_mut();
-                let mut ids = Vec::new();
-                queue.retain(|(store, id)| {
-                    if *store == mine {
-                        ids.push(*id);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                ids
-            });
-            if ids.is_empty() {
-                break;
-            }
-            for id in ids {
-                unregister_process(self, writer, id);
-            }
-        }
+    fn lock_writer(&self) -> std::sync::MutexGuard<'_, Writer> {
+        self.writer.lock().expect("persistent-term writer poisoned")
     }
     /// Create an empty store.
     pub fn new() -> Self {
@@ -220,20 +252,32 @@ impl Store {
             writer: Mutex::new(Writer {
                 next_area: 1,
                 retired: HashMap::new(),
-                last_trace: RetirementTrace::default(),
+                retired_order: VecDeque::new(),
             }),
+            active_area: RwLock::new(None),
+            last_trace: std::array::from_fn(|_| AtomicU64::new(0)),
             processes: SegQueue::new(),
-            next_process: AtomicU64::new(1),
             registration_generation: AtomicU64::new(0),
             registrations_in_flight: AtomicUsize::new(0),
             process_scan: Mutex::new(()),
             retired_len: AtomicUsize::new(0),
+            retired_generation: AtomicU64::new(0),
             freed: AtomicU64::new(0),
+            updates: AtomicU64::new(0),
+            updater: AtomicUsize::new(0),
         }
     }
     /// Whether any literal area is waiting for a process collection.
     pub fn has_retired(&self) -> bool {
         self.retired_len.load(Ordering::Acquire) != 0
+    }
+    /// Monotonic generation advanced whenever a new area needs collector work.
+    pub fn retired_generation(&self) -> u64 {
+        self.retired_generation.load(Ordering::Acquire)
+    }
+    /// Monotonic count of published table updates (`put`, `erase`, `clear`).
+    pub fn table_updates(&self) -> u64 {
+        self.updates.load(Ordering::Acquire)
     }
     /// Areas released after their last process acknowledged them.
     pub fn freed_literal_areas(&self) -> u64 {
@@ -241,16 +285,21 @@ impl Store {
     }
     /// Latest GC retirement trace. Zero until a collection owed an area.
     pub fn last_retirement(&self) -> RetirementTrace {
-        self.lock_writer().last_trace
+        RetirementTrace {
+            pending_before: self.last_trace[0].load(Ordering::Relaxed) as usize,
+            pending_after: self.last_trace[1].load(Ordering::Relaxed) as usize,
+            freed: self.last_trace[2].load(Ordering::Relaxed),
+            copied_roots: self.last_trace[3].load(Ordering::Relaxed),
+        }
     }
     /// Register a process for literal retirement before its first read.
     pub fn register_process(&self) -> ProcessRegistration<'_> {
         self.registrations_in_flight.fetch_add(1, Ordering::SeqCst);
         let generation = self.registration_generation.load(Ordering::Acquire);
-        let id = self.next_process.fetch_add(1, Ordering::Relaxed);
         let account = Arc::new(ProcessAccount {
-            id,
             generation,
+            exited: AtomicBool::new(false),
+            waiting_area: AtomicU64::new(0),
             capacity: AtomicU64::new(0),
             used: AtomicU64::new(0),
             binary: AtomicU64::new(0),
@@ -259,7 +308,6 @@ impl Store {
         self.registrations_in_flight.fetch_sub(1, Ordering::SeqCst);
         ProcessRegistration {
             store: self,
-            id,
             account: Some(account),
         }
     }
@@ -308,7 +356,7 @@ impl Store {
             .load(std::sync::atomic::Ordering::Acquire, &guard);
         let table = deref_table(table);
         let idx = table.lookup(key, hash);
-        table.term[idx].as_ref().map(|item| item.value)
+        table.bucket(idx).as_ref().map(|item| item.value)
     }
     /// Insert or replace a value. An exactly equal value is a no-op.
     // Port of erts/emulator/beam/erl_bif_persistent.c:314 (persistent_term_put_2), OTP-29.1.1
@@ -331,7 +379,7 @@ impl Store {
         let current_table = deref_table(current);
 
         let idx = current_table.lookup(key, hash);
-        if let Some(old) = &current_table.term[idx] {
+        if let Some(old) = current_table.bucket(idx) {
             if exact_eq(old.value, value) {
                 // Port of erts/emulator/beam/erl_bif_persistent.c:726 (same value), OTP-29.1.1
                 return Ok(true);
@@ -348,16 +396,16 @@ impl Store {
         let entry = Arc::new(Stored { area, key, value });
 
         // Port of erts/emulator/beam/erl_bif_persistent.c:275 (TRAPPING_COPY_TABLE), OTP-29.1.1
-        let mut next = if current_table.term[idx].is_none() && current_table.must_grow() {
+        let mut next = if current_table.bucket(idx).is_none() && current_table.must_grow() {
             let mut new_table = Table {
                 allocated: current_table.allocated * 2,
                 num_entries: current_table.num_entries,
-                term: vec![None; current_table.allocated * 2],
+                term: Table::empty_buckets(current_table.allocated * 2),
             };
             // Port of erts/emulator/beam/erl_bif_persistent.c:1100 (copy_table_place_3), OTP-29.1.1
-            for item in current_table.term.iter().flatten() {
+            for (_, item) in current_table.entries() {
                 let new_idx = new_table.lookup(item.key, lookup_hash(item.key));
-                new_table.term[new_idx] = Some(Arc::clone(item));
+                *new_table.bucket_mut(new_idx) = Some(Arc::clone(item));
             }
             new_table
         } else {
@@ -365,7 +413,7 @@ impl Store {
         };
 
         let new_idx = next.lookup(key, hash);
-        if let Some(old) = next.term[new_idx].replace(entry) {
+        if let Some(old) = next.bucket_mut(new_idx).replace(entry) {
             self.retire(&mut writer, old);
         } else {
             next.num_entries += 1;
@@ -388,12 +436,14 @@ impl Store {
         let current_table = deref_table(current);
 
         let idx = current_table.lookup(key, hash);
-        if current_table.term[idx].is_none() {
+        if current_table.bucket(idx).is_none() {
             return false;
         }
 
         // Port of erts/emulator/beam/erl_bif_persistent.c:1025 (is_erasable), OTP-29.1.1
-        let is_erasable = current_table.term[(idx + 1) & (current_table.allocated - 1)].is_none();
+        let is_erasable = current_table
+            .bucket((idx + 1) & (current_table.allocated - 1))
+            .is_none();
 
         let mut next;
         let old;
@@ -401,7 +451,7 @@ impl Store {
         if !current_table.must_shrink() && is_erasable {
             // Port of erts/emulator/beam/erl_bif_persistent.c:478 (fast erase), OTP-29.1.1
             next = current_table.clone();
-            old = next.term[idx].take().unwrap();
+            old = next.bucket_mut(idx).take().unwrap();
             next.num_entries -= 1;
         } else {
             // Rehash
@@ -413,16 +463,14 @@ impl Store {
             next = Table {
                 allocated: new_size,
                 num_entries: current_table.num_entries - 1,
-                term: vec![None; new_size],
+                term: Table::empty_buckets(new_size),
             };
-            old = current_table.term[idx].clone().unwrap();
+            old = current_table.bucket(idx).clone().unwrap();
 
-            for (i, item) in current_table.term.iter().enumerate() {
-                if i != idx
-                    && let Some(stored) = item
-                {
+            for (i, stored) in current_table.entries() {
+                if i != idx {
                     let new_idx = next.lookup(stored.key, lookup_hash(stored.key));
-                    next.term[new_idx] = Some(Arc::clone(stored));
+                    *next.bucket_mut(new_idx) = Some(Arc::clone(stored));
                 }
             }
         }
@@ -438,7 +486,7 @@ impl Store {
         let current = self
             .table
             .load(std::sync::atomic::Ordering::Acquire, &guard);
-        for stored in deref_table(current).term.iter().flatten() {
+        for (_, stored) in deref_table(current).entries() {
             self.retire(&mut writer, Arc::clone(stored));
         }
         self.publish(Table::new(), current, &guard);
@@ -451,38 +499,36 @@ impl Store {
             // replaces the per-process writer-locked registration snapshot;
             // processes that existed before this area retired acknowledge it
             // only after their next GC rewrites all roots.
-            let _scan = self.process_scan.lock().expect("process scan poisoned");
-            // Publish retirement before taking the process snapshot. A process
-            // dropped during the scan then waits for this writer and removes
-            // its weak handle from the completed snapshot.
-            self.retired_len.fetch_add(1, Ordering::Release);
-            let generation = self.registration_generation.fetch_add(1, Ordering::SeqCst);
-            while self.registrations_in_flight.load(Ordering::SeqCst) != 0 {
-                std::hint::spin_loop();
-            }
-            let mut waiting = HashMap::new();
-            let mut live = Vec::new();
-            while let Some(account) = self.processes.pop() {
-                if let Some(account) = account.upgrade() {
-                    if account.generation <= generation {
-                        waiting.insert(account.id, Arc::downgrade(&account));
-                    }
-                    live.push(Arc::downgrade(&account));
-                }
-            }
-            for account in live {
-                self.processes.push(account);
-            }
-            let id = writer.next_area;
-            writer.next_area += 1;
-            writer.retired.insert(
-                id,
-                Pending {
-                    stored: old,
-                    waiting,
-                },
-            );
+            let generation = self.start_retirement();
+            self.finish_retirement(writer, RetiredStorage::Persistent(old), generation);
         }
+    }
+
+    /// Retain a purged module's literal heap until every existing process has copied its roots.
+    pub fn retire_module_area(&self, area: Arc<VecHeap>) {
+        let mut writer = self.lock_writer();
+        let generation = self.start_retirement();
+        self.finish_retirement(&mut writer, RetiredStorage::Module(area), generation);
+    }
+
+    fn start_retirement(&self) -> u64 {
+        // Port of erts/emulator/beam/erl_bif_persistent.c:1191-1203, OTP-29.1.1.
+        // The preloaded collector owns one process snapshot at a time; queued
+        // areas retain only this cutoff until release_literal_area_switch.
+        self.retired_len.fetch_add(1, Ordering::Release);
+        let generation = self.registration_generation.fetch_add(1, Ordering::SeqCst);
+        while self.registrations_in_flight.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
+        generation
+    }
+
+    fn finish_retirement(&self, writer: &mut Writer, area: RetiredStorage, generation: u64) {
+        let id = writer.next_area;
+        writer.next_area += 1;
+        writer.retired.insert(id, Pending { area, generation });
+        writer.retired_order.push_back(id);
+        self.retired_generation.fetch_add(1, Ordering::Release);
     }
     fn publish(
         &self,
@@ -493,6 +539,7 @@ impl Store {
         // Port of erts/emulator/beam/erl_bif_persistent.c:1175 (table_updater), OTP-29.1.1
         self.table
             .store(Owned::new(next), std::sync::atomic::Ordering::Release);
+        self.updates.fetch_add(1, Ordering::Release);
         // SAFETY: only the writer publishes tables; pinned readers may finish
         // before the old table and its Arc owners are destroyed.
         unsafe { guard.defer_destroy(current) };
@@ -510,10 +557,8 @@ impl Store {
         let bytes = 96 // sizeof(HashTable) + offsetof(HashTable, term) is 96 in erl
             + (table.allocated - 1) * 8 // term array inside HashTable
             + table
-                .term
-                .iter()
-                .flatten()
-                .map(|item| 16 + item.area.used_words() * 8) // size of literal area struct + words
+                .entries()
+                .map(|(_, item)| 16 + item.area.used_words() * 8) // size of literal area struct + words
                 .sum::<usize>();
         (table.num_entries, bytes)
     }
@@ -524,48 +569,303 @@ impl Store {
             .table
             .load(std::sync::atomic::Ordering::Acquire, &guard);
         let table = deref_table(current);
-        for item in table.term.iter().flatten() {
+        for (_, item) in table.entries() {
             visit(item.key, item.value);
+        }
+    }
+    /// Capture the current table without retaining the table epoch guard.
+    pub fn snapshot(&self) -> Snapshot {
+        let guard = pin();
+        let current = self.table.load(Ordering::Acquire, &guard);
+        let table = deref_table(current);
+        Snapshot {
+            allocated: table.allocated,
+            num_entries: table.num_entries,
+            term: Arc::clone(&table.term),
         }
     }
     /// Return retired areas this process still needs to scan and copy.
     pub fn retired_areas(&self, process: &ProcessRegistration<'_>) -> Vec<RetiredArea> {
         assert!(std::ptr::eq(self, process.store));
+        let Some(account) = process.account.as_ref() else {
+            return Vec::new();
+        };
+        let Some(active) = self
+            .active_area
+            .read()
+            .expect("active literal area poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        (account.waiting_area.load(Ordering::Acquire) == active.id)
+            .then(|| RetiredArea {
+                id: active.id,
+                _area: active.area.clone(),
+                pointer_ranges: Arc::clone(&active.pointer_ranges),
+            })
+            .into_iter()
+            .collect()
+    }
+    /// Whether a live process predates any area still waiting for collector release.
+    pub fn has_pending_for(&self, process: &ProcessRegistration<'_>) -> bool {
+        assert!(std::ptr::eq(self, process.store));
+        let Some(account) = process.account.as_ref() else {
+            return false;
+        };
         let writer = self.lock_writer();
         writer
             .retired
-            .iter()
-            .filter(|(_, pending)| {
-                pending
-                    .waiting
-                    .get(&process.id)
-                    .is_some_and(|account| account.strong_count() > 0)
-            })
-            .map(|(&id, pending)| RetiredArea {
+            .values()
+            .any(|pending| account.generation <= pending.generation)
+    }
+    /// Switch the collector to the oldest area that still has process references.
+    // Port of erts/emulator/beam/beam_bif_load.c:1801 (release_literal_area_switch), OTP-29.1.1.
+    pub fn collector_switch_area(&self) -> bool {
+        let mut writer = self.lock_writer();
+        let current_active = {
+            self.active_area
+                .read()
+                .expect("active literal area poisoned")
+                .as_ref()
+                .cloned()
+        };
+        if let Some(active) = current_active {
+            if active.outstanding.load(Ordering::Acquire) != 0 {
+                return true;
+            }
+            let mut slot = self
+                .active_area
+                .write()
+                .expect("active literal area poisoned");
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &active))
+            {
+                slot.take();
+            }
+            if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some()
+                && let RetiredStorage::Persistent(stored) = &active.area
+            {
+                eprintln!(
+                    "literal_release area={} stored_refs={}",
+                    active.id,
+                    Arc::strong_count(stored)
+                );
+            }
+            writer.retired.remove(&active.id);
+            self.note_area_freed();
+            if writer.retired_order.front() == Some(&active.id) {
+                writer.retired_order.pop_front();
+            }
+        }
+        loop {
+            let Some(id) = writer.retired_order.front().copied() else {
+                return false;
+            };
+            let Some((generation, area)) = writer
+                .retired
+                .get(&id)
+                .map(|pending| (pending.generation, pending.area.clone()))
+            else {
+                writer.retired_order.pop_front();
+                continue;
+            };
+            if generation > self.registration_generation.load(Ordering::Acquire) {
+                return false;
+            }
+            let _scan = self.process_scan.lock().expect("process scan poisoned");
+            while self.registrations_in_flight.load(Ordering::SeqCst) != 0 {
+                std::hint::spin_loop();
+            }
+            let mut live = Vec::new();
+            let mut waiting = Vec::new();
+            while let Some(account) = self.processes.pop() {
+                if let Some(account) = account.upgrade() {
+                    if account.generation <= generation && !account.exited.load(Ordering::Acquire) {
+                        waiting.push(Arc::clone(&account));
+                    }
+                    live.push(Arc::downgrade(&account));
+                }
+            }
+            for account in live {
+                self.processes.push(account);
+            }
+            if waiting.is_empty() {
+                writer.retired.remove(&id);
+                writer.retired_order.pop_front();
+                self.note_area_freed();
+                continue;
+            }
+            for account in &waiting {
+                account.waiting_area.store(id, Ordering::Release);
+            }
+            let active = Arc::new(ActiveArea {
                 id,
-                stored: Arc::clone(&pending.stored),
-            })
-            .collect()
+                pointer_ranges: Arc::from(area.pointer_ranges()),
+                area,
+                outstanding: AtomicUsize::new(waiting.len()),
+            });
+            *self
+                .active_area
+                .write()
+                .expect("active literal area poisoned") = Some(Arc::clone(&active));
+            if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+                eprintln!("literal_switch area={} waiting={}", id, waiting.len());
+            }
+            for account in &waiting {
+                if account.exited.load(Ordering::Acquire) {
+                    self.acknowledge_account(&active, account, 0);
+                }
+            }
+            if active.outstanding.load(Ordering::Acquire) != 0 {
+                return true;
+            }
+        }
+    }
+    fn note_area_freed(&self) {
+        self.retired_len.fetch_sub(1, Ordering::AcqRel);
+        self.freed.fetch_add(1, Ordering::Relaxed);
+        self.last_trace[2].fetch_add(1, Ordering::Relaxed);
+    }
+    /// Internal identifier for the area currently being copied by the collector.
+    pub fn collector_area(&self) -> Option<u64> {
+        self.active_area
+            .read()
+            .expect("active literal area poisoned")
+            .as_ref()
+            .map(|active| active.id)
+    }
+    /// Whether every process has completed copying the active area.
+    pub fn collector_area_complete(&self) -> bool {
+        self.active_area
+            .read()
+            .expect("active literal area poisoned")
+            .as_ref()
+            .is_some_and(|active| active.outstanding.load(Ordering::Acquire) == 0)
+    }
+    /// Return one area this process still owes to the collector.
+    pub fn retired_area(
+        &self,
+        process: &ProcessRegistration<'_>,
+        area_id: u64,
+    ) -> Option<RetiredArea> {
+        assert!(std::ptr::eq(self, process.store));
+        let active = self
+            .active_area
+            .read()
+            .expect("active literal area poisoned")
+            .as_ref()
+            .filter(|active| active.id == area_id)?
+            .clone();
+        Some(RetiredArea {
+            id: area_id,
+            _area: active.area.clone(),
+            pointer_ranges: Arc::clone(&active.pointer_ranges),
+        })
     }
     /// Acknowledge after scanning all process roots and copying live references.
     pub fn acknowledge(&self, process: &ProcessRegistration<'_>, area_id: u64) -> bool {
+        self.acknowledge_copied(process, area_id, 0)
+    }
+    /// Acknowledge one collector area and record the process's scan result.
+    pub fn acknowledge_copied(
+        &self,
+        process: &ProcessRegistration<'_>,
+        area_id: u64,
+        copied_roots: u64,
+    ) -> bool {
         assert!(std::ptr::eq(self, process.store));
-        let mut writer = self.lock_writer();
-        let Some(pending) = writer.retired.get_mut(&area_id) else {
+        let Some(account) = process.account.as_ref() else {
             return false;
         };
-        if pending.waiting.remove(&process.id).is_none() {
+        let Some(active) = self
+            .active_area
+            .read()
+            .expect("active literal area poisoned")
+            .as_ref()
+            .filter(|active| active.id == area_id)
+            .cloned()
+        else {
+            return false;
+        };
+        self.acknowledge_account(&active, account, copied_roots)
+    }
+
+    fn acknowledge_account(
+        &self,
+        active: &ActiveArea,
+        account: &ProcessAccount,
+        copied_roots: u64,
+    ) -> bool {
+        if account
+            .waiting_area
+            .compare_exchange(active.id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return false;
         }
-        if pending.waiting.is_empty() {
-            writer.retired.remove(&area_id);
-            self.retired_len.fetch_sub(1, Ordering::AcqRel);
-            self.freed.fetch_add(1, Ordering::Relaxed);
+        let before = active.outstanding.fetch_sub(1, Ordering::AcqRel);
+        if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+            eprintln!(
+                "literal_ack area={} before={} copied={}",
+                active.id, before, copied_roots
+            );
         }
+        self.last_trace[0].store(before as u64, Ordering::Relaxed);
+        self.last_trace[1].store(before.saturating_sub(1) as u64, Ordering::Relaxed);
+        self.last_trace[3].store(copied_roots, Ordering::Relaxed);
         true
     }
-    /// Acknowledge every retired area this process still owes, after its GC
-    /// has copied live roots out of those areas.
+    /// Take the global update permission for `process`; `true` when it already holds it.
+    // Port of erts/emulator/beam/erl_bif_persistent.c:1312 (try_seize_update_permission),
+    // OTP-29.1.1. A process that fails yields and retries instead of joining a wait queue.
+    pub fn try_seize_update_permission(&self, process: &ProcessRegistration<'_>) -> bool {
+        assert!(std::ptr::eq(self, process.store));
+        let owner = registration_owner(process);
+        match self
+            .updater
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(current) => current == owner,
+        }
+    }
+    /// Release the update permission if `process` holds it.
+    // Port of erts/emulator/beam/erl_bif_persistent.c:1338 (release_update_permission),
+    // OTP-29.1.1.
+    pub fn release_update_permission(&self, process: &ProcessRegistration<'_>) {
+        assert!(std::ptr::eq(self, process.store));
+        let owner = registration_owner(process);
+        let _ = self
+            .updater
+            .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+    /// Remove a terminated process from the active retirement barrier.
+    pub fn process_exited(&self, process: &ProcessRegistration<'_>) {
+        assert!(std::ptr::eq(self, process.store));
+        // erts finishes a suspended updater's table_updater even when the process is
+        // killed, which releases the permission; the update is already published here.
+        self.release_update_permission(process);
+        process
+            .account
+            .as_ref()
+            .expect("live process registration")
+            .exited
+            .store(true, Ordering::Release);
+        if let Some(account) = process.account.as_ref()
+            && let Some(active) = self
+                .active_area
+                .read()
+                .expect("active literal area poisoned")
+                .as_ref()
+                .cloned()
+        {
+            self.acknowledge_account(&active, account, 0);
+        }
+    }
+    /// Acknowledge the active area after this process has copied its live roots.
     pub fn release_retired(
         &self,
         process: &ProcessRegistration<'_>,
@@ -593,11 +893,14 @@ impl Store {
             copied_roots,
         };
         if pending_before > 0 {
-            self.lock_writer().last_trace = trace;
+            self.last_trace[0].store(trace.pending_before as u64, Ordering::Relaxed);
+            self.last_trace[1].store(trace.pending_after as u64, Ordering::Relaxed);
+            self.last_trace[2].store(trace.freed, Ordering::Relaxed);
+            self.last_trace[3].store(trace.copied_roots, Ordering::Relaxed);
         }
         trace
     }
-    /// Number of retained areas awaiting VM acknowledgements.
+    /// Number of retained areas queued for or awaiting collector release.
     pub fn retired_count(&self) -> usize {
         self.lock_writer().retired.len()
     }
@@ -621,46 +924,39 @@ impl Drop for Store {
 /// A live VM process, registered for literal-area collection.
 pub struct ProcessRegistration<'a> {
     store: &'a Store,
-    id: u64,
     account: Option<Arc<ProcessAccount>>,
-}
-fn unregister_process(store: &Store, writer: &mut Writer, id: u64) {
-    let mut released = 0_usize;
-    writer.retired.retain(|_, pending| {
-        let was_waiting = pending.waiting.remove(&id).is_some();
-        let release = was_waiting && pending.waiting.is_empty();
-        if release {
-            released += 1;
-        }
-        !release
-    });
-    if released > 0 {
-        store.retired_len.fetch_sub(released, Ordering::AcqRel);
-        store.freed.fetch_add(released as u64, Ordering::Relaxed);
-    }
 }
 impl Drop for ProcessRegistration<'_> {
     fn drop(&mut self) {
-        drop(self.account.take());
-        if !self.store.has_retired() {
-            return;
+        self.store.release_update_permission(self);
+        if let Some(account) = self.account.take() {
+            account.exited.store(true, Ordering::Release);
+            if let Some(active) = self
+                .store
+                .active_area
+                .read()
+                .expect("active literal area poisoned")
+                .as_ref()
+                .cloned()
+            {
+                self.store.acknowledge_account(&active, &account, 0);
+            }
         }
-        // Process teardown is lock-free unless there are literal areas to retire.
-        if WRITER_DEPTH.with(|depth| depth.get() > 0) {
-            let store = self.store as *const Store;
-            let id = self.id;
-            DEFERRED_UNREGISTER.with(|queue| queue.borrow_mut().push((store, id)));
-            return;
-        }
-        let mut writer = self.store.lock_writer();
-        unregister_process(self.store, &mut writer, self.id);
     }
+}
+
+fn registration_owner(process: &ProcessRegistration<'_>) -> usize {
+    process
+        .account
+        .as_ref()
+        .map_or(0, |account| Arc::as_ptr(account) as usize)
 }
 
 /// A retired area held alive while the VM scans process roots.
 pub struct RetiredArea {
     id: u64,
-    stored: Arc<Stored>,
+    _area: RetiredStorage,
+    pointer_ranges: Arc<[(usize, usize)]>,
 }
 impl RetiredArea {
     /// Stable retirement ID to pass to `Store::acknowledge`.
@@ -669,7 +965,13 @@ impl RetiredArea {
     }
     /// Whether a term pointer directly belongs to this area.
     pub fn contains(&self, term: Term) -> bool {
-        self.stored.area.is_literal(term)
+        if !term.is_pointer() {
+            return false;
+        }
+        let address = (term.tagged_word() & !7) as usize;
+        self.pointer_ranges
+            .iter()
+            .any(|&(start, end)| address >= start && address < end)
     }
     /// Copy a direct reference into the process heap; callers scan nested roots.
     pub fn copy_root<H: HeapAlloc>(&self, term: Term, heap: &mut H) -> Result<Term, TermError> {
@@ -834,13 +1136,80 @@ mod tests {
         store.put(key, key).unwrap();
         let after = store.register_process();
 
+        assert!(store.collector_switch_area());
         let old_areas = store.retired_areas(&before);
         assert_eq!(old_areas.len(), 1);
         assert!(store.retired_areas(&after).is_empty());
         let id = old_areas[0].id();
         drop(old_areas);
+        assert!(store.collector_switch_area());
         assert!(store.acknowledge(&before, id));
+        assert!(!store.collector_switch_area());
         assert!(!store.has_retired());
+    }
+
+    #[test]
+    fn purged_module_literals_wait_for_all_existing_processes() {
+        let store = Store::new();
+        let first = store.register_process();
+        let second = store.register_process();
+        let mut area = VecHeap::new();
+        let literal = TermBuilder::new(&mut area)
+            .tuple(&[Term::small(23).unwrap()])
+            .unwrap();
+        let area = Arc::new(area);
+        store.retire_module_area(Arc::clone(&area));
+
+        assert!(store.collector_switch_area());
+        let retired = store.retired_areas(&first);
+        assert_eq!(retired.len(), 1);
+        assert!(retired[0].contains(literal));
+        assert!(store.retired_areas(&second)[0].contains(literal));
+        let id = retired[0].id();
+        drop(retired);
+        assert!(store.collector_switch_area());
+        assert!(store.acknowledge(&first, id));
+        assert!(store.has_retired());
+        assert!(store.acknowledge(&second, id));
+        assert!(!store.collector_switch_area());
+        assert!(!store.has_retired());
+    }
+
+    #[test]
+    fn concurrent_processes_acknowledge_one_active_area() {
+        let store = Store::new();
+        let processes: Vec<_> = (0..64).map(|_| store.register_process()).collect();
+        let area = Arc::new(VecHeap::new());
+        store.retire_module_area(area);
+        assert!(store.collector_switch_area());
+        let area_id = store.collector_area().unwrap();
+
+        std::thread::scope(|scope| {
+            let store = &store;
+            for process in &processes {
+                scope.spawn(move || assert!(store.acknowledge(process, area_id)));
+            }
+        });
+
+        assert!(!store.collector_switch_area());
+        assert!(!store.has_retired());
+    }
+
+    #[test]
+    fn exited_processes_are_not_added_to_later_retirement_barriers() {
+        let store = Store::new();
+        let process = store.register_process();
+        store.process_exited(&process);
+        let mut area = VecHeap::new();
+        let literal = TermBuilder::new(&mut area)
+            .tuple(&[Term::small(23).unwrap()])
+            .unwrap();
+        store.retire_module_area(Arc::new(area));
+        assert!(store.has_retired());
+        assert!(!store.collector_switch_area());
+        assert!(!store.has_retired());
+        assert!(store.retired_areas(&process).is_empty());
+        assert!(literal.is_pointer());
     }
 
     #[test]
@@ -853,15 +1222,21 @@ mod tests {
         let value = TermBuilder::new(&mut heap).tuple(&[key]).unwrap();
         store.put(key, value).unwrap();
         store.put(key, Term::small(2).unwrap()).unwrap();
+        assert!(store.collector_switch_area());
         let (area_id, weak) = {
             let writer = store.writer.lock().unwrap();
             let (&id, pending) = writer.retired.iter().next().unwrap();
-            (id, Arc::downgrade(&pending.stored))
+            let RetiredStorage::Persistent(stored) = &pending.area else {
+                unreachable!("persistent-term test stores a persistent area")
+            };
+            (id, Arc::downgrade(stored))
         };
         assert!(weak.upgrade().is_some());
+        assert!(store.collector_switch_area());
         assert!(store.acknowledge(&first, area_id));
         assert!(weak.upgrade().is_some());
         assert!(store.acknowledge(&second, area_id));
+        assert!(!store.collector_switch_area());
         for _ in 0..32 {
             let guard = pin();
             guard.flush();

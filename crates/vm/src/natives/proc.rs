@@ -775,6 +775,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "group_leader", 2),
     ("erts_internal", "group_leader", 3),
     ("erlang", "processes", 0),
+    ("erlang", "processes_next", 1),
     ("erlang", "pid_to_list", 1),  // elixir_loop1
     ("erlang", "ref_to_list", 1),  // mix_loop6
     ("erlang", "port_to_list", 1), // mix_loop6
@@ -1292,7 +1293,7 @@ fn call_values(
         return None;
     }
     // Erlang wrappers around these BIFs must keep running as BEAM.
-    if matches!(function, "trace" | "processes_next") && module != "erts_internal" {
+    if function == "trace" && module != "erts_internal" {
         return None;
     }
     if function == "fun_info_mfa" && module != "erlang" {
@@ -1579,7 +1580,10 @@ fn call_values(
                 process_display_call(module, process, ctx, *target, *display)
             }
             ("processes_next", [cursor]) if module == "erts_internal" => {
-                processes_next(process, *cursor)
+                processes_next(process, ctx, *cursor)
+            }
+            ("processes_next", [iterator]) if module == "erlang" => {
+                erlang_processes_next(process, ctx, *iterator)
             }
             ("trace", [spec, how, flags]) if module == "erts_internal" || module == "erlang" => {
                 trace(vm, process, ctx, 0, *spec, *how, *flags)
@@ -2941,16 +2945,122 @@ fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {
 // and erl_ptab.c:1472 (erts_ptab_processes_next), OTP-29.1.1.
 // The cursor is the next process-table index, so exiting processes do not
 // invalidate a scan that is already in progress.
-fn processes_next(process: &mut Process, cursor: Term) -> Result<Term, VmError> {
+fn processes_next(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    cursor: Term,
+) -> Result<Term, VmError> {
     let index = u32::try_from(cursor.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
-    let pids = live_pids(process)?;
-    let Some(pid) = pids.into_iter().find(|pid| pid.index >= index) else {
+    let max_pids = ctx.remaining().max(1);
+    let limit = index.saturating_add(max_pids.saturating_mul(25));
+    if index == limit {
         return Ok(atom("none"));
-    };
-    let pid_term = pid.to_term().ok_or_else(badarg)?;
-    let next = Term::small(i64::from(pid.index) + 1).ok_or_else(badarg)?;
-    let batch = make_list(process, [pid_term])?;
+    }
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let scheduler = runtime.scheduler()?;
+    let mut pids = runtime
+        .processes
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|pid| pid.index >= index && pid.index < limit && scheduler.lookup(*pid))
+        .collect::<Vec<_>>();
+    pids.sort_by_key(|pid| (pid.index, pid.generation));
+    let scan_end = pids
+        .get(max_pids as usize - 1)
+        .map_or(limit, |pid| pid.index.saturating_add(1));
+    pids.truncate(max_pids as usize);
+    if pids.is_empty() {
+        ctx.consume(((scan_end.saturating_sub(index) / 25) + 1).min(ctx.remaining()));
+        return Ok(atom("none"));
+    }
+    let pid_terms = pids
+        .iter()
+        .map(|pid| pid.to_term().ok_or_else(badarg))
+        .collect::<Result<Vec<_>, _>>()?;
+    let scanned = ((scan_end.saturating_sub(index) / 25) + 1).min(ctx.remaining());
+    ctx.consume(scanned);
+    let next = Term::small(i64::from(scan_end)).ok_or_else(badarg)?;
+    let batch = make_list(process, pid_terms)?;
     make_tuple(process, &[next, batch])
+}
+
+// Port of erts/preloaded/src/erlang.erl:5655-5665, OTP-29.1.1.
+fn erlang_processes_next(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    iterator: Term,
+) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm;
+
+    fn build(process: &mut Process, term: &OwnedTerm) -> Result<Term, VmError> {
+        arinsal_term::from_owned(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .map_err(|error| VmError::Unsupported(format!("process iterator term: {error:?}")))
+    }
+
+    let owned = arinsal_term::to_owned(iterator).map_err(|_| badarg())?;
+    let OwnedTerm::Tuple(fields) = &owned else {
+        return Err(badarg());
+    };
+    if fields.len() != 2 {
+        return Err(badarg());
+    }
+    let batch = fields[1].clone();
+    let reference = fields[0].clone();
+    match &batch {
+        OwnedTerm::Nil => {
+            let cursor = build(process, &reference)?;
+            let next = processes_next(process, ctx, cursor)?;
+            let next = arinsal_term::to_owned(next).map_err(|_| badarg())?;
+            if next == OwnedTerm::atom("none") {
+                return Ok(atom("none"));
+            }
+            let OwnedTerm::Tuple(next_fields) = &next else {
+                return Err(badarg());
+            };
+            if next_fields.len() != 2 {
+                return Err(badarg());
+            }
+            let batch = &next_fields[1];
+            let next_reference = next_fields[0].clone();
+            let OwnedTerm::List { elems, tail } = batch else {
+                return Err(badarg());
+            };
+            if !matches!(**tail, OwnedTerm::Nil) {
+                return Err(badarg());
+            }
+            let Some((pid, remaining)) = elems.split_first() else {
+                let next_iterator = build(
+                    process,
+                    &OwnedTerm::Tuple(vec![next_reference, OwnedTerm::Nil]),
+                )?;
+                return erlang_processes_next(process, ctx, next_iterator);
+            };
+            let next_iterator = OwnedTerm::tuple(vec![
+                next_reference,
+                OwnedTerm::List {
+                    elems: remaining.to_vec(),
+                    tail: Box::new(OwnedTerm::Nil),
+                },
+            ]);
+            build(process, &OwnedTerm::tuple(vec![pid.clone(), next_iterator]))
+        }
+        OwnedTerm::List { elems, tail } if matches!(**tail, OwnedTerm::Nil) => {
+            let Some((pid, remaining)) = elems.split_first() else {
+                return Err(badarg());
+            };
+            let next_iterator = OwnedTerm::tuple(vec![
+                reference,
+                OwnedTerm::List {
+                    elems: remaining.to_vec(),
+                    tail: Box::new(OwnedTerm::Nil),
+                },
+            ]);
+            build(process, &OwnedTerm::tuple(vec![pid.clone(), next_iterator]))
+        }
+        _ => Err(badarg()),
+    }
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:4011 (fun_info_mfa_1), OTP-29.1.1.

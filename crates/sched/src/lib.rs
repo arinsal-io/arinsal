@@ -189,8 +189,26 @@ pub enum Signal<M> {
     Unalias(u64),
     /// Ask a process to collect its heap at its next signal safe point.
     GarbageCollect,
+    /// Ask a process to copy terms from a retiring literal area.
+    LiteralAreaCopy {
+        area_id: u64,
+        request: M,
+        how: LiteralCopyHow,
+        requester: Pid,
+    },
     /// Execute the process-signal blocking callback on the target process.
     ProcSigBlock(i64),
+}
+
+/// Phase of a literal-area copy request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiteralCopyHow {
+    /// Drain earlier signals and inspect process roots.
+    Init,
+    /// Check whether literal copying needs a collection.
+    CheckGc,
+    /// Collect and copy every remaining reference.
+    NeedGc,
 }
 
 /// Ordered contents of a process mailbox.
@@ -228,6 +246,8 @@ pub trait Task: Send + 'static {
     type Message: Send + 'static;
     /// Execute cooperatively, consuming at most `budget` reductions.
     fn run(&mut self, ctx: &mut RunCtx<Self::Message>, budget: u32) -> RunOutcome;
+    /// Release task-owned runtime registrations after all workers have stopped.
+    fn scheduler_shutdown(&mut self) {}
     /// Cumulative time spent collecting this task's heap.
     fn gc_nanoseconds(&self) -> u64 {
         0
@@ -497,6 +517,22 @@ impl<T: Task> ProcessTable<T> {
             .flat_map(|page| page.slots.iter())
             .filter(|slot| !slot.load(Ordering::Acquire, guard).is_null())
             .count()
+    }
+
+    fn scheduler_shutdown(&self) {
+        let allocated = self.next.load(Ordering::Acquire).min(self.capacity);
+        for index in 0..allocated {
+            let Some((page, offset)) = self.page(index) else {
+                continue;
+            };
+            let pid = Pid {
+                index,
+                generation: page.generations[offset].load(Ordering::Acquire),
+            };
+            if let Some(process) = self.lookup(pid) {
+                process.cell.lock().unwrap().task.scheduler_shutdown();
+            }
+        }
     }
 
     fn test_next_id(&self, set: bool, next_id: u32) -> Option<u32> {
@@ -1024,13 +1060,22 @@ impl<T: Task> Inner<T> {
         let process = self.table.lookup(to).ok_or(Error::NoProcess)?;
         let state = process.state.load(Ordering::Acquire);
         let counted = state != WAITING && state != UNSCHEDULED;
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:1560-1563, OTP-29.1.1.
+        // Literal-copy requests are non-message signals and enter a shared run queue.
+        let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
         if counted {
             process.backlog.fetch_add(1, Ordering::Relaxed);
         }
         self.fanin_delivery(&process, 1);
-        if let Err(error) =
-            self.deliver_process(process.clone(), from, payload, local, remaining, true)
-        {
+        if let Err(error) = self.deliver_process(
+            process.clone(),
+            from,
+            payload,
+            local,
+            remaining,
+            true,
+            force_enqueue,
+        ) {
             if counted {
                 process.backlog.fetch_sub(1, Ordering::Relaxed);
             }
@@ -1039,6 +1084,7 @@ impl<T: Task> Inner<T> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // `force_enqueue` routes literal-copy signals like erts.
     fn deliver_process(
         &self,
         process: Arc<Process<T>>,
@@ -1047,6 +1093,7 @@ impl<T: Task> Inner<T> {
         local: Option<&mut Local<T>>,
         remaining: u32,
         wake: bool,
+        force_enqueue: bool,
     ) -> Result<(), Error> {
         // Hold inflight across the EXITED load and the push so an exiting
         // receiver cannot detach an empty mailbox and then miss this event.
@@ -1057,7 +1104,7 @@ impl<T: Task> Inner<T> {
         }
         process.input.push(Event { from, payload });
         if wake {
-            self.wake_after_publish(process.clone(), local, remaining);
+            self.wake_after_publish(process.clone(), local, remaining, force_enqueue);
         }
         process.publish_inflight.fetch_sub(1, Ordering::Release);
         Ok(())
@@ -1070,6 +1117,7 @@ impl<T: Task> Inner<T> {
         local: Option<&mut Local<T>>,
         remaining: u32,
         wake: bool,
+        force_enqueue: bool,
     ) -> Result<(), Error> {
         let process = self.table.lookup(to).ok_or(Error::NoProcess)?;
         process.publish_inflight.fetch_add(1, Ordering::AcqRel);
@@ -1081,7 +1129,7 @@ impl<T: Task> Inner<T> {
         self.fanin_delivery(&process, events.len());
         process.input.push_block_reuse(events);
         if wake {
-            self.wake_after_publish(process.clone(), local, remaining);
+            self.wake_after_publish(process.clone(), local, remaining, force_enqueue);
         }
         process.publish_inflight.fetch_sub(1, Ordering::Release);
         Ok(())
@@ -1102,7 +1150,7 @@ impl<T: Task> Inner<T> {
         process.backlog.fetch_add(1, Ordering::Relaxed);
         self.fanin_delivery(&process, 1);
         process.input.push(event);
-        self.wake_after_publish(process.clone(), local, remaining);
+        self.wake_after_publish(process.clone(), local, remaining, false);
         process.publish_inflight.fetch_sub(1, Ordering::Release);
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:712 (signal enqueue), OTP-29.1.1.
         Ok(())
@@ -1113,6 +1161,7 @@ impl<T: Task> Inner<T> {
         process: Arc<Process<T>>,
         local: Option<&mut Local<T>>,
         remaining: u32,
+        force_enqueue: bool,
     ) {
         let wait_timer = process.wait_timer.load(Ordering::Acquire);
         if process
@@ -1128,7 +1177,11 @@ impl<T: Task> Inner<T> {
                 process,
                 inherited: Some(remaining),
             };
-            self.place_runnable(item, local);
+            if force_enqueue {
+                self.enqueue(item, false);
+            } else {
+                self.place_runnable(item, local);
+            }
         }
     }
 
@@ -2018,6 +2071,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
             | Signal::MonitorDown { .. }
             | Signal::MonitorNoproc(_)
             | Signal::GarbageCollect
+            | Signal::LiteralAreaCopy { .. }
             | Signal::ProcSigBlock(_) => true,
             Signal::UnlinkAck(id) => *id != 0,
             Signal::Link
@@ -2104,7 +2158,14 @@ impl<T: Task> Runner<'_, T> {
             }
             if self
                 .inner
-                .deliver_block(to, events, self.local.as_deref_mut(), remaining, true)
+                .deliver_block(
+                    to,
+                    events,
+                    self.local.as_deref_mut(),
+                    remaining,
+                    true,
+                    false,
+                )
                 .is_err()
             {
                 take_lost_monitors(events)
@@ -2174,6 +2235,7 @@ impl<T: Task> Runner<'_, T> {
                 payload,
                 self.local.as_deref_mut(),
                 remaining,
+                false,
                 false,
             )
             .is_err()
@@ -2266,6 +2328,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         let process = self.lookup(to).ok_or(Error::NoProcess)?;
         let waiting = process.state.load(Ordering::Acquire) == WAITING;
         let wakes = payload_wakes(&payload);
+        let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
         if waiting || monitor || deferred.is_some() {
             self.flush_target(to, remaining);
             if let Some(first) = deferred {
@@ -2282,6 +2345,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                     self.local.as_deref_mut(),
                     remaining,
                     wakes,
+                    force_enqueue,
                 );
                 let lost = if delivered.is_err() {
                     take_lost_monitors(&mut events)
@@ -2306,6 +2370,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                     self.local.as_deref_mut(),
                     remaining,
                     wakes,
+                    force_enqueue,
                 )?;
             }
             // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message), OTP-29.1.1.
@@ -2386,7 +2451,14 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                     Vec::new()
                 } else if self
                     .inner
-                    .deliver_block(to, events, self.local.as_deref_mut(), remaining, true)
+                    .deliver_block(
+                        to,
+                        events,
+                        self.local.as_deref_mut(),
+                        remaining,
+                        true,
+                        false,
+                    )
                     .is_err()
                 {
                     take_lost_monitors(events)
@@ -3042,7 +3114,9 @@ mod msgq_stage_microbench {
         let started = Instant::now();
         for _ in 0..N {
             process.state.store(WAITING, Ordering::SeqCst);
-            scheduler.inner.wake_after_publish(process.clone(), None, 0);
+            scheduler
+                .inner
+                .wake_after_publish(process.clone(), None, 0, false);
         }
         report("wake transition + schedule", N, started);
         scheduler
@@ -3273,6 +3347,7 @@ impl<T: Task> Drop for Scheduler<T> {
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
+        self.inner.table.scheduler_shutdown();
     }
 }
 

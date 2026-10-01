@@ -69,6 +69,9 @@ unsafe impl Send for Resource {}
 unsafe impl Sync for Resource {}
 impl Drop for Resource {
     fn drop(&mut self) {
+        if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+            eprintln!("resource_drop data={:p}", self.data);
+        }
         // SAFETY: a registered type remains allocated, and data is live until this drop ends.
         unsafe {
             if let Some(dtor) = (*self.kind).callbacks.dtor {

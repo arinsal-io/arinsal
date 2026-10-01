@@ -5,6 +5,7 @@ use crate::{
     FunEntry, FunRef, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, Node, RECORD, SUB_BITS, Term,
     TermError, TermKind, size_object,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 enum Job {
@@ -15,18 +16,79 @@ enum Job {
 /// Copy an Erlang term after sizing its entire reachable object graph.
 /// Sharing of ordinary heap objects is deliberately not retained, as in erts.
 pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term, TermError> {
-    if !dst.supports_writable_binary() {
-        let mut stack = vec![root];
-        while let Some(term) = stack.pop() {
-            if crate::bits::binary_owner_is_writable(term) {
-                return Err(TermError::Unsupported("writable binary heap owner"));
-            }
-            stack.extend(crate::ops::children(term).filter(|child| child.is_pointer()));
-        }
+    validate_destination(root, dst)?;
+    copy_term_with_mode(root, dst, false, size_object(root))
+}
+
+/// Copy a term while retaining aliases among its heap objects.
+/// Port of erts/emulator/beam/copy.c:1111 (copy_shared_calculate), OTP-29.1.1.
+pub fn copy_term_preserving_sharing<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+) -> Result<Term, TermError> {
+    copy_term_preserving_sharing_with_cache(root, dst, &mut SharedCopyCache::default())
+}
+
+/// Cache aliases across roots copied in one literal-area collection.
+#[derive(Default)]
+pub struct SharedCopyCache {
+    copied: HashMap<u64, Term>,
+}
+
+/// Copy one root while reusing aliases established by earlier roots.
+/// Port of erts/emulator/beam/copy.c:1382 (copy_shared_perform_x), OTP-29.1.1.
+pub fn copy_term_preserving_sharing_with_cache<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+    cache: &mut SharedCopyCache,
+) -> Result<Term, TermError> {
+    validate_destination(root, dst)?;
+    let size = crate::size_object_preserving_sharing_after(root, cache.copied.keys().copied());
+    copy_term_body(root, dst, true, size, cache)
+}
+
+fn validate_destination<H: HeapAlloc + ?Sized>(root: Term, dst: &H) -> Result<(), TermError> {
+    if dst.supports_writable_binary() {
+        return Ok(());
     }
-    let size = size_object(root);
+    let mut stack = vec![root];
+    while let Some(term) = stack.pop() {
+        if crate::bits::binary_owner_is_writable(term) {
+            return Err(TermError::Unsupported("writable binary heap owner"));
+        }
+        stack.extend(crate::ops::children(term).filter(|child| child.is_pointer()));
+    }
+    Ok(())
+}
+
+fn copy_term_with_mode<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+    preserve_sharing: bool,
+    size: usize,
+) -> Result<Term, TermError> {
+    copy_term_body(
+        root,
+        dst,
+        preserve_sharing,
+        size,
+        &mut SharedCopyCache::default(),
+    )
+}
+
+fn copy_term_body<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+    preserve_sharing: bool,
+    size: usize,
+    cache: &mut SharedCopyCache,
+) -> Result<Term, TermError> {
     if size == 0 {
-        return Ok(root);
+        return Ok(cache
+            .copied
+            .get(&(root.bits() & !7))
+            .copied()
+            .unwrap_or(root));
     }
     let base = dst.alloc(size).ok_or(TermError::HeapFull)?;
     let mut offset = 0;
@@ -54,13 +116,19 @@ pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term,
                     unsafe { *slot = source.bits() };
                     continue;
                 }
-                if !source.is_pointer() {
+                let shared_copy = if preserve_sharing {
+                    cache.copied.get(&(source.bits() & !7)).copied()
+                } else {
+                    None
+                };
+                if !source.is_pointer() || shared_copy.is_some() {
                     // SAFETY: slot belongs to the destination allocation.
                     unsafe {
-                        *slot = source.bits();
+                        *slot = shared_copy.unwrap_or(source).bits();
                     }
                     continue;
                 }
+                let source_address = source.bits() & !7;
                 let is_list = source.classify() == TermKind::List;
                 if is_list {
                     // A cons run is laid out in one reserved span. Only boxed heads
@@ -81,6 +149,11 @@ pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term,
                             *link = Term::from_ptr(to, 1).bits();
                             *to = head.bits();
                         }
+                        if preserve_sharing {
+                            cache
+                                .copied
+                                .insert(from as usize as u64, Term::from_ptr(to, 1));
+                        }
                         if head.is_pointer() {
                             jobs.push(Job::Copy(head, to));
                         }
@@ -92,6 +165,10 @@ pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term,
                             continue;
                         }
                         if tail.bits() & 3 == 1 {
+                            if preserve_sharing {
+                                jobs.push(Job::Copy(tail, link));
+                                break;
+                            }
                             // SAFETY: a tagged cons pointer belongs to the live source.
                             from = unsafe { tail.raw_ptr() };
                             continue;
@@ -117,6 +194,9 @@ pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term,
                 unsafe {
                     std::ptr::copy_nonoverlapping(from, to, words);
                     *slot = Term::from_ptr(to, 2).bits();
+                }
+                if preserve_sharing {
+                    cache.copied.insert(source_address, Term::from_ptr(to, 2));
                 }
                 match header & 63 {
                     ARITY => {

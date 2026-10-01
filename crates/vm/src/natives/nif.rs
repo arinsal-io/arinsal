@@ -978,7 +978,11 @@ fn nif_send_hook(target: Term, message: Term) -> bool {
         let Ok(message) = Message::copy_from(message) else {
             return false;
         };
-        scheduler.send(hub.pid, pid, message).is_ok()
+        let sent = scheduler.send(hub.pid, pid, message).is_ok();
+        if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+            eprintln!("resource_send from={:?} to={:?} sent={sent}", hub.pid, pid);
+        }
+        sent
     })
 }
 

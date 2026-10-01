@@ -43,13 +43,7 @@ fn eight_readers_and_one_hundred_thousand_updates() {
                     let (a, b) = tuple_pair(value);
                     assert_eq!(b, -a, "torn persistent-term read");
                 }
-                let areas = store.retired_areas(&process);
-                for area in areas {
-                    assert!(area.contains(store.get(key).unwrap()) || area.id() > 0);
-                    let id = area.id();
-                    drop(area);
-                    assert!(store.acknowledge(&process, id));
-                }
+                assert!(store.retired_areas(&process).is_empty());
             });
         }
         start.wait();
@@ -62,10 +56,11 @@ fn eight_readers_and_one_hundred_thousand_updates() {
         assert_eq!(
             store.retired_count(),
             100_000,
-            "retired areas must await every process"
+            "retired areas stay queued until the collector selects them"
         );
         done.store(true, Ordering::Release);
     });
+    assert!(!store.collector_switch_area());
     assert_eq!(store.retired_count(), 0);
     let value = store.get(key).unwrap();
     assert_eq!(tuple_pair(value).0, 100_000);
@@ -114,6 +109,7 @@ fn vm_test_double_copies_then_acknowledges_each_area() {
     let borrowed = store.get(key).unwrap();
     store.put(key, Term::small(99).unwrap()).unwrap();
     assert_eq!(store.retired_count(), 1);
+    assert!(store.collector_switch_area());
     let first_area = store.retired_areas(&first).pop().unwrap();
     let second_area = store.retired_areas(&second).pop().unwrap();
     assert!(first_area.contains(borrowed));
@@ -129,6 +125,8 @@ fn vm_test_double_copies_then_acknowledges_each_area() {
     second_area.copy_root(borrowed, &mut second_heap).unwrap();
     drop(second_area);
     assert!(store.acknowledge(&second, id));
+    assert_eq!(store.retired_count(), 1);
+    assert!(!store.collector_switch_area());
     assert_eq!(store.retired_count(), 0);
     assert_eq!(tuple_pair(copied), (17, 23));
 }

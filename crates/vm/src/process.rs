@@ -3,11 +3,15 @@
 use crate::{Process, RunState, SharedCode, Vm, VmError};
 use arinsal_beam::{BeamFile, Operand};
 use arinsal_beamasm::SchedulerRegisters;
+use arinsal_pterm::RetiredArea;
 use arinsal_sched::{
     Config, Event, Payload, Pid, ReceiveMarker, RunCtx, RunOutcome, Scheduler, Signal, Task,
 };
 use arinsal_spec::Opcode;
-use arinsal_term::{ProcessHeap, Term, TermBuilder, copy_term, size_object};
+use arinsal_term::{
+    ProcessHeap, SharedCopyCache, Term, TermBuilder, copy_term,
+    copy_term_preserving_sharing_with_cache, size_object,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
@@ -277,6 +281,69 @@ impl MessageQueue {
         (indices, roots)
     }
 
+    /// Check queue roots and detached fragments for pointers into a retiring area.
+    // Port of erts/emulator/beam/beam_bif_load.c:1046-1092, OTP-29.1.1.
+    pub(crate) fn has_literal_area_reference(&self, area: &RetiredArea) -> bool {
+        self.entries.iter().any(|entry| {
+            area.contains(entry.term)
+                || entry
+                    .fragment
+                    .as_ref()
+                    .and_then(|fragment| fragment.heap.as_ref())
+                    .is_some_and(|heap| heap.has_heap_reference(|term| area.contains(term)))
+        })
+    }
+
+    /// Maximum detached message words inspected by literal-copy checks.
+    pub(crate) fn literal_scan_words(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| {
+                1 + entry
+                    .fragment
+                    .as_ref()
+                    .and_then(|fragment| fragment.heap.as_ref())
+                    .map_or(0, ProcessHeap::literal_scan_words)
+            })
+            .sum()
+    }
+
+    /// Move affected detached message terms into the process heap before releasing their area.
+    // Port of erts/emulator/beam/erl_gc.c:1136 (`erts_garbage_collect_literals`), OTP-29.1.1.
+    pub(crate) fn copy_literal_area_references(
+        &mut self,
+        heap: &mut ProcessHeap,
+        area: &RetiredArea,
+    ) -> Result<u32, VmError> {
+        let mut shared_copy = SharedCopyCache::default();
+        let mut copied = 0;
+        for entry in &mut self.entries {
+            let references_area = area.contains(entry.term)
+                || entry
+                    .fragment
+                    .as_ref()
+                    .and_then(|fragment| fragment.heap.as_ref())
+                    .is_some_and(|fragment| {
+                        fragment.has_heap_reference(|term| area.contains(term))
+                    });
+            if !references_area {
+                continue;
+            }
+            let updated = copy_term_preserving_sharing_with_cache(
+                entry.term,
+                &mut arinsal_bifs::FragmentingHeap(heap),
+                &mut shared_copy,
+            )
+            .map_err(|error| VmError::Unsupported(format!("literal message copy {error:?}")))?;
+            entry.term = updated;
+            if let Some(fragment) = entry.fragment.as_mut() {
+                fragment.heap = None;
+            }
+            copied += 1;
+        }
+        Ok(copied)
+    }
+
     pub(crate) fn update_gc_roots(&mut self, indices: &[usize], roots: &[Term]) {
         for (&index, &term) in indices.iter().zip(roots) {
             self.entries[index].term = term;
@@ -328,6 +395,56 @@ impl Message {
             })),
             priority: false,
         })
+    }
+
+    /// Build the signal envelope that the literal-copy handler will reuse as its reply.
+    // Port of erts/emulator/beam/beam_bif_load.c:1750-1787 (`erts_proc_sig_send_cla_request`), OTP-29.1.1.
+    pub(crate) fn literal_copy_request(
+        area: Term,
+        how: arinsal_sched::LiteralCopyHow,
+        target: Pid,
+    ) -> Result<Self, VmError> {
+        let target = target
+            .to_term()
+            .ok_or_else(|| VmError::Unsupported("invalid literal-copy target pid".into()))?;
+        let mut heap = ProcessHeap::with_words(size_object(area).saturating_add(8));
+        let area = copy_term(area, &mut heap)
+            .map_err(|error| VmError::Unsupported(format!("literal-copy area: {error:?}")))?;
+        let request = TermBuilder::new(&mut heap)
+            .tuple(&[
+                area,
+                crate::signals::atom(match how {
+                    arinsal_sched::LiteralCopyHow::Init => "init",
+                    arinsal_sched::LiteralCopyHow::CheckGc => "check_gc",
+                    arinsal_sched::LiteralCopyHow::NeedGc => "need_gc",
+                }),
+                target,
+            ])
+            .map_err(|error| VmError::Unsupported(format!("literal-copy request: {error:?}")))?;
+        Ok(Self {
+            term: request,
+            fragment: Some(Box::new(MessageFragment {
+                heap: Some(heap),
+                seq_token: None,
+            })),
+            priority: false,
+        })
+    }
+
+    /// Append the collector reply to its original request fragment.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8083 (`send_cla_reply`), OTP-29.1.1.
+    pub(crate) fn literal_copy_reply(mut self, result: Term) -> Result<Self, VmError> {
+        let heap = self
+            .fragment
+            .as_mut()
+            .and_then(|fragment| fragment.heap.as_mut())
+            .ok_or_else(|| {
+                VmError::Unsupported("literal-copy request lost its heap fragment".into())
+            })?;
+        self.term = TermBuilder::new(heap)
+            .tuple(&[crate::signals::atom("copy_literals"), self.term, result])
+            .map_err(|error| VmError::Unsupported(format!("literal-copy reply: {error:?}")))?;
+        Ok(self)
     }
 
     /// Mark this envelope for priority insertion at the receiver.
@@ -1355,7 +1472,10 @@ impl Executor {
         })();
         std::mem::swap(&mut process.x, &mut self.x);
         std::mem::swap(&mut process.fr, &mut self.fr);
-        if matches!(result, Ok(RunState::Yield | RunState::Wait { .. })) {
+        if matches!(
+            result,
+            Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield)
+        ) {
             let (live_x, live_fr) = self.vm.registers[process.module];
             // A native continuation keeps the live X registers of its yield site, which the
             // interpreted module's register count does not bound.
@@ -2267,6 +2387,13 @@ impl Process {
                         cold.prio_links.remove(&from);
                     }
                 }
+                Payload::Signal(Signal::LiteralAreaCopy {
+                    request, requester, ..
+                }) => {
+                    let _ = crate::natives::sys::reply_exiting_literal_area(
+                        self, ctx, request, requester,
+                    );
+                }
                 _ => {}
             }
         }
@@ -2758,6 +2885,16 @@ impl Process {
                 Payload::Signal(arinsal_sched::Signal::GarbageCollect) => {
                     self.force_gc()?;
                 }
+                Payload::Signal(arinsal_sched::Signal::LiteralAreaCopy {
+                    area_id,
+                    request,
+                    how,
+                    requester,
+                }) => {
+                    crate::natives::sys::copy_literal_area(
+                        self, ctx, area_id, request, how, requester,
+                    )?;
+                }
             }
         }
         crate::natives::erts_debug::after_message_queue_change(self);
@@ -2777,7 +2914,16 @@ impl Process {
     /// Force a collection of the running process before the current BIF returns.
     /// Port of erts/emulator/beam/erl_gc.h:152 (`ERTS_FORCE_GC`), OTP-29.1.1.
     pub(crate) fn force_gc(&mut self) -> Result<(), VmError> {
-        self.collect_heap_roots(self.x.len(), &mut [], 0)?;
+        let live = self.x.len();
+        self.force_gc_live(live)
+    }
+
+    /// Force collection with the current BEAM live-register count.
+    // Port of erts/emulator/beam/erl_gc.c:1136 (`erts_garbage_collect_literals`), OTP-29.1.1.
+    pub(crate) fn force_gc_live(&mut self, live: usize) -> Result<(), VmError> {
+        let live = live.min(self.x.len());
+        let gc = self.collect_heap_roots(live, &mut [], 0)?;
+        crate::natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
         Ok(())
     }
 
@@ -2791,6 +2937,14 @@ impl Process {
     ) -> Result<arinsal_term::GcStats, VmError> {
         let (indices, mut roots) = self.inbox.gc_root_snapshot();
         let mailbox_len = roots.len();
+        let continuation = self
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.persistent_get_all.as_ref())
+            .map(|state| state.result);
+        if let Some(result) = continuation {
+            roots.push(result);
+        }
         roots.extend_from_slice(extra);
         let stats = self
             .heap
@@ -2799,7 +2953,15 @@ impl Process {
         self.stats.gc.collections += stats.collections;
         self.stats.gc.nanoseconds += stats.nanoseconds;
         self.inbox.update_gc_roots(&indices, &roots[..mailbox_len]);
-        extra.copy_from_slice(&roots[mailbox_len..]);
+        if continuation.is_some()
+            && let Some(state) = self
+                .cold
+                .as_mut()
+                .and_then(|cold| cold.persistent_get_all.as_mut())
+        {
+            state.result = roots[mailbox_len];
+        }
+        extra.copy_from_slice(&roots[mailbox_len + usize::from(continuation.is_some())..]);
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
         Ok(stats)
     }
@@ -2908,7 +3070,15 @@ impl Task for Process {
     }
 
     fn run(&mut self, ctx: &mut RunCtx<'_, Message>, budget: u32) -> RunOutcome {
-        abort_on_worker_panic(|| self.run_task(ctx, budget))
+        let outcome = abort_on_worker_panic(|| self.run_task(ctx, budget));
+        if matches!(outcome, RunOutcome::Exit(_)) {
+            arinsal_pterm::global_store().process_exited(&self._persistent_terms);
+        }
+        outcome
+    }
+
+    fn scheduler_shutdown(&mut self) {
+        arinsal_pterm::global_store().process_exited(&self._persistent_terms);
     }
 
     fn scheduler_profile_event(
@@ -2929,6 +3099,7 @@ impl Task for Process {
 
     fn reap_signals(&mut self, pid: Pid, events: Vec<Event<Message>>) {
         let mut monitors = Vec::new();
+        let mut literal_replies = Vec::new();
         for event in events {
             match event.payload {
                 Payload::Signal(Signal::Monitor(reference)) => {
@@ -2937,10 +3108,19 @@ impl Task for Process {
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     monitors.retain(|(id, _)| *id != reference);
                 }
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
+                // OTP-29.1.1: an exiting process still answers a queued literal-copy request.
+                Payload::Signal(Signal::LiteralAreaCopy {
+                    request, requester, ..
+                }) => {
+                    if let Ok(reply) = request.literal_copy_reply(crate::signals::atom("ok")) {
+                        literal_replies.push((requester, reply));
+                    }
+                }
                 _ => {}
             }
         }
-        if monitors.is_empty() {
+        if monitors.is_empty() && literal_replies.is_empty() {
             return;
         }
         let Ok(scheduler) = self
@@ -2954,6 +3134,9 @@ impl Task for Process {
         let Some(scheduler) = scheduler else {
             return;
         };
+        for (requester, reply) in literal_replies {
+            let _ = scheduler.send(pid, requester, reply);
+        }
         for (reference, watcher) in monitors {
             let reason = self
                 .final_exit_reason
@@ -3084,6 +3267,10 @@ impl Process {
                 RunOutcome::Exit(0)
             }
             Err(error) => {
+                if matches!(error, VmError::Yield) {
+                    runtime.note_status(ctx.pid(), "runnable");
+                    return RunOutcome::Yield;
+                }
                 crate::signals::process_exiting(self, ctx);
                 runtime.processes.lock().unwrap().remove(&ctx.pid());
                 if trace_boot_enabled() {
@@ -3107,8 +3294,9 @@ impl Vm {
         runtime: &Arc<Runtime>,
         module: &str,
         function: &str,
-    ) -> Result<(), VmError> {
+    ) -> Result<Pid, VmError> {
         let module_id = self.load_named(module)?;
+        *runtime.code.lock().unwrap() = self.snapshot_shared();
         let ip = self.modules[module_id]
             .export(function, 0)
             .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 is not exported")))?;
@@ -3121,7 +3309,7 @@ impl Vm {
             .map_err(|error| VmError::Unsupported(format!("system process {module}: {error}")))?;
         runtime.processes.lock().unwrap().insert(pid);
         runtime.system_processes.lock().unwrap().insert(pid);
-        Ok(())
+        Ok(pid)
     }
 
     /// Run an exported function with schedulable BEAM processes.
@@ -3209,6 +3397,19 @@ impl Vm {
             // code_server dies during ensure_loaded of an on_load module.
             self.spawn_system_process(&scheduler, &runtime, "erts_code_purger", "start")?;
         }
+        // Port of erts/emulator/beam/erl_init.c system-process startup: every
+        // runtime needs the preloaded owner of the literal-area release protocol.
+        let literal_collector = self.spawn_system_process(
+            &scheduler,
+            &runtime,
+            "erts_literal_area_collector",
+            "start",
+        )?;
+        runtime
+            .names
+            .lock()
+            .unwrap()
+            .insert("erts_literal_area_collector".into(), literal_collector);
         let mut process = Process::with_spawn_registers(args.len(), 0);
         process.module = module_id;
         process.ip = ip;
@@ -3226,6 +3427,20 @@ impl Vm {
         if simulation_seed.is_some() {
             loop {
                 if let Ok(result) = receiver.try_recv() {
+                    while arinsal_pterm::global_store().has_retired() {
+                        if !scheduler.step() {
+                            let now = runtime.virtual_ms.fetch_add(1, Ordering::Relaxed) + 1;
+                            scheduler.advance_ms(1).map_err(|error| {
+                                VmError::Unsupported(format!("simulation clock: {error}"))
+                            })?;
+                            if now > 60_000 {
+                                return Err(VmError::Unsupported(
+                                    "literal collector did not finish before simulation timeout"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     return result;
                 }
                 if !scheduler.step() {
@@ -3244,6 +3459,9 @@ impl Vm {
         let result = receiver
             .recv()
             .map_err(|_| VmError::Unsupported("entry process disappeared".into()))?;
+        while arinsal_pterm::global_store().has_retired() {
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
         let shared = code.lock().unwrap();
         self.sync_shared(&shared);
         result
