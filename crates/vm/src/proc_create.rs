@@ -116,6 +116,9 @@ pub(crate) struct ProcessCold {
     pub(crate) native_error_pc: usize,
     /// The current apply comes from native code, whose call site names the caller frame.
     pub(crate) native_apply: bool,
+    /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
+    /// yielded before finishing, with the trace actions its return events still need.
+    pub(crate) traced_native_call: Option<(usize, usize, Vec<crate::trace::CallActions>)>,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
     pub(crate) native_call_pc: usize,
     /// `error_info` of the current native exception (erts keeps it with the stack trace).

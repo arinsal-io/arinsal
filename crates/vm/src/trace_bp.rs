@@ -15,9 +15,53 @@ pub(crate) struct Pattern {
     pub(crate) meta: Option<OwnedTerm>,
     pub(crate) count: u64,
     pub(crate) paused: bool,
+    /// Write order; the newest pattern covering a function decides its state.
+    pub(crate) seq: u64,
+    /// Marks a `false` pattern that overrides older wildcard patterns.
+    pub(crate) off: bool,
 }
 
 type Key = (usize, u64, String, String, Option<u8>);
+
+fn covers(spec: (&str, &str, Option<u8>), module: &str, function: &str, arity: Option<u8>) -> bool {
+    (spec.0 == "_" || spec.0 == module)
+        && (spec.1 == "_" || spec.1 == function)
+        && spec.2.is_none_or(|a| Some(a) == arity)
+}
+
+fn overlaps(a: (&str, &str, Option<u8>), b: (&str, &str, Option<u8>)) -> bool {
+    (a.0 == "_" || b.0 == "_" || a.0 == b.0)
+        && (a.1 == "_" || b.1 == "_" || a.1 == b.1)
+        && (a.2.is_none() || b.2.is_none() || a.2 == b.2)
+}
+
+/// Per session, the newest pattern covering the function, unless it disables tracing.
+/// Port of the per-function breakpoint state of erts/emulator/beam/beam_bp.c, OTP-29.1.1.
+fn winners<'a>(
+    entries: &'a HashMap<Key, Pattern>,
+    runtime: usize,
+    session: Option<u64>,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Vec<(&'a Key, &'a Pattern)> {
+    let mut best: HashMap<u64, (&Key, &Pattern)> = HashMap::new();
+    for (key, pattern) in entries {
+        if key.0 != runtime
+            || session.is_some_and(|wanted| wanted != key.1)
+            || !covers((&key.2, &key.3, key.4), module, function, Some(arity))
+        {
+            continue;
+        }
+        let slot = best.entry(key.1).or_insert((key, pattern));
+        if pattern.seq > slot.1.seq {
+            *slot = (key, pattern);
+        }
+    }
+    best.into_values()
+        .filter(|(_, pattern)| !pattern.off)
+        .collect()
+}
 
 static DEBUGGER_SUPPORT: AtomicBool = AtomicBool::new(false);
 static LINE_BREAKPOINT_INSTRUMENTATION: AtomicBool = AtomicBool::new(true);
@@ -205,15 +249,51 @@ pub(crate) fn set(
     arity: Option<u8>,
     pattern: Option<Pattern>,
 ) -> bool {
-    let key = (scope(process), session, module, function, arity);
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let runtime = scope(process);
+    let spec = (module.as_str(), function.as_str(), arity);
     let mut entries = patterns().lock().unwrap();
-    let existed = if let Some(pattern) = pattern {
-        entries.insert(key, pattern).is_some()
-    } else {
-        entries.remove(&key).is_some()
-    };
-    active().store(!entries.is_empty(), Ordering::Relaxed);
+    // A new pattern replaces every older pattern of the session it covers.
+    let before = entries.len();
+    entries.retain(|key, _| {
+        key.0 != runtime || key.1 != session || !covers(spec, &key.2, &key.3, key.4)
+    });
+    let existed = entries.len() != before;
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let key = (runtime, session, module.clone(), function.clone(), arity);
+    if let Some(mut pattern) = pattern {
+        pattern.seq = seq;
+        pattern.off = false;
+        entries.insert(key, pattern);
+    } else if entries.iter().any(|(old, _)| {
+        old.0 == runtime && old.1 == session && overlaps((&old.2, &old.3, old.4), spec)
+    }) {
+        // An older, wider pattern still covers part of this spec: remember the exception.
+        entries.insert(
+            key,
+            Pattern {
+                session,
+                flags: Vec::new(),
+                match_spec: None,
+                meta: None,
+                count: 0,
+                paused: false,
+                seq,
+                off: true,
+            },
+        );
+    }
+    active().store(entries.values().any(|p| !p.off), Ordering::Relaxed);
     existed
+}
+
+/// Remove all MFA breakpoint patterns owned by a destroyed trace session.
+// Port of erts/emulator/beam/erl_bif_trace.c:1352-1375, OTP-29.1.1.
+pub(crate) fn clear_session(process: &Process, session: u64) {
+    let runtime = scope(process);
+    let mut entries = patterns().lock().unwrap();
+    entries.retain(|(owner, id, _, _, _), _| *owner != runtime || *id != session);
+    active().store(entries.values().any(|p| !p.off), Ordering::Relaxed);
 }
 
 pub(crate) fn pause(
@@ -238,6 +318,7 @@ pub(crate) fn pause(
     }
 }
 
+// Port of erts/emulator/beam/beam_bp.c:1115-1285, OTP-29.1.1.
 pub(crate) fn matching(
     process: &Process,
     module: &str,
@@ -246,39 +327,63 @@ pub(crate) fn matching(
     local: bool,
 ) -> Vec<Pattern> {
     let entries = patterns().lock().unwrap();
-    entries
-        .iter()
-        .filter(|((runtime, _, m, f, a), pattern)| {
-            *runtime == scope(process)
-                && (m == "_" || m == module)
-                && (f == "_" || f == function)
-                && a.is_none_or(|a| a == arity)
-                && pattern
-                    .flags
-                    .iter()
-                    .any(|flag| flag == if local { "local" } else { "global" })
+    winners(&entries, scope(process), None, module, function, arity)
+        .into_iter()
+        .filter(|(_, pattern)| {
+            let has_global = pattern.flags.iter().any(|flag| flag == "global");
+            let has_local = pattern.flags.iter().any(|flag| flag == "local");
+            // No flag at all means a plain global call trace; call_count alone only counts.
+            let has_trace = pattern.flags.is_empty()
+                || pattern.flags.iter().any(|flag| flag != "call_count")
+                || pattern.match_spec.is_some();
+            has_trace
+                && if local {
+                    has_local
+                } else {
+                    has_global || (!has_local && !has_global)
+                }
         })
         .map(|(_, pattern)| pattern.clone())
         .collect()
 }
 
+/// True while some runtime holds a function trace pattern; keeps untraced BIF calls on the fast path.
+pub(crate) fn any_pattern() -> bool {
+    active().load(Ordering::Relaxed)
+}
+
+/// Whether a pattern of any session or runtime selects this function.
+// Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
+pub(crate) fn selects(module: &str, function: &str, arity: u8) -> bool {
+    patterns()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|((_, _, m, f, a), pattern)| {
+            !pattern.off && covers((m, f, *a), module, function, Some(arity))
+        })
+}
+
 pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: u8, local: bool) {
-    for ((runtime, _, m, f, a), pattern) in patterns().lock().unwrap().iter_mut() {
-        if *runtime == scope(process)
-            && (m == "_" || m == module)
-            && (f == "_" || f == function)
-            && a.is_none_or(|a| a == arity)
-            && pattern.flags.iter().any(|flag| flag == "call_count")
-            && (pattern
-                .flags
-                .iter()
-                .any(|flag| flag == if local { "local" } else { "global" })
-                || (local
-                    && !pattern
-                        .flags
-                        .iter()
-                        .any(|flag| flag == "local" || flag == "global")))
-        {
+    let mut entries = patterns().lock().unwrap();
+    let keys = winners(&entries, scope(process), None, module, function, arity)
+        .into_iter()
+        .filter(|(_, pattern)| {
+            pattern.flags.iter().any(|flag| flag == "call_count")
+                && (pattern
+                    .flags
+                    .iter()
+                    .any(|flag| flag == if local { "local" } else { "global" })
+                    || (local
+                        && !pattern
+                            .flags
+                            .iter()
+                            .any(|flag| flag == "local" || flag == "global")))
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in keys {
+        if let Some(pattern) = entries.get_mut(&key) {
             pattern.count = pattern.count.saturating_add(1);
         }
     }
@@ -291,19 +396,37 @@ pub(crate) fn info(
     arity: u8,
     item: &str,
 ) -> Option<OwnedTerm> {
+    info_session(process, 0, module, function, arity, item)
+}
+
+pub(crate) fn info_session(
+    process: &Process,
+    session: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+    item: &str,
+) -> Option<OwnedTerm> {
+    // Port of erts/emulator/beam/erl_bif_trace.c:1403-1465, OTP-29.1.1.
     let entries = patterns().lock().unwrap();
-    let pattern = entries.get(&(
+    let pattern = winners(
+        &entries,
         scope(process),
-        0,
-        module.to_owned(),
-        function.to_owned(),
-        Some(arity),
-    ));
+        Some(session),
+        module,
+        function,
+        arity,
+    )
+    .into_iter()
+    .next()
+    .map(|(_, pattern)| pattern);
     let false_atom = || OwnedTerm::Atom("false".into());
     let traced = || {
         pattern.map_or_else(false_atom, |pattern| {
             OwnedTerm::Atom(
-                if pattern.flags.iter().any(|flag| flag == "global") {
+                if pattern.flags.iter().any(|flag| flag == "global")
+                    || !pattern.flags.iter().any(|flag| flag == "local")
+                {
                     "global"
                 } else {
                     "local"
@@ -312,10 +435,12 @@ pub(crate) fn info(
             )
         })
     };
+    // An untraced function reports `{match_spec, false}`; a traced one without a match
+    // specification reports `[]`.
     let match_spec = || {
-        pattern
-            .and_then(|pattern| pattern.match_spec.clone())
-            .unwrap_or(OwnedTerm::Nil)
+        pattern.map_or_else(false_atom, |pattern| {
+            pattern.match_spec.clone().unwrap_or(OwnedTerm::Nil)
+        })
     };
     let call_count = || {
         pattern.map_or_else(false_atom, |pattern| {
@@ -363,34 +488,32 @@ pub(crate) fn info(
     }
 }
 
+// Port of erts/emulator/beam/erl_bif_trace.c:498 and 2721, OTP-29.1.1.
 pub(crate) fn breakpoint_kinds(
     process: &Process,
     module: &str,
     function: &str,
     arity: u8,
 ) -> (bool, bool) {
-    let runtime = scope(process);
     let entries = patterns().lock().unwrap();
-    let patterns = entries.iter().filter_map(|((owner, _, m, f, a), pattern)| {
-        (*owner == runtime
-            && (m == "_" || m == module)
-            && (f == "_" || f == function)
-            && a.is_none_or(|a| a == arity))
-        .then_some(pattern)
-    });
+    let patterns = winners(&entries, scope(process), None, module, function, arity)
+        .into_iter()
+        .map(|(_, pattern)| pattern);
     let mut local = crate::trace::return_to_enabled(process)
         || debug_breakpoint_enabled(process, module, function, arity);
     let mut global = false;
     for pattern in patterns {
-        if pattern.flags.iter().any(|flag| flag == "global") {
-            global = true;
-        } else if pattern.flags.iter().any(|flag| flag == "local")
-            || (pattern.flags.iter().any(|flag| flag == "call_count")
-                && !pattern
-                    .flags
-                    .iter()
-                    .any(|flag| flag == "local" || flag == "global"))
+        if pattern.flags.iter().any(|flag| flag == "call_count") {
+            local = true;
+        }
+        if pattern.flags.iter().any(|flag| flag == "global")
+            || !pattern
+                .flags
+                .iter()
+                .any(|flag| flag == "local" || flag == "global")
         {
+            global = true;
+        } else if pattern.flags.iter().any(|flag| flag == "local") {
             local = true;
         }
     }

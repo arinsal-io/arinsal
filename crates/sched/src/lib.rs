@@ -1298,7 +1298,7 @@ impl<T: Task> Inner<T> {
         let worker = process.wait_timer_worker.load(Ordering::Relaxed);
         if let Some(timers) = self.sim_timers.as_ref() {
             if let Some(wheel) = timers.get(worker) {
-                wheel.lock().unwrap().cancel(id);
+                wheel.lock().unwrap().cancel_at(id, self.clock.now_ms());
             }
         } else if let Some(queue) = self.canceled_timers.get(worker) {
             queue.push(CanceledTimer {
@@ -2052,6 +2052,13 @@ trait ContextOps<M> {
         ms: u64,
         callback: TimerCallback<M>,
     ) -> Result<TimerRef, Error>;
+    fn start_timer_to(
+        &mut self,
+        pid: Pid,
+        ms: u64,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<TimerRef, Error>;
     fn mark_exited(&mut self, pid: Pid);
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool;
@@ -2317,6 +2324,17 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     ) -> Result<TimerRef, Error> {
         self.inner.flush(self.remaining);
         self.inner.start_timer_callback(self.pid, ms, callback)
+    }
+    /// Schedule a timer for a pid using this task's current scheduler worker.
+    pub fn start_timer_to(
+        &mut self,
+        pid: Pid,
+        ms: u64,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<TimerRef, Error> {
+        self.inner.flush(self.remaining);
+        self.inner.start_timer_to(pid, ms, msg, wrapped)
     }
     /// Port of erts/emulator/beam/erl_bif_info.c:5079-5091, OTP-29.1.1.
     /// Pause other running tasks until the callback returns.
@@ -2834,6 +2852,22 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             true,
         )
     }
+    fn start_timer_to(
+        &mut self,
+        pid: Pid,
+        ms: u64,
+        msg: T::Message,
+        wrapped: bool,
+    ) -> Result<TimerRef, Error> {
+        self.inner.start_timer(
+            pid,
+            ms,
+            TimerPayload::Message(pid, msg, wrapped),
+            self.local.as_deref_mut(),
+            None,
+            true,
+        )
+    }
 }
 
 /// Scheduler facade. Dropping it stops and joins worker threads.
@@ -3159,6 +3193,11 @@ impl<T: Task> Scheduler<T> {
         true
     }
 
+    /// Return the number of scheduler workers owned by this runtime.
+    pub fn worker_count(&self) -> usize {
+        self.inner.parked.len()
+    }
+
     /// Pause or resume all task dispatch on this scheduler.
     pub fn set_scheduling_blocked(&self, blocked: bool, caller: Option<usize>) {
         self.inner.scheduling_blocker.store(
@@ -3205,6 +3244,10 @@ impl<T: Task> Scheduler<T> {
         }
         names.insert(name, pid);
         Ok(())
+    }
+    /// Remove a previously registered local name.
+    pub fn unregister(&self, name: &str) -> Option<Pid> {
+        self.inner.names.lock().unwrap().remove(name)
     }
     /// Resolve a registered local name, discarding names for exited tasks.
     pub fn whereis(&self, name: &str) -> Option<Pid> {

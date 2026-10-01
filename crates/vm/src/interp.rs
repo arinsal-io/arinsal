@@ -2157,7 +2157,14 @@ impl Vm {
                         if let Some(result) = call_fast_tuple_bif(p, fast_op, arity as usize) {
                             (result, 0)
                         } else {
-                            calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity as usize])
+                            self.call_bif_traced(
+                                p,
+                                ctx.as_deref_mut(),
+                                module_id,
+                                import as usize,
+                                bif,
+                                arity as usize,
+                            )
                         };
                     p.reductions_used = p
                         .reductions_used
@@ -2238,8 +2245,14 @@ impl Vm {
                         // Native entry takes its reduction counter from the
                         // process, not the interpreter's cached `reds`.
                         p.reductions = reds;
-                        let (result, bif_reductions) =
-                            calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity as usize]);
+                        let (result, bif_reductions) = self.call_bif_traced(
+                            p,
+                            ctx.as_deref_mut(),
+                            module_id,
+                            import as usize,
+                            bif,
+                            arity as usize,
+                        );
                         p.reductions_used = p
                             .reductions_used
                             .saturating_add(u64::from(bif_reductions));
@@ -3205,20 +3218,6 @@ impl Vm {
                     continue;
                 }
                 Instr::RemoveMessage => {
-                    if let Some(ctx) = ctx.as_deref_mut()
-                        && crate::trace::flags(p, ctx.pid()) & crate::trace::RECEIVE != 0
-                        && let Some(&message) = p.inbox.get(p.receive_cursor)
-                    {
-                        crate::trace::emit(
-                            Some(self),
-                            p,
-                            ctx,
-                            ctx.pid(),
-                            crate::trace::RECEIVE,
-                            "receive",
-                            &[message],
-                        );
-                    }
                     p.remove_message_with_vm(self, ctx.as_deref_mut())?;
                 }
                 Instr::Wait { target } => {
@@ -3288,6 +3287,9 @@ impl Vm {
                     });
                 }
                 Instr::Timeout => {
+                    if let Some(ctx) = ctx.as_deref_mut() {
+                        crate::trace::timeout_event(Some(self), p, ctx);
+                    }
                     p.timeout();
                     if let Some(ctx) = ctx.as_deref_mut() {
                         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2331

@@ -155,7 +155,9 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
     };
     let program = match compiled {
         Ok(program) => program,
-        Err(_) => return compiler_error_result(specification, dst),
+        Err(_) => {
+            return compiler_error_result(specification, dialect == MatchDialect::Trace, dst);
+        }
     };
     let test_context = TestContext {
         inner: context,
@@ -178,8 +180,12 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
     ])?)
 }
 
-fn compiler_error_result<H: HeapAlloc>(specification: Term, dst: &mut H) -> Result<Term, EtsError> {
-    let messages = compiler_diagnostics(specification);
+fn compiler_error_result<H: HeapAlloc>(
+    specification: Term,
+    trace: bool,
+    dst: &mut H,
+) -> Result<Term, EtsError> {
+    let messages = compiler_diagnostics(specification, trace);
     let mut builder = TermBuilder::new(dst);
     let mut diagnostics = Vec::with_capacity(messages.len());
     for message in messages {
@@ -330,7 +336,7 @@ fn owned_unbound_variable(term: &OwnedTerm, bound: &HashSet<usize>) -> Option<us
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:6031, OTP-29.1.1 (match_spec_test).
-fn compiler_diagnostics(specification: Term) -> Vec<String> {
+fn compiler_diagnostics(specification: Term, trace: bool) -> Vec<String> {
     const INVALID: &str = "Invalid match specification.";
     let Ok(clauses) = proper_list(specification) else {
         return vec![INVALID.into()];
@@ -356,7 +362,7 @@ fn compiler_diagnostics(specification: Term) -> Vec<String> {
             messages.push(INVALID.into());
             continue;
         };
-        if body.is_empty() {
+        if body.is_empty() && !trace {
             messages.push("Body clause does not return anything.".into());
             continue;
         }
@@ -367,9 +373,13 @@ fn compiler_diagnostics(specification: Term) -> Vec<String> {
         }
         for (expressions, is_guard) in [(&guards, true), (&body, false)] {
             for expression in expressions {
-                if let Some(index) = unbound_variable(*expression, &bound) {
+                let valid = validate_expr(*expression, is_guard, &bound, trace, 0);
+                if valid == Err(EtsError::Term(arinsal_term::TermError::SystemLimit)) {
+                    // Port of erts/emulator/beam/erl_db_util.c:5602-5606, OTP-29.1.1.
+                    messages.push("Excessive nesting; system limit reached.".into());
+                } else if let Some(index) = unbound_variable(*expression, &bound) {
                     messages.push(format!("Variable ${index} is unbound."));
-                } else if validate_expr(*expression, is_guard, &bound, false).is_err() {
+                } else if valid.is_err() {
                     messages.push(INVALID.into());
                 }
             }
@@ -381,13 +391,25 @@ fn compiler_diagnostics(specification: Term) -> Vec<String> {
     messages
 }
 
+/// Deepest expression nesting a match specification may use before compilation fails with
+/// `system_limit` (erl 29.1.1 on this machine gives up after roughly 1300 levels).
+const MAX_NESTING: usize = 1000;
+
 // Port of erts/emulator/beam/erl_db_util.c:572, OTP-29.1.1 (guard_tab).
 fn validate_expr(
     term: Term,
     guard: bool,
     bound: &HashSet<usize>,
     trace: bool,
+    depth: usize,
 ) -> Result<(), EtsError> {
+    // Port of erts/emulator/beam/erl_db_util.c:5602-5606 (dmc_expr stack_guard), OTP-29.1.1.
+    // erts bounds the compiler recursion by the remaining C stack; a fixed nesting bound
+    // keeps the same system_limit outcome without reading the native stack.
+    if depth > MAX_NESTING {
+        return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
+    }
+    let depth = depth + 1;
     if let Some(index) = variable(term) {
         return if bound.contains(&index) {
             Ok(())
@@ -397,10 +419,15 @@ fn validate_expr(
     }
     if term.classify() == TermKind::List {
         // Port of erts/emulator/beam/erl_db_util.c:4269, OTP-29.1.1 (dmc_list).
-        // SAFETY: the copied specification heap remains live during compilation.
-        let (head, tail) = unsafe { term.cons_ref() }.ok_or(EtsError::BadArg)?;
-        validate_expr(head, guard, bound, trace)?;
-        return validate_expr(tail, guard, bound, trace);
+        // Walk the spine iteratively: long lists are not nesting.
+        let mut rest = term;
+        while rest.classify() == TermKind::List {
+            // SAFETY: the copied specification heap remains live during compilation.
+            let (head, tail) = unsafe { rest.cons_ref() }.ok_or(EtsError::BadArg)?;
+            validate_expr(head, guard, bound, trace, depth)?;
+            rest = tail;
+        }
+        return validate_expr(rest, guard, bound, trace, depth);
     }
     if term.classify() == TermKind::Map {
         // Port of erts/emulator/beam/erl_db_util.c:4411, OTP-29.1.1 (dmc_map).
@@ -411,9 +438,9 @@ fn validate_expr(
         let mut heap = VecHeap::new();
         for (key, value) in pairs {
             let key = from_owned(key, &mut heap)?;
-            validate_expr(key, guard, bound, trace)?;
+            validate_expr(key, guard, bound, trace, depth)?;
             let value = from_owned(value, &mut heap)?;
-            validate_expr(value, guard, bound, trace)?;
+            validate_expr(value, guard, bound, trace, depth)?;
         }
         return Ok(());
     }
@@ -426,7 +453,7 @@ fn validate_expr(
     }
     if !guard && elements.len() == 1 && elements[0].classify() == TermKind::Tuple {
         // Port of erts/emulator/beam/erl_db_util.c:4384, OTP-29.1.1 (dmc_tuple).
-        return validate_construct(elements[0], bound, trace);
+        return validate_construct(elements[0], bound, trace, depth);
     }
     let Some(name) = atom_name(elements[0]) else {
         return Err(EtsError::BadArg);
@@ -472,19 +499,27 @@ fn validate_expr(
         return Err(EtsError::BadArg);
     }
     for &argument in &elements[1..] {
-        validate_expr(argument, guard, bound, trace)?;
+        validate_expr(argument, guard, bound, trace, depth)?;
     }
     Ok(())
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:4384, OTP-29.1.1 (dmc_tuple).
-fn validate_construct(term: Term, bound: &HashSet<usize>, trace: bool) -> Result<(), EtsError> {
+fn validate_construct(
+    term: Term,
+    bound: &HashSet<usize>,
+    trace: bool,
+    depth: usize,
+) -> Result<(), EtsError> {
+    if depth > MAX_NESTING {
+        return Err(EtsError::Term(arinsal_term::TermError::SystemLimit));
+    }
     if term.classify() == TermKind::Tuple {
         for element in tuple(term)? {
-            validate_construct(element, bound, trace)?;
+            validate_construct(element, bound, trace, depth + 1)?;
         }
     } else {
-        validate_expr(term, false, bound, trace)?;
+        validate_expr(term, false, bound, trace, depth)?;
     }
     Ok(())
 }
@@ -515,6 +550,50 @@ impl MatchProgram {
         Self::compile_with_mode(specification, true)
     }
 
+    /// Compile a `send` or `receive` event match specification.
+    ///
+    /// `send` patterns drop the call-only forms; `receive` patterns also drop the
+    /// effectful trace forms.
+    // Port of erts/emulator/beam/erl_db_util.c:1187-1192 (erts_match_set_compile_trace flags)
+    // and 5009-5437 (check_trace), OTP-29.1.1.
+    pub fn compile_trace_event(specification: Term, receive: bool) -> Result<Self, EtsError> {
+        fn forbidden(term: Term, receive: bool) -> bool {
+            match term.classify() {
+                TermKind::List => proper_list(term)
+                    .map(|items| items.into_iter().any(|item| forbidden(item, receive)))
+                    .unwrap_or(false),
+                TermKind::Tuple => {
+                    let Ok(parts) = tuple(term) else {
+                        return false;
+                    };
+                    let name = parts.first().and_then(|&head| atom_name(head));
+                    match name.as_deref() {
+                        Some("const") => false,
+                        Some("caller" | "caller_line" | "current_stacktrace") => true,
+                        Some(
+                            "is_seq_trace" | "set_seq_token" | "get_seq_token" | "process_dump"
+                            | "enable_trace" | "disable_trace" | "trace" | "silent",
+                        ) if receive => true,
+                        _ => parts.iter().skip(1).any(|&part| forbidden(part, receive)),
+                    }
+                }
+                _ => false,
+            }
+        }
+        let program = Self::compile_trace(specification)?;
+        let blocked = program.clauses.iter().any(|clause| {
+            clause
+                .guards
+                .iter()
+                .chain(&clause.body)
+                .any(|&expr| forbidden(expr, receive))
+        });
+        if blocked {
+            return Err(EtsError::BadArg);
+        }
+        Ok(program)
+    }
+
     // Port of erts/emulator/beam/erl_db_util.c:1717, OTP-29.1.1 (db_match_compile).
     fn compile_with_mode(specification: Term, trace: bool) -> Result<Self, EtsError> {
         let mut heap = VecHeap::new();
@@ -533,10 +612,10 @@ impl MatchProgram {
             let mut bound = HashSet::new();
             head_variables(triple[0], &mut bound)?;
             for &guard in &guards {
-                validate_expr(guard, true, &bound, trace)?;
+                validate_expr(guard, true, &bound, trace, 0)?;
             }
             for &expr in &body {
-                validate_expr(expr, false, &bound, trace)?;
+                validate_expr(expr, false, &bound, trace, 0)?;
             }
             clauses.push(Clause {
                 head: triple[0],

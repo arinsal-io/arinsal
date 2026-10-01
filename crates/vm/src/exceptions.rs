@@ -168,7 +168,7 @@ fn atom(name: &str) -> Result<Term, VmError> {
     stacktrace::atom_term(name)
 }
 
-fn tuple(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
+pub(super) fn tuple(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
         .tuple(values)
         .map_err(|e| VmError::Unsupported(format!("exception tuple {e:?}")))
@@ -180,7 +180,7 @@ fn list(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
         .map_err(|e| VmError::Unsupported(format!("exception list {e:?}")))
 }
 
-fn class_term(class: Class) -> Result<Term, VmError> {
+pub(super) fn class_term(class: Class) -> Result<Term, VmError> {
     atom(match class {
         Class::Error => "error",
         Class::Exit => "exit",

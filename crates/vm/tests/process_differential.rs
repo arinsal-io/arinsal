@@ -97,7 +97,12 @@ scenario(22,N) ->
 scenario(23,N) ->
     {Pid,R}=spawn_opt(node(),proc_diff,send_value,[self(),N],[monitor]),
     receive N -> ok end,
-    receive {'DOWN',R,process,Pid,normal} -> N end.
+    receive {'DOWN',R,process,Pid,normal} -> N end;
+scenario(24,N) ->
+    Pid=spawn(fun()->receive after infinity -> ok end end),
+    Pid!hej,
+    timer:sleep(300),
+    {N,process_info(Pid,[reductions,status])}.
 send_value(P,N) -> P ! N.
 "#;
 
@@ -114,7 +119,7 @@ fn process_scenarios_match_otp_29() {
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(20);
     let mut count = 0;
-    for category in 0..24 {
+    for category in 0..25 {
         for n in 1..=repetitions {
             let expected = reference.call(
                 "proc_diff",

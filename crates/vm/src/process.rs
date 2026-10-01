@@ -661,6 +661,7 @@ pub(crate) struct Runtime {
     aliases: AliasTable,
     pub(crate) timers: Mutex<HashMap<u64, arinsal_sched::TimerRef>>,
     pub(crate) timer_owners: Mutex<HashMap<u64, Pid>>,
+    pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
     pub(crate) system_monitor_flags: AtomicU8,
@@ -2483,6 +2484,7 @@ impl Process {
             &[reason],
         );
         crate::trace::clear(self, ctx.pid());
+        crate::trace::tracer_exited(self, ctx.pid());
         // Further publishes fail with `NoProcess` and the watcher synthesizes
         // DOWN. Signals already queued are installed before we notify.
         ctx.begin_exit();
@@ -2623,6 +2625,36 @@ impl Process {
         self.send_message_prio(Some(vm), Some(ctx), target, value, false)
     }
 
+    fn trace_send(
+        &mut self,
+        vm: Option<&mut Vm>,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+        sender: Pid,
+        event: &str,
+        value: Term,
+        target: Term,
+    ) {
+        match ctx {
+            Some(ctx) => crate::trace::emit(
+                vm,
+                self,
+                ctx,
+                sender,
+                crate::trace::SEND,
+                event,
+                &[value, target],
+            ),
+            None => crate::trace::emit_process(
+                vm,
+                self,
+                sender,
+                crate::trace::SEND,
+                event,
+                &[value, target],
+            ),
+        }
+    }
+
     /// Send with an optional OTP 28+ `[priority]` request.
     // Port of erts/emulator/beam/erl_message.c / bif.c send with priority, OTP-29.1.1.
     pub(crate) fn send_message_prio(
@@ -2725,14 +2757,28 @@ impl Process {
                 .ok_or_else(|| VmError::Unsupported("send requires a scheduler".into()))?;
             let mut names = runtime.names.lock().unwrap();
             let pid = names.get(name.as_ref()).copied();
-            if let Some(pid) = pid
+            let pid = if let Some(pid) = pid
                 && !runtime.scheduler()?.lookup(pid)
             {
                 names.remove(name.as_ref());
                 None
             } else {
                 pid
+            };
+            drop(names);
+            if pid.is_none() {
+                // Port of erts/emulator/beam/bif.c:2532-2536 (do_send), OTP-29.1.1: a send to
+                // an unregistered name is traced before it fails.
+                self.trace_send(
+                    vm.as_deref_mut(),
+                    ctx.as_deref_mut(),
+                    sender,
+                    "send",
+                    value,
+                    target,
+                );
             }
+            pid
         } else {
             return Err(VmError::Trap(crate::exceptions::Trap::error(
                 crate::signals::atom("badarg"),
@@ -2743,25 +2789,26 @@ impl Process {
                 "badarg",
             )))
         })?;
-        match ctx.as_deref_mut() {
-            Some(ctx) => crate::trace::emit(
-                vm.as_deref_mut(),
-                self,
-                ctx,
-                sender,
-                crate::trace::SEND,
-                "send",
-                &[value, target],
-            ),
-            None => crate::trace::emit_process(
-                vm.as_deref_mut(),
-                self,
-                sender,
-                crate::trace::SEND,
-                "send",
-                &[value, target],
-            ),
-        }
+        // Port of erts/emulator/beam/erl_trace.c:824-832 (trace_send), OTP-29.1.1.
+        let event = if crate::trace::active()
+            && self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.scheduler().ok())
+                .is_some_and(|scheduler| !scheduler.lookup(pid))
+        {
+            "send_to_non_existing_process"
+        } else {
+            "send"
+        };
+        self.trace_send(
+            vm.as_deref_mut(),
+            ctx.as_deref_mut(),
+            sender,
+            event,
+            value,
+            target,
+        );
         let mut envelope = Message::copy_from(value)?;
         if via_prio_alias {
             envelope = envelope.with_priority();
@@ -2800,6 +2847,26 @@ impl Process {
         self.drain_until_marker(ctx, Some(marker))
     }
 
+    /// Receive-trace a signal that was converted into a message.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:3804-3890 (convert_to_msg with
+    // receive tracing) and 8627 (trace_receive), OTP-29.1.1.
+    fn trace_converted_signal(&mut self, ctx: &mut RunCtx<'_, Message>, message: Term, from: Pid) {
+        if crate::trace::active()
+            && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
+        {
+            crate::trace::receive_event(None, self, ctx, message, Some(from));
+        }
+    }
+
+    /// Receive-trace the message, if any, that a conversion appended after `queued` entries.
+    fn trace_new_message(&mut self, ctx: &mut RunCtx<'_, Message>, queued: usize, from: Pid) {
+        if self.inbox.len() > queued
+            && let Some(message) = self.inbox.get(self.inbox.len() - 1).copied()
+        {
+            self.trace_converted_signal(ctx, message, from);
+        }
+    }
+
     fn drain_until_marker(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
@@ -2820,9 +2887,20 @@ impl Process {
                     let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+                    let sender = from;
                     let new_prio_len =
                         self.inbox
                             .push_message(message, data, &mut self.heap, old_prio_len)?;
+                    let trace_index = if priority {
+                        old_prio_len
+                    } else {
+                        self.inbox.len().saturating_sub(1)
+                    };
+                    if let Some(term) = self.inbox.get(trace_index).copied()
+                        && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
+                    {
+                        crate::trace::receive_event(None, self, ctx, term, Some(sender));
+                    }
                     self.cold_mut().prio_len = new_prio_len;
                     if priority {
                         let priority_term =
@@ -2855,6 +2933,18 @@ impl Process {
                 }
                 Payload::Signal(arinsal_sched::Signal::Link) => {
                     self.cold_mut().links.insert(from);
+                    if let Some(linker) = from.to_term() {
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8585-8589, OTP-29.1.1.
+                        crate::trace::emit(
+                            None,
+                            self,
+                            ctx,
+                            ctx.pid(),
+                            crate::trace::PROCS,
+                            "getting_linked",
+                            &[linker],
+                        );
+                    }
                 }
                 // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
                 Payload::Signal(arinsal_sched::Signal::ProcSigBlock(milliseconds)) => {
@@ -2866,6 +2956,18 @@ impl Process {
                     if let Some(cold) = self.cold.as_mut() {
                         cold.links.remove(&from);
                         cold.prio_links.remove(&from);
+                    }
+                    if let Some(unlinker) = from.to_term() {
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8579-8582, OTP-29.1.1.
+                        crate::trace::emit(
+                            None,
+                            self,
+                            ctx,
+                            ctx.pid(),
+                            crate::trace::PROCS,
+                            "getting_unlinked",
+                            &[unlinker],
+                        );
                     }
                 }
                 Payload::Signal(arinsal_sched::Signal::Monitor(reference)) => {
@@ -2892,6 +2994,7 @@ impl Process {
                         // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
                         // A scheduler proxy stands in for a remote PID internally, but
                         // EXIT messages expose the peer's original PID to Erlang code.
+                        let sender = from;
                         let from = crate::dist::remote_pid_term(self, from)?
                             .or_else(|| from.to_term())
                             .ok_or_else(|| {
@@ -2903,6 +3006,7 @@ impl Process {
                         } else {
                             self.inbox.push_back(tuple);
                         }
+                        self.trace_converted_signal(ctx, tuple, sender);
                         continue;
                     }
                     if reason != Term::atom(arinsal_term::atoms::NORMAL) {
@@ -2928,11 +3032,15 @@ impl Process {
                     }
                 }
                 Payload::Signal(arinsal_sched::Signal::MonitorNoproc(reference)) => {
+                    let queued = self.inbox.len();
                     self.deliver_monitor_down(from, reference, crate::signals::atom("noproc"))?;
+                    self.trace_new_message(ctx, queued, from);
                 }
                 Payload::Signal(arinsal_sched::Signal::MonitorDown { reference, reason }) => {
                     let reason = reason.into_receiver(self)?;
+                    let queued = self.inbox.len();
                     self.deliver_monitor_down(from, reference, reason)?;
+                    self.trace_new_message(ctx, queued, from);
                 }
                 Payload::Timer { reference, message } => {
                     let timer_id = message.timer_id;
@@ -2942,6 +3050,7 @@ impl Process {
                     let reference = crate::signals::reference(self, id)?;
                     let tuple = self.tuple(&[crate::signals::atom("timeout"), reference, term])?;
                     self.inbox.push_back(tuple);
+                    self.trace_converted_signal(ctx, tuple, from);
                 }
                 Payload::Signal(arinsal_sched::Signal::UnlinkAck(id)) => {
                     // Port of erts/emulator/beam/erl_proc_sig_queue.c:6794
@@ -3463,6 +3572,7 @@ impl Vm {
             aliases: AliasTable::new(),
             timers: Mutex::new(HashMap::new()),
             timer_owners: Mutex::new(HashMap::new()),
+            next_trace_weak_id: AtomicU64::new(0),
             ports: Mutex::new(HashMap::new()),
             system_monitor: Mutex::new(None),
             system_monitor_flags: AtomicU8::new(0),

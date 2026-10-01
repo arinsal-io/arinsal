@@ -639,6 +639,21 @@ impl ProcessHeap {
                 .sum::<usize>()
     }
 
+    /// Old generation capacity in words.
+    pub fn old_heap_words(&self) -> usize {
+        self.old_words.len()
+    }
+
+    /// Number of heap fragments attached to this heap.
+    pub fn fragment_count(&self) -> usize {
+        self.fragments.len()
+    }
+
+    /// Words held in heap fragments.
+    pub fn fragment_words(&self) -> usize {
+        self.fragments.iter().map(|fragment| fragment.len()).sum()
+    }
+
     /// Number of allocated words in the old generation.
     pub fn old_used_words(&self) -> usize {
         self.old_htop

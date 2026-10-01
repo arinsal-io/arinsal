@@ -167,6 +167,145 @@ run() ->
             .term;
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual));
     }
+
+    #[test]
+    fn absolute_timer_deadline_matches_otp_monotonic_clock() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping absolute timer differential test");
+            return;
+        };
+        let source = "-module(absolute_timer_probe). -export([run/0]). run() -> Deadline=erlang:monotonic_time(millisecond)+25, Ref=erlang:start_timer(Deadline,self(),done,[{abs,true}]), receive {timeout,Ref,done} -> ok after 1000 -> timeout end.";
+        let beam = reference
+            .compile_named("absolute_timer_probe", source, &[])
+            .unwrap();
+        reference.load("absolute_timer_probe", &beam).unwrap();
+        let expected = reference.call("absolute_timer_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("absolute_timer_probe", "run", &[], 2, None)
+            .unwrap_or_else(|error| panic!("absolute timer VM error: {error:?}"));
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn cancel_after_timeout_is_queued_keeps_the_original_reference() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping queued-timeout cancellation differential test");
+            return;
+        };
+        let source = r#"
+-module(queued_timeout_cancel_probe).
+-export([run/0]).
+run() ->
+    Ref = erlang:start_timer(5, self(), done),
+    Until = erlang:monotonic_time(millisecond) + 20,
+    busy_wait(Until),
+    Cancel = erlang:cancel_timer(Ref),
+    receive {timeout, Ref, done} -> {Cancel =:= false, received}
+    after 100 -> timeout end.
+busy_wait(Until) ->
+    case erlang:monotonic_time(millisecond) >= Until of
+        true -> ok;
+        false -> busy_wait(Until)
+    end.
+"#;
+        let beam = reference
+            .compile_named("queued_timeout_cancel_probe", source, &[])
+            .expect("compile queued-timeout cancellation probe");
+        reference
+            .load("queued_timeout_cancel_probe", &beam)
+            .unwrap();
+        let expected = reference.call("queued_timeout_cancel_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("queued_timeout_cancel_probe", "run", &[], 2, None)
+            .unwrap_or_else(|error| panic!("queued-timeout cancellation VM error: {error:?}"));
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn timers_for_dead_pids_match_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping dead-pid timer differential test");
+            return;
+        };
+        let source = concat!(
+            "-module(dead_pid_timer_probe). -export([run/0]).\n",
+            "run() -> P=spawn(fun()->ok end), wait_dead(P), ",
+            "R1=erlang:start_timer(60000,P,probe), ",
+            "R2=erlang:send_after(60000,P,probe), ",
+            "{erlang:read_timer(R1),erlang:cancel_timer(R1), ",
+            "erlang:read_timer(R2),erlang:cancel_timer(R2)}.\n",
+            "wait_dead(P) -> case erlang:is_process_alive(P) of ",
+            "true -> erlang:yield(), wait_dead(P); false -> ok end."
+        );
+        let beam = reference
+            .compile_named("dead_pid_timer_probe", source, &[])
+            .unwrap();
+        reference.load("dead_pid_timer_probe", &beam).unwrap();
+        let expected = reference.call("dead_pid_timer_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("dead_pid_timer_probe", "run", &[], 2, None)
+            .unwrap_or_else(|error| panic!("dead-pid timer VM error: {error:?}"));
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn read_timer_preserves_deadlines_above_signed_32_bit_range() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping wide timer differential test");
+            return;
+        };
+        let source = concat!(
+            "-module(wide_timer_probe). -export([run/0]).\n",
+            "run() -> R=erlang:send_after(2147488000,self(),probe), ",
+            "Left=erlang:read_timer(R), erlang:cancel_timer(R), ",
+            "is_integer(Left) andalso Left > 2147483647."
+        );
+        let beam = reference
+            .compile_named("wide_timer_probe", source, &[])
+            .unwrap();
+        reference.load("wide_timer_probe", &beam).unwrap();
+        let expected = reference.call("wide_timer_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("wide_timer_probe", "run", &[], 2, None)
+            .unwrap_or_else(|error| panic!("wide timer VM error: {error:?}"));
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn unresolved_registered_timer_destination_resolves_at_expiry_like_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping registered-name timer differential test");
+            return;
+        };
+        let source = concat!(
+            "-module(registered_timer_probe). -export([run/0]).\n",
+            "run() -> Ref=make_ref(), T1=erlang:start_timer(25,late_timer_probe,Ref), ",
+            "T2=erlang:send_after(25,late_timer_probe,Ref), ",
+            "true=register(late_timer_probe,self()), ",
+            "receive {timeout,T1,Ref}->ok after 1000->timeout1 end, ",
+            "receive Ref->ok after 1000->timeout2 end, ",
+            "{erlang:read_timer(T1),erlang:read_timer(T2)}."
+        );
+        let beam = reference
+            .compile_named("registered_timer_probe", source, &[])
+            .unwrap();
+        reference.load("registered_timer_probe", &beam).unwrap();
+        let expected = reference.call("registered_timer_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("registered_timer_probe", "run", &[], 2, None)
+            .unwrap_or_else(|error| panic!("registered-name timer VM error: {error:?}"));
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
+    }
 }
 
 fn list(term: Term) -> Option<Vec<Term>> {
@@ -277,13 +416,13 @@ fn spawn_mfa(
         .to_term()
         .ok_or_else(|| VmError::Unsupported("pid limit".into()))?;
     if crate::trace::spawn_interested(parent, ctx.pid()) {
-        let arg_list = TermBuilder::new(&mut parent.heap)
+        let arg_list = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
             .list_from_iter(args.iter().copied())
             .map_err(|error| VmError::Unsupported(format!("spawn trace args: {error:?}")))?;
-        let mfa = TermBuilder::new(&mut parent.heap)
+        let mfa = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
             .tuple(&[module, function, arg_list])
             .map_err(|error| VmError::Unsupported(format!("spawn trace MFA: {error:?}")))?;
-        crate::trace::spawned(vm, parent, ctx, pid, mfa);
+        crate::trace::spawned(vm, parent, ctx, pid, mfa, linked);
     }
     if let Some(id) = monitor_id {
         parent.cold_mut().monitors.insert(id, pid);
@@ -445,6 +584,19 @@ fn spawn_fun(
         parent.cold_mut().links.insert(pid);
     }
     let pid_term = pid.to_term().ok_or_else(|| badarg("spawn/1"))?;
+    if crate::trace::spawn_interested(parent, ctx.pid()) {
+        // erts spawns a fun as erlang:apply(Fun, []) for trace purposes.
+        let mfa = (|| {
+            let args = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
+                .list_from_iter([fun, Term::NIL])
+                .ok()?;
+            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
+                .tuple(&[atom("erlang"), atom("apply"), args])
+                .ok()
+        })()
+        .ok_or_else(|| VmError::Unsupported("spawn trace MFA".into()))?;
+        crate::trace::spawned(vm, parent, ctx, pid, mfa, linked);
+    }
     if let Some(id) = monitor_id {
         parent.cold_mut().monitors.insert(id, pid);
         if let Some(tag) = monitor_tag {
@@ -1833,6 +1985,9 @@ fn call_resolved(
                 None
             };
             let rt = process.runtime.clone().ok_or_else(|| badarg("timer/3"))?;
+            // Port of erts/emulator/beam/erl_hl_timer.c:1804-1850, OTP-29.1.1.
+            // A dead pid gets a ref but no timer entry; an unresolved name can
+            // become registered before its timer expires.
             let id = rt.next_ref();
             let mut message = Message::copy_from(*message)?;
             if matches!(entry, SignalBif::StartTimer3 | SignalBif::StartTimer4) {
@@ -1950,6 +2105,9 @@ fn call_resolved(
             rt.timer_owners.lock().unwrap().remove(&id);
             let timer = rt.timers.lock().unwrap().remove(&id);
             let remaining = timer.and_then(|timer| rt.scheduler().ok()?.cancel_timer(timer));
+            if remaining.is_some() {
+                rt.timers.lock().unwrap().remove(&id);
+            }
             timer_query_result(process, ctx, *reference, remaining, true, options)
         }
         (SignalBif::ReadTimer1, [reference]) | (SignalBif::ReadTimer2, [reference, _]) => {

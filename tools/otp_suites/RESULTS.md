@@ -5,17 +5,18 @@
 | `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
 | `bif_SUITE` | 34 | 29/34 | 28/34 | 1 | 0 | group_leader_prio_dirty: failed {'EXIT', {fw_error, {ct_framework,error_notification, {badarg |
 | `big_SUITE` | 23 | 23/23 | 18/23 | 5 | 0 | big_float_2: failed {{badmatch,0.0}; big_float_3: failed {{badmatch,3.402823669209385e38}; reductions: failed {badarg; system_limit: failed {badarg; toobig: failed {{badmatch, {'EXIT', {system_limit |
-| `binary_SUITE` | 55 | 42/55 | 40/55 | 2 | 0 | gc_test: failed {{badmatch,[{49295590496,192,4}]}; local_ext: failed timeout |
+| `binary_SUITE` | 55 | 42/55 | 34/55 | 8 | 0 | bad_terms: failed {'EXIT',error}, unknown_location; copy_terms: failed {'EXIT',error}, unknown_location; error_after_yield: failed {{badmatch,false}; gc_test: failed {{badmatch,{binary,[]}}; local_ext: failed {{badmatch,{error,exbadport}}; otp_5484: failed {'EXIT',error}, unknown_location; t2b_deterministic: failed {{badmatch; terms: failed {'EXIT',error}, unknown_location |
 | `bs_construct_SUITE` | 31 | 30/31 | 26/31 | 4 | 0 | bs_append_offheap: failed "missing binary in erts_bs_private_append"; error_info: failed {{badmatch,false}; in_guard: failed {badarg; reductions: failed {if_clause |
 | `bs_match_bin_SUITE` | 9 | 9/9 | 9/9 | 0 | 0 | none |
 | `bs_match_int_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
 | `bs_match_misc_SUITE` | 20 | 20/20 | 18/20 | 2 | 0 | bad_bs_match: failed {{badmatch,{module,bad_bs_match}}; fp16: failed {badarg |
 | `bs_match_tail_SUITE` | 4 | 4/4 | 0/4 | 4 | 0 | aligned: missing; huge_tail: missing; unaligned: missing; zero_tail: missing; suite-level: failed: 'bs_match_tail_SUITE:all/0 is missing', unknown_location |
 | `bs_utf_SUITE` | 8 | 8/8 | 0/8 | 8 | -9 | bad_construction: missing; utf16_illegal_sequences: missing; utf16_roundtrip: missing; utf32_illegal_sequences: missing; utf32_roundtrip: missing; utf8_big_file: missing; utf8_illegal_sequences: missing; utf8_roundtrip: missing |
+| `call_trace_SUITE` | 14 | 14/14 | 6/14 | 8 | 0 | change_pam: failed {test_case_failed,no_trace_message}; deep_exception: failed {test_case_failed, {unexpected; errors: failed {test_case_failed,{unexpected,5037}}; exception_nocatch: failed {test_case_failed, {unexpected; exception_trace: failed {test_case_failed,no_trace_message}; on_load: failed {badarg; return_trace: failed {test_case_failed,no_trace_message}; upgrade: failed {{badmatch,{error,not_purged}} |
 | `counters_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
 | `erts_debug_SUITE` | 8 | 7/8 | 7/8 | 0 | 0 | none |
 | `exception_SUITE` | 16 | 15/16 | 15/16 | 0 | 0 | none |
-| `float_SUITE` | 15 | 14/15 | 13/15 | 1 | 0 | fp_drv: failed {badarg |
+| `float_SUITE` | 15 | 14/15 | 12/15 | 2 | 0 | arith: failed {{badmatch,{{'EXIT',badarith}, [0, 3595386269724631416290548474634087135961411350516899931978349536063145215600570775211791172655337563430809179070287649284686426537789283655369350…; fp_drv: failed {'EXIT',error}, unknown_location |
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
 | `guard_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | bad_arith: failed {badarith; type_tests: failed {badarg |
 | `hash_SUITE` | 29 | 27/29 | 26/29 | 1 | 0 | test_phash2_10MB_plus_bin: failed {function_clause |
@@ -30,6 +31,7 @@
 | `small_SUITE` | 13 | 13/13 | 8/13 | 5 | 0 | addition: failed {timetrap_timeout,60000; mul_add: failed {badarith; test_bitwise: failed {timetrap_timeout,60000; test_bsl: failed {timetrap_timeout,60000; test_bsr: failed {timetrap_timeout,60000 |
 | `statistics_SUITE` | 18 | 18/18 | 16/18 | 2 | 0 | scheduler_wall_time: failed {badarg; scheduler_wall_time_all: failed {badarg |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | 0 | none |
-| `timer_bif_SUITE` | 23 | 20/23 | 20/23 | 0 | 0 | none |
+| `timer_bif_SUITE` | 23 | 20/23 | 14/23 | 6 | 0 | auto_cancel_yielding: failed {{case_clause,false}; cleanup: failed {{case_clause,false}; registered_process: failed {{case_clause,false}; same_time_yielding: failed {{case_clause,false}; same_time_yielding_with_cancel: failed {{case_clause,false}; same_time_yielding_with_cancel_other: failed {{case_clause,false} |
+| `trace_SUITE` | 39 | 34/39 | 22/39 | 12 | 0 | more_system_monitor_args: failed {badarg; procs_trace: failed {{badmatch,timeout}; suspend: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; suspend_opts: failed "Unexpected trace messages"; system_monitor_args: failed {badarg; system_monitor_large_heap_1: failed {badarg; system_monitor_large_heap_2: failed {badarg; system_monitor_long_gc_1: failed {badarg; system_monitor_long_gc_2: failed {badarg; system_monitor_long_message_queue: failed {badarg; system_monitor_long_message_queue_ignore: failed {badarg; system_monitor_long_schedule: skipped "Unable to load slow_drv (windows or no usleep()?)" |
 | `tuple_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
-| `unique_SUITE` | 2 | 1/2 | 1/2 | 0 | 0 | none |
+| `unique_SUITE` | 2 | 1/2 | 0/2 | 1 | 0 | unique_integer_white_box: failed {badarg |

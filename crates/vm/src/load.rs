@@ -890,20 +890,22 @@ impl Vm {
             }
             global_patches.push((function.as_str(), *arity, global));
         }
+        let mut exports_retargeted = false;
         for (index, export) in module.exports.iter().enumerate() {
             for &(function, arity, global) in &global_patches {
                 if export.function == function && export.arity == arity {
                     module.set_global_trace_breakpoint(index, global);
+                    exports_retargeted = true;
                 }
             }
         }
-        if local_patches.is_empty() {
-            return;
-        }
-        let Some(module) = self.modules.get_mut(module_id) else {
-            return;
-        };
-        if !Arc::make_mut(module).set_trace_breakpoints(&local_patches) {
+        let changed = !local_patches.is_empty()
+            && self
+                .modules
+                .get_mut(module_id)
+                .is_some_and(|module| Arc::make_mut(module).set_trace_breakpoints(&local_patches));
+        // Import caches hold the old export target; a new epoch forces re-resolution.
+        if !changed && !exports_retargeted {
             return;
         }
         let Some(module) = self.modules.get(module_id) else {
@@ -933,7 +935,7 @@ impl Vm {
             .modules
             .iter()
             .enumerate()
-            .filter(|(_, module)| module.name == module_name)
+            .filter(|(_, module)| module_name == "_" || module.name == module_name)
             .map(|(module_id, module)| {
                 let functions = module
                     .functions

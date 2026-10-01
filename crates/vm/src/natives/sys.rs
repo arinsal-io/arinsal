@@ -723,7 +723,7 @@ fn term_to_string(process: &mut Process, args: &[Term]) -> Result<Term, VmError>
         .map_err(|error| VmError::Unsupported(format!("term_to_string allocation: {error:?}")))
 }
 
-fn print_otp_term(term: &arinsal_etf::OwnedTerm, limit: usize) -> String {
+pub(crate) fn print_otp_term(term: &arinsal_etf::OwnedTerm, limit: usize) -> String {
     use arinsal_etf::OwnedTerm;
 
     fn printable_string(items: &[OwnedTerm]) -> Option<String> {
@@ -959,6 +959,8 @@ fn system_info(
         Some("alloc_util_allocators") => Some(allocator_names(process)),
         Some("allocator") => Some(all_allocator_options(process)),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
+        // Port of erts/emulator/beam/erl_bif_info.c:3370-3376, OTP-29.1.1.
+        Some("lock_checking") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         Some("check_io") => Some(check_io_info(process)),
         Some("ethread_info") => Some(ethread_info(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3549 (max_integer), OTP-29.1.1.
@@ -3628,6 +3630,32 @@ mod tests {
     use super::*;
     use arinsal_difftest::{CallResult, RefErl};
     use arinsal_sched::{Config, RunCtx, RunOutcome, Scheduler, Task};
+
+    #[test]
+    fn changing_online_scheduler_count_matches_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping scheduler-count differential test");
+            return;
+        };
+        let source = concat!(
+            "-module(scheduler_count_probe). -export([run/0]).\n",
+            "run() -> Previous=erlang:system_flag(schedulers_online,1), ",
+            "Current=erlang:system_info(schedulers_online), ",
+            "erlang:system_flag(schedulers_online,Previous), {Previous,Current}."
+        );
+        let beam = reference
+            .compile_named("scheduler_count_probe", source, &[])
+            .unwrap();
+        reference.load("scheduler_count_probe", &beam).unwrap();
+        let expected = reference.call("scheduler_count_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("scheduler_count_probe", "run", &[], 10, None)
+            .unwrap_or_else(|error| panic!("scheduler-count VM error: {error:?}"));
+        assert_eq!(expected, CallResult::Ok(actual.term));
+    }
+
     #[test]
     fn garbage_collect_result_matches_otp() {
         let Ok(reference) = RefErl::start() else {

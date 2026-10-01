@@ -3,8 +3,8 @@
 use crate::{Process, Vm, VmError, process::Message};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{Term, TermBuilder, from_owned, global_atoms};
-use std::cell::Cell;
+use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned, global_atoms};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -23,6 +23,13 @@ pub(crate) const CALL: u64 = 1 << 10;
 pub(crate) const ARITY: u64 = 1 << 15;
 pub(crate) const RETURN_TO: u64 = 1 << 16;
 pub(crate) const SILENT: u64 = 1 << 17;
+pub(crate) const FIRST_LINK: u64 = 1 << 9;
+pub(crate) const GARBAGE_COLLECTION: u64 = 1 << 14;
+pub(crate) const RUNNING_PORTS: u64 = 1 << 20;
+pub(crate) const RUNNING_PROCS: u64 = 1 << 21;
+pub(crate) const PORTS: u64 = 1 << 22;
+pub(crate) const SCHEDULER_ID: u64 = 1 << 23;
+pub(crate) const EXITING: u64 = 1 << 24;
 
 #[derive(Clone)]
 struct Entry {
@@ -32,6 +39,7 @@ struct Entry {
 
 #[derive(Clone)]
 pub(crate) enum Tracer {
+    Default,
     Pid(Pid),
     Port(u64),
     Module { module: String, state: OwnedTerm },
@@ -44,6 +52,7 @@ struct TraceEvent<'a> {
     tracee: Term,
     name: &'a str,
     fields: &'a [Term],
+    extra: Option<Term>,
 }
 
 struct CallEvent<'a> {
@@ -73,11 +82,39 @@ pub(crate) struct NativeTraceAction {
 }
 
 struct CallMatchContext {
-    message: Cell<Option<Term>>,
+    /// `{message, Term}` result, copied out of the match program's scratch heap, which dies
+    /// when the program run returns.
+    message: RefCell<Option<(VecHeap, Term)>>,
+    /// `print_process_info` text, captured before the program runs when it uses
+    /// `{process_dump}`, and the heaps holding binaries built from it.
+    dump: Option<Vec<u8>>,
+    dump_heaps: RefCell<Vec<VecHeap>>,
     silent: Cell<bool>,
     return_trace: Cell<bool>,
     exception_trace: Cell<bool>,
     caller: Option<Term>,
+}
+
+impl CallMatchContext {
+    fn new(caller: Option<Term>, dump: Option<Vec<u8>>) -> Self {
+        Self {
+            message: RefCell::new(None),
+            silent: Cell::new(false),
+            return_trace: Cell::new(false),
+            exception_trace: Cell::new(false),
+            caller,
+            dump,
+            dump_heaps: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Copy the `{message, Term}` result into the tracee heap.
+    // Port of erts/emulator/beam/erl_db_util.c:2452-2460 (matchPushC with ERTS_PAM_COPY_RESULT:
+    // trace results live on the tracee heap), OTP-29.1.1.
+    fn take_message(&self, process: &mut Process) -> Option<Term> {
+        let (_heap, term) = self.message.borrow_mut().take()?;
+        copy_term(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)).ok()
+    }
 }
 
 impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
@@ -89,7 +126,9 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
         match name {
             "message" => {
                 let value = *arguments.first().ok_or(arinsal_ets::EtsError::BadArg)?;
-                self.message.set(Some(value));
+                let mut heap = VecHeap::new();
+                let copy = copy_term(value, &mut heap)?;
+                *self.message.borrow_mut() = Some((heap, copy));
                 Ok(value)
             }
             "silent" => {
@@ -110,9 +149,18 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
                 self.exception_trace.set(true);
                 Ok(crate::signals::atom("true"))
             }
-            "process_dump" => Err(arinsal_ets::EtsError::Unsupported(
-                "process_dump trace action",
-            )),
+            "process_dump" => {
+                let dump = self
+                    .dump
+                    .as_deref()
+                    .ok_or(arinsal_ets::EtsError::Unsupported(
+                        "process_dump outside a process",
+                    ))?;
+                let mut heap = VecHeap::new();
+                let binary = TermBuilder::new(&mut heap).binary(dump)?;
+                self.dump_heaps.borrow_mut().push(heap);
+                Ok(binary)
+            }
             _ => Err(arinsal_ets::EtsError::Unsupported(
                 "trace match specification operation",
             )),
@@ -125,14 +173,46 @@ fn table() -> &'static Mutex<TraceTable> {
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Whether any process is traced at all.
+pub(crate) fn active() -> bool {
+    enabled().load(Ordering::Relaxed)
+}
+
 fn enabled() -> &'static AtomicBool {
     static ENABLED: AtomicBool = AtomicBool::new(false);
     &ENABLED
 }
 
-fn sessions() -> &'static Mutex<HashMap<(usize, u64), Tracer>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<(usize, u64), Tracer>>> = OnceLock::new();
+#[derive(Clone)]
+struct TraceSession {
+    tracer: Tracer,
+    name: String,
+    weak_id: i64,
+}
+
+fn sessions() -> &'static Mutex<HashMap<(usize, u64), TraceSession>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<(usize, u64), TraceSession>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+type NewProcessTracing = Mutex<HashMap<(usize, u64), (u64, Option<Tracer>)>>;
+
+fn new_process_tracing() -> &'static NewProcessTracing {
+    static TRACING: OnceLock<NewProcessTracing> = OnceLock::new();
+    TRACING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone)]
+struct EventPattern {
+    enabled: bool,
+    match_spec: Option<OwnedTerm>,
+}
+
+type EventPatterns = Mutex<HashMap<(usize, u64, &'static str), EventPattern>>;
+
+fn event_patterns() -> &'static EventPatterns {
+    static EVENTS: OnceLock<EventPatterns> = OnceLock::new();
+    EVENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn scope(process: &Process) -> usize {
@@ -142,6 +222,7 @@ fn scope(process: &Process) -> usize {
         .map_or(0, |runtime| std::sync::Arc::as_ptr(runtime) as usize)
 }
 
+#[cfg(test)]
 pub(crate) fn configure(
     process: &Process,
     pid: Pid,
@@ -181,6 +262,59 @@ pub(crate) fn configure_session(
     before
 }
 
+/// Whether `pid` is already traced in `session` by a live tracer other than `tracer`.
+// Port of erts/emulator/beam/erl_bif_trace.c:853-863 (start_trace), OTP-29.1.1.
+pub(crate) fn traced_by_other(process: &Process, session: u64, pid: Pid, tracer: &Tracer) -> bool {
+    let current = table()
+        .lock()
+        .unwrap()
+        .get(&(scope(process), session, pid))
+        .filter(|entry| entry.flags != 0)
+        .map(|entry| entry.tracer.clone());
+    let Some(current) = current else {
+        return false;
+    };
+    let same = match (&current, tracer) {
+        (Tracer::Default, Tracer::Default) => true,
+        (Tracer::Pid(a), Tracer::Pid(b)) => a == b,
+        (Tracer::Port(a), Tracer::Port(b)) => a == b,
+        (
+            Tracer::Module { module, state },
+            Tracer::Module {
+                module: other_module,
+                state: other_state,
+            },
+        ) => module == other_module && state == other_state,
+        _ => false,
+    };
+    if same {
+        return false;
+    }
+    let Some(runtime) = process.runtime.as_ref() else {
+        return false;
+    };
+    match current {
+        Tracer::Default => false,
+        Tracer::Pid(tracer) => runtime
+            .scheduler()
+            .is_ok_and(|scheduler| scheduler.lookup(tracer)),
+        Tracer::Port(id) => runtime.ports.lock().unwrap().contains_key(&id),
+        Tracer::Module { .. } => true,
+    }
+}
+
+// Port of erts/emulator/beam/erl_process.c:12692-12705, OTP-29.1.1.
+fn replace_session_flags(process: &Process, session: u64, pid: Pid, flags: u64, tracer: Tracer) {
+    let key = (scope(process), session, pid);
+    let mut table = table().lock().unwrap();
+    if flags == 0 {
+        table.remove(&key);
+    } else {
+        table.insert(key, Entry { flags, tracer });
+    }
+    enabled().store(!table.is_empty(), Ordering::Relaxed);
+}
+
 pub(crate) fn flags(process: &Process, pid: Pid) -> u64 {
     if !enabled().load(Ordering::Relaxed) {
         return 0;
@@ -211,7 +345,55 @@ pub(crate) fn clear_runtime(runtime: usize) {
         .lock()
         .unwrap()
         .retain(|(owner, _), _| *owner != runtime);
+    new_process_tracing()
+        .lock()
+        .unwrap()
+        .retain(|(owner, _), _| *owner != runtime);
+    event_patterns()
+        .lock()
+        .unwrap()
+        .retain(|(owner, _, _), _| *owner != runtime);
     enabled().store(!table().lock().unwrap().is_empty(), Ordering::Relaxed);
+}
+
+/// Store the state of an ERTS send or receive trace event pattern.
+// Port of erts/emulator/beam/erl_bif_trace.c:2800-2828 (stage_trace_event_pattern), OTP-29.1.1.
+pub(crate) fn set_event_pattern(
+    process: &Process,
+    session: u64,
+    event: &str,
+    enabled: bool,
+    match_spec: Option<OwnedTerm>,
+) {
+    let event = match event {
+        "send" => "send",
+        "receive" => "receive",
+        _ => return,
+    };
+    let key = (scope(process), session, event);
+    event_patterns().lock().unwrap().insert(
+        key,
+        EventPattern {
+            enabled,
+            match_spec,
+        },
+    );
+}
+
+fn event_pattern(process: &Process, session: u64, event: &str) -> Option<EventPattern> {
+    let key = (scope(process), session, event);
+    event_patterns().lock().unwrap().get(&key).cloned()
+}
+
+// Port of erts/emulator/beam/erl_bif_trace.c:2474-2505, OTP-29.1.1.
+pub(crate) fn event_match_spec(
+    process: &Process,
+    session: u64,
+    event: &str,
+) -> (bool, Option<OwnedTerm>) {
+    event_pattern(process, session, event)
+        .map(|pattern| (pattern.enabled, pattern.match_spec))
+        .unwrap_or((false, None))
 }
 
 pub(crate) fn session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
@@ -220,6 +402,47 @@ pub(crate) fn session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
         .unwrap()
         .get(&(scope(process), session, pid))
         .map_or(0, |entry| entry.flags)
+}
+
+// Port of erts/emulator/beam/erl_trace.c:559-582, OTP-29.1.1.
+pub(crate) fn configure_new_processes(
+    process: &Process,
+    session: u64,
+    how_on: bool,
+    flags: u64,
+    tracer: Tracer,
+) {
+    let key = (scope(process), session);
+    let mut tracing = new_process_tracing().lock().unwrap();
+    let (current, current_tracer) = tracing.entry(key).or_default();
+    if how_on {
+        *current |= flags;
+        *current_tracer = Some(tracer);
+    } else {
+        *current &= !flags;
+        if *current == 0 {
+            *current_tracer = None;
+        }
+    }
+    if *current == 0 {
+        tracing.remove(&key);
+    }
+}
+
+pub(crate) fn new_process_flags(process: &Process, session: u64) -> u64 {
+    new_process_tracing()
+        .lock()
+        .unwrap()
+        .get(&(scope(process), session))
+        .map_or(0, |(flags, _)| *flags)
+}
+
+pub(crate) fn new_process_tracer(process: &Process, session: u64) -> Option<Tracer> {
+    new_process_tracing()
+        .lock()
+        .unwrap()
+        .get(&(scope(process), session))
+        .and_then(|(_, tracer)| tracer.clone())
 }
 
 pub(crate) fn tracer(process: &Process, pid: Pid) -> Option<Tracer> {
@@ -236,6 +459,31 @@ pub(crate) fn clear(process: &Process, pid: Pid) {
     enabled().store(!entries.is_empty(), Ordering::Relaxed);
 }
 
+/// Remove process and future-process tracing owned by a dying tracer.
+// Port of erts/emulator/beam/erl_trace.c (tracer process termination), OTP-29.1.1.
+pub(crate) fn tracer_exited(process: &Process, pid: Pid) {
+    let runtime = scope(process);
+    let mut entries = table().lock().unwrap();
+    entries.retain(|(owner, _, _), entry| {
+        *owner != runtime || !matches!(entry.tracer, Tracer::Pid(tracer) if tracer == pid)
+    });
+    let any_entries = !entries.is_empty();
+    drop(entries);
+    for ((owner, _), (flags, tracer_state)) in new_process_tracing().lock().unwrap().iter_mut() {
+        if *owner == runtime
+            && matches!(tracer_state.as_ref(), Some(Tracer::Pid(tracer)) if *tracer == pid)
+        {
+            *flags = 0;
+            *tracer_state = None;
+        }
+    }
+    new_process_tracing()
+        .lock()
+        .unwrap()
+        .retain(|(owner, _), (flags, _)| *owner != runtime || *flags != 0);
+    enabled().store(any_entries, Ordering::Relaxed);
+}
+
 /// Port of erts/emulator/beam/beam_bp.c:1115-1285 (generic entry breakpoint), OTP-29.1.1.
 /// Emit a call event after the function entry has resolved its trace pattern.
 pub(crate) fn call_event(
@@ -248,7 +496,6 @@ pub(crate) fn call_event(
     local: bool,
 ) -> Result<Vec<CallActions>, VmError> {
     let pid = ctx.pid();
-    let flags = flags(process, pid);
     let patterns = crate::trace_bp::matching(process, module, function, args.len() as u8, local);
     if patterns.is_empty() {
         return Ok(Vec::new());
@@ -258,10 +505,12 @@ pub(crate) fn call_event(
         if pattern.paused {
             continue;
         }
+        let flags = session_flags(process, pattern.session, pid);
         let mut extra = None;
         let mut return_trace = false;
         let mut exception_trace = false;
         if let Some(specification) = pattern.match_spec.as_ref() {
+            let dump = process_dump_for(specification, Some(&*vm), process, ctx);
             // Port of erts/emulator/beam/erl_trace.c:1266-1267, OTP-29.1.1.
             let against = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
                 .list_from_iter(args.iter().copied())
@@ -273,13 +522,7 @@ pub(crate) fn call_event(
             .map_err(|error| VmError::Unsupported(format!("trace match spec: {error:?}")))?;
             let program = arinsal_ets::match_spec::MatchProgram::compile_trace(specification)
                 .map_err(|_| VmError::Unsupported("invalid trace match specification".into()))?;
-            let context = CallMatchContext {
-                message: Cell::new(None),
-                silent: Cell::new(false),
-                return_trace: Cell::new(false),
-                exception_trace: Cell::new(false),
-                caller: caller_mfa(process, vm)?,
-            };
+            let context = CallMatchContext::new(caller_mfa(process, vm)?, dump);
             let result = program
                 .run_with_context(
                     against,
@@ -298,7 +541,7 @@ pub(crate) fn call_event(
             if result == crate::signals::atom("false") {
                 continue;
             }
-            extra = context.message.get();
+            extra = context.take_message(process);
             return_trace = context.return_trace.get();
             exception_trace = context.exception_trace.get();
         }
@@ -330,6 +573,31 @@ pub(crate) fn call_event(
         }
     }
     Ok(actions)
+}
+
+/// Capture the process dump up front when a match specification uses `{process_dump}`.
+// Port of erts/emulator/beam/erl_db_util.c:2756-2765 (matchProcessDump), OTP-29.1.1.
+fn process_dump_for(
+    specification: &OwnedTerm,
+    vm: Option<&Vm>,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Option<Vec<u8>> {
+    fn uses(term: &OwnedTerm) -> bool {
+        match term {
+            OwnedTerm::Tuple(fields) => {
+                matches!(fields.as_slice(), [OwnedTerm::Atom(name)] if name == "process_dump")
+                    || fields.iter().any(uses)
+            }
+            OwnedTerm::List { elems, tail } => elems.iter().any(uses) || uses(tail),
+            OwnedTerm::Map(pairs) => pairs.iter().any(|(key, value)| uses(key) || uses(value)),
+            _ => false,
+        }
+    }
+    if !uses(specification) {
+        return None;
+    }
+    crate::natives::proc::process_dump(vm, process, ctx).ok()
 }
 
 fn emit_call_event(
@@ -379,7 +647,17 @@ fn emit_call_event(
     } else {
         vec![call]
     };
-    emit_filtered(Some(vm), process, ctx, pid, CALL, "call", &fields, session);
+    emit_filtered(
+        Some(vm),
+        process,
+        ctx,
+        pid,
+        CALL,
+        "call",
+        &fields,
+        session,
+        None,
+    );
     Ok(actions)
 }
 
@@ -437,8 +715,6 @@ pub(crate) fn native_call_event(
     else {
         return Vec::new();
     };
-    let process_flags = flags(process, pid);
-    let emit_calls = process_flags & CALL != 0 && process_flags & SILENT == 0;
     let patterns = crate::trace_bp::matching(process, module, function, arity, true);
     if patterns.is_empty() {
         return Vec::new();
@@ -446,6 +722,8 @@ pub(crate) fn native_call_event(
     let args = process.x[..usize::from(arity)].to_vec();
     let mut actions = Vec::new();
     for pattern in patterns {
+        let process_flags = session_flags(process, pattern.session, pid);
+        let emit_calls = process_flags & CALL != 0 && process_flags & SILENT == 0;
         let mut extra = None;
         let mut return_trace = false;
         let mut exception_trace = false;
@@ -481,13 +759,7 @@ pub(crate) fn native_call_event(
             else {
                 continue;
             };
-            let context = CallMatchContext {
-                message: Cell::new(None),
-                silent: Cell::new(false),
-                return_trace: Cell::new(false),
-                exception_trace: Cell::new(false),
-                caller: None,
-            };
+            let context = CallMatchContext::new(None, None);
             let result = program.run_with_context(
                 subject,
                 &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
@@ -498,7 +770,7 @@ pub(crate) fn native_call_event(
             {
                 continue;
             }
-            extra = context.message.get();
+            extra = context.take_message(process);
             return_trace = context.return_trace.get();
             exception_trace = context.exception_trace.get();
         }
@@ -687,7 +959,7 @@ pub(crate) fn return_event(
     exception: bool,
     exception_class_and_reason: Option<Term>,
 ) -> Result<(), VmError> {
-    let flags = flags(process, ctx.pid());
+    let flags = session_flags(process, session, ctx.pid());
     if flags & CALL == 0 || flags & SILENT != 0 {
         return Ok(());
     }
@@ -731,7 +1003,67 @@ pub(crate) fn return_event(
         },
         &fields,
         Some(session),
+        None,
     );
+    Ok(())
+}
+
+/// Emit the return or exception events of a traced BIF whose call event ran inline.
+// Port of erts/emulator/beam/emu/trace_instrs.tab:25-70 (return_trace), applied to BIFs as in
+// erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)] // The BIF identity and outcome stay explicit.
+pub(crate) fn bif_return_events(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    actions: &[CallActions],
+    module: &str,
+    function: &str,
+    arity: u8,
+    outcome: Result<Term, Term>,
+) -> Result<(), VmError> {
+    if actions
+        .iter()
+        .all(|action| !action.return_trace && !action.exception_trace)
+    {
+        return Ok(());
+    }
+    let atom_of = |name: &str| {
+        global_atoms()
+            .intern(name)
+            .map(Term::atom)
+            .map_err(|_| VmError::Unsupported("trace return atom".into()))
+    };
+    let mfa = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .tuple(&[
+            atom_of(module)?,
+            atom_of(function)?,
+            Term::small(i64::from(arity)).unwrap_or(Term::NIL),
+        ])
+        .map_err(|error| VmError::Unsupported(format!("trace return MFA: {error:?}")))?;
+    for action in actions {
+        let (name, wanted, value) = match outcome {
+            Ok(value) => (
+                "return_from",
+                action.return_trace || action.exception_trace,
+                value,
+            ),
+            Err(class_and_reason) => ("exception_from", action.exception_trace, class_and_reason),
+        };
+        if wanted {
+            emit_filtered(
+                Some(vm),
+                process,
+                ctx,
+                ctx.pid(),
+                CALL,
+                name,
+                &[mfa, value],
+                Some(action.session),
+                None,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -743,7 +1075,7 @@ pub(crate) fn return_to_event(
     ctx: &mut RunCtx<'_, Message>,
     session: u64,
 ) -> Result<(), VmError> {
-    let flags = flags(process, ctx.pid());
+    let flags = session_flags(process, session, ctx.pid());
     if flags & RETURN_TO == 0 || flags & SILENT != 0 {
         return Ok(());
     }
@@ -810,16 +1142,19 @@ pub(crate) fn return_to_event(
         "return_to",
         &[mfa],
         Some(session),
+        None,
     );
     Ok(())
 }
 
+// Port of erts/emulator/beam/erl_process.c:12685-12713, OTP-29.1.1.
 pub(crate) fn spawned(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     child: Pid,
     mfa: Term,
+    linked: bool,
 ) {
     let parent = ctx.pid();
     if let Some(child_term) = child.to_term() {
@@ -832,39 +1167,132 @@ pub(crate) fn spawned(
             "spawn",
             &[child_term, mfa],
         );
+        if linked {
+            // Port of erts/emulator/beam/erl_process.c:12884-12888 (erl_create_process link
+            // trace), OTP-29.1.1.
+            emit(Some(vm), process, ctx, parent, PROCS, "link", &[child_term]);
+        }
     }
-    let inherited = flags(process, parent);
-    let inherit = inherited & (SET_ON_SPAWN | SET_ON_FIRST_SPAWN) != 0;
-    if inherit {
-        let mut child_flags = inherited & !(SET_ON_SPAWN | SET_ON_FIRST_SPAWN);
-        if inherited & SET_ON_FIRST_SPAWN != 0 {
-            let _ = configure(
+    let defaults = new_process_tracing()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((owner, _), (flags, _))| *owner == scope(process) && *flags != 0)
+        .map(|((_, session), (flags, tracer))| (*session, *flags, tracer.clone()))
+        .collect::<Vec<_>>();
+    for (session, flags, tracer) in defaults {
+        configure_session(
+            process,
+            session,
+            child,
+            true,
+            flags,
+            tracer.unwrap_or(Tracer::Pid(parent)),
+        );
+    }
+    let runtime = scope(process);
+    let entries = table()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((owner, _, pid), _)| *owner == runtime && *pid == parent)
+        .map(|((_, session, _), entry)| (*session, entry.clone()))
+        .collect::<Vec<_>>();
+    for (session, entry) in entries {
+        let flags = entry.flags;
+        let inherits_spawn = flags & (SET_ON_SPAWN | SET_ON_FIRST_SPAWN) != 0;
+        let inherits_link = linked && flags & (SET_ON_LINK | FIRST_LINK) != 0;
+        if !inherits_spawn && !inherits_link {
+            continue;
+        }
+        let mut child_flags = flags;
+        let mut clear_parent = 0;
+        if flags & SET_ON_FIRST_SPAWN != 0 {
+            child_flags &= !(SET_ON_SPAWN | SET_ON_FIRST_SPAWN);
+            clear_parent |= SET_ON_SPAWN | SET_ON_FIRST_SPAWN;
+        }
+        if linked && flags & FIRST_LINK != 0 {
+            child_flags &= !(SET_ON_LINK | FIRST_LINK);
+            clear_parent |= SET_ON_LINK | FIRST_LINK;
+        }
+        if clear_parent != 0 {
+            configure_session(
                 process,
+                session,
                 parent,
                 false,
-                SET_ON_FIRST_SPAWN,
-                Tracer::Pid(parent),
+                clear_parent,
+                entry.tracer.clone(),
             );
-            child_flags |= inherited & SET_ON_FIRST_SPAWN;
         }
         if child_flags != 0 {
-            let target = tracer(process, parent).unwrap_or(Tracer::Pid(parent));
-            configure(process, child, true, child_flags, target);
+            // The parent trace flags replace a same-session new-process default.
+            replace_session_flags(process, session, child, child_flags, entry.tracer);
         }
+    }
+    if linked && let Some(parent_term) = parent.to_term() {
+        emit(
+            Some(vm),
+            process,
+            ctx,
+            child,
+            PROCS,
+            "spawned",
+            &[parent_term, mfa],
+        );
+        emit(
+            Some(vm),
+            process,
+            ctx,
+            child,
+            PROCS,
+            "getting_linked",
+            &[parent_term],
+        );
     }
 }
 
 pub(crate) fn spawn_interested(process: &Process, parent: Pid) -> bool {
     flags(process, parent) & (PROCS | SET_ON_SPAWN | SET_ON_FIRST_SPAWN) != 0
+        || new_process_tracing()
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((runtime, _), (flags, _))| *runtime == scope(process) && *flags != 0)
 }
 
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:618-655, OTP-29.1.1.
 pub(crate) fn linked(process: &Process, from: Pid, to: Pid) {
     for (source, target) in [(from, to), (to, from)] {
-        let source_flags = flags(process, source);
-        if source_flags & SET_ON_LINK != 0 {
-            let target_flags = source_flags & !SET_ON_LINK;
-            let target_tracer = tracer(process, source).unwrap_or(Tracer::Pid(source));
-            configure(process, target, true, target_flags, target_tracer);
+        let source_entries = table()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((runtime, _, pid), entry)| {
+                *runtime == scope(process)
+                    && *pid == source
+                    && entry.flags & (SET_ON_LINK | FIRST_LINK) != 0
+            })
+            .map(|((_, session, _), entry)| (*session, entry.clone()))
+            .collect::<Vec<_>>();
+        for (session, entry) in source_entries {
+            let first_link = entry.flags & FIRST_LINK != 0;
+            let target_flags = if first_link {
+                entry.flags & !(SET_ON_LINK | FIRST_LINK)
+            } else {
+                entry.flags
+            };
+            replace_session_flags(process, session, target, target_flags, entry.tracer.clone());
+            if first_link {
+                configure_session(
+                    process,
+                    session,
+                    source,
+                    false,
+                    SET_ON_LINK | FIRST_LINK,
+                    entry.tracer,
+                );
+            }
         }
     }
 }
@@ -880,7 +1308,53 @@ pub(crate) fn emit(
     name: &str,
     fields: &[Term],
 ) {
-    emit_filtered(vm, process, ctx, subject, class, name, fields, None);
+    emit_filtered(vm, process, ctx, subject, class, name, fields, None, None);
+}
+
+pub(crate) fn receive_event(
+    vm: Option<&mut Vm>,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    message: Term,
+    from: Option<Pid>,
+) {
+    let node = crate::signals::atom("nonode@nohost");
+    let from = from
+        .and_then(Pid::to_term)
+        .unwrap_or(crate::signals::atom("undefined"));
+    emit_filtered(
+        vm,
+        process,
+        ctx,
+        ctx.pid(),
+        RECEIVE,
+        "receive",
+        &[message],
+        None,
+        Some(&[node, from, message]),
+    );
+}
+
+// Port of erts/emulator/beam/emu/msg_instrs.tab:276, OTP-29.1.1.
+pub(crate) fn timeout_event(
+    vm: Option<&mut Vm>,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) {
+    let node = crate::signals::atom("clock_service");
+    let undefined = crate::signals::atom("undefined");
+    let timeout = crate::signals::atom("timeout");
+    emit_filtered(
+        vm,
+        process,
+        ctx,
+        ctx.pid(),
+        RECEIVE,
+        "receive",
+        &[timeout],
+        None,
+        Some(&[node, undefined, timeout]),
+    );
 }
 
 pub(crate) fn emit_process(
@@ -933,6 +1407,7 @@ fn emit_filtered_without_ctx(
                     tracee: subject_term,
                     name,
                     fields,
+                    extra: None,
                 },
             );
             continue;
@@ -957,7 +1432,7 @@ fn emit_filtered_without_ctx(
                 .unwrap_or_default()
                 .as_micros();
             values.push(
-                TermBuilder::new(&mut process.heap)
+                TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
                     .tuple(&[
                         Term::small((micros / 1_000_000 / 1_000_000) as i64).unwrap_or(Term::NIL),
                         Term::small((micros / 1_000_000 % 1_000_000) as i64).unwrap_or(Term::NIL),
@@ -980,13 +1455,21 @@ fn emit_filtered_without_ctx(
                 .unwrap_or(Term::NIL),
             );
         }
-        let Ok(event) = TermBuilder::new(&mut process.heap).tuple(&values) else {
+        // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253 (enif_make_tuple_from_array
+        // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
+        // the event, so the tuple may land in a heap fragment.
+        let Ok(event) =
+            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&values)
+        else {
             continue;
         };
         let Ok(message) = Message::copy_from(event) else {
             continue;
         };
         match entry.tracer {
+            Tracer::Default => continue,
+            // A process never traces itself: the default tracer discards such events.
+            Tracer::Pid(pid) if pid == subject => continue,
             Tracer::Pid(pid) => {
                 if let Some(runtime) = &process.runtime
                     && let Ok(scheduler) = runtime.scheduler()
@@ -1062,6 +1545,7 @@ fn emit_filtered(
     name: &str,
     fields: &[Term],
     session: Option<u64>,
+    match_args: Option<&[Term]>,
 ) {
     if !enabled().load(Ordering::Relaxed) {
         return;
@@ -1076,7 +1560,7 @@ fn emit_filtered(
                 && entry.flags & class != 0
                 && session.is_none_or(|wanted| *sid == wanted)
         })
-        .map(|(_, entry)| entry.clone())
+        .map(|((_, session, _), entry)| (*session, entry.clone()))
         .collect::<Vec<_>>();
     if entries.is_empty() {
         return;
@@ -1084,7 +1568,67 @@ fn emit_filtered(
     let Some(subject_term) = subject.to_term() else {
         return;
     };
-    for entry in entries {
+    for (session, entry) in entries {
+        let mut extra = None;
+        // Port of erts/emulator/beam/erl_trace.c:805-832 (trace_send), OTP-29.1.1: a send to a
+        // dead local process is filtered by the send pattern but reported under its own name.
+        let pattern_name = if name == "send_to_non_existing_process" {
+            "send"
+        } else {
+            name
+        };
+        if matches!(pattern_name, "send" | "receive")
+            && let Some(pattern) = event_pattern(process, session, pattern_name)
+        {
+            if !pattern.enabled {
+                continue;
+            }
+            if let Some(specification) = pattern.match_spec {
+                let generated_args;
+                let arguments = if let Some(arguments) = match_args {
+                    arguments
+                } else if pattern_name == "send" && fields.len() >= 2 {
+                    generated_args = [fields[1], fields[0]];
+                    &generated_args
+                } else {
+                    fields
+                };
+                let dump = process_dump_for(&specification, vm.as_deref(), process, ctx);
+                let against =
+                    match TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                        .list_from_iter(arguments.iter().copied())
+                    {
+                        Ok(against) => against,
+                        Err(_) => continue,
+                    };
+                let specification = match from_owned(
+                    &specification,
+                    &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                ) {
+                    Ok(specification) => specification,
+                    Err(_) => continue,
+                };
+                let program =
+                    match arinsal_ets::match_spec::MatchProgram::compile_trace(specification) {
+                        Ok(program) => program,
+                        Err(_) => continue,
+                    };
+                let context = CallMatchContext::new(None, dump);
+                let result = program.run_with_context(
+                    against,
+                    &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                    &context,
+                );
+                if context.silent.get()
+                    || !result.is_ok_and(|result| {
+                        result.is_some_and(|value| value != crate::signals::atom("false"))
+                    })
+                {
+                    continue;
+                }
+                extra = context.take_message(process);
+            }
+        }
         if let Tracer::Module { module, state } = &entry.tracer {
             let Some(vm) = vm.as_deref_mut() else {
                 continue;
@@ -1100,6 +1644,7 @@ fn emit_filtered(
                     tracee: subject_term,
                     name,
                     fields,
+                    extra,
                 },
             );
             continue;
@@ -1118,6 +1663,15 @@ fn emit_filtered(
             crate::signals::atom(name),
         ]);
         values.extend_from_slice(fields);
+        if let Some(extra) = extra {
+            values.push(extra);
+        }
+        if entry.flags & SCHEDULER_ID != 0 {
+            values.push(
+                Term::small(ctx.scheduler_id().unwrap_or(0) as i64)
+                    .unwrap_or(crate::signals::atom("undefined")),
+            );
+        }
         if entry.flags & TIMESTAMP != 0 {
             let micros = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1129,7 +1683,10 @@ fn emit_filtered(
                 micros % 1_000_000,
             ]
             .map(|value| Term::small(value as i64).unwrap_or(Term::NIL));
-            if let Ok(tuple) = TermBuilder::new(&mut process.heap).tuple(&stamp) {
+            if let Ok(tuple) =
+                TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    .tuple(&stamp)
+            {
                 values.push(tuple);
             }
         } else if entry.flags & (MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0 {
@@ -1146,13 +1703,20 @@ fn emit_filtered(
             .unwrap_or(Term::NIL);
             values.push(stamp);
         }
-        let Ok(event) = TermBuilder::new(&mut process.heap).tuple(&values) else {
+        // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253 (enif_make_tuple_from_array
+        // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
+        // the event, so the tuple may land in a heap fragment.
+        let Ok(event) =
+            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&values)
+        else {
             return;
         };
         let Ok(message) = Message::copy_from(event) else {
             return;
         };
         match entry.tracer {
+            Tracer::Default => continue,
+            Tracer::Pid(pid) if pid == subject => continue,
             Tracer::Pid(pid) => {
                 let _ = ctx.send(pid, message);
             }
@@ -1197,10 +1761,8 @@ fn emit_module(
     }
     let data = event.fields.first().copied().unwrap_or(Term::NIL);
     let mut options = Vec::new();
-    if event.name == "send"
-        && let Some(extra) = event.fields.get(1)
-    {
-        options.push((crate::signals::atom("extra"), *extra));
+    if let Some(extra) = event.extra {
+        options.push((crate::signals::atom("extra"), extra));
     }
     if event.flags & TIMESTAMP != 0 {
         options.push((
@@ -1218,7 +1780,9 @@ fn emit_module(
             crate::signals::atom("monotonic"),
         ));
     }
-    let Ok(options) = TermBuilder::new(&mut process.heap).flatmap_from_pairs(&options) else {
+    let Ok(options) = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .flatmap_from_pairs(&options)
+    else {
         return;
     };
     let _ = crate::natives::nif::invoke_tracer(
@@ -1230,14 +1794,23 @@ fn emit_module(
     );
 }
 
-pub(crate) fn create_session(process: &Process, tracer: Tracer) -> u64 {
+pub(crate) fn create_session(process: &Process, name: String, tracer: Tracer) -> (u64, i64) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let id = 0x7000_0000_0000_0000 | NEXT.fetch_add(1, Ordering::Relaxed).max(1);
-    sessions()
-        .lock()
-        .unwrap()
-        .insert((scope(process), id), tracer);
-    id
+    let weak_id = process
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.next_trace_weak_id.fetch_add(1, Ordering::Relaxed))
+        .unwrap_or(0) as i64;
+    sessions().lock().unwrap().insert(
+        (scope(process), id),
+        TraceSession {
+            tracer,
+            name,
+            weak_id,
+        },
+    );
+    (id, weak_id)
 }
 
 pub(crate) fn session_tracer(process: &Process, session: u64) -> Option<Tracer> {
@@ -1245,18 +1818,52 @@ pub(crate) fn session_tracer(process: &Process, session: u64) -> Option<Tracer> 
         .lock()
         .unwrap()
         .get(&(scope(process), session))
-        .cloned()
+        .map(|session| session.tracer.clone())
+}
+
+pub(crate) fn process_tracer(process: &Process, session: u64, pid: Pid) -> Option<Tracer> {
+    // Port of erts/emulator/beam/erl_bif_trace.c:1640-1708, OTP-29.1.1.
+    table()
+        .lock()
+        .unwrap()
+        .get(&(scope(process), session, pid))
+        .map(|entry| entry.tracer.clone())
+}
+
+pub(crate) fn session_refs(process: &Process) -> Vec<(String, i64)> {
+    let runtime = scope(process);
+    let mut refs = sessions()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((owner, _), _)| *owner == runtime)
+        .map(|(_, session)| (session.name.clone(), session.weak_id))
+        .collect::<Vec<_>>();
+    refs.sort_unstable_by_key(|(_, weak_id)| std::cmp::Reverse(*weak_id));
+    refs.push(("legacy".to_owned(), -1));
+    refs
 }
 
 pub(crate) fn destroy_session(process: &Process, session: u64) -> bool {
+    let runtime = scope(process);
     let existed = sessions()
         .lock()
         .unwrap()
-        .remove(&(scope(process), session))
+        .remove(&(runtime, session))
         .is_some();
     let mut entries = table().lock().unwrap();
-    entries.retain(|(runtime, id, _), _| *runtime != scope(process) || *id != session);
-    enabled().store(!entries.is_empty(), Ordering::Relaxed);
+    entries.retain(|(owner, id, _), _| *owner != runtime || *id != session);
+    event_patterns()
+        .lock()
+        .unwrap()
+        .retain(|(owner, id, _), _| *owner != runtime || *id != session);
+    new_process_tracing()
+        .lock()
+        .unwrap()
+        .remove(&(runtime, session));
+    let any_entries = !entries.is_empty();
+    drop(entries);
+    enabled().store(any_entries, Ordering::Relaxed);
     existed
 }
 
@@ -1278,6 +1885,78 @@ mod tests {
         vm.load_bytes(&beam).unwrap();
         let actual = vm.eval_scheduled(name, "run", &[], 1, None).unwrap();
         assert_eq!(expected, CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn send_event_pattern_false_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3a_send_pattern",
+            "-module(trace_t3a_send_pattern). -export([run/0]). run() -> Parent=self(), S=trace:session_create(s,Parent,[]), 1=trace:send(S,false,[]), P=spawn(fun() -> receive go -> Parent ! done end end), trace:process(S,P,true,[send]), P ! go, receive done -> ok after 1000 -> timeout end, Result=receive {trace,P,send,_,_} -> unexpected after 0 -> quiet end, trace:session_destroy(S), Result.",
+        );
+    }
+
+    #[test]
+    fn event_match_spec_info_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3a_event_info",
+            "-module(trace_t3a_event_info). -export([run/0]). run() -> 1=erlang:trace_pattern(send,false,[]), Before=erlang:trace_info(send,match_spec), 1=erlang:trace_pattern(send,true,[]), Enabled=erlang:trace_info(send,match_spec), Spec=[{'_',[],[{message,4711}]}], 1=erlang:trace_pattern(send,Spec,[]), Active=erlang:trace_info(send,match_spec), 1=erlang:trace_pattern(send,false,[]), Disabled=erlang:trace_info(send,match_spec), {Before,Enabled,Active,Disabled}.",
+        );
+    }
+
+    #[test]
+    fn receive_event_match_spec_uses_sender_and_message_like_otp() {
+        trace_pattern_diff(
+            "trace_t3a_receive_match_spec",
+            "-module(trace_t3a_receive_match_spec). -export([run/0]). run() -> Parent=self(), S=trace:session_create(s,Parent,[]), 1=trace:recv(S,[{[node(),'$1',go],[{is_pid,'$1'}],[]}],[]), P=spawn(fun() -> receive go -> Parent!hello end end), 1=trace:process(S,P,true,['receive']), P!go, receive hello -> ok end, Result=receive {trace,P,'receive',go} -> is_pid(P) after 1000 -> missing end, trace:session_destroy(S), Result.",
+        );
+    }
+
+    #[test]
+    fn receive_timeout_event_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3a_receive_timeout",
+            "-module(trace_t3a_receive_timeout). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive after 1 -> ok end end), 1=erlang:trace(P,true,['receive']), receive {trace,P,'receive',timeout} -> ok after 1000 -> missing end.",
+        );
+    }
+
+    #[test]
+    fn trace_existing_then_all_clear_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3a_existing_clear",
+            "-module(trace_t3a_existing_clear). -export([run/0]). run() -> Tracer=spawn(fun receiver/0), N=erlang:trace(existing,true,[send,{tracer,Tracer}]), {flags,[send]}=erlang:trace_info(self(),flags), {tracer,Tracer}=erlang:trace_info(self(),tracer), M=erlang:trace(all,false,[all]), {flags,[]}=erlang:trace_info(self(),flags), {tracer,[]}=erlang:trace_info(self(),tracer), N=:=M. receiver() -> receive _ -> receiver() end.",
+        );
+    }
+
+    #[test]
+    fn trace_spawn_link_events_match_otp() {
+        trace_pattern_diff(
+            "trace_t3a_spawn_link_events",
+            "-module(trace_t3a_spawn_link_events). -export([run/0,child/1]). run() -> Parent=self(), 1=erlang:trace(Parent,true,[procs,set_on_first_spawn]), ParentFlags=erlang:trace_info(Parent,flags), Child=spawn_link(trace_t3a_spawn_link_events,child,[Parent]), ChildFlags=erlang:trace_info(Child,flags), Spawned=receive {trace,Child,spawned,Parent,_MFA} -> true after 1000 -> false end, Linked=receive {trace,Child,getting_linked,Parent} -> true after 1000 -> false end, Child!go, receive done -> ok end, {ParentFlags,ChildFlags,Spawned,Linked}. child(Parent) -> receive go -> Parent!done end.",
+        );
+    }
+
+    #[test]
+    fn tracer_can_set_call_pattern_while_tracee_waits() {
+        trace_pattern_diff(
+            "trace_t3a_tracer_sets_pattern",
+            "-module(trace_t3a_tracer_sets_pattern). -export([run/0,foo/0]). run() -> Parent=self(), Tracer=spawn(fun() -> 1=erlang:trace(Parent,true,[call]), receive {apply,From} -> N=erlang:trace_pattern({trace_t3a_tracer_sets_pattern,foo,0},true,[]), From!{apply_result,N} end end), Tracer!{apply,self()}, N=receive {apply_result,Result} -> Result after 1000 -> timeout end, foo(), Event=receive {trace,Parent,call,{trace_t3a_tracer_sets_pattern,foo,[]}} -> true after 1000 -> false end, {N,Event}. foo() -> ok.",
+        );
+    }
+
+    #[test]
+    fn child_can_set_call_pattern_without_tracing_the_caller() {
+        trace_pattern_diff(
+            "trace_t3a_child_sets_pattern",
+            "-module(trace_t3a_child_sets_pattern). -export([run/0]). run() -> Parent=self(), Tracer=spawn(fun() -> receive apply_pattern -> N=erlang:trace_pattern({trace_t3a_child_sets_pattern,no_such,0},true,[]), Parent!{pattern_result,N} end end), Tracer!apply_pattern, receive {pattern_result,N} -> N after 1000 -> timeout end.",
+        );
+    }
+
+    #[test]
+    fn send_event_match_spec_uses_destination_and_message_arguments() {
+        trace_pattern_diff(
+            "trace_t3a_send_match_spec",
+            "-module(trace_t3a_send_match_spec). -export([run/0]). run() -> Parent=self(), S=trace:session_create(s,Parent,[]), 1=trace:send(S,[{['$1','_'],[{is_pid,'$1'}],[{message,4711}]}],[]), P=spawn(fun() -> receive go -> Parent!hello end end), 1=trace:process(S,P,true,[send]), P!go, receive {trace,P,send,hello,Parent,4711} -> {is_pid(P),is_pid(Parent),4711} after 1000 -> missing end.",
+        );
     }
 
     #[test]
@@ -1533,13 +2212,53 @@ mod tests {
         let process = Process::new();
         let session = create_session(
             &process,
+            "trace_test".to_owned(),
             Tracer::Pid(Pid {
                 index: 7005,
                 generation: 1,
             }),
         );
-        assert!(destroy_session(&process, session));
-        assert!(!destroy_session(&process, session));
+        assert!(!crate::trace_bp::set(
+            &process,
+            session.0,
+            "trace_test".into(),
+            "function".into(),
+            Some(0),
+            Some(crate::trace_bp::Pattern {
+                session: session.0,
+                flags: vec!["global".into()],
+                match_spec: None,
+                meta: None,
+                count: 0,
+                paused: false,
+                seq: 0,
+                off: false,
+            }),
+        ));
+        assert!(
+            crate::trace_bp::info_session(
+                &process,
+                session.0,
+                "trace_test",
+                "function",
+                0,
+                "traced"
+            )
+            .is_some()
+        );
+        assert!(destroy_session(&process, session.0));
+        crate::trace_bp::clear_session(&process, session.0);
+        assert!(
+            crate::trace_bp::info_session(
+                &process,
+                session.0,
+                "trace_test",
+                "function",
+                0,
+                "traced"
+            ) == Some(arinsal_etf::OwnedTerm::Atom("false".into()))
+        );
+        assert!(!destroy_session(&process, session.0));
     }
 
     #[test]
@@ -1549,13 +2268,81 @@ mod tests {
             index: 7006,
             generation: 1,
         };
-        let a = create_session(&process, Tracer::Pid(pid));
-        let b = create_session(&process, Tracer::Pid(pid));
-        configure_session(&process, a, pid, true, SEND, Tracer::Pid(pid));
-        configure_session(&process, b, pid, true, RECEIVE, Tracer::Pid(pid));
-        assert_eq!(session_flags(&process, a, pid), SEND);
-        assert_eq!(session_flags(&process, b, pid), RECEIVE);
-        destroy_session(&process, a);
-        destroy_session(&process, b);
+        let a = create_session(&process, "a".to_owned(), Tracer::Pid(pid));
+        let b = create_session(&process, "b".to_owned(), Tracer::Pid(pid));
+        configure_session(&process, a.0, pid, true, SEND, Tracer::Pid(pid));
+        configure_session(&process, b.0, pid, true, RECEIVE, Tracer::Pid(pid));
+        assert_eq!(session_flags(&process, a.0, pid), SEND);
+        assert_eq!(session_flags(&process, b.0, pid), RECEIVE);
+        destroy_session(&process, a.0);
+        destroy_session(&process, b.0);
+    }
+
+    #[test]
+    fn trace_session_info_all_matches_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping trace session info differential test");
+            return;
+        };
+        let source = "-module(trace_t4_session_info). -export([run/0]). run() -> Before=trace:session_info(all), S=trace:session_create(sample,self(),[]), During=trace:session_info(all), true=trace:session_destroy(S), After=trace:session_info(all), {Before,During,After}.";
+        let beam = reference
+            .compile_named("trace_t4_session_info", source, &[])
+            .unwrap();
+        reference.load("trace_t4_session_info", &beam).unwrap();
+        let expected = reference.call("trace_t4_session_info", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("trace_t4_session_info", "run", &[], 2, None)
+            .unwrap_or_else(|error| panic!("session info VM error: {error:?}"));
+        assert_eq!(expected, CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn trace_session_routes_call_events_and_keeps_legacy_info_isolated() {
+        trace_pattern_diff(
+            "trace_t4_session_call",
+            "-module(trace_t4_session_call). -export([run/0, f/0]). run() -> Parent=self(), S=trace:session_create(sample,undefined,[]), Tracer=spawn(fun() -> 1=trace:process(S,Parent,true,[call]), Count=trace:function(S,{trace_t4_session_call,f,0},true,[global]), Parent!{ready,Count}, receive Event={trace,Parent,call,{trace_t4_session_call,f,[]}} -> Parent!Event after 1000 -> ok end end), {ready,PatternCount}=receive Ready -> Ready after 1000 -> timeout end, SessionFlags=trace:info(S,Parent,flags), LegacyFlags=erlang:trace_info(Parent,flags), Pattern=trace:info(S,{trace_t4_session_call,f,0},traced), trace_t4_session_call:f(), Event=receive {trace,Pid,call,{trace_t4_session_call,f,[]}} when Pid =:= Parent -> {trace,is_pid(Pid),call,{trace_t4_session_call,f,[]}} after 1000 -> missing end, {is_pid(Tracer),PatternCount,SessionFlags,LegacyFlags,Pattern,Event}. f() -> ok.",
+        );
+    }
+
+    #[test]
+    fn call_trace_flags_do_not_cross_trace_sessions() {
+        trace_pattern_diff(
+            "trace_t4_session_call_isolation",
+            "-module(trace_t4_session_call_isolation). -export([run/0,f/0]). run() -> Parent=self(), A=trace:session_create(a,Parent,[]), B=trace:session_create(b,Parent,[]), 1=trace:process(A,Parent,true,[call]), 1=trace:function(B,{trace_t4_session_call_isolation,f,0},true,[global]), trace_t4_session_call_isolation:f(), Event=receive {trace,Parent,call,{trace_t4_session_call_isolation,f,[]}} -> unexpected after 0 -> quiet end, trace:session_destroy(A), trace:session_destroy(B), Event. f() -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_session_inherits_process_flags_on_spawn() {
+        trace_pattern_diff(
+            "trace_t4_session_spawn",
+            "-module(trace_t4_session_spawn). -export([run/0]). run() -> Parent=self(), S=trace:session_create(sample,undefined,[]), 1=trace:process(S,Parent,true,[send,set_on_spawn]), P=spawn(fun() -> Parent!ready, receive hello -> Parent!ack end end), receive ready -> ok after 1000 -> timeout end, P!hello, receive ack -> ok after 1000 -> timeout end, (fun Collect(0,Acc) -> lists:reverse(Acc); Collect(N,Acc) -> receive {trace,Tracee,send,Message,To} when (Tracee =:= Parent orelse Tracee =:= P) andalso (Message =:= hello orelse Message =:= ack) -> Collect(N-1,[{is_pid(Tracee),Message,is_pid(To)}|Acc]) after 1000 -> timeout end end)(2,[]).",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_with_empty_flags_is_a_global_call_trace() {
+        trace_pattern_diff(
+            "trace_t5_empty_flags",
+            "-module(trace_t5_empty_flags). -export([run/0,f/1]). f(X) -> X. run() -> Me=self(), T=spawn(fun() -> receive {go,From} -> erlang:trace(From,true,[call]), erlang:trace_pattern({trace_t5_empty_flags,f,1},[],[]), From ! armed, receive stop -> ok end end end), T!{go,Me}, receive armed -> ok end, trace_t5_empty_flags:f(1), receive {trace,Me,call,{trace_t5_empty_flags,f,[1]}} -> T!stop, ok after 1000 -> timeout end.",
+        );
+    }
+
+    #[test]
+    fn send_pattern_message_results_outlive_the_match_program() {
+        trace_pattern_diff(
+            "trace_t7_send_message",
+            "-module(trace_t7_send_message). -export([run/0,sender/0]). sender() -> receive {go,To,M} -> To ! M, sender() end. run() -> R=spawn(fun L() -> receive _ -> L() end end), S=spawn(trace_t7_send_message,sender,[]), 1=erlang:trace(S,true,[send]), erlang:trace_pattern(send,[{['_','_'],[],[{message,\"4711\"}]}],[]), Strings=[begin S ! {go,R,m}, receive {trace,S,send,m,R,X} -> X after 1000 -> timeout end end || _ <- lists:seq(1,8)], erlang:trace_pattern(send,[{['_','_'],[],[{message,{process_dump}}]}],[]), S ! {go,R,m}, Dump=receive {trace,S,send,m,R,D} -> is_binary(D) after 1000 -> timeout end, {Strings,Dump}.",
+        );
+    }
+
+    #[test]
+    fn new_process_tracing_reaches_funs_spawned_with_spawn_1() {
+        trace_pattern_diff(
+            "trace_t6_new_fun_spawn",
+            "-module(trace_t6_new_fun_spawn). -export([run/0]). run() -> Me=self(), T=spawn(fun() -> erlang:trace(new,true,[send]), Me!armed, receive stop -> ok end end), receive armed -> ok end, W=spawn(fun() -> receive go -> Me!done end end), {flags,F}=erlang:trace_info(W,flags), W!go, receive done -> ok end, T!stop, F.",
+        );
     }
 }
