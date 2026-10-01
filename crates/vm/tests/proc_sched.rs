@@ -11,7 +11,8 @@ const SOURCE: &str = r#"
     spawn_success_only_bad/0, spawn_reply_no/0, spawn_tag/0, spawn_link_order/0,
     spawn_monitor_ref/0, spawn_remote/0, spawn_bad_list/0, spawn_bad_fun/0,
     abandon_ref/0, abandon_bad/0, heap_flag/0, heap_kill_yes/0, heap_kill_no/0,
-    heap_bin_no/0, heap_bin_yes/0, die/0
+    heap_bin_no/0, heap_bin_yes/0, die/0,
+    spawn_opt_max_heap/0, spawn_opt_hfrag_kill/0, gc_trace_tags/0
 ]).
 
 die() -> exit(boom).
@@ -220,6 +221,36 @@ heap_bin(Include) ->
     after 80 -> alive
     end.
 
+spawn_opt_max_heap() ->
+    {Pid, Ref} = spawn_opt(fun() -> receive after 5000 -> ok end end,
+                           [monitor, {max_heap_size, 1000}, {fullsweep_after, 7}]),
+    {garbage_collection, Gc} = process_info(Pid, garbage_collection),
+    #{size := Size} = proplists:get_value(max_heap_size, Gc),
+    FullSweep = proplists:get_value(fullsweep_after, Gc),
+    exit(Pid, kill),
+    receive {'DOWN', Ref, process, Pid, killed} -> {Size, FullSweep} after 2000 -> timeout end.
+
+%% A BIF that allocates a heap fragment larger than the young heap must
+%% collect after the call so the limit is enforced.
+spawn_opt_hfrag_kill() ->
+    {Pid, Ref} = spawn_opt(fun F() -> erlang:make_tuple(2000, []), F() end,
+                           [monitor, {max_heap_size, 1000}]),
+    receive {'DOWN', Ref, process, Pid, Reason} -> Reason after 5000 -> timeout end.
+
+gc_trace_tags() ->
+    Pid = spawn(fun() -> receive after 5000 -> ok end end),
+    erlang:trace(Pid, true, [garbage_collection]),
+    erlang:garbage_collect(Pid, [{type, major}]),
+    Major = trace_tag(Pid, 2),
+    erlang:garbage_collect(Pid, [{type, minor}]),
+    Minor = trace_tag(Pid, 2),
+    exit(Pid, kill),
+    {Major, Minor}.
+
+trace_tag(_Pid, 0) -> [];
+trace_tag(Pid, N) ->
+    receive {trace, Pid, Tag, _} -> [Tag | trace_tag(Pid, N - 1)] after 2000 -> timeout end.
+
 heap_bin_no() -> heap_bin(false).
 heap_bin_yes() -> heap_bin(true).
 "#;
@@ -258,6 +289,9 @@ fn proc_sched_matches_otp_29() {
         "abandon_ref",
         "abandon_bad",
         "heap_flag",
+        "spawn_opt_max_heap",
+        "spawn_opt_hfrag_kill",
+        "gc_trace_tags",
         "heap_kill_yes",
         "heap_kill_no",
         "heap_bin_no",

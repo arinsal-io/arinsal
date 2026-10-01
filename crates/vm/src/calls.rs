@@ -424,6 +424,7 @@ impl Vm {
                 ));
             }
         };
+        let value = p.gc_after_bif(value)?;
         let charge = bif_reductions.saturating_add(1);
         p.reductions = p
             .reductions

@@ -18,10 +18,12 @@
 | `exception_SUITE` | 16 | 15/16 | 15/16 | 0 | 0 | none |
 | `float_SUITE` | 15 | 14/15 | 12/15 | 2 | 0 | arith: failed {{badmatch,{{'EXIT',badarith}, [0, 3595386269724631416290548474634087135961411350516899931978349536063145215600570775211791172655337563430809179070287649284686426537789283655369350…; fp_drv: failed {'EXIT',error}, unknown_location |
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
+| `gc_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
 | `guard_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | bad_arith: failed {badarith; type_tests: failed {badarg |
 | `hash_SUITE` | 29 | 27/29 | 26/29 | 1 | 0 | test_phash2_10MB_plus_bin: failed {function_clause |
 | `list_bif_SUITE` | 9 | 8/9 | 8/9 | 0 | 0 | none |
 | `map_SUITE` | 64 | 63/64 | 55/64 | 8 | 0 | t_bif_map_merge: failed {{badmatch,false}; t_map_compare: failed {{badmatch,true}; t_map_display: failed {undefined; t_map_encode_decode: failed {{badmatch,#{a => 2,"hi" => "value"}}; t_tracing: failed {badarg; t_update_assoc_sharing: failed {{badmatch,false}; t_update_exact: failed {{badmatch, {'EXIT', {{badkey,42.0}; t_update_exact_large: failed {{badmatch, {'EXIT', {{badkey,42.0} |
+| `message_queue_data_SUITE` | 5 | 4/5 | 4/5 | 0 | 0 | none |
 | `num_bif_SUITE` | 11 | 11/11 | 11/11 | 0 | 0 | none |
 | `op_SUITE` | 12 | 12/12 | 5/12 | 7 | -9 | combined_relops: missing; complex_relop: missing; is_in_range: missing; range_tests: missing; term_equivalence: missing; typed_relop: missing; unsafe_fusing: missing |
 | `persistent_term_SUITE` | 22 | 22/22 | 0/22 | 22 | -9 | basic: failed {'EXIT',{badarg,[]}}, unknown_location; collisions: missing; destruction: missing; error_info: missing; gc_binary_orig: missing; get_all_race: missing; get_put_colliding_bucket: missing; get_trapping: missing; info: missing; info_trapping: missing; init_restart: missing; keys: missing; killed_while_trapping: missing; killed_while_trapping_erase: missing; killed_while_trapping_put: missing; non_message_signal: missing; off_heap_values: missing; purging: missing; put_erase_trapping: missing; shared_magic_ref: missing; sharing: missing; whole_message: missing |

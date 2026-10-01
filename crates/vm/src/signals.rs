@@ -411,6 +411,8 @@ fn spawn_mfa(
     // scheduler can run `code_server`'s on_load fun to `exit/1` before a
     // Monitor signal sent after `spawn` is delivered, and the DOWN is then lost.
     // Port of erts/emulator/beam/erl_process.c (spawn_opt monitor before schedule), OTP-29.1.1.
+    let tuning = SpawnTuning::take();
+    tuning.apply_to_child(&mut child);
     let monitor_id = arm_child_link_monitor(&mut child, ctx.pid(), linked, monitored);
     let pid = if let Some(scheduler_id) = scheduler_id {
         scheduler.spawn_unscheduled_on(child, scheduler_id)
@@ -419,6 +421,7 @@ fn spawn_mfa(
     }
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
     rt.processes.lock().unwrap().insert(pid);
+    tuning.register(&rt, pid);
     if linked {
         parent.cold_mut().links.insert(pid);
     }
@@ -575,6 +578,8 @@ fn spawn_fun(
         .runtime
         .clone()
         .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?;
+    let tuning = SpawnTuning::take();
+    tuning.apply_to_child(&mut child);
     let monitor_id = arm_child_link_monitor(&mut child, ctx.pid(), linked, monitored);
     #[cfg(feature = "pf-mem-counters")]
     {
@@ -591,6 +596,7 @@ fn spawn_fun(
     #[cfg(feature = "pf-mem-counters")]
     PF_SPAWN_FUN_SCHED_NS.fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
     rt.processes.lock().unwrap().insert(pid);
+    tuning.register(&rt, pid);
     if linked {
         parent.cold_mut().links.insert(pid);
     }
@@ -630,7 +636,65 @@ fn spawn_fun(
     Ok(pid_term)
 }
 
+/// `spawn_opt` GC and mailbox options that the child must carry from its first slice.
+///
+/// Port of erts/emulator/beam/erl_process.c:12222 (`erts_parse_spawn_opts`), OTP-29.1.1.
+/// The spawn helpers take it through a thread-local so their positional flag lists stay frozen.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SpawnTuning {
+    max_heap: Option<crate::process::MaxHeap>,
+    fullsweep: Option<u16>,
+    min_bin_vheap: Option<usize>,
+    off_heap_queue: Option<bool>,
+}
+
+thread_local! {
+    static SPAWN_TUNING: std::cell::Cell<SpawnTuning> = std::cell::Cell::new(SpawnTuning::default());
+}
+
+impl SpawnTuning {
+    /// Run `spawn` with this tuning visible to the child set-up, clearing it on every exit path.
+    fn around<T>(self, spawn: impl FnOnce() -> T) -> T {
+        SPAWN_TUNING.with(|cell| cell.set(self));
+        let result = spawn();
+        SPAWN_TUNING.with(|cell| cell.set(SpawnTuning::default()));
+        result
+    }
+
+    fn take() -> SpawnTuning {
+        SPAWN_TUNING.with(std::cell::Cell::take)
+    }
+
+    fn apply_to_child(&self, child: &mut Process) {
+        if let Some(fullsweep) = self.fullsweep {
+            child.heap.set_fullsweep_after(fullsweep);
+            child.cold_mut().flags.insert(
+                "fullsweep_after".to_owned(),
+                Term::small(i64::from(fullsweep)).unwrap(),
+            );
+        }
+        if let Some(words) = self.min_bin_vheap {
+            let words = crate::natives::sys::normalize_spawn_heap_minimum(Some(words), true);
+            child.cold_mut().flags.insert(
+                "min_bin_vheap_size".to_owned(),
+                Term::small(words as i64).unwrap(),
+            );
+        }
+        if let Some(off_heap) = self.off_heap_queue {
+            child.cold_mut().flags.insert(
+                "message_queue_data".to_owned(),
+                atom(if off_heap { "off_heap" } else { "on_heap" }),
+            );
+        }
+    }
+
+    fn register(&self, runtime: &Runtime, pid: Pid) {
+        crate::natives::proc::register_spawn_max_heap(runtime, pid, self.max_heap);
+    }
+}
+
 struct SpawnOpts {
+    tuning: SpawnTuning,
     link: bool,
     monitor: bool,
     monitor_tag: Option<arinsal_etf::OwnedTerm>,
@@ -641,6 +705,7 @@ struct SpawnOpts {
 
 fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
     let mut opts = SpawnOpts {
+        tuning: SpawnTuning::default(),
         link: false,
         monitor: false,
         monitor_tag: None,
@@ -697,21 +762,44 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
                         _ => return Err(badarg("erlang:spawn_opt")),
                     }
                 }
-            } else if tuple.len() == 2
-                && tuple.get(0).and_then(atom_name).is_some_and(|name| {
-                    matches!(
-                        name.as_str(),
-                        "min_bin_vheap_size"
-                            | "max_heap_size"
-                            | "fullsweep_after"
-                            | "priority"
-                            | "message_queue_data"
-                            | "async_dist"
+            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("max_heap_size")) {
+                opts.tuning.max_heap = Some(
+                    crate::natives::proc::parse_max_heap(
+                        tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?,
                     )
-                })
+                    .map_err(|()| badarg("erlang:spawn_opt"))?,
+                );
+            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("fullsweep_after")) {
+                let value = tuple
+                    .get(1)
+                    .and_then(Term::as_small)
+                    .filter(|&value| value >= 0)
+                    .ok_or_else(|| badarg("erlang:spawn_opt"))?;
+                opts.tuning.fullsweep = Some(value.min(i64::from(u16::MAX)) as u16);
+            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("min_bin_vheap_size")) {
+                let value = tuple
+                    .get(1)
+                    .and_then(Term::as_small)
+                    .filter(|&value| value >= 0)
+                    .ok_or_else(|| badarg("erlang:spawn_opt"))?;
+                opts.tuning.min_bin_vheap = Some(value as usize);
+            } else if tuple.len() == 2 && tuple.get(0) == Some(atom("message_queue_data")) {
+                match tuple.get(1) {
+                    Some(value) if value == atom("off_heap") => {
+                        opts.tuning.off_heap_queue = Some(true);
+                    }
+                    Some(value) if value == atom("on_heap") => {
+                        opts.tuning.off_heap_queue = Some(false);
+                    }
+                    _ => return Err(badarg("erlang:spawn_opt")),
+                }
+            } else if tuple.len() == 2
+                && tuple
+                    .get(0)
+                    .and_then(atom_name)
+                    .is_some_and(|name| matches!(name.as_str(), "priority" | "async_dist"))
             {
-                // Accepted process tuning options. Their effects need scheduler
-                // and heap controls outside this task's frozen interfaces.
+                // Accepted; priority needs a scheduler spawn entry that takes it.
             } else if tuple.len() == 2 && tuple.get(0) == Some(atom("scheduler")) {
                 let scheduler = tuple
                     .get(1)
@@ -725,6 +813,14 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
         } else {
             return Err(badarg("erlang:spawn_opt"));
         }
+    }
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(opts.min_heap_size, false);
+    if opts
+        .tuning
+        .max_heap
+        .is_some_and(|limit| limit.size != 0 && limit.size < min_heap as u64)
+    {
+        return Err(badarg("erlang:spawn_opt"));
     }
     Ok(opts)
 }
@@ -1417,18 +1513,20 @@ fn call_resolved(
         (SignalBif::SpawnMonitor2, [node, fun]) => local_node(*node)
             .and_then(|()| spawn_fun(vm, process, ctx, *fun, false, true, None, None, false, None)),
         (SignalBif::SpawnOpt2, [fun, options]) => spawn_options(*options).and_then(|opts| {
-            spawn_fun(
-                vm,
-                process,
-                ctx,
-                *fun,
-                opts.link,
-                opts.monitor,
-                opts.min_heap_size,
-                opts.monitor_tag,
-                opts.monitor_alias,
-                opts.scheduler,
-            )
+            opts.tuning.around(|| {
+                spawn_fun(
+                    vm,
+                    process,
+                    ctx,
+                    *fun,
+                    opts.link,
+                    opts.monitor,
+                    opts.min_heap_size,
+                    opts.monitor_tag,
+                    opts.monitor_alias,
+                    opts.scheduler,
+                )
+            })
         }),
         (SignalBif::Spawn3, [module, function, args]) => spawn_mfa(
             vm,
@@ -1514,38 +1612,7 @@ fn call_resolved(
         }
         (SignalBif::SpawnOpt4, [module, function, args, options]) => spawn_options(*options)
             .and_then(|opts| {
-                spawn_mfa(
-                    vm,
-                    process,
-                    ctx,
-                    (*module, *function, *args),
-                    opts.link,
-                    opts.monitor,
-                    opts.min_heap_size,
-                    opts.monitor_tag,
-                    opts.monitor_alias,
-                    opts.scheduler,
-                )
-            }),
-        (SignalBif::SpawnOpt3, [node, fun, options]) => local_node(*node).and_then(|()| {
-            spawn_options(*options).and_then(|opts| {
-                spawn_fun(
-                    vm,
-                    process,
-                    ctx,
-                    *fun,
-                    opts.link,
-                    opts.monitor,
-                    opts.min_heap_size,
-                    opts.monitor_tag,
-                    opts.monitor_alias,
-                    opts.scheduler,
-                )
-            })
-        }),
-        (SignalBif::SpawnOpt5, [node, module, function, args, options]) => local_node(*node)
-            .and_then(|()| {
-                spawn_options(*options).and_then(|opts| {
+                opts.tuning.around(|| {
                     spawn_mfa(
                         vm,
                         process,
@@ -1558,6 +1625,43 @@ fn call_resolved(
                         opts.monitor_alias,
                         opts.scheduler,
                     )
+                })
+            }),
+        (SignalBif::SpawnOpt3, [node, fun, options]) => local_node(*node).and_then(|()| {
+            spawn_options(*options).and_then(|opts| {
+                opts.tuning.around(|| {
+                    spawn_fun(
+                        vm,
+                        process,
+                        ctx,
+                        *fun,
+                        opts.link,
+                        opts.monitor,
+                        opts.min_heap_size,
+                        opts.monitor_tag,
+                        opts.monitor_alias,
+                        opts.scheduler,
+                    )
+                })
+            })
+        }),
+        (SignalBif::SpawnOpt5, [node, module, function, args, options]) => local_node(*node)
+            .and_then(|()| {
+                spawn_options(*options).and_then(|opts| {
+                    opts.tuning.around(|| {
+                        spawn_mfa(
+                            vm,
+                            process,
+                            ctx,
+                            (*module, *function, *args),
+                            opts.link,
+                            opts.monitor,
+                            opts.min_heap_size,
+                            opts.monitor_tag,
+                            opts.monitor_alias,
+                            opts.scheduler,
+                        )
+                    })
                 })
             }),
         (SignalBif::Register2, [name, pid]) => {

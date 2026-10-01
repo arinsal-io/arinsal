@@ -674,6 +674,14 @@ impl ProcessHeap {
         self.fullsweep_after
     }
 
+    /// Whether the next collection is a full sweep.
+    /// Port of erts/emulator/beam/erl_gc.c:787 (minor/major choice in `erts_garbage_collect_nobump`), OTP-29.1.1.
+    pub fn collection_is_major(&self) -> bool {
+        let promote_bound = self.old_htop.saturating_add(self.high_water);
+        self.minor_since_major >= self.fullsweep_after
+            || (!self.old_words.is_empty() && promote_bound > self.old_words.len())
+    }
+
     /// Whether heap fragments exceed the free young-generation area.
     /// Port of erl_gc.h:132-139 (`ERTS_IS_GC_DESIRED`), OTP-29.1.1.
     pub fn gc_desired(&self) -> bool {
@@ -807,9 +815,7 @@ impl ProcessHeap {
             })
             .collect::<Vec<_>>();
         fragment_ranges.sort_unstable_by_key(|&(start, _)| start);
-        let promote_bound = self.old_htop.saturating_add(self.high_water);
-        let major = self.minor_since_major >= self.fullsweep_after
-            || (!self.old_words.is_empty() && promote_bound > self.old_words.len());
+        let major = self.collection_is_major();
         let stack = self.stack_words();
         let source_words = self
             .htop

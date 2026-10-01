@@ -16,6 +16,7 @@ pub(crate) const SET_ON_FIRST_SPAWN: u64 = 1 << 7;
 pub(crate) const SET_ON_LINK: u64 = 1 << 8;
 pub(crate) const PROCS: u64 = 1 << 11;
 pub(crate) const RUNNING: u64 = 1 << 13;
+pub(crate) const GC: u64 = 1 << 14;
 pub(crate) const TIMESTAMP: u64 = 1;
 pub(crate) const STRICT_MONOTONIC_TIMESTAMP: u64 = 2;
 pub(crate) const MONOTONIC_TIMESTAMP: u64 = 4;

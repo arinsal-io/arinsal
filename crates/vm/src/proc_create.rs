@@ -60,6 +60,8 @@ pub struct Process {
     pub(crate) native_pc: Option<usize>,
     // Last BEAM live operand or call arity for allocation instructions without one.
     pub(crate) gc_live: usize,
+    /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
+    pub(crate) max_heap_peak: usize,
     pub(crate) reductions: i32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_enabled: bool,
@@ -313,6 +315,7 @@ impl Process {
             ip: 0,
             native_pc: None,
             gc_live: 0,
+            max_heap_peak: 0,
             reductions: 4000,
             reductions_used: 0,
             gc_enabled: true,

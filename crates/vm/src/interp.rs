@@ -2171,6 +2171,7 @@ impl Vm {
                         .saturating_add(u64::from(bif_reductions));
                     match result {
                         Ok(value) => {
+                            let value = p.gc_after_bif(value)?;
                             p.x[0] = value;
                             (htop, stop) = p.heap.heap_cursor();
                             heap_dirty = false;
@@ -2258,6 +2259,7 @@ impl Vm {
                             .saturating_add(u64::from(bif_reductions));
                         match result {
                             Ok(value) => {
+                                let value = p.gc_after_bif(value)?;
                                 // SAFETY: `x` is the base of the live X file, which
                                 // has a slot 0. This BIF does not reallocate it.
                                 unsafe { *x = value };

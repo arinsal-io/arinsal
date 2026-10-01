@@ -1011,11 +1011,15 @@ pub(crate) fn collect_heap(
         process.gc_deferred = true;
         return Ok(());
     }
+    // A requested major sweep must not change the process's own `fullsweep_after`.
+    let fullsweep_after = process.heap.fullsweep_after();
     if major {
         process.heap.set_fullsweep_after(0);
     }
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (message queue GC scan), OTP-29.1.1.
-    process.collect_heap_roots(process.gc_live, keep, 0)?;
+    let collected = process.collect_heap_roots(process.gc_live, keep, 0);
+    process.heap.set_fullsweep_after(fullsweep_after);
+    collected?;
     Ok(())
 }
 
@@ -2261,6 +2265,26 @@ fn spawn_apply(
     Ok(pid)
 }
 
+/// Record a spawn-time `max_heap_size` unless it is the system default.
+/// Port of erts/emulator/beam/erl_process.c:12222 (`erts_parse_spawn_opts`), OTP-29.1.1.
+pub(crate) fn register_spawn_max_heap(
+    runtime: &crate::process::Runtime,
+    pid: Pid,
+    requested: Option<crate::process::MaxHeap>,
+) {
+    let max_heap = requested.unwrap_or(crate::natives::sys::gc_spawn_defaults().max_heap_size);
+    if !is_default_max_heap(max_heap)
+        || runtime
+            .ever_max_heap
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        runtime
+            .ever_max_heap
+            .store(true, std::sync::atomic::Ordering::Release);
+        runtime.max_heaps.lock().unwrap().insert(pid, max_heap);
+    }
+}
+
 fn is_default_max_heap(limit: crate::process::MaxHeap) -> bool {
     limit.size == 0 && limit.kill && limit.log && !limit.include_shared_binaries && !limit.reported
 }
@@ -2349,7 +2373,7 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
         .map_err(|error| VmError::Unsupported(format!("max_heap_size map: {error:?}")))
 }
 
-fn parse_max_heap(value: Term) -> Result<crate::process::MaxHeap, ()> {
+pub(crate) fn parse_max_heap(value: Term) -> Result<crate::process::MaxHeap, ()> {
     let mut limit = crate::process::MaxHeap::default();
     if let Some(size) = value.as_small() {
         if size < 0 {
@@ -2445,7 +2469,7 @@ fn trace_flag_bit(name: &str) -> Option<u64> {
         "call" => crate::trace::CALL,
         "procs" => crate::trace::PROCS,
         "running" => crate::trace::RUNNING,
-        "garbage_collection" => bit(11),
+        "garbage_collection" => crate::trace::GC,
         "arity" => crate::trace::ARITY,
         "return_to" => crate::trace::RETURN_TO,
         "silent" => crate::trace::SILENT,
@@ -2467,7 +2491,7 @@ fn trace_flag_bit(name: &str) -> Option<u64> {
                 | crate::trace::CALL
                 | crate::trace::PROCS
                 | crate::trace::RUNNING
-                | bit(11)
+                | crate::trace::GC
                 | crate::trace::RETURN_TO
                 | bit(17)
                 | bit(18)

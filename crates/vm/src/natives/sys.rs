@@ -3079,15 +3079,14 @@ fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
         Some("minor") => false,
         _ => return Err(badarg()),
     };
+    let fullsweep_after = process.heap.fullsweep_after();
     if major {
         process.heap.set_fullsweep_after(0);
     }
     let live = 1;
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (on-heap mailbox roots), OTP-29.1.1.
     let collected = process.collect_heap_roots(live, &mut [], 0);
-    if major {
-        process.heap.set_fullsweep_after(u16::MAX);
-    }
+    process.heap.set_fullsweep_after(fullsweep_after);
     let gc = collected.map_err(|error| VmError::Unsupported(format!("GC {error:?}")))?;
     after_collection(process, live, gc.collections, gc.words_reclaimed);
     Ok(atom("true"))

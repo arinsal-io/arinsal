@@ -1806,7 +1806,8 @@ fn heap_limit_kills(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> boo
         if limit.size == 0 {
             return false;
         }
-        let mut used = process.heap.total_heap_size_words() as u64;
+        // Only a collection checks the limit (`garbage_collect`), so judge the size seen there.
+        let mut used = std::mem::take(&mut process.max_heap_peak) as u64;
         if limit.include_shared_binaries {
             used = used.saturating_add(off_heap_binary_words(process) as u64);
         }
@@ -1936,6 +1937,11 @@ fn report_max_heap(
     let Some(pid) = ctx.pid().to_term() else {
         return;
     };
+    let group_leader = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.group_leader)
+        .and_then(Pid::to_term);
     let bool_atom = |on: bool| crate::signals::atom(if on { "true" } else { "false" });
     let built = (|| -> Result<Term, VmError> {
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
@@ -1960,13 +1966,41 @@ fn report_max_heap(
         let args = builder
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("logger args: {error:?}")))?;
+        // Port of erts/emulator/beam/utils.c:773 (`do_send_logger_message`), OTP-29.1.1:
+        // `#{error_logger => #{emulator => true, tag => error}, gl => GL, pid => Pid, time => Us}`.
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros() as i64);
+        let el_tag = builder
+            .flatmap_from_pairs(&[
+                (
+                    crate::signals::atom("emulator"),
+                    crate::signals::atom("true"),
+                ),
+                (crate::signals::atom("tag"), crate::signals::atom("error")),
+            ])
+            .map_err(|error| VmError::Unsupported(format!("logger tag map: {error:?}")))?;
+        let mut pairs = vec![
+            (crate::signals::atom("error_logger"), el_tag),
+            (
+                crate::signals::atom("time"),
+                Term::small(micros).unwrap_or(Term::NIL),
+            ),
+        ];
+        if let Some(gl) = group_leader {
+            pairs.push((crate::signals::atom("gl"), gl));
+        }
+        pairs.push((crate::signals::atom("pid"), pid));
+        let meta = builder
+            .flatmap_from_pairs(&pairs)
+            .map_err(|error| VmError::Unsupported(format!("logger metadata: {error:?}")))?;
         builder
             .tuple(&[
                 crate::signals::atom("log"),
                 crate::signals::atom("error"),
                 format,
                 args,
-                Term::NIL,
+                meta,
             ])
             .map_err(|error| VmError::Unsupported(format!("logger message: {error:?}")))
     })();
@@ -3133,6 +3167,23 @@ impl Process {
         previous
     }
 
+    /// Collect after a BIF whose heap fragments outgrew the free young area.
+    /// Port of erts/emulator/beam/erl_gc.c:418 (`erts_gc_after_bif_call_lhf`), OTP-29.1.1:
+    /// the BIF result is the only live register.
+    #[inline]
+    pub(crate) fn gc_after_bif(&mut self, result: Term) -> Result<Term, VmError> {
+        if !self.heap.gc_desired() {
+            return Ok(result);
+        }
+        let mut roots = [result];
+        let gc = self.collect_heap_roots(0, &mut roots, 0)?;
+        crate::natives::sys::after_collection(self, 0, gc.collections, gc.words_reclaimed);
+        // Only X0 survives a call; the dead registers now point into the freed heap and
+        // must not be scanned by later literal-area or root walks.
+        self.x[1..].fill(Term::NIL);
+        Ok(roots[0])
+    }
+
     /// Force a collection of the running process before the current BIF returns.
     /// Port of erts/emulator/beam/erl_gc.h:152 (`ERTS_FORCE_GC`), OTP-29.1.1.
     pub(crate) fn force_gc(&mut self) -> Result<(), VmError> {
@@ -3160,6 +3211,34 @@ impl Process {
         Ok(())
     }
 
+    /// Emit a `garbage_collection` trace event with the GC info list and `{wordsize, Size}`.
+    /// Port of erts/emulator/beam/erl_trace.c:1439 (`trace_gc`), OTP-29.1.1.
+    fn trace_gc(&mut self, pid: arinsal_sched::Pid, tag: &str, size: usize) {
+        let entries = [
+            ("heap_block_size", self.heap.capacity_words()),
+            ("heap_size", self.heap.heap_size_words()),
+            ("old_heap_size", self.heap.old_used_words()),
+            ("stack_size", self.heap.stack_words()),
+            ("wordsize", size),
+        ];
+        let mut tuples = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            let Some(value) = Term::small(value as i64) else {
+                return;
+            };
+            let Ok(tuple) =
+                TermBuilder::new(&mut self.heap).tuple(&[crate::signals::atom(name), value])
+            else {
+                return;
+            };
+            tuples.push(tuple);
+        }
+        let Ok(info) = TermBuilder::new(&mut self.heap).list_from_iter(tuples) else {
+            return;
+        };
+        crate::trace::emit_process(None, self, pid, crate::trace::GC, tag, &[info]);
+    }
+
     /// Collect live registers together with only on-heap mailbox message roots.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (message queue GC scan), OTP-29.1.1.
     pub(crate) fn collect_heap_roots(
@@ -3168,6 +3247,15 @@ impl Process {
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<arinsal_term::GcStats, VmError> {
+        // Port of erts/emulator/beam/erl_gc.c:3730 (`has_reached_max_heap_size`) call in
+        // `garbage_collect`, OTP-29.1.1: the limit is judged on the pre-collection size.
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
+        {
+            self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
+        }
         let (indices, mut roots) = self.inbox.gc_root_snapshot();
         let mailbox_len = roots.len();
         let continuation = self
@@ -3183,10 +3271,30 @@ impl Process {
         if let Some(cold) = self.cold.as_ref() {
             roots.extend_from_slice(&cold.apply_roots);
         }
+        // Port of erts/emulator/beam/erl_gc.c:832-901 (`trace_gc` around minor/major collections), OTP-29.1.1.
+        let traced = self
+            .self_pid
+            .filter(|&pid| crate::trace::flags(self, pid) & crate::trace::GC != 0);
+        let end_tag = if self.heap.collection_is_major() {
+            "gc_major_end"
+        } else {
+            "gc_minor_end"
+        };
+        if let Some(pid) = traced {
+            let start_tag = if end_tag == "gc_major_end" {
+                "gc_major_start"
+            } else {
+                "gc_minor_start"
+            };
+            self.trace_gc(pid, start_tag, min_free);
+        }
         let stats = self
             .heap
             .collect(&mut self.x[..live_x], &mut roots, min_free)
             .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
+        if let Some(pid) = traced {
+            self.trace_gc(pid, end_tag, stats.words_reclaimed as usize);
+        }
         self.stats.gc.collections += stats.collections;
         self.stats.gc.nanoseconds += stats.nanoseconds;
         self.inbox.update_gc_roots(&indices, &roots[..mailbox_len]);
@@ -3202,6 +3310,14 @@ impl Process {
         extra.copy_from_slice(&roots[extra_start..extra_end]);
         if let Some(cold) = self.cold.as_mut() {
             cold.apply_roots.copy_from_slice(&roots[extra_end..]);
+        }
+        if self.max_heap_peak != 0
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
+        {
+            self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
         Ok(stats)
