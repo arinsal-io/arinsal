@@ -50,12 +50,61 @@ pub(crate) struct BpFunction {
     pub(crate) exported: bool,
 }
 
+/// A trace match specification with its compiled program, built on first use.
+// Port of erts/emulator/beam/beam_bp.c (MatchSetRef / erts_match_set_compile), OTP-29.1.1: erts
+// compiles the match set once in `trace_pattern` and every call runs the stored Binary.
+pub(crate) struct MatchSpec {
+    pub(crate) source: OwnedTerm,
+    /// The spec calls `{process_dump}`; erts captures the dump only then.
+    pub(crate) uses_process_dump: bool,
+    /// The spec calls `{caller}` or `{caller_line}`.
+    pub(crate) uses_caller: bool,
+    program: OnceLock<Result<arinsal_ets::match_spec::MatchProgram, ()>>,
+}
+
+impl MatchSpec {
+    fn new(source: OwnedTerm) -> Self {
+        fn uses(term: &OwnedTerm, name: &str) -> bool {
+            match term {
+                OwnedTerm::Tuple(fields) => {
+                    matches!(fields.as_slice(), [OwnedTerm::Atom(atom)] if atom == name)
+                        || fields.iter().any(|field| uses(field, name))
+                }
+                OwnedTerm::List { elems, tail } => {
+                    elems.iter().any(|elem| uses(elem, name)) || uses(tail, name)
+                }
+                OwnedTerm::Map(pairs) => pairs
+                    .iter()
+                    .any(|(key, value)| uses(key, name) || uses(value, name)),
+                _ => false,
+            }
+        }
+        Self {
+            uses_process_dump: uses(&source, "process_dump"),
+            uses_caller: uses(&source, "caller") || uses(&source, "caller_line"),
+            source,
+            program: OnceLock::new(),
+        }
+    }
+
+    /// The compiled program; `compile` builds it from the source on first use.
+    pub(crate) fn program(
+        &self,
+        compile: impl FnOnce(&OwnedTerm) -> Result<arinsal_ets::match_spec::MatchProgram, ()>,
+    ) -> Result<&arinsal_ets::match_spec::MatchProgram, ()> {
+        self.program
+            .get_or_init(|| compile(&self.source))
+            .as_ref()
+            .map_err(|_| ())
+    }
+}
+
 /// Port of erts/emulator/beam/beam_bp.h:75-83 (GenericBpData), OTP-29.1.1.
 #[derive(Clone, Default)]
 struct GenericBpData {
     flags: u32,
-    local_ms: Option<Arc<OwnedTerm>>,
-    meta_ms: Option<Arc<OwnedTerm>>,
+    local_ms: Option<Arc<MatchSpec>>,
+    meta_ms: Option<Arc<MatchSpec>>,
     count: Option<Arc<AtomicU64>>,
 }
 
@@ -154,7 +203,7 @@ pub(crate) fn module_code_changed(code: u64, module: &str) {
 fn set_function_break(
     bps: &mut Vec<GenericBp>,
     tag: (usize, u64, u64),
-    match_spec: Option<&Arc<OwnedTerm>>,
+    match_spec: Option<&Arc<MatchSpec>>,
     break_flags: u32,
     count_op: BreakOp,
 ) {
@@ -300,7 +349,7 @@ pub(crate) fn set_trace_pattern(
     flags: TracePatternFlags,
 ) {
     let tag = (scope(process), code_scope(process), session);
-    let match_spec = match_spec.map(Arc::new);
+    let match_spec = match_spec.map(|source| Arc::new(MatchSpec::new(source)));
     let mut table = breakpoints().write().unwrap();
     // First the code breakpoints ("local" tracing).
     for function in functions {
@@ -395,7 +444,7 @@ pub(crate) fn clear_session(process: &Process, session: u64) {
 /// The trace data of one session's breakpoint that fires on a call.
 pub(crate) struct Pattern {
     pub(crate) session: u64,
-    pub(crate) match_spec: Option<Arc<OwnedTerm>>,
+    pub(crate) match_spec: Option<Arc<MatchSpec>>,
 }
 
 /// The sessions tracing a call: local (code breakpoint) or global (export) call trace.
@@ -522,7 +571,9 @@ pub(crate) fn info_session(
     // specification reports `[]`.
     let match_spec = || {
         if bp.flags & (BPF_GLOBAL_TRACE | BPF_LOCAL_TRACE) != 0 {
-            bp.local_ms.as_deref().cloned().unwrap_or(OwnedTerm::Nil)
+            bp.local_ms
+                .as_deref()
+                .map_or(OwnedTerm::Nil, |spec| spec.source.clone())
         } else {
             false_atom()
         }

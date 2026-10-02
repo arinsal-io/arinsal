@@ -508,20 +508,35 @@ pub(crate) fn call_event(
         let mut extra = None;
         let mut return_trace = false;
         let mut exception_trace = false;
-        if let Some(specification) = pattern.match_spec.as_ref() {
-            let dump = process_dump_for(specification, Some(&*vm), process, ctx);
+        if let Some(spec) = pattern.match_spec.as_ref() {
+            let dump = if spec.uses_process_dump {
+                crate::natives::proc::process_dump(Some(&*vm), process, ctx).ok()
+            } else {
+                None
+            };
             // Port of erts/emulator/beam/erl_trace.c:1266-1267, OTP-29.1.1.
             let against = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
                 .list_from_iter(args.iter().copied())
                 .map_err(|error| VmError::Unsupported(format!("trace subject: {error:?}")))?;
-            let specification = from_owned(
-                specification,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-            )
-            .map_err(|error| VmError::Unsupported(format!("trace match spec: {error:?}")))?;
-            let program = arinsal_ets::match_spec::MatchProgram::compile_trace(specification)
-                .map_err(|_| VmError::Unsupported("invalid trace match specification".into()))?;
-            let context = CallMatchContext::new(caller_mfa(process, vm)?, dump);
+            let program = spec
+                .program(|source| {
+                    let specification = from_owned(
+                        source,
+                        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                    )
+                    .map_err(|_| ())?;
+                    arinsal_ets::match_spec::MatchProgram::compile_trace(specification)
+                        .map_err(|_| ())
+                })
+                .map_err(|()| VmError::Unsupported("invalid trace match specification".into()))?;
+            let context = CallMatchContext::new(
+                if spec.uses_caller {
+                    caller_mfa(process, vm)?
+                } else {
+                    None
+                },
+                dump,
+            );
             let result = program
                 .run_with_context(
                     against,
