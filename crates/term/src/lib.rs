@@ -33,7 +33,7 @@ pub use copy::{
     copy_term_preserving_sharing_with_cache,
 };
 pub use fun::{ExportEntry, FunEntry, FunRef};
-pub use gc::{FragmentAlloc, GcStats};
+pub use gc::{FragmentAlloc, FragmentIndex, GcStats};
 pub use hamt::{boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_node_children};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
 pub use heap::{

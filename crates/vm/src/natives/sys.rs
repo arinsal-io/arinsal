@@ -8,7 +8,7 @@ use arinsal_bifs::Ctx;
 use arinsal_pterm::RetiredArea;
 use arinsal_sched::RunCtx;
 use arinsal_term::{
-    SharedCopyCache, Term, TermBuilder, TermKind, copy_term,
+    FragmentIndex, SharedCopyCache, Term, TermBuilder, TermKind, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms,
 };
 use std::collections::HashSet;
@@ -142,7 +142,9 @@ fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
         .iter()
         .copied()
         .chain((0..process.heap.stack_words()).filter_map(|index| process.heap.stack_get(index)));
-    let x_and_stack = references_retired_from_roots(process, roots, std::slice::from_ref(area));
+    let mut frag_index = FragmentIndex::default();
+    let x_and_stack =
+        references_retired_from_roots(process, roots, std::slice::from_ref(area), &mut frag_index);
     let inbox = process.inbox.has_literal_area_reference(area);
     let dictionary = process.cold.as_ref().is_some_and(|cold| {
         cold.dictionary
@@ -153,7 +155,14 @@ fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
         .cold
         .as_ref()
         .and_then(|cold| cold.persistent_get_all.as_ref())
-        .is_some_and(|state| references_retired(process, state.result, std::slice::from_ref(area)));
+        .is_some_and(|state| {
+            references_retired(
+                process,
+                state.result,
+                std::slice::from_ref(area),
+                &mut frag_index,
+            )
+        });
     heap || x_and_stack || inbox || dictionary || continuation
 }
 
@@ -3339,10 +3348,11 @@ fn rewrite_roots(
 ) -> Result<u32, VmError> {
     let mut copied = 0_u32;
     let mut shared_copy = SharedCopyCache::default();
+    let mut frag_index = FragmentIndex::default();
     let live = live_x.min(process.x.len());
     for index in 0..live {
         let term = process.x[index];
-        let (term, did) = rewrite_root(process, term, areas, &mut shared_copy)?;
+        let (term, did) = rewrite_root(process, term, areas, &mut shared_copy, &mut frag_index)?;
         process.x[index] = term;
         copied += u32::from(did);
     }
@@ -3351,15 +3361,17 @@ fn rewrite_roots(
         let Some(term) = process.heap.stack_get(index) else {
             continue;
         };
-        let (term, did) = rewrite_root(process, term, areas, &mut shared_copy)?;
+        let (term, did) = rewrite_root(process, term, areas, &mut shared_copy, &mut frag_index)?;
         process.heap.stack_set(index, term);
         copied += u32::from(did);
     }
     if let Some(cold) = process.cold.as_mut() {
         let dictionary = std::mem::take(&mut cold.dictionary);
         for (key, value) in dictionary {
-            let (key, key_copied) = rewrite_root(process, key, areas, &mut shared_copy)?;
-            let (value, value_copied) = rewrite_root(process, value, areas, &mut shared_copy)?;
+            let (key, key_copied) =
+                rewrite_root(process, key, areas, &mut shared_copy, &mut frag_index)?;
+            let (value, value_copied) =
+                rewrite_root(process, value, areas, &mut shared_copy, &mut frag_index)?;
             process.cold_mut().dictionary.push((key, value));
             copied += u32::from(key_copied) + u32::from(value_copied);
         }
@@ -3370,7 +3382,8 @@ fn rewrite_roots(
         .and_then(|cold| cold.persistent_get_all.as_ref())
         .map(|state| state.result)
     {
-        let (updated, did) = rewrite_root(process, result, areas, &mut shared_copy)?;
+        let (updated, did) =
+            rewrite_root(process, result, areas, &mut shared_copy, &mut frag_index)?;
         process
             .cold_mut()
             .persistent_get_all
@@ -3383,7 +3396,8 @@ fn rewrite_roots(
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8460 (off-heap queue GC handling), OTP-29.1.1.
     let (indices, mut inbox) = process.inbox.gc_root_snapshot();
     for term in &mut inbox {
-        let (updated, did) = rewrite_root(process, *term, areas, &mut shared_copy)?;
+        let (updated, did) =
+            rewrite_root(process, *term, areas, &mut shared_copy, &mut frag_index)?;
         *term = updated;
         copied += u32::from(did);
     }
@@ -3396,8 +3410,9 @@ fn rewrite_root(
     term: Term,
     areas: &[RetiredArea],
     shared_copy: &mut SharedCopyCache,
+    index: &mut FragmentIndex,
 ) -> Result<(Term, bool), VmError> {
-    if !references_retired(process, term, areas) {
+    if !references_retired(process, term, areas, index) {
         return Ok((term, false));
     }
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
@@ -3406,14 +3421,20 @@ fn rewrite_root(
     Ok((copied, true))
 }
 
-fn references_retired(process: &Process, term: Term, areas: &[RetiredArea]) -> bool {
-    references_retired_from_roots(process, std::iter::once(term), areas)
+fn references_retired(
+    process: &Process,
+    term: Term,
+    areas: &[RetiredArea],
+    index: &mut FragmentIndex,
+) -> bool {
+    references_retired_from_roots(process, std::iter::once(term), areas, index)
 }
 
 fn references_retired_from_roots(
     process: &Process,
     roots: impl IntoIterator<Item = Term>,
     areas: &[RetiredArea],
+    index: &mut FragmentIndex,
 ) -> bool {
     let mut stack = roots.into_iter().collect::<Vec<_>>();
     let mut seen = HashSet::new();
@@ -3429,7 +3450,7 @@ fn references_retired_from_roots(
         if areas.iter().any(|area| area.contains(term)) {
             return true;
         }
-        if !process.heap.owns_term(term) {
+        if !process.heap.owns_term_indexed(term, index) {
             continue;
         }
         push_children(term, &mut stack);

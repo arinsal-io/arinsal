@@ -1,7 +1,7 @@
 //! Iterative deep copy into one destination allocation.
 use crate::fun::{clone_export_entry, clone_fun_entry};
 use crate::literal::LiteralAreas;
-use crate::ops::{LiteralSkip, size_object_inner};
+use crate::ops::{LiteralSkip, size_object_inner, size_object_with_prior};
 use crate::{
     ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, FUN,
     FunEntry, FunRef, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, Node, RECORD, SUB_BITS, Term,
@@ -88,7 +88,14 @@ pub fn copy_term_preserving_sharing_with_cache<H: HeapAlloc + ?Sized>(
     cache: &mut SharedCopyCache,
 ) -> Result<Term, TermError> {
     validate_destination(root, dst)?;
-    let size = crate::size_object_preserving_sharing_after(root, cache.copied.keys().copied());
+    let size = size_object_with_prior(
+        root,
+        true,
+        &mut Default::default(),
+        Some(&cache.copied),
+        LiteralSkip::None,
+        None,
+    );
     copy_term_body(root, dst, true, size, cache, LiteralSkip::None, None)
 }
 

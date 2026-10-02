@@ -430,6 +430,28 @@ pub(crate) fn size_object_inner(
     skip: LiteralSkip<'_>,
     unshared_literals: Option<&crate::LiteralAreas>,
 ) -> usize {
+    size_object_with_prior(
+        root,
+        preserve_sharing,
+        &mut visited,
+        None,
+        skip,
+        unshared_literals,
+    )
+}
+
+/// Like `size_object_inner`, but objects already copied by earlier roots of the
+/// same shared-copy operation (`prior`) are looked up in place instead of being
+/// re-collected into a fresh set per root (quadratic over a large message queue).
+pub(crate) fn size_object_with_prior(
+    root: Term,
+    preserve_sharing: bool,
+    visited: &mut std::collections::HashSet<u64>,
+    prior: Option<&std::collections::HashMap<u64, Term>>,
+    skip: LiteralSkip<'_>,
+    unshared_literals: Option<&crate::LiteralAreas>,
+) -> usize {
+    let seen_before = |address: u64| prior.is_some_and(|p| p.contains_key(&address));
     let mut size = 0;
     let mut stack = Vec::new();
     let mut current = Some(root);
@@ -454,7 +476,10 @@ pub(crate) fn size_object_inner(
                         term = Term::NIL;
                         break;
                     }
-                    if preserve_sharing && !visited.insert(ptr as usize as u64) {
+                    if preserve_sharing
+                        && (seen_before(ptr as usize as u64)
+                            || !visited.insert(ptr as usize as u64))
+                    {
                         term = Term::NIL;
                         break;
                     }
@@ -484,7 +509,9 @@ pub(crate) fn size_object_inner(
                 size += size_object(term);
                 continue;
             }
-            if preserve_sharing && !visited.insert(term.bits() & !7) {
+            if preserve_sharing
+                && (seen_before(term.bits() & !7) || !visited.insert(term.bits() & !7))
+            {
                 continue;
             }
             // SAFETY: term is live and its boxed header describes the allocation.

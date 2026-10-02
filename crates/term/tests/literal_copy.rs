@@ -106,3 +106,58 @@ fn literal_registry_forgets_dropped_areas() {
     drop(area);
     assert!(!LiteralAreas::current().is_literal(address));
 }
+
+/// Port of the per-root copy in erl_gc.c:1136 (erts_garbage_collect_literals): roots copied
+/// in one collection reuse earlier copies and must not be resized against a rebuilt set.
+#[test]
+fn shared_copy_cache_reuses_earlier_roots() {
+    use arinsal_term::{ProcessHeap, SharedCopyCache, copy_term_preserving_sharing_with_cache};
+    let mut source = VecHeap::new();
+    let mut builder = TermBuilder::new(&mut source);
+    let shared = builder.list_from_slice(&[small(1), small(2)]).unwrap();
+    let roots: Vec<Term> = (0..50)
+        .map(|n| builder.tuple(&[shared, small(n)]).unwrap())
+        .collect();
+    let mut heap = ProcessHeap::with_words(64);
+    let mut cache = SharedCopyCache::default();
+    let mut copies = Vec::new();
+    for root in &roots {
+        let mut target = arinsal_term::FragmentAlloc::new(&mut heap);
+        copies
+            .push(copy_term_preserving_sharing_with_cache(*root, &mut target, &mut cache).unwrap());
+    }
+    // The list is copied once; every copy aliases the first copy's list.
+    let first = element(copies[0], 1);
+    assert!(copies.iter().all(|copy| element(*copy, 1) == first));
+    assert_eq!(cons(first).0, small(1));
+}
+
+#[test]
+fn indexed_ownership_matches_linear_scan() {
+    use arinsal_term::{FragmentAlloc, FragmentIndex, ProcessHeap};
+    let mut heap = ProcessHeap::with_words(64);
+    let mut index = FragmentIndex::default();
+    let mut terms = Vec::new();
+    for round in 0..200 {
+        let term = {
+            let mut alloc = FragmentAlloc::new(&mut heap);
+            let mut builder = TermBuilder::new(&mut alloc);
+            builder.tuple(&[small(round), small(1)]).unwrap()
+        };
+        terms.push(term);
+        // The index follows fragments appended after its last use.
+        for t in &terms {
+            assert!(heap.owns_term(*t));
+            assert!(heap.owns_term_indexed(*t, &mut index));
+        }
+    }
+    let foreign = {
+        let mut other = VecHeap::new();
+        TermBuilder::new(&mut other).tuple(&[small(9)]).unwrap()
+    };
+    assert_eq!(
+        heap.owns_term(foreign),
+        heap.owns_term_indexed(foreign, &mut index)
+    );
+    assert!(!heap.owns_term_indexed(small(3), &mut index));
+}
