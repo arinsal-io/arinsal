@@ -3527,28 +3527,24 @@ fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {
         .copied()
         .filter(|pid| scheduler.lookup(*pid))
         .collect::<Vec<_>>();
-    pids.sort_by_key(|pid| (pid.index, pid.generation));
+    pids.sort_by_key(|pid| crate::process::pid_table_index(*pid));
     Ok(pids)
 }
 
 // Port of erts/emulator/beam/bif.c:4107 (erts_internal_processes_next_1)
-// and erl_ptab.c:1472 (erts_ptab_processes_next), OTP-29.1.1.
+// and erl_ptab.c:1473 (erts_ptab_processes_next), OTP-29.1.1.
 // The cursor is the next process-table index, so exiting processes do not
 // invalidate a scan that is already in progress.
-/// Process table size (`process_limit`).
-const PROCESS_TABLE_MAX: u32 = 1_048_576;
-
 fn processes_next(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     cursor: Term,
 ) -> Result<Term, VmError> {
     let index = u32::try_from(cursor.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
-    // Port of erts/emulator/beam/erl_ptab.c:1473 (erts_ptab_processes_next), OTP-29.1.1.
     let max_pids = ctx.remaining().max(1);
     let limit = index
         .saturating_add(max_pids.saturating_mul(25))
-        .min(PROCESS_TABLE_MAX);
+        .min(arinsal_term::ptab::process_table_layout().max());
     if index == limit && index != 0 {
         return Ok(atom("none"));
     }
@@ -3557,22 +3553,11 @@ fn processes_next(
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
-    let mut pids = runtime
-        .processes
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .filter(|pid| pid.index >= index && pid.index < limit && scheduler.lookup(*pid))
-        .collect::<Vec<_>>();
-    pids.sort_by_key(|pid| (pid.index, pid.generation));
-    let scan_end = pids
-        .get(max_pids as usize - 1)
-        .map_or(limit, |pid| pid.index.saturating_add(1));
-    pids.truncate(max_pids as usize);
-    if pids.is_empty() {
-        ctx.consume(((scan_end.saturating_sub(index) / 25) + 1).min(ctx.remaining()));
-        return Ok(atom("none"));
+    let (mut pids, scan_end) = scheduler.pids_in_table_range(index, limit, max_pids as usize);
+    // List only processes registered with this runtime, as erlang:processes/0 does.
+    {
+        let processes = runtime.processes.lock().unwrap();
+        pids.retain(|pid| processes.contains(pid));
     }
     let pid_terms = pids
         .iter()

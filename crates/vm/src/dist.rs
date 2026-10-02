@@ -646,10 +646,10 @@ fn remote_proxy(handle: u64, remote: &OwnedTerm) -> Result<Pid, VmError> {
     if let Some(pid) = state.remote_pids.get(&key) {
         return Ok(*pid);
     }
-    let pid = Pid {
-        index: NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
-        generation: local_creation,
-    };
+    let pid = Pid::new(
+        NEXT_REMOTE_PID.fetch_add(1, Ordering::Relaxed) & ((1 << 28) - 1),
+        local_creation,
+    );
     state.remote_pids.insert(key, pid);
     state.proxy_to_remote.insert(pid, remote.clone());
     Ok(pid)
@@ -1713,8 +1713,8 @@ fn handle_spawn_request_port(
         let tables = node_tables::lock();
         result = OwnedTerm::Pid {
             node: tables.local_name.clone(),
-            id: child.index,
-            serial: child.generation,
+            id: child.number(),
+            serial: child.serial(),
             creation: tables.local_creation,
         };
         drop(tables);
@@ -1832,8 +1832,8 @@ pub(crate) fn forward_link_exit_if_proxy(
     };
     let local = OwnedTerm::Pid {
         node: local_name.clone(),
-        id: deceased.index,
-        serial: deceased.generation,
+        id: deceased.number(),
+        serial: deceased.serial(),
         creation: local_creation,
     };
     let reason = node_tables::relabel_local_node(reason, &local_name, local_creation);
@@ -1914,8 +1914,8 @@ pub(crate) fn forward_monitor_down_if_proxy(
             });
         let deceased_term = OwnedTerm::Pid {
             node: local_name.clone(),
-            id: deceased.index,
-            serial: deceased.generation,
+            id: deceased.number(),
+            serial: deceased.serial(),
             creation: local_creation,
         };
         let exit_payload = state.flags & node_tables::DFLAG_EXIT_PAYLOAD != 0;
@@ -2307,8 +2307,8 @@ fn local_pid_owned(pid: Pid) -> OwnedTerm {
     let tables = node_tables::lock();
     OwnedTerm::Pid {
         node: tables.local_name.clone(),
-        id: pid.index,
-        serial: pid.generation,
+        id: pid.number(),
+        serial: pid.serial(),
         creation: tables.local_creation,
     }
 }
@@ -2797,13 +2797,12 @@ fn local_pid(term: &OwnedTerm, local: &str) -> Option<Pid> {
         return None;
     };
     let local_creation = node_tables::lock().local_creation;
-    if !local_pid_matches(node, *creation, local, local_creation) {
+    if !local_pid_matches(node, *creation, local, local_creation)
+        || *id > arinsal_term::ptab::MAX_INTERNAL_PID_NUMBER
+    {
         return None;
     }
-    Some(Pid {
-        index: *id,
-        generation: *serial,
-    })
+    Some(Pid::new(*id, *serial))
 }
 
 fn local_pid_matches(node: &str, creation: u32, local: &str, local_creation: u32) -> bool {
@@ -2987,14 +2986,7 @@ mod tests {
 
     #[test]
     fn dist_state_starts_empty_with_connection_caches() {
-        let state = DistState::new(
-            11,
-            Pid {
-                index: 1,
-                generation: 2,
-            },
-            0,
-        );
+        let state = DistState::new(11, Pid::new(1, 2), 0);
         assert!(state.output.is_empty());
         assert_eq!(state.pending_bytes, 0);
         assert_eq!(state.incoming_cache.get(0), None);
@@ -3003,14 +2995,7 @@ mod tests {
 
     #[test]
     fn dist_output_encodes_distribution_header_and_send_control() {
-        let mut state = DistState::new(
-            11,
-            Pid {
-                index: 1,
-                generation: 2,
-            },
-            0,
-        );
+        let mut state = DistState::new(11, Pid::new(1, 2), 0);
         let control = OwnedTerm::tuple(vec![
             OwnedTerm::Int(2),
             OwnedTerm::Atom("from@host".into()),
@@ -3035,14 +3020,7 @@ mod tests {
 
     #[test]
     fn dist_queue_accounts_for_pending_bytes() {
-        let mut state = DistState::new(
-            12,
-            Pid {
-                index: 1,
-                generation: 0,
-            },
-            0,
-        );
+        let mut state = DistState::new(12, Pid::new(1, 0), 0);
         state
             .queue_term(OwnedTerm::tuple(vec![OwnedTerm::Int(2)]), None)
             .unwrap();

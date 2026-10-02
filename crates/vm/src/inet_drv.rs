@@ -397,15 +397,7 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
     let outcome = {
         let mut inner = sock.inner.lock().unwrap();
         // Dummy caller/ids: dist never waits on inet_reply for these writes.
-        accept_send(
-            &mut inner,
-            Pid {
-                index: 0,
-                generation: 0,
-            },
-            [0, 0, 0],
-            data,
-        )
+        accept_send(&mut inner, Pid::new(0, 0), [0, 0, 0], data)
     };
     match outcome {
         SendOutcome::Reply(_) | SendOutcome::Deferred => {}

@@ -200,10 +200,7 @@ fn after_collection_one(
     if node != "nonode@nohost" {
         return;
     }
-    let receiver = arinsal_sched::Pid {
-        index: *receiver_id,
-        generation: *receiver_generation,
-    };
+    let receiver = arinsal_sched::Pid::new(*receiver_id, *receiver_generation);
     let heap_words = process.heap.capacity_words();
     let total_heap_words = process.heap.total_heap_size_words();
     let heap_used = process.heap.used_words();
@@ -285,8 +282,8 @@ fn send_system_monitor_event(
         OwnedTerm::atom("monitor"),
         OwnedTerm::Pid {
             node: "nonode@nohost".into(),
-            id: pid.index,
-            serial: pid.generation,
+            id: pid.number(),
+            serial: pid.serial(),
             creation: 0,
         },
         OwnedTerm::atom(kind),
@@ -351,10 +348,7 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
     if node != "nonode@nohost" {
         return;
     }
-    let receiver = arinsal_sched::Pid {
-        index: *receiver_id,
-        generation: *receiver_generation,
-    };
+    let receiver = arinsal_sched::Pid::new(*receiver_id, *receiver_generation);
     let fields = OwnedTerm::list(vec![
         OwnedTerm::tuple(vec![
             OwnedTerm::atom("timeout"),
@@ -367,8 +361,8 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
         OwnedTerm::atom("monitor"),
         OwnedTerm::Pid {
             node: "nonode@nohost".into(),
-            id: pid.index,
-            serial: pid.generation,
+            id: pid.number(),
+            serial: pid.serial(),
             creation: 0,
         },
         OwnedTerm::atom("long_schedule"),
@@ -444,16 +438,13 @@ fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorSt
     if node != "nonode@nohost" {
         return;
     }
-    let receiver = arinsal_sched::Pid {
-        index: *receiver_id,
-        generation: *receiver_generation,
-    };
+    let receiver = arinsal_sched::Pid::new(*receiver_id, *receiver_generation);
     let event = OwnedTerm::Tuple(vec![
         OwnedTerm::atom("monitor"),
         OwnedTerm::Pid {
             node: "nonode@nohost".into(),
-            id: pid.index,
-            serial: pid.generation,
+            id: pid.number(),
+            serial: pid.serial(),
             creation: 0,
         },
         OwnedTerm::atom("long_message_queue"),
@@ -509,10 +500,7 @@ fn notify_busy_port_one(
     if node != "nonode@nohost" {
         return;
     }
-    let receiver = arinsal_sched::Pid {
-        index: *receiver_id,
-        generation: *receiver_generation,
-    };
+    let receiver = arinsal_sched::Pid::new(*receiver_id, *receiver_generation);
     let Some(port) = Term::port(port_id) else {
         return;
     };
@@ -572,17 +560,14 @@ fn notify_busy_dist_port_one(
     if node != "nonode@nohost" {
         return;
     }
-    let receiver = arinsal_sched::Pid {
-        index: *receiver_id,
-        generation: *receiver_generation,
-    };
+    let receiver = arinsal_sched::Pid::new(*receiver_id, *receiver_generation);
     let mut heap = arinsal_term::ProcessHeap::with_words(16);
     let event = OwnedTerm::Tuple(vec![
         OwnedTerm::atom("monitor"),
         OwnedTerm::Pid {
             node: "nonode@nohost".into(),
-            id: sender.index,
-            serial: sender.generation,
+            id: sender.number(),
+            serial: sender.serial(),
             creation: 0,
         },
         OwnedTerm::atom("busy_dist_port"),
@@ -1401,10 +1386,7 @@ fn internal_state_tuple_get(
                 node,
             },
         ) if node == "nonode@nohost" => {
-            let pid = arinsal_sched::Pid {
-                index: *id,
-                generation: *serial,
-            };
+            let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid == ctx.pid() {
                 return Ok(Some(atom("running")));
             }
@@ -1435,10 +1417,7 @@ fn internal_state_tuple_get(
                 node,
             },
         ) if node == "nonode@nohost" => {
-            let pid = arinsal_sched::Pid {
-                index: *id,
-                generation: *serial,
-            };
+            let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
                 let published = process
                     .runtime
@@ -1460,10 +1439,7 @@ fn internal_state_tuple_get(
                 node,
             },
         ) if node == "nonode@nohost" => {
-            let pid = arinsal_sched::Pid {
-                index: *id,
-                generation: *serial,
-            };
+            let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
                 let published = process
                     .runtime
@@ -1703,7 +1679,7 @@ fn internal_link_list_from(
         let Some(pid_term) = pid.to_term() else {
             continue;
         };
-        let id = int(process, pid.index as usize)?;
+        let id = int(process, pid.number() as usize)?;
         records.push(tuple(
             process,
             &[
@@ -1976,9 +1952,13 @@ fn internal_state_get(
                 .runtime
                 .as_ref()
                 .and_then(|runtime| runtime.scheduler().ok())
-                .and_then(|scheduler| scheduler.test_next_process_id(false, 0));
+                .map(|scheduler| scheduler.test_next_process_id(false, 0));
             match next {
-                Some(next) => int(process, next as usize),
+                Some(next) => {
+                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                        .int_from_i128(i128::from(next))
+                        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+                }
                 None => Ok(atom("false")),
             }
         }
@@ -2185,15 +2165,11 @@ fn internal_state_set(
                 return Err(badarg());
             };
             let result = match arg_name(selector).as_deref() {
-                Some("next_pid") => u32::try_from(next).ok().and_then(|next| {
-                    process
-                        .runtime
-                        .as_ref()?
-                        .scheduler()
-                        .ok()?
-                        .test_next_process_id(true, next)
-                        .map(i128::from)
-                }),
+                Some("next_pid") => process
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.scheduler().ok())
+                    .map(|scheduler| i128::from(scheduler.test_next_process_id(true, next))),
                 _ => process
                     .runtime
                     .as_ref()
@@ -2531,10 +2507,7 @@ fn internal_state_set(
             if node != "nonode@nohost" {
                 return Err(badarg());
             }
-            let pid = arinsal_sched::Pid {
-                index: *id,
-                generation: *serial,
-            };
+            let pid = arinsal_sched::Pid::new(*id, *serial);
             let Some(runtime) = process.runtime.as_ref() else {
                 return Ok(atom("false"));
             };

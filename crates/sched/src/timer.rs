@@ -1038,10 +1038,7 @@ mod tests {
 
     #[test]
     fn deadlines_and_cancel() {
-        let pid = Pid {
-            index: 0,
-            generation: 0,
-        };
+        let pid = Pid::new(0, 0);
         let mut wheel = Wheel::<u8>::new(0);
         wheel.insert(1, 1, TimerPayload::Message(pid, 1, true));
         wheel.insert(2, 257, TimerPayload::Message(pid, 2, true));
@@ -1054,14 +1051,8 @@ mod tests {
 
     #[test]
     fn process_exit_cancels_timers_targeting_that_process() {
-        let target = Pid {
-            index: 3,
-            generation: 1,
-        };
-        let other = Pid {
-            index: 4,
-            generation: 1,
-        };
+        let target = Pid::new(3, 1);
+        let other = Pid::new(4, 1);
         let mut wheel = Wheel::<u8>::new(0);
         wheel.insert(1, 10, TimerPayload::Message(target, 1, false));
         wheel.insert(2, 20, TimerPayload::Message(target, 2, true));
@@ -1110,10 +1101,7 @@ mod tests {
 
     #[test]
     fn same_deadline_long_timers_keep_insertion_order_after_cancel() {
-        let pid = Pid {
-            index: 0,
-            generation: 0,
-        };
+        let pid = Pid::new(0, 0);
         let mut wheel = Wheel::<u8>::new(0);
         let deadline = LATER_REVOLUTION + 100;
         for id in 1..=3 {
@@ -1127,10 +1115,7 @@ mod tests {
 
     #[test]
     fn later_slot_cascades_when_soon_window_reaches_it() {
-        let pid = Pid {
-            index: 0,
-            generation: 0,
-        };
+        let pid = Pid::new(0, 0);
         let mut wheel = Wheel::<u8>::new(0);
         let deadline = 17_000;
         wheel.insert(1, deadline, TimerPayload::Message(pid, 1, true));
@@ -1141,10 +1126,7 @@ mod tests {
 
     #[test]
     fn bump_resumes_large_fast_forward_after_limit() {
-        let pid = Pid {
-            index: 0,
-            generation: 0,
-        };
+        let pid = Pid::new(0, 0);
         let mut wheel = Wheel::<u8>::new(0);
         let deadline = SOON_SIZE as u64 + 123;
         for id in 1..=20_050 {

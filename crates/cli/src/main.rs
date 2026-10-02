@@ -234,6 +234,20 @@ fn erl_launch(args: &[String]) -> ! {
             }),
         flags: launch.emulator.allocator_options.clone(),
     });
+    // Port of erts/emulator/beam/erl_init.c:1874 (+P) and erl_process.c:765
+    // (erts_ptab_init_table), OTP-29.1.1: the table rounds the limit up to a power of two.
+    // `+P legacy` keeps the default size; the legacy id algorithm is not ported.
+    if let Some(arinsal_args::Limit::Value(limit)) = launch.emulator.process_limit {
+        arinsal_term::ptab::set_process_table_layout(arinsal_term::ptab::PtabLayout::new(
+            u32::try_from(limit).unwrap_or(u32::MAX),
+        ));
+    }
+    // Port of erts/emulator/beam/erl_init.c:2427 (+Q) and io.c:3016 (erts_ptab_init_table), OTP-29.1.1.
+    if let Some(arinsal_args::Limit::Value(limit)) = launch.emulator.port_limit {
+        arinsal_term::ptab::set_port_table_layout(arinsal_term::ptab::PtabLayout::new(
+            u32::try_from(limit).unwrap_or(u32::MAX),
+        ));
+    }
     if launch.detached {
         // erlexec forks and calls setsid (erlexec.c:1199). Arinsal does not detach.
         eprintln!("arinsal: -detached is not supported");

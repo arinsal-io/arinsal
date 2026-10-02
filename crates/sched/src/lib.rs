@@ -64,6 +64,7 @@ mod timer;
 pub use mailbox::{Incoming, Private, ReceiveMarker};
 pub use timer::TimerRef;
 
+use arinsal_term::ptab::{PTAB_ID_DATA_MASK, PtabIdRing};
 use crossbeam_deque::{Steal, Stealer, Worker};
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use crossbeam_queue::SegQueue;
@@ -74,7 +75,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use timer::{CanceledTimer, TimerCommand, TimerPayload, Wheel};
@@ -123,25 +124,52 @@ pub const MSACC_STATE_COUNT: usize = 7;
 const ACCOUNTING_WALL: u8 = 1;
 const ACCOUNTING_MSACC: u8 = 2;
 
-/// Local pid matching the 28-bit index and 32-bit generation in `arinsal-term`.
+/// Local pid: the 60-bit process-table data of erts (`serial << 28 | number`).
+///
+/// Ordering follows the data, as erts compares internal pids
+/// (erts/emulator/beam/utils.c:1768, erts_cmp_compound), OTP-29.1.1.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Pid {
-    /// Process-table slot, at most 28 bits.
-    pub index: u32,
-    /// Incremented before a slot is reused.
-    pub generation: u32,
+    data: u64,
 }
 
 impl Pid {
+    /// Pid from its number (at most 28 bits) and serial.
+    pub fn new(number: u32, serial: u32) -> Self {
+        debug_assert!(number <= arinsal_term::ptab::MAX_INTERNAL_PID_NUMBER);
+        Self::from_data((u64::from(serial) << arinsal_term::ptab::PID_NUM_SIZE) | u64::from(number))
+    }
+
+    /// Pid from process-table data.
+    pub const fn from_data(data: u64) -> Self {
+        Self {
+            data: data & PTAB_ID_DATA_MASK,
+        }
+    }
+
+    /// Process-table data.
+    pub const fn data(self) -> u64 {
+        self.data
+    }
+
+    /// Number printed as `N` in `<0.N.S>`.
+    pub const fn number(self) -> u32 {
+        (self.data & arinsal_term::ptab::MAX_INTERNAL_PID_NUMBER as u64) as u32
+    }
+
+    /// Serial printed as `S` in `<0.N.S>`.
+    pub const fn serial(self) -> u32 {
+        (self.data >> arinsal_term::ptab::PID_NUM_SIZE) as u32
+    }
+
     /// Convert to the term crate's tagged local pid.
     pub fn to_term(self) -> Option<arinsal_term::Term> {
-        arinsal_term::Term::pid(self.index, self.generation)
+        Some(arinsal_term::Term::pid_from_data(self.data))
     }
 
     /// Decode a tagged local pid.
     pub fn from_term(term: arinsal_term::Term) -> Option<Self> {
-        term.as_pid()
-            .map(|(index, generation)| Self { index, generation })
+        term.as_pid_data().map(Self::from_data)
     }
 }
 
@@ -542,46 +570,58 @@ impl<T: Task> Process<T> {
     }
 }
 
+/// Process table: erts' `ErtsPTab` slots plus its free identifier ring.
+///
+/// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element,
+/// erts_ptab_delete_element, erts_ptab_test_next_id), OTP-29.1.1. Slot pages are
+/// materialized lazily.
 struct ProcessTable<T: Task> {
+    ids: PtabIdRing,
+    /// `ptab->list.data.rwmtx`: test_next_id excludes concurrent inserts and removals.
+    lock: RwLock<()>,
     pages: Vec<OnceLock<ProcessPage<T>>>,
-    capacity: u32,
-    next: AtomicU32,
-    free: Mutex<Vec<u32>>,
 }
 
 struct ProcessPage<T: Task> {
     slots: Box<[Atomic<Arc<Process<T>>>]>,
-    generations: Box<[AtomicU32]>,
 }
 
 impl<T: Task> ProcessPage<T> {
     fn new() -> Self {
         Self {
             slots: (0..PID_PAGE_SIZE).map(|_| Atomic::null()).collect(),
-            generations: (0..PID_PAGE_SIZE).map(|_| AtomicU32::new(0)).collect(),
         }
     }
 }
 
 impl<T: Task> ProcessTable<T> {
     fn new(capacity: u32) -> Self {
+        let ids = PtabIdRing::new(capacity);
+        let pages = (ids.layout().max() as usize).div_ceil(PID_PAGE_SIZE);
         Self {
-            pages: (0..(capacity as usize).div_ceil(PID_PAGE_SIZE))
-                .map(|_| OnceLock::new())
-                .collect(),
-            capacity,
-            next: AtomicU32::new(0),
-            free: Mutex::new(Vec::new()),
+            ids,
+            lock: RwLock::new(()),
+            pages: (0..pages).map(|_| OnceLock::new()).collect(),
         }
     }
 
-    fn page(&self, index: u32) -> Option<(&ProcessPage<T>, usize)> {
-        if index >= self.capacity {
-            return None;
-        }
-        let index = index as usize;
-        let page = self.pages[index / PID_PAGE_SIZE].get()?;
-        Some((page, index % PID_PAGE_SIZE))
+    fn page(&self, pix: u32) -> Option<(&ProcessPage<T>, usize)> {
+        let pix = pix as usize;
+        let page = self.pages.get(pix / PID_PAGE_SIZE)?.get()?;
+        Some((page, pix % PID_PAGE_SIZE))
+    }
+
+    fn slot_occupied(&self, pix: u32) -> bool {
+        self.page(pix).is_some_and(|(page, offset)| {
+            !page.slots[offset]
+                .load(Ordering::Acquire, &epoch::pin())
+                .is_null()
+        })
+    }
+
+    /// Table index of a pid, the order `erlang:processes/0` reports.
+    fn index(&self, pid: Pid) -> u32 {
+        self.ids.layout().data2pix(pid.data())
     }
 
     fn insert(
@@ -590,29 +630,13 @@ impl<T: Task> ProcessTable<T> {
         priority: Priority,
         bound_worker: Option<usize>,
     ) -> Result<Arc<Process<T>>, Error> {
-        // Port of erts/emulator/beam/erl_process.c:12180 (alloc_process), OTP-29.1.1.
-        // Fresh pids use the monotonic range without contending on the reuse pool.
-        let mut next = self.next.load(Ordering::Relaxed);
-        let index = loop {
-            if next >= self.capacity {
-                break self.free.lock().unwrap().pop().ok_or(Error::Capacity)?;
-            }
-            match self.next.compare_exchange_weak(
-                next,
-                next + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break next,
-                Err(actual) => next = actual,
-            }
-        };
-        let page = self.pages[index as usize / PID_PAGE_SIZE].get_or_init(ProcessPage::new);
-        let offset = index as usize % PID_PAGE_SIZE;
-        let pid = Pid {
-            index,
-            generation: page.generations[offset].load(Ordering::Relaxed),
-        };
+        // Port of erts/emulator/beam/erl_ptab.c:500 (erts_ptab_new_element), OTP-29.1.1.
+        let _shared = self.lock.read().unwrap();
+        let data = self.ids.reserve().ok_or(Error::Capacity)?;
+        let pid = Pid::from_data(data);
+        let pix = self.ids.layout().data2pix(data) as usize;
+        let page = self.pages[pix / PID_PAGE_SIZE].get_or_init(ProcessPage::new);
+        let offset = pix % PID_PAGE_SIZE;
         let process = Arc::new(Process {
             pid,
             user_priority: AtomicU8::new(priority.index() as u8),
@@ -641,8 +665,8 @@ impl<T: Task> ProcessTable<T> {
         Ok(process)
     }
 
-    fn lookup(&self, pid: Pid) -> Option<Arc<Process<T>>> {
-        let (page, offset) = self.page(pid.index)?;
+    fn load_slot(&self, pix: u32) -> Option<Arc<Process<T>>> {
+        let (page, offset) = self.page(pix)?;
         let slot = &page.slots[offset];
         let guard = &epoch::pin();
         let ptr = slot.load(Ordering::Acquire, guard);
@@ -650,21 +674,27 @@ impl<T: Task> ProcessTable<T> {
             return None;
         }
         // SAFETY: the epoch guard keeps the stored Arc alive during clone.
-        let process = unsafe { ptr.deref().clone() };
-        (process.pid == pid).then_some(process)
+        Some(unsafe { ptr.deref().clone() })
+    }
+
+    fn lookup(&self, pid: Pid) -> Option<Arc<Process<T>>> {
+        self.load_slot(self.index(pid))
+            .filter(|process| process.pid == pid)
     }
 
     fn remove(&self, pid: Pid) {
+        // Port of erts/emulator/beam/erl_ptab.c:675 (erts_ptab_delete_element), OTP-29.1.1.
+        let _shared = self.lock.read().unwrap();
         let guard = &epoch::pin();
-        let (page, offset) = self.page(pid.index).expect("live pid has a page");
+        let (page, offset) = self.page(self.index(pid)).expect("live pid has a page");
         let slot = &page.slots[offset];
         let old = slot.swap(epoch::Shared::null(), Ordering::AcqRel, guard);
-        if !old.is_null() {
-            // SAFETY: the old pointer is detached; epochs protect concurrent lookups.
-            unsafe { guard.defer_destroy(old) };
-            page.generations[offset].fetch_add(1, Ordering::Relaxed);
-            self.free.lock().unwrap().push(pid.index);
+        if old.is_null() {
+            return;
         }
+        // SAFETY: the old pointer is detached; epochs protect concurrent lookups.
+        unsafe { guard.defer_destroy(old) };
+        self.ids.release(pid.data());
     }
 
     fn live_count(&self) -> usize {
@@ -677,46 +707,41 @@ impl<T: Task> ProcessTable<T> {
             .count()
     }
 
-    fn scheduler_shutdown(&self) {
-        let allocated = self.next.load(Ordering::Acquire).min(self.capacity);
-        for index in 0..allocated {
-            let Some((page, offset)) = self.page(index) else {
+    /// Live pids in slots `first..limit`, at most `max`, and the slot after the last
+    /// one inspected.
+    ///
+    /// Port of erts/emulator/beam/erl_ptab.c:1515 (erts_ptab_processes_next scan loop), OTP-29.1.1.
+    fn pids_in_range(&self, first: u32, limit: u32, max: usize) -> (Vec<Pid>, u32) {
+        let mut pids = Vec::new();
+        let mut pix = first;
+        while pix < limit && pids.len() < max {
+            if self.page(pix).is_none() {
+                // An unmaterialized page has no live slot.
+                pix =
+                    ((pix as usize / PID_PAGE_SIZE + 1) * PID_PAGE_SIZE).min(limit as usize) as u32;
                 continue;
-            };
-            let pid = Pid {
-                index,
-                generation: page.generations[offset].load(Ordering::Acquire),
-            };
-            if let Some(process) = self.lookup(pid) {
+            }
+            if let Some(process) = self.load_slot(pix) {
+                pids.push(process.pid);
+            }
+            pix += 1;
+        }
+        (pids, pix)
+    }
+
+    fn scheduler_shutdown(&self) {
+        for pix in 0..self.ids.layout().max() {
+            if let Some(process) = self.load_slot(pix) {
                 process.cell.lock().unwrap().task.scheduler_shutdown();
             }
         }
     }
 
-    fn test_next_id(&self, set: bool, next_id: u32) -> Option<u32> {
-        // Port of erts/emulator/beam/erl_ptab.c:1356-1460 (`erts_ptab_test_next_id`), OTP-29.1.1.
-        let current = self.next.load(Ordering::Relaxed);
-        let start = if set {
-            next_id.wrapping_add(1) % self.capacity
-        } else {
-            current % self.capacity
-        };
-        for offset in 0..self.capacity {
-            let index = start.wrapping_add(offset) % self.capacity;
-            let occupied = self.page(index).is_some_and(|(page, slot)| {
-                !page.slots[slot]
-                    .load(Ordering::Acquire, &epoch::pin())
-                    .is_null()
-            });
-            if !occupied {
-                if set {
-                    self.next.store(index, Ordering::Relaxed);
-                    self.free.lock().unwrap().retain(|free| *free != index);
-                }
-                return Some(index);
-            }
-        }
-        None
+    fn test_next_id(&self, set: bool, next: u64) -> u64 {
+        // Port of erts/emulator/beam/erl_ptab.c:1356 (erts_ptab_test_next_id), OTP-29.1.1.
+        let _exclusive = self.lock.write().unwrap();
+        self.ids
+            .test_next_id(set, next, |pix| self.slot_occupied(pix))
     }
 }
 
@@ -2245,7 +2270,7 @@ impl<T: Task> Inner<T> {
         if self.table.lookup(pid).is_none() {
             return Err(Error::NoProcess);
         }
-        let fallback = pid.index as usize % self.timer_commands.len();
+        let fallback = pid.number() as usize % self.timer_commands.len();
         let worker = owner
             .or_else(|| local.as_deref().map(|local| local.worker_id))
             .filter(|worker| *worker < self.timer_commands.len())
@@ -2588,7 +2613,7 @@ impl<T: Task> Local<T> {
         if self.pid_cache.is_empty() {
             self.pid_cache = (0..1024).map(|_| None).collect();
         }
-        let slot = pid.index as usize % self.pid_cache.len();
+        let slot = pid.number() as usize % self.pid_cache.len();
         let entry = &mut self.pid_cache[slot];
         if let Some((cached_pid, process)) = entry
             && *cached_pid == pid
@@ -4229,9 +4254,25 @@ impl<T: Task> Scheduler<T> {
 
     /// Inspect or set the next free process table id for internal-state tests.
     ///
-    /// Returns `None` when the process table has no available id.
-    pub fn test_next_process_id(&self, set: bool, next_id: u32) -> Option<u32> {
+    /// Returns the data of the next pid to hand out (the invalid data when the table is full).
+    pub fn test_next_process_id(&self, set: bool, next_id: u64) -> u64 {
         self.inner.table.test_next_id(set, next_id)
+    }
+
+    /// Process-table slot of a pid; `erlang:processes/0` lists pids in this order.
+    pub fn process_table_index(&self, pid: Pid) -> u32 {
+        self.inner.table.index(pid)
+    }
+
+    /// Live pids in process-table slots `first..limit`, at most `max`, and the slot
+    /// after the last one inspected (`erts_ptab_processes_next`).
+    pub fn pids_in_table_range(&self, first: u32, limit: u32, max: usize) -> (Vec<Pid>, u32) {
+        self.inner.table.pids_in_range(first, limit, max)
+    }
+
+    /// Process-table size (`erlang:system_info(process_limit)`).
+    pub fn process_table_size(&self) -> u32 {
+        self.inner.table.ids.layout().max()
     }
     /// Register a local name for a live pid.
     pub fn register(&self, name: impl Into<String>, pid: Pid) -> Result<(), Error> {
@@ -4400,10 +4441,7 @@ mod msgq_stage_microbench {
         report("lookup", N, started);
 
         let ingress = Incoming::default();
-        let sender = Pid {
-            index: 1,
-            generation: 0,
-        };
+        let sender = Pid::new(1, 0);
         let blocks: Vec<Vec<Event<usize>>> = (0..N / 32)
             .map(|block| {
                 (0..32)
@@ -4674,14 +4712,7 @@ mod spawn_request_tests {
             .spawn_unscheduled(LinkSignalProbe(Arc::clone(&observed)))
             .unwrap();
         scheduler
-            .signal(
-                Pid {
-                    index: 7,
-                    generation: 0,
-                },
-                child,
-                Signal::Link,
-            )
+            .signal(Pid::new(7, 0), child, Signal::Link)
             .unwrap();
 
         assert!(!scheduler.step(), "setup signal scheduled the child");

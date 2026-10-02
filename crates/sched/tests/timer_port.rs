@@ -121,7 +121,7 @@ fn cross_scheduler_cancel_via_owner_queue() {
         .spawn(Sink(Arc::new(Mutex::new(Vec::new()))))
         .unwrap();
     let owner_one_pid = scheduler.spawn(Sink(output)).unwrap();
-    assert_eq!(owner_one_pid.index, 1);
+    assert_eq!(owner_one_pid.number(), 1);
     let timer = scheduler.start_timer(owner_one_pid, 30_000, 17).unwrap();
 
     thread::scope(|scope| {

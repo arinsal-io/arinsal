@@ -640,13 +640,13 @@ impl AliasTable {
     fn encode(target: Option<Pid>, priority: bool) -> u64 {
         match target {
             None => ALIAS_INACTIVE,
-            // Index is 28 bits and generation is 32. Bit 60 marks a live alias
+            // Pid data is 60 bits. Bit 60 marks a live alias
             // so the inactive sentinel `1` cannot collide with pid 0. Bit 61
             // marks a priority alias (OTP 28+).
             Some(pid) => {
                 const PRESENT: u64 = 1 << 60;
                 const PRIORITY: u64 = 1 << 61;
-                let mut raw = PRESENT | ((pid.generation as u64) << 28) | u64::from(pid.index);
+                let mut raw = PRESENT | pid.data();
                 if priority {
                     raw |= PRIORITY;
                 }
@@ -667,13 +667,7 @@ impl AliasTable {
         if raw & PRESENT == 0 {
             return None;
         }
-        Some((
-            Some(Pid {
-                index: (raw & ((1 << 28) - 1)) as u32,
-                generation: ((raw >> 28) & 0xffff_ffff) as u32,
-            }),
-            raw & PRIORITY != 0,
-        ))
+        Some((Some(Pid::from_data(raw)), raw & PRIORITY != 0))
     }
 
     fn load(&self, id: u64) -> Option<(Option<Pid>, bool)> {
@@ -2367,6 +2361,13 @@ fn resume_after_native_return(process: &mut Process) -> bool {
 
 // g_proc_sched. `erlang:apply/3` is the continuation erts installs after
 // `erts_hibernate` and the body of `erts_internal:spawn_init/1`.
+/// Process-table slot of a local pid; `erlang:processes/0` lists pids in slot order.
+///
+/// Port of erts/emulator/beam/erl_node_container_utils.h:128 (internal_pid_index), OTP-29.1.1.
+pub(crate) fn pid_table_index(pid: Pid) -> u32 {
+    arinsal_term::ptab::process_table_layout().data2pix(pid.data())
+}
+
 pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError> {
     let module_id = vm.load_named("erlang")?;
     let entry = vm.modules[module_id]
@@ -2849,7 +2850,7 @@ impl Runtime {
                 (*target, *count - outstanding, outstanding)
             })
             .collect();
-        rows.sort_by_key(|(pid, _, _)| (pid.index, pid.generation));
+        rows.sort_by_key(|(pid, _, _)| pid_table_index(*pid));
         rows
     }
 
@@ -5090,6 +5091,7 @@ impl Vm {
             reductions: reductions.max(1),
             dirty_cpu_schedulers,
             dirty_io_schedulers,
+            max_processes: arinsal_term::ptab::process_table_layout().max(),
             ..Config::default()
         };
         let scheduler = Arc::new(match simulation_seed {
@@ -5100,20 +5102,43 @@ impl Vm {
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
         let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
         *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
+        let mut process = Process::with_spawn_registers(args.len(), 0);
+        process.module = module_id;
+        process.ip = ip;
+        process.x[..args.len()].copy_from_slice(args);
+        process.set_runtime(Some(runtime.clone()));
+        process.cold_mut().initial_call =
+            Some((module.to_owned(), function.to_owned(), args.len() as u8));
+        process.entry = true;
+        process.heap.set_min_heap_size(8192);
+        // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
+        // the first process gets the first pid; it runs once the system processes
+        // exist, as erts starts its schedulers only after spawning them.
+        let entry_pid: Pid = scheduler
+            .spawn_unscheduled(process)
+            .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+        runtime.processes.lock().unwrap().insert(entry_pid);
         if module == "erl_init" && function == "start" {
             // Port of erts/emulator/beam/erl_init.c:2550 (erl_system_process_otp
             // "erts_code_purger"), OTP-29.1.1. code_server:finish_on_load sends
             // to this registered process; without it the send is badarg and
             // code_server dies during ensure_loaded of an on_load module.
-            self.spawn_system_process(&scheduler, &runtime, "erts_code_purger", "start")?;
+            self.spawn_system_process_priority(
+                &scheduler,
+                &runtime,
+                "erts_code_purger",
+                "start",
+                arinsal_sched::Priority::High,
+            )?;
         }
         // Port of erts/emulator/beam/erl_init.c system-process startup: every
         // runtime needs the preloaded owner of the literal-area release protocol.
-        let literal_collector = self.spawn_system_process(
+        let literal_collector = self.spawn_system_process_priority(
             &scheduler,
             &runtime,
             "erts_literal_area_collector",
             "start",
+            arinsal_sched::Priority::High,
         )?;
         // erl 29.1.1 does not register the collector; it is found by initial_call.
         *runtime.literal_collector.lock().unwrap() = Some(literal_collector);
@@ -5138,19 +5163,12 @@ impl Vm {
         scheduler.set_dirty_signal_handlers(handlers[0], handlers[1], handlers[2], |pid| {
             pid.to_term().and_then(|term| Message::copy_from(term).ok())
         });
-        let mut process = Process::with_spawn_registers(args.len(), 0);
-        process.module = module_id;
-        process.ip = ip;
-        process.x[..args.len()].copy_from_slice(args);
-        process.set_runtime(Some(runtime.clone()));
-        process.cold_mut().initial_call =
-            Some((module.to_owned(), function.to_owned(), args.len() as u8));
-        process.entry = true;
-        process.heap.set_min_heap_size(8192);
-        let _entry_pid: Pid = scheduler
-            .spawn(process)
+        // Port of erts/emulator/beam/erl_init.c:2599 (erl_system_process_otp
+        // "erts_trace_cleaner"), OTP-29.1.1.
+        self.spawn_system_process(&scheduler, &runtime, "erts_trace_cleaner", "start")?;
+        scheduler
+            .schedule_unscheduled(entry_pid)
             .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        runtime.processes.lock().unwrap().insert(_entry_pid);
         if simulation_seed.is_some() {
             loop {
                 if let Ok(result) = receiver.try_recv() {

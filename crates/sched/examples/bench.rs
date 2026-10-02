@@ -99,14 +99,8 @@ fn pingpong(workers: usize) {
     let count = Arc::new(AtomicUsize::new(0));
     let sched = Scheduler::new(config(workers, 2));
     let limit = 2_000_000;
-    let a = Pid {
-        index: 0,
-        generation: 0,
-    };
-    let b = Pid {
-        index: 1,
-        generation: 0,
-    };
+    let a = Pid::new(0, 0);
+    let b = Pid::new(1, 0);
     assert_eq!(
         sched
             .spawn(Dummy {
@@ -146,10 +140,7 @@ fn ring(workers: usize) {
     let sched = Scheduler::new(config(workers, 1_000));
     let limit = 2_000_000;
     for i in 0..1_000 {
-        let next = Pid {
-            index: (i + 1) % 1_000,
-            generation: 0,
-        };
+        let next = Pid::new((i + 1) % 1_000, 0);
         sched
             .spawn(Dummy {
                 mode: Mode::Forward(next),
@@ -158,10 +149,7 @@ fn ring(workers: usize) {
             })
             .unwrap();
     }
-    let first = Pid {
-        index: 0,
-        generation: 0,
-    };
+    let first = Pid::new(0, 0);
     let cpu_before = usage().0;
     let start = Instant::now();
     sched.send(first, first, ()).unwrap();

@@ -141,10 +141,7 @@ impl NifSelectReactor {
         if node != "nonode@nohost" {
             return;
         }
-        let pid = Pid {
-            index: *id,
-            generation: *serial,
-        };
+        let pid = Pid::new(*id, *serial);
         let Some(hub) = NIF_HUBS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
