@@ -355,13 +355,30 @@ impl HashStorage {
         objects
     }
 
+    /// Free every object and return to the initial single-segment layout.
+    // Port of erts/emulator/beam/erl_db_hash.c:4017 (db_delete_all_objects_hash:
+    // db_free_table_continue_hash + db_create_hash), OTP-29.1.1.
     pub(super) fn clear_buckets(&mut self) {
-        for bucket in self
-            .segments
-            .iter_mut()
-            .flat_map(|segment| segment.iter_mut())
-        {
-            bucket.head = None;
+        self.segments.clear();
+        self.segments.push(Box::new(Segment::first()));
+        self.nactive = FIRST_SEGMENT;
+        self.szm = FIRST_SEGMENT - 1;
+        self.nslots = FIRST_SEGMENT;
+    }
+
+    /// Detach all buckets (and, for a table being deleted, the pseudo-deleted list) so they can
+    /// be released a few segments at a time, leaving the initial single-segment layout.
+    // Port of erts/emulator/beam/erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
+    pub(super) fn take_garbage(&mut self, with_deleted: bool) -> HashGarbage {
+        let segments = std::mem::take(&mut self.segments);
+        self.clear_buckets();
+        HashGarbage {
+            segments,
+            deleted: if with_deleted {
+                std::mem::take(&mut self.deleted)
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -1098,6 +1115,50 @@ impl ConcurrentHashStorage {
 #[inline]
 fn exact_key(left: Term, right: Term) -> bool {
     arinsal_term::exact_eq(left, right)
+}
+
+/// Bucket storage detached from a table, released incrementally.
+pub struct HashGarbage {
+    segments: Vec<Box<Segment>>,
+    deleted: Vec<StoredTerm>,
+}
+
+impl HashGarbage {
+    /// Release up to `reds` reductions of work; `keep` receives live objects instead of freeing
+    /// them (a fixed table keeps them as pseudo-deleted). Returns whether everything is done.
+    ///
+    /// Port of erts/emulator/beam/erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
+    pub(super) fn step(
+        &mut self,
+        reds: &mut isize,
+        mut keep: Option<&mut Vec<StoredTerm>>,
+    ) -> bool {
+        while let Some(object) = self.deleted.pop() {
+            drop(object);
+            *reds -= 1;
+            if *reds < 0 {
+                return false;
+            }
+        }
+        while let Some(mut segment) = self.segments.pop() {
+            let mut records = 0isize;
+            for bucket in segment.iter_mut() {
+                let mut node = bucket.head.take();
+                while let Some(mut current) = node {
+                    node = current.next.take();
+                    records += 1;
+                    if let Some(keep) = keep.as_deref_mut() {
+                        keep.push(current.object);
+                    }
+                }
+            }
+            *reds -= (EXT_SEGMENT / 64) as isize + records;
+            if *reds < 0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]

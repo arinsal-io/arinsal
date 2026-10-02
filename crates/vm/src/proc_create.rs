@@ -167,6 +167,11 @@ pub(crate) struct ProcessCold {
     /// Result of a published `persistent_term` update, returned when the yielded
     /// updater runs again (erts resumes the suspended updater after `table_updater`).
     pub(crate) persistent_update_result: Option<Term>,
+    /// Storage of a table being released by a trapped `ets:delete/1` or
+    /// `ets:internal_delete_all/2`.
+    pub(crate) ets_free: Option<EtsFree>,
+    /// Exit work (owned ETS tables) that yielded; the process stays scheduled until it ends.
+    pub(crate) exit_cont: Option<Box<ExitCont>>,
     /// A process-local BIF trap waiting for its private continuation export.
     pub(crate) bif_trap: Option<BifTrapPending>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
@@ -589,4 +594,25 @@ pub(crate) enum DelayedGc {
         how: arinsal_sched::LiteralCopyHow,
         requester: arinsal_sched::Pid,
     },
+}
+
+/// Port of erts/emulator/beam/erl_db.c:3006-3080 (ets_delete_1 continuation) and
+/// erl_db.c:3234 (ets_internal_delete_all_2), OTP-29.1.1: what a trapped call still has to free.
+pub(crate) struct EtsFree {
+    /// Table whose objects were detached by `ets:internal_delete_all/2`; `None` for `ets:delete/1`.
+    pub(crate) tid: Option<arinsal_ets::Tid>,
+    /// Object count `ets:internal_delete_all/2` returns when done.
+    pub(crate) nitems: usize,
+    pub(crate) garbage: arinsal_ets::Garbage,
+}
+
+/// Port of erts/emulator/beam/erl_process.c:14160 (erts_continue_exit_process trap state),
+/// OTP-29.1.1: the part of process exit that is resumed after a yield.
+pub(crate) struct ExitCont {
+    pub(crate) reason: arinsal_term::Term,
+    /// Storage of the owned table whose release was interrupted (`FREE_OWNED_TABLE`).
+    pub(crate) garbage: Option<arinsal_ets::Garbage>,
+    /// Result the entry process reports once exit completes, and its exit code.
+    pub(crate) entry_result: Option<Result<crate::ScheduledResult, crate::VmError>>,
+    pub(crate) code: u64,
 }

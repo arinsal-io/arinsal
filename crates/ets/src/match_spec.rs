@@ -207,6 +207,215 @@ pub struct KeyBounds {
     pub lower: Option<(Term, bool)>,
     /// Upper key and whether it is inclusive.
     pub upper: Option<(Term, bool)>,
+    /// Lowest key pattern any clause head can match (possibly partly bound).
+    pub least: Option<Term>,
+    /// Highest key pattern any clause head can match (possibly partly bound).
+    pub most: Option<Term>,
+}
+
+impl KeyBounds {
+    /// Whether `key` sorts before every key the match specification can select.
+    #[inline]
+    pub fn is_below(&self, key: Term) -> bool {
+        self.lower.is_some_and(|(bound, inclusive)| {
+            let order = cmp(key, bound);
+            order == Ordering::Less || (order == Ordering::Equal && !inclusive)
+        }) || self
+            .least
+            .is_some_and(|least| cmp_partly_bound(least, key) > 0)
+    }
+
+    /// Whether `key` sorts after every key the match specification can select.
+    #[inline]
+    pub fn is_above(&self, key: Term) -> bool {
+        self.upper.is_some_and(|(bound, inclusive)| {
+            let order = cmp(key, bound);
+            order == Ordering::Greater || (order == Ordering::Equal && !inclusive)
+        }) || self
+            .most
+            .is_some_and(|most| cmp_partly_bound(most, key) < 0)
+    }
+}
+
+/// Whether a term is `'_'` or a `'$N'` match variable.
+fn is_match_variable(term: Term) -> bool {
+    let Some(atom) = term.as_atom() else {
+        return false;
+    };
+    global_atoms().text(atom).is_some_and(|text| {
+        text == "_"
+            || text
+                .strip_prefix('$')
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+fn sign(order: Ordering) -> i32 {
+    order as i32
+}
+
+/// Port of erts/emulator/beam/erl_db_tree.c:3853 (do_cmp_partly_bound), OTP-29.1.1.
+fn do_cmp_partly_bound(a: Term, b: Term, done: &mut bool) -> i32 {
+    if is_match_variable(a) {
+        *done = true;
+        return 0;
+    }
+    if a == b {
+        return 0;
+    }
+    match a.classify() {
+        TermKind::List if b.classify() == TermKind::List => {
+            let (mut a, mut b) = (a, b);
+            loop {
+                let (Some((ah, at)), Some((bh, bt))) = (cons(a), cons(b)) else {
+                    return sign(cmp(a, b));
+                };
+                let j = do_cmp_partly_bound(ah, bh, done);
+                if j != 0 || *done {
+                    return j;
+                }
+                if at == bt {
+                    return 0;
+                }
+                if at.classify() != TermKind::List || bt.classify() != TermKind::List {
+                    return do_cmp_partly_bound(at, bt, done);
+                }
+                a = at;
+                b = bt;
+            }
+        }
+        TermKind::Tuple if b.classify() == TermKind::Tuple => {
+            let (Some(at), Some(bt)) = (tuple_view(a), tuple_view(b)) else {
+                return sign(cmp(a, b));
+            };
+            if at.len() != bt.len() {
+                return if at.len() < bt.len() { -1 } else { 1 };
+            }
+            for (x, y) in at.iter().zip(bt.iter()) {
+                let j = do_cmp_partly_bound(x, y, done);
+                if j != 0 || *done {
+                    return j;
+                }
+            }
+            0
+        }
+        _ => sign(cmp(a, b)),
+    }
+}
+
+/// Port of erts/emulator/beam/erl_db_tree.c:3917 (cmp_partly_bound), OTP-29.1.1.
+pub(crate) fn cmp_partly_bound(partly_bound_key: Term, bound_key: Term) -> i32 {
+    do_cmp_partly_bound(partly_bound_key, bound_key, &mut false)
+}
+
+/// Shared walk of `do_partly_bound_can_match_lesser/greater`; `lesser` picks the direction.
+// Port of erts/emulator/beam/erl_db_tree.c:3988 and :4059, OTP-29.1.1.
+fn do_partly_bound_can_match(a: Term, b: Term, lesser: bool, done: &mut bool) -> bool {
+    let want = |order: i32| if lesser { order < 0 } else { order > 0 };
+    if is_match_variable(a) {
+        *done = true;
+        return !is_match_variable(b);
+    } else if is_match_variable(b) {
+        *done = true;
+        return false;
+    }
+    if a == b {
+        return false;
+    }
+    match (a.classify(), b.classify()) {
+        (TermKind::Tuple, TermKind::Tuple) => {
+            let (Some(at), Some(bt)) = (tuple_view(a), tuple_view(b)) else {
+                return false;
+            };
+            if at.len() != bt.len() {
+                return (at.len() < bt.len()) == lesser;
+            }
+            for (x, y) in at.iter().zip(bt.iter()) {
+                let j = do_partly_bound_can_match(x, y, lesser, done);
+                if j || *done {
+                    return j;
+                }
+            }
+            false
+        }
+        (TermKind::List, TermKind::List) => {
+            let (mut a, mut b) = (a, b);
+            loop {
+                let (Some((ah, at)), Some((bh, bt))) = (cons(a), cons(b)) else {
+                    return false;
+                };
+                let j = do_partly_bound_can_match(ah, bh, lesser, done);
+                if j || *done {
+                    return j;
+                }
+                if at == bt {
+                    return false;
+                }
+                if at.classify() != TermKind::List || bt.classify() != TermKind::List {
+                    return do_partly_bound_can_match(at, bt, lesser, done);
+                }
+                a = at;
+                b = bt;
+            }
+        }
+        _ => {
+            // Differing tags and same-tag scalars both reduce to CMP.
+            let order = sign(cmp(a, b));
+            if order != 0 {
+                *done = true;
+            }
+            want(order)
+        }
+    }
+}
+
+/// Whether `a` (a key pattern) can match a key lesser than `b`'s.
+fn partly_bound_can_match_lesser(a: Term, b: Term) -> bool {
+    do_partly_bound_can_match(a, b, true, &mut false)
+}
+
+/// Whether `a` (a key pattern) can match a key greater than `b`'s.
+fn partly_bound_can_match_greater(a: Term, b: Term) -> bool {
+    do_partly_bound_can_match(a, b, false, &mut false)
+}
+
+/// Port of erts/emulator/beam/erl_db_util.c:3962 (db_is_fully_bound), OTP-29.1.1.
+/// Maps count as variable, like in erts.
+fn is_fully_bound(term: Term) -> bool {
+    match term.classify() {
+        TermKind::List => {
+            let mut rest = term;
+            while let Some((head, tail)) = cons(rest) {
+                if !is_fully_bound(head) {
+                    return false;
+                }
+                rest = tail;
+            }
+            is_fully_bound(rest)
+        }
+        TermKind::Tuple => tuple_view(term).is_some_and(|items| items.iter().all(is_fully_bound)),
+        TermKind::Map => false,
+        _ => !is_match_variable(term),
+    }
+}
+
+/// Port of erts/emulator/beam/erl_db_util.c (db_has_map), OTP-29.1.1.
+fn has_map(term: Term) -> bool {
+    match term.classify() {
+        TermKind::Map => true,
+        TermKind::List => {
+            let mut rest = term;
+            while let Some((head, tail)) = cons(rest) {
+                if has_map(head) {
+                    return true;
+                }
+                rest = tail;
+            }
+            has_map(rest)
+        }
+        TermKind::Tuple => tuple_view(term).is_some_and(|items| items.iter().any(has_map)),
+        _ => false,
+    }
 }
 
 fn atom_name(term: Term) -> Option<String> {
@@ -219,18 +428,29 @@ fn proper_list(mut term: Term) -> Result<Vec<Term>, EtsError> {
     // Port of erts/emulator/beam/erl_db_util.c:4269, OTP-29.1.1 (dmc_list).
     let mut values = Vec::new();
     while term != Term::NIL {
-        // SAFETY: all list terms are held by a live source or program heap.
-        let (head, tail) = unsafe { term.cons_ref() }.ok_or(EtsError::BadArg)?;
+        let (head, tail) = cons(term).ok_or(EtsError::BadArg)?;
         values.push(head);
         term = tail;
     }
     Ok(values)
 }
 
+/// Borrowed tuple view of a term held by a live source or program heap.
+fn tuple_view<'a>(term: Term) -> Option<arinsal_term::TupleRef<'a>> {
+    // SAFETY: every term handled here lives in the caller's source or program heap,
+    // which stays pinned for the duration of the borrow.
+    unsafe { term.tuple_ref() }
+}
+
+/// Head and tail of a list cell held by a live source or program heap.
+fn cons(term: Term) -> Option<(Term, Term)> {
+    // SAFETY: as for `tuple_view`.
+    unsafe { term.cons_ref() }
+}
+
 fn tuple(term: Term) -> Result<Vec<Term>, EtsError> {
     // Port of erts/emulator/beam/erl_db_util.c:4384, OTP-29.1.1 (dmc_tuple).
-    // SAFETY: source or program heap is live during extraction.
-    let view = unsafe { term.tuple_ref() }.ok_or(EtsError::BadArg)?;
+    let view = tuple_view(term).ok_or(EtsError::BadArg)?;
     Ok(view.iter().collect())
 }
 
@@ -260,8 +480,7 @@ fn head_variables(term: Term, bound: &mut HashSet<usize>) -> Result<(), EtsError
         }
         TermKind::List => {
             // Port of erts/emulator/beam/erl_db_util.c:2324, OTP-29.1.1 (matchList).
-            // SAFETY: the copied specification heap remains live during compilation.
-            let (head, tail) = unsafe { term.cons_ref() }.ok_or(EtsError::BadArg)?;
+            let (head, tail) = cons(term).ok_or(EtsError::BadArg)?;
             head_variables(head, bound)?;
             head_variables(tail, bound)?;
         }
@@ -422,8 +641,7 @@ fn validate_expr(
         // Walk the spine iteratively: long lists are not nesting.
         let mut rest = term;
         while rest.classify() == TermKind::List {
-            // SAFETY: the copied specification heap remains live during compilation.
-            let (head, tail) = unsafe { rest.cons_ref() }.ok_or(EtsError::BadArg)?;
+            let (head, tail) = cons(rest).ok_or(EtsError::BadArg)?;
             validate_expr(head, guard, bound, trace, depth)?;
             rest = tail;
         }
@@ -743,6 +961,59 @@ impl MatchProgram {
     /// Infer a key interval only when one clause has direct key comparisons.
     // Port of erts/emulator/beam/erl_db_util.c:1700, OTP-29.1.1 (db_getkey).
     pub fn key_bounds(&self, keypos: usize) -> Option<KeyBounds> {
+        let mut bounds = self.guard_bounds(keypos).unwrap_or(KeyBounds {
+            lower: None,
+            upper: None,
+            least: None,
+            most: None,
+        });
+        if let Some((least, most)) = self.head_key_range(keypos) {
+            bounds.least = Some(least);
+            bounds.most = Some(most);
+        }
+        (bounds.lower.is_some()
+            || bounds.upper.is_some()
+            || bounds.least.is_some()
+            || bounds.most.is_some())
+        .then_some(bounds)
+    }
+
+    /// Least and most key pattern over all clause heads when the keys are bound or
+    /// partly bound in every clause that can match at all.
+    // Port of erts/emulator/beam/erl_db_tree.c:2756 (analyze_pattern) and :3828
+    // (key_boundness), OTP-29.1.1.
+    fn head_key_range(&self, keypos: usize) -> Option<(Term, Term)> {
+        let (mut least, mut most): (Option<Term>, Option<Term>) = (None, None);
+        let mut ranged = false;
+        for clause in &self.clauses {
+            let head = clause.head;
+            if is_match_variable(head) {
+                return None;
+            }
+            let Some(items) = tuple_view(head) else {
+                continue;
+            };
+            let Some(key) = items.get(keypos.checked_sub(1)?) else {
+                continue;
+            };
+            if !is_fully_bound(key) && (is_match_variable(key) || has_map(key)) {
+                return None;
+            }
+            ranged = true;
+            if least.is_none_or(|l| partly_bound_can_match_lesser(key, l)) {
+                least = Some(key);
+            }
+            if most.is_none_or(|m| partly_bound_can_match_greater(key, m)) {
+                most = Some(key);
+            }
+        }
+        if !ranged {
+            return None;
+        }
+        Some((least?, most?))
+    }
+
+    fn guard_bounds(&self, keypos: usize) -> Option<KeyBounds> {
         let [clause] = self.clauses.as_slice() else {
             return None;
         };
@@ -751,6 +1022,8 @@ impl MatchProgram {
         let mut bounds = KeyBounds {
             lower: None,
             upper: None,
+            least: None,
+            most: None,
         };
         for &guard in &clause.guards {
             let expr = tuple(guard).ok()?;
@@ -854,7 +1127,7 @@ impl MatchProgram {
         {
             return None;
         }
-        self.key_bounds(keypos)?;
+        self.guard_bounds(keypos)?;
         Some(Term::atom(global_atoms().intern("true").ok()?))
     }
 }

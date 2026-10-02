@@ -529,6 +529,9 @@ struct TaskCell<T: Task> {
 }
 struct Process<T: Task> {
     pid: Pid,
+    /// Creation order of this incarnation, so a reused pid is distinguishable.
+    /// Port of erts/emulator/beam/erl_ptab.c:530 (`u.alive.started_interval`), OTP-29.1.1.
+    started_interval: u64,
     /// User priority (`process_flag(priority, _)`).
     /// Port of erl_process.h (`ERTS_PSFLGS_USR_PRIO_MASK`), OTP-29.1.1.
     user_priority: AtomicU8,
@@ -644,8 +647,10 @@ impl<T: Task> ProcessTable<T> {
         let pix = self.ids.layout().data2pix(data) as usize;
         let page = self.pages[pix / PID_PAGE_SIZE].get_or_init(ProcessPage::new);
         let offset = pix % PID_PAGE_SIZE;
+        static NEXT_STARTED_INTERVAL: AtomicU64 = AtomicU64::new(1);
         let process = Arc::new(Process {
             pid,
+            started_interval: NEXT_STARTED_INTERVAL.fetch_add(1, Ordering::Relaxed),
             user_priority: AtomicU8::new(priority.index() as u8),
             sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
             run_epoch: AtomicU64::new(0),
@@ -4139,6 +4144,14 @@ impl<T: Task> Scheduler<T> {
     /// Whether a pid currently identifies a live task.
     pub fn lookup(&self, pid: Pid) -> bool {
         self.inner.table.lookup(pid).is_some()
+    }
+    /// Creation order of the live task with this pid; differs between incarnations
+    /// of a reused pid. Port of erts/emulator/beam/erl_db.c:4908 (heir_started_interval), OTP-29.1.1.
+    pub fn started_interval(&self, pid: Pid) -> Option<u64> {
+        self.inner
+            .table
+            .lookup(pid)
+            .map(|process| process.started_interval)
     }
     /// Whether a scheduler is executing the task right now.
     // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status: ERTS_PSFLG_RUNNING), OTP-29.1.1.

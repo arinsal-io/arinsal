@@ -461,6 +461,21 @@ pub(crate) fn clear(process: &Process, pid: Pid) {
     enabled().store(!entries.is_empty(), Ordering::Relaxed);
 }
 
+/// Keep only the `exiting` flag of an exiting process's trace entries, so its scheduling
+/// events stay visible until `out_exited` while all other events stop at exit.
+// Port of erts/emulator/beam/erl_process.c:14784 (delete_all_trace_refs after out_exited), OTP-29.1.1.
+pub(crate) fn retain_exiting(process: &Process, pid: Pid) {
+    let mut entries = table().lock().unwrap();
+    entries.retain(|(runtime, _, subject), entry| {
+        if *runtime != scope(process) || *subject != pid {
+            return true;
+        }
+        entry.flags &= EXITING;
+        entry.flags != 0
+    });
+    enabled().store(!entries.is_empty(), Ordering::Relaxed);
+}
+
 /// Remove process and future-process tracing owned by a dying tracer.
 // Port of erts/emulator/beam/erl_trace.c (tracer process termination), OTP-29.1.1.
 pub(crate) fn tracer_exited(process: &Process, pid: Pid) {
@@ -1503,7 +1518,19 @@ pub(crate) fn running_mfa(
             let (function, arity) = rest.rsplit_once('/')?;
             Some((module, function, arity.parse::<u8>().ok()?))
         });
-    let (module, function, arity) = if let Some(continuation) = continuation {
+    // Port of erts/emulator/beam/erl_db.c:3075 (BIF_TRAP1 ets_delete_continue_exp) and :3275
+    // (BIF_TRAP2 ets_internal_delete_all_2), OTP-29.1.1: a trapped call runs as the trap export.
+    let ets_trap = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.ets_free.as_ref())
+        .map(|state| match state.tid {
+            None => ("ets", "delete_trap", 1),
+            Some(_) => ("ets", "internal_delete_all", 2),
+        });
+    let (module, function, arity) = if let Some(trap) = ets_trap {
+        trap
+    } else if let Some(continuation) = continuation {
         continuation
     } else {
         let Some(module) = vm.modules.get(process.module) else {

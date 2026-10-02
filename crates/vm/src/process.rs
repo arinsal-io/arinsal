@@ -3514,6 +3514,20 @@ impl Process {
     }
 
     fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+        self.exit_stage1(vm, ctx, reason);
+        self.cold_mut().exit_cont = Some(Box::new(crate::proc_create::ExitCont {
+            reason,
+            garbage: None,
+            entry_result: None,
+            code: 0,
+        }));
+        let mut reds = isize::MAX;
+        self.exit_ets(ctx, &mut reds);
+        self.exit_stage3(ctx, reason);
+    }
+
+    /// Process exit up to the release of owned ETS tables.
+    fn exit_stage1(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.final_exit_reason = Some(reason);
         crate::natives::code::code_mod_permission_process_exit(self, ctx.pid(), ctx);
         crate::trace::emit(
@@ -3549,12 +3563,8 @@ impl Process {
             );
         }
         crate::natives::erts_debug::monitor_process_exited(self, ctx.pid());
-        crate::trace::clear(self, ctx.pid());
+        crate::trace::retain_exiting(self, ctx.pid());
         crate::trace::tracer_exited(self, ctx.pid());
-        // Further publishes fail with `NoProcess` and the watcher synthesizes
-        // DOWN. Signals already queued are installed before we notify.
-        ctx.begin_exit();
-        self.absorb_exit_signals(ctx);
         // Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1:
         // delayed literal-copy requests of an exiting process are answered with `ok`.
         if let Some(cold) = self.cold.as_mut() {
@@ -3588,24 +3598,53 @@ impl Process {
             }
             runtime.forget_process(ctx.pid());
         }
-        if let (Some(runtime), Some(owner)) = (&self.runtime, ctx.pid().to_term()) {
-            // Port of erts/emulator/beam/erl_db.c:5031 (erts_db_process_exiting), OTP-29.1.1.
-            if runtime.ets.read().unwrap().has_fixations(owner) {
-                runtime.ets.write().unwrap().release_fixations(owner);
+    }
+
+    /// Release the tables this exiting process owns, `reds` reductions at a time. Returns
+    /// whether all of them are released; otherwise the process yields and calls again.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:5031 (erts_db_process_exiting), OTP-29.1.1.
+    fn exit_ets(&mut self, ctx: &mut RunCtx<'_, Message>, reds: &mut isize) -> bool {
+        let (Some(runtime), Some(owner)) = (self.runtime.clone(), ctx.pid().to_term()) else {
+            return true;
+        };
+        // FREE_OWNED_TABLE: finish the table whose release was interrupted.
+        if let Some(mut garbage) = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.exit_cont.as_mut())
+            .and_then(|cont| cont.garbage.take())
+            && !garbage.step(reds)
+        {
+            self.cold_mut()
+                .exit_cont
+                .as_mut()
+                .expect("exit state")
+                .garbage = Some(garbage);
+            return false;
+        }
+        // GET_OWNED_TABLE
+        loop {
+            if *reds <= 0 {
+                return false;
             }
-            let owned = {
-                let registry = runtime.ets.read().unwrap();
-                registry
-                    .owned_by(owner)
-                    .into_iter()
-                    .filter_map(|tid| {
-                        let table = registry.get(tid).ok()?;
-                        let name = table.options.named_table.then_some(table.options.name);
-                        Some((tid, name, table.options.heir))
-                    })
-                    .collect::<Vec<_>>()
+            let Some(tid) = runtime.ets.read().unwrap().first_owned(owner) else {
+                break;
             };
-            for (tid, name, heir) in owned {
+            let info = {
+                let registry = runtime.ets.read().unwrap();
+                registry.get(tid).ok().map(|table| {
+                    (
+                        table.options.named_table.then_some(table.options.name),
+                        table.options.heir,
+                    )
+                })
+            };
+            let Some((name, heir)) = info else {
+                runtime.ets.write().unwrap().forget_owned(owner, tid);
+                continue;
+            };
+            {
                 // Port of erts/emulator/beam/erl_db.c:4898-4900 (give_table_to_heir),
                 // OTP-29.1.1: an owner that is its own heir keeps, and so deletes, the table.
                 let heir = heir.filter(|heir| heir.pid != owner);
@@ -3615,9 +3654,9 @@ impl Process {
                 {
                     // Port of erts/emulator/beam/erl_db.c:4910-4930 (give_table_to_heir),
                     // OTP-29.1.1: `{heir, Pid}` hands the table over without a message.
-                    let alive = runtime
-                        .scheduler()
-                        .is_ok_and(|scheduler| scheduler.lookup(pid));
+                    let alive = runtime.scheduler().is_ok_and(|scheduler| {
+                        scheduler.started_interval(pid) == Some(heir.started_interval)
+                    });
                     if alive
                         && runtime
                             .ets
@@ -3629,8 +3668,11 @@ impl Process {
                         continue;
                     }
                 } else if let Some(heir) = heir
-                    && let Some(pid) = Pid::from_term(heir.pid)
-                {
+                && let Some(pid) = Pid::from_term(heir.pid)
+                // erl_db.c:4908: a heir that died and whose pid was reused keeps nothing.
+                && runtime.scheduler().is_ok_and(|scheduler| {
+                    scheduler.started_interval(pid) == Some(heir.started_interval)
+                }) {
                     let mut heap = arinsal_term::VecHeap::new();
                     // Port of erts/emulator/beam/erl_db.c:4959-4962
                     // (send_ets_transfer_message), OTP-29.1.1.
@@ -3659,9 +3701,37 @@ impl Process {
                         }
                     }
                 }
-                let _ = runtime.ets.write().unwrap().delete(tid);
+            }
+            let detached = runtime.ets.write().unwrap().detach(tid);
+            let Ok((mut garbage, fixations)) = detached else {
+                runtime.ets.write().unwrap().forget_owned(owner, tid);
+                continue;
+            };
+            // FREE_OWNED_TABLE
+            *reds -= fixations as isize;
+            if !garbage.step(reds) {
+                self.cold_mut()
+                    .exit_cont
+                    .as_mut()
+                    .expect("exit state")
+                    .garbage = Some(garbage);
+                return false;
             }
         }
+        // UNFIX_TABLES
+        if runtime.ets.read().unwrap().has_fixations(owner) {
+            runtime.ets.write().unwrap().release_fixations(owner);
+        }
+        true
+    }
+
+    /// Process exit after its tables are released: pending signals, names, links and monitors.
+    fn exit_stage3(&mut self, ctx: &mut RunCtx<'_, Message>, reason: Term) {
+        crate::trace::clear(self, ctx.pid());
+        // Further publishes fail with `NoProcess` and the watcher synthesizes
+        // DOWN. Signals already queued are installed before we notify.
+        ctx.begin_exit();
+        self.absorb_exit_signals(ctx);
         if let Some(runtime) = &self.runtime {
             // Port of erts/emulator/beam/erl_process.c:14421-14464, OTP-29.1.1.
             // The registered name is the last Erlang resource released, after owned ETS tables.
@@ -3706,15 +3776,6 @@ impl Process {
                 );
             }
         }
-    }
-
-    fn notify_exit_with_executor(&mut self, ctx: &mut RunCtx<'_, Message>, reason: Term) {
-        EXECUTOR.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if let Some((_, executor)) = slot.as_mut() {
-                self.notify_exit(&mut executor.vm, ctx, reason);
-            }
-        });
     }
 
     pub(crate) fn send_message(&mut self, target: Term, value: Term) -> Result<Term, VmError> {
@@ -4744,6 +4805,30 @@ fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, re
     }
 }
 
+/// Run `f` on this worker's executor for `runtime`, creating it on first use.
+fn with_executor<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Executor) -> R) -> R {
+    EXECUTOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let key = Arc::as_ptr(runtime) as usize;
+        let replace = slot.as_ref().is_none_or(|(cached_key, executor)| {
+            *cached_key != key || executor.owner.strong_count() == 0
+        });
+        if replace {
+            *slot = Some((
+                key,
+                Executor {
+                    owner: Arc::downgrade(runtime),
+                    vm: Vm::shared_replica(Arc::clone(&runtime.code), &runtime.paths),
+                    x: Box::new([]),
+                    fr: Box::new([]),
+                    native_registers: SchedulerRegisters::default(),
+                },
+            ));
+        }
+        f(&mut slot.as_mut().expect("executor slot initialized").1)
+    })
+}
+
 impl Task for Process {
     type Message = Message;
 
@@ -4876,6 +4961,96 @@ fn abort_on_worker_panic(run: impl FnOnce() -> RunOutcome) -> RunOutcome {
 }
 
 impl Process {
+    /// Terminate the process: everything up to the owned ETS tables now, the tables a slice of
+    /// reductions at a time, and the rest once they are released.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:14160 (erts_continue_exit_process), OTP-29.1.1.
+    fn exit_with(
+        &mut self,
+        runtime: &Arc<Runtime>,
+        ctx: &mut RunCtx<'_, Message>,
+        reason: Term,
+        entry_result: Option<Result<ScheduledResult, VmError>>,
+        code: u64,
+    ) -> RunOutcome {
+        with_executor(runtime, |executor| {
+            self.exit_stage1(&mut executor.vm, ctx, reason)
+        });
+        self.cold_mut().exit_cont = Some(Box::new(crate::proc_create::ExitCont {
+            reason,
+            garbage: None,
+            entry_result,
+            code,
+        }));
+        self.continue_exit(runtime, ctx, false)
+    }
+
+    /// Run the interruptible part of process exit; yields with `out_exiting` when the
+    /// reductions run out and finishes with `out_exited`.
+    fn continue_exit(
+        &mut self,
+        runtime: &Arc<Runtime>,
+        ctx: &mut RunCtx<'_, Message>,
+        resumed: bool,
+    ) -> RunOutcome {
+        let zero = [Term::small(0).expect("small zero")];
+        if resumed {
+            with_executor(runtime, |executor| {
+                crate::trace::emit(
+                    Some(&mut executor.vm),
+                    self,
+                    ctx,
+                    ctx.pid(),
+                    crate::trace::EXITING,
+                    "in_exiting",
+                    &zero,
+                );
+            });
+        }
+        let initial = ctx.remaining() as isize;
+        let mut reds = initial;
+        let done = self.exit_ets(ctx, &mut reds);
+        ctx.consume((initial - reds).clamp(0, initial) as u32);
+        if !done {
+            runtime.note_status(ctx.pid(), "exiting");
+            with_executor(runtime, |executor| {
+                crate::trace::emit(
+                    Some(&mut executor.vm),
+                    self,
+                    ctx,
+                    ctx.pid(),
+                    crate::trace::EXITING,
+                    "out_exiting",
+                    &zero,
+                );
+            });
+            return RunOutcome::Yield;
+        }
+        let cont = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.exit_cont.take())
+            .expect("exit state");
+        with_executor(runtime, |executor| {
+            crate::trace::emit(
+                Some(&mut executor.vm),
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::EXITING,
+                "out_exited",
+                &zero,
+            );
+        });
+        self.exit_stage3(ctx, cont.reason);
+        if self.entry
+            && let Some(result) = cont.entry_result
+        {
+            let _ = runtime.result.send(result);
+        }
+        RunOutcome::Exit(cont.code)
+    }
+
     fn run_task(&mut self, ctx: &mut RunCtx<'_, Message>, budget: u32) -> RunOutcome {
         let Some(runtime) = self.runtime.clone() else {
             return RunOutcome::Exit(1);
@@ -4887,6 +5062,15 @@ impl Process {
         if self.dirty_exiting() {
             // Exited by a dirty signal handler while queued for a dirty scheduler.
             return RunOutcome::Exit(1);
+        }
+        if self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.exit_cont.is_some())
+        {
+            // Port of erts/emulator/beam/erl_process.c:10528 (in_exiting), OTP-29.1.1: an
+            // exiting process only continues its exit when scheduled in.
+            return self.continue_exit(&runtime, ctx, true);
         }
         let result = self.run_executor(&runtime, ctx, budget);
         if self.dirty_exiting() {
@@ -4904,29 +5088,7 @@ impl Process {
         ctx: &mut RunCtx<'_, Message>,
         budget: u32,
     ) -> Result<RunState, VmError> {
-        let result = EXECUTOR.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let key = Arc::as_ptr(runtime) as usize;
-            let replace = slot.as_ref().is_none_or(|(cached_key, executor)| {
-                *cached_key != key || executor.owner.strong_count() == 0
-            });
-            if replace {
-                *slot = Some((
-                    key,
-                    Executor {
-                        owner: Arc::downgrade(runtime),
-                        vm: Vm::shared_replica(Arc::clone(&runtime.code), &runtime.paths),
-                        x: Box::new([]),
-                        fr: Box::new([]),
-                        native_registers: SchedulerRegisters::default(),
-                    },
-                ));
-            }
-            slot.as_mut()
-                .expect("executor slot initialized")
-                .1
-                .run(self, ctx, budget)
-        });
+        let result = with_executor(runtime, |executor| executor.run(self, ctx, budget));
         if self
             .cold
             .as_ref()
@@ -4954,13 +5116,16 @@ impl Process {
         // g_proc_sched. Port of erts/emulator/beam/erl_gc.c:1197 (max_heap_size kill), OTP-29.1.1.
         if result.is_ok() && heap_limit_kills(self, ctx) {
             runtime.processes.lock().unwrap().remove(&ctx.pid());
-            self.notify_exit_with_executor(ctx, crate::signals::atom("killed"));
-            if self.entry {
-                let _ = runtime
-                    .result
-                    .send(Err(VmError::Unsupported("max_heap_size".into())));
-            }
-            return RunOutcome::Exit(1);
+            let entry_result = self
+                .entry
+                .then(|| Err(VmError::Unsupported("max_heap_size".into())));
+            return self.exit_with(
+                &runtime,
+                ctx,
+                crate::signals::atom("killed"),
+                entry_result,
+                1,
+            );
         }
         runtime.note_relations(ctx.pid(), self.cold.as_deref());
         let parked = self
@@ -5007,20 +5172,24 @@ impl Process {
                 }
                 crate::signals::process_exiting(self, ctx);
                 runtime.processes.lock().unwrap().remove(&ctx.pid());
-                self.notify_exit_with_executor(ctx, crate::signals::atom("normal"));
-                if self.entry {
+                let entry_result = self.entry.then(|| {
                     self.stats.heap_words = self.heap.capacity_words();
                     let owned = arinsal_term::to_owned(term).map_err(|error| {
                         VmError::Unsupported(format!("result conversion: {error:?}"))
                     });
-                    let result = owned.map(|term_owned| ScheduledResult {
+                    owned.map(|term_owned| ScheduledResult {
                         text: format!("{term_owned}"),
                         term: term_owned,
                         stats: self.stats.snapshot(),
-                    });
-                    let _ = runtime.result.send(result);
-                }
-                RunOutcome::Exit(0)
+                    })
+                });
+                self.exit_with(
+                    &runtime,
+                    ctx,
+                    crate::signals::atom("normal"),
+                    entry_result,
+                    0,
+                )
             }
             Err(error) => {
                 if matches!(error, VmError::Yield) {
@@ -5041,11 +5210,8 @@ impl Process {
                 if trace_boot_enabled() {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
-                self.notify_exit_with_executor(ctx, reason);
-                if self.entry {
-                    let _ = runtime.result.send(Err(error));
-                }
-                RunOutcome::Exit(1)
+                let entry_result = self.entry.then_some(Err(error));
+                self.exit_with(&runtime, ctx, reason, entry_result, 1)
             }
         }
     }
