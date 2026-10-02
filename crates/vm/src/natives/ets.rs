@@ -799,9 +799,10 @@ fn call_inner(
                 Err(ResolveFail::BadType) => return Err(badarg_cause("type")),
             };
             let table = registry.get(tid).map_err(err)?;
+            let schedulers = rt.scheduler()?.scheduler_count();
             if args.len() == 1 {
                 table
-                    .info_list(atom("nonode@nohost"), &mut heap)
+                    .info_list_for_schedulers(atom("nonode@nohost"), &mut heap, schedulers)
                     .map_err(err)
             } else {
                 let key = info_item_name(args[1]).ok_or_else(badarg)?;
@@ -812,7 +813,7 @@ fn call_inner(
                         .map_err(|_| system_limit());
                 }
                 table
-                    .info_item(key, atom("nonode@nohost"), &mut heap)
+                    .info_item_for_schedulers(key, atom("nonode@nohost"), &mut heap, schedulers)
                     .map_err(err)
             }
         }

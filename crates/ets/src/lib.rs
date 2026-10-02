@@ -1779,22 +1779,49 @@ impl Table {
 
     /// Heap and table allocations, reported in machine words.
     pub fn memory_words(&self) -> usize {
+        self.memory_words_for_schedulers(1)
+    }
+
+    /// Return the OTP table allocation total for the runtime's scheduler count.
+    pub fn memory_words_for_schedulers(&self, schedulers: usize) -> usize {
         // Port of erl_db_hash.c:1017 and erl_db_tree.c:560, OTP-29.1.1.
-        // These are sizeof(DbTable)+the initial 256-bucket hash segment and
-        // sizeof(DbTableTree), respectively, on the supported 64-bit target.
+        // OTP's frequent-read rwlocks reserve one cache line per reader group plus
+        // two bookkeeping lines. Its decentralized counter array reserves one
+        // cache-line counter slot per scheduler plus one spare slot.
+        let schedulers = schedulers.max(1);
+        let concurrent = schedulers > 1 && self.options.protection != Protection::Private;
+        let rwlock_words = 8 * (schedulers + 2);
         match &self.storage {
             Storage::Ordered(root) => {
                 let mut objects = Vec::new();
                 Node::walk(root, &mut objects);
-                146 + objects
-                    .iter()
-                    .map(|object| object.db_size_words)
-                    .sum::<usize>()
+                let table =
+                    146 + usize::from(concurrent && self.options.read_concurrency) * rwlock_words;
+                table
+                    + objects
+                        .iter()
+                        .map(|object| object.db_size_words)
+                        .sum::<usize>()
             }
             Storage::CATree(tree) => {
-                146 + tree.objects().map_or(0, |objects| {
-                    objects.iter().map(|object| object.db_size_words).sum()
-                })
+                let table = if concurrent {
+                    // Port of erl_db_catree.c:1031-1053 and erl_flxctr.c:51-55,
+                    // OTP-29.1.1. This includes the initial base node, its lock,
+                    // and (when enabled) the decentralized counter allocation.
+                    93 + 8 * schedulers
+                        + if self.options.decentralized_counters {
+                            18 + 8 * schedulers
+                        } else {
+                            0
+                        }
+                        + usize::from(self.options.read_concurrency) * rwlock_words
+                } else {
+                    146
+                };
+                table
+                    + tree.objects().map_or(0, |objects| {
+                        objects.iter().map(|object| object.db_size_words).sum()
+                    })
             }
             Storage::Hash(storage) => {
                 // The empty hash table reports 312 words on OTP 29.1.1/M1;
@@ -1802,7 +1829,18 @@ impl Table {
                 // Port of erl_db_hash.c:3331-3345: an extended segment uses
                 // 2048 bucket words. The first extension table has 256
                 // pointers; later tables grow by 128 pointers at a time.
-                let extra_slots = storage.nslots.saturating_sub(256);
+                let lock_count = match self.options.write_concurrency {
+                    WriteConcurrency::Disabled => 0,
+                    WriteConcurrency::Enabled => 64,
+                    WriteConcurrency::Auto => storage.lock_count(),
+                    WriteConcurrency::Fixed(count) => count,
+                };
+                let allocated_slots = storage.nslots.max(if lock_count > storage.nslots {
+                    storage.nslots + (lock_count - storage.nslots).div_ceil(2048) * 2048
+                } else {
+                    storage.nslots
+                });
+                let extra_slots = allocated_slots.saturating_sub(256);
                 let ext_segments = extra_slots.div_ceil(2048);
                 let ext_capacity = if ext_segments == 0 {
                     0
@@ -1816,8 +1854,41 @@ impl Table {
                 } else {
                     7 + ext_capacity
                 };
+                let fine_locks = if !concurrent || lock_count == 0 {
+                    0
+                } else {
+                    // Port of erl_db_hash.c:1041-1072 and erl_db_hash.h:54-69,
+                    // OTP-29.1.1. The cache-line padded lock slots and the
+                    // runtime-sized reader arrays are included in the ETS counter.
+                    16 * lock_count
+                        + rwlock_words
+                        + if self.options.read_concurrency {
+                            lock_count * rwlock_words
+                        } else {
+                            0
+                        }
+                };
+                let read_lock = if concurrent
+                    && self.options.read_concurrency
+                    && self.options.write_concurrency == WriteConcurrency::Disabled
+                {
+                    rwlock_words
+                } else {
+                    0
+                };
+                let decentralized = if self.options.decentralized_counters
+                    && self.options.write_concurrency != WriteConcurrency::Disabled
+                    && concurrent
+                {
+                    18 + 8 * schedulers
+                } else {
+                    0
+                };
                 312 + extra_slots
                     + ext_table
+                    + fine_locks
+                    + read_lock
+                    + decentralized
                     + storage
                         .values()
                         .chain(&storage.deleted)
@@ -1833,6 +1904,17 @@ impl Table {
         key: &str,
         node: Term,
         dst: &mut H,
+    ) -> Result<Term, EtsError> {
+        self.info_item_for_schedulers(key, node, dst, 1)
+    }
+
+    /// Return one `ets:info/2` value using the owning runtime's scheduler count.
+    pub fn info_item_for_schedulers<H: HeapAlloc>(
+        &self,
+        key: &str,
+        node: Term,
+        dst: &mut H,
+        schedulers: usize,
     ) -> Result<Term, EtsError> {
         let atom = |name: &str| -> Term { Term::atom(global_atoms().intern(name).unwrap()) };
         let bool_term = |value: bool| atom(if value { "true" } else { "false" });
@@ -1861,7 +1943,7 @@ impl Table {
                 None => Ok(atom("none")),
             },
             "size" => int_term(self.len(), dst),
-            "memory" => int_term(self.memory_words(), dst),
+            "memory" => int_term(self.memory_words_for_schedulers(schedulers), dst),
             "node" => Ok(copy_term(node, dst)?),
             "named_table" => Ok(bool_term(self.options.named_table)),
             "read_concurrency" => Ok(bool_term(self.options.read_concurrency)),
@@ -1911,6 +1993,16 @@ impl Table {
 
     /// Return the `ets:info/1` property list in OTP key order.
     pub fn info_list<H: HeapAlloc>(&self, node: Term, dst: &mut H) -> Result<Term, EtsError> {
+        self.info_list_for_schedulers(node, dst, 1)
+    }
+
+    /// Return the `ets:info/1` property list using the owning scheduler count.
+    pub fn info_list_for_schedulers<H: HeapAlloc>(
+        &self,
+        node: Term,
+        dst: &mut H,
+        schedulers: usize,
+    ) -> Result<Term, EtsError> {
         let names = [
             "id",
             "decentralized_counters",
@@ -1931,7 +2023,7 @@ impl Table {
         let mut items = Vec::with_capacity(names.len());
         for name in names {
             let key = Term::atom(global_atoms().intern(name).unwrap());
-            let value = self.info_item(name, node, dst)?;
+            let value = self.info_item_for_schedulers(name, node, dst, schedulers)?;
             items.push(TermBuilder::new(dst).tuple(&[key, value])?);
         }
         Ok(TermBuilder::new(dst).list_from_iter(items)?)
