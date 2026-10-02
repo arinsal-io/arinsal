@@ -15,7 +15,7 @@ permissions:
 jobs:
   test:
     name: Rust and BEAM compatibility
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 90
 
     steps:
@@ -42,7 +42,7 @@ jobs:
         run: tools/difftest/smoke.sh
 
       - name: Compare VM stage1 cases with OTP
-        run: timeout 600 cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
+        run: cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
 
       - name: Fetch Elixir demo dependencies
         working-directory: examples/arinsal_demo
