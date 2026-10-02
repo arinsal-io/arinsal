@@ -2290,7 +2290,11 @@ impl Executor {
         }
         let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
         let running_fields = running.as_slice();
-        if matches!(result, Ok(RunState::Yield | RunState::Wait { .. })) {
+        // A waiting process is not collected when it switches out: erts only runs
+        // `scheduler_gc_proc` for a process being scheduled in (a yielded process is still
+        // active) or handling signals/sys tasks, so a sleeping receiver with on-heap message
+        // fragments keeps them until it next runs.
+        if matches!(result, Ok(RunState::Yield)) {
             // erts collects a switched-out process rooting only its `c_p->arity` live X
             // registers; the saved register file above that holds dead registers whose
             // pointers may refer to a heap an earlier collection already freed.
