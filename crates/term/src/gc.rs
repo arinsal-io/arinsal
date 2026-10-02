@@ -621,6 +621,27 @@ impl ProcessHeap {
             })
     }
 
+    /// Like `owns_term`, but resolves fragment ownership through `index`, which
+    /// is brought up to date first. Avoids a linear fragment scan per term when
+    /// a root scan visits many terms of a heap with many fragments.
+    pub fn owns_term_indexed(&self, term: Term, index: &mut FragmentIndex) -> bool {
+        if !term.is_pointer() {
+            return false;
+        }
+        let address = (term.bits() & !7) as usize;
+        if self.words.contains_initialized(address, self.htop)
+            || self.old_words.contains_initialized(address, self.old_htop)
+        {
+            return true;
+        }
+        index.sync(&self.fragments);
+        index
+            .ranges
+            .range(..=address)
+            .next_back()
+            .is_some_and(|(_, end)| address < *end)
+    }
+
     /// Allocate a heap fragment and return its pointer after it enters the owner list.
     pub fn gc_fragment(&mut self, words: usize) -> *mut u64 {
         self.heap_fragment(words)
@@ -1527,4 +1548,28 @@ pub struct GcInfoWords {
     pub old_heap_size: usize,
     /// Used young-heap words.
     pub heap_size: usize,
+}
+
+/// Address index over a heap's fragments for repeated ownership queries.
+#[derive(Default)]
+pub struct FragmentIndex {
+    synced: usize,
+    ranges: std::collections::BTreeMap<usize, usize>,
+}
+
+impl FragmentIndex {
+    /// Fragments are only ever appended between collections; a shorter list
+    /// means a collection ran and the index is rebuilt.
+    fn sync(&mut self, fragments: &[crate::heap::Fragment]) {
+        if fragments.len() < self.synced {
+            self.synced = 0;
+            self.ranges.clear();
+        }
+        for fragment in &fragments[self.synced..] {
+            let start = fragment.as_ptr() as usize;
+            self.ranges
+                .insert(start, start.saturating_add(fragment.len() * 8));
+        }
+        self.synced = fragments.len();
+    }
 }
