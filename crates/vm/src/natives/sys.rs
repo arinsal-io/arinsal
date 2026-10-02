@@ -28,43 +28,45 @@ const RECORD: u64 = 0x1c;
 const SUB_BITS: u64 = 0x24;
 const MAP: u64 = 0x2c;
 
-static LAST_REDUCTIONS: AtomicU64 = AtomicU64::new(0);
-static LAST_EXACT_REDUCTIONS: AtomicU64 = AtomicU64::new(0);
-static LAST_CONTEXT_SWITCHES: AtomicU64 = AtomicU64::new(0);
-static GC_COUNT: AtomicU64 = AtomicU64::new(0);
-static GC_WORDS: AtomicU64 = AtomicU64::new(0);
-static LAST_RUNTIME_MS: AtomicU64 = AtomicU64::new(0);
-static LAST_WALL_MS: AtomicU64 = AtomicU64::new(0);
-static CPU_ORIGIN_NS: OnceLock<u64> = OnceLock::new();
-static WALL_ORIGIN: OnceLock<Instant> = OnceLock::new();
-static MICROSTATE: AtomicBool = AtomicBool::new(false);
 type MicrostateBaseline = (Instant, Vec<[u64; 7]>, [u64; 2]);
-static CPU_TOPOLOGY: OnceLock<Mutex<Option<arinsal_etf::OwnedTerm>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct SchedBase {
     started: Instant,
     active_ns: Vec<u64>,
 }
-static SCHED_WALL: Mutex<Option<SchedBase>> = Mutex::new(None);
-static MICROSTATE_BASE: Mutex<Option<MicrostateBaseline>> = Mutex::new(None);
-static SYSTEM_LOGGER: OnceLock<Mutex<Term>> = OnceLock::new();
-/// Initialize statistics origins when the VM is created, as erts does at boot.
-pub(crate) fn initialize_statistics_origins() {
+/// Clock origins captured when the VM boots and copied into its runtime.
+#[derive(Clone, Copy)]
+pub(crate) struct StatisticsOrigins {
+    cpu_ns: u64,
+    wall: Instant,
+}
+
+impl StatisticsOrigins {
+    pub(crate) fn now() -> Self {
+        Self {
+            cpu_ns: cpu_ns(),
+            wall: Instant::now(),
+        }
+    }
+}
+
+/// Initialize clock origins before a VM can execute code.
+pub(crate) fn initialize_statistics_origins() -> StatisticsOrigins {
     arinsal_bifs::initialize_time_origin();
-    CPU_ORIGIN_NS.get_or_init(cpu_ns);
-    WALL_ORIGIN.get_or_init(Instant::now);
+    StatisticsOrigins::now()
 }
 
 /// Record a collection and acknowledge persistent-term literals this process may hold.
 pub(crate) fn after_collection(
-    _process: &mut Process,
+    process: &mut Process,
     _live_x: usize,
     collections: u64,
     words_reclaimed: u64,
 ) {
-    GC_COUNT.fetch_add(collections, Ordering::Relaxed);
-    GC_WORDS.fetch_add(words_reclaimed, Ordering::Relaxed);
+    let flags = runtime_state(process);
+    flags.gc_count.fetch_add(collections, Ordering::Relaxed);
+    flags.gc_words.fetch_add(words_reclaimed, Ordering::Relaxed);
 }
 
 /// Handle one phase of a literal-copy request after earlier signals have drained.
@@ -989,6 +991,8 @@ fn system_info(
         Some("schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.schedulers_total as u64)
         })),
+        // Port of erts/emulator/beam/erl_bif_info.c:3283-3324 (`all_schedulers_state`), OTP-29.1.1.
+        Some("all_schedulers_state") => Some(all_schedulers_state(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
         Some("scheduler_id") => Some(
             ctx.and_then(RunCtx::scheduler_id)
@@ -2151,31 +2155,39 @@ fn statistics(
     };
     match name {
         "runtime" => {
-            let (total, delta) = since(runtime_ms(), &LAST_RUNTIME_MS);
+            let flags = runtime_state(process);
+            let (total, delta) = since(runtime_ms(flags), &flags.last_runtime_ms);
             pair(process, total, delta)
         }
         "wall_clock" => {
-            let (total, delta) = since(wall_ms(), &LAST_WALL_MS);
+            let flags = runtime_state(process);
+            let (total, delta) = since(wall_ms(flags), &flags.last_wall_ms);
             pair(process, total, delta)
         }
         "reductions" => {
-            let (total, delta) = since(reduction_total(ctx.as_deref()), &LAST_REDUCTIONS);
+            let flags = runtime_state(process);
+            let (total, delta) = since(reduction_total(ctx.as_deref()), &flags.last_reductions);
             pair(process, total, delta)
         }
         "exact_reductions" => {
-            let (total, delta) = since(reduction_total(ctx.as_deref()), &LAST_EXACT_REDUCTIONS);
+            let flags = runtime_state(process);
+            let (total, delta) = since(
+                reduction_total(ctx.as_deref()),
+                &flags.last_exact_reductions,
+            );
             pair(process, total, delta)
         }
         "context_switches" => {
             let total =
                 scheduler_stats(process, ctx.as_deref()).map_or(0, |stats| stats.context_switches);
-            let (_, delta) = since(total, &LAST_CONTEXT_SWITCHES);
+            let flags = runtime_state(process);
+            let (_, delta) = since(total, &flags.last_context_switches);
             pair(process, total, delta)
         }
         "garbage_collection" => triple(
             process,
-            GC_COUNT.load(Ordering::Relaxed),
-            GC_WORDS.load(Ordering::Relaxed),
+            runtime_state(process).gc_count.load(Ordering::Relaxed),
+            runtime_state(process).gc_words.load(Ordering::Relaxed),
             0,
         ),
         "io" => io_counters(process),
@@ -2231,8 +2243,8 @@ fn system_flag(
     };
     match name {
         "multi_scheduling" => multi_scheduling(process, ctx, args[1]),
-        "schedulers_online" => schedulers_online(process, args[1], false),
-        "dirty_cpu_schedulers_online" => schedulers_online(process, args[1], true),
+        "schedulers_online" => schedulers_online(process, ctx, args[1], false),
+        "dirty_cpu_schedulers_online" => schedulers_online(process, ctx, args[1], true),
         "fullsweep_after" => fullsweep_after(process, args[1]),
         "min_heap_size" => heap_minimum(process, args[1], true),
         "min_bin_vheap_size" => heap_minimum(process, args[1], false),
@@ -2272,15 +2284,15 @@ fn system_flag(
             set_cpu_topology(process, args[1], "system_flag")
         }
         "erts_alloc" => erts_alloc_flag(process, args[1]),
-        "system_logger" => set_system_logger(args[1]),
+        "system_logger" => set_system_logger(process, args[1]),
         _ => Err(badarg()),
     }
 }
 
 // Port of erts/emulator/beam/erl_cpu_topology.c:1348 (`erts_set_cpu_topology`), OTP-29.1.1.
 fn cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
-    let current = CPU_TOPOLOGY
-        .get_or_init(|| Mutex::new(None))
+    let current = runtime_state(process)
+        .cpu_topology
         .lock()
         .expect("CPU topology state")
         .clone();
@@ -2309,8 +2321,8 @@ fn set_cpu_topology(
         }
         Some(owned)
     };
-    let mut current = CPU_TOPOLOGY
-        .get_or_init(|| Mutex::new(None))
+    let mut current = runtime_state(process)
+        .cpu_topology
         .lock()
         .expect("CPU topology state");
     let previous = current.clone();
@@ -2399,8 +2411,8 @@ fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>
         .and_then(|cold| cold.group_leader)
         .and_then(|leader| leader.to_term())
         .unwrap_or(Term::NIL);
-    let timestamp = WALL_ORIGIN
-        .get_or_init(Instant::now)
+    let timestamp = runtime_state(process)
+        .wall_origin
         .elapsed()
         .as_micros()
         .try_into()
@@ -2540,13 +2552,15 @@ fn erts_alloc_flag(process: &mut Process, value: Term) -> Result<Term, VmError> 
     Ok(atom("notsup"))
 }
 
-pub(crate) fn set_system_logger(value: Term) -> Result<Term, VmError> {
+pub(crate) fn set_system_logger(process: &Process, value: Term) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_trace.c:2486, OTP-29.1.1.
     if value != atom("logger") && value != atom("undefined") && value.as_pid().is_none() {
         return Err(badarg());
     }
-    let slot = SYSTEM_LOGGER.get_or_init(|| Mutex::new(atom("logger")));
-    let mut current = slot.lock().expect("system logger");
+    let mut current = runtime_state(process)
+        .system_logger
+        .lock()
+        .expect("system logger");
     Ok(std::mem::replace(&mut *current, value))
 }
 
@@ -2568,7 +2582,10 @@ fn set_scheduler_wall_enabled(
     ctx: &mut RunCtx<'_, Message>,
     enable: bool,
 ) -> Result<Term, VmError> {
-    let mut state = SCHED_WALL.lock().expect("scheduler wall time");
+    let mut state = runtime_state(process)
+        .sched_wall
+        .lock()
+        .expect("scheduler wall time");
     let previous = state.is_some();
     if enable && state.is_none() {
         *state = Some(SchedBase {
@@ -2583,7 +2600,8 @@ fn set_scheduler_wall_enabled(
     if enable && !previous {
         let active_ns = scheduler_stats(process, Some(ctx))
             .map_or_else(Vec::new, |stats| all_active_ns(&stats));
-        SCHED_WALL
+        runtime_state(process)
+            .sched_wall
             .lock()
             .expect("scheduler wall time")
             .as_mut()
@@ -2594,7 +2612,11 @@ fn set_scheduler_wall_enabled(
 }
 
 fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, Message>) {
-    let enabled = SCHED_WALL.lock().expect("scheduler wall time").is_some();
+    let enabled = runtime_state(process)
+        .sched_wall
+        .lock()
+        .expect("scheduler wall time")
+        .is_some();
     if let Some(scheduler) = process
         .runtime
         .as_ref()
@@ -2603,6 +2625,24 @@ fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, Message>) {
         scheduler.set_accounting_enabled(enabled);
     }
     ctx.set_wall_accounting_enabled(enabled);
+}
+
+/// Statistics counters and bookkeeping of one runtime; erts keeps them in emulator globals.
+pub(crate) struct StatisticsState {
+    pub(crate) last_reductions: AtomicU64,
+    pub(crate) last_exact_reductions: AtomicU64,
+    pub(crate) last_context_switches: AtomicU64,
+    pub(crate) gc_count: AtomicU64,
+    pub(crate) gc_words: AtomicU64,
+    last_runtime_ms: AtomicU64,
+    last_wall_ms: AtomicU64,
+    cpu_origin_ns: u64,
+    wall_origin: Instant,
+    microstate: AtomicBool,
+    cpu_topology: Mutex<Option<arinsal_etf::OwnedTerm>>,
+    sched_wall: Mutex<Option<SchedBase>>,
+    microstate_base: Mutex<Option<MicrostateBaseline>>,
+    system_logger: Mutex<Term>,
 }
 
 /// `erlang:system_flag/2` state of one runtime.
@@ -2619,6 +2659,38 @@ pub(crate) struct SystemFlags {
     dirty_io_total: usize,
     trace_word: i64,
     outstanding: u64,
+}
+
+impl StatisticsState {
+    pub(crate) fn new(origins: StatisticsOrigins) -> Self {
+        Self {
+            last_reductions: AtomicU64::new(0),
+            last_exact_reductions: AtomicU64::new(0),
+            last_context_switches: AtomicU64::new(0),
+            gc_count: AtomicU64::new(0),
+            gc_words: AtomicU64::new(0),
+            last_runtime_ms: AtomicU64::new(0),
+            last_wall_ms: AtomicU64::new(0),
+            cpu_origin_ns: origins.cpu_ns,
+            wall_origin: origins.wall,
+            microstate: AtomicBool::new(false),
+            cpu_topology: Mutex::new(None),
+            sched_wall: Mutex::new(None),
+            microstate_base: Mutex::new(None),
+            system_logger: Mutex::new(atom("logger")),
+        }
+    }
+}
+
+fn runtime_state(process: &Process) -> &StatisticsState {
+    static UNATTACHED: OnceLock<StatisticsState> = OnceLock::new();
+    process
+        .runtime
+        .as_ref()
+        .map(|runtime| &runtime.statistics)
+        .unwrap_or_else(|| {
+            UNATTACHED.get_or_init(|| StatisticsState::new(StatisticsOrigins::now()))
+        })
 }
 
 pub(crate) struct GcSpawnDefaults {
@@ -2920,7 +2992,12 @@ pub(crate) fn release_multi_scheduling_blocks(process: &mut Process, pid: arinsa
     }
 }
 
-fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term, VmError> {
+fn schedulers_online(
+    process: &Process,
+    ctx: &RunCtx<'_, Message>,
+    value: Term,
+    dirty: bool,
+) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8228 (erts_set_schedulers_online), OTP-29.1.1.
     let requested = value.as_small().ok_or_else(badarg)?;
     with_flags(process, |flags| {
@@ -2971,6 +3048,16 @@ fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term
             .and_then(|runtime| runtime.scheduler().ok())
         {
             scheduler.set_dirty_cpu_online(flags.dirty_cpu_online);
+            if !dirty && multi_scheduling_state(process, |state| state.any_blocked()) {
+                // Port of erts/emulator/beam/erl_process.c:8316-8321
+                // (`erts_set_schedulers_online`), OTP-29.1.1: keep the blocking
+                // scheduler online so the suspended caller can be resumed.
+                let caller = ctx
+                    .worker_id()
+                    .filter(|worker| *worker < flags.schedulers_online)
+                    .unwrap_or(0);
+                scheduler.set_scheduling_blocked(true, Some(caller));
+            }
         }
         Term::small(previous as i64).ok_or_else(badarg)
     })
@@ -3136,16 +3223,19 @@ fn set_microstate(
     ctx: &mut RunCtx<'_, Message>,
     value: Term,
 ) -> Result<Term, VmError> {
-    let previous = MICROSTATE.load(Ordering::Relaxed);
+    let previous = runtime_state(process).microstate.load(Ordering::Relaxed);
     match atom_name(value) {
         Some("true") => {
-            MICROSTATE.store(true, Ordering::Relaxed);
+            runtime_state(process)
+                .microstate
+                .store(true, Ordering::Relaxed);
             set_microstate_workers(process, true);
             ctx.set_msacc_accounting_enabled(true);
             ctx.set_msacc_state(arinsal_sched::MsaccState::Emulator);
             if !previous {
                 ctx.set_gc_accounting_baseline(process.stats.gc.nanoseconds);
-                if MICROSTATE_BASE
+                if runtime_state(process)
+                    .microstate_base
                     .lock()
                     .expect("microstate baseline")
                     .is_none()
@@ -3155,7 +3245,9 @@ fn set_microstate(
             }
         }
         Some("false") => {
-            MICROSTATE.store(false, Ordering::Relaxed);
+            runtime_state(process)
+                .microstate
+                .store(false, Ordering::Relaxed);
             ctx.account_gc_total(process.stats.gc.nanoseconds);
             ctx.set_msacc_accounting_enabled(false);
             set_microstate_workers(process, false);
@@ -3191,8 +3283,10 @@ fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, Message>) {
     let stats = scheduler_stats(process, Some(ctx));
     let counters = stats.as_ref().map_or_else(Vec::new, all_msacc_ns);
     let poll_baseline = crate::check_io::msacc_snapshot();
-    *MICROSTATE_BASE.lock().expect("microstate baseline") =
-        Some((Instant::now(), counters, poll_baseline));
+    *runtime_state(process)
+        .microstate_base
+        .lock()
+        .expect("microstate baseline") = Some((Instant::now(), counters, poll_baseline));
 }
 
 fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
@@ -3409,15 +3503,13 @@ fn cpu_ns() -> u64 {
     (ts.tv_sec as u64).saturating_mul(1_000_000_000) + ts.tv_nsec as u64
 }
 
-fn runtime_ms() -> u64 {
+fn runtime_ms(flags: &StatisticsState) -> u64 {
     let now = cpu_ns();
-    let origin = *CPU_ORIGIN_NS.get_or_init(|| now);
-    now.saturating_sub(origin) / 1_000_000
+    now.saturating_sub(flags.cpu_origin_ns) / 1_000_000
 }
 
-fn wall_ms() -> u64 {
-    let origin = *WALL_ORIGIN.get_or_init(Instant::now);
-    u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+fn wall_ms(flags: &StatisticsState) -> u64 {
+    u64::try_from(flags.wall_origin.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn logical_processors() -> usize {
@@ -3436,6 +3528,64 @@ fn scheduler_stats(
         .as_ref()
         .and_then(|runtime| runtime.scheduler().ok())
         .map(|scheduler| scheduler.stats())
+}
+
+fn all_schedulers_state(process: &mut Process) -> Result<Term, VmError> {
+    let (normal, online, dirty_cpu, dirty_online, dirty_io) = with_flags(process, |flags| {
+        (
+            flags.schedulers_total,
+            flags.schedulers_online,
+            flags.dirty_cpu_total,
+            flags.dirty_cpu_online,
+            flags.dirty_io_total,
+        )
+    });
+    // Port of erts/emulator/beam/erl_process.c:8130-8152 (`erts_schedulers_state`), OTP-29.1.1.
+    // These are scheduler suspend counts, not workers currently executing tasks.
+    let (any_blocked, blocked) = multi_scheduling_state(process, |state| {
+        (state.any_blocked(), state.state() == "blocked")
+    });
+    let active = if any_blocked { 1 } else { online };
+    let dirty_cpu_active = if blocked { 0 } else { dirty_online };
+    let dirty_io_active = if blocked { 0 } else { dirty_io };
+    let mut states = Vec::with_capacity(3);
+    states.push(scheduler_state_owned(
+        "normal",
+        [normal as u64, online as u64, active as u64],
+    ));
+    if dirty_cpu > 0 {
+        states.push(scheduler_state_owned(
+            "dirty_cpu",
+            [
+                dirty_cpu as u64,
+                dirty_online as u64,
+                dirty_cpu_active as u64,
+            ],
+        ));
+    }
+    if dirty_io > 0 {
+        states.push(scheduler_state_owned(
+            "dirty_io",
+            [dirty_io as u64, dirty_io as u64, dirty_io_active as u64],
+        ));
+    }
+    owned_system_info(
+        process,
+        arinsal_etf::OwnedTerm::List {
+            elems: states,
+            tail: Box::new(arinsal_etf::OwnedTerm::Nil),
+        },
+    )
+}
+
+fn scheduler_state_owned(kind: &str, [total, online, active]: [u64; 3]) -> arinsal_etf::OwnedTerm {
+    use arinsal_etf::OwnedTerm as O;
+    O::Tuple(vec![
+        O::Atom(kind.to_owned()),
+        O::Int(total as i64),
+        O::Int(online as i64),
+        O::Int(active as i64),
+    ])
 }
 
 fn queue_counts(
@@ -3484,7 +3634,11 @@ fn scheduler_wall(
     include_dirty_io: bool,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c scheduler active/total time accounting, OTP-29.1.1.
-    let base = SCHED_WALL.lock().expect("scheduler wall time").clone();
+    let base = runtime_state(process)
+        .sched_wall
+        .lock()
+        .expect("scheduler wall time")
+        .clone();
     let Some(base) = base else {
         return Ok(atom("undefined"));
     };
@@ -3541,7 +3695,8 @@ fn microstate(
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_msacc.c result layout, OTP-29.1.1.
     // erts keeps msacc counters from boot, so the list exists even if accounting was never on.
-    if MICROSTATE_BASE
+    if runtime_state(process)
+        .microstate_base
         .lock()
         .expect("microstate baseline")
         .is_none()
@@ -3549,11 +3704,15 @@ fn microstate(
     {
         reset_microstate_baseline(process, ctx);
     }
-    let baseline = MICROSTATE_BASE.lock().expect("microstate baseline").clone();
+    let baseline = runtime_state(process)
+        .microstate_base
+        .lock()
+        .expect("microstate baseline")
+        .clone();
     let Some((started, baseline, poll_baseline)) = baseline else {
         return Ok(atom("undefined"));
     };
-    let elapsed = if MICROSTATE.load(Ordering::Relaxed) {
+    let elapsed = if runtime_state(process).microstate.load(Ordering::Relaxed) {
         u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
     } else {
         0
@@ -3810,6 +3969,110 @@ mod tests {
     /// Tests that change or read the process-global scheduler flags run one
     /// at a time; the flags are shared by every test in this binary.
     static SCHEDULER_FLAGS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn all_scheduler_state_matches_otp() {
+        let _flags = SCHEDULER_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping all scheduler state differential test");
+            return;
+        };
+        let beam = reference
+            .compile_named(
+                "all_scheduler_state_probe",
+                "-module(all_scheduler_state_probe). -export([run/0]). run() -> erlang:system_info(all_schedulers_state).",
+                &[],
+            )
+            .unwrap();
+        reference.load("all_scheduler_state_probe", &beam).unwrap();
+        let expected = reference.call("all_scheduler_state_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("all_scheduler_state_probe", "run", &[], 10, None)
+            .unwrap_or_else(|error| panic!("all scheduler state VM error: {error:?}"));
+        assert_eq!(expected, CallResult::Ok(actual.term));
+    }
+
+    #[test]
+    fn system_logger_is_isolated_between_vm_runtimes() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping per-runtime system logger test");
+            return;
+        };
+        let first_beam = reference
+            .compile_named(
+                "runtime_logger_first",
+                "-module(runtime_logger_first). -export([run/0]). run() -> erlang:system_flag(system_logger, undefined).",
+                &[],
+            )
+            .unwrap();
+        let second_beam = reference
+            .compile_named(
+                "runtime_logger_second",
+                "-module(runtime_logger_second). -export([run/0]). run() -> erlang:system_flag(system_logger, undefined).",
+                &[],
+            )
+            .unwrap();
+        let mut first = Vm::new([]);
+        first.load_bytes(&first_beam).unwrap();
+        assert_eq!(
+            first
+                .eval_scheduled("runtime_logger_first", "run", &[], 1, None)
+                .unwrap()
+                .term,
+            OwnedTerm::atom("logger")
+        );
+        let mut second = Vm::new([]);
+        second.load_bytes(&second_beam).unwrap();
+        assert_eq!(
+            second
+                .eval_scheduled("runtime_logger_second", "run", &[], 1, None)
+                .unwrap()
+                .term,
+            OwnedTerm::atom("logger")
+        );
+    }
+
+    #[test]
+    fn statistics_reduction_delta_is_isolated_between_vm_runtimes() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping per-runtime statistics test");
+            return;
+        };
+        let beam = reference
+            .compile_named(
+                "runtime_reductions_probe",
+                "-module(runtime_reductions_probe). -export([run/0]). run() -> First=erlang:statistics(reductions), Second=erlang:statistics(reductions), {First,Second}.",
+                &[],
+            )
+            .unwrap();
+        let mut first = Vm::new([]);
+        first.load_bytes(&beam).unwrap();
+        first
+            .eval_scheduled("runtime_reductions_probe", "run", &[], 1, None)
+            .unwrap();
+
+        let mut second = Vm::new([]);
+        second.load_bytes(&beam).unwrap();
+        let result = second
+            .eval_scheduled("runtime_reductions_probe", "run", &[], 1, None)
+            .unwrap_or_else(|error| panic!("statistics VM error: {error:?}"));
+        let OwnedTerm::Tuple(values) = &result.term else {
+            panic!(
+                "statistics(reductions) returned a non-tuple: {:?}",
+                result.term
+            );
+        };
+        let Some(OwnedTerm::Tuple(first_read)) = values.first() else {
+            panic!("first statistics result was not a tuple: {values:?}");
+        };
+        assert_eq!(first_read.len(), 2);
+        assert_eq!(
+            first_read[0], first_read[1],
+            "a fresh runtime must start with no previous reductions delta"
+        );
+    }
 
     #[test]
     fn changing_online_scheduler_count_matches_otp() {

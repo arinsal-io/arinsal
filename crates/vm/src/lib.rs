@@ -202,6 +202,7 @@ pub struct EvalResult {
 /// Lazy module loader and single-process execution engine.
 pub struct Vm {
     paths: Vec<PathBuf>,
+    pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
     pub(crate) otp_root: Option<PathBuf>,
     pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
     loaded: SharedTable<HashMap<String, usize>>,

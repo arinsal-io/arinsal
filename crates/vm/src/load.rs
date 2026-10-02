@@ -468,7 +468,7 @@ impl Vm {
         paths: impl IntoIterator<Item = PathBuf>,
         otp: PathBuf,
     ) -> Self {
-        crate::natives::sys::initialize_statistics_origins();
+        let statistics_origins = crate::natives::sys::initialize_statistics_origins();
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
         paths.push(PathBuf::from("."));
         paths.push(PathBuf::from("bench/out/ebin"));
@@ -485,6 +485,7 @@ impl Vm {
         let code_scope = beamasm_integration::new_code_scope();
         Self {
             paths,
+            statistics_origins,
             otp_root: Some(otp),
             modules: SharedTable::new(Vec::new()),
             loaded: SharedTable::new(HashMap::new()),
@@ -1061,6 +1062,7 @@ impl Vm {
         let code_scope = code.lock().unwrap().code_scope;
         let mut vm = Self {
             paths: paths.to_vec(),
+            statistics_origins: crate::natives::sys::StatisticsOrigins::now(),
             otp_root: None,
             modules: SharedTable::new(Vec::new()),
             loaded: SharedTable::new(HashMap::new()),

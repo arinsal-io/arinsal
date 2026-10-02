@@ -700,6 +700,7 @@ impl AliasTable {
 
 /// Shared interpreter and scheduler handles for a set of local processes.
 pub(crate) struct Runtime {
+    pub(crate) statistics: crate::natives::sys::StatisticsState,
     code: Arc<Mutex<SharedCode>>,
     /// The node's code scope, which keys its native code registries.
     pub(crate) code_scope: u64,
@@ -5146,6 +5147,7 @@ impl Vm {
         let (sender, receiver) = mpsc::channel();
         let code = Arc::new(Mutex::new(self.snapshot_shared()));
         let runtime = Arc::new(Runtime {
+            statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
             code: Arc::clone(&code),
             code_scope: self.code_scope,
             processes: Mutex::new(std::collections::HashSet::new()),
