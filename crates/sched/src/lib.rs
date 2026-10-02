@@ -4267,12 +4267,25 @@ impl<T: Task> Drop for Scheduler<T> {
         // The last handle may drop on a worker (e.g. a process exiting while the owner already
         // released its handle); that worker cannot join itself and stops on its own.
         let current = std::thread::current().id();
+        let mut on_worker = false;
         for handle in self.threads.drain(..) {
             if handle.thread().id() != current {
                 let _ = handle.join();
+            } else {
+                on_worker = true;
             }
         }
-        self.inner.table.scheduler_shutdown();
+        if on_worker {
+            // This worker still holds the cell of the exiting process; shutting down inline would
+            // lock that cell again and self-deadlock. A helper thread waits for the worker to
+            // release it (it holds its own `Inner` reference, so the table stays alive).
+            let inner = Arc::clone(&self.inner);
+            let _ = std::thread::Builder::new()
+                .name("sched-shutdown".into())
+                .spawn(move || inner.table.scheduler_shutdown());
+        } else {
+            self.inner.table.scheduler_shutdown();
+        }
     }
 }
 
@@ -4911,4 +4924,67 @@ fn profile_scheduler_transition<T: Task>(
         Some(local),
         0,
     );
+}
+
+#[cfg(test)]
+mod worker_drop_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+
+    type Slot = Arc<Mutex<Option<Scheduler<DropFromWorker>>>>;
+
+    struct DropFromWorker {
+        slot: Option<Slot>,
+        shutdown: mpsc::Sender<()>,
+    }
+
+    impl Task for DropFromWorker {
+        type Message = ();
+
+        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _budget: u32) -> RunOutcome {
+            // The last scheduler handle drops on this worker while its cell is locked.
+            match &self.slot {
+                Some(slot) => {
+                    drop(slot.lock().unwrap().take());
+                    RunOutcome::Exit(0)
+                }
+                None => RunOutcome::Wait { timeout_ms: None },
+            }
+        }
+
+        fn scheduler_shutdown(&mut self) {
+            let _ = self.shutdown.send(());
+        }
+    }
+
+    #[test]
+    fn last_handle_dropped_by_exiting_worker_does_not_deadlock() {
+        let scheduler = Scheduler::new(Config {
+            workers: 1,
+            max_processes: 8,
+            ..Config::default()
+        });
+        let slot: Slot = Arc::new(Mutex::new(None));
+        let (shutdown, shutdown_seen) = mpsc::channel();
+        // A parked bystander proves the shutdown pass ran over the table.
+        scheduler
+            .spawn(DropFromWorker {
+                slot: None,
+                shutdown,
+            })
+            .unwrap();
+        let (unused, _) = mpsc::channel();
+        let task = DropFromWorker {
+            slot: Some(Arc::clone(&slot)),
+            shutdown: unused,
+        };
+        let mut guard = slot.lock().unwrap();
+        scheduler.spawn(task).unwrap();
+        *guard = Some(scheduler);
+        drop(guard);
+        shutdown_seen
+            .recv_timeout(Duration::from_secs(10))
+            .expect("scheduler shutdown must complete after the worker released its cell");
+    }
 }
