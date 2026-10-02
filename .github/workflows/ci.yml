@@ -27,6 +27,7 @@ jobs:
         with:
           otp-version: "29.1.1"
           elixir-version: "1.20.4"
+          gleam-version: "1.9.0"
           version-type: strict
           install-hex: true
           install-rebar: true
@@ -54,3 +55,15 @@ jobs:
       - name: Test Elixir demo on Arinsal
         working-directory: examples/arinsal_demo
         run: mix arinsal test
+
+      - name: Build Gleam smoke fixture
+        working-directory: tests/languages/gleam
+        run: gleam build
+
+      - name: Run Gleam-generated BEAM code on Arinsal
+        shell: bash
+        run: |
+          beam_dir="$(find tests/languages/gleam/build/dev/erlang -type d -name ebin -print -quit)"
+          test -n "$beam_dir"
+          result="$(target/release/arinsal eval -pa "$beam_dir" arinsal_gleam_smoke answer)"
+          grep -Fxq '42' <<< "$result"
