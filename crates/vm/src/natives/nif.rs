@@ -360,6 +360,7 @@ fn dyn_call<const N: usize>(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bi
             library,
             function,
             trap,
+            done: None,
         },
     )
 }
@@ -373,11 +374,50 @@ pub(crate) struct PendingNif {
     library: Arc<arinsal_nif::NifLibrary>,
     function: arinsal_nif::NifFunction,
     trap: arinsal_nif::NifTrap,
+    /// Outcome of the call once a dirty scheduler executed it as a dirty job; its heap
+    /// is already part of the process heap.
+    done: Option<Result<arinsal_nif::NifCall, BifError>>,
 }
 
 impl PendingNif {
     pub(crate) fn roots_mut(&mut self) -> &mut [Term] {
-        &mut self.trap.args
+        match &mut self.done {
+            Some(Ok(arinsal_nif::NifCall::Return(value))) => std::slice::from_mut(value),
+            Some(Ok(arinsal_nif::NifCall::Schedule(trap))) => &mut trap.args,
+            _ => &mut self.trap.args,
+        }
+    }
+
+    /// Scheduler class this call or continuation must execute on.
+    pub(crate) fn class(&self) -> SchedulerClass {
+        arinsal_nif::scheduler_class(self.trap.flags)
+    }
+
+    /// Whether a dirty job already executed this call.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done.is_some()
+    }
+
+    /// Execute the call on the current dirty scheduler without the process: results are
+    /// built on `heap`, which the process adopts afterwards.
+    ///
+    /// Port of erts/emulator/beam/erl_nif.c:426 (erts_call_dirty_nif), OTP-29.1.1: the NIF
+    /// runs on a shadow process whose heap fragments move to the real process.
+    pub(crate) fn run_dirty(&mut self, heap: &mut arinsal_term::ProcessHeap) {
+        let current = current_class();
+        let pid = HUB.with(|hub| hub.borrow().as_ref().and_then(|hub| hub.pid.to_term()));
+        let mut fragment = FragmentingHeap(heap);
+        let mut ctx = Ctx::new(&mut fragment);
+        let (function, trap) = (&self.function, &self.trap);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            function.call_on(&mut ctx, trap.fptr, &trap.args, pid, current)
+        }))
+        .unwrap_or_else(|_| {
+            Err(BifError::Error(Term::atom(
+                global_atoms().intern("error").expect("built-in atom"),
+            )))
+        });
+        self.done = Some(result);
     }
 }
 
@@ -401,17 +441,40 @@ fn current_class() -> SchedulerClass {
 fn run_nif(ctx: &mut Ctx<'_>, pending: PendingNif) -> Result<Term, BifError> {
     let current = current_class();
     let target = arinsal_nif::scheduler_class(pending.trap.flags);
-    if target != current && !(target == SchedulerClass::Normal && pending.is_entry()) {
+    if pending.done.is_none()
+        && target != current
+        && !(target == SchedulerClass::Normal && pending.is_entry())
+    {
         RESCHEDULED.with(|slot| *slot.borrow_mut() = Some(pending));
         return Err(BifError::Dirty(target));
     }
-    let pid = HUB.with(|hub| hub.borrow().as_ref().and_then(|hub| hub.pid.to_term()));
     let PendingNif {
         library,
         function,
         trap,
+        done,
     } = pending;
-    match function.call_on(ctx, trap.fptr, &trap.args, pid, current)? {
+    let result = match done {
+        Some(result) => result,
+        // Port of erts/emulator/beam/erl_nif.c:468 (erts_call_dirty_nif), OTP-29.1.1: on a
+        // dirty scheduler the call runs as a dirty job without the main process lock.
+        None if current != SchedulerClass::Normal && target == current => {
+            RESCHEDULED.with(|slot| {
+                *slot.borrow_mut() = Some(PendingNif {
+                    library,
+                    function,
+                    trap,
+                    done: None,
+                })
+            });
+            return Err(BifError::Dirty(current));
+        }
+        None => {
+            let pid = HUB.with(|hub| hub.borrow().as_ref().and_then(|hub| hub.pid.to_term()));
+            function.call_on(ctx, trap.fptr, &trap.args, pid, current)
+        }
+    };
+    match result? {
         arinsal_nif::NifCall::Return(value) => Ok(value),
         arinsal_nif::NifCall::Schedule(trap) => {
             let target = arinsal_nif::scheduler_class(trap.flags);
@@ -420,6 +483,7 @@ fn run_nif(ctx: &mut Ctx<'_>, pending: PendingNif) -> Result<Term, BifError> {
                     library,
                     function,
                     trap,
+                    done: None,
                 })
             });
             Err(BifError::Dirty(target))
@@ -1095,6 +1159,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
     arinsal_nif::set_vm_hooks(arinsal_nif::VmHooks {
         send: Some(nif_send_hook),
         thread_type: Some(nif_thread_type),
+        current_process_exiting: Some(crate::dirty::current_process_exiting),
         ..arinsal_nif::VmHooks::default()
     });
 }

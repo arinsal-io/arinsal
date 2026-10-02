@@ -104,6 +104,12 @@ pub(crate) struct ProcessCold {
     /// The process already exited while its dirty job keeps running.
     /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
     pub(crate) dirty_exited: bool,
+    /// Shared copy of `dirty_exited` for a dirty job running without the process.
+    pub(crate) dirty_exit_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// A dirty BIF call waiting for its dirty job, or the job's result.
+    pub(crate) dirty_bif: Option<crate::dirty::DirtyBif>,
+    /// Result of a static dirty NIF executed as a dirty job.
+    pub(crate) static_nif_done: Option<Result<Term, arinsal_bifs::BifError>>,
     /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
     pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this process currently has a runnable profile activation.

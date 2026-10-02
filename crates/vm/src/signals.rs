@@ -1053,11 +1053,8 @@ fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool 
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
 // (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1.
-// A process executing a dirty job has its signals handled at the job's wait
-// points (`Process::handle_dirty_signals`), so the handler processes are never
-// notified and find every live process `normal`. Only they may call the BIF.
 fn dirty_process_handle_signals(
-    vm: &Vm,
+    vm: &mut Vm,
     process: &Process,
     ctx: &mut RunCtx<'_, Message>,
     target: Term,
@@ -1079,10 +1076,18 @@ fn dirty_process_handle_signals(
     let Some(pid) = Pid::from_term(target) else {
         return Ok(atom("false"));
     };
-    if !crate::natives::proc::live(process, pid)? {
-        return Ok(atom("noproc"));
-    }
-    Ok(atom("normal"))
+    let result = ctx.handle_dirty_signals(pid, &mut |task, target_ctx| {
+        if let Some(target) = task.downcast_mut::<Process>() {
+            target.handle_dirty_signals(vm, target_ctx);
+        }
+    });
+    Ok(atom(match result {
+        arinsal_sched::DirtySignals::NoProc => "noproc",
+        arinsal_sched::DirtySignals::Normal => "normal",
+        arinsal_sched::DirtySignals::More => "more",
+        // erts handles every queued signal within the reduction budget; so does `drain`.
+        arinsal_sched::DirtySignals::Idle | arinsal_sched::DirtySignals::Handled => "ok",
+    }))
 }
 
 fn deliver(

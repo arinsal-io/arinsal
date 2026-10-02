@@ -348,6 +348,37 @@ pub trait Task: Send + 'static {
     }
     /// Signals that landed after the task decided to exit, before it left the table.
     fn reap_signals(&mut self, _pid: Pid, _events: Vec<Event<Self::Message>>) {}
+    /// A dirty job this task wants to execute on the current dirty scheduler of `kind`
+    /// without holding its task cell, so its signals can be handled meanwhile.
+    ///
+    /// Port of erts/emulator/beam/erl_nif.c:468 and bif.c:5803 (`erts_call_dirty_nif` and
+    /// `erts_call_dirty_bif` release the main process lock around the call), OTP-29.1.1.
+    fn take_dirty_job(&mut self, _kind: DirtyKind) -> Option<DirtyJob> {
+        None
+    }
+    /// Hand the result of a job from [`Task::take_dirty_job`] back to the task, with
+    /// its task cell locked again.
+    fn finish_dirty_job(&mut self, _result: Box<dyn std::any::Any>) {}
+}
+
+/// A dirty job executed without the task cell, on the dirty scheduler thread that took it;
+/// see [`Task::take_dirty_job`].
+pub type DirtyJob = Box<dyn FnOnce() -> Box<dyn std::any::Any>>;
+
+/// Outcome of [`RunCtx::handle_dirty_signals`], mirroring the results of
+/// `erts_internal:dirty_process_handle_signals/1`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirtySignals {
+    /// The pid identifies no live process.
+    NoProc,
+    /// The process is not in a dirty state; it handles its own signals.
+    Normal,
+    /// Nothing was queued.
+    Idle,
+    /// Another thread holds the task cell while the process is still dirty.
+    More,
+    /// The callback handled the queued signals.
+    Handled,
 }
 
 /// Configuration for threaded and simulated execution.
@@ -885,6 +916,20 @@ struct Inner<T: Task> {
     /// Port of erts/emulator/beam/erl_process.c:7580 (msb_scheduler_type_switch), OTP-29.1.1.
     msb_exec: Mutex<MsbExec>,
     msb_switch: Condvar,
+    /// The `erts_dirty_process_signal_handler` processes and their notification message.
+    dirty_signal_handlers: OnceLock<DirtySignalHandlers<T::Message>>,
+}
+
+/// Normal, high and max priority dirty signal handler processes.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:84-86
+/// (`erts_dirty_process_signal_handler`, `_high`, `_max`), OTP-29.1.1.
+struct DirtySignalHandlers<M> {
+    normal: Pid,
+    high: Pid,
+    max: Pid,
+    /// Builds the message telling a handler which process needs its signals handled.
+    message: Box<dyn Fn(Pid) -> Option<M> + Send + Sync>,
 }
 
 /// Which of normal scheduler 1, dirty CPU scheduler 1 and dirty I/O scheduler 1 executes
@@ -1145,23 +1190,31 @@ impl<T: Task> Inner<T> {
         }
     }
 
-    fn dirty_thread(&self, slot: usize) -> Option<&DirtyThread> {
-        let cpu = self.dirty[0].threads.len();
-        if slot < cpu {
-            self.dirty[0].threads.get(slot)
-        } else {
-            self.dirty[1].threads.get(slot - cpu)
-        }
+    /// Port of erts/emulator/beam/erl_process.h:1367 (`ERTS_PROC_IN_DIRTY_STATE`), OTP-29.1.1:
+    /// queued on or executing on a dirty scheduler.
+    fn in_dirty_state(process: &Process<T>) -> bool {
+        process.dirty.load(Ordering::SeqCst) != 0
+            || process.dirty_runner.load(Ordering::SeqCst) != 0
     }
 
-    /// Wake the dirty thread executing `process`, so a dirty job waiting in
-    /// [`RunCtx::dirty_wait`] can let its signals be handled.
-    fn notify_dirty_runner(&self, process: &Process<T>) {
-        let runner = process.dirty_runner.load(Ordering::SeqCst);
-        if runner != 0
-            && let Some(thread) = self.dirty_thread(runner - 1).and_then(|t| t.handle.get())
-        {
-            thread.unpark();
+    /// Ask a dirty signal handler to handle the signals of `process`, which is in a dirty
+    /// state. `priority` overrides the process's user priority.
+    ///
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:979 (notify_dirty_signal_handler) and
+    /// erl_proc_sig_queue.c:1039 (erts_ensure_dirty_proc_signals_handled), OTP-29.1.1.
+    fn notify_dirty_signal_handler(&self, process: &Process<T>, priority: Option<Priority>) {
+        let Some(handlers) = self.dirty_signal_handlers.get() else {
+            return;
+        };
+        let priority = priority
+            .unwrap_or_else(|| Priority::from_index(process.user_priority.load(Ordering::Acquire)));
+        let handler = match priority {
+            Priority::Max => handlers.max,
+            Priority::High => handlers.high,
+            Priority::Normal | Priority::Low => handlers.normal,
+        };
+        if let Some(message) = (handlers.message)(process.pid) {
+            let _ = self.deliver(process.pid, handler, Payload::Message(message), None, 0);
         }
     }
 
@@ -1810,7 +1863,11 @@ impl<T: Task> Inner<T> {
             .compare_exchange(WAITING, QUEUED, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            self.notify_dirty_runner(&process);
+            // Port of erts/emulator/beam/erl_proc_sig_queue.h:2072 (erts_proc_notify_new_sig),
+            // OTP-29.1.1.
+            if Self::in_dirty_state(&process) {
+                self.notify_dirty_signal_handler(&process, None);
+            }
         } else {
             if wait_timer != 0 {
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
@@ -2598,9 +2655,11 @@ pub struct RunCtx<'a, M: Send + 'static> {
     sched_type: SchedulerType,
     user_priority: &'a AtomicU8,
     sys_task_run: bool,
+    /// A dirty signal handler acts for a process whose dirty job is executing.
+    dirty_running: bool,
 }
 
-trait ContextOps<M> {
+trait ContextOps<M: Send + 'static> {
     fn deliver(
         &mut self,
         from: Pid,
@@ -2657,6 +2716,12 @@ trait ContextOps<M> {
         priority: Priority,
         remaining: u32,
     ) -> Result<(), Error>;
+    fn handle_dirty_signals(
+        &mut self,
+        pid: Pid,
+        remaining: u32,
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
+    ) -> DirtySignals;
 }
 
 impl<M: Send + 'static> RunCtx<'_, M> {
@@ -2718,16 +2783,24 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     pub fn has_pending_input(&self) -> bool {
         self.input.has_pending()
     }
-    /// Block a dirty job for at most `timeout`, returning early when a message or
-    /// signal arrives for this process, so the job can let it be handled.
+    /// Whether this context acts for a process executing on a dirty scheduler, on
+    /// behalf of a dirty signal handler.
     ///
-    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8893 (dirty process signal
-    /// handling): erts handles those signals on a system process while the dirty job runs.
-    pub fn dirty_wait(&mut self, timeout: Duration) {
-        self.flush_pending();
-        if !self.input.has_pending() {
-            thread::park_timeout(timeout);
-        }
+    /// Port of erts/emulator/beam/erl_process.h (`ERTS_PSFLG_DIRTY_RUNNING`), OTP-29.1.1.
+    pub fn dirty_running(&self) -> bool {
+        self.dirty_running
+    }
+    /// Handle the queued signals of process `pid` while it is in a dirty state, with its
+    /// task cell locked and a context acting as that process.
+    ///
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
+    /// (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1.
+    pub fn handle_dirty_signals(
+        &mut self,
+        pid: Pid,
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
+    ) -> DirtySignals {
+        self.inner.handle_dirty_signals(pid, self.remaining, handle)
     }
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&mut self, work: impl Fn(usize) + Send + Sync + 'static) {
@@ -3189,6 +3262,66 @@ impl<T: Task> Runner<'_, T> {
 }
 
 impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
+    // (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1: the task cell is the
+    // main process lock, taken with a try-lock.
+    fn handle_dirty_signals(
+        &mut self,
+        pid: Pid,
+        remaining: u32,
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>),
+    ) -> DirtySignals {
+        let inner = self.inner;
+        let Some(process) = inner.table.lookup(pid) else {
+            return DirtySignals::NoProc;
+        };
+        let state = |process: &Process<T>| {
+            if process.state.load(Ordering::SeqCst) == EXITED {
+                Some(DirtySignals::NoProc)
+            } else if !Inner::in_dirty_state(process) {
+                Some(DirtySignals::Normal)
+            } else {
+                None
+            }
+        };
+        if let Some(result) = state(&process) {
+            return result;
+        }
+        if !process.input.has_pending() {
+            return DirtySignals::Idle;
+        }
+        let mut cell = match process.cell.try_lock() {
+            Ok(cell) => cell,
+            Err(_) => return state(&process).unwrap_or(DirtySignals::More),
+        };
+        if let Some(result) = state(&process) {
+            return result;
+        }
+        let TaskCell { task, private } = &mut *cell;
+        let mut ctx = RunCtx {
+            inner: self,
+            pid,
+            input: &process.input,
+            private,
+            backlog: &process.backlog,
+            bound_worker: &process.bound_worker,
+            worker: None,
+            worker_count: inner.config.workers,
+            remaining,
+            budget: remaining,
+            private_wake: false,
+            progress: None,
+            msacc_enabled: false,
+            wall_enabled: false,
+            gc_accounted_total: 0,
+            sched_type: SchedulerType::Normal,
+            user_priority: &process.user_priority,
+            sys_task_run: false,
+            dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
+        };
+        handle(task, &mut ctx);
+        DirtySignals::Handled
+    }
     fn deliver_sys_task(
         &mut self,
         from: Pid,
@@ -3742,6 +3875,7 @@ impl<T: Task> Scheduler<T> {
                 last_dirty: SchedulerType::DirtyIo,
             }),
             msb_switch: Condvar::new(),
+            dirty_signal_handlers: OnceLock::new(),
         });
         let mut threads = Vec::new();
         if !simulated {
@@ -3847,6 +3981,29 @@ impl<T: Task> Scheduler<T> {
     /// Wake a task that is waiting without a mailbox event.
     pub fn wake(&self, pid: Pid) -> bool {
         self.inner.wake_waiting(pid)
+    }
+    /// Register the dirty signal handler processes for normal (and low), high and max
+    /// priority processes. `message` builds the notification naming a process in a dirty
+    /// state with signals to handle. Returns `false` when handlers are already set.
+    ///
+    /// Port of erts/emulator/beam/erl_init.c:2570-2597 (dirty signal handler startup),
+    /// OTP-29.1.1.
+    pub fn set_dirty_signal_handlers(
+        &self,
+        normal: Pid,
+        high: Pid,
+        max: Pid,
+        message: impl Fn(Pid) -> Option<T::Message> + Send + Sync + 'static,
+    ) -> bool {
+        self.inner
+            .dirty_signal_handlers
+            .set(DirtySignalHandlers {
+                normal,
+                high,
+                max,
+                message: Box::new(message),
+            })
+            .is_ok()
     }
     /// Whether the task is queued on or executing on a dirty scheduler.
     ///
@@ -4263,6 +4420,7 @@ mod msgq_stage_microbench {
             sched_type: SchedulerType::Normal,
             user_priority: &user_priority,
             sys_task_run: false,
+            dirty_running: false,
         };
         let started = Instant::now();
         assert!(context.fetch_pending());
@@ -4607,6 +4765,19 @@ fn run_one<'a, T: Task>(
     }
     let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
     let mut cell = process.cell.lock().unwrap();
+    if let Some(kind) = dirty
+        && let Some(job) = cell.task.take_dirty_job(kind)
+    {
+        // Port of erts/emulator/beam/erl_nif.c:468-499 (erts_call_dirty_nif), OTP-29.1.1:
+        // the job runs without the main lock, so a dirty signal handler can take it.
+        drop(cell);
+        // The simulator runs dirty jobs on its own thread; report the job's scheduler type.
+        let thread_type = SCHEDULER_TYPE.with(|current| current.replace(kind.into()));
+        let result = job();
+        SCHEDULER_TYPE.with(|current| current.set(thread_type));
+        cell = process.cell.lock().unwrap();
+        cell.task.finish_dirty_job(result);
+    }
     let (outcome, remaining, private_pending, active_ns) = {
         let mut runner = Runner {
             inner,
@@ -4641,6 +4812,7 @@ fn run_one<'a, T: Task>(
                 sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
                 user_priority: &process.user_priority,
                 sys_task_run,
+                dirty_running: false,
             };
             if msacc_enabled {
                 ctx.set_msacc_state(MsaccState::Emulator);
@@ -4702,6 +4874,11 @@ fn run_one<'a, T: Task>(
             }
             process.state.store(QUEUED, Ordering::Release);
             inner.enqueue_dirty(process.clone(), kind);
+            // Port of erts/emulator/beam/erl_process.c:9763 (ensure signals are handled while
+            // scheduled dirty), OTP-29.1.1.
+            if process.input.has_pending() {
+                inner.notify_dirty_signal_handler(&process, Some(process.priority()));
+            }
         }
         RunOutcome::Yield if dirty.is_some() => {
             // Port of erts/emulator/beam/erl_process.c:10190 (a finished dirty job moves the

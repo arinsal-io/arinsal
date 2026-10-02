@@ -868,7 +868,16 @@ pub extern "C" fn enif_inspect_iolist_as_binary(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_is_current_process_alive(e: *mut ErlNifEnv) -> c_int {
-    i32::from(env(e).pid.is_some())
+    // Port of erts/emulator/beam/erl_nif.c:2304 (enif_is_current_process_alive), OTP-29.1.1:
+    // `!ERTS_PROC_IS_EXITING(c_p)`; a dirty NIF sees its process exit while it runs.
+    if env(e).pid.is_none() {
+        return 0;
+    }
+    let hook = crate::extras::hooks()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .current_process_exiting;
+    i32::from(!hook.is_some_and(|exiting| exiting()))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_self(e: *mut ErlNifEnv, out: *mut Term) -> *mut Term {

@@ -25,7 +25,7 @@ fn flag_value(process: &Process, name: &str) -> Option<Term> {
     process.cold.as_ref()?.flags.get(name).copied()
 }
 
-fn set_flag(process: &mut Process, name: &str, value: Term) -> Option<Term> {
+pub(crate) fn set_flag(process: &mut Process, name: &str, value: Term) -> Option<Term> {
     process.cold_mut().flags.insert(name.to_owned(), value)
 }
 
@@ -1127,7 +1127,11 @@ pub(crate) fn fulfill_request(
                 Some(message) => Some(message.decode_into(process)?),
                 None => None,
             };
-            let status = atom(if crate::signals::is_waiting(process, ctx.pid()) {
+            // Port of erts/emulator/beam/erl_process.c:9305 (erts_process_state2status), OTP-29.1.1:
+            // a process executing a dirty job is running.
+            let status = atom(if ctx.dirty_running() {
+                "running"
+            } else if crate::signals::is_waiting(process, ctx.pid()) {
                 "waiting"
             } else {
                 "runnable"

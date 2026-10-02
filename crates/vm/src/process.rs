@@ -3898,13 +3898,13 @@ impl Process {
 }
 
 impl Process {
-    /// Handle incoming signals while this process executes a dirty job.
+    /// Handle incoming signals while this process is in a dirty state. A dirty signal
+    /// handler process calls this with `ctx` acting as this process.
     ///
     /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
-    /// (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1. erts handles them on a
-    /// dirty signal handler process while the job runs; here the job's wait points do it.
-    /// Collections are deferred until the job returns, and an exit signal makes the process
-    /// exiting: pending requests fail now and it terminates on a normal scheduler.
+    /// (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1. Collections are deferred
+    /// until the job returns, and an exit signal makes the process exiting: pending requests
+    /// fail now and it terminates on a normal scheduler.
     pub(crate) fn handle_dirty_signals(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>) {
         if self.dirty_exiting() {
             return;
@@ -3915,6 +3915,7 @@ impl Process {
         if let Err(error) = result {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // an exiting process is terminated while its dirty job keeps running.
+            self.set_dirty_exited();
             crate::signals::process_exiting(self, ctx);
             if let Some(runtime) = self.runtime.clone() {
                 runtime.processes.lock().unwrap().remove(&ctx.pid());
@@ -3926,6 +3927,7 @@ impl Process {
             {
                 let _ = runtime.result.send(Err(error));
             }
+            // `notify_exit` released the cold state; the process stays marked exited.
             self.cold_mut().dirty_exited = true;
         }
         // Replies, exit and DOWN signals must not wait for the dirty job to return.
@@ -4406,6 +4408,17 @@ impl Task for Process {
         )
     }
 
+    fn take_dirty_job(
+        &mut self,
+        kind: arinsal_sched::DirtyKind,
+    ) -> Option<arinsal_sched::DirtyJob> {
+        Process::take_dirty_job(self, kind)
+    }
+
+    fn finish_dirty_job(&mut self, result: Box<dyn std::any::Any>) {
+        Process::finish_dirty_job(self, result);
+    }
+
     fn reap_signals(&mut self, pid: Pid, events: Vec<Event<Message>>) {
         let mut monitors = Vec::new();
         let mut links = Vec::new();
@@ -4491,6 +4504,10 @@ impl Process {
         if !self.cold_mut().profile_active {
             crate::natives::misc::profile_process_event(self, ctx, true);
             self.cold_mut().profile_active = true;
+        }
+        if self.dirty_exiting() {
+            // Exited by a dirty signal handler while queued for a dirty scheduler.
+            return RunOutcome::Exit(1);
         }
         let result = self.run_executor(&runtime, ctx, budget);
         if self.dirty_exiting() {
@@ -4656,8 +4673,35 @@ impl Vm {
         module: &str,
         function: &str,
     ) -> Result<Pid, VmError> {
+        self.spawn_system_process_priority(
+            scheduler,
+            runtime,
+            module,
+            function,
+            arinsal_sched::Priority::Normal,
+        )
+    }
+
+    // Port of erts/emulator/beam/erl_init.c:402 (erl_system_process_otp), OTP-29.1.1.
+    fn spawn_system_process_priority(
+        &mut self,
+        scheduler: &Scheduler<Process>,
+        runtime: &Arc<Runtime>,
+        module: &str,
+        function: &str,
+        priority: arinsal_sched::Priority,
+    ) -> Result<Pid, VmError> {
         let module_id = self.load_named(module)?;
-        *runtime.code.lock().unwrap() = self.snapshot_shared();
+        {
+            // Executors already running system processes spawned earlier keep the epoch
+            // counter they were created with; a fresh counter would leave them comparing
+            // against a dead one and re-synchronizing (and copying tables) on every load.
+            let mut code = runtime.code.lock().unwrap();
+            let epoch = Arc::clone(&code.epoch);
+            *code = self.snapshot_shared();
+            epoch.fetch_add(1, Ordering::AcqRel);
+            code.epoch = epoch;
+        }
         let ip = self.modules[module_id]
             .export(function, 0)
             .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 is not exported")))?;
@@ -4667,8 +4711,17 @@ impl Vm {
         process.initial_call = Some((module_id, ip));
         process.set_runtime(Some(Arc::clone(runtime)));
         process.cold_mut().initial_call = Some((module.to_owned(), function.to_owned(), 0));
+        if priority != arinsal_sched::Priority::Normal {
+            let name = match priority {
+                arinsal_sched::Priority::Max => "max",
+                arinsal_sched::Priority::High => "high",
+                arinsal_sched::Priority::Normal => "normal",
+                arinsal_sched::Priority::Low => "low",
+            };
+            crate::natives::proc::set_flag(&mut process, "priority", crate::signals::atom(name));
+        }
         let pid = scheduler
-            .spawn(process)
+            .spawn_priority(process, priority)
             .map_err(|error| VmError::Unsupported(format!("system process {module}: {error}")))?;
         runtime.processes.lock().unwrap().insert(pid);
         runtime.system_processes.lock().unwrap().insert(pid);
@@ -4771,17 +4824,6 @@ impl Vm {
             // to this registered process; without it the send is badarg and
             // code_server dies during ensure_loaded of an on_load module.
             self.spawn_system_process(&scheduler, &runtime, "erts_code_purger", "start")?;
-            // Port of erts/emulator/beam/erl_init.c:2570-2595, OTP-29.1.1.
-            // The dirty signal handlers exist even when this runtime has no dirty schedulers.
-            for _ in 0..3 {
-                let pid = self.spawn_system_process(
-                    &scheduler,
-                    &runtime,
-                    "erts_dirty_process_signal_handler",
-                    "start",
-                )?;
-                runtime.dirty_signal_handlers.lock().unwrap().insert(pid);
-            }
         }
         // Port of erts/emulator/beam/erl_init.c system-process startup: every
         // runtime needs the preloaded owner of the literal-area release protocol.
@@ -4793,6 +4835,27 @@ impl Vm {
         )?;
         // erl 29.1.1 does not register the collector; it is found by initial_call.
         *runtime.literal_collector.lock().unwrap() = Some(literal_collector);
+        // Port of erts/emulator/beam/erl_init.c:2570-2597, OTP-29.1.1: normal, high and max
+        // priority dirty signal handlers exist even without dirty schedulers.
+        let mut handlers = Vec::with_capacity(3);
+        for priority in [
+            arinsal_sched::Priority::Normal,
+            arinsal_sched::Priority::High,
+            arinsal_sched::Priority::Max,
+        ] {
+            let pid = self.spawn_system_process_priority(
+                &scheduler,
+                &runtime,
+                "erts_dirty_process_signal_handler",
+                "start",
+                priority,
+            )?;
+            runtime.dirty_signal_handlers.lock().unwrap().insert(pid);
+            handlers.push(pid);
+        }
+        scheduler.set_dirty_signal_handlers(handlers[0], handlers[1], handlers[2], |pid| {
+            pid.to_term().and_then(|term| Message::copy_from(term).ok())
+        });
         let mut process = Process::with_spawn_registers(args.len(), 0);
         process.module = module_id;
         process.ip = ip;
@@ -4806,9 +4869,6 @@ impl Vm {
             .spawn(process)
             .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
         runtime.processes.lock().unwrap().insert(_entry_pid);
-        if !scheduler.lookup(_entry_pid) {
-            runtime.processes.lock().unwrap().remove(&_entry_pid);
-        }
         if simulation_seed.is_some() {
             loop {
                 if let Ok(result) = receiver.try_recv() {

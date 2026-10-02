@@ -383,8 +383,34 @@ pub(crate) fn release_nif_slots(identities: impl IntoIterator<Item = usize>) {
     }
 }
 
+/// The static NIF `identity` with the arguments in `process.x` as a dirty job; the
+/// executor's [`run_static_nif`] takes its result.
+///
+/// Port of erts/emulator/beam/erl_nif.c:426 (erts_call_dirty_nif), OTP-29.1.1.
+pub(crate) fn static_nif_job(
+    process: &mut crate::Process,
+    identity: usize,
+) -> Option<arinsal_sched::DirtyJob> {
+    let (module, arity, entry) = static_nifs().lock().ok().and_then(|nifs| {
+        let nif = nifs.get(&identity)?;
+        Some((nif.module.clone(), nif.arity, nif.entry?))
+    })?;
+    // The job runs on this thread; NIF services find the process through these.
+    crate::natives::nif::refresh_hub_native(process);
+    if module == "prim_tty" {
+        crate::natives::tty::note_caller_native(process);
+    }
+    let args = process.x.get(..usize::from(arity))?.to_vec();
+    Some(crate::dirty::static_nif_job(move |heap| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::calls::call_bif(heap, entry, &args)
+        }))
+        .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))))
+    }))
+}
+
 /// Runs a static NIF with the arguments in `process.x`, for a dirty NIF call the executor
-/// performs on a dirty scheduler.
+/// performs on a dirty scheduler, or takes the result of its dirty job.
 pub(crate) fn run_static_nif(
     process: &mut crate::Process,
     identity: usize,
@@ -412,11 +438,18 @@ pub(crate) fn run_static_nif(
         .cold
         .as_mut()
         .and_then(|cold| cold.nif_pending.take());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pending {
-        Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
-        None => crate::calls::call_bif(&mut process.heap, entry, &args),
-    }))
-    .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))));
+    let done = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.static_nif_done.take());
+    let result = match done {
+        Some(result) => result,
+        None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pending {
+            Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
+            None => crate::calls::call_bif(&mut process.heap, entry, &args),
+        }))
+        .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error")))),
+    };
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
 

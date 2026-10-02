@@ -10,6 +10,7 @@ mod check_io;
 mod compare;
 #[cfg(feature = "difftest")]
 mod difftest;
+mod dirty;
 mod dist;
 mod exceptions;
 mod floats;

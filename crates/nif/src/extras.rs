@@ -28,9 +28,11 @@ pub struct VmHooks {
     pub demonitor: Option<fn(usize, &[u8; 32]) -> i32>,
     /// `enif_thread_type` value of the calling thread.
     pub thread_type: Option<fn() -> c_int>,
+    /// Whether the process the calling thread executes a NIF for is exiting.
+    pub current_process_exiting: Option<fn() -> bool>,
 }
 static HOOKS: OnceLock<Mutex<VmHooks>> = OnceLock::new();
-fn hooks() -> &'static Mutex<VmHooks> {
+pub(crate) fn hooks() -> &'static Mutex<VmHooks> {
     HOOKS.get_or_init(|| Mutex::new(VmHooks::default()))
 }
 /// Install VM service callbacks; each callback must keep terms live during its invocation.
