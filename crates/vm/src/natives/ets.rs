@@ -109,8 +109,8 @@ fn badarg_cause(cause: &'static str) -> VmError {
 /// Attach the failing BIF as the top stack frame, as erts does for every ETS BIF.
 // Port of erts/emulator/beam/beam_common.c:900-998 (save_stacktrace), OTP-29.1.1.
 fn bif_frame(
-    module: &str,
-    function: &str,
+    module: &'static str,
+    function: &'static str,
     args: &[Term],
     result: Result<Term, VmError>,
 ) -> Result<Term, VmError> {
@@ -119,11 +119,22 @@ fn bif_frame(
         return result;
     };
     if trap.class == arinsal_bifs::Class::Error && trap.top.is_none() && trap.trace.is_none() {
-        let atoms = arinsal_term::global_atoms();
-        let intern = |name: &str| {
-            atoms
+        // Per-thread cache keyed by the literal's address: every failing ETS BIF passes
+        // through here, and the shared atom table takes a lock plus a SipHash per name.
+        thread_local! {
+            static NAMES: std::cell::RefCell<std::collections::HashMap<(usize, usize), arinsal_term::Atom>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let intern = |name: &'static str| {
+            let key = (name.as_ptr() as usize, name.len());
+            if let Some(atom) = NAMES.with(|names| names.borrow().get(&key).copied()) {
+                return Ok(atom);
+            }
+            let atom = arinsal_term::global_atoms()
                 .intern(name)
-                .map_err(|_| VmError::Unsupported(format!("BIF frame atom {name}")))
+                .map_err(|_| VmError::Unsupported(format!("BIF frame atom {name}")))?;
+            NAMES.with(|names| names.borrow_mut().insert(key, atom));
+            Ok(atom)
         };
         trap.top = Some(crate::stacktrace::TopFrame::Bif {
             module: intern(module)?,

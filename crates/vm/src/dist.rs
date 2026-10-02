@@ -2427,6 +2427,7 @@ fn enqueue_port_packets_locked(
     state.output.extend(packets);
     state.output_ready_packets += ready_count;
     if deferred_count != 0 {
+        node_tables::ANY_FRAGMENT_CONTINUATION.store(true, std::sync::atomic::Ordering::Release);
         state
             .fragment_continuations
             .push_back(node_tables::DistFragmentContinuation {
@@ -2484,6 +2485,7 @@ fn enqueue_port_output_no_suspend_locked(
     if state.fragment_continuations.is_empty() {
         state.output_ready_packets += packets.len();
     } else {
+        node_tables::ANY_FRAGMENT_CONTINUATION.store(true, std::sync::atomic::Ordering::Release);
         state.pending_bytes = state.pending_bytes.saturating_sub(packet_bytes);
         state
             .fragment_continuations
@@ -2504,6 +2506,11 @@ pub(crate) fn continue_fragmented_send(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
 ) -> Result<(), VmError> {
+    // Called every scheduling iteration: skip the global node-table lock while no
+    // distribution entry has a deferred fragmented send (erts keeps this per process).
+    if !node_tables::ANY_FRAGMENT_CONTINUATION.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
     let sender = ctx.pid();
     let send_count = (ctx.remaining() as usize / 10).max(1);
     let (port_id, packet_count, more) = {
@@ -2516,6 +2523,16 @@ pub(crate) fn continue_fragmented_send(
                     .any(|continuation| continuation.sender == Some(sender))
             })
         }) else {
+            // Flag writers hold this lock, so clearing it here cannot lose a new push.
+            if !tables.entries.values().any(|entry| {
+                entry
+                    .dist
+                    .as_ref()
+                    .is_some_and(|state| !state.fragment_continuations.is_empty())
+            }) {
+                node_tables::ANY_FRAGMENT_CONTINUATION
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
             return Ok(());
         };
         let port_id = state.port_id.ok_or_else(badarg)?;

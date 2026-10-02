@@ -449,7 +449,15 @@ impl Vm {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("ERL_ROOTDIR").map(PathBuf::from))
             .or_else(|| {
-                arinsal_args::discover_otp_root(&arinsal_args::ProcessEnv).map(PathBuf::from)
+                // Discovery runs the `erl` launcher (~100 ms); every VM of a process shares it.
+                static DISCOVERED: std::sync::OnceLock<Option<PathBuf>> =
+                    std::sync::OnceLock::new();
+                DISCOVERED
+                    .get_or_init(|| {
+                        arinsal_args::discover_otp_root(&arinsal_args::ProcessEnv)
+                            .map(PathBuf::from)
+                    })
+                    .clone()
             })
             .unwrap_or_default();
         Self::new_with_otp_root(paths, otp)

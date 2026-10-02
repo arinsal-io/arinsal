@@ -316,6 +316,7 @@ fn process_scenarios_match_otp_29() {
         .map_or_else(|| (0..39).collect::<Vec<_>>(), |category| vec![category]);
     let mut count = 0;
     for category in categories {
+        let started = std::time::Instant::now();
         for n in 1..=repetitions {
             let expected = reference.call(
                 "proc_diff",
@@ -345,6 +346,7 @@ fn process_scenarios_match_otp_29() {
             );
             count += 1;
         }
+        eprintln!("category {category}: {:?}", started.elapsed());
     }
     assert!(
         count >= 200 || repetitions < 20,
@@ -914,6 +916,54 @@ scenario(2) -> try exit({stopped,42}) catch exit:{stopped,42} -> caught_exit end
             .unwrap_or_else(|error| panic!("category {category}: {error}"));
         assert_eq!(expected, CallResult::Ok(actual.term), "category {category}");
     }
+}
+
+/// Regression for the `process_differential` hang: caught BIF errors were ~50x slower than
+/// erts because every raw stacktrace kept a slot forever and each capture resolved native
+/// frames eagerly. 400k caught `badarg`s in a tight loop must finish quickly, with the
+/// same result as erts.
+#[test]
+fn tight_loop_of_caught_bif_errors_is_fast_and_matches_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping caught error loop test");
+        return;
+    };
+    let source = r#"
+-module(caught_loop).
+-compile(nowarn_deprecated_catch).
+-export([run/1]).
+run(N) -> {loop(N, 0), try_loop(N, 0)}.
+loop(0, Acc) -> Acc;
+loop(N, Acc) ->
+    {'EXIT', {badarg, _}} = catch ets:lookup(caught_loop_missing, key),
+    loop(N - 1, Acc + 1).
+try_loop(0, Acc) -> Acc;
+try_loop(N, Acc) ->
+    try ets:lookup(caught_loop_missing, key) catch error:badarg -> ok end,
+    try_loop(N - 1, Acc + 1).
+"#;
+    let beam = reference.compile_named("caught_loop", source, &[]).unwrap();
+    reference.load("caught_loop", &beam).unwrap();
+    let count = 200_000;
+    let expected = reference.call("caught_loop", "run", &[OwnedTerm::Int(count)]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let started = std::time::Instant::now();
+    let actual = vm
+        .eval_scheduled(
+            "caught_loop",
+            "run",
+            &[Term::small(count).unwrap()],
+            1,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("caught_loop: {error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "caught error loop took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Symbolic stack traces from BEAM continuations.
 
-use crate::{NativeFunction, Process, VmError};
+use crate::{Process, VmError};
 use arinsal_bifs::{Class, FragmentingHeap};
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::Module;
@@ -135,7 +135,7 @@ pub(super) struct RawTrace {
     module: Option<Arc<Module>>,
     ip: usize,
     /// Native function and pc that raised the exception, when it came from native code.
-    native_top: Option<(NativeFunction, usize)>,
+    native_top: Option<usize>,
     continuations: Vec<Continuation>,
     frames: Vec<Term>,
     depth: usize,
@@ -144,7 +144,7 @@ pub(super) struct RawTrace {
 
 enum Continuation {
     Interpreted(Arc<Module>, usize),
-    Native(crate::native_bridge::NativeStackFrame, usize),
+    Native(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -259,6 +259,7 @@ pub(super) fn capture(
     raw.ip = ip;
     raw.depth = depth.max(1);
     raw.continuations.clear();
+    raw.continuations.reserve(raw.depth.min(16));
     raw.native_top = None;
     // OTP starts with the failing instruction as `prev` and compares it with
     // each continuation after moving that continuation back to its call site.
@@ -286,17 +287,16 @@ pub(super) fn capture(
             index += 4usize.saturating_add(action_count.saturating_mul(2));
             continue;
         }
-        if raw_address & 3 == 0
-            && let Some(function) = crate::native_bridge::native_stack_frame_at(raw_address)
-        {
+        if raw_address & 3 == 0 && arinsal_term::may_be_native_code_pointer(raw_address) {
             // Port of erts/emulator/beam/beam_common.c:815-835 (save_stacktrace), OTP-29.1.1:
             // only non-duplicate return addresses are recorded, each looked up one byte back,
-            // inside its call instruction.
+            // inside its call instruction. Like erts' is_CP test this only checks the word's
+            // shape (plus the lock-free native hull); the function is looked up in `build`.
             if previous_native != Some(raw_address) {
                 previous_native = Some(raw_address);
                 previous = None;
                 raw.continuations
-                    .push(Continuation::Native(function, raw_address - 1));
+                    .push(Continuation::Native(raw_address - 1));
             }
             index += 1;
             continue;
@@ -329,7 +329,7 @@ pub(super) fn capture(
 }
 
 /// Records the native function and pc at which the exception was raised.
-pub(super) fn set_native_top(raw: &mut RawTrace, function: NativeFunction, pc: usize) {
+pub(super) fn set_native_top(raw: &mut RawTrace, pc: usize) {
     let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
     if pc & tag != 0 {
         // Port of erts/emulator/beam/beam_common.c:792-835 (save_stacktrace), OTP-29.1.1:
@@ -337,14 +337,14 @@ pub(super) fn set_native_top(raw: &mut RawTrace, function: NativeFunction, pc: u
         // recorded again; its line is looked up inside the call instruction.
         let site = (pc & !tag) - 1;
         if matches!(raw.continuations.first(),
-            Some(Continuation::Native(_, address)) if *address == site)
+            Some(Continuation::Native(address)) if *address == site)
         {
             raw.continuations.remove(0);
         }
-        raw.native_top = Some((function, site));
+        raw.native_top = Some(site);
         return;
     }
-    raw.native_top = Some((function, pc));
+    raw.native_top = Some(pc);
 }
 
 /// Preserve an explicit `raise/3` stacktrace with its class across `try/after`.
@@ -668,10 +668,8 @@ pub(super) fn build(
     )?;
     // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
     let native_pc = p.cold.as_ref().map_or(0, |cold| cold.native_call_pc);
-    if native_pc != 0
-        && let Some(function) = crate::native_function_at(native_pc)
-    {
-        set_native_top(&mut raw, function, native_pc);
+    if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
+        set_native_top(&mut raw, native_pc);
     }
     build_saved(p, &mut raw)
 }
@@ -730,7 +728,12 @@ pub(super) fn build_saved(p: &mut Process, raw: &mut RawTrace) -> Result<Term, V
         .module
         .as_ref()
         .ok_or_else(|| VmError::Unsupported("stacktrace module".into()))?;
-    let (frame_module, function, arity, location) = if let Some((native, pc)) = &raw.native_top {
+    let (frame_module, function, arity, location) = if let Some((native, pc)) = raw
+        .native_top
+        .and_then(|pc| crate::native_function_at(pc).map(|native| (native, pc)))
+    {
+        let pc = &pc;
+        let native = &native;
         let location = native
             .line_at(*pc)
             .and_then(|(file, line)| {
@@ -819,7 +822,11 @@ pub(super) fn build_saved(p: &mut Process, raw: &mut RawTrace) -> Result<Term, V
         if raw.frames.len() >= raw.depth {
             break;
         }
-        if let Continuation::Native(function, _address) = continuation {
+        if let Continuation::Native(address) = continuation {
+            // Resolved lazily like erts, which saves raw pcs and decodes them in build_stacktrace.
+            let Some(function) = crate::native_bridge::native_stack_frame_at(*address) else {
+                continue;
+            };
             let location = function.line.and_then(|line| {
                 function
                     .file_term

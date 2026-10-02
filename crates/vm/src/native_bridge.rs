@@ -369,6 +369,23 @@ pub fn native_function_at(address: usize) -> Option<NativeFunction> {
         .cloned()
 }
 
+/// Runs `visit` on the native function containing `address` without cloning its metadata.
+/// `visit` runs under the registry read lock and must not register or unregister code.
+pub(crate) fn with_native_function_at<R>(
+    address: usize,
+    visit: impl FnOnce(&NativeFunction) -> R,
+) -> Option<R> {
+    if !arinsal_term::may_be_native_code_pointer(address) {
+        return None;
+    }
+    let functions = native_functions().read().ok()?;
+    let index = functions.partition_point(|function| function.start <= address);
+    functions
+        .get(index.checked_sub(1)?)
+        .filter(|function| address < function.end)
+        .map(visit)
+}
+
 /// Test native code membership without cloning function metadata.
 pub(crate) fn is_native_function_at(address: usize) -> bool {
     if !arinsal_term::may_be_native_code_pointer(address) {
