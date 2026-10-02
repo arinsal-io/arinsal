@@ -479,6 +479,8 @@ pub(crate) struct Wheel<M> {
     high_level: TimerTree,
     entries: HashMap<u64, Entry<M>>,
     target_entries: HashMap<Pid, HashSet<u64>>,
+    /// Cached [`Wheel::next_timeout`]; valid until the wheel reaches it or its timers change.
+    next_timeout: Option<u64>,
 }
 
 impl<M> Wheel<M> {
@@ -496,6 +498,7 @@ impl<M> Wheel<M> {
             high_level: TimerTree::new(),
             entries: HashMap::new(),
             target_entries: HashMap::new(),
+            next_timeout: None,
         }
     }
 
@@ -511,6 +514,7 @@ impl<M> Wheel<M> {
 
     // Port of erts/emulator/beam/time.c:1256-1291, OTP-29.1.1.
     fn insert_slot(&mut self, id: u64, mut entry: Entry<M>, kind: WheelKind, slot: usize) {
+        self.next_timeout = None;
         let bucket = match kind {
             WheelKind::Soon => &mut self.soon[slot],
             WheelKind::Later => &mut self.later[slot],
@@ -542,6 +546,7 @@ impl<M> Wheel<M> {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:1219-1323, OTP-29.1.1.
     fn insert_long(&mut self, id: u64, mut entry: Entry<M>) {
+        self.next_timeout = None;
         let node = self.high_level.insert_node(entry.deadline);
         let tail = self.high_level.node(node).tail;
         entry.kind = WheelKind::HighLevel;
@@ -637,6 +642,7 @@ impl<M> Wheel<M> {
 
     // Port of erts/emulator/beam/time.c:705-738 and erl_hl_timer.c:3340-3362, OTP-29.1.1.
     fn detach(&mut self, id: u64) -> Option<Entry<M>> {
+        self.next_timeout = None;
         let entry = self.entries.remove(&id)?;
         if entry.kind == WheelKind::HighLevel {
             self.remove_long_entry(&entry, id);
@@ -699,6 +705,66 @@ impl<M> Wheel<M> {
         self.entries
             .get(&id)
             .map(|entry| entry.deadline.saturating_sub(now))
+    }
+
+    /// Earliest wheel position at which [`Wheel::advance`] has work: a due timer, a later
+    /// wheel slot that moves into the soon wheel, or a long timer that cascades into the
+    /// wheels. `None` when the wheel holds no timers.
+    ///
+    /// Port of erts/emulator/beam/time.c:477 (find_next_timeout), OTP-29.1.1: the soon wheel
+    /// gives an exact timeout; the later wheel and the high-level tree give a pre-timeout.
+    pub(crate) fn next_timeout(&mut self) -> Option<u64> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        if !self.at_once.is_empty()
+            || !self.pending.is_empty()
+            || self.bump_cursor < self.bump_pending.len()
+        {
+            return Some(self.now);
+        }
+        // Removed timers only make the cached position early, never late.
+        if let Some(cached) = self.next_timeout.filter(|&cached| cached > self.now) {
+            return Some(cached);
+        }
+        let mut next = u64::MAX;
+        for offset in 1..SOON_SIZE as u64 {
+            let bucket = &self.soon[Self::soon_slot(self.now + offset)];
+            if !bucket.is_empty() {
+                next = bucket
+                    .iter()
+                    .filter_map(|id| self.entries.get(id))
+                    .map(|entry| entry.deadline)
+                    .min()
+                    .unwrap_or(self.now + offset);
+                break;
+            }
+        }
+        // `advance` drains the later slot one ahead of each LATER_SLOT_SIZE boundary; the
+        // slot drained at the current boundary is never refilled.
+        let base = self.now & !(LATER_SLOT_SIZE - 1);
+        for index in 1..SOON_SIZE as u64 {
+            let boundary = base + index * LATER_SLOT_SIZE;
+            if boundary >= next {
+                break;
+            }
+            let slot = (Self::later_slot(boundary) + 1) & (SOON_SIZE - 1);
+            if !self.later[slot].is_empty() {
+                next = boundary;
+                break;
+            }
+        }
+        if let Some(node) = self.high_level.first_at_or_before(u64::MAX) {
+            let cascade = self
+                .high_level
+                .node(node)
+                .key
+                .saturating_sub(LATER_REVOLUTION - 1);
+            next = next.min(cascade);
+        }
+        let next = next.max(self.now + 1);
+        self.next_timeout = Some(next);
+        Some(next)
     }
 
     // Port of erts/emulator/beam/time.c:1270-1291, OTP-29.1.1.
