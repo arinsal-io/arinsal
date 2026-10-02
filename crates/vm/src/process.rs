@@ -1206,6 +1206,11 @@ impl Executor {
                                     }
                                     break Ok(RunState::Wait { timeout_ms });
                                 }
+                                // A native `i_yield` is a scheduler boundary even when the
+                                // interpreter left a deferred yield request in the process.
+                                // Port of erts/emulator/beam/erl_process.c:10550
+                                // (trace_schedule_out), OTP-29.1.1.
+                                process.force_yield = false;
                                 break Ok(RunState::Yield);
                             }
                             arinsal_beamasm::ExitReason::CallUnported {
@@ -2209,15 +2214,22 @@ impl Executor {
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. })) {
             process.collect_bin_vheap_if_due(process.x.len())?;
         }
-        crate::trace::emit(
-            Some(&mut self.vm),
-            process,
-            ctx,
-            ctx.pid(),
-            crate::trace::RUNNING,
-            "out",
-            running_fields,
-        );
+        // OTP emits regular `out` only when a process is scheduled out; normal exit uses the
+        // separate `out_exiting` event when that flag is enabled.
+        // Port of erts/emulator/beam/erl_process.c:10550-10567, OTP-29.1.1.
+        if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
+            || matches!(result, Err(VmError::Yield | VmError::Dirty(_)))
+        {
+            crate::trace::emit(
+                Some(&mut self.vm),
+                process,
+                ctx,
+                ctx.pid(),
+                crate::trace::RUNNING,
+                "out",
+                running_fields,
+            );
+        }
         crate::natives::erts_debug::after_schedule(
             process,
             schedule_started.elapsed().as_nanos() as u64,
