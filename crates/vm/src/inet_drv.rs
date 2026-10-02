@@ -297,6 +297,12 @@ pub(crate) fn detach(id: u64) {
     let Some(sock) = registry().lock().unwrap().remove(&id) else {
         return;
     };
+    // The port closed while owning a dist connection (its controller exited, e.g. through
+    // `net_kernel:disconnect/1`): tear the connection down and deliver nodedown.
+    // Port of erts/emulator/beam/dist.c (erts_do_net_exits via the dist port's exit), OTP-29.1.1.
+    if crate::node_tables::is_dist_port(id) {
+        let _ = crate::dist::port_connection_closed(&sock.runtime, id);
+    }
     unpin_scheduler(&sock.handle.scheduler());
     let pending = {
         let mut inner = sock.inner.lock().unwrap();

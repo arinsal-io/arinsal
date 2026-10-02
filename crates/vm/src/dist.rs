@@ -1497,6 +1497,11 @@ fn dist_spawn_request(
     } else {
         entry.pending_spawn_requests.insert(id, request);
     }
+    drop(tables);
+    if kind == "spawn_opt" {
+        // Port of erts/emulator/beam/dist.c:6076 (ok_result = {Ref, SpawnsMonitor}), OTP-29.1.1.
+        return tuple(process, vec![reference, boolean(monitor)]);
+    }
     Ok(reference)
 }
 
@@ -2659,22 +2664,10 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
         let Some(packet) = packet else {
             break;
         };
-        let port_busy = match crate::inet_drv::dist_output(port_id, &packet) {
-            Ok(busy) => busy,
-            Err(error) => {
-                let mut tables = node_tables::lock();
-                if let Some(state) = tables.entries.values_mut().find_map(|entry| {
-                    entry
-                        .dist
-                        .as_mut()
-                        .filter(|state| state.port_id == Some(port_id))
-                }) {
-                    state.output.push_front(packet);
-                    state.flushing_output = false;
-                }
-                return Err(VmError::Unsupported(format!("dist port write: {error:?}")));
-            }
-        };
+        // The port is gone (closed between the queue push and this flush): erts drops the
+        // data and the port exit tears the connection down
+        // (erts/emulator/beam/dist.c, dist_port_exit / erts_do_net_exits), OTP-29.1.1.
+        let port_busy = crate::inet_drv::dist_output(port_id, &packet).unwrap_or_default();
         let resumed = {
             let mut tables = node_tables::lock();
             let Some(state) = tables.entries.values_mut().find_map(|entry| {

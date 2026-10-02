@@ -73,14 +73,6 @@ fn system_limit() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(atom("system_limit")))
 }
 
-fn local_node(node: Term) -> Result<(), VmError> {
-    match atom_name(node).as_deref() {
-        Some("nonode@nohost") => Ok(()),
-        Some(_) => Err(VmError::Unsupported("distributed spawn".into())),
-        None => Err(badarg("spawn node")),
-    }
-}
-
 fn runtime(process: &Process) -> Result<&Runtime, VmError> {
     process
         .runtime
@@ -1324,21 +1316,13 @@ pub(crate) fn native_is_process_alive(
 #[derive(Clone, Copy)]
 enum SignalBif {
     Spawn1,
-    Spawn2,
     Spawn3,
-    Spawn4,
     SpawnLink1,
-    SpawnLink2,
     SpawnLink3,
-    SpawnLink4,
     SpawnMonitor1,
-    SpawnMonitor2,
     SpawnMonitor3,
-    SpawnMonitor4,
     SpawnOpt2,
-    SpawnOpt3,
     SpawnOpt4,
-    SpawnOpt5,
     Register2,
     Unregister1,
     Whereis1,
@@ -1390,21 +1374,13 @@ macro_rules! resolved_signal_handler {
 }
 
 resolved_signal_handler!(spawn1, Spawn1);
-resolved_signal_handler!(spawn2, Spawn2);
 resolved_signal_handler!(spawn3, Spawn3);
-resolved_signal_handler!(spawn4, Spawn4);
 resolved_signal_handler!(spawn_link1, SpawnLink1);
-resolved_signal_handler!(spawn_link2, SpawnLink2);
 resolved_signal_handler!(spawn_link3, SpawnLink3);
-resolved_signal_handler!(spawn_link4, SpawnLink4);
 resolved_signal_handler!(spawn_monitor1, SpawnMonitor1);
-resolved_signal_handler!(spawn_monitor2, SpawnMonitor2);
 resolved_signal_handler!(spawn_monitor3, SpawnMonitor3);
-resolved_signal_handler!(spawn_monitor4, SpawnMonitor4);
 resolved_signal_handler!(spawn_opt2, SpawnOpt2);
-resolved_signal_handler!(spawn_opt3, SpawnOpt3);
 resolved_signal_handler!(spawn_opt4, SpawnOpt4);
-resolved_signal_handler!(spawn_opt5, SpawnOpt5);
 resolved_signal_handler!(register2, Register2);
 resolved_signal_handler!(unregister1, Unregister1);
 resolved_signal_handler!(whereis1, Whereis1);
@@ -1446,21 +1422,13 @@ pub(crate) fn handler(
 ) -> Option<crate::natives::ResolvedNative> {
     Some(match (module, function, arity) {
         ("erlang", "spawn", 1) => spawn1,
-        ("erlang", "spawn", 2) => spawn2,
         ("erlang", "spawn", 3) => spawn3,
-        ("erlang", "spawn", 4) => spawn4,
         ("erlang", "spawn_link", 1) => spawn_link1,
-        ("erlang", "spawn_link", 2) => spawn_link2,
         ("erlang", "spawn_link", 3) => spawn_link3,
-        ("erlang", "spawn_link", 4) => spawn_link4,
         ("erlang", "spawn_monitor", 1) => spawn_monitor1,
-        ("erlang", "spawn_monitor", 2) => spawn_monitor2,
         ("erlang", "spawn_monitor", 3) => spawn_monitor3,
-        ("erlang", "spawn_monitor", 4) => spawn_monitor4,
         ("erlang", "spawn_opt", 2) => spawn_opt2,
-        ("erlang", "spawn_opt", 3) => spawn_opt3,
         ("erlang", "spawn_opt", 4) => spawn_opt4,
-        ("erlang", "spawn_opt", 5) => spawn_opt5,
         ("erlang", "register", 2) => register2,
         ("erlang", "unregister", 1) => unregister1,
         ("erlang", "whereis", 1) => whereis1,
@@ -1617,21 +1585,12 @@ fn call_resolved(
         (SignalBif::Spawn1, [fun]) => spawn_fun(
             vm, process, ctx, *fun, false, false, None, None, false, None,
         ),
-        (SignalBif::Spawn2, [node, fun]) => local_node(*node).and_then(|()| {
-            spawn_fun(
-                vm, process, ctx, *fun, false, false, None, None, false, None,
-            )
-        }),
         (SignalBif::SpawnLink1, [fun]) => {
             spawn_fun(vm, process, ctx, *fun, true, false, None, None, false, None)
         }
-        (SignalBif::SpawnLink2, [node, fun]) => local_node(*node)
-            .and_then(|()| spawn_fun(vm, process, ctx, *fun, true, false, None, None, false, None)),
         (SignalBif::SpawnMonitor1, [fun]) => {
             spawn_fun(vm, process, ctx, *fun, false, true, None, None, false, None)
         }
-        (SignalBif::SpawnMonitor2, [node, fun]) => local_node(*node)
-            .and_then(|()| spawn_fun(vm, process, ctx, *fun, false, true, None, None, false, None)),
         (SignalBif::SpawnOpt2, [fun, options]) => spawn_options(*options).and_then(|opts| {
             opts.tuning.around(|| {
                 spawn_fun_with_priority(
@@ -1661,20 +1620,6 @@ fn call_resolved(
             false,
             None,
         ),
-        (SignalBif::Spawn4, [node, module, function, args]) => local_node(*node).and_then(|()| {
-            spawn_mfa(
-                vm,
-                process,
-                ctx,
-                (*module, *function, *args),
-                false,
-                false,
-                None,
-                None,
-                false,
-                None,
-            )
-        }),
         (SignalBif::SpawnLink3, [module, function, args]) => spawn_mfa(
             vm,
             process,
@@ -1687,22 +1632,6 @@ fn call_resolved(
             false,
             None,
         ),
-        (SignalBif::SpawnLink4, [node, module, function, args]) => {
-            local_node(*node).and_then(|()| {
-                spawn_mfa(
-                    vm,
-                    process,
-                    ctx,
-                    (*module, *function, *args),
-                    true,
-                    false,
-                    None,
-                    None,
-                    false,
-                    None,
-                )
-            })
-        }
         (SignalBif::SpawnMonitor3, [module, function, args]) => spawn_mfa(
             vm,
             process,
@@ -1715,22 +1644,6 @@ fn call_resolved(
             false,
             None,
         ),
-        (SignalBif::SpawnMonitor4, [node, module, function, args]) => {
-            local_node(*node).and_then(|()| {
-                spawn_mfa(
-                    vm,
-                    process,
-                    ctx,
-                    (*module, *function, *args),
-                    false,
-                    true,
-                    None,
-                    None,
-                    false,
-                    None,
-                )
-            })
-        }
         (SignalBif::SpawnOpt4, [module, function, args, options]) => spawn_options(*options)
             .and_then(|opts| {
                 opts.tuning.around(|| {
@@ -1747,45 +1660,6 @@ fn call_resolved(
                         opts.scheduler,
                         opts.priority,
                     )
-                })
-            }),
-        (SignalBif::SpawnOpt3, [node, fun, options]) => local_node(*node).and_then(|()| {
-            spawn_options(*options).and_then(|opts| {
-                opts.tuning.around(|| {
-                    spawn_fun_with_priority(
-                        vm,
-                        process,
-                        ctx,
-                        *fun,
-                        opts.link,
-                        opts.monitor,
-                        opts.min_heap_size,
-                        opts.monitor_tag,
-                        opts.monitor_alias,
-                        opts.scheduler,
-                        opts.priority,
-                    )
-                })
-            })
-        }),
-        (SignalBif::SpawnOpt5, [node, module, function, args, options]) => local_node(*node)
-            .and_then(|()| {
-                spawn_options(*options).and_then(|opts| {
-                    opts.tuning.around(|| {
-                        spawn_mfa_with_priority(
-                            vm,
-                            process,
-                            ctx,
-                            (*module, *function, *args),
-                            opts.link,
-                            opts.monitor,
-                            opts.min_heap_size,
-                            opts.monitor_tag,
-                            opts.monitor_alias,
-                            opts.scheduler,
-                            opts.priority,
-                        )
-                    })
                 })
             }),
         (SignalBif::Register2, [name, pid]) => {

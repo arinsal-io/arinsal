@@ -316,7 +316,9 @@ def main() -> int:
         for name in suites:
             try:
                 erc, ecases, emeta, elapsed = erl_reference(name, build, args.timeout, not args.no_erl_cache)
-                extra = timeout_hook(elapsed, args.case_floor, args.case_factor)
+                # Cases erl does not pass need no generous limit (e.g. erl itself hits a 9-minute timetrap).
+                passing = {c: t for c, t in elapsed.items() if ecases.get(c, ("",))[0] == "ok"}
+                extra = timeout_hook(passing, args.case_floor, args.case_factor)
                 if args.case:
                     extra += ",{testcase,[" + ",".join(f"'{c.strip()}'" for c in args.case.split(",") if c.strip()) + "]}"
                 if args.group:
