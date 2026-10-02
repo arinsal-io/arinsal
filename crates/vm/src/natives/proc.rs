@@ -58,6 +58,26 @@ fn make_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
         .map_err(|error| VmError::Unsupported(format!("process tuple allocation: {error:?}")))
 }
 
+/// Scheduler priority named by a `priority` process flag value.
+pub(crate) fn scheduler_priority(name: &str) -> Option<Priority> {
+    match name {
+        "max" => Some(Priority::Max),
+        "high" => Some(Priority::High),
+        "normal" => Some(Priority::Normal),
+        "low" => Some(Priority::Low),
+        _ => None,
+    }
+}
+
+/// The process's user priority (`process_flag(priority, _)`).
+pub(crate) fn user_priority(process: &Process) -> Priority {
+    flag_value(process, "priority")
+        .and_then(atom_name)
+        .as_deref()
+        .and_then(scheduler_priority)
+        .unwrap_or(Priority::Normal)
+}
+
 fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError> {
     let previous = match name {
         "trap_exit" => {
@@ -1120,6 +1140,13 @@ pub(crate) fn fulfill_request(
             let request_id = request_id.decode_into(process)?;
             gc_message(process, request_id, true)
         }
+        crate::signals::RemoteOp::SystemTaskTest { request_id } => {
+            let request_id = request_id.decode_into(process)?;
+            make_tuple(
+                process,
+                &[atom("system_task_test"), request_id, atom("true")],
+            )
+        }
         crate::signals::RemoteOp::Display => {
             eprintln!("process {:?}: backtrace", ctx.pid());
             make_tuple(process, &[reference, atom("true")])
@@ -1131,7 +1158,9 @@ pub(crate) fn fulfill_request(
             async_request,
             kill,
         } => {
-            let references = process.references_code(module, native);
+            // Port of erts/emulator/beam/beam_bif_load.c (erts_check_process_code), OTP-29.1.1:
+            // a module without old code is never referenced.
+            let references = module.is_some_and(|module| process.references_code(module, native));
             if kill && references {
                 let reason = Message::copy_from(atom("kill"))?;
                 ctx.signal(ctx.pid(), Signal::Exit(reason))
@@ -1165,6 +1194,13 @@ pub(crate) fn failure_reply(
         crate::signals::RemoteOp::Collect { request_id, .. } => {
             let request_id = request_id.decode_into(process)?;
             gc_message(process, request_id, false)
+        }
+        crate::signals::RemoteOp::SystemTaskTest { request_id } => {
+            let request_id = request_id.decode_into(process)?;
+            make_tuple(
+                process,
+                &[atom("system_task_test"), request_id, atom("false")],
+            )
         }
         crate::signals::RemoteOp::CheckProcessCode { async_request, .. } => {
             let result = atom("false");
@@ -1502,7 +1538,17 @@ fn call_values(
                     }
                     return Term::small(previous as i64).ok_or_else(badarg);
                 }
-                flag(process, &name, *value)
+                let previous = flag(process, &name, *value)?;
+                if name == "priority" {
+                    // Port of erts/emulator/beam/erl_process.c (erts_set_process_priority),
+                    // OTP-29.1.1: the scheduler queues the process at the new priority.
+                    let priority = atom_name(*value)
+                        .as_deref()
+                        .and_then(scheduler_priority)
+                        .ok_or_else(badarg)?;
+                    ctx.set_priority(priority);
+                }
+                Ok(previous)
             }
             ("process_flag", [target, name, value]) if module == "erts_internal" => {
                 if Pid::from_term(*target) != Some(ctx.pid()) {

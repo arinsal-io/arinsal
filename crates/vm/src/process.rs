@@ -943,6 +943,11 @@ impl Executor {
                         }
                     }
                 }
+                // Port of erts/emulator/beam/erl_process.c:10318-10372 (ERTS_PSFLG_RUNNING_SYS:
+                // handle signals and execute system tasks before Erlang code), OTP-29.1.1.
+                if ctx.sys_task_run() {
+                    process.drain(ctx)?;
+                }
                 loop {
                     // A caught exception re-enters this loop without replenishing its process slice.
                     if ctx.remaining() == 0 {

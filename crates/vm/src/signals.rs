@@ -5,7 +5,7 @@ use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, copy_term, global_atoms, to_owned};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "pf-mem-counters")]
@@ -1126,12 +1126,12 @@ fn request_system_task(
         (requester, args[1], args[2], args[3])
     };
     let priority_name = atom_name(priority).ok_or_else(|| badarg("request_system_task"))?;
-    if !matches!(
-        priority_name.as_str(),
-        "max" | "high" | "normal" | "low" | "inherit"
-    ) {
-        return Err(badarg("request_system_task"));
-    }
+    // `inherit` takes the caller's user priority.
+    let priority = match priority_name.as_str() {
+        "inherit" => crate::natives::proc::user_priority(process),
+        name => crate::natives::proc::scheduler_priority(name)
+            .ok_or_else(|| badarg("request_system_task"))?,
+    };
     let Some(target_pid) = Pid::from_term(target) else {
         return Err(badarg("request_system_task"));
     };
@@ -1145,7 +1145,7 @@ fn request_system_task(
     let arg0 = tuple.get(2);
     let type_name = atom_name(req_type).ok_or_else(|| badarg("request_system_task"))?;
     let alive = crate::natives::proc::live(process, target_pid)?;
-    let (tag, result) = match type_name.as_str() {
+    let tag = match type_name.as_str() {
         "garbage_collect" => {
             let major = match arg0.and_then(atom_name).as_deref() {
                 Some("major") => true,
@@ -1156,67 +1156,50 @@ fn request_system_task(
                 let mut rooted = [req_id];
                 crate::natives::proc::collect_heap(process, major, &mut rooted)?;
                 req_id = rooted[0];
-                ("garbage_collect", true)
-            } else if alive {
-                let copied = Message::copy_from(req_id)?;
-                match submit(
-                    process,
-                    ctx,
-                    target_pid,
-                    RemoteOp::Collect {
-                        request_id: copied,
-                        major,
-                    },
-                    None,
-                )? {
-                    Submit::Sent(_) => return Ok(atom("ok")),
-                    Submit::Dead => ("garbage_collect", false),
-                }
-            } else {
-                ("garbage_collect", false)
+                let message =
+                    task_tuple(process, &[atom("garbage_collect"), req_id, atom("true")])?;
+                deliver(process, ctx, requester, message)?;
+                return Ok(atom("ok"));
             }
+            let op = RemoteOp::Collect {
+                request_id: Message::copy_from(req_id)?,
+                major,
+            };
+            (op, "garbage_collect")
         }
         "check_process_code" => {
             let module = arg0
                 .and_then(atom_name)
                 .ok_or_else(|| badarg("request_system_task"))?;
             vm.sync_code_epoch();
-            let request = Message::copy_from(req_id)?;
-            if alive && let Some(&old) = vm.old.get(&module) {
-                let op = RemoteOp::CheckProcessCode {
-                    module: old,
-                    native: crate::load::native_code_range(&vm.code_meta, old),
-                    async_request: Some(request),
-                    kill: false,
-                };
-                if matches!(submit(process, ctx, target_pid, op, None)?, Submit::Sent(_)) {
-                    return Ok(atom("ok"));
-                }
-            }
-            let message = task_tuple(
-                process,
-                &[atom("check_process_code"), req_id, atom("false")],
-            )?;
-            deliver(process, ctx, requester, message)?;
-            return Ok(atom("ok"));
+            let old = vm.old.get(&module).copied();
+            let op = RemoteOp::CheckProcessCode {
+                module: old,
+                native: old.and_then(|old| crate::load::native_code_range(&vm.code_meta, old)),
+                async_request: Some(Message::copy_from(req_id)?),
+                kill: false,
+            };
+            (op, "check_process_code")
         }
         "system_task_test" => {
-            if !alive {
-                ("system_task_test", false)
-            } else {
-                ("system_task_test", true)
-            }
+            let op = RemoteOp::SystemTaskTest {
+                request_id: Message::copy_from(req_id)?,
+            };
+            (op, "system_task_test")
         }
         _ => return Err(badarg("request_system_task")),
     };
-    let message = task_tuple(
-        process,
-        &[
-            atom(tag),
-            req_id,
-            atom(if result { "true" } else { "false" }),
-        ],
-    )?;
+    let (op, tag) = tag;
+    if alive
+        && matches!(
+            submit_sys_task(process, ctx, requester, target_pid, op, priority)?,
+            Submit::Sent(_)
+        )
+    {
+        return Ok(atom("ok"));
+    }
+    // Port of erts/emulator/beam/erl_process.c:11466 (noproc: notify_sys_task_executed), OTP-29.1.1.
+    let message = task_tuple(process, &[atom(tag), req_id, atom("false")])?;
     deliver(process, ctx, requester, message)?;
     Ok(atom("ok"))
 }
@@ -2460,12 +2443,15 @@ pub(crate) enum RemoteOp {
     Alive,
     /// Check whether the target still has a direct reference to old module code.
     CheckProcessCode {
-        module: usize,
+        /// Old code of the checked module; `None` when it has none (the result is `false`).
+        module: Option<usize>,
         /// Native code range of the old module version, when BeamAsm compiled it.
         native: Option<(usize, usize)>,
         async_request: Option<Message>,
         kill: bool,
     },
+    /// `erts_internal:request_system_task/3,4` `system_task_test` (erts `ERTS_PSTT_TEST`).
+    SystemTaskTest { request_id: Message },
 }
 
 /// How the caller extracts the reply once it is in the mailbox.
@@ -2504,7 +2490,9 @@ struct Waiter {
 type Slot = (usize, Pid);
 
 struct Tables {
-    requests: BTreeMap<Slot, Vec<Pending>>,
+    /// Per-target requests in submission order; wakeups usually arrive in that order,
+    /// so lookups hit the front (system task blasts queue hundreds of thousands).
+    requests: BTreeMap<Slot, VecDeque<Pending>>,
     waiters: BTreeMap<Slot, Waiter>,
     /// Processes that already answered their final requests but are still registered; a
     /// request sent to one now would never be served.
@@ -2627,6 +2615,34 @@ pub(crate) fn submit_id(
     op: RemoteOp,
     wait: Option<WaitKind>,
 ) -> Result<Submit, VmError> {
+    submit_from(process, ctx, ctx.pid(), target, id, op, wait, None)
+}
+
+/// Queue a process system task on `target` at `priority`; the reply goes to `requester`.
+///
+/// Port of erts/emulator/beam/erl_process.c:7221 (schedule_process_sys_task), OTP-29.1.1.
+pub(crate) fn submit_sys_task(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    requester: Pid,
+    target: Pid,
+    op: RemoteOp,
+    priority: Priority,
+) -> Result<Submit, VmError> {
+    submit_from(process, ctx, requester, target, 0, op, None, Some(priority))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_from(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    from: Pid,
+    target: Pid,
+    id: u64,
+    op: RemoteOp,
+    wait: Option<WaitKind>,
+    priority: Option<Priority>,
+) -> Result<Submit, VmError> {
     let id = if id == 0 {
         runtime(process)?.next_ref()
     } else {
@@ -2644,18 +2660,18 @@ pub(crate) fn submit_id(
             .requests
             .entry((slot_of, target))
             .or_default()
-            .push(Pending {
-                id,
-                from: ctx.pid(),
-                op,
-            });
+            .push_back(Pending { id, from, op });
         if let Some(kind) = wait {
             tables
                 .waiters
                 .insert((slot_of, ctx.pid()), Waiter { id, kind });
         }
     }
-    match ctx.signal(target, Signal::UnlinkAck(id)) {
+    let sent = match priority {
+        Some(priority) => ctx.signal_sys_task(target, Signal::UnlinkAck(id), priority),
+        None => ctx.signal(target, Signal::UnlinkAck(id)),
+    };
+    match sent {
         Ok(()) => Ok(Submit::Sent(id)),
         Err(arinsal_sched::Error::NoProcess) => {
             let mut tables = tables().lock().unwrap();
@@ -2683,7 +2699,10 @@ pub(crate) fn handle_request(
         let Some(index) = queue.iter().position(|pending| pending.id == id) else {
             return Ok(());
         };
-        queue.remove(index)
+        let Some(pending) = queue.remove(index) else {
+            return Ok(());
+        };
+        pending
     };
     // Port of erts/emulator/beam/erl_process.c:10831 (save_gc_task), OTP-29.1.1:
     // a garbage_collect request waits (reply included) until GC is enabled again.
@@ -2753,7 +2772,7 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
     if let Some(cold) = process.cold.as_mut() {
         for task in std::mem::take(&mut cold.delayed_gc) {
             if let crate::proc_create::DelayedGc::Request(request) = task {
-                pending.push(request);
+                pending.push_back(request);
             }
         }
     }
