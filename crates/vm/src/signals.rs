@@ -269,6 +269,46 @@ busy_wait(Until) ->
         assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
     }
 
+    /// Port of erl_hl_timer.c:2237 (access_bif_timer): a synchronous cancel or read of a
+    /// timer owned by another scheduler waits for the owner's reply message, so two
+    /// schedulers accessing each other's timers at the same time make progress.
+    #[test]
+    fn cross_scheduler_sync_timer_access_matches_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping cross-scheduler timer differential test");
+            return;
+        };
+        let source = concat!(
+            "-module(cross_timer_probe). -export([run/0]).\n",
+            "run() -> S=self(), ",
+            "Ps=[spawn_opt(fun() -> worker(S) end, [{scheduler, N}]) || N <- [1,2]], ",
+            "[P ! {peers, Ps} || P <- Ps], ",
+            "Rs=lists:sort([receive {P, R} -> R end || P <- Ps]), ",
+            "[P ! stop || P <- Ps], Rs.\n",
+            "worker(S) -> receive {peers, Ps} -> ok end, ",
+            "Ts=[erlang:send_after(60000, self(), x) || _ <- lists:seq(1,200)], ",
+            "[P ! {timers, self(), Ts} || P <- Ps, P =/= self()], ",
+            "Other=receive {timers, _, O} -> O end, ",
+            "Read=[erlang:read_timer(T) || T <- Other], ",
+            "Cancel=[erlang:cancel_timer(T, [{info, false}]) || T <- Other], ",
+            "Again=[erlang:cancel_timer(T) || T <- Other], ",
+            "S ! {self(), {lists:all(fun is_integer/1, Read), lists:usort(Cancel), ",
+            "lists:usort(Again), length(Ts)}}, ",
+            "receive stop -> ok end."
+        );
+        let beam = reference
+            .compile_named("cross_timer_probe", source, &[])
+            .unwrap();
+        reference.load("cross_timer_probe", &beam).unwrap();
+        let expected = reference.call("cross_timer_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("cross_timer_probe", "run", &[], 2, None)
+            .unwrap_or_else(|error| panic!("cross-scheduler timer VM error: {error:?}"));
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
+    }
+
     #[test]
     fn unresolved_registered_timer_destination_resolves_at_expiry_like_otp() {
         let Ok(reference) = RefErl::start() else {
@@ -397,11 +437,19 @@ fn spawn_mfa_with_priority(
     if let Some(words) = min_heap_size {
         // Port of erts/emulator/beam/erl_process.c:12594 (erl_create_process, min_heap_size
         // rounded up by erts_next_heap_size), OTP-29.1.1.
-        let words = crate::natives::sys::normalize_spawn_heap_minimum(Some(words), false);
+        let words = crate::natives::sys::normalize_spawn_heap_minimum(
+            parent.runtime.as_deref(),
+            Some(words),
+            false,
+        );
         child.heap = arinsal_term::ProcessHeap::with_words(words.max(64));
         child.heap.set_min_heap_size(words);
     }
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(min_heap_size, false);
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
+        parent.runtime.as_deref(),
+        min_heap_size,
+        false,
+    );
     child.heap.set_min_heap_size(min_heap);
     child.cold_mut().flags.insert(
         "min_heap_size".to_owned(),
@@ -629,11 +677,19 @@ fn spawn_fun_with_priority(
     if let Some(words) = min_heap_size {
         // Port of erts/emulator/beam/erl_process.c:12594 (erl_create_process, min_heap_size
         // rounded up by erts_next_heap_size), OTP-29.1.1.
-        let words = crate::natives::sys::normalize_spawn_heap_minimum(Some(words), false);
+        let words = crate::natives::sys::normalize_spawn_heap_minimum(
+            parent.runtime.as_deref(),
+            Some(words),
+            false,
+        );
         child.heap = arinsal_term::ProcessHeap::with_words(words.max(64));
         child.heap.set_min_heap_size(words);
     }
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(min_heap_size, false);
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
+        parent.runtime.as_deref(),
+        min_heap_size,
+        false,
+    );
     child.heap.set_min_heap_size(min_heap);
     child.cold_mut().flags.insert(
         "min_heap_size".to_owned(),
@@ -768,7 +824,11 @@ impl SpawnTuning {
             );
         }
         if let Some(words) = self.min_bin_vheap {
-            let words = crate::natives::sys::normalize_spawn_heap_minimum(Some(words), true);
+            let words = crate::natives::sys::normalize_spawn_heap_minimum(
+                child.runtime.as_deref(),
+                Some(words),
+                true,
+            );
             child.heap.set_min_bin_vheap_size(words as u64);
             child.cold_mut().flags.insert(
                 "min_bin_vheap_size".to_owned(),
@@ -800,7 +860,7 @@ struct SpawnOpts {
 }
 
 // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
-fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
+fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmError> {
     let mut opts = SpawnOpts {
         tuning: SpawnTuning::default(),
         link: false,
@@ -875,7 +935,7 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
                 opts.tuning.max_heap = Some(
                     crate::natives::proc::parse_max_heap_from(
                         tuple.get(1).ok_or_else(|| badarg("erlang:spawn_opt"))?,
-                        crate::natives::sys::gc_spawn_defaults().max_heap_size,
+                        crate::natives::sys::gc_spawn_defaults(runtime).max_heap_size,
                     )
                     .map_err(|()| badarg("erlang:spawn_opt"))?,
                 );
@@ -929,7 +989,8 @@ fn spawn_options(term: Term) -> Result<SpawnOpts, VmError> {
     if opts.min_heap_size.is_none() && opts.tuning.max_heap.is_none() {
         opts.tuning.min_bin_vheap = None;
     }
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(opts.min_heap_size, false);
+    let min_heap =
+        crate::natives::sys::normalize_spawn_heap_minimum(runtime, opts.min_heap_size, false);
     if opts
         .tuning
         .max_heap
@@ -995,34 +1056,106 @@ fn timer_query_options(term: Term, cancel: bool) -> Result<TimerQueryOptions, Vm
 }
 
 // Port of erts/emulator/beam/erl_hl_timer.c:2222 (no_timer_result), OTP-29.1.1.
-fn timer_query_result(
+/// Where the answer of a synchronous timer access goes.
+enum TimerAccess {
+    /// The owning scheduler has not answered yet and the caller is still in the BIF.
+    Pending,
+    /// Answered before the caller parked.
+    Done(Option<u64>),
+    /// The caller parked on `{Ref, Result}`; the owner sends it.
+    Parked {
+        target: Pid,
+        reply: OwnedTerm,
+        info: bool,
+        scheduler: std::sync::Arc<arinsal_sched::Scheduler<Process>>,
+    },
+}
+
+/// Synchronous `cancel_timer`/`read_timer`.
+///
+/// Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer), OTP-29.1.1: the
+/// scheduler owning the timer answers directly; otherwise the request is scheduled on
+/// the owner and the caller waits for `{Ref, Result}` like `erts_await_result`, so no
+/// scheduler thread ever blocks on another one.
+fn access_timer_sync(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
-    reference: Term,
-    remaining: Option<u64>,
+    timer_reference: Term,
+    timer: Option<arinsal_sched::TimerRef>,
     cancel: bool,
-    options: TimerQueryOptions,
+    info: bool,
 ) -> Result<Term, VmError> {
-    let value = remaining
-        .and_then(|ms| Term::small(ms as i64))
-        .unwrap_or_else(|| atom("false"));
-    if !options.asynchronous {
-        return Ok(if options.info { value } else { atom("ok") });
+    let rt = runtime(process)?;
+    let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) else {
+        return Ok(atom(if info { "false" } else { "ok" }));
+    };
+    let state = std::sync::Arc::new(Mutex::new(TimerAccess::Pending));
+    let answer = std::sync::Arc::clone(&state);
+    let callback = move |remaining: Option<u64>| {
+        let mut state = answer.lock().unwrap();
+        let TimerAccess::Parked {
+            target,
+            reply,
+            info,
+            scheduler,
+        } = std::mem::replace(&mut *state, TimerAccess::Done(remaining))
+        else {
+            return;
+        };
+        let value = if !info {
+            OwnedTerm::atom("ok")
+        } else {
+            remaining.map_or_else(
+                || OwnedTerm::atom("false"),
+                |ms| match i64::try_from(ms) {
+                    Ok(value) => OwnedTerm::Int(value),
+                    Err(_) => OwnedTerm::BigInt(num_bigint::BigInt::from(ms)),
+                },
+            )
+        };
+        if let Ok(message) = Message::from_owned(&OwnedTerm::Tuple(vec![reply, value])) {
+            let _ = scheduler.send(target, target, message);
+        }
+    };
+    if cancel {
+        scheduler.cancel_timer_async(timer, callback);
+    } else {
+        scheduler.read_timer_async(timer, callback);
     }
-    if options.info {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let message = TermBuilder::new(&mut heap)
-            .tuple(&[
-                atom(if cancel { "cancel_timer" } else { "read_timer" }),
-                reference,
-                value,
-            ])
-            .map_err(|error| VmError::Unsupported(format!("timer reply allocation: {error:?}")))?;
-        let envelope = Message::copy_from(message)?;
-        ctx.send(ctx.pid(), envelope)
-            .map_err(|error| VmError::Unsupported(format!("timer reply: {error}")))?;
+    let mut guard = state.lock().unwrap();
+    if let TimerAccess::Done(remaining) = *guard {
+        let value = remaining
+            .and_then(|ms| Term::small(ms as i64))
+            .unwrap_or_else(|| atom("false"));
+        return Ok(if info { value } else { atom("ok") });
     }
-    Ok(atom("ok"))
+    let id = rt.next_ref();
+    // The reply reference shares node and creation with the (local) timer reference.
+    // Nothing is allocated on the caller's heap: the BIF is retried once the reply is in.
+    let reply = match to_owned(timer_reference) {
+        Ok(OwnedTerm::Ref {
+            ref node, creation, ..
+        }) => OwnedTerm::Ref {
+            node: node.clone(),
+            creation,
+            ids: vec![id as u32, (id >> 32) as u32, 0],
+        },
+        _ => return Err(badarg("timer reference")),
+    };
+    tables().lock().unwrap().waiters.insert(
+        (scope(process), ctx.pid()),
+        Waiter {
+            id,
+            kind: WaitKind::Info,
+        },
+    );
+    *guard = TimerAccess::Parked {
+        target: ctx.pid(),
+        reply,
+        info,
+        scheduler,
+    };
+    Err(await_reply())
 }
 
 fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool {
@@ -1591,23 +1724,25 @@ fn call_resolved(
         (SignalBif::SpawnMonitor1, [fun]) => {
             spawn_fun(vm, process, ctx, *fun, false, true, None, None, false, None)
         }
-        (SignalBif::SpawnOpt2, [fun, options]) => spawn_options(*options).and_then(|opts| {
-            opts.tuning.around(|| {
-                spawn_fun_with_priority(
-                    vm,
-                    process,
-                    ctx,
-                    *fun,
-                    opts.link,
-                    opts.monitor,
-                    opts.min_heap_size,
-                    opts.monitor_tag,
-                    opts.monitor_alias,
-                    opts.scheduler,
-                    opts.priority,
-                )
+        (SignalBif::SpawnOpt2, [fun, options]) => {
+            spawn_options(process.runtime.as_deref(), *options).and_then(|opts| {
+                opts.tuning.around(|| {
+                    spawn_fun_with_priority(
+                        vm,
+                        process,
+                        ctx,
+                        *fun,
+                        opts.link,
+                        opts.monitor,
+                        opts.min_heap_size,
+                        opts.monitor_tag,
+                        opts.monitor_alias,
+                        opts.scheduler,
+                        opts.priority,
+                    )
+                })
             })
-        }),
+        }
         (SignalBif::Spawn3, [module, function, args]) => spawn_mfa(
             vm,
             process,
@@ -1644,8 +1779,8 @@ fn call_resolved(
             false,
             None,
         ),
-        (SignalBif::SpawnOpt4, [module, function, args, options]) => spawn_options(*options)
-            .and_then(|opts| {
+        (SignalBif::SpawnOpt4, [module, function, args, options]) => {
+            spawn_options(process.runtime.as_deref(), *options).and_then(|opts| {
                 opts.tuning.around(|| {
                     spawn_mfa_with_priority(
                         vm,
@@ -1661,7 +1796,8 @@ fn call_resolved(
                         opts.priority,
                     )
                 })
-            }),
+            })
+        }
         (SignalBif::Register2, [name, pid]) => {
             let name = atom_name(*name).ok_or_else(|| badarg("register/2"));
             name.and_then(|name| {
@@ -2152,6 +2288,11 @@ fn call_resolved(
                 }
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("cancel_timer/1"))?;
+            if !options.asynchronous
+                && let Some(done) = poll(process, ctx.pid())?
+            {
+                return Ok(done);
+            }
             let rt = runtime(process)?;
             if options.asynchronous {
                 let timer = rt.timers.lock().unwrap().get(&id).copied();
@@ -2211,11 +2352,7 @@ fn call_resolved(
             }
             rt.timer_owners.lock().unwrap().remove(&id);
             let timer = rt.timers.lock().unwrap().remove(&id);
-            let remaining = timer.and_then(|timer| rt.scheduler().ok()?.cancel_timer(timer));
-            if remaining.is_some() {
-                rt.timers.lock().unwrap().remove(&id);
-            }
-            timer_query_result(process, ctx, *reference, remaining, true, options)
+            access_timer_sync(process, ctx, *reference, timer, true, options.info)
         }
         (SignalBif::ReadTimer1, [reference]) | (SignalBif::ReadTimer2, [reference, _]) => {
             let options = if let Some(options) = args.get(1) {
@@ -2227,6 +2364,11 @@ fn call_resolved(
                 }
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("read_timer/1"))?;
+            if !options.asynchronous
+                && let Some(done) = poll(process, ctx.pid())?
+            {
+                return Ok(done);
+            }
             let rt = runtime(process)?;
             let timer = rt.timers.lock().unwrap().get(&id).copied();
             if options.asynchronous {
@@ -2265,8 +2407,7 @@ fn call_resolved(
                 }
                 return Ok(atom("ok"));
             }
-            let remaining = timer.and_then(|timer| rt.scheduler().ok()?.read_timer(timer));
-            timer_query_result(process, ctx, *reference, remaining, false, options)
+            access_timer_sync(process, ctx, *reference, timer, false, options.info)
         }
         (SignalBif::SpawnSystemProcess3, [module, function, args]) => {
             let pid = spawn_mfa(
@@ -2664,6 +2805,7 @@ pub(crate) fn reply_request(
 
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
 pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+    crate::natives::sys::release_multi_scheduling_blocks(process, ctx.pid());
     // OTP destroys the trapped BIF state together with the exiting process.
     // Persistent get/0's snapshot retains a table generation and its literals.
     if let Some(cold) = process.cold.as_mut() {

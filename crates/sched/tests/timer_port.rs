@@ -175,3 +175,95 @@ fn owner_worker_timer_facade_is_reentrant() {
         (Some(60_000), Some(60_000), None)
     );
 }
+
+type TimerSlots = Arc<Mutex<[Option<arinsal_sched::TimerRef>; 2]>>;
+
+/// Cancels the timer of the task bound to the other worker while that task does the same.
+struct CrossCancelTask {
+    scheduler: Arc<OnceLock<Weak<Scheduler<CrossCancelTask>>>>,
+    slots: TimerSlots,
+    me: usize,
+    result: mpsc::Sender<(usize, Option<u64>, Option<u64>)>,
+}
+
+impl Task for CrossCancelTask {
+    type Message = u64;
+
+    fn run(&mut self, ctx: &mut RunCtx<u64>, _: u32) -> RunOutcome {
+        let Some(scheduler) = self.scheduler.get().and_then(Weak::upgrade) else {
+            return RunOutcome::Exit(1);
+        };
+        let Ok(timer) = scheduler.start_timer(ctx.pid(), 60_000, 1) else {
+            return RunOutcome::Exit(2);
+        };
+        self.slots.lock().unwrap()[self.me] = Some(timer);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let other = loop {
+            if let Some(other) = self.slots.lock().unwrap()[1 - self.me] {
+                break other;
+            }
+            if Instant::now() > deadline {
+                return RunOutcome::Exit(3);
+            }
+            thread::yield_now();
+        };
+        // Both workers now ask each other at the same time; erts serves such requests as
+        // aux work, so neither may block the other.
+        let read = scheduler.read_timer(other);
+        let canceled = scheduler.cancel_timer(other);
+        let _ = self.result.send((self.me, read, canceled));
+        RunOutcome::Exit(0)
+    }
+}
+
+#[test]
+fn cross_scheduler_requests_do_not_deadlock() {
+    let scheduler_ref = Arc::new(OnceLock::new());
+    let scheduler = Arc::new(Scheduler::new(Config {
+        workers: 2,
+        max_processes: 8,
+        ..Config::default()
+    }));
+    assert!(scheduler_ref.set(Arc::downgrade(&scheduler)).is_ok());
+    let slots: TimerSlots = Arc::new(Mutex::new([None, None]));
+    let (sender, receiver) = mpsc::channel();
+    for me in 0..2 {
+        let pid = scheduler
+            .spawn_unscheduled_on(
+                CrossCancelTask {
+                    scheduler: scheduler_ref.clone(),
+                    slots: slots.clone(),
+                    me,
+                    result: sender.clone(),
+                },
+                me + 1,
+            )
+            .unwrap();
+        scheduler.schedule_unscheduled(pid).unwrap();
+    }
+    for _ in 0..2 {
+        let (_, read, canceled) = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cross-scheduler timer request deadlocked");
+        assert!(matches!(read, Some(ms) if ms <= 60_000));
+        assert!(matches!(canceled, Some(ms) if ms <= 60_000));
+    }
+}
+
+#[test]
+fn foreign_thread_insert_is_visible_to_later_requests() {
+    let scheduler = Scheduler::new(Config {
+        workers: 2,
+        max_processes: 4,
+        ..Config::default()
+    });
+    let pid = scheduler
+        .spawn(Sink(Arc::new(Mutex::new(Vec::new()))))
+        .unwrap();
+    // Inserted asynchronously on the owning worker; the queued request order keeps
+    // the following read and cancel behind the insertion.
+    let timer = scheduler.start_timer(pid, 30_000, 5).unwrap();
+    assert!(matches!(scheduler.read_timer(timer), Some(ms) if ms <= 30_000));
+    assert!(matches!(scheduler.cancel_timer(timer), Some(ms) if ms <= 30_000));
+    assert_eq!(scheduler.cancel_timer(timer), None);
+}

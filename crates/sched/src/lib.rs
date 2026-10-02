@@ -2000,11 +2000,7 @@ impl<T: Task> Inner<T> {
                 wheel.lock().unwrap().cancel_at(id, self.clock.now_ms());
             }
         } else if let Some(queue) = self.canceled_timers.get(worker) {
-            queue.push(CanceledTimer {
-                id,
-                reply: None,
-                callback: None,
-            });
+            queue.push(CanceledTimer { id });
             self.wake_worker(worker);
         }
     }
@@ -2096,7 +2092,16 @@ impl<T: Task> Inner<T> {
     }
 
     fn apply_timer_commands(&self, local: &mut Local<T>) {
-        let mut service = local.timer_service.borrow_mut();
+        let service = Rc::clone(&local.timer_service);
+        self.run_timer_commands(&mut service.borrow_mut());
+    }
+
+    /// Serve the timer requests other threads queued for this scheduler.
+    ///
+    /// Port of erts/emulator/beam/erl_hl_timer.c:2083 (bif_timer_access_request) and
+    /// erl_hl_timer.c (scheduled_start_callback_timer, handle_canceled_queue), OTP-29.1.1:
+    /// the owning scheduler answers from its aux work; requesters never wait on it.
+    fn run_timer_commands(&self, service: &mut TimerService<T::Message>) {
         let commands = service.commands.clone();
         while let Some(command) = commands.pop() {
             match command {
@@ -2104,26 +2109,14 @@ impl<T: Task> Inner<T> {
                     id,
                     deadline,
                     payload,
-                    reply,
                 } => {
                     if !service.wheel.has_timers() {
                         let _ = service.wheel.advance(self.clock.now_ms());
                     }
                     service.wheel.insert(id, deadline, payload);
-                    let _ = reply.send(());
                 }
-                TimerCommand::Read {
-                    id,
-                    reply,
-                    callback,
-                } => {
-                    let remaining = service.wheel.remaining_at(id, self.clock.now_ms());
-                    if let Some(reply) = reply {
-                        let _ = reply.send(remaining);
-                    }
-                    if let Some(callback) = callback {
-                        callback(remaining);
-                    }
+                TimerCommand::Read { id, callback } => {
+                    callback(service.wheel.remaining_at(id, self.clock.now_ms()));
                 }
                 TimerCommand::Cancel { id, callback } => {
                     let remaining = service
@@ -2151,17 +2144,47 @@ impl<T: Task> Inner<T> {
         }
         let canceled_queue = service.canceled.clone();
         while let Some(canceled) = canceled_queue.pop() {
-            let remaining = service
-                .wheel
-                .cancel_at(canceled.id, self.clock.now_ms())
-                .map(|(remaining, _)| remaining);
-            if let Some(reply) = canceled.reply {
-                let _ = reply.send(remaining);
-            }
-            if let Some(callback) = canceled.callback {
-                callback(remaining);
-            }
+            service.wheel.cancel_at(canceled.id, self.clock.now_ms());
         }
+    }
+
+    /// The owner's wheel with every request queued before this call applied, so a
+    /// request issued on the owner sees timers that other threads inserted earlier.
+    fn owner_timer_service_synced(
+        &self,
+        worker: usize,
+    ) -> Option<Rc<RefCell<TimerService<T::Message>>>> {
+        let service = self.owner_timer_service(worker)?;
+        if let Ok(mut borrowed) = service.try_borrow_mut() {
+            self.run_timer_commands(&mut borrowed);
+        }
+        Some(service)
+    }
+
+    /// Block a non-owner thread on an asynchronous timer request.
+    ///
+    /// A scheduler thread keeps serving its own timer requests while it waits, so two
+    /// schedulers that query each other's timers cannot deadlock.
+    fn await_timer_reply(&self, receiver: mpsc::Receiver<Option<u64>>) -> Option<u64> {
+        let own = self
+            .current_worker()
+            .and_then(|worker| self.owner_timer_service(worker));
+        let Some(own) = own else {
+            return progress_wait(|| receiver.recv()).ok().flatten();
+        };
+        progress_wait(|| {
+            loop {
+                match receiver.recv_timeout(Duration::from_micros(50)) {
+                    Ok(remaining) => return remaining,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Ok(mut service) = own.try_borrow_mut() {
+                            self.run_timer_commands(&mut service);
+                        }
+                    }
+                }
+            }
+        })
     }
 
     fn fire_timer(
@@ -2304,15 +2327,16 @@ impl<T: Task> Inner<T> {
             }
             wheel.insert(id, deadline, payload);
         } else if let Some(queue) = self.timer_commands.get(worker) {
-            let (reply, receiver) = mpsc::sync_channel(0);
+            // Port of erts/emulator/beam/erl_hl_timer.c:2731 (erts_start_timer_callback),
+            // OTP-29.1.1: a thread that does not own the wheel schedules the insertion as
+            // aux work on the owner and continues. Later requests for this timer use the
+            // same queue, so they observe the insertion.
             queue.push(TimerCommand::Insert {
                 id,
                 deadline,
                 payload,
-                reply,
             });
             self.wake_worker(worker);
-            let _ = progress_wait(|| receiver.recv());
         } else {
             return Err(Error::NoProcess);
         }
@@ -2325,37 +2349,21 @@ impl<T: Task> Inner<T> {
         Ok(TimerRef { worker, id })
     }
 
+    /// Synchronous cancel for threads outside the scheduler (tests, drivers).
     fn cancel_timer(&self, reference: TimerRef) -> Option<u64> {
-        if let Some(timers) = self.sim_timers.as_ref() {
-            self.poll_timers(reference.worker, None, true);
-            return timers
-                .get(reference.worker)?
-                .lock()
-                .unwrap()
-                .cancel_at(reference.id, self.clock.now_ms())
-                .map(|x| x.0);
-        }
-        if let Some(service) = self.owner_timer_service(reference.worker) {
-            return service
-                .borrow_mut()
-                .wheel
-                .cancel_at(reference.id, self.clock.now_ms())
-                .map(|(remaining, _)| remaining);
-        }
-        let queue = self.canceled_timers.get(reference.worker)?;
-        let (reply, receiver) = mpsc::sync_channel(0);
-        queue.push(CanceledTimer {
-            id: reference.id,
-            reply: Some(reply),
-            callback: None,
-        });
-        // Port of erts/emulator/beam/erl_hl_timer.c (cross-scheduler cancel
-        // request), OTP-29.1.1. The owner drains its cancellation queue before
-        // invoking this scheduling-point callback.
-        self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
-        progress_wait(|| receiver.recv()).ok().flatten()
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.cancel_timer_async(
+            reference,
+            Box::new(move |remaining| {
+                let _ = reply.send(remaining);
+            }),
+        );
+        self.await_timer_reply(receiver)
     }
 
+    // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer), OTP-29.1.1:
+    // the owning scheduler accesses its wheel directly; any other thread schedules the
+    // request as aux work on the owner and gets the answer through `callback`.
     fn cancel_timer_async(
         &self,
         reference: TimerRef,
@@ -2375,9 +2383,9 @@ impl<T: Task> Inner<T> {
             callback(remaining);
             return;
         }
-        if let Some(service) = self.owner_timer_service(reference.worker) {
+        if let Some(service) = self.owner_timer_service_synced(reference.worker) {
             // The wheel's own `now` lags the clock between advances; remaining
-            // time is measured against the current time like the sync paths.
+            // time is measured against the current time.
             let remaining = service
                 .borrow_mut()
                 .wheel
@@ -2394,35 +2402,21 @@ impl<T: Task> Inner<T> {
             id: reference.id,
             callback,
         });
-        // Port of erts/emulator/beam/erl_hl_timer.c (cross-scheduler async
-        // cancellation), OTP-29.1.1. The owner answers from its next aux point.
+        // Port of erts/emulator/beam/erl_hl_timer.c:2083 (bif_timer_access_request),
+        // OTP-29.1.1: the owner answers from its next aux point.
         self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
     }
 
+    /// Synchronous read for threads outside the scheduler (tests, drivers).
     fn read_timer(&self, reference: TimerRef) -> Option<u64> {
-        if let Some(timers) = self.sim_timers.as_ref() {
-            self.poll_timers(reference.worker, None, true);
-            return timers
-                .get(reference.worker)?
-                .lock()
-                .unwrap()
-                .remaining_at(reference.id, self.clock.now_ms());
-        }
-        if let Some(service) = self.owner_timer_service(reference.worker) {
-            return service
-                .borrow()
-                .wheel
-                .remaining_at(reference.id, self.clock.now_ms());
-        }
-        let queue = self.timer_commands.get(reference.worker)?;
-        let (reply, receiver) = mpsc::sync_channel(0);
-        queue.push(TimerCommand::Read {
-            id: reference.id,
-            reply: Some(reply),
-            callback: None,
-        });
-        self.wake_worker(reference.worker);
-        progress_wait(|| receiver.recv()).ok().flatten()
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.read_timer_async(
+            reference,
+            Box::new(move |remaining| {
+                let _ = reply.send(remaining);
+            }),
+        );
+        self.await_timer_reply(receiver)
     }
 
     fn read_timer_async(&self, reference: TimerRef, callback: Box<dyn FnOnce(Option<u64>) + Send>) {
@@ -2436,13 +2430,12 @@ impl<T: Task> Inner<T> {
             }));
             return;
         }
-        if let Some(service) = self.owner_timer_service(reference.worker) {
-            callback(
-                service
-                    .borrow()
-                    .wheel
-                    .remaining_at(reference.id, self.clock.now_ms()),
-            );
+        if let Some(service) = self.owner_timer_service_synced(reference.worker) {
+            let remaining = service
+                .borrow()
+                .wheel
+                .remaining_at(reference.id, self.clock.now_ms());
+            callback(remaining);
             return;
         }
         let Some(commands) = self.timer_commands.get(reference.worker) else {
@@ -2451,10 +2444,9 @@ impl<T: Task> Inner<T> {
         };
         commands.push(TimerCommand::Read {
             id: reference.id,
-            reply: None,
-            callback: Some(callback),
+            callback,
         });
-        self.wake_worker(reference.worker);
+        self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
     }
 }
 

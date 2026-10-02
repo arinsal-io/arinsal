@@ -190,6 +190,9 @@ pub(crate) struct ProcessCold {
     /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
     /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
     pub(crate) delayed_gc: Vec<DelayedGc>,
+    /// erts `F_HAVE_BLCKD_MSCHED | F_HAVE_BLCKD_NMSCHED`: this process holds a
+    /// multi-scheduling block of its runtime.
+    pub(crate) have_blocked_multi_scheduling: bool,
     pub(crate) dictionary: Vec<(Term, Term)>,
     pub(crate) dictionary_heap: arinsal_term::VecHeap,
     pub(crate) flags: HashMap<String, Term>,
@@ -269,6 +272,13 @@ impl Process {
     /// store (its literal-area collector handshake).
     pub(crate) fn set_runtime(&mut self, runtime: Option<std::sync::Arc<crate::process::Runtime>>) {
         let scope = runtime.as_ref().map_or(0, |runtime| runtime.code_scope);
+        if let Some(runtime) = runtime.as_deref() {
+            // A new process takes `system_flag(min_bin_vheap_size)` of the runtime it joins;
+            // explicit spawn options are applied after this.
+            self.heap.set_min_bin_vheap_size(
+                crate::natives::sys::gc_spawn_defaults(Some(runtime)).min_bin_vheap_size as u64,
+            );
+        }
         self.runtime = runtime;
         if !std::ptr::eq(
             self._persistent_terms.store(),
@@ -359,7 +369,7 @@ impl Process {
         // Keeping a modest young generation avoids collecting every few instructions.
         heap.set_min_heap_size(min_heap);
         heap.set_min_bin_vheap_size(
-            crate::natives::sys::gc_spawn_defaults().min_bin_vheap_size as u64,
+            crate::natives::sys::gc_spawn_defaults(None).min_bin_vheap_size as u64,
         );
         let mut process = Self {
             header: ProcessHeader::default(),

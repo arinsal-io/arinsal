@@ -9,7 +9,68 @@ const SOURCE: &str = r#"
 -export([online/0, heap_defaults/0, control_flags/0,
          topology/0, bind_type/0, allocator/0, invalid_topology/0,
          topology_round_trip/0, blocked_scheduler_run_queue/0,
-         microstate_after_disable/0]).
+         microstate_after_disable/0, blocker_exit/0, change_flags/0,
+         runtime_defaults/0]).
+
+%% erts_continue_exit_process releases the blocks an exiting process holds.
+blocker_exit() ->
+    S = self(),
+    P = spawn(fun() ->
+                  R = erlang:system_flag(multi_scheduling, block),
+                  S ! {r, R},
+                  receive stop -> ok end
+              end),
+    R1 = receive {r, R} -> R end,
+    A = {R1, erlang:system_info(multi_scheduling),
+         erlang:system_info(multi_scheduling_blockers) =:= [P],
+         erlang:system_flag(multi_scheduling, unblock)},
+    M = monitor(process, P),
+    P ! stop,
+    receive {'DOWN', M, _, _, _} -> ok end,
+    B = {erlang:system_info(multi_scheduling),
+         erlang:system_info(multi_scheduling_blockers)},
+    C1 = erlang:system_flag(multi_scheduling, block),
+    C2 = erlang:system_flag(multi_scheduling, block),
+    C3 = erlang:system_flag(multi_scheduling, unblock),
+    C4 = erlang:system_info(multi_scheduling_blockers) =:= [self()],
+    C5 = erlang:system_flag(multi_scheduling, unblock),
+    D1 = erlang:system_flag(multi_scheduling, block_normal),
+    D2 = erlang:system_info(normal_multi_scheduling_blockers) =:= [self()],
+    D3 = erlang:system_flag(multi_scheduling, block),
+    D4 = erlang:system_flag(multi_scheduling, unblock_normal),
+    D5 = erlang:system_flag(multi_scheduling, unblock),
+    D6 = erlang:system_flag(multi_scheduling, unblock),
+    E = spawn(fun() ->
+                  blocked_normal = erlang:system_flag(multi_scheduling, block_normal),
+                  exit(kill_me)
+              end),
+    EM = monitor(process, E),
+    receive {'DOWN', EM, _, _, _} -> ok end,
+    {A, B, {C1, C2, C3, C4, C5}, {D1, D2, D3, D4, D5, D6},
+     erlang:system_info(multi_scheduling),
+     erlang:system_info(normal_multi_scheduling_blockers)}.
+
+%% Leaves every flag changed; a later runtime must not see these values.
+change_flags() ->
+    erlang:system_flag(fullsweep_after, 7),
+    erlang:system_flag(min_heap_size, 1000),
+    erlang:system_flag(min_bin_vheap_size, 100000),
+    erlang:system_flag(trace_control_word, 5),
+    erlang:system_flag(outstanding_system_requests_limit, 3),
+    erlang:system_flag(schedulers_online, 1),
+    erlang:system_flag(multi_scheduling, block_normal),
+    ok.
+
+runtime_defaults() ->
+    {erlang:system_info(fullsweep_after), erlang:system_info(min_heap_size),
+     erlang:system_info(min_bin_vheap_size),
+     erlang:system_flag(trace_control_word, 0),
+     erlang:system_flag(outstanding_system_requests_limit, 1 bsl 20),
+     erlang:system_info(schedulers_online),
+     erlang:system_info(dirty_cpu_schedulers_online),
+     erlang:system_info(multi_scheduling),
+     element(2, process_info(spawn(fun() -> receive _ -> ok end end),
+                             min_bin_vheap_size))}.
 
 online() ->
     Current = erlang:system_info(schedulers_online),
@@ -177,4 +238,36 @@ fn sysflag_rt_user_cpu_topology_round_trip_matches_otp() {
 #[test]
 fn sysflag_rt_blocked_scheduler_keeps_the_caller_runnable() {
     compare("blocked_scheduler_run_queue");
+}
+
+#[test]
+fn sysflag_rt_exiting_blocker_releases_multi_scheduling() {
+    compare("blocker_exit");
+}
+
+/// Several runtimes share this OS process; erts keeps these flags per emulator.
+#[test]
+fn sysflag_rt_flags_are_per_runtime() {
+    let _lock = FLAG_TEST_LOCK.lock().expect("system flag test lock");
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping per-runtime system flag test");
+        return;
+    };
+    let beam = reference
+        .compile_named("sysflag_rt", SOURCE, &[])
+        .expect("compile system flag fixture");
+    reference.load("sysflag_rt", &beam).expect("load reference");
+    let expected = reference.call("sysflag_rt", "runtime_defaults", &[]);
+    let mut first = Vm::new([]);
+    first.load_bytes(&beam).expect("load first VM");
+    let changed = first
+        .eval_scheduled("sysflag_rt", "change_flags", &[], 1, None)
+        .unwrap_or_else(|error| panic!("change_flags: {error}"));
+    assert_eq!(changed.term, arinsal_etf::OwnedTerm::Atom("ok".into()));
+    let mut second = Vm::new([]);
+    second.load_bytes(&beam).expect("load second VM");
+    let actual = second
+        .eval_scheduled("sysflag_rt", "runtime_defaults", &[], 1, None)
+        .unwrap_or_else(|error| panic!("runtime_defaults: {error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
 }

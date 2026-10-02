@@ -983,10 +983,10 @@ fn system_info(
             u64::from(crate::node_tables::lock().local_creation),
         )),
         // Port of erts/emulator/beam/erl_bif_info.c:2773 (system_info_1), OTP-29.1.1.
-        Some("schedulers_online") => Some(with_flags(|flags| {
+        Some("schedulers_online") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.schedulers_online as u64)
         })),
-        Some("schedulers") => Some(with_flags(|flags| {
+        Some("schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.schedulers_total as u64)
         })),
         // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
@@ -995,33 +995,52 @@ fn system_info(
                 .and_then(|id| Term::small(id as i64))
                 .ok_or_else(badarg),
         ),
-        Some("dirty_cpu_schedulers") => Some(with_flags(|flags| {
+        Some("dirty_cpu_schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.dirty_cpu_total as u64)
         })),
-        Some("dirty_cpu_schedulers_online") => Some(with_flags(|flags| {
+        Some("dirty_cpu_schedulers_online") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.dirty_cpu_online as u64)
         })),
-        Some("dirty_io_schedulers") => Some(with_flags(|flags| {
+        Some("dirty_io_schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.dirty_io_total as u64)
         })),
-        Some("fullsweep_after") => Some(with_flags(|flags| {
+        Some("fullsweep_after") => Some(read_flags(process, |process, flags| {
             tagged(process, "fullsweep_after", u64::from(flags.fullsweep_after))
         })),
-        Some("min_heap_size") => Some(with_flags(|flags| {
+        Some("min_heap_size") => Some(read_flags(process, |process, flags| {
             tagged(process, "min_heap_size", flags.min_heap_size as u64)
         })),
-        Some("min_bin_vheap_size") => Some(with_flags(|flags| {
+        Some("min_bin_vheap_size") => Some(read_flags(process, |process, flags| {
             tagged(
                 process,
                 "min_bin_vheap_size",
                 flags.min_bin_vheap_size as u64,
             )
         })),
-        Some("max_heap_size") => Some(with_flags(|flags| max_heap_map(process, flags.max_heap))),
-        Some("multi_scheduling") => Some(Ok(atom(multi_scheduling_state(process).state()))),
+        Some("max_heap_size") => Some(read_flags(process, |process, flags| {
+            max_heap_map(process, flags.max_heap)
+        })),
+        Some("multi_scheduling") => Some(Ok(atom(multi_scheduling_state(process, |state| {
+            state.state()
+        })))),
+        // Port of erts/emulator/beam/erl_bif_info.c:3390 (multi_scheduling_blockers), OTP-29.1.1.
+        Some(name @ ("multi_scheduling_blockers" | "normal_multi_scheduling_blockers")) => {
+            let normal = name.starts_with("normal");
+            let single = with_flags(process, |flags| flags.schedulers_total == 1);
+            let blockers = if single {
+                Vec::new()
+            } else {
+                multi_scheduling_state(process, |state| state.blockers(normal))
+            };
+            let terms = blockers
+                .into_iter()
+                .filter_map(arinsal_sched::Pid::to_term)
+                .collect::<Vec<_>>();
+            Some(cons_list(process, &terms))
+        }
         Some("cpu_topology") => Some(cpu_topology_info(process)),
         Some("scheduler_bind_type") => Some(Ok(atom("unbound"))),
-        Some("scheduler_bindings") => Some(with_flags(|flags| {
+        Some("scheduler_bindings") => Some(read_flags(process, |process, flags| {
             tuple(process, &vec![atom("unbound"); flags.schedulers_total])
         })),
         Some("sequential_tracer") => Some(crate::seq_trace::system_tracer_info(process)),
@@ -2214,13 +2233,13 @@ fn system_flag(
         "multi_scheduling" => multi_scheduling(process, ctx, args[1]),
         "schedulers_online" => schedulers_online(process, args[1], false),
         "dirty_cpu_schedulers_online" => schedulers_online(process, args[1], true),
-        "fullsweep_after" => fullsweep_after(args[1]),
-        "min_heap_size" => heap_minimum(args[1], true),
-        "min_bin_vheap_size" => heap_minimum(args[1], false),
+        "fullsweep_after" => fullsweep_after(process, args[1]),
+        "min_heap_size" => heap_minimum(process, args[1], true),
+        "min_bin_vheap_size" => heap_minimum(process, args[1], false),
         "max_heap_size" => max_heap_flag(process, args[1]),
         "debug_flags" => Ok(atom("true")),
         "backtrace_depth" => backtrace_depth(vm, args[1]),
-        "trace_control_word" => trace_control_word(args[1]),
+        "trace_control_word" => trace_control_word(process, args[1]),
         "sequential_tracer" => crate::seq_trace::set_system_tracer(vm, process, args[1]),
         "reset_seq_trace" => {
             crate::seq_trace::clear_all();
@@ -2228,7 +2247,7 @@ fn system_flag(
         }
         "scheduler_wall_time" => set_scheduler_wall(process, ctx, args[1]),
         "microstate_accounting" => set_microstate(process, ctx, args[1]),
-        "outstanding_system_requests_limit" => outstanding_limit(args[1]),
+        "outstanding_system_requests_limit" => outstanding_limit(process, args[1]),
         "scheduling_statistics" => scheduling_statistics(args[1]),
         "time_offset" if atom_name(args[1]) == Some("finalize") => Ok(atom("final")),
         "scheduler_bind_type" => {
@@ -2586,7 +2605,9 @@ fn set_runtime_accounting(process: &Process, ctx: &mut RunCtx<'_, Message>) {
     ctx.set_wall_accounting_enabled(enabled);
 }
 
-struct SystemFlags {
+/// `erlang:system_flag/2` state of one runtime.
+#[derive(Clone)]
+pub(crate) struct SystemFlags {
     fullsweep_after: u16,
     min_heap_size: i64,
     min_bin_vheap_size: i64,
@@ -2606,8 +2627,8 @@ pub(crate) struct GcSpawnDefaults {
     pub(crate) min_bin_vheap_size: i64,
 }
 
-pub(crate) fn gc_spawn_defaults() -> GcSpawnDefaults {
-    with_flags(|flags| GcSpawnDefaults {
+pub(crate) fn gc_spawn_defaults(runtime: Option<&crate::process::Runtime>) -> GcSpawnDefaults {
+    with_runtime_flags(runtime, |flags| GcSpawnDefaults {
         fullsweep_after: flags.fullsweep_after,
         max_heap_size: flags.max_heap,
         min_bin_vheap_size: flags.min_bin_vheap_size,
@@ -2615,19 +2636,25 @@ pub(crate) fn gc_spawn_defaults() -> GcSpawnDefaults {
 }
 
 pub(crate) fn multi_scheduling_blocked(process: &Process) -> bool {
-    multi_scheduling_state(process).any_blocked()
+    multi_scheduling_state(process, crate::process::MultiScheduling::any_blocked)
 }
 
-fn multi_scheduling_state(process: &Process) -> crate::process::MultiScheduling {
-    process
-        .runtime
-        .as_ref()
-        .map(|runtime| *runtime.multi_scheduling.lock().unwrap())
-        .unwrap_or_default()
+fn multi_scheduling_state<T>(
+    process: &Process,
+    body: impl FnOnce(&crate::process::MultiScheduling) -> T,
+) -> T {
+    match process.runtime.as_ref() {
+        Some(runtime) => body(&runtime.multi_scheduling.lock().unwrap()),
+        None => body(&crate::process::MultiScheduling::default()),
+    }
 }
 
-pub(crate) fn normalize_spawn_heap_minimum(requested: Option<usize>, binary: bool) -> usize {
-    with_flags(|flags| {
+pub(crate) fn normalize_spawn_heap_minimum(
+    runtime: Option<&crate::process::Runtime>,
+    requested: Option<usize>,
+    binary: bool,
+) -> usize {
+    with_runtime_flags(runtime, |flags| {
         let minimum = if binary {
             flags.min_bin_vheap_size
         } else {
@@ -2642,41 +2669,68 @@ pub(crate) fn normalize_spawn_heap_minimum(requested: Option<usize>, binary: boo
     })
 }
 
-fn with_flags<T>(body: impl FnOnce(&mut SystemFlags) -> T) -> T {
-    static FLAGS: OnceLock<Mutex<SystemFlags>> = OnceLock::new();
-    let flags = FLAGS.get_or_init(|| {
-        let cpus = logical_processors();
-        let (
-            schedulers_total,
-            schedulers_online,
-            dirty_cpu_total,
-            dirty_cpu_online,
-            dirty_io_total,
-        ) = boot_scheduler_counts(cpus);
-        Mutex::new(SystemFlags {
-            // Port of erl_init.c:1328-1332 (`ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
-            fullsweep_after: std::env::var("ERL_FULLSWEEP_AFTER")
-                .ok()
-                .map(|value| value.trim().parse::<i64>().unwrap_or(0) as u16)
-                .unwrap_or(u16::MAX),
-            min_heap_size: 233,
-            min_bin_vheap_size: 46_422,
-            max_heap: crate::process::MaxHeap::default(),
-            schedulers_online,
-            schedulers_total,
-            dirty_cpu_online,
-            dirty_cpu_total,
-            dirty_io_total,
-            trace_word: 0,
-            outstanding: (cpus as u64).saturating_mul(2),
+impl SystemFlags {
+    /// Values a runtime boots with, from the command line and the environment.
+    pub(crate) fn boot() -> Self {
+        static BOOT: OnceLock<SystemFlags> = OnceLock::new();
+        BOOT.get_or_init(|| {
+            let cpus = logical_processors();
+            let (
+                schedulers_total,
+                schedulers_online,
+                dirty_cpu_total,
+                dirty_cpu_online,
+                dirty_io_total,
+            ) = boot_scheduler_counts(cpus);
+            SystemFlags {
+                // Port of erl_init.c:1328-1332 (`ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
+                fullsweep_after: std::env::var("ERL_FULLSWEEP_AFTER")
+                    .ok()
+                    .map(|value| value.trim().parse::<i64>().unwrap_or(0) as u16)
+                    .unwrap_or(u16::MAX),
+                min_heap_size: 233,
+                min_bin_vheap_size: 46_422,
+                max_heap: crate::process::MaxHeap::default(),
+                schedulers_online,
+                schedulers_total,
+                dirty_cpu_online,
+                dirty_cpu_total,
+                dirty_io_total,
+                trace_word: 0,
+                outstanding: (cpus as u64).saturating_mul(2),
+            }
         })
-    });
-    body(&mut flags.lock().expect("system flags"))
+        .clone()
+    }
+}
+
+/// erts keeps these flags in the emulator's globals; every runtime is a separate emulator
+/// here, and several runtimes can share one OS process.
+fn with_flags<T>(process: &Process, body: impl FnOnce(&mut SystemFlags) -> T) -> T {
+    with_runtime_flags(process.runtime.as_deref(), body)
+}
+
+/// A snapshot of the flags for code that allocates on `process` while reading them.
+fn read_flags<T>(process: &mut Process, body: impl FnOnce(&mut Process, &SystemFlags) -> T) -> T {
+    let flags = with_flags(process, |flags| flags.clone());
+    body(process, &flags)
+}
+
+/// Flags of `runtime`; an unscheduled evaluation without a runtime sees the boot values
+/// and its changes are dropped.
+pub(crate) fn with_runtime_flags<T>(
+    runtime: Option<&crate::process::Runtime>,
+    body: impl FnOnce(&mut SystemFlags) -> T,
+) -> T {
+    match runtime {
+        Some(runtime) => body(&mut runtime.system_flags.lock().expect("system flags")),
+        None => body(&mut SystemFlags::boot()),
+    }
 }
 
 /// Dirty CPU total and online, and dirty I/O scheduler counts chosen at boot.
-pub(crate) fn dirty_scheduler_defaults() -> (usize, usize, usize) {
-    with_flags(|flags| {
+pub(crate) fn dirty_scheduler_defaults(runtime: &crate::process::Runtime) -> (usize, usize, usize) {
+    with_runtime_flags(Some(runtime), |flags| {
         (
             flags.dirty_cpu_total,
             flags.dirty_cpu_online,
@@ -2685,8 +2739,8 @@ pub(crate) fn dirty_scheduler_defaults() -> (usize, usize, usize) {
     })
 }
 
-pub(crate) fn scheduler_online_default() -> usize {
-    with_flags(|flags| flags.schedulers_online)
+pub(crate) fn scheduler_online_default(runtime: &crate::process::Runtime) -> usize {
+    with_runtime_flags(Some(runtime), |flags| flags.schedulers_online)
 }
 
 fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
@@ -2808,44 +2862,63 @@ fn next_heap_size(size: i64) -> i64 {
 }
 
 fn multi_scheduling(
-    process: &Process,
+    process: &mut Process,
     ctx: &RunCtx<'_, Message>,
     value: Term,
 ) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling), OTP-29.1.1.
     let action = match atom_name(value) {
-        Some("block") => (Some(true), None),
-        Some("unblock") => (Some(false), None),
-        Some("block_normal") => (None, Some(true)),
-        Some("unblock_normal") => (None, Some(false)),
+        Some("block") => crate::process::MsbChange::Block { normal: false },
+        Some("unblock") => crate::process::MsbChange::Unblock { normal: false },
+        Some("block_normal") => crate::process::MsbChange::Block { normal: true },
+        Some("unblock_normal") => crate::process::MsbChange::Unblock { normal: true },
         _ => return Err(badarg()),
     };
-    let apply = |state: &mut crate::process::MultiScheduling| {
-        if let Some(blocked) = action.0 {
-            state.blocked = blocked;
-        }
-        if let Some(blocked) = action.1 {
-            state.normal_blocked = blocked;
-        }
-    };
+    let pid = ctx.pid();
     // An unscheduled evaluation has no runtime and no other scheduler to block.
-    let Some(runtime) = process.runtime.as_ref() else {
+    let Some(runtime) = process.runtime.clone() else {
         let mut state = crate::process::MultiScheduling::default();
-        apply(&mut state);
+        state.change(pid, action);
         return Ok(atom(state.state()));
     };
     let mut state = runtime.multi_scheduling.lock().unwrap();
-    apply(&mut state);
+    if state.change(pid, action) {
+        // erts F_HAVE_BLCKD_MSCHED / F_HAVE_BLCKD_NMSCHED: released when this process exits.
+        process.cold_mut().have_blocked_multi_scheduling = true;
+    }
     if let Ok(scheduler) = runtime.scheduler() {
         scheduler.set_scheduling_blocked(state.any_blocked(), ctx.worker_id());
     }
     Ok(atom(state.state()))
 }
 
+/// Release every multi-scheduling block `process` still holds.
+///
+/// Port of erts/emulator/beam/erl_process.c:14318-14353 (erts_continue_exit_process,
+/// ERTS_CONTINUE_EXIT_BLCKD_MSHED / _NMSHED), OTP-29.1.1.
+pub(crate) fn release_multi_scheduling_blocks(process: &mut Process, pid: arinsal_sched::Pid) {
+    let Some(cold) = process.cold.as_mut() else {
+        return;
+    };
+    if !std::mem::take(&mut cold.have_blocked_multi_scheduling) {
+        return;
+    }
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    let mut state = runtime.multi_scheduling.lock().unwrap();
+    state.release(pid);
+    if !state.any_blocked()
+        && let Ok(scheduler) = runtime.scheduler()
+    {
+        scheduler.set_scheduling_blocked(false, None);
+    }
+}
+
 fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_process.c:8228 (erts_set_schedulers_online), OTP-29.1.1.
     let requested = value.as_small().ok_or_else(badarg)?;
-    with_flags(|flags| {
+    with_flags(process, |flags| {
         // Port of erts/emulator/beam/bif.c:5015 and :5178
         // (system_flag_2 scheduler controls), OTP-29.1.1.
         // Normal schedulers bound the number of dirty CPU schedulers online.
@@ -2898,20 +2971,20 @@ fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term
     })
 }
 
-fn fullsweep_after(value: Term) -> Result<Term, VmError> {
+fn fullsweep_after(process: &Process, value: Term) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let stored = u16::try_from(requested).unwrap_or(u16::MAX);
-    with_flags(|flags| {
+    with_flags(process, |flags| {
         let previous = flags.fullsweep_after;
         flags.fullsweep_after = stored;
         Ok(Term::small(i64::from(previous)).unwrap())
     })
 }
 
-fn heap_minimum(value: Term, heap: bool) -> Result<Term, VmError> {
+fn heap_minimum(process: &Process, value: Term, heap: bool) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
     let rounded = next_heap_size(requested);
-    with_flags(|flags| {
+    with_flags(process, |flags| {
         let slot = if heap {
             &mut flags.min_heap_size
         } else {
@@ -2930,18 +3003,18 @@ fn backtrace_depth(vm: &mut Vm, value: Term) -> Result<Term, VmError> {
     Term::small(previous as i64).ok_or_else(badarg)
 }
 
-fn trace_control_word(value: Term) -> Result<Term, VmError> {
+fn trace_control_word(process: &Process, value: Term) -> Result<Term, VmError> {
     let requested = value.as_small().ok_or_else(badarg)?;
-    with_flags(|flags| {
+    with_flags(process, |flags| {
         let previous = flags.trace_word;
         flags.trace_word = requested;
         Term::small(previous).ok_or_else(badarg)
     })
 }
 
-fn outstanding_limit(value: Term) -> Result<Term, VmError> {
+fn outstanding_limit(process: &Process, value: Term) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n > 0).ok_or_else(badarg)?;
-    with_flags(|flags| {
+    with_flags(process, |flags| {
         let previous = flags.outstanding;
         flags.outstanding = requested as u64;
         Term::small(i64::try_from(previous).unwrap_or(i64::MAX)).ok_or_else(badarg)
@@ -2956,8 +3029,8 @@ fn scheduling_statistics(value: Term) -> Result<Term, VmError> {
 }
 
 fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    let parsed = parse_system_max_heap(value)?;
-    let previous = with_flags(|flags| {
+    let parsed = parse_system_max_heap(process, value)?;
+    let previous = with_flags(process, |flags| {
         let old = flags.max_heap;
         if parsed.size < flags.min_heap_size as u64 && parsed.size != 0 {
             return Err(badarg());
@@ -2970,17 +3043,22 @@ fn max_heap_flag(process: &mut Process, value: Term) -> Result<Term, VmError> {
 
 /// The current system-wide max_heap_size flags: erts parses every max_heap_size value starting from them
 /// (erts/emulator/beam/erl_process.c erts_max_heap_size: `*max_heap_flags = H_MAX_FLAGS`), OTP-29.1.1.
-pub(crate) fn system_max_heap() -> crate::process::MaxHeap {
+pub(crate) fn system_max_heap(
+    runtime: Option<&crate::process::Runtime>,
+) -> crate::process::MaxHeap {
     crate::process::MaxHeap {
         reported: false,
-        ..with_flags(|flags| flags.max_heap)
+        ..with_runtime_flags(runtime, |flags| flags.max_heap)
     }
 }
 
-fn parse_system_max_heap(value: Term) -> Result<crate::process::MaxHeap, VmError> {
+fn parse_system_max_heap(
+    process: &Process,
+    value: Term,
+) -> Result<crate::process::MaxHeap, VmError> {
     let mut limit = crate::process::MaxHeap {
         size: 0,
-        ..system_max_heap()
+        ..system_max_heap(process.runtime.as_deref())
     };
     if let Some(size) = value.as_small() {
         if size < 0 {
@@ -3362,7 +3440,7 @@ fn queue_counts(
     include_dirty_io: bool,
 ) -> Vec<u64> {
     // Port of erts/emulator/beam/erl_process.c:9281 (erts_run_queues_len), OTP-29.1.1.
-    let schedulers = with_flags(|flags| flags.schedulers_total);
+    let schedulers = with_flags(process, |flags| flags.schedulers_total);
     // erts exposes one aggregated run queue for each dirty scheduler class.
     let slots = schedulers + 1 + usize::from(include_dirty_io);
     let mut values = vec![0; slots];
@@ -3407,7 +3485,7 @@ fn scheduler_wall(
     };
     let total_us = u64::try_from(base.started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let stats = scheduler_stats(process, ctx);
-    let (schedulers, dirty_cpu, dirty_io) = with_flags(|flags| {
+    let (schedulers, dirty_cpu, dirty_io) = with_flags(process, |flags| {
         (
             flags.schedulers_total,
             flags.dirty_cpu_total,
@@ -3479,7 +3557,7 @@ fn microstate(
         ctx.account_gc_total(process.stats.gc.nanoseconds);
     }
     let stats = scheduler_stats(process, ctx.as_deref());
-    let (online, dirty_cpu, dirty_io) = with_flags(|flags| {
+    let (online, dirty_cpu, dirty_io) = with_flags(process, |flags| {
         (
             flags.schedulers_online,
             flags.dirty_cpu_total,

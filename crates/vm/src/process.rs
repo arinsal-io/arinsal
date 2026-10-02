@@ -752,36 +752,99 @@ pub(crate) struct Runtime {
     pub(crate) max_heaps: Mutex<HashMap<Pid, MaxHeap>>,
     pub(crate) ever_max_heap: AtomicBool,
     pub(crate) debug_wait_active: AtomicBool,
+    /// `erlang:system_flag/2` settings of this runtime.
+    pub(crate) system_flags: Mutex<crate::natives::sys::SystemFlags>,
     /// Multi-scheduling block state of this runtime.
     pub(crate) multi_scheduling: Mutex<MultiScheduling>,
+}
+
+/// A `system_flag(multi_scheduling, _)` request.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MsbChange {
+    Block { normal: bool },
+    Unblock { normal: bool },
 }
 
 /// `erlang:system_flag(multi_scheduling, _)` state of one runtime.
 ///
 /// Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling,
-/// `schdlr_sspnd.msb` / `schdlr_sspnd.nmsb`), OTP-29.1.1. erts keeps this in the
-/// runtime's scheduler suspend state, so a runtime always boots with multi-scheduling
-/// enabled; it is never inherited from another runtime sharing the OS process.
-#[derive(Clone, Copy, Debug, Default)]
+/// `schdlr_sspnd.msb.blckrs` / `schdlr_sspnd.nmsb.blckrs`), OTP-29.1.1: each block adds
+/// the caller to the blocker list once more, each unblock removes one entry, and the
+/// runtime stays blocked while a list is non-empty.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct MultiScheduling {
-    pub(crate) blocked: bool,
-    pub(crate) normal_blocked: bool,
+    blockers: Vec<Pid>,
+    normal_blockers: Vec<Pid>,
 }
 
 impl MultiScheduling {
-    /// Port of erts/emulator/beam/erl_bif_info.c (system_info(multi_scheduling)), OTP-29.1.1.
-    pub(crate) fn state(self) -> &'static str {
-        if self.blocked {
+    /// Port of erts/emulator/beam/erl_bif_info.c:2790 (system_info(multi_scheduling)),
+    /// OTP-29.1.1.
+    pub(crate) fn state(&self) -> &'static str {
+        if !self.blockers.is_empty() {
             "blocked"
-        } else if self.normal_blocked {
+        } else if !self.normal_blockers.is_empty() {
             "blocked_normal"
         } else {
             "enabled"
         }
     }
 
-    pub(crate) fn any_blocked(self) -> bool {
-        self.blocked || self.normal_blocked
+    pub(crate) fn any_blocked(&self) -> bool {
+        !self.blockers.is_empty() || !self.normal_blockers.is_empty()
+    }
+
+    /// Apply `change` for `pid`; true when `pid` now holds a block.
+    pub(crate) fn change(&mut self, pid: Pid, change: MsbChange) -> bool {
+        match change {
+            MsbChange::Block { normal } => {
+                self.list(normal).push(pid);
+                true
+            }
+            MsbChange::Unblock { normal } => {
+                let list = self.list(normal);
+                if let Some(index) = list.iter().position(|blocker| *blocker == pid) {
+                    list.remove(index);
+                }
+                self.holds(pid)
+            }
+        }
+    }
+
+    /// Drop every block of an exiting process.
+    pub(crate) fn release(&mut self, pid: Pid) {
+        self.blockers.retain(|blocker| *blocker != pid);
+        self.normal_blockers.retain(|blocker| *blocker != pid);
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:8692 (erts_multi_scheduling_blockers),
+    /// OTP-29.1.1: distinct blockers, the list built by consing in blocking order.
+    pub(crate) fn blockers(&self, normal: bool) -> Vec<Pid> {
+        let list = if normal {
+            &self.normal_blockers
+        } else {
+            &self.blockers
+        };
+        let mut distinct = Vec::new();
+        for pid in list {
+            if !distinct.contains(pid) {
+                distinct.push(*pid);
+            }
+        }
+        distinct.reverse();
+        distinct
+    }
+
+    fn holds(&self, pid: Pid) -> bool {
+        self.blockers.contains(&pid) || self.normal_blockers.contains(&pid)
+    }
+
+    fn list(&mut self, normal: bool) -> &mut Vec<Pid> {
+        if normal {
+            &mut self.normal_blockers
+        } else {
+            &mut self.blockers
+        }
     }
 }
 
@@ -1834,11 +1897,11 @@ impl Executor {
                                             Err(VmError::Unsupported(message))
                                                 if crate::signals::is_await_message(&message) =>
                                             {
-                                                for (register, value) in
-                                                    process.x.iter_mut().zip(&saved_arguments)
-                                                {
-                                                    *register = *value;
-                                                }
+                                                // The X registers still hold the arguments, moved
+                                                // by any collection the call ran (signal handling
+                                                // on entry); the copies taken before it are stale.
+                                                // They stay live until the call is redone.
+                                                process.gc_live = saved_arguments.len();
                                                 let cold = process.cold_mut();
                                                 cold.native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
@@ -5086,10 +5149,11 @@ impl Vm {
             max_heaps: Mutex::new(HashMap::new()),
             ever_max_heap: AtomicBool::new(false),
             debug_wait_active: AtomicBool::new(false),
+            system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
             multi_scheduling: Mutex::new(MultiScheduling::default()),
         });
         let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
-            crate::natives::sys::dirty_scheduler_defaults();
+            crate::natives::sys::dirty_scheduler_defaults(&runtime);
         let config = Config {
             workers,
             reductions: reductions.max(1),
@@ -5102,7 +5166,7 @@ impl Vm {
             Some(seed) => Scheduler::simulation(config, seed),
             None => Scheduler::new(config),
         });
-        let online = crate::natives::sys::scheduler_online_default();
+        let online = crate::natives::sys::scheduler_online_default(&runtime);
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
         let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
         *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
