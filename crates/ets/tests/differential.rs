@@ -439,6 +439,151 @@ fn reference() -> Option<&'static RefErl> {
 }
 
 #[test]
+fn table_memory_concurrency_options_match_otp() {
+    let Some(erl) = reference() else { return };
+    let schedulers = match erl.eval("erlang:system_info(schedulers)").unwrap() {
+        OwnedTerm::Int(count) => count as usize,
+        other => panic!("unexpected scheduler count: {other:?}"),
+    };
+    for (kind, name) in [
+        (TableType::Set, "set"),
+        (TableType::Bag, "bag"),
+        (TableType::DuplicateBag, "duplicate_bag"),
+        (TableType::OrderedSet, "ordered_set"),
+    ] {
+        for read_concurrency in [false, true] {
+            for write_concurrency in [false, true] {
+                for decentralized_counters in [false, true] {
+                    let opts = format!(
+                        "{{read_concurrency,{read_concurrency}}},{{write_concurrency,{write_concurrency}}},{{decentralized_counters,{decentralized_counters}}}"
+                    );
+                    let expected = erl
+                        .eval(&format!(
+                            "T=ets:new(t,[public,{name},{opts}]), M0=ets:info(T,memory), ets:insert(T,[{{I,I}} || I <- lists:seq(1,8)]), M1=ets:info(T,memory), ets:delete(T,2), ets:delete(T,4), [M0,M1,ets:info(T,memory)]"
+                        ))
+                        .unwrap();
+                    let OwnedTerm::List {
+                        elems: expected_values,
+                        ..
+                    } = &expected
+                    else {
+                        panic!("OTP returned non-list memory results: {expected:?}");
+                    };
+                    let settings = TableOptions {
+                        name: global_atoms().intern("ets_memory_diff").unwrap(),
+                        named_table: false,
+                        table_type: kind,
+                        keypos: 1,
+                        protection: Protection::Public,
+                        owner: Term::pid(1, 0).unwrap(),
+                        heir: None,
+                        read_concurrency,
+                        write_concurrency: if write_concurrency {
+                            WriteConcurrency::Enabled
+                        } else {
+                            WriteConcurrency::Disabled
+                        },
+                        decentralized_counters,
+                        compressed: false,
+                    };
+                    let mut registry = Registry::new();
+                    let tid = registry.create(settings).unwrap();
+                    let table = registry.get(tid).unwrap();
+                    let mut actual = vec![table.memory_words_for_schedulers(schedulers)];
+                    drop(table);
+                    for key in 1..=8 {
+                        let mut heap = arinsal_term::VecHeap::new();
+                        let object = arinsal_term::TermBuilder::new(&mut heap)
+                            .tuple(&[Term::small(key).unwrap(), Term::small(key).unwrap()])
+                            .unwrap();
+                        registry.get_mut(tid).unwrap().insert(&[object]).unwrap();
+                    }
+                    actual.push(
+                        registry
+                            .get(tid)
+                            .unwrap()
+                            .memory_words_for_schedulers(schedulers),
+                    );
+                    for key in [2, 4] {
+                        registry
+                            .get_mut(tid)
+                            .unwrap()
+                            .delete_key(Term::small(key).unwrap());
+                    }
+                    actual.push(
+                        registry
+                            .get(tid)
+                            .unwrap()
+                            .memory_words_for_schedulers(schedulers),
+                    );
+                    assert_eq!(
+                        expected_values,
+                        &actual
+                            .into_iter()
+                            .map(|words| OwnedTerm::Int(words as i64))
+                            .collect::<Vec<_>>(),
+                        "{name}, read_concurrency={read_concurrency}, write_concurrency={write_concurrency}, decentralized_counters={decentralized_counters}"
+                    );
+                }
+            }
+        }
+    }
+
+    let expected = erl
+        .eval("T=ets:new(t,[public,set,{write_concurrency,{debug_hash_fixed_number_of_locks,1024}}]), M0=ets:info(T,memory), ets:insert(T,[{I,I} || I <- lists:seq(1,8)]), M1=ets:info(T,memory), ets:delete(T,2), ets:delete(T,4), [M0,M1,ets:info(T,memory)]")
+        .unwrap();
+    let OwnedTerm::List {
+        elems: expected_values,
+        ..
+    } = &expected
+    else {
+        panic!("OTP returned non-list fixed-lock memory results: {expected:?}");
+    };
+    let mut settings = options(TableType::Set);
+    settings.protection = Protection::Public;
+    settings.write_concurrency = WriteConcurrency::Fixed(1024);
+    settings.decentralized_counters = true;
+    let mut registry = Registry::new();
+    let tid = registry.create(settings).unwrap();
+    let table = registry.get(tid).unwrap();
+    let mut actual = vec![table.memory_words_for_schedulers(schedulers)];
+    drop(table);
+    for key in 1..=8 {
+        let mut heap = arinsal_term::VecHeap::new();
+        let object = arinsal_term::TermBuilder::new(&mut heap)
+            .tuple(&[Term::small(key).unwrap(), Term::small(key).unwrap()])
+            .unwrap();
+        registry.get_mut(tid).unwrap().insert(&[object]).unwrap();
+    }
+    actual.push(
+        registry
+            .get(tid)
+            .unwrap()
+            .memory_words_for_schedulers(schedulers),
+    );
+    for key in [2, 4] {
+        registry
+            .get_mut(tid)
+            .unwrap()
+            .delete_key(Term::small(key).unwrap());
+    }
+    actual.push(
+        registry
+            .get(tid)
+            .unwrap()
+            .memory_words_for_schedulers(schedulers),
+    );
+    assert_eq!(
+        expected_values,
+        &actual
+            .into_iter()
+            .map(|words| OwnedTerm::Int(words as i64))
+            .collect::<Vec<_>>(),
+        "set, fixed write concurrency locks=1024"
+    );
+}
+
+#[test]
 fn concurrent_immediate_overwrite_owns_its_storage() {
     let table = ConcurrentTable::new(options(TableType::Set), 4).unwrap();
     for value in 0..100 {
