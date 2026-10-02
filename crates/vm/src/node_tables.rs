@@ -410,6 +410,11 @@ static NEXT_CONN_SEED: AtomicU32 = AtomicU32::new(1);
 /// Ports currently acting as distribution controllers (`port_id` → node name).
 static DIST_PORTS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
 
+/// Set (under the table lock) whenever a fragmented send is deferred; cleared by
+/// `continue_fragmented_send` once no entry holds one.
+pub(crate) static ANY_FRAGMENT_CONTINUATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn lock() -> MutexGuard<'static, NodeTables> {
     let mut tables = TABLES
         .get_or_init(|| Mutex::new(NodeTables::default()))

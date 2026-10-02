@@ -1661,19 +1661,23 @@ impl Executor {
                                     // caller is the native function holding the return address.
                                     let interpreter_module = process.module;
                                     // A module whose on_load is running is not current yet.
-                                    if let Some(caller) = crate::native_function_at(resume_pc)
-                                        .and_then(|caller| {
-                                            self.vm
-                                                .pending_on_load
-                                                .get(&caller.module)
-                                                .copied()
-                                                .filter(|id| {
-                                                    self.vm.native_code_contains(*id, resume_pc)
-                                                })
-                                                .or_else(|| {
-                                                    self.vm.loaded.get(&caller.module).copied()
-                                                })
-                                        })
+                                    if let Some(caller) =
+                                        crate::native_bridge::with_native_function_at(
+                                            resume_pc,
+                                            |caller| {
+                                                self.vm
+                                                    .pending_on_load
+                                                    .get(&caller.module)
+                                                    .copied()
+                                                    .filter(|id| {
+                                                        self.vm.native_code_contains(*id, resume_pc)
+                                                    })
+                                                    .or_else(|| {
+                                                        self.vm.loaded.get(&caller.module).copied()
+                                                    })
+                                            },
+                                        )
+                                        .flatten()
                                     {
                                         process.module = caller;
                                     }
