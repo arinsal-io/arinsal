@@ -7,7 +7,7 @@ const SOURCE: &str = r#"
 -module(proc_sched).
 -export([
     hibernate/0, suspend_order/0, suspend_opts/0, suspend_self/0, resume_plain/0,
-    suspend_badopt/0, spawn_ok/0, spawn_missing/0, spawn_badopt/0, spawn_error_only/0,
+    suspend_badopt/0, hibernate_heap_size/0, spawn_ok/0, spawn_missing/0, spawn_badopt/0, spawn_error_only/0,
     spawn_success_only_bad/0, spawn_reply_no/0, spawn_tag/0, spawn_link_order/0,
     spawn_monitor_ref/0, spawn_remote/0, spawn_bad_list/0, spawn_bad_fun/0,
     abandon_ref/0, abandon_bad/0, heap_flag/0, heap_kill_yes/0, heap_kill_no/0,
@@ -44,6 +44,15 @@ hibernate() ->
     Pid ! ping,
     Woke = receive {woke, ping} -> ping after 2000 -> timeout end,
     {Status, Cf, Woke}.
+
+hibernate_heap_size() ->
+    Parent = self(),
+    Pid = spawn(fun() -> Parent ! ready, erlang:hibernate(erlang, apply, [fun() -> receive _ -> ok end end, []]) end),
+    receive ready -> ok end,
+    receive after 25 -> ok end,
+    [{heap_size, Heap}, {total_heap_size, Total}] = process_info(Pid, [heap_size, total_heap_size]),
+    exit(Pid, kill),
+    Heap =:= Total.
 
 wait_waiting(_Pid, 0) -> ok;
 wait_waiting(Pid, N) ->
@@ -269,6 +278,7 @@ fn proc_sched_matches_otp_29() {
         .expect("load proc_sched");
     let functions = [
         "hibernate",
+        "hibernate_heap_size",
         "suspend_order",
         "suspend_opts",
         "suspend_self",

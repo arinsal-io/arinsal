@@ -742,6 +742,8 @@ pub(crate) struct Runtime {
     suspend_waiters: Mutex<Vec<SuspendWaiter>>,
     pub(crate) suspend_total: Mutex<HashMap<Pid, u32>>,
     pub(crate) ever_suspended: AtomicBool,
+    /// The code modification permission (`code_ix.c` `code_mod_permission`) of this node.
+    pub(crate) code_mod_permission: Mutex<crate::natives::code::CodeModPermission>,
     /// Suspend-monitor pauses of receive and BIF timers (`erts_pause_proc_timer`).
     pub(crate) pauses: Mutex<HashMap<Pid, TimerPause>>,
     pub(crate) published: Mutex<HashMap<Pid, Published>>,
@@ -3411,6 +3413,7 @@ impl Process {
 
     fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.final_exit_reason = Some(reason);
+        crate::natives::code::code_mod_permission_process_exit(self, ctx.pid(), ctx);
         crate::trace::emit(
             Some(vm),
             self,
@@ -5075,6 +5078,7 @@ impl Vm {
             suspend_waiters: Mutex::new(Vec::new()),
             suspend_total: Mutex::new(HashMap::new()),
             ever_suspended: AtomicBool::new(false),
+            code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
             pauses: Mutex::new(HashMap::new()),
             published: Mutex::new(HashMap::new()),
             hibernating: Mutex::new(HashMap::new()),

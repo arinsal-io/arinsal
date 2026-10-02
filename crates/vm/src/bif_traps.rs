@@ -345,7 +345,7 @@ pub(crate) fn execute_named(
     import: usize,
     arity: usize,
     mut args: [Term; 3],
-    ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+    mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<TrapResult, VmError>> {
     let gc_enabled_on_entry = process.gc_enabled;
     let pending_site = process
@@ -430,6 +430,17 @@ pub(crate) fn execute_named(
         process.set_gc_enabled(false);
     }
     let result = handler(process, &args[..arity], state.as_ref(), pid, gc_was_enabled);
+    if module_name == "erts_debug"
+        && function_name == "set_internal_state"
+        && args
+            .get(1)
+            .and_then(|term| term.as_atom())
+            .and_then(|atom| global_atoms().text(atom))
+            == Some("false")
+        && let Some(run) = ctx.as_deref_mut()
+    {
+        crate::natives::code::wake_code_mod_permission_waiter(process, run);
+    }
     Some(match result {
         Err(error) => {
             process.cold_mut().bif_trap = None;
@@ -470,8 +481,13 @@ pub(crate) fn execute_named(
             reductions,
         }) => {
             // The ptab list state holds no heap terms, so the process stays collectable
-            // while trapped (erts keeps it GC-able in ptab_list_continue/2).
-            if continuation != PTAB_LIST_CONTINUATION {
+            // while trapped (erts keeps it GC-able in ptab_list_continue/2). The same holds
+            // for a code-permission waiter: its state is a flag and its arguments are atoms,
+            // and erts runs a GC task of the suspended waiter (code_ix.c:323,
+            // erts_reject_code_permissions).
+            if continuation != PTAB_LIST_CONTINUATION
+                && continuation != CODE_PERMISSION_CONTINUATION
+            {
                 process.set_gc_enabled(false);
             }
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
@@ -523,7 +539,7 @@ fn charge(
 }
 
 fn code_permission(
-    _process: &mut Process,
+    process: &mut Process,
     args: &[Term],
     _state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
@@ -547,12 +563,17 @@ fn code_permission(
     let pid = pid.ok_or(BifError::Unsupported(
         "code_mod_permission requires a scheduler",
     ))?;
-    if crate::natives::try_code_mod_permission(pid, acquire) {
+    if process
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| crate::natives::try_code_mod_permission(runtime, pid, acquire))
+    {
         return Ok(TrapResult::Done {
             value: Term::atom(global_atoms().intern("true").unwrap()),
             reductions: 1,
         });
     }
+    crate::natives::code::wait_for_code_mod_permission(process, pid);
     Ok(TrapResult::Yield {
         continuation: CODE_PERMISSION_CONTINUATION,
         state: MagicRef::new(acquire),

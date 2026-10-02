@@ -170,6 +170,10 @@ fn process_info(
     status: Term,
     drain_inbox: bool,
 ) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/erl_bif_info.c:794-804 (`process_info`), OTP-29.1.1:
+    // report heap counters from one snapshot even though building the result may grow the heap.
+    let heap_size = process.heap.heap_size_words();
+    let total_heap_size = process.heap.total_heap_size_words();
     // Messages already queued are part of process_info. A request handled from
     // inside drain must not pull signals that were ordered after it.
     if drain_inbox {
@@ -253,11 +257,9 @@ fn process_info(
                 make_list(process, entries)?
             }
             "trap_exit" => atom(if process.trap_exit { "true" } else { "false" }),
-            "heap_size" => Term::small(process.heap.heap_size_words() as i64).ok_or_else(badarg)?,
+            "heap_size" => Term::small(heap_size as i64).ok_or_else(badarg)?,
             // Port of erts/emulator/beam/erl_message.c:1006 (message queue data info), OTP-29.1.1.
-            "total_heap_size" => {
-                Term::small(process.heap.total_heap_size_words() as i64).ok_or_else(badarg)?
-            }
+            "total_heap_size" => Term::small(total_heap_size as i64).ok_or_else(badarg)?,
             "stack_size" => Term::small(process.heap.stack_words() as i64).ok_or_else(badarg)?,
             "memory" => Term::small(
                 (std::mem::size_of::<Process>() + process.heap.total_heap_size_words() * 8) as i64,
@@ -1146,6 +1148,7 @@ pub(crate) fn fulfill_request(
         crate::signals::RemoteOp::Collect { request_id, major } => {
             // The id lives in the signal envelope, not in a GC root. Collect
             // first, then install it on the heap the reply is built in.
+            crate::natives::code::code_mod_permission_before_gc(process, ctx);
             collect_heap(process, major, &mut [])?;
             let request_id = request_id.decode_into(process)?;
             gc_message(process, request_id, true)

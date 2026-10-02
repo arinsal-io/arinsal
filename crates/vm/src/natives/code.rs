@@ -1,5 +1,6 @@
 //! Code loading and module query natives.
 
+use crate::process::Runtime;
 use crate::{CodeMeta, Process, Vm, VmError, exceptions};
 use arinsal_beam::BeamFile;
 use arinsal_bifs::FragmentingHeap;
@@ -9,30 +10,120 @@ use arinsal_sched::Pid;
 use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
 use arinsal_spec::Opcode;
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, OnceLock, TryLockError};
 
-static CODE_MOD_PERMISSION: OnceLock<Mutex<Option<Pid>>> = OnceLock::new();
+/// State of the code modification permission; one per node.
+#[derive(Default)]
+pub(crate) struct CodeModPermission {
+    owner: Option<Pid>,
+    handover: bool,
+    waiters: VecDeque<Pid>,
+    wake: VecDeque<Pid>,
+}
 
-/// Acquire or release the VM-wide code modification permission.
+/// Acquire or release the node-wide code modification permission.
 /// Port of erts/emulator/beam/code_ix.c:378 (`erts_try_seize_code_mod_permission`), OTP-29.1.1.
-/// Try the code modification lock without occupying a scheduler thread.
-pub(crate) fn try_code_mod_permission(pid: Pid, acquire: bool) -> bool {
-    let owner = CODE_MOD_PERMISSION.get_or_init(|| Mutex::new(None));
-    let mut current = match owner.try_lock() {
-        Ok(current) => current,
-        Err(TryLockError::WouldBlock) => return false,
-        Err(TryLockError::Poisoned(error)) => error.into_inner(),
-    };
+/// The lock is held only for the bookkeeping, so it is taken blocking like `perm->lock`.
+pub(crate) fn try_code_mod_permission(runtime: &Runtime, pid: Pid, acquire: bool) -> bool {
+    let mut current = lock(runtime);
     if acquire {
-        if current.is_some_and(|owner| owner != pid) {
+        if current.owner.is_some_and(|owner| owner != pid) {
             return false;
         }
-        *current = Some(pid);
-    } else {
-        *current = None;
+        current.owner = Some(pid);
+        current.handover = false;
+    } else if current.owner == Some(pid) {
+        current.hand_over();
     }
     true
+}
+
+fn lock(runtime: &Runtime) -> std::sync::MutexGuard<'_, CodeModPermission> {
+    runtime
+        .code_mod_permission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl CodeModPermission {
+    /// Port of erts/emulator/beam/code_ix.c:279 (`release_code_permission`), OTP-29.1.1:
+    /// the permission goes to the first queued waiter, which is resumed to retry.
+    fn hand_over(&mut self) {
+        self.owner = self.waiters.pop_front();
+        self.handover = self.owner.is_some();
+        if let Some(waiter) = self.owner {
+            self.wake.push_back(waiter);
+        }
+    }
+}
+
+/// Queue a blocked code loader and suspend it until permission is handed over.
+pub(crate) fn wait_for_code_mod_permission(process: &Process, pid: Pid) {
+    if let Some(runtime) = &process.runtime {
+        let mut state = lock(runtime);
+        if !state.waiters.contains(&pid) {
+            state.waiters.push_back(pid);
+            runtime.suspend_internal(pid);
+        }
+    }
+}
+
+/// Resume the process that received code modification permission.
+pub(crate) fn wake_code_mod_permission_waiter(
+    process: &Process,
+    ctx: &mut RunCtx<'_, crate::process::Message>,
+) {
+    let Some(runtime) = &process.runtime else {
+        return;
+    };
+    let waiter = lock(runtime).wake.pop_front();
+    if let Some(waiter) = waiter
+        && runtime.resume_internal(waiter)
+    {
+        // A zero id does not wake a parked process; erts_resume schedules the waiter.
+        let _ = ctx.signal(waiter, Signal::UnlinkAck(u64::MAX));
+    }
+}
+
+/// Remove a process that exited while waiting or immediately after handover.
+/// Port of erts/emulator/beam/code_ix.c:430 (`erts_reject_code_permissions`), OTP-29.1.1.
+pub(crate) fn code_mod_permission_process_exit(
+    process: &Process,
+    pid: Pid,
+    ctx: &mut RunCtx<'_, crate::process::Message>,
+) {
+    let Some(runtime) = &process.runtime else {
+        return;
+    };
+    {
+        let mut state = lock(runtime);
+        state.waiters.retain(|waiter| *waiter != pid);
+        if state.owner == Some(pid) {
+            state.hand_over();
+        }
+    }
+    wake_code_mod_permission_waiter(process, ctx);
+}
+
+/// A GC system task may arrive after permission was handed to a suspended waiter: the
+/// waiter gives the permission on and retries after the collection.
+/// Port of erts/emulator/beam/code_ix.c:430 (`erts_reject_code_permissions`), OTP-29.1.1.
+pub(crate) fn code_mod_permission_before_gc(
+    process: &Process,
+    ctx: &mut RunCtx<'_, crate::process::Message>,
+) {
+    let Some(runtime) = &process.runtime else {
+        return;
+    };
+    {
+        let mut state = lock(runtime);
+        if state.owner == Some(ctx.pid()) && state.handover {
+            state.hand_over();
+        }
+    }
+    wake_code_mod_permission_waiter(process, ctx);
 }
 
 /// Port of erts/emulator/beam/beam_bif_load.c:50-66 (`purge_state`), OTP-29.1.1.
