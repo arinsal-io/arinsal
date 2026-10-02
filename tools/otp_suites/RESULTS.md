@@ -2,7 +2,7 @@
 
 | Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |
 |---|---:|---:|---:|---:|---:|---|
-| `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | -9 | first failure:  |
 | `bif_SUITE` | 34 | 29/34 | 28/34 | 1 | 0 | group_leader_prio_dirty: failed {'EXIT', {fw_error, {ct_framework,error_notification, {badarg |
 | `big_SUITE` | 23 | 23/23 | 18/23 | 5 | 0 | big_float_2: failed {{badmatch,0.0}; big_float_3: failed {{badmatch,3.402823669209385e38}; reductions: failed {badarg; system_limit: failed {badarg; toobig: failed {{badmatch, {'EXIT', {system_limit |
 | `binary_SUITE` | 55 | 42/55 | 34/55 | 8 | 0 | bad_terms: failed {'EXIT',error}, unknown_location; copy_terms: failed {'EXIT',error}, unknown_location; error_after_yield: failed {{badmatch,false}; gc_test: failed {{badmatch,{binary,[]}}; local_ext: failed {{badmatch,{error,exbadport}}; otp_5484: failed {'EXIT',error}, unknown_location; t2b_deterministic: failed {{badmatch; terms: failed {'EXIT',error}, unknown_location |

@@ -1,16 +1,12 @@
 //! Shared atomic arrays used by `atomics` and `counters`.
 //!
-//! The registry intentionally retains every array.  OTP releases its magic
-//! binary when the last reference is collected; that needs stage-4 resource
-//! support and is not available yet.
-
 use std::cell::Cell;
-use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
 
 use arinsal_maps::from_list;
-use arinsal_term::{Identity, Term, TermBuilder, atoms, global_atoms};
+use arinsal_term::{MagicRef, Term, TermBuilder, atoms, global_atoms};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
@@ -20,12 +16,7 @@ use crate::{BifError, BifFn, Ctx};
 const BADARG: BifError = BifError::BADARG;
 const SIGNED_OPTION: u64 = 1;
 const COUNTER_SHARDS: usize = 16;
-const REF_KIND: u32 = 0xA710;
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-static ARRAYS: LazyLock<Mutex<HashMap<u32, Arc<Array>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
-
 enum Cells {
     Signed(Vec<AtomicI64>),
     Unsigned(Vec<AtomicU64>),
@@ -35,6 +26,17 @@ enum Cells {
 struct Array {
     cells: Cells,
     signed: bool,
+    #[cfg(test)]
+    dropped: Option<Arc<AtomicU32>>,
+}
+
+impl Drop for Array {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(dropped) = &self.dropped {
+            dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
@@ -58,33 +60,16 @@ pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
 }
 
 fn new_ref(ctx: &mut Ctx<'_>, array: Array) -> Result<Term, BifError> {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    if id == 0 {
-        return Err(BifError::SystemLimit);
-    }
-    ARRAYS
-        .lock()
-        .expect("atomics registry poisoned")
-        .insert(id, Arc::new(array));
     TermBuilder::new(&mut Heap(ctx.heap))
-        .local_ref([REF_KIND, id, 0])
+        .magic_ref(MagicRef::new(array))
         .map_err(|_| BifError::SystemLimit)
 }
 
-fn resolve(term: Term) -> Result<(u32, Arc<Array>), BifError> {
-    match term.identity() {
-        Some(Identity::Ref { ids, .. }) if ids.len() == 3 && ids[0] == REF_KIND && ids[2] == 0 => {
-            let id = ids[1];
-            ARRAYS
-                .lock()
-                .expect("atomics registry poisoned")
-                .get(&id)
-                .cloned()
-                .map(|array| (id, array))
-                .ok_or(BADARG)
-        }
-        _ => Err(BADARG),
-    }
+fn resolve(term: &Term) -> Result<&Array, BifError> {
+    // SAFETY: every live magic ref term is retained by its heap, and BIF calls cannot collect
+    // that heap while this borrow is in use.
+    let owner = unsafe { term.magic_ref() }.ok_or(BADARG)?;
+    owner.downcast_ref::<Array>().ok_or(BADARG)
 }
 
 fn integer_usize(term: Term) -> Result<usize, BifError> {
@@ -172,23 +157,31 @@ fn atomics_new(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     } else {
         Cells::Unsigned(unsigned_cells(count)?)
     };
-    new_ref(ctx, Array { cells, signed })
+    new_ref(
+        ctx,
+        Array {
+            cells,
+            signed,
+            #[cfg(test)]
+            dropped: None,
+        },
+    )
 }
 
 fn atomics_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     let value = match &array.cells {
         Cells::Signed(cells) => cells[i].load(Ordering::SeqCst),
         Cells::Unsigned(cells) => cells[i].load(Ordering::SeqCst) as i64,
         Cells::Sharded(_) => return Err(BADARG),
     };
-    output(ctx, &array, value)
+    output(ctx, array, value)
 }
 
 fn atomics_put(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     match &array.cells {
         Cells::Signed(cells) => cells[i].store(signed_value(args[2])?, Ordering::SeqCst),
         Cells::Unsigned(cells) => cells[i].store(unsigned_value(args[2])?, Ordering::SeqCst),
@@ -203,8 +196,8 @@ fn atomics_add_common(
     return_value: bool,
     subtract: bool,
 ) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     let mut increment = arithmetic_value(args[2])?;
     if subtract {
         increment = increment.wrapping_neg();
@@ -219,7 +212,7 @@ fn atomics_add_common(
         Cells::Sharded(_) => return Err(BADARG),
     };
     if return_value {
-        output(ctx, &array, value)
+        output(ctx, array, value)
     } else {
         Ok(Term::atom(atoms::OK))
     }
@@ -233,19 +226,19 @@ fn atomics_add_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 fn atomics_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     let was = match &array.cells {
         Cells::Signed(cells) => cells[i].swap(signed_value(args[2])?, Ordering::SeqCst),
         Cells::Unsigned(cells) => cells[i].swap(unsigned_value(args[2])?, Ordering::SeqCst) as i64,
         Cells::Sharded(_) => return Err(BADARG),
     };
-    output(ctx, &array, was)
+    output(ctx, array, was)
 }
 
 fn atomics_compare_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     match &array.cells {
         Cells::Signed(cells) => match cells[i].compare_exchange(
             signed_value(args[2])?,
@@ -254,7 +247,7 @@ fn atomics_compare_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bi
             Ordering::SeqCst,
         ) {
             Ok(_) => Ok(Term::atom(atoms::OK)),
-            Err(was) => output(ctx, &array, was),
+            Err(was) => output(ctx, array, was),
         },
         Cells::Unsigned(cells) => match cells[i].compare_exchange(
             unsigned_value(args[2])?,
@@ -263,14 +256,14 @@ fn atomics_compare_exchange(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bi
             Ordering::SeqCst,
         ) {
             Ok(_) => Ok(Term::atom(atoms::OK)),
-            Err(was) => output(ctx, &array, was as i64),
+            Err(was) => output(ctx, array, was as i64),
         },
         Cells::Sharded(_) => Err(BADARG),
     }
 }
 
 fn atomics_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
+    let array = resolve(&args[0])?;
     let maximum = if array.signed {
         i64::MAX as u64
     } else {
@@ -280,7 +273,7 @@ fn atomics_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let pairs = [
         (
             Term::atom(global_atoms().intern("size").expect("OTP atom")),
-            integer(ctx, len(&array))?,
+            integer(ctx, len(array))?,
         ),
         (
             Term::atom(global_atoms().intern("max").expect("OTP atom")),
@@ -292,7 +285,7 @@ fn atomics_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         ),
         (
             Term::atom(global_atoms().intern("memory").expect("OTP atom")),
-            integer(ctx, len(&array) * 8 + 32)?,
+            integer(ctx, len(array) * 8 + 32)?,
         ),
     ];
     from_list(&pairs, ctx.heap).map_err(|_| BifError::SystemLimit)
@@ -329,25 +322,27 @@ fn counters_new(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         Array {
             cells: Cells::Sharded(cells),
             signed: true,
+            #[cfg(test)]
+            dropped: None,
         },
     )
 }
 
 fn counters_get(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     let Cells::Sharded(cells) = &array.cells else {
         return Err(BADARG);
     };
     let sum = cells[i].iter().fold(0_i64, |sum, cell| {
         sum.wrapping_add(cell.load(Ordering::Relaxed))
     });
-    output(ctx, &array, sum)
+    output(ctx, array, sum)
 }
 
 fn counters_add(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     let value = arithmetic_value(args[2])?;
     let Cells::Sharded(cells) = &array.cells else {
         return Err(BADARG);
@@ -359,8 +354,8 @@ fn counters_add(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 fn counters_put(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
-    let i = index(&array, args[1])?;
+    let array = resolve(&args[0])?;
+    let i = index(array, args[1])?;
     let value = signed_value(args[2])?;
     let Cells::Sharded(cells) = &array.cells else {
         return Err(BADARG);
@@ -373,7 +368,7 @@ fn counters_put(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 fn counters_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (_, array) = resolve(args[0])?;
+    let array = resolve(&args[0])?;
     let Cells::Sharded(cells) = &array.cells else {
         return Err(BADARG);
     };
@@ -387,4 +382,31 @@ fn counters_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         ctx.heap,
     )
     .map_err(|_| BifError::SystemLimit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arinsal_term::ProcessHeap;
+
+    #[test]
+    fn atomic_array_is_freed_with_its_last_magic_ref_heap_owner() {
+        let dropped = Arc::new(AtomicU32::new(0));
+        let mut heap = ProcessHeap::with_words(64);
+        {
+            let array = Array {
+                cells: Cells::Signed(vec![AtomicI64::new(0)]),
+                signed: true,
+                dropped: Some(dropped.clone()),
+            };
+            let mut ctx = Ctx::new(&mut heap);
+            let reference = new_ref(&mut ctx, array).unwrap();
+            assert!(reference.is_magic_ref());
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        heap.collect(&mut [], &mut [], 0).unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        drop(heap);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
 }
