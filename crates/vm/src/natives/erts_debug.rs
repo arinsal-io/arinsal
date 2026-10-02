@@ -2468,10 +2468,15 @@ fn internal_state_set(
                 Some("false") => false,
                 _ => return Err(badarg()),
             };
-            if !crate::natives::code::try_code_mod_permission(ctx.pid(), acquire) {
+            if !process.runtime.as_ref().is_some_and(|runtime| {
+                crate::natives::code::try_code_mod_permission(runtime, ctx.pid(), acquire)
+            }) {
                 return Err(VmError::Unsupported(
                     "code_mod_permission must resume through its BIF continuation".into(),
                 ));
+            }
+            if !acquire {
+                crate::natives::code::wake_code_mod_permission_waiter(process, ctx);
             }
             return Ok(atom("true"));
         }

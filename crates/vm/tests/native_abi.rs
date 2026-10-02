@@ -994,13 +994,15 @@ fn code_mod_permission_waiter_yields_to_the_lock_owner() {
             _ = erts_debug:set_internal_state(available_internal_state, true),
             true = erts_debug:set_internal_state(code_mod_permission, true),
             Parent = self(),
-            _Pid = spawn(fun() ->
-                Parent ! attempting,
+            Pid = spawn(fun() ->
+                Parent ! {attempting, self()},
                 true = erts_debug:set_internal_state(code_mod_permission, true),
                 Parent ! acquired,
                 true = erts_debug:set_internal_state(code_mod_permission, false)
             end),
-            receive attempting -> ok end,
+            receive {attempting, Pid} -> ok end,
+            timer:sleep(10),
+            {status, suspended} = process_info(Pid, status),
             erlang:bump_reductions(100000),
             true = erts_debug:set_internal_state(code_mod_permission, false),
             receive acquired -> released_after_yield after 1000 -> timeout end.
