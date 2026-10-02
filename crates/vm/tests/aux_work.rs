@@ -1,4 +1,4 @@
-use arinsal_difftest::{CallResult, RefErl};
+use arinsal_difftest::{CallOptions, CallResult, RefErl};
 use arinsal_etf::{EncodeOptions, OwnedTerm, decode, encode};
 use arinsal_vm::Vm;
 
@@ -77,7 +77,14 @@ fn aux_work_async_timer_cancel_reply_matches_erts() {
             First = receive {read_timer, Ref, V1} -> V1 after 5000 -> timeout end,
             Remaining = receive {cancel_timer, Ref, V2} -> V2 after 5000 -> timeout end,
             Last = receive {read_timer, Ref, V3} -> V3 after 5000 -> timeout end,
+            ExpiredRef = erlang:start_timer(1, self(), expired_timer_message),
+            receive {timeout, ExpiredRef, expired_timer_message} -> ok
+            after 5000 -> timeout end,
+            ok = erlang:cancel_timer(ExpiredRef, [{async, true}, {info, true}]),
+            ExpiredReply = receive {cancel_timer, ExpiredRef, V4} -> V4
+                           after 5000 -> timeout end,
             is_integer(First) andalso is_integer(Remaining) andalso Last =:= false
+                andalso ExpiredReply =:= false
                 andalso (First =:= Remaining orelse First =:= Remaining + 1)."#;
     let beam = reference
         .compile_named("aux_work_async_timer_cancel", source, &[])
@@ -221,23 +228,38 @@ fn aux_work_process_exit_cancels_owned_timer_memory() {
         -export([run/0]).
         run() ->
             erts_debug:set_internal_state(available_internal_state, true),
+            %% Warm fixed-size timer allocator bins before measuring the baseline.
+            warm_up(),
             Baseline = mem(),
             Parent = self(),
-            Online = 2,
-            Pid = spawn(fun() ->
-                lists:foreach(fun(I) ->
-                    process_flag(scheduler, (I rem Online) + 1),
-                    erlang:start_timer((1 bsl 28) + I * 10, self(), timer_message)
-                end, lists:seq(1, 301 * Online)),
-                Parent ! timers_started,
-                receive after infinity -> ok end
-            end),
+            Pid = spawn(fun() -> start_owner(Parent) end),
             receive timers_started -> ok after 30000 -> exit(start_timeout) end,
             During = mem(),
             Larger = Baseline =:= -1 orelse During > Baseline,
-            exit(Pid, kill),
-            Restored = wait_until(fun() -> mem() =:= Baseline end, 2000),
+            stop_owner(Pid),
+            RestoreDeadline = erlang:monotonic_time(millisecond) + 60000,
+            Restored = wait_until(fun() -> mem() =:= Baseline end, RestoreDeadline),
             {Larger, Restored}.
+        warm_up() ->
+            Parent = self(),
+            Pid = spawn(fun() -> start_owner(Parent) end),
+            receive timers_started -> ok after 30000 -> exit(warmup_start_timeout) end,
+            stop_owner(Pid),
+            _ = mem(),
+            ok.
+        start_owner(Parent) ->
+            Online = 2,
+            lists:foreach(fun(I) ->
+                process_flag(scheduler, (I rem Online) + 1),
+                erlang:start_timer((1 bsl 28) + I * 10, self(), timer_message)
+            end, lists:seq(1, 301 * Online)),
+            Parent ! timers_started,
+            receive after infinity -> ok end.
+        stop_owner(Pid) ->
+            Monitor = erlang:monitor(process, Pid),
+            exit(Pid, kill),
+            receive {'DOWN', Monitor, process, Pid, killed} -> ok
+            after 30000 -> exit(process_exit_timeout) end.
         mem() ->
             erts_debug:set_internal_state(wait, timer_cancellations),
             erts_debug:set_internal_state(wait, deallocations),
@@ -264,17 +286,30 @@ fn aux_work_process_exit_cancels_owned_timer_memory() {
         mem_types(Types) -> lists:sum(
             [Allocated + Used || {Type, Allocated, Used} <- Types,
                 Type =:= bif_timer orelse Type =:= accessor_bif_timer]).
-        wait_until(_Predicate, 0) -> false;
-        wait_until(Predicate, Attempts) ->
+        wait_until(Predicate, Deadline) ->
             case catch Predicate() of
                 true -> true;
-                _ -> timer:sleep(5), wait_until(Predicate, Attempts - 1)
+                _ ->
+                    case erlang:monotonic_time(millisecond) >= Deadline of
+                        true -> false;
+                        false -> timer:sleep(5), wait_until(Predicate, Deadline)
+                    end
             end."#;
     let beam = reference
         .compile_named("aux_work_timer_memory", source, &[])
         .unwrap();
     reference.load("aux_work_timer_memory", &beam).unwrap();
-    let expected = reference.call("aux_work_timer_memory", "run", &[]);
+    let expected = reference
+        .call_opts(
+            "aux_work_timer_memory",
+            "run",
+            &[],
+            &CallOptions {
+                timeout_ms: Some(120_000),
+                ..CallOptions::default()
+            },
+        )
+        .result;
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
