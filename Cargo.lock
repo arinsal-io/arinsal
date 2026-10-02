@@ -165,6 +165,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arinsal-drv"
+version = "0.0.1"
+dependencies = [
+ "cc",
+ "libc",
+ "libloading",
+]
+
+[[package]]
 name = "arinsal-etf"
 version = "0.0.1"
 dependencies = [
@@ -404,6 +413,7 @@ dependencies = [
  "arinsal-bifs",
  "arinsal-bits",
  "arinsal-difftest",
+ "arinsal-drv",
  "arinsal-etf",
  "arinsal-ets",
  "arinsal-float",

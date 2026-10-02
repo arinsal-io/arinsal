@@ -47,7 +47,12 @@ fn misc_bifs_ddll_static_driver_results_match_erts() {
                   erl_ddll:info("tcp_inet", port_count),
                   erl_ddll:info("tcp_inet", processes),
                   erl_ddll:try_load("/missing", "tcp_inet", []),
-                  erl_ddll:try_load("/missing", "not_a_driver", []),
+                  %% The open_error code indexes the node's dlerror string table,
+                  %% which depends on earlier failed loads in the same node.
+                  case erl_ddll:try_load("/missing", "not_a_driver", []) of
+                      {error, {open_error, N}} when N =< -10 -> open_error;
+                      Other -> Other
+                  end,
                   erl_ddll:try_unload("tcp_inet", []),
                   erl_ddll:format_error_int(pending_process),
                   begin R=erl_ddll:monitor(driver, {"tcp_inet", loaded}),
@@ -81,7 +86,13 @@ fn misc_bifs_ddll_missing_driver_fails_with_formattable_open_error() {
         return;
     };
     let source = r#"-module(misc_bifs_missing_driver). -export([run/0]).
-        run() -> erl_ddll:try_load("/tmp", "arinsal_missing_driver", [])."#;
+        run() -> case erl_ddll:try_load("/tmp", "arinsal_missing_driver", []) of
+                      %% The code indexes the dlerror string table, which is
+                      %% shared by every VM in this test process.
+                      {error, {open_error, N} = E} when N =< -10 ->
+                          {open_error, erl_ddll:format_error_int(E)};
+                      Other -> Other
+                  end."#;
     let beam = reference
         .compile_named("misc_bifs_missing_driver", source, &[])
         .unwrap();

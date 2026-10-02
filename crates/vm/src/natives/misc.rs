@@ -5,12 +5,9 @@ use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_sched::RunCtx;
 use arinsal_term::{Term, TermBuilder, from_owned, global_atoms, to_owned};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-const DDLL_STATIC: &[&str] = &["tcp_inet", "udp_inet", "ram_file_drv"];
 
 #[derive(Clone, Default)]
 struct Profile {
@@ -36,11 +33,6 @@ static PROFILE_UNIQUE: AtomicU64 = AtomicU64::new(0);
 fn profile() -> &'static Mutex<Profile> {
     static PROFILE: OnceLock<Mutex<Profile>> = OnceLock::new();
     PROFILE.get_or_init(|| Mutex::new(Profile::default()))
-}
-
-fn ddll_monitors() -> &'static Mutex<HashSet<u64>> {
-    static MONITORS: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-    MONITORS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
@@ -104,13 +96,13 @@ pub(crate) fn call(
             }
             ("erlang", "system_profile", 0) => profile_get(process),
             ("erlang", "system_profile", 2) => profile_set(process, args),
-            ("erl_ddll", "loaded_drivers", 0) => loaded_drivers(process),
-            ("erl_ddll", "info", 2) => ddll_info(process, args),
-            ("erl_ddll", "try_load", 3) => ddll_try_load(process, args),
-            ("erl_ddll", "try_unload", 2) => ddll_try_unload(process, args),
-            ("erl_ddll", "format_error_int", 1) => format_error(process, args[0]),
-            ("erl_ddll", "monitor", 2) => ddll_monitor(ctx, process, args),
-            ("erl_ddll", "demonitor", 1) => ddll_demonitor(args[0]),
+            ("erl_ddll", "loaded_drivers", 0) => crate::ddll::loaded_drivers(process),
+            ("erl_ddll", "info", 2) => crate::ddll::info(process, args),
+            ("erl_ddll", "try_load", 3) => crate::ddll::try_load(process, ctx, args),
+            ("erl_ddll", "try_unload", 2) => crate::ddll::try_unload(process, ctx, args),
+            ("erl_ddll", "format_error_int", 1) => crate::ddll::format_error(process, args[0]),
+            ("erl_ddll", "monitor", 2) => crate::ddll::monitor(process, ctx, args),
+            ("erl_ddll", "demonitor", 1) => crate::ddll::demonitor(ctx, args[0]),
             ("erts_debug", "dist_ext_to_term", 2) => dist_ext_to_term(process, args),
             ("string", "list_to_float", 1) => string_list_to_float(process, args[0]),
             _ => return None,
@@ -385,283 +377,6 @@ fn profile_timestamp(timestamp: Timestamp) -> O {
     }
 }
 
-fn loaded_drivers(process: &mut Process) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_ddll.c:666 (erl_ddll_loaded_drivers_0), OTP-29.1.1.
-    let values = DDLL_STATIC
-        .iter()
-        .map(|name| O::list(name.bytes().map(|b| O::Int(b as i64)).collect()))
-        .collect();
-    let result = O::Tuple(vec![
-        O::Atom("ok".into()),
-        O::List {
-            elems: values,
-            tail: Box::new(O::Nil),
-        },
-    ]);
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    from_owned(&result, &mut heap).map_err(|_| badarg())
-}
-
-fn driver_name(term: Term) -> Option<String> {
-    let owned = to_owned(term).ok()?;
-    match &owned {
-        O::Atom(name) => Some(name.clone()),
-        O::List { .. } => elems_to_string(&owned),
-        _ => None,
-    }
-}
-
-fn elems_to_string(term: &O) -> Option<String> {
-    let O::List { elems, tail } = term else {
-        return None;
-    };
-    if **tail != O::Nil {
-        return None;
-    }
-    let bytes = elems
-        .iter()
-        .map(|v| match v {
-            O::Int(n) if (0..=255).contains(n) => Some(*n as u8),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    String::from_utf8(bytes).ok()
-}
-
-fn ddll_info(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_ddll.c:694 (erl_ddll_info_2), OTP-29.1.1.
-    let name = driver_name(args[0]).ok_or_else(badarg)?;
-    let item = atom_text(args[1]).ok_or_else(badarg)?;
-    if !DDLL_STATIC.contains(&name.as_str()) {
-        return Err(badarg());
-    }
-    let result = match item.as_str() {
-        "processes" | "awaiting_load" | "awaiting_unload" => O::Atom("linked_in_driver".into()),
-        "driver_options" => O::Nil,
-        "port_count" => O::Atom("linked_in_driver".into()),
-        "linked_in_driver" => O::Atom("true".into()),
-        "permanent" => O::Atom("false".into()),
-        _ => return Err(badarg()),
-    };
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    from_owned(&result, &mut heap).map_err(|_| badarg())
-}
-
-fn ddll_try_load(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_ddll.c:178 (erl_ddll_try_load_3), OTP-29.1.1.
-    let path = driver_name(args[0]).ok_or_else(badarg)?;
-    let name = driver_name(args[1]).ok_or_else(badarg)?;
-    let options = to_owned(args[2]).map_err(|_| badarg())?;
-    if !proper_list(&options) {
-        return Err(badarg());
-    }
-    let mut reload = false;
-    for option in list_items(&options).unwrap_or_default() {
-        match &option {
-            O::Tuple(items)
-                if items.len() == 2
-                    && items[0] == O::Atom("monitor".into())
-                    && matches!(&items[1], O::Atom(a) if a == "pending" || a == "pending_driver") =>
-                {}
-            O::Tuple(items)
-                if items.len() == 2
-                    && items[0] == O::Atom("reload".into())
-                    && matches!(&items[1], O::Atom(a) if a == "pending" || a == "pending_driver") =>
-            {
-                reload = true;
-            }
-            O::Tuple(items)
-                if items.len() == 2
-                    && items[0] == O::Atom("driver_options".into())
-                    && valid_driver_options(&items[1]) => {}
-            _ => return Err(badarg()),
-        }
-    }
-    let err = if DDLL_STATIC.contains(&name.as_str()) {
-        tuple(process, &[atom("error"), atom("linked_in_driver")])?
-    } else if reload {
-        tuple(process, &[atom("error"), atom("not_loaded")])?
-    } else {
-        let candidate = std::path::Path::new(&path).join(format!("{name}.so"));
-        let code = if std::path::Path::new(&path).is_file() || candidate.exists() {
-            -11
-        } else {
-            -10
-        };
-        let detail = tuple(
-            process,
-            &[
-                atom("open_error"),
-                Term::small(code).expect("small driver error code"),
-            ],
-        )?;
-        tuple(process, &[atom("error"), detail])?
-    };
-    Ok(err)
-}
-
-fn valid_driver_options(options: &O) -> bool {
-    list_items(options).is_some_and(|items| {
-        items
-            .iter()
-            .all(|item| item == &O::Atom("kill_ports".into()))
-    })
-}
-
-fn ddll_try_unload(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_ddll.c:419 (erl_ddll_try_unload_2), OTP-29.1.1.
-    let name = driver_name(args[0]).ok_or_else(badarg)?;
-    let options = to_owned(args[1]).map_err(|_| badarg())?;
-    if !proper_list(&options) {
-        return Err(badarg());
-    }
-    for option in list_items(&options).unwrap_or_default() {
-        if option != O::Atom("kill_ports".into())
-            && !matches!(option, O::Tuple(ref v) if v.len() == 2 && v[0] == O::Atom("monitor".into()) && matches!(v[1], O::Atom(ref a) if a == "pending" || a == "pending_driver"))
-        {
-            return Err(badarg());
-        }
-    }
-    tuple(
-        process,
-        &[
-            atom("error"),
-            atom(if DDLL_STATIC.contains(&name.as_str()) {
-                "linked_in_driver"
-            } else {
-                "not_loaded"
-            }),
-        ],
-    )
-}
-
-fn ddll_monitor(
-    ctx: &mut RunCtx<'_, Message>,
-    process: &mut Process,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_ddll.c:655 (erl_ddll_monitor_2), OTP-29.1.1.
-    if atom_text(args[0]).as_deref() != Some("driver") {
-        return Err(badarg());
-    }
-    let owned = to_owned(args[1]).map_err(|_| badarg())?;
-    let O::Tuple(description) = &owned else {
-        return Err(badarg());
-    };
-    let [name_term, O::Atom(state)] = description.as_slice() else {
-        return Err(badarg());
-    };
-    if !["loaded", "unloaded", "unloaded_only"].contains(&state.as_str()) {
-        return Err(badarg());
-    }
-    let name = match name_term {
-        O::Atom(name) => name.clone(),
-        O::List { elems, tail } if **tail == O::Nil => {
-            let bytes = elems
-                .iter()
-                .map(|term| match term {
-                    O::Int(n) => u8::try_from(*n).ok(),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(badarg)?;
-            String::from_utf8(bytes).map_err(|_| badarg())?
-        }
-        _ => return Err(badarg()),
-    };
-    static NEXT_DDLL_REF: AtomicU64 = AtomicU64::new(1);
-    let id = NEXT_DDLL_REF.fetch_add(1, Ordering::Relaxed);
-    let reference = crate::signals::reference(process, id)?;
-    ddll_monitors().lock().unwrap().insert(id);
-    if DDLL_STATIC.contains(&name.as_str()) {
-        let name = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-            .string_to_list(&name)
-            .map_err(|_| badarg())?;
-        let message = tuple(
-            process,
-            &[
-                atom("UP"),
-                reference,
-                atom("driver"),
-                name,
-                atom("permanent"),
-            ],
-        )?;
-        ddll_notify(ctx, id, message)?;
-    } else {
-        let name = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-            .string_to_list(&name)
-            .map_err(|_| badarg())?;
-        let message = tuple(
-            process,
-            &[
-                atom("DOWN"),
-                reference,
-                atom("driver"),
-                name,
-                atom("unloaded"),
-            ],
-        )?;
-        ddll_notify(ctx, id, message)?;
-    }
-    Ok(reference)
-}
-
-fn ddll_notify(ctx: &mut RunCtx<'_, Message>, id: u64, message: Term) -> Result<(), VmError> {
-    // A queued driver-state transition consumes its monitor. Demonitor removes
-    // the same entry before this transition can publish a notification.
-    if ddll_monitors().lock().unwrap().remove(&id) {
-        ctx.send(ctx.pid(), Message::copy_from(message)?)
-            .map_err(|_| badarg())?;
-    }
-    Ok(())
-}
-
-fn ddll_demonitor(reference: Term) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_ddll.c:641 (erl_ddll_demonitor_1), OTP-29.1.1.
-    let id = crate::signals::ref_id(reference).ok_or_else(badarg)?;
-    ddll_monitors().lock().unwrap().remove(&id);
-    Ok(atom("true"))
-}
-
-fn format_error(process: &mut Process, code: Term) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_bif_ddll.c:813 (erl_ddll_format_error_int_1), OTP-29.1.1.
-    let owned_code = to_owned(code).map_err(|_| badarg())?;
-    let message = match &owned_code {
-        O::Tuple(items)
-            if items.len() == 2
-                && items[0] == O::Atom("open_error".into())
-                && matches!(items[1], O::Int(_)) =>
-        {
-            format!("Driver dynamic loading failed with error code {}", items[1])
-        }
-        O::Atom(key) => match key.as_str() {
-            "inconsistent" => {
-                "Driver name and/or driver options are inconsistent with currently loaded driver"
-                    .to_owned()
-            }
-            "linked_in_driver" => {
-                "Driver is statically linked and cannot be loaded/unloaded".to_owned()
-            }
-            "permanent" => "DDLL driver is permanent an cannot be unloaded/loaded".to_owned(),
-            "not_loaded" => "DDLL driver is not loaded".to_owned(),
-            "not_loaded_by_this_process" => "DDLL driver was not loaded by this process".to_owned(),
-            "not_pending" => "DDLL load not pending for this driver name".to_owned(),
-            "already_loaded" => "DDLL driver is already loaded successfully".to_owned(),
-            "pending_reload" => "Driver reloading is already pending".to_owned(),
-            "pending_process" => {
-                "Driver is loaded by others when attempting option {reload, pending_driver}"
-                    .to_owned()
-            }
-            _ => return Err(badarg()),
-        },
-        _ => return Err(badarg()),
-    };
-    let value = O::list(message.bytes().map(|b| O::Int(b as i64)).collect());
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    from_owned(&value, &mut heap).map_err(|_| badarg())
-}
-
 fn dist_ext_to_term(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/external.c:1340 (erts_debug_dist_ext_to_term_2), OTP-29.1.1.
     let cache_owned = to_owned(args[0]).map_err(|_| badarg())?;
@@ -725,20 +440,6 @@ fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmErr
     tuple(process, &[float, rest])
 }
 
-fn proper_list(o: &O) -> bool {
-    match o {
-        O::Nil => true,
-        O::List { tail, .. } => **tail == O::Nil,
-        _ => false,
-    }
-}
-fn list_items(o: &O) -> Option<Vec<O>> {
-    match o {
-        O::Nil => Some(vec![]),
-        O::List { elems, tail } if **tail == O::Nil => Some(elems.clone()),
-        _ => None,
-    }
-}
 fn tuple(process: &mut Process, items: &[Term]) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     TermBuilder::new(&mut heap)
@@ -747,9 +448,6 @@ fn tuple(process: &mut Process, items: &[Term]) -> Result<Term, VmError> {
 }
 fn atom(name: &str) -> Term {
     Term::atom(global_atoms().intern(name).expect("runtime atom"))
-}
-fn atom_text(term: Term) -> Option<String> {
-    global_atoms().text(term.as_atom()?).map(|s| s.to_string())
 }
 fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(atom("badarg")))
