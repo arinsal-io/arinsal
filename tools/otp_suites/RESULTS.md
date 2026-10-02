@@ -12,7 +12,7 @@
 | `bs_match_misc_SUITE` | 20 | 20/20 | 18/20 | 2 | 0 | bad_bs_match: failed {{badmatch,{module,bad_bs_match}}; fp16: failed {badarg |
 | `bs_match_tail_SUITE` | 4 | 4/4 | 0/4 | 4 | 0 | aligned: missing; huge_tail: missing; unaligned: missing; zero_tail: missing; suite-level: failed: 'bs_match_tail_SUITE:all/0 is missing', unknown_location |
 | `bs_utf_SUITE` | 8 | 8/8 | 0/8 | 8 | -9 | bad_construction: missing; utf16_illegal_sequences: missing; utf16_roundtrip: missing; utf32_illegal_sequences: missing; utf32_roundtrip: missing; utf8_big_file: missing; utf8_illegal_sequences: missing; utf8_roundtrip: missing |
-| `call_trace_SUITE` | 14 | 14/14 | 14/14 | 0 | 0 | none |
+| `call_trace_SUITE` | 14 | 14/14 | 14/14 | 0 | -9 | first failure:  |
 | `code_SUITE` | 29 | 27/29 | 12/29 | 15 | -9 | call_fun_before_load: missing; check_process_code_dirty_exec_proc: missing; check_process_code_signal_order: missing; code_permission: failed {function_clause; code_permission_gc: failed {{badmatch, {error, {load_failed, "Failed to load NIF library: 'dlopen(/var/folders/v5/w846m1655ylfpfnhmtgfbnvm0000gn/T/otp-code-source-vfzuq5o9/test/code_SUITE_data/erts_test_sync…; constant_pools: failed {badarg; constant_refc_binaries: failed {badarg; coverage: missing; erl_544: missing; false_dependency: missing; fun_confusion: missing; many_purges: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; max_heap_size: missing; t_copy_literals: missing; t_copy_literals_frags: missing |
 | `counters_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
 | `erts_debug_SUITE` | 8 | 7/8 | 7/8 | 0 | 0 | none |
@@ -36,6 +36,6 @@
 | `statistics_SUITE` | 18 | 18/18 | 16/18 | 2 | 0 | scheduler_wall_time: failed {badarg; scheduler_wall_time_all: failed {badarg |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | 0 | none |
 | `timer_bif_SUITE` | 23 | 20/23 | 14/23 | 6 | 0 | auto_cancel_yielding: failed {{case_clause,false}; cleanup: failed {{case_clause,false}; registered_process: failed {{case_clause,false}; same_time_yielding: failed {{case_clause,false}; same_time_yielding_with_cancel: failed {{case_clause,false}; same_time_yielding_with_cancel_other: failed {{case_clause,false} |
-| `trace_SUITE` | 39 | 34/39 | 32/39 | 2 | 0 | suspend_opts: failed {{badmatch,0}; system_monitor_long_schedule: skipped "Unable to load slow_drv (windows or no usleep()?)" |
+| `trace_SUITE` | 39 | 34/39 | 33/39 | 1 | 0 | system_monitor_long_schedule: skipped "Unable to load slow_drv (windows or no usleep()?)" |
 | `tuple_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
 | `unique_SUITE` | 2 | 1/2 | 0/2 | 1 | 0 | unique_integer_white_box: failed {badarg |

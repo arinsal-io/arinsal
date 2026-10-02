@@ -608,6 +608,16 @@ impl Process {
     }
 }
 
+/// Reply for a suspend whose suspender waits on it (`{Tag, Res}`), with the variant sent
+/// when the target exits first.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:3192 (erts_proc_sig_send_sync_suspend), OTP-29.1.1.
+pub(crate) struct SuspendWaiter {
+    pub(crate) by: Pid,
+    pub(crate) target: Pid,
+    pub(crate) ready: Message,
+    pub(crate) exited: Message,
+}
+
 const ALIAS_SLAB: usize = 4096;
 const ALIAS_SLABS: usize = 256;
 const ALIAS_INACTIVE: u64 = 1;
@@ -734,6 +744,8 @@ pub(crate) struct Runtime {
     /// Asynchronous suspends of a running process that it has not yet acted on.
     // Port of erts/emulator/beam/erl_process.c:9013 (`erts_internal_suspend_process_2` pending suspend), OTP-29.1.1.
     suspend_outstanding: Mutex<HashMap<(Pid, Pid), u32>>,
+    /// Replies owed to suspenders once their suspend is active (erts sync-suspend signal).
+    suspend_waiters: Mutex<Vec<SuspendWaiter>>,
     pub(crate) suspend_total: Mutex<HashMap<Pid, u32>>,
     pub(crate) ever_suspended: AtomicBool,
     /// Suspend-monitor pauses of receive and BIF timers (`erts_pause_proc_timer`).
@@ -2797,6 +2809,16 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// True while some async suspend of `target` is not yet active; later suspends queue
+    /// behind it, as the suspend signals do in erts.
+    fn has_outstanding_suspends(&self, target: Pid) -> bool {
+        self.suspend_outstanding
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((_, pending_target), count)| *pending_target == target && *count > 0)
+    }
+
     /// The target scheduled out with suspends pending: they are all active now.
     pub(crate) fn suspends_activated(&self, target: Pid) {
         if self.ever_suspended.load(Ordering::Acquire) {
@@ -2804,6 +2826,7 @@ impl Runtime {
                 .lock()
                 .unwrap()
                 .retain(|(_, pending_target), _| *pending_target != target);
+            self.flush_suspend_waiters(target);
         }
     }
 
@@ -2842,10 +2865,11 @@ impl Runtime {
         // A running target keeps going until it next schedules out.
         let pending = asynchronous
             && by != target
-            && self.suspend_total_of(target) == 0
-            && self
-                .scheduler()
-                .is_ok_and(|scheduler| scheduler.is_running(target));
+            && (self.has_outstanding_suspends(target)
+                || (self.suspend_total_of(target) == 0
+                    && self
+                        .scheduler()
+                        .is_ok_and(|scheduler| scheduler.is_running(target))));
         let mut counts = self.suspend_counts.lock().unwrap();
         let entry = counts.entry((by, target)).or_insert(0);
         if unless_suspending && *entry > 0 {
@@ -2857,12 +2881,19 @@ impl Runtime {
         *entry += 1;
         drop(counts);
         if pending {
-            *self
-                .suspend_outstanding
-                .lock()
-                .unwrap()
-                .entry((by, target))
-                .or_insert(0) += 1;
+            // Decided under the lock that `suspends_activated` clears with: the signal stays
+            // queued only while an older one is still queued or the target is running.
+            let mut outstanding = self.suspend_outstanding.lock().unwrap();
+            let queued = outstanding
+                .iter()
+                .any(|((_, queued_target), count)| *queued_target == target && *count > 0);
+            if queued
+                || self
+                    .scheduler()
+                    .is_ok_and(|scheduler| scheduler.is_running(target))
+            {
+                *outstanding.entry((by, target)).or_insert(0) += 1;
+            }
         }
         {
             let mut totals = self.suspend_total.lock().unwrap();
@@ -2873,6 +2904,68 @@ impl Runtime {
         }
         self.note_status(target, "suspended");
         Ok(true)
+    }
+
+    /// True while the `by` -> `target` suspend monitor is not active yet.
+    pub(crate) fn suspend_pending(&self, by: Pid, target: Pid) -> bool {
+        self.suspend_outstanding
+            .lock()
+            .unwrap()
+            .get(&(by, target))
+            .is_some_and(|count| *count > 0)
+    }
+
+    /// Queue the reply to a suspend and deliver it as soon as the monitor is active.
+    pub(crate) fn add_suspend_waiter(&self, waiter: SuspendWaiter) {
+        let target = waiter.target;
+        self.suspend_waiters.lock().unwrap().push(waiter);
+        self.flush_suspend_waiters(target);
+    }
+
+    /// Deliver the replies of every suspend of `target` that became active.
+    fn flush_suspend_waiters(&self, target: Pid) {
+        let ready: Vec<SuspendWaiter> = {
+            let mut waiters = self.suspend_waiters.lock().unwrap();
+            if waiters.is_empty() {
+                return;
+            }
+            let outstanding = self.suspend_outstanding.lock().unwrap();
+            let (ready, rest): (Vec<_>, Vec<_>) = waiters.drain(..).partition(|waiter| {
+                waiter.target == target
+                    && outstanding
+                        .get(&(waiter.by, waiter.target))
+                        .is_none_or(|count| *count == 0)
+            });
+            *waiters = rest;
+            ready
+        };
+        if let Ok(scheduler) = self.scheduler() {
+            for waiter in ready {
+                let _ = scheduler.send(waiter.target, waiter.by, waiter.ready);
+            }
+        }
+    }
+
+    /// A process is gone: its suspenders get the exited reply, its own waits are dropped.
+    fn drop_suspend_waiters(&self, pid: Pid) {
+        let gone: Vec<SuspendWaiter> = {
+            let mut waiters = self.suspend_waiters.lock().unwrap();
+            if waiters.is_empty() {
+                return;
+            }
+            let (gone, rest): (Vec<_>, Vec<_>) = waiters
+                .drain(..)
+                .partition(|waiter| waiter.target == pid || waiter.by == pid);
+            *waiters = rest;
+            gone
+        };
+        if let Ok(scheduler) = self.scheduler() {
+            for waiter in gone {
+                if waiter.target == pid && waiter.by != pid {
+                    let _ = scheduler.send(waiter.target, waiter.by, waiter.exited);
+                }
+            }
+        }
     }
 
     /// Runtime-internal suspend without a suspend monitor (`erts_suspend`), used for a
@@ -2936,6 +3029,7 @@ impl Runtime {
                 .remove(&(by, target));
         }
         drop(counts);
+        self.flush_suspend_waiters(target);
         if by != target {
             self.resume_timers(target, 1);
         }
@@ -3064,6 +3158,9 @@ impl Runtime {
     }
 
     pub(crate) fn forget_process(&self, pid: Pid) {
+        if self.ever_suspended.load(Ordering::Acquire) {
+            self.drop_suspend_waiters(pid);
+        }
         if self.ever_suspended.load(Ordering::Acquire) {
             self.pauses.lock().unwrap().remove(&pid);
         }
@@ -4974,6 +5071,7 @@ impl Vm {
             result: sender,
             suspend_counts: Mutex::new(HashMap::new()),
             suspend_outstanding: Mutex::new(HashMap::new()),
+            suspend_waiters: Mutex::new(Vec::new()),
             suspend_total: Mutex::new(HashMap::new()),
             ever_suspended: AtomicBool::new(false),
             pauses: Mutex::new(HashMap::new()),

@@ -1904,11 +1904,38 @@ fn suspend_process(
         Err(()) => return Ok(atom("system_limit")),
         Ok(changed) => changed,
     };
-    if parsed.asynchronous
-        && let Some(tag) = parsed.tag
-    {
-        let message = make_tuple(process, &[tag, atom("suspended")])?;
-        process.inbox.push_back(message);
+    // Port of erts/emulator/beam/erl_process.c:9061-9163, OTP-29.1.1: a synchronous suspend on a
+    // monitor that is not active yet, and every tagged asynchronous suspend, is answered by a
+    // reply message once the suspend is active.
+    let result = atom(if changed { "true" } else { "false" });
+    let sync = !parsed.asynchronous && runtime.suspend_pending(ctx.pid(), target_pid);
+    if sync || parsed.tag.is_some() {
+        let (tag, ready, exited) = if sync {
+            let id = arinsal_bifs::next_ref_id();
+            let reference = Term::local_ref(
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                [id as u32, (id >> 32) as u32, 0],
+            )
+            .map_err(|error| VmError::Unsupported(format!("suspend reference: {error:?}")))?;
+            (reference, result, atom("exited"))
+        } else {
+            (
+                parsed.tag.unwrap_or(Term::NIL),
+                atom("suspended"),
+                atom("badarg"),
+            )
+        };
+        let ready = make_tuple(process, &[tag, ready])?;
+        let exited = make_tuple(process, &[tag, exited])?;
+        runtime.add_suspend_waiter(crate::process::SuspendWaiter {
+            by: ctx.pid(),
+            target: target_pid,
+            ready: crate::process::Message::copy_from(ready)?,
+            exited: crate::process::Message::copy_from(exited)?,
+        });
+        if sync {
+            return Ok(tag);
+        }
     }
     Ok(atom(if changed { "true" } else { "false" }))
 }
