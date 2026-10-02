@@ -322,7 +322,11 @@ impl Process {
         Self::with_registers_and_min_heap(x_registers, float_registers, 64)
     }
     pub(crate) fn with_spawn_registers(x_registers: usize, float_registers: usize) -> Self {
-        Self::with_registers_and_min_heap(x_registers, float_registers, 233)
+        let mut process = Self::with_registers_and_min_heap(x_registers, float_registers, 233);
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
+        // count): a collection before the first run must keep the initial arguments alive.
+        process.gc_live = x_registers;
+        process
     }
     pub(crate) fn with_registers_and_min_heap(
         x_registers: usize,
@@ -549,6 +553,8 @@ pub(crate) struct NativeBifError {
 pub(crate) enum DelayedGc {
     /// Plain `garbage_collect` request.
     Collect,
+    /// Asynchronous `garbage_collect/2,3` request whose reply is still owed.
+    Request(crate::signals::Pending),
     /// Literal-area copy phase that needs a collection.
     Literal {
         area_id: u64,

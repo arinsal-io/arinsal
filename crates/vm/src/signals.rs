@@ -2488,10 +2488,11 @@ pub(crate) enum Submit {
     Dead,
 }
 
-struct Pending {
-    id: u64,
-    from: Pid,
-    op: RemoteOp,
+/// A queued signal request; `Collect` ones may be saved while GC is disabled.
+pub(crate) struct Pending {
+    pub(crate) id: u64,
+    pub(crate) from: Pid,
+    pub(crate) op: RemoteOp,
 }
 
 struct Waiter {
@@ -2684,6 +2685,24 @@ pub(crate) fn handle_request(
         };
         queue.remove(index)
     };
+    // Port of erts/emulator/beam/erl_process.c:10831 (save_gc_task), OTP-29.1.1:
+    // a garbage_collect request waits (reply included) until GC is enabled again.
+    if !process.gc_enabled && matches!(pending.op, RemoteOp::Collect { .. }) {
+        process
+            .cold_mut()
+            .delayed_gc
+            .push(crate::proc_create::DelayedGc::Request(pending));
+        return Ok(());
+    }
+    reply_request(process, ctx, pending)
+}
+
+/// Run a queued request and send its reply.
+pub(crate) fn reply_request(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    pending: Pending,
+) -> Result<(), VmError> {
     let reply = crate::natives::proc::fulfill_request(process, ctx, pending.id, pending.op)?;
     let message = Message::copy_from(reply)?;
     match ctx.send(pending.from, message) {
@@ -2730,6 +2749,14 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         tables.exited.insert(slot);
         tables.requests.remove(&slot).unwrap_or_default()
     };
+    let mut pending = pending;
+    if let Some(cold) = process.cold.as_mut() {
+        for task in std::mem::take(&mut cold.delayed_gc) {
+            if let crate::proc_create::DelayedGc::Request(request) = task {
+                pending.push(request);
+            }
+        }
+    }
     for pending in pending {
         let Ok(reply) = crate::natives::proc::failure_reply(process, pending.id, pending.op) else {
             continue;

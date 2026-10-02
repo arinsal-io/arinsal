@@ -3503,6 +3503,9 @@ impl Process {
             for task in std::mem::take(&mut self.cold_mut().delayed_gc) {
                 match task {
                     crate::proc_create::DelayedGc::Collect => self.force_gc()?,
+                    crate::proc_create::DelayedGc::Request(pending) => {
+                        crate::signals::reply_request(self, ctx, pending)?
+                    }
                     crate::proc_create::DelayedGc::Literal {
                         area_id,
                         request,
