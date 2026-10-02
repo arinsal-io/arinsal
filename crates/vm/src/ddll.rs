@@ -69,6 +69,8 @@ struct DeHandle {
 struct DriverRow {
     name: String,
     handle: Option<u64>,
+    /// A driver registered by `add_driver_entry` (no `DE_Handle`).
+    linked: Option<Arc<Driver>>,
 }
 
 struct Table {
@@ -98,6 +100,7 @@ fn table() -> &'static Mutex<Table> {
                 .map(|name| DriverRow {
                     name: (*name).to_owned(),
                     handle: None,
+                    linked: None,
                 })
                 .collect(),
             handles: HashMap::new(),
@@ -320,6 +323,7 @@ fn do_load_driver_entry(table: &mut Table, id: u64, path: &str, name: &str) -> i
                 DriverRow {
                     name: name.to_owned(),
                     handle: Some(id),
+                    linked: None,
                 },
             );
             arinsal_drv::ERL_DE_NO_ERROR
@@ -511,6 +515,7 @@ pub(crate) fn try_load(
     ctx: &RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
+    crate::port::install_hooks();
     let options = to_owned(args[2]).map_err(|_| badarg())?;
     let mut flags = 0;
     let mut monitor = 0u8;
@@ -1181,6 +1186,19 @@ pub(crate) enum Found {
     Static,
     /// A dynamically loaded driver and its handle.
     Dynamic(u64, Arc<Driver>),
+    /// A driver registered by `add_driver_entry`.
+    Linked(Arc<Driver>),
+}
+
+impl Found {
+    /// The driver and its `DE_Handle` id for drivers other than the built-in ones.
+    pub(crate) fn into_loaded(self) -> Option<(Option<u64>, Arc<Driver>)> {
+        match self {
+            Found::Static => None,
+            Found::Dynamic(id, driver) => Some((Some(id), driver)),
+            Found::Linked(driver) => Some((None, driver)),
+        }
+    }
 }
 
 /// Port of io.c:600-625: a driver by name, skipping force-unloading handles
@@ -1192,7 +1210,10 @@ pub(crate) fn find_driver(name: &str) -> Option<Found> {
             return None;
         }
         match row.handle {
-            None => Some(Found::Static),
+            None => Some(match &row.linked {
+                Some(driver) => Found::Linked(Arc::clone(driver)),
+                None => Found::Static,
+            }),
             Some(id) => {
                 let handle = table.handles.get(&id)?;
                 if matches!(handle.status, Status::ForceUnload | Status::ForceReload) {
@@ -1236,6 +1257,24 @@ pub(crate) fn port_opened(id: u64, port: &Arc<DriverPort>) {
         handle.port_count += 1;
         handle.ports.retain(|port| port.strong_count() > 0);
         handle.ports.push(Arc::downgrade(port));
+    }
+}
+
+/// Port of io.c:781 (driver_create_port, erts_ddll_increment_port_count) for a port made by
+/// `driver_create_port`: found through its driver instead of a handle id.
+pub(crate) fn port_opened_for(driver: &Arc<Driver>, port: &Arc<DriverPort>) {
+    let id = {
+        let table = table().lock().unwrap();
+        table.handles.iter().find_map(|(id, handle)| {
+            handle
+                .driver
+                .as_ref()
+                .is_some_and(|d| Arc::ptr_eq(d, driver))
+                .then_some(*id)
+        })
+    };
+    if let Some(id) = id {
+        port_opened(id, port);
     }
 }
 
@@ -1288,4 +1327,79 @@ fn port_freed(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) {
         run_pending(table, &mut notices);
     }
     deliver(scheduler, notices);
+}
+
+/// Port of erts/emulator/beam/io.c:7636 (erts_add_driver_entry): a driver added
+/// by `add_driver_entry` goes to the head of `driver_list`.
+pub(crate) fn add_linked(driver: Arc<Driver>) {
+    let mut table = table().lock().unwrap();
+    table.drivers.insert(
+        0,
+        DriverRow {
+            name: driver.name().to_owned(),
+            handle: None,
+            linked: Some(driver),
+        },
+    );
+}
+
+/// Port of erts/emulator/beam/io.c:7684 (remove_driver_entry): `1` removed, `0`
+/// no such entry, `-1` the entry belongs to a dynamically loaded driver.
+pub(crate) fn remove_linked(entry: usize) -> i32 {
+    let mut guard = table().lock().unwrap();
+    let table = &mut *guard;
+    let found = table
+        .drivers
+        .iter()
+        .position(|row| match (&row.linked, row.handle) {
+            (Some(driver), _) => driver.entry_addr() == entry,
+            (None, Some(id)) => table
+                .handles
+                .get(&id)
+                .and_then(|handle| handle.driver.as_ref())
+                .is_some_and(|driver| driver.entry_addr() == entry),
+            (None, None) => false,
+        });
+    match found {
+        None => 0,
+        Some(at) if table.drivers[at].handle.is_some() => -1,
+        Some(at) => {
+            table.drivers.remove(at);
+            1
+        }
+    }
+}
+
+/// Port of erts/emulator/beam/io.c:7318 (driver_lock_driver) and
+/// erl_bif_ddll.c:1022 (erts_ddll_lock_driver): the driver becomes permanent.
+/// `false` for a driver that is not dynamically loaded.
+pub(crate) fn lock_driver(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) -> bool {
+    let mut notices = Vec::new();
+    {
+        let mut guard = table().lock().unwrap();
+        let table = &mut *guard;
+        let Some(id) = table.handles.iter().find_map(|(id, handle)| {
+            handle
+                .driver
+                .as_ref()
+                .is_some_and(|d| Arc::ptr_eq(d, driver))
+                .then_some(*id)
+        }) else {
+            return false;
+        };
+        let name = driver.name().to_owned();
+        let handle = table.handles.get_mut(&id).expect("live handle");
+        for awaiting in [
+            Awaiting::AwaitLoad,
+            Awaiting::AwaitUnload,
+            Awaiting::AwaitUnloadOnly,
+        ] {
+            notify_all(handle, &name, awaiting, "UP", "permanent", &mut notices);
+        }
+        handle.procs.clear();
+        reference_driver(table, id);
+        table.handles.get_mut(&id).expect("live handle").status = Status::Permanent;
+    }
+    deliver(scheduler, notices);
+    true
 }

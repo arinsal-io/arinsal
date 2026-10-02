@@ -15,6 +15,36 @@ fn environment() -> &'static RwLock<Environment> {
     ENVIRONMENT.get_or_init(|| RwLock::new(std::env::vars_os().collect()))
 }
 
+/// A variable of the VM-owned environment (`erl_drv_getenv`).
+pub(crate) fn get(key: &[u8]) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let name = std::ffi::OsStr::from_bytes(key);
+    environment()
+        .read()
+        .unwrap()
+        .iter()
+        .find(|(candidate, _)| candidate == name)
+        .map(|(_, value)| value.clone().into_vec())
+}
+
+/// Set a variable of the VM-owned environment (`erl_drv_putenv`).
+pub(crate) fn put(key: &[u8], value: &[u8]) {
+    use std::os::unix::ffi::OsStringExt;
+    seed_raw(
+        OsString::from_vec(key.to_vec()),
+        OsString::from_vec(value.to_vec()),
+    );
+}
+
+fn seed_raw(name: OsString, value: OsString) {
+    let mut env = environment().write().unwrap();
+    if let Some((_, existing)) = env.iter_mut().find(|(key, _)| *key == name) {
+        *existing = value;
+    } else {
+        env.push((name, value));
+    }
+}
+
 /// Snapshot of the VM-owned environment for a newly spawned child.
 pub(crate) fn snapshot() -> Environment {
     environment().read().unwrap().clone()

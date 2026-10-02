@@ -2669,6 +2669,11 @@ pub(crate) fn normalize_spawn_heap_minimum(
     })
 }
 
+/// `erlang:system_info(schedulers)` at boot: the scheduler count `driver_system_info` reports.
+pub(crate) fn schedulers_total() -> usize {
+    SystemFlags::boot().schedulers_total
+}
+
 impl SystemFlags {
     /// Values a runtime boots with, from the command line and the environment.
     pub(crate) fn boot() -> Self {

@@ -9,10 +9,15 @@
 //! its symbols (`-Wl,-export_dynamic` on macOS, `-rdynamic` on Linux).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[macro_use]
+mod export_macro;
 pub mod api;
 mod asyncq;
 mod binary;
 mod exports;
+mod exports_lib;
+mod ext;
+mod hooks;
 mod linebuf;
 mod lock;
 mod poll;
@@ -22,6 +27,10 @@ mod timer;
 
 pub use asyncq::set_async_threads;
 pub use poll::{PollBackend, set_poll_backend};
+mod mem;
+mod queue;
+mod termspec;
+mod threads;
 
 /// Layout constants generated from the installed `erl_driver.h`.
 #[allow(non_upper_case_globals, dead_code)]
@@ -35,10 +44,12 @@ mod errno_table {
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::mem::offset_of;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 pub use binary::ErlDrvBinary;
+pub use ext::{BUSY_MSGQ_DISABLED, ErlDrvMonitor, InitAck};
+pub use hooks::{SystemHooks, set_system_hooks};
 use linebuf::LineBuf;
 use lock::{ReentrantGuard, ReentrantLock};
 
@@ -132,7 +143,7 @@ struct ErlDrvEntry {
     minor_version: c_int,
     driver_flags: c_int,
     handle2: *mut c_void,
-    process_exit: Option<DrvFn2>,
+    process_exit: Option<extern "C" fn(DrvData, *mut ErlDrvMonitor)>,
     stop_select: Option<DrvFn2>,
     emergency_close: Option<DrvFn1>,
 }
@@ -189,6 +200,7 @@ pub(crate) struct Callbacks {
     pub(crate) timeout: Option<DrvFn1>,
     pub(crate) ready_async: Option<DrvFn2>,
     pub(crate) stop_select: Option<DrvFn2>,
+    process_exit: Option<extern "C" fn(DrvData, *mut ErlDrvMonitor)>,
 }
 
 /// A loaded dynamic driver (`erts_driver_t` with its `DE_Handle` library).
@@ -200,6 +212,8 @@ pub struct Driver {
     library: Mutex<usize>,
     /// Driver lock for drivers without `ERL_DRV_FLAG_USE_PORT_LOCKING` (io.c:7567).
     lock: Option<ReentrantLock>,
+    /// Address of the `ErlDrvEntry` (`erts_driver_t.entry`).
+    entry_addr: usize,
 }
 
 fn dl_errcodes() -> &'static Mutex<Vec<String>> {
@@ -260,7 +274,7 @@ pub fn ddll_error(code: i32) -> String {
 
 /// Port of erts/emulator/sys/unix/erl_unix_sys_ddll.c:107-148 (erts_sys_ddll_open,
 /// erts_sys_ddll_open_noext), OTP-29.1.1.
-fn dl_open(full_name: &str) -> Result<usize, i32> {
+pub(crate) fn dl_open(full_name: &str) -> Result<usize, i32> {
     let dlname = format!("{full_name}.so");
     let path = CString::new(dlname.clone()).map_err(|_| ERL_DE_ERROR_UNSPECIFIED)?;
     last_dlerror();
@@ -280,7 +294,7 @@ fn dl_open(full_name: &str) -> Result<usize, i32> {
     Err(find_errcode(shown))
 }
 
-fn dl_sym(handle: usize, name: &CStr) -> Result<*mut c_void, i32> {
+pub(crate) fn dl_sym(handle: usize, name: &CStr) -> Result<*mut c_void, i32> {
     last_dlerror();
     // SAFETY: handle is a live dlopen handle and name is NUL terminated.
     let sym = unsafe { libc::dlsym(handle as *mut c_void, name.as_ptr()) };
@@ -290,9 +304,14 @@ fn dl_sym(handle: usize, name: &CStr) -> Result<*mut c_void, i32> {
     }
 }
 
-fn dl_close(handle: usize) {
+/// Port of erl_unix_sys_ddll.c:268 (erts_sys_ddll_close2): `0` or an error code.
+pub(crate) fn dl_close(handle: usize) -> i32 {
+    last_dlerror();
     // SAFETY: the handle came from dlopen and no code from it runs any more.
-    unsafe { libc::dlclose(handle as *mut c_void) };
+    if unsafe { libc::dlclose(handle as *mut c_void) } == 0 {
+        return ERL_DE_NO_ERROR;
+    }
+    find_errcode(&last_dlerror().unwrap_or_default())
 }
 
 impl Driver {
@@ -315,8 +334,8 @@ impl Driver {
         let init: unsafe extern "C" fn() -> *const ErlDrvEntry =
             unsafe { std::mem::transmute(init) };
         // SAFETY: the library is loaded; driver_init returns static entry data or NULL.
-        let entry = unsafe { init().as_ref().copied() };
-        let Some(entry) = entry else {
+        let entry_ptr = unsafe { init() };
+        let Some(entry) = mem::deref(entry_ptr).copied() else {
             return fail(ERL_DE_LOAD_ERROR_FAILED_INIT);
         };
         if entry.extended_marker as u32 != layout::ERL_DRV_EXTENDED_MARKER as u32
@@ -352,9 +371,11 @@ impl Driver {
                 timeout: entry.timeout,
                 ready_async: entry.ready_async,
                 stop_select: entry.stop_select,
+                process_exit: entry.process_exit,
             },
             library: Mutex::new(handle),
             lock: (flags & ERL_DRV_FLAG_USE_PORT_LOCKING == 0).then(ReentrantLock::default),
+            entry_addr: entry_ptr as usize,
         });
         if let Some(init) = entry.init {
             // SAFETY: the entry's init takes no arguments and runs once after loading.
@@ -364,6 +385,51 @@ impl Driver {
             }
         }
         Ok(driver)
+    }
+
+    /// Port of erts/emulator/beam/io.c:7554 (init_driver) for an entry that is
+    /// not in a library: one registered by `add_driver_entry`. `Err` carries
+    /// the `ERL_DE_*` code when the entry is unusable or its `init` fails.
+    pub(crate) fn linked(entry_ptr: *const ErlDrvEntry) -> Result<Arc<Driver>, i32> {
+        let entry = mem::deref(entry_ptr)
+            .copied()
+            .ok_or(ERL_DE_LOAD_ERROR_FAILED_INIT)?;
+        let name = mem::cstr(entry.driver_name).ok_or(ERL_DE_LOAD_ERROR_BAD_NAME)?;
+        let flags = entry.driver_flags;
+        let driver = Arc::new(Driver {
+            name: name.to_string_lossy().into_owned(),
+            flags,
+            callbacks: Callbacks {
+                start: entry.start,
+                stop: entry.stop,
+                finish: entry.finish,
+                output: entry.output,
+                outputv: entry.outputv,
+                control: entry.control,
+                call: entry.call,
+                ready_input: entry.ready_input,
+                ready_output: entry.ready_output,
+                timeout: entry.timeout,
+                ready_async: entry.ready_async,
+                stop_select: entry.stop_select,
+                process_exit: entry.process_exit,
+            },
+            library: Mutex::new(0),
+            lock: (flags & ERL_DRV_FLAG_USE_PORT_LOCKING == 0).then(ReentrantLock::default),
+            entry_addr: entry_ptr as usize,
+        });
+        if let Some(init) = entry.init {
+            // SAFETY: the entry's init takes no arguments and runs once when it is added.
+            if unsafe { init() } != 0 {
+                return Err(ERL_DE_LOAD_ERROR_FAILED_INIT);
+            }
+        }
+        Ok(driver)
+    }
+
+    /// Address of the driver's `ErlDrvEntry`, to match `remove_driver_entry`.
+    pub fn entry_addr(&self) -> usize {
+        self.entry_addr
     }
 
     /// Driver name.
@@ -460,6 +526,42 @@ pub trait PortHost: Send + Sync {
     fn ddll_reference(&self, port: &DriverPort);
     /// `erts_ddll_dereference_driver`.
     fn ddll_dereference(&self, port: &DriverPort);
+    /// Port of io.c:3496 (deliver_vec_message): `{Port, {data, Data}}` where `Data`
+    /// is `header` followed by the segments (one binary each with `binary`, else all
+    /// bytes as one flat list; a single binary segment is not wrapped in a list).
+    fn deliver_vec(&self, port: &DriverPort, header: &[u8], segments: &[Vec<u8>], binary: bool);
+    /// Port of io.c:5658 (driver_deliver_term end): queue `{Port, Term}`-less
+    /// `term` as a message from the port to process `to` (process-table data) or
+    /// the connected process. `false` when the receiver does not exist.
+    fn deliver_term(
+        &self,
+        port: &DriverPort,
+        to: Option<u64>,
+        term: &arinsal_etf::OwnedTerm,
+    ) -> bool;
+    /// Process-table data of the connected process (`ERTS_PORT_GET_CONNECTED`).
+    fn connected(&self, port: &DriverPort) -> u64;
+    /// Port of io.c:5203 (set_busy_port): `ERTS_PTS_FLG_BUSY_PORT`.
+    fn set_busy(&self, port: &DriverPort, on: bool);
+    /// Port of io.c:7006 (do_driver_monitor_process): monitor process `pid` for
+    /// `port` under `monitor`. `false` when the process does not exist. When it
+    /// exits the VM calls [`DriverPort::process_exit`].
+    fn monitor_process(&self, port: &DriverPort, pid: u64, monitor: u64) -> bool;
+    /// Port of io.c:7059 (do_driver_demonitor_process).
+    fn demonitor_process(&self, port: &DriverPort, monitor: u64);
+    /// Port of io.c:7318 (driver_lock_driver): make the driver permanent.
+    fn lock_driver(&self, port: &DriverPort) -> bool;
+    /// Port of io.c:2912 (init_ack_send_reply): answer the pending `open_port`.
+    fn init_ack(&self, port: &DriverPort, reply: InitAck);
+    /// Port of io.c:781 (driver_create_port): a new port of `creator`'s driver
+    /// owned by (and linked to) `owner`, with `drv_data` as its driver data.
+    fn create_port(
+        &self,
+        creator: &DriverPort,
+        owner: u64,
+        name: &str,
+        drv_data: usize,
+    ) -> Option<Arc<DriverPort>>;
 }
 
 const SFLG_BINARY_IO: u32 = 1;
@@ -477,7 +579,7 @@ pub struct DriverPort {
     control_flags: AtomicI32,
     state: AtomicU32,
     linebuf: Mutex<Option<LineBuf>>,
-    /// Caller during a callback (`prt->caller`) as the VM packs it, zero otherwise.
+    /// Caller during a callback (`prt->caller`): the pid data with [`CALLER_SET`], else zero.
     caller: AtomicU64,
     lock: Option<ReentrantLock>,
     /// `open_port` name (`prt->name`), set by [`DriverPort::start`].
@@ -486,7 +588,20 @@ pub struct DriverPort {
     reds: AtomicI32,
     timer: Mutex<timer::PortTimer>,
     timer_epoch: AtomicU64,
+    /// `prt->ioq`.
+    queue: Mutex<queue::IoQueue>,
+    /// `prt->port_data_lock` (a `threads::PortDataLock`), zero when none.
+    pdl: AtomicUsize,
+    /// Process monitors held by this port: monitor id to process-table data.
+    monitors: Mutex<HashMap<u64, u64>>,
+    msgq_limits: Mutex<ext::MsgqLimits>,
+    os_pid: AtomicI64,
+    /// An `open_port` is waiting for `erl_drv_init_ack`.
+    async_open: std::sync::atomic::AtomicBool,
 }
+
+/// Set in `DriverPort::caller` while a callback has a caller (pid data 0 is a valid pid).
+const CALLER_SET: u64 = 1 << 63;
 
 fn registry() -> &'static Mutex<HashMap<usize, Weak<DriverPort>>> {
     static PORTS: OnceLock<Mutex<HashMap<usize, Weak<DriverPort>>>> = OnceLock::new();
@@ -500,6 +615,16 @@ pub(crate) fn port_of(handle: DrvPortPtr) -> Option<Arc<DriverPort>> {
         .unwrap()
         .get(&(handle as usize))
         .and_then(Weak::upgrade)
+}
+
+/// Live port by VM port number (`erts_port_lookup_raw`).
+pub(crate) fn port_by_id(id: u64) -> Option<Arc<DriverPort>> {
+    registry()
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(Weak::upgrade)
+        .find(|port| port.id == id)
 }
 
 impl DriverPort {
@@ -520,6 +645,12 @@ impl DriverPort {
             reds: AtomicI32::new(0),
             timer: Mutex::new(timer::PortTimer::None),
             timer_epoch: AtomicU64::new(0),
+            queue: Mutex::new(queue::IoQueue::default()),
+            pdl: AtomicUsize::new(0),
+            monitors: Mutex::new(HashMap::new()),
+            msgq_limits: Mutex::new(ext::MSGQ_LIMITS_DEFAULT),
+            os_pid: AtomicI64::new(-1),
+            async_open: std::sync::atomic::AtomicBool::new(false),
         });
         registry()
             .lock()
@@ -538,9 +669,28 @@ impl DriverPort {
         &self.driver
     }
 
-    /// Caller during a callback as the VM packs it, zero otherwise (`prt->caller`).
+    /// Caller during a callback as pid data, zero otherwise (`prt->caller`).
     pub fn caller(&self) -> u64 {
-        self.caller.load(Ordering::Acquire)
+        self.caller_data().unwrap_or(0)
+    }
+
+    /// Pid data of the caller during a callback.
+    pub(crate) fn caller_data(&self) -> Option<u64> {
+        let caller = self.caller.load(Ordering::Acquire);
+        (caller & CALLER_SET != 0).then_some(caller & !CALLER_SET)
+    }
+
+    fn set_caller(&self, caller: u64) {
+        self.caller.store(caller | CALLER_SET, Ordering::Release);
+    }
+
+    fn clear_caller(&self) {
+        self.caller.store(0, Ordering::Release);
+    }
+
+    /// Whether the port is closing (`ERTS_PORT_SFLG_CLOSING`).
+    pub(crate) fn terminating(&self) -> bool {
+        self.state.load(Ordering::Acquire) & SFLG_TERMINATING != 0
     }
 
     /// `prt->control_flags`.
@@ -548,7 +698,7 @@ impl DriverPort {
         self.control_flags.load(Ordering::Acquire)
     }
 
-    fn handle(&self) -> DrvPortPtr {
+    pub(crate) fn handle(&self) -> DrvPortPtr {
         std::ptr::from_ref(self).cast_mut().cast()
     }
 
@@ -605,13 +755,13 @@ impl DriverPort {
         let Some(start) = self.driver.callbacks.start else {
             return Ok(());
         };
-        self.caller.store(caller, Ordering::Release);
+        self.set_caller(caller);
         // SAFETY: the command buffer is NUL terminated and outlives the call; the
         // handle stays registered while the port exists.
         let data = unsafe { start(self.handle(), command.as_mut_ptr().cast()) };
         // erts saves errno right after `start` for ERL_DRV_ERROR_ERRNO.
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        self.caller.store(0, Ordering::Release);
+        self.clear_caller();
         match data as isize {
             -1 => Err(StartError::General),
             -2 => Err(StartError::Errno(errno)),
@@ -627,6 +777,7 @@ impl DriverPort {
     pub fn abandon(&self) {
         self.state.fetch_or(SFLG_TERMINATING, Ordering::AcqRel);
         registry().lock().unwrap().remove(&(self.handle() as usize));
+        self.release_resources();
     }
 
     /// Port state flags set by `open_port` after `start` (erl_bif_port.c:1140).
@@ -652,7 +803,7 @@ impl DriverPort {
         if !self.live() {
             return false;
         }
-        self.caller.store(caller, Ordering::Release);
+        self.set_caller(caller);
         if let Some(outputv) = self.driver.callbacks.outputv {
             self.call_outputv(outputv, pieces);
         } else if let Some(output) = self.driver.callbacks.output {
@@ -664,7 +815,7 @@ impl DriverPort {
             // SAFETY: the buffer outlives the call; drv_data came from start.
             unsafe { output(self.data(), buf.as_mut_ptr().cast(), buf.len()) };
         }
-        self.caller.store(0, Ordering::Release);
+        self.clear_caller();
         true
     }
 
@@ -738,7 +889,7 @@ impl DriverPort {
         let mut resp_buf = [0u8; ERL_ONHEAP_BINARY_LIMIT];
         let pre: *mut c_char = resp_buf.as_mut_ptr().cast();
         let mut rbuf = pre;
-        self.caller.store(caller, Ordering::Release);
+        self.set_caller(caller);
         // SAFETY: input and the preallocated reply buffer outlive the call.
         let cres = unsafe {
             control(
@@ -750,7 +901,7 @@ impl DriverPort {
                 resp_buf.len(),
             )
         };
-        self.caller.store(0, Ordering::Release);
+        self.clear_caller();
         if cres < 0 {
             return None;
         }
@@ -793,7 +944,7 @@ impl DriverPort {
         let pre: *mut c_char = resp_buf.as_mut_ptr().cast();
         let mut rbuf = pre;
         let mut ret_flags: c_uint = 0;
-        self.caller.store(caller, Ordering::Release);
+        self.set_caller(caller);
         // SAFETY: input and the preallocated reply buffer outlive the call.
         let cres = unsafe {
             call(
@@ -806,7 +957,7 @@ impl DriverPort {
                 &mut ret_flags,
             )
         };
-        self.caller.store(0, Ordering::Release);
+        self.clear_caller();
         let reply = if cres <= 0 || rbuf.is_null() {
             None
         } else if rbuf == pre {
@@ -838,6 +989,7 @@ impl DriverPort {
             unsafe { stop(self.data()) };
         }
         registry().lock().unwrap().remove(&(self.handle() as usize));
+        self.release_resources();
         true
     }
 

@@ -1,4 +1,5 @@
 #include <erl_driver.h>
+#include <erl_nif.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -52,5 +53,44 @@ int main(void) {
     VAL(ERL_DRV_WRITE);
     VAL(ERL_DRV_USE);
     VAL(ERL_DRV_USE_NO_CALLBACK);
+    VAL(ERL_DRV_NIL);
+    VAL(ERL_DRV_ATOM);
+    VAL(ERL_DRV_INT);
+    VAL(ERL_DRV_PORT);
+    VAL(ERL_DRV_BINARY);
+    VAL(ERL_DRV_STRING);
+    VAL(ERL_DRV_TUPLE);
+    VAL(ERL_DRV_LIST);
+    VAL(ERL_DRV_STRING_CONS);
+    VAL(ERL_DRV_PID);
+    VAL(ERL_DRV_FLOAT);
+    VAL(ERL_DRV_EXT2TERM);
+    VAL(ERL_DRV_UINT);
+    VAL(ERL_DRV_BUF2BINARY);
+    VAL(ERL_DRV_INT64);
+    VAL(ERL_DRV_UINT64);
+    VAL(ERL_DRV_MAP);
+    VAL(PORT_FLAG_BINARY);
+    VAL(PORT_FLAG_LINE);
+    VAL(ERL_NIF_MAJOR_VERSION);
+    VAL(ERL_NIF_MINOR_VERSION);
+    SIZE(ErlDrvMonitor);
+    SIZE(ErlDrvSysInfo);
+    OFF(ErlDrvSysInfo, driver_major_version);
+    OFF(ErlDrvSysInfo, driver_minor_version);
+    OFF(ErlDrvSysInfo, erts_version);
+    OFF(ErlDrvSysInfo, otp_release);
+    OFF(ErlDrvSysInfo, thread_support);
+    OFF(ErlDrvSysInfo, smp_support);
+    OFF(ErlDrvSysInfo, async_threads);
+    OFF(ErlDrvSysInfo, scheduler_threads);
+    OFF(ErlDrvSysInfo, nif_major_version);
+    OFF(ErlDrvSysInfo, nif_minor_version);
+    OFF(ErlDrvSysInfo, dirty_scheduler_support);
+    SIZE(ErlDrvNowData);
+    OFF(ErlDrvNowData, megasecs);
+    OFF(ErlDrvNowData, secs);
+    OFF(ErlDrvNowData, microsecs);
+    SIZE(ErlDrvThreadOpts);
     return 0;
 }
