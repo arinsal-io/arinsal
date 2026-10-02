@@ -71,6 +71,12 @@ impl HeapAlloc for Heap<'_> {
     fn retain_export(&mut self, value: Arc<ExportEntry>) {
         self.0.retain_export(value)
     }
+    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
+        self.0.retain_magic(owner)
+    }
+    fn supports_magic(&self) -> bool {
+        self.0.supports_magic()
+    }
 }
 
 // Consecutive cons cells must not request a fresh heap fragment per element.

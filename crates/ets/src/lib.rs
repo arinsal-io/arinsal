@@ -8,8 +8,8 @@ use catree::CATree;
 use tree::Node;
 
 use arinsal_term::{
-    Atom, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, Identity, Node as TermNode, Term,
-    TermBuilder, TermError, TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq,
+    Atom, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, Identity, MagicRef, Node as TermNode,
+    Term, TermBuilder, TermError, TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq,
     global_atoms, internal_hash, term_sequence,
 };
 use num_bigint::BigInt;
@@ -720,6 +720,7 @@ pub(crate) struct StoredTerm {
     // The tuple heap contains NIL sentinels in those positions and never keeps
     // the original boxed values alive.
     compressed_elements: Vec<Option<Vec<u8>>>,
+    compressed_magic_refs: Vec<Option<Arc<MagicRef>>>,
     compressed_bytes: usize,
     db_size_words: usize,
     order: u64,
@@ -744,6 +745,7 @@ struct OffHeap {
     nodes: Vec<Arc<TermNode>>,
     funs: Vec<Arc<FunEntry>>,
     exports: Vec<Arc<ExportEntry>>,
+    magic: Vec<Arc<MagicRef>>,
 }
 
 impl ObjectHeap {
@@ -757,6 +759,25 @@ impl ObjectHeap {
     fn off_heap(&mut self) -> &mut OffHeap {
         self.off_heap
             .get_or_insert_with(|| Box::new(OffHeap::default()))
+    }
+
+    fn magic_owner(&self, term: Term) -> Option<Arc<MagicRef>> {
+        if !term.is_magic_ref() {
+            return None;
+        }
+        let Identity::Ref { ids, .. } = term.identity()? else {
+            return None;
+        };
+        if ids.len() != 3 || ids[2] != u32::MAX {
+            return None;
+        }
+        let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
+        self.off_heap
+            .as_ref()?
+            .magic
+            .iter()
+            .find(|owner| owner.id() == id)
+            .cloned()
     }
 }
 
@@ -796,6 +817,12 @@ impl HeapAlloc for ObjectHeap {
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
         self.off_heap().exports.push(entry);
     }
+    fn retain_magic(&mut self, owner: Arc<MagicRef>) {
+        self.off_heap().magic.push(owner);
+    }
+    fn supports_magic(&self) -> bool {
+        true
+    }
 }
 
 impl StoredTerm {
@@ -826,6 +853,7 @@ impl StoredTerm {
                 term: Term::small(0).unwrap(),
                 inline_pair: Some(pair),
                 compressed_elements: Vec::new(),
+                compressed_magic_refs: Vec::new(),
                 compressed_bytes: 0,
                 db_size_words,
                 order: 0,
@@ -846,6 +874,7 @@ impl StoredTerm {
         let db_size_words = Self::accounted_words(term, keypos, compressed, prefix_words, 0);
         let mut heap = ObjectHeap::new();
         let mut compressed_elements = Vec::new();
+        let mut compressed_magic_refs = Vec::new();
         let mut compressed_bytes = 0;
         let term = if compressed {
             // Port of erts/emulator/beam/erl_db_util.c:3490 (copy_to_comp), OTP-29.1.1.
@@ -857,6 +886,12 @@ impl StoredTerm {
                     && element.is_pointer()
                     && element.classify() != TermKind::Bitstring
                 {
+                    if element.is_magic_ref() {
+                        // Compressed bytes carry the reference identity, while ETS must retain
+                        // its magic owner until the stored row is deleted.
+                        copy_term(element, &mut heap)?;
+                    }
+                    compressed_magic_refs.push(heap.magic_owner(element));
                     let owned = arinsal_term::to_owned(element)?;
                     let ext = arinsal_etf::encode(&owned, arinsal_etf::EncodeOptions::default());
                     let mut ext = ets_external_atoms(&ext, true)?;
@@ -865,6 +900,7 @@ impl StoredTerm {
                     compressed_elements.push(Some(ext));
                     elements.push(Term::NIL);
                 } else {
+                    compressed_magic_refs.push(None);
                     // Port of erts/emulator/beam/erl_db_util.c:3490-3501,
                     // OTP-29.1.1: ETS external encoding keeps binary refs on
                     // the object's off-heap chain.
@@ -883,6 +919,7 @@ impl StoredTerm {
             term,
             inline_pair: None,
             compressed_elements,
+            compressed_magic_refs,
             compressed_bytes,
             db_size_words: if compressed {
                 Self::accounted_words(object, keypos, true, prefix_words, compressed_bytes)
@@ -906,6 +943,7 @@ impl StoredTerm {
                 term: Term::small(0).unwrap(),
                 inline_pair: Some(pair),
                 compressed_elements: Vec::new(),
+                compressed_magic_refs: Vec::new(),
                 compressed_bytes: 0,
                 db_size_words: self.db_size_words,
                 order: self.order,
@@ -915,6 +953,7 @@ impl StoredTerm {
         }
         let mut copy = Self::copy_heap(self.term)?;
         copy.compressed_elements = self.compressed_elements.clone();
+        copy.compressed_magic_refs = self.compressed_magic_refs.clone();
         copy.compressed_bytes = self.compressed_bytes;
         copy.db_size_words = self.db_size_words;
         Ok(copy)
@@ -961,6 +1000,13 @@ impl StoredTerm {
         dst: &mut H,
     ) -> Result<Term, EtsError> {
         if let Some(bytes) = self.compressed_elements.get(index).and_then(Option::as_ref) {
+            if let Some(owner) = self
+                .compressed_magic_refs
+                .get(index)
+                .and_then(Option::as_ref)
+            {
+                return Ok(TermBuilder::new(dst).magic_ref(owner.clone())?);
+            }
             let mut ext = Vec::with_capacity(bytes.len() + 1);
             ext.push(131);
             ext.extend_from_slice(bytes);
@@ -1076,6 +1122,14 @@ impl StoredTerm {
         let mut elements = Vec::with_capacity(tuple.len());
         for (index, element) in tuple.into_iter().enumerate() {
             if let Some(bytes) = self.compressed_elements.get(index).and_then(Option::as_ref) {
+                if let Some(owner) = self
+                    .compressed_magic_refs
+                    .get(index)
+                    .and_then(Option::as_ref)
+                {
+                    elements.push(TermBuilder::new(dst).magic_ref(owner.clone())?);
+                    continue;
+                }
                 let mut ext = Vec::with_capacity(bytes.len() + 1);
                 ext.push(131);
                 ext.extend_from_slice(bytes);
