@@ -86,9 +86,15 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         // erts/emulator/beam/erl_init.c:1354, OTP-29.1.1.
         "outstanding_system_requests_limit" => integer(ctx, cpus.saturating_mul(2)),
         "thread_pool_size" => integer(ctx, 1),
-        "process_limit" => integer(ctx, 1_048_576),
+        "process_limit" => integer(
+            ctx,
+            u64::from(arinsal_term::ptab::process_table_layout().max()),
+        ),
         "atom_limit" => integer(ctx, 1_048_576),
-        "port_limit" => integer(ctx, 1_048_576),
+        "port_limit" => integer(
+            ctx,
+            u64::from(arinsal_term::ptab::port_table_layout().max()),
+        ),
         "ets_limit" => integer(ctx, 8192),
         "fullsweep_after" => tagged_integer(ctx, "fullsweep_after", 65_535),
         "min_heap_size" => tagged_integer(ctx, "min_heap_size", 233),

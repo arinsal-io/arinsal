@@ -867,10 +867,7 @@ mod tests {
     fn monitor_node_creates_known_entry_and_disconnect_reports_watchers() {
         let mut tables = NodeTables::default();
         assert!(tables.set_local_node("test@localhost".into(), 4));
-        let pid = arinsal_sched::Pid {
-            index: 1,
-            generation: 0,
-        };
+        let pid = arinsal_sched::Pid::new(1, 0);
         assert!(tables.monitor(pid, "unknown@host".into(), true));
         let watchers = tables.disconnect("unknown@host");
         assert_eq!(watchers.len(), 1);

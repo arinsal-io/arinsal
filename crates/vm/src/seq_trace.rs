@@ -655,10 +655,7 @@ mod tests {
     fn seq_trace_label_flags_and_serial_are_mutable() {
         let _guard = test_lock().lock().unwrap();
         let mut process = Process::new();
-        let pid = Pid {
-            index: 8101,
-            generation: 1,
-        };
+        let pid = Pid::new(8101, 1);
         let label = Term::small(99).unwrap();
         set_component(&mut process, pid, crate::signals::atom("label"), label).unwrap();
         set_component(
@@ -676,10 +673,7 @@ mod tests {
     fn seq_trace_reset_clears_active_tokens() {
         let _guard = test_lock().lock().unwrap();
         let mut process = Process::new();
-        let pid = Pid {
-            index: 8102,
-            generation: 1,
-        };
+        let pid = Pid::new(8102, 1);
         set_component(
             &mut process,
             pid,

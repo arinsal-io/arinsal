@@ -13,6 +13,7 @@ mod literal;
 mod magic;
 mod ops;
 mod owned;
+pub mod ptab;
 mod record;
 mod region;
 pub mod validate;
@@ -162,24 +163,35 @@ impl Term {
     pub const fn catch(index: u64) -> Self {
         Self((index << 6) | 0x1b)
     }
-    /// Local pid: 28-bit process index and 32-bit generation in the 60-bit payload.
+    /// Local pid from its number (28 bits) and serial (32 bits).
+    ///
+    /// Port of erts/emulator/beam/erl_node_container_utils.h:123 (make_internal_pid)
+    /// and erl_term.h:655 (make_pid_data), OTP-29.1.1.
     #[inline]
-    pub const fn pid(index: u32, generation: u32) -> Option<Self> {
-        if index >= (1 << 28) {
+    pub fn pid(number: u32, serial: u32) -> Option<Self> {
+        if number > ptab::MAX_INTERNAL_PID_NUMBER {
             None
         } else {
-            Some(Self(
-                ((((generation as u64) << 28) | index as u64) << 4) | 3,
+            Some(Self::pid_from_data(
+                ((serial as u64) << ptab::PID_NUM_SIZE) | number as u64,
             ))
         }
     }
-    /// Local port identifier, up to 60 bits.
+    /// Local pid from its 60-bit process-table data.
     #[inline]
-    pub const fn port(id: u64) -> Option<Self> {
-        if id >= (1_u64 << 60) {
+    pub fn pid_from_data(data: u64) -> Self {
+        let pixdata = ptab::process_table_layout().data2pixdata(data & ptab::PTAB_ID_DATA_MASK);
+        Self((pixdata << 4) | 3)
+    }
+    /// Local port from its 60-bit port number (port-table data).
+    ///
+    /// Port of erts/emulator/beam/erl_node_container_utils.h:250 (make_internal_port), OTP-29.1.1.
+    #[inline]
+    pub fn port(id: u64) -> Option<Self> {
+        if id > ptab::PTAB_ID_DATA_MASK {
             None
         } else {
-            Some(Self((id << 4) | 7))
+            Some(Self((ptab::port_table_layout().data2pixdata(id) << 4) | 7))
         }
     }
     /// Return the tagged bits inside this crate.
@@ -230,21 +242,34 @@ impl Term {
             None
         }
     }
-    /// Extract local pid index and generation.
+    /// Extract a local pid's number and serial.
+    ///
+    /// Port of erts/emulator/beam/erl_node_container_utils.h:134 (internal_pid_number,
+    /// internal_pid_serial), OTP-29.1.1.
     #[inline]
-    pub const fn as_pid(self) -> Option<(u32, u32)> {
+    pub fn as_pid(self) -> Option<(u32, u32)> {
+        let data = self.as_pid_data()?;
+        Some((
+            (data & ptab::MAX_INTERNAL_PID_NUMBER as u64) as u32,
+            (data >> ptab::PID_NUM_SIZE) as u32,
+        ))
+    }
+    /// Extract a local pid's 60-bit process-table data.
+    #[inline]
+    pub fn as_pid_data(self) -> Option<u64> {
         if self.0 & 15 == 3 {
-            let payload = self.0 >> 4;
-            Some(((payload & ((1 << 28) - 1)) as u32, (payload >> 28) as u32))
+            Some(ptab::process_table_layout().pixdata2data(self.0 >> 4))
         } else {
             None
         }
     }
-    /// Extract a local port identifier.
+    /// Extract a local port number.
+    ///
+    /// Port of erts/emulator/beam/erl_node_container_utils.h:205 (internal_port_number), OTP-29.1.1.
     #[inline]
-    pub const fn as_port(self) -> Option<u64> {
+    pub fn as_port(self) -> Option<u64> {
         if self.0 & 15 == 7 {
-            Some(self.0 >> 4)
+            Some(ptab::port_table_layout().pixdata2data(self.0 >> 4))
         } else {
             None
         }

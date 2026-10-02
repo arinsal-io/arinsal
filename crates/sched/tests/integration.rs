@@ -396,14 +396,8 @@ fn bounded_runnext_gives_external_work_a_turn() {
         runnext_limit: 3,
         ..Config::default()
     });
-    let first = Pid {
-        index: 0,
-        generation: 0,
-    };
-    let second = Pid {
-        index: 1,
-        generation: 0,
-    };
+    let first = Pid::new(0, 0);
+    let second = Pid::new(1, 0);
     assert_eq!(
         sched.spawn(Work::Ping(second, count.clone())).unwrap(),
         first
@@ -447,8 +441,8 @@ fn pid_generation_and_timer_firing() {
     assert!(sched.step());
     assert!(!sched.lookup(first));
     let second = sched.spawn(Exit).unwrap();
-    assert_eq!(first.index, second.index);
-    assert_ne!(first.generation, second.generation);
+    // erts hands out the next free-ring data, not the slot just released.
+    assert_ne!(first, second);
     assert_eq!(Pid::from_term(second.to_term().unwrap()), Some(second));
 
     let counter = Arc::new(AtomicUsize::new(0));
@@ -583,7 +577,7 @@ fn simulation_seed_replays_dispatch_order() {
     impl Task for Record {
         type Message = ();
         fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
-            self.0.lock().unwrap().push(ctx.pid().index);
+            self.0.lock().unwrap().push(ctx.pid().number());
             RunOutcome::Exit(0)
         }
     }
@@ -621,7 +615,7 @@ fn simulation_replays_batched_multi_recipient_delivery() {
                 Work::Sink(output) => {
                     while let Some(event) = ctx.receive() {
                         if let Payload::Message(value) = event.payload {
-                            output.lock().unwrap().push((ctx.pid().index, value));
+                            output.lock().unwrap().push((ctx.pid().number(), value));
                         }
                     }
                     RunOutcome::Wait { timeout_ms: None }

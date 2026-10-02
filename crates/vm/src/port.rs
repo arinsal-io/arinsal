@@ -175,7 +175,7 @@ pub(crate) fn test_next_port_id(
     set: bool,
     next_id: u64,
 ) -> Option<u64> {
-    const MAX_PORT_ID: u64 = u32::MAX as u64;
+    const MAX_PORT_ID: u64 = arinsal_term::ptab::PTAB_INVALID_DATA - 1;
     let ports = runtime.ports.lock().unwrap();
     let start = if set {
         next_id.checked_add(1)?
@@ -947,9 +947,9 @@ fn start_dyn_driver(
     Ok(port)
 }
 
-/// Caller identity for drivers (`prt->caller`): `index | generation << 32`.
+/// Caller identity for drivers (`prt->caller`): the erts pid data word.
 fn packed_pid(pid: Pid) -> u64 {
-    u64::from(pid.index) | (u64::from(pid.generation) << 32)
+    pid.data()
 }
 
 /// `PortHost` for a dynamically loaded driver port.

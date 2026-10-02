@@ -954,7 +954,7 @@ fn processes(
     const CHUNK_SIZE: u32 = 1000;
     const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
     const CONSES_PER_RED: usize = 75;
-    const TABLE_MAX: u32 = 1_048_576;
+    let table_max = arinsal_term::ptab::process_table_layout().max();
     let reds_left = process.reductions.max(0) as u32;
     let (state, first) = if let Some(state) = state {
         (Arc::clone(state), false)
@@ -969,7 +969,7 @@ fn processes(
             .copied()
             .filter(|pid| scheduler.lookup(*pid))
             .collect::<Vec<_>>();
-        pids.sort_by_key(|pid| (pid.index, pid.generation));
+        pids.sort_by_key(|pid| crate::process::pid_table_index(*pid));
         (
             MagicRef::new(Mutex::new(PtabListState {
                 pids,
@@ -995,11 +995,11 @@ fn processes(
             .ok_or(BifError::BADARG)?
             .lock()
             .map_err(|_| BifError::SystemLimit)?;
-        while list.next_index < TABLE_MAX && spent < reds_left {
-            list.next_index = (list.next_index + CHUNK_SIZE).min(TABLE_MAX);
+        while list.next_index < table_max && spent < reds_left {
+            list.next_index = (list.next_index + CHUNK_SIZE).min(table_max);
             spent += MIN_START_REDS;
         }
-        if list.next_index >= TABLE_MAX {
+        if list.next_index >= table_max {
             spent = spent.max(list.pids.len().div_ceil(CONSES_PER_RED) as u32);
             true
         } else {

@@ -2081,10 +2081,7 @@ mod tests {
     #[test]
     fn trace_send_flag_is_recorded_and_cleared() {
         let process = Process::new();
-        let pid = Pid {
-            index: 7001,
-            generation: 1,
-        };
+        let pid = Pid::new(7001, 1);
         configure(&process, pid, true, SEND, Tracer::Pid(pid));
         assert_eq!(flags(&process, pid), SEND);
         configure(&process, pid, false, SEND, Tracer::Pid(pid));
@@ -2094,10 +2091,7 @@ mod tests {
     #[test]
     fn trace_receive_flag_is_recorded() {
         let process = Process::new();
-        let pid = Pid {
-            index: 7002,
-            generation: 1,
-        };
+        let pid = Pid::new(7002, 1);
         configure(&process, pid, true, RECEIVE, Tracer::Pid(pid));
         assert_eq!(flags(&process, pid), RECEIVE);
         configure(&process, pid, false, RECEIVE, Tracer::Pid(pid));
@@ -2106,10 +2100,7 @@ mod tests {
     #[test]
     fn trace_procs_flags_are_recorded() {
         let process = Process::new();
-        let pid = Pid {
-            index: 7003,
-            generation: 1,
-        };
+        let pid = Pid::new(7003, 1);
         configure(
             &process,
             pid,
@@ -2130,10 +2121,7 @@ mod tests {
     #[test]
     fn trace_timestamp_flags_are_recorded() {
         let process = Process::new();
-        let pid = Pid {
-            index: 7004,
-            generation: 1,
-        };
+        let pid = Pid::new(7004, 1);
         let bits = TIMESTAMP | MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP;
         configure(&process, pid, true, bits, Tracer::Pid(pid));
         assert_eq!(flags(&process, pid) & bits, bits);
@@ -2243,10 +2231,7 @@ mod tests {
         let session = create_session(
             &process,
             "trace_test".to_owned(),
-            Tracer::Pid(Pid {
-                index: 7005,
-                generation: 1,
-            }),
+            Tracer::Pid(Pid::new(7005, 1)),
         );
         crate::trace_bp::set_trace_pattern(
             &process,
@@ -2290,10 +2275,7 @@ mod tests {
     #[test]
     fn trace_sessions_store_flags_independently() {
         let process = Process::new();
-        let pid = Pid {
-            index: 7006,
-            generation: 1,
-        };
+        let pid = Pid::new(7006, 1);
         let a = create_session(&process, "a".to_owned(), Tracer::Pid(pid));
         let b = create_session(&process, "b".to_owned(), Tracer::Pid(pid));
         configure_session(&process, a.0, pid, true, SEND, Tracer::Pid(pid));
