@@ -4749,6 +4749,7 @@ impl Task for Process {
     }
 
     fn run(&mut self, ctx: &mut RunCtx<'_, Message>, budget: u32) -> RunOutcome {
+        ctx.set_parallel_signal_buffers(self.message_queue_data() == MessageQueueData::OffHeap);
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, budget));
         if matches!(outcome, RunOutcome::Exit(_)) {
             self._persistent_terms

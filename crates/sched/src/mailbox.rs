@@ -3,9 +3,16 @@
 use crossbeam_queue::SegQueue;
 use std::collections::VecDeque;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 const RECYCLED_BLOCK_LIMIT: usize = 64;
+const SIGNAL_BUFFER_COUNT: usize = 64;
+const BUFFER_CONTENTION_INSTALL_LIMIT: usize = 50;
+const BUFFER_FLUSH_ROUNDS: usize = 8192;
+const BUFFER_ENQUEUES_TO_KEEP: usize = BUFFER_FLUSH_ROUNDS + BUFFER_FLUSH_ROUNDS / 2;
+
+type SignalBuffers<T> = [Mutex<VecDeque<T>>; SIGNAL_BUFFER_COUNT];
 
 struct Node<T> {
     next: *mut Node<T>,
@@ -28,6 +35,15 @@ pub struct Incoming<T> {
     spare_single: AtomicPtr<Node<T>>,
     recycled: SegQueue<Box<Node<T>>>,
     recycled_count: AtomicUsize,
+    buffering_allowed: AtomicBool,
+    buffers_enabled: AtomicBool,
+    buffer_transition: RwLock<()>,
+    buffers: RwLock<Option<Arc<SignalBuffers<T>>>>,
+    buffered_count: AtomicUsize,
+    contention_count: AtomicUsize,
+    buffer_enqueues: AtomicUsize,
+    enqueues_since_decision: AtomicUsize,
+    flush_rounds_left: AtomicUsize,
 }
 
 // SAFETY: producers only publish owned nodes; the sole receiver owns detached nodes.
@@ -42,6 +58,15 @@ impl<T> Default for Incoming<T> {
             spare_single: AtomicPtr::new(ptr::null_mut()),
             recycled: SegQueue::new(),
             recycled_count: AtomicUsize::new(0),
+            buffering_allowed: AtomicBool::new(false),
+            buffers_enabled: AtomicBool::new(false),
+            buffer_transition: RwLock::new(()),
+            buffers: RwLock::new(None),
+            buffered_count: AtomicUsize::new(0),
+            contention_count: AtomicUsize::new(0),
+            buffer_enqueues: AtomicUsize::new(0),
+            enqueues_since_decision: AtomicUsize::new(0),
+            flush_rounds_left: AtomicUsize::new(BUFFER_FLUSH_ROUNDS),
         }
     }
 }
@@ -50,6 +75,39 @@ impl<T> Incoming<T> {
     /// Append an event without acquiring the receiver's task lock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:712 (signal enqueue), OTP-29.1.1.
     pub fn push(&self, value: T) {
+        if self.buffers_enabled.load(Ordering::Acquire) {
+            let _transition = self.buffer_transition.write().unwrap();
+            self.flush_buffers_locked(true);
+            self.push_direct(value);
+        } else {
+            let _transition = self.buffer_transition.read().unwrap();
+            self.push_direct(value);
+        }
+    }
+
+    /// Publish a signal through its sender's parallel buffer when buffering is enabled.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10261, OTP-29.1.1.
+    pub fn push_routed(&self, slot: usize, value: T) {
+        let _transition = self.buffer_transition.read().unwrap();
+        if self.buffers_enabled.load(Ordering::Acquire) {
+            self.buffers
+                .read()
+                .unwrap()
+                .as_ref()
+                .expect("installed signal buffers")[slot % SIGNAL_BUFFER_COUNT]
+                .lock()
+                .unwrap()
+                .push_back(value);
+            self.buffered_count.fetch_add(1, Ordering::Release);
+            self.buffer_enqueues.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let retries = self.push_direct(value);
+            drop(_transition);
+            self.note_contention(retries);
+        }
+    }
+
+    fn push_direct(&self, value: T) -> usize {
         let spare = self.spare_single.swap(ptr::null_mut(), Ordering::AcqRel);
         let mut node = if spare.is_null() {
             self.take_recycled().unwrap_or_else(|| {
@@ -66,7 +124,106 @@ impl<T> Incoming<T> {
         };
         node.single = true;
         node.single_value = Some(value);
-        self.publish(node);
+        self.publish(node)
+    }
+
+    /// Enable the per sender buffers, or flush and disable them.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694, OTP-29.1.1.
+    pub fn set_buffers_enabled(&self, enabled: bool) {
+        let _transition = self.buffer_transition.write().unwrap();
+        if !enabled {
+            if self.buffers_enabled.load(Ordering::Acquire) {
+                self.flush_buffers_locked(false);
+            }
+            self.buffers_enabled.store(false, Ordering::Release);
+            *self.buffers.write().unwrap() = None;
+            self.buffer_enqueues.store(0, Ordering::Relaxed);
+            self.enqueues_since_decision.store(0, Ordering::Relaxed);
+            self.flush_rounds_left
+                .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
+        }
+        self.buffering_allowed.store(enabled, Ordering::Release);
+    }
+
+    /// Force installation for the test hook that enables OTP's adaptive optimization.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10700-10718, OTP-29.1.1.
+    pub fn force_buffers_enabled(&self) {
+        let _transition = self.buffer_transition.write().unwrap();
+        self.buffering_allowed.store(true, Ordering::Release);
+        self.install_buffers_locked();
+        self.flush_rounds_left
+            .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
+        self.buffer_enqueues.store(0, Ordering::Relaxed);
+        self.enqueues_since_decision.store(0, Ordering::Relaxed);
+        self.buffers_enabled.store(true, Ordering::Release);
+    }
+
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10661-10694, OTP-29.1.1.
+    fn note_contention(&self, retries: usize) {
+        if retries == 0 || !self.buffering_allowed.load(Ordering::Acquire) {
+            return;
+        }
+        let count = self.contention_count.fetch_add(retries, Ordering::AcqRel) + retries;
+        if count > BUFFER_CONTENTION_INSTALL_LIMIT {
+            let _transition = self.buffer_transition.write().unwrap();
+            if self.buffering_allowed.load(Ordering::Acquire)
+                && !self.buffers_enabled.load(Ordering::Acquire)
+            {
+                self.install_buffers_locked();
+                self.flush_rounds_left
+                    .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
+                self.buffer_enqueues.store(0, Ordering::Relaxed);
+                self.enqueues_since_decision.store(0, Ordering::Relaxed);
+                self.buffers_enabled.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn install_buffers_locked(&self) {
+        let mut buffers = self.buffers.write().unwrap();
+        if buffers.is_none() {
+            *buffers = Some(Arc::new(std::array::from_fn(|_| {
+                Mutex::new(VecDeque::new())
+            })));
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10532, OTP-29.1.1.
+    fn flush_buffers_locked(&self, adapt: bool) {
+        let buffers_guard = self.buffers.read().unwrap();
+        let Some(buffers) = buffers_guard.as_ref() else {
+            return;
+        };
+        for buffer in buffers.iter() {
+            let mut buffer = buffer.lock().unwrap();
+            while let Some(value) = buffer.pop_front() {
+                self.push_direct(value);
+                self.buffered_count.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        if adapt && self.buffers_enabled.load(Ordering::Acquire) {
+            let count = self.buffer_enqueues.swap(0, Ordering::AcqRel);
+            let total = self
+                .enqueues_since_decision
+                .fetch_add(count, Ordering::AcqRel)
+                + count;
+            if self.flush_rounds_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+                if total < BUFFER_ENQUEUES_TO_KEEP {
+                    self.buffers_enabled.store(false, Ordering::Release);
+                    self.contention_count.store(0, Ordering::Relaxed);
+                    self.buffer_enqueues.store(0, Ordering::Relaxed);
+                    drop(buffers_guard);
+                    *self.buffers.write().unwrap() = None;
+                    self.enqueues_since_decision.store(0, Ordering::Relaxed);
+                    self.flush_rounds_left
+                        .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
+                    return;
+                }
+                self.enqueues_since_decision.store(0, Ordering::Relaxed);
+                self.flush_rounds_left
+                    .store(BUFFER_FLUSH_ROUNDS, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Publish a sender-ordered block with one ingress operation.
@@ -78,8 +235,19 @@ impl<T> Incoming<T> {
 
     /// Publish a block and return an empty slab to the producer when available.
     pub fn push_block_reuse(&self, values: &mut Vec<T>) {
+        if self.buffers_enabled.load(Ordering::Acquire) {
+            let _transition = self.buffer_transition.write().unwrap();
+            self.flush_buffers_locked(true);
+            self.push_block_reuse_inner(values);
+        } else {
+            let _transition = self.buffer_transition.read().unwrap();
+            self.push_block_reuse_inner(values);
+        }
+    }
+
+    fn push_block_reuse_inner(&self, values: &mut Vec<T>) -> usize {
         if values.is_empty() {
-            return;
+            return 0;
         }
         let mut node = self.take_recycled().unwrap_or_else(|| {
             Box::new(Node {
@@ -92,12 +260,41 @@ impl<T> Incoming<T> {
         node.single = false;
         node.single_value = None;
         std::mem::swap(&mut node.values, values);
-        self.publish(node);
+        self.publish(node)
     }
 
-    fn publish(&self, node: Box<Node<T>>) {
+    /// Publish a sender ordered block through the matching per sender buffers.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10261, OTP-29.1.1.
+    pub fn push_block_routed(&self, values: &mut Vec<T>, sender_slot: impl Fn(&T) -> usize) {
+        if values.is_empty() {
+            return;
+        }
+        let _transition = self.buffer_transition.read().unwrap();
+        if !self.buffers_enabled.load(Ordering::Acquire) {
+            let retries = self.push_block_reuse_inner(values);
+            drop(_transition);
+            self.note_contention(retries);
+            return;
+        }
+        for value in values.drain(..) {
+            let slot = sender_slot(&value) % SIGNAL_BUFFER_COUNT;
+            self.buffers
+                .read()
+                .unwrap()
+                .as_ref()
+                .expect("installed signal buffers")[slot]
+                .lock()
+                .unwrap()
+                .push_back(value);
+            self.buffered_count.fetch_add(1, Ordering::Release);
+        }
+        self.buffer_enqueues.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn publish(&self, node: Box<Node<T>>) -> usize {
         let node = Box::into_raw(node);
         let mut old = self.head.load(Ordering::Relaxed);
+        let mut retries = 0;
         loop {
             // SAFETY: `node` is unpublished and owned by this producer until CAS succeeds.
             unsafe { (*node).next = old };
@@ -107,8 +304,11 @@ impl<T> Incoming<T> {
                 .head
                 .compare_exchange_weak(old, node, Ordering::SeqCst, Ordering::Relaxed)
             {
-                Ok(_) => return,
-                Err(actual) => old = actual,
+                Ok(_) => return retries,
+                Err(actual) => {
+                    retries += 1;
+                    old = actual;
+                }
             }
         }
     }
@@ -144,11 +344,19 @@ impl<T> Incoming<T> {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1547 (pending signal probe), OTP-29.1.1.
     pub fn has_pending(&self) -> bool {
         !self.head.load(Ordering::SeqCst).is_null()
+            || self.buffered_count.load(Ordering::Acquire) != 0
     }
 
     /// Move a snapshot of incoming events to the receiver's private queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:1568 (receiver signal fetch), OTP-29.1.1.
     pub fn drain_into(&self, private: &mut Private<T>) -> usize {
+        let _transition = self
+            .buffers_enabled
+            .load(Ordering::Acquire)
+            .then(|| self.buffer_transition.write().unwrap());
+        if _transition.is_some() {
+            self.flush_buffers_locked(true);
+        }
         let mut node = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
         let mut reversed = ptr::null_mut();
         let mut count = 0;
@@ -492,6 +700,29 @@ mod tests {
             expected[sender] += 1;
         }
         assert_eq!(expected, [32; 4]);
+    }
+
+    #[test]
+    fn parallel_sender_buffer_flush_preserves_sender_order() {
+        let input = Incoming::default();
+        let mut private = Private::default();
+        input.force_buffers_enabled();
+        for sequence in 0..128 {
+            input.push_routed(17, sequence);
+        }
+        assert!(input.has_pending());
+        assert_eq!(input.drain_into(&mut private), 128);
+        assert_eq!(
+            (0..128).map(|_| private.pop().unwrap()).collect::<Vec<_>>(),
+            (0..128).collect::<Vec<_>>()
+        );
+
+        input.push_routed(17, 128);
+        input.set_buffers_enabled(false);
+        input.push_routed(17, 129);
+        assert_eq!(input.drain_into(&mut private), 2);
+        assert_eq!(private.pop(), Some(128));
+        assert_eq!(private.pop(), Some(129));
     }
 
     #[test]

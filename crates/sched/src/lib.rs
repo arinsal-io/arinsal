@@ -133,6 +133,13 @@ pub struct Pid {
     data: u64,
 }
 
+fn signal_buffer_slot(pid: Pid) -> usize {
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10284, OTP-29.1.1.
+    pid.to_term()
+        .map(arinsal_term::internal_hash)
+        .unwrap_or(u64::from(pid.number())) as usize
+}
+
 impl Pid {
     /// Pid from its number (at most 28 bits) and serial.
     pub fn new(number: u32, serial: u32) -> Self {
@@ -1878,7 +1885,9 @@ impl<T: Task> Inner<T> {
             process.publish_inflight.fetch_sub(1, Ordering::Release);
             return Err(Error::NoProcess);
         }
-        process.input.push(Event { from, payload });
+        process
+            .input
+            .push_routed(signal_buffer_slot(from), Event { from, payload });
         if wake {
             self.wake_after_publish(process.clone(), local, remaining, force_enqueue);
         }
@@ -1903,7 +1912,9 @@ impl<T: Task> Inner<T> {
         }
         process.backlog.fetch_add(events.len(), Ordering::Relaxed);
         self.fanin_delivery(&process, events.len());
-        process.input.push_block_reuse(events);
+        process
+            .input
+            .push_block_routed(events, |event| signal_buffer_slot(event.from));
         if wake {
             self.wake_after_publish(process.clone(), local, remaining, force_enqueue);
         }
@@ -1925,7 +1936,9 @@ impl<T: Task> Inner<T> {
         }
         process.backlog.fetch_add(1, Ordering::Relaxed);
         self.fanin_delivery(&process, 1);
-        process.input.push(event);
+        process
+            .input
+            .push_routed(signal_buffer_slot(event.from), event);
         self.wake_after_publish(process.clone(), local, remaining, false);
         process.publish_inflight.fetch_sub(1, Ordering::Release);
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:712 (signal enqueue), OTP-29.1.1.
@@ -2858,6 +2871,18 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Whether events wait in this process's shared input queue.
     pub fn has_pending_input(&self) -> bool {
         self.input.has_pending()
+    }
+    /// Configure the receiver's parallel sender buffers for off heap mailboxes.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694, OTP-29.1.1.
+    pub fn set_parallel_signal_buffers(&mut self, enabled: bool) {
+        self.input.set_buffers_enabled(enabled);
+    }
+
+    /// Force installation of parallel sender buffers for runtime regression tests.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:10700-10718, OTP-29.1.1.
+    pub fn force_parallel_signal_buffers(&mut self) -> bool {
+        self.input.force_buffers_enabled();
+        true
     }
     /// Whether this context acts for a process executing on a dirty scheduler, on
     /// behalf of a dirty signal handler.
