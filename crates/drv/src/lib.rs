@@ -10,10 +10,18 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod api;
+mod asyncq;
 mod binary;
 mod exports;
 mod linebuf;
 mod lock;
+mod poll;
+mod select;
+mod task;
+mod timer;
+
+pub use asyncq::set_async_threads;
+pub use poll::{PollBackend, set_poll_backend};
 
 /// Layout constants generated from the installed `erl_driver.h`.
 #[allow(non_upper_case_globals, dead_code)]
@@ -65,51 +73,68 @@ pub const ERL_ONHEAP_BINARY_LIMIT: usize = 64;
 // Port of erts/emulator/beam/io.c:106-107, OTP-29.1.1.
 const ERL_SMALL_IO_BIN_LIMIT: usize = 4 * ERL_ONHEAP_BINARY_LIMIT;
 const SMALL_WRITE_VEC: usize = 16;
+// Port of erts/emulator/beam/erl_vm.h:53 (CONTEXT_REDS) and erl_port.h:362-366
+// (ERTS_PORT_REDS_*), OTP-29.1.1.
+const CONTEXT_REDS: i32 = 4000;
+const REDS_EXECUTE: i32 = CONTEXT_REDS / 4;
+const CALLBACK_VREDS: i32 = CONTEXT_REDS / 20;
+const REDS_TIMEOUT: i32 = CONTEXT_REDS / 100;
+const REDS_INPUT: i32 = CONTEXT_REDS / 100;
 
 type DrvData = *mut c_void;
 type DrvPortPtr = *mut c_void;
-type DrvEvent = *mut c_void;
+
+// Shared callback signatures: one `unsafe` site per signature instead of one per field.
+type InitFn = unsafe extern "C" fn() -> c_int;
+type VoidFn = unsafe extern "C" fn();
+type StartFn = unsafe extern "C" fn(DrvPortPtr, *mut c_char) -> DrvData;
+/// `void (*)(void *)`: `stop`, `timeout`, `flush`, `emergency_close`, `async_invoke`.
+pub(crate) type DrvFn1 = unsafe extern "C" fn(*mut c_void);
+/// `void (*)(void *, void *)`: `ready_input`, `ready_output`, `ready_async`,
+/// `process_exit` and `stop_select` (data or event first, one opaque pointer second).
+pub(crate) type DrvFn2 = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type OutputFn = unsafe extern "C" fn(DrvData, *mut c_char, usize);
+type OutputvFn = unsafe extern "C" fn(DrvData, *mut ErlIOVec);
+type ControlFn =
+    unsafe extern "C" fn(DrvData, c_uint, *mut c_char, usize, *mut *mut c_char, usize) -> isize;
+type CallFn = unsafe extern "C" fn(
+    DrvData,
+    c_uint,
+    *mut c_char,
+    usize,
+    *mut *mut c_char,
+    usize,
+    *mut c_uint,
+) -> isize;
 
 /// `struct erl_drv_entry` from erl_driver.h (non-`ERL_SYS_DRV` variant).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ErlDrvEntry {
-    init: Option<unsafe extern "C" fn() -> c_int>,
-    start: Option<unsafe extern "C" fn(DrvPortPtr, *mut c_char) -> DrvData>,
-    stop: Option<unsafe extern "C" fn(DrvData)>,
-    output: Option<unsafe extern "C" fn(DrvData, *mut c_char, usize)>,
-    ready_input: Option<unsafe extern "C" fn(DrvData, DrvEvent)>,
-    ready_output: Option<unsafe extern "C" fn(DrvData, DrvEvent)>,
+    init: Option<InitFn>,
+    start: Option<StartFn>,
+    stop: Option<DrvFn1>,
+    output: Option<OutputFn>,
+    ready_input: Option<DrvFn2>,
+    ready_output: Option<DrvFn2>,
     driver_name: *const c_char,
-    finish: Option<unsafe extern "C" fn()>,
+    finish: Option<VoidFn>,
     handle: *mut c_void,
-    control: Option<
-        unsafe extern "C" fn(DrvData, c_uint, *mut c_char, usize, *mut *mut c_char, usize) -> isize,
-    >,
-    timeout: Option<unsafe extern "C" fn(DrvData)>,
-    outputv: Option<unsafe extern "C" fn(DrvData, *mut ErlIOVec)>,
-    ready_async: Option<unsafe extern "C" fn(DrvData, *mut c_void)>,
-    flush: Option<unsafe extern "C" fn(DrvData)>,
-    call: Option<
-        unsafe extern "C" fn(
-            DrvData,
-            c_uint,
-            *mut c_char,
-            usize,
-            *mut *mut c_char,
-            usize,
-            *mut c_uint,
-        ) -> isize,
-    >,
-    unused_event_callback: Option<unsafe extern "C" fn()>,
+    control: Option<ControlFn>,
+    timeout: Option<DrvFn1>,
+    outputv: Option<OutputvFn>,
+    ready_async: Option<DrvFn2>,
+    flush: Option<DrvFn1>,
+    call: Option<CallFn>,
+    unused_event_callback: Option<VoidFn>,
     extended_marker: c_int,
     major_version: c_int,
     minor_version: c_int,
     driver_flags: c_int,
     handle2: *mut c_void,
-    process_exit: Option<unsafe extern "C" fn(DrvData, *mut c_void)>,
-    stop_select: Option<unsafe extern "C" fn(DrvEvent, *mut c_void)>,
-    emergency_close: Option<unsafe extern "C" fn(DrvData)>,
+    process_exit: Option<DrvFn2>,
+    stop_select: Option<DrvFn2>,
+    emergency_close: Option<DrvFn1>,
 }
 
 const _: () = assert!(size_of::<ErlDrvEntry>() == layout::SIZE_ErlDrvEntry);
@@ -151,33 +176,26 @@ const _: () = assert!(offset_of!(ErlIOVec, binv) == layout::OFF_ErlIOVec_binv);
 
 /// Callbacks of a loaded entry (`erts_driver_t`, io.c:7554 init_driver).
 #[derive(Clone, Copy)]
-struct Callbacks {
-    start: Option<unsafe extern "C" fn(DrvPortPtr, *mut c_char) -> DrvData>,
-    stop: Option<unsafe extern "C" fn(DrvData)>,
-    finish: Option<unsafe extern "C" fn()>,
-    output: Option<unsafe extern "C" fn(DrvData, *mut c_char, usize)>,
-    outputv: Option<unsafe extern "C" fn(DrvData, *mut ErlIOVec)>,
-    control: Option<
-        unsafe extern "C" fn(DrvData, c_uint, *mut c_char, usize, *mut *mut c_char, usize) -> isize,
-    >,
-    call: Option<
-        unsafe extern "C" fn(
-            DrvData,
-            c_uint,
-            *mut c_char,
-            usize,
-            *mut *mut c_char,
-            usize,
-            *mut c_uint,
-        ) -> isize,
-    >,
+pub(crate) struct Callbacks {
+    start: Option<StartFn>,
+    stop: Option<DrvFn1>,
+    finish: Option<VoidFn>,
+    output: Option<OutputFn>,
+    outputv: Option<OutputvFn>,
+    control: Option<ControlFn>,
+    call: Option<CallFn>,
+    pub(crate) ready_input: Option<DrvFn2>,
+    pub(crate) ready_output: Option<DrvFn2>,
+    pub(crate) timeout: Option<DrvFn1>,
+    pub(crate) ready_async: Option<DrvFn2>,
+    pub(crate) stop_select: Option<DrvFn2>,
 }
 
 /// A loaded dynamic driver (`erts_driver_t` with its `DE_Handle` library).
 pub struct Driver {
     name: String,
     flags: i32,
-    callbacks: Callbacks,
+    pub(crate) callbacks: Callbacks,
     /// `dlopen` handle; zero once closed.
     library: Mutex<usize>,
     /// Driver lock for drivers without `ERL_DRV_FLAG_USE_PORT_LOCKING` (io.c:7567).
@@ -329,6 +347,11 @@ impl Driver {
                 outputv: entry.outputv,
                 control: entry.control,
                 call: entry.call,
+                ready_input: entry.ready_input,
+                ready_output: entry.ready_output,
+                timeout: entry.timeout,
+                ready_async: entry.ready_async,
+                stop_select: entry.stop_select,
             },
             library: Mutex::new(handle),
             lock: (flags & ERL_DRV_FLAG_USE_PORT_LOCKING == 0).then(ReentrantLock::default),
@@ -430,6 +453,13 @@ pub trait PortHost: Send + Sync {
     fn exit(&self, port: &DriverPort, reason: ExitReason);
     /// Unlink the connected process (`driver_exit`).
     fn unlink_connected(&self, port: &DriverPort);
+    /// `erts_send_error_to_logger_nogl`: an error report from the runtime itself.
+    fn log_error(&self, text: &str);
+    /// `erts_ddll_reference_referenced_driver`: an async job keeps the driver library
+    /// loaded until [`PortHost::ddll_dereference`].
+    fn ddll_reference(&self, port: &DriverPort);
+    /// `erts_ddll_dereference_driver`.
+    fn ddll_dereference(&self, port: &DriverPort);
 }
 
 const SFLG_BINARY_IO: u32 = 1;
@@ -450,6 +480,12 @@ pub struct DriverPort {
     /// Caller during a callback (`prt->caller`) as the VM packs it, zero otherwise.
     caller: AtomicU64,
     lock: Option<ReentrantLock>,
+    /// `open_port` name (`prt->name`), set by [`DriverPort::start`].
+    name: Mutex<String>,
+    /// `prt->reds`: reductions used by the running task (`erl_drv_consume_timeslice`).
+    reds: AtomicI32,
+    timer: Mutex<timer::PortTimer>,
+    timer_epoch: AtomicU64,
 }
 
 fn registry() -> &'static Mutex<HashMap<usize, Weak<DriverPort>>> {
@@ -480,6 +516,10 @@ impl DriverPort {
             linebuf: Mutex::new(None),
             caller: AtomicU64::new(0),
             lock,
+            name: Mutex::new(String::new()),
+            reds: AtomicI32::new(0),
+            timer: Mutex::new(timer::PortTimer::None),
+            timer_epoch: AtomicU64::new(0),
         });
         registry()
             .lock()
@@ -524,6 +564,30 @@ impl DriverPort {
             .lock()
     }
 
+    /// Reductions at the first task of a batch: `ERTS_PORT_REDS_EXECUTE` plus the
+    /// virtual reductions added before every task (erl_port_task.c:1730, :1851).
+    fn start_task(&self) {
+        self.reds
+            .store(REDS_EXECUTE + CALLBACK_VREDS, Ordering::Release);
+    }
+
+    fn add_reds(&self, reds: i32) {
+        self.reds.fetch_add(reds, Ordering::AcqRel);
+    }
+
+    /// Port of erl_port_task.c:1282 (erl_drv_consume_timeslice): `true` when the task
+    /// has used up its slice.
+    pub(crate) fn consume_timeslice(&self, percent: c_int) -> bool {
+        let percent = percent.clamp(1, 100);
+        let used = percent * ((CONTEXT_REDS + 99) / 100);
+        let total = self.reds.fetch_add(used, Ordering::AcqRel) + used;
+        if total < CONTEXT_REDS {
+            return false;
+        }
+        self.reds.store(CONTEXT_REDS, Ordering::Release);
+        true
+    }
+
     fn live(&self) -> bool {
         let state = self.state.load(Ordering::Acquire);
         state & SFLG_STARTED != 0 && state & SFLG_TERMINATING == 0
@@ -532,6 +596,7 @@ impl DriverPort {
     /// Port of io.c:542 (erts_open_driver, the `start` call). `command` is the
     /// whole `open_port` name; `caller` the raw pid term of the opening process.
     pub fn start(&self, command: &str, caller: u64) -> Result<(), StartError> {
+        *self.name.lock().unwrap() = command.to_owned();
         let mut command = CString::new(command)
             .map_err(|_| StartError::Badarg)?
             .into_bytes_with_nul();
@@ -603,11 +668,7 @@ impl DriverPort {
         true
     }
 
-    fn call_outputv(
-        &self,
-        outputv: unsafe extern "C" fn(DrvData, *mut ErlIOVec),
-        pieces: &[IoPiece<'_>],
-    ) {
+    fn call_outputv(&self, outputv: OutputvFn, pieces: &[IoPiece<'_>]) {
         let segments = vec_segments(pieces);
         let csize: usize = segments
             .iter()
@@ -768,6 +829,8 @@ impl DriverPort {
         if previous & SFLG_TERMINATING != 0 {
             return false;
         }
+        // io.c:3725: the timer is cancelled before `stop`.
+        self.cancel_timer();
         if previous & SFLG_STARTED != 0
             && let Some(stop) = self.driver.callbacks.stop
         {

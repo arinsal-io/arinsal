@@ -1204,6 +1204,29 @@ pub(crate) fn find_driver(name: &str) -> Option<Found> {
     })
 }
 
+/// Port of erl_bif_ddll.c:1096 (erts_ddll_reference_referenced_driver): an async job
+/// keeps the driver loaded.
+pub(crate) fn reference_referenced(driver: &Arc<Driver>) {
+    let mut guard = table().lock().unwrap();
+    let table = &mut *guard;
+    let id = table.handles.iter().find_map(|(id, handle)| {
+        handle
+            .driver
+            .as_ref()
+            .is_some_and(|d| Arc::ptr_eq(d, driver))
+            .then_some(*id)
+    });
+    if let Some(id) = id {
+        reference_driver(table, id);
+    }
+}
+
+/// Port of erl_bif_ddll.c:1103 (erts_ddll_dereference_driver): the reference of
+/// [`reference_referenced`] ends, which may complete a pending unload.
+pub(crate) fn dereference_referenced(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) {
+    port_freed(scheduler, driver);
+}
+
 /// Port of io.c:646-648 (erts_ddll_increment_port_count, erts_ddll_reference_driver).
 pub(crate) fn port_opened(id: u64, port: &Arc<DriverPort>) {
     let mut table = table().lock().unwrap();

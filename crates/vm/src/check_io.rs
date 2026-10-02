@@ -258,6 +258,24 @@ pub(crate) fn register(
     interests: InterestSet,
     ready: impl FnOnce(RawFd, Ready) + Send + 'static,
 ) -> io::Result<Registration> {
+    register_kind(fd, interests, RegistrationKind::Nif, ready)
+}
+
+/// Add an asynchronous one-shot `driver_select` event to the shared poll set.
+pub(crate) fn register_driver(
+    fd: RawFd,
+    interests: InterestSet,
+    ready: impl FnOnce(RawFd, Ready) + Send + 'static,
+) -> io::Result<Registration> {
+    register_kind(fd, interests, RegistrationKind::Driver, ready)
+}
+
+fn register_kind(
+    fd: RawFd,
+    interests: InterestSet,
+    kind: RegistrationKind,
+    ready: impl FnOnce(RawFd, Ready) + Send + 'static,
+) -> io::Result<Registration> {
     let poller = poller();
     let id = Token(poller.next_token.fetch_add(1, Ordering::Relaxed));
     let (ack_tx, ack_rx) = mpsc::sync_channel(1);
@@ -267,7 +285,7 @@ pub(crate) fn register(
             id,
             fd,
             interests,
-            kind: RegistrationKind::Nif,
+            kind,
             ready: Box::new(ready),
             ack: ack_tx,
         }))
