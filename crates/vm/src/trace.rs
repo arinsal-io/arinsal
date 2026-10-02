@@ -537,15 +537,24 @@ pub(crate) fn call_event(
             if context.silent.get() {
                 continue;
             }
-            let Some(result) = result else {
-                continue;
-            };
-            if result == crate::signals::atom("false") {
+            return_trace = context.return_trace.get();
+            exception_trace = context.exception_trace.get();
+            // Port of erts/emulator/beam/erl_trace.c:1293-1297 (erts_call_trace), OTP-29.1.1.
+            // A false result (`{message,false}`) only drops the call message;
+            // {return_trace} and {exception_trace} still apply.
+            let suppress_call = result.is_none_or(|result| result == crate::signals::atom("false"));
+            if suppress_call {
+                if return_trace || exception_trace {
+                    actions.push(CallActions {
+                        session: pattern.session,
+                        return_trace,
+                        exception_trace,
+                        return_to: false,
+                    });
+                }
                 continue;
             }
             extra = context.take_message(process);
-            return_trace = context.return_trace.get();
-            exception_trace = context.exception_trace.get();
         }
         if flags & CALL != 0 && flags & SILENT == 0 {
             emit_call_event(
@@ -1211,7 +1220,8 @@ pub(crate) fn spawned(
 }
 
 pub(crate) fn spawn_interested(process: &Process, parent: Pid) -> bool {
-    flags(process, parent) & (PROCS | SET_ON_SPAWN | SET_ON_FIRST_SPAWN) != 0
+    flags(process, parent) & (PROCS | SET_ON_SPAWN | SET_ON_FIRST_SPAWN | SET_ON_LINK | FIRST_LINK)
+        != 0
         || new_process_tracing()
             .lock()
             .unwrap()
@@ -1988,6 +1998,30 @@ mod tests {
         trace_pattern_diff(
             "trace_t3a_return",
             "-module(trace_t3a_return). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> f(), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_return,f,0}, [{'_',[],[{return_trace}]}],[local]), P ! go, receive {trace,P,return_from,{trace_t3a_return,f,0},ok} -> ok after 1000 -> missing end. f() -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_message_false_keeps_return_trace_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3b_msg_false",
+            "-module(trace_t3b_msg_false). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> f(1), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3b_msg_false,f,1}, [{'_',[],[{return_trace},{message,false}]}],[local]), P ! go, receive {trace,P,return_from,{trace_t3b_msg_false,f,1},ok} -> receive {trace,P,call,_} -> call_traced after 200 -> ok end after 1000 -> missing end. f(_) -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_bif_return_and_apply_match_otp() {
+        trace_pattern_diff(
+            "trace_t3b_bif_apply",
+            "-module(trace_t3b_bif_apply). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> catch erlang:apply(erlang,error,[x]), catch erlang:throw(y), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({erlang,error,1}, [{'_',[],[{exception_trace}]}],[global]), erlang:trace_pattern({erlang,throw,1}, [{'_',[],[{exception_trace}]}],[global]), P ! go, receive done -> ok end, flush(). flush() -> receive {trace,_,Tag,MFA,R} -> [{Tag,MFA,R}|flush()]; {trace,_,Tag,MFA} -> [{Tag,MFA}|flush()] after 300 -> [] end.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_on_load_state_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3b_on_load",
+            "-module(trace_t3b_on_load). -export([run/0]). run() -> A=erlang:trace_pattern(on_load, [], []), B=erlang:trace_info(on_load, traced), C=erlang:trace_pattern(on_load, true, [local]), D=erlang:trace_info(on_load, traced), E=erlang:trace_pattern(on_load, false, [local]), F=erlang:trace_info(on_load, match_spec), G=catch erlang:trace_pattern({'_',foo,1}, true, []), {A,B,C,D,E,F,element(1,G)}.",
         );
     }
 

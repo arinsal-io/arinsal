@@ -393,7 +393,18 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
     {
         return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
     }
-    match vm.publish_prepared(prepared_modules) {
+    let loaded_names: Vec<String> = prepared_modules
+        .iter()
+        .map(|(module, _, _)| module.name.clone())
+        .collect();
+    let published = vm.publish_prepared(prepared_modules);
+    if published.is_ok() {
+        for name in &loaded_names {
+            crate::trace_bp::module_code_changed(vm.code_scope, name);
+            apply_on_load_patterns(vm, process, name);
+        }
+    }
+    match published {
         Ok(on_load) if on_load.is_empty() => Ok(atom("ok")),
         Ok(on_load) => {
             let names = make_list(process, on_load.iter().map(|name| atom(name)))?;
@@ -407,6 +418,35 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
             make_tuple(process, &[atom(reason), names])
         }
     }
+}
+
+/// Apply every session's `trace_pattern(on_load, ...)` to a freshly loaded module.
+// Port of erts/emulator/beam/beam_bif_load.c:944-975 (set_on_load_trace_pattern), OTP-29.1.1.
+fn apply_on_load_patterns(vm: &mut Vm, process: &Process, name: &str) {
+    let patterns = crate::trace_bp::on_load_patterns_of(process);
+    if patterns.is_empty() {
+        return;
+    }
+    for (session, on_load) in patterns {
+        crate::trace_bp::set(
+            process,
+            session,
+            name.to_owned(),
+            "_".to_owned(),
+            None,
+            Some(crate::trace_bp::Pattern {
+                session,
+                flags: on_load.flags,
+                match_spec: on_load.match_spec,
+                meta: None,
+                count: 0,
+                paused: false,
+                seq: 0,
+                off: false,
+            }),
+        );
+    }
+    vm.refresh_trace_pattern(process, name, "_", None);
 }
 
 fn check_process_code(vm: &Vm, process: &Process, name: &str) -> bool {
@@ -1043,7 +1083,11 @@ fn call_values(
         })()),
         ("erlang", "delete_module", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
-            delete(vm, &name)
+            let result = delete(vm, &name);
+            if matches!(result, Ok(term) if term == atom("true")) {
+                crate::trace_bp::module_code_changed(vm.code_scope, &name);
+            }
+            result
         })()),
         ("erts_internal", "purge_module", 2) => Some((|| {
             let allowed = process.runtime.as_ref().and_then(|runtime| {

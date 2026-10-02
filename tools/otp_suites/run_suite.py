@@ -58,7 +58,7 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
     ei_lib = next((root / "lib").glob("erl_interface-*/lib"), None)
     # macOS already declares sys_nerr/sys_errlist with const-qualified types;
     # use the system strerror() instead of port_test.c's legacy fallback.
-    defs = "-DHAVE_ISFINITE -DHAVE_STRERROR" if name == "port" else "-DHAVE_ISFINITE"
+    defs = "-DHAVE_ISFINITE -DHAVE_UNISTD_H -DHAVE_STRERROR" if name == "port" else "-DHAVE_ISFINITE -DHAVE_UNISTD_H"
     erts_internal = next(root.glob("erts-*/include/internal"), root / "usr/include/internal")
     values = {
         "CC": "clang", "LD": "clang", "SHLIB_LD": "clang",

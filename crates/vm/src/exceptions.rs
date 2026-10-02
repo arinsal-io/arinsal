@@ -195,6 +195,21 @@ fn atom(name: &str) -> Result<Term, VmError> {
         .map_or_else(|| stacktrace::atom_term(name), Ok)
 }
 
+/// `{Class, Reason}` as reported by exception trace events.
+// Port of erts/emulator/beam/beam_common.c:510-516 (handle_error): a throw with no catch
+// active is reported as `{error,{nocatch,Reason}}` from the first event on.
+pub(crate) fn trace_class_reason(
+    p: &mut Process,
+    class: Class,
+    reason: Term,
+) -> Result<Term, VmError> {
+    if class == Class::Throw && p.header.catches == 0 {
+        let nocatch = tuple(p, &[atom("nocatch")?, reason])?;
+        return tuple(p, &[class_term(Class::Error)?, nocatch]);
+    }
+    tuple(p, &[class_term(class)?, reason])
+}
+
 pub(super) fn tuple(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
     TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
         .tuple(values)
@@ -645,7 +660,7 @@ pub(super) fn resume(
                     .unwrap_or(0);
                 let frame_words = 4usize.saturating_add(action_count.saturating_mul(2));
                 if let Some(function) = crate::native_function_at(function_pc) {
-                    let class_reason = tuple(p, &[class_term(trap.class)?, trap.reason])?;
+                    let class_reason = trace_class_reason(p, trap.class, trap.reason)?;
                     for action_index in 0..action_count {
                         let session = p
                             .heap
@@ -732,8 +747,7 @@ pub(super) fn resume(
                     && exception != 0
                     && let Some(trace_ctx) = ctx.as_deref_mut()
                 {
-                    let class = class_term(trap.class)?;
-                    let class_reason = tuple(p, &[class, trap.reason])?;
+                    let class_reason = trace_class_reason(p, trap.class, trap.reason)?;
                     crate::trace::return_event(
                         vm,
                         p,

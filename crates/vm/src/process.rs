@@ -1071,6 +1071,14 @@ impl Executor {
                                 crate::run_native(process, &mut self.native_registers, code_ptr);
                             let consumed = fcalls_before.saturating_sub(process.reductions);
                             ctx.consume(u32::try_from(consumed).unwrap_or(0));
+                            // Native `timeout` has no scheduler context to send its trace event.
+                            if process
+                                .cold
+                                .as_mut()
+                                .is_some_and(|cold| std::mem::take(&mut cold.native_timeout_trace))
+                            {
+                                crate::trace::timeout_event(Some(&mut self.vm), process, ctx);
+                            }
                             // Port of erts/emulator/beam/erl_process.c (erts_current_reductions),
                             // OTP-29.1.1: the process's reduction count includes what its
                             // native code consumed from FCALLS.
@@ -1490,7 +1498,15 @@ impl Executor {
                                     &export.module,
                                     &export.function,
                                     export.arity,
-                                ) {
+                                ) || (crate::trace_bp::any_pattern()
+                                    && crate::beamasm_integration::dispatch_bif(target_pc)
+                                        .is_some()
+                                    && crate::trace_bp::selects(
+                                        &export.module,
+                                        &export.function,
+                                        export.arity,
+                                    ))
+                                {
                                     let saved_arguments =
                                         process.x[..usize::from(export.arity)].to_vec();
                                     // BIFs such as load_nif/2 identify their caller through
@@ -1586,6 +1602,14 @@ impl Executor {
                                             let (module_before, ip_before) =
                                                 (process.module, process.ip);
                                             process.cold_mut().native_call_pc = call_site_pc;
+                                            let traced = self.vm.trace_native_call_named(
+                                                process,
+                                                ctx,
+                                                &export.module,
+                                                &export.function,
+                                                usize::from(export.arity),
+                                                (usize::MAX, call_site_pc),
+                                            );
                                             let result = self.vm.dispatch_native(
                                                 process,
                                                 ctx,
@@ -1595,6 +1619,13 @@ impl Executor {
                                                 (export.class, export.native_bits),
                                             );
                                             process.cold_mut().native_call_pc = 0;
+                                            if let (Some((module, function, args)), Some(result)) =
+                                                (&traced, &result)
+                                            {
+                                                self.vm.trace_native_return(
+                                                    process, ctx, module, function, args, result,
+                                                );
+                                            }
                                             // Port of erts/emulator/beam/beam_bif_load.c:793
                                             // (call_on_load_function_1), OTP-29.1.1: the BIF traps
                                             // into the on_load function like a call; the native
@@ -1616,10 +1647,13 @@ impl Executor {
                                         let (bif, arity) =
                                             crate::beamasm_integration::dispatch_bif(target_pc)?;
                                         let arity = usize::from(arity);
-                                        let (result, reductions) = crate::calls::call_bif_metered(
-                                            &mut process.heap,
+                                        let (result, reductions) = self.vm.call_bif_traced_named(
+                                            process,
+                                            ctx,
+                                            &export.module,
+                                            &export.function,
                                             bif,
-                                            &process.x[..arity],
+                                            arity,
                                         );
                                         process.reductions_used = process
                                             .reductions_used
@@ -1674,9 +1708,13 @@ impl Executor {
                                                 // (save_stacktrace: a failing BIF is the top
                                                 // frame, the calling function the next one),
                                                 // OTP-29.1.1.
+                                                // erts omits erlang:error/1,2,3 from the trace
+                                                // (beam_common.c save_stacktrace).
                                                 if trap.class == arinsal_bifs::Class::Error
                                                     && trap.top.is_none()
                                                     && trap.trace.is_none()
+                                                    && !(export.module == "erlang"
+                                                        && export.function == "error")
                                                 {
                                                     trap.top =
                                                         Some(crate::stacktrace::TopFrame::Bif {

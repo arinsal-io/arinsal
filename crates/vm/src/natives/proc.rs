@@ -2846,6 +2846,9 @@ fn trace_session_info(
     spec: Term,
     item: Term,
 ) -> Result<Term, VmError> {
+    if atom_name(spec).as_deref() == Some("on_load") {
+        return trace_info_on_load(process, session, item);
+    }
     if let Some(event) = atom_name(spec)
         && matches!(event.as_str(), "send" | "receive")
     {
@@ -2968,6 +2971,9 @@ fn trace_session_info(
 }
 
 fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<Term, VmError> {
+    if atom_name(spec).as_deref() == Some("on_load") {
+        return trace_info_on_load(process, 0, item);
+    }
     if let Some(event) = atom_name(spec)
         && matches!(event.as_str(), "send" | "receive")
     {
@@ -3148,6 +3154,120 @@ fn unsupported_trace_action(term: &arinsal_etf::OwnedTerm) -> Option<&'static st
     }
 }
 
+// Port of erts/emulator/beam/erl_bif_trace.c:465-468 and 2523-2603
+// (change_on_load_trace_pattern), OTP-29.1.1.
+fn trace_pattern_on_load(
+    process: &mut Process,
+    session: u64,
+    pattern: Term,
+    flags: Term,
+) -> Result<Term, VmError> {
+    let owned_flags = arinsal_term::to_owned(flags).map_err(|_| badarg())?;
+    let names = match &owned_flags {
+        arinsal_etf::OwnedTerm::Nil => Vec::new(),
+        arinsal_etf::OwnedTerm::List { elems, tail }
+            if tail.as_ref() == &arinsal_etf::OwnedTerm::Nil =>
+        {
+            let mut names = Vec::new();
+            for flag in elems {
+                match flag {
+                    arinsal_etf::OwnedTerm::Atom(name)
+                        if matches!(name.as_str(), "local" | "global" | "call_count") =>
+                    {
+                        names.push(name.clone());
+                    }
+                    arinsal_etf::OwnedTerm::Tuple(_) => {
+                        return Err(VmError::Unsupported(
+                            "meta tracing requires the tracer callback hook".into(),
+                        ));
+                    }
+                    _ => return Err(badarg()),
+                }
+            }
+            names
+        }
+        _ => return Err(badarg()),
+    };
+    if names.iter().any(|n| n == "global") && names.len() > 1 {
+        return Err(badarg());
+    }
+    if pattern == atom("pause") || pattern == atom("restart") {
+        return Err(badarg());
+    }
+    let on = pattern != atom("false");
+    let mut match_spec = None;
+    if on && pattern != atom("true") && pattern != Term::NIL {
+        compile_trace_pattern(pattern, None)?;
+        let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
+        if let Some(message) = unsupported_trace_action(&owned) {
+            return Err(VmError::Unsupported(message.into()));
+        }
+        match_spec = Some(owned);
+    }
+    crate::trace_bp::change_on_load(process, session, on, &names, match_spec);
+    Ok(Term::small(0).expect("zero matches"))
+}
+
+/// `trace_info(on_load, Key)` of a session.
+// Port of erts/emulator/beam/erl_bif_trace.c:2292-2420 (trace_info_on_load), OTP-29.1.1.
+fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result<Term, VmError> {
+    let state = crate::trace_bp::on_load_pattern(process, session);
+    let Some(state) = state else {
+        return make_tuple(process, &[item, atom("false")]);
+    };
+    let local = state.flags.iter().any(|n| n == "local");
+    let breakpoint = local || state.flags.iter().any(|n| n == "call_count");
+    let traced = if !breakpoint {
+        "global"
+    } else if local {
+        "local"
+    } else {
+        "false"
+    };
+    let match_spec = |process: &mut Process| -> Result<Term, VmError> {
+        if !breakpoint || local {
+            match &state.match_spec {
+                Some(ms) => arinsal_term::from_owned(
+                    ms,
+                    &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                )
+                .map_err(|_| badarg()),
+                None => Ok(Term::NIL),
+            }
+        } else {
+            Ok(atom("false"))
+        }
+    };
+    let call_count = atom(if state.flags.iter().any(|n| n == "call_count") {
+        "true"
+    } else {
+        "false"
+    });
+    let value = match atom_name(item).as_deref() {
+        Some("traced") => atom(traced),
+        Some("match_spec") => match_spec(process)?,
+        Some("meta" | "meta_match_spec" | "call_time" | "call_memory") => atom("false"),
+        Some("call_count") => call_count,
+        Some("all") => {
+            let ms = match_spec(process)?;
+            let entries = [
+                ("traced", atom(traced)),
+                ("match_spec", ms),
+                ("meta", atom("false")),
+                ("meta_match_spec", atom("false")),
+                ("call_count", call_count),
+            ];
+            let mut pairs = Vec::new();
+            for (key, value) in entries {
+                pairs.push(make_tuple(process, &[atom(key), value])?);
+            }
+            make_list(process, pairs)?
+        }
+        _ => return Err(badarg()),
+    };
+    make_tuple(process, &[item, value])
+}
+
 fn trace_pattern(
     vm: &mut Vm,
     process: &mut Process,
@@ -3191,6 +3311,9 @@ fn trace_pattern(
         crate::trace::set_event_pattern(process, session, &event, enabled, match_spec);
         return Ok(Term::small(1).expect("one event pattern"));
     }
+    if atom_name(spec).as_deref() == Some("on_load") {
+        return trace_pattern_on_load(process, session, pattern, flags);
+    }
     let owned_spec = arinsal_term::to_owned(spec).map_err(|_| badarg())?;
     let arinsal_etf::OwnedTerm::Tuple(spec_fields) = &owned_spec else {
         return Err(badarg());
@@ -3203,6 +3326,14 @@ fn trace_pattern(
     else {
         return Err(badarg());
     };
+    // Port of erts/emulator/beam/erl_bif_trace.c:480-488: a wildcard may only be followed by
+    // wildcards.
+    if (module == "_"
+        && (function != "_" || !matches!(arity_term, arinsal_etf::OwnedTerm::Atom(a) if a == "_")))
+        || (function == "_" && !matches!(arity_term, arinsal_etf::OwnedTerm::Atom(a) if a == "_"))
+    {
+        return Err(badarg());
+    }
     let module = module.clone();
     let function = function.clone();
     let arity = if matches!(arity_term, arinsal_etf::OwnedTerm::Atom(name) if name == "_") {

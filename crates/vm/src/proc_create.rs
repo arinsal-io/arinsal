@@ -130,6 +130,8 @@ pub(crate) struct ProcessCold {
     pub(crate) native_apply: bool,
     /// Call site (module, ip) of a traced native BIF whose call event was emitted and which
     /// yielded before finishing, with the trace actions its return events still need.
+    /// Native code ran `timeout` while tracing is active; the executor emits the receive event.
+    pub(crate) native_timeout_trace: bool,
     pub(crate) traced_native_call: Option<(usize, usize, Vec<crate::trace::CallActions>)>,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
     pub(crate) native_call_pc: usize,

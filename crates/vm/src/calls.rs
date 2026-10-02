@@ -298,21 +298,45 @@ impl Vm {
             return untraced(p);
         };
         let (module, function) = (entry.module.clone(), entry.function.clone());
-        let (Some(ctx), true) = (
-            ctx,
-            crate::trace_bp::selects(&module, &function, arity as u8),
-        ) else {
+        let Some(ctx) = ctx else {
             return untraced(p);
         };
+        self.call_bif_traced_named(p, ctx, &module, &function, bif, arity)
+    }
+
+    /// Call a BIF by name, emitting call and return events when a pattern selects it.
+    pub(crate) fn call_bif_traced_named(
+        &mut self,
+        p: &mut Process,
+        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        module: &str,
+        function: &str,
+        bif: arinsal_bifs::BifFn,
+        arity: usize,
+    ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
+        let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
+        if !crate::trace_bp::any_pattern()
+            || !crate::trace_bp::selects(module, function, arity as u8)
+        {
+            return untraced(p);
+        }
+        let (module, function) = (module.to_owned(), function.to_owned());
         let args = p.x[..arity].to_vec();
-        let actions = crate::trace::call_event(self, p, ctx, &module, &function, &args, false)
-            .unwrap_or_default();
+        // A native import that missed (dynamic natives) already emitted the call event.
+        let actions = match p
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.traced_native_call.take())
+        {
+            Some((_, _, actions)) => actions,
+            None => crate::trace::call_event(self, p, ctx, &module, &function, &args, false)
+                .unwrap_or_default(),
+        };
         let (result, reductions) = untraced(p);
         let outcome = match result {
             Ok(value) => Some(Ok(value)),
             Err(error) => match exceptions::bif_error(p, &module, &function, &args, error) {
-                VmError::Trap(trap) => exceptions::class_term(trap.class)
-                    .and_then(|class| exceptions::tuple(p, &[class, trap.reason]))
+                VmError::Trap(trap) => exceptions::trace_class_reason(p, trap.class, trap.reason)
                     .ok()
                     .map(Err),
                 _ => None,
@@ -350,23 +374,46 @@ impl Vm {
         }
         let entry = self.modules.get(caller_module)?.imports.get(import)?;
         let (module, function) = (entry.module.clone(), entry.function.clone());
-        if !crate::trace_bp::selects(&module, &function, arity as u8) {
+        self.trace_native_call_named(
+            p,
+            ctx,
+            &module,
+            &function,
+            arity,
+            (caller_module, caller_ip),
+        )
+    }
+
+    /// `trace_native_call` for a caller that knows the callee name, keyed by its call site.
+    pub(crate) fn trace_native_call_named(
+        &mut self,
+        p: &mut Process,
+        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        module: &str,
+        function: &str,
+        arity: usize,
+        site: (usize, usize),
+    ) -> Option<(String, String, Vec<Term>)> {
+        if !crate::trace_bp::any_pattern()
+            || !crate::trace_bp::selects(module, function, arity as u8)
+        {
             return None;
         }
+        let (module, function) = (module.to_owned(), function.to_owned());
         let args = p.x[..arity].to_vec();
-        let resumed = p.cold.as_ref().is_some_and(|cold| {
-            matches!(&cold.traced_native_call, Some((m, ip, _)) if *m == caller_module && *ip == caller_ip)
-        });
+        let resumed = p.cold.as_ref().is_some_and(
+            |cold| matches!(&cold.traced_native_call, Some((m, ip, _)) if (*m, *ip) == site),
+        );
         if !resumed {
             let actions = crate::trace::call_event(self, p, ctx, &module, &function, &args, false)
                 .unwrap_or_default();
-            p.cold_mut().traced_native_call = Some((caller_module, caller_ip, actions));
+            p.cold_mut().traced_native_call = Some((site.0, site.1, actions));
         }
         Some((module, function, args))
     }
 
     /// Emit the return or exception events of a traced native BIF that finished.
-    fn trace_native_return(
+    pub(crate) fn trace_native_return(
         &mut self,
         p: &mut Process,
         ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
@@ -389,9 +436,7 @@ impl Vm {
         let outcome = match result {
             Ok(value) => Ok(*value),
             Err(VmError::Trap(trap)) => {
-                match exceptions::class_term(trap.class)
-                    .and_then(|class| exceptions::tuple(p, &[class, trap.reason]))
-                {
+                match exceptions::trace_class_reason(p, trap.class, trap.reason) {
                     Ok(pair) => Err(pair),
                     Err(_) => return,
                 }
@@ -845,6 +890,17 @@ impl Vm {
             .export_slot(function_name, import_arity)
             .is_none()
         {
+            // Port of erts/emulator/beam/beam_common.c (call_error_handler): a missing
+            // export of a loaded module also goes through error_handler:undefined_function/3.
+            if self.should_autoload(p, module_name) {
+                return self.call_undefined_function(
+                    p,
+                    module_name,
+                    function_name,
+                    import_arity as usize,
+                    tail,
+                );
+            }
             return Err(VmError::Exception {
                 reason: "undef".into(),
                 frame: format!("{module_name}:{function_name}/{import_arity}"),

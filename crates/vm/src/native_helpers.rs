@@ -303,6 +303,9 @@ pub extern "C" fn arinsal_beamasm_wait_timeout(
 pub extern "C" fn arinsal_beamasm_timeout(header: *mut ProcessHeader) {
     if let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) {
         process.timeout();
+        if crate::trace::active() {
+            process.cold_mut().native_timeout_trace = true;
+        }
     }
 }
 
@@ -765,6 +768,10 @@ fn invoke_dispatch_bif(
             | arinsal_loader::ImportClass::Dynamic
             | arinsal_loader::ImportClass::Fun
     ) || crate::bif_traps::traps(&export.module, &export.function, export.arity)
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif trace trampolines),
+        // OTP-29.1.1: a traced BIF runs in the executor, which has the trace context.
+        || (crate::trace_bp::any_pattern()
+            && crate::trace_bp::selects(&export.module, &export.function, export.arity))
     {
         process.reductions = process.header.fcalls;
         if export_call {

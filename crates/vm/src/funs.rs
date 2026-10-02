@@ -545,6 +545,55 @@ impl Vm {
         tail: bool,
         mut ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<ImportOutcome, VmError> {
+        // A BIF reached through apply is traced like a direct call.
+        // Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
+        let traced = match ctx.as_deref_mut() {
+            Some(run)
+                if arity <= usize::from(u8::MAX)
+                    && crate::trace_bp::any_pattern()
+                    && arinsal_spec::bif_lookup(module, function, arity as u8).is_some() =>
+            {
+                let site = (usize::MAX - 1, p.ip);
+                self.trace_native_call_named(p, run, module, function, arity, site)
+            }
+            _ => None,
+        };
+        let result =
+            self.call_named_untraced(p, atoms, module, function, arity, tail, ctx.as_deref_mut());
+        let (Some((module, function, args)), Some(run)) = (traced, ctx) else {
+            return result;
+        };
+        match result {
+            Ok(outcome) => {
+                let value = match &outcome {
+                    ImportOutcome::Returned(value) => Some(*value),
+                    ImportOutcome::Advanced => Some(p.x[0]),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    self.trace_native_return(p, run, &module, &function, &args, &Ok(value));
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                let failed: Result<Term, VmError> = Err(error);
+                self.trace_native_return(p, run, &module, &function, &args, &failed);
+                failed.map(|_| ImportOutcome::Advanced)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // Same signature as `call_named_resolved`, which it backs.
+    fn call_named_untraced(
+        &mut self,
+        p: &mut Process,
+        atoms: Option<(arinsal_term::Atom, arinsal_term::Atom)>,
+        module: &str,
+        function: &str,
+        arity: usize,
+        tail: bool,
+        mut ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
         p.gc_live = arity;
         if arity > u8::MAX as usize {
             return Err(VmError::Exception {
@@ -756,12 +805,17 @@ impl Vm {
                 });
             }
         };
-        let target = self.modules[module_id]
-            .export(function, arity as u8)
-            .ok_or_else(|| VmError::Exception {
+        let Some(target) = self.modules[module_id].export(function, arity as u8) else {
+            // Port of erts/emulator/beam/beam_common.c (call_error_handler).
+            if self.should_autoload(p, module) {
+                return self
+                    .call_undefined_function_with_ctx(p, module, function, arity, tail, ctx);
+            }
+            return Err(VmError::Exception {
                 reason: "undef".into(),
                 frame: format!("{module}:{function}/{arity}"),
-            })?;
+            });
+        };
         if !tail {
             calls::push_continuation(p, p.module, p.ip + 1, arity)?;
         }

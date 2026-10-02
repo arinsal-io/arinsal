@@ -40,14 +40,17 @@ fn overlaps(a: (&str, &str, Option<u8>), b: (&str, &str, Option<u8>)) -> bool {
 fn winners<'a>(
     entries: &'a HashMap<Key, Pattern>,
     runtime: usize,
+    code: u64,
     session: Option<u64>,
     module: &str,
     function: &str,
     arity: u8,
 ) -> Vec<(&'a Key, &'a Pattern)> {
     let mut best: HashMap<u64, (&Key, &Pattern)> = HashMap::new();
+    let cutoff = module_cutoff(code, module);
     for (key, pattern) in entries {
         if key.0 != runtime
+            || pattern.seq < cutoff
             || session.is_some_and(|wanted| wanted != key.1)
             || !covers((&key.2, &key.3, key.4), module, function, Some(arity))
         {
@@ -60,6 +63,136 @@ fn winners<'a>(
     }
     best.into_values()
         .filter(|(_, pattern)| !pattern.off)
+        .collect()
+}
+
+static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn cutoffs() -> &'static Mutex<HashMap<(u64, String), u64>> {
+    static CUTOFFS: OnceLock<Mutex<HashMap<(u64, String), u64>>> = OnceLock::new();
+    CUTOFFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn module_cutoff(code: u64, module: &str) -> u64 {
+    cutoffs()
+        .lock()
+        .unwrap()
+        .get(&(code, module.to_owned()))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn code_scope(process: &Process) -> u64 {
+    process
+        .runtime
+        .as_ref()
+        .map_or(0, |runtime| runtime.code_scope)
+}
+
+/// Breakpoints belong to a code instance: a patterns set before a module was
+/// loaded, upgraded or deleted never applies to the module's later code.
+// Port of erts/emulator/beam/beam_bif_load.c:470-480 and 714-720
+// (erts_clear_module_break on finish_loading / delete_module), OTP-29.1.1.
+pub(crate) fn module_code_changed(code: u64, module: &str) {
+    let seq = SEQUENCE.load(Ordering::Relaxed);
+    cutoffs()
+        .lock()
+        .unwrap()
+        .insert((code, module.to_owned()), seq);
+}
+
+/// Session state of `trace_pattern(on_load, ...)`: the pattern applied to every module when it
+/// is loaded.
+// Port of erts/emulator/beam/erl_bif_trace.c:2523-2603 (change_on_load_trace_pattern), OTP-29.1.1.
+#[derive(Clone, Default)]
+pub(crate) struct OnLoadPattern {
+    /// Subset of `local`, `call_count`; empty means a global call trace.
+    pub flags: Vec<String>,
+    pub match_spec: Option<OwnedTerm>,
+}
+
+fn on_load_patterns() -> &'static Mutex<HashMap<(usize, u64), OnLoadPattern>> {
+    static ON_LOAD: OnceLock<Mutex<HashMap<(usize, u64), OnLoadPattern>>> = OnceLock::new();
+    ON_LOAD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Apply `trace_pattern(on_load, ...)` to a session. `on` is false for a `false` pattern.
+pub(crate) fn change_on_load(
+    process: &Process,
+    session: u64,
+    on: bool,
+    flags: &[String],
+    match_spec: Option<OwnedTerm>,
+) {
+    let breakpoint = |names: &[String]| names.iter().any(|n| n == "local" || n == "call_count");
+    let key = (scope(process), session);
+    let mut map = on_load_patterns().lock().unwrap();
+    let new_flags: Vec<String> = flags.iter().filter(|n| *n != "global").cloned().collect();
+    let new_breakpoint = breakpoint(&new_flags);
+    let Some(current) = map.get_mut(&key) else {
+        // Off -> on; turning an absent pattern off changes nothing.
+        if on {
+            map.insert(
+                key,
+                OnLoadPattern {
+                    flags: new_flags,
+                    match_spec,
+                },
+            );
+        }
+        return;
+    };
+    let current_breakpoint = breakpoint(&current.flags);
+    if current_breakpoint && new_breakpoint {
+        // Breakpoint trace -> breakpoint trace: merge or subtract the flags.
+        if on {
+            for name in new_flags {
+                if !current.flags.contains(&name) {
+                    current.flags.push(name);
+                }
+            }
+        } else {
+            current.flags.retain(|name| !new_flags.contains(name));
+            if !breakpoint(&current.flags) {
+                map.remove(&key);
+                return;
+            }
+        }
+        if flags.iter().any(|n| n == "local") || !flags.iter().any(|n| n == "call_count") {
+            current.match_spec = match_spec;
+        }
+    } else if !current_breakpoint && !new_breakpoint {
+        if on {
+            current.match_spec = match_spec;
+        } else {
+            map.remove(&key);
+        }
+    } else if on {
+        // Switching between global and breakpoint trace replaces the pattern.
+        *current = OnLoadPattern {
+            flags: new_flags,
+            match_spec,
+        };
+    }
+}
+
+pub(crate) fn on_load_pattern(process: &Process, session: u64) -> Option<OnLoadPattern> {
+    on_load_patterns()
+        .lock()
+        .unwrap()
+        .get(&(scope(process), session))
+        .cloned()
+}
+
+/// The on_load patterns of all sessions of this runtime.
+pub(crate) fn on_load_patterns_of(process: &Process) -> Vec<(u64, OnLoadPattern)> {
+    let runtime = scope(process);
+    on_load_patterns()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((owner, _), _)| *owner == runtime)
+        .map(|((_, session), pattern)| (*session, pattern.clone()))
         .collect()
 }
 
@@ -226,6 +359,10 @@ impl Drop for crate::process::Runtime {
 fn clear_scope(runtime: usize) {
     let mut entries = patterns().lock().unwrap();
     entries.retain(|(scope, _, _, _, _), _| *scope != runtime);
+    on_load_patterns()
+        .lock()
+        .unwrap()
+        .retain(|(scope, _), _| *scope != runtime);
     active().store(!entries.is_empty(), Ordering::Relaxed);
     registrations()
         .lock()
@@ -249,7 +386,6 @@ pub(crate) fn set(
     arity: Option<u8>,
     pattern: Option<Pattern>,
 ) -> bool {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
     let runtime = scope(process);
     let spec = (module.as_str(), function.as_str(), arity);
     let mut entries = patterns().lock().unwrap();
@@ -293,6 +429,10 @@ pub(crate) fn clear_session(process: &Process, session: u64) {
     let runtime = scope(process);
     let mut entries = patterns().lock().unwrap();
     entries.retain(|(owner, id, _, _, _), _| *owner != runtime || *id != session);
+    on_load_patterns()
+        .lock()
+        .unwrap()
+        .remove(&(runtime, session));
     active().store(entries.values().any(|p| !p.off), Ordering::Relaxed);
 }
 
@@ -327,24 +467,32 @@ pub(crate) fn matching(
     local: bool,
 ) -> Vec<Pattern> {
     let entries = patterns().lock().unwrap();
-    winners(&entries, scope(process), None, module, function, arity)
-        .into_iter()
-        .filter(|(_, pattern)| {
-            let has_global = pattern.flags.iter().any(|flag| flag == "global");
-            let has_local = pattern.flags.iter().any(|flag| flag == "local");
-            // No flag at all means a plain global call trace; call_count alone only counts.
-            let has_trace = pattern.flags.is_empty()
-                || pattern.flags.iter().any(|flag| flag != "call_count")
-                || pattern.match_spec.is_some();
-            has_trace
-                && if local {
-                    has_local
-                } else {
-                    has_global || (!has_local && !has_global)
-                }
-        })
-        .map(|(_, pattern)| pattern.clone())
-        .collect()
+    winners(
+        &entries,
+        scope(process),
+        code_scope(process),
+        None,
+        module,
+        function,
+        arity,
+    )
+    .into_iter()
+    .filter(|(_, pattern)| {
+        let has_global = pattern.flags.iter().any(|flag| flag == "global");
+        let has_local = pattern.flags.iter().any(|flag| flag == "local");
+        // No flag at all means a plain global call trace; call_count alone only counts.
+        let has_trace = pattern.flags.is_empty()
+            || pattern.flags.iter().any(|flag| flag != "call_count")
+            || pattern.match_spec.is_some();
+        has_trace
+            && if local {
+                has_local
+            } else {
+                has_global || (!has_local && !has_global)
+            }
+    })
+    .map(|(_, pattern)| pattern.clone())
+    .collect()
 }
 
 /// True while some runtime holds a function trace pattern; keeps untraced BIF calls on the fast path.
@@ -366,22 +514,30 @@ pub(crate) fn selects(module: &str, function: &str, arity: u8) -> bool {
 
 pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: u8, local: bool) {
     let mut entries = patterns().lock().unwrap();
-    let keys = winners(&entries, scope(process), None, module, function, arity)
-        .into_iter()
-        .filter(|(_, pattern)| {
-            pattern.flags.iter().any(|flag| flag == "call_count")
-                && (pattern
-                    .flags
-                    .iter()
-                    .any(|flag| flag == if local { "local" } else { "global" })
-                    || (local
-                        && !pattern
-                            .flags
-                            .iter()
-                            .any(|flag| flag == "local" || flag == "global")))
-        })
-        .map(|(key, _)| key.clone())
-        .collect::<Vec<_>>();
+    let keys = winners(
+        &entries,
+        scope(process),
+        code_scope(process),
+        None,
+        module,
+        function,
+        arity,
+    )
+    .into_iter()
+    .filter(|(_, pattern)| {
+        pattern.flags.iter().any(|flag| flag == "call_count")
+            && (pattern
+                .flags
+                .iter()
+                .any(|flag| flag == if local { "local" } else { "global" })
+                || (local
+                    && !pattern
+                        .flags
+                        .iter()
+                        .any(|flag| flag == "local" || flag == "global")))
+    })
+    .map(|(key, _)| key.clone())
+    .collect::<Vec<_>>();
     for key in keys {
         if let Some(pattern) = entries.get_mut(&key) {
             pattern.count = pattern.count.saturating_add(1);
@@ -412,6 +568,7 @@ pub(crate) fn info_session(
     let pattern = winners(
         &entries,
         scope(process),
+        code_scope(process),
         Some(session),
         module,
         function,
@@ -496,9 +653,17 @@ pub(crate) fn breakpoint_kinds(
     arity: u8,
 ) -> (bool, bool) {
     let entries = patterns().lock().unwrap();
-    let patterns = winners(&entries, scope(process), None, module, function, arity)
-        .into_iter()
-        .map(|(_, pattern)| pattern);
+    let patterns = winners(
+        &entries,
+        scope(process),
+        code_scope(process),
+        None,
+        module,
+        function,
+        arity,
+    )
+    .into_iter()
+    .map(|(_, pattern)| pattern);
     let mut local = crate::trace::return_to_enabled(process)
         || debug_breakpoint_enabled(process, module, function, arity);
     let mut global = false;
