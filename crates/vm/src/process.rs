@@ -8,6 +8,8 @@ use arinsal_sched::{
     Config, Event, Payload, Pid, ReceiveMarker, RunCtx, RunOutcome, Scheduler, Signal, Task,
 };
 use arinsal_spec::Opcode;
+use arinsal_term::ptab::PtabIdRing;
+use arinsal_term::ptab::{PtabLayout, set_port_table_layout};
 use arinsal_term::{
     ProcessHeap, SharedCopyCache, Term, TermBuilder, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
@@ -729,7 +731,8 @@ pub(crate) struct Runtime {
     >,
     pub(crate) system_monitor_flags: AtomicU8,
     pub(crate) long_message_queues: Mutex<HashSet<Pid>>,
-    pub(crate) next_port: AtomicU64,
+    /// Port identifier table's free id ring, like `erts_port.ptab`.
+    pub(crate) port_ids: PtabIdRing,
     pub(crate) simulated: bool,
     pub(crate) virtual_ms: AtomicU64,
     pub(crate) ets: std::sync::RwLock<arinsal_ets::Registry>,
@@ -5147,6 +5150,11 @@ impl Vm {
             })?;
         let (sender, receiver) = mpsc::channel();
         let code = Arc::new(Mutex::new(self.snapshot_shared()));
+        let port_layout = PtabLayout::new(1 << 20);
+        set_port_table_layout(port_layout);
+        let port_ids = PtabIdRing::new(1 << 20);
+        // erts creates its forker port first and keeps port id zero occupied.
+        assert_eq!(port_ids.reserve(), Some(0));
         let runtime = Arc::new(Runtime {
             statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
             code: Arc::clone(&code),
@@ -5169,7 +5177,7 @@ impl Vm {
             session_monitors: Mutex::new(Vec::new()),
             system_monitor_flags: AtomicU8::new(0),
             long_message_queues: Mutex::new(HashSet::new()),
-            next_port: AtomicU64::new(16),
+            port_ids,
             simulated: simulation_seed.is_some(),
             virtual_ms: AtomicU64::new(0),
             ets: std::sync::RwLock::new(arinsal_ets::Registry::new()),

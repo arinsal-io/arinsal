@@ -864,6 +864,17 @@ pub(crate) fn print_otp_term(term: &arinsal_etf::OwnedTerm, limit: usize) -> Str
                 let exponent = exponent.parse::<i32>().unwrap_or(0);
                 out.push_str(&format!("{mantissa}e{exponent:+03}"));
             }
+            // Port of erts/emulator/beam/erl_printf_term.c:508-524 (PID_DEF/PORT_DEF), OTP-29.1.1.
+            OwnedTerm::Pid {
+                node, id, serial, ..
+            } => {
+                let node = if node == "nonode@nohost" { "0" } else { node };
+                out.push_str(&format!("<{node}.{id}.{serial}>"));
+            }
+            OwnedTerm::Port { node, id, .. } => {
+                let node = if node == "nonode@nohost" { "0" } else { node };
+                out.push_str(&format!("#Port<{node}.{id}>"));
+            }
             OwnedTerm::Atom(name) => {
                 out.push_str(&term.to_string());
                 *remaining = remaining.saturating_sub(name.len());
