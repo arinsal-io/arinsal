@@ -382,18 +382,37 @@ impl CATree {
         }
     }
 
+    /// Detach every base node's tree for incremental release, leaving one empty base node.
+    ///
     /// Port of erts/emulator/beam/erl_db_catree.c:1414 (db_free_table_continue_catree), OTP-29.1.1.
-    pub(crate) fn clear(&self) {
+    #[expect(clippy::vec_box, reason = "tree links already own boxed nodes")]
+    pub(crate) fn take_all(&self) -> Vec<Box<Node>> {
         let _adaptation = self.adaptation.lock().expect("CA-tree adaptation poisoned");
         let routes = self.routes.load_full();
+        let mut roots = Vec::new();
         for route in routes.iter() {
             route.base.is_valid.store(false, AtomicOrdering::Release);
+            if let Some(root) = route
+                .base
+                .root
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                roots.push(root);
+            }
         }
         self.routes
             .store(Arc::new(RouteSnapshot::new(vec![RouteEntry {
                 first_key: None,
                 base: BaseNode::new(None),
             }])));
+        roots
+    }
+
+    /// Remove every object.
+    pub(crate) fn clear(&self) {
+        drop(self.take_all());
     }
 
     /// Port of erts/emulator/beam/erl_db_catree.c:2471 (db_calc_stats_catree), OTP-29.1.1.

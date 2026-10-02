@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(miri))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use hash::{ConcurrentHashStorage, HashStorage, ets_hash};
+use hash::{ConcurrentHashStorage, HashGarbage, HashStorage, ets_hash};
 
 /// Table identity. The VM can expose this as a local reference.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -108,6 +108,9 @@ pub struct Heir {
     /// `{heir, Pid, Data}` sends `'ETS-TRANSFER'`; `{heir, Pid}` keeps erts'
     /// non-value heir data and transfers silently (erl_db.c:2670-2686, :4919-4929).
     pub transfer: bool,
+    /// Creation order of the heir process when it was set, so a reused pid does not
+    /// inherit (erl_db.c:5327-5333, heir_started_interval).
+    pub started_interval: u64,
 }
 
 /// Validated table creation options.
@@ -1350,14 +1353,8 @@ mod _obsolete_ordered_treap {
                 return Ok(());
             };
             let key = node.object.key(state.keypos);
-            let below = state.bounds.lower.is_some_and(|(bound, inclusive)| {
-                let order = cmp(key, bound);
-                order == Ordering::Less || (order == Ordering::Equal && !inclusive)
-            });
-            let above = state.bounds.upper.is_some_and(|(bound, inclusive)| {
-                let order = cmp(key, bound);
-                order == Ordering::Greater || (order == Ordering::Equal && !inclusive)
-            });
+            let below = state.bounds.is_below(key);
+            let above = state.bounds.is_above(key);
             let first = if state.reverse {
                 &node.right
             } else {
@@ -1563,14 +1560,8 @@ fn select_range_constant<H: HeapAlloc>(
         return Ok(());
     };
     let key = node.object.key(state.keypos);
-    let below = state.bounds.lower.is_some_and(|(bound, inclusive)| {
-        let order = cmp(key, bound);
-        order == Ordering::Less || (order == Ordering::Equal && !inclusive)
-    });
-    let above = state.bounds.upper.is_some_and(|(bound, inclusive)| {
-        let order = cmp(key, bound);
-        order == Ordering::Greater || (order == Ordering::Equal && !inclusive)
-    });
+    let below = state.bounds.is_below(key);
+    let above = state.bounds.is_above(key);
     let (first, second) = if state.reverse {
         (&node.right, &node.left)
     } else {
@@ -2463,6 +2454,44 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    /// Detach every object for incremental release, leaving the table empty. `whole` also
+    /// takes the pseudo-deleted objects of a table that is being deleted.
+    ///
+    /// Port of erts/emulator/beam/erl_db_hash.c:4017 (db_delete_all_objects_hash) and
+    /// erl_db_tree.c:2531 (db_free_table_continue_tree), OTP-29.1.1.
+    pub fn take_garbage(&mut self, whole: bool) -> Garbage {
+        match &mut self.storage {
+            Storage::Ordered(root) => Garbage(GarbageKind::Tree(root.take().into_iter().collect())),
+            Storage::CATree(tree) => Garbage(GarbageKind::Tree(tree.take_all())),
+            Storage::Hash(storage) => {
+                let garbage = storage.take_garbage(whole);
+                storage.size = 0;
+                storage.size_bias = 0;
+                Garbage(GarbageKind::Hash {
+                    garbage,
+                    keep: !whole && self.fixed > 0,
+                })
+            }
+        }
+    }
+
+    /// Release `garbage` taken from this table within `reds` reductions; a fixed hash table
+    /// keeps its objects pseudo-deleted. Returns whether all of it is released.
+    pub fn free_garbage(&mut self, garbage: &mut Garbage, reds: &mut isize) -> bool {
+        // An unfix while the release is in progress turns the remaining objects into garbage.
+        let fixed = self.fixed > 0;
+        match (&mut garbage.0, &mut self.storage) {
+            (
+                GarbageKind::Hash {
+                    garbage,
+                    keep: true,
+                },
+                Storage::Hash(storage),
+            ) if fixed => garbage.step(reds, Some(&mut storage.deleted)),
+            _ => garbage.step(reds),
+        }
     }
 
     /// Remove every object.
@@ -3675,6 +3704,42 @@ impl Table {
     }
 }
 
+/// Storage detached from a table, released a slice of reductions at a time.
+pub struct Garbage(GarbageKind);
+
+enum GarbageKind {
+    /// Hash buckets; `keep` moves live objects to the table's pseudo-deleted list.
+    Hash { garbage: HashGarbage, keep: bool },
+    /// Tree nodes still to be freed.
+    #[expect(clippy::vec_box, reason = "tree links already own boxed nodes")]
+    Tree(Vec<Box<Node>>),
+}
+
+impl Garbage {
+    /// Release up to `reds` reductions of work, counting down below zero when it ran out.
+    /// Returns whether everything is released.
+    ///
+    /// Port of erts/emulator/beam/erl_db_tree.c:2531 (do_free_tree_continue) and
+    /// erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
+    pub fn step(&mut self, reds: &mut isize) -> bool {
+        match &mut self.0 {
+            GarbageKind::Hash { garbage, .. } => garbage.step(reds, None),
+            GarbageKind::Tree(stack) => {
+                while let Some(mut node) = stack.pop() {
+                    stack.extend(node.left.take());
+                    stack.extend(node.right.take());
+                    drop(node);
+                    *reds -= 1;
+                    if *reds < 0 {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
 /// Registry for named and unnamed tables.
 pub struct Registry {
     tables: Vec<TableSlot>,
@@ -3809,6 +3874,15 @@ impl Registry {
 
     /// Remove a table from the registry.
     pub fn delete(&mut self, tid: Tid) -> Result<(), EtsError> {
+        self.detach(tid).map(|_| ())
+    }
+
+    /// Remove a table from the registry and return its storage, to be released incrementally,
+    /// with the number of fixations it dropped.
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:3006 (ets_delete_1: DB_DELETE status, name removal,
+    /// free_fixations_locked) up to the free_table_continue call, OTP-29.1.1.
+    pub fn detach(&mut self, tid: Tid) -> Result<(Garbage, usize), EtsError> {
         let index = tid.slot().ok_or(EtsError::NoTable)?;
         let slot = self
             .tables
@@ -3818,12 +3892,34 @@ impl Registry {
         let shared = slot.table.take().ok_or(EtsError::NoTable)?;
         slot.generation = slot.generation.wrapping_add(1).max(1);
         self.free_slots.push(index);
-        let table = shared.read();
+        let mut table = shared.write();
         self.remove_owned_table(table.options.owner, tid);
         if table.options.named_table {
             self.names.remove(&table.options.name);
         }
-        Ok(())
+        let mut fixations = 0;
+        for (pid, count) in &table.fixed_processes {
+            fixations += count;
+            let pid = pid.raw_term().unwrap();
+            if let Some(tables) = self.fixed_tables.get_mut(&pid) {
+                tables.remove(&tid);
+                if tables.is_empty() {
+                    self.fixed_tables.remove(&pid);
+                }
+            }
+        }
+        Ok((table.take_garbage(true), fixations))
+    }
+
+    /// Any table `owner` still owns (head of erts `ERTS_PSD_ETS_OWNED_TABLES`).
+    // Port of erts/emulator/beam/erl_db.c:5057 (GET_OWNED_TABLE), OTP-29.1.1.
+    pub fn first_owned(&self, owner: Term) -> Option<Tid> {
+        self.owned_tables.get(&owner)?.iter().next().copied()
+    }
+
+    /// Drop a stale ownership entry whose table no longer exists.
+    pub fn forget_owned(&mut self, owner: Term, tid: Tid) {
+        self.remove_owned_table(owner, tid);
     }
 
     /// Return the tables owned by one process without inspecting unrelated tables.

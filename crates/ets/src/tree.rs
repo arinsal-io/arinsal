@@ -361,14 +361,8 @@ impl Node {
     ) -> Result<(), EtsError> {
         let Some(node) = root else { return Ok(()) };
         let key = node.object.key(state.keypos);
-        let below = state.bounds.lower.is_some_and(|(bound, inclusive)| {
-            let order = cmp(key, bound);
-            order == Ordering::Less || (order == Ordering::Equal && !inclusive)
-        });
-        let above = state.bounds.upper.is_some_and(|(bound, inclusive)| {
-            let order = cmp(key, bound);
-            order == Ordering::Greater || (order == Ordering::Equal && !inclusive)
-        });
+        let below = state.bounds.is_below(key);
+        let above = state.bounds.is_above(key);
         let first = if state.reverse {
             &node.right
         } else {

@@ -1,5 +1,6 @@
 //! ETS BIFs whose storage and access policy belong to the scheduled runtime.
 
+use crate::proc_create::EtsFree;
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_ets::match_spec::MatchDialect;
@@ -223,6 +224,8 @@ fn err(error: EtsError) -> VmError {
         EtsError::BadArgCause(cause) => badarg_cause(cause),
         EtsError::BadArg | EtsError::NameTaken => badarg(),
         EtsError::Unsupported(_) => badarg(),
+        // Port of erts/emulator/beam/erl_db.c:1450 (DB_ERROR_SYSRES -> SYSTEM_LIMIT), OTP-29.1.1.
+        EtsError::Term(arinsal_term::TermError::SystemLimit) => system_limit(),
         EtsError::Term(_) => badarg(),
     }
 }
@@ -461,6 +464,95 @@ impl arinsal_ets::match_spec::MatchContext for ProcessMatchContext {
     }
 }
 
+/// Charge `used` reductions to the process and the scheduler quantum.
+///
+/// Port of erts/emulator/beam/erl_bif_info.c (BUMP_REDS), OTP-29.1.1.
+fn bump_reds(process: &mut Process, ctx: &mut RunCtx<'_, Message>, used: isize) {
+    let used = used.clamp(0, ctx.remaining() as isize) as u32;
+    process.reductions -= used as i32;
+    process.reductions_used = process.reductions_used.saturating_add(u64::from(used));
+    ctx.consume(used);
+}
+
+/// `ets:delete/1` and `ets:internal_delete_all/2`: release the storage a slice of reductions
+/// at a time, trapping to the same BIF until it is all released.
+///
+/// Port of erts/emulator/beam/erl_db.c:3006 (ets_delete_1), :3234 (ets_internal_delete_all_2),
+/// :5378 (ets_delete_trap) and :5405 (free_table_continue), OTP-29.1.1.
+fn delete_or_clear(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    function: EtsBif,
+    args: &[Term],
+    caller: Term,
+) -> Result<Term, VmError> {
+    let rt = process.runtime.clone().ok_or_else(badarg)?;
+    let initial = ctx.remaining() as isize;
+    let mut reds = initial;
+    let mut state = process.cold.as_mut().and_then(|cold| cold.ets_free.take());
+    let done = if let Some(state) = state.as_mut() {
+        // Trapped before: the table is already unreachable (delete) or empty (delete_all).
+        match state.tid {
+            None => state.garbage.step(&mut reds),
+            Some(tid) => {
+                let registry = rt.ets.read().unwrap();
+                let mut table = registry.get_mut(tid).map_err(err)?;
+                table.free_garbage(&mut state.garbage, &mut reds)
+            }
+        }
+    } else if function == EtsBif::Delete {
+        let mut registry = rt.ets.write().unwrap();
+        let tid = handle(&registry, args[0])?;
+        if !allowed(&*registry.get(tid).map_err(err)?, caller, true) {
+            return Err(badarg_cause("access"));
+        }
+        let (garbage, fixations) = registry.detach(tid).map_err(err)?;
+        drop(registry);
+        reds -= fixations as isize;
+        let mut fresh = EtsFree {
+            tid: None,
+            nitems: 0,
+            garbage,
+        };
+        let done = fresh.garbage.step(&mut reds);
+        state = Some(fresh);
+        done
+    } else {
+        let registry = rt.ets.read().unwrap();
+        let tid = handle(&registry, args[0])?;
+        let mut table = registry.get_mut(tid).map_err(err)?;
+        if !allowed(&table, caller, true) {
+            return Err(badarg_cause("access"));
+        }
+        if args[1] != atom("undefined") {
+            return Err(badarg());
+        }
+        let nitems = table.len();
+        let mut fresh = EtsFree {
+            tid: Some(tid),
+            nitems,
+            garbage: table.take_garbage(false),
+        };
+        let done = table.free_garbage(&mut fresh.garbage, &mut reds);
+        state = Some(fresh);
+        done
+    };
+    let state = state.expect("delete state present");
+    if !done {
+        bump_reds(process, ctx, isize::MAX);
+        process.cold_mut().ets_free = Some(state);
+        return Err(VmError::Yield);
+    }
+    bump_reds(process, ctx, initial - reds);
+    if function == EtsBif::Delete {
+        return Ok(atom("true"));
+    }
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    TermBuilder::new(&mut heap)
+        .int_from_i128(state.nitems as i128)
+        .map_err(|_| badarg())
+}
+
 fn call_inner(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -503,6 +595,12 @@ fn call_inner(
             return Ok(atom("ok"));
         }
         return Err(badarg());
+    }
+    if matches!(
+        (function, args.len()),
+        (EtsBif::Delete, 1) | (EtsBif::InternalDeleteAll, 2)
+    ) {
+        return delete_or_clear(process, ctx, function, args, caller);
     }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock), OTP-29.1.1: table operations
@@ -622,8 +720,13 @@ fn call_inner(
                             // Port of erts/emulator/beam/erl_db.c:5319-5337 (set_heir),
                             // OTP-29.1.1: a dead heir leaves the table without one.
                             opts.heir = None;
-                            if rt.scheduler().map_err(|_| badarg())?.lookup(heir_pid) {
+                            if let Some(started_interval) = rt
+                                .scheduler()
+                                .map_err(|_| badarg())?
+                                .started_interval(heir_pid)
+                            {
                                 opts.heir = Some(Heir {
+                                started_interval,
                                 pid,
                                 data: if pair.len() == 3 {
                                     pair.get(2).unwrap()
@@ -713,14 +816,6 @@ fn call_inner(
                     .map_err(err)
             }
         }
-        (EtsBif::Delete, [target]) => {
-            let tid = handle(&registry, *target)?;
-            if !allowed(&*registry.get(tid).map_err(err)?, caller, true) {
-                return Err(badarg());
-            }
-            registry.exclusive()?.delete(tid).map_err(err)?;
-            Ok(atom("true"))
-        }
         (EtsBif::Delete, [target, key]) => {
             let tid = handle(&registry, *target)?;
             let mut table = registry.get_mut(tid).map_err(err)?;
@@ -729,20 +824,6 @@ fn call_inner(
             }
             table.delete_key(*key);
             Ok(atom("true"))
-        }
-        // Port of erts/emulator/beam/erl_db.c:3234 (`ets_internal_delete_all_2`),
-        // OTP-29.1.1. Table deletion is synchronous under this VM's registry lock.
-        (EtsBif::InternalDeleteAll, [target, holder]) => {
-            let tid = handle(&registry, *target)?;
-            let mut table = registry.get_mut(tid).map_err(err)?;
-            if !allowed(&table, caller, true) || *holder != atom("undefined") {
-                return Err(badarg());
-            }
-            let count = table.len();
-            table.delete_all_objects();
-            TermBuilder::new(&mut heap)
-                .int_from_i128(count as i128)
-                .map_err(|_| badarg())
         }
         // Port of erts/emulator/beam/erl_db.c:4648 and erl_db_hash.c:4117,
         // OTP-29.1.1.
@@ -764,6 +845,9 @@ fn call_inner(
         (EtsBif::SetOpts, [target, options]) => {
             let tid = handle(&registry, *target)?;
             let mut table = registry.get_mut(tid).map_err(err)?;
+            if !allowed(&table, caller, true) {
+                return Err(badarg_cause("access"));
+            }
             if table.options.owner != caller {
                 return Err(badarg());
             }
@@ -817,14 +901,15 @@ fn call_inner(
                             arinsal_term::from_owned(&fields[2], &mut heap)
                                 .map_err(|_| badarg())?
                         };
-                        let live = rt
+                        let started = rt
                             .scheduler()
                             .map_err(|_| badarg())?
-                            .lookup(pid);
-                        heir = Some(live.then_some(Heir {
+                            .started_interval(pid);
+                        heir = Some(started.map(|started_interval| Heir {
                             pid: pid_term,
                             data,
                             transfer: fields.len() == 3,
+                            started_interval,
                         }));
                     } else {
                         return Err(badarg());
@@ -1067,14 +1152,17 @@ fn call_inner(
         (EtsBif::Select | EtsBif::SelectReverse, [target, spec, limit])
         | (EtsBif::Match, [target, spec, limit])
         | (EtsBif::MatchObject, [target, spec, limit]) => {
-            let limit =
-                usize::try_from(limit.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
             let tid = handle(&registry, *target)?;
             let (program, result, retain) = {
                 let table = registry.get(tid).map_err(err)?;
                 if !allowed(&table, caller, false) {
                     return Err(badarg_cause("access"));
                 }
+                // Table errors precede the chunk size check (erl_db.c:3792-3841).
+                let limit = limit
+                    .as_small()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(badarg)?;
                 // Chunk size is strictly greater than 0. Port of erl_db.c:3828, OTP-29.1.1.
                 if limit == 0 {
                     return Err(badarg());
