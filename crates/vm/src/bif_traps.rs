@@ -44,8 +44,16 @@ const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
+const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "erlang",
+        function: "processes",
+        arity: 0,
+        continuation: PTAB_LIST_CONTINUATION,
+        handler: processes,
+    },
     Entry {
         module: "erts_debug",
         function: "set_internal_state",
@@ -461,7 +469,11 @@ pub(crate) fn execute_named(
             state,
             reductions,
         }) => {
-            process.set_gc_enabled(false);
+            // The ptab list state holds no heap terms, so the process stays collectable
+            // while trapped (erts keeps it GC-able in ptab_list_continue/2).
+            if continuation != PTAB_LIST_CONTINUATION {
+                process.set_gc_enabled(false);
+            }
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.module,
                 caller_ip: process.ip,
@@ -918,4 +930,99 @@ fn term_encode(
         builder.binary(&bytes).map_err(|_| BifError::SystemLimit)?
     };
     Ok(TrapResult::Done { value, reductions })
+}
+
+/// Progress of one `erlang:processes/0` call.
+struct PtabListState {
+    /// Consistent snapshot of the table taken when the BIF started.
+    pids: Vec<arinsal_sched::Pid>,
+    /// Next table index to inspect.
+    next_index: u32,
+}
+
+// Port of erts/emulator/beam/erl_ptab.c:746 (erts_ptab_list) and :1281 (ptab_list_continue),
+// OTP-29.1.1. Costs follow the engine's constants (erl_ptab.c:42-57): 25 table indices per
+// reduction scanned in chunks of 1000, 75 result conses per reduction.
+fn processes(
+    process: &mut Process,
+    _args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    const INDICES_PER_RED: u32 = 25;
+    const CHUNK_SIZE: u32 = 1000;
+    const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
+    const CONSES_PER_RED: usize = 75;
+    const TABLE_MAX: u32 = 1_048_576;
+    let reds_left = process.reductions.max(0) as u32;
+    let (state, first) = if let Some(state) = state {
+        (Arc::clone(state), false)
+    } else {
+        let runtime = process.runtime.as_ref().ok_or(BifError::BADARG)?;
+        let scheduler = runtime.scheduler().map_err(|_| BifError::BADARG)?;
+        let mut pids = runtime
+            .processes
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?
+            .iter()
+            .copied()
+            .filter(|pid| scheduler.lookup(*pid))
+            .collect::<Vec<_>>();
+        pids.sort_by_key(|pid| (pid.index, pid.generation));
+        (
+            MagicRef::new(Mutex::new(PtabListState {
+                pids,
+                next_index: 0,
+            })),
+            true,
+        )
+    };
+    let yield_now = |state: Arc<MagicRef>, reductions: u32| {
+        Ok(TrapResult::Yield {
+            continuation: PTAB_LIST_CONTINUATION,
+            state,
+            reductions,
+        })
+    };
+    if first && reds_left < MIN_START_REDS {
+        return yield_now(state, 1);
+    }
+    let mut spent = 0_u32;
+    let done = {
+        let mut list = state
+            .downcast_ref::<Mutex<PtabListState>>()
+            .ok_or(BifError::BADARG)?
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?;
+        while list.next_index < TABLE_MAX && spent < reds_left {
+            list.next_index = (list.next_index + CHUNK_SIZE).min(TABLE_MAX);
+            spent += MIN_START_REDS;
+        }
+        if list.next_index >= TABLE_MAX {
+            spent = spent.max(list.pids.len().div_ceil(CONSES_PER_RED) as u32);
+            true
+        } else {
+            false
+        }
+    };
+    if !done {
+        return yield_now(state, spent);
+    }
+    let pid_terms = state
+        .downcast_ref::<Mutex<PtabListState>>()
+        .ok_or(BifError::BADARG)?
+        .lock()
+        .map_err(|_| BifError::SystemLimit)?
+        .pids
+        .iter()
+        .filter_map(|pid| pid.to_term())
+        .collect::<Vec<_>>();
+    let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .list_from_iter(pid_terms)
+        .map_err(|_| BifError::SystemLimit)?;
+    Ok(TrapResult::Done {
+        value,
+        reductions: spent,
+    })
 }

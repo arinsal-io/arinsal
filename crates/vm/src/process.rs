@@ -719,6 +719,8 @@ pub(crate) struct Runtime {
     pub(crate) suspend_counts: Mutex<HashMap<(Pid, Pid), u32>>,
     pub(crate) suspend_total: Mutex<HashMap<Pid, u32>>,
     pub(crate) ever_suspended: AtomicBool,
+    /// Suspend-monitor pauses of receive and BIF timers (`erts_pause_proc_timer`).
+    pub(crate) pauses: Mutex<HashMap<Pid, TimerPause>>,
     pub(crate) published: Mutex<HashMap<Pid, Published>>,
     pub(crate) hibernating: Mutex<HashMap<Pid, HibernateCont>>,
     pub(crate) ever_hibernated: AtomicBool,
@@ -757,6 +759,13 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Accumulated suspend-monitor pause of one process's timers.
+pub(crate) struct TimerPause {
+    count: u32,
+    since: std::time::Instant,
+    shift: std::time::Duration,
 }
 
 /// Status another process can read while this one is not running.
@@ -2171,6 +2180,11 @@ impl Executor {
             runtime.note_status(pid, "suspended");
             return Ok(Some(RunState::Wait { timeout_ms: None }));
         }
+        if let Some(shift) = runtime.take_pause_shift(pid)
+            && let Some(deadline) = process.receive_deadline.as_mut()
+        {
+            *deadline += shift;
+        }
         if runtime.is_hibernating(pid) {
             process.drain(ctx)?;
             if process.inbox.is_empty() {
@@ -2737,6 +2751,9 @@ impl Runtime {
             let mut totals = self.suspend_total.lock().unwrap();
             *totals.entry(target).or_insert(0) += 1;
         }
+        if by != target {
+            self.pause_timers(target, 1);
+        }
         self.note_status(target, "suspended");
         Ok(true)
     }
@@ -2798,6 +2815,9 @@ impl Runtime {
             counts.remove(&(by, target));
         }
         drop(counts);
+        if by != target {
+            self.resume_timers(target, 1);
+        }
         let wake = {
             let mut totals = self.suspend_total.lock().unwrap();
             let total = totals.entry(target).or_insert(0);
@@ -2842,6 +2862,9 @@ impl Runtime {
         {
             let mut totals = self.suspend_total.lock().unwrap();
             for (target, count) in held {
+                if target != by {
+                    self.resume_timers(target, count);
+                }
                 if let Some(total) = totals.get_mut(&target) {
                     *total = total.saturating_sub(count);
                     if *total == 0 {
@@ -2863,7 +2886,66 @@ impl Runtime {
         wake
     }
 
+    /// A suspend monitor became active on `target`: its receive timeout and the BIF timers
+    /// aimed at it stop counting down.
+    /// Port of erts/emulator/beam/erl_process.c:9140 (erts_internal_suspend_process_2) and
+    /// erl_hl_timer.c:2849 (erts_pause_proc_timer), OTP-29.1.1.
+    fn pause_timers(&self, target: Pid, count: u32) {
+        let first = {
+            let mut pauses = self.pauses.lock().unwrap();
+            let pause = pauses.entry(target).or_insert_with(|| TimerPause {
+                count: 0,
+                since: std::time::Instant::now(),
+                shift: std::time::Duration::ZERO,
+            });
+            pause.count += count;
+            pause.count == count
+        };
+        if first && let Ok(scheduler) = self.scheduler() {
+            scheduler.pause_target_timers(target);
+        }
+    }
+
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:6617 and erl_hl_timer.c:2919
+    /// (erts_resume_paused_proc_timer), OTP-29.1.1: the last resume re-arms the timers.
+    fn resume_timers(&self, target: Pid, count: u32) {
+        let last = {
+            let mut pauses = self.pauses.lock().unwrap();
+            let Some(pause) = pauses.get_mut(&target) else {
+                return;
+            };
+            pause.count = pause.count.saturating_sub(count);
+            if pause.count == 0 {
+                pause.shift += pause.since.elapsed();
+                true
+            } else {
+                false
+            }
+        };
+        if last && let Ok(scheduler) = self.scheduler() {
+            scheduler.resume_target_timers(target);
+        }
+    }
+
+    /// Time the process spent suspended since it last asked; shifts its receive deadline.
+    pub(crate) fn take_pause_shift(&self, pid: Pid) -> Option<std::time::Duration> {
+        if !self.ever_suspended.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut pauses = self.pauses.lock().unwrap();
+        let pause = pauses.get_mut(&pid)?;
+        if pause.count != 0 {
+            return None;
+        }
+        let shift = pause.shift;
+        pauses.remove(&pid);
+        Some(shift)
+    }
+
     pub(crate) fn forget_process(&self, pid: Pid) {
+        if self.ever_suspended.load(Ordering::Acquire) {
+            self.pauses.lock().unwrap().remove(&pid);
+        }
         if self.ever_hibernated.load(Ordering::Acquire) {
             self.hibernating.lock().unwrap().remove(&pid);
         }
@@ -4161,10 +4243,15 @@ impl Process {
         if let Some(cold) = self.cold.as_mut() {
             cold.monitors.remove(&reference);
         }
+        let name = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.monitor_names.remove(&reference));
         let reference = crate::signals::reference(self, reference)?;
         let from = crate::dist::remote_pid_term(self, from)?
             .or_else(|| from.to_term())
             .ok_or_else(|| VmError::Unsupported("invalid monitor sender pid".into()))?;
+        let from = crate::signals::monitor_object(self, name.as_deref(), from)?;
         let tuple = self.tuple(&[
             tag,
             reference,
@@ -4321,12 +4408,17 @@ impl Task for Process {
 
     fn reap_signals(&mut self, pid: Pid, events: Vec<Event<Message>>) {
         let mut monitors = Vec::new();
+        let mut links = Vec::new();
         let mut literal_replies = Vec::new();
         for event in events {
             match event.payload {
                 Payload::Signal(Signal::Monitor(reference)) => {
                     monitors.push((reference, event.from));
                 }
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
+                // OTP-29.1.1: a link that reaches a process after its exit handling gets `noproc`.
+                Payload::Signal(Signal::Link) => links.push(event.from),
+                Payload::Signal(Signal::Unlink(_)) => links.retain(|from| *from != event.from),
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     monitors.retain(|(id, _)| *id != reference);
                 }
@@ -4342,7 +4434,7 @@ impl Task for Process {
                 _ => {}
             }
         }
-        if monitors.is_empty() && literal_replies.is_empty() {
+        if monitors.is_empty() && literal_replies.is_empty() && links.is_empty() {
             return;
         }
         let Ok(scheduler) = self
@@ -4358,6 +4450,11 @@ impl Task for Process {
         };
         for (requester, reply) in literal_replies {
             let _ = scheduler.send(pid, requester, reply);
+        }
+        for linker in links {
+            if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
+                let _ = scheduler.signal(pid, linker, Signal::Exit(reason));
+            }
         }
         for (reference, watcher) in monitors {
             let reason = self
@@ -4642,6 +4739,7 @@ impl Vm {
             suspend_counts: Mutex::new(HashMap::new()),
             suspend_total: Mutex::new(HashMap::new()),
             ever_suspended: AtomicBool::new(false),
+            pauses: Mutex::new(HashMap::new()),
             published: Mutex::new(HashMap::new()),
             hibernating: Mutex::new(HashMap::new()),
             ever_hibernated: AtomicBool::new(false),

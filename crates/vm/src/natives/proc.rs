@@ -213,8 +213,6 @@ fn process_info(
     for key in keys {
         if let Some((lookup_key, selector)) = dictionary_lookup(key) {
             // Port of erts/emulator/beam/erl_bif_info.c:852, OTP-29.1.1.
-            let lookup_key =
-                arinsal_term::from_owned(&lookup_key, &mut process.heap).map_err(|_| badarg())?;
             let value = process
                 .cold
                 .as_ref()
@@ -961,6 +959,9 @@ fn validate_info_item(item: Term) -> Result<(), VmError> {
         }
         return Ok(());
     }
+    if dictionary_lookup(item).is_some() {
+        return Ok(());
+    }
     let name = atom_name(item).ok_or_else(badarg)?;
     if known_info_item(&name) {
         Ok(())
@@ -969,15 +970,9 @@ fn validate_info_item(item: Term) -> Result<(), VmError> {
     }
 }
 
-fn dictionary_lookup(selector: Term) -> Option<(arinsal_etf::OwnedTerm, Term)> {
-    let owned = arinsal_term::to_owned(selector).ok()?;
-    let arinsal_etf::OwnedTerm::Tuple(tuple) = &owned else {
-        return None;
-    };
-    if tuple.len() != 2 || tuple[0] != arinsal_etf::OwnedTerm::Atom("dictionary".into()) {
-        return None;
-    }
-    Some((tuple[1].clone(), selector))
+fn dictionary_lookup(selector: Term) -> Option<(Term, Term)> {
+    let (tag, key) = tuple2(selector)?;
+    (tag == atom("dictionary")).then_some((key, selector))
 }
 
 /// The native function and source location a native caller is executing a BIF at.
@@ -992,6 +987,17 @@ fn native_call_site(process: &Process) -> Option<(crate::native_bridge::NativeFu
 }
 
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
+    // A trapped BIF reports its continuation export, as erts does.
+    if let Some((module, rest)) = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .and_then(|pending| pending.continuation.split_once(':'))
+        && let Some((function, arity)) = rest.rsplit_once('/')
+        && let Ok(arity) = arity.parse::<u8>()
+    {
+        return Ok((module.to_owned(), function.to_owned(), arity));
+    }
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module, function.function, function.arity));
     }
@@ -1478,7 +1484,12 @@ fn call_values(
             ("list_to_ref", [chars]) if module == "erlang" => list_to_ref(process, *chars),
             // Port of erts/emulator/beam/bif.c:4487 (fun_to_list_1), OTP-29.1.1.
             ("fun_to_list", [fun]) if module == "erlang" => charlist(process, &fun_to_list(*fun)?),
-            ("yield", []) if module == "erlang" => Ok(atom("true")),
+            // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield), OTP-29.1.1:
+            // the process goes to the back of its run queue and returns `true`.
+            ("yield", []) if module == "erlang" => {
+                process.force_yield = true;
+                Ok(atom("true"))
+            }
             ("process_flag", [name, value]) => {
                 if *name == atom("monitor_nodes") {
                     let enabled = match *value {
@@ -3466,16 +3477,25 @@ fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {
 // and erl_ptab.c:1472 (erts_ptab_processes_next), OTP-29.1.1.
 // The cursor is the next process-table index, so exiting processes do not
 // invalidate a scan that is already in progress.
+/// Process table size (`process_limit`).
+const PROCESS_TABLE_MAX: u32 = 1_048_576;
+
 fn processes_next(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     cursor: Term,
 ) -> Result<Term, VmError> {
     let index = u32::try_from(cursor.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
+    // Port of erts/emulator/beam/erl_ptab.c:1473 (erts_ptab_processes_next), OTP-29.1.1.
     let max_pids = ctx.remaining().max(1);
-    let limit = index.saturating_add(max_pids.saturating_mul(25));
-    if index == limit {
+    let limit = index
+        .saturating_add(max_pids.saturating_mul(25))
+        .min(PROCESS_TABLE_MAX);
+    if index == limit && index != 0 {
         return Ok(atom("none"));
+    }
+    if index > limit {
+        return Err(badarg());
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;

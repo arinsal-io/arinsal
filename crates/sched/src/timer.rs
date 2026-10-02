@@ -435,6 +435,14 @@ pub(crate) enum TimerCommand<M> {
     CancelTarget {
         pid: Pid,
     },
+    /// Hold the BIF timers aimed at `pid` (a suspended process).
+    PauseTarget {
+        pid: Pid,
+    },
+    /// Re-arm the held timers of `pid` with their remaining time.
+    ResumeTarget {
+        pid: Pid,
+    },
 }
 
 pub(crate) struct CanceledTimer {
@@ -481,6 +489,8 @@ pub(crate) struct Wheel<M> {
     target_entries: HashMap<Pid, HashSet<u64>>,
     /// Cached [`Wheel::next_timeout`]; valid until the wheel reaches it or its timers change.
     next_timeout: Option<u64>,
+    /// Timers held while their destination is suspended, with the time they had left.
+    paused: HashMap<Pid, Vec<(u64, TimerPayload<M>)>>,
 }
 
 impl<M> Wheel<M> {
@@ -499,6 +509,7 @@ impl<M> Wheel<M> {
             entries: HashMap::new(),
             target_entries: HashMap::new(),
             next_timeout: None,
+            paused: HashMap::new(),
         }
     }
 
@@ -568,6 +579,14 @@ impl<M> Wheel<M> {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:2661-2695, OTP-29.1.1.
     pub(crate) fn insert(&mut self, id: u64, deadline: u64, payload: TimerPayload<M>) {
+        // Port of erts/emulator/beam/erl_hl_timer.c:1838 (setup_bif_timer), OTP-29.1.1: a timer
+        // started for a process whose timers are paused is created paused.
+        if let TimerPayload::Message(target, _, _) = &payload
+            && let Some(held) = self.paused.get_mut(target)
+        {
+            held.push((deadline.saturating_sub(self.now), payload));
+            return;
+        }
         let order = self.next_order;
         self.next_order = self.next_order.wrapping_add(1);
         if let TimerPayload::Message(target, _, _) = &payload {
@@ -677,10 +696,32 @@ impl<M> Wheel<M> {
     // Port of erts/emulator/beam/erl_hl_timer.c:67-68 and erl_process.c:14300-14304,
     // OTP-29.1.1. Process exit cancels all BIF timers whose destination is the exiting process.
     pub(crate) fn cancel_target(&mut self, pid: Pid) -> usize {
+        // erts_destroy_paused_bif_timers (erl_hl_timer.c:2988): paused timers die with the process.
+        self.paused.remove(&pid);
         let ids = self.target_entries.remove(&pid).unwrap_or_default();
         ids.into_iter()
             .filter(|id| self.cancel_at(*id, self.now).is_some())
             .count()
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers), OTP-29.1.1.
+    pub(crate) fn pause_target(&mut self, pid: Pid, now: u64) {
+        let ids = self.target_entries.remove(&pid).unwrap_or_default();
+        let mut held = Vec::new();
+        for id in ids {
+            if let Some(timer) = self.cancel_at(id, now) {
+                held.push(timer);
+            }
+        }
+        self.paused.entry(pid).or_default().extend(held);
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:2949 (erts_resume_paused_bif_timers), OTP-29.1.1:
+    // each held timer is re-armed with a fresh identity and its remaining time.
+    pub(crate) fn resume_target(&mut self, pid: Pid, now: u64, mut next_id: impl FnMut() -> u64) {
+        for (remaining, payload) in self.paused.remove(&pid).unwrap_or_default() {
+            self.insert(next_id(), now.saturating_add(remaining.max(1)), payload);
+        }
     }
 
     fn remove_target_entry(&mut self, id: u64, payload: &TimerPayload<M>) {

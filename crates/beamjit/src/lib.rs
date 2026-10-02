@@ -4321,18 +4321,17 @@ fn emit_op(
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
                 assembler.dispatch_export(entry, true)
             }
-            "i_yield"
-            | "i_hibernate"
-            | "i_perf_counter"
-            | "i_load_nif"
-            | "i_call_on_load_function" => {
+            "i_yield" => {
+                count(0)?;
+                assembler.emit_i_yield()
+            }
+            "i_hibernate" | "i_perf_counter" | "i_load_nif" | "i_call_on_load_function" => {
                 // Port of erts/emulator/beam/jit/arm/ops.tab:660-680, 612-641, OTP-29.1.1: the
                 // loader turns these BIF calls into instructions. They keep their
                 // scheduler-visible behaviour by calling the BIF's export, whose import the
                 // module still carries.
                 count(0)?;
                 let (module, function, arity) = match op.name() {
-                    "i_yield" => ("erlang", "yield", 0),
                     "i_hibernate" => ("erlang", "hibernate", 0),
                     "i_perf_counter" => ("os", "perf_counter", 0),
                     "i_load_nif" => ("erlang", "load_nif", 2),

@@ -1941,44 +1941,25 @@ fn call_resolved(
         (SignalBif::Monitor2, [kind, target]) | (SignalBif::Monitor3, [kind, target, _])
             if *kind == atom("process") =>
         {
-            let options = if args.len() == 3 {
-                list(args[2]).ok_or_else(|| badarg("monitor/3"))?
-            } else {
-                Vec::new()
-            };
-            let mut tag = atom("DOWN");
-            let mut alias = false;
-            let mut priority = false;
-            for option in options {
-                if option == atom("priority") {
-                    priority = true;
-                    continue;
-                }
-                // SAFETY: Each option is rooted in the caller's heap.
-                let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg("monitor/3"))?;
-                if tuple.len() != 2 {
-                    return Err(badarg("monitor/3"));
-                }
-                match (tuple.get(0), tuple.get(1)) {
-                    (Some(key), Some(value)) if key == atom("tag") => tag = value,
-                    (Some(key), Some(value))
-                        if key == atom("alias")
-                            && ["explicit_unalias", "demonitor", "reply_demonitor"]
-                                .iter()
-                                .any(|name| value == atom(name)) =>
-                    {
-                        alias = true
-                    }
-                    _ => return Err(badarg("monitor/3")),
-                }
-            }
+            let (tag, alias, priority) = monitor_options(args)?;
             let rt = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
             // boot_loop1: code_server:call/1 monitors its registered name.
-            let name = atom_name(*target);
+            // Port of erts/emulator/beam/bif.c:1100 (erts_internal_monitor? monitor_2/3
+            // local arm), OTP-29.1.1: `Name` and `{Name, node()}` both monitor by name.
+            let name = match atom_name(*target) {
+                Some(name) => Some(name),
+                None if Pid::from_term(*target).is_none() => {
+                    crate::dist::name_node_tuple(*target)?.map(|(name, _node)| name)
+                }
+                None => None,
+            };
             let pid = if let Some(pid) = Pid::from_term(*target) {
                 Some(pid)
             } else if let Some(name) = name.as_ref() {
                 rt.names.lock().unwrap().get(name).copied()
+            } else if matches!(to_owned(*target), Ok(arinsal_etf::OwnedTerm::Pid { .. })) {
+                // A pid of another incarnation of this node never matches a live process.
+                None
             } else {
                 return Err(badarg("monitor/2"));
             };
@@ -2001,31 +1982,28 @@ fn call_resolved(
             }
             if let Some(pid) = pid.filter(|pid| rt.scheduler().is_ok_and(|s| s.lookup(*pid))) {
                 process.cold_mut().monitors.insert(id, pid);
+                if let Some(name) = name.as_ref() {
+                    process.cold_mut().monitor_names.insert(id, name.clone());
+                }
                 if let Err(error) = ctx.signal(pid, Signal::Monitor(id)) {
                     process.cold_mut().monitors.remove(&id);
+                    process.cold_mut().monitor_names.remove(&id);
                     process.cold_mut().monitor_tags.remove(&id);
                     if error != arinsal_sched::Error::NoProcess {
                         return Err(VmError::Unsupported(format!("monitor: {error}")));
                     }
                     // The target stopped accepting monitor signals before this request.
                     let reason = atom("noproc");
+                    let object = monitor_object(process, name.as_deref(), *target)?;
                     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
                     let down = TermBuilder::new(&mut heap)
-                        .tuple(&[tag, ref_term, atom("process"), *target, reason])
+                        .tuple(&[tag, ref_term, atom("process"), object, reason])
                         .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
                     process.inbox.push_back(down);
                 }
             } else {
+                let object = monitor_object(process, name.as_deref(), *target)?;
                 let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-                let object = if let Some(name) = name {
-                    TermBuilder::new(&mut heap)
-                        .tuple(&[atom(&name), atom("nonode@nohost")])
-                        .map_err(|error| {
-                            VmError::Unsupported(format!("monitor object: {error:?}"))
-                        })?
-                } else {
-                    *target
-                };
                 let down = TermBuilder::new(&mut heap)
                     .tuple(&[tag, ref_term, atom("process"), object, atom("noproc")])
                     .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
@@ -2044,16 +2022,28 @@ fn call_resolved(
             let id = runtime.next_ref();
             reference(process, id)
         }
-        (SignalBif::Monitor2, [kind, target]) if *kind == atom("port") => {
+        (SignalBif::Monitor2, [kind, target]) | (SignalBif::Monitor3, [kind, target, _])
+            if *kind == atom("port") =>
+        {
+            let (tag, alias, _priority) = monitor_options(args)?;
             let runtime = process.runtime.clone().ok_or_else(|| badarg("monitor/2"))?;
             let reference_id = runtime.next_ref();
             let reference_term = reference(process, reference_id)?;
+            if alias {
+                process.cold_mut().aliases.insert(reference_id);
+                runtime.alias_bind_prio(reference_id, Some(ctx.pid()), false);
+            }
             let (port_id, object) = if let Some(id) = target.as_port() {
                 (
                     Some(id),
                     to_owned(*target).map_err(|_| badarg("monitor/2"))?,
                 )
-            } else if let Some(name) = atom_name(*target) {
+            } else if let Some(name) = atom_name(*target).or_else(|| {
+                crate::dist::name_node_tuple(*target)
+                    .ok()
+                    .flatten()
+                    .map(|(name, _node)| name)
+            }) {
                 let id = runtime.port_names.lock().unwrap().get(&name).copied();
                 let node = crate::node_tables::lock().local_name.clone();
                 (
@@ -2063,10 +2053,17 @@ fn call_resolved(
                         arinsal_etf::OwnedTerm::Atom(node),
                     ]),
                 )
+            } else if let Ok(object @ arinsal_etf::OwnedTerm::Port { .. }) = to_owned(*target) {
+                // A port of another incarnation of this node never matches a live port.
+                (None, object)
             } else {
                 return Err(badarg("monitor/2"));
             };
             if let Some(id) = port_id.filter(|id| runtime.ports.lock().unwrap().contains_key(id)) {
+                if tag != atom("DOWN") {
+                    // Port monitors carry no tag yet (typed gap, see report).
+                    return Err(VmError::Unsupported("monitor(port, _, [{tag, _}])".into()));
+                }
                 let port = Term::port(id).ok_or_else(|| badarg("monitor/2"))?;
                 if !crate::port::monitor(
                     process,
@@ -2080,13 +2077,7 @@ fn call_resolved(
                     let object = arinsal_term::from_owned(&object, &mut heap)
                         .map_err(|_| badarg("monitor/2"))?;
                     let down = TermBuilder::new(&mut heap)
-                        .tuple(&[
-                            atom("DOWN"),
-                            reference_term,
-                            atom("port"),
-                            object,
-                            atom("noproc"),
-                        ])
+                        .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
                         .map_err(|error| {
                             VmError::Unsupported(format!("port DOWN tuple: {error:?}"))
                         })?;
@@ -2098,13 +2089,7 @@ fn call_resolved(
                 let object = arinsal_term::from_owned(&object, &mut heap)
                     .map_err(|_| badarg("monitor/2"))?;
                 let down = TermBuilder::new(&mut heap)
-                    .tuple(&[
-                        atom("DOWN"),
-                        reference_term,
-                        atom("port"),
-                        object,
-                        atom("noproc"),
-                    ])
+                    .tuple(&[tag, reference_term, atom("port"), object, atom("noproc")])
                     .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
                 process.inbox.push_back(down);
                 Ok(reference_term)
@@ -2489,10 +2474,57 @@ struct Waiter {
 /// Runtime address plus pid. Simulations reuse pid numbers, and tests run in parallel.
 type Slot = (usize, Pid);
 
+/// Requests queued for one target: plain signal requests in submission order and system
+/// tasks per priority, as in erts' `ErtsProcSysTaskQs`.
+#[derive(Default)]
+struct Requests {
+    plain: VecDeque<Pending>,
+    sys: [VecDeque<Pending>; 4],
+    /// Normal-priority tasks run since the last low-priority one.
+    ncount: u8,
+}
+
+impl Requests {
+    fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.sys.iter().all(VecDeque::is_empty)
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:10646 (fetch_sys_task), OTP-29.1.1:
+    /// highest priority first; a waiting low-priority task runs after `RESCHEDULE_LOW`
+    /// normal ones (erl_process.h:373).
+    fn fetch_sys_task(&mut self) -> Option<Pending> {
+        const RESCHEDULE_LOW: u8 = 8;
+        const NORMAL: usize = 2;
+        const LOW: usize = 3;
+        let first = self.sys.iter().position(|queue| !queue.is_empty())?;
+        let index = if first == NORMAL && !self.sys[LOW].is_empty() {
+            self.ncount += 1;
+            if self.ncount <= RESCHEDULE_LOW {
+                NORMAL
+            } else {
+                self.ncount = 0;
+                LOW
+            }
+        } else {
+            first
+        };
+        self.sys[index].pop_front()
+    }
+}
+
+fn sys_index(priority: Priority) -> usize {
+    match priority {
+        Priority::Max => 0,
+        Priority::High => 1,
+        Priority::Normal => 2,
+        Priority::Low => 3,
+    }
+}
+
 struct Tables {
     /// Per-target requests in submission order; wakeups usually arrive in that order,
     /// so lookups hit the front (system task blasts queue hundreds of thousands).
-    requests: BTreeMap<Slot, VecDeque<Pending>>,
+    requests: BTreeMap<Slot, Requests>,
     waiters: BTreeMap<Slot, Waiter>,
     /// Processes that already answered their final requests but are still registered; a
     /// request sent to one now would never be served.
@@ -2656,11 +2688,12 @@ fn submit_from(
         if tables.exited.contains(&(slot_of, target)) {
             return Ok(Submit::Dead);
         }
-        tables
-            .requests
-            .entry((slot_of, target))
-            .or_default()
-            .push_back(Pending { id, from, op });
+        let queues = tables.requests.entry((slot_of, target)).or_default();
+        let pending = Pending { id, from, op };
+        match priority {
+            Some(priority) => queues.sys[sys_index(priority)].push_back(pending),
+            None => queues.plain.push_back(pending),
+        }
         if let Some(kind) = wait {
             tables
                 .waiters
@@ -2675,8 +2708,11 @@ fn submit_from(
         Ok(()) => Ok(Submit::Sent(id)),
         Err(arinsal_sched::Error::NoProcess) => {
             let mut tables = tables().lock().unwrap();
-            if let Some(queue) = tables.requests.get_mut(&(slot_of, target)) {
-                queue.retain(|pending| pending.id != id);
+            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
+                queues.plain.retain(|pending| pending.id != id);
+                for queue in &mut queues.sys {
+                    queue.retain(|pending| pending.id != id);
+                }
             }
             tables.waiters.remove(&(slot_of, ctx.pid()));
             Ok(Submit::Dead)
@@ -2693,15 +2729,22 @@ pub(crate) fn handle_request(
 ) -> Result<(), VmError> {
     let pending = {
         let mut tables = tables().lock().unwrap();
-        let Some(queue) = tables.requests.get_mut(&(scope(process), ctx.pid())) else {
+        let Some(queues) = tables.requests.get_mut(&(scope(process), ctx.pid())) else {
             return Ok(());
         };
-        let Some(index) = queue.iter().position(|pending| pending.id == id) else {
+        // A wakeup for a system task runs whichever task erts would fetch next; ids of
+        // plain requests are matched exactly.
+        let plain = queues
+            .plain
+            .iter()
+            .position(|pending| pending.id == id)
+            .and_then(|index| queues.plain.remove(index));
+        let Some(pending) = plain.or_else(|| queues.fetch_sys_task()) else {
             return Ok(());
         };
-        let Some(pending) = queue.remove(index) else {
-            return Ok(());
-        };
+        if queues.is_empty() {
+            tables.requests.remove(&(scope(process), ctx.pid()));
+        }
         pending
     };
     // Port of erts/emulator/beam/erl_process.c:10831 (save_gc_task), OTP-29.1.1:
@@ -2766,7 +2809,12 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
             tables.exited.remove(entry);
         }
         tables.exited.insert(slot);
-        tables.requests.remove(&slot).unwrap_or_default()
+        let queues = tables.requests.remove(&slot).unwrap_or_default();
+        let mut all = queues.plain;
+        for queue in queues.sys {
+            all.extend(queue);
+        }
+        all
     };
     let mut pending = pending;
     if let Some(cold) = process.cold.as_mut() {
@@ -2785,6 +2833,57 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         };
         let _ = ctx.send(pending.from, message);
     }
+}
+
+/// Options of `monitor/3`: `{tag, Tag}`, `{alias, Mode}` and `priority`.
+fn monitor_options(args: &[Term]) -> Result<(Term, bool, bool), VmError> {
+    let options = if args.len() == 3 {
+        list(args[2]).ok_or_else(|| badarg("monitor/3"))?
+    } else {
+        Vec::new()
+    };
+    let mut tag = atom("DOWN");
+    let mut alias = false;
+    let mut priority = false;
+    for option in options {
+        if option == atom("priority") {
+            priority = true;
+            continue;
+        }
+        // SAFETY: Each option is rooted in the caller's heap.
+        let tuple = unsafe { option.tuple_ref() }.ok_or_else(|| badarg("monitor/3"))?;
+        if tuple.len() != 2 {
+            return Err(badarg("monitor/3"));
+        }
+        match (tuple.get(0), tuple.get(1)) {
+            (Some(key), Some(value)) if key == atom("tag") => tag = value,
+            (Some(key), Some(value))
+                if key == atom("alias")
+                    && ["explicit_unalias", "demonitor", "reply_demonitor"]
+                        .iter()
+                        .any(|name| value == atom(name)) =>
+            {
+                alias = true
+            }
+            _ => return Err(badarg("monitor/3")),
+        }
+    }
+    Ok((tag, alias, priority))
+}
+
+/// The object of a local process monitor's `DOWN`: `{Name, node()}` for a name, else the pid.
+pub(crate) fn monitor_object(
+    process: &mut Process,
+    name: Option<&str>,
+    target: Term,
+) -> Result<Term, VmError> {
+    let Some(name) = name else {
+        return Ok(target);
+    };
+    let node = crate::node_tables::lock().local_name.clone();
+    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .tuple(&[atom(name), atom(&node)])
+        .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))
 }
 
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:3027
@@ -2828,22 +2927,7 @@ fn link_opt(
         return Ok(atom("true"));
     }
     if !runtime(process)?.scheduler()?.lookup(pid) {
-        let reason = atom("noproc");
-        if process.trap_exit {
-            let pid_term = pid.to_term().ok_or_else(|| badarg("link"))?;
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-            let exit = TermBuilder::new(&mut heap)
-                .tuple(&[atom("EXIT"), pid_term, reason])
-                .map_err(|_| system_limit())?;
-            if priority {
-                process.push_priority_message(exit)?;
-            } else {
-                process.inbox.push_back(exit);
-            }
-            return Ok(atom("true"));
-        }
-        process.note_exit_reason(reason)?;
-        return Err(VmError::Trap(crate::exceptions::Trap::error(reason)));
+        return link_noproc(process, pid, priority);
     }
     crate::trace::linked(process, ctx.pid(), pid);
     process.cold_mut().links.insert(pid);
@@ -2862,15 +2946,40 @@ fn link_opt(
         "link",
         &[linked_term],
     );
-    if let Err(error) = ctx.signal(pid, Signal::Link)
-        && error != arinsal_sched::Error::NoProcess
-    {
-        return Err(match error {
-            arinsal_sched::Error::Capacity => system_limit(),
-            _ => badarg("link"),
-        });
+    match ctx.signal(pid, Signal::Link) {
+        Ok(()) => {}
+        Err(arinsal_sched::Error::NoProcess) => {
+            // The target left the table between the lookup and the signal: undo the link.
+            process.cold_mut().links.remove(&pid);
+            process.cold_mut().prio_links.remove(&pid);
+            return link_noproc(process, pid, priority);
+        }
+        Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
+        Err(_) => return Err(badarg("link")),
     }
     Ok(atom("true"))
+}
+
+/// Linking to a process that does not exist: an `{'EXIT', Pid, noproc}` message when trapping
+/// exits, else a `noproc` error.
+// Port of erts/emulator/beam/bif.c:675 (erts_link_opts / link noproc arm), OTP-29.1.1.
+fn link_noproc(process: &mut Process, pid: Pid, priority: bool) -> Result<Term, VmError> {
+    let reason = atom("noproc");
+    if process.trap_exit {
+        let pid_term = pid.to_term().ok_or_else(|| badarg("link"))?;
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let exit = TermBuilder::new(&mut heap)
+            .tuple(&[atom("EXIT"), pid_term, reason])
+            .map_err(|_| system_limit())?;
+        if priority {
+            process.push_priority_message(exit)?;
+        } else {
+            process.inbox.push_back(exit);
+        }
+        return Ok(atom("true"));
+    }
+    process.note_exit_reason(reason)?;
+    Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
 }
 
 // Port of erts/emulator/beam/bif.c:1721 (send_exit_signal_bif), OTP-29.1.1.

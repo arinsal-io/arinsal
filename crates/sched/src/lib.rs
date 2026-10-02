@@ -1608,6 +1608,32 @@ impl<T: Task> Inner<T> {
         }
     }
 
+    /// Ask every timer wheel to pause or resume the timers aimed at `pid`.
+    fn broadcast_target_timers(&self, pid: Pid, pause: bool) {
+        if let Some(timers) = self.sim_timers.as_ref() {
+            let now = self.clock.now_ms();
+            for wheel in timers {
+                let mut wheel = wheel.lock().unwrap();
+                if pause {
+                    wheel.pause_target(pid, now);
+                } else {
+                    wheel.resume_target(pid, now, || {
+                        self.next_timer.fetch_add(1, Ordering::Relaxed)
+                    });
+                }
+            }
+            return;
+        }
+        for (worker, queue) in self.timer_commands.iter().enumerate() {
+            queue.push(if pause {
+                TimerCommand::PauseTarget { pid }
+            } else {
+                TimerCommand::ResumeTarget { pid }
+            });
+            self.wake_worker(worker);
+        }
+    }
+
     fn owner_timer_service(&self, worker: usize) -> Option<Rc<RefCell<TimerService<T::Message>>>> {
         let inner_id = self as *const Self as usize;
         OWNER_TIMER_SERVICES.with(|services| {
@@ -1969,6 +1995,18 @@ impl<T: Task> Inner<T> {
                 }
                 TimerCommand::CancelTarget { pid } => {
                     service.wheel.cancel_target(pid);
+                }
+                TimerCommand::PauseTarget { pid } => {
+                    service.wheel.pause_target(pid, self.clock.now_ms());
+                }
+                TimerCommand::ResumeTarget { pid } => {
+                    let now = self.clock.now_ms();
+                    if !service.wheel.has_timers() {
+                        let _ = service.wheel.advance(now);
+                    }
+                    service.wheel.resume_target(pid, now, || {
+                        self.next_timer.fetch_add(1, Ordering::Relaxed)
+                    });
                 }
             }
         }
@@ -4023,6 +4061,19 @@ impl<T: Task> Scheduler<T> {
             None,
             true,
         )
+    }
+    /// Hold every BIF timer aimed at `pid` until [`Scheduler::resume_target_timers`]; used
+    /// while the process is suspended.
+    ///
+    /// Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers), OTP-29.1.1.
+    pub fn pause_target_timers(&self, pid: Pid) {
+        self.inner.broadcast_target_timers(pid, true);
+    }
+    /// Re-arm the timers held by [`Scheduler::pause_target_timers`] with their remaining time.
+    ///
+    /// Port of erts/emulator/beam/erl_hl_timer.c:2949 (erts_resume_paused_bif_timers), OTP-29.1.1.
+    pub fn resume_target_timers(&self, pid: Pid) {
+        self.inner.broadcast_target_timers(pid, false);
     }
     /// Cancel a pending timer and return its remaining milliseconds.
     pub fn cancel_timer(&self, reference: TimerRef) -> Option<u64> {

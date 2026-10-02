@@ -666,6 +666,13 @@ pub(super) fn build(
         &p.heap,
         depth,
     )?;
+    // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
+    let native_pc = p.cold.as_ref().map_or(0, |cold| cold.native_call_pc);
+    if native_pc != 0
+        && let Some(function) = crate::native_function_at(native_pc)
+    {
+        set_native_top(&mut raw, function, native_pc);
+    }
     build_saved(p, &mut raw)
 }
 

@@ -199,6 +199,8 @@ pub(crate) struct ProcessCold {
     /// Monitor message tag, owned off-heap. A tuple tag such as
     /// `{'ON_LOAD_DOWN', Mod}` must survive GC until the monitored process exits.
     pub(crate) monitor_tags: std::collections::BTreeMap<u64, arinsal_etf::OwnedTerm>,
+    /// Registered name of monitors created by name; their `DOWN` object is `{Name, Node}`.
+    pub(crate) monitor_names: std::collections::BTreeMap<u64, String>,
 }
 
 pub(crate) struct PersistentGetAll {

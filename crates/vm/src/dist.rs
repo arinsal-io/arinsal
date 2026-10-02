@@ -2759,7 +2759,7 @@ pub(crate) fn local_reg_name(target: Term) -> Result<Option<Term>, VmError> {
     Ok(Some(atom(&name)))
 }
 
-fn name_node_tuple(target: Term) -> Result<Option<(String, String)>, VmError> {
+pub(crate) fn name_node_tuple(target: Term) -> Result<Option<(String, String)>, VmError> {
     let owned = owned(target)?;
     let OwnedTerm::Tuple(ref parts) = owned else {
         return Ok(None);

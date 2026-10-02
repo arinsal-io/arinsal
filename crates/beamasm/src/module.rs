@@ -650,6 +650,21 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    /// `erlang:yield/0`: returns `true` after a context switch at the next instruction.
+    // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield) and
+    // erts/emulator/beam/jit/arm/instr_call.cpp (emit_i_yield), OTP-29.1.1.
+    pub fn emit_i_yield(&mut self) -> Result<(), ModuleError> {
+        let continuation = self.code.new_label();
+        let true_word = arinsal_term::Term::atom(arinsal_term::atoms::TRUE).tagged_word();
+        self.code.emit(|e| e.mov_const(XREGS[0], true_word))?;
+        self.code.adr(Gpr::x(8), continuation)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
+        self.emit_yield_live(1)?;
+        self.code.b(self.yield_label)?;
+        self.code.bind(continuation)?;
+        Ok(())
+    }
+
     fn emit_redundant_bridge_cp_pop(&mut self) -> Result<(), ModuleError> {
         let keep = self.code.new_label();
         let bridge = arinsal_enter_native_return as *const () as u64;
