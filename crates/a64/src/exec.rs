@@ -154,6 +154,8 @@ impl CodeMemory {
         };
 
         #[cfg(not(target_os = "macos"))]
+        // SAFETY: mmap creates a private mapping of mapped_size; its failure is checked,
+        // and mprotect makes the mapping executable before it is used.
         let ptr = unsafe {
             // Port of erts/emulator/beam/jit/beam_jit_main.cpp:206-235, OTP-29.1.1
             let prot = libc::PROT_READ | libc::PROT_WRITE;
