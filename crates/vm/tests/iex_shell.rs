@@ -60,10 +60,21 @@ fn run(args: &[&str], input: &str, path: String, cwd: Option<&Path>) -> Output {
 
 fn normalized(stdout: &[u8]) -> String {
     let text = String::from_utf8_lossy(stdout).replace("\r\n", "\n");
-    text.lines()
+    let mut lines = text
+        .lines()
         .filter(|line| !line.starts_with("Erlang/OTP "))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect::<Vec<_>>();
+    // erts itself races the final prompt against System.halt: an unterminated trailing
+    // `iex(N)> ` may or may not be printed, so it is not part of the compared output.
+    if lines.last().is_some_and(|line| {
+        line.strip_prefix("iex(")
+            .and_then(|rest| rest.strip_suffix(")> "))
+            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+    }) && !text.ends_with('\n')
+    {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 fn assert_success(output: &Output, label: &str) {
