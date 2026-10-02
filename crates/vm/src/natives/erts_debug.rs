@@ -1346,7 +1346,7 @@ fn internal_state_tuple_get(
         && name == "node_and_dist_references"
         && mode == "blocked"
     {
-        if !crate::natives::sys::multi_scheduling_blocked() {
+        if !crate::natives::sys::multi_scheduling_blocked(process) {
             return Err(badarg());
         }
         ctx.block_thread_progress(std::time::Duration::ZERO);

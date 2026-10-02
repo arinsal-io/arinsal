@@ -903,6 +903,7 @@ fn install_accepted(listen: &Arc<Sock>, fd: OwnedFd, caller: Pid, aref: u16) {
         runtime,
         handle,
         inner: Mutex::new(born),
+        io: Mutex::new(()),
     });
     registry().lock().unwrap().insert(id, sock);
     // Port of inet_drv.c:2514 (send_async_ok_port), OTP-29.1.1.
@@ -1986,6 +1987,13 @@ struct Sock {
     runtime: Arc<Runtime>,
     handle: Arc<PortHandle>,
     inner: Mutex<Inner>,
+    /// Serializes taking packets from the receive buffer with emitting them, which happens
+    /// after `inner` is released.
+    ///
+    /// Port of erts/emulator/beam/erl_port_task.c:1677 (erts_port_task_execute), OTP-29.1.1:
+    /// one thread at a time executes a port's tasks, so the packets a callback takes from
+    /// the receive buffer reach the owner (or `erts_net_message`) in buffer order.
+    io: Mutex<()>,
 }
 
 impl Sock {
@@ -1995,6 +2003,7 @@ impl Sock {
             runtime,
             handle,
             inner: Mutex::new(Inner::default()),
+            io: Mutex::new(()),
         }
     }
 }
@@ -2996,6 +3005,7 @@ fn deliver_pending_close(sock: &Arc<Sock>) {
 }
 
 fn satisfy(sock: &Arc<Sock>) {
+    let _io = sock.io.lock().unwrap_or_else(|poison| poison.into_inner());
     let (outs, abandon) = {
         let mut inner = sock.inner.lock().unwrap();
         let mut outs = Vec::new();

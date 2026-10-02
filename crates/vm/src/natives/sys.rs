@@ -1018,7 +1018,7 @@ fn system_info(
             )
         })),
         Some("max_heap_size") => Some(with_flags(|flags| max_heap_map(process, flags.max_heap))),
-        Some("multi_scheduling") => Some(with_flags(|flags| Ok(atom(flags.multi)))),
+        Some("multi_scheduling") => Some(Ok(atom(multi_scheduling_state(process).state()))),
         Some("cpu_topology") => Some(cpu_topology_info(process)),
         Some("scheduler_bind_type") => Some(Ok(atom("unbound"))),
         Some("scheduler_bindings") => Some(with_flags(|flags| {
@@ -2598,9 +2598,6 @@ struct SystemFlags {
     dirty_io_total: usize,
     trace_word: i64,
     outstanding: u64,
-    multi: &'static str,
-    multi_blocked: bool,
-    normal_blocked: bool,
 }
 
 pub(crate) struct GcSpawnDefaults {
@@ -2617,8 +2614,16 @@ pub(crate) fn gc_spawn_defaults() -> GcSpawnDefaults {
     })
 }
 
-pub(crate) fn multi_scheduling_blocked() -> bool {
-    with_flags(|flags| matches!(flags.multi, "blocked" | "blocked_normal"))
+pub(crate) fn multi_scheduling_blocked(process: &Process) -> bool {
+    multi_scheduling_state(process).any_blocked()
+}
+
+fn multi_scheduling_state(process: &Process) -> crate::process::MultiScheduling {
+    process
+        .runtime
+        .as_ref()
+        .map(|runtime| *runtime.multi_scheduling.lock().unwrap())
+        .unwrap_or_default()
 }
 
 pub(crate) fn normalize_spawn_heap_minimum(requested: Option<usize>, binary: bool) -> usize {
@@ -2664,9 +2669,6 @@ fn with_flags<T>(body: impl FnOnce(&mut SystemFlags) -> T) -> T {
             dirty_io_total,
             trace_word: 0,
             outstanding: (cpus as u64).saturating_mul(2),
-            multi: "enabled",
-            multi_blocked: false,
-            normal_blocked: false,
         })
     });
     body(&mut flags.lock().expect("system flags"))
@@ -2683,8 +2685,8 @@ pub(crate) fn dirty_scheduler_defaults() -> (usize, usize, usize) {
     })
 }
 
-pub(crate) fn scheduler_online_default() -> (usize, bool) {
-    with_flags(|flags| (flags.schedulers_online, flags.multi != "enabled"))
+pub(crate) fn scheduler_online_default() -> usize {
+    with_flags(|flags| flags.schedulers_online)
 }
 
 fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
@@ -2818,33 +2820,26 @@ fn multi_scheduling(
         Some("unblock_normal") => (None, Some(false)),
         _ => return Err(badarg()),
     };
-    with_flags(|flags| {
+    let apply = |state: &mut crate::process::MultiScheduling| {
         if let Some(blocked) = action.0 {
-            flags.multi_blocked = blocked;
+            state.blocked = blocked;
         }
         if let Some(blocked) = action.1 {
-            flags.normal_blocked = blocked;
+            state.normal_blocked = blocked;
         }
-        let next = if flags.multi_blocked {
-            "blocked"
-        } else if flags.normal_blocked {
-            "blocked_normal"
-        } else {
-            "enabled"
-        };
-        flags.multi = next;
-        if let Some(scheduler) = process
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.scheduler().ok())
-        {
-            scheduler.set_scheduling_blocked(
-                flags.multi_blocked || flags.normal_blocked,
-                ctx.worker_id(),
-            );
-        }
-        Ok(atom(next))
-    })
+    };
+    // An unscheduled evaluation has no runtime and no other scheduler to block.
+    let Some(runtime) = process.runtime.as_ref() else {
+        let mut state = crate::process::MultiScheduling::default();
+        apply(&mut state);
+        return Ok(atom(state.state()));
+    };
+    let mut state = runtime.multi_scheduling.lock().unwrap();
+    apply(&mut state);
+    if let Ok(scheduler) = runtime.scheduler() {
+        scheduler.set_scheduling_blocked(state.any_blocked(), ctx.worker_id());
+    }
+    Ok(atom(state.state()))
 }
 
 fn schedulers_online(process: &Process, value: Term, dirty: bool) -> Result<Term, VmError> {

@@ -940,3 +940,53 @@ gather(N) -> receive ok -> gather(N-1) after 5000 -> timeout end.
         .unwrap();
     assert_eq!(result.term, OwnedTerm::Atom("ok".into()));
 }
+
+/// A multi-scheduling block belongs to the runtime that set it. A runtime started
+/// while another runtime in the same OS process is blocked used to inherit the block
+/// with no blocking scheduler, so every worker parked and the entry never ran.
+#[test]
+fn multi_scheduling_block_does_not_leak_into_new_runtimes() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping multi-scheduling isolation test");
+        return;
+    };
+    let source = r#"
+-module(msb_isolation).
+-export([block/0, fresh/0]).
+block() -> erlang:system_flag(multi_scheduling, block_normal).
+fresh() ->
+    Parent = self(),
+    Pids = [spawn(fun() -> Parent ! {self(), erlang:system_info(multi_scheduling)} end)
+            || _ <- lists:seq(1, 8)],
+    States = [receive {Pid, State} -> State after 5000 -> timeout end || Pid <- Pids],
+    {erlang:system_info(multi_scheduling), lists:usort(States)}.
+"#;
+    let beam = reference
+        .compile_named("msb_isolation", source, &[])
+        .unwrap();
+    reference.load("msb_isolation", &beam).unwrap();
+    let expected = reference.call("msb_isolation", "fresh", &[]);
+
+    let mut blocker = Vm::new([]);
+    blocker.load_bytes(&beam).unwrap();
+    let blocked = blocker
+        .eval_scheduled("msb_isolation", "block", &[], 2, None)
+        .unwrap();
+    assert_eq!(blocked.term, OwnedTerm::Atom("blocked_normal".into()));
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let fresh_beam = beam.clone();
+    std::thread::spawn(move || {
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&fresh_beam).unwrap();
+        let result = vm
+            .eval_scheduled("msb_isolation", "fresh", &[], 2, None)
+            .map(|result| result.term);
+        let _ = sender.send(result);
+    });
+    let actual = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("runtime started after another runtime blocked multi-scheduling hung");
+    assert_eq!(expected, CallResult::Ok(actual.unwrap()));
+    drop(blocker);
+}

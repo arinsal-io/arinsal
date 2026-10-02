@@ -826,6 +826,11 @@ struct ProgressGuard {
     active: bool,
 }
 
+thread_local! {
+    /// Thread progress this thread currently holds active, for waits deep in the scheduler.
+    static ACTIVE_PROGRESS: RefCell<Option<Arc<ThreadProgress>>> = const { RefCell::new(None) };
+}
+
 impl ThreadProgress {
     fn enter(progress: Arc<Self>) -> ProgressGuard {
         let mut state = progress.state.lock().unwrap();
@@ -833,11 +838,41 @@ impl ThreadProgress {
             state = progress.changed.wait(state).unwrap();
         }
         state.active += 1;
+        drop(state);
+        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(Arc::clone(&progress)));
         ProgressGuard {
-            progress: Arc::clone(&progress),
+            progress,
             active: true,
         }
     }
+}
+
+/// Run a blocking wait on another thread without holding back thread progress.
+///
+/// Port of erts/emulator/beam/erl_thr_progress.c:884 (erts_thr_progress_prepare_wait) and
+/// :913 (erts_thr_progress_finalize_wait), OTP-29.1.1: a managed thread that waits stops
+/// counting as active, so a thread blocking thread progress never waits for a thread that
+/// in turn waits for it. Without this, `block_for` on one scheduler and a cross-scheduler
+/// request from another (statistics, timer commands) deadlock with every scheduler parked.
+fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
+    let Some(progress) = ACTIVE_PROGRESS.with(|active| active.borrow_mut().take()) else {
+        return wait();
+    };
+    {
+        let mut state = progress.state.lock().unwrap();
+        state.active -= 1;
+        progress.changed.notify_all();
+    }
+    let result = wait();
+    {
+        let mut state = progress.state.lock().unwrap();
+        while state.blocked {
+            state = progress.changed.wait(state).unwrap();
+        }
+        state.active += 1;
+    }
+    ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(progress));
+    result
 }
 
 impl ProgressGuard {
@@ -867,6 +902,7 @@ impl ProgressGuard {
 
 impl Drop for ProgressGuard {
     fn drop(&mut self) {
+        ACTIVE_PROGRESS.with(|active| active.borrow_mut().take());
         if self.active {
             let mut state = self.progress.state.lock().unwrap();
             state.active -= 1;
@@ -1556,7 +1592,25 @@ impl<T: Task> Inner<T> {
             let (reply, receive) = mpsc::channel();
             self.stats_requests[worker].push(reply);
             self.wake_worker(worker);
-            snapshots.push(receive.recv().unwrap_or_default());
+            // Two schedulers collecting statistics at once wait on each other, so the
+            // waiting scheduler keeps answering requests addressed to it.
+            let snapshot = progress_wait(|| {
+                loop {
+                    if let Some(local) = current {
+                        while let Some(request) = self.stats_requests[local.worker_id].pop() {
+                            let _ = request.send(
+                                local.stats_snapshot(local.msacc_enabled, local.wall_enabled),
+                            );
+                        }
+                    }
+                    match receive.recv_timeout(Duration::from_millis(1)) {
+                        Ok(snapshot) => break snapshot,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break Default::default(),
+                    }
+                }
+            });
+            snapshots.push(snapshot);
         }
         let mut counts: Vec<u64> = self
             .worker_counts
@@ -2233,7 +2287,7 @@ impl<T: Task> Inner<T> {
                 reply,
             });
             self.wake_worker(worker);
-            let _ = receiver.recv();
+            let _ = progress_wait(|| receiver.recv());
         } else {
             return Err(Error::NoProcess);
         }
@@ -2274,7 +2328,7 @@ impl<T: Task> Inner<T> {
         // request), OTP-29.1.1. The owner drains its cancellation queue before
         // invoking this scheduling-point callback.
         self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
-        receiver.recv().ok().flatten()
+        progress_wait(|| receiver.recv()).ok().flatten()
     }
 
     fn cancel_timer_async(
@@ -2343,7 +2397,7 @@ impl<T: Task> Inner<T> {
             callback: None,
         });
         self.wake_worker(reference.worker);
-        receiver.recv().ok().flatten()
+        progress_wait(|| receiver.recv()).ok().flatten()
     }
 
     fn read_timer_async(&self, reference: TimerRef, callback: Box<dyn FnOnce(Option<u64>) + Send>) {

@@ -658,3 +658,69 @@ fn simulation_replays_batched_multi_recipient_delivery() {
         assert_eq!(run(), first);
     }
 }
+
+/// One scheduler blocks thread progress while another collects scheduler statistics,
+/// which waits for every other scheduler. The collector must not hold thread progress
+/// while it waits, or both schedulers wait for each other forever.
+struct ProgressRacer {
+    blocker: bool,
+    rounds: Arc<AtomicUsize>,
+    bound: bool,
+}
+
+impl Task for ProgressRacer {
+    type Message = u32;
+    fn run(&mut self, ctx: &mut RunCtx<u32>, _: u32) -> RunOutcome {
+        if !self.bound {
+            self.bound = true;
+            ctx.bind_scheduler(if self.blocker { 1 } else { 2 });
+            return RunOutcome::Yield;
+        }
+        for _ in 0..50 {
+            if self.blocker {
+                ctx.block_thread_progress(Duration::ZERO);
+            } else {
+                let _ = ctx.scheduler_stats();
+            }
+        }
+        if self.rounds.fetch_add(1, Ordering::AcqRel) + 1 >= 400 {
+            RunOutcome::Exit(0)
+        } else {
+            RunOutcome::Yield
+        }
+    }
+}
+
+#[test]
+fn thread_progress_block_and_statistics_do_not_deadlock() {
+    let sched = Scheduler::new(Config {
+        workers: 2,
+        max_processes: 16,
+        ..Config::default()
+    });
+    let blocker_rounds = Arc::new(AtomicUsize::new(0));
+    let stats_rounds = Arc::new(AtomicUsize::new(0));
+    for (blocker, rounds) in [(true, &blocker_rounds), (false, &stats_rounds)] {
+        sched
+            .spawn(ProgressRacer {
+                blocker,
+                rounds: Arc::clone(rounds),
+                bound: false,
+            })
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while blocker_rounds.load(Ordering::Acquire) < 400 || stats_rounds.load(Ordering::Acquire) < 400
+    {
+        if Instant::now() >= deadline {
+            let rounds = (
+                blocker_rounds.load(Ordering::Acquire),
+                stats_rounds.load(Ordering::Acquire),
+            );
+            // Deadlocked workers never finish, so dropping the scheduler would hang too.
+            std::mem::forget(sched);
+            panic!("thread progress deadlock after (blocker, stats) rounds {rounds:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

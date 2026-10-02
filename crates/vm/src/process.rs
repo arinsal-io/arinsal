@@ -744,6 +744,37 @@ pub(crate) struct Runtime {
     pub(crate) max_heaps: Mutex<HashMap<Pid, MaxHeap>>,
     pub(crate) ever_max_heap: AtomicBool,
     pub(crate) debug_wait_active: AtomicBool,
+    /// Multi-scheduling block state of this runtime.
+    pub(crate) multi_scheduling: Mutex<MultiScheduling>,
+}
+
+/// `erlang:system_flag(multi_scheduling, _)` state of one runtime.
+///
+/// Port of erts/emulator/beam/erl_process.c:8484 (erts_block_multi_scheduling,
+/// `schdlr_sspnd.msb` / `schdlr_sspnd.nmsb`), OTP-29.1.1. erts keeps this in the
+/// runtime's scheduler suspend state, so a runtime always boots with multi-scheduling
+/// enabled; it is never inherited from another runtime sharing the OS process.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MultiScheduling {
+    pub(crate) blocked: bool,
+    pub(crate) normal_blocked: bool,
+}
+
+impl MultiScheduling {
+    /// Port of erts/emulator/beam/erl_bif_info.c (system_info(multi_scheduling)), OTP-29.1.1.
+    pub(crate) fn state(self) -> &'static str {
+        if self.blocked {
+            "blocked"
+        } else if self.normal_blocked {
+            "blocked_normal"
+        } else {
+            "enabled"
+        }
+    }
+
+    pub(crate) fn any_blocked(self) -> bool {
+        self.blocked || self.normal_blocked
+    }
 }
 
 impl Runtime {
@@ -4929,6 +4960,7 @@ impl Vm {
             max_heaps: Mutex::new(HashMap::new()),
             ever_max_heap: AtomicBool::new(false),
             debug_wait_active: AtomicBool::new(false),
+            multi_scheduling: Mutex::new(MultiScheduling::default()),
         });
         let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
             crate::natives::sys::dirty_scheduler_defaults();
@@ -4943,10 +4975,9 @@ impl Vm {
             Some(seed) => Scheduler::simulation(config, seed),
             None => Scheduler::new(config),
         });
-        let (online, blocked) = crate::natives::sys::scheduler_online_default();
+        let online = crate::natives::sys::scheduler_online_default();
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
         let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
-        scheduler.set_scheduling_blocked(blocked, None);
         *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
         if module == "erl_init" && function == "start" {
             // Port of erts/emulator/beam/erl_init.c:2550 (erl_system_process_otp
