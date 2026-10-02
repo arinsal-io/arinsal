@@ -504,9 +504,6 @@ pub(crate) fn call_event(
     }
     let mut actions = Vec::new();
     for pattern in patterns {
-        if pattern.paused {
-            continue;
-        }
         let flags = session_flags(process, pattern.session, pid);
         let mut extra = None;
         let mut return_trace = false;
@@ -2236,24 +2233,20 @@ mod tests {
                 generation: 1,
             }),
         );
-        assert!(!crate::trace_bp::set(
+        crate::trace_bp::set_trace_pattern(
             &process,
             session.0,
-            "trace_test".into(),
-            "function".into(),
-            Some(0),
-            Some(crate::trace_bp::Pattern {
-                session: session.0,
-                flags: vec!["global".into()],
-                match_spec: None,
-                meta: None,
-                count: 0,
-                paused: false,
-                seq: 0,
-                off: false,
-            }),
-        ));
-        assert!(
+            &[crate::trace_bp::BpFunction {
+                module: "trace_test".into(),
+                function: "function".into(),
+                arity: 0,
+                exported: true,
+            }],
+            None,
+            crate::trace_bp::BreakOp::Set,
+            crate::trace_bp::TracePatternFlags::default(),
+        );
+        assert_eq!(
             crate::trace_bp::info_session(
                 &process,
                 session.0,
@@ -2261,8 +2254,8 @@ mod tests {
                 "function",
                 0,
                 "traced"
-            )
-            .is_some()
+            ),
+            Some(arinsal_etf::OwnedTerm::Atom("global".into()))
         );
         assert!(destroy_session(&process, session.0));
         crate::trace_bp::clear_session(&process, session.0);

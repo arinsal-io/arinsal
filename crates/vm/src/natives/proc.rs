@@ -3411,65 +3411,82 @@ fn trace_pattern(
             "meta tracing requires the tracer callback hook".into(),
         ));
     }
+    // Port of erts/emulator/beam/erl_bif_trace.c:334-475 (trace_pattern), OTP-29.1.1.
+    let flags = crate::trace_bp::TracePatternFlags {
+        breakpoint: names.iter().any(|name| name != "global"),
+        local: names.iter().any(|name| name == "local"),
+        meta: names.iter().any(|name| name == "meta"),
+        call_count: names.iter().any(|name| name == "call_count"),
+    };
     let mut match_spec = None;
-    if pattern == atom("false") {
-        crate::trace_bp::set(
-            process,
-            session,
-            module.clone(),
-            function.clone(),
-            arity,
-            None,
-        );
-        vm.refresh_trace_pattern(process, &module, &function, arity);
-    } else if pattern == atom("pause") || pattern == atom("restart") {
-        crate::trace_bp::pause(
-            process,
-            session,
-            &module,
-            &function,
-            arity,
-            pattern == atom("pause"),
-        );
+    let on = if pattern == atom("false") {
+        crate::trace_bp::BreakOp::Nop
+    } else if pattern == atom("true") || pattern == Term::NIL {
+        crate::trace_bp::BreakOp::Set
+    } else if pattern == atom("restart") {
+        crate::trace_bp::BreakOp::Restart
+    } else if pattern == atom("pause") {
+        crate::trace_bp::BreakOp::Pause
     } else {
-        if pattern != atom("true") && pattern != Term::NIL {
-            compile_trace_pattern(pattern, None)?;
-            let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
-            if let Some(message) = unsupported_trace_action(&owned) {
-                return Err(VmError::Unsupported(message.into()));
-            }
-            match_spec = Some(owned);
+        compile_trace_pattern(pattern, None)?;
+        let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
+        if let Some(message) = unsupported_trace_action(&owned) {
+            return Err(VmError::Unsupported(message.into()));
         }
-        let count_flag = names.iter().any(|name| name == "call_count");
-        if count_flag
-            && match_spec.is_some()
-            && !names.iter().any(|name| name == "local" || name == "meta")
-        {
-            return Err(badarg());
-        }
-        let count = matched_functions(vm, &module, &function, arity);
-        crate::trace_bp::set(
-            process,
-            session,
-            module.clone(),
-            function.clone(),
-            arity,
-            Some(crate::trace_bp::Pattern {
-                session,
-                flags: names,
-                match_spec,
-                meta,
-                count: 0,
-                paused: false,
-                seq: 0,
-                off: false,
-            }),
-        );
-        vm.refresh_trace_pattern(process, &module, &function, arity);
-        return Term::small(count as i64).ok_or_else(badarg);
+        match_spec = Some(owned);
+        crate::trace_bp::BreakOp::Set
+    };
+    if match_spec.is_some() && !flags.local && !flags.meta && flags.call_count {
+        return Err(badarg());
     }
-    let count = matched_functions(vm, &module, &function, arity);
+    let functions = bp_functions(vm, &module, &function, arity);
+    crate::trace_bp::set_trace_pattern(process, session, &functions, match_spec, on, flags);
+    vm.refresh_trace_pattern(process, &module, &function, arity);
+    // Port of erts/emulator/beam/erl_bif_trace.c:2712-2716, OTP-29.1.1: breakpoints count the
+    // matched functions, global tracing the matched export entries.
+    let count = if flags.breakpoint {
+        functions.len()
+    } else {
+        functions
+            .iter()
+            .filter(|function| function.exported)
+            .count()
+    };
     Term::small(count as i64).ok_or_else(badarg)
+}
+
+/// The functions of the current code of the selected modules.
+// Port of erts/emulator/beam/beam_bp.c:183-260 (erts_bp_match_functions), OTP-29.1.1.
+pub(crate) fn bp_functions(
+    vm: &Vm,
+    module: &str,
+    function: &str,
+    arity: Option<u8>,
+) -> Vec<crate::trace_bp::BpFunction> {
+    vm.modules
+        .iter()
+        .enumerate()
+        .filter(|(id, loaded)| {
+            (module == "_" || loaded.name == module) && vm.loaded.get(&loaded.name) == Some(id)
+        })
+        .flat_map(|(_, loaded)| {
+            loaded
+                .functions
+                .iter()
+                .filter(|(_, name, n)| {
+                    (function == "_" || *name == function) && arity.is_none_or(|a| a == *n)
+                })
+                .map(|(_, name, n)| crate::trace_bp::BpFunction {
+                    module: loaded.name.clone(),
+                    function: name.clone(),
+                    arity: *n,
+                    exported: loaded
+                        .exports
+                        .iter()
+                        .any(|export| export.function == *name && export.arity == *n),
+                })
+        })
+        .collect()
 }
 
 fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {

@@ -427,23 +427,21 @@ fn apply_on_load_patterns(vm: &mut Vm, process: &Process, name: &str) {
     if patterns.is_empty() {
         return;
     }
+    let functions = crate::natives::proc::bp_functions(vm, name, "_", None);
     for (session, on_load) in patterns {
-        crate::trace_bp::set(
+        let flags = crate::trace_bp::TracePatternFlags {
+            breakpoint: !on_load.flags.is_empty(),
+            local: on_load.flags.iter().any(|flag| flag == "local"),
+            meta: on_load.flags.iter().any(|flag| flag == "meta"),
+            call_count: on_load.flags.iter().any(|flag| flag == "call_count"),
+        };
+        crate::trace_bp::set_trace_pattern(
             process,
             session,
-            name.to_owned(),
-            "_".to_owned(),
-            None,
-            Some(crate::trace_bp::Pattern {
-                session,
-                flags: on_load.flags,
-                match_spec: on_load.match_spec,
-                meta: None,
-                count: 0,
-                paused: false,
-                seq: 0,
-                off: false,
-            }),
+            &functions,
+            on_load.match_spec,
+            crate::trace_bp::BreakOp::Set,
+            flags,
         );
     }
     vm.refresh_trace_pattern(process, name, "_", None);

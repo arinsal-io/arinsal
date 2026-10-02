@@ -1,121 +1,110 @@
-//! Function call trace patterns and call counters.
+//! Function call trace breakpoints and call counters.
+//!
+//! Port of the per-function breakpoint data of erts/emulator/beam/beam_bp.c (GenericBp,
+//! GenericBpData), OTP-29.1.1: `trace_pattern` writes breakpoint data into every matched
+//! function, so a traced call finds its data with one lookup, independent of how many
+//! patterns were set.
 
 use crate::Process;
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::Pid;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-#[derive(Clone)]
-pub(crate) struct Pattern {
-    pub(crate) session: u64,
-    pub(crate) flags: Vec<String>,
-    pub(crate) match_spec: Option<OwnedTerm>,
-    pub(crate) meta: Option<OwnedTerm>,
-    pub(crate) count: u64,
-    pub(crate) paused: bool,
-    /// Write order; the newest pattern covering a function decides its state.
-    pub(crate) seq: u64,
-    /// Marks a `false` pattern that overrides older wildcard patterns.
-    pub(crate) off: bool,
+// Port of erts/emulator/beam/beam_bp.c:55-66 (ERTS_BPF_*), OTP-29.1.1. Call time, call memory
+// and debug breakpoints are not stored here: the first two are not supported, debug
+// breakpoints live in `debug_breakpoints`.
+const BPF_LOCAL_TRACE: u32 = 0x01;
+const BPF_META_TRACE: u32 = 0x02;
+const BPF_COUNT: u32 = 0x04;
+const BPF_COUNT_ACTIVE: u32 = 0x08;
+const BPF_GLOBAL_TRACE: u32 = 0x80;
+const BPF_ALL: u32 = 0x3FF;
+
+/// Port of erts/emulator/beam/beam_bp.h:104-109 (enum erts_break_op), OTP-29.1.1.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakOp {
+    Nop,
+    Set,
+    Restart,
+    Pause,
 }
 
-type Key = (usize, u64, String, String, Option<u8>);
-
-fn covers(spec: (&str, &str, Option<u8>), module: &str, function: &str, arity: Option<u8>) -> bool {
-    (spec.0 == "_" || spec.0 == module)
-        && (spec.1 == "_" || spec.1 == function)
-        && spec.2.is_none_or(|a| Some(a) == arity)
+/// Port of erts/emulator/beam/erl_bif_trace.c (struct trace_pattern_flags), OTP-29.1.1.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TracePatternFlags {
+    /// Any of the flags below: a code breakpoint rather than export (global) tracing.
+    pub(crate) breakpoint: bool,
+    pub(crate) local: bool,
+    pub(crate) meta: bool,
+    pub(crate) call_count: bool,
 }
 
-fn overlaps(a: (&str, &str, Option<u8>), b: (&str, &str, Option<u8>)) -> bool {
-    (a.0 == "_" || b.0 == "_" || a.0 == b.0)
-        && (a.1 == "_" || b.1 == "_" || a.1 == b.1)
-        && (a.2.is_none() || b.2.is_none() || a.2 == b.2)
+/// A function matched by a trace pattern (erts BpFunction).
+pub(crate) struct BpFunction {
+    pub(crate) module: String,
+    pub(crate) function: String,
+    pub(crate) arity: u8,
+    /// Has an export entry, which is where global call tracing lives.
+    pub(crate) exported: bool,
 }
 
-/// Per session, the newest pattern covering the function, unless it disables tracing.
-/// Port of the per-function breakpoint state of erts/emulator/beam/beam_bp.c, OTP-29.1.1.
-fn winners<'a>(
-    entries: &'a HashMap<Key, Pattern>,
+/// Port of erts/emulator/beam/beam_bp.h:75-83 (GenericBpData), OTP-29.1.1.
+#[derive(Clone, Default)]
+struct GenericBpData {
+    flags: u32,
+    local_ms: Option<Arc<OwnedTerm>>,
+    meta_ms: Option<Arc<OwnedTerm>>,
+    count: Option<Arc<AtomicU64>>,
+}
+
+/// Port of erts/emulator/beam/beam_bp.h:85-94 (GenericBp), OTP-29.1.1: one per trace session
+/// and function. Runtime and code scope tag the VM instance the function belongs to.
+struct GenericBp {
     runtime: usize,
     code: u64,
-    session: Option<u64>,
+    session: u64,
+    data: [GenericBpData; 2],
+}
+
+/// The breakpoints of one function, by module, name and arity; borrowed-key lookups keep the
+/// traced call path allocation free.
+type BpTable = HashMap<String, HashMap<String, HashMap<u8, Vec<GenericBp>>>>;
+
+fn breakpoints() -> &'static RwLock<BpTable> {
+    static TABLE: OnceLock<RwLock<BpTable>> = OnceLock::new();
+    TABLE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Port of erts/emulator/beam/beam_bp.h:230-238 (erts_active_bp_ix, erts_staging_bp_ix),
+/// OTP-29.1.1. Only changed with the table write lock held.
+static ACTIVE_BP_IX: AtomicUsize = AtomicUsize::new(0);
+
+fn active_bp_ix() -> usize {
+    ACTIVE_BP_IX.load(Ordering::Acquire)
+}
+
+fn staging_bp_ix() -> usize {
+    active_bp_ix() ^ 1
+}
+
+/// The breakpoints of one function in this VM, any session.
+fn function_bps<'a>(
+    table: &'a BpTable,
+    runtime: usize,
+    code: u64,
     module: &str,
     function: &str,
     arity: u8,
-) -> Vec<(&'a Key, &'a Pattern)> {
-    let mut best: HashMap<u64, (&Key, &Pattern)> = HashMap::new();
-    let cutoff = module_cutoff(code, module);
-    for (key, pattern) in entries {
-        if key.0 != runtime
-            || pattern.seq < cutoff
-            || session.is_some_and(|wanted| wanted != key.1)
-            || !covers((&key.2, &key.3, key.4), module, function, Some(arity))
-        {
-            continue;
-        }
-        let slot = best.entry(key.1).or_insert((key, pattern));
-        if pattern.seq > slot.1.seq {
-            *slot = (key, pattern);
-        }
-    }
-    best.into_values()
-        .filter(|(_, pattern)| !pattern.off)
-        .collect()
-}
-
-/// Memo of `winners` over all sessions per function. Every call into a traced function asks for
-/// it several times and the pattern table can hold thousands of entries (a session tracing all
-/// exports), so scanning per call starves the traced process. Cleared (while the pattern table
-/// lock is held) by everything that changes the table or the module cutoffs.
-type WinnerCache = HashMap<(usize, u64, u8, String, String), Vec<Key>>;
-
-fn winner_cache() -> &'static Mutex<WinnerCache> {
-    static CACHE: OnceLock<Mutex<WinnerCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn invalidate_winners() {
-    winner_cache().lock().unwrap().clear();
-}
-
-fn winners_all<'a>(
-    entries: &'a HashMap<Key, Pattern>,
-    runtime: usize,
-    code: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> Vec<(&'a Key, &'a Pattern)> {
-    let probe = (runtime, code, arity, module.to_owned(), function.to_owned());
-    if let Some(keys) = winner_cache().lock().unwrap().get(&probe) {
-        return keys
-            .iter()
-            .filter_map(|key| entries.get_key_value(key))
-            .collect();
-    }
-    let found = winners(entries, runtime, code, None, module, function, arity);
-    let keys = found.iter().map(|(key, _)| (*key).clone()).collect();
-    winner_cache().lock().unwrap().insert(probe, keys);
-    found
-}
-
-static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-fn cutoffs() -> &'static Mutex<HashMap<(u64, String), u64>> {
-    static CUTOFFS: OnceLock<Mutex<HashMap<(u64, String), u64>>> = OnceLock::new();
-    CUTOFFS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn module_cutoff(code: u64, module: &str) -> u64 {
-    cutoffs()
-        .lock()
-        .unwrap()
-        .get(&(code, module.to_owned()))
-        .copied()
-        .unwrap_or(0)
+) -> impl Iterator<Item = &'a GenericBp> {
+    table
+        .get(module)
+        .and_then(|functions| functions.get(function))
+        .and_then(|arities| arities.get(&arity))
+        .into_iter()
+        .flatten()
+        .filter(move |g| g.runtime == runtime && g.code == code)
 }
 
 fn code_scope(process: &Process) -> u64 {
@@ -125,18 +114,534 @@ fn code_scope(process: &Process) -> u64 {
         .map_or(0, |runtime| runtime.code_scope)
 }
 
-/// Breakpoints belong to a code instance: a patterns set before a module was
-/// loaded, upgraded or deleted never applies to the module's later code.
-// Port of erts/emulator/beam/beam_bif_load.c:470-480 and 714-720
-// (erts_clear_module_break on finish_loading / delete_module), OTP-29.1.1.
+fn update_active(table: &BpTable) {
+    active().store(
+        table
+            .values()
+            .flat_map(|functions| functions.values())
+            .flat_map(|arities| arities.values())
+            .any(|bps| !bps.is_empty()),
+        Ordering::Relaxed,
+    );
+}
+
+/// Breakpoints belong to a code instance: breakpoints set before a module was loaded,
+/// upgraded or deleted never apply to the module's later code.
+// Port of erts/emulator/beam/beam_bp.c:854-900 (erts_clear_module_break), called from
+// erts/emulator/beam/beam_bif_load.c:470-480 and 714-720, OTP-29.1.1.
 pub(crate) fn module_code_changed(code: u64, module: &str) {
-    let _entries = patterns().lock().unwrap();
-    let seq = SEQUENCE.load(Ordering::Relaxed);
-    cutoffs()
+    let mut table = breakpoints().write().unwrap();
+    if let Some(functions) = table.get_mut(module) {
+        for bps in functions
+            .values_mut()
+            .flat_map(|arities| arities.values_mut())
+        {
+            bps.retain(|g| g.code != code);
+        }
+        functions.retain(|_, arities| {
+            arities.retain(|_, bps| !bps.is_empty());
+            !arities.is_empty()
+        });
+        if functions.is_empty() {
+            table.remove(module);
+        }
+    }
+    update_active(&table);
+}
+
+/// Port of erts/emulator/beam/beam_bp.c (set_function_break), OTP-29.1.1, for the staging
+/// copy of one session's breakpoint of one function.
+fn set_function_break(
+    bps: &mut Vec<GenericBp>,
+    tag: (usize, u64, u64),
+    match_spec: Option<&Arc<OwnedTerm>>,
+    break_flags: u32,
+    count_op: BreakOp,
+) {
+    let ix = staging_bp_ix();
+    let (runtime, code, session) = tag;
+    let position = bps
+        .iter()
+        .position(|g| g.runtime == runtime && g.code == code && g.session == session);
+    // Global trace lives in the export entry's own GenericBp in erts: a code breakpoint exists
+    // only while some code breakpoint flag is staged.
+    let exists = position.is_some_and(|index| {
+        break_flags == BPF_GLOBAL_TRACE || bps[index].data[ix].flags & !BPF_GLOBAL_TRACE != 0
+    });
+    if !exists && matches!(count_op, BreakOp::Restart | BreakOp::Pause) {
+        // Do not insert a new breakpoint.
+        return;
+    }
+    let index = match position {
+        Some(index) => index,
+        None => {
+            bps.push(GenericBp {
+                runtime,
+                code,
+                session,
+                data: Default::default(),
+            });
+            bps.len() - 1
+        }
+    };
+    let bp = &mut bps[index].data[ix];
+    let common = break_flags & bp.flags;
+    if common & BPF_COUNT != 0 {
+        if count_op == BreakOp::Pause {
+            bp.flags &= !BPF_COUNT_ACTIVE;
+        } else {
+            bp.flags |= BPF_COUNT_ACTIVE;
+            if let Some(count) = &bp.count {
+                count.store(0, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
+    if break_flags & (BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE) != 0 {
+        bp.local_ms = match_spec.cloned();
+    } else if break_flags & BPF_META_TRACE != 0 {
+        bp.meta_ms = match_spec.cloned();
+    } else if break_flags & BPF_COUNT != 0 {
+        bp.count = Some(Arc::new(AtomicU64::new(0)));
+    }
+    bp.flags |= break_flags;
+}
+
+/// Port of erts/emulator/beam/beam_bp.c (clear_function_break_session), OTP-29.1.1.
+fn clear_function_break(bps: &mut [GenericBp], tag: (usize, u64, u64), break_flags: u32) {
+    let ix = staging_bp_ix();
+    let (runtime, code, session) = tag;
+    let Some(g) = bps
+        .iter_mut()
+        .find(|g| g.runtime == runtime && g.code == code && g.session == session)
+    else {
+        return;
+    };
+    let bp = &mut g.data[ix];
+    let common = bp.flags & break_flags;
+    if common == 0 {
+        return;
+    }
+    bp.flags &= !break_flags;
+    if common & (BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE) != 0 {
+        bp.local_ms = None;
+    }
+    if common & BPF_META_TRACE != 0 {
+        bp.meta_ms = None;
+    }
+    if common & BPF_COUNT != 0 {
+        bp.count = None;
+    }
+}
+
+/// Copy the active data to the staging area and unlink disabled breakpoints after a commit.
+// Port of erts/emulator/beam/beam_bp.c:443-560 (consolidate_bp_data,
+// consolidate_bp_data_session), OTP-29.1.1.
+fn consolidate_bp_data(bps: &mut Vec<GenericBp>) {
+    let (active, staging) = (active_bp_ix(), staging_bp_ix());
+    for g in bps.iter_mut() {
+        g.data[staging] = g.data[active].clone();
+    }
+    bps.retain(|g| g.data[active].flags != 0);
+}
+
+fn function_entry<'a>(
+    table: &'a mut BpTable,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> &'a mut Vec<GenericBp> {
+    table
+        .entry(module.to_owned())
+        .or_default()
+        .entry(function.to_owned())
+        .or_default()
+        .entry(arity)
+        .or_default()
+}
+
+/// Commit the staged breakpoints of the given functions and consolidate them.
+// Port of erts/emulator/beam/beam_bp.c:562-569 (erts_commit_staged_bp) and the consolidation
+// step of erts/emulator/beam/erl_bif_trace.c (erts_finish_breakpointing), OTP-29.1.1.
+fn commit_and_consolidate(table: &mut BpTable, functions: &[BpFunction]) {
+    ACTIVE_BP_IX.store(staging_bp_ix(), Ordering::Release);
+    for function in functions {
+        let Some(arities) = table
+            .get_mut(&function.module)
+            .and_then(|functions| functions.get_mut(&function.function))
+        else {
+            continue;
+        };
+        if let Some(bps) = arities.get_mut(&function.arity) {
+            consolidate_bp_data(bps);
+            if bps.is_empty() {
+                arities.remove(&function.arity);
+            }
+        }
+        if arities.is_empty() {
+            let functions = table.get_mut(&function.module).unwrap();
+            functions.remove(&function.function);
+            if functions.is_empty() {
+                table.remove(&function.module);
+            }
+        }
+    }
+    update_active(table);
+}
+
+/// Set or clear the breakpoints of one session in the matched functions.
+// Port of erts/emulator/beam/erl_bif_trace.c:2621-2725 (erts_set_trace_pattern), OTP-29.1.1.
+pub(crate) fn set_trace_pattern(
+    process: &Process,
+    session: u64,
+    functions: &[BpFunction],
+    match_spec: Option<OwnedTerm>,
+    on: BreakOp,
+    flags: TracePatternFlags,
+) {
+    let tag = (scope(process), code_scope(process), session);
+    let match_spec = match_spec.map(Arc::new);
+    let mut table = breakpoints().write().unwrap();
+    // First the code breakpoints ("local" tracing).
+    for function in functions {
+        let bps = function_entry(
+            &mut table,
+            &function.module,
+            &function.function,
+            function.arity,
+        );
+        if on != BreakOp::Nop {
+            if !flags.breakpoint {
+                clear_function_break(bps, tag, BPF_ALL & !BPF_GLOBAL_TRACE);
+            } else {
+                if flags.local {
+                    set_function_break(
+                        bps,
+                        tag,
+                        match_spec.as_ref(),
+                        BPF_LOCAL_TRACE,
+                        BreakOp::Nop,
+                    );
+                }
+                if flags.meta {
+                    set_function_break(bps, tag, match_spec.as_ref(), BPF_META_TRACE, BreakOp::Nop);
+                }
+                if flags.call_count {
+                    set_function_break(bps, tag, None, BPF_COUNT | BPF_COUNT_ACTIVE, on);
+                }
+            }
+        } else {
+            if flags.local {
+                clear_function_break(bps, tag, BPF_LOCAL_TRACE);
+            }
+            if flags.meta {
+                clear_function_break(bps, tag, BPF_META_TRACE);
+            }
+            if flags.call_count {
+                clear_function_break(bps, tag, BPF_COUNT | BPF_COUNT_ACTIVE);
+            }
+        }
+    }
+    // Then the export entries, once the code breakpoints are set.
+    for function in functions.iter().filter(|function| function.exported) {
+        let bps = function_entry(
+            &mut table,
+            &function.module,
+            &function.function,
+            function.arity,
+        );
+        if on != BreakOp::Nop && !flags.breakpoint {
+            set_function_break(
+                bps,
+                tag,
+                match_spec.as_ref(),
+                BPF_GLOBAL_TRACE,
+                BreakOp::Nop,
+            );
+        } else if on == BreakOp::Nop && flags.breakpoint {
+            // Turning off breakpoint tracing leaves global tracing alone.
+        } else {
+            // Turn off global tracing, explicitly or before turning on breakpoint tracing.
+            clear_function_break(bps, tag, BPF_GLOBAL_TRACE);
+        }
+    }
+    commit_and_consolidate(&mut table, functions);
+}
+
+/// Remove all breakpoints owned by a destroyed trace session.
+// Port of erts/emulator/beam/erl_bif_trace.c:2727-2760 (prepare_clear_all_trace_pattern) and
+// 1352-1375, OTP-29.1.1.
+pub(crate) fn clear_session(process: &Process, session: u64) {
+    let runtime = scope(process);
+    let mut table = breakpoints().write().unwrap();
+    table.retain(|_, functions| {
+        functions.retain(|_, arities| {
+            arities.retain(|_, bps| {
+                bps.retain(|g| g.runtime != runtime || g.session != session);
+                !bps.is_empty()
+            });
+            !arities.is_empty()
+        });
+        !functions.is_empty()
+    });
+    update_active(&table);
+    drop(table);
+    on_load_patterns()
         .lock()
         .unwrap()
-        .insert((code, module.to_owned()), seq);
-    invalidate_winners();
+        .remove(&(runtime, session));
+}
+
+/// The trace data of one session's breakpoint that fires on a call.
+pub(crate) struct Pattern {
+    pub(crate) session: u64,
+    pub(crate) match_spec: Option<Arc<OwnedTerm>>,
+}
+
+/// The sessions tracing a call: local (code breakpoint) or global (export) call trace.
+// Port of erts/emulator/beam/beam_bp.c:1017-1060 (do_session_breakpoint), OTP-29.1.1.
+pub(crate) fn matching(
+    process: &Process,
+    module: &str,
+    function: &str,
+    arity: u8,
+    local: bool,
+) -> Vec<Pattern> {
+    let wanted = if local {
+        BPF_LOCAL_TRACE
+    } else {
+        BPF_GLOBAL_TRACE
+    };
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        module,
+        function,
+        arity,
+    )
+    .filter(|g| g.data[ix].flags & wanted != 0)
+    .map(|g| Pattern {
+        session: g.session,
+        match_spec: g.data[ix].local_ms.clone(),
+    })
+    .collect()
+}
+
+/// True while some runtime holds a function breakpoint; keeps untraced BIF calls on the fast path.
+pub(crate) fn any_pattern() -> bool {
+    active().load(Ordering::Relaxed)
+}
+
+/// Whether a breakpoint of any session or runtime is set on this function.
+// Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
+pub(crate) fn selects(module: &str, function: &str, arity: u8) -> bool {
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    table
+        .get(module)
+        .and_then(|functions| functions.get(function))
+        .and_then(|arities| arities.get(&arity))
+        .is_some_and(|bps| bps.iter().any(|g| g.data[ix].flags != 0))
+}
+
+/// Count a call entering the function's code.
+// Port of erts/emulator/beam/beam_bp.c:1090-1092 (do_session_breakpoint, ERTS_BPF_COUNT_ACTIVE),
+// OTP-29.1.1. Call counters live in the function's code breakpoint, which global (export)
+// breakpoint hits do not reach.
+pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: u8, local: bool) {
+    if !local || !any_pattern() {
+        return;
+    }
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    for g in function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        module,
+        function,
+        arity,
+    ) {
+        let bp = &g.data[ix];
+        if bp.flags & BPF_COUNT_ACTIVE != 0
+            && let Some(count) = &bp.count
+        {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn info(
+    process: &Process,
+    module: &str,
+    function: &str,
+    arity: u8,
+    item: &str,
+) -> Option<OwnedTerm> {
+    info_session(process, 0, module, function, arity, item)
+}
+
+pub(crate) fn info_session(
+    process: &Process,
+    session: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+    item: &str,
+) -> Option<OwnedTerm> {
+    // Port of erts/emulator/beam/erl_bif_trace.c:1793-1850 (function_is_traced) and
+    // 2132-2230 (trace_info_func_epilogue), OTP-29.1.1.
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    let bp = function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        module,
+        function,
+        arity,
+    )
+    .find(|g| g.session == session)
+    .map(|g| g.data[ix].clone())
+    .unwrap_or_default();
+    drop(table);
+    let false_atom = || OwnedTerm::Atom("false".into());
+    let traced = || {
+        if bp.flags & BPF_GLOBAL_TRACE != 0 {
+            OwnedTerm::Atom("global".into())
+        } else if bp.flags & BPF_LOCAL_TRACE != 0 {
+            OwnedTerm::Atom("local".into())
+        } else {
+            false_atom()
+        }
+    };
+    // An untraced function reports `{match_spec, false}`; a traced one without a match
+    // specification reports `[]`.
+    let match_spec = || {
+        if bp.flags & (BPF_GLOBAL_TRACE | BPF_LOCAL_TRACE) != 0 {
+            bp.local_ms.as_deref().cloned().unwrap_or(OwnedTerm::Nil)
+        } else {
+            false_atom()
+        }
+    };
+    let call_count = || match &bp.count {
+        Some(count) if bp.flags & BPF_COUNT != 0 => {
+            OwnedTerm::Int(count.load(Ordering::Relaxed) as i64)
+        }
+        _ => false_atom(),
+    };
+    match item {
+        "traced" => Some(traced()),
+        "match_spec" => Some(match_spec()),
+        "meta" | "meta_match_spec" | "call_memory" | "call_time" => Some(false_atom()),
+        "call_count" => Some(call_count()),
+        "all" => {
+            let values = [
+                ("traced", traced()),
+                ("match_spec", match_spec()),
+                ("meta", false_atom()),
+                ("meta_match_spec", false_atom()),
+                ("call_memory", false_atom()),
+                ("call_time", false_atom()),
+                ("call_count", call_count()),
+            ];
+            Some(OwnedTerm::List {
+                elems: values
+                    .into_iter()
+                    .map(|(key, value)| OwnedTerm::Tuple(vec![OwnedTerm::Atom(key.into()), value]))
+                    .collect(),
+                tail: Box::new(OwnedTerm::Nil),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Which breakpoints the function needs: a code breakpoint (`local`) and/or an export
+/// breakpoint (`global`).
+// Port of erts/emulator/beam/beam_bp.c:585-760 (erts_install_breakpoints,
+// erts_uninstall_breakpoints) and erts/emulator/beam/erl_bif_trace.c:2690-2715, OTP-29.1.1.
+pub(crate) fn breakpoint_kinds(
+    process: &Process,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> (bool, bool) {
+    let mut local = crate::trace::return_to_enabled(process)
+        || debug_breakpoint_enabled(process, module, function, arity);
+    let mut global = false;
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    for g in function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        module,
+        function,
+        arity,
+    ) {
+        let flags = g.data[ix].flags;
+        local |= flags & !BPF_GLOBAL_TRACE != 0;
+        global |= flags & BPF_GLOBAL_TRACE != 0;
+    }
+    (local, global)
+}
+
+fn active() -> &'static AtomicBool {
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    &ACTIVE
+}
+
+fn scope(process: &Process) -> usize {
+    process
+        .runtime
+        .as_ref()
+        .map_or(0, |runtime| std::sync::Arc::as_ptr(runtime) as usize)
+}
+
+// Runtime-scoped breakpoint entries must not keep the global gate enabled
+// after the owning VM runtime has been dropped.
+impl Drop for crate::process::Runtime {
+    fn drop(&mut self) {
+        crate::trace::clear_runtime(self as *const Self as usize);
+        clear_scope(self as *const Self as usize);
+    }
+}
+
+fn clear_scope(runtime: usize) {
+    {
+        let mut table = breakpoints().write().unwrap();
+        table.retain(|_, functions| {
+            functions.retain(|_, arities| {
+                arities.retain(|_, bps| {
+                    bps.retain(|g| g.runtime != runtime);
+                    !bps.is_empty()
+                });
+                !arities.is_empty()
+            });
+            !functions.is_empty()
+        });
+        update_active(&table);
+    }
+    on_load_patterns()
+        .lock()
+        .unwrap()
+        .retain(|(scope, _), _| *scope != runtime);
+    registrations()
+        .lock()
+        .unwrap()
+        .retain(|scope, _| *scope != runtime);
+    line_breakpoints()
+        .lock()
+        .unwrap()
+        .retain(|(scope, _, _), _| *scope != runtime);
+    debug_breakpoints()
+        .lock()
+        .unwrap()
+        .retain(|(scope, _, _, _), _| *scope != runtime);
 }
 
 /// Session state of `trace_pattern(on_load, ...)`: the pattern applied to every module when it
@@ -255,11 +760,6 @@ pub(crate) fn set_line_breakpoint_instrumentation(enabled: bool) {
     LINE_BREAKPOINT_INSTRUMENTATION.store(enabled, Ordering::Release);
 }
 
-fn patterns() -> &'static Mutex<HashMap<Key, Pattern>> {
-    static PATTERNS: OnceLock<Mutex<HashMap<Key, Pattern>>> = OnceLock::new();
-    PATTERNS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 type LineKey = (usize, usize, u32);
 fn line_breakpoints() -> &'static Mutex<HashMap<LineKey, bool>> {
     static BREAKPOINTS: OnceLock<Mutex<HashMap<LineKey, bool>>> = OnceLock::new();
@@ -371,354 +871,4 @@ pub(crate) fn line_breakpoint_enabled(process: &Process, module_id: usize, line:
         .get(&(scope(process), module_id, line))
         .copied()
         .unwrap_or(false)
-}
-
-fn active() -> &'static AtomicBool {
-    static ACTIVE: AtomicBool = AtomicBool::new(false);
-    &ACTIVE
-}
-
-fn scope(process: &Process) -> usize {
-    process
-        .runtime
-        .as_ref()
-        .map_or(0, |runtime| std::sync::Arc::as_ptr(runtime) as usize)
-}
-
-// Runtime-scoped breakpoint entries must not keep the global gate enabled
-// after the owning VM runtime has been dropped.
-impl Drop for crate::process::Runtime {
-    fn drop(&mut self) {
-        crate::trace::clear_runtime(self as *const Self as usize);
-        clear_scope(self as *const Self as usize);
-    }
-}
-
-fn clear_scope(runtime: usize) {
-    let mut entries = patterns().lock().unwrap();
-    entries.retain(|(scope, _, _, _, _), _| *scope != runtime);
-    on_load_patterns()
-        .lock()
-        .unwrap()
-        .retain(|(scope, _), _| *scope != runtime);
-    invalidate_winners();
-    active().store(!entries.is_empty(), Ordering::Relaxed);
-    registrations()
-        .lock()
-        .unwrap()
-        .retain(|scope, _| *scope != runtime);
-    line_breakpoints()
-        .lock()
-        .unwrap()
-        .retain(|(scope, _, _), _| *scope != runtime);
-    debug_breakpoints()
-        .lock()
-        .unwrap()
-        .retain(|(scope, _, _, _), _| *scope != runtime);
-}
-
-pub(crate) fn set(
-    process: &Process,
-    session: u64,
-    module: String,
-    function: String,
-    arity: Option<u8>,
-    pattern: Option<Pattern>,
-) -> bool {
-    let runtime = scope(process);
-    let spec = (module.as_str(), function.as_str(), arity);
-    let mut entries = patterns().lock().unwrap();
-    // A new pattern replaces every older pattern of the session it covers.
-    let before = entries.len();
-    entries.retain(|key, _| {
-        key.0 != runtime || key.1 != session || !covers(spec, &key.2, &key.3, key.4)
-    });
-    let existed = entries.len() != before;
-    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let key = (runtime, session, module.clone(), function.clone(), arity);
-    if let Some(mut pattern) = pattern {
-        pattern.seq = seq;
-        pattern.off = false;
-        entries.insert(key, pattern);
-    } else if entries.iter().any(|(old, _)| {
-        old.0 == runtime && old.1 == session && overlaps((&old.2, &old.3, old.4), spec)
-    }) {
-        // An older, wider pattern still covers part of this spec: remember the exception.
-        entries.insert(
-            key,
-            Pattern {
-                session,
-                flags: Vec::new(),
-                match_spec: None,
-                meta: None,
-                count: 0,
-                paused: false,
-                seq,
-                off: true,
-            },
-        );
-    }
-    invalidate_winners();
-    active().store(entries.values().any(|p| !p.off), Ordering::Relaxed);
-    existed
-}
-
-/// Remove all MFA breakpoint patterns owned by a destroyed trace session.
-// Port of erts/emulator/beam/erl_bif_trace.c:1352-1375, OTP-29.1.1.
-pub(crate) fn clear_session(process: &Process, session: u64) {
-    let runtime = scope(process);
-    let mut entries = patterns().lock().unwrap();
-    entries.retain(|(owner, id, _, _, _), _| *owner != runtime || *id != session);
-    on_load_patterns()
-        .lock()
-        .unwrap()
-        .remove(&(runtime, session));
-    invalidate_winners();
-    active().store(entries.values().any(|p| !p.off), Ordering::Relaxed);
-}
-
-pub(crate) fn pause(
-    process: &Process,
-    session: u64,
-    module: &str,
-    function: &str,
-    arity: Option<u8>,
-    paused: bool,
-) {
-    if let Some(pattern) = patterns().lock().unwrap().get_mut(&(
-        scope(process),
-        session,
-        module.to_owned(),
-        function.to_owned(),
-        arity,
-    )) {
-        pattern.paused = paused;
-        if !paused {
-            pattern.count = 0;
-        }
-    }
-}
-
-// Port of erts/emulator/beam/beam_bp.c:1115-1285, OTP-29.1.1.
-pub(crate) fn matching(
-    process: &Process,
-    module: &str,
-    function: &str,
-    arity: u8,
-    local: bool,
-) -> Vec<Pattern> {
-    let entries = patterns().lock().unwrap();
-    winners_all(
-        &entries,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .into_iter()
-    .filter(|(_, pattern)| {
-        let has_global = pattern.flags.iter().any(|flag| flag == "global");
-        let has_local = pattern.flags.iter().any(|flag| flag == "local");
-        // No flag at all means a plain global call trace; call_count alone only counts.
-        let has_trace = pattern.flags.is_empty()
-            || pattern.flags.iter().any(|flag| flag != "call_count")
-            || pattern.match_spec.is_some();
-        has_trace
-            && if local {
-                has_local
-            } else {
-                has_global || (!has_local && !has_global)
-            }
-    })
-    .map(|(_, pattern)| pattern.clone())
-    .collect()
-}
-
-/// True while some runtime holds a function trace pattern; keeps untraced BIF calls on the fast path.
-pub(crate) fn any_pattern() -> bool {
-    active().load(Ordering::Relaxed)
-}
-
-/// Whether a pattern of any session or runtime selects this function.
-// Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
-pub(crate) fn selects(module: &str, function: &str, arity: u8) -> bool {
-    patterns()
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|((_, _, m, f, a), pattern)| {
-            !pattern.off && covers((m, f, *a), module, function, Some(arity))
-        })
-}
-
-pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: u8, local: bool) {
-    let mut entries = patterns().lock().unwrap();
-    let keys = winners_all(
-        &entries,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .into_iter()
-    .filter(|(_, pattern)| {
-        pattern.flags.iter().any(|flag| flag == "call_count")
-            && (pattern
-                .flags
-                .iter()
-                .any(|flag| flag == if local { "local" } else { "global" })
-                || (local
-                    && !pattern
-                        .flags
-                        .iter()
-                        .any(|flag| flag == "local" || flag == "global")))
-    })
-    .map(|(key, _)| key.clone())
-    .collect::<Vec<_>>();
-    for key in keys {
-        if let Some(pattern) = entries.get_mut(&key) {
-            pattern.count = pattern.count.saturating_add(1);
-        }
-    }
-}
-
-pub(crate) fn info(
-    process: &Process,
-    module: &str,
-    function: &str,
-    arity: u8,
-    item: &str,
-) -> Option<OwnedTerm> {
-    info_session(process, 0, module, function, arity, item)
-}
-
-pub(crate) fn info_session(
-    process: &Process,
-    session: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-    item: &str,
-) -> Option<OwnedTerm> {
-    // Port of erts/emulator/beam/erl_bif_trace.c:1403-1465, OTP-29.1.1.
-    let entries = patterns().lock().unwrap();
-    let pattern = winners(
-        &entries,
-        scope(process),
-        code_scope(process),
-        Some(session),
-        module,
-        function,
-        arity,
-    )
-    .into_iter()
-    .next()
-    .map(|(_, pattern)| pattern);
-    let false_atom = || OwnedTerm::Atom("false".into());
-    let traced = || {
-        pattern.map_or_else(false_atom, |pattern| {
-            OwnedTerm::Atom(
-                if pattern.flags.iter().any(|flag| flag == "global")
-                    || !pattern.flags.iter().any(|flag| flag == "local")
-                {
-                    "global"
-                } else {
-                    "local"
-                }
-                .into(),
-            )
-        })
-    };
-    // An untraced function reports `{match_spec, false}`; a traced one without a match
-    // specification reports `[]`.
-    let match_spec = || {
-        pattern.map_or_else(false_atom, |pattern| {
-            pattern.match_spec.clone().unwrap_or(OwnedTerm::Nil)
-        })
-    };
-    let call_count = || {
-        pattern.map_or_else(false_atom, |pattern| {
-            if pattern.flags.iter().any(|flag| flag == "call_count") {
-                OwnedTerm::Int(pattern.count as i64)
-            } else {
-                false_atom()
-            }
-        })
-    };
-    match item {
-        "traced" => Some(traced()),
-        "match_spec" => Some(match_spec()),
-        "meta" => Some(
-            pattern
-                .and_then(|pattern| pattern.meta.clone())
-                .unwrap_or_else(false_atom),
-        ),
-        "meta_match_spec" | "call_memory" | "call_time" => Some(false_atom()),
-        "call_count" => Some(call_count()),
-        "all" => {
-            let values = [
-                ("traced", traced()),
-                ("match_spec", match_spec()),
-                (
-                    "meta",
-                    pattern
-                        .and_then(|pattern| pattern.meta.clone())
-                        .unwrap_or_else(false_atom),
-                ),
-                ("meta_match_spec", false_atom()),
-                ("call_memory", false_atom()),
-                ("call_time", false_atom()),
-                ("call_count", call_count()),
-            ];
-            Some(OwnedTerm::List {
-                elems: values
-                    .into_iter()
-                    .map(|(key, value)| OwnedTerm::Tuple(vec![OwnedTerm::Atom(key.into()), value]))
-                    .collect(),
-                tail: Box::new(OwnedTerm::Nil),
-            })
-        }
-        _ => None,
-    }
-}
-
-// Port of erts/emulator/beam/erl_bif_trace.c:498 and 2721, OTP-29.1.1.
-pub(crate) fn breakpoint_kinds(
-    process: &Process,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> (bool, bool) {
-    let entries = patterns().lock().unwrap();
-    let patterns = winners_all(
-        &entries,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .into_iter()
-    .map(|(_, pattern)| pattern);
-    let mut local = crate::trace::return_to_enabled(process)
-        || debug_breakpoint_enabled(process, module, function, arity);
-    let mut global = false;
-    for pattern in patterns {
-        if pattern.flags.iter().any(|flag| flag == "call_count") {
-            local = true;
-        }
-        if pattern.flags.iter().any(|flag| flag == "global")
-            || !pattern
-                .flags
-                .iter()
-                .any(|flag| flag == "local" || flag == "global")
-        {
-            global = true;
-        } else if pattern.flags.iter().any(|flag| flag == "local") {
-            local = true;
-        }
-    }
-    (local, global)
 }

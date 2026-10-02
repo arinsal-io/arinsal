@@ -2072,6 +2072,7 @@ impl Executor {
                             .as_ref()
                             .is_some_and(|runtime| runtime.suspend_total_of(ctx.pid()) > 0)
                     {
+                        process.cold_mut().suspend_parked = true;
                         break Ok(RunState::Wait { timeout_ms: None });
                     }
                     let trap = match result {
@@ -2247,6 +2248,7 @@ impl Executor {
             }
             runtime.suspends_activated(pid);
             runtime.note_status(pid, "suspended");
+            process.cold_mut().suspend_parked = true;
             return Ok(Some(RunState::Wait { timeout_ms: None }));
         }
         if let Some(shift) = runtime.take_pause_shift(pid)
@@ -4743,13 +4745,20 @@ impl Process {
             return RunOutcome::Exit(1);
         }
         runtime.note_relations(ctx.pid(), self.cold.as_deref());
+        let parked = self
+            .cold
+            .as_mut()
+            .is_some_and(|cold| std::mem::take(&mut cold.suspend_parked));
         match result {
             Ok(RunState::Yield) => {
                 runtime.note_status(ctx.pid(), "runnable");
                 RunOutcome::Yield
             }
             Ok(RunState::Wait { timeout_ms }) => {
-                runtime.note_status(ctx.pid(), "waiting");
+                // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status),
+                // OTP-29.1.1: suspension keeps ERTS_PSFLG_ACTIVE, so a process resumed while
+                // this slice ended is runnable, not waiting.
+                runtime.note_status(ctx.pid(), if parked { "runnable" } else { "waiting" });
                 RunOutcome::Wait { timeout_ms }
             }
             Ok(RunState::Done(term)) => {

@@ -101,6 +101,9 @@ unsafe impl Send for Process {}
 const _: () = assert!(std::mem::offset_of!(Process, header) == 0);
 #[derive(Default)]
 pub(crate) struct ProcessCold {
+    /// The last slice ended because the process is suspended, not because it waits in a
+    /// receive: it stays active (runnable once resumed).
+    pub(crate) suspend_parked: bool,
     /// The process already exited while its dirty job keeps running.
     /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
     pub(crate) dirty_exited: bool,
