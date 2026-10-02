@@ -13,8 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Rust and BEAM compatibility
+  rust-tests:
+    name: Rust and OTP tests
     runs-on: macos-15
     timeout-minutes: 90
 
@@ -22,15 +22,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Erlang/OTP and Elixir
+      - name: Set up Erlang/OTP
         uses: erlef/setup-beam@v1
         with:
           otp-version: "29.1.1"
-          elixir-version: "1.20.4"
-          gleam-version: "1.9.0"
           version-type: strict
-          install-hex: true
-          install-rebar: true
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -43,6 +39,28 @@ jobs:
 
       - name: Compare VM stage1 cases with OTP
         run: cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
+
+  language-interop:
+    name: Elixir and Gleam interoperability
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Erlang/OTP, Elixir, and Gleam
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29.1.1"
+          elixir-version: "1.20.4"
+          gleam-version: "1.9.0"
+          version-type: strict
+          install-hex: true
+          install-rebar: true
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
 
       - name: Fetch Elixir demo dependencies
         working-directory: examples/arinsal_demo
