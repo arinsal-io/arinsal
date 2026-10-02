@@ -1,0 +1,17 @@
+[package]
+name = "arinsal-drv"
+description = "OTP 29 linked-in (erl_driver.h) driver ABI hosted by the Arinsal executable"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libloading = "0.8.9"
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.4.7"

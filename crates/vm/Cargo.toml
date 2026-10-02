@@ -31,6 +31,7 @@ arinsal-bits.workspace = true
 arinsal-bifs.workspace = true
 arinsal-re.workspace = true
 arinsal-nif.workspace = true
+arinsal-drv.workspace = true
 arinsal-nif-file.workspace = true
 arinsal-nif-buffer.workspace = true
 arinsal-nif-zlib.workspace = true

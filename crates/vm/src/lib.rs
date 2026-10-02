@@ -8,6 +8,7 @@ pub mod boot;
 mod calls;
 mod check_io;
 mod compare;
+mod ddll;
 #[cfg(feature = "difftest")]
 mod difftest;
 mod dirty;

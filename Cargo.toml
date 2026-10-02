@@ -24,6 +24,7 @@ members = [
     "crates/re",
     "crates/nif-zlib",
     "crates/nif",
+    "crates/drv",
     "crates/loader",
     "crates/jit",
     "crates/opt", # opt_ir
@@ -63,6 +64,7 @@ arinsal-nif-socket = { path = "crates/nif-socket" }
 arinsal-re = { path = "crates/re" }
 arinsal-nif-zlib = { path = "crates/nif-zlib" }
 arinsal-nif = { path = "crates/nif" }
+arinsal-drv = { path = "crates/drv" }
 arinsal-loader = { path = "crates/loader" }
 arinsal-jit = { path = "crates/jit" }
 arinsal-opt = { path = "crates/opt" } # opt_ir

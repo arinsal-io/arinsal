@@ -3380,6 +3380,8 @@ impl Process {
             }
             if let Ok(scheduler) = runtime.scheduler() {
                 crate::port::owner_exit(&runtime, &scheduler, ctx.pid(), reason);
+                // Port of erts/emulator/beam/erl_process.c:14416 (erts_ddll_proc_dead).
+                crate::ddll::proc_dead(&scheduler, ctx.pid());
             }
             runtime.forget_process(ctx.pid());
         }
