@@ -298,6 +298,8 @@ fn process_info(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                let mut links = links;
+                links.extend(crate::port::linked_ports(process, pid));
                 make_list(process, links)?
             }
             "monitors" => {
@@ -339,6 +341,8 @@ fn process_info(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                let mut vals = vals;
+                vals.extend(crate::port::driver_monitoring_ports(process, pid));
                 make_list(process, vals)?
             }
             "priority" | "message_queue_data" | "error_handler" | "save_calls" | "sensitive"

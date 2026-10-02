@@ -838,6 +838,7 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
             if term != atom("ok") {
                 return Ok(term);
             }
+            crate::ddll::add_taint(&caller);
             term
         }
     };

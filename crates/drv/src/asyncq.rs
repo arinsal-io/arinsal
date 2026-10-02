@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use crate::task::{self, Task, call1, call2};
+use crate::threads;
 use crate::{DriverPort, DrvFn1, REDS_INPUT};
 
 /// Default `+A` of OTP 29: one async thread.
@@ -33,6 +34,8 @@ pub(crate) struct Job {
     invoke: DrvFn1,
     data: usize,
     free: Option<DrvFn1>,
+    /// The port data lock the job holds a reference on (`ErtsAsync.pdl`), zero when none.
+    pdl: usize,
 }
 
 struct Pool {
@@ -91,6 +94,9 @@ impl Job {
         if self.deliver() {
             self.free();
         }
+        if self.pdl != 0 {
+            threads::pdl_dec(self.pdl as *mut threads::PortDataLock);
+        }
         self.port.host.ddll_dereference(&self.port);
     }
 }
@@ -105,11 +111,12 @@ pub(crate) fn driver_async(
     free: Option<DrvFn1>,
 ) -> c_long {
     let threads = CONFIGURED.load(Ordering::Relaxed);
-    let job = Job {
+    let mut job = Job {
         port: Arc::clone(&port),
         invoke,
         data: data as usize,
         free,
+        pdl: 0,
     };
     if threads == 0 {
         call1(invoke, data);
@@ -135,6 +142,12 @@ pub(crate) fn driver_async(
             queue
         }
     };
+    // Port of erl_async.c:596: the job keeps the port data lock alive until it is ready.
+    let pdl = port.pdl.load(Ordering::Acquire);
+    if pdl != 0 {
+        threads::pdl_inc(pdl as *mut threads::PortDataLock);
+        job.pdl = pdl;
+    }
     port.host.ddll_reference(&port);
     let _ = pool.queues[queue].lock().unwrap().send(job);
     id as c_long

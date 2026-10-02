@@ -986,6 +986,19 @@ fn system_info(
         Some("lock_checking") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         // Port of erts/emulator/beam/erl_bif_info.c:2888-2889, OTP-29.1.1.
         Some("ets_always_compress") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
+        // Port of erts/emulator/beam/erl_bif_info.c:3412 (taints), OTP-29.1.1.
+        Some("taints") => Some(crate::ddll::taint_term(process)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3235-3248 (driver_version, nif_version), OTP-29.1.1.
+        Some("driver_version") => Some(crate::ddll::text_term(
+            process,
+            &format!(
+                "{}.{}",
+                arinsal_drv::layout::ERL_DRV_EXTENDED_MAJOR_VERSION,
+                arinsal_drv::layout::ERL_DRV_EXTENDED_MINOR_VERSION
+            ),
+        )),
+        Some("nif_version") => Some(crate::ddll::text_term(process, "2.18")),
+        Some("threads") => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
         Some("check_io") => Some(check_io_info(process)),
         Some("ethread_info") => Some(ethread_info(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:3549 (max_integer), OTP-29.1.1.

@@ -378,6 +378,63 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
     }
 }
 
+/// Emit a long-schedule event for a port task that ran longer than the monitor limit.
+// Port of erts/emulator/beam/erl_trace.c:1591 (monitor_long_schedule_port), OTP-29.1.1.
+pub(crate) fn after_port_task(
+    runtime: &crate::process::Runtime,
+    port: Term,
+    from: arinsal_sched::Pid,
+    operation: &str,
+    elapsed_nanoseconds: u64,
+) {
+    if runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_LONG_SCHEDULE == 0 {
+        return;
+    }
+    let (Ok(port), Ok(scheduler)) = (to_owned(port), runtime.scheduler()) else {
+        return;
+    };
+    for state in monitor_states(runtime) {
+        let Some(MonitorOption::Limit(limit)) = state.options.get("long_schedule") else {
+            continue;
+        };
+        let elapsed_ms = elapsed_nanoseconds / 1_000_000;
+        if elapsed_ms <= *limit {
+            continue;
+        }
+        let OwnedTerm::Pid {
+            node,
+            id: receiver_id,
+            serial: receiver_generation,
+            creation: 0,
+        } = &state.receiver
+        else {
+            continue;
+        };
+        if node != "nonode@nohost" {
+            continue;
+        }
+        let receiver = arinsal_sched::Pid::new(*receiver_id, *receiver_generation);
+        let event = OwnedTerm::Tuple(vec![
+            OwnedTerm::atom("monitor"),
+            port.clone(),
+            OwnedTerm::atom("long_schedule"),
+            OwnedTerm::list(vec![
+                OwnedTerm::tuple(vec![
+                    OwnedTerm::atom("timeout"),
+                    OwnedTerm::Int(elapsed_ms as i64),
+                ]),
+                OwnedTerm::tuple(vec![OwnedTerm::atom("port_op"), OwnedTerm::atom(operation)]),
+            ]),
+        ]);
+        let mut heap = ProcessHeap::with_words(64);
+        if let Ok(term) = from_owned(&event, &mut heap)
+            && let Ok(message) = Message::copy_from(term)
+        {
+            let _ = scheduler.send(from, receiver, message);
+        }
+    }
+}
+
 /// Emit long-message-queue events when the mailbox crosses its configured limits.
 // Port of erts/emulator/beam/erl_trace.c:1863-1918, OTP-29.1.1.
 pub(crate) fn after_message_queue_change(process: &mut Process) {

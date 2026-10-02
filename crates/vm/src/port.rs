@@ -149,7 +149,8 @@ pub(crate) struct PortHandle {
     id: u64,
     out: Mutex<Option<OwnedFd>>,
     wake_r: Mutex<Option<OwnedFd>>,
-    wake_w: OwnedFd,
+    /// `None` for loaded-driver ports: they have no worker thread to wake.
+    wake_w: Option<OwnedFd>,
     wake_needed: AtomicBool,
     framing: Option<(u8, usize)>,
     owner: Mutex<Pid>,
@@ -218,7 +219,11 @@ impl Drop for PortIdReservation<'_> {
 
 fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservation<'_>, VmError> {
     let _ports = runtime.ports.lock().unwrap();
-    let id = runtime.port_ids.reserve().ok_or_else(badarg)?;
+    // erts open_port fails with system_limit once the port table is full (erl_port.c, OTP-29.1.1).
+    let id = runtime
+        .port_ids
+        .reserve()
+        .ok_or_else(|| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))?;
     Ok(PortIdReservation {
         runtime,
         id,
@@ -298,13 +303,16 @@ fn string_bytes(t: Term) -> Option<Vec<u8>> {
     }
 }
 fn iodata(t: Term) -> Option<Vec<u8>> {
-    fn append(term: Term, tail: bool, out: &mut Vec<u8>) -> Option<()> {
-        if term.classify() == TermKind::List {
+    fn append(mut term: Term, mut tail: bool, out: &mut Vec<u8>) -> Option<()> {
+        // The spine is walked in a loop: long lists must not recurse per cell.
+        while term.classify() == TermKind::List {
             // SAFETY: The list is traversed before the caller's process heap can move.
             let (head, rest) = unsafe { term.cons_ref()? };
             append(head, false, out)?;
-            append(rest, true, out)
-        } else if term == Term::NIL {
+            term = rest;
+            tail = true;
+        }
+        if term == Term::NIL {
             Some(())
         // SAFETY: This view is consumed before the caller's process heap can move.
         } else if let Some(binary) = unsafe { term.binary_ref() } {
@@ -649,6 +657,7 @@ fn start(
                             binary,
                             eof: want_eof,
                             line,
+                            parallelism,
                         },
                     );
                 }
@@ -940,6 +949,7 @@ struct DriverIoFlags {
     binary: bool,
     eof: bool,
     line: Option<usize>,
+    parallelism: bool,
 }
 
 /// `ERL_DRV_FLAG_USE_INIT_ACK`.
@@ -961,17 +971,12 @@ fn start_dyn_driver(
     let reservation = reserve_port_id(&runtime)?;
     let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
-    let handle = make_handle(
+    let handle = make_driver_handle(
         port_id,
-        None,
-        None,
         ctx.pid(),
-        0,
         name.clone(),
-        false,
-        default_limits(),
+        io.parallelism,
         Arc::clone(&scheduler),
-        false,
     )?;
     arinsal_drv::set_poll_backend(Arc::new(DrvPoll {
         state: Arc::default(),
@@ -1049,6 +1054,24 @@ impl DrvHost {
 }
 
 impl arinsal_drv::PortHost for DrvHost {
+    fn task_done(&self, port: &arinsal_drv::DriverPort, op: &str, elapsed_ns: u64) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        let Some(handle) = runtime.ports.lock().unwrap().get(&port.id()).cloned() else {
+            return;
+        };
+        if let Some(term) = Term::port(port.id()) {
+            crate::natives::erts_debug::after_port_task(
+                &runtime,
+                term,
+                handle.owner_pid(),
+                op,
+                elapsed_ns,
+            );
+        }
+    }
+
     // Port of erts/emulator/beam/io.c:3357 (deliver_read_message), OTP-29.1.1.
     fn deliver_data(
         &self,
@@ -1356,17 +1379,12 @@ impl arinsal_drv::PortHost for DrvHost {
         }
         let reservation = reserve_port_id(&runtime).ok()?;
         let port_id = reservation.id();
-        let handle = make_handle(
+        let handle = make_driver_handle(
             port_id,
-            None,
-            None,
             owner,
-            0,
             name.to_owned(),
             false,
-            default_limits(),
             Arc::clone(&scheduler),
-            false,
         )
         .ok()?;
         let driver = Arc::clone(creator.driver());
@@ -1651,7 +1669,10 @@ fn notify_links_monitors(
             );
         }
     }
-    let monitors = std::mem::take(&mut *handle.monitors.lock().unwrap());
+    // The lock is held while the DOWNs are queued so that a concurrent `demonitor(_, [flush])`
+    // either removes the monitor first or finds the message already in its mailbox.
+    let mut guard = handle.monitors.lock().unwrap();
+    let monitors = std::mem::take(&mut *guard);
     for (reference, monitor) in monitors {
         let mut heap = ProcessHeap::with_words(32);
         let Ok(reference_term) =
@@ -1773,14 +1794,73 @@ fn make_handle(
     scheduler: Arc<Scheduler<Process>>,
     inet: bool,
 ) -> Result<Arc<PortHandle>, VmError> {
-    let (wake_r, wake_w) = wake_pipe().map_err(|_| badarg())?;
+    make_handle_with(
+        id,
+        out,
+        framing,
+        owner,
+        os_pid,
+        name,
+        parallelism,
+        limits,
+        scheduler,
+        inet,
+        true,
+    )
+}
+
+/// Port handle of a loaded driver: no wake pipe, so a full port table does not need two
+/// descriptors per port.
+#[allow(clippy::too_many_arguments)]
+fn make_driver_handle(
+    id: u64,
+    owner: Pid,
+    name: String,
+    parallelism: bool,
+    scheduler: Arc<Scheduler<Process>>,
+) -> Result<Arc<PortHandle>, VmError> {
+    make_handle_with(
+        id,
+        None,
+        None,
+        owner,
+        0,
+        name,
+        parallelism,
+        default_limits(),
+        scheduler,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_handle_with(
+    id: u64,
+    out: Option<OwnedFd>,
+    framing: Option<(u8, usize)>,
+    owner: Pid,
+    os_pid: u32,
+    name: String,
+    parallelism: bool,
+    limits: BusyLimits,
+    scheduler: Arc<Scheduler<Process>>,
+    inet: bool,
+    wake: bool,
+) -> Result<Arc<PortHandle>, VmError> {
+    let (wake_r, wake_w) = if wake {
+        let (r, w) = wake_pipe().map_err(|_| badarg())?;
+        (Some(r), Some(w))
+    } else {
+        (None, None)
+    };
     if let Some(fd) = out.as_ref() {
         set_nonblock(fd.as_raw_fd());
     }
     let handle = Arc::new(PortHandle {
         id,
         out: Mutex::new(out),
-        wake_r: Mutex::new(Some(wake_r)),
+        wake_r: Mutex::new(wake_r),
         wake_w,
         wake_needed: AtomicBool::new(true),
         framing,
@@ -1908,7 +1988,10 @@ fn nb_write(fd: RawFd, buf: &[u8]) -> std::io::Result<usize> {
 
 fn poke(handle: &PortHandle) {
     if handle.wake_needed.swap(false, Ordering::AcqRel) {
-        let fd = handle.wake_w.as_raw_fd();
+        let Some(wake_w) = handle.wake_w.as_ref() else {
+            return;
+        };
+        let fd = wake_w.as_raw_fd();
         // SAFETY: the wake pipe write end stays open for the life of the handle.
         unsafe {
             libc::write(fd, (&1u8 as *const u8).cast(), 1);
@@ -2406,7 +2489,7 @@ pub(crate) fn family(
         }
         ("port_close", [port]) if module == "erts_internal" => close(process, *port),
         ("port_connect", [port, pid]) if module == "erts_internal" => {
-            connect(process, *port, *pid, false)
+            connect(process, *port, *pid, None)
         }
         // Port of erts/emulator/beam/erl_bif_port.c:322 (erts_internal_port_control_3), OTP-29.1.1.
         // Spawn and fd ports have no driver control. The internal BIF returns the
@@ -2573,7 +2656,18 @@ fn driver_control(
         return Ok(atom("badarg"));
     }
     let bytes = pieces.into_iter().flat_map(|(b, _)| b).collect::<Vec<_>>();
-    let Some(reply) = drv_port.control(op, &bytes, packed_pid(caller)) else {
+    let started = std::time::Instant::now();
+    let reply = drv_port.control(op, &bytes, packed_pid(caller));
+    if let (Some(port), Some(runtime)) = (Term::port(drv_port.id()), process.runtime.as_ref()) {
+        crate::natives::erts_debug::after_port_task(
+            runtime,
+            port,
+            caller,
+            "proc_sig",
+            started.elapsed().as_nanos() as u64,
+        );
+    }
+    let Some(reply) = reply else {
         return Ok(atom("badarg"));
     };
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
@@ -2588,6 +2682,8 @@ fn driver_control(
     .map_err(|_| badarg())
 }
 
+/// Next local port id for `open_port`, or `system_limit` when the port table is full.
+// Port of erts/emulator/beam/erl_ptab.c (erts_ptab_new_element), OTP-29.1.1.
 fn notsup() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(atom("notsup")))
 }
@@ -2747,12 +2843,29 @@ fn release_io(handle: &PortHandle) {
     poke(handle);
 }
 
+fn remove_and_notify(
+    runtime: &crate::process::Runtime,
+    id: u64,
+    scheduler: &Scheduler<Process>,
+    from: Pid,
+    reason: Term,
+) -> Option<Arc<PortHandle>> {
+    let mut ports = runtime.ports.lock().unwrap();
+    let handle = ports.remove(&id)?;
+    runtime.port_ids.release(id);
+    notify_links_monitors(&handle, id, scheduler, from, false, reason);
+    Some(handle)
+}
+
 fn close(process: &Process, term: Term) -> Result<Term, VmError> {
     let sender = process.self_pid.ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler().map_err(|_| badarg())?;
     let id = term.as_port().ok_or_else(badarg)?;
-    let removed = remove_port(runtime, id);
+    // Port of erts/emulator/beam/io.c:3698 (terminate_port): links get a port exit signal,
+    // monitors a DOWN, both with the port as origin. Removal and notification share one
+    // critical section of the port table so `demonitor` cannot slip between them.
+    let removed = remove_and_notify(runtime, id, &scheduler, sender, atom("normal"));
     if let Some(handle) = removed {
         if handle.inet {
             crate::inet_drv::detach(id);
@@ -2760,46 +2873,6 @@ fn close(process: &Process, term: Term) -> Result<Term, VmError> {
             crate::inet_udp::detach(id);
         }
         release_io(&handle);
-        let reason_term = atom("normal");
-        let port = Term::port(id).ok_or_else(badarg)?;
-        for linked in handle.links.lock().unwrap().iter().copied() {
-            if linked == sender && process.trap_exit {
-                let mut heap = ProcessHeap::with_words(24);
-                let exit = TermBuilder::new(&mut heap)
-                    .tuple(&[atom("EXIT"), port, reason_term])
-                    .map_err(|error| VmError::Unsupported(format!("port EXIT tuple: {error:?}")))?;
-                if let Ok(message) = Message::copy_from(exit) {
-                    let _ = scheduler.send(sender, linked, message);
-                }
-                continue;
-            }
-            if let Ok(reason) = Message::copy_from(reason_term) {
-                let _ = scheduler.signal(sender, linked, arinsal_sched::Signal::Exit(reason));
-            }
-        }
-        let monitors = std::mem::take(&mut *handle.monitors.lock().unwrap());
-        for (reference, monitor) in monitors {
-            let mut heap = ProcessHeap::with_words(32);
-            let reference_term = TermBuilder::new(&mut heap)
-                .local_ref([reference as u32, (reference >> 32) as u32, 0])
-                .map_err(|error| {
-                    VmError::Unsupported(format!("port monitor reference: {error:?}"))
-                })?;
-            let object = from_owned(&monitor.object, &mut heap)
-                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
-            let down = TermBuilder::new(&mut heap)
-                .tuple(&[
-                    atom("DOWN"),
-                    reference_term,
-                    atom("port"),
-                    object,
-                    atom("normal"),
-                ])
-                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
-            if let Ok(message) = Message::copy_from(down) {
-                let _ = scheduler.send(sender, monitor.pid, message);
-            }
-        }
         Ok(atom("true"))
     } else {
         Err(badarg())
@@ -2824,62 +2897,27 @@ pub(crate) fn exit_port(
     reason: Term,
 ) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let removed = remove_port(runtime, id).ok_or_else(badarg)?;
+    // Port of erts/emulator/beam/io.c:3854 (deliver_port_exit): `kill` reaches links as `killed`.
+    let reason = if reason == atom("kill") {
+        atom("killed")
+    } else {
+        reason
+    };
+    let Some(runtime) = process.runtime.as_ref() else {
+        return Ok(());
+    };
+    let scheduler = runtime.scheduler()?;
+    let Some(removed) = remove_and_notify(runtime, id, &scheduler, ctx.pid(), reason) else {
+        return Ok(());
+    };
     if removed.inet {
         crate::inet_drv::detach(id);
     }
     release_io(&removed);
-
-    let refs = std::mem::take(&mut *removed.monitors.lock().unwrap());
-    for (reference, monitor) in refs {
-        if monitor.pid == ctx.pid() {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-            let reference_term = TermBuilder::new(&mut heap)
-                .local_ref([reference as u32, (reference >> 32) as u32, 0])
-                .map_err(|error| {
-                    VmError::Unsupported(format!("port monitor reference: {error:?}"))
-                })?;
-            let object = from_owned(&monitor.object, &mut heap)
-                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
-            let down = TermBuilder::new(&mut heap)
-                .tuple(&[atom("DOWN"), reference_term, atom("port"), object, reason])
-                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
-            process.inbox.push_back(down);
-        } else {
-            let mut heap = ProcessHeap::with_words(32);
-            let reference_term = TermBuilder::new(&mut heap)
-                .local_ref([reference as u32, (reference >> 32) as u32, 0])
-                .map_err(|error| {
-                    VmError::Unsupported(format!("port monitor reference: {error:?}"))
-                })?;
-            let object = from_owned(&monitor.object, &mut heap)
-                .map_err(|error| VmError::Unsupported(format!("port monitor object: {error:?}")))?;
-            let down = TermBuilder::new(&mut heap)
-                .tuple(&[atom("DOWN"), reference_term, atom("port"), object, reason])
-                .map_err(|error| VmError::Unsupported(format!("port DOWN tuple: {error:?}")))?;
-            if let Ok(message) = Message::copy_from(down) {
-                let _ = ctx.send(monitor.pid, message);
-            }
-        }
-    }
-    for linked in removed.links.lock().unwrap().iter().copied() {
-        if linked == ctx.pid() && process.trap_exit {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-            let exit = TermBuilder::new(&mut heap)
-                .tuple(&[atom("EXIT"), port, reason])
-                .map_err(|error| VmError::Unsupported(format!("port EXIT tuple: {error:?}")))?;
-            process.inbox.push_back(exit);
-            continue;
-        }
-        if let Ok(message) = Message::copy_from(reason) {
-            let _ = ctx.signal(linked, arinsal_sched::Signal::Exit(message));
-        }
-    }
     Ok(())
 }
 
-fn connect(process: &Process, port: Term, pid: Term, notify: bool) -> Result<Term, VmError> {
+fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Result<Term, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let pid = Pid::from_term(pid).ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -2896,13 +2934,9 @@ fn connect(process: &Process, port: Term, pid: Term, notify: bool) -> Result<Ter
     handle.links.lock().unwrap().insert(pid);
     *handle.owner.lock().unwrap() = pid;
     let scheduler = runtime.scheduler()?;
-    if notify {
-        event_message(
-            &scheduler,
-            process.self_pid.ok_or_else(badarg)?,
-            id,
-            atom("connected"),
-        );
+    if let Some(from) = notify {
+        // io.c:2351 (set_port_connected): `{Port, connected}` goes to the `From` of the signal.
+        event_message(&scheduler, from, id, atom("connected"));
     }
     Ok(atom("true"))
 }
@@ -3031,20 +3065,26 @@ pub(crate) fn owner_exit(
 }
 
 /// Add or remove a process from a port's link set.
-pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Result<(), VmError> {
+pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Result<bool, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
-    let handle = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
-        .ok_or_else(badarg)?;
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
+        return Ok(!linked);
+    };
+    // Termination removes the port from the table and drains `links` in one critical section
+    // of the table lock (`remove_and_notify`); taking the locks in the same order makes this
+    // registration either visible to it or refused.
+    let ports = runtime.ports.lock().unwrap();
+    if linked && !ports.contains_key(&id) {
+        return Ok(false);
+    }
     let mut links = handle.links.lock().unwrap();
     if linked {
         links.insert(pid);
     } else {
         links.remove(&pid);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Register or remove a process monitor on a port.
@@ -3060,10 +3100,39 @@ pub(crate) fn monitor(
     let handle = process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
-        .ok_or_else(badarg)?;
-    let state = handle.state.lock().unwrap();
-    if monitored && state.exit_complete {
+        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned());
+    let Some(handle) = handle else {
+        // The port vanished between lookup and registration: the caller sends DOWN noproc.
+        return Ok(!monitored);
+    };
+    if monitored && let Some(drv_port) = handle.driver.get() {
+        // Port of erts/emulator/beam/io.c:6787 (erts_port_monitor): the request is a port
+        // signal, handled once the callback holding the port lock has returned.
+        return drv_port.serialized(|| {
+            register_monitor(process, id, &handle, reference, pid, object, monitored)
+        });
+    }
+    register_monitor(process, id, &handle, reference, pid, object, monitored)
+}
+
+fn register_monitor(
+    process: &Process,
+    id: u64,
+    handle: &Arc<PortHandle>,
+    reference: u64,
+    pid: Pid,
+    object: OwnedTerm,
+    monitored: bool,
+) -> Result<bool, VmError> {
+    if monitored && handle.state.lock().unwrap().exit_complete {
+        return Ok(false);
+    }
+    // See `link`: same lock order as termination (table, then monitors).
+    let ports = process
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.ports.lock().unwrap());
+    if monitored && !ports.as_ref().is_some_and(|ports| ports.contains_key(&id)) {
         return Ok(false);
     }
     let mut monitors = handle.monitors.lock().unwrap();
@@ -3073,6 +3142,47 @@ pub(crate) fn monitor(
         monitors.remove(&reference);
     }
     Ok(true)
+}
+
+/// Ports linked to `pid`, in id order, for `process_info(Pid, links)`.
+pub(crate) fn linked_ports(process: &Process, pid: Pid) -> Vec<Term> {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u64> = runtime
+        .ports
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, handle)| handle.links.lock().unwrap().contains(&pid))
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    ids.into_iter().filter_map(Term::port).collect()
+}
+
+/// Ports monitoring `pid` through `driver_monitor_process`, for `process_info(Pid, monitored_by)`.
+pub(crate) fn driver_monitoring_ports(process: &Process, pid: Pid) -> Vec<Term> {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<u64> = runtime
+        .ports
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, handle)| {
+            handle
+                .drv_monitors
+                .lock()
+                .unwrap()
+                .values()
+                .any(|monitored| *monitored == pid)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    ids.into_iter().filter_map(Term::port).collect()
 }
 
 /// Monitor targets reported by `process_info/2` for one process.
@@ -3112,30 +3222,37 @@ pub(crate) fn demonitor(process: &Process, reference: u64) -> bool {
 pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let handle = runtime
-        .ports
-        .lock()
-        .unwrap()
-        .get(&id)
-        .cloned()
-        .ok_or_else(badarg)?;
-    let owner_pid = process.self_pid.ok_or_else(badarg)?;
+    // A message to a dead local port is dropped (erts_port_command DROPPED).
+    let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
+        return Ok(());
+    };
     let Some(parts) = tuple(message) else {
         signal_badsig(&handle, id);
         return Ok(());
     };
-    if parts.len() != 2 || parts[0] != process.self_pid.and_then(Pid::to_term).ok_or_else(badarg)? {
+    // Port of erts/emulator/beam/io.c:3991 (erts_port_command): the first element names the
+    // connected process (checked per operation), not necessarily the sender.
+    let from = if parts.len() == 2 {
+        Pid::from_term(parts[0])
+    } else {
+        None
+    };
+    let Some(from) = from else {
         signal_badsig(&handle, id);
         return Ok(());
-    }
+    };
+    let from_connected = *handle.owner.lock().unwrap() == from;
     if parts[1] == atom("close") {
-        if Some(*handle.owner.lock().unwrap()) != process.self_pid {
+        if !from_connected {
             signal_badsig(&handle, id);
             return Ok(());
         }
         if handle.os_pid == 0 {
-            close(process, port)?;
-            event_message(&handle.scheduler, owner_pid, id, atom("closed"));
+            // A port that terminated meanwhile drops the signal.
+            if close(process, port).is_err() {
+                return Ok(());
+            }
+            event_message(&handle.scheduler, from, id, atom("closed"));
             return Ok(());
         }
         let notify_now = {
@@ -3149,7 +3266,7 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
         };
         remove_port(runtime, id);
         if notify_now {
-            event_message(&handle.scheduler, owner_pid, id, atom("closed"));
+            event_message(&handle.scheduler, from, id, atom("closed"));
         } else {
             poke(&handle);
         }
@@ -3159,6 +3276,38 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
         signal_badsig(&handle, id);
         return Ok(());
     };
+    if command.len() == 2 && command[0] == atom("command") && !from_connected {
+        // io.c:1887 (erts_port_output, bang op): only the connected process may command.
+        signal_badsig(&handle, id);
+        return Ok(());
+    }
+    if command.len() == 2
+        && command[0] == atom("command")
+        && let Some(drv_port) = handle.driver.get()
+    {
+        // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `Port ! {Pid, {command, D}}`.
+        let mut pieces = Vec::new();
+        if io_pieces(command[1], &mut pieces).is_none() {
+            signal_badsig(&handle, id);
+            return Ok(());
+        }
+        let pieces = pieces
+            .iter()
+            .map(|(bytes, refc)| {
+                if *refc {
+                    arinsal_drv::IoPiece::Refc(bytes)
+                } else {
+                    arinsal_drv::IoPiece::Copied(bytes)
+                }
+            })
+            .collect::<Vec<_>>();
+        if !drv_port.output(&pieces, packed_pid(from))
+            && runtime.ports.lock().unwrap().contains_key(&id)
+        {
+            signal_badsig(&handle, id);
+        }
+        return Ok(());
+    }
     if command.len() == 2 && command[0] == atom("command") {
         let Some(mut data) = iodata(command[1]) else {
             signal_badsig(&handle, id);
@@ -3199,12 +3348,13 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
         return Ok(());
     }
     if command.len() == 2 && command[0] == atom("connect") {
-        if Some(*handle.owner.lock().unwrap()) != process.self_pid || command[1].as_pid().is_none()
-        {
+        if !from_connected || command[1].as_pid().is_none() {
             signal_badsig(&handle, id);
             return Ok(());
         }
-        if connect(process, port, command[1], true).is_err() {
+        if connect(process, port, command[1], Some(from)).is_err()
+            && runtime.ports.lock().unwrap().contains_key(&id)
+        {
             signal_badsig(&handle, id);
         }
         return Ok(());
