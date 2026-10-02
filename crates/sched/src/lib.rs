@@ -2051,8 +2051,8 @@ impl<T: Task> Inner<T> {
         Some(deadline.saturating_sub(self.clock.now_ms()))
     }
 
-    fn poll_timers(&self, worker: usize, mut local: Option<&mut Local<T>>, force: bool) {
-        let due = if let Some(local) = local.as_deref_mut() {
+    fn poll_timers(&self, worker: usize, local: Option<&mut Local<T>>, force: bool) {
+        if let Some(local) = local {
             debug_assert_eq!(local.worker_id, worker);
             {
                 let service = local.timer_service.borrow();
@@ -2063,31 +2063,33 @@ impl<T: Task> Inner<T> {
                     return;
                 }
             }
+            let should_advance = force || local.check_time_reds >= self.config.reductions;
+            if should_advance {
+                local.check_time_reds = 0;
+                let now = self.clock.now_ms();
+                let due = local.timer_service.borrow_mut().wheel.advance(now);
+                for (id, event) in due {
+                    self.fire_timer(worker, id, event, Some(local));
+                }
+            }
+            // Port of erts/emulator/beam/erl_hl_timer.c:1922-1964 (access_btm), OTP-29.1.1:
+            // expired timers cannot be canceled successfully.
             self.apply_timer_commands(local);
-            if !local.timer_service.borrow().wheel.has_timers() {
-                return;
-            }
-            // Port of erts/emulator/beam/erl_process.c:9803 (ERTS_CHECK_TIME_REDS), OTP-29.1.1.
-            if !force && local.check_time_reds < self.config.reductions {
-                return;
-            }
-            local.check_time_reds = 0;
-            let now = self.clock.now_ms();
-            local.timer_service.borrow_mut().wheel.advance(now)
-        } else if let Some(timers) = self.sim_timers.as_ref() {
-            let Some(wheel) = timers.get(worker) else {
-                return;
-            };
-            if !wheel.lock().unwrap().has_timers() {
-                return;
-            }
-            let now = self.clock.now_ms();
-            wheel.lock().unwrap().advance(now)
-        } else {
+            return;
+        }
+        let Some(timers) = self.sim_timers.as_ref() else {
             return;
         };
+        let Some(wheel) = timers.get(worker) else {
+            return;
+        };
+        if !wheel.lock().unwrap().has_timers() {
+            return;
+        }
+        let now = self.clock.now_ms();
+        let due = wheel.lock().unwrap().advance(now);
         for (id, event) in due {
-            self.fire_timer(worker, id, event, local.as_deref_mut());
+            self.fire_timer(worker, id, event, None);
         }
     }
 
