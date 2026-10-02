@@ -310,6 +310,15 @@ impl Drop for Vm {
     }
 }
 impl Vm {
+    /// Registers a native function for this VM and removes it when its code scope is released.
+    pub fn register_native_function(
+        &mut self,
+        mut function: NativeFunction,
+    ) -> Result<(), &'static str> {
+        function.scope = self.code_scope;
+        native_bridge::register_native_function(function)
+    }
+
     /// Paths currently searched for lazy module loading.
     pub fn paths(&self) -> &[PathBuf] {
         &self.paths

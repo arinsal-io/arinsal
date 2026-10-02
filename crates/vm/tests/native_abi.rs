@@ -401,7 +401,8 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
     let offset = memory.alloc(bytes.len()).unwrap();
     memory.write_bytes(offset, &bytes).unwrap();
     let entry = memory.ptr_at(offset) as usize;
-    register_native_function(NativeFunction {
+    let mut vm = Vm::new([]);
+    vm.register_native_function(NativeFunction {
         scope: 0,
         start: entry,
         end: entry + bytes.len(),
@@ -419,7 +420,6 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
     })
     .unwrap();
 
-    let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let result = vm
         .eval_scheduled("native_abi_test", "bridge", &[], 1, None)

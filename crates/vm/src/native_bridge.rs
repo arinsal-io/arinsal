@@ -314,6 +314,29 @@ pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
     native_generation().fetch_add(1, Ordering::Release);
 }
 
+/// Unregisters scoped native entries when their owning VM code scope is released.
+pub(crate) fn unregister_native_scope(scope: u64) {
+    if scope == 0 {
+        return;
+    }
+    let Ok(mut functions) = native_functions().write() else {
+        return;
+    };
+    let mut removed = Vec::new();
+    functions.retain(|function| {
+        if function.scope == scope {
+            removed.push((function.start, function.end));
+            false
+        } else {
+            true
+        }
+    });
+    for (start, end) in removed {
+        arinsal_term::unregister_native_code_range(start, end);
+    }
+    native_generation().fetch_add(1, Ordering::Release);
+}
+
 pub(crate) fn native_registry_generation() -> u64 {
     native_generation().load(Ordering::Acquire)
 }
@@ -404,18 +427,25 @@ pub(crate) fn native_functions_of(
     scope: u64,
     module: &str,
 ) -> std::collections::HashMap<(String, u8), NativeFunction> {
-    native_functions().read().map_or_else(
-        |_| std::collections::HashMap::new(),
-        |functions| {
-            functions
-                .iter()
-                .filter(|entry| {
-                    (entry.scope == scope || entry.scope == 0) && entry.module == module
-                })
-                .map(|entry| ((entry.function.clone(), entry.arity), entry.clone()))
-                .collect()
-        },
-    )
+    let Ok(functions) = native_functions().read() else {
+        return std::collections::HashMap::new();
+    };
+    let mut scoped = functions
+        .iter()
+        .filter(|entry| entry.scope == scope && entry.module == module)
+        .map(|entry| ((entry.function.clone(), entry.arity), entry.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    if scope != 0 {
+        for entry in functions
+            .iter()
+            .filter(|entry| entry.scope == 0 && entry.module == module)
+        {
+            scoped
+                .entry((entry.function.clone(), entry.arity))
+                .or_insert_with(|| entry.clone());
+        }
+    }
+    scoped
 }
 
 pub(crate) fn native_function_for(

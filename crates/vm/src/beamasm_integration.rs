@@ -142,6 +142,7 @@ pub(crate) fn new_code_scope() -> u64 {
 
 /// Forgets the export state of a node whose code is gone.
 pub(crate) fn release_code_scope(scope: u64) {
+    crate::native_bridge::unregister_native_scope(scope);
     let Ok(mut registry) = dispatch_registry().write() else {
         return;
     };
