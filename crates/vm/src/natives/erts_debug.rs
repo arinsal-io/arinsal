@@ -2317,7 +2317,17 @@ fn internal_state_set(
             };
         }
         Some("ets_force_trap") => return Ok(atom("notsup")),
-        Some("proc_sig_buffers") if value == atom("true") => return Ok(atom("false")),
+        Some("proc_sig_buffers") if value == atom("true") => {
+            return Ok(atom(
+                if process.message_queue_data() == crate::process::MessageQueueData::OffHeap
+                    && ctx.force_parallel_signal_buffers()
+                {
+                    "true"
+                } else {
+                    "false"
+                },
+            ));
+        }
         Some("proc_sig_buffers") => return Ok(atom("notsup")),
         Some("abort") => {
             let reason = to_owned(value).map_err(|_| badarg())?;

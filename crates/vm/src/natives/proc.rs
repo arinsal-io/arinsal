@@ -1559,6 +1559,10 @@ fn call_values(
                     return Term::small(previous as i64).ok_or_else(badarg);
                 }
                 let previous = flag(process, &name, *value)?;
+                if name == "message_queue_data" {
+                    // Port of erts/emulator/beam/bif.c:process_flag_2, OTP-29.1.1.
+                    ctx.set_parallel_signal_buffers(*value == atom("off_heap"));
+                }
                 if name == "priority" {
                     // Port of erts/emulator/beam/erl_process.c (erts_set_process_priority),
                     // OTP-29.1.1: the scheduler queues the process at the new priority.
