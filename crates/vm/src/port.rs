@@ -180,18 +180,57 @@ pub(crate) fn test_next_port_id(
     set: bool,
     next_id: u64,
 ) -> Option<u64> {
-    const MAX_PORT_ID: u64 = arinsal_term::ptab::PTAB_INVALID_DATA - 1;
     let ports = runtime.ports.lock().unwrap();
-    let start = if set {
-        next_id.checked_add(1)?
-    } else {
-        runtime.next_port.load(Ordering::Relaxed)
-    };
-    let candidate = (start..=MAX_PORT_ID).find(|id| !ports.contains_key(id))?;
-    if set {
-        runtime.next_port.store(candidate, Ordering::Relaxed);
+    Some(runtime.port_ids.test_next_id(set, next_id, |pix| {
+        ports
+            .keys()
+            .any(|id| arinsal_term::ptab::port_table_layout().data2pix(*id) == pix)
+    }))
+}
+
+/// Port of erts/emulator/beam/erl_ptab.c:500, 675 (new/delete element), OTP-29.1.1.
+/// A reserved local port id is returned to the ptab ring if construction fails.
+struct PortIdReservation<'a> {
+    runtime: &'a crate::process::Runtime,
+    id: u64,
+    committed: bool,
+}
+
+impl PortIdReservation<'_> {
+    fn id(&self) -> u64 {
+        self.id
     }
-    Some(candidate)
+
+    fn commit(mut self) -> u64 {
+        self.committed = true;
+        self.id
+    }
+}
+
+impl Drop for PortIdReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ports = self.runtime.ports.lock().unwrap();
+            self.runtime.port_ids.release(self.id);
+        }
+    }
+}
+
+fn reserve_port_id(runtime: &crate::process::Runtime) -> Result<PortIdReservation<'_>, VmError> {
+    let _ports = runtime.ports.lock().unwrap();
+    let id = runtime.port_ids.reserve().ok_or_else(badarg)?;
+    Ok(PortIdReservation {
+        runtime,
+        id,
+        committed: false,
+    })
+}
+
+fn remove_port(runtime: &crate::process::Runtime, id: u64) -> Option<Arc<PortHandle>> {
+    let mut ports = runtime.ports.lock().unwrap();
+    let handle = ports.remove(&id)?;
+    runtime.port_ids.release(id);
+    Some(handle)
 }
 
 impl PortHandle {
@@ -805,9 +844,8 @@ fn start(
         .map(|stdout: ChildStdout| stdout.into_raw_fd());
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
-    let port_id = runtime
-        .next_port
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reservation = reserve_port_id(runtime)?;
+    let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
     let handle = make_handle(
         port_id,
@@ -826,6 +864,7 @@ fn start(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    reservation.commit();
     let owner = ctx.pid();
     std::thread::Builder::new()
         .name(format!("arinsal-port-{port_id}"))
@@ -864,9 +903,8 @@ fn start_driver(
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
-    let port_id = runtime
-        .next_port
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reservation = reserve_port_id(runtime)?;
+    let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
     let handle = make_handle(
         port_id,
@@ -885,6 +923,7 @@ fn start_driver(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    reservation.commit();
     // g_inet_udp
     if udp {
         crate::inet_udp::attach(Arc::clone(runtime), port_id, Arc::clone(&handle));
@@ -919,9 +958,8 @@ fn start_dyn_driver(
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
     install_hooks();
-    let port_id = runtime
-        .next_port
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reservation = reserve_port_id(&runtime)?;
+    let port_id = reservation.id();
     let port = Term::port(port_id).ok_or_else(badarg)?;
     let handle = make_handle(
         port_id,
@@ -957,9 +995,10 @@ fn start_dyn_driver(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    reservation.commit();
     let caller = packed_pid(ctx.pid());
     if let Err(error) = drv_port.start(&name, caller) {
-        runtime.ports.lock().unwrap().remove(&port_id);
+        remove_port(&runtime, port_id);
         drv_port.abandon();
         release_io(&handle);
         if handle_id.is_some() {
@@ -1315,9 +1354,8 @@ impl arinsal_drv::PortHost for DrvHost {
         if !scheduler.lookup(owner) {
             return None;
         }
-        let port_id = runtime
-            .next_port
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reservation = reserve_port_id(&runtime).ok()?;
+        let port_id = reservation.id();
         let handle = make_handle(
             port_id,
             None,
@@ -1343,6 +1381,7 @@ impl arinsal_drv::PortHost for DrvHost {
         let _ = handle.driver.set(Arc::clone(&drv_port));
         crate::ddll::port_opened_for(&driver, &drv_port);
         runtime.ports.lock().unwrap().insert(port_id, handle);
+        reservation.commit();
         Some(drv_port)
     }
 }
@@ -1458,7 +1497,7 @@ pub(crate) fn install_hooks() {
 /// Port of erts/emulator/beam/io.c:3841 (erts_deliver_port_exit) for a driver that
 /// fails: the port terminates (`stop`), then links and monitors see `reason`.
 fn driver_port_exit(runtime: &crate::process::Runtime, id: u64, reason: Term) {
-    let Some(handle) = runtime.ports.lock().unwrap().remove(&id) else {
+    let Some(handle) = remove_port(runtime, id) else {
         return;
     };
     let owner = handle.owner_pid();
@@ -1527,9 +1566,8 @@ pub(crate) fn alloc_inet_port(
     name: String,
 ) -> Result<(u64, Arc<PortHandle>), VmError> {
     let scheduler = runtime.scheduler()?;
-    let port_id = runtime
-        .next_port
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reservation = reserve_port_id(runtime)?;
+    let port_id = reservation.id();
     let handle = make_handle(
         port_id,
         None,
@@ -1547,12 +1585,13 @@ pub(crate) fn alloc_inet_port(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    reservation.commit();
     Ok((port_id, handle))
 }
 
 /// Remove an inet port after the peer closes an active socket (`driver_exit`).
 pub(crate) fn abandon_port(runtime: &crate::process::Runtime, id: u64) {
-    let Some(handle) = runtime.ports.lock().unwrap().remove(&id) else {
+    let Some(handle) = remove_port(runtime, id) else {
         return;
     };
     crate::inet_drv::detach(id);
@@ -1789,9 +1828,8 @@ fn start_fd(
     let writer = duplicate_fd(output_fd).map_err(|_| badarg())?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
-    let id = runtime
-        .next_port
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reservation = reserve_port_id(runtime)?;
+    let id = reservation.id();
     let port = Term::port(id).ok_or_else(badarg)?;
     let handle = make_handle(
         id,
@@ -1810,6 +1848,7 @@ fn start_fd(
         .lock()
         .unwrap()
         .insert(id, Arc::clone(&handle));
+    reservation.commit();
     let owner = ctx.pid();
     let read_fd = reader.into_raw_fd();
     let binary = opts.binary;
@@ -2713,10 +2752,7 @@ fn close(process: &Process, term: Term) -> Result<Term, VmError> {
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler().map_err(|_| badarg())?;
     let id = term.as_port().ok_or_else(badarg)?;
-    let removed = process
-        .runtime
-        .as_ref()
-        .and_then(|r| r.ports.lock().unwrap().remove(&id));
+    let removed = remove_port(runtime, id);
     if let Some(handle) = removed {
         if handle.inet {
             crate::inet_drv::detach(id);
@@ -2788,11 +2824,8 @@ pub(crate) fn exit_port(
     reason: Term,
 ) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
-    let removed = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().remove(&id))
-        .ok_or_else(badarg)?;
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let removed = remove_port(runtime, id).ok_or_else(badarg)?;
     if removed.inet {
         crate::inet_drv::detach(id);
     }
@@ -2931,7 +2964,11 @@ pub(crate) fn owner_exit(
             })
             .collect::<Vec<_>>();
         ids.into_iter()
-            .filter_map(|id| ports.remove(&id).map(|handle| (id, handle)))
+            .filter_map(|id| {
+                let handle = ports.remove(&id)?;
+                runtime.port_ids.release(id);
+                Some((id, handle))
+            })
             .collect::<Vec<_>>()
     };
     for (port_id, handle) in closed {
@@ -3110,7 +3147,7 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
             state.send_closed = true;
             state.exit_complete
         };
-        runtime.ports.lock().unwrap().remove(&id);
+        remove_port(runtime, id);
         if notify_now {
             event_message(&handle.scheduler, owner_pid, id, atom("closed"));
         } else {
@@ -3178,7 +3215,7 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
 
 fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4125 (ports/0), OTP-29.1.1.
-    // Standard I/O is a registered port even when no user port is open.
+    // The forker is port zero and exists even when no user port is open.
     let mut values = vec![Term::port(0).expect("standard I/O port tag")];
     if let Some(runtime) = &process.runtime {
         values.extend(
