@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Rust and BEAM compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Erlang/OTP and Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29.1.1"
+          elixir-version: "1.20.4"
+          version-type: strict
+          install-hex: true
+          install-rebar: true
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+
+      - name: Run Rust checks and tests
+        run: tools/check.sh
+
+      - name: Check difftest protocol against OTP
+        run: tools/difftest/smoke.sh
+
+      - name: Compare VM stage1 cases with OTP
+        run: timeout 600 cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
+
+      - name: Fetch Elixir demo dependencies
+        working-directory: examples/arinsal_demo
+        run: mix deps.get
+
+      - name: Test Elixir demo on ERTS
+        working-directory: examples/arinsal_demo
+        run: mix test
+
+      - name: Test Elixir demo on Arinsal
+        working-directory: examples/arinsal_demo
+        run: mix arinsal test
