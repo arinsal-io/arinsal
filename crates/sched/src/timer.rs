@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::SyncSender;
 
 use crate::Pid;
 
@@ -421,12 +420,10 @@ pub(crate) enum TimerCommand<M> {
         id: u64,
         deadline: u64,
         payload: TimerPayload<M>,
-        reply: SyncSender<()>,
     },
     Read {
         id: u64,
-        reply: Option<SyncSender<Option<u64>>>,
-        callback: Option<Box<dyn FnOnce(Option<u64>) + Send>>,
+        callback: Box<dyn FnOnce(Option<u64>) + Send>,
     },
     Cancel {
         id: u64,
@@ -445,10 +442,9 @@ pub(crate) enum TimerCommand<M> {
     },
 }
 
+/// A receive timeout cancelled by another thread (erts canceled-timer queue).
 pub(crate) struct CanceledTimer {
     pub(crate) id: u64,
-    pub(crate) reply: Option<SyncSender<Option<u64>>>,
-    pub(crate) callback: Option<Box<dyn FnOnce(Option<u64>) + Send>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

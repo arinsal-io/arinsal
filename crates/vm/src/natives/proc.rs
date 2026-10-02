@@ -130,9 +130,11 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
             let normalized = match name {
                 "fullsweep_after" => n.min(u16::MAX as i64),
                 "min_heap_size" => n.max(233),
-                "min_bin_vheap_size" => {
-                    crate::natives::sys::normalize_spawn_heap_minimum(Some(n as usize), true) as i64
-                }
+                "min_bin_vheap_size" => crate::natives::sys::normalize_spawn_heap_minimum(
+                    process.runtime.as_deref(),
+                    Some(n as usize),
+                    true,
+                ) as i64,
                 _ => n,
             };
             let previous_min_bin_vheap = process.heap.min_bin_vheap_size();
@@ -2027,7 +2029,7 @@ fn spawn_request(
     if module.as_atom().is_none() || function.as_atom().is_none() || list(args).is_none() {
         return Ok(atom("badarg"));
     }
-    let Some(parsed) = parse_spawn_options(options) else {
+    let Some(parsed) = parse_spawn_options(process.runtime.as_deref(), options) else {
         return Ok(atom("badopt"));
     };
     let runtime = process
@@ -2189,7 +2191,10 @@ struct LocalSpawn {
     monitor_id: Option<u64>,
 }
 
-fn parse_spawn_options(options: Term) -> Option<LocalSpawn> {
+fn parse_spawn_options(
+    runtime: Option<&crate::process::Runtime>,
+    options: Term,
+) -> Option<LocalSpawn> {
     let items = list(options)?;
     let mut parsed = LocalSpawn {
         link: false,
@@ -2228,7 +2233,10 @@ fn parse_spawn_options(options: Term) -> Option<LocalSpawn> {
                     _ => parsed.bad = true,
                 }
             } else if key == atom("max_heap_size") {
-                match parse_max_heap_from(value, super::sys::gc_spawn_defaults().max_heap_size) {
+                match parse_max_heap_from(
+                    value,
+                    super::sys::gc_spawn_defaults(runtime).max_heap_size,
+                ) {
                     Ok(limit) => parsed.max_heap = Some(limit),
                     Err(()) => parsed.bad = true,
                 }
@@ -2279,7 +2287,8 @@ fn parse_spawn_options(options: Term) -> Option<LocalSpawn> {
             parsed.bad = true;
         }
     }
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(parsed.min_heap, false) as u64;
+    let min_heap =
+        crate::natives::sys::normalize_spawn_heap_minimum(runtime, parsed.min_heap, false) as u64;
     if parsed
         .max_heap
         .is_some_and(|limit| limit.size != 0 && limit.size < min_heap)
@@ -2313,19 +2322,29 @@ fn spawn_apply(
     options: &LocalSpawn,
 ) -> Result<Pid, VmError> {
     let (module_id, entry) = crate::process::erlang_apply_entry(vm)?;
-    let defaults = crate::natives::sys::gc_spawn_defaults();
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(options.min_heap, false);
+    let runtime = parent.runtime.clone();
+    let defaults = crate::natives::sys::gc_spawn_defaults(runtime.as_deref());
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
+        runtime.as_deref(),
+        options.min_heap,
+        false,
+    );
     let min_bin_vheap = if options.min_bin_vheap.is_some()
         && options.min_heap.is_none()
         && options.max_heap.is_none()
     {
         defaults.min_bin_vheap_size as usize
     } else {
-        crate::natives::sys::normalize_spawn_heap_minimum(options.min_bin_vheap, true)
+        crate::natives::sys::normalize_spawn_heap_minimum(
+            runtime.as_deref(),
+            options.min_bin_vheap,
+            true,
+        )
     };
     let fullsweep_after = options.fullsweep.unwrap_or(defaults.fullsweep_after);
     let max_heap = options.max_heap.unwrap_or(defaults.max_heap_size);
     let mut child = Process::with_spawn_registers(3, 0);
+    child.set_runtime(parent.runtime.clone());
     if options.min_heap.is_some() {
         child.heap = arinsal_term::ProcessHeap::with_words(min_heap.max(64));
     }
@@ -2334,7 +2353,6 @@ fn spawn_apply(
     child.heap.set_fullsweep_after(fullsweep_after);
     child.module = module_id;
     child.ip = entry;
-    child.set_runtime(parent.runtime.clone());
     if let (Some(m), Some(f), Some(arguments)) = (module.as_atom(), function.as_atom(), list(args))
     {
         let names = arinsal_term::global_atoms();
@@ -2419,7 +2437,8 @@ pub(crate) fn register_spawn_max_heap(
     pid: Pid,
     requested: Option<crate::process::MaxHeap>,
 ) {
-    let max_heap = requested.unwrap_or(crate::natives::sys::gc_spawn_defaults().max_heap_size);
+    let max_heap =
+        requested.unwrap_or(crate::natives::sys::gc_spawn_defaults(Some(runtime)).max_heap_size);
     if !is_default_max_heap(max_heap)
         || runtime
             .ever_max_heap
