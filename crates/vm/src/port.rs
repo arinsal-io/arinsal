@@ -919,6 +919,9 @@ fn start_dyn_driver(
         Arc::clone(&scheduler),
         false,
     )?;
+    arinsal_drv::set_poll_backend(Arc::new(DrvPoll {
+        state: Arc::default(),
+    }));
     let host = DrvHost {
         runtime: Arc::downgrade(runtime),
     };
@@ -1040,6 +1043,120 @@ impl arinsal_drv::PortHost for DrvHost {
         if let Some(handle) = self.handle(port.id()) {
             let owner = handle.owner_pid();
             handle.links.lock().unwrap().remove(&owner);
+        }
+    }
+
+    // Port of erts/emulator/beam/utils.c:802 (do_send_logger_message) for
+    // erts_send_error_to_logger_nogl: an `error_msg` event to the logger process.
+    fn log_error(&self, text: &str) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            eprint!("{text}");
+            return;
+        };
+        let logger = {
+            let names = runtime.names.lock().expect("registered process names");
+            names
+                .get("logger")
+                .or_else(|| names.get("error_logger"))
+                .copied()
+        };
+        let Some(logger) = logger else {
+            eprint!("{text}");
+            return;
+        };
+        let Ok(scheduler) = runtime.scheduler() else {
+            return;
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros())
+            .try_into()
+            .unwrap_or(i64::MAX);
+        let mut heap = ProcessHeap::with_words(output_heap_words(text.len() * 2 + 64, false, 96));
+        let event = (|| -> Result<Term, arinsal_term::TermError> {
+            let mut builder = TermBuilder::new(&mut heap);
+            let format = builder.string_to_list("~s")?;
+            let message = builder.string_to_list(text)?;
+            let args = builder.list_from_iter([message])?;
+            let error_logger = builder.flatmap_from_pairs(&[
+                (atom("emulator"), atom("true")),
+                (atom("tag"), atom("error")),
+            ])?;
+            let metadata = builder.flatmap_from_pairs(&[
+                (atom("error_logger"), error_logger),
+                (atom("time"), Term::small(timestamp).unwrap_or(Term::NIL)),
+            ])?;
+            builder.tuple(&[atom("log"), atom("error"), format, args, metadata])
+        })();
+        if let Ok(event) = event
+            && let Ok(message) = Message::copy_from(event)
+        {
+            let _ = scheduler.send(logger, logger, message);
+        }
+    }
+
+    fn ddll_reference(&self, port: &arinsal_drv::DriverPort) {
+        crate::ddll::reference_referenced(port.driver());
+    }
+
+    fn ddll_dereference(&self, port: &arinsal_drv::DriverPort) {
+        if let Some(runtime) = self.runtime.upgrade()
+            && let Ok(scheduler) = runtime.scheduler()
+        {
+            crate::ddll::dereference_referenced(&scheduler, port.driver());
+        }
+    }
+}
+
+/// Registrations of the shared poller that `driver_select` holds.
+#[derive(Default)]
+struct DrvPollState {
+    live: HashMap<u64, crate::check_io::Registration>,
+    /// Fired before `register` returned its handle.
+    fired: HashSet<u64>,
+}
+
+/// The shared poller as the `driver_select` poll set.
+struct DrvPoll {
+    state: Arc<Mutex<DrvPollState>>,
+}
+
+impl arinsal_drv::PollBackend for DrvPoll {
+    fn register(
+        &self,
+        id: u64,
+        fd: i32,
+        write: bool,
+        ready: Box<dyn FnOnce() + Send>,
+    ) -> std::io::Result<()> {
+        let state = Arc::clone(&self.state);
+        let registration = crate::check_io::register_driver(
+            fd,
+            crate::check_io::InterestSet {
+                readable: !write,
+                writable: write,
+            },
+            move |_, _| {
+                {
+                    let mut state = state.lock().unwrap();
+                    if state.live.remove(&id).is_none() {
+                        state.fired.insert(id);
+                    }
+                }
+                ready();
+            },
+        )?;
+        let mut state = self.state.lock().unwrap();
+        if !state.fired.remove(&id) {
+            state.live.insert(id, registration);
+        }
+        Ok(())
+    }
+
+    fn deregister(&self, id: u64) {
+        let registration = self.state.lock().unwrap().live.remove(&id);
+        if let Some(registration) = registration {
+            crate::check_io::deregister(registration);
         }
     }
 }

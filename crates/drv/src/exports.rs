@@ -1,12 +1,13 @@
 //! C driver API implemented by the core host (see `api::DRIVER_API`).
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::hint::black_box;
 use std::sync::{Mutex, OnceLock};
 
 use crate::binary::{self, ErlDrvBinary};
-use crate::{ExitReason, errno_id, port_of};
+use crate::task::fd_of;
+use crate::{DrvFn1, ExitReason, asyncq, errno_id, port_of, select};
 
 /// Borrow `len` bytes at `ptr`; NULL or zero length is empty.
 fn bytes<'a>(ptr: *const c_char, len: usize) -> &'a [u8] {
@@ -180,6 +181,92 @@ pub extern "C" fn driver_binary_dec_refc(bin: *mut ErlDrvBinary) -> isize {
     binary::dec_refc(bin)
 }
 
+/// Port of erts/emulator/sys/common/erl_check_io.c:988 (driver_select), OTP-29.1.1.
+#[unsafe(no_mangle)]
+pub extern "C" fn driver_select(
+    port: *mut c_void,
+    event: *mut c_void,
+    mode: c_int,
+    on: c_int,
+) -> c_int {
+    let Some(port) = port_of(port) else {
+        return -1;
+    };
+    select::driver_select(&port, fd_of(event), mode, on != 0)
+}
+
+/// Port of io.c:6900 (driver_set_timer). A driver without `timeout` gets the default
+/// no-op callback of io.c:7535, so this never fails for a valid port.
+#[unsafe(no_mangle)]
+pub extern "C" fn driver_set_timer(port: *mut c_void, time: c_ulong) -> c_int {
+    let Some(port) = port_of(port) else {
+        return -1;
+    };
+    port.set_timer(time as i64);
+    0
+}
+
+/// Port of io.c:6919 (driver_cancel_timer).
+#[unsafe(no_mangle)]
+pub extern "C" fn driver_cancel_timer(port: *mut c_void) -> c_int {
+    let Some(port) = port_of(port) else {
+        return -1;
+    };
+    port.cancel_timer();
+    0
+}
+
+/// Port of io.c:6930 (driver_read_timer).
+#[unsafe(no_mangle)]
+pub extern "C" fn driver_read_timer(port: *mut c_void, time_left: *mut c_ulong) -> c_int {
+    let Some(port) = port_of(port) else {
+        return -1;
+    };
+    // SAFETY: the driver passes NULL or a writable `unsigned long`.
+    if let Some(out) = unsafe { time_left.as_mut() } {
+        *out = port.read_timer() as c_ulong;
+    }
+    0
+}
+
+/// Port of erl_port_task.c:1282 (erl_drv_consume_timeslice).
+#[unsafe(no_mangle)]
+pub extern "C" fn erl_drv_consume_timeslice(port: *mut c_void, percent: c_int) -> c_int {
+    let Some(port) = port_of(port) else {
+        return -1;
+    };
+    c_int::from(port.consume_timeslice(percent))
+}
+
+/// Port of erl_async.c:518 (driver_async_port_key): the port number spreads ports
+/// over the async queues.
+#[unsafe(no_mangle)]
+pub extern "C" fn driver_async_port_key(port: *mut c_void) -> c_uint {
+    port_of(port).map_or(0, |port| port.id as c_uint)
+}
+
+/// Port of erl_async.c:541 (driver_async).
+#[unsafe(no_mangle)]
+pub extern "C" fn driver_async(
+    port: *mut c_void,
+    key: *mut c_uint,
+    async_invoke: Option<DrvFn1>,
+    async_data: *mut c_void,
+    async_free: Option<DrvFn1>,
+) -> c_long {
+    let (Some(port), Some(invoke)) = (port_of(port), async_invoke) else {
+        return -1;
+    };
+    // SAFETY: the driver passes NULL or a writable `unsigned int` key.
+    asyncq::driver_async(
+        port,
+        unsafe { key.as_mut() },
+        invoke,
+        async_data,
+        async_free,
+    )
+}
+
 /// Exported symbol addresses by name, for `api` checks.
 pub(crate) fn exported() -> &'static [(&'static str, usize)] {
     static EXPORTS: OnceLock<Vec<(&'static str, usize)>> = OnceLock::new();
@@ -206,6 +293,22 @@ pub(crate) fn exported() -> &'static [(&'static str, usize)] {
                 set_port_control_flags as *const () as usize,
             ),
             ("erl_errno_id", erl_errno_id as *const () as usize),
+            ("driver_select", driver_select as *const () as usize),
+            ("driver_set_timer", driver_set_timer as *const () as usize),
+            (
+                "driver_cancel_timer",
+                driver_cancel_timer as *const () as usize,
+            ),
+            ("driver_read_timer", driver_read_timer as *const () as usize),
+            (
+                "erl_drv_consume_timeslice",
+                erl_drv_consume_timeslice as *const () as usize,
+            ),
+            (
+                "driver_async_port_key",
+                driver_async_port_key as *const () as usize,
+            ),
+            ("driver_async", driver_async as *const () as usize),
             ("driver_alloc", driver_alloc as *const () as usize),
             ("driver_realloc", driver_realloc as *const () as usize),
             ("driver_free", driver_free as *const () as usize),
