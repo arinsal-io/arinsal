@@ -4,7 +4,8 @@ use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx, Scheduler};
 use arinsal_term::{
-    ProcessHeap, Term, TermBuilder, TermKind, copy_term, from_owned, global_atoms, to_owned,
+    ProcessHeap, Term, TermBuilder, TermKind, VecHeap, copy_term, from_owned, global_atoms,
+    to_owned,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -166,6 +167,10 @@ pub(crate) struct PortHandle {
     inet: bool,
     /// Dynamically loaded (`erl_ddll`) driver port.
     driver: OnceLock<Arc<arinsal_drv::DriverPort>>,
+    /// Processes this driver port monitors (`driver_monitor_process`): monitor id to pid.
+    drv_monitors: Mutex<HashMap<u64, Pid>>,
+    /// The `open_port` waiting for `erl_drv_init_ack`: reference id and opener.
+    async_open: Mutex<Option<(u64, Pid)>>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -536,7 +541,7 @@ fn event_message(scheduler: &Scheduler<Process>, owner: Pid, port_id: u64, event
 
 fn start(
     vm: &mut Vm,
-    process: &Process,
+    process: &mut Process,
     ctx: &RunCtx<'_, Message>,
     spec: Term,
     opts: Term,
@@ -582,29 +587,34 @@ fn start(
         // the command names the driver; `spawn` falls back to the spawn driver.
         let first = name.split(' ').next().unwrap_or_default();
         match crate::ddll::find_driver(first) {
-            Some(crate::ddll::Found::Dynamic(handle_id, driver)) => {
-                if want_status {
-                    return Err(badarg());
-                }
-                let line = framing.and_then(|(mode, n)| (mode == 1).then_some(n));
-                return start_dyn_driver(
-                    process,
-                    ctx,
-                    handle_id,
-                    driver,
-                    name,
-                    DriverIoFlags {
-                        binary,
-                        eof: want_eof,
-                        line,
-                    },
-                );
-            }
             Some(crate::ddll::Found::Static) if *kind == atom("spawn_driver") => {
                 return start_driver(process, ctx, name);
             }
             None if *kind == atom("spawn_driver") => return Err(badarg()),
-            _ => {}
+            Some(found) => {
+                if let Some((handle_id, driver)) = found.into_loaded() {
+                    if want_status {
+                        return Err(badarg());
+                    }
+                    let line = framing.and_then(|(mode, n)| (mode == 1).then_some(n));
+                    return start_dyn_driver(
+                        process,
+                        ctx,
+                        handle_id,
+                        driver,
+                        name,
+                        DriverIoFlags {
+                            msgq: limits
+                                .msgq_enabled
+                                .then_some((limits.msgq_low, limits.msgq_high)),
+                            binary,
+                            eof: want_eof,
+                            line,
+                        },
+                    );
+                }
+            }
+            None => {}
         }
     }
     let (name, executable, child_program, child_args) = match spec.as_slice() {
@@ -886,23 +896,29 @@ fn start_driver(
 
 /// `open_port` options that become driver port state flags.
 struct DriverIoFlags {
+    /// `{busy_limits_msgq, {Low, High}}`, `None` when disabled.
+    msgq: Option<(usize, usize)>,
     binary: bool,
     eof: bool,
     line: Option<usize>,
 }
 
+/// `ERL_DRV_FLAG_USE_INIT_ACK`.
+const ERL_DRV_FLAG_USE_INIT_ACK: i32 = 1 << 3;
+
 /// Port of erts/emulator/beam/io.c:542 (erts_open_driver) for a dynamically loaded
 /// driver, with the state flags erl_bif_port.c:1140 sets after `start`.
 fn start_dyn_driver(
-    process: &Process,
+    process: &mut Process,
     ctx: &RunCtx<'_, Message>,
-    handle_id: u64,
+    handle_id: Option<u64>,
     driver: Arc<arinsal_drv::Driver>,
     name: String,
     io: DriverIoFlags,
 ) -> Result<Term, VmError> {
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
+    install_hooks();
     let port_id = runtime
         .next_port
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -923,11 +939,19 @@ fn start_dyn_driver(
         state: Arc::default(),
     }));
     let host = DrvHost {
-        runtime: Arc::downgrade(runtime),
+        runtime: Arc::downgrade(&runtime),
     };
     let drv_port = arinsal_drv::DriverPort::new(Arc::clone(&driver), port_id, Box::new(host));
     let _ = handle.driver.set(Arc::clone(&drv_port));
-    crate::ddll::port_opened(handle_id, &drv_port);
+    if let Some(handle_id) = handle_id {
+        crate::ddll::port_opened(handle_id, &drv_port);
+    }
+    // Port of io.c:683: the message queue limits are set before `start`.
+    let (low, high) = io.msgq.unwrap_or((
+        arinsal_drv::BUSY_MSGQ_DISABLED,
+        arinsal_drv::BUSY_MSGQ_DISABLED,
+    ));
+    drv_port.set_msgq_limits(low, high);
     runtime
         .ports
         .lock()
@@ -938,7 +962,9 @@ fn start_dyn_driver(
         runtime.ports.lock().unwrap().remove(&port_id);
         drv_port.abandon();
         release_io(&handle);
-        crate::ddll::port_closed(&scheduler, &driver);
+        if handle_id.is_some() {
+            crate::ddll::port_closed(&scheduler, &driver);
+        }
         // Port of erts/emulator/beam/erl_bif_port.c:69-89 (open_port error atoms).
         return Ok(match error {
             arinsal_drv::StartError::General => atom("einval"),
@@ -947,6 +973,17 @@ fn start_dyn_driver(
         });
     }
     drv_port.set_io_flags(io.binary, io.eof, io.line);
+    if driver.flags() & ERL_DRV_FLAG_USE_INIT_ACK != 0 {
+        // Port of erts/emulator/beam/erl_bif_port.c:102: the opener gets a
+        // reference and the port, or the error, in `{Ref, Result}` from `erl_drv_init_ack`.
+        let reference = runtime.next_ref();
+        *handle.async_open.lock().unwrap() = Some((reference, ctx.pid()));
+        drv_port.expect_init_ack();
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        return TermBuilder::new(&mut heap)
+            .local_ref([reference as u32, (reference >> 32) as u32, 0])
+            .map_err(|_| badarg());
+    }
     Ok(port)
 }
 
@@ -1106,6 +1143,208 @@ impl arinsal_drv::PortHost for DrvHost {
             crate::ddll::dereference_referenced(&scheduler, port.driver());
         }
     }
+
+    // Port of erts/emulator/beam/io.c:3496 (deliver_vec_message), OTP-29.1.1.
+    fn deliver_vec(
+        &self,
+        port: &arinsal_drv::DriverPort,
+        header: &[u8],
+        segments: &[Vec<u8>],
+        binary: bool,
+    ) {
+        let Some(handle) = self.handle(port.id()) else {
+            return;
+        };
+        let Some(port_term) = Term::port(port.id()) else {
+            return;
+        };
+        let total: usize = segments.iter().map(Vec::len).sum();
+        let words = if binary {
+            total / 4 + segments.len() * 12
+        } else {
+            total * 2
+        } + header.len() * 2
+            + 32;
+        let mut heap = ProcessHeap::with_words(words);
+        let build = |heap: &mut ProcessHeap| -> Result<Term, arinsal_term::TermError> {
+            let mut list = Term::NIL;
+            if binary {
+                // erts conses every binary but the last onto it, so the tail of the
+                // list is the last binary itself and a single binary is not a list.
+                for (at, segment) in segments.iter().enumerate().rev() {
+                    let bin = TermBuilder::new(heap).binary(segment)?;
+                    list = if at + 1 == segments.len() {
+                        bin
+                    } else {
+                        TermBuilder::new(heap).cons(bin, list)?
+                    };
+                }
+            } else {
+                for byte in segments.iter().flatten().rev() {
+                    list = TermBuilder::new(heap)
+                        .cons(Term::small(i64::from(*byte)).unwrap(), list)?;
+                }
+            }
+            for byte in header.iter().rev() {
+                list = TermBuilder::new(heap).cons(Term::small(i64::from(*byte)).unwrap(), list)?;
+            }
+            let data = TermBuilder::new(heap).tuple(&[atom("data"), list])?;
+            TermBuilder::new(heap).tuple(&[port_term, data])
+        };
+        if let Ok(message) = build(&mut heap) {
+            publish(&handle.scheduler, handle.owner_pid(), port_term, message);
+        }
+    }
+
+    // Port of erts/emulator/beam/io.c:5658 (driver_deliver_term, message queueing), OTP-29.1.1.
+    fn deliver_term(
+        &self,
+        port: &arinsal_drv::DriverPort,
+        to: Option<u64>,
+        term: &OwnedTerm,
+    ) -> bool {
+        let Some(handle) = self.handle(port.id()) else {
+            return false;
+        };
+        let target = to.map_or_else(|| handle.owner_pid(), Pid::from_data);
+        if !handle.scheduler.lookup(target) {
+            return false;
+        }
+        let mut heap = VecHeap::new();
+        let Ok(built) = from_owned(term, &mut heap) else {
+            return false;
+        };
+        let Ok(message) = Message::copy_from(built) else {
+            return false;
+        };
+        handle.scheduler.send(target, target, message).is_ok()
+    }
+
+    fn connected(&self, port: &arinsal_drv::DriverPort) -> u64 {
+        self.handle(port.id())
+            .map_or(0, |handle| handle.owner_pid().data())
+    }
+
+    // Port of erts/emulator/beam/io.c:5203 (set_busy_port), OTP-29.1.1.
+    fn set_busy(&self, port: &arinsal_drv::DriverPort, on: bool) {
+        let Some(handle) = self.handle(port.id()) else {
+            return;
+        };
+        let woken = {
+            let mut st = handle.state.lock().unwrap();
+            st.busy_port = on;
+            if !on && !st.busy_msgq {
+                std::mem::take(&mut st.suspended)
+            } else {
+                Vec::new()
+            }
+        };
+        wake_suspended(&handle.scheduler, woken);
+    }
+
+    // Port of erts/emulator/beam/io.c:7006 (do_driver_monitor_process), OTP-29.1.1.
+    fn monitor_process(&self, port: &arinsal_drv::DriverPort, pid: u64, monitor: u64) -> bool {
+        let Some(handle) = self.handle(port.id()) else {
+            return false;
+        };
+        let target = Pid::from_data(pid);
+        if !handle.scheduler.lookup(target) {
+            return false;
+        }
+        handle.drv_monitors.lock().unwrap().insert(monitor, target);
+        true
+    }
+
+    fn demonitor_process(&self, port: &arinsal_drv::DriverPort, monitor: u64) {
+        if let Some(handle) = self.handle(port.id()) {
+            handle.drv_monitors.lock().unwrap().remove(&monitor);
+        }
+    }
+
+    // Port of erts/emulator/beam/io.c:7318 (driver_lock_driver), OTP-29.1.1.
+    fn lock_driver(&self, port: &arinsal_drv::DriverPort) -> bool {
+        self.handle(port.id())
+            .is_some_and(|handle| crate::ddll::lock_driver(&handle.scheduler, port.driver()))
+    }
+
+    // Port of erts/emulator/beam/io.c:2912 (init_ack_send_reply), OTP-29.1.1.
+    fn init_ack(&self, port: &arinsal_drv::DriverPort, reply: arinsal_drv::InitAck) {
+        let Some(handle) = self.handle(port.id()) else {
+            return;
+        };
+        let Some((reference, opener)) = handle.async_open.lock().unwrap().take() else {
+            return;
+        };
+        let Some(port_term) = Term::port(port.id()) else {
+            return;
+        };
+        let result = match reply {
+            arinsal_drv::InitAck::Opened => port_term,
+            arinsal_drv::InitAck::Failed(error) => {
+                // The opener is no longer linked to a port that failed to open.
+                handle.links.lock().unwrap().remove(&opener);
+                atom(&match error {
+                    arinsal_drv::StartError::General => "einval".to_owned(),
+                    arinsal_drv::StartError::Errno(errno) => arinsal_drv::errno_id(errno),
+                    arinsal_drv::StartError::Badarg => "badarg".to_owned(),
+                })
+            }
+        };
+        let mut heap = ProcessHeap::with_words(16);
+        let Ok(reference) =
+            TermBuilder::new(&mut heap).local_ref([reference as u32, (reference >> 32) as u32, 0])
+        else {
+            return;
+        };
+        if let Ok(message) = TermBuilder::new(&mut heap).tuple(&[reference, result]) {
+            publish(&handle.scheduler, opener, port_term, message);
+        }
+    }
+
+    // Port of erts/emulator/beam/io.c:781 (driver_create_port), OTP-29.1.1.
+    fn create_port(
+        &self,
+        creator: &arinsal_drv::DriverPort,
+        owner: u64,
+        name: &str,
+        drv_data: usize,
+    ) -> Option<Arc<arinsal_drv::DriverPort>> {
+        let runtime = self.runtime.upgrade()?;
+        let scheduler = runtime.scheduler().ok()?;
+        let owner = Pid::from_data(owner);
+        if !scheduler.lookup(owner) {
+            return None;
+        }
+        let port_id = runtime
+            .next_port
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handle = make_handle(
+            port_id,
+            None,
+            None,
+            owner,
+            0,
+            name.to_owned(),
+            false,
+            default_limits(),
+            Arc::clone(&scheduler),
+            false,
+        )
+        .ok()?;
+        let driver = Arc::clone(creator.driver());
+        let drv_port = arinsal_drv::DriverPort::new(
+            Arc::clone(&driver),
+            port_id,
+            Box::new(DrvHost {
+                runtime: self.runtime.clone(),
+            }),
+        );
+        drv_port.adopt(drv_data);
+        let _ = handle.driver.set(Arc::clone(&drv_port));
+        crate::ddll::port_opened_for(&driver, &drv_port);
+        runtime.ports.lock().unwrap().insert(port_id, handle);
+        Some(drv_port)
+    }
 }
 
 /// Registrations of the shared poller that `driver_select` holds.
@@ -1159,6 +1398,61 @@ impl arinsal_drv::PollBackend for DrvPoll {
             crate::check_io::deregister(registration);
         }
     }
+}
+
+/// Process-wide services for the driver API (`arinsal_drv::SystemHooks`).
+struct VmHooks {
+    offset: OnceLock<i128>,
+}
+
+impl arinsal_drv::SystemHooks for VmHooks {
+    fn monotonic_nanos(&self) -> i128 {
+        arinsal_bifs::monotonic_time_nanos()
+    }
+
+    fn time_offset_nanos(&self) -> i128 {
+        *self.offset.get_or_init(|| {
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i128;
+            wall - arinsal_bifs::monotonic_time_nanos()
+        })
+    }
+
+    fn getenv(&self, key: &[u8]) -> Option<Vec<u8>> {
+        crate::natives::env::get(key)
+    }
+
+    fn putenv(&self, key: &[u8], value: &[u8]) {
+        crate::natives::env::put(key, value);
+    }
+
+    fn async_threads(&self) -> usize {
+        1
+    }
+
+    fn scheduler_threads(&self) -> usize {
+        crate::natives::sys::schedulers_total()
+    }
+
+    fn add_driver(&self, driver: Arc<arinsal_drv::Driver>) {
+        crate::ddll::add_linked(driver);
+    }
+
+    fn remove_driver(&self, entry: usize) -> i32 {
+        crate::ddll::remove_linked(entry)
+    }
+}
+
+/// Install the driver API hooks once, before the first driver code runs.
+pub(crate) fn install_hooks() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        arinsal_drv::set_system_hooks(Arc::new(VmHooks {
+            offset: OnceLock::new(),
+        }));
+    });
 }
 
 /// Port of erts/emulator/beam/io.c:3841 (erts_deliver_port_exit) for a driver that
@@ -1477,6 +1771,8 @@ fn make_handle(
         data: Mutex::new(OwnedTerm::Atom("undefined".into())),
         inet,
         driver: OnceLock::new(),
+        drv_monitors: Mutex::new(HashMap::new()),
+        async_open: Mutex::new(None),
     });
     Ok(handle)
 }
@@ -2272,12 +2568,14 @@ fn port_command(
         .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
         .ok_or_else(badarg)?;
     let mut nosuspend = false;
+    let mut force = false;
     if args.len() == 3 {
         let options = list(args[2]).ok_or_else(badarg)?;
         for option in options {
             if option == atom("nosuspend") {
                 nosuspend = true;
             } else if option == atom("force") {
+                force = true;
                 // tcp_inet sets ERL_DRV_FLAG_SOFT_BUSY (inet_drv.c driver flags).
                 // spawn/fd drivers do not, so `force` is `notsup` there.
                 let soft_busy = handle
@@ -2294,6 +2592,21 @@ fn port_command(
     }
     if let Some(drv_port) = handle.driver.get() {
         // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for a loaded driver.
+        {
+            let mut st = handle.state.lock().unwrap();
+            let soft_busy = drv_port.driver().flags() & ERL_DRV_FLAG_SOFT_BUSY != 0;
+            let forced = force && soft_busy;
+            if st.busy_port && !forced {
+                if nosuspend {
+                    return Ok(atom("false"));
+                }
+                st.suspended.push(ctx.pid());
+                drop(st);
+                crate::natives::erts_debug::notify_busy_port(process, ctx.pid(), id);
+                BUSY_SUSPEND.with(|flag| flag.set(true));
+                return Err(badarg());
+            }
+        }
         let mut pieces = Vec::new();
         io_pieces(data, &mut pieces).ok_or_else(badarg)?;
         let pieces = pieces
@@ -2570,6 +2883,34 @@ pub(crate) fn owner_exit(
     owner: Pid,
     reason: Term,
 ) {
+    // Port of erts/emulator/beam/io.c:7143 (erts_fire_port_monitor): ports that
+    // monitor the exiting process run their driver's `process_exit` callback.
+    let fired: Vec<(Arc<arinsal_drv::DriverPort>, u64)> = {
+        let ports = runtime.ports.lock().unwrap();
+        ports
+            .values()
+            .flat_map(|handle| {
+                let Some(drv_port) = handle.driver.get() else {
+                    return Vec::new();
+                };
+                let mut monitors = handle.drv_monitors.lock().unwrap();
+                let ids: Vec<u64> = monitors
+                    .iter()
+                    .filter(|(_, pid)| **pid == owner)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in &ids {
+                    monitors.remove(id);
+                }
+                ids.into_iter()
+                    .map(|id| (Arc::clone(drv_port), id))
+                    .collect()
+            })
+            .collect()
+    };
+    for (drv_port, monitor) in fired {
+        drv_port.process_exit(monitor);
+    }
     // g_port_fix: synchronous owner-exit hook; the caller is the termination path.
     let closed = {
         let mut ports = runtime.ports.lock().unwrap();
@@ -2886,7 +3227,33 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .values()
         .filter_map(|monitor| monitor.pid.to_term())
         .collect::<Vec<_>>();
+    let drv_port = handle.driver.get();
+    let process_monitors = drv_port
+        .map(|drv| drv.monitored())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|data| {
+            let pid = Pid::from_data(data).to_term().ok_or_else(badarg)?;
+            TermBuilder::new(&mut heap)
+                .tuple(&[atom("process"), pid])
+                .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let monitors = TermBuilder::new(&mut heap)
+        .list_from_iter(process_monitors)
+        .map_err(|e| VmError::Unsupported(format!("port info monitors: {e:?}")))?;
     let memory = 48 + monitored_pids.len() * 24;
+    let queue_size = drv_port.map_or_else(
+        || handle.state.lock().unwrap().outq.len(),
+        |drv| drv.queue_size(),
+    );
+    // Port of erts/emulator/beam/io.c (port_info os_pid): a driver that never
+    // called `erl_drv_set_os_pid` reports `undefined`.
+    let os_pid = match drv_port.map(|drv| drv.os_pid()) {
+        Some(pid) if pid < 0 => atom("undefined"),
+        Some(pid) => Term::small(pid).unwrap(),
+        None => Term::small(handle.os_pid as i64).unwrap(),
+    };
     let monitored_by = TermBuilder::new(&mut heap)
         .list_from_iter(monitored_pids)
         .map_err(|error| VmError::Unsupported(format!("port monitored_by: {error:?}")))?;
@@ -2897,14 +3264,11 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         ("connected", connected),
         ("input", Term::small(0).unwrap()),
         ("output", Term::small(0).unwrap()),
-        ("os_pid", Term::small(handle.os_pid as i64).unwrap()),
-        ("monitors", Term::NIL),
+        ("os_pid", os_pid),
+        ("monitors", monitors),
         ("monitored_by", monitored_by),
         ("memory", Term::small(memory as i64).unwrap()),
-        (
-            "queue_size",
-            Term::small(handle.state.lock().unwrap().outq.len() as i64).unwrap(),
-        ),
+        ("queue_size", Term::small(queue_size as i64).unwrap()),
         ("locking", atom("port_level")),
         (
             "parallelism",

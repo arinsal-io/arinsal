@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 libloading = "0.8.9"
 libc = "0.2"
+arinsal-etf.workspace = true
+num-bigint.workspace = true
 
 [build-dependencies]
 cc = "1.4.7"

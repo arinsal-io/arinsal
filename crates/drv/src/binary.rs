@@ -141,3 +141,8 @@ pub fn free(ptr: *mut c_void) {
     // SAFETY: `ptr` is null or came from driver_alloc/driver_realloc.
     unsafe { libc::free(ptr) }
 }
+
+/// Copy of `len` bytes at `offset` in the binary; the caller checked the bounds.
+pub(crate) fn read(bin: *mut ErlDrvBinary, offset: usize, len: usize) -> Vec<u8> {
+    crate::mem::slice(bytes_ptr(bin).wrapping_add(offset), len).to_vec()
+}
