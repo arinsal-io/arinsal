@@ -252,7 +252,16 @@ scenario(38,N) ->
     true=erlang:bump_reductions(100),
     {reductions,R2}=process_info(self(),reductions),
     Diff=R2-R1,
-    {Diff >= 100 andalso Diff =< 110,N}.
+    {Diff >= 100 andalso Diff =< 110,N};
+scenario(39,N) ->
+    %% gc_SUITE:max_heap_size: a sleeping receiver is not collected until a GC request.
+    Pid=spawn_opt(fun() -> receive after 10000 -> ok end end,
+                  [{max_heap_size,1024},{message_queue_data,on_heap}]),
+    [Pid ! lists:duplicate(I,I) || I <- lists:seq(1,100)],
+    Ref=erlang:monitor(process,Pid),
+    erlang:process_info(Pid,messages),
+    erlang:garbage_collect(Pid),
+    receive {'DOWN',Ref,process,Pid,Reason} -> {Reason,N} after 5000 -> {timeout,N} end.
 wait_for_unregistered(Name) ->
     case whereis(Name) of
         undefined -> ok;
@@ -313,7 +322,7 @@ fn process_scenarios_match_otp_29() {
     let categories = std::env::var("ARINSAL_CASE_ONLY")
         .ok()
         .and_then(|value| value.parse::<i64>().ok())
-        .map_or_else(|| (0..39).collect::<Vec<_>>(), |category| vec![category]);
+        .map_or_else(|| (0..40).collect::<Vec<_>>(), |category| vec![category]);
     let mut count = 0;
     for category in categories {
         let started = std::time::Instant::now();
