@@ -33,7 +33,7 @@
 | `receive_SUITE` | 14 | 12/14 | 12/14 | 0 | 0 | none |
 | `ref_SUITE` | 5 | 4/5 | 4/5 | 0 | 0 | none |
 | `small_SUITE` | 13 | 13/13 | 8/13 | 5 | 0 | addition: failed {timetrap_timeout,60000; mul_add: failed {badarith; test_bitwise: failed {timetrap_timeout,60000; test_bsl: failed {timetrap_timeout,60000; test_bsr: failed {timetrap_timeout,60000 |
-| `statistics_SUITE` | 18 | 18/18 | 16/18 | 2 | 0 | scheduler_wall_time: failed {badarg; scheduler_wall_time_all: failed {badarg |
+| `statistics_SUITE` | 18 | 18/18 | 18/18 | 0 | 0 | none |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | 0 | none |
 | `timer_bif_SUITE` | 23 | 20/23 | 14/23 | 6 | 0 | auto_cancel_yielding: failed {{case_clause,false}; cleanup: failed {{case_clause,false}; registered_process: failed {{case_clause,false}; same_time_yielding: failed {{case_clause,false}; same_time_yielding_with_cancel: failed {{case_clause,false}; same_time_yielding_with_cancel_other: failed {{case_clause,false} |
 | `trace_SUITE` | 39 | 34/39 | 33/39 | 1 | 0 | system_monitor_long_schedule: skipped "Unable to load slow_drv (windows or no usleep()?)" |

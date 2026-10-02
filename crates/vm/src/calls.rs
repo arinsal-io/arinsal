@@ -802,7 +802,7 @@ impl Vm {
         }
         // ---- vm_exc ----
         if module_name == "erlang" && function_name == "system_flag" && arity == 2 {
-            let value = exceptions::system_flag(&mut self.backtrace_depth, p.x[0], p.x[1])?;
+            let value = exceptions::system_flag(p, &mut self.backtrace_depth, p.x[0], p.x[1])?;
             return self.finish_native_value(p, tail, value);
         }
         if let Some(bif) = bif {

@@ -443,12 +443,13 @@ pub(super) fn direct_bif_error(
 }
 
 pub(super) fn system_flag(
+    process: &crate::Process,
     depth_limit: &mut usize,
     key: Term,
     value: Term,
 ) -> Result<Term, VmError> {
     if key == atom("system_logger")? {
-        return crate::natives::sys::set_system_logger(value);
+        return crate::natives::sys::set_system_logger(process, value);
     }
     if key != atom("backtrace_depth")? {
         return Err(VmError::Unsupported("system_flag setting".into()));
