@@ -6,8 +6,8 @@ use crate::{Process, Vm, VmError};
 use arinsal_ets::match_spec::MatchDialect;
 use arinsal_ets::match_spec::MatchProgram;
 use arinsal_ets::{
-    BigCounterOp, ElementLookup, EtsError, Heir, Protection, SelectContinuation, TableOptions,
-    TableType, Tid, WriteConcurrency,
+    BigCounterOp, ElementLookup, EtsError, Heir, Protection, SelectContinuation, Table,
+    TableOptions, TableType, Tid, WriteConcurrency,
 };
 use arinsal_sched::{Pid, RunCtx};
 use arinsal_term::{HeapAlloc, Term, TermBuilder, TermKind, copy_term, global_atoms};
@@ -266,7 +266,7 @@ impl RegistryAccess<'_> {
 
 fn resolve(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, ResolveFail> {
     if let Some(tid) = Tid::from_term(term) {
-        return if registry.get(tid).is_ok() {
+        return if registry.shared(tid).is_ok() {
             Ok(tid)
         } else {
             Err(ResolveFail::Missing)
@@ -383,14 +383,143 @@ fn output_list<H: HeapAlloc>(heap: &mut H, items: Vec<Term>) -> Result<Term, VmE
         .map_err(|_| badarg())
 }
 
+/// Caller pid as a term; an invalid pid never reaches a BIF, so the fallback only keeps
+/// the table's access check failing closed.
+fn caller_of(ctx: &RunCtx<'_, Message>) -> Term {
+    ctx.pid().to_term().unwrap_or(Term::NIL)
+}
+
+/// A read-mostly ETS BIF that native code runs without leaving the generated code.
+///
+/// Returns `None` when the call must go through the scheduler path instead (any error, so
+/// the BIF frame is built there, or state the direct path does not handle); it has no
+/// effect on the table in that case.
+pub(crate) type DirectEts = fn(&mut Process, &[Term]) -> Option<Term>;
+
+/// Direct entry for `ets:function/arity`, if it has one.
+pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<DirectEts> {
+    if module != "ets" {
+        return None;
+    }
+    match (function, arity) {
+        ("lookup", 2) => Some(direct_lookup),
+        ("member", 2) => Some(direct_member),
+        ("insert", 2) => Some(direct_insert),
+        _ => None,
+    }
+}
+
+fn direct_caller(process: &Process) -> Option<Term> {
+    process.self_pid?.to_term()
+}
+
+/// Runtime, table identity, lock handle and creation options of a cached table.
+type CachedTable = (usize, Tid, arinsal_ets::SharedTable, TableOptions);
+
+thread_local! {
+    /// Per-scheduler handles of recently used tables, keyed by runtime and table identity, so
+    /// a call takes no registry lock: erts reaches a table through its lock-free
+    /// `meta_main_tab` (erl_db.c:805 db_get_table_aux). A deleted table is caught by its
+    /// `detached` flag under the table lock.
+    static TABLE_CACHE: std::cell::RefCell<[Option<CachedTable>; 32]> =
+        const { std::cell::RefCell::new([const { None }; 32]) };
+}
+
+/// Run `body` on the locked-table handle of a table reference, `None` for anything but a
+/// live unnamed table (named tables take the scheduler path).
+fn with_cached_table<R>(
+    process: &mut Process,
+    target: Term,
+    body: impl FnOnce(&arinsal_ets::SharedTable, &TableOptions, &mut Process) -> Option<R>,
+) -> Option<R> {
+    let tid = Tid::from_term(target)?;
+    let rt_id = std::sync::Arc::as_ptr(process.runtime.as_ref()?) as usize;
+    let slot = (tid.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59) as usize;
+    TABLE_CACHE.with(|cache| {
+        let hit = cache.borrow()[slot]
+            .as_ref()
+            .is_some_and(|(cached_rt, cached, ..)| *cached_rt == rt_id && *cached == tid);
+        if !hit {
+            let rt = process.runtime.as_ref()?;
+            let shared = rt.ets.read().unwrap().shared(tid).ok()?.clone();
+            let options = shared.read().options;
+            cache.borrow_mut()[slot] = Some((rt_id, tid, shared, options));
+        }
+        let cache = cache.borrow();
+        let (_, _, shared, options) = cache[slot].as_ref()?;
+        body(shared, options, process)
+    })
+}
+
+fn direct_lookup(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let caller = direct_caller(process)?;
+    let key = args[1];
+    with_cached_table(process, args[0], |shared, _, process| {
+        let table = shared.read();
+        if table.is_detached() || !allowed(&table, caller, false) {
+            return None;
+        }
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let values = table.lookup(key, &mut heap).ok()?;
+        output_list(&mut heap, values).ok()
+    })
+}
+
+fn direct_member(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let caller = direct_caller(process)?;
+    let key = args[1];
+    with_cached_table(process, args[0], |shared, _, _| {
+        let table = shared.read();
+        if table.is_detached() || !allowed(&table, caller, false) {
+            return None;
+        }
+        Some(boolean_term(table.member(key)))
+    })
+}
+
+fn direct_insert(process: &mut Process, args: &[Term]) -> Option<Term> {
+    // A failed list insert may have stored a prefix, which a redo through the scheduler
+    // path would store again.
+    // SAFETY: the object term lives in the caller's process heap for this call.
+    unsafe { args[1].tuple_ref() }?;
+    let caller = direct_caller(process)?;
+    let object = args[1];
+    with_cached_table(process, args[0], |shared, options, _| {
+        // The copy into table storage is the long part of an insert: do it before the
+        // exclusive lock so readers are not held up behind it.
+        let prepared = Table::prepare_object(options, object).ok()?;
+        // A CA tree (ordered_set with write_concurrency) takes its own route and base-node
+        // locks, so its writers share the table lock.
+        let prepared = if options.table_type == TableType::OrderedSet
+            && options.write_concurrency != WriteConcurrency::Disabled
+        {
+            let table = shared.read();
+            if table.is_detached() || !allowed(&table, caller, true) {
+                return None;
+            }
+            match table.insert_shared(prepared) {
+                None => return Some(boolean_term(true)),
+                Some(prepared) => prepared,
+            }
+        } else {
+            prepared
+        };
+        let mut table = shared.write();
+        if table.is_detached() || !allowed(&table, caller, true) {
+            return None;
+        }
+        table.insert_prepared(prepared);
+        Some(boolean_term(true))
+    })
+}
+
 fn insert_args(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    caller: Term,
     insert_new: bool,
     target: Term,
     objects: Term,
 ) -> Result<Term, VmError> {
-    let caller = ctx.pid().to_term().ok_or_else(badarg)?;
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
@@ -425,13 +554,12 @@ fn insert_args(
 
 fn lookup_args(
     process: &mut Process,
-    ctx: &RunCtx<'_, Message>,
+    caller: Term,
     member: bool,
     target: Term,
     key: Term,
 ) -> Result<Term, VmError> {
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
-    let caller = ctx.pid().to_term().ok_or_else(badarg)?;
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
     let table = registry.get(tid).map_err(err)?;
@@ -1608,7 +1736,7 @@ fn entry_insert(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    let result = insert_args(process, ctx, false, target, objects);
+    let result = insert_args(process, caller_of(ctx), false, target, objects);
     Some(bif_frame("ets", "insert", &[target, objects], result))
 }
 
@@ -1624,7 +1752,7 @@ fn entry_insert_new(
     let (Some(target), Some(objects)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    let result = insert_args(process, ctx, true, target, objects);
+    let result = insert_args(process, caller_of(ctx), true, target, objects);
     Some(bif_frame("ets", "insert_new", &[target, objects], result))
 }
 
@@ -1640,7 +1768,7 @@ fn entry_lookup(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    let result = lookup_args(process, ctx, false, target, key);
+    let result = lookup_args(process, caller_of(ctx), false, target, key);
     Some(bif_frame("ets", "lookup", &[target, key], result))
 }
 
@@ -1656,7 +1784,7 @@ fn entry_member(
     let (Some(target), Some(key)) = (args.get(process, 0), args.get(process, 1)) else {
         return Some(Err(badarg()));
     };
-    let result = lookup_args(process, ctx, true, target, key);
+    let result = lookup_args(process, caller_of(ctx), true, target, key);
     Some(bif_frame("ets", "member", &[target, key], result))
 }
 

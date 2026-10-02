@@ -453,7 +453,8 @@ pub(crate) fn size_object_with_prior(
 ) -> usize {
     let seen_before = |address: u64| prior.is_some_and(|p| p.contains_key(&address));
     let mut size = 0;
-    let mut stack = Vec::new();
+    // Most copied terms (table rows, small messages) fit inline: no allocation per call.
+    let mut stack: SmallVec<[Term; 32]> = SmallVec::new();
     let mut current = Some(root);
     while let Some(mut term) = current.take().or_else(|| stack.pop()) {
         while term.bits() & 3 == 1 {

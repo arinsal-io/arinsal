@@ -37,7 +37,7 @@ use arinsal_term::Term;
 pub(crate) mod code;
 pub(crate) use crate::dist;
 pub(crate) use code::try_code_mod_permission;
-mod ets;
+pub(crate) mod ets;
 mod maps;
 pub(crate) mod nif;
 mod re;

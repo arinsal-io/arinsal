@@ -1665,23 +1665,7 @@ impl Executor {
                                     // caller is the native function holding the return address.
                                     let interpreter_module = process.module;
                                     // A module whose on_load is running is not current yet.
-                                    if let Some(caller) =
-                                        crate::native_bridge::with_native_function_at(
-                                            resume_pc,
-                                            |caller| {
-                                                self.vm
-                                                    .pending_on_load
-                                                    .get(&caller.module)
-                                                    .copied()
-                                                    .filter(|id| {
-                                                        self.vm.native_code_contains(*id, resume_pc)
-                                                    })
-                                                    .or_else(|| {
-                                                        self.vm.loaded.get(&caller.module).copied()
-                                                    })
-                                            },
-                                        )
-                                        .flatten()
+                                    if let Some(caller) = native_caller_module(&self.vm, resume_pc)
                                     {
                                         process.module = caller;
                                     }
@@ -1717,15 +1701,21 @@ impl Executor {
                                             process.x.get(1).copied().unwrap_or(Term::NIL),
                                             process.x.get(2).copied().unwrap_or(Term::NIL),
                                         ];
-                                        if let Some(trapped) = crate::bif_traps::execute_named(
-                                            process,
-                                            &export.module,
-                                            &export.function,
-                                            target_pc,
-                                            usize::from(export.arity),
-                                            trap_args,
-                                            Some(ctx),
-                                        ) {
+                                        if (export.trap_entry
+                                            || process
+                                                .cold
+                                                .as_ref()
+                                                .is_some_and(|cold| cold.bif_trap.is_some()))
+                                            && let Some(trapped) = crate::bif_traps::execute_named(
+                                                process,
+                                                &export.module,
+                                                &export.function,
+                                                target_pc,
+                                                usize::from(export.arity),
+                                                trap_args,
+                                                Some(ctx),
+                                            )
+                                        {
                                             match trapped {
                                                 Ok(crate::bif_traps::TrapResult::Yield {
                                                     ..
@@ -2428,6 +2418,49 @@ fn switched_out_live(process: &Process) -> usize {
         live => live - 1,
     }
     .min(process.x.len())
+}
+
+/// Return address, native code generation, code epoch and the owning module.
+type CallerModuleEntry = (usize, u64, u64, Option<usize>);
+
+thread_local! {
+    /// Direct-mapped memo of `native_caller_module`, keyed by return address and validated
+    /// against the native code generation and the code snapshot epoch.
+    static CALLER_MODULE_CACHE: std::cell::RefCell<[CallerModuleEntry; 256]> =
+        const { std::cell::RefCell::new([(0, 0, 0, None); 256]) };
+}
+
+/// Module that owns the native function holding `resume_pc`; a module whose `-on_load`
+/// is running is not current yet.
+fn native_caller_module(vm: &Vm, resume_pc: usize) -> Option<usize> {
+    let generation = crate::native_bridge::native_registry_generation();
+    // A running on_load changes the answer without touching the native code table.
+    let memo = vm.pending_on_load.is_empty();
+    let slot = (resume_pc >> 2) & 255;
+    if memo {
+        let hit = CALLER_MODULE_CACHE.with(|cache| {
+            let entry = cache.borrow()[slot];
+            (entry.0 == resume_pc && entry.1 == generation && entry.2 == vm.seen_epoch)
+                .then_some(entry.3)
+        });
+        if let Some(found) = hit {
+            return found;
+        }
+    }
+    let found = crate::native_bridge::with_native_function_at(resume_pc, |caller| {
+        vm.pending_on_load
+            .get(&caller.module)
+            .copied()
+            .filter(|id| vm.native_code_contains(*id, resume_pc))
+            .or_else(|| vm.loaded.get(&caller.module).copied())
+    })
+    .flatten();
+    if memo {
+        CALLER_MODULE_CACHE.with(|cache| {
+            cache.borrow_mut()[slot] = (resume_pc, generation, vm.seen_epoch, found);
+        });
+    }
+    found
 }
 
 fn resume_after_native_return(process: &mut Process) -> bool {

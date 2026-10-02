@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 arc-swap = "1.9.2"
 parking_lot = "0.12.5"
+crossbeam-utils = "0.8.21"
+smallvec = "1.15.1"
 arinsal-term.workspace = true
 arinsal-etf.workspace = true
 num-bigint.workspace = true
