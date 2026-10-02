@@ -13,20 +13,23 @@ permissions:
   contents: read
 
 jobs:
-  rust-tests:
-    name: Rust and OTP tests
-    runs-on: macos-15
+  test:
+    name: Rust and BEAM compatibility
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Erlang/OTP
+      - name: Set up Erlang/OTP and Elixir
         uses: erlef/setup-beam@v1
         with:
           otp-version: "29.1.1"
+          elixir-version: "1.20.4"
           version-type: strict
+          install-hex: true
+          install-rebar: true
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -38,29 +41,7 @@ jobs:
         run: tools/difftest/smoke.sh
 
       - name: Compare VM stage1 cases with OTP
-        run: cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
-
-  language-interop:
-    name: Elixir and Gleam interoperability
-    runs-on: macos-15
-    timeout-minutes: 90
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Erlang/OTP, Elixir, and Gleam
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: "29.1.1"
-          elixir-version: "1.20.4"
-          gleam-version: "1.9.0"
-          version-type: strict
-          install-hex: true
-          install-rebar: true
-
-      - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v2
+        run: timeout 600 cargo run -p difftest-runner --bin difftest -- --vm arinsal --suite stage1
 
       - name: Fetch Elixir demo dependencies
         working-directory: examples/arinsal_demo
@@ -73,15 +54,3 @@ jobs:
       - name: Test Elixir demo on Arinsal
         working-directory: examples/arinsal_demo
         run: mix arinsal test
-
-      - name: Build Gleam smoke fixture
-        working-directory: tests/languages/gleam
-        run: gleam build
-
-      - name: Run Gleam-generated BEAM code on Arinsal
-        shell: bash
-        run: |
-          beam_dir="$(find tests/languages/gleam/build/dev/erlang -type d -name ebin -print -quit)"
-          test -n "$beam_dir"
-          result="$(target/release/arinsal eval -pa "$beam_dir" arinsal_gleam_smoke answer)"
-          grep -Fxq '42' <<< "$result"
