@@ -405,8 +405,16 @@ pub(crate) fn run_static_nif(
         crate::natives::tty::note_caller_native(process);
     }
     let args = process.x[..usize::from(arity)].to_vec();
-    crate::calls::call_bif(&mut process.heap, entry, &args)
-        .map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
+    let pending = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.nif_pending.take());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pending {
+        Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
+        None => crate::calls::call_bif(&mut process.heap, entry, &args),
+    }))
+    .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))));
+    result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
 }
 
 /// Calls a static NIF body through the same BIF function used by NativeBody.
@@ -456,12 +464,11 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
         && arinsal_nif_tty::dirty_io(&nif.function, nif.arity)
         && arinsal_sched::current_scheduler_type() != arinsal_sched::SchedulerType::DirtyIo
     {
-        process.cold_mut().native_dirty_nif = Some((identity as usize, 0));
-        process.header.i =
-            arinsal_beamasm::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as *const u8 as *const _;
-        process.header.freason = 1 << 10;
-        process.sync_native_header();
-        return 0;
+        return trap_to_dirty_nif(
+            process,
+            identity as usize,
+            arinsal_bifs::SchedulerClass::DirtyIo,
+        );
     }
     // Like the interpreter's NativeBody: every static NIF body reads the scheduler hub.
     crate::natives::nif::refresh_hub_native(process);
@@ -483,6 +490,15 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
             process.sync_native_header();
             crate::native_hooks::raw(value)
         }
+        Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
+            // Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and
+            // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
+            // continuation the executor runs on a scheduler of `class`.
+            if let Some(pending) = crate::natives::nif::take_rescheduled() {
+                process.cold_mut().nif_pending = Some(pending);
+            }
+            trap_to_dirty_nif(process, identity as usize, class)
+        }
         Ok(Err(error)) => {
             let args = process.x[..usize::from(nif.arity)].to_vec();
             set_native_bif_error(process, &nif.module, &nif.function, &args, error);
@@ -496,6 +512,22 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
             0
         }
     }
+}
+
+/// Leave native code through the dirty NIF dispatch trap; the executor runs NIF
+/// `identity` (or the process's pending continuation) on a scheduler of `class` and
+/// resumes after the native call with the result in x0.
+fn trap_to_dirty_nif(
+    process: &mut crate::Process,
+    identity: usize,
+    class: arinsal_bifs::SchedulerClass,
+) -> u64 {
+    process.cold_mut().native_dirty_nif = Some((identity, 0, class));
+    process.header.i =
+        arinsal_beamasm::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as *const u8 as *const _;
+    process.header.freason = 1 << 10;
+    process.sync_native_header();
+    0
 }
 
 /// Dispatches a BIF export from the shared export trampoline.
@@ -966,6 +998,8 @@ fn set_light_bif_error(process: &mut crate::Process, error: arinsal_bifs::BifErr
             reason,
         ),
         BifError::Unsupported(_) => (1, crate::signals::atom("undef")),
+        // NIF bodies trap to the executor before reaching here (`trap_to_dirty_nif`).
+        BifError::Dirty(_) => (1, crate::signals::atom("notsup")),
     };
     process.header.freason = class;
     process.header.fvalue = crate::native_hooks::raw(reason);

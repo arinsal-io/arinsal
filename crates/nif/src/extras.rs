@@ -26,6 +26,8 @@ pub struct VmHooks {
     pub monitor: Option<MonitorHook>,
     /// Remove a process monitor.
     pub demonitor: Option<fn(usize, &[u8; 32]) -> i32>,
+    /// `enif_thread_type` value of the calling thread.
+    pub thread_type: Option<fn() -> c_int>,
 }
 static HOOKS: OnceLock<Mutex<VmHooks>> = OnceLock::new();
 fn hooks() -> &'static Mutex<VmHooks> {
@@ -393,8 +395,15 @@ pub extern "C" fn enif_getenv(key: *const c_char, value: *mut c_char, size: *mut
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_thread_type() -> c_int {
-    1
+    // Port of erts/emulator/beam/erl_nif.c:3593 (enif_thread_type), OTP-29.1.1.
+    let hook = hooks()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .thread_type;
+    hook.map_or(ERL_NIF_THR_UNDEFINED, |thread_type| thread_type())
 }
+/// `ERL_NIF_THR_UNDEFINED` from erl_nif.h.
+const ERL_NIF_THR_UNDEFINED: c_int = 0;
 
 pub(crate) fn retain_exports() {
     let exports: &[usize] = &[

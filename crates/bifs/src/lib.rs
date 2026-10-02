@@ -66,6 +66,23 @@ pub enum BifError {
     },
     /// The BIF exists but this part is not implemented in Arinsal yet.
     Unsupported(&'static str),
+    /// The call must continue on a scheduler of this class; the VM re-executes it there.
+    /// Port of erts/emulator/beam/erl_nif.c:3540 (enif_schedule_nif dirty flags), OTP-29.1.1.
+    Dirty(SchedulerClass),
+}
+
+/// Scheduler class a rescheduled native call continues on.
+///
+/// Port of erts/emulator/beam/erl_process.h (`ERTS_PSFLG_DIRTY_CPU_PROC`,
+/// `ERTS_PSFLG_DIRTY_IO_PROC`), OTP-29.1.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerClass {
+    /// A normal scheduler.
+    Normal,
+    /// A dirty CPU scheduler (`ERL_NIF_DIRTY_JOB_CPU_BOUND`).
+    DirtyCpu,
+    /// A dirty I/O scheduler (`ERL_NIF_DIRTY_JOB_IO_BOUND`).
+    DirtyIo,
 }
 
 impl BifError {

@@ -1946,8 +1946,13 @@ impl Vm {
                     }
                     // Panic landing the previous native-body path used. The
                     // argument slice is not copied unless the body fails.
+                    // A NIF rescheduled to this scheduler resumes its continuation instead.
+                    let pending = p.cold.as_mut().and_then(|cold| cold.nif_pending.take());
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        calls::call_bif(&mut p.heap, native, &p.x[..arity])
+                        match pending {
+                            Some(pending) => natives::nif::resume_pending(&mut p.heap, pending),
+                            None => calls::call_bif(&mut p.heap, native, &p.x[..arity]),
+                        }
                     }));
                     let result = match result {
                         Ok(result) => result,
@@ -1983,6 +1988,11 @@ impl Vm {
                         }
                     };
                     p.x[0] = value;
+                    // Port of erts/emulator/beam/erl_process.c:10190, OTP-29.1.1: a finished
+                    // dirty job continues on a normal scheduler.
+                    if arinsal_sched::current_scheduler_type().is_dirty() {
+                        p.force_yield = true;
+                    }
                     (htop, stop) = p.heap.heap_cursor();
                     depth = p.heap.stack_words();
                     heap_dirty = false;

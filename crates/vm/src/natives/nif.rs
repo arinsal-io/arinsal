@@ -1,7 +1,7 @@
 //! `erlang:load_nif/2`, dynamic `.so` bindings, and the static `erl_tracer` NIFs.
 //!
-//! Dirty NIF flags are accepted and the callback still runs on the calling
-//! scheduler. There is no dirty-scheduler pool in this phase.
+//! Dirty NIFs and dirty `enif_schedule_nif` continuations move the calling process
+//! to the dirty scheduler pools (see [`PendingNif`]).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -10,9 +10,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arinsal_bifs::{BifError, BifFn, Ctx, FragmentingHeap};
+use arinsal_bifs::{BifError, BifFn, Ctx, FragmentingHeap, SchedulerClass};
 use arinsal_loader::Instr;
-use arinsal_sched::{Pid, RunCtx, Scheduler};
+use arinsal_sched::{Pid, RunCtx, Scheduler, SchedulerType};
 use arinsal_term::{
     HeapAlloc, Term, TermBuilder, TermKind, VecHeap, exact_eq, from_owned, global_atoms,
 };
@@ -346,10 +346,107 @@ fn dyn_call<const N: usize>(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bi
             .ok_or(BifError::BADARG)?;
         (Arc::clone(&slot.library), function)
     };
-    let _library = library;
-    // Dirty flags stay on this scheduler; see the module comment.
+    if args.len() != function.arity as usize {
+        return Err(BifError::BADARG);
+    }
+    let trap = arinsal_nif::NifTrap {
+        fptr: function.fptr,
+        flags: function.flags,
+        args: args.to_vec(),
+    };
+    run_nif(
+        ctx,
+        PendingNif {
+            library,
+            function,
+            trap,
+        },
+    )
+}
+
+/// A dirty NIF call or `enif_schedule_nif` continuation waiting for a scheduler of
+/// another class. The process keeps it while it migrates and re-executes its
+/// `NativeBody` there; `trap.args` are GC roots meanwhile.
+///
+/// Port of erts/emulator/beam/erl_nfunc_sched.h (`ErtsNativeFunc` trap wrapper), OTP-29.1.1.
+pub(crate) struct PendingNif {
+    library: Arc<arinsal_nif::NifLibrary>,
+    function: arinsal_nif::NifFunction,
+    trap: arinsal_nif::NifTrap,
+}
+
+impl PendingNif {
+    pub(crate) fn roots_mut(&mut self) -> &mut [Term] {
+        &mut self.trap.args
+    }
+}
+
+thread_local! {
+    /// Continuation handed from a native body that returned `BifError::Dirty` to the VM.
+    static RESCHEDULED: std::cell::RefCell<Option<PendingNif>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_class() -> SchedulerClass {
+    match arinsal_sched::current_scheduler_type() {
+        SchedulerType::Normal => SchedulerClass::Normal,
+        SchedulerType::DirtyCpu => SchedulerClass::DirtyCpu,
+        SchedulerType::DirtyIo => SchedulerClass::DirtyIo,
+    }
+}
+
+// Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and erl_nif.c:440
+// (erts_call_dirty_nif), OTP-29.1.1: a NIF or continuation runs only on a scheduler of
+// the class its flags select; otherwise the process is rescheduled there.
+fn run_nif(ctx: &mut Ctx<'_>, pending: PendingNif) -> Result<Term, BifError> {
+    let current = current_class();
+    let target = arinsal_nif::scheduler_class(pending.trap.flags);
+    if target != current && !(target == SchedulerClass::Normal && pending.is_entry()) {
+        RESCHEDULED.with(|slot| *slot.borrow_mut() = Some(pending));
+        return Err(BifError::Dirty(target));
+    }
     let pid = HUB.with(|hub| hub.borrow().as_ref().and_then(|hub| hub.pid.to_term()));
-    function.call_with_pid(ctx, args, pid)
+    let PendingNif {
+        library,
+        function,
+        trap,
+    } = pending;
+    match function.call_on(ctx, trap.fptr, &trap.args, pid, current)? {
+        arinsal_nif::NifCall::Return(value) => Ok(value),
+        arinsal_nif::NifCall::Schedule(trap) => {
+            let target = arinsal_nif::scheduler_class(trap.flags);
+            RESCHEDULED.with(|slot| {
+                *slot.borrow_mut() = Some(PendingNif {
+                    library,
+                    function,
+                    trap,
+                })
+            });
+            Err(BifError::Dirty(target))
+        }
+    }
+}
+
+impl PendingNif {
+    /// A plain (non-dirty) NIF entry runs wherever the process executes.
+    fn is_entry(&self) -> bool {
+        self.trap.flags == 0 && self.trap.fptr as usize == self.function.fptr as usize
+    }
+}
+
+/// Take the continuation a native body left behind with `BifError::Dirty`.
+pub(crate) fn take_rescheduled() -> Option<PendingNif> {
+    RESCHEDULED.with(|slot| slot.borrow_mut().take())
+}
+
+/// Resume a rescheduled NIF continuation on the current scheduler.
+pub(crate) fn resume_pending(
+    heap: &mut arinsal_term::ProcessHeap,
+    pending: PendingNif,
+) -> Result<Term, BifError> {
+    let mut fragment = arinsal_bifs::FragmentingHeap(heap);
+    let mut ctx = Ctx::new(&mut fragment);
+    run_nif(&mut ctx, pending)
 }
 
 /// Invoke one patched tracer NIF synchronously on the tracee's scheduler.
@@ -997,8 +1094,18 @@ fn install_hub_for(process: &Process, pid: Pid) {
     arinsal_nif_socket::set_reactor(Some(reactor.clone()));
     arinsal_nif::set_vm_hooks(arinsal_nif::VmHooks {
         send: Some(nif_send_hook),
+        thread_type: Some(nif_thread_type),
         ..arinsal_nif::VmHooks::default()
     });
+}
+
+// Port of erts/emulator/beam/erl_nif.c:3593 (enif_thread_type), OTP-29.1.1.
+fn nif_thread_type() -> std::ffi::c_int {
+    match arinsal_sched::current_scheduler_type() {
+        SchedulerType::Normal => 1,
+        SchedulerType::DirtyCpu => 2,
+        SchedulerType::DirtyIo => 3,
+    }
 }
 
 fn nif_send_hook(target: Term, message: Term) -> bool {

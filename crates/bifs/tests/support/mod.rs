@@ -33,6 +33,9 @@ pub fn call(module: &str, name: &str, args: &[OwnedTerm]) -> CallResult {
                 BifError::Unsupported(reason) => {
                     return CallResult::TransportError(format!("unsupported: {reason}"));
                 }
+                BifError::Dirty(class) => {
+                    return CallResult::TransportError(format!("dirty reschedule: {class:?}"));
+                }
             };
             CallResult::Exception {
                 class: class.to_owned(),

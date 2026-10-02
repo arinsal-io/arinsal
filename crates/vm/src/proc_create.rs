@@ -139,9 +139,9 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait_timeout: Option<u64>,
     /// The pending native wait belongs to a receive without clauses.
     pub(crate) native_wait_self: bool,
-    /// Static NIF identity and native return point of a dirty NIF call waiting for a dirty
-    /// scheduler.
-    pub(crate) native_dirty_nif: Option<(usize, usize)>,
+    /// Static NIF identity, native return point and target scheduler class of a NIF call
+    /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
+    pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
     /// Return address and call site of the native call that `native_retry` redoes.
     pub(crate) native_retry_site: Option<(usize, usize)>,
     /// The interpreter returned only to hand control to `native_pc`; the slice continues.
@@ -161,6 +161,8 @@ pub(crate) struct ProcessCold {
     /// Operand registers of `apply` calls in progress. A callee may collect before it
     /// yields back to re-execute the apply, so these stay GC roots until it returns.
     pub(crate) apply_roots: Vec<Term>,
+    /// A NIF call rescheduled to another scheduler class; its arguments are GC roots.
+    pub(crate) nif_pending: Option<crate::natives::nif::PendingNif>,
     // Saved continuation addresses for traces still referenced by handler code.
     pub(crate) raw_traces: Vec<stacktrace::RawTrace>,
     /// Reusable slots for raw traces that have been materialized.

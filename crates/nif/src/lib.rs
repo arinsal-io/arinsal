@@ -66,7 +66,7 @@ pub const C_SHIM_EXPORTS: &[&str] = &[
     "enif_free_iovec",
 ];
 
-use arinsal_bifs::{BifError, Ctx};
+use arinsal_bifs::{BifError, Ctx, SchedulerClass};
 use arinsal_term::{
     ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, VecHeap, WritableBinary,
 };
@@ -314,7 +314,7 @@ pub struct ErlNifEnv {
     library: Option<Arc<Library>>,
     pid: Option<Term>,
     pending: Option<Term>,
-    scheduled: Option<(NifFn, Vec<Term>)>,
+    scheduled: Option<(NifFn, c_int, Vec<Term>)>,
     independent: bool,
     scratch: Vec<Vec<u8>>,
     owned_binary_allocations: Vec<usize>,
@@ -408,6 +408,9 @@ pub struct NifFunction {
 }
 impl NifFunction {
     /// Invoke through a process-bound environment and convert NIF exceptions.
+    ///
+    /// Continuations scheduled with `enif_schedule_nif` run inline; use
+    /// [`NifFunction::call_on`] where they may have to move to another scheduler.
     pub fn call(&self, ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         self.call_with_pid(ctx, args, None)
     }
@@ -421,26 +424,109 @@ impl NifFunction {
         if args.len() != self.arity as usize {
             return Err(BifError::BADARG);
         }
+        let mut next = (self.fptr, args.to_vec());
+        loop {
+            match self.step(ctx, next.0, &next.1, pid)? {
+                NifCall::Return(value) => return Ok(value),
+                NifCall::Schedule(trap) => next = (trap.fptr, trap.args),
+            }
+        }
+    }
+    /// Scheduler class this function's dirty flags request.
+    pub fn scheduler_class(&self) -> SchedulerClass {
+        scheduler_class(self.flags)
+    }
+    /// Invoke `fptr` (this function or one of its scheduled continuations) on a
+    /// scheduler of class `current`.
+    ///
+    /// Port of erts/emulator/beam/erl_nif.c:3540 (enif_schedule_nif) and
+    /// erl_nif.c:440 (erts_call_dirty_nif), OTP-29.1.1: a continuation scheduled
+    /// with flags `0` runs at once on a normal scheduler. Any other continuation,
+    /// and every continuation scheduled from a dirty scheduler, is returned so
+    /// the caller reschedules the process on the requested scheduler class.
+    pub fn call_on(
+        &self,
+        ctx: &mut Ctx<'_>,
+        fptr: NifFn,
+        args: &[Term],
+        pid: Option<Term>,
+        current: SchedulerClass,
+    ) -> Result<NifCall, BifError> {
+        let mut result = self.step(ctx, fptr, args, pid)?;
+        while let NifCall::Schedule(trap) = &result {
+            if current != SchedulerClass::Normal || scheduler_class(trap.flags) != current {
+                break;
+            }
+            let NifCall::Schedule(trap) = result else {
+                unreachable!()
+            };
+            result = self.step(ctx, trap.fptr, &trap.args, pid)?;
+        }
+        Ok(result)
+    }
+    fn step(
+        &self,
+        ctx: &mut Ctx<'_>,
+        fptr: NifFn,
+        args: &[Term],
+        pid: Option<Term>,
+    ) -> Result<NifCall, BifError> {
         let _call = (self.flags != 0).then(|| self.halt_calls.enter()).flatten();
         let mut env = ErlNifEnv::bound(ctx.heap, pid);
         env.priv_data = self.priv_data;
         // SAFETY: the pointer belongs to a loaded library; arguments remain live.
-        let mut result = unsafe { (self.fptr)(&mut env, args.len() as c_int, args.as_ptr()) };
-        while let Some((next, scheduled_args)) = env.scheduled.take() {
-            // SAFETY: scheduled arguments live until this callback returns.
-            result = unsafe {
-                next(
-                    &mut env,
-                    scheduled_args.len() as c_int,
-                    scheduled_args.as_ptr(),
-                )
-            };
-        }
+        let result = unsafe { fptr(&mut env, args.len() as c_int, args.as_ptr()) };
         if let Some(reason) = env.pending {
             return Err(BifError::Error(reason));
         }
-        Ok(result)
+        if let Some((fptr, flags, args)) = env.scheduled.take() {
+            return Ok(NifCall::Schedule(NifTrap {
+                fptr,
+                flags: flags as u32,
+                args,
+            }));
+        }
+        Ok(NifCall::Return(result))
     }
+}
+
+/// Map `ErlNifFunc.flags` or `enif_schedule_nif` flags to a scheduler class.
+///
+/// Port of erts/emulator/beam/erl_nif.c:3566-3572 (enif_schedule_nif), OTP-29.1.1:
+/// any dirty flag other than exactly `ERL_NIF_DIRTY_JOB_CPU_BOUND` selects I/O.
+pub fn scheduler_class(flags: u32) -> SchedulerClass {
+    match flags {
+        0 => SchedulerClass::Normal,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND => SchedulerClass::DirtyCpu,
+        _ => SchedulerClass::DirtyIo,
+    }
+}
+
+/// `ERL_NIF_DIRTY_JOB_CPU_BOUND` from erl_nif.h.
+pub const ERL_NIF_DIRTY_JOB_CPU_BOUND: u32 = 1;
+/// `ERL_NIF_DIRTY_JOB_IO_BOUND` from erl_nif.h.
+pub const ERL_NIF_DIRTY_JOB_IO_BOUND: u32 = 2;
+
+/// Outcome of one NIF invocation.
+pub enum NifCall {
+    /// The NIF returned this term.
+    Return(Term),
+    /// The NIF called `enif_schedule_nif`; the continuation still has to run.
+    Schedule(NifTrap),
+}
+
+/// A continuation scheduled with `enif_schedule_nif`.
+///
+/// Port of erts/emulator/beam/erl_nfunc_sched.h (`ErtsNativeFunc`), OTP-29.1.1.
+/// `args` are process heap terms; the owner keeps them as GC roots.
+#[derive(Clone)]
+pub struct NifTrap {
+    /// Function to call next.
+    pub fptr: NifFn,
+    /// `enif_schedule_nif` flags selecting its scheduler class.
+    pub flags: u32,
+    /// Arguments for `fptr`.
+    pub args: Vec<Term>,
 }
 struct HaltCalls {
     enabled: bool,
@@ -595,7 +681,7 @@ pub struct NifImage {
     unload: Option<UnloadFn>,
 }
 impl NifImage {
-    /// Function table in `ErlNifEntry` order. Dirty flags are `0`, `1` (I/O), or `2` (CPU).
+    /// Function table in `ErlNifEntry` order. Dirty flags are `0`, `1` (CPU), or `2` (I/O).
     pub fn functions(&self) -> &[NifFunction] {
         &self.functions
     }
@@ -763,6 +849,13 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
             .to_string_lossy()
             .into_owned();
         let fptr = fptr.ok_or_else(|| NifError::BadLibrary("null NIF function".into()))?;
+        // Port of erts/emulator/beam/erl_nif.c:4868 (erts_load_nif flag check), OTP-29.1.1.
+        if flags != 0 && flags != ERL_NIF_DIRTY_JOB_IO_BOUND && flags != ERL_NIF_DIRTY_JOB_CPU_BOUND
+        {
+            return Err(NifError::BadLibrary(format!(
+                "Illegal flags field value {flags} for NIF {module}:{fname}/{arity}"
+            )));
+        }
         functions.push(NifFunction {
             name: fname,
             arity,

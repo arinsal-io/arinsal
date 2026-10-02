@@ -931,7 +931,9 @@ pub extern "C" fn enif_schedule_nif(
         return enif_make_badarg(e);
     };
     // Port of erts/emulator/beam/erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1.
-    if argc < 0 || (argc > 0 && argv.is_null()) || !matches!(flags, 0..=2) || env(e).independent {
+    // Flags other than 0 or a combination of the two dirty job bits raise badarg; a
+    // combination of both selects the I/O pool (see `scheduler_class`).
+    if argc < 0 || (argc > 0 && argv.is_null()) || !(0..=3).contains(&flags) || env(e).independent {
         return enif_make_badarg(e);
     };
     // SAFETY: NIF passes a live argument array whose terms remain on the bound heap.
@@ -941,7 +943,7 @@ pub extern "C" fn enif_schedule_nif(
         // SAFETY: a positive arity requires a live argument array.
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }.to_vec()
     };
-    env(e).scheduled = Some((f, args));
+    env(e).scheduled = Some((f, flags, args));
     term(0)
 }
 

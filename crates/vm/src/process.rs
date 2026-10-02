@@ -969,19 +969,36 @@ impl Executor {
                     // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1:
                     // the dirty scheduler runs the NIF, then the process returns to a normal
                     // scheduler to continue after the call.
-                    if ctx.scheduler_type() == arinsal_sched::SchedulerType::DirtyIo
-                        && let Some((identity, resume_pc)) = process
-                            .cold
-                            .as_mut()
-                            .and_then(|cold| cold.native_dirty_nif.take())
+                    if let Some((identity, resume_pc, class)) =
+                        process.cold.as_ref().and_then(|cold| cold.native_dirty_nif)
+                        && scheduler_class(ctx.scheduler_type()) == class
                     {
+                        process.cold_mut().native_dirty_nif = None;
                         match crate::native_helpers::run_static_nif(process, identity) {
                             Ok(value) => {
                                 process.x[0] = value;
                                 process.cold_mut().native_continuation_resume = true;
                                 process.cold_mut().native_resume_live = 2;
                                 process.native_pc = Some(resume_pc);
-                                break Ok(RunState::Yield);
+                                if ctx.scheduler_type().is_dirty() {
+                                    break Ok(RunState::Yield);
+                                }
+                                continue;
+                            }
+                            Err(error @ (VmError::Dirty(_) | VmError::Yield)) => {
+                                // A continuation scheduled for another scheduler class.
+                                let class = match error {
+                                    VmError::Dirty(arinsal_sched::DirtyKind::Cpu) => {
+                                        arinsal_bifs::SchedulerClass::DirtyCpu
+                                    }
+                                    VmError::Dirty(arinsal_sched::DirtyKind::Io) => {
+                                        arinsal_bifs::SchedulerClass::DirtyIo
+                                    }
+                                    _ => arinsal_bifs::SchedulerClass::Normal,
+                                };
+                                process.cold_mut().native_dirty_nif =
+                                    Some((identity, resume_pc, class));
+                                break Err(error);
                             }
                             Err(VmError::Trap(trap)) => {
                                 if let Some(error) = crate::exceptions::resume(
@@ -1177,10 +1194,20 @@ impl Executor {
                                         process.heap.release_stack(1);
                                     }
                                     let cold = process.cold_mut();
-                                    if let Some((_, resume)) = cold.native_dirty_nif.as_mut() {
-                                        *resume = resume_pc;
-                                    }
-                                    break Err(VmError::Dirty(arinsal_sched::DirtyKind::Io));
+                                    let class =
+                                        cold.native_dirty_nif.as_mut().map(|(_, resume, class)| {
+                                            *resume = resume_pc;
+                                            *class
+                                        });
+                                    break Err(match class {
+                                        Some(arinsal_bifs::SchedulerClass::DirtyCpu) => {
+                                            VmError::Dirty(arinsal_sched::DirtyKind::Cpu)
+                                        }
+                                        Some(arinsal_bifs::SchedulerClass::Normal) => {
+                                            VmError::Yield
+                                        }
+                                        _ => VmError::Dirty(arinsal_sched::DirtyKind::Io),
+                                    });
                                 }
                                 if target_pc
                                     == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
@@ -3927,8 +3954,11 @@ impl Process {
         }
         roots.extend_from_slice(extra);
         let extra_end = roots.len();
-        if let Some(cold) = self.cold.as_ref() {
+        if let Some(cold) = self.cold.as_mut() {
             roots.extend_from_slice(&cold.apply_roots);
+            if let Some(pending) = cold.nif_pending.as_mut() {
+                roots.extend_from_slice(pending.roots_mut());
+            }
         }
         // Port of erts/emulator/beam/erl_gc.c:832-901 (`trace_gc` around minor/major collections), OTP-29.1.1.
         let traced = self
@@ -3979,7 +4009,12 @@ impl Process {
         let extra_start = mailbox_len + usize::from(continuation.is_some());
         extra.copy_from_slice(&roots[extra_start..extra_end]);
         if let Some(cold) = self.cold.as_mut() {
-            cold.apply_roots.copy_from_slice(&roots[extra_end..]);
+            let apply_end = extra_end + cold.apply_roots.len();
+            cold.apply_roots
+                .copy_from_slice(&roots[extra_end..apply_end]);
+            if let Some(pending) = cold.nif_pending.as_mut() {
+                pending.roots_mut().copy_from_slice(&roots[apply_end..]);
+            }
         }
         if self.max_heap_peak != 0
             || self
@@ -4718,6 +4753,15 @@ fn initialize_feature_defaults(store: &arinsal_pterm::Store) -> Result<(), VmErr
         .put_new(key, Term::atom(arinsal_term::atoms::TRUE))
         .map(|_| ())
         .map_err(|error| VmError::Load(format!("feature default: {error:?}")))
+}
+
+/// Scheduler class of a scheduler type, for matching rescheduled NIF calls.
+fn scheduler_class(kind: arinsal_sched::SchedulerType) -> arinsal_bifs::SchedulerClass {
+    match kind {
+        arinsal_sched::SchedulerType::Normal => arinsal_bifs::SchedulerClass::Normal,
+        arinsal_sched::SchedulerType::DirtyCpu => arinsal_bifs::SchedulerClass::DirtyCpu,
+        arinsal_sched::SchedulerType::DirtyIo => arinsal_bifs::SchedulerClass::DirtyIo,
+    }
 }
 
 #[cfg(test)]

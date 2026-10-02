@@ -873,6 +873,18 @@ struct Inner<T: Task> {
     progress: Arc<ThreadProgress>,
     /// Dirty CPU and dirty I/O pools, indexed by [`DirtyKind::index`].
     dirty: [DirtyPool<T>; 2],
+    /// Scheduler type allowed to execute while multi-scheduling is blocked.
+    /// Port of erts/emulator/beam/erl_process.c:7580 (msb_scheduler_type_switch), OTP-29.1.1.
+    msb_exec: Mutex<MsbExec>,
+    msb_switch: Condvar,
+}
+
+/// Which of normal scheduler 1, dirty CPU scheduler 1 and dirty I/O scheduler 1 executes
+/// while multi-scheduling is blocked, plus the dirty type that ran last.
+#[derive(Clone, Copy)]
+struct MsbExec {
+    current: SchedulerType,
+    last_dirty: SchedulerType,
 }
 
 /// One dirty scheduler pool: a single run queue shared by all of its threads.
@@ -1024,6 +1036,105 @@ impl<T: Task> Inner<T> {
         }
         // Offline dirty CPU threads also wait on this condvar, so wake them all.
         pool.ready.notify_all();
+        // While multi-scheduling is blocked the blocking scheduler hands execution over.
+        if self.scheduling_blocked.load(Ordering::Acquire) {
+            let blocker = self.scheduling_blocker.load(Ordering::Acquire);
+            if let Some(thread) = self.sleepers.get(blocker).and_then(OnceLock::get) {
+                thread.unpark();
+            }
+        }
+    }
+
+    /// Highest dirty priority (lowest index) queued in `kind`'s pool.
+    fn dirty_best_priority(&self, kind: DirtyKind) -> Option<usize> {
+        let queue = self.dirty[kind.index()].queue.lock().unwrap();
+        queue.by_priority.iter().position(|queue| !queue.is_empty())
+    }
+
+    /// Hand execution from the blocking normal scheduler to a dirty scheduler when dirty
+    /// work of at least the normal work's priority is queued, and wait until it is back.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:7580-7700 (msb_scheduler_type_switch),
+    /// OTP-29.1.1.
+    fn msb_switch_to_dirty(&self, normal_prio: Option<usize>) -> bool {
+        const NONE: usize = usize::MAX;
+        let nrml = normal_prio.unwrap_or(NONE);
+        let dcpu = self.dirty_best_priority(DirtyKind::Cpu).unwrap_or(NONE);
+        let dio = self.dirty_best_priority(DirtyKind::Io).unwrap_or(NONE);
+        if dcpu == NONE && dio == NONE {
+            return false;
+        }
+        let mut exec = SchedulerType::Normal;
+        if dcpu < nrml {
+            exec = if dio < dcpu {
+                SchedulerType::DirtyIo
+            } else {
+                SchedulerType::DirtyCpu
+            };
+        } else if dio < nrml {
+            exec = SchedulerType::DirtyIo;
+        }
+        if exec == SchedulerType::Normal {
+            if dcpu == nrml {
+                exec = SchedulerType::DirtyCpu;
+            } else if dio == nrml {
+                exec = SchedulerType::DirtyIo;
+            } else {
+                return false;
+            }
+        }
+        let mut state = self.msb_exec.lock().unwrap();
+        if dio == dcpu {
+            exec = if state.last_dirty == SchedulerType::DirtyIo {
+                SchedulerType::DirtyCpu
+            } else {
+                SchedulerType::DirtyIo
+            };
+        }
+        state.current = exec;
+        state.last_dirty = exec;
+        // Dirty threads check `msb_exec` while holding their pool lock; never hold both here.
+        drop(state);
+        let kind = if exec == SchedulerType::DirtyCpu {
+            DirtyKind::Cpu
+        } else {
+            DirtyKind::Io
+        };
+        {
+            // Take the pool lock so the dirty thread cannot miss the notification.
+            let _queue = self.dirty[kind.index()].queue.lock().unwrap();
+            self.dirty[kind.index()].ready.notify_all();
+        }
+        let mut state = self.msb_exec.lock().unwrap();
+        while state.current != SchedulerType::Normal
+            && self.scheduling_blocked.load(Ordering::Acquire)
+            && !self.stopped.load(Ordering::Acquire)
+        {
+            state = self
+                .msb_switch
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap()
+                .0;
+        }
+        state.current = SchedulerType::Normal;
+        true
+    }
+
+    /// Whether dirty thread `index` of `kind` may execute a job now.
+    fn dirty_may_execute(&self, kind: DirtyKind, index: usize) -> bool {
+        if !self.scheduling_blocked.load(Ordering::Acquire) {
+            return true;
+        }
+        index == 0 && self.msb_exec.lock().unwrap().current == SchedulerType::from(kind)
+    }
+
+    /// After one dirty job under blocked multi-scheduling, return to the normal scheduler.
+    fn msb_dirty_done(&self, kind: DirtyKind) {
+        let mut state = self.msb_exec.lock().unwrap();
+        if state.current == SchedulerType::from(kind) {
+            state.current = SchedulerType::Normal;
+            self.msb_switch.notify_all();
+        }
     }
 
     fn dirty_thread(&self, slot: usize) -> Option<&DirtyThread> {
@@ -3511,6 +3622,11 @@ impl<T: Task> Scheduler<T> {
                 DirtyPool::new(dirty_cpu, 0),
                 DirtyPool::new(dirty_io, dirty_cpu),
             ],
+            msb_exec: Mutex::new(MsbExec {
+                current: SchedulerType::Normal,
+                last_dirty: SchedulerType::DirtyIo,
+            }),
+            msb_switch: Condvar::new(),
         });
         let mut threads = Vec::new();
         if !simulated {
@@ -3756,6 +3872,11 @@ impl<T: Task> Scheduler<T> {
             .store(blocked, Ordering::Release);
         if !blocked {
             self.wake_all_workers();
+            self.inner.msb_switch.notify_all();
+            for pool in &self.inner.dirty {
+                let _queue = pool.queue.lock().unwrap();
+                pool.ready.notify_all();
+            }
         }
     }
 
@@ -4673,6 +4794,25 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         inner.poll_pending_waits(&mut local);
         local.set_msacc_state(MsaccState::Other);
         inner.flush_local_metrics(&mut local);
+        if inner.scheduling_blocked.load(Ordering::Acquire) && inner.sim.is_none() {
+            let injected = (0..inner.injectors.len()).find(|&p| !inner.injectors[p].is_empty());
+            let normal_prio = match (local.best_priority(), injected) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            if inner.dirty_best_priority(DirtyKind::Cpu).is_some()
+                || inner.dirty_best_priority(DirtyKind::Io).is_some()
+            {
+                local.set_msacc_state(MsaccState::Sleep);
+                local.set_wall_enabled(false);
+                let switched = inner.msb_switch_to_dirty(normal_prio);
+                local.set_msacc_state(MsaccState::Other);
+                if switched {
+                    continue;
+                }
+                local.set_wall_enabled(wall_enabled);
+            }
+        }
         let mut item = None;
         // Port of erts/emulator/beam/erl_process.c:9603 (one run queue per scheduler,
         // FIFO within a priority), OTP-29.1.1: bound processes share their scheduler with
@@ -4861,6 +5001,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 }
                 if index < pool.online.load(Ordering::Acquire)
                     && queue.len != 0
+                    && inner.dirty_may_execute(kind, index)
                     && let Some(process) =
                         queue.by_priority.iter_mut().find_map(VecDeque::pop_front)
                 {
@@ -4889,9 +5030,14 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         );
         process.dirty_runner.store(0, Ordering::SeqCst);
         let msacc = inner.msacc_accounting();
-        let mut stats = thread.stats.lock().unwrap();
-        stats.end_active(msacc);
-        stats.set_state(MsaccState::Sleep, msacc);
+        {
+            let mut stats = thread.stats.lock().unwrap();
+            stats.end_active(msacc);
+            stats.set_state(MsaccState::Sleep, msacc);
+        }
+        // Port of erts/emulator/beam/erl_process.c:7600, OTP-29.1.1: under blocked
+        // multi-scheduling a dirty scheduler executes one job, then switches back.
+        inner.msb_dirty_done(kind);
     }
 }
 
