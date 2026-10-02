@@ -122,6 +122,9 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
             env["ARINSAL_BEAMASM"] = "1"
         result = run(cmd, limit, env=env)
         (logdir / "runner-output.log").write_text(result.stdout, encoding="utf-8", errors="replace")
+        keep = os.environ.get("ARINSAL_RUNNER_LOG")
+        if keep and exe != "erl":
+            pathlib.Path(keep).write_text(result.stdout, encoding="utf-8", errors="replace")
         return result.returncode, result.stdout
 
 

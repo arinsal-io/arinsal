@@ -502,6 +502,9 @@ pub enum ControlReply {
 
 /// Message delivery and exit handling supplied by the VM for one port.
 pub trait PortHost: Send + Sync {
+    /// A port task (`op` is `timeout`, `input` or `output`) ran for `elapsed_ns`; the host
+    /// reports it to `erlang:system_monitor` long_schedule (erl_port_task.c:1838).
+    fn task_done(&self, _port: &DriverPort, _op: &str, _elapsed_ns: u64) {}
     /// `{Port, {data, Data}}` (io.c:3357 deliver_read_message) to the connected
     /// process. `line` is `Some(eol)` for `{line, N}` ports.
     fn deliver_data(
@@ -704,6 +707,13 @@ impl DriverPort {
 
     fn data(&self) -> DrvData {
         self.drv_data.load(Ordering::Acquire) as DrvData
+    }
+
+    /// Run `f` with the port lock held: a port signal (monitor, link) takes effect after
+    /// the callback that currently owns the port finishes, like erts port signals.
+    pub fn serialized<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.guard();
+        f()
     }
 
     fn guard(&self) -> ReentrantGuard<'_> {

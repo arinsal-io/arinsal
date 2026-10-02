@@ -311,6 +311,7 @@ fn notify_all(
 fn do_load_driver_entry(table: &mut Table, id: u64, path: &str, name: &str) -> i32 {
     match Driver::load(path, name) {
         Ok(driver) => {
+            add_taint(name);
             let handle = table.handles.get_mut(&id).expect("live handle");
             handle.driver = Some(driver);
             handle.refc = 0;
@@ -1255,7 +1256,10 @@ pub(crate) fn port_opened(id: u64, port: &Arc<DriverPort>) {
         reference_driver(&mut table, id);
         let handle = table.handles.get_mut(&id).expect("live handle");
         handle.port_count += 1;
-        handle.ports.retain(|port| port.strong_count() > 0);
+        // Pruning on every open is quadratic; sizes that are powers of two keep it amortized.
+        if handle.ports.len().is_power_of_two() {
+            handle.ports.retain(|port| port.strong_count() > 0);
+        }
         handle.ports.push(Arc::downgrade(port));
     }
 }
@@ -1402,4 +1406,35 @@ pub(crate) fn lock_driver(scheduler: &Scheduler<Process>, driver: &Arc<Driver>) 
     }
     deliver(scheduler, notices);
     true
+}
+
+fn taint_list() -> &'static Mutex<Vec<String>> {
+    static TAINTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    TAINTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Port of erts/emulator/beam/erl_nif.c:4471 (erts_add_taint): a loaded driver or NIF
+/// library name, remembered once, in load order.
+pub(crate) fn add_taint(name: &str) {
+    let mut taints = taint_list().lock().unwrap();
+    if !taints.iter().any(|known| known == name) {
+        taints.push(name.to_owned());
+    }
+}
+
+/// Port of erts/emulator/beam/erl_nif.c:4492 (erts_nif_taints) for `system_info(taints)`.
+pub(crate) fn taints() -> Vec<String> {
+    taint_list().lock().unwrap().clone()
+}
+
+/// `system_info(taints)` as an atom list.
+pub(crate) fn taint_term(process: &mut Process) -> Result<Term, VmError> {
+    let list = O::list(taints().into_iter().map(O::Atom).collect());
+    build(process, &list)
+}
+
+/// A string as an Erlang list of bytes.
+pub(crate) fn text_term(process: &mut Process, text: &str) -> Result<Term, VmError> {
+    let list = O::list(text.bytes().map(|b| O::Int(i64::from(b))).collect());
+    build(process, &list)
 }

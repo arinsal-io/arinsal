@@ -974,9 +974,10 @@ fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmE
                 let scheduler = tuple
                     .get(1)
                     .and_then(Term::as_small)
-                    .filter(|&scheduler| scheduler >= 1)
+                    .filter(|&scheduler| scheduler >= 0)
                     .ok_or_else(|| badarg("erlang:spawn_opt"))?;
-                opts.scheduler = Some(scheduler as usize);
+                // Port of erts/emulator/beam/erl_process.c:12361 (erts_parse_spawn_opts): 0 means unbound.
+                opts.scheduler = (scheduler != 0).then_some(scheduler as usize);
             } else {
                 return Err(badarg("erlang:spawn_opt"));
             }
@@ -1937,7 +1938,13 @@ fn call_resolved(
         (SignalBif::Link1, [target]) => link_opt(vm, process, ctx, *target, Term::NIL),
         (SignalBif::Link2, [target, opts]) => link_opt(vm, process, ctx, *target, *opts),
         (SignalBif::Unlink1, [port]) if port.as_port().is_some() => {
-            crate::port::link(process, *port, ctx.pid(), false)?;
+            // A dead port has nothing left to unlink from.
+            if port
+                .as_port()
+                .is_some_and(|id| crate::port::is_live(process, id))
+            {
+                crate::port::link(process, *port, ctx.pid(), false)?;
+            }
             Ok(atom("true"))
         }
         (SignalBif::Unlink1, [pid]) => {
@@ -2079,7 +2086,13 @@ fn call_resolved(
                     ]),
                 )
             } else if let Ok(object @ arinsal_etf::OwnedTerm::Port { .. }) = to_owned(*target) {
-                // A port of another incarnation of this node never matches a live port.
+                // Port of erts/emulator/beam/bif.c:923 (monitor/3): a port of another node is badarg;
+                // a port of another incarnation of this node never matches a live port.
+                if let arinsal_etf::OwnedTerm::Port { node, .. } = &object
+                    && *node != crate::node_tables::lock().local_name
+                {
+                    return Err(badarg("monitor/2"));
+                }
                 (None, object)
             } else {
                 return Err(badarg("monitor/2"));
@@ -2949,8 +2962,14 @@ fn link_opt(
     opts: Term,
 ) -> Result<Term, VmError> {
     let priority = parse_priority_opts(opts)?;
-    if target.as_port().is_some() {
-        crate::port::link(process, target, ctx.pid(), true)?;
+    if let Some(id) = target.as_port() {
+        // Port of erts/emulator/beam/bif.c:1286 (link_2): a dead local port answers noproc.
+        if !crate::port::is_live(process, id) {
+            return link_noproc_term(process, target, priority);
+        }
+        if !crate::port::link(process, target, ctx.pid(), true)? {
+            return link_noproc_term(process, target, priority);
+        }
         return Ok(atom("true"));
     }
     let pid = Pid::from_term(target).ok_or_else(|| badarg("link"))?;
@@ -2996,9 +3015,14 @@ fn link_opt(
 /// exits, else a `noproc` error.
 // Port of erts/emulator/beam/bif.c:675 (erts_link_opts / link noproc arm), OTP-29.1.1.
 fn link_noproc(process: &mut Process, pid: Pid, priority: bool) -> Result<Term, VmError> {
+    let pid_term = pid.to_term().ok_or_else(|| badarg("link"))?;
+    link_noproc_term(process, pid_term, priority)
+}
+
+fn link_noproc_term(process: &mut Process, target: Term, priority: bool) -> Result<Term, VmError> {
     let reason = atom("noproc");
     if process.trap_exit {
-        let pid_term = pid.to_term().ok_or_else(|| badarg("link"))?;
+        let pid_term = target;
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
         let exit = TermBuilder::new(&mut heap)
             .tuple(&[atom("EXIT"), pid_term, reason])
@@ -3033,8 +3057,11 @@ fn send_exit_signal_bif(
     exit2: bool,
 ) -> Result<Term, VmError> {
     let want_priority = parse_priority_opts(opts)?;
-    if id.as_port().is_some() {
-        crate::port::exit_port(process, ctx, id, reason)?;
+    if let Some(port_id) = id.as_port() {
+        // Port of erts/emulator/beam/bif.c:1721: an exit signal to a dead port is dropped.
+        if crate::port::is_live(process, port_id) {
+            crate::port::exit_port(process, ctx, id, reason)?;
+        }
         return Ok(atom("true"));
     }
     let mut via_prio_alias = false;

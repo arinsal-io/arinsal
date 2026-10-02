@@ -351,7 +351,13 @@ impl DriverPort {
             self.driver.callbacks.ready_output
         };
         match callback {
-            Some(callback) => call2(callback, self.data(), event_of(fd)),
+            Some(callback) => {
+                let started = std::time::Instant::now();
+                call2(callback, self.data(), event_of(fd));
+                let op = if dir == 0 { "input" } else { "output" };
+                self.host
+                    .task_done(self, op, started.elapsed().as_nanos() as u64);
+            }
             None => {
                 let (kind, callback, bit) = if dir == 0 {
                     ("Input", "ready_input()", READ)
