@@ -194,9 +194,11 @@ dependencies = [
  "arinsal-difftest",
  "arinsal-etf",
  "arinsal-term",
+ "crossbeam-utils",
  "num-bigint",
  "num-traits",
  "parking_lot",
+ "smallvec",
 ]
 
 [[package]]

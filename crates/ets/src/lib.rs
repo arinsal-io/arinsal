@@ -446,6 +446,170 @@ fn integer_value(term: Term) -> Option<BigInt> {
     unsafe { term.big_ref() }.map(|value| value.to_bigint())
 }
 
+/// Whether `bytes` holds only terms [`decode_ets_fast`] builds, as one complete term.
+fn ets_fast_supported(bytes: &[u8]) -> bool {
+    fn be(bytes: &[u8], pos: usize, count: usize) -> Option<usize> {
+        bytes
+            .get(pos..pos + count)?
+            .iter()
+            .try_fold(0_usize, |acc, byte| {
+                acc.checked_mul(256)?.checked_add(usize::from(*byte))
+            })
+    }
+    fn scan(bytes: &[u8], pos: &mut usize, depth: u32) -> Option<()> {
+        if depth > 256 {
+            return None;
+        }
+        let tag = *bytes.get(*pos)?;
+        *pos += 1;
+        match tag {
+            97 => *pos += 1,
+            98 => *pos += 4,
+            70 => *pos += 8,
+            b'I' => *pos += 2,
+            b'K' => *pos += 3,
+            106 => {}
+            104 => {
+                let arity = be(bytes, *pos, 1)?;
+                *pos += 1;
+                for _ in 0..arity {
+                    scan(bytes, pos, depth + 1)?;
+                }
+            }
+            105 => {
+                let arity = be(bytes, *pos, 4)?;
+                *pos += 4;
+                for _ in 0..arity {
+                    scan(bytes, pos, depth + 1)?;
+                }
+            }
+            107 => {
+                let len = be(bytes, *pos, 2)?;
+                *pos += 2 + len;
+            }
+            108 => {
+                let count = be(bytes, *pos, 4)?;
+                *pos += 4;
+                for _ in 0..count {
+                    scan(bytes, pos, depth + 1)?;
+                }
+                scan(bytes, pos, depth + 1)?;
+            }
+            109 => {
+                let len = be(bytes, *pos, 4)?;
+                *pos += 4 + len;
+            }
+            88 => {
+                // Local pid: marker, id, serial, zeroed creation.
+                if *bytes.get(*pos)? != 106 {
+                    return None;
+                }
+                *pos += 13;
+            }
+            90 => {
+                let count = be(bytes, *pos, 2)?;
+                if count != 3 || *bytes.get(*pos + 2)? != 106 {
+                    return None;
+                }
+                *pos += 2 + 1 + 4 + 4 * count;
+            }
+            _ => return None,
+        }
+        (*pos <= bytes.len()).then_some(())
+    }
+    let mut pos = 0;
+    scan(bytes, &mut pos, 0).is_some() && pos == bytes.len()
+}
+
+/// Build one ETS-external element straight on `dst`, for the common term shapes (integers,
+/// atoms, floats, binaries, strings, lists, tuples, local pids and references). `bytes`
+/// must have passed [`ets_fast_supported`].
+// Port of erts/emulator/beam/external.c:3263 (dec_term, the arms for these tags with the
+// ETS local-atom extension), OTP-29.1.1.
+fn decode_ets_fast<H: HeapAlloc>(bytes: &[u8], dst: &mut H) -> Result<Term, EtsError> {
+    fn be(bytes: &[u8], pos: &mut usize, count: usize) -> u64 {
+        let value = bytes[*pos..*pos + count]
+            .iter()
+            .fold(0_u64, |acc, byte| (acc << 8) | u64::from(*byte));
+        *pos += count;
+        value
+    }
+    fn build<H: HeapAlloc>(bytes: &[u8], pos: &mut usize, dst: &mut H) -> Result<Term, EtsError> {
+        let tag = bytes[*pos];
+        *pos += 1;
+        Ok(match tag {
+            97 => Term::small(be(bytes, pos, 1) as i64).ok_or(EtsError::BadArg)?,
+            98 => {
+                let value = be(bytes, pos, 4) as u32 as i32;
+                TermBuilder::new(dst).int_from_i64(i64::from(value))?
+            }
+            70 => {
+                let bits = be(bytes, pos, 8);
+                TermBuilder::new(dst).float(f64::from_bits(bits))?
+            }
+            b'I' => Term::atom(Atom(be(bytes, pos, 2) as u32)),
+            b'K' => Term::atom(Atom(be(bytes, pos, 3) as u32)),
+            106 => Term::NIL,
+            104 | 105 => {
+                let arity = be(bytes, pos, if tag == 104 { 1 } else { 4 }) as usize;
+                let mut elements: smallvec::SmallVec<[Term; 16]> = smallvec::SmallVec::new();
+                for _ in 0..arity {
+                    elements.push(build(bytes, pos, dst)?);
+                }
+                TermBuilder::new(dst).tuple(&elements)?
+            }
+            107 => {
+                let len = be(bytes, pos, 2) as usize;
+                let chars = &bytes[*pos..*pos + len];
+                *pos += len;
+                TermBuilder::new(dst).list_from_iter(
+                    chars
+                        .iter()
+                        .map(|&byte| Term::small(i64::from(byte)).unwrap()),
+                )?
+            }
+            108 => {
+                let count = be(bytes, pos, 4) as usize;
+                let mut elements: smallvec::SmallVec<[Term; 16]> = smallvec::SmallVec::new();
+                for _ in 0..count {
+                    elements.push(build(bytes, pos, dst)?);
+                }
+                let mut list = build(bytes, pos, dst)?;
+                let mut builder = TermBuilder::new(dst);
+                for element in elements.into_iter().rev() {
+                    list = builder.cons(element, list)?;
+                }
+                list
+            }
+            109 => {
+                let len = be(bytes, pos, 4) as usize;
+                let data = &bytes[*pos..*pos + len];
+                *pos += len;
+                TermBuilder::new(dst).binary(data)?
+            }
+            88 => {
+                *pos += 1;
+                let id = be(bytes, pos, 4) as u32;
+                let serial = be(bytes, pos, 4) as u32;
+                *pos += 4;
+                Term::pid(id, serial).ok_or(EtsError::BadArg)?
+            }
+            _ => {
+                // 90: local reference with three words.
+                *pos += 2 + 1 + 4;
+                let ids = [
+                    be(bytes, pos, 4) as u32,
+                    be(bytes, pos, 4) as u32,
+                    be(bytes, pos, 4) as u32,
+                ];
+                TermBuilder::new(dst).local_ref(ids)?
+            }
+        })
+    }
+    let mut pos = 0;
+    build(bytes, &mut pos, dst)
+}
+
 // Port of erts/emulator/beam/external.c:750 and :810, OTP-29.1.1. The ETS
 // external format replaces atom names with local atom-table references.
 fn ets_external_atoms(bytes: &[u8], compress: bool) -> Result<Vec<u8>, EtsError> {
@@ -1130,6 +1294,10 @@ impl StoredTerm {
                     elements.push(TermBuilder::new(dst).magic_ref(owner.clone())?);
                     continue;
                 }
+                if ets_fast_supported(bytes) {
+                    elements.push(decode_ets_fast(bytes, dst)?);
+                    continue;
+                }
                 let mut ext = Vec::with_capacity(bytes.len() + 1);
                 ext.push(131);
                 ext.extend_from_slice(bytes);
@@ -1645,6 +1813,12 @@ enum Storage {
     CATree(CATree),
 }
 
+/// An object already copied into table-owned storage, ready for `Table::insert_prepared`.
+pub struct PreparedObject {
+    stored: StoredTerm,
+    hash: u64,
+}
+
 /// One ETS table, with table-owned object heaps.
 pub struct Table {
     /// Stable table identifier.
@@ -1652,16 +1826,24 @@ pub struct Table {
     /// Creation options and owner metadata.
     pub options: TableOptions,
     storage: Storage,
-    max_arity: usize,
+    max_arity: AtomicUsize,
     fixed: usize,
     fixed_system_time: Option<StoredTerm>,
     fixed_monotonic_time: Option<StoredTerm>,
     fixed_processes: Vec<(StoredTerm, usize)>,
     _heir_data: Option<StoredTerm>,
     counter_results: Option<Box<VecHeap>>,
+    /// Set once the registry has detached the table (`ets:delete/1`); cached handles to it
+    /// must then fail like a deleted table.
+    detached: bool,
 }
 
 impl Table {
+    /// Whether the table was deleted while a cached handle to it was still in use.
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+
     fn new(tid: Tid, mut options: TableOptions) -> Result<Self, EtsError> {
         if options.keypos == 0 {
             return Err(EtsError::BadArg);
@@ -1686,13 +1868,14 @@ impl Table {
             tid,
             options,
             storage,
-            max_arity: 0,
+            max_arity: AtomicUsize::new(0),
             fixed: 0,
             fixed_system_time: None,
             fixed_monotonic_time: None,
             fixed_processes: Vec::new(),
             _heir_data: heir_data,
             counter_results: None,
+            detached: false,
         })
     }
 
@@ -2099,6 +2282,51 @@ impl Table {
         }
     }
 
+    /// Build the table-owned copy of one object, which needs no table state beyond the
+    /// creation options: callers do it before taking the table's write lock.
+    // Port of erts/emulator/beam/erl_db_hash.c:1580 (db_put_hash: the term is copied by
+    // `new_dbterm` before the bucket lock is taken for set tables), OTP-29.1.1.
+    pub fn prepare_object(
+        options: &TableOptions,
+        object: Term,
+    ) -> Result<PreparedObject, EtsError> {
+        let key = key_of(object, options.keypos)?;
+        let hash = ets_hash(key);
+        let stored = StoredTerm::copy_for_table(
+            object,
+            options.compressed,
+            options.keypos,
+            if options.table_type == TableType::OrderedSet {
+                3
+            } else {
+                2
+            },
+        )?;
+        Ok(PreparedObject { stored, hash })
+    }
+
+    /// Store a prepared object through a shared reference when the storage synchronizes its own
+    /// writers (a CA tree), returning `None`; any other storage hands the object back for
+    /// `insert_prepared` under the exclusive table lock.
+    // Port of erts/emulator/beam/erl_db_catree.c:1733 (db_put_catree: only the route and
+    // base-node locks are taken, not the table lock), OTP-29.1.1.
+    pub fn insert_shared(&self, prepared: PreparedObject) -> Option<PreparedObject> {
+        match &self.storage {
+            Storage::CATree(tree) => {
+                self.max_arity
+                    .fetch_max(prepared.stored.arity(), AtomicOrdering::Relaxed);
+                tree.insert(prepared.stored);
+                None
+            }
+            _ => Some(prepared),
+        }
+    }
+
+    /// Store an object built by [`Table::prepare_object`] like `insert` of a single object.
+    pub fn insert_prepared(&mut self, prepared: PreparedObject) {
+        self.put_hashed(prepared.stored, prepared.hash, false);
+    }
+
     /// Insert one or several objects. Validation and copying finish before mutation.
     pub fn insert(&mut self, objects: &[Term]) -> Result<(), EtsError> {
         if let [object] = objects {
@@ -2149,7 +2377,8 @@ impl Table {
     }
 
     fn put_hashed(&mut self, object: StoredTerm, hash: u64, new_only: bool) {
-        self.max_arity = self.max_arity.max(object.arity());
+        self.max_arity
+            .fetch_max(object.arity(), AtomicOrdering::Relaxed);
         let keypos = self.options.keypos;
         match &mut self.storage {
             Storage::Ordered(root) => *root = Some(Node::insert(root.take(), object, keypos)),
@@ -2472,7 +2701,7 @@ impl Table {
         if position == 0 {
             return Err(EtsError::BadArg);
         }
-        if position > self.max_arity {
+        if position > self.max_arity.load(AtomicOrdering::Relaxed) {
             return Err(if self.member(key) {
                 EtsError::BadArg
             } else {
@@ -3815,7 +4044,7 @@ impl Table {
         let keypos = self.options.keypos;
         let compressed = self.options.compressed;
         if let Storage::Hash(storage) = &mut self.storage {
-            let mut max_arity = self.max_arity;
+            let mut max_arity = self.max_arity.load(AtomicOrdering::Relaxed);
             let count = storage.replace_each(|object| {
                 let mut heap = VecHeap::new();
                 let current = object.copy_out(&mut heap)?;
@@ -3826,7 +4055,7 @@ impl Table {
                 max_arity = max_arity.max(replacement.arity());
                 Ok(Some(replacement))
             })?;
-            self.max_arity = max_arity;
+            self.max_arity.store(max_arity, AtomicOrdering::Relaxed);
             return Ok(count);
         }
         let mut heap = VecHeap::new();
@@ -3907,7 +4136,90 @@ struct TableSlot {
 /// Port of erts/emulator/beam/erl_db.c:446-500 (db_lock/db_unlock), OTP-29.1.1: each table
 /// carries its own `rwlock`; reads take it shared and writes exclusive. The registry lock
 /// only guards the identity and name maps (erts `meta_main_tab` and `meta_name_tab`).
-pub type SharedTable = Arc<parking_lot::RwLock<Table>>;
+pub type SharedTable = Arc<TableLock>;
+
+/// A table's reader/writer lock with one shard per scheduler group: a reader locks only its
+/// own shard, so concurrent lookups do not bounce one cache line; a writer locks every shard.
+///
+/// Port of erts/emulator/beam/erl_db.c:446-500 (db_lock with `read_concurrency`, which uses
+/// reader groups of `erts_rwmtx`), OTP-29.1.1.
+pub struct TableLock {
+    lock: crossbeam_utils::sync::ShardedLock<Table>,
+    /// Writers waiting for the shards. Readers hold off while it is non-zero, so a writer
+    /// needs every shard free only for the moment the readers already inside drain.
+    writers_waiting: std::sync::atomic::AtomicUsize,
+}
+
+impl TableLock {
+    fn new(table: Table) -> Self {
+        Self {
+            lock: crossbeam_utils::sync::ShardedLock::new(table),
+            writers_waiting: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Lock the table for reading.
+    pub fn read(&self) -> crossbeam_utils::sync::ShardedLockReadGuard<'_, Table> {
+        // Hold times are a lookup or an insert: spinning beats parking the scheduler thread
+        // (and the wake-up latency) for the few contended acquisitions.
+        let mut spins = 0_u32;
+        loop {
+            if self
+                .writers_waiting
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                match self.lock.try_read() {
+                    Ok(guard) => return guard,
+                    Err(std::sync::TryLockError::Poisoned(poison)) => return poison.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                }
+            }
+            spins += 1;
+            if spins > 20_000 {
+                return self
+                    .lock
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            Self::backoff(spins);
+        }
+    }
+
+    /// Lock the table for writing.
+    pub fn write(&self) -> crossbeam_utils::sync::ShardedLockWriteGuard<'_, Table> {
+        use std::sync::atomic::Ordering;
+        self.writers_waiting.fetch_add(1, Ordering::AcqRel);
+        let mut spins = 0_u32;
+        let guard = loop {
+            match self.lock.try_write() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poison)) => break poison.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            spins += 1;
+            if spins > 20_000 {
+                break self
+                    .lock
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            Self::backoff(spins);
+        };
+        self.writers_waiting.fetch_sub(1, Ordering::AcqRel);
+        guard
+    }
+
+    fn backoff(spins: u32) {
+        if spins < 64 {
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
 
 impl Registry {
     /// Start an empty registry.
@@ -3954,7 +4266,7 @@ impl Registry {
                 table: None,
             });
         }
-        self.tables[index].table = Some(Arc::new(parking_lot::RwLock::new(table)));
+        self.tables[index].table = Some(Arc::new(TableLock::new(table)));
         self.owned_tables
             .entry(options.owner)
             .or_default()
@@ -3974,12 +4286,18 @@ impl Registry {
     }
 
     /// Lock a table for reading.
-    pub fn get(&self, tid: Tid) -> Result<parking_lot::RwLockReadGuard<'_, Table>, EtsError> {
+    pub fn get(
+        &self,
+        tid: Tid,
+    ) -> Result<crossbeam_utils::sync::ShardedLockReadGuard<'_, Table>, EtsError> {
         Ok(self.shared(tid)?.read())
     }
 
     /// Lock a table for writing.
-    pub fn get_mut(&self, tid: Tid) -> Result<parking_lot::RwLockWriteGuard<'_, Table>, EtsError> {
+    pub fn get_mut(
+        &self,
+        tid: Tid,
+    ) -> Result<crossbeam_utils::sync::ShardedLockWriteGuard<'_, Table>, EtsError> {
         Ok(self.shared(tid)?.write())
     }
 
@@ -4039,6 +4357,7 @@ impl Registry {
         slot.generation = slot.generation.wrapping_add(1).max(1);
         self.free_slots.push(index);
         let mut table = shared.write();
+        table.detached = true;
         self.remove_owned_table(table.options.owner, tid);
         if table.options.named_table {
             self.names.remove(&table.options.name);

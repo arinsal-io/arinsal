@@ -95,16 +95,21 @@ impl NativeTargetCache {
     }
 }
 
-struct DispatchTarget {
+#[derive(Clone)]
+pub(crate) struct DispatchTarget {
     slot: Arc<arinsal_beamasm::bif::ExportEntry>,
-    module: String,
-    function: String,
-    module_atom: arinsal_term::Atom,
-    function_atom: arinsal_term::Atom,
-    arity: u8,
+    pub module: String,
+    pub function: String,
+    pub module_atom: arinsal_term::Atom,
+    pub function_atom: arinsal_term::Atom,
+    pub arity: u8,
     bif: Option<arinsal_bifs::BifFn>,
-    class: arinsal_loader::ImportClass,
-    native_bits: usize,
+    pub class: arinsal_loader::ImportClass,
+    pub native_bits: usize,
+    /// The BIF has a continuation entry in `bif_traps`; others skip that table on every call.
+    pub trap_entry: bool,
+    /// Runs the BIF inside native code, see `natives::ets::DirectEts`.
+    pub direct_ets: Option<crate::natives::ets::DirectEts>,
 }
 
 /// One node's export state, like an erts code index: import slots, interpreted and native
@@ -124,9 +129,19 @@ struct ScopeExports {
 #[derive(Default)]
 struct DispatchRegistry {
     scopes: HashMap<u64, ScopeExports>,
-    by_identity: HashMap<usize, Arc<DispatchTarget>>,
+    // Leaked on first registration: native BIF calls read these on every call, and a shared
+    // reference count would bounce between schedulers. Each is a few hundred bytes per import.
+    by_identity: HashMap<usize, &'static DispatchTarget>,
     // Slots for `call_bif_mfa`; unlike imports they always enter the BIF itself.
     bif_mfas: HashMap<Mfa, Arc<DispatchTarget>>,
+}
+
+impl DispatchRegistry {
+    fn intern_identity(&mut self, identity: usize, entry: &Arc<DispatchTarget>) {
+        self.by_identity
+            .entry(identity)
+            .or_insert_with(|| Box::leak(Box::new(DispatchTarget::clone(entry))));
+    }
 }
 
 fn dispatch_registry() -> &'static RwLock<DispatchRegistry> {
@@ -192,6 +207,12 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
             };
             Arc::new(DispatchTarget {
                 slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(address)),
+                trap_entry: crate::bif_traps::traps(&import.module, &import.function, import.arity),
+                direct_ets: crate::natives::ets::direct_entry(
+                    &import.module,
+                    &import.function,
+                    import.arity,
+                ),
                 module: import.module.clone(),
                 function: import.function.clone(),
                 module_atom: import.module_atom,
@@ -203,7 +224,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
             })
         }));
         let identity = Arc::as_ptr(&entry.slot) as usize;
-        registry.by_identity.insert(identity, entry);
+        registry.intern_identity(identity, &entry);
         identities.push(identity);
     }
     Some(identities)
@@ -221,6 +242,8 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
         Arc::new(DispatchTarget {
             slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(trampoline)),
+            trap_entry: crate::bif_traps::traps(module, function, arity),
+            direct_ets: crate::natives::ets::direct_entry(module, function, arity),
             module: module.to_owned(),
             function: function.to_owned(),
             module_atom,
@@ -232,7 +255,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         })
     }));
     let identity = Arc::as_ptr(&entry.slot) as usize;
-    registry.by_identity.insert(identity, entry);
+    registry.intern_identity(identity, &entry);
     Some(identity)
 }
 
@@ -346,28 +369,57 @@ pub(crate) fn set_global_breakpoint(
 }
 
 /// Descriptor addressed directly by the native export slot.
-pub(crate) struct ExportDispatch {
-    pub module: String,
-    pub function: String,
-    pub module_atom: arinsal_term::Atom,
-    pub function_atom: arinsal_term::Atom,
-    pub arity: u8,
-    pub class: arinsal_loader::ImportClass,
-    pub native_bits: usize,
+pub(crate) type ExportDispatch = &'static DispatchTarget;
+
+thread_local! {
+    /// Per-scheduler copy of `by_identity`: an identity is the address of a slot the cached
+    /// target keeps alive, so a stale entry can only be a target nothing calls any more. It
+    /// keeps native BIF calls off the shared registry lock and its hash map.
+    static TARGET_CACHE: std::cell::RefCell<HashMap<usize, &'static DispatchTarget, IdentityHasher>> =
+        const { std::cell::RefCell::new(HashMap::with_hasher(IdentityHasher)) };
+}
+
+/// Hasher for keys that are already well-spread addresses.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct IdentityHasher;
+
+impl std::hash::BuildHasher for IdentityHasher {
+    type Hasher = IdentityState;
+    fn build_hasher(&self) -> IdentityState {
+        IdentityState(0)
+    }
+}
+
+pub(crate) struct IdentityState(u64);
+
+impl std::hash::Hasher for IdentityState {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) ^ u64::from(byte);
+        }
+    }
+    fn write_usize(&mut self, value: usize) {
+        // Slot addresses are 8-aligned; fold the high bits down so buckets differ.
+        self.0 = (value as u64) ^ ((value as u64) >> 12);
+    }
+}
+
+fn target_for_identity(identity: usize) -> Option<&'static DispatchTarget> {
+    if let Some(found) = TARGET_CACHE.with(|cache| cache.borrow().get(&identity).copied()) {
+        return Some(found);
+    }
+    let registry = dispatch_registry().read().ok()?;
+    let target = *registry.by_identity.get(&identity)?;
+    drop(registry);
+    TARGET_CACHE.with(|cache| cache.borrow_mut().insert(identity, target));
+    Some(target)
 }
 
 pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
-    let registry = dispatch_registry().read().ok()?;
-    let target = registry.by_identity.get(&identity)?;
-    Some(ExportDispatch {
-        module: target.module.clone(),
-        function: target.function.clone(),
-        module_atom: target.module_atom,
-        function_atom: target.function_atom,
-        arity: target.arity,
-        class: target.class,
-        native_bits: target.native_bits,
-    })
+    target_for_identity(identity)
 }
 
 /// Returns the published native entry for an MFA, if this module was BeamAsm-compiled.
@@ -419,8 +471,7 @@ pub(crate) fn apply3_unported_entry() -> usize {
 }
 
 pub(crate) fn dispatch_bif(identity: usize) -> Option<(arinsal_bifs::BifFn, u8)> {
-    let registry = dispatch_registry().read().ok()?;
-    let target = registry.by_identity.get(&identity)?;
+    let target = target_for_identity(identity)?;
     Some((target.bif?, target.arity))
 }
 

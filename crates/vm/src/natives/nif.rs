@@ -204,6 +204,8 @@ impl NifSelectReactor {
 
 thread_local! {
     static HUB: std::cell::RefCell<Option<Hub>> = const { std::cell::RefCell::new(None) };
+    /// Runtime whose scheduler `HUB` refers to, so a repeated install can be skipped.
+    static HUB_RUNTIME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn atom(name: &str) -> Term {
@@ -1121,6 +1123,18 @@ pub(crate) fn refresh_hub_native(process: &Process) {
     let Some(pid) = process.self_pid.as_ref() else {
         return;
     };
+    // Every native BIF call lands here: when this thread already serves this process the
+    // hub, its registry entry and the global hooks are all in place, so skip the global
+    // locks they would take.
+    let runtime = process
+        .runtime
+        .as_ref()
+        .map_or(0, |rt| Arc::as_ptr(rt) as usize);
+    if HUB_RUNTIME.get() == runtime
+        && HUB.with(|hub| hub.borrow().as_ref().is_some_and(|hub| hub.pid == *pid))
+    {
+        return;
+    }
     install_hub_for(process, *pid);
 }
 
@@ -1137,6 +1151,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
             pid,
         });
     });
+    HUB_RUNTIME.set(Arc::as_ptr(runtime) as usize);
     NIF_HUBS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()

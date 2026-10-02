@@ -2393,19 +2393,33 @@ impl Vm {
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: `ip` and `base` belong to the current module.
                     let offset = unsafe { ip.offset_from(base) } as usize;
-                    if dealloc > 0 && !p.heap.release_stack(dealloc as usize) {
+                    // A BIF that yielded re-executes this instruction after its frame was
+                    // released, so the release must not happen twice.
+                    let released = dealloc > 0
+                        && p.cold
+                            .as_mut()
+                            .is_some_and(|cold| cold.ext_last_released.take() == Some((module_id, offset)));
+                    if dealloc > 0 && !released && !p.heap.release_stack(dealloc as usize) {
                         return Err(VmError::Unsupported("stack underflow".into()));
                     }
                     p.module = module_id;
                     p.ip = offset;
                     p.reductions = reds;
-                    let outcome = self.call_import(
+                    let outcome = match self.call_import(
                         p,
                         import as usize,
                         arity as usize,
                         tail,
                         ctx.as_deref_mut(),
-                    )?;
+                    ) {
+                        // A BIF yielding with an error (ets:delete/1 releasing a big table):
+                        // the instruction runs again, with its frame already released.
+                        Err(VmError::Yield) if dealloc > 0 => {
+                            p.cold_mut().ext_last_released = Some((module_id, offset));
+                            return Err(VmError::Yield);
+                        }
+                        other => other?,
+                    };
                     let native_resume = p
                         .cold
                         .as_mut()
@@ -2447,6 +2461,9 @@ impl Vm {
                     ip = match outcome {
                         ImportOutcome::Returned(value) => return Ok(RunState::Done(value)),
                         ImportOutcome::Yield => {
+                            if dealloc > 0 {
+                                p.cold_mut().ext_last_released = Some((module_id, offset));
+                            }
                             sync_cursor(p, htop, &mut heap_dirty);
                             p.reductions = reds;
                             return Ok(RunState::Yield);
@@ -3935,20 +3952,40 @@ impl Vm {
                         Opcode::CallExt | Opcode::CallExtLast | Opcode::CallExtOnly => {
                             let tail = opcode != Opcode::CallExt;
                             if opcode == Opcode::CallExtLast {
-                                p.heap.release_stack(c.value() as usize);
+                                // A yielded BIF re-executes this instruction: the frame is
+                                // already gone then.
+                                let site = (p.module, p.ip);
+                                let released = p
+                                    .cold
+                                    .as_mut()
+                                    .is_some_and(|cold| cold.ext_last_released.take() == Some(site));
+                                if !released {
+                                    p.heap.release_stack(c.value() as usize);
+                                }
                             }
-                            let outcome = self.call_import(
+                            let outcome = match self.call_import(
                                 p,
                                 b.value() as usize,
                                 a.value() as usize,
                                 tail,
                                 ctx.as_deref_mut(),
-                            )?;
+                            ) {
+                                Err(VmError::Yield) if opcode == Opcode::CallExtLast => {
+                                    let site = (p.module, p.ip);
+                                    p.cold_mut().ext_last_released = Some(site);
+                                    return Err(VmError::Yield);
+                                }
+                                other => other?,
+                            };
                             match outcome {
                                 ImportOutcome::Returned(value) => {
                                     return Ok(RunState::Done(value));
                                 }
                                 ImportOutcome::Yield => {
+                                    if opcode == Opcode::CallExtLast {
+                                        let site = (p.module, p.ip);
+                                        p.cold_mut().ext_last_released = Some(site);
+                                    }
                                     sync_cursor(p, htop, &mut heap_dirty);
                                     p.reductions = reds;
                                     return Ok(RunState::Yield);

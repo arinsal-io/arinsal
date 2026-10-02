@@ -794,6 +794,44 @@ fn invoke_dispatch_bif(
     }
     let export = crate::beamasm_integration::export_dispatch(identity)?;
 
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif), OTP-29.1.1:
+    // the table BIFs run on the process heap straight from the generated code; anything the
+    // direct path declines is redone through the scheduler.
+    if let Some(direct) = export.direct_ets
+        && !crate::trace_bp::any_pattern()
+    {
+        let arity = usize::from(export.arity);
+        let mut args = [Term::NIL; 3];
+        for (destination, raw) in args
+            .iter_mut()
+            .zip(registers.x_reg_array.iter().copied())
+            .take(arity)
+        {
+            *destination = crate::native_hooks::from_raw(raw);
+        }
+        if let Some(value) = direct(process, &args[..arity]) {
+            process.reductions = process.header.fcalls;
+            if export_call {
+                charge_bif_reductions(process, 1);
+            }
+            process.x[0] = value;
+            let mut raw = crate::native_hooks::raw(value);
+            if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
+                if process.collect_bin_vheap_if_due(1).is_err() {
+                    crate::native_hooks::set_error(process, "system_limit");
+                    publish_dispatch_x(process, registers);
+                    process.sync_native_header();
+                    return Some(0);
+                }
+                raw = crate::native_hooks::raw(process.x[0]);
+            }
+            registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            return Some(raw);
+        }
+    }
+
     // Trapping BIFs keep continuation state that only the executor's call site handles.
     if matches!(
         export.class,

@@ -19,6 +19,10 @@ enum Job {
 /// Copy an Erlang term after sizing its entire reachable object graph.
 /// Sharing of ordinary heap objects is deliberately not retained, as in erts.
 pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term, TermError> {
+    // Immediates and tuples of immediates (table rows, small messages) need no traversal.
+    if let Some(copied) = copy_flat(root, dst)? {
+        return Ok(copied);
+    }
     validate_destination(root, dst)?;
     copy_term_with_mode(root, dst, false, size_object(root), LiteralSkip::None)
 }
@@ -99,11 +103,41 @@ pub fn copy_term_preserving_sharing_with_cache<H: HeapAlloc + ?Sized>(
     copy_term_body(root, dst, true, size, cache, LiteralSkip::None, None)
 }
 
+/// Copy `root` when it is an immediate or a tuple whose elements are all immediates; `None`
+/// leaves the general traversal to the caller.
+/// Port of erts/emulator/beam/copy.c:648 (copy_struct_x, the tuple arm with no boxed
+/// elements), OTP-29.1.1.
+fn copy_flat<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Option<Term>, TermError> {
+    if !root.is_pointer() {
+        return Ok(Some(root));
+    }
+    let Some(header) = root.header() else {
+        return Ok(None);
+    };
+    if header & 63 != ARITY || root.bits() == ((&EMPTY_TUPLE as *const u64 as u64) | 2) {
+        return Ok(None);
+    }
+    let words = 1 + (header >> 6) as usize;
+    // SAFETY: a live tuple has its header and `words - 1` element words initialized.
+    let from = unsafe { root.raw_ptr() };
+    for index in 1..words {
+        // SAFETY: element words follow the header.
+        if Term(unsafe { *from.add(index) }).is_pointer() {
+            return Ok(None);
+        }
+    }
+    let to = dst.alloc(words).ok_or(TermError::HeapFull)?;
+    // SAFETY: the allocation holds `words` writable words and cannot overlap the source.
+    unsafe { std::ptr::copy_nonoverlapping(from, to, words) };
+    Ok(Some(Term::from_ptr(to, 2)))
+}
+
 fn validate_destination<H: HeapAlloc + ?Sized>(root: Term, dst: &H) -> Result<(), TermError> {
     if dst.supports_writable_binary() {
         return Ok(());
     }
-    let mut stack = vec![root];
+    let mut stack: smallvec::SmallVec<[Term; 32]> = smallvec::SmallVec::new();
+    stack.push(root);
     while let Some(term) = stack.pop() {
         if crate::bits::binary_owner_is_writable(term) {
             return Err(TermError::Unsupported("writable binary heap owner"));
@@ -150,7 +184,8 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
     let base = dst.alloc(size).ok_or(TermError::HeapFull)?;
     let mut offset = 0;
     let mut root_word = 0_u64;
-    let mut jobs = vec![Job::Copy(root, &mut root_word, false)];
+    let mut jobs: smallvec::SmallVec<[Job; 32]> = smallvec::SmallVec::new();
+    jobs.push(Job::Copy(root, &mut root_word, false));
     while let Some(job) = jobs.pop() {
         match job {
             Job::FixBase(p) => {

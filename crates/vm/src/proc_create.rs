@@ -170,6 +170,9 @@ pub(crate) struct ProcessCold {
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<EtsFree>,
+    /// Module and instruction of a `call_ext_last` whose frame was already released when its
+    /// BIF yielded, so the re-executed instruction does not release it twice.
+    pub(crate) ext_last_released: Option<(usize, usize)>,
     /// Exit work (owned ETS tables) that yielded; the process stays scheduled until it ends.
     pub(crate) exit_cont: Option<Box<ExitCont>>,
     /// A process-local BIF trap waiting for its private continuation export.
