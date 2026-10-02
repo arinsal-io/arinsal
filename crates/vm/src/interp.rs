@@ -2457,6 +2457,18 @@ impl Vm {
                             unsafe { base.add(p.ip) }
                         }
                     };
+                    // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield), OTP-29.1.1.
+                    // `yield/0` has already produced its result and advanced this call site;
+                    // switch out here so the following opcode cannot absorb the yield.
+                    if p.force_yield && matches!(&outcome, ImportOutcome::Advanced) {
+                        p.force_yield = false;
+                        p.gc_live = 1;
+                        sync_cursor(p, htop, &mut heap_dirty);
+                        p.module = module_id;
+                        p.ip = offset.saturating_add(1);
+                        p.reductions = reds;
+                        return Ok(RunState::Yield);
+                    }
                     if let ImportOutcome::Jump(target) = outcome {
                         // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317,
                         // OTP-29.1.1: return to the scheduler at an unported callee.

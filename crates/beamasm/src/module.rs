@@ -652,7 +652,7 @@ impl BeamModuleAssembler {
 
     /// `erlang:yield/0`: returns `true` after a context switch at the next instruction.
     // Port of erts/emulator/beam/emu/trace_instrs.tab:110 (i_yield) and
-    // erts/emulator/beam/jit/arm/instr_call.cpp (emit_i_yield), OTP-29.1.1.
+    // erts/emulator/beam/jit/arm/instr_common.cpp:3121 (emit_i_yield), OTP-29.1.1.
     pub fn emit_i_yield(&mut self) -> Result<(), ModuleError> {
         let continuation = self.code.new_label();
         let true_word = arinsal_term::Term::atom(arinsal_term::atoms::TRUE).tagged_word();
