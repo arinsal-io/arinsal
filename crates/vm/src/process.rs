@@ -1734,7 +1734,7 @@ impl Executor {
                                                     ..
                                                 }) => {
                                                     process.x[0] = value;
-                                                    process.collect_bin_vheap_if_due(0)?;
+                                                    process.collect_bin_vheap_if_due(1)?;
                                                     Some(Ok(process.x[0]))
                                                 }
                                                 Ok(crate::bif_traps::TrapResult::Failed {
@@ -2283,7 +2283,13 @@ impl Executor {
         let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
         let running_fields = running.as_slice();
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. })) {
-            process.collect_bin_vheap_if_due(process.x.len())?;
+            // erts collects a switched-out process rooting only its `c_p->arity` live X
+            // registers; the saved register file above that holds dead registers whose
+            // pointers may refer to a heap an earlier collection already freed.
+            // Port of erts/emulator/beam/erl_process.c:10415 (ERTS_IS_GC_DESIRED ->
+            // scheduler_gc_proc, garbage_collect with p->arity), OTP-29.1.1.
+            let live = switched_out_live(process);
+            process.collect_bin_vheap_if_due(live)?;
         }
         // OTP emits regular `out` only when a process is scheduled out; normal exit uses the
         // separate `out_exiting` event when that flag is enabled.
@@ -2393,6 +2399,25 @@ impl Executor {
     }
 }
 
+/// Exact live X register count of a process that just switched out: a native
+/// continuation records `live + 1` in `native_resume_live` (the JIT's `c_p->arity`),
+/// interpreted code its switch-out point's count in `gc_live`.
+fn switched_out_live(process: &Process) -> usize {
+    let native_live = if process.native_pc.is_some() {
+        process
+            .cold
+            .as_ref()
+            .map_or(0, |cold| usize::from(cold.native_resume_live))
+    } else {
+        0
+    };
+    match native_live {
+        0 => process.gc_live,
+        live => live - 1,
+    }
+    .min(process.x.len())
+}
+
 fn resume_after_native_return(process: &mut Process) -> bool {
     loop {
         let Some(word) = process.heap.stack_get(0) else {
@@ -2460,7 +2485,13 @@ fn hibernate_resumes_in_place(process: &Process, pid: Pid) -> bool {
 /// arguments in X0..X2. Run after the BIF has unwound so no caller keeps stale terms.
 // Port of erts/emulator/beam/beam_common.c:1584-1592 (erts_hibernate), OTP-29.1.1.
 fn hibernate_collect(process: &mut Process, pid: Pid) -> Result<(), VmError> {
-    if !process.gc_enabled || hibernate_resumes_in_place(process, pid) {
+    if hibernate_resumes_in_place(process, pid) {
+        return Ok(());
+    }
+    // erts_hibernate sets `c_p->arity = 3`: X0..X2 are the only live registers while
+    // the process waits.
+    process.gc_live = 3;
+    if !process.gc_enabled {
         return Ok(());
     }
     process.garbage_collect_hibernate(3).map(|_| ())
@@ -4490,15 +4521,15 @@ impl Process {
     }
 
     /// Collect after a BIF left heap fragments larger than the free area or pushed the
-    /// virtual binary heap over its limit.
+    /// virtual binary heap over its limit. Exactly `x[..live_x]` are roots; a BIF result
+    /// in X0 needs `live_x >= 1`.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
     pub(crate) fn collect_bin_vheap_if_due(&mut self, live_x: usize) -> Result<(), VmError> {
         if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.gc_enabled {
             return Ok(());
         }
-        let mut result = [self.x[0]];
-        let stats = self.collect_heap_roots(live_x, &mut result, 0)?;
-        self.x[0] = result[0];
+        let live_x = live_x.min(self.x.len());
+        let stats = self.collect_heap_roots(live_x, &mut [], 0)?;
         crate::natives::sys::after_collection(
             self,
             live_x,

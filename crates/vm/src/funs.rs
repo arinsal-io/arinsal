@@ -656,7 +656,7 @@ impl Vm {
             return match result? {
                 crate::bif_traps::TrapResult::Done { value, .. } => {
                     p.x[0] = value;
-                    p.collect_bin_vheap_if_due(0)?;
+                    p.collect_bin_vheap_if_due(1)?;
                     if tail {
                         Ok(match Self::ret(p) {
                             Some(value) => ImportOutcome::Returned(value),

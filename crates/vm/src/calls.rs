@@ -604,7 +604,7 @@ impl Vm {
         p.x[0] = value;
         // Port of erts/emulator/beam/erl_gc.c:418 (erts_gc_after_bif_call_lhf), OTP-29.1.1:
         // a BIF that pushed the virtual binary heap over its limit collects before returning.
-        p.collect_bin_vheap_if_due(0)?;
+        p.collect_bin_vheap_if_due(1)?;
         if tail {
             return Ok(match Self::ret(p) {
                 Some(value) => ImportOutcome::Returned(value),
