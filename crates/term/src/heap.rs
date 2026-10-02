@@ -12,9 +12,8 @@ use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use std::cell::UnsafeCell;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::ops::Index;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 pub(crate) struct WordBlock {
     memory: Box<AllocBlock>,
@@ -733,19 +732,6 @@ pub struct VecHeap {
     chunk_words: usize,
 }
 
-fn literal_ranges() -> &'static Mutex<HashSet<(usize, usize)>> {
-    static RANGES: OnceLock<Mutex<HashSet<(usize, usize)>>> = OnceLock::new();
-    RANGES.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-pub(crate) fn is_literal_pointer(ptr: *const u64) -> bool {
-    let address = ptr as usize;
-    literal_ranges()
-        .lock()
-        .expect("literal range registry poisoned")
-        .iter()
-        .any(|&(start, end)| start <= address && address < end)
-}
 // SAFETY: Reading an allocated literal through a shared heap is safe. Every
 // operation that can write or grow VecHeap requires exclusive `&mut self`.
 unsafe impl Sync for VecHeap {}
@@ -772,9 +758,9 @@ impl VecHeap {
         heap.chunk_words |= LITERAL_HEAP_BIT;
         heap
     }
-    fn with_chunk_words(words: usize) -> Self {
+    fn with_literal_chunk_words(words: usize) -> Self {
         let mut heap = Self::new();
-        heap.chunk_words = words.max(1);
+        heap.chunk_words = words.max(1) | LITERAL_HEAP_BIT;
         heap
     }
     fn is_literal_area(&self) -> bool {
@@ -815,11 +801,7 @@ impl Drop for VecHeap {
         for chunk in &self.chunks {
             if self.is_literal_area() {
                 let start = chunk.as_ptr() as usize;
-                let end = start + chunk.len() * 8;
-                literal_ranges()
-                    .lock()
-                    .expect("literal range registry poisoned")
-                    .remove(&(start, end));
+                crate::literal::unregister(start, start + chunk.len() * 8);
             }
             #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
@@ -839,10 +821,7 @@ impl HeapAlloc for VecHeap {
                 && let Some(chunk) = self.chunks.last()
             {
                 let start = chunk.as_ptr() as usize;
-                literal_ranges()
-                    .lock()
-                    .expect("literal range registry poisoned")
-                    .insert((start, start + chunk.len() * 8));
+                crate::literal::register(start, start + chunk.len() * 8);
             }
             // g_asan: literal areas and other VecHeaps stay address-stable.
             #[cfg(any(feature = "validate-terms", debug_assertions, test))]
@@ -905,7 +884,7 @@ impl LiteralArea {
     /// Reserve a first chunk sized for a known literal graph.
     pub fn with_capacity_words(words: usize) -> Self {
         Self {
-            heap: VecHeap::with_chunk_words(words),
+            heap: VecHeap::with_literal_chunk_words(words),
         }
     }
     /// Build literals before publishing the area to readers.

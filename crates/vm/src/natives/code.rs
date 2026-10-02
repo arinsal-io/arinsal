@@ -896,11 +896,15 @@ fn release_area_switch(
     if !literal_collector(vm, process, pid) {
         return Err(notsup());
     }
-    Ok(atom(if store.collector_switch_area() {
-        "true"
-    } else {
-        "false"
-    }))
+    let previous = store.collector_area();
+    let switched = store.collector_switch_area();
+    if switched && store.collector_area() != previous {
+        // Port of beam_bif_load.c:1830-1838 (publish_new_info), OTP-29.1.1: wait
+        // for thread progress so every scheduler's in-flight send or spawn has
+        // finished with the literal snapshot taken before the purge area was set.
+        ctx.block_thread_progress(std::time::Duration::ZERO);
+    }
+    Ok(atom(if switched { "true" } else { "false" }))
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:1750

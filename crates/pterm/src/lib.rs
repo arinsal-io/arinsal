@@ -678,6 +678,7 @@ impl Store {
                 .is_some_and(|current| Arc::ptr_eq(current, &active))
             {
                 slot.take();
+                arinsal_term::set_literal_purge_area(&active.pointer_ranges, false);
             }
             if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some()
                 && let RetiredStorage::Persistent(stored) = &active.area
@@ -717,7 +718,11 @@ impl Store {
             let mut waiting = Vec::new();
             while let Some(account) = self.processes.pop() {
                 if let Some(account) = account.upgrade() {
-                    if account.generation <= generation && !account.exited.load(Ordering::Acquire) {
+                    // Port of erts/preloaded/src/erts_literal_area_collector.erl:
+                    // every live process gets a copy-literals request, not only
+                    // those that existed at retirement; younger processes may
+                    // have received references in messages or spawn arguments.
+                    if !account.exited.load(Ordering::Acquire) {
                         waiting.push(Arc::clone(&account));
                     }
                     live.push(Arc::downgrade(&account));
@@ -741,6 +746,9 @@ impl Store {
                 area,
                 outstanding: AtomicUsize::new(waiting.len()),
             });
+            // Port of erts/emulator/beam/beam_bif_load.c:1715 (rla_switch_area):
+            // literal-aware copies now copy this area instead of sharing it.
+            arinsal_term::set_literal_purge_area(&active.pointer_ranges, true);
             *self
                 .active_area
                 .write()
@@ -1213,7 +1221,9 @@ mod tests {
     }
 
     #[test]
-    fn retirement_waits_only_for_processes_present_at_the_cutoff() {
+    fn retirement_waits_for_every_live_process_at_the_switch() {
+        // A process registered after the erase may have received the literal in a
+        // message or as a spawn argument, so the collector waits for it too.
         let store = Store::new();
         let before = store.register_process();
         let key = Term::small(2).unwrap();
@@ -1226,11 +1236,12 @@ mod tests {
         assert!(store.collector_switch_area());
         let old_areas = store.retired_areas(&before);
         assert_eq!(old_areas.len(), 1);
-        assert!(store.retired_areas(&after).is_empty());
+        assert_eq!(store.retired_areas(&after).len(), 1);
         let id = old_areas[0].id();
         drop(old_areas);
-        assert!(store.collector_switch_area());
         assert!(store.acknowledge(&before, id));
+        assert!(store.collector_switch_area());
+        assert!(store.acknowledge(&after, id));
         assert!(!store.collector_switch_area());
         assert!(!store.has_retired());
     }

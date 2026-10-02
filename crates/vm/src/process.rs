@@ -190,9 +190,10 @@ impl MessageQueue {
                 let mut target = arinsal_bifs::FragmentingHeap(heap);
                 let mut fragment = message.fragment.take().expect("fragment was checked");
                 let term = if fragment.heap.is_some() {
-                    copy_term(message.term, &mut target).map_err(|error| {
-                        VmError::Unsupported(format!("on-heap message copy: {error:?}"))
-                    })?
+                    let literals = arinsal_term::LiteralAreas::current();
+                    arinsal_term::copy_term_litopt(message.term, &mut target, &literals).map_err(
+                        |error| VmError::Unsupported(format!("on-heap message copy: {error:?}")),
+                    )?
                 } else {
                     message.term
                 };
@@ -427,7 +428,9 @@ impl Message {
         // Port of erts/emulator/beam/erl_message.c:824 (erts_send_message),
         // OTP-29.1.1. Exact sizing keeps unused words out of long-lived
         // message fragments.
-        let words = size_object(term);
+        // Literals outside the collector's purge area stay shared (copy_struct_litopt).
+        let literals = arinsal_term::LiteralAreas::current();
+        let words = arinsal_term::size_object_litopt(term, &literals);
         if words == 0 {
             return Ok(Self {
                 term,
@@ -438,7 +441,7 @@ impl Message {
         }
         let mut fragment =
             ProcessHeap::with_words_for_type(words, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
-        let term = copy_term(term, &mut fragment)
+        let term = arinsal_term::copy_term_litopt(term, &mut fragment, &literals)
             .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?;
         Ok(Self {
             term,
@@ -543,7 +546,11 @@ impl Message {
                 .as_ref()
                 .is_some_and(|fragment| fragment.heap.is_some())
             {
-                copy_term(self.term, &mut heap)
+                arinsal_term::copy_term_litopt(
+                    self.term,
+                    &mut heap,
+                    &arinsal_term::LiteralAreas::current(),
+                )
             } else {
                 Ok(self.term)
             };

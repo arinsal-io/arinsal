@@ -9,6 +9,7 @@ mod hash;
 mod heap;
 mod identity;
 mod internal_hash;
+mod literal;
 mod magic;
 mod ops;
 mod owned;
@@ -27,7 +28,7 @@ pub use bits::{
     writable_gc_visit,
 };
 pub use copy::{
-    SharedCopyCache, copy_term, copy_term_preserving_sharing,
+    SharedCopyCache, copy_shared, copy_term, copy_term_litopt, copy_term_preserving_sharing,
     copy_term_preserving_sharing_with_cache,
 };
 pub use fun::{ExportEntry, FunEntry, FunRef};
@@ -40,6 +41,7 @@ pub use heap::{
 };
 pub use identity::{Identity, Node};
 pub use internal_hash::{internal_hash, internal_salted_hash};
+pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use magic::MagicRef;
 pub use native_code::{
     is_native_code_pointer, may_be_native_code_pointer, register_native_code_range,
@@ -47,8 +49,8 @@ pub use native_code::{
 };
 pub use ops::{
     cmp, cmp_exact, exact_eq, flat_size, integer_magnitude_cmp, loose_eq, size_object,
-    size_object_preserving_sharing, size_object_preserving_sharing_after, small_add, small_mul,
-    small_sub,
+    size_object_litopt, size_object_preserving_sharing, size_object_preserving_sharing_after,
+    size_shared, small_add, small_mul, small_sub,
 };
 pub use owned::{from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence};

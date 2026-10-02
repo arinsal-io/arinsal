@@ -107,7 +107,7 @@ impl FlatMapRef<'_> {
 impl Term {
     /// Whether this pointer belongs to a loaded module's immutable literal area.
     pub fn is_literal(self) -> bool {
-        self.is_pointer() && crate::heap::is_literal_pointer((self.bits() & !7) as *const u64)
+        self.is_pointer() && crate::literal::is_literal_pointer((self.bits() & !7) as *const u64)
     }
 
     /// Borrow a boxed float.

@@ -348,7 +348,59 @@ pub(crate) fn children(term: Term) -> Children {
 /// Number of words needed for a deep copy, counting shared objects each time.
 /// Port of `erts/emulator/beam/copy.c:88` (`size_object_x`), OTP-29.1.1.
 pub fn size_object(root: Term) -> usize {
-    size_object_inner(root, false, std::collections::HashSet::new())
+    size_object_inner(
+        root,
+        false,
+        std::collections::HashSet::new(),
+        LiteralSkip::None,
+        None,
+    )
+}
+
+/// Words a literal-aware copy needs: literals outside the purge area are not copied.
+/// Port of erts/emulator/beam/copy.c:88 (size_object_x with a litopt), OTP-29.1.1.
+pub fn size_object_litopt(root: Term, literals: &crate::LiteralAreas) -> usize {
+    size_object_inner(
+        root,
+        false,
+        std::collections::HashSet::new(),
+        LiteralSkip::Kept(literals),
+        None,
+    )
+}
+
+/// `erts_debug:size_shared/1`: words with sharing preserved, ignoring every literal.
+/// Port of erts/emulator/beam/copy.c:319 (size_shared), OTP-29.1.1.
+pub fn size_shared(root: Term) -> usize {
+    let literals = crate::LiteralAreas::current();
+    size_object_inner(
+        root,
+        true,
+        std::collections::HashSet::new(),
+        LiteralSkip::All(&literals),
+        None,
+    )
+}
+
+/// Which literal objects a sizing or copying traversal leaves in place.
+#[derive(Clone, Copy)]
+pub(crate) enum LiteralSkip<'a> {
+    /// Copy literals like ordinary heap objects (`size_object`, `copy_struct`).
+    None,
+    /// Keep literals outside the collector's purge area (`litopt`).
+    Kept(&'a crate::LiteralAreas),
+    /// Keep every literal (`size_shared`).
+    All(&'a crate::LiteralAreas),
+}
+
+impl LiteralSkip<'_> {
+    pub(crate) fn skips(self, address: u64) -> bool {
+        match self {
+            Self::None => false,
+            Self::Kept(literals) => literals.keeps(address),
+            Self::All(literals) => literals.is_literal(address),
+        }
+    }
 }
 
 /// Number of words needed by a deep copy that preserves object aliases.
@@ -362,13 +414,21 @@ pub fn size_object_preserving_sharing_after(
     root: Term,
     seen: impl IntoIterator<Item = u64>,
 ) -> usize {
-    size_object_inner(root, true, seen.into_iter().collect())
+    size_object_inner(
+        root,
+        true,
+        seen.into_iter().collect(),
+        LiteralSkip::None,
+        None,
+    )
 }
 
-fn size_object_inner(
+pub(crate) fn size_object_inner(
     root: Term,
     preserve_sharing: bool,
     mut visited: std::collections::HashSet<u64>,
+    skip: LiteralSkip<'_>,
+    unshared_literals: Option<&crate::LiteralAreas>,
 ) -> usize {
     let mut size = 0;
     let mut stack = Vec::new();
@@ -381,6 +441,19 @@ fn size_object_inner(
             unsafe {
                 let mut ptr = term.raw_ptr();
                 loop {
+                    if skip.skips(ptr as usize as u64) {
+                        term = Term::NIL;
+                        break;
+                    }
+                    // Port of erts/emulator/beam/copy.c:1164-1170 (copy_shared_calculate
+                    // adds size_object of a copied literal), OTP-29.1.1.
+                    if preserve_sharing
+                        && unshared_literals.is_some_and(|l| l.is_literal(ptr as usize as u64))
+                    {
+                        size += size_object(Term(ptr as u64 | 1));
+                        term = Term::NIL;
+                        break;
+                    }
                     if preserve_sharing && !visited.insert(ptr as usize as u64) {
                         term = Term::NIL;
                         break;
@@ -403,6 +476,14 @@ fn size_object_inner(
             continue;
         }
         if let Some(h) = term.header() {
+            if skip.skips(term.bits() & !7) {
+                continue;
+            }
+            if preserve_sharing && unshared_literals.is_some_and(|l| l.is_literal(term.bits() & !7))
+            {
+                size += size_object(term);
+                continue;
+            }
             if preserve_sharing && !visited.insert(term.bits() & !7) {
                 continue;
             }

@@ -541,6 +541,28 @@ impl Process {
     }
 
     pub(crate) fn wait_timeout(&mut self, value: Term) -> Result<Option<u64>, VmError> {
+        // Port of erts/emulator/beam/emu/msg_instrs.tab:329-334 (wait.src), OTP-29.1.1:
+        // once the timer is set (F_TIMO), a re-executed wait_timeout must not read
+        // its operand again; no X register is live across the wait.
+        let simulated = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.simulated);
+        if simulated {
+            if let (Some(deadline), Some(runtime)) =
+                (self.receive_deadline_ms, self.runtime.as_ref())
+            {
+                let now = runtime.virtual_ms.load(Ordering::Relaxed);
+                return Ok(Some(deadline.saturating_sub(now)));
+            }
+        } else if let Some(deadline) = self.receive_deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(Some(0));
+            }
+            let remaining = deadline.saturating_duration_since(now).as_millis() as u64;
+            return Ok(Some(remaining.max(1)));
+        }
         if value.as_atom() == Some(arinsal_term::atoms::INFINITY) {
             return Ok(None);
         }

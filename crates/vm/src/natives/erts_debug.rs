@@ -6,7 +6,7 @@ use arinsal_etf::OwnedTerm;
 use arinsal_sched::{DirtyKind, Pid, RunCtx, SchedulerType};
 use arinsal_term::{
     ProcessHeap, Term, TermBuilder, TermKind, copy_term, from_owned, global_atoms,
-    hashmap_node_children, size_object, term_sequence, to_owned,
+    hashmap_node_children, term_sequence, to_owned,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -902,24 +902,22 @@ fn dirty(
 
 /// Port of erts/emulator/beam/beam_debug.c:86 (erts_debug_size_shared_1), OTP-29.1.1.
 fn size_shared(process: &mut Process, value: Term) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/copy.c:319 (size_shared), OTP-29.1.1.
-    // Literal graphs are outside the process heap until literal-area GC copies them.
-    let size = if process.heap.owns_term(value) {
-        size_object(value)
-    } else {
-        0
-    };
-    int(process, size)
+    int(process, arinsal_term::size_shared(value))
 }
 
 /// Port of erts/emulator/beam/beam_debug.c:170 (erts_debug_copy_shared_2), OTP-29.1.1.
 fn copy_shared(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    if args[1] != atom("true") && args[1] != atom("false") {
+    let copy_literals = if args[1] == atom("true") {
+        true
+    } else if args[1] == atom("false") {
+        false
+    } else {
         return Err(badarg());
-    }
-    copy_term(
+    };
+    arinsal_term::copy_shared(
         args[0],
         &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        copy_literals,
     )
     .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }

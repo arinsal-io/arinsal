@@ -4,7 +4,7 @@ use crate::process::{Message, Runtime};
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
-use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, copy_term, global_atoms, to_owned};
+use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, global_atoms, to_owned};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
@@ -447,9 +447,12 @@ fn spawn_mfa_with_priority(
             .and_then(|cold| cold.group_leader)
             .unwrap_or_else(|| ctx.pid()),
     );
+    // Port of erts/emulator/beam/erl_process.c:12546,12638 (spawn arguments are
+    // copied with size_object_litopt/copy_struct_litopt), OTP-29.1.1.
+    let literals = arinsal_term::LiteralAreas::current();
     for (index, term) in args.iter().copied().enumerate() {
         let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
-        child.x[index] = copy_term(term, &mut heap)
+        child.x[index] = arinsal_term::copy_term_litopt(term, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn argument: {error:?}")))?;
     }
     let rt = parent
@@ -659,7 +662,9 @@ fn spawn_fun_with_priority(
     if free_count > 0 {
         let copied = {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
-            copy_term(fun, &mut heap)
+            // Port of erts/emulator/beam/erl_process.c:12546,12638 (copy_struct_litopt
+            // of the spawn arguments), OTP-29.1.1.
+            arinsal_term::copy_term_litopt(fun, &mut heap, &arinsal_term::LiteralAreas::current())
                 .map_err(|error| VmError::Unsupported(format!("spawn fun copy: {error:?}")))?
         };
         // SAFETY: The copied fun is retained by the child's heap.

@@ -2346,12 +2346,15 @@ fn spawn_apply(
         child.cold_mut().monitored_by.insert(id, ctx.pid());
     }
     {
+        // Port of erts/emulator/beam/erl_process.c:12546,12638 (spawn arguments use
+        // copy_struct_litopt), OTP-29.1.1.
+        let literals = arinsal_term::LiteralAreas::current();
         let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
-        child.x[0] = copy_term(module, &mut heap)
+        child.x[0] = arinsal_term::copy_term_litopt(module, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn module: {error:?}")))?;
-        child.x[1] = copy_term(function, &mut heap)
+        child.x[1] = arinsal_term::copy_term_litopt(function, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn function: {error:?}")))?;
-        child.x[2] = copy_term(args, &mut heap)
+        child.x[2] = arinsal_term::copy_term_litopt(args, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn args: {error:?}")))?;
     }
     let runtime = parent

@@ -3,7 +3,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(recv_timeout_diff).
--export([before/0, during/0, down/0, nested/0, marker/0, priority/0]).
+-export([before/0, during/0, down/0, nested/0, marker/0, priority/0, rearm/0]).
 
 before() ->
     self() ! before_timeout,
@@ -46,9 +46,31 @@ priority() ->
     receive First ->
         receive Second -> {First, Second} end
     end.
+
+%% Messages arriving during `receive after Tmo` re-execute wait_timeout with no
+%% live X register; the armed timer must not re-read the operand.
+rearm() ->
+    GoTime = erlang:monotonic_time(millisecond) + 500,
+    Self = self(),
+    F = fun () ->
+                Tmo = case GoTime - erlang:monotonic_time(millisecond) of
+                          Left when Left < 0 -> 0;
+                          Left -> Left
+                      end,
+                receive after Tmo -> ok end,
+                Self ! {done, self()}
+        end,
+    Ps = [element(1, spawn_opt(F, [link, monitor, {message_queue_data, on_heap}]))
+          || _ <- lists:seq(1, 50)],
+    [[P ! [N | N] || N <- lists:seq(1, 1000)] || P <- Ps],
+    lists:usort([receive {done, P} -> ok after 10000 -> timeout end || P <- Ps]).
 "#;
 
 fn compare(function: &str) {
+    compare_with(function, Some(0x71e0));
+}
+
+fn compare_with(function: &str, seed: Option<u64>) {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping {function} receive-timeout differential test");
         return;
@@ -61,7 +83,7 @@ fn compare(function: &str) {
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).unwrap();
     let actual = vm
-        .eval_scheduled("recv_timeout_diff", function, &[], 2, Some(0x71e0))
+        .eval_scheduled("recv_timeout_diff", function, &[], 2, seed)
         .unwrap_or_else(|error| panic!("{function}: {error}"));
     assert_eq!(expected, CallResult::Ok(actual.term), "{function}");
 }
@@ -94,4 +116,9 @@ fn recv_timeout_marker_with_after() {
 #[test]
 fn recv_timeout_priority_message_with_after() {
     compare("priority");
+}
+
+#[test]
+fn recv_timeout_rearmed_wait_ignores_dead_operand() {
+    compare_with("rearm", None);
 }
