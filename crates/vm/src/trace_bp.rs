@@ -66,6 +66,42 @@ fn winners<'a>(
         .collect()
 }
 
+/// Memo of `winners` over all sessions per function. Every call into a traced function asks for
+/// it several times and the pattern table can hold thousands of entries (a session tracing all
+/// exports), so scanning per call starves the traced process. Cleared (while the pattern table
+/// lock is held) by everything that changes the table or the module cutoffs.
+type WinnerCache = HashMap<(usize, u64, u8, String, String), Vec<Key>>;
+
+fn winner_cache() -> &'static Mutex<WinnerCache> {
+    static CACHE: OnceLock<Mutex<WinnerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn invalidate_winners() {
+    winner_cache().lock().unwrap().clear();
+}
+
+fn winners_all<'a>(
+    entries: &'a HashMap<Key, Pattern>,
+    runtime: usize,
+    code: u64,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Vec<(&'a Key, &'a Pattern)> {
+    let probe = (runtime, code, arity, module.to_owned(), function.to_owned());
+    if let Some(keys) = winner_cache().lock().unwrap().get(&probe) {
+        return keys
+            .iter()
+            .filter_map(|key| entries.get_key_value(key))
+            .collect();
+    }
+    let found = winners(entries, runtime, code, None, module, function, arity);
+    let keys = found.iter().map(|(key, _)| (*key).clone()).collect();
+    winner_cache().lock().unwrap().insert(probe, keys);
+    found
+}
+
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn cutoffs() -> &'static Mutex<HashMap<(u64, String), u64>> {
@@ -94,11 +130,13 @@ fn code_scope(process: &Process) -> u64 {
 // Port of erts/emulator/beam/beam_bif_load.c:470-480 and 714-720
 // (erts_clear_module_break on finish_loading / delete_module), OTP-29.1.1.
 pub(crate) fn module_code_changed(code: u64, module: &str) {
+    let _entries = patterns().lock().unwrap();
     let seq = SEQUENCE.load(Ordering::Relaxed);
     cutoffs()
         .lock()
         .unwrap()
         .insert((code, module.to_owned()), seq);
+    invalidate_winners();
 }
 
 /// Session state of `trace_pattern(on_load, ...)`: the pattern applied to every module when it
@@ -363,6 +401,7 @@ fn clear_scope(runtime: usize) {
         .lock()
         .unwrap()
         .retain(|(scope, _), _| *scope != runtime);
+    invalidate_winners();
     active().store(!entries.is_empty(), Ordering::Relaxed);
     registrations()
         .lock()
@@ -419,6 +458,7 @@ pub(crate) fn set(
             },
         );
     }
+    invalidate_winners();
     active().store(entries.values().any(|p| !p.off), Ordering::Relaxed);
     existed
 }
@@ -433,6 +473,7 @@ pub(crate) fn clear_session(process: &Process, session: u64) {
         .lock()
         .unwrap()
         .remove(&(runtime, session));
+    invalidate_winners();
     active().store(entries.values().any(|p| !p.off), Ordering::Relaxed);
 }
 
@@ -467,11 +508,10 @@ pub(crate) fn matching(
     local: bool,
 ) -> Vec<Pattern> {
     let entries = patterns().lock().unwrap();
-    winners(
+    winners_all(
         &entries,
         scope(process),
         code_scope(process),
-        None,
         module,
         function,
         arity,
@@ -514,11 +554,10 @@ pub(crate) fn selects(module: &str, function: &str, arity: u8) -> bool {
 
 pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: u8, local: bool) {
     let mut entries = patterns().lock().unwrap();
-    let keys = winners(
+    let keys = winners_all(
         &entries,
         scope(process),
         code_scope(process),
-        None,
         module,
         function,
         arity,
@@ -653,11 +692,10 @@ pub(crate) fn breakpoint_kinds(
     arity: u8,
 ) -> (bool, bool) {
     let entries = patterns().lock().unwrap();
-    let patterns = winners(
+    let patterns = winners_all(
         &entries,
         scope(process),
         code_scope(process),
-        None,
         module,
         function,
         arity,

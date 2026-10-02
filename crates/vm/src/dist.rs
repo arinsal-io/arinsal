@@ -2446,10 +2446,11 @@ fn finish_port_enqueue(
     should_suspend: bool,
 ) -> Result<(), VmError> {
     if should_suspend {
-        let suspended = process
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.suspend(sender, sender, false).unwrap_or(false));
+        let suspended = process.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .suspend(sender, sender, false, false)
+                .unwrap_or(false)
+        });
         if suspended {
             process.force_yield = true;
             let mut tables = node_tables::lock();
@@ -2592,10 +2593,11 @@ pub(crate) fn continue_fragmented_send(
         }
     };
     if busy
-        && process
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.suspend(sender, sender, false).unwrap_or(false))
+        && process.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .suspend(sender, sender, false, false)
+                .unwrap_or(false)
+        })
     {
         process.force_yield = true;
         let mut tables = node_tables::lock();

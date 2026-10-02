@@ -1730,9 +1730,11 @@ fn call_values(
                 trace_session_create(vm, process, ctx, *name, *tracer, *options)
             }
             ("trace_session_destroy", [session]) if module == "erts_internal" => {
+                let session_term = *session;
                 let session = trace_session_id(*session).ok_or_else(badarg)?;
                 let destroyed = crate::trace::destroy_session(process, session);
                 if destroyed {
+                    crate::natives::erts_debug::session_destroyed(process, session_term);
                     crate::trace_bp::clear_session(process, session);
                     vm.refresh_all_trace_breakpoints(process);
                 }
@@ -1886,13 +1888,19 @@ fn suspend_process(
             && let Some(tag) = parsed.tag
         {
             let message = make_tuple(process, &[tag, atom("badarg")])?;
-            let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
-            process.send_message(self_pid, message)?;
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c:3215 (suspend reply, queued without
+            // a send trace), OTP-29.1.1: the reply is not a traced `!`.
+            process.inbox.push_back(message);
             return Ok(atom("true"));
         }
         return Ok(atom("badarg"));
     }
-    let changed = match runtime.suspend(ctx.pid(), target_pid, parsed.unless_suspending) {
+    let changed = match runtime.suspend(
+        ctx.pid(),
+        target_pid,
+        parsed.unless_suspending,
+        parsed.asynchronous,
+    ) {
         Err(()) => return Ok(atom("system_limit")),
         Ok(changed) => changed,
     };
@@ -1900,8 +1908,7 @@ fn suspend_process(
         && let Some(tag) = parsed.tag
     {
         let message = make_tuple(process, &[tag, atom("suspended")])?;
-        let self_pid = ctx.pid().to_term().ok_or_else(badarg)?;
-        process.send_message(self_pid, message)?;
+        process.inbox.push_back(message);
     }
     Ok(atom(if changed { "true" } else { "false" }))
 }

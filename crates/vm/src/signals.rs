@@ -1829,11 +1829,14 @@ fn call_resolved(
                 } else {
                     return Err(badarg("register/2"));
                 }
+                // Port of erts/emulator/beam/register.c:237-240 (erts_register_name), OTP-29.1.1:
+                // the event belongs to the process that gets the name, not to the caller.
+                let subject = Pid::from_term(*pid).unwrap_or(ctx.pid());
                 crate::trace::emit(
                     Some(vm),
                     process,
                     ctx,
-                    ctx.pid(),
+                    subject,
                     crate::trace::PROCS,
                     "register",
                     &[atom(&name)],
@@ -1850,11 +1853,12 @@ fn call_resolved(
                 if removed_pid.is_none() && removed_port.is_none() {
                     return Err(badarg("unregister/1"));
                 }
+                // Port of erts/emulator/beam/register.c:297-307 (erts_unregister_name), OTP-29.1.1.
                 crate::trace::emit(
                     Some(vm),
                     process,
                     ctx,
-                    ctx.pid(),
+                    removed_pid.unwrap_or(ctx.pid()),
                     crate::trace::PROCS,
                     "unregister",
                     &[atom(&name)],
@@ -1940,6 +1944,7 @@ fn call_resolved(
                     );
                 }
                 let _ = ctx.signal(pid, Signal::Unlink(0));
+                wake_for_procs_trace(process, ctx, pid);
                 atom("true")
             })
         }
@@ -2962,6 +2967,7 @@ fn link_opt(
         Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
         Err(_) => return Err(badarg("link")),
     }
+    wake_for_procs_trace(process, ctx, pid);
     Ok(atom("true"))
 }
 
@@ -2985,6 +2991,15 @@ fn link_noproc(process: &mut Process, pid: Pid, priority: bool) -> Result<Term, 
     }
     process.note_exit_reason(reason)?;
     Err(VmError::Trap(crate::exceptions::Trap::error(reason)))
+}
+
+/// Link and unlink signals are applied lazily, but erts handles them on arrival, which is when a
+/// `procs` trace reports getting_linked/getting_unlinked: wake a receiver that is traced for it.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:8578-8589 (getting_unlinked/getting_linked), OTP-29.1.1.
+fn wake_for_procs_trace(process: &Process, ctx: &mut RunCtx<'_, Message>, target: Pid) {
+    if crate::trace::flags(process, target) & crate::trace::PROCS != 0 {
+        let _ = ctx.signal(target, Signal::UnlinkAck(u64::MAX));
+    }
 }
 
 // Port of erts/emulator/beam/bif.c:1721 (send_exit_signal_bif), OTP-29.1.1.

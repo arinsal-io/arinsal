@@ -193,8 +193,11 @@ pub enum Signal<M> {
     MonitorNoproc(u64),
     /// Demonitor request carrying a VM reference.
     Demonitor(u64),
-    /// Exit signal carrying an opaque reason envelope.
+    /// Exit signal (`exit/2`) carrying an opaque reason envelope.
     Exit(M),
+    /// Exit signal of a link: removes the receiver's link to the sender.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4640 (ERTS_SIG_Q_OP_EXIT_LINKED), OTP-29.1.1.
+    ExitLinked(M),
     /// Port exit signal preserving the port term used as the signal origin.
     PortExit { port: M, reason: M },
     /// Monitor DOWN signal carrying an opaque reason envelope.
@@ -3082,6 +3085,7 @@ fn payload_wakes<M>(payload: &Payload<M>) -> bool {
         Payload::Message(_) | Payload::Timer { .. } | Payload::TimerMessage { .. } => true,
         Payload::Signal(signal) => match signal {
             Signal::Exit(_)
+            | Signal::ExitLinked(_)
             | Signal::PortExit { .. }
             | Signal::MonitorDown { .. }
             | Signal::MonitorNoproc(_)
@@ -4037,6 +4041,14 @@ impl<T: Task> Scheduler<T> {
     /// Whether a pid currently identifies a live task.
     pub fn lookup(&self, pid: Pid) -> bool {
         self.inner.table.lookup(pid).is_some()
+    }
+    /// Whether a scheduler is executing the task right now.
+    // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status: ERTS_PSFLG_RUNNING), OTP-29.1.1.
+    pub fn is_running(&self, pid: Pid) -> bool {
+        self.inner
+            .table
+            .lookup(pid)
+            .is_some_and(|process| process.state.load(Ordering::Acquire) == RUNNING)
     }
     /// Inspect a task only while its scheduler state is `WAITING`.
     ///

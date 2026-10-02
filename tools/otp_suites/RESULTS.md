@@ -36,6 +36,6 @@
 | `statistics_SUITE` | 18 | 18/18 | 16/18 | 2 | 0 | scheduler_wall_time: failed {badarg; scheduler_wall_time_all: failed {badarg |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | 0 | none |
 | `timer_bif_SUITE` | 23 | 20/23 | 14/23 | 6 | 0 | auto_cancel_yielding: failed {{case_clause,false}; cleanup: failed {{case_clause,false}; registered_process: failed {{case_clause,false}; same_time_yielding: failed {{case_clause,false}; same_time_yielding_with_cancel: failed {{case_clause,false}; same_time_yielding_with_cancel_other: failed {{case_clause,false} |
-| `trace_SUITE` | 39 | 34/39 | 22/39 | 12 | 0 | more_system_monitor_args: failed {badarg; procs_trace: failed {{badmatch,timeout}; suspend: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; suspend_opts: failed "Unexpected trace messages"; system_monitor_args: failed {badarg; system_monitor_large_heap_1: failed {badarg; system_monitor_large_heap_2: failed {badarg; system_monitor_long_gc_1: failed {badarg; system_monitor_long_gc_2: failed {badarg; system_monitor_long_message_queue: failed {badarg; system_monitor_long_message_queue_ignore: failed {badarg; system_monitor_long_schedule: skipped "Unable to load slow_drv (windows or no usleep()?)" |
+| `trace_SUITE` | 39 | 34/39 | 32/39 | 2 | -9 | suspend: failed testcase_aborted; system_monitor_long_schedule: skipped "Unable to load slow_drv (windows or no usleep()?)" |
 | `tuple_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
 | `unique_SUITE` | 2 | 1/2 | 0/2 | 1 | 0 | unique_integer_white_box: failed {badarg |

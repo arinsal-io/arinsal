@@ -708,6 +708,13 @@ pub(crate) struct Runtime {
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
+    /// `system_monitor` state of dynamic trace sessions, keyed by the session term.
+    pub(crate) session_monitors: Mutex<
+        Vec<(
+            arinsal_etf::OwnedTerm,
+            crate::natives::erts_debug::SystemMonitorState,
+        )>,
+    >,
     pub(crate) system_monitor_flags: AtomicU8,
     pub(crate) long_message_queues: Mutex<HashSet<Pid>>,
     pub(crate) next_port: AtomicU64,
@@ -717,6 +724,9 @@ pub(crate) struct Runtime {
     result: mpsc::Sender<Result<ScheduledResult, VmError>>,
     // g_proc_sched: suspend counts and the status other processes can observe.
     pub(crate) suspend_counts: Mutex<HashMap<(Pid, Pid), u32>>,
+    /// Asynchronous suspends of a running process that it has not yet acted on.
+    // Port of erts/emulator/beam/erl_process.c:9013 (`erts_internal_suspend_process_2` pending suspend), OTP-29.1.1.
+    suspend_outstanding: Mutex<HashMap<(Pid, Pid), u32>>,
     pub(crate) suspend_total: Mutex<HashMap<Pid, u32>>,
     pub(crate) ever_suspended: AtomicBool,
     /// Suspend-monitor pauses of receive and BIF timers (`erts_pause_proc_timer`).
@@ -894,6 +904,9 @@ impl Executor {
             process.x = registers.into_boxed_slice();
         }
         process.x[..self.x.len()].copy_from_slice(&self.x);
+        // The tail still holds the previous run's registers on this executor; those are
+        // pointers into another process's heap and must not reach this process's GC roots.
+        process.x[self.x.len()..].fill(Term::NIL);
         if process.fr.len() < self.fr.len() {
             let mut registers = process.fr.to_vec();
             registers.resize(self.fr.len(), 0.0);
@@ -1278,6 +1291,17 @@ impl Executor {
                                     )?;
                                     process.cold_mut().native_continuation_resume = true;
                                     process.native_pc = Some(resume_pc);
+                                    // A loop of traced calls leaves native code on every call and
+                                    // would never reach the end-of-slice check: preempt here once
+                                    // the budget is used up (erts counts reductions per call).
+                                    // The breakpoint left native code before its call's reduction was
+                                    // charged.
+                                    process.reductions = process.reductions.saturating_sub(1);
+                                    process.reductions_used =
+                                        process.reductions_used.saturating_add(1);
+                                    if !ctx.consume(1) || process.reductions <= 0 {
+                                        break Ok(RunState::Yield);
+                                    }
                                     continue;
                                 }
                                 if target_pc == arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY {
@@ -2177,6 +2201,13 @@ impl Executor {
         let pid = ctx.pid();
         if runtime.suspend_total_of(pid) > 0 {
             process.drain(ctx)?;
+            // The resumer's wake-up signal may have been consumed by the drain above: re-check
+            // so a resume racing with this suspension is not lost (otherwise the process
+            // waits forever).
+            if runtime.suspend_total_of(pid) == 0 {
+                return Ok(None);
+            }
+            runtime.suspends_activated(pid);
             runtime.note_status(pid, "suspended");
             return Ok(Some(RunState::Wait { timeout_ms: None }));
         }
@@ -2714,16 +2745,34 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// The target scheduled out with suspends pending: they are all active now.
+    pub(crate) fn suspends_activated(&self, target: Pid) {
+        if self.ever_suspended.load(Ordering::Acquire) {
+            self.suspend_outstanding
+                .lock()
+                .unwrap()
+                .retain(|(_, pending_target), _| *pending_target != target);
+        }
+    }
+
     /// `{Suspendee, Active, Outstanding}` rows for `process_info(P, suspending)`.
     pub(crate) fn suspending_of(&self, by: Pid) -> Vec<(Pid, u32, u32)> {
         if !self.ever_suspended.load(Ordering::Acquire) {
             return Vec::new();
         }
         let counts = self.suspend_counts.lock().unwrap();
+        let outstanding = self.suspend_outstanding.lock().unwrap();
         let mut rows: Vec<_> = counts
             .iter()
             .filter(|((from, _), count)| *from == by && **count > 0)
-            .map(|((_, target), count)| (*target, *count, 0))
+            .map(|((_, target), count)| {
+                let outstanding = outstanding
+                    .get(&(by, *target))
+                    .copied()
+                    .unwrap_or(0)
+                    .min(*count);
+                (*target, *count - outstanding, outstanding)
+            })
             .collect();
         rows.sort_by_key(|(pid, _, _)| (pid.index, pid.generation));
         rows
@@ -2735,8 +2784,16 @@ impl Runtime {
         by: Pid,
         target: Pid,
         unless_suspending: bool,
+        asynchronous: bool,
     ) -> Result<bool, ()> {
         self.ever_suspended.store(true, Ordering::Release);
+        // A running target keeps going until it next schedules out.
+        let pending = asynchronous
+            && by != target
+            && self.suspend_total_of(target) == 0
+            && self
+                .scheduler()
+                .is_ok_and(|scheduler| scheduler.is_running(target));
         let mut counts = self.suspend_counts.lock().unwrap();
         let entry = counts.entry((by, target)).or_insert(0);
         if unless_suspending && *entry > 0 {
@@ -2747,6 +2804,14 @@ impl Runtime {
         }
         *entry += 1;
         drop(counts);
+        if pending {
+            *self
+                .suspend_outstanding
+                .lock()
+                .unwrap()
+                .entry((by, target))
+                .or_insert(0) += 1;
+        }
         {
             let mut totals = self.suspend_total.lock().unwrap();
             *totals.entry(target).or_insert(0) += 1;
@@ -2813,6 +2878,10 @@ impl Runtime {
         *entry -= 1;
         if *entry == 0 {
             counts.remove(&(by, target));
+            self.suspend_outstanding
+                .lock()
+                .unwrap()
+                .remove(&(by, target));
         }
         drop(counts);
         if by != target {
@@ -3201,6 +3270,30 @@ impl Process {
             "exit",
             &[reason],
         );
+        // Port of erts/emulator/beam/erl_process.c:14421-14464, OTP-29.1.1: releasing the
+        // registered name is traced after the exit event.
+        let registered: Vec<String> = self.runtime.as_ref().map_or_else(Vec::new, |runtime| {
+            runtime
+                .names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, pid)| **pid == ctx.pid())
+                .map(|(name, _)| name.clone())
+                .collect()
+        });
+        for name in registered {
+            crate::trace::emit(
+                Some(vm),
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::PROCS,
+                "unregister",
+                &[crate::signals::atom(&name)],
+            );
+        }
+        crate::natives::erts_debug::monitor_process_exited(self, ctx.pid());
         crate::trace::clear(self, ctx.pid());
         crate::trace::tracer_exited(self, ctx.pid());
         // Further publishes fail with `NoProcess` and the watcher synthesizes
@@ -3331,7 +3424,7 @@ impl Process {
                 continue;
             }
             if let Ok(message) = Message::copy_from(reason) {
-                let _ = ctx.signal(pid, arinsal_sched::Signal::Exit(message));
+                let _ = ctx.signal(pid, arinsal_sched::Signal::ExitLinked(message));
             }
         }
         for (reference, pid) in cold.monitored_by {
@@ -3752,18 +3845,7 @@ impl Process {
                         cold.links.remove(&from);
                         cold.prio_links.remove(&from);
                     }
-                    if let Some(unlinker) = from.to_term() {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8579-8582, OTP-29.1.1.
-                        crate::trace::emit(
-                            None,
-                            self,
-                            ctx,
-                            ctx.pid(),
-                            crate::trace::PROCS,
-                            "getting_unlinked",
-                            &[unlinker],
-                        );
-                    }
+                    self.trace_getting_unlinked(ctx, from);
                 }
                 Payload::Signal(arinsal_sched::Signal::Monitor(reference)) => {
                     self.cold_mut().monitored_by.insert(reference, from);
@@ -3773,14 +3855,30 @@ impl Process {
                         cold.monitored_by.remove(&reference);
                     }
                 }
-                Payload::Signal(arinsal_sched::Signal::Exit(message)) => {
+                Payload::Signal(
+                    signal
+                    @ (arinsal_sched::Signal::Exit(_) | arinsal_sched::Signal::ExitLinked(_)),
+                ) => {
+                    let (linked_exit, message) = match signal {
+                        arinsal_sched::Signal::ExitLinked(message) => (true, message),
+                        arinsal_sched::Signal::Exit(message) => (false, message),
+                        _ => unreachable!(),
+                    };
+                    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4685-4795
+                    // (handle_exit_signal), OTP-29.1.1: a link exit removes the link and a
+                    // process that survives it traces getting_unlinked.
                     let priority = message.is_priority()
                         || self
                             .cold
                             .as_ref()
                             .is_some_and(|cold| cold.prio_links.contains(&from));
+                    let was_linked = linked_exit
+                        && self.cold.as_mut().is_some_and(|cold| {
+                            cold.prio_links.remove(&from);
+                            cold.links.remove(&from)
+                        });
                     let reason = message.into_receiver(self)?;
-                    if reason == crate::signals::atom("kill") {
+                    if reason == crate::signals::atom("kill") && !linked_exit {
                         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
                         // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
                         return Err(VmError::Trap(crate::exceptions::Trap::killed()));
@@ -3802,11 +3900,17 @@ impl Process {
                             self.inbox.push_back(tuple);
                         }
                         self.trace_converted_signal(ctx, tuple, sender);
+                        if was_linked {
+                            self.trace_getting_unlinked(ctx, sender);
+                        }
                         continue;
                     }
                     if reason != Term::atom(arinsal_term::atoms::NORMAL) {
                         self.note_exit_reason(reason)?;
                         return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                    }
+                    if was_linked {
+                        self.trace_getting_unlinked(ctx, from);
                     }
                 }
                 // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
@@ -3894,6 +3998,23 @@ impl Process {
         }
         crate::natives::erts_debug::after_message_queue_change(self);
         Ok(())
+    }
+}
+
+impl Process {
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:8578 (getting_unlinked), OTP-29.1.1.
+    fn trace_getting_unlinked(&mut self, ctx: &mut RunCtx<'_, Message>, unlinker: Pid) {
+        if let Some(unlinker) = unlinker.to_term() {
+            crate::trace::emit(
+                None,
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::PROCS,
+                "getting_unlinked",
+                &[unlinker],
+            );
+        }
     }
 }
 
@@ -4782,6 +4903,7 @@ impl Vm {
             next_trace_weak_id: AtomicU64::new(0),
             ports: Mutex::new(HashMap::new()),
             system_monitor: Mutex::new(None),
+            session_monitors: Mutex::new(Vec::new()),
             system_monitor_flags: AtomicU8::new(0),
             long_message_queues: Mutex::new(HashSet::new()),
             next_port: AtomicU64::new(16),
@@ -4790,6 +4912,7 @@ impl Vm {
             ets: std::sync::RwLock::new(arinsal_ets::Registry::new()),
             result: sender,
             suspend_counts: Mutex::new(HashMap::new()),
+            suspend_outstanding: Mutex::new(HashMap::new()),
             suspend_total: Mutex::new(HashMap::new()),
             ever_suspended: AtomicBool::new(false),
             pauses: Mutex::new(HashMap::new()),

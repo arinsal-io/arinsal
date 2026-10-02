@@ -47,12 +47,75 @@ pub(crate) enum MonitorOption {
     Queue(u64, u64),
 }
 
-fn refresh_system_monitor_flags(
-    runtime: &crate::process::Runtime,
-    state: Option<&SystemMonitorState>,
-) {
+/// An exiting system monitor process stops being the monitor.
+// Port of erts/emulator/beam/erl_process.c:14397-14400 (erts_continue_exit_process:
+// erts_system_monitor_clear), OTP-29.1.1.
+pub(crate) fn monitor_process_exited(process: &Process, pid: arinsal_sched::Pid) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    let Some(owned) = pid.to_term().and_then(|term| to_owned(term).ok()) else {
+        return;
+    };
+    let mut changed = false;
+    {
+        let mut state = runtime.system_monitor.lock().unwrap();
+        if state.as_ref().is_some_and(|state| state.receiver == owned) {
+            *state = None;
+            changed = true;
+        }
+    }
+    {
+        let mut sessions = runtime.session_monitors.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|(_, state)| state.receiver != owned);
+        changed |= sessions.len() != before;
+    }
+    if changed {
+        runtime.long_message_queues.lock().unwrap().clear();
+        refresh_system_monitor_flags(runtime);
+    }
+}
+
+/// A destroyed trace session no longer has a system monitor.
+// Port of erts/emulator/beam/erl_trace.c (erts_trace_session_destroy clears the session's
+// system_monitor), OTP-29.1.1.
+pub(crate) fn session_destroyed(process: &Process, session: Term) {
+    let (Some(runtime), Ok(key)) = (process.runtime.as_ref(), to_owned(session)) else {
+        return;
+    };
+    runtime
+        .session_monitors
+        .lock()
+        .unwrap()
+        .retain(|(owner, _)| *owner != key);
+    runtime.long_message_queues.lock().unwrap().clear();
+    refresh_system_monitor_flags(runtime);
+}
+
+/// Every active monitor: the legacy one and those of dynamic sessions.
+fn monitor_states(runtime: &crate::process::Runtime) -> Vec<SystemMonitorState> {
+    let mut states: Vec<_> = runtime
+        .system_monitor
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
+    states.extend(
+        runtime
+            .session_monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, state)| state.clone()),
+    );
+    states
+}
+
+fn refresh_system_monitor_flags(runtime: &crate::process::Runtime) {
     let mut flags = 0;
-    if let Some(state) = state {
+    for state in &monitor_states(runtime) {
         if matches!(
             state.options.get("large_heap"),
             Some(MonitorOption::Limit(_))
@@ -93,6 +156,18 @@ fn refresh_system_monitor_flags(
 /// Emit the monitor events that are observable from the VM's collection hook.
 // Port of erts/emulator/beam/erl_gc.c:904-920 and erl_trace.c:1604-1741, OTP-29.1.1.
 pub(crate) fn after_collection(process: &mut Process, elapsed_nanoseconds: u64) {
+    if let Some(runtime) = process.runtime.clone() {
+        for state in monitor_states(&runtime) {
+            after_collection_one(process, elapsed_nanoseconds, &state);
+        }
+    }
+}
+
+fn after_collection_one(
+    process: &mut Process,
+    elapsed_nanoseconds: u64,
+    state: &SystemMonitorState,
+) {
     let Some(runtime) = process.runtime.clone() else {
         return;
     };
@@ -111,9 +186,6 @@ pub(crate) fn after_collection(process: &mut Process, elapsed_nanoseconds: u64) 
                 .is_some_and(|term| term.tagged_word() == process.header.self_pid)
         })
     else {
-        return;
-    };
-    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
         return;
     };
     let OwnedTerm::Pid {
@@ -195,6 +267,11 @@ fn send_system_monitor_event(
     kind: &str,
     values: Vec<(&str, usize)>,
 ) {
+    // Port of erts/emulator/beam/erl_trace.c:2756-2765 (sys_msg_dispatcher_func): the monitor
+    // is never told about its own events.
+    if pid == receiver {
+        return;
+    }
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
@@ -227,6 +304,14 @@ fn send_system_monitor_event(
 /// Emit long-schedule events after a scheduler execution slice.
 // Port of erts/emulator/beam/erl_trace.c:1510-1595, OTP-29.1.1.
 pub(crate) fn after_schedule(process: &mut Process, elapsed_nanoseconds: u64) {
+    if let Some(runtime) = process.runtime.clone() {
+        for state in monitor_states(&runtime) {
+            after_schedule_one(process, elapsed_nanoseconds, &state);
+        }
+    }
+}
+
+fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &SystemMonitorState) {
     let Some(runtime) = process.runtime.clone() else {
         return;
     };
@@ -245,9 +330,6 @@ pub(crate) fn after_schedule(process: &mut Process, elapsed_nanoseconds: u64) {
                 .is_some_and(|term| term.tagged_word() == process.header.self_pid)
         })
     else {
-        return;
-    };
-    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
         return;
     };
     let Some(MonitorOption::Limit(limit)) = state.options.get("long_schedule") else {
@@ -305,6 +387,14 @@ pub(crate) fn after_schedule(process: &mut Process, elapsed_nanoseconds: u64) {
 /// Emit long-message-queue events when the mailbox crosses its configured limits.
 // Port of erts/emulator/beam/erl_trace.c:1863-1918, OTP-29.1.1.
 pub(crate) fn after_message_queue_change(process: &mut Process) {
+    if let Some(runtime) = process.runtime.clone() {
+        for state in monitor_states(&runtime) {
+            after_message_queue_change_one(process, &state);
+        }
+    }
+}
+
+fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorState) {
     let Some(runtime) = process.runtime.clone() else {
         return;
     };
@@ -323,9 +413,6 @@ pub(crate) fn after_message_queue_change(process: &mut Process) {
                 .is_some_and(|term| term.tagged_word() == process.header.self_pid)
         })
     else {
-        return;
-    };
-    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
         return;
     };
     let Some(MonitorOption::Queue(off, on)) = state.options.get("long_message_queue") else {
@@ -385,15 +472,25 @@ pub(crate) fn after_message_queue_change(process: &mut Process) {
 /// Emit the event when a sender is suspended on a busy local port.
 // Port of erts/emulator/beam/erl_process.c:9396-9397 and erl_trace.c:1928-1937, OTP-29.1.1.
 pub(crate) fn notify_busy_port(process: &Process, sender: arinsal_sched::Pid, port_id: u64) {
+    if let Some(runtime) = process.runtime.clone() {
+        for state in monitor_states(&runtime) {
+            notify_busy_port_one(process, sender, port_id, &state);
+        }
+    }
+}
+
+fn notify_busy_port_one(
+    process: &Process,
+    sender: arinsal_sched::Pid,
+    port_id: u64,
+    state: &SystemMonitorState,
+) {
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
     if runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_BUSY_PORT == 0 {
         return;
     }
-    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
-        return;
-    };
     if !matches!(
         state.options.get("busy_port"),
         Some(MonitorOption::Bool(true))
@@ -438,15 +535,25 @@ pub(crate) fn notify_busy_port(process: &Process, sender: arinsal_sched::Pid, po
 /// Emit the event when a sender is suspended on a busy distribution port.
 // Port of erts/emulator/beam/erl_trace.c:1942-1948, OTP-29.1.1.
 pub(crate) fn notify_busy_dist_port(process: &Process, sender: arinsal_sched::Pid, port_id: u64) {
+    if let Some(runtime) = process.runtime.clone() {
+        for state in monitor_states(&runtime) {
+            notify_busy_dist_port_one(process, sender, port_id, &state);
+        }
+    }
+}
+
+fn notify_busy_dist_port_one(
+    process: &Process,
+    sender: arinsal_sched::Pid,
+    port_id: u64,
+    state: &SystemMonitorState,
+) {
     let Some(runtime) = process.runtime.as_ref() else {
         return;
     };
     if runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_BUSY_DIST_PORT == 0 {
         return;
     }
-    let Some(state) = runtime.system_monitor.lock().unwrap().clone() else {
-        return;
-    };
     if !matches!(
         state.options.get("busy_dist_port"),
         Some(MonitorOption::Bool(true))
@@ -2462,25 +2569,31 @@ fn system_check(selector: Term) -> Result<Term, VmError> {
 
 /// Port of erts/emulator/beam/erl_bif_trace.c:3276-3388, OTP-29.1.1.
 fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmError> {
-    if session == atom("legacy") {
-        let state = process
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.system_monitor.lock().unwrap().clone());
-        let Some(state) = state else {
-            return Ok(atom("undefined"));
-        };
-        let owned = OwnedTerm::Tuple(vec![
-            state.receiver,
-            OwnedTerm::list(monitor_options(&state.options)),
-        ]);
-        return from_owned(
-            &owned,
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-        )
-        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
-    }
-    Err(badarg())
+    let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let state = if session == atom("legacy") {
+        runtime.system_monitor.lock().unwrap().clone()
+    } else {
+        let key = to_owned(session).map_err(|_| badarg())?;
+        runtime
+            .session_monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(owner, _)| *owner == key)
+            .map(|(_, state)| state.clone())
+    };
+    let Some(state) = state else {
+        return Ok(atom("undefined"));
+    };
+    let owned = OwnedTerm::Tuple(vec![
+        state.receiver,
+        OwnedTerm::list(monitor_options(&state.options)),
+    ]);
+    from_owned(
+        &owned,
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    )
+    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
 fn monitor_options(options: &HashMap<&'static str, MonitorOption>) -> Vec<OwnedTerm> {
@@ -2597,11 +2710,37 @@ fn system_monitor_set(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    if args[0] != atom("legacy") {
-        return Err(badarg());
-    }
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
-    let old = runtime.system_monitor.lock().unwrap().clone();
+    // `None` is the legacy (global) monitor, `Some` the monitor of a dynamic trace session.
+    let key = if args[0] == atom("legacy") {
+        None
+    } else {
+        Some(to_owned(args[0]).map_err(|_| badarg())?)
+    };
+    let store = |state: Option<SystemMonitorState>| {
+        match &key {
+            None => *runtime.system_monitor.lock().unwrap() = state,
+            Some(key) => {
+                let mut sessions = runtime.session_monitors.lock().unwrap();
+                sessions.retain(|(owner, _)| owner != key);
+                if let Some(state) = state {
+                    sessions.push((key.clone(), state));
+                }
+            }
+        }
+        runtime.long_message_queues.lock().unwrap().clear();
+        refresh_system_monitor_flags(&runtime);
+    };
+    let old = match &key {
+        None => runtime.system_monitor.lock().unwrap().clone(),
+        Some(key) => runtime
+            .session_monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(owner, _)| owner == key)
+            .map(|(_, state)| state.clone()),
+    };
     let old_term = if let Some(state) = old {
         from_owned(
             &OwnedTerm::Tuple(vec![
@@ -2616,9 +2755,7 @@ fn system_monitor_set(
     };
     let options = parse_monitor_options(args[2]).ok_or_else(badarg)?;
     if args[1] == atom("undefined") || args[2] == Term::NIL {
-        *runtime.system_monitor.lock().unwrap() = None;
-        runtime.long_message_queues.lock().unwrap().clear();
-        refresh_system_monitor_flags(&runtime, None);
+        store(None);
         return Ok(old_term);
     }
     let receiver = to_owned(args[1]).map_err(|_| badarg())?;
@@ -2650,9 +2787,7 @@ fn system_monitor_set(
         return Err(badarg());
     }
     let state = SystemMonitorState { receiver, options };
-    *runtime.system_monitor.lock().unwrap() = Some(state.clone());
-    runtime.long_message_queues.lock().unwrap().clear();
-    refresh_system_monitor_flags(&runtime, Some(&state));
+    store(Some(state));
     Ok(old_term)
 }
 
