@@ -2936,7 +2936,15 @@ fn port_command(
                 }
             })
             .collect::<Vec<_>>();
-        trace_command_received(process, ctx.pid(), id, &pieces);
+        let bytes = pieces
+            .iter()
+            .flat_map(|piece| match piece {
+                arinsal_drv::IoPiece::Copied(bytes) | arinsal_drv::IoPiece::Refc(bytes) => {
+                    bytes.iter().copied()
+                }
+            })
+            .collect::<Vec<_>>();
+        trace_command_received_data(process, ctx.pid(), id, data, &bytes);
         if !drv_port.output(&pieces, packed_pid(ctx.pid())) {
             return Err(badarg());
         }
@@ -3001,12 +3009,7 @@ fn port_command(
             return Err(badarg());
         }
     }
-    trace_command_received(
-        process,
-        ctx.pid(),
-        id,
-        &[arinsal_drv::IoPiece::Copied(&framed)],
-    );
+    trace_command_received_data(process, ctx.pid(), id, data, &framed);
     command_bytes(&handle, &framed).map_err(|()| badarg())?;
     Ok(atom("true"))
 }
@@ -3037,6 +3040,37 @@ fn trace_command_received(
         return;
     };
     let Ok(command) = TermBuilder::new(&mut heap).tuple(&[atom("command"), bytes]) else {
+        return;
+    };
+    let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, command]) else {
+        return;
+    };
+    crate::trace::emit_port_event(runtime, id, crate::trace::RECEIVE, "receive", &[event]);
+}
+
+fn trace_command_received_data(process: &Process, caller: Pid, id: u64, data: Term, bytes: &[u8]) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    let Some(caller) = caller.to_term() else {
+        return;
+    };
+    let mut heap = VecHeap::new();
+    let binary_list = to_owned(data).ok().is_some_and(|owned| {
+        matches!(&owned, arinsal_etf::OwnedTerm::List { elems, tail }
+            if **tail == arinsal_etf::OwnedTerm::Nil
+                && !elems.is_empty()
+                && elems.iter().all(|item| matches!(item, arinsal_etf::OwnedTerm::Binary(_))))
+    });
+    let data = if binary_list {
+        copy_term(data, &mut heap)
+    } else {
+        TermBuilder::new(&mut heap).binary(bytes)
+    };
+    let (Ok(caller), Ok(data)) = (copy_term(caller, &mut heap), data) else {
+        return;
+    };
+    let Ok(command) = TermBuilder::new(&mut heap).tuple(&[atom("command"), data]) else {
         return;
     };
     let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, command]) else {
@@ -3127,11 +3161,15 @@ fn remove_and_notify(
 }
 
 fn close(process: &Process, term: Term) -> Result<Term, VmError> {
+    close_inner(process, term, true)
+}
+
+fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Term, VmError> {
     let sender = process.self_pid.ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler().map_err(|_| badarg())?;
     let id = term.as_port().ok_or_else(badarg)?;
-    if let Some(caller) = sender.to_term() {
+    if trace_receive && let Some(caller) = sender.to_term() {
         let mut heap = VecHeap::new();
         if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, atom("close")]) {
             crate::trace::emit_port_event(runtime, id, crate::trace::RECEIVE, "receive", &[event]);
@@ -3217,16 +3255,13 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         return Err(badarg());
     }
     let old_owner = handle.owner_pid();
-    if old_owner != pid
-        && let Some(old_owner_term) = old_owner.to_term()
+    if notify.is_none()
+        && let (Some(from), Some(target)) = (process.self_pid, pid.to_term())
     {
-        crate::trace::emit_port_event(
-            runtime,
-            id,
-            crate::trace::PORTS,
-            "getting_unlinked",
-            &[old_owner_term],
-        );
+        let mut heap = VecHeap::new();
+        if let Ok(message) = TermBuilder::new(&mut heap).tuple(&[atom("connect"), target]) {
+            trace_port_receive_term(process, from, id, message);
+        }
     }
     handle.links.lock().unwrap().insert(pid);
     *handle.owner.lock().unwrap() = pid;
@@ -3242,7 +3277,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         );
     }
     let scheduler = runtime.scheduler()?;
-    if let Some(from) = notify {
+    if let Some(from) = notify.or(process.self_pid) {
         // io.c:2351 (set_port_connected): `{Port, connected}` goes to the `From` of the signal.
         event_message(&scheduler, from, id, handle.trace_scope, atom("connected"));
     }
@@ -3672,11 +3707,9 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
             signal_badsig(&handle, id);
             return Ok(());
         }
+        trace_port_receive_term(process, from, id, parts[1]);
         if handle.os_pid == 0 {
             // A port that terminated meanwhile drops the signal.
-            if close(process, port).is_err() {
-                return Ok(());
-            }
             event_message(
                 &handle.scheduler,
                 from,
@@ -3684,6 +3717,9 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
                 handle.trace_scope,
                 atom("closed"),
             );
+            if close_inner(process, port, false).is_err() {
+                return Ok(());
+            }
             return Ok(());
         }
         let notify_now = {
