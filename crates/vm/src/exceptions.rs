@@ -625,7 +625,7 @@ pub(super) fn resume(
         // handle because materializing that handle would return the same nil.
         if trace == Term::NIL {
             empty_trace_handle(trap.class)
-        } else if empty_trace_class(trace).is_some() || stacktrace::raw_index(trace).is_some() {
+        } else if empty_trace_class(trace).is_some() || stacktrace::is_saved(trace) {
             trace
         } else {
             save_explicit(p, trace, trap.class)?
@@ -820,15 +820,13 @@ fn save_raw(
     class: Class,
     top: Option<&stacktrace::TopFrame>,
 ) -> Result<Term, VmError> {
-    let slot = available_trace_slot(p);
-    let tag = stacktrace::raw_tag(slot)?;
     let error_pc = p
         .cold
         .as_deref_mut()
         .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
-    let raw = &mut p.cold.as_deref_mut().expect("raw trace storage").raw_traces[slot];
+    let mut raw = stacktrace::RawTrace::default();
     stacktrace::capture(
-        raw,
+        &mut raw,
         Some(class),
         top,
         &vm.modules,
@@ -837,114 +835,26 @@ fn save_raw(
         depth,
     )?;
     if error_pc != 0 && crate::native_bridge::is_native_function_at(error_pc) {
-        stacktrace::set_native_top(raw, error_pc);
+        stacktrace::set_native_top(&mut raw, error_pc);
     }
-    Ok(tag)
+    stacktrace::store(p, raw)
 }
 
 fn save_explicit(p: &mut Process, trace: Term, class: Class) -> Result<Term, VmError> {
-    let slot = available_trace_slot(p);
-    let tag = stacktrace::raw_tag(slot)?;
-    stacktrace::save_explicit(
-        &mut p.cold.as_deref_mut().expect("raw trace storage").raw_traces[slot],
-        class,
-        trace,
-    )?;
-    Ok(tag)
-}
-
-/// Smallest `raw_traces` length that triggers a sweep of unreferenced handles.
-const RAW_TRACE_SWEEP_MIN: usize = 32;
-
-/// Frees raw traces no register or stack slot refers to any more.
-///
-/// erts keeps `c_p->ftrace` as a heap term that the GC reclaims when a handler drops it
-/// (e.g. `try ... catch _:_ -> ok end`, or `catch` whose value is unused). Our handles are
-/// immediates, so nothing would ever free those slots; the live handles can only be in X
-/// registers or stack slots, which are scanned here when the table has doubled.
-fn sweep_raw_traces(p: &mut Process) {
-    let len = p.cold.as_deref().map_or(0, |cold| cold.raw_traces.len());
-    let mut live = vec![false; len];
-    let words = (0..p.heap.stack_words()).filter_map(|index| p.heap.stack_get(index));
-    for term in p.x.iter().copied().chain(words) {
-        if let Some(index) = stacktrace::raw_index(term)
-            && let Some(mark) = live.get_mut(index)
-        {
-            *mark = true;
-        }
-    }
-    let cold = p.cold_mut();
-    let mut kept = 0usize;
-    for (index, is_live) in live.into_iter().enumerate() {
-        let trace = &mut cold.raw_traces[index];
-        if is_live {
-            kept += 1;
-        } else if !trace.available {
-            *trace = stacktrace::RawTrace::default();
-            trace.available = true;
-            cold.free_raw_trace_slots.push(index);
-        }
-    }
-    cold.raw_trace_sweep_at = RAW_TRACE_SWEEP_MIN.max(kept.saturating_mul(2));
-}
-
-fn available_trace_slot(p: &mut Process) -> usize {
-    let cold = p.cold_mut();
-    if cold.free_raw_trace_slots.is_empty()
-        && cold.raw_traces.len() >= cold.raw_trace_sweep_at.max(RAW_TRACE_SWEEP_MIN)
-    {
-        sweep_raw_traces(p);
-    }
-    let cold = p.cold_mut();
-    if let Some(slot) = cold.free_raw_trace_slots.pop() {
-        cold.raw_traces[slot].available = false;
-        return slot;
-    }
-    let slot = cold.raw_traces.len();
-    cold.raw_traces.push(stacktrace::RawTrace::default());
-    slot
-}
-
-fn release_trace_slot(p: &mut Process, slot: usize) {
-    let cold = p.cold_mut();
-    let Some(trace) = cold.raw_traces.get_mut(slot) else {
-        return;
-    };
-    if !trace.available {
-        trace.available = true;
-        cold.free_raw_trace_slots.push(slot);
-    }
+    let mut raw = stacktrace::RawTrace::default();
+    stacktrace::save_explicit(&mut raw, class, trace)?;
+    stacktrace::store(p, raw)
 }
 
 pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError> {
     if empty_trace_class(trace).is_some() {
         return Ok(Term::NIL);
     }
-    let Some(index) = stacktrace::raw_index(trace) else {
-        return Ok(trace);
-    };
-    let mut raw = {
-        let cold = p
-            .cold
-            .as_mut()
-            .ok_or_else(|| VmError::Unsupported("raw stacktrace storage".into()))?;
-        let raw = cold
-            .raw_traces
-            .get_mut(index)
-            .ok_or_else(|| VmError::Unsupported("raw stacktrace index".into()))?;
-        std::mem::take(raw)
-    };
-    let result = stacktrace::build_saved(p, &mut raw);
-    let slot = p
-        .cold_mut()
-        .raw_traces
-        .get_mut(index)
-        .ok_or_else(|| VmError::Unsupported("raw stacktrace index".into()))?;
-    *slot = raw;
-    if result.is_ok() {
-        release_trace_slot(p, index);
+    // The saved trace stays behind the term: the same one can be rebuilt by a later raise.
+    match stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw)) {
+        Some(result) => result,
+        None => Ok(trace),
     }
-    result
 }
 
 fn strip_top_location(p: &mut Process, trace: Term) -> Result<Term, VmError> {
@@ -975,33 +885,4 @@ fn strip_top_location(p: &mut Process, trace: Term) -> Result<Term, VmError> {
 
 pub(super) fn from_legacy(reason: &str) -> Result<Trap, VmError> {
     Ok(Trap::error(atom(reason)?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unreferenced_raw_traces_are_swept_and_referenced_ones_kept() {
-        let mut p = Process::new();
-        // A handler that dropped its trace (`catch` with an unused value) leaves the slot
-        // unreferenced; one still in X2 must survive the sweep.
-        for _ in 0..RAW_TRACE_SWEEP_MIN {
-            let slot = available_trace_slot(&mut p);
-            assert!(slot < RAW_TRACE_SWEEP_MIN);
-        }
-        p.x[2] = stacktrace::raw_tag(5).unwrap();
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..4 * RAW_TRACE_SWEEP_MIN {
-            let slot = available_trace_slot(&mut p);
-            assert_ne!(slot, 5, "live handle slot was reused");
-            seen.insert(slot);
-        }
-        assert!(
-            p.cold_mut().raw_traces.len() <= 2 * RAW_TRACE_SWEEP_MIN,
-            "raw trace table grew without bound: {}",
-            p.cold_mut().raw_traces.len()
-        );
-        assert!(seen.len() > 1);
-    }
 }
