@@ -406,6 +406,9 @@ pub(crate) fn execute_named(
                 "BIF continuation export mismatch".into(),
             )));
         }
+        // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
+        // arguments), OTP-29.1.1: a resumed call takes its arguments from the trap state.
+        args = pending.args;
         (entry.handler, Some(Arc::clone(&pending.state)))
     } else {
         (entry?.handler, None)
@@ -429,6 +432,7 @@ pub(crate) fn execute_named(
     if module_name == "erlang" && function_name == "binary_to_term" {
         process.set_gc_enabled(false);
     }
+    let resumed = state.is_some();
     let result = handler(process, &args[..arity], state.as_ref(), pid, gc_was_enabled);
     if module_name == "erts_debug"
         && function_name == "set_internal_state"
@@ -447,7 +451,7 @@ pub(crate) fn execute_named(
             process.set_gc_enabled(gc_was_enabled);
             // Re-enabling GC may collect: the X registers, not the copies, hold the live
             // arguments.
-            let args = live_args(process, &args, arity);
+            let args = call_args(process, &args, arity, resumed);
             Err(exceptions::bif_error(
                 process,
                 module_name,
@@ -466,7 +470,7 @@ pub(crate) fn execute_named(
             process.cold_mut().bif_trap = None;
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
-            let args = live_args(process, &args, arity);
+            let args = call_args(process, &args, arity, resumed);
             Err(exceptions::bif_error(
                 process,
                 module_name,
@@ -497,6 +501,21 @@ pub(crate) fn execute_named(
                 continuation,
                 state,
                 gc_was_enabled,
+                arity,
+                callee: (
+                    global_atoms().intern(module_name).expect("BIF module atom"),
+                    global_atoms()
+                        .intern(function_name)
+                        .expect("BIF function atom"),
+                ),
+                args: if resumed {
+                    args
+                } else {
+                    let live = live_args(process, &args, arity);
+                    let mut saved = [Term::NIL; 3];
+                    saved[..arity].copy_from_slice(&live);
+                    saved
+                },
             });
             charge(process, ctx, reductions);
             Ok(TrapResult::Yield {
@@ -519,6 +538,16 @@ fn live_args(process: &Process, copies: &[Term; 3], arity: usize) -> Vec<Term> {
     (0..arity)
         .map(|slot| process.x.get(slot).copied().unwrap_or(copies[slot]))
         .collect()
+}
+
+/// The arguments for an error report: those held in the trap state on a resumed call, the live
+/// X registers on the first call.
+fn call_args(process: &Process, saved: &[Term; 3], arity: usize, resumed: bool) -> Vec<Term> {
+    if resumed {
+        saved[..arity].to_vec()
+    } else {
+        live_args(process, saved, arity)
+    }
 }
 
 fn charge(

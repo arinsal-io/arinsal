@@ -235,6 +235,14 @@ pub(crate) struct BifTrapPending {
     pub(crate) continuation: &'static str,
     pub(crate) state: std::sync::Arc<arinsal_term::MagicRef>,
     pub(crate) gc_was_enabled: bool,
+    /// The call's arguments, kept with the trap state like the arguments of a BIF_TRAP export:
+    /// a retry never reads them back from the X registers.
+    pub(crate) args: [Term; 3],
+    /// Number of meaningful entries in `args`.
+    pub(crate) arity: usize,
+    /// The trapped BIF's module and function: an `apply` that trapped is redone as
+    /// `apply(Module, Function, Args)` built from the trap state.
+    pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
 }
 impl Process {
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.

@@ -1505,13 +1505,60 @@ impl Executor {
                                                         .as_ref()
                                                         .is_some_and(|cold| cold.bif_trap.is_some())
                                                     {
-                                                        for (register, value) in
-                                                            process.x.iter_mut().zip(&saved_x)
+                                                        // Port of erts/emulator/beam/beam_common.c
+                                                        // (BIF_TRAP: the trap export carries its own
+                                                        // arguments), OTP-29.1.1: the operands saved
+                                                        // before the call are stale once the BIF
+                                                        // collected, so the redone apply is rebuilt
+                                                        // from the arguments kept in the trap state.
+                                                        let pending = process
+                                                            .cold
+                                                            .as_ref()
+                                                            .and_then(|cold| cold.bif_trap.as_ref())
+                                                            .map(|pending| {
+                                                                (
+                                                                    pending.callee,
+                                                                    pending.args,
+                                                                    pending.arity,
+                                                                )
+                                                            });
+                                                        let retry_pc = if let Some((
+                                                            (module, function),
+                                                            args,
+                                                            arity,
+                                                        )) = pending
                                                         {
-                                                            *register = *value;
-                                                        }
+                                                            let list = {
+                                                                let mut heap =
+                                                                    arinsal_bifs::FragmentingHeap(
+                                                                        &mut process.heap,
+                                                                    );
+                                                                TermBuilder::new(&mut heap)
+                                                                    .list_from_slice(&args[..arity])
+                                                            };
+                                                            match list {
+                                                                Ok(list) => {
+                                                                    process.x[0] =
+                                                                        Term::atom(module);
+                                                                    process.x[1] =
+                                                                        Term::atom(function);
+                                                                    process.x[2] = list;
+                                                                    arinsal_beamasm::dispatch::APPLY3_UNPORTED
+                                                                }
+                                                                Err(_) => {
+                                                                    break Err(
+                                                                        VmError::Unsupported(
+                                                                            "trap state arguments"
+                                                                                .into(),
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        } else {
+                                                            target_pc
+                                                        };
                                                         process.cold_mut().native_retry =
-                                                            Some(target_pc);
+                                                            Some(retry_pc);
                                                         process.native_pc = Some(code_ptr);
                                                     }
                                                     break Ok(RunState::Yield);
