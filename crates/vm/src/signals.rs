@@ -2999,10 +2999,14 @@ fn link_opt(
     match ctx.signal(pid, Signal::Link) {
         Ok(()) => {}
         Err(arinsal_sched::Error::NoProcess) => {
-            // The target left the table between the lookup and the signal: undo the link.
-            process.cold_mut().links.remove(&pid);
-            process.cold_mut().prio_links.remove(&pid);
-            return link_noproc(process, pid, priority);
+            // The target exited between the lookup and the signal: like erts, keep the link
+            // and let a `noproc` link exit from the target dissolve it.
+            // Port of erts/emulator/beam/bif.c:180-183 (link_opt), OTP-29.1.1.
+            let reason = Message::copy_from(atom("noproc"))?;
+            runtime(process)?
+                .scheduler()?
+                .signal(pid, ctx.pid(), Signal::ExitLinked(reason))
+                .map_err(|_| badarg("link"))?;
         }
         Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
         Err(_) => return Err(badarg("link")),

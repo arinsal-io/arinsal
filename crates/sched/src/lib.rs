@@ -3576,7 +3576,12 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         // A literal-copy request is never buffered: a request lost to an exiting target
         // would never be answered, so the sender must see `NoProcess` at once. Port of
         // erts/emulator/beam/erl_proc_sig_queue.c:3480 (erts_proc_sig_send_cla_request), OTP-29.1.1.
-        if waiting || monitor || deferred.is_some() || force_enqueue {
+        // Neither is a link: erts enqueues it at once and `link/1` answers a target that is
+        // already gone with a `noproc` link exit; a buffered link dropped at slice end would
+        // lose the target's exit signal. Port of erts/emulator/beam/bif.c:180-183 (link_opt),
+        // OTP-29.1.1.
+        let link = matches!(&payload, Payload::Signal(Signal::Link));
+        if waiting || monitor || link || deferred.is_some() || force_enqueue {
             self.flush_target(to, remaining);
             if let Some(first) = deferred {
                 let mut events = self
