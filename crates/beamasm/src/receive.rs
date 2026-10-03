@@ -168,7 +168,10 @@ impl BeamModuleAssembler {
             hooks.remove_message as usize,
             &[Gpr::x(22), Gpr::x(24)],
             6,
-            crate::Update::NONE,
+            // erts passes HTOP/E by value because seq_trace_output builds into heap
+            // fragments; the hook allocates the `receive` event on the process heap, so
+            // the heap and stack cursors must be published and reloaded around it.
+            crate::Update::HEAP_ALLOC,
         )?;
         self.code.emit(|e| e.mov_reg(FCALLS, Gpr::w(0)))?;
         Ok(())
