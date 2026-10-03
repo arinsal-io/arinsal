@@ -248,10 +248,19 @@ pub extern "C" fn arinsal_beamasm_remove_message(
     fcalls: i32,
     _unused: usize,
 ) -> i32 {
-    let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
+    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return fcalls;
     };
-    if process.remove_message(None).is_err() {
+    // A message carrying a seq_trace token emits its `receive` event on the receiver's own
+    // heap here (the tracer may be the receiver itself), so the native HTOP and stack
+    // pointer must round-trip like in every other allocating helper.
+    process
+        .heap
+        .set_frame_pointer(registers.tmp_mem[2] as usize);
+    let result = process.remove_message(None);
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    process.sync_native_header();
+    if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }
     fcalls
