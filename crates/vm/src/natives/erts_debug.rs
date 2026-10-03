@@ -37,6 +37,7 @@ const MONITOR_BUSY_DIST_PORT: u8 = 32;
 pub(crate) struct SystemMonitorState {
     pub(crate) receiver: OwnedTerm,
     pub(crate) options: HashMap<&'static str, MonitorOption>,
+    key: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -80,7 +81,10 @@ pub(crate) fn monitor_process_exited(process: &Process, pid: arinsal_sched::Pid)
 // Port of erts/emulator/beam/erl_trace.c (erts_trace_session_destroy clears the session's
 // system_monitor), OTP-29.1.1.
 pub(crate) fn session_destroyed(process: &Process, session: Term) {
-    let (Some(runtime), Ok(key)) = (process.runtime.as_ref(), to_owned(session)) else {
+    let (Some(runtime), Some(key)) = (
+        process.runtime.as_ref(),
+        crate::natives::proc::trace_session_id(process, session),
+    ) else {
         return;
     };
     runtime
@@ -100,6 +104,10 @@ fn monitor_states(runtime: &crate::process::Runtime) -> Vec<SystemMonitorState> 
         .unwrap()
         .iter()
         .cloned()
+        .map(|mut state| {
+            state.key = None;
+            state
+        })
         .collect();
     states.extend(
         runtime
@@ -107,7 +115,11 @@ fn monitor_states(runtime: &crate::process::Runtime) -> Vec<SystemMonitorState> 
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, state)| state.clone()),
+            .map(|(key, state)| {
+                let mut state = state.clone();
+                state.key = Some(*key);
+                state
+            }),
     );
     states
 }
@@ -469,12 +481,24 @@ fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorSt
         return;
     };
     let count = process.inbox.len() as u64;
-    let active = runtime.long_message_queues.lock().unwrap().contains(&pid);
+    let monitor_key = (pid, state.key);
+    let active = runtime
+        .long_message_queues
+        .lock()
+        .unwrap()
+        .contains(&monitor_key);
     let value = if !active && count >= *on {
-        runtime.long_message_queues.lock().unwrap().insert(pid);
+        let mut queues = runtime.long_message_queues.lock().unwrap();
+        if !active {
+            queues.push(monitor_key);
+        }
         Some(true)
     } else if active && count <= *off {
-        runtime.long_message_queues.lock().unwrap().remove(&pid);
+        runtime
+            .long_message_queues
+            .lock()
+            .unwrap()
+            .retain(|key| key != &monitor_key);
         Some(false)
     } else {
         None
@@ -2729,7 +2753,7 @@ fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmEr
     let state = if session == atom("legacy") {
         runtime.system_monitor.lock().unwrap().clone()
     } else {
-        let key = to_owned(session).map_err(|_| badarg())?;
+        let key = crate::natives::proc::trace_session_id(process, session).ok_or_else(badarg)?;
         runtime
             .session_monitors
             .lock()
@@ -2743,7 +2767,7 @@ fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmEr
     };
     let owned = OwnedTerm::Tuple(vec![
         state.receiver,
-        OwnedTerm::list(monitor_options(&state.options)),
+        OwnedTerm::list(monitor_options_for_trace_info(&state.options)),
     ]);
     from_owned(
         &owned,
@@ -2752,7 +2776,9 @@ fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmEr
     .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
-fn monitor_options(options: &HashMap<&'static str, MonitorOption>) -> Vec<OwnedTerm> {
+pub(crate) fn monitor_options_for_trace_info(
+    options: &HashMap<&'static str, MonitorOption>,
+) -> Vec<OwnedTerm> {
     let mut result = Vec::new();
     for name in ["busy_dist_port", "busy_port"] {
         if matches!(options.get(name), Some(MonitorOption::Bool(true))) {
@@ -2871,7 +2897,17 @@ fn system_monitor_set(
     let key = if args[0] == atom("legacy") {
         None
     } else {
-        Some(to_owned(args[0]).map_err(|_| badarg())?)
+        Some(crate::natives::proc::trace_session_id(process, args[0]).ok_or_else(badarg)?)
+    };
+    let session_tracer = if args[1] == atom("session") {
+        let session =
+            crate::natives::proc::trace_session_id(process, args[0]).ok_or_else(badarg)?;
+        match crate::trace::session_tracer(process, session).ok_or_else(badarg)? {
+            crate::trace::Tracer::Pid(pid) => Some(pid.to_term().ok_or_else(badarg)?),
+            _ => return Err(badarg()),
+        }
+    } else {
+        None
     };
     let store = |state: Option<SystemMonitorState>| {
         match &key {
@@ -2880,7 +2916,7 @@ fn system_monitor_set(
                 let mut sessions = runtime.session_monitors.lock().unwrap();
                 sessions.retain(|(owner, _)| owner != key);
                 if let Some(state) = state {
-                    sessions.push((key.clone(), state));
+                    sessions.push((*key, state));
                 }
             }
         }
@@ -2897,11 +2933,11 @@ fn system_monitor_set(
             .find(|(owner, _)| owner == key)
             .map(|(_, state)| state.clone()),
     };
-    let old_term = if let Some(state) = old {
+    let old_term = if let Some(state) = old.clone() {
         from_owned(
             &OwnedTerm::Tuple(vec![
                 state.receiver,
-                OwnedTerm::list(monitor_options(&state.options)),
+                OwnedTerm::list(monitor_options_for_trace_info(&state.options)),
             ]),
             &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
         )
@@ -2909,12 +2945,50 @@ fn system_monitor_set(
     } else {
         atom("undefined")
     };
-    let options = parse_monitor_options(args[2]).ok_or_else(badarg)?;
-    if args[1] == atom("undefined") || args[2] == Term::NIL {
+    let mut options = parse_monitor_options(args[2]).ok_or_else(badarg)?;
+    if key.is_none() && (args[1] == atom("undefined") || args[2] == Term::NIL) {
         store(None);
         return Ok(old_term);
     }
-    let receiver = to_owned(args[1]).map_err(|_| badarg())?;
+    let receiver = if let Some(receiver) = session_tracer {
+        let mut updated = old.map(|state| state.options).unwrap_or_default();
+        for (name, value) in options {
+            updated.insert(name, value);
+        }
+        let input = to_owned(args[2]).map_err(|_| badarg())?;
+        let entries = match &input {
+            OwnedTerm::Nil => Vec::new(),
+            OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
+            _ => return Err(badarg()),
+        };
+        for entry in entries {
+            let (name, value) = match &entry {
+                OwnedTerm::Atom(name) => (name.clone(), OwnedTerm::Atom("true".into())),
+                OwnedTerm::Tuple(pair) if pair.len() == 2 => {
+                    let OwnedTerm::Atom(name) = &pair[0] else {
+                        return Err(badarg());
+                    };
+                    (name.clone(), pair[1].clone())
+                }
+                _ => return Err(badarg()),
+            };
+            if matches!(value, OwnedTerm::Atom(ref atom) if atom == "false") {
+                updated.remove(match name.as_str() {
+                    "busy_port" => "busy_port",
+                    "busy_dist_port" => "busy_dist_port",
+                    "large_heap" => "large_heap",
+                    "long_gc" => "long_gc",
+                    "long_schedule" => "long_schedule",
+                    "long_message_queue" => "long_message_queue",
+                    _ => return Err(badarg()),
+                });
+            }
+        }
+        options = updated;
+        to_owned(receiver).map_err(|_| badarg())?
+    } else {
+        to_owned(args[1]).map_err(|_| badarg())?
+    };
     let OwnedTerm::Pid {
         node, creation: 0, ..
     } = &receiver
@@ -2942,9 +3016,13 @@ fn system_monitor_set(
     if !matches_live_pid {
         return Err(badarg());
     }
-    let state = SystemMonitorState { receiver, options };
+    let state = SystemMonitorState {
+        receiver,
+        options,
+        key,
+    };
     store(Some(state));
-    Ok(old_term)
+    Ok(if key.is_some() { atom("ok") } else { old_term })
 }
 
 /// Native-family dispatcher.

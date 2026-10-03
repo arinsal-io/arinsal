@@ -2313,7 +2313,7 @@ fn spawn_request(
     Ok(reference)
 }
 
-fn trace_session_id(process: &Process, session: Term) -> Option<u64> {
+pub(crate) fn trace_session_id(process: &Process, session: Term) -> Option<u64> {
     let owned = arinsal_term::to_owned(session).ok()?;
     match &owned {
         arinsal_etf::OwnedTerm::Ref { ids, .. } if ids.len() >= 3 && ids[2] == u32::MAX => {
@@ -3345,6 +3345,28 @@ fn trace_session_info(
     spec: Term,
     item: Term,
 ) -> Result<Term, VmError> {
+    if atom_name(spec).as_deref() == Some("system") {
+        if atom_name(item).as_deref() != Some("all") {
+            return Err(badarg());
+        }
+        let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+        let state = runtime
+            .session_monitors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(owner, _)| *owner == session)
+            .map(|(_, state)| state.clone());
+        let options = state.map_or_else(Vec::new, |state| {
+            crate::natives::erts_debug::monitor_options_for_trace_info(&state.options)
+        });
+        let options = arinsal_term::from_owned(
+            &arinsal_etf::OwnedTerm::list(options),
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        )
+        .map_err(|_| badarg())?;
+        return make_tuple(process, &[spec, options]);
+    }
     if atom_name(spec).as_deref() == Some("on_load") {
         if atom_name(item).as_deref() == Some("session") {
             let refs = crate::trace_bp::on_load_patterns_of(process)

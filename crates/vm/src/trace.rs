@@ -702,10 +702,33 @@ pub(crate) fn port_opened(runtime: &crate::process::Runtime, port: u64) {
 
 pub(crate) fn port_closed(runtime: &crate::process::Runtime, port: u64) {
     let owner = runtime as *const crate::process::Runtime as usize;
+    table().lock().unwrap().retain(|(scope, _, _), entry| {
+        *scope != owner || !matches!(entry.tracer, Tracer::Port(tracer) if tracer == port)
+    });
+    let mut new_processes = new_process_tracing().lock().unwrap();
+    new_processes.retain(|(scope, _), (flags, tracer)| {
+        if *scope == owner && matches!(tracer, Some(Tracer::Port(tracer)) if *tracer == port) {
+            *flags = 0;
+            *tracer = None;
+        }
+        *scope != owner || *flags != 0
+    });
     let mut entries = port_table().lock().unwrap();
-    entries.retain(|(scope, _, id), _| *scope != owner || *id != port);
+    entries.retain(|(scope, _, id), entry| {
+        *scope != owner
+            || (*id != port && !matches!(entry.tracer, Tracer::Port(tracer) if tracer == port))
+    });
+    drop(entries);
+    let mut defaults = new_port_tracing().lock().unwrap();
+    defaults.retain(|(scope, _), (flags, tracer)| {
+        if *scope == owner && matches!(tracer, Some(Tracer::Port(tracer)) if *tracer == port) {
+            *flags = 0;
+            *tracer = None;
+        }
+        *scope != owner || *flags != 0
+    });
     enabled().store(
-        !entries.is_empty() || !table().lock().unwrap().is_empty(),
+        !port_table().lock().unwrap().is_empty() || !table().lock().unwrap().is_empty(),
         Ordering::Relaxed,
     );
 }
@@ -1328,7 +1351,8 @@ fn apply_match_trace_action(
         }
         _ => return false,
     };
-    if set_session_flags(process, session, target, clear, set, tracer.clone()) {
+    let applied = set_session_flags(process, session, target, clear, set, tracer.clone());
+    if applied {
         return true;
     }
     if set == 0 {

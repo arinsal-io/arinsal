@@ -731,15 +731,10 @@ pub(crate) struct Runtime {
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
-    /// `system_monitor` state of dynamic trace sessions, keyed by the session term.
-    pub(crate) session_monitors: Mutex<
-        Vec<(
-            arinsal_etf::OwnedTerm,
-            crate::natives::erts_debug::SystemMonitorState,
-        )>,
-    >,
+    /// `system_monitor` state of dynamic trace sessions, keyed by session id.
+    pub(crate) session_monitors: Mutex<Vec<(u64, crate::natives::erts_debug::SystemMonitorState)>>,
     pub(crate) system_monitor_flags: AtomicU8,
-    pub(crate) long_message_queues: Mutex<HashSet<Pid>>,
+    pub(crate) long_message_queues: Mutex<Vec<(Pid, Option<u64>)>>,
     /// Port identifier table's free id ring, like `erts_port.ptab`.
     pub(crate) port_ids: PtabIdRing,
     pub(crate) simulated: bool,
@@ -5919,7 +5914,7 @@ impl Vm {
             system_monitor: Mutex::new(None),
             session_monitors: Mutex::new(Vec::new()),
             system_monitor_flags: AtomicU8::new(0),
-            long_message_queues: Mutex::new(HashSet::new()),
+            long_message_queues: Mutex::new(Vec::new()),
             port_ids,
             simulated: simulation_seed.is_some(),
             virtual_ms: AtomicU64::new(0),
