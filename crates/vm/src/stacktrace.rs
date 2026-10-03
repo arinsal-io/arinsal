@@ -10,7 +10,7 @@ use arinsal_term::{
 use arinsal_term::{ExportEntry, ExternalBinary, FunEntry, MagicRef, Node, WritableBinary};
 use std::sync::{Arc, Mutex, OnceLock};
 
-// Reserve the last encodable handler module index for private trace handles.
+// Reserve the last encodable handler module index for the empty-trace markers.
 const RAW_TRACE_PREFIX: u64 = (1 << 26) - 1;
 const CONTINUATION_BIT: u64 = 1 << 57;
 
@@ -139,7 +139,6 @@ pub(super) struct RawTrace {
     continuations: Vec<Continuation>,
     frames: Vec<Term>,
     depth: usize,
-    pub(super) available: bool,
 }
 
 enum Continuation {
@@ -174,6 +173,30 @@ impl BifArgs {
             elems,
             tail: Box::new(OwnedTerm::Nil),
         })))
+    }
+
+    /// Copy for storage in a saved trace: the payload is invisible to GC, so inline
+    /// heap pointers are turned into an owned copy; immediates cannot dangle.
+    fn detached(&self) -> Result<Self, VmError> {
+        match self {
+            Self::Inline { values, len }
+                if values[..usize::from(*len)].iter().any(|t| t.is_pointer()) =>
+            {
+                let elems = values[..usize::from(*len)]
+                    .iter()
+                    .map(|term| {
+                        to_owned(*term).map_err(|error| {
+                            VmError::Unsupported(format!("exception arg {error:?}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::Owned(Box::new(OwnedTerm::List {
+                    elems,
+                    tail: Box::new(OwnedTerm::Nil),
+                })))
+            }
+            other => Ok(other.clone()),
+        }
     }
 
     pub(super) fn root_terms(&self, roots: &mut Vec<Term>) -> Option<(usize, usize)> {
@@ -238,7 +261,7 @@ pub(super) fn capture(
             } => Ok(StoredTopFrame::Bif {
                 module: *module,
                 function: *function,
-                args: args.clone(),
+                args: args.detached()?,
                 info: *info,
             }),
             TopFrame::CurrentArgs(args) => Ok(StoredTopFrame::CurrentArgs(
@@ -358,45 +381,42 @@ pub(super) fn save_explicit(raw: &mut RawTrace, class: Class, trace: Term) -> Re
     Ok(())
 }
 
+/// Saved trace stored in a process-heap magic reference.
+///
+/// Port of erts/emulator/beam/beam_common.c:880 (save_stacktrace), OTP-29.1.1: erts keeps
+/// `struct StackTrace` in an opaque heap object, so GC copies and reclaims it with the process.
+pub(super) struct SavedTrace(Mutex<RawTrace>);
+
+/// Allocate `raw` as a heap term of `p`; the heap owns it until GC finds it unreachable.
+pub(super) fn store(p: &mut Process, raw: RawTrace) -> Result<Term, VmError> {
+    let owner = MagicRef::new(SavedTrace(Mutex::new(raw)));
+    TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+        .magic_ref(owner)
+        .map_err(|e| VmError::Unsupported(format!("raw stacktrace {e:?}")))
+}
+
+/// Run `f` on the saved trace behind `term`, or return `None` when it is not one.
+pub(super) fn with_saved<R>(term: Term, f: impl FnOnce(&mut RawTrace) -> R) -> Option<R> {
+    // SAFETY: the term is reachable from a live process register or stack, so its heap
+    // and the retained owner stay valid for this call; nothing below collects.
+    let saved = unsafe { term.magic_ref() }?.downcast_ref::<SavedTrace>()?;
+    let mut raw = saved.0.lock().unwrap_or_else(|e| e.into_inner());
+    Some(f(&mut raw))
+}
+
+/// True when `term` is a saved raw trace.
+pub(super) fn is_saved(term: Term) -> bool {
+    with_saved(term, |_| ()).is_some()
+}
+
 /// Exception class saved with a raw trace for a later `raise` instruction.
-pub(super) fn raw_class(p: &Process, term: Term) -> Option<Class> {
-    let index = raw_index(term)?;
-    p.cold
-        .as_ref()
-        .and_then(|cold| cold.raw_traces.get(index))
-        .and_then(|raw| raw.class)
+pub(super) fn raw_class(_p: &Process, term: Term) -> Option<Class> {
+    with_saved(term, |raw| raw.class).flatten()
 }
 
 /// Port of erts/emulator/beam/beam_common.c:1148-1178 (raw_raise).
-pub(super) fn set_raw_class(p: &mut Process, term: Term, class: Class) -> bool {
-    let Some(index) = raw_index(term) else {
-        return false;
-    };
-    let Some(raw) = p
-        .cold
-        .as_mut()
-        .and_then(|cold| cold.raw_traces.get_mut(index))
-    else {
-        return false;
-    };
-    raw.class = Some(class);
-    true
-}
-
-/// Encode a process-local raw trace handle as an internal catch immediate.
-pub(super) fn raw_tag(index: usize) -> Result<Term, VmError> {
-    let index = u32::try_from(index).map_err(|_| VmError::Unsupported("raw trace index".into()))?;
-    Ok(Term::catch((RAW_TRACE_PREFIX << 32) | u64::from(index)))
-}
-
-/// Decode a raw trace handle without treating a BEAM catch tag as one.
-pub(super) fn raw_index(term: Term) -> Option<usize> {
-    if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
-        return None;
-    }
-    // SAFETY: CATCH is immediate and contains no heap pointer.
-    let payload = unsafe { term.raw_bits() } >> 6;
-    (payload >> 32 == RAW_TRACE_PREFIX).then_some(payload as u32 as usize)
+pub(super) fn set_raw_class(_p: &mut Process, term: Term, class: Class) -> bool {
+    with_saved(term, |raw| raw.class = Some(class)).is_some()
 }
 
 /// What `save_stacktrace` puts in a BIF frame's `error_info`.
@@ -501,6 +521,7 @@ pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
     // SAFETY: CATCH is an immediate and carries no heap pointer.
     let payload = unsafe { term.raw_bits() } >> 6;
     if payload >> 32 == RAW_TRACE_PREFIX {
+        // Empty-trace marker, not a continuation.
         return None;
     }
     // Interpreter continuations use an immediate module/IP pair. Catch tags
