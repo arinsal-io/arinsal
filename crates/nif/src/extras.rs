@@ -1,5 +1,5 @@
 //! Independent environments, time, ETF, and VM extension hooks.
-use crate::{ErlNifBinary, ErlNifEnv, term, terms};
+use crate::{ErlNifBinary, ErlNifEnv, terms};
 use arinsal_bifs::Ctx;
 use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
@@ -45,6 +45,8 @@ pub struct VmHooks {
     pub send: Option<fn(Term, Term) -> bool>,
     /// Resolve an atom name to a pid.
     pub whereis_pid: Option<fn(Term) -> Option<Term>>,
+    /// Check whether a local process is present in the caller's runtime.
+    pub is_process_alive: Option<fn(Term, Term) -> bool>,
     /// `enif_select_x`.
     pub select: Option<SelectHook>,
     /// Resolve an atom name to a port.
@@ -176,11 +178,22 @@ pub extern "C" fn enif_whereis_port(_: *mut ErlNifEnv, name: Term, out: *mut Ter
     1
 }
 #[unsafe(no_mangle)]
+// Port of erts/emulator/beam/erl_nif.c:2323 (enif_is_process_alive), OTP-29.1.1.
 pub extern "C" fn enif_is_process_alive(e: *mut ErlNifEnv, pid: *const Term) -> c_int {
-    if pid.is_null() {
+    if e.is_null() || pid.is_null() {
         return 0;
     };
-    i32::from(load(pid) == env_pid(e).unwrap_or(term(0)))
+    let target = load(pid);
+    if target.as_pid().is_none() {
+        return 0;
+    }
+    let Some(caller) = env_pid(e) else {
+        return 0;
+    };
+    let Some(hook) = hooks().lock().unwrap().is_process_alive else {
+        return 0;
+    };
+    i32::from(hook(caller, target))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_is_port_alive(_: *mut ErlNifEnv, port: *const Term) -> c_int {
