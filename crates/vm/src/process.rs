@@ -2265,8 +2265,11 @@ impl Executor {
                                                         Some(crate::stacktrace::TopFrame::Bif {
                                                             module: export.module_atom,
                                                             function: export.function_atom,
+                                                            // The X registers still hold the arguments, moved
+                                                            // by any collection the call ran; the copies taken
+                                                            // before it are stale.
                                                             args: crate::stacktrace::BifArgs::from_terms(
-                                                                &saved_arguments,
+                                                                &process.x[..saved_arguments.len()],
                                                             )?,
                                                             info: crate::stacktrace::BifErrorInfo::Plain,
                                                         });
@@ -2858,11 +2861,18 @@ fn native_caller_module(vm: &Vm, resume_pc: usize) -> Option<usize> {
         }
     }
     let found = crate::native_bridge::with_native_function_at(resume_pc, |caller| {
-        vm.pending_on_load
-            .get(&caller.module)
-            .copied()
-            .filter(|id| vm.native_code_contains(*id, resume_pc))
-            .or_else(|| vm.loaded.get(&caller.module).copied())
+        // The pc names exactly one code instance: the one being loaded, the old one or the
+        // current one (a reload runs the new on_load while the previous code is current).
+        [
+            vm.pending_on_load.get(&caller.module),
+            vm.loaded.get(&caller.module),
+            vm.old.get(&caller.module),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .find(|id| vm.native_code_contains(*id, resume_pc))
+        .or_else(|| vm.loaded.get(&caller.module).copied())
     })
     .flatten();
     if memo {
@@ -4993,6 +5003,16 @@ impl Process {
         }
         roots.extend_from_slice(extra);
         let extra_end = roots.len();
+        // The process dictionary is rooted on the process heap, like erts' ProcDict.
+        // Port of erts/emulator/beam/erl_process_dict.c (erts_dicts_mem_size / GC roots), OTP-29.1.1.
+        let dict_len = self.cold.as_ref().map_or(0, |cold| cold.dictionary.len());
+        if let Some(cold) = self.cold.as_ref() {
+            for (key, value) in &cold.dictionary {
+                roots.push(*key);
+                roots.push(*value);
+            }
+        }
+        let dict_end = roots.len();
         if let Some(cold) = self.cold.as_mut() {
             roots.extend_from_slice(&cold.apply_roots);
             if let Some(pending) = cold.nif_pending.as_mut() {
@@ -5058,9 +5078,15 @@ impl Process {
         let extra_start = mailbox_len + usize::from(continuation.is_some());
         extra.copy_from_slice(&roots[extra_start..extra_end]);
         if let Some(cold) = self.cold.as_mut() {
-            let apply_end = extra_end + cold.apply_roots.len();
+            for (index, entry) in cold.dictionary.iter_mut().enumerate().take(dict_len) {
+                *entry = (
+                    roots[extra_end + 2 * index],
+                    roots[extra_end + 2 * index + 1],
+                );
+            }
+            let apply_end = dict_end + cold.apply_roots.len();
             cold.apply_roots
-                .copy_from_slice(&roots[extra_end..apply_end]);
+                .copy_from_slice(&roots[dict_end..apply_end]);
             if let Some(pending) = cold.nif_pending.as_mut() {
                 pending.roots_mut().copy_from_slice(&roots[apply_end..]);
             }
@@ -5296,6 +5322,38 @@ fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, re
     {
         let _ = ctx.send(logger, message);
     }
+}
+
+thread_local! {
+    static TRACER_REPLICAS: std::cell::RefCell<Vec<(usize, Vm)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` on a code replica of `runtime` private to this worker, for callers that need a
+/// [`Vm`] while the executor's own is borrowed (receive tracing runs inside signal handling,
+/// which has only the process). The replica is taken out while `f` runs, so a nested call
+/// simply builds another one.
+pub(crate) fn with_replica_vm<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Vm) -> R) -> R {
+    let key = Arc::as_ptr(runtime) as usize;
+    let cached = TRACER_REPLICAS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.iter()
+            .position(|(cached_key, _)| *cached_key == key)
+            .map(|index| slot.swap_remove(index).1)
+    });
+    let mut vm =
+        cached.unwrap_or_else(|| Vm::shared_replica(Arc::clone(&runtime.code), &runtime.paths));
+    vm.sync_code_epoch();
+    let result = f(&mut vm);
+    TRACER_REPLICAS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        // Runtimes come and go in tests; keep only the most recent replicas.
+        if slot.len() >= 4 {
+            slot.remove(0);
+        }
+        slot.push((key, vm));
+    });
+    result
 }
 
 /// Run `f` on this worker's executor for `runtime`, creating it on first use.
@@ -5549,6 +5607,7 @@ impl Process {
         let Some(runtime) = self.runtime.clone() else {
             return RunOutcome::Exit(1);
         };
+        self.cold_mut().scheduler_id = ctx.scheduler_id().unwrap_or(0);
         if !self.cold_mut().profile_active {
             crate::natives::misc::profile_process_event(self, ctx, true);
             self.cold_mut().profile_active = true;

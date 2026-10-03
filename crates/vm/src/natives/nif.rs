@@ -524,13 +524,15 @@ pub(crate) fn resume_pending(
 
 /// Invoke one patched tracer NIF synchronously on the tracee's scheduler.
 pub(crate) fn invoke_tracer(
-    vm: &mut Vm,
+    vm: &Vm,
     process: &mut Process,
     module: &str,
     function: &str,
     args: &[Term],
 ) -> Option<Term> {
-    let module = vm.modules.iter().find(|entry| entry.name == module)?;
+    // Port of erts/emulator/beam/erl_trace.c:3017-3060 (load_tracer_nif): only the module's
+    // current code can supply the tracer NIFs, not an old or purged instance.
+    let module = vm.modules.get(*vm.loaded.get(module)?)?;
     let arity = u8::try_from(args.len()).ok()?;
     let entry = module
         .functions
@@ -545,7 +547,11 @@ pub(crate) fn invoke_tracer(
 }
 
 pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {
-    let Some(module) = vm.modules.iter().find(|entry| entry.name == module_name) else {
+    let Some(module) = vm
+        .loaded
+        .get(module_name)
+        .and_then(|&id| vm.modules.get(id))
+    else {
         return false;
     };
     [("enabled", 3), ("trace", 5)]
@@ -565,11 +571,13 @@ fn trampolines() -> &'static [BifFn] {
     TABLE
 }
 
-fn publish(vm: &mut Vm) {
+/// Publish the NIF table and the library bound for `key` to the shared code. Only that key is
+/// added: a replica's copy of `loaded_nifs` may predate a purge, which must stay purged.
+fn publish(vm: &mut Vm, key: &str) {
     if let Some(shared) = &vm.shared {
         let mut code = shared.lock().unwrap_or_else(|poison| poison.into_inner());
         code.native_fns.clone_from(&vm.native_fns);
-        code.loaded_nifs.clone_from(&vm.loaded_nifs);
+        code.loaded_nifs.insert(key.to_owned());
         // Other schedulers copy `native_fns` only when the epoch changes.
         // The patched `NativeBody` instructions are already visible.
         code.epoch
@@ -817,12 +825,18 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     bytes.extend(b".so");
     // The caller's code (and its native version) may have been loaded by another scheduler.
     vm.sync_code_epoch();
-    let caller_id = process.module;
+    let mut caller_id = process.module;
     let caller = vm
         .modules
         .get(caller_id)
         .map(|module| module.name.clone())
         .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
+    // Port of erts/emulator/beam/erl_nif.c:4736 (erts_load_nif: the caller is the code being
+    // loaded, `modp->on_load`, while its on_load function runs), OTP-29.1.1. A reloaded module's
+    // on_load can execute the previous version's native code, which names the wrong instance.
+    if let Some(&pending) = vm.pending_on_load.get(&caller) {
+        caller_id = pending;
+    }
     if caller == "erlang" {
         return error_reason(
             process,
@@ -830,7 +844,10 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
             "load_nif/2 must be explicitly called from the NIF module. It cannot be called through apply/3.",
         );
     }
-    if vm.loaded_nifs.contains(&caller) {
+    if vm
+        .loaded_nifs
+        .contains(&crate::load::nif_key(&caller, caller_id))
+    {
         return error_reason(
             process,
             "reload",
@@ -855,8 +872,9 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
         }
     };
     if loaded == atom("ok") {
-        vm.loaded_nifs.insert(caller);
-        publish(vm);
+        let key = crate::load::nif_key(&caller, caller_id);
+        vm.loaded_nifs.insert(key.clone());
+        publish(vm, &key);
     }
     Ok(loaded)
 }
@@ -878,7 +896,13 @@ fn push_continuation(process: &mut Process, module: usize, ip: usize) -> Result<
 
 fn call_on_load(vm: &mut Vm, process: &mut Process, module: Term) -> Result<Term, VmError> {
     let name = atom_name(module).ok_or_else(badarg)?;
-    let id = vm.load_named(&name).map_err(|_| badarg())?;
+    // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1: the
+    // function of the code instance being loaded runs, not the still current previous version.
+    vm.sync_code_epoch();
+    let id = match vm.pending_on_load.get(&name).copied() {
+        Some(id) => id,
+        None => vm.load_named(&name).map_err(|_| badarg())?,
+    };
     let entry = vm.modules[id]
         .functions
         .iter()
@@ -1037,7 +1061,7 @@ fn build_trace<H: HeapAlloc>(heap: &mut H, args: &[Term]) -> Option<Term> {
     TermBuilder::new(heap).tuple(&parts).ok()
 }
 
-fn deliver_trace(process: &mut Process, ctx: &mut RunCtx<'_, Message>, args: &[Term]) {
+fn deliver_trace(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, args: &[Term]) {
     let message = {
         let mut heap = FragmentingHeap(&mut process.heap);
         build_trace(&mut heap, args)
@@ -1049,32 +1073,9 @@ fn deliver_trace(process: &mut Process, ctx: &mut RunCtx<'_, Message>, args: &[T
         let _ = process.send_message(args[1], message);
         return;
     }
-    if args[1].as_port().is_none() {
-        return;
+    if args[1].as_port().is_some() {
+        let _ = crate::port::trace_command(process, args[1], message);
     }
-    let encoded = {
-        let mut heap = FragmentingHeap(&mut process.heap);
-        let mut bif = Ctx::new(&mut heap);
-        let Some(encode) = arinsal_bifs::lookup("erlang", "term_to_binary", 1) else {
-            return;
-        };
-        encode(&mut bif, &[message]).ok()
-    };
-    let Some(encoded) = encoded else {
-        return;
-    };
-    let command = match tuple(process, &[atom("command"), encoded]) {
-        Ok(command) => command,
-        Err(_) => return,
-    };
-    let Some(caller) = ctx.pid().to_term() else {
-        return;
-    };
-    let envelope = match tuple(process, &[caller, command]) {
-        Ok(envelope) => envelope,
-        Err(_) => return,
-    };
-    let _ = crate::port::send_message(process, args[1], envelope);
 }
 
 struct DynHeap<'a>(&'a mut dyn HeapAlloc);
@@ -1427,7 +1428,12 @@ fn call_values(
         let reason = args.first().copied().unwrap_or_else(|| atom("badarg"));
         return Some(Err(VmError::Trap(crate::exceptions::Trap::error(reason))));
     }
-    if module == "erl_tracer" && vm.loaded_nifs.contains("erl_tracer") {
+    if module == "erl_tracer"
+        && vm
+            .loaded_nifs
+            .iter()
+            .any(|key| key.starts_with("erl_tracer#"))
+    {
         if function == "enabled" && args.len() == 3 {
             return Some(Ok(tracer_enabled_term(args, state_alive(process, args[1]))));
         }

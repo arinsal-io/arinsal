@@ -3,7 +3,7 @@
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
-use arinsal_term::{FunRef, Identity, Term, TermBuilder, TermKind, copy_term, global_atoms};
+use arinsal_term::{FunRef, Identity, Term, TermBuilder, TermKind, global_atoms};
 
 fn atom(name: &str) -> Term {
     Term::atom(global_atoms().intern(name).expect("short built-in atom"))
@@ -1597,11 +1597,10 @@ fn call_values(
                     .iter()
                     .find_map(|(stored, old)| term_equal(*stored, *key).then_some(*old))
                     .unwrap_or_else(|| atom("undefined"));
-                let key = copy_term(*key, &mut cold.dictionary_heap)
-                    .map_err(|error| VmError::Unsupported(format!("dictionary key: {error:?}")))?;
-                let value = copy_term(*value, &mut cold.dictionary_heap).map_err(|error| {
-                    VmError::Unsupported(format!("dictionary value: {error:?}"))
-                })?;
+                // The dictionary lives on the process heap like erts' ProcDict, so
+                // GC roots it and releases off-heap owners (magic refs) once erased.
+                // Port of erts/emulator/beam/erl_process_dict.c (pd_hash_put), OTP-29.1.1.
+                let (key, value) = (*key, *value);
                 if let Some((stored, old)) = cold
                     .dictionary
                     .iter_mut()
@@ -1729,14 +1728,14 @@ fn call_values(
                 trace(vm, process, ctx, 0, *spec, *how, *flags)
             }
             ("trace", [session, spec, how, flags]) if module == "erts_internal" => {
-                let session = trace_session_id(*session).ok_or_else(badarg)?;
+                let session = trace_session_id(process, *session).ok_or_else(badarg)?;
                 trace(vm, process, ctx, session, *spec, *how, *flags)
             }
             ("trace_pattern", [spec, pattern, flags]) if module == "erts_internal" => {
                 trace_pattern(vm, process, 0, *spec, *pattern, *flags)
             }
             ("trace_pattern", [session, spec, pattern, flags]) if module == "erts_internal" => {
-                let session = trace_session_id(*session).ok_or_else(badarg)?;
+                let session = trace_session_id(process, *session).ok_or_else(badarg)?;
                 trace_pattern(vm, process, session, *spec, *pattern, *flags)
             }
             ("trace_session_create", [name, tracer, options]) if module == "erts_internal" => {
@@ -1744,7 +1743,7 @@ fn call_values(
             }
             ("trace_session_destroy", [session]) if module == "erts_internal" => {
                 let session_term = *session;
-                let session = trace_session_id(*session).ok_or_else(badarg)?;
+                let session = trace_session_id(process, *session).ok_or_else(badarg)?;
                 let destroyed = crate::trace::destroy_session(process, session);
                 if destroyed {
                     crate::natives::erts_debug::session_destroyed(process, session_term);
@@ -1760,7 +1759,7 @@ fn call_values(
                 let session = if atom_name(*session).as_deref() == Some("any") {
                     0
                 } else {
-                    trace_session_id(*session).ok_or_else(badarg)?
+                    trace_session_id(process, *session).ok_or_else(badarg)?
                 };
                 trace_session_info(vm, process, session, *spec, *item)
             }
@@ -2090,16 +2089,34 @@ fn spawn_request(
     Ok(reference)
 }
 
-fn trace_session_id(session: Term) -> Option<u64> {
+fn trace_session_id(process: &Process, session: Term) -> Option<u64> {
     let owned = arinsal_term::to_owned(session).ok()?;
     match &owned {
+        arinsal_etf::OwnedTerm::Ref { ids, .. } if ids.len() >= 3 && ids[2] == u32::MAX => {
+            crate::trace::session_from_magic_ref(
+                process,
+                u64::from(ids[0]) | (u64::from(ids[1]) << 32),
+            )
+        }
         arinsal_etf::OwnedTerm::Ref { ids, .. } if ids.len() >= 2 => {
             Some(ids[0] as u64 | (u64::from(ids[1]) << 32))
         }
-        arinsal_etf::OwnedTerm::Tuple(fields) => match fields.first()? {
-            arinsal_etf::OwnedTerm::Ref { ids, .. } if ids.len() >= 2 => {
+        arinsal_etf::OwnedTerm::Tuple(fields) => match fields.as_slice() {
+            [arinsal_etf::OwnedTerm::Ref { ids, .. }, _]
+                if ids.len() >= 3 && ids[2] == u32::MAX =>
+            {
+                crate::trace::session_from_magic_ref(
+                    process,
+                    u64::from(ids[0]) | (u64::from(ids[1]) << 32),
+                )
+            }
+            [arinsal_etf::OwnedTerm::Ref { ids, .. }, _] if ids.len() >= 2 => {
                 Some(ids[0] as u64 | (u64::from(ids[1]) << 32))
             }
+            [
+                arinsal_etf::OwnedTerm::Atom(name),
+                arinsal_etf::OwnedTerm::Int(weak_id),
+            ] => crate::trace::session_id(process, name, *weak_id),
             _ => None,
         },
         _ => None,
@@ -2669,17 +2686,22 @@ pub(crate) fn trace_flag_bit(name: &str) -> Option<u64> {
                 | crate::trace::SET_ON_SPAWN
                 | crate::trace::SET_ON_FIRST_SPAWN
                 | crate::trace::SET_ON_LINK
-                | bit(9)
+                | bit(6)
                 | crate::trace::CALL
                 | crate::trace::PROCS
                 | crate::trace::RUNNING
                 | crate::trace::GC
                 | crate::trace::RETURN_TO
-                | bit(17)
+                | crate::trace::ARITY
+                | crate::trace::SILENT
                 | bit(18)
-                | bit(19)
                 | crate::trace::SCHEDULER_ID
                 | bit(21)
+                | crate::trace::RUNNING_PORTS
+                | crate::trace::PORTS
+                | crate::trace::TIMESTAMP
+                | crate::trace::MONOTONIC_TIMESTAMP
+                | crate::trace::STRICT_MONOTONIC_TIMESTAMP
         }
         _ => return None,
     })
@@ -2695,6 +2717,8 @@ fn trace(
     how: Term,
     flags: Term,
 ) -> Result<Term, VmError> {
+    // A tracer module may have been loaded by another scheduler just now.
+    vm.sync_code_epoch();
     let on = if how == atom("true") {
         true
     } else if how == atom("false") {
@@ -2720,6 +2744,16 @@ fn trace(
         let tuple = unsafe { flag.tuple_ref() }.ok_or_else(badarg)?;
         let name = tuple.get(0).and_then(atom_name).ok_or_else(badarg)?;
         if name != "tracer" || !matches!(tuple.len(), 2 | 3) {
+            return Err(badarg());
+        }
+        // Port of erts/emulator/beam/erl_bif_trace.c:1010-1030 (parse_trace_flags): a session's
+        // tracer is fixed at creation, so `{tracer, _}` is only valid for the legacy session.
+        if session != 0
+            && !matches!(
+                crate::trace::session_tracer(process, session),
+                Some(crate::trace::Tracer::Default)
+            )
+        {
             return Err(badarg());
         }
         if tuple.len() == 3 {
@@ -2754,20 +2788,31 @@ fn trace(
             return Err(badarg());
         }
     }
+    let process_mask = mask & !(crate::trace::PORTS | crate::trace::RUNNING_PORTS);
+    const PORT_FLAGS: u64 = crate::trace::SEND
+        | crate::trace::RECEIVE
+        | crate::trace::TIMESTAMP
+        | crate::trace::STRICT_MONOTONIC_TIMESTAMP
+        | crate::trace::MONOTONIC_TIMESTAMP
+        | crate::trace::SILENT
+        | crate::trace::RUNNING_PORTS
+        | crate::trace::PORTS
+        | crate::trace::SCHEDULER_ID;
+    let port_mask = mask & PORT_FLAGS;
     // Port of erts/emulator/beam/erl_bif_trace.c:853-863 and 1103-1108 (start_trace), OTP-29.1.1:
     // a tracee keeps a live tracer; such tracees are skipped and not counted.
-    let apply = |pid: Pid| {
-        if on && crate::trace::traced_by_other(process, session, pid, &tracer) {
+    let apply = |process: &mut Process, pid: Pid| {
+        if on && crate::trace::traced_by_other(vm, process, session, pid, &tracer) {
             return false;
         }
-        crate::trace::configure_session(process, session, pid, on, mask, tracer.clone());
+        crate::trace::configure_session(process, session, pid, on, process_mask, tracer.clone());
         true
     };
     let matches = if let Some(pid) = Pid::from_term(spec) {
         if !live(process, pid)? {
             return Err(badarg());
         }
-        if !apply(pid) {
+        if !apply(process, pid) {
             // Port of erts/emulator/beam/erl_bif_trace.c:1172-1176 (already_traced), OTP-29.1.1.
             // The "** can only have one tracer per process" logger report is not sent yet.
             return Err(badarg());
@@ -2778,10 +2823,14 @@ fn trace(
         let known = process
             .runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(&id));
+            .is_some_and(|runtime| id == 0 || runtime.ports.lock().unwrap().contains_key(&id));
         if !known {
             return Err(badarg());
         }
+        if on && crate::trace::traced_port_by_other(vm, process, session, id, &tracer) {
+            return Err(badarg());
+        }
+        crate::trace::configure_port(process, session, id, on, port_mask, tracer.clone());
         1
     } else {
         match atom_name(spec).as_deref() {
@@ -2791,29 +2840,118 @@ fn trace(
                 let pids = live_pids(process)?;
                 let mut count = 0;
                 for pid in pids {
-                    count += usize::from(apply(pid));
+                    count += usize::from(apply(process, pid));
                 }
                 if matches!(spec_name, "all" | "processes") {
                     crate::trace::configure_new_processes(
                         process,
                         session,
                         on,
-                        mask,
+                        process_mask,
+                        tracer.clone(),
+                    );
+                }
+                if matches!(spec_name, "all" | "existing") {
+                    let mut ports = vec![0];
+                    ports.extend(
+                        process
+                            .runtime
+                            .as_ref()
+                            .map(|runtime| {
+                                runtime
+                                    .ports
+                                    .lock()
+                                    .unwrap()
+                                    .keys()
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default(),
+                    );
+                    for port in &ports {
+                        crate::trace::configure_port(
+                            process,
+                            session,
+                            *port,
+                            on,
+                            port_mask,
+                            tracer.clone(),
+                        );
+                    }
+                    count += ports.len();
+                }
+                if spec_name == "all" {
+                    crate::trace::configure_new_ports(
+                        process,
+                        session,
+                        on,
+                        port_mask,
                         tracer.clone(),
                     );
                 }
                 count
             }
             Some("new" | "new_processes") => {
-                crate::trace::configure_new_processes(process, session, on, mask, tracer.clone());
+                crate::trace::configure_new_processes(
+                    process,
+                    session,
+                    on,
+                    process_mask,
+                    tracer.clone(),
+                );
+                if atom_name(spec).as_deref() == Some("new") {
+                    crate::trace::configure_new_ports(
+                        process,
+                        session,
+                        on,
+                        port_mask,
+                        tracer.clone(),
+                    );
+                }
                 0
             }
-            Some("ports" | "existing_ports") => process
-                .runtime
-                .as_ref()
-                .map(|runtime| runtime.ports.lock().unwrap().len())
-                .unwrap_or(0),
-            Some("new_ports") => 0,
+            Some("ports" | "existing_ports") => {
+                let mut ports = vec![0];
+                ports.extend(
+                    process
+                        .runtime
+                        .as_ref()
+                        .map(|runtime| {
+                            runtime
+                                .ports
+                                .lock()
+                                .unwrap()
+                                .keys()
+                                .copied()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                );
+                for port in &ports {
+                    crate::trace::configure_port(
+                        process,
+                        session,
+                        *port,
+                        on,
+                        port_mask,
+                        tracer.clone(),
+                    );
+                }
+                if atom_name(spec).as_deref() == Some("ports") {
+                    crate::trace::configure_new_ports(
+                        process,
+                        session,
+                        on,
+                        port_mask,
+                        tracer.clone(),
+                    );
+                }
+                ports.len()
+            }
+            Some("new_ports") => {
+                crate::trace::configure_new_ports(process, session, on, port_mask, tracer.clone());
+                0
+            }
             _ => return Err(badarg()),
         }
     };
@@ -2858,7 +2996,10 @@ fn trace_session_create(
     };
     let name = atom_name(name).ok_or_else(badarg)?;
     let (id, weak_id) = crate::trace::create_session(process, name.clone(), tracer);
-    let reference = crate::signals::reference(process, id)?;
+    let handle = crate::trace::session_handle(process, id);
+    let reference = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .magic_ref(handle)
+        .map_err(|_| badarg())?;
     let name = Term::atom(global_atoms().intern(&name).map_err(|_| badarg())?);
     let weak_id = Term::small(weak_id).ok_or_else(badarg)?;
     let weak_ref = make_tuple(process, &[name, weak_id])?;
@@ -2871,7 +3012,17 @@ fn module_tracer(vm: &Vm, module: Term, state: Term) -> Result<crate::trace::Tra
         return Err(badarg());
     }
     let state = arinsal_term::to_owned(state).map_err(|_| badarg())?;
-    Ok(crate::trace::Tracer::Module { module, state })
+    let instance = vm
+        .loaded
+        .get(&module)
+        .and_then(|&id| vm.modules.get(id))
+        .cloned()
+        .ok_or_else(badarg)?;
+    Ok(crate::trace::Tracer::Module {
+        module,
+        state,
+        instance,
+    })
 }
 
 fn trace_flag_names() -> &'static [(&'static str, u64)] {
@@ -2903,12 +3054,35 @@ fn trace_flag_names() -> &'static [(&'static str, u64)] {
     ]
 }
 
+fn process_trace_flag_names() -> impl Iterator<Item = (&'static str, u64)> {
+    trace_flag_names()
+        .iter()
+        .copied()
+        .filter(|(_, bit)| *bit & (crate::trace::PORTS | crate::trace::RUNNING_PORTS) == 0)
+}
+
+fn port_trace_flag_names() -> impl Iterator<Item = (&'static str, u64)> {
+    const PORT_FLAGS: u64 = crate::trace::SEND
+        | crate::trace::RECEIVE
+        | crate::trace::TIMESTAMP
+        | crate::trace::STRICT_MONOTONIC_TIMESTAMP
+        | crate::trace::MONOTONIC_TIMESTAMP
+        | crate::trace::SILENT
+        | crate::trace::RUNNING_PORTS
+        | crate::trace::PORTS
+        | crate::trace::SCHEDULER_ID;
+    trace_flag_names()
+        .iter()
+        .copied()
+        .filter(|(_, bit)| *bit & PORT_FLAGS != 0)
+}
+
 fn trace_tracer_term(process: &mut Process, tracer: crate::trace::Tracer) -> Result<Term, VmError> {
     Ok(match tracer {
         crate::trace::Tracer::Default => Term::NIL,
         crate::trace::Tracer::Pid(pid) => pid.to_term().unwrap_or(Term::NIL),
         crate::trace::Tracer::Port(id) => Term::port(id).unwrap_or(Term::NIL),
-        crate::trace::Tracer::Module { module, state } => {
+        crate::trace::Tracer::Module { module, state, .. } => {
             let module = Term::atom(global_atoms().intern(&module).map_err(|_| badarg())?);
             let state = arinsal_term::from_owned(
                 &state,
@@ -2920,6 +3094,25 @@ fn trace_tracer_term(process: &mut Process, tracer: crate::trace::Tracer) -> Res
     })
 }
 
+fn trace_session_refs_term(
+    process: &mut Process,
+    refs: Vec<(String, i64)>,
+) -> Result<Term, VmError> {
+    let refs = refs
+        .into_iter()
+        .map(|(name, weak_id)| {
+            let name = Term::atom(global_atoms().intern(&name).expect("session name atom"));
+            let weak_id = if weak_id < 0 {
+                atom("default")
+            } else {
+                Term::small(weak_id).ok_or_else(badarg)?
+            };
+            make_tuple(process, &[name, weak_id])
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    make_list(process, refs)
+}
+
 // Port of erts/emulator/beam/erl_bif_trace.c:1403-1465, OTP-29.1.1.
 fn trace_session_info(
     vm: &Vm,
@@ -2929,11 +3122,24 @@ fn trace_session_info(
     item: Term,
 ) -> Result<Term, VmError> {
     if atom_name(spec).as_deref() == Some("on_load") {
+        if atom_name(item).as_deref() == Some("session") {
+            let refs = crate::trace_bp::on_load_patterns_of(process)
+                .into_iter()
+                .filter_map(|(session, _)| crate::trace::session_ref(process, session))
+                .collect();
+            let refs = trace_session_refs_term(process, refs)?;
+            return make_tuple(process, &[item, refs]);
+        }
         return trace_info_on_load(process, session, item);
     }
     if let Some(event) = atom_name(spec)
         && matches!(event.as_str(), "send" | "receive")
     {
+        if atom_name(item).as_deref() == Some("session") {
+            let refs = crate::trace::event_session_refs(process, &event);
+            let refs = trace_session_refs_term(process, refs)?;
+            return make_tuple(process, &[item, refs]);
+        }
         if atom_name(item).as_deref() != Some("match_spec") {
             return Err(badarg());
         }
@@ -2973,12 +3179,16 @@ fn trace_session_info(
         return make_tuple(process, &[item, refs]);
     }
     if matches!(atom_name(spec).as_deref(), Some("new" | "new_processes")) {
+        if atom_name(item).as_deref() == Some("session") {
+            let refs = crate::trace::new_process_session_refs(process);
+            let refs = trace_session_refs_term(process, refs)?;
+            return make_tuple(process, &[item, refs]);
+        }
         let flags = crate::trace::new_process_flags(process, session);
         let value = match atom_name(item).as_deref() {
             Some("flags") => make_list(
                 process,
-                trace_flag_names()
-                    .iter()
+                process_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
                     .map(|(name, _)| atom(name)),
             )?,
@@ -2990,8 +3200,66 @@ fn trace_session_info(
         };
         return make_tuple(process, &[item, value]);
     }
+    if atom_name(spec).as_deref() == Some("new_ports") {
+        if atom_name(item).as_deref() == Some("session") {
+            let refs = crate::trace::new_port_session_refs(process);
+            let refs = trace_session_refs_term(process, refs)?;
+            return make_tuple(process, &[item, refs]);
+        }
+        let flags = crate::trace::new_port_flags(process, session);
+        let value = match atom_name(item).as_deref() {
+            Some("flags") => make_list(
+                process,
+                port_trace_flag_names()
+                    .filter(|(_, bit)| flags & bit != 0)
+                    .map(|(name, _)| atom(name)),
+            )?,
+            Some("tracer") => crate::trace::new_port_tracer(process, session)
+                .map(|tracer| trace_tracer_term(process, tracer))
+                .transpose()?
+                .unwrap_or(Term::NIL),
+            _ => return Ok(atom("undefined")),
+        };
+        return make_tuple(process, &[item, value]);
+    }
     if let Some(mfa) = trace_mfa(spec) {
         return trace_info_function(vm, process, session, mfa, item);
+    }
+    if let Some(port) = spec.as_port() {
+        if port != 0 && !crate::port::is_live(process, port) {
+            return Ok(atom("undefined"));
+        }
+        if session == 0 && atom_name(item).as_deref() == Some("session") {
+            let refs = crate::trace::port_session_refs(process, port)
+                .into_iter()
+                .map(|(name, weak_id)| {
+                    let name = Term::atom(global_atoms().intern(&name).expect("session name atom"));
+                    let weak_id = if weak_id < 0 {
+                        atom("default")
+                    } else {
+                        Term::small(weak_id).ok_or_else(badarg)?
+                    };
+                    make_tuple(process, &[name, weak_id])
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let refs = make_list(process, refs)?;
+            return make_tuple(process, &[item, refs]);
+        }
+        let flags = crate::trace::port_flags(process, session, port);
+        let value = match atom_name(item).as_deref() {
+            Some("flags") => make_list(
+                process,
+                port_trace_flag_names()
+                    .filter(|(_, bit)| flags & bit != 0)
+                    .map(|(name, _)| atom(name)),
+            )?,
+            Some("tracer") => crate::trace::port_tracer(process, session, port)
+                .map(|tracer| trace_tracer_term(process, tracer))
+                .transpose()?
+                .unwrap_or(Term::NIL),
+            _ => return Ok(atom("undefined")),
+        };
+        return make_tuple(process, &[item, value]);
     }
     let Some(pid) = Pid::from_term(spec) else {
         return Ok(atom("undefined"));
@@ -2999,12 +3267,16 @@ fn trace_session_info(
     if !live(process, pid)? {
         return Ok(atom("undefined"));
     }
+    if session == 0 && atom_name(item).as_deref() == Some("session") {
+        let refs = crate::trace::process_session_refs(process, pid);
+        let refs = trace_session_refs_term(process, refs)?;
+        return make_tuple(process, &[item, refs]);
+    }
     let flags = crate::trace::session_flags(process, session, pid);
     let value = match atom_name(item).as_deref() {
         Some("flags") => make_list(
             process,
-            trace_flag_names()
-                .iter()
+            process_trace_flag_names()
                 .filter(|(_, bit)| flags & bit != 0)
                 .map(|(name, _)| atom(name)),
         )?,
@@ -3018,7 +3290,7 @@ fn trace_session_info(
                     crate::trace::Tracer::Port(id) => {
                         Term::port(id).unwrap_or_else(|| atom("undefined"))
                     }
-                    crate::trace::Tracer::Module { module, state } => {
+                    crate::trace::Tracer::Module { module, state, .. } => {
                         let module =
                             Term::atom(global_atoms().intern(&module).expect("tracer module atom"));
                         let state = arinsal_term::from_owned(
@@ -3065,8 +3337,7 @@ fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<
         let value = match atom_name(item).as_deref() {
             Some("flags") => make_list(
                 process,
-                trace_flag_names()
-                    .iter()
+                process_trace_flag_names()
                     .filter(|(_, bit)| flags & bit != 0)
                     .map(|(name, _)| atom(name)),
             )?,
@@ -3078,8 +3349,61 @@ fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<
         };
         return make_tuple(process, &[item, value]);
     }
+    if atom_name(spec).as_deref() == Some("new_ports") {
+        let flags = crate::trace::new_port_flags(process, 0);
+        let value = match atom_name(item).as_deref() {
+            Some("flags") => make_list(
+                process,
+                port_trace_flag_names()
+                    .filter(|(_, bit)| flags & bit != 0)
+                    .map(|(name, _)| atom(name)),
+            )?,
+            Some("tracer") => crate::trace::new_port_tracer(process, 0)
+                .map(|tracer| trace_tracer_term(process, tracer))
+                .transpose()?
+                .unwrap_or(Term::NIL),
+            _ => return Ok(atom("undefined")),
+        };
+        return make_tuple(process, &[item, value]);
+    }
     if let Some(mfa) = trace_mfa(spec) {
         return trace_info_function(vm, process, 0, mfa, item);
+    }
+    if let Some(port) = spec.as_port() {
+        if port != 0 && !crate::port::is_live(process, port) {
+            return Ok(atom("undefined"));
+        }
+        if atom_name(item).as_deref() == Some("session") {
+            let refs = crate::trace::port_session_refs(process, port)
+                .into_iter()
+                .map(|(name, weak_id)| {
+                    let name = Term::atom(global_atoms().intern(&name).expect("session name atom"));
+                    let weak_id = if weak_id < 0 {
+                        atom("default")
+                    } else {
+                        Term::small(weak_id).ok_or_else(badarg)?
+                    };
+                    make_tuple(process, &[name, weak_id])
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let refs = make_list(process, refs)?;
+            return make_tuple(process, &[item, refs]);
+        }
+        let flags = crate::trace::port_flags(process, 0, port);
+        let value = match atom_name(item).as_deref() {
+            Some("flags") => make_list(
+                process,
+                port_trace_flag_names()
+                    .filter(|(_, bit)| flags & bit != 0)
+                    .map(|(name, _)| atom(name)),
+            )?,
+            Some("tracer") => crate::trace::port_tracer(process, 0, port)
+                .map(|tracer| trace_tracer_term(process, tracer))
+                .transpose()?
+                .unwrap_or(Term::NIL),
+            _ => return Ok(atom("undefined")),
+        };
+        return make_tuple(process, &[item, value]);
     }
     let Some(pid) = Pid::from_term(spec) else {
         return Ok(atom("undefined"));
@@ -3090,8 +3414,7 @@ fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<
     let flags = crate::trace::session_flags(process, 0, pid);
     let value = match atom_name(item).as_deref() {
         Some("flags") => {
-            let list = trace_flag_names()
-                .iter()
+            let list = process_trace_flag_names()
                 .filter(|(_, bit)| flags & bit != 0)
                 .map(|(name, _)| atom(name));
             let list_term = make_list(process, list)?;
@@ -3106,7 +3429,7 @@ fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<
                 Some(crate::trace::Tracer::Port(id)) => {
                     Term::port(id).unwrap_or_else(|| atom("undefined"))
                 }
-                Some(crate::trace::Tracer::Module { module, state }) => {
+                Some(crate::trace::Tracer::Module { module, state, .. }) => {
                     let module =
                         Term::atom(global_atoms().intern(&module).expect("tracer module atom"));
                     let state = arinsal_term::from_owned(
@@ -3168,6 +3491,18 @@ fn trace_info_function(
         WANT_META, WANT_TIME, WANT_TRACE,
     };
     let key = atom_name(item).unwrap_or_default();
+    if key == "session" {
+        // Port of erts/emulator/beam/erl_bif_trace.c:2427-2468 (trace_info_sessions), OTP-29.1.1.
+        if !function_exists(vm, &module, &function, arity) {
+            return make_tuple(process, &[item, atom("undefined")]);
+        }
+        let refs = crate::trace_bp::sessions_for_function(process, &module, &function, arity)
+            .into_iter()
+            .filter_map(|session| crate::trace::session_ref(process, session))
+            .collect();
+        let refs = trace_session_refs_term(process, refs)?;
+        return make_tuple(process, &[item, refs]);
+    }
     let want = match key.as_str() {
         "traced" | "match_spec" => WANT_TRACE,
         "meta" | "meta_match_spec" => WANT_META,
