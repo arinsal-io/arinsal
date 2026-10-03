@@ -340,6 +340,8 @@ pub struct Module {
     pub name_atom: Atom,
     /// Native record definitions decoded from this module's `Recs` chunk.
     pub records: Vec<arinsal_beam::NativeRecord>,
+    /// `[Definition | Defaults]` literal of each of `records`, in the module's literal area.
+    pub record_defs: Vec<Term>,
     /// Compact code.
     pub code: Box<[Instr]>,
     /// Rare instructions retained in the generic operand format.
@@ -421,6 +423,7 @@ impl Clone for Module {
             name: self.name.clone(),
             name_atom: self.name_atom,
             records: self.records.clone(),
+            record_defs: self.record_defs.clone(),
             code: self.code.clone(),
             generic: self.generic.clone(),
             selects: self.selects.iter().map(SelectTable::clone).collect(),
@@ -1565,10 +1568,33 @@ pub fn load_with_instrumentations(
     for export in &exports {
         export.bind_code(code.as_ptr(), code.len());
     }
+    // Port of erts/emulator/beam/beam_file.c:1100-1310 (parse_record_chunk): the definition
+    // and default values of every record live in the module's literal area.
+    let mut record_defs = Vec::with_capacity(file.records.len());
+    for record in &file.records {
+        let name = global_atoms()
+            .intern(&record.name)
+            .map_err(|_| LoadError::Limit)?;
+        let mut fields = Vec::with_capacity(record.fields.len());
+        for (field, default) in &record.fields {
+            let field = global_atoms().intern(field).map_err(|_| LoadError::Limit)?;
+            let default = default
+                .as_ref()
+                .map(|default| from_owned(default, &mut literals))
+                .transpose()
+                .map_err(|_| LoadError::Limit)?;
+            fields.push((field, default));
+        }
+        let cons = TermBuilder::new(&mut literals)
+            .native_record_literal(name_atom, name, record.is_exported, &fields)
+            .map_err(|_| LoadError::Limit)?;
+        record_defs.push(cons);
+    }
     Ok(Module {
         name: file.module.clone(),
         name_atom,
         records: file.records.clone(),
+        record_defs,
         code,
         generic,
         selects,

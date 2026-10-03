@@ -29,7 +29,13 @@ fn fixture() -> (u64, u64) {
     (rt::term_bits(guard.1), rt::term_bits(guard.2))
 }
 
-extern "C" fn get_field(_header: *mut ProcessHeader, source: u64, _id: u64, _name: u64) -> u64 {
+extern "C" fn get_field(
+    _header: *mut ProcessHeader,
+    source: u64,
+    _id: u64,
+    _name: u64,
+    _raise: u64,
+) -> u64 {
     if source & 7 != 2 || rt::read_heap_word(source, 0) & 0x3f != 0x1c {
         return 0;
     }
@@ -53,13 +59,13 @@ extern "C" fn get_elements(
     regs: *mut SchedulerRegisters,
     source: u64,
     _count: u64,
-    _start: u64,
+    start: u64,
 ) -> u64 {
     if source & 7 != 2 || rt::read_heap_word(source, 0) & 0x3f != 0x1c {
         return 0;
     }
     let value = rt::read_heap_word(source, 2);
-    rt::scheduler_registers_mut(regs, |regs| regs.x_reg_array[1] = value);
+    rt::scheduler_registers_mut(regs, |regs| regs.x_reg_array[start as usize] = value);
     1
 }
 
@@ -296,7 +302,13 @@ fn native_get_elements() {
     let (record, _) = fixture();
     let (exit, _, regs, _) = run_native(
         |asm| {
-            asm.emit_i_get_record_elements(2, ArgVal::X(0), 1, &[ArgVal::Immediate(1)], runtime())?;
+            asm.emit_i_get_record_elements(
+                2,
+                ArgVal::X(0),
+                &[ArgVal::Immediate(1)],
+                &[ArgVal::X(1)],
+                runtime(),
+            )?;
             asm.emit_raw(|e| {
                 e.mov_reg(Gpr::x(0), Gpr::xzr())?;
                 e.ret(Gpr::x(30))
@@ -331,4 +343,55 @@ fn native_bad_record_error() {
     );
     assert_eq!(exit, ExitReason::Returned);
     assert_eq!(regs[1], 0);
+}
+
+/// A record of `module` that is not exported, kept alive in a leaked heap for the test.
+fn private_record(module: &str) -> u64 {
+    let heap = Box::leak(Box::new(ProcessHeap::with_words(64)));
+    let record = TermBuilder::new(heap)
+        .native_record(
+            atom(module),
+            atom("sample"),
+            false,
+            &[(atom("value"), Term::small(1).unwrap())],
+        )
+        .unwrap();
+    rt::term_bits(record)
+}
+
+/// Returns 1 when `is_record_accessible` falls through and 2 when it takes the fail label.
+fn accessible(record: u64, external: bool, current_module: &str) -> u64 {
+    let module = rt::term_bits(Term::atom(atom(current_module)));
+    let (exit, _, regs, _) = run_native(
+        |asm| {
+            asm.emit_is_record_accessible(2, ArgVal::X(0), external, ArgVal::Immediate(module))?;
+            asm.move_(ArgVal::Immediate(tagged_small(1)), ArgVal::X(1))?;
+            asm.emit_raw(|e| {
+                e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ret(Gpr::x(30))
+            })?;
+            asm.emit_i_func_label(2)?;
+            asm.move_(ArgVal::Immediate(tagged_small(2)), ArgVal::X(1))?;
+            asm.emit_raw(|e| {
+                e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ret(Gpr::x(30))
+            })
+        },
+        |_, _, regs| regs.x_reg_array[0] = record,
+    );
+    assert_eq!(exit, ExitReason::Returned);
+    regs[1] >> 4
+}
+
+#[test]
+fn unexported_records_are_accessible_only_from_their_module() {
+    let private = private_record("record_private_owner");
+    // An external access always needs an exported record; a local one also accepts the
+    // defining module.
+    assert_eq!(accessible(private, true, "record_private_owner"), 2);
+    assert_eq!(accessible(private, false, "record_private_owner"), 1);
+    assert_eq!(accessible(private, false, "record_private_other"), 2);
+    let (exported, _) = fixture();
+    assert_eq!(accessible(exported, true, "record_private_other"), 1);
+    assert_eq!(accessible(exported, false, "record_private_other"), 1);
 }

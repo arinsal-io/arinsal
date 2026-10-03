@@ -2869,14 +2869,19 @@ pub(crate) fn reply_request(
     ctx: &mut RunCtx<'_, Message>,
     pending: Pending,
 ) -> Result<(), VmError> {
-    // The reply only lives until it is copied into the message below; a parked target
-    // never collects, so its scratch terms are released instead of piling up.
-    let scratch = matches!(pending.op, RemoteOp::Info { .. }).then(|| process.heap.scratch_mark());
-    let reply = crate::natives::proc::fulfill_request(process, ctx, pending.id, pending.op)?;
-    let message = Message::copy_from(reply)?;
-    if let Some(mark) = scratch {
-        process.heap.scratch_release(&mark);
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_process_info), OTP-29.1.1: the
+    // reply to a process_info request is built in the reply message's own heap fragment, not
+    // on the target's heap, which a parked target would never collect.
+    let detached = matches!(pending.op, RemoteOp::Info { .. });
+    if detached {
+        process.heap.begin_detached();
     }
+    let message = crate::natives::proc::fulfill_request(process, ctx, pending.id, pending.op)
+        .and_then(Message::copy_from);
+    if detached {
+        process.heap.end_detached();
+    }
+    let message = message?;
     match ctx.send(pending.from, message) {
         Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(()),
         Err(error) => Err(VmError::Unsupported(format!("request reply: {error}"))),

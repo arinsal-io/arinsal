@@ -1073,6 +1073,29 @@ fn apply_rule(
                     offset: code[at].offset,
                 });
             }
+            "create_local_record" => {
+                // Port of erts/emulator/beam/generators.tab:255-295 (gen.create_local_record),
+                // OTP-29.1.1: the record definition literal is appended to the module's literal
+                // table after the BEAM literals, one entry per record chunk entry.
+                let [Operand::Atom(name), dst, live, _, Operand::List(new)] = args.as_slice()
+                else {
+                    return None;
+                };
+                let beam = beam?;
+                let name = beam.atom(*name)?;
+                let position = beam.records.iter().position(|record| record.name == name)?;
+                let literal = u32::try_from(beam.literals.len() + position).ok()?;
+                produced.push(Node {
+                    name: "create_local_native_record".into(),
+                    args: vec![
+                        Operand::Literal(literal),
+                        dst.clone(),
+                        live.clone(),
+                        Operand::List(new.clone()),
+                    ],
+                    offset: code[at].offset,
+                });
+            }
             "make_fun3" => {
                 if args.len() != 4 {
                     return None;

@@ -75,7 +75,7 @@ extern "C" fn map_update(process: *mut ProcessHeader, _: u64, _: u64, _: u64, _:
     VALUE
 }
 
-extern "C" fn record_get(process: *mut ProcessHeader, _: u64, _: u64, _: u64) -> u64 {
+extern "C" fn record_get(process: *mut ProcessHeader, _: u64, _: u64, _: u64, _: u64) -> u64 {
     observe(process);
     VALUE
 }
@@ -97,10 +97,12 @@ extern "C" fn record_get_elements(
     registers: *mut SchedulerRegisters,
     _: u64,
     _: u64,
-    _: u64,
+    base: u64,
 ) -> u64 {
     observe(process);
-    rt::scheduler_registers_mut(registers, |regs| regs.x_reg_array[0] = REG_OUTPUT);
+    rt::scheduler_registers_mut(registers, |regs| {
+        regs.x_reg_array[base as usize] = REG_OUTPUT
+    });
     1
 }
 
@@ -389,7 +391,13 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
 
     let (seen, after, header) = run(
         |asm| {
-            asm.emit_i_get_record_elements(90, ArgVal::X(5), 1, &[ArgVal::X(0)], record_runtime())
+            asm.emit_i_get_record_elements(
+                90,
+                ArgVal::X(5),
+                &[ArgVal::Immediate(0x2f)],
+                &[ArgVal::X(0)],
+                record_runtime(),
+            )
         },
         initial,
         TargetFrame::None,
@@ -475,7 +483,13 @@ fn record_elements_runtime_call_reloads_helper_written_xreg() {
     let initial = sentinels();
     let (seen, after, header) = run(
         |asm| {
-            asm.emit_i_get_record_elements(90, ArgVal::X(5), 1, &[ArgVal::X(0)], record_runtime())
+            asm.emit_i_get_record_elements(
+                90,
+                ArgVal::X(5),
+                &[ArgVal::Immediate(0x2f)],
+                &[ArgVal::X(0)],
+                record_runtime(),
+            )
         },
         initial,
         TargetFrame::None,

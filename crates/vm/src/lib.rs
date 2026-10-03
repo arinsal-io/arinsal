@@ -40,6 +40,7 @@ mod bits;
 mod maps;
 mod native_helpers;
 mod native_hooks;
+mod native_records;
 mod natives;
 pub use calls::call_bif;
 pub use native_hooks::{

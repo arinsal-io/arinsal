@@ -544,7 +544,7 @@ impl Message {
             // Port of erts/emulator/beam/erl_message.c:734 (immediate message term), OTP-29.1.1.
             return Ok(self.term);
         }
-        if process.message_queue_data() == MessageQueueData::OnHeap {
+        if process.message_queue_data() == MessageQueueData::OnHeap || process.heap.is_detached() {
             // Port of erts/emulator/beam/erl_message.c:943 (copy_message), OTP-29.1.1.
             // The receiver owns its process lock while draining, so queued terms
             // can be copied directly into its managed heap.
@@ -5405,6 +5405,12 @@ impl Task for Process {
 
     fn run(&mut self, ctx: &mut RunCtx<'_, Message>, budget: u32) -> RunOutcome {
         ctx.set_parallel_signal_buffers(self.message_queue_data() == MessageQueueData::OffHeap);
+        // Records built or decoded while this process runs use its node's canonical definitions.
+        arinsal_term::set_record_scope(
+            self.runtime
+                .as_ref()
+                .map_or(0, |runtime| runtime.code_scope),
+        );
         let outcome = abort_on_worker_panic(|| self.run_task(ctx, budget));
         if matches!(outcome, RunOutcome::Exit(_)) {
             self._persistent_terms

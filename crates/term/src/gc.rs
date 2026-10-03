@@ -5,6 +5,7 @@
 //! sweep copies both heaps into a new young heap. Stack frame pointers into the
 //! current stack block are rebased; code pointers and CATCH words remain intact.
 
+use crate::VecHeap;
 use crate::bits::{binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
@@ -505,16 +506,6 @@ fn prefetch_term(term: Term) {
     let _ = term;
 }
 
-/// Allocation state captured by [`ProcessHeap::scratch_mark`].
-#[derive(Clone, Copy, Debug)]
-pub struct ScratchMark {
-    young: usize,
-    old_htop: usize,
-    htop: usize,
-    fragments: usize,
-    fragment_words: u32,
-}
-
 impl ProcessHeap {
     /// Maximum heap, stack, and fragment words inspected by literal GC checks.
     // Port of erts/emulator/beam/beam_bif_load.c:976 (`erts_check_copy_literals_gc_need_max_reds`), OTP-29.1.1.
@@ -657,32 +648,26 @@ impl ProcessHeap {
         self.heap_fragment(words)
     }
 
-    /// Mark the allocation state so scratch terms built for a reply can be dropped.
-    pub fn scratch_mark(&self) -> ScratchMark {
-        ScratchMark {
-            young: self.words.as_ptr() as usize,
-            old_htop: self.old_htop,
-            htop: self.htop,
-            fragments: self.fragments.len(),
-            fragment_words: self.fragment_words,
-        }
+    /// Send every allocation to a separate growable heap until [`ProcessHeap::end_detached`].
+    ///
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_process_info), OTP-29.1.1: erts
+    /// builds the answer to a signal request in the reply message's own heap fragment, so the
+    /// target's young heap, fragments and off-heap lists never see it. Terms built meanwhile
+    /// live only until `end_detached`.
+    pub fn begin_detached(&mut self) {
+        self.owners.detached = Some(Box::new(VecHeap::new()));
+        self.detached = true;
     }
 
-    /// Drop everything allocated since `mark`, unless a collection ran meanwhile.
-    ///
-    /// erts builds `process_info` replies in the message's own heap fragment, so a
-    /// parked (hibernated) target never accumulates them.
-    pub fn scratch_release(&mut self, mark: &ScratchMark) {
-        if self.words.as_ptr() as usize != mark.young
-            || self.old_htop != mark.old_htop
-            || self.fragments.len() < mark.fragments
-            || self.htop < mark.htop
-        {
-            return;
-        }
-        self.fragments.truncate(mark.fragments);
-        self.fragment_words = mark.fragment_words;
-        self.htop = mark.htop;
+    /// Whether allocations currently go to the detached heap.
+    pub fn is_detached(&self) -> bool {
+        self.detached
+    }
+
+    /// Drop the detached heap and everything built in it.
+    pub fn end_detached(&mut self) {
+        self.detached = false;
+        self.owners.detached = None;
     }
 
     /// Total words in the contiguous young heap and stack allocation.

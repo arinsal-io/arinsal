@@ -162,6 +162,7 @@ pub(crate) fn new_code_scope() -> u64 {
 
 /// Forgets the export state of a node whose code is gone.
 pub(crate) fn release_code_scope(scope: u64) {
+    arinsal_term::drop_record_scope(scope);
     crate::native_bridge::unregister_native_scope(scope);
     crate::code_ix::release_scope(scope);
     let Ok(mut registry) = dispatch_registry().write() else {
@@ -891,6 +892,9 @@ impl<'a> VmModuleEnv<'a> {
             let term = from_owned(&value, literal_heap).map_err(|error| format!("{error:?}"))?;
             literals.push(raw_word(term));
         }
+        // Port of erts/emulator/beam/generators.tab:255-295 (gen.create_local_record): the
+        // definition literal of every record follows the BEAM literals.
+        literals.extend(module.record_defs.iter().map(|cons| raw_word(*cons)));
         let mut zero_capture_funs = HashMap::new();
         let lambda_entries = module
             .funs
@@ -1049,6 +1053,17 @@ impl ModuleEnv for VmModuleEnv<'_> {
                 (Arc::as_ptr(entry) as usize, entry.arity)
             })
             .ok_or_else(|| format!("lambda {index} has no loaded fun entry"))
+    }
+
+    fn record_runtime(&self) -> arinsal_beamasm::records::RecordRuntime {
+        arinsal_beamasm::records::RecordRuntime {
+            get_field: crate::native_records::arinsal_beamasm_get_record_field,
+            get_local_field: crate::native_records::arinsal_beamasm_get_local_record_field,
+            create_local: crate::native_records::arinsal_beamasm_create_local_record,
+            create: crate::native_records::arinsal_beamasm_create_record,
+            get_elements: crate::native_records::arinsal_beamasm_get_record_elements,
+            update: crate::native_records::arinsal_beamasm_update_record,
+        }
     }
 
     fn retain_fun_helper(&self) -> usize {
