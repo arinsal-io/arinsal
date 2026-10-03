@@ -86,6 +86,14 @@ pub struct FinalizedModule {
     pub line_table: Vec<ModuleLine>,
     /// Patch sites for per-function tracing breakpoints: label to entry word and skip branch.
     pub trace_breakpoints: HashMap<u32, (usize, u32)>,
+    /// Patch sites of line breakpoints: source line, offset of the `b next` word and its
+    /// original encoding (restored when the breakpoint is disabled).
+    pub line_breakpoints: Vec<(u32, usize, u32)>,
+    /// For each line-breakpoint site, ascending: the offset of the return address of the
+    /// breakpoint call and the offset of the address that stands for the instrumented
+    /// function in the hit's stack frame (just inside the site, so that a return-address
+    /// lookup one byte back lands on the site's line).
+    pub line_breakpoint_returns: Vec<(usize, usize)>,
     /// NIF load patch sites: function label to the word that skips the call-NIF body
     /// until `load_nif` replaces it with a NOP.
     pub nif_patches: HashMap<u32, usize>,
@@ -145,6 +153,10 @@ pub struct BeamModuleAssembler {
     func_clause_stub: Option<Label>,
     line_table: Vec<ModuleLine>,
     trace_breakpoints: HashMap<u32, (usize, Label)>,
+    /// Line, live count and word offset recorded by `i_debug_line` until its trampoline.
+    pending_debug_line: Option<(u32, u16)>,
+    line_breakpoints: Vec<(u32, usize, Label)>,
+    line_breakpoint_returns: Vec<(usize, usize)>,
     nif_patches: HashMap<u32, usize>,
     current_function_label: Option<u32>,
     next_fresh_label: u32,
@@ -202,6 +214,9 @@ impl BeamModuleAssembler {
             line_table: Vec::new(),
             arith_fail: 0,
             trace_breakpoints: HashMap::new(),
+            pending_debug_line: None,
+            line_breakpoints: Vec::new(),
+            line_breakpoint_returns: Vec::new(),
             nif_patches: HashMap::new(),
             current_function_label: None,
             next_fresh_label: 0x7000_0000,
@@ -381,6 +396,76 @@ impl BeamModuleAssembler {
         {
             return Err(ModuleError::DuplicateLabel(function));
         }
+        Ok(())
+    }
+
+    /// Records the line and live registers of the next line-breakpoint trampoline and aligns
+    /// the code so the trampoline's branch can be rewritten atomically.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3203-3222 (emit_i_debug_line),
+    // OTP-29.1.1: erts also loads `live` into TMP1 for the shared trampoline; here `live`
+    // and the line travel in the trap identity, so no register is needed.
+    pub fn emit_i_debug_line(&mut self, line: u32, live: u16) -> Result<(), ModuleError> {
+        self.pending_debug_line = Some((line, live));
+        while !self.code.offset().is_multiple_of(8) {
+            self.code.emit(|e| {
+                e.nop();
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Emits the patchable line-breakpoint prologue that follows `i_debug_line`.
+    ///
+    /// Disabled, `b next` skips the trap. Enabled (the branch becomes a NOP), the live X
+    /// registers are spilled by the executor and `erts_internal:breakpoint/4` is called;
+    /// the code after the trap restores the registers when that call returns.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:257-348
+    // (emit_i_line_breakpoint_trampoline_shared and emit_i_line_breakpoint_trampoline),
+    // OTP-29.1.1: erts calls erts_line_breakpoint_hit__prepare_call/__cleanup from a shared
+    // fragment; here the executor does the prepare step on the trap and the restore
+    // (erts_line_breakpoint_hit__cleanup) is emitted inline at the continuation.
+    pub fn emit_i_line_breakpoint_trampoline(
+        &mut self,
+        fragment: usize,
+    ) -> Result<(), ModuleError> {
+        let Some((line, live)) = self.pending_debug_line.take() else {
+            return Err(ModuleError::InvalidOperand(
+                "line breakpoint trampoline without i_debug_line",
+            ));
+        };
+        let patch = self.code.offset();
+        let next = self.code.new_label();
+        self.code.b(next)?;
+        self.code.emit(|e| {
+            e.mov_const(
+                Gpr::x(13),
+                crate::dispatch::line_breakpoint_identity(line, live) as u64,
+            )
+        })?;
+        let resume = self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
+        // Resumed here with the spilled registers on top of the stack.
+        for index in 0..u32::from(live) {
+            let offset = index * 8;
+            self.code.emit(|e| e.ldr_uoff(Gpr::x(10), E, offset))?;
+            if index < 6 {
+                self.code
+                    .emit(|e| e.mov_reg(XREGS[index as usize], Gpr::x(10)))?;
+            } else {
+                self.code
+                    .emit(|e| e.str_uoff(Gpr::x(10), SCHEDULER_REGS, offset))?;
+            }
+        }
+        // The spilled registers, then the frame's return address pushed under them.
+        let mut bytes = (u32::from(live) + 1) * 8;
+        while bytes != 0 {
+            let chunk = bytes.min(4088) as u16;
+            self.code.emit(|e| e.add_imm(E, E, chunk, false))?;
+            bytes -= u32::from(chunk);
+        }
+        self.code.bind(next)?;
+        self.line_breakpoints.push((line, patch, next));
+        self.line_breakpoint_returns.push((resume, patch + 4));
         Ok(())
     }
 
@@ -1021,13 +1106,14 @@ impl BeamModuleAssembler {
         update: crate::Update,
     ) -> Result<(), ModuleError> {
         self.emit_runtime_fragment_with(helper, args, live, update)
+            .map(|_| ())
     }
 
     pub(super) fn emit_runtime_fragment(
         &mut self,
         fragment: usize,
         args: &[Gpr],
-    ) -> Result<(), ModuleError> {
+    ) -> Result<usize, ModuleError> {
         self.emit_runtime_fragment_with(
             fragment,
             args,
@@ -1038,13 +1124,14 @@ impl BeamModuleAssembler {
         )
     }
 
+    /// Returns the code offset of the fragment call's return address.
     pub(super) fn emit_runtime_fragment_with(
         &mut self,
         fragment: usize,
         args: &[Gpr],
         live: usize,
         update: crate::Update,
-    ) -> Result<(), ModuleError> {
+    ) -> Result<usize, ModuleError> {
         if args.len() > 5 {
             return Err(ModuleError::InvalidOperand(
                 "runtime hook has too many arguments",
@@ -1060,13 +1147,14 @@ impl BeamModuleAssembler {
             e.str_uoff(Gpr::x(30), C_P, 72)?;
             e.blr(Gpr::x(17))
         })?;
+        let return_address = self.code.offset();
         crate::emit_leave_runtime(&mut self.code, live, update)?;
         self.code.emit(|e| {
             e.ldr_uoff(Gpr::x(30), C_P, 72)?;
             e.ldr_uoff(Gpr::x(9), C_P, 40)
         })?;
         self.error_if_nonzero(Gpr::x(9))?;
-        Ok(())
+        Ok(return_address)
     }
 
     /// Calls a loader-patched static NIF body through the process runtime.
@@ -1282,6 +1370,16 @@ impl BeamModuleAssembler {
                 Some((function, (offset, branch)))
             })
             .collect::<HashMap<_, _>>();
+        let line_breakpoints = self
+            .line_breakpoints
+            .iter()
+            .filter_map(|&(line, offset, next)| {
+                let delta =
+                    i64::try_from(*labels.get(&next)?).ok()? - i64::try_from(offset).ok()?;
+                let immediate = u32::try_from(delta / 4).ok()?;
+                Some((line, offset, 0x1400_0000 | (immediate & 0x03ff_ffff)))
+            })
+            .collect::<Vec<_>>();
         let catch_base = crate::catch::reserve_catch_indices(self.catch_patches.len())?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:952-974 (patchCatches), OTP-29.1.1
         let catch_table = self
@@ -1346,6 +1444,8 @@ impl BeamModuleAssembler {
                 })
                 .collect(),
             trace_breakpoints,
+            line_breakpoints,
+            line_breakpoint_returns: self.line_breakpoint_returns,
             nif_patches: self.nif_patches,
         })
     }

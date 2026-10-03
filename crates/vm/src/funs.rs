@@ -1006,6 +1006,13 @@ impl Vm {
                 },
             )
         })?;
+        // The register file is sized for the running module; the callee may take more
+        // arguments (up to erts MAX_ARG), so grow it before the copy.
+        if args.len() <= 255 && args.len() >= p.x.len() {
+            let mut registers = p.x.to_vec();
+            registers.resize(args.len() + 1, Term::NIL);
+            p.x = registers.into_boxed_slice();
+        }
         if args.len() >= p.x.len() {
             return Err(exceptions::bif_error(
                 p,

@@ -518,6 +518,19 @@ pub(crate) fn continuation_tag(module: usize, ip: usize) -> Result<Term, VmError
     Ok(Term::catch(CONTINUATION_BIT | module << 32 | u64::from(ip)))
 }
 
+/// Handler address of a stack word that is a catch tag of native code.
+pub(crate) fn native_catch_address(term: Term) -> Option<usize> {
+    if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
+        return None;
+    }
+    // SAFETY: CATCH is an immediate and carries no heap pointer.
+    let payload = unsafe { term.raw_bits() } >> 6;
+    if payload >> 32 != 0 || payload & CONTINUATION_BIT != 0 {
+        return None;
+    }
+    crate::native_bridge::native_catch(u32::try_from(payload).ok()?)
+}
+
 pub(super) fn decode_tag(term: Term) -> Option<(bool, usize, usize)> {
     if term.tagged_word() & 63 != 0x1b || term.classify() != TermKind::Catch {
         return None;

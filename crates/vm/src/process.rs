@@ -1359,6 +1359,144 @@ impl Executor {
                                         _ => VmError::Dirty(arinsal_sched::DirtyKind::Io),
                                     });
                                 }
+                                if let Some((line, live)) =
+                                    arinsal_beamasm::dispatch::decode_line_breakpoint_identity(
+                                        target_pc,
+                                    )
+                                {
+                                    // Port of erts/emulator/beam/beam_bp.c:1821-1865
+                                    // (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1:
+                                    // spill the live X registers, then call
+                                    // erts_internal:breakpoint/4; the native code at
+                                    // `resume_pc` restores them when it returns.
+                                    let function =
+                                        crate::native_function_at(resume_pc).ok_or_else(|| {
+                                            VmError::Unsupported(format!(
+                                                "native line breakpoint resume address is unregistered: {resume_pc:#x}"
+                                            ))
+                                        })?;
+                                    if process.heap.stack_get(0).is_some_and(|word| {
+                                        word.tagged_word() as usize == resume_pc
+                                    }) {
+                                        process.heap.release_stack(1);
+                                    }
+                                    let live = usize::from(live);
+                                    let width =
+                                        live.max(6).min(self.native_registers.x_reg_array.len());
+                                    if process.x.len() < width {
+                                        let mut x = process.x.to_vec();
+                                        x.resize(width, Term::NIL);
+                                        process.x = x.into_boxed_slice();
+                                    }
+                                    for (destination, raw) in process
+                                        .x
+                                        .iter_mut()
+                                        .zip(self.native_registers.x_reg_array.iter().copied())
+                                        .take(live)
+                                    {
+                                        *destination = crate::native_hooks::from_raw(raw);
+                                    }
+                                    let handler =
+                                        self.vm.load_named("erts_internal").is_ok_and(|id| {
+                                            self.vm.modules[id].functions.iter().any(
+                                                |(_, name, arity)| {
+                                                    name == "breakpoint" && *arity == 4
+                                                },
+                                            )
+                                        });
+                                    // The handler's own breakpoints are not reported.
+                                    let cycle = function.module == "erts_internal"
+                                        && function.function == "breakpoint"
+                                        && function.arity == 4;
+                                    // Port of erts/emulator/beam/emu/instrs.tab:1269-1286
+                                    // (i_enabled_line_breakpoint), OTP-29.1.1: the frame's own
+                                    // return address, then the spilled registers above it.
+                                    let site = crate::beamasm_integration::line_breakpoint_site(
+                                        resume_pc,
+                                    )
+                                    .ok_or_else(|| {
+                                        VmError::Unsupported(format!(
+                                            "native line breakpoint site is unregistered: {resume_pc:#x}"
+                                        ))
+                                    })?;
+                                    if !process.heap.reserve_stack(1)
+                                        || !process.heap.stack_set(
+                                            0,
+                                            crate::proc_create::native_continuation_term(site),
+                                        )
+                                        || !process.heap.reserve_stack(live)
+                                    {
+                                        break Err(VmError::Unsupported(
+                                            "line breakpoint stack is full".into(),
+                                        ));
+                                    }
+                                    for index in 0..live {
+                                        let value = process.x[index];
+                                        if !process.heap.stack_set(index, value) {
+                                            break;
+                                        }
+                                    }
+                                    if !handler || cycle {
+                                        process.cold_mut().native_continuation_resume = true;
+                                        process.cold_mut().native_resume_live = 2;
+                                        process.native_pc = Some(resume_pc);
+                                        continue;
+                                    }
+                                    if !process.heap.reserve_stack(1)
+                                        || !process.heap.stack_set(
+                                            0,
+                                            crate::proc_create::native_continuation_term(resume_pc),
+                                        )
+                                    {
+                                        break Err(VmError::Unsupported(
+                                            "line breakpoint stack is full".into(),
+                                        ));
+                                    }
+                                    let module_atom = arinsal_term::global_atoms()
+                                        .intern(&function.module)
+                                        .map_err(|_| VmError::Unsupported("atom table".into()))?;
+                                    let function_atom = arinsal_term::global_atoms()
+                                        .intern(&function.function)
+                                        .map_err(|_| VmError::Unsupported("atom table".into()))?;
+                                    let handler_module = arinsal_term::global_atoms()
+                                        .intern("erts_internal")
+                                        .map_err(|_| VmError::Unsupported("atom table".into()))?;
+                                    let handler_function = arinsal_term::global_atoms()
+                                        .intern("breakpoint")
+                                        .map_err(|_| VmError::Unsupported("atom table".into()))?;
+                                    process.x[0] = Term::atom(module_atom);
+                                    process.x[1] = Term::atom(function_atom);
+                                    process.x[2] = Term::small(i64::from(function.arity))
+                                        .expect("arity is a small integer");
+                                    process.x[3] = Term::small(i64::from(line))
+                                        .expect("line is a small integer");
+                                    process.x[4] = Term::atom(handler_module);
+                                    process.x[5] = Term::atom(handler_function);
+                                    process.gc_live = 4;
+                                    process.cold_mut().native_apply = true;
+                                    let result =
+                                        self.vm.apply_fixed(process, 4, true, 0, Some(ctx));
+                                    process.cold_mut().native_apply = false;
+                                    match result? {
+                                        crate::ImportOutcome::Jump(_)
+                                        | crate::ImportOutcome::Advanced => {}
+                                        crate::ImportOutcome::Yield => {
+                                            if process.native_pc.is_some()
+                                                && native_transfer_continues(process, ctx)
+                                            {
+                                                continue;
+                                            }
+                                            break Ok(RunState::Yield);
+                                        }
+                                        crate::ImportOutcome::Returned(value) => {
+                                            process.x[0] = value;
+                                            if process.native_pc.is_none() {
+                                                break Ok(RunState::Done(value));
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if target_pc
                                     == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
                                 {

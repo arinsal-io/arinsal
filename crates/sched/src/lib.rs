@@ -4173,12 +4173,15 @@ impl<T: Task> Scheduler<T> {
     /// Inspect a waiting task while holding its scheduler-owned task cell.
     /// Port of erts/emulator/beam/erl_debugger.c:570-600, OTP-29.1.1.
     pub fn inspect_waiting<R>(&self, pid: Pid, inspect: impl FnOnce(&T) -> R) -> Option<R> {
+        // A suspended process may still sit in a run queue (erts: not RUNNING); its task is
+        // owned by the cell until a worker claims it, and claiming sets RUNNING first.
+        let inspectable = |state| state == WAITING || state == QUEUED;
         let process = self.inner.table.lookup(pid)?;
-        if process.state.load(Ordering::Acquire) != WAITING {
+        if !inspectable(process.state.load(Ordering::Acquire)) {
             return None;
         }
         let cell = process.cell.lock().unwrap();
-        (process.state.load(Ordering::Acquire) == WAITING).then(|| inspect(&cell.task))
+        inspectable(process.state.load(Ordering::Acquire)).then(|| inspect(&cell.task))
     }
     /// Number of live tasks; this scan is for diagnostics.
     pub fn live_count(&self) -> usize {
