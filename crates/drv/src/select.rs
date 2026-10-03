@@ -4,8 +4,9 @@
 //! drv_select_steal :1711, iready/oready :1874, erts_check_io task execution and
 //! `erts_io_notify_port_task_executed`), OTP-29.1.1, for a kqueue poll set: updates are
 //! applied synchronously (`wake_poller == 0`), so `stop_select` runs inside the
-//! `driver_select` call that removes the last event. NIF selects (`enif_select`) have
-//! their own registrations in the VM and do not share this table.
+//! `driver_select` call that removes the last event. `enif_select` (erl_check_io.c:1236)
+//! shares the table like `ErtsDrvEventState` does: an fd is either a driver or a NIF
+//! selection, and the other kind steals it.
 
 use std::collections::HashMap;
 use std::ffi::c_int;
@@ -37,9 +38,43 @@ struct Dir {
     running: bool,
 }
 
-/// `ErtsDrvEventState` of type `ERTS_EV_TYPE_DRV_SEL`.
+/// A message `enif_select` prepared for one direction (`struct erts_nif_select_event`).
+pub trait NifSelectMessage: Send {
+    /// Queue the message to its recipient (`send_select_msg`); dropping it discards it
+    /// (`clear_select_event`).
+    fn deliver(self: Box<Self>);
+    /// Text of the recipient for the steal report.
+    fn recipient(&self) -> String;
+}
+
+/// The resource behind an `enif_select` (`state->driver.stop.resource`).
+pub trait NifSelectResource: Send + Sync {
+    /// Identity of the resource (its data address).
+    fn id(&self) -> usize;
+    /// `Module:Name` of the resource type.
+    fn type_name(&self) -> String;
+    /// `enif_keep_resource`.
+    fn keep(&self);
+    /// `enif_release_resource`.
+    fn release(&self);
+    /// `erts_resource_stop`.
+    fn stop(&self, fd: i32, direct: bool);
+    /// `erts_send_error_to_logger_nogl`.
+    fn log_error(&self, text: &str);
+}
+
+/// `ErtsDrvEventState` of type `ERTS_EV_TYPE_NIF`: the selecting resource and the
+/// messages waiting for READ (0) and WRITE (1).
+struct NifSel {
+    resource: Arc<dyn NifSelectResource>,
+    messages: [Option<Box<dyn NifSelectMessage>>; 2],
+}
+
+/// `ErtsDrvEventState` of type `ERTS_EV_TYPE_DRV_SEL` or `ERTS_EV_TYPE_NIF`.
 #[derive(Default)]
 struct FdState {
+    /// `state->driver.nif` while the type is `ERTS_EV_TYPE_NIF`.
+    nif: Option<NifSel>,
     /// `state->events`: `READ | WRITE`.
     events: c_int,
     /// `ERTS_EV_FLAG_USED`: `ERL_DRV_USE` was given when the events were set.
@@ -61,11 +96,12 @@ fn next_registration() -> u64 {
 }
 
 /// Arm direction `dir` of `fd` if it is selected, not armed and not running
-/// (`state->active_events |= ...` plus `erts_io_control`).
-fn arm(fd: i32, state: &mut FdState, dir: usize) {
+/// (`state->active_events |= ...` plus `erts_io_control`). `false` when the poller
+/// rejected the descriptor (`ERTS_POLL_EV_NVAL`).
+fn arm_dir(fd: i32, state: &mut FdState, dir: usize) -> bool {
     let slot = &mut state.dirs[dir];
     if state.events & DIRS[dir] == 0 || slot.reg.is_some() || slot.running {
-        return;
+        return true;
     }
     let id = next_registration();
     slot.reg = Some(id);
@@ -81,8 +117,17 @@ fn arm(fd: i32, state: &mut FdState, dir: usize) {
         None => false,
     };
     if !notified {
-        // The poller rejected the descriptor: erts reports it ready at once
-        // (`new_events & (ERR|NVAL)` in driver_select) and lets the driver find the error.
+        state.dirs[dir].reg = None;
+    }
+    notified
+}
+
+/// `arm_dir` for a driver: a rejected descriptor is reported ready at once
+/// (`new_events & (ERR|NVAL)` in driver_select) and the driver finds the error.
+fn arm(fd: i32, state: &mut FdState, dir: usize) {
+    if !arm_dir(fd, state, dir) {
+        let id = next_registration();
+        state.dirs[dir].reg = Some(id);
         task::schedule(Task::Ready { fd, dir, reg: id });
     }
 }
@@ -248,6 +293,12 @@ pub(crate) fn driver_select(port: &Arc<DriverPort>, fd: i32, mode: c_int, on: bo
             mode |= READ | WRITE;
         }
     }
+    // erl_check_io.c:1049: `ERTS_EV_TYPE_NIF` goes through `drv_select_steal`.
+    let released = if table.get(&fd).is_some_and(|s| s.nif.is_some()) {
+        steal_from_nif(&mut table, fd, port, mode, on)
+    } else {
+        None
+    };
     // `new_drv_ev_state`: an entry of type NONE until something is selected.
     table.entry(fd).or_default();
     for (dir, bit) in DIRS.iter().enumerate() {
@@ -298,10 +349,248 @@ pub(crate) fn driver_select(port: &Arc<DriverPort>, fd: i32, mode: c_int, on: bo
         table.remove(&fd);
     }
     drop(table);
+    if let Some(resource) = released {
+        resource.release();
+    }
     if stop_select {
         port.stop_select(fd);
     }
     0
+}
+
+/// Port of erl_check_io.c:878 (deselect) for `ERTS_EV_TYPE_NIF` with mode 0: drop the
+/// events and pending messages and hand back the resource the selection kept; the
+/// caller releases it once the table is unlocked.
+fn deselect_nif(table: &mut HashMap<i32, FdState>, fd: i32) -> Option<Arc<dyn NifSelectResource>> {
+    let state = table.get_mut(&fd)?;
+    for dir in 0..2 {
+        disarm(state, dir);
+    }
+    state.events = 0;
+    let nif = state.nif.take();
+    if !state.used {
+        table.remove(&fd);
+    }
+    nif.map(|nif| nif.resource)
+}
+
+/// `steal` text for a `ERTS_EV_TYPE_NIF` victim (erl_check_io.c:1638).
+fn nif_victim_text(state: &FdState) -> String {
+    let Some(nif) = &state.nif else {
+        return "no one\n".into();
+    };
+    let mut text = format!("resource {}", nif.resource.type_name());
+    let mut with = "with";
+    for (message, label) in nif.messages.iter().zip(["in-pid", "out-pid"]) {
+        if let Some(message) = message {
+            text.push_str(&format!(" {with} {label} {}", message.recipient()));
+            with = "and";
+        }
+    }
+    text.push('\n');
+    text
+}
+
+/// Port of erl_check_io.c:1711 (drv_select_steal) when the victim is a NIF selection.
+fn steal_from_nif(
+    table: &mut HashMap<i32, FdState>,
+    fd: i32,
+    port: &DriverPort,
+    mode: c_int,
+    on: bool,
+) -> Option<Arc<dyn NifSelectResource>> {
+    let victim = nif_victim_text(table.get(&fd)?);
+    let text = format!(
+        "driver_select({:#x}, {fd},{}) by {}driver #Port<0.{}> stealing control of fd={fd} from {victim}",
+        port.handle() as usize,
+        mode_text(mode, on),
+        name_part(port),
+        port.id
+    );
+    let released = deselect_nif(table, fd);
+    port.host.log_error(&text);
+    released
+}
+
+/// Port of erl_check_io.c:1236 (enif_select_x). `mode` holds `ErlNifSelectFlags`;
+/// `messages` are the READ and WRITE messages prepared for an `on` selection. Failures
+/// carry `INT_MIN`, like erts.
+pub fn nif_select(
+    resource: Arc<dyn NifSelectResource>,
+    fd: i32,
+    mode: c_int,
+    messages: [Option<Box<dyn NifSelectMessage>>; 2],
+) -> c_int {
+    const STOP: c_int = 1 << 2;
+    const CANCEL: c_int = 1 << 3;
+    const ERROR: c_int = 1 << 5;
+    const STOP_CALLED: c_int = 1;
+    const INVALID_EVENT: c_int = 1 << 2;
+    const FAILED: c_int = 1 << 3;
+    const READ_CANCELLED: c_int = 1 << 4;
+    const WRITE_CANCELLED: c_int = 1 << 5;
+    const NOTSUP: c_int = 1 << 7;
+    if fd < 0 {
+        return i32::MIN | INVALID_EVENT;
+    }
+    let mut table = table();
+    let known = table.contains_key(&fd);
+    let (on, mode) = if mode & STOP != 0 {
+        if !known {
+            // Fast track to the stop callback.
+            drop(table);
+            resource.stop(fd, true);
+            return STOP_CALLED;
+        }
+        (false, READ | WRITE | USE)
+    } else {
+        // The kqueue poll set has no error event (ERTS_POLL_EV_ERR).
+        if mode & ERROR != 0 {
+            return i32::MIN | NOTSUP;
+        }
+        (mode & CANCEL == 0, mode)
+    };
+    let stop_mode = mode & USE != 0;
+    // Stealing: another resource, or a driver holding one of the selected directions.
+    let mut released = None;
+    if table.get(&fd).is_some_and(|s| s.nif.is_some()) {
+        let other = table
+            .get(&fd)
+            .and_then(|s| s.nif.as_ref())
+            .is_some_and(|nif| nif.resource.id() != resource.id());
+        if other {
+            // Port of erl_check_io.c:1722 (nif_select_steal).
+            let text = format!(
+                "enif_select(_, {fd},{}, {}) stealing control of fd={fd} from {}",
+                nif_mode_text(mode),
+                resource.type_name(),
+                nif_victim_text(&table[&fd])
+            );
+            released = deselect_nif(&mut table, fd);
+            resource.log_error(&text);
+        }
+    } else if table.contains_key(&fd) && need_to_steal(&mut table, fd, mode & (READ | WRITE)) {
+        let mut text = format!(
+            "enif_select(_, {fd},{}, {}) stealing control of fd={fd} from ",
+            nif_mode_text(mode),
+            resource.type_name()
+        );
+        let mut deselect_mode = 0;
+        if let Some(state) = table.get(&fd) {
+            for (dir, bit) in DIRS.iter().enumerate() {
+                if mode & bit == 0 {
+                    continue;
+                }
+                if let Some(owner) = &state.dirs[dir].owner {
+                    if deselect_mode != 0 {
+                        text.push_str("and ");
+                    }
+                    text.push_str(if dir == 0 {
+                        "input driver "
+                    } else {
+                        "output driver "
+                    });
+                    text.push_str(&format!("{}#Port<0.{}> ", name_part(owner), owner.id));
+                    deselect_mode |= bit;
+                }
+            }
+        }
+        text.push('\n');
+        if deselect_mode != 0 {
+            deselect(&mut table, fd, deselect_mode);
+        }
+        resource.log_error(&text);
+    }
+    let state = table.entry(fd).or_default();
+    let old_events = state.events;
+    let mut ctl = mode & (READ | WRITE);
+    let mut ret = 0;
+    let mut failed = false;
+    if on {
+        ctl &= !old_events;
+        state.events |= ctl;
+        if state.nif.is_none() && ctl != 0 {
+            state.nif = Some(NifSel {
+                resource: Arc::clone(&resource),
+                messages: [None, None],
+            });
+            resource.keep();
+        }
+        for (dir, bit) in DIRS.iter().enumerate() {
+            if ctl & bit != 0 && !arm_dir(fd, state, dir) {
+                failed = true;
+            }
+        }
+        if failed {
+            // `new_events & ERTS_POLL_EV_NVAL`: a fresh selection is undone.
+            if old_events == 0
+                && let Some(nif) = state.nif.take()
+            {
+                state.events = 0;
+                released = Some(nif.resource);
+            }
+            ret = i32::MIN | FAILED;
+        } else if let Some(nif) = state.nif.as_mut() {
+            for (dir, message) in messages.into_iter().enumerate() {
+                if mode & DIRS[dir] != 0 {
+                    nif.messages[dir] = message;
+                }
+            }
+        }
+    } else {
+        ctl &= old_events;
+        state.events &= !ctl;
+        for (dir, bit) in DIRS.iter().enumerate() {
+            if ctl & bit != 0 {
+                disarm(state, dir);
+            }
+        }
+        if let Some(nif) = state.nif.as_mut() {
+            if mode & READ != 0 && nif.messages[0].take().is_some() {
+                ret |= READ_CANCELLED;
+            }
+            if mode & WRITE != 0 && nif.messages[1].take().is_some() {
+                ret |= WRITE_CANCELLED;
+            }
+        }
+        if stop_mode {
+            // wake_poller == 0: the descriptor is out of the poll set, call stop now.
+            let had_nif = state.nif.take();
+            state.used = false;
+            released = had_nif.map(|nif| nif.resource);
+            ret |= STOP_CALLED;
+        }
+    }
+    // check_fd_cleanup
+    if table
+        .get(&fd)
+        .is_some_and(|s| s.events == 0 && s.nif.is_none() && !s.used)
+    {
+        table.remove(&fd);
+    }
+    drop(table);
+    if stop_mode {
+        resource.stop(fd, true);
+    }
+    if let Some(released) = released {
+        released.release();
+    }
+    ret
+}
+
+fn nif_mode_text(mode: c_int) -> String {
+    format!(
+        "{}{}{}",
+        if mode & 1 != 0 { " READ" } else { "" },
+        if mode & 2 != 0 { " WRITE" } else { "" },
+        if mode & 4 != 0 {
+            " STOP"
+        } else if mode & 8 != 0 {
+            " CANCEL"
+        } else {
+            ""
+        }
+    )
 }
 
 /// A poll registration fired: run `ready_input`/`ready_output` of the owner, then
@@ -316,6 +605,17 @@ pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
             return;
         }
         state.dirs[dir].reg = None;
+        if let Some(nif) = state.nif.as_mut() {
+            // erl_check_io.c:2121 (`ERTS_EV_TYPE_NIF` in erts_check_io): the selection is
+            // one-shot; the prepared message goes to its recipient.
+            state.events &= !DIRS[dir];
+            let message = nif.messages[dir].take();
+            drop(table);
+            if let Some(message) = message {
+                message.deliver();
+            }
+            return;
+        }
         let Some(owner) = state.dirs[dir].owner.clone() else {
             return;
         };

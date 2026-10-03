@@ -52,6 +52,7 @@ pub use ext::{BUSY_MSGQ_DISABLED, ErlDrvMonitor, InitAck};
 pub use hooks::{SystemHooks, set_system_hooks};
 use linebuf::LineBuf;
 use lock::{ReentrantGuard, ReentrantLock};
+pub use select::{NifSelectMessage, NifSelectResource, nif_select};
 
 // Port of erts/emulator/beam/global.h:172-181 (ERL_DE_* load error codes), OTP-29.1.1.
 /// No error.

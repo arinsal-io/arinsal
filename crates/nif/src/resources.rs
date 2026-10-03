@@ -21,6 +21,20 @@ struct Resource {
     kind: *mut ResourceType,
     data: *mut u8,
     size: usize,
+    /// Identity shared by every term of this resource while one is alive (erts: all
+    /// magic refs point at the same magic binary). Weak: the payload owns the resource.
+    magic: Mutex<Weak<MagicRef>>,
+}
+impl Resource {
+    fn magic_ref(self: &Arc<Self>) -> Arc<MagicRef> {
+        let mut slot = self.magic.lock().unwrap();
+        if let Some(magic) = slot.upgrade() {
+            return magic;
+        }
+        let magic = MagicRef::new(Arc::clone(self));
+        *slot = Arc::downgrade(&magic);
+        magic
+    }
 }
 fn from_reference(reference: Term) -> Option<Arc<Resource>> {
     // SAFETY: the caller retains the reference term and its heap during the callback.
@@ -52,6 +66,40 @@ pub fn resource_down(reference: Term, pid: Term, monitor: &[u8; 32]) -> bool {
 /// Deliver a reactor stop event to a live resource's stop callback.
 pub fn resource_stop(reference: Term, event: i32, direct: bool) -> bool {
     let Some(owner) = from_reference(reference) else {
+        return false;
+    };
+    // SAFETY: the resource owner keeps its registered callback and payload live.
+    let Some(callback) = (unsafe { (*owner.kind).callbacks.stop }) else {
+        return false;
+    };
+    let mut env = ErlNifEnv::independent();
+    // SAFETY: the NIF callback sees a live environment and resource allocation.
+    unsafe { callback(&mut env, owner.data.cast(), event, i32::from(direct)) };
+    true
+}
+/// The resource at `data` as a magic reference term on `heap`.
+pub(crate) fn resource_term(data: *mut c_void, heap: &mut arinsal_term::VecHeap) -> Option<Term> {
+    let owner = owner_for(data)?;
+    TermBuilder::new(heap).magic_ref(owner.magic_ref()).ok()
+}
+/// `Module:Name` of the type of the resource at `data`.
+pub fn resource_type_name(data: usize) -> String {
+    let Some(owner) = owner_for(data as *mut c_void) else {
+        return String::new();
+    };
+    let kind = owner.kind as usize;
+    types()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, candidate)| **candidate == kind)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default()
+}
+/// Port of erts/emulator/beam/erl_nif.c:1318 (erts_resource_stop) for the resource at
+/// `data`; `false` when its type has no stop callback.
+pub fn resource_stop_data(data: usize, event: i32, direct: bool) -> bool {
+    let Some(owner) = owner_for(data as *mut c_void) else {
         return false;
     };
     // SAFETY: the resource owner keeps its registered callback and payload live.
@@ -283,6 +331,7 @@ pub extern "C" fn enif_alloc_resource(kind: *mut c_void, size: usize) -> *mut c_
         kind: kind.cast(),
         data,
         size,
+        magic: Mutex::new(Weak::new()),
     });
     owners()
         .lock()
@@ -339,7 +388,7 @@ pub extern "C" fn enif_make_resource(e: *mut ErlNifEnv, data: *mut c_void) -> Te
     let Some(owner) = owner else {
         return terms::enif_make_badarg(e);
     };
-    let magic = MagicRef::new(owner);
+    let magic = owner.magic_ref();
     // SAFETY: the host passes a live environment to this callback.
     let env = unsafe { &mut *e };
     TermBuilder::new(&mut env.heap)
@@ -384,7 +433,7 @@ pub extern "C" fn enif_make_resource_binary(
         return terms::enif_make_badarg(e);
     };
     // SAFETY: the magic owner retains the native resource containing these bytes.
-    let external = unsafe { ExternalBinary::new(bytes.cast::<u8>(), size, MagicRef::new(owner)) };
+    let external = unsafe { ExternalBinary::new(bytes.cast::<u8>(), size, owner.magic_ref()) };
     // SAFETY: The resource allocation and callback remain live during this access.
     let env = unsafe { &mut *e };
     TermBuilder::new(&mut env.heap)
