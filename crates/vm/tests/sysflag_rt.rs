@@ -8,7 +8,8 @@ const SOURCE: &str = r#"
 -module(sysflag_rt).
 -export([online/0, heap_defaults/0, control_flags/0,
          topology/0, bind_type/0, allocator/0, invalid_topology/0,
-         topology_round_trip/0, blocked_scheduler_run_queue/0,
+         topology_round_trip/0, topology_legacy_form/0, topology_root_levels/0,
+         blocked_scheduler_run_queue/0,
          microstate_after_disable/0, blocker_exit/0, change_flags/0,
          runtime_defaults/0]).
 
@@ -141,6 +142,31 @@ topology_round_trip() ->
     Restored = erlang:system_flag(cpu_topology, undefined),
     {Previous, Current, Restored, erlang:system_info(cpu_topology)}.
 
+topology_legacy_form() ->
+    Previous = erlang:system_flag(cpu_topology,
+                                   [{processor, [], [{core, {logical, 0}}]}]),
+    Current = {erlang:system_info(cpu_topology),
+               erlang:system_info({cpu_topology, defined})},
+    Restored = erlang:system_flag(cpu_topology, undefined),
+    {Previous, Current, Restored}.
+
+%% Root-level core lists and several nodes (uneven reader-group spreading).
+topology_root_levels() ->
+    L = fun(I) -> {logical, I} end,
+    Old = erlang:system_info({cpu_topology, defined}),
+    Groups = fun(Topology, N) ->
+        erlang:system_flag(cpu_topology, Topology),
+        erts_debug:set_internal_state(available_internal_state, true),
+        lists:sort(erts_debug:get_internal_state({reader_groups_map, N}))
+    end,
+    Nodes = [{node, [{core, [{thread, L(T + 4 * C)} || T <- [0, 1, 2, 3]]}
+                     || C <- [N * 3, N * 3 + 1, N * 3 + 2]]} || N <- [0, 1, 2, 3]],
+    R = {Groups([{core, L(0)}, {core, L(65535)}], 10),
+         Groups([{thread, L(0)}, {thread, L(1)}, {thread, L(2)}], 2),
+         [Groups(Nodes, N) || N <- [1, 2, 3, 5, 7, 12, 40]]},
+    erlang:system_flag(cpu_topology, Old),
+    R.
+
 blocked_scheduler_run_queue() ->
     Previous = erlang:system_flag(multi_scheduling, block),
     Pid = spawn(fun Hog() -> Hog() end),
@@ -233,6 +259,16 @@ fn sysflag_rt_invalid_cpu_topology_matches_otp() {
 #[test]
 fn sysflag_rt_user_cpu_topology_round_trip_matches_otp() {
     compare("topology_round_trip");
+}
+
+#[test]
+fn sysflag_rt_cpu_topology_legacy_nested_form_matches_otp() {
+    compare("topology_legacy_form");
+}
+
+#[test]
+fn sysflag_rt_cpu_topology_root_levels_and_reader_groups_match_otp() {
+    compare("topology_root_levels");
 }
 
 #[test]
