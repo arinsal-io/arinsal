@@ -2,6 +2,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod extras;
+mod internal_test;
 mod iterators;
 mod resources;
 mod terms;
@@ -906,6 +907,7 @@ pub fn ensure_exports() {
     resources::retain_exports();
     extras::retain_exports();
     iterators::retain_exports();
+    internal_test::retain_exports();
 }
 pub(crate) fn term(bits: u64) -> Term {
     // SAFETY: callers obtain bits from existing terms or the NIF ABI.

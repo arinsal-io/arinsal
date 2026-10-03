@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <stdint.h>
 
 typedef void ErlNifOnHaltCallback(void *);
 struct enif_environment_t {
@@ -21,6 +22,82 @@ extern ERL_NIF_TERM arinsal_nif_tuple(ErlNifEnv *, const ERL_NIF_TERM *, unsigne
 extern ERL_NIF_TERM arinsal_nif_list(ErlNifEnv *, const ERL_NIF_TERM *, unsigned);
 extern char *arinsal_nif_format_term(ERL_NIF_TERM);
 extern void arinsal_nif_free_formatted(char *);
+
+typedef struct {
+    int (*erts_milli_sleep)(long);
+    void (*ethr_atomic_dec)(void *);
+    void (*ethr_atomic_inc)(void *);
+    void (*ethr_atomic_init)(void *, intptr_t);
+    intptr_t (*ethr_atomic_read)(void *);
+    void (*ethr_atomic_set)(void *, intptr_t);
+    int (*ethr_rwmutex_destroy)(void *);
+    int (*ethr_rwmutex_init_opt)(void *, void *);
+    void (*ethr_rwmutex_rlock)(void *);
+    void (*ethr_rwmutex_runlock)(void *);
+    void (*ethr_rwmutex_rwlock)(void *);
+    void (*ethr_rwmutex_rwunlock)(void *);
+    int (*ethr_rwmutex_tryrlock)(void *);
+    int (*ethr_rwmutex_tryrwlock)(void *);
+    int (*ethr_thr_create)(pthread_t *, void *(*)(void *), void *, void *);
+    int (*ethr_thr_join)(pthread_t, void **);
+} ArinsalInternalTest;
+
+extern intptr_t arinsal_internal_test_dispatch(uint32_t, uintptr_t, uintptr_t);
+
+static int internal_sleep(long ms) {
+    struct timespec req = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+    while (nanosleep(&req, &req) != 0) {
+        if (errno != EINTR) return errno;
+    }
+    return 0;
+}
+static void internal_atomic_dec(void *a) { __atomic_sub_fetch((intptr_t *)a, 1, __ATOMIC_SEQ_CST); }
+static void internal_atomic_inc(void *a) { __atomic_add_fetch((intptr_t *)a, 1, __ATOMIC_SEQ_CST); }
+static void internal_atomic_init(void *a, intptr_t value) { __atomic_store_n((intptr_t *)a, value, __ATOMIC_SEQ_CST); }
+static intptr_t internal_atomic_read(void *a) { return __atomic_load_n((intptr_t *)a, __ATOMIC_SEQ_CST); }
+static void internal_atomic_set(void *a, intptr_t value) { __atomic_store_n((intptr_t *)a, value, __ATOMIC_SEQ_CST); }
+static void *internal_rwmutex_handle(void *storage) { return *(void **)storage; }
+static int internal_rwmutex_init(void *storage, void *opts) {
+    intptr_t handle;
+    uintptr_t type = opts ? (uintptr_t)*(int *)opts : 0;
+    handle = arinsal_internal_test_dispatch(6, (uintptr_t)storage, type);
+    if (handle < 0) return (int)-handle;
+    *(void **)storage = (void *)handle;
+    return 0;
+}
+static int internal_rwmutex_destroy(void *storage) {
+    void *handle = internal_rwmutex_handle(storage);
+    int result;
+    if (!handle) return EINVAL;
+    result = (int)arinsal_internal_test_dispatch(7, (uintptr_t)handle, 0);
+    if (result == 0) *(void **)storage = NULL;
+    return result;
+}
+#define INTERNAL_RW_LOCK(name, op) \
+    static void name(void *storage) { (void)arinsal_internal_test_dispatch(op, (uintptr_t)internal_rwmutex_handle(storage), 0); }
+#define INTERNAL_RW_TRY(name, op) \
+    static int name(void *storage) { return (int)arinsal_internal_test_dispatch(op, (uintptr_t)internal_rwmutex_handle(storage), 0); }
+INTERNAL_RW_LOCK(internal_rwmutex_rlock, 8)
+INTERNAL_RW_LOCK(internal_rwmutex_runlock, 9)
+INTERNAL_RW_LOCK(internal_rwmutex_rwlock, 10)
+INTERNAL_RW_LOCK(internal_rwmutex_rwunlock, 11)
+INTERNAL_RW_TRY(internal_rwmutex_tryrlock, 12)
+INTERNAL_RW_TRY(internal_rwmutex_tryrwlock, 13)
+
+static int internal_thr_create(pthread_t *tid, void *(*start)(void *), void *arg, void *opts) {
+    (void)opts;
+    return pthread_create(tid, NULL, start, arg);
+}
+static int internal_thr_join(pthread_t tid, void **result) { return pthread_join(tid, result); }
+
+__attribute__((visibility("default")))
+const ArinsalInternalTest erts_internal_test_instance = {
+    internal_sleep, internal_atomic_dec, internal_atomic_inc, internal_atomic_init,
+    internal_atomic_read, internal_atomic_set, internal_rwmutex_destroy, internal_rwmutex_init,
+    internal_rwmutex_rlock, internal_rwmutex_runlock, internal_rwmutex_rwlock,
+    internal_rwmutex_rwunlock, internal_rwmutex_tryrlock, internal_rwmutex_tryrwlock,
+    internal_thr_create, internal_thr_join
+};
 
 void arinsal_nif_shim_anchor(void) {}
 long long arinsal_nif_cpu_micros(void) {
