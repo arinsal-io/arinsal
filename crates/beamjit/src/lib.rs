@@ -3814,6 +3814,7 @@ fn emit_op(
                     let literal = env.binary_literal(bytes).map_err(EmitError::Operand)?;
                     segments.push(BsSegment {
                         kind: BsSegmentKind::Binary,
+                        index: number(fields.get(1)).map_err(EmitError::Operand)?,
                         src: ArgVal::Literal(literal),
                         size: ArgVal::Immediate(length as u64),
                         size_is_units: true,
@@ -3835,6 +3836,7 @@ fn emit_op(
                 };
                 segments.push(BsSegment {
                     kind,
+                    index: number(fields.get(1)).map_err(EmitError::Operand)?,
                     src: arg(fields.get(4), beam, env).map_err(EmitError::Operand)?,
                     size,
                     size_is_units,

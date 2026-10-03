@@ -1511,7 +1511,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         alloc as usize,
     );
     let base_slot = live.max(6);
-    let root_live = base_slot + count * 6;
+    let root_live = base_slot + count * 7;
     if root_live > registers.x_reg_array.len() {
         crate::native_hooks::set_error(process, "system_limit");
         return 0;
@@ -1533,7 +1533,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     let parse = |process: &crate::Process| -> Option<Vec<Segment<'static>>> {
         let mut segments = Vec::with_capacity(count);
         for index in 0..count {
-            let base = base_slot + index * 6;
+            let base = base_slot + index * 7;
             let small = |offset: usize| {
                 process.x[base + offset]
                     .as_small()
@@ -1550,9 +1550,9 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
                 7 => SegType::Utf32,
                 _ => return None,
             };
-            let flags = small(2)?;
-            let size_term = process.x[base + 5];
-            let size = if small(3)? != 0 {
+            let flags = small(3)?;
+            let size_term = process.x[base + 6];
+            let size = if small(4)? != 0 {
                 SegSize::Units(size_term.as_small().and_then(|n| u64::try_from(n).ok())?)
             } else if size_term == all {
                 SegSize::All
@@ -1561,14 +1561,14 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
             };
             segments.push(Segment {
                 ty,
-                index: index + 1,
-                unit: u8::try_from(small(1)?).ok()?,
+                index: usize::try_from(small(1)?).ok()?,
+                unit: u8::try_from(small(2)?).ok()?,
                 flags: SegFlags {
                     little: flags & 2 != 0,
                     signed: flags & 4 != 0,
                     native: flags & 16 != 0,
                 },
-                value: SegmentValue::Term(process.x[base + 4]),
+                value: SegmentValue::Term(process.x[base + 5]),
                 size,
             });
         }

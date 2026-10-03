@@ -108,6 +108,7 @@ fn writable_runtime_publishes_heap_and_stack_pointers() {
 fn construction_runtime_keeps_non_destination_x_registers() {
     let segment = BsSegment {
         kind: BsSegmentKind::Integer,
+        index: 1,
         src: ArgVal::X(0),
         size: ArgVal::X(1),
         size_is_units: false,

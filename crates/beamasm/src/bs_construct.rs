@@ -36,6 +36,8 @@ pub enum BsSegmentKind {
 pub struct BsSegment {
     /// Segment operation.
     pub kind: BsSegmentKind,
+    /// One-based source segment index for construction error metadata.
+    pub index: u32,
     /// Value source.
     pub src: ArgVal,
     /// Size operand: a term, or an untagged unit count when `size_is_units`.
@@ -51,8 +53,8 @@ pub struct BsSegment {
 /// First X register array slot used to stage segments for the runtime hook when fewer than six
 /// X registers are live; otherwise staging starts at the live count, past every live register.
 pub const STAGING_BASE: u32 = 6;
-/// Words staged per segment: kind, unit, flags, size-is-units, source, size.
-pub const STAGING_WORDS: u32 = 6;
+/// Words staged per segment: kind, index, unit, flags, size-is-units, source, size.
+pub const STAGING_WORDS: u32 = 7;
 
 const C_P: Gpr = Gpr::x(21);
 const SCHEDULER_REGS: Gpr = Gpr::x(19);
@@ -137,17 +139,18 @@ impl BeamModuleAssembler {
             let small = |value: u64| (value << 4) | 0xf;
             for (slot, value) in [
                 (0, small(segment.kind as u64)),
-                (1, small(u64::from(segment.unit))),
-                (2, small(u64::from(segment.flags))),
-                (3, small(u64::from(segment.size_is_units))),
+                (1, small(u64::from(segment.index))),
+                (2, small(u64::from(segment.unit))),
+                (3, small(u64::from(segment.flags))),
+                (4, small(u64::from(segment.size_is_units))),
             ] {
                 self.code.emit(|e| {
                     e.mov_const(Gpr::x(9), value)?;
                     e.str_uoff(Gpr::x(9), SCHEDULER_REGS, (base + slot) * 8)
                 })?;
             }
-            for (slot, operand) in [(4, segment.src), (5, segment.size)] {
-                let operand = if slot == 5 && segment.size_is_units {
+            for (slot, operand) in [(5, segment.src), (6, segment.size)] {
+                let operand = if slot == 6 && segment.size_is_units {
                     match segment.size {
                         ArgVal::Immediate(units) => ArgVal::Immediate(small(units)),
                         other => other,
