@@ -175,7 +175,9 @@ core::arch::global_asm!(
     "ldr x20, [x21, #8]",
     "ldr w22, [x21, #32]",
     "ldr x23, [x21, #0]",
-    "mov x24, xzr",
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp:236-247, OTP-29.1.1: the runtime
+    // already resolved the process's code index (save_calls or the active one).
+    "ldr x24, [x19, #16480]",
     "ldp x25, x26, [x19, #0]",
     "ldp x27, x28, [x19, #16]",
     "ldp x15, x16, [x19, #32]",

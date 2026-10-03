@@ -116,7 +116,17 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
             set_flag(process, name, value);
             previous
         }
-        "sensitive" | "async_dist" => {
+        "sensitive" => {
+            if value != atom("true") && value != atom("false") {
+                return Err(badarg());
+            }
+            // Port of erts/emulator/beam/bif.c:2173 (process_flag sensitive), OTP-29.1.1.
+            let pid = process.self_pid.ok_or_else(badarg)?;
+            let old = crate::trace::set_sensitive(process, pid, value == atom("true"));
+            set_flag(process, name, value);
+            atom(if old { "true" } else { "false" })
+        }
+        "async_dist" => {
             if value != atom("true") && value != atom("false") {
                 return Err(badarg());
             }
@@ -124,8 +134,14 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
         }
         "fullsweep_after" | "min_heap_size" | "min_bin_vheap_size" | "save_calls" => {
             let n = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
-            if name == "save_calls" && n > 1000 {
+            if name == "save_calls" && n > 10_000 {
                 return Err(badarg());
+            }
+            if name == "save_calls" {
+                // Port of erts/emulator/beam/bif.c:1907 (process_flag save_calls), OTP-29.1.1.
+                let old = crate::trace::set_save_calls(process, n as usize);
+                set_flag(process, name, Term::small(n).unwrap());
+                return Ok(Term::small(old as i64).unwrap());
             }
             let normalized = match name {
                 "fullsweep_after" => n.min(u16::MAX as i64),
@@ -229,6 +245,15 @@ fn process_info(
                         .map(|(_, value)| *value)
                 })
                 .unwrap_or_else(|| atom("undefined"));
+            // Port of erts/emulator/beam/erl_bif_info.c:2288 (ERTS_PI_IX_DICTIONARY_LOOKUP), OTP-29.1.1.
+            let value = if process
+                .self_pid
+                .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
+            {
+                atom("undefined")
+            } else {
+                value
+            };
             pairs.push(make_tuple(process, &[selector, value])?);
             continue;
         }
@@ -237,14 +262,27 @@ fn process_info(
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:6768 (message queue info), OTP-29.1.1.
             "message_queue_len" => Term::small(process.inbox.len() as i64).ok_or_else(badarg)?,
             // Port of erts/emulator/beam/erl_proc_sig_queue.c:6794 (messages process info), OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_bif_info.c:1692 (ERTS_PI_IX_MESSAGES), OTP-29.1.1.
             "messages" => {
-                let messages = process.inbox.copied_terms(&mut process.heap)?;
+                let sensitive = process
+                    .self_pid
+                    .is_some_and(|pid| crate::trace::is_sensitive(process, pid));
+                let messages = if sensitive {
+                    Vec::new()
+                } else {
+                    process.inbox.copied_terms(&mut process.heap)?
+                };
                 make_list(process, messages)?
             }
+            // Port of erts/emulator/beam/erl_bif_info.c:1964 (ERTS_PI_IX_DICTIONARY), OTP-29.1.1.
             "dictionary" => {
+                let sensitive = process
+                    .self_pid
+                    .is_some_and(|pid| crate::trace::is_sensitive(process, pid));
                 let raw = process
                     .cold
                     .as_ref()
+                    .filter(|_| !sensitive)
                     .map(|cold| {
                         cold.dictionary
                             .iter()
@@ -355,9 +393,11 @@ fn process_info(
                 _ => Term::small(0).unwrap(),
             }),
             "backtrace" => {
+                let running = status == atom("running");
+                let text = backtrace_text(vm, process, running)?;
                 let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
                 TermBuilder::new(&mut heap)
-                    .binary(&[])
+                    .binary(&text)
                     .map_err(|e| VmError::Unsupported(format!("backtrace binary: {e:?}")))?
             }
             "binary" => {
@@ -539,7 +579,30 @@ fn process_info(
                     .collect::<Result<Vec<_>, _>>()?;
                 make_list(process, rows)?
             }
-            "last_calls" => atom("false"),
+            // Port of erts/emulator/beam/erl_bif_info.c:2183 (ERTS_PI_IX_LAST_CALLS), OTP-29.1.1.
+            "last_calls" => match crate::trace::saved_calls(process) {
+                None => atom("false"),
+                Some(calls) => {
+                    // erts conses newest first, so the list starts with the oldest call.
+                    let mut terms = Vec::with_capacity(calls.len());
+                    for call in calls.iter().rev() {
+                        terms.push(match call {
+                            crate::trace::SavedCall::Send => atom("send"),
+                            crate::trace::SavedCall::Receive => atom("receive"),
+                            crate::trace::SavedCall::Timeout => atom("timeout"),
+                            crate::trace::SavedCall::Mfa(m, f, a) => make_tuple(
+                                process,
+                                &[
+                                    Term::atom(*m),
+                                    Term::atom(*f),
+                                    Term::small(i64::from(*a)).ok_or_else(badarg)?,
+                                ],
+                            )?,
+                        });
+                    }
+                    make_list(process, terms)?
+                }
+            },
             "sequential_trace_token" => crate::seq_trace::get_token_term(process, pid)?,
             "suspending" => suspending_term(process, pid)?,
             "trace" => Term::small(trace_mask(process, pid) as i64).unwrap(),
@@ -1009,6 +1072,13 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module, function.function, function.arity));
     }
+    // A process suspended inside native code: `module`/`ip` are its last interpreter position.
+    if let Some(function) = process
+        .native_pc
+        .and_then(crate::native_bridge::native_function_at)
+    {
+        return Ok((function.module, function.function, function.arity));
+    }
     if let Some(vm) = vm {
         let module = vm.modules.get(process.module).ok_or_else(badarg)?;
         let (function, arity) = module.function_at(process.ip).unwrap_or(("undefined", 0));
@@ -1022,6 +1092,160 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
             Some((module.name.clone(), function.to_owned(), arity))
         })
         .ok_or_else(badarg)
+}
+
+/// `module:function/arity + offset` of an interpreter continuation or native address.
+fn pc_description(modules: &[std::sync::Arc<crate::Module>], word: Term, native: bool) -> String {
+    let address = word.tagged_word() as usize;
+    let is_native =
+        native || address & 3 == 0 && crate::native_bridge::is_native_function_at(address);
+    if is_native && let Some(function) = crate::native_bridge::native_function_at(address) {
+        return format!(
+            "{}:{}/{} + {}",
+            function.module,
+            function.function,
+            function.arity,
+            address - function.start
+        );
+    }
+    if let Some((_, module, ip)) = crate::stacktrace::decode_tag(word)
+        && let Some(code) = modules.get(module)
+        && let Some((start, name, arity)) = code.functions.iter().rev().find(|(s, _, _)| *s <= ip)
+    {
+        return format!("{}:{}/{} + {}", code.name, name, arity, ip - start);
+    }
+    "unknown function".into()
+}
+
+/// The text of `process_info(Pid, backtrace)`: program counter and the stack, innermost first.
+// Port of erts/emulator/beam/erl_process.c:14896 (erts_stack_dump), :14911
+// (erts_program_counter_info), :14970 (stack_element_dump), OTP-29.1.1.
+fn backtrace_text(
+    vm: Option<&Vm>,
+    process: &mut Process,
+    running: bool,
+) -> Result<Vec<u8>, VmError> {
+    if process
+        .self_pid
+        .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
+    {
+        return Ok(Vec::new());
+    }
+    match vm {
+        Some(vm) => Ok(backtrace_with(&vm.modules, process, running)),
+        None => {
+            let runtime = process.runtime.clone().ok_or_else(badarg)?;
+            Ok(runtime.with_modules(|modules| backtrace_with(modules, process, running)))
+        }
+    }
+}
+
+fn backtrace_with(
+    modules: &[std::sync::Arc<crate::Module>],
+    process: &Process,
+    running: bool,
+) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let print = |word: Term| match arinsal_term::to_owned(word) {
+        Ok(owned) => super::sys::print_otp_term(&owned, i32::MAX as usize),
+        Err(_) => "<unprintable>".into(),
+    };
+    let mut text = String::new();
+    let native_pc = process
+        .native_pc
+        .filter(|pc| crate::native_bridge::is_native_function_at(*pc))
+        .or_else(|| {
+            let pc = process.cold.as_ref()?.native_call_pc;
+            let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
+            let pc = if pc & tag != 0 { (pc & !tag) - 1 } else { pc };
+            (pc != 0 && crate::native_bridge::is_native_function_at(pc)).then_some(pc)
+        });
+    let (address, description) = match native_pc {
+        Some(pc) => (pc, pc_description(modules, Term::NIL, true)),
+        None => (process.ip, String::new()),
+    };
+    let description = if native_pc.is_some() {
+        let function = crate::native_bridge::native_function_at(address);
+        function.map_or(description, |f| {
+            format!(
+                "{}:{}/{} + {}",
+                f.module,
+                f.function,
+                f.arity,
+                address - f.start
+            )
+        })
+    } else {
+        modules
+            .get(process.module)
+            .and_then(|code| {
+                let (start, name, arity) = code
+                    .functions
+                    .iter()
+                    .rev()
+                    .find(|(s, _, _)| *s <= process.ip)?;
+                Some(format!(
+                    "{}:{}/{} + {}",
+                    code.name,
+                    name,
+                    arity,
+                    process.ip - start
+                ))
+            })
+            .unwrap_or_else(|| "invalid".into())
+    };
+    let _ = writeln!(text, "Program counter: {address:#018x} ({description})");
+    if !running {
+        let arity = if native_pc.is_some() {
+            usize::from(process.header.arity)
+        } else {
+            modules
+                .get(process.module)
+                .and_then(|code| code.function_at(process.ip))
+                .map_or(0, |(_, arity)| usize::from(arity))
+        };
+        let _ = writeln!(text, "arity = {arity}");
+        for argument in process.x.iter().take(arity) {
+            let _ = writeln!(text, "   {}", print(*argument));
+        }
+    }
+    let base = process.heap.frame_pointer();
+    let mut yreg = 0usize;
+    for index in 0..process.heap.stack_words() {
+        let Some(word) = process.heap.stack_get(index) else {
+            continue;
+        };
+        let raw = word.tagged_word() as usize;
+        let native_return = raw & 3 == 0 && crate::native_bridge::is_native_function_at(raw);
+        let continuation = matches!(crate::stacktrace::decode_tag(word), Some((false, _, _)));
+        let bridge = raw == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
+        if bridge {
+            // The native-to-interpreter bridge frame has no erts counterpart.
+            continue;
+        }
+        if native_return || continuation {
+            let slot = base.wrapping_add(index * 8);
+            let description = pc_description(modules, word, native_return);
+            let _ = writeln!(
+                text,
+                "\n{slot:#018x} Return addr {raw:#018x} ({description})"
+            );
+            yreg = 0;
+            continue;
+        }
+        let _ = write!(text, "{:<8} ", format!("y({yreg})"));
+        yreg += 1;
+        if word.classify() == TermKind::Catch {
+            let _ = writeln!(
+                text,
+                "Catch {raw:#018x} ({})",
+                pc_description(modules, word, false)
+            );
+        } else {
+            let _ = writeln!(text, "{}", print(word));
+        }
+    }
+    text.into_bytes()
 }
 
 fn current_stacktrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, VmError> {

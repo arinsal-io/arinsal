@@ -3628,6 +3628,11 @@ impl Vm {
                 }
                 // ---- processes and messages ----
                 Instr::Send => {
+                    // Port of erts/emulator/beam/emu/bif_instrs.tab:244-249 (call_bif records
+                    // the export of a process saving calls), OTP-29.1.1.
+                    if crate::trace::saves_calls(p) {
+                        crate::trace::save_call_send_export(p);
+                    }
                     sync_cursor(p, htop, &mut heap_dirty);
                     // SAFETY: The current instruction is within this module.
                     p.ip = unsafe { ip.offset_from(base) } as usize;
@@ -3636,6 +3641,10 @@ impl Vm {
                         Some(ctx) => p.send_message_in(self, ctx, p.x[0], p.x[1])?,
                         None => p.send_message_with_vm(self, p.x[0], p.x[1])?,
                     };
+                    // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send), OTP-29.1.1.
+                    if crate::trace::saves_calls(p) {
+                        crate::trace::save_call(p, crate::trace::SavedCall::Send);
+                    }
                     p.x[0] = value;
                 }
                 Instr::LoopRec { empty, dst } => {
@@ -3661,6 +3670,9 @@ impl Vm {
                     continue;
                 }
                 Instr::RemoveMessage => {
+                    if crate::trace::saves_calls(p) {
+                        crate::trace::save_call(p, crate::trace::SavedCall::Receive);
+                    }
                     p.remove_message_with_vm(self, ctx.as_deref_mut())?;
                 }
                 Instr::Wait { target } => {
@@ -3730,6 +3742,9 @@ impl Vm {
                     });
                 }
                 Instr::Timeout => {
+                    if crate::trace::saves_calls(p) {
+                        crate::trace::save_call(p, crate::trace::SavedCall::Timeout);
+                    }
                     if let Some(ctx) = ctx.as_deref_mut() {
                         crate::trace::timeout_event(Some(self), p, ctx);
                     }

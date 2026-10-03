@@ -25,6 +25,7 @@ pub struct DispatchFragments {
     apply_fixed_offset: usize,
     apply2_offset: usize,
     apply3_offset: usize,
+    save_calls_export_offset: usize,
 }
 
 /// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
@@ -68,12 +69,15 @@ pub const DIRTY_NIF_DISPATCH_IDENTITY: usize = usize::MAX - 0xF7;
 
 impl DispatchFragments {
     /// Emits the export and light-BIF runtime fragments once for the VM.
+    /// `save_calls_helper(c_p, export)` records a remote call of a process saving calls and
+    /// returns the export's address in the active code index.
     // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210 and
     // erts/emulator/beam/jit/arm/instr_bif.cpp:378-471, OTP-29.1.1.
     pub fn new(
         export_helper: usize,
         light_bif_helper: usize,
         exception_resolver: usize,
+        save_calls_helper: usize,
     ) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
         let export = code.new_label();
@@ -84,6 +88,7 @@ impl DispatchFragments {
         let apply_fixed = code.new_label();
         let apply2 = code.new_label();
         let apply3 = code.new_label();
+        let save_calls_export = code.new_label();
         code.bind(export)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
         emit_export_fragment(&mut code, export_helper, raise_exception)
@@ -110,6 +115,10 @@ impl DispatchFragments {
             emit_unported_fragment(&mut code, sentinel)
                 .map_err(|_| ExecError::InvalidSize("apply unported fragment"))?;
         }
+        code.bind(save_calls_export)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_save_calls_export_fragment(&mut code, save_calls_helper)
+            .map_err(|_| ExecError::InvalidSize("save_calls export fragment"))?;
         code.bind(raise_exception)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_raise_exception_fragment(&mut code, exception_resolver)
@@ -134,12 +143,18 @@ impl DispatchFragments {
             apply_fixed_offset: labels[&apply_fixed],
             apply2_offset: labels[&apply2],
             apply3_offset: labels[&apply3],
+            save_calls_export_offset: labels[&save_calls_export],
         })
     }
 
     /// Shared export-entry trampoline address.
     pub fn export_trampoline(&self) -> usize {
         self.memory.ptr_at(self.export_offset) as usize
+    }
+
+    /// Entry of every export in `ERTS_SAVE_CALLS_CODE_IX` (`beam_save_calls_export`).
+    pub fn save_calls_export(&self) -> usize {
+        self.memory.ptr_at(self.save_calls_export_offset) as usize
     }
 
     /// Shared light-BIF fragment address.
@@ -222,6 +237,31 @@ fn emit_export_fragment(
         encoder.br(Gpr::x(17))
     })?;
     Ok(())
+}
+
+/// Records a remote call of a process saving calls, then continues through the export's
+/// address in the active code index. The export entry is in x1 and the return address in
+/// x30; both are preserved since this runs between caller and callee.
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:123-148 (emit_dispatch_save_calls_export),
+// OTP-29.1.1.
+fn emit_save_calls_export_fragment(
+    code: &mut CodeBuffer,
+    helper: usize,
+) -> Result<(), BufferError> {
+    code.emit(|encoder| encoder.stp_pre(Gpr::x(30), Gpr::x(1), Gpr::sp(), -16))?;
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_const(Gpr::x(17), helper as u64)?;
+        encoder.blr(Gpr::x(17))?;
+        encoder.mov_reg(Gpr::x(17), Gpr::x(0))
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.ldp_post(Gpr::x(30), Gpr::x(1), Gpr::sp(), 16)?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.br(Gpr::x(17))
+    })
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:220-286, OTP-29.1.1.

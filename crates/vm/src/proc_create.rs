@@ -76,6 +76,9 @@ pub struct Process {
     // ---- processes and messages ----
     pub(crate) runtime: Option<std::sync::Arc<process::Runtime>>,
     pub(crate) self_pid: Option<arinsal_sched::Pid>,
+    /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
+    /// like erts' `c_p->scheduler_data`.
+    pub(crate) scheduler_id: u32,
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
     pub(crate) inbox: process::MessageQueue,
@@ -105,6 +108,8 @@ pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceA
 
 #[derive(Default)]
 pub(crate) struct ProcessCold {
+    /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
+    pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
     /// The last slice ended because the process is suspended, not because it waits in a
     /// receive: it stays active (runnable once resumed).
     pub(crate) suspend_parked: bool,
@@ -428,6 +433,7 @@ impl Process {
             final_exit_reason: None,
             runtime: None,
             self_pid: None,
+            scheduler_id: 0,
             hibernated: false,
             inbox: process::MessageQueue::default(),
             receive_cursor: 0,

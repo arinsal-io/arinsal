@@ -16,12 +16,23 @@ pub type BifIdentityHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64, 
 /// Apply resolver supplied by the runtime; zero means the target could not be resolved.
 pub type ApplyResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32) -> usize;
 
-/// Mutable indirection used by external calls, matching OTP's two code indices.
-// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:394-401, OTP-29.1.1.
+/// Number of code indexes (`ERTS_NUM_CODE_IX`): active, staging and the one being retired.
+// Port of erts/emulator/beam/code_ix.h:72-78, OTP-29.1.1.
+pub const ERTS_NUM_CODE_IX: usize = 3;
+/// Length of an export's address vector: one slot per code index plus the save_calls slot.
+pub const ERTS_ADDRESSV_SIZE: usize = ERTS_NUM_CODE_IX + 1;
+/// Code index of a process with `process_flag(save_calls, N > 0)`: every remote call lands in
+/// the save_calls dispatch fragment.
+pub const ERTS_SAVE_CALLS_CODE_IX: usize = ERTS_ADDRESSV_SIZE - 1;
+
+/// Mutable indirection used by external calls: one address per code index (`ErtsDispatchable`).
+/// Native code calls `addresses[active_code_ix]`.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:394-401 and erts/emulator/beam/code_ix.h:91-95
+// (ErtsDispatchable), OTP-29.1.1.
 #[repr(C)]
 pub struct ExportEntry {
-    /// Native entry addresses indexed by the active code generation.
-    pub addresses: [AtomicUsize; 2],
+    /// Native entry addresses indexed by code index; the last slot is the save_calls entry.
+    pub addresses: [AtomicUsize; ERTS_ADDRESSV_SIZE],
 }
 
 // erts calls `i_bif*` with only `Update::eReductions` (instr_bif.cpp:47-64) because its guard
@@ -30,19 +41,40 @@ pub struct ExportEntry {
 const PLAIN_BIF_UPDATE: Update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
 
 impl ExportEntry {
-    /// Creates an export entry for a native function.
-    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:394-401, OTP-29.1.1.
+    /// Creates an export entry whose every code index, the save_calls one included, enters
+    /// `address`.
     pub const fn new(address: usize) -> Self {
+        Self::with_save_calls(address, address)
+    }
+
+    /// Creates an export entry entering `address` in every code index and `save_calls` in
+    /// `ERTS_SAVE_CALLS_CODE_IX`.
+    // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
+    pub const fn with_save_calls(address: usize, save_calls: usize) -> Self {
         Self {
-            addresses: [AtomicUsize::new(address), AtomicUsize::new(address)],
+            addresses: [
+                AtomicUsize::new(address),
+                AtomicUsize::new(address),
+                AtomicUsize::new(address),
+                AtomicUsize::new(save_calls),
+            ],
         }
     }
 
-    /// Repoints both code-generation slots while this VM uses one active code version.
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:150-169, OTP-29.1.1.
-    pub fn update(&self, address: usize) {
-        self.addresses[0].store(address, Ordering::Release);
-        self.addresses[1].store(address, Ordering::Release);
+    /// The address entered in code index `ix`.
+    pub fn address(&self, ix: usize) -> usize {
+        self.addresses[ix].load(Ordering::Acquire)
+    }
+
+    /// Sets the address entered in code index `ix`.
+    pub fn set_address(&self, ix: usize, address: usize) {
+        self.addresses[ix].store(address, Ordering::Release);
+    }
+
+    /// Copies the address of code index `src` into `dst` when a staging area opens.
+    // Port of erts/emulator/beam/export.c:100-106 (export_stage), OTP-29.1.1.
+    pub fn stage(&self, src: usize, dst: usize) {
+        self.set_address(dst, self.address(src));
     }
 }
 
@@ -55,6 +87,8 @@ const XREGS: [Gpr; 6] = [
     Gpr::x(10 + 6),
 ];
 const E: Gpr = Gpr::x(20);
+/// The process's code index (`active_code_ix`), loaded on every entry into native code.
+const ACTIVE_CODE_IX: Gpr = Gpr::x(24);
 
 impl BeamModuleAssembler {
     /// Calls a lightweight BIF with the supplied X-register arguments.
@@ -449,7 +483,7 @@ impl BeamModuleAssembler {
         let target = Gpr::x(14);
         self.code.emit(|e| {
             e.mov_const(Gpr::x(13), export as *const ExportEntry as u64)?;
-            e.ldr_uoff(target, Gpr::x(13), 0)?;
+            e.ldr_regoff(target, Gpr::x(13), ACTIVE_CODE_IX, 3)?;
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
             e.mov_reg(Gpr::x(1), Gpr::x(13))?;
             if tail {

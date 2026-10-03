@@ -360,7 +360,7 @@ fn module_with_export(export: &'static ExportEntry, value: u64, tail_kind: u8) -
 fn native_i_call_ext() {
     let export = Box::leak(Box::new(ExportEntry::new(0)));
     let module = module_with_export(export, tagged(31), 0);
-    export.update(module.entries[&2] as usize);
+    export.set_address(0, module.entries[&2] as usize);
     assert_eq!(
         execute(&module, 1, ProcessHeader::default(), [0; 3]).0,
         tagged(31)
@@ -372,7 +372,7 @@ fn native_i_call_ext() {
 fn native_i_call_ext_last() {
     let export = Box::leak(Box::new(ExportEntry::new(0)));
     let module = module_with_export(export, tagged(32), 2);
-    export.update(module.entries[&2] as usize);
+    export.set_address(0, module.entries[&2] as usize);
     execute(&module, 1, ProcessHeader::default(), [0; 3]);
 }
 
@@ -381,7 +381,7 @@ fn native_i_call_ext_last() {
 fn native_i_call_ext_only() {
     let export = Box::leak(Box::new(ExportEntry::new(0)));
     let module = module_with_export(export, tagged(33), 1);
-    export.update(module.entries[&2] as usize);
+    export.set_address(0, module.entries[&2] as usize);
     execute(&module, 1, ProcessHeader::default(), [0; 3]);
 }
 
@@ -390,12 +390,12 @@ fn native_i_call_ext_only() {
 fn export_entry_repoints_between_calls() {
     let export = Box::leak(Box::new(ExportEntry::new(0)));
     let module = module_with_export(export, tagged(41), 0);
-    export.update(module.entries[&2] as usize);
+    export.set_address(0, module.entries[&2] as usize);
     assert_eq!(
         execute(&module, 1, ProcessHeader::default(), [0; 3]).0,
         tagged(41)
     );
-    export.update(module.entries[&3] as usize);
+    export.set_address(0, module.entries[&3] as usize);
     assert_eq!(
         execute(&module, 1, ProcessHeader::default(), [0; 3]).0,
         tagged(42)

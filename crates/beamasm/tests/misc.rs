@@ -56,7 +56,7 @@ fn tagged(value: u64) -> u64 {
 #[test]
 fn native_send() {
     const IDENTITY: usize = 0x1234;
-    let fragments = DispatchFragments::new(0, light_bif_hook as *const () as usize, 0).unwrap();
+    let fragments = DispatchFragments::new(0, light_bif_hook as *const () as usize, 0, 0).unwrap();
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
     asm.emit_enter_frame().unwrap();

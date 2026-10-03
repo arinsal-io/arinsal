@@ -1064,6 +1064,7 @@ impl Executor {
     ) -> Result<RunState, VmError> {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
         process.self_pid = Some(ctx.pid());
+        process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
         let schedule_started = std::time::Instant::now();
         let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
         let running_fields = running.as_slice();
@@ -1289,7 +1290,10 @@ impl Executor {
                     if let Some(code_ptr) = process.native_pc.take() {
                         crate::beamasm_integration::count_native_call();
                         // Native receives look at the private queue only; fetch what arrived.
+                        // Signals handled here (process_info) still see the process suspended at
+                        // its native resume pc, as erts reads `c_p->i` while it waits.
                         process.drain(ctx)?;
+                        process.native_pc = None;
                         process.header.self_pid =
                             ctx.pid().to_term().expect("valid pid").tagged_word();
                         process.self_pid = Some(ctx.pid());
@@ -1335,6 +1339,17 @@ impl Executor {
                             // used = CONTEXT_REDS - FCALLS), OTP-29.1.1: native code counts down
                             // FCALLS; the scheduler charges what it used.
                             let fcalls_before = process.reductions;
+                            // A code change this scheduler committed waits for thread
+                            // progress first: every other scheduler then finishes the slice it
+                            // runs with the previous code index (erts' code barrier).
+                            if crate::code_ix::take_code_barrier() {
+                                ctx.block_thread_progress(std::time::Duration::ZERO);
+                            }
+                            self.native_registers.active_code_ix = self
+                                .vm
+                                .code_ix
+                                .process_code_ix(crate::trace::saves_calls(process))
+                                as u64;
                             let native =
                                 crate::run_native(process, &mut self.native_registers, code_ptr);
                             let consumed = fcalls_before.saturating_sub(process.reductions);
@@ -4188,6 +4203,7 @@ impl Process {
     /// Process exit after its tables are released: pending signals, names, links and monitors.
     fn exit_stage3(&mut self, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         crate::trace::clear(self, ctx.pid());
+        crate::trace::clear_save_calls(self);
         // Further publishes fail with `NoProcess` and the watcher synthesizes
         // DOWN. Signals already queued are installed before we notify.
         ctx.begin_exit();

@@ -287,6 +287,21 @@ impl Vm {
         arity: usize,
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
         let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
+        if crate::trace::saves_calls(p)
+            && let Some(import) = self
+                .modules
+                .get(module_id)
+                .and_then(|module| module.imports.get(import))
+        {
+            crate::trace::save_call(
+                p,
+                crate::trace::SavedCall::Mfa(
+                    import.module_atom,
+                    import.function_atom,
+                    import.arity,
+                ),
+            );
+        }
         if !crate::trace_bp::any_pattern() {
             return untraced(p);
         }
@@ -715,6 +730,18 @@ impl Vm {
         mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
     ) -> Result<ImportOutcome, VmError> {
         p.gc_live = arity;
+        if crate::trace::saves_calls(p)
+            && let Some(import) = self.modules[p.module].imports.get(index)
+        {
+            crate::trace::save_call(
+                p,
+                crate::trace::SavedCall::Mfa(
+                    import.module_atom,
+                    import.function_atom,
+                    import.arity,
+                ),
+            );
+        }
         if let Some(result) = crate::bif_traps::execute(
             self,
             p,

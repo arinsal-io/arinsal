@@ -66,7 +66,7 @@ fn run(
     Box<[u64; 64]>,
 ) {
     TARGET.store(target, Ordering::Release);
-    let fragments = DispatchFragments::new(0, helper, 0).unwrap();
+    let fragments = DispatchFragments::new(0, helper, 0, 0).unwrap();
     let mut assembler = BeamModuleAssembler::new();
     assembler.emit_i_func_label(1).unwrap();
     assembler

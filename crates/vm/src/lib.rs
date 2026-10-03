@@ -7,6 +7,7 @@ mod bif_dispatch;
 pub mod boot;
 mod calls;
 mod check_io;
+mod code_ix;
 mod compare;
 mod ddll;
 #[cfg(feature = "difftest")]
@@ -216,6 +217,8 @@ pub struct Vm {
     beamasm_targets: beamasm_integration::NativeTargetCache,
     /// Identity of this node's code (erts' code index state); native registries are per scope.
     pub(crate) code_scope: u64,
+    /// Code indexes of this node (`code_ix.c`).
+    pub(crate) code_ix: Arc<crate::code_ix::CodeIndexes>,
     registers: SharedTable<Vec<(usize, usize)>>,
     native_fns: SharedTable<Vec<arinsal_bifs::BifFn>>,
     loaded_nifs: SharedTable<std::collections::HashSet<String>>,

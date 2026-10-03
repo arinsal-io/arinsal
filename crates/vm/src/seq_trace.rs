@@ -197,8 +197,9 @@ pub(crate) fn on_send(
 ) -> Option<Box<Token>> {
     let mut token = token(process)?;
     token.serial = token.serial.saturating_add(1);
+    // Port of erts/emulator/beam/erl_trace.c:920-941 (seq_trace_update_serial), OTP-29.1.1:
+    // the token takes the process's lastcnt, which only receiving a message updates.
     token.previous = token.last;
-    token.last = token.serial;
     token.sender = pid
         .to_term()
         .and_then(|p| to_owned(p).ok())
@@ -258,6 +259,9 @@ pub(crate) fn on_receive(
             },
         );
     }
+    // The receiver's counters follow the serial it received, whether or not the sender
+    // (a sensitive process) emitted output for it.
+    token.last = token.serial;
     token.previous = token.last;
     put(process, Some(token));
 }
@@ -278,6 +282,12 @@ fn emit(
     event: SeqEvent,
 ) {
     // Port of erts/emulator/beam/erl_trace.c:964-1024 (seq_trace_output_generic), OTP-29.1.1.
+    if process
+        .self_pid
+        .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
+    {
+        return;
+    }
     let target = tracer().lock().unwrap().clone();
     let Some(target_term) = from_owned(
         &target,
@@ -620,7 +630,6 @@ fn print(
     };
     t.serial = t.serial.saturating_add(1);
     t.previous = t.last;
-    t.last = t.serial;
     let sender = pid
         .to_term()
         .and_then(|p| to_owned(p).ok())
@@ -633,7 +642,7 @@ fn print(
         SeqEvent {
             kind: "print",
             sender,
-            receiver: OwnedTerm::atom("undefined"),
+            receiver: OwnedTerm::Nil,
             info: msg,
         },
     );
