@@ -4967,7 +4967,8 @@ impl Task for Process {
         }
         for linker in links {
             if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
-                let _ = scheduler.signal(pid, linker, Signal::Exit(reason));
+                // A link exit (erts_proc_exit_handle_link), so the linker drops its half.
+                let _ = scheduler.signal(pid, linker, Signal::ExitLinked(reason));
             }
         }
         for (reference, watcher) in monitors {
