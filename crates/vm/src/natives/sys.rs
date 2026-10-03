@@ -2465,7 +2465,7 @@ fn set_cpu_topology(
         if !valid_cpu_topology(&owned) {
             return Err(bif_error_for(process, error_function, &[value], "badarg"));
         }
-        Some(owned)
+        Some(canonical_cpu_topology(owned))
     };
     let mut current = runtime_state(process)
         .cpu_topology
@@ -2475,12 +2475,65 @@ fn set_cpu_topology(
     *current = new;
     drop(current);
     match previous {
-        Some(topology) => arinsal_term::from_owned(
-            &topology,
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-        )
-        .map_err(|_| badarg()),
+        Some(topology) => {
+            let term = arinsal_term::from_owned(
+                &topology,
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            )
+            .map_err(|_| badarg())?;
+            Ok(term)
+        }
         None => Ok(atom("undefined")),
+    }
+}
+
+// The Erlang wrapper accepts the historical {Tag, [], Children} spelling and
+// formats singleton core/thread levels away after assigning their implicit id 0.
+fn canonical_cpu_topology(topology: arinsal_etf::OwnedTerm) -> arinsal_etf::OwnedTerm {
+    use arinsal_etf::OwnedTerm as O;
+
+    fn node(term: &O) -> O {
+        let O::Tuple(fields) = term else {
+            return term.clone();
+        };
+        let (tag, child) = match fields.as_slice() {
+            [O::Atom(tag), child] => (tag.as_str(), child),
+            [O::Atom(tag), O::Nil, child] => (tag.as_str(), child),
+            _ => return term.clone(),
+        };
+        let children = match child {
+            O::List { elems, tail } if matches!(tail.as_ref(), O::Nil) => O::List {
+                elems: elems.iter().map(node).collect(),
+                tail: Box::new(O::Nil),
+            },
+            child => node(child),
+        };
+        let children = match &children {
+            O::Tuple(fields) if matches!(fields.first(), Some(O::Atom(name)) if name == "core" || name == "thread") => {
+                fields.get(1).cloned().unwrap_or(O::Nil)
+            }
+            O::List { elems, tail } if elems.len() == 1 && matches!(tail.as_ref(), O::Nil) => {
+                match &elems[0] {
+                    O::Tuple(fields) if matches!(fields.first(), Some(O::Atom(name)) if name == "core" || name == "thread") => {
+                        fields.get(1).cloned().unwrap_or(O::Nil)
+                    }
+                    _ => O::List {
+                        elems: elems.clone(),
+                        tail: tail.clone(),
+                    },
+                }
+            }
+            _ => children,
+        };
+        O::Tuple(vec![O::Atom(tag.into()), children])
+    }
+
+    match &topology {
+        O::List { elems, tail } => O::List {
+            elems: elems.iter().map(node).collect(),
+            tail: tail.clone(),
+        },
+        _ => topology,
     }
 }
 
@@ -2493,25 +2546,24 @@ fn valid_cpu_topology(topology: &arinsal_etf::OwnedTerm) -> bool {
     if !matches!(tail.as_ref(), OwnedTerm::Nil) || elems.is_empty() {
         return false;
     }
-    fn visit(node: &OwnedTerm, parent_rank: i8, logical_ids: &mut HashSet<i64>) -> bool {
+    fn visit(node: &OwnedTerm, parent: &str, logical_ids: &mut HashSet<i64>) -> bool {
         let OwnedTerm::Tuple(fields) = node else {
             return false;
         };
         let (tag, child) = match fields.as_slice() {
-            [OwnedTerm::Atom(tag), child] | [OwnedTerm::Atom(tag), child, OwnedTerm::Nil] => {
-                (tag.as_str(), child)
-            }
+            [OwnedTerm::Atom(tag), child] => (tag.as_str(), child),
+            [OwnedTerm::Atom(tag), OwnedTerm::Nil, child] => (tag.as_str(), child),
             _ => return false,
         };
-        let rank = match tag {
-            "node" => 0,
-            "processor" => 1,
-            "core" => 2,
-            "thread" => 3,
-            "logical" => 4,
-            _ => return false,
-        };
-        if rank <= parent_rank {
+        let allowed = matches!(
+            (parent, tag),
+            ("root", "node" | "processor" | "core" | "thread")
+                | ("node", "processor" | "core" | "thread" | "logical")
+                | ("processor", "node" | "core" | "thread" | "logical")
+                | ("core", "thread" | "logical")
+                | ("thread", "logical")
+        );
+        if !allowed {
             return false;
         }
         if tag == "logical" {
@@ -2527,13 +2579,348 @@ fn valid_cpu_topology(topology: &arinsal_etf::OwnedTerm) -> bool {
             }
             _ => children.push(child),
         }
+        let sibling_tag = children.first().and_then(|child| match child {
+            OwnedTerm::Tuple(fields) => fields.first().and_then(|tag| match tag {
+                OwnedTerm::Atom(tag) => Some(tag.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        });
         !children.is_empty()
+            && sibling_tag.is_some()
             && children
                 .into_iter()
-                .all(|child| visit(child, rank, logical_ids))
+                .all(|child| {
+                    let same_tag = match &child {
+                        OwnedTerm::Tuple(fields) => matches!(fields.first(), Some(OwnedTerm::Atom(child_tag)) if Some(child_tag.as_str()) == sibling_tag),
+                        _ => false,
+                    };
+                    same_tag && visit(child, tag, logical_ids)
+                })
     }
     let mut logical_ids = HashSet::new();
-    elems.iter().all(|node| visit(node, -1, &mut logical_ids)) && !logical_ids.is_empty()
+    elems
+        .iter()
+        .all(|node| visit(node, "root", &mut logical_ids))
+        && !logical_ids.is_empty()
+}
+
+/// Build OTP's test reader-group assignment for the currently defined topology.
+// Port of erts/emulator/beam/erl_cpu_topology.c:1834-1848 and :1918-2256, OTP-29.1.1.
+pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm as O;
+
+    if groups <= 0 {
+        return Err(badarg());
+    }
+    let topology = runtime_state(process)
+        .cpu_topology
+        .lock()
+        .expect("CPU topology state")
+        .clone();
+    let Some(O::List { elems, tail }) = topology.as_ref() else {
+        return Ok(Term::NIL);
+    };
+    if !matches!(tail.as_ref(), O::Nil) {
+        return Ok(Term::NIL);
+    }
+
+    // The group builder only needs the ordered hierarchy levels associated with
+    // each logical processor. The synthetic ids preserve sibling boundaries.
+    #[derive(Clone, Copy)]
+    struct Cpu {
+        level: [i32; 6],
+    }
+    fn visit(term: &O, parent: [i32; 6], parent_tag: &str, rows: &mut Vec<Cpu>) -> bool {
+        let O::Tuple(fields) = term else { return false };
+        let (tag, child) = match fields.as_slice() {
+            [O::Atom(tag), child] => (tag.as_str(), child),
+            [O::Atom(tag), O::Nil, child] => (tag.as_str(), child),
+            _ => return false,
+        };
+        let rank = match tag {
+            "node" => 0,
+            "processor" => 1,
+            "core" => 3,
+            "thread" => 4,
+            "logical" => 5,
+            _ => return false,
+        };
+        let allowed = matches!(
+            (parent_tag, tag),
+            ("root", "node" | "processor" | "core" | "thread")
+                | ("node", "processor" | "core" | "thread" | "logical")
+                | ("processor", "node" | "core" | "thread" | "logical")
+                | ("core", "thread" | "logical")
+                | ("thread", "logical")
+        );
+        if !allowed {
+            return false;
+        }
+        if rank == 5 {
+            let O::Int(id) = child else { return false };
+            let Ok(id) = i32::try_from(*id) else {
+                return false;
+            };
+            let mut level = parent;
+            level[5] = id;
+            if level[1] < 0 {
+                level[1] = 0;
+            }
+            if level[3] < 0 {
+                level[3] = 0;
+            }
+            if level[4] < 0 {
+                level[4] = 0;
+            }
+            rows.push(Cpu { level });
+            return true;
+        }
+        let mut level = parent;
+        let field = if rank == 0 && parent_tag == "processor" {
+            2
+        } else {
+            rank as usize
+        };
+        level[field] = parent[field].max(0);
+        if field == 2 {
+            level[0] = parent[0];
+        }
+        let children = match child {
+            O::List { elems, tail } if matches!(tail.as_ref(), O::Nil) => elems.clone(),
+            other => vec![other.clone()],
+        };
+        if children.is_empty() {
+            return false;
+        }
+        let sibling_tag = children.first().and_then(|child| match child {
+            O::Tuple(fields) => fields.first().and_then(|tag| match tag {
+                O::Atom(tag) => Some(tag.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        if sibling_tag.is_none() {
+            return false;
+        }
+        for (next, child) in children.into_iter().enumerate() {
+            let O::Tuple(fields) = &child else {
+                return false;
+            };
+            let child_tag = match fields.first() {
+                Some(O::Atom(tag)) => tag.as_str(),
+                _ => return false,
+            };
+            if sibling_tag.as_deref() != Some(child_tag) {
+                return false;
+            }
+            let child_rank = match child_tag {
+                "node" => 0,
+                "processor" => 1,
+                "core" => 3,
+                "thread" => 4,
+                "logical" => 5,
+                _ => return false,
+            };
+            let target_field = if child_rank == 0 && rank == 1 {
+                2
+            } else {
+                child_rank as usize
+            };
+            let mut child_parent = level;
+            child_parent[target_field] = i32::try_from(next).unwrap_or(i32::MAX);
+            if !visit(&child, child_parent, tag, rows) {
+                return false;
+            }
+        }
+        true
+    }
+
+    let mut rows = Vec::new();
+    let root = [-1; 6];
+    let mut root_ids = [0_i32; 6];
+    for term in elems {
+        let O::Tuple(fields) = term else {
+            return Err(badarg());
+        };
+        let tag = match fields.first() {
+            Some(O::Atom(tag)) => tag.as_str(),
+            _ => return Err(badarg()),
+        };
+        let field = match tag {
+            "node" => 0,
+            "processor" => 1,
+            "core" => 3,
+            "thread" => 4,
+            _ => return Err(badarg()),
+        };
+        let mut parent = root;
+        parent[field] = root_ids[field];
+        root_ids[field] += 1;
+        if !visit(term, parent, "root", &mut rows) {
+            return Err(badarg());
+        }
+    }
+    if rows.is_empty() {
+        return Ok(Term::NIL);
+    }
+
+    // Port of make_available_cpu_topology: count changes at each level.
+    let mut counts = [-1_i32; 6];
+    let mut previous = [-2_i32; 6];
+    for row in &mut rows {
+        let raw_levels = row.level;
+        let mut changed_at = 5;
+        for level in 0..5 {
+            if previous[level] != raw_levels[level] {
+                changed_at = level;
+                break;
+            }
+        }
+        for count in counts.iter_mut().skip(changed_at) {
+            *count += 1;
+        }
+        row.level[..5].copy_from_slice(&counts[..5]);
+        previous = raw_levels;
+    }
+    let mut no = counts;
+    for count in &mut no {
+        *count += 1;
+    }
+
+    // Port of erts/emulator/beam/erl_cpu_topology.c:2087-2256 (make_cpu_groups_map,
+    // sub_levels, write_cpu_groups), OTP-29.1.1.
+    let groups = groups as usize;
+    let spread = (0..4)
+        .find(|&level| no[level] as usize > groups)
+        .unwrap_or(3);
+    let mut assigned = vec![0_i32; rows.len()];
+    if no[spread] as usize <= groups {
+        let mut cg = -1;
+        let mut last = -1;
+        for (ix, row) in rows.iter().enumerate() {
+            if last != row.level[spread] {
+                cg += 1;
+                last = row.level[spread];
+            }
+            assigned[ix] = cg;
+        }
+    } else {
+        // (id, sub_levels, cpu_groups); `tl` is the level above the spread level, -1 for none.
+        let tl = spread as isize - 1;
+        let toplevels = if spread == 0 {
+            1
+        } else {
+            no[spread - 1] as usize
+        };
+        let mut counts: Vec<(i32, usize, usize)> = Vec::with_capacity(toplevels);
+        if toplevels == 1 {
+            counts.push((0, no[spread] as usize, groups));
+        } else {
+            let tl = tl as usize;
+            let mut cgs = groups;
+            let cgs_per_tl = cgs / toplevels;
+            let mut a = 0;
+            for _ in 0..toplevels {
+                let id = rows[a].level[tl];
+                let mut last = -1;
+                let mut sub = 0;
+                loop {
+                    if last != rows[a].level[spread] {
+                        sub += 1;
+                        last = rows[a].level[spread];
+                    }
+                    a += 1;
+                    if !(a < rows.len() && id == rows[a].level[tl]) {
+                        break;
+                    }
+                }
+                counts.push((id, sub, 0));
+            }
+            counts.sort_by(|x, y| y.1.cmp(&x.1).then(x.0.cmp(&y.0)));
+            for entry in &mut counts {
+                if entry.1 < cgs_per_tl {
+                    entry.2 = entry.1;
+                    cgs -= entry.1;
+                } else {
+                    entry.2 = cgs_per_tl;
+                    cgs -= cgs_per_tl;
+                }
+            }
+            while cgs > 0 {
+                let mut progressed = false;
+                for entry in &mut counts {
+                    if entry.1 == entry.2 {
+                        break;
+                    }
+                    entry.2 += 1;
+                    progressed = true;
+                    cgs -= 1;
+                    if cgs == 0 {
+                        break;
+                    }
+                }
+                // The C loop spins forever here; no group can be placed, so it is badarg.
+                if !progressed {
+                    return Err(badarg());
+                }
+            }
+            counts.sort_by_key(|entry| entry.0);
+        }
+        let mut a = 0;
+        let mut cg = -1_i32;
+        let mut ix = 0;
+        while a < rows.len() {
+            let (id, sub_levels, cpu_groups) = counts[ix];
+            // The C code divides by zero when fewer groups than top levels were requested.
+            let (Some(per_group), Some(xsl)) = (
+                sub_levels.checked_div(cpu_groups),
+                sub_levels.checked_rem(cpu_groups),
+            ) else {
+                return Err(badarg());
+            };
+            let xsl_cg_lim = (cpu_groups - xsl) as i32 + cg + 1;
+            let mut sls = 0;
+            let mut last = -1;
+            loop {
+                if last != rows[a].level[spread] {
+                    if sls == 0 {
+                        sls = per_group;
+                        cg += 1;
+                        if cg >= xsl_cg_lim {
+                            sls += 1;
+                        }
+                    }
+                    last = rows[a].level[spread];
+                    sls -= 1;
+                }
+                assigned[a] = cg;
+                a += 1;
+                if !(a < rows.len() && (tl < 0 || rows[a].level[tl as usize] == id)) {
+                    break;
+                }
+            }
+            ix += 1;
+        }
+    }
+    let mut pairs = rows
+        .iter()
+        .zip(assigned)
+        .map(|(row, group)| (row.level[5], group))
+        .collect::<Vec<_>>();
+    pairs.sort_unstable_by_key(|(logical, _)| *logical);
+    owned_system_info(
+        process,
+        O::List {
+            elems: pairs
+                .into_iter()
+                .map(|(logical, group)| {
+                    O::Tuple(vec![O::Int(logical.into()), O::Int(i64::from(group + 1))])
+                })
+                .collect(),
+            tail: Box::new(O::Nil),
+        },
+    )
 }
 
 // Port of erts/emulator/beam/utils.c:919 (`send_warning_to_logger`) and :802

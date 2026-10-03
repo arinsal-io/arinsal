@@ -1549,7 +1549,7 @@ fn internal_state_tuple_get(
         ("reader_groups_map", OwnedTerm::Int(groups))
             if *groups > 0 && Term::small(*groups).is_some() =>
         {
-            Ok(Some(Term::NIL))
+            crate::natives::sys::reader_groups_map(process, *groups).map(Some)
         }
         ("fake_scheduler_bindings", OwnedTerm::Atom(mode))
             if matches!(

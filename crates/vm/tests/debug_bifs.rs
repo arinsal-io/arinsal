@@ -16,6 +16,7 @@ const SOURCE: &str = r#"
          internal_state_get_remaining_tuples/0,
          internal_state_proc_sig_block/0,
          internal_state_inconsistent/0, internal_state_abort/0, internal_state_broken_halt/0,
+         reader_group_maps/0,
          monitor_long_schedule/0, monitor_long_gc/0, monitor_long_message_queue/0,
          allocator_info/0]).
 
@@ -98,6 +99,35 @@ internal_state_get_tuples() ->
               erts_debug:get_internal_state({make_unique_integer, 0, 1}),
               erts_debug:get_internal_state({term_to_binary, abc, []}),
      caught(fun() -> erts_debug:get_internal_state({connection_id, foo}) end)}.
+
+reader_group_maps() ->
+    erts_debug:set_internal_state(available_internal_state, true),
+    Topology = [p([c(l(0)),c(l(1)),c(l(2)),c(l(3)),c(l(4))]),
+                p([t(l(5)),t(l(6)),t(l(7)),t(l(8)),t(l(9))]),
+                p([t(l(10))]),
+                p([c(l(11)),c(l(12)),c(l(13))]),
+                p([c(l(14)),c(l(15))])],
+    erlang:system_flag(cpu_topology, Topology),
+    Result1 = [erts_debug:get_internal_state({reader_groups_map, N}) || N <- [2,5,6,7,8,9,10,100]],
+    Topology2 = [{processor,[{node,[{core,l(20)},{core,l(21)}]},
+                             {node,[{core,l(22)},{core,l(23)}]},
+                             {node,[{core,l(24)},{core,l(25)}]}]}],
+    erlang:system_flag(cpu_topology, Topology2),
+    Result2 = [erts_debug:get_internal_state({reader_groups_map, N}) || N <- [2,3,5]],
+    Topology3 = [p([t(l(0)),t(l(1)),t(l(2)),t(l(3)),t(l(4))]),
+                 p([t(l(5))]),
+                 p([c(l(6)),c(l(7)),c(l(8))]),
+                 p([c(l(9)),c(l(10))]),
+                 p([c(l(11)),c(l(12)),c(l(13)),c(l(14)),c(l(15))])],
+    erlang:system_flag(cpu_topology, Topology3),
+    Result3 = [erts_debug:get_internal_state({reader_groups_map, N}) || N <- [6,7]],
+    erlang:system_flag(cpu_topology, undefined),
+    {Result1, Result2, Result3}.
+
+p(Children) -> {processor, Children}.
+c(Child) -> {core, Child}.
+t(Child) -> {thread, Child}.
+l(Id) -> {logical, Id}.
 
 internal_state_more_get_tuples() ->
     erts_debug:set_internal_state(available_internal_state, true),
@@ -465,6 +495,16 @@ fn internal_state_tuple_get_dispatch_matches_otp() {
         return;
     };
     let (expected, actual) = run(&reference, "internal_state_get_tuples");
+    assert_reference(expected, actual);
+}
+
+#[test]
+fn debug_reader_group_maps_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping reader-group map differential test");
+        return;
+    };
+    let (expected, actual) = run(&reference, "reader_group_maps");
     assert_reference(expected, actual);
 }
 
