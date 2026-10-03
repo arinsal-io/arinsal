@@ -245,6 +245,10 @@ pub extern "C" fn enif_make_uint64(e: *mut ErlNifEnv, n: u64) -> Term {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_make_double(e: *mut ErlNifEnv, n: f64) -> Term {
+    // Port of erts/emulator/beam/erl_nif.c:2203 (enif_make_double): NaN and infinity raise badarg.
+    if !n.is_finite() {
+        return enif_make_badarg(e);
+    }
     built(env(e), |b| b.float(n))
 }
 

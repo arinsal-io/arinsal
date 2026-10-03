@@ -10,8 +10,33 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// The VM may register services once processes and the reactor are connected.
-/// Reactor event registration callback.
-pub type SelectHook = fn(usize, i32, usize, Option<Term>, Term) -> i32;
+/// A message `enif_select` prepared for one direction: it owns its heap.
+pub struct SelectMessage {
+    /// Pid that gets the message.
+    pub recipient: Term,
+    /// Message term, living on the private heap.
+    pub message: Term,
+    _heap: VecHeap,
+}
+/// One `enif_select_x` call, handed to the VM's check-io table.
+pub struct SelectRequest {
+    /// `ErlNifEvent`.
+    pub fd: c_int,
+    /// `ErlNifSelectFlags`.
+    pub flags: c_int,
+    /// Resource data address (`obj`).
+    pub resource: usize,
+    /// READ and WRITE messages, prepared when the call selects (not cancel or stop).
+    pub messages: [Option<SelectMessage>; 2],
+}
+/// `enif_select_x` implementation (erl_check_io.c:1236).
+pub type SelectHook = fn(SelectRequest) -> i32;
+/// Local port lookup by registered name.
+pub type WhereisPortHook = fn(Term) -> Option<Term>;
+/// Whether a port term denotes a live local port.
+pub type PortAliveHook = fn(Term) -> bool;
+/// `enif_port_command`: sender pid, port, data.
+pub type PortCommandHook = fn(Option<Term>, Term, Term) -> bool;
 /// Resource process monitor registration callback.
 pub type MonitorHook = fn(usize, Term, &mut [u8; 32]) -> i32;
 #[derive(Default, Clone, Copy)]
@@ -20,8 +45,14 @@ pub struct VmHooks {
     pub send: Option<fn(Term, Term) -> bool>,
     /// Resolve an atom name to a pid.
     pub whereis_pid: Option<fn(Term) -> Option<Term>>,
-    /// Register or cancel a reactor event.
+    /// `enif_select_x`.
     pub select: Option<SelectHook>,
+    /// Resolve an atom name to a port.
+    pub whereis_port: Option<WhereisPortHook>,
+    /// Whether a port is alive.
+    pub port_alive: Option<PortAliveHook>,
+    /// Send a command to a port.
+    pub port_command: Option<PortCommandHook>,
     /// Register a process monitor for a native resource.
     pub monitor: Option<MonitorHook>,
     /// Remove a process monitor.
@@ -52,6 +83,24 @@ fn messages() -> &'static Mutex<Vec<SentMessage>> {
 /// Drain messages recorded by the standalone host.
 pub fn take_test_messages() -> Vec<SentMessage> {
     std::mem::take(&mut *messages().lock().unwrap())
+}
+
+/// Read a pid or port term the NIF caller keeps live for the callback.
+fn load(p: *const Term) -> Term {
+    // SAFETY: The NIF caller retains this storage for the callback.
+    unsafe { *p }
+}
+/// Write a term to caller-provided storage, if any.
+fn store(out: *mut Term, value: Term) {
+    if !out.is_null() {
+        // SAFETY: The NIF caller retains this storage for the callback.
+        unsafe { *out = value }
+    }
+}
+/// The calling process of a NIF environment.
+fn env_pid(e: *mut ErlNifEnv) -> Option<Term> {
+    // SAFETY: the NIF caller passes its live environment.
+    unsafe { e.as_ref() }.and_then(|env| env.pid)
 }
 
 #[unsafe(no_mangle)]
@@ -87,7 +136,7 @@ pub extern "C" fn enif_send(
         return 0;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let to = unsafe { *pid };
+    let to = load(pid);
     if to.as_pid().is_none() {
         return 0;
     };
@@ -111,73 +160,137 @@ pub extern "C" fn enif_whereis_pid(_: *mut ErlNifEnv, name: Term, out: *mut Term
         return 0;
     };
     let Some(pid) = hook(name) else { return 0 };
-    if !out.is_null() {
-        // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-        unsafe { *out = pid }
-    };
+    store(out, pid);
     1
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn enif_whereis_port(_: *mut ErlNifEnv, _name: Term, _out: *mut Term) -> c_int {
-    0
+pub extern "C" fn enif_whereis_port(_: *mut ErlNifEnv, name: Term, out: *mut Term) -> c_int {
+    if name.as_atom().is_none() {
+        return 0;
+    }
+    let Some(hook) = hooks().lock().unwrap().whereis_port else {
+        return 0;
+    };
+    let Some(port) = hook(name) else { return 0 };
+    store(out, port);
+    1
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_is_process_alive(e: *mut ErlNifEnv, pid: *const Term) -> c_int {
     if pid.is_null() {
         return 0;
     };
-    i32::from(
-        // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-        unsafe { *pid } == unsafe { (*e).pid }.unwrap_or(term(0)),
-    )
+    i32::from(load(pid) == env_pid(e).unwrap_or(term(0)))
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn enif_is_port_alive(_: *mut ErlNifEnv, _port: *const Term) -> c_int {
-    0
+pub extern "C" fn enif_is_port_alive(_: *mut ErlNifEnv, port: *const Term) -> c_int {
+    if port.is_null() {
+        return 0;
+    }
+    let Some(hook) = hooks().lock().unwrap().port_alive else {
+        return 0;
+    };
+    i32::from(hook(load(port)))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_port_command(
-    _: *mut ErlNifEnv,
-    _port: *const Term,
+    e: *mut ErlNifEnv,
+    port: *const Term,
     _msg_env: *mut ErlNifEnv,
-    _msg: Term,
+    msg: Term,
 ) -> c_int {
-    0
+    if port.is_null() {
+        return 0;
+    }
+    let Some(hook) = hooks().lock().unwrap().port_command else {
+        return 0;
+    };
+    i32::from(hook(env_pid(e), load(port), msg))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_select(
     e: *mut ErlNifEnv,
-    event: usize,
+    event: c_int,
     flags: c_int,
     obj: *mut c_void,
     pid: *const Term,
-    reference: Term,
+    msg: Term,
 ) -> c_int {
-    let _ = e;
-    let Some(hook) = hooks().lock().unwrap().select else {
-        return 128;
-    };
-    let target = if pid.is_null() {
-        None
-    } else {
-        Some(
-            // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-            unsafe { *pid },
-        )
-    };
-    hook(event, flags, obj as usize, target, reference)
+    enif_select_x(e, event, flags, obj, pid, msg, ptr::null_mut())
 }
+const SELECT_READ: c_int = 1;
+const SELECT_WRITE: c_int = 1 << 1;
+const SELECT_STOP: c_int = 1 << 2;
+const SELECT_CANCEL: c_int = 1 << 3;
+const SELECT_CUSTOM_MSG: c_int = 1 << 4;
+const SELECT_FAILED: c_int = 1 << 3;
+/// Port of erts/emulator/sys/common/erl_check_io.c:699 (prepare_select_msg).
+fn prepare_select_msg(
+    recipient: Term,
+    flags: c_int,
+    resource: *mut c_void,
+    msg: Term,
+    event: &str,
+) -> Option<SelectMessage> {
+    let mut heap = VecHeap::new();
+    let message = if flags & SELECT_CUSTOM_MSG != 0 {
+        copy_term(msg, &mut heap).ok()?
+    } else {
+        // {select, Resource, Ref, EventAtom}
+        let resource = crate::resources::resource_term(resource, &mut heap)?;
+        let reference = copy_term(msg, &mut heap).ok()?;
+        let atoms = arinsal_term::global_atoms();
+        let tag = Term::atom(atoms.intern("select").ok()?);
+        let event = Term::atom(atoms.intern(event).ok()?);
+        TermBuilder::new(&mut heap)
+            .tuple(&[tag, resource, reference, event])
+            .ok()?
+    };
+    Some(SelectMessage {
+        recipient,
+        message,
+        _heap: heap,
+    })
+}
+/// Port of erts/emulator/sys/common/erl_check_io.c:1236 (enif_select_x), OTP-29.1.1.
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_select_x(
     e: *mut ErlNifEnv,
-    event: usize,
+    event: c_int,
     flags: c_int,
     obj: *mut c_void,
     pid: *const Term,
     msg: Term,
     _msg_env: *mut ErlNifEnv,
 ) -> c_int {
-    enif_select(e, event, flags, obj, pid, msg)
+    let Some(hook) = hooks().lock().unwrap().select else {
+        return i32::MIN | 128;
+    };
+    let mut messages = [None, None];
+    if flags & (SELECT_STOP | SELECT_CANCEL) == 0 {
+        let recipient = if pid.is_null() {
+            env_pid(e)
+        } else {
+            Some(load(pid))
+        };
+        let Some(recipient) = recipient else {
+            return i32::MIN | SELECT_FAILED;
+        };
+        for (slot, (bit, name)) in messages
+            .iter_mut()
+            .zip([(SELECT_READ, "ready_input"), (SELECT_WRITE, "ready_output")])
+        {
+            if flags & bit != 0 {
+                *slot = prepare_select_msg(recipient, flags, obj, msg, name);
+            }
+        }
+    }
+    hook(SelectRequest {
+        fd: event,
+        flags,
+        resource: obj as usize,
+        messages,
+    })
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_monitor_process(
@@ -194,8 +307,7 @@ pub extern "C" fn enif_monitor_process(
     };
     hook(
         obj as usize,
-        // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-        unsafe { *pid },
+        load(pid),
         // SAFETY: The NIF caller or VM hook retains this storage for the callback.
         unsafe { &mut *monitor },
     )

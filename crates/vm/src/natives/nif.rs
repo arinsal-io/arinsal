@@ -59,6 +59,16 @@ pub(crate) fn execute_on_halt() {
 struct Hub {
     scheduler: Weak<Scheduler<Process>>,
     pid: Pid,
+    runtime: Weak<crate::process::Runtime>,
+}
+
+/// The hub of the most recent NIF caller: NIF-created threads and the poller have no
+/// thread-local hub, but erts has one global runtime.
+static GLOBAL_HUB: Mutex<Option<Hub>> = Mutex::new(None);
+
+fn current_hub() -> Option<Hub> {
+    HUB.with(|hub| hub.borrow().clone())
+        .or_else(|| GLOBAL_HUB.lock().unwrap().clone())
 }
 
 struct SelectRegistration {
@@ -1149,8 +1159,10 @@ fn install_hub_for(process: &Process, pid: Pid) {
         *hub.borrow_mut() = Some(Hub {
             scheduler: Arc::downgrade(&scheduler),
             pid,
+            runtime: Arc::downgrade(runtime),
         });
     });
+    *GLOBAL_HUB.lock().unwrap() = HUB.with(|hub| hub.borrow().clone());
     HUB_RUNTIME.set(Arc::as_ptr(runtime) as usize);
     NIF_HUBS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1161,6 +1173,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
             Hub {
                 scheduler: Arc::downgrade(&scheduler),
                 pid,
+                runtime: Arc::downgrade(runtime),
             },
         );
     let reactor = SOCKET_REACTOR.get_or_init(|| {
@@ -1171,6 +1184,11 @@ fn install_hub_for(process: &Process, pid: Pid) {
     arinsal_nif_socket::set_reactor(Some(reactor.clone()));
     arinsal_nif::set_vm_hooks(arinsal_nif::VmHooks {
         send: Some(nif_send_hook),
+        select: Some(nif_select_hook),
+        whereis_pid: Some(nif_whereis_pid_hook),
+        whereis_port: Some(nif_whereis_port_hook),
+        port_alive: Some(nif_port_alive_hook),
+        port_command: Some(nif_port_command_hook),
         thread_type: Some(nif_thread_type),
         current_process_exiting: Some(crate::dirty::current_process_exiting),
         ..arinsal_nif::VmHooks::default()
@@ -1190,22 +1208,137 @@ fn nif_send_hook(target: Term, message: Term) -> bool {
     let Some(pid) = Pid::from_term(target) else {
         return false;
     };
-    HUB.with(|hub| {
-        let Some(hub) = hub.borrow().clone() else {
-            return false;
+    let Some(hub) = current_hub() else {
+        return false;
+    };
+    let Some(scheduler) = hub.scheduler.upgrade() else {
+        return false;
+    };
+    let Ok(message) = Message::copy_from(message) else {
+        return false;
+    };
+    let sent = scheduler.send(hub.pid, pid, message).is_ok();
+    if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+        eprintln!("resource_send from={:?} to={:?} sent={sent}", hub.pid, pid);
+    }
+    sent
+}
+
+/// A resource that an `enif_select` keeps selected in the check-io table.
+struct SelectedResource {
+    data: usize,
+    runtime: Weak<crate::process::Runtime>,
+}
+
+impl arinsal_drv::NifSelectResource for SelectedResource {
+    fn id(&self) -> usize {
+        self.data
+    }
+
+    fn type_name(&self) -> String {
+        arinsal_nif::resource_type_name(self.data)
+    }
+
+    fn keep(&self) {
+        arinsal_nif::enif_keep_resource(self.data as *mut std::ffi::c_void);
+    }
+
+    fn release(&self) {
+        arinsal_nif::enif_release_resource(self.data as *mut std::ffi::c_void);
+    }
+
+    fn stop(&self, fd: i32, direct: bool) {
+        arinsal_nif::resource_stop_data(self.data, fd, direct);
+    }
+
+    fn log_error(&self, text: &str) {
+        crate::port::log_error_for(&self.runtime, text);
+    }
+}
+
+/// A prepared `enif_select` message on its way to the recipient (`send_select_msg`).
+struct SelectEvent {
+    hub: Hub,
+    recipient: Pid,
+    message: arinsal_nif::SelectMessage,
+}
+
+impl arinsal_drv::NifSelectMessage for SelectEvent {
+    fn deliver(self: Box<Self>) {
+        let Some(scheduler) = self.hub.scheduler.upgrade() else {
+            return;
         };
-        let Some(scheduler) = hub.scheduler.upgrade() else {
-            return false;
+        let Ok(envelope) = Message::copy_from(self.message.message) else {
+            return;
         };
-        let Ok(message) = Message::copy_from(message) else {
-            return false;
-        };
-        let sent = scheduler.send(hub.pid, pid, message).is_ok();
-        if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
-            eprintln!("resource_send from={:?} to={:?} sent={sent}", hub.pid, pid);
-        }
-        sent
-    })
+        let _ = scheduler.send(self.hub.pid, self.recipient, envelope);
+    }
+
+    fn recipient(&self) -> String {
+        format!("{:?}", self.recipient)
+    }
+}
+
+// Port of erts/emulator/sys/common/erl_check_io.c:1236 (enif_select_x), OTP-29.1.1: the
+// NIF selection lives in the same fd table as `driver_select`.
+fn nif_select_hook(request: arinsal_nif::SelectRequest) -> i32 {
+    let Some(hub) = current_hub() else {
+        return i32::MIN | 8;
+    };
+    crate::port::install_poll_backend();
+    let resource = Arc::new(SelectedResource {
+        data: request.resource,
+        runtime: hub.runtime.clone(),
+    });
+    let messages = request.messages.map(|message| {
+        let message = message?;
+        let recipient = Pid::from_term(message.recipient)?;
+        Some(Box::new(SelectEvent {
+            hub: hub.clone(),
+            recipient,
+            message,
+        }) as Box<dyn arinsal_drv::NifSelectMessage>)
+    });
+    arinsal_drv::nif_select(resource, request.fd, request.flags, messages)
+}
+
+// Port of erts/emulator/beam/erl_nif.c:1149 (call_whereis): the process or port a name
+// is registered for; `enif_get_local_pid`/`enif_get_local_port` check the type.
+fn nif_whereis_pid_hook(name: Term) -> Option<Term> {
+    let runtime = current_hub()?.runtime.upgrade()?;
+    let name = atom_name(name)?;
+    let pid = *runtime.names.lock().unwrap().get(&name)?;
+    pid.to_term()
+}
+
+fn nif_whereis_port_hook(name: Term) -> Option<Term> {
+    let runtime = current_hub()?.runtime.upgrade()?;
+    let name = atom_name(name)?;
+    let id = *runtime.port_names.lock().unwrap().get(&name)?;
+    Term::port(id)
+}
+
+// Port of erts/emulator/beam/erl_nif.c:2340 (enif_is_port_alive).
+fn nif_port_alive_hook(port: Term) -> bool {
+    let Some(runtime) = current_hub().and_then(|hub| hub.runtime.upgrade()) else {
+        return false;
+    };
+    let Some(id) = port.as_port() else {
+        return false;
+    };
+    crate::port::runtime_port_live(&runtime, id)
+}
+
+// Port of erts/emulator/beam/erl_nif.c:1097 (enif_port_command).
+fn nif_port_command_hook(from: Option<Term>, port: Term, data: Term) -> bool {
+    let Some(hub) = current_hub() else {
+        return false;
+    };
+    let Some(runtime) = hub.runtime.upgrade() else {
+        return false;
+    };
+    let from = from.and_then(Pid::from_term).unwrap_or(hub.pid);
+    crate::port::nif_port_command(&runtime, port, from, data)
 }
 
 /// Scheduler-path natives in this family that always handle the MFA.

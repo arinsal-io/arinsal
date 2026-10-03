@@ -33,7 +33,7 @@
 | `driver_SUITE` | 50 | 40/50 | 10/50 | 31 | -6 | async_blast: missing; caller: missing; consume_timeslice: missing; driver_monitor: missing; driver_system_info_base_ver: missing; driver_system_info_current_ver: missing; driver_system_info_prev_ver: missing; env: missing; erl_errno_id: missing; invalid_extended_marker_drv: missing; ioq_exit_ready_async: missing; ioq_exit_ready_input: missing; ioq_exit_ready_input_async: missing; ioq_exit_ready_output: missing; ioq_exit_ready_output_async: missing; ioq_exit_timeout: missing; ioq_exit_timeout_async: missing; larger_major_vsn_drv: missing; larger_minor_vsn_drv: missing; many_events: missing; missing_callbacks: missing; otp_6879: missing; otp_9302: missing; peek_non_existing_queue: missing; poll_pipe: missing; smaller_major_vsn_drv: missing; smaller_minor_vsn_drv: missing; thr_free_drv: missing; thr_msg_blast: missing; thread_mseg_alloc_cache_clean: missing; zero_extended_marker_garb_drv: missing |
 | `dump_SUITE` | 5 | 0/5 | 0/5 | 0 | 0 | none |
 | `efile_SUITE` | 2 | 0/2 | 0/2 | 0 | 0 | none |
-| `erl_debugger_SUITE` | 28 | 27/28 | 27/28 | 0 | 0 | none |
+| `erl_debugger_SUITE` | 28 | 27/28 | 21/28 | 6 | -9 | test_bps_work_with_large_number_of_live_xregs: failed {'EXIT', {system_limit, {erlang,apply, [many_live_xregs,many_args, [10,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18, 19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34, 35,36,37,38,…; test_hitting_bp_stops_and_notifies_debugger_process: failed {{timeout_receiving, "{ debugger_event , Session , { breakpoint , _ , { foo , go , 1 } , 7 , _ } }", {next_message, {executed,<0.280.0>,{foo,go,1},{line,7}}}}; test_stack_frames_returns_frames: failed {{timeout_receiving,"{ sync , P }", {next_message, {debugger_event,21, {breakpoint,<0.346.0>, {call_stacks,three_levels,2}, 5,#Fun<erts_internal.0.84522871>}}}}; test_stack_frames_returns_running_if_not_suspended: failed {{badmatch,running}; test_stack_frames_returns_y_regs_controlled_by_size: failed {{badkey,0}; test_stack_frames_works_with_hibernate: failed {{badmatch,normal} |
 | `erl_drv_thread_SUITE` | 3 | 0/3 | 0/3 | 0 | -9 | first failure: failed: {test_case_failed, |
 | `erl_link_SUITE` | 16 | 6/16 | 4/16 | 2 | 0 | links: failed {{badmatch,[{erl_link,process,<0.170.0>,linked,170}]}; process_monitors: failed {{badmatch,[]} |
 | `erts_debug_SUITE` | 8 | 7/8 | 7/8 | 0 | 0 | none |
@@ -45,7 +45,7 @@
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
 | `gc_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
 | `guard_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
-| `hash_SUITE` | 29 | 27/29 | 19/29 | 8 | 0 | test_phash2_with_large_bin: auto_skipped {failed, {ct_framework,end_tc, {testcase_aborted, {arinsal_case_timeout, test_phash2_with_short_tuple,20000}}}}; test_phash2_with_large_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout, test_phash2_with_short_list,20000}}}}; test_phash2_with_short_list: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_list, 20000}}}}; test_phash2_with_short_tuple: failed testcase_aborted; test_phash2_with_small_unaligned_sub_binary: failed testcase_aborted; test_phash2_with_super_large_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout, test_phash2_with_tiny_bin,20000}}}}; test_phash2_with_tiny_bin: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tuple, 20000}}}}; test_phash2_with_tiny_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tiny, 20000}}}} |
+| `hash_SUITE` | 29 | 27/29 | 21/29 | 6 | 0 | test_phash2_with_large_bin: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.375.0>}]}}}, unknown_location; test_phash2_with_short_list: failed testcase_aborted; test_phash2_with_short_tuple: failed testcase_aborted; test_phash2_with_small_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_with_42, 20000}}}}; test_phash2_with_tiny_bin: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tuple, 20000}}}}; test_phash2_with_tiny_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tiny, 20000}}}} |
 | `hash_property_test_SUITE` | 3 | 0/3 | 0/3 | 0 | 0 | none |
 | `hello_SUITE` | 1 | 1/1 | 0/1 | 1 | 0 | hello: failed {badarg |
 | `hibernate_SUITE` | 10 | 10/10 | 7/10 | 3 | 0 | dynamic_call: failed {'EXIT',error}, unknown_location; in_place: failed {{badmatch,false}; no_heap: failed {{badmatch,[{heap_size,4},{total_heap_size,24}]} |
@@ -63,8 +63,8 @@
 | `multi_load_SUITE` | 3 | 3/3 | 3/3 | 0 | 0 | none |
 | `native_record_SUITE` | 10 | 9/10 | 1/10 | 8 | 0 | create: failed {'EXIT',error}, unknown_location; errors: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.212.0>}]}}}, unknown_location; explicit_module_name: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.185.0>}]}}}, unknown_location; external_term_format: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.201.0>}]}}}, unknown_location; gc: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.195.0>}]}}}, unknown_location; gh_11398: failed {{badmatch,#native_record_SUITE:exp{a = 1}}; records_module: failed {{badmatch, #native_record_SUITE:b{x = foo,y = none,z = none}}; term_order: failed {{badmatch,false} |
 | `nested_SUITE` | 4 | 4/4 | 4/4 | 0 | 0 | none |
-| `nif_SUITE` | 80 | 0/80 | 0/80 | 0 | -6 | first failure: failed: {check_io_debug,error,undef}, [{nif_SUITE,basic}] |
-| `node_container_SUITE` | 20 | 12/20 | 12/20 | 0 | 0 | none |
+| `nif_SUITE` | 80 | 0/80 | 0/80 | 0 | 0 | none |
+| `node_container_SUITE` | 20 | 12/20 | 5/20 | 7 | 0 | ets_refc: failed {{badmatch,0}; magic_ref: failed {{badmatch,true}; match_spec_refc: failed {{badmatch,0}; node_table_gc: failed {{badmatch,false}; ref_eq: failed {badarg,mk_ref,[{"nonode@nohost",0},[4711]]}; term_to_binary_to_term_eq: failed {badarg,mk_ref,[{"nonode@nohost",0},[4711]]}; timer_refc: failed {{badmatch,0} |
 | `nofrag_SUITE` | 5 | 5/5 | 4/5 | 1 | -9 | debug_breakpoint: failed dont_execute_me |
 | `num_bif_SUITE` | 11 | 11/11 | 11/11 | 0 | 0 | none |
 | `op_SUITE` | 12 | 12/12 | 10/12 | 2 | 0 | complex_relop: failed testcase_aborted; relop: failed testcase_aborted |
@@ -88,7 +88,7 @@
 | `small_SUITE` | 13 | 13/13 | 13/13 | 0 | 0 | none |
 | `smoke_test_SUITE` | 3 | 2/3 | 1/3 | 1 | 0 | jump_table: failed {badarg |
 | `statistics_SUITE` | 18 | 18/18 | 18/18 | 0 | 0 | none |
-| `system_info_SUITE` | 12 | 10/12 | 10/12 | 0 | 0 | none |
+| `system_info_SUITE` | 12 | 10/12 | 3/12 | 7 | 0 | atom_count: failed {{badmatch,false}; ets_count: failed {badarg; memory: failed {{badmatch,false}; misc_smoke_tests: failed {badarg; process_count: failed {{badmatch,0}; procs_bug: failed {badarg; system_logger: failed {badarg |
 | `system_profile_SUITE` | 6 | 6/6 | 3/6 | 3 | 0 | dont_profile_profiler: failed {{badmatch,true}; runnable_ports: failed {{badmatch,false}; scheduler: failed {{badmatch,false} |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | -9 | first failure: failed: {not_alive, |
 | `timer_bif_SUITE` | 23 | 20/23 | 20/23 | 0 | 0 | none |

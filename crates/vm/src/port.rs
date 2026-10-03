@@ -978,9 +978,7 @@ fn start_dyn_driver(
         io.parallelism,
         Arc::clone(&scheduler),
     )?;
-    arinsal_drv::set_poll_backend(Arc::new(DrvPoll {
-        state: Arc::default(),
-    }));
+    install_poll_backend();
     let host = DrvHost {
         runtime: Arc::downgrade(&runtime),
     };
@@ -1500,6 +1498,26 @@ impl arinsal_drv::SystemHooks for VmHooks {
     fn remove_driver(&self, entry: usize) -> i32 {
         crate::ddll::remove_linked(entry)
     }
+}
+
+/// Install the shared poller as the `driver_select`/`enif_select` poll set.
+pub(crate) fn install_poll_backend() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        arinsal_drv::set_poll_backend(Arc::new(DrvPoll {
+            state: Arc::default(),
+        }));
+    });
+}
+
+/// `erts_send_error_to_logger_nogl` for `runtime`.
+pub(crate) fn log_error_for(runtime: &Weak<crate::process::Runtime>, text: &str) {
+    arinsal_drv::PortHost::log_error(
+        &DrvHost {
+            runtime: runtime.clone(),
+        },
+        text,
+    );
 }
 
 /// Install the driver API hooks once, before the first driver code runs.
@@ -2449,8 +2467,13 @@ pub(crate) fn is_live(process: &Process, id: u64) -> bool {
     process
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
-        .is_some_and(|handle| !handle.state.lock().unwrap().exit_complete)
+        .is_some_and(|runtime| runtime_port_live(runtime, id))
+}
+
+/// Whether local port `id` of `runtime` exists and has not finished exiting.
+pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> bool {
+    let handle = runtime.ports.lock().unwrap().get(&id).cloned();
+    handle.is_some_and(|handle| !handle.state.lock().unwrap().exit_complete)
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:734 (port_get_data_1), OTP-29.1.1.
@@ -3219,6 +3242,98 @@ pub(crate) fn demonitor(process: &Process, reference: u64) -> bool {
         .any(|handle| handle.monitors.lock().unwrap().remove(&reference).is_some())
 }
 
+/// Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `{command, Data}`; also
+/// the body of `erts_port_output_async` (`enif_port_command`). Failures signal the port.
+fn output_command(
+    runtime: &crate::process::Runtime,
+    handle: &Arc<PortHandle>,
+    id: u64,
+    from: Pid,
+    data: Term,
+) {
+    if let Some(drv_port) = handle.driver.get() {
+        // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `Port ! {Pid, {command, D}}`.
+        let mut pieces = Vec::new();
+        if io_pieces(data, &mut pieces).is_none() {
+            signal_badsig(handle, id);
+            return;
+        }
+        let pieces = pieces
+            .iter()
+            .map(|(bytes, refc)| {
+                if *refc {
+                    arinsal_drv::IoPiece::Refc(bytes)
+                } else {
+                    arinsal_drv::IoPiece::Copied(bytes)
+                }
+            })
+            .collect::<Vec<_>>();
+        if !drv_port.output(&pieces, packed_pid(from))
+            && runtime.ports.lock().unwrap().contains_key(&id)
+        {
+            signal_badsig(handle, id);
+        }
+        return;
+    }
+    let Some(mut data) = iodata(data) else {
+        signal_badsig(handle, id);
+        return;
+    };
+    if let Some((2, hdr)) = handle.framing {
+        match hdr {
+            1 => {
+                if data.len() > u8::MAX as usize {
+                    signal_port_exit(handle, id, atom("einval"));
+                    return;
+                }
+                data.insert(0, data.len() as u8);
+            }
+            2 => {
+                if data.len() > u16::MAX as usize {
+                    signal_port_exit(handle, id, atom("einval"));
+                    return;
+                }
+                data.splice(0..0, (data.len() as u16).to_be_bytes());
+            }
+            4 => {
+                if data.len() > u32::MAX as usize {
+                    signal_port_exit(handle, id, atom("einval"));
+                    return;
+                }
+                data.splice(0..0, (data.len() as u32).to_be_bytes());
+            }
+            _ => {
+                signal_badsig(handle, id);
+                return;
+            }
+        }
+    }
+    if command_bytes(handle, &data).is_err() {
+        signal_badsig(handle, id);
+    }
+}
+
+/// Port of erts/emulator/beam/erl_nif.c:1097 (enif_port_command): `erts_port_output_async`
+/// of `data` on behalf of `from`; `false` when the port is gone.
+pub(crate) fn nif_port_command(
+    runtime: &crate::process::Runtime,
+    port: Term,
+    from: Pid,
+    data: Term,
+) -> bool {
+    let Some(id) = port.as_port() else {
+        return false;
+    };
+    let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
+        return false;
+    };
+    if handle.state.lock().unwrap().exit_complete {
+        return false;
+    }
+    output_command(runtime, &handle, id, from, data);
+    true
+}
+
 pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Result<(), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -3281,70 +3396,8 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
         signal_badsig(&handle, id);
         return Ok(());
     }
-    if command.len() == 2
-        && command[0] == atom("command")
-        && let Some(drv_port) = handle.driver.get()
-    {
-        // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `Port ! {Pid, {command, D}}`.
-        let mut pieces = Vec::new();
-        if io_pieces(command[1], &mut pieces).is_none() {
-            signal_badsig(&handle, id);
-            return Ok(());
-        }
-        let pieces = pieces
-            .iter()
-            .map(|(bytes, refc)| {
-                if *refc {
-                    arinsal_drv::IoPiece::Refc(bytes)
-                } else {
-                    arinsal_drv::IoPiece::Copied(bytes)
-                }
-            })
-            .collect::<Vec<_>>();
-        if !drv_port.output(&pieces, packed_pid(from))
-            && runtime.ports.lock().unwrap().contains_key(&id)
-        {
-            signal_badsig(&handle, id);
-        }
-        return Ok(());
-    }
     if command.len() == 2 && command[0] == atom("command") {
-        let Some(mut data) = iodata(command[1]) else {
-            signal_badsig(&handle, id);
-            return Ok(());
-        };
-        if let Some((2, hdr)) = handle.framing {
-            match hdr {
-                1 => {
-                    if data.len() > u8::MAX as usize {
-                        signal_port_exit(&handle, id, atom("einval"));
-                        return Ok(());
-                    }
-                    data.insert(0, data.len() as u8);
-                }
-                2 => {
-                    if data.len() > u16::MAX as usize {
-                        signal_port_exit(&handle, id, atom("einval"));
-                        return Ok(());
-                    }
-                    data.splice(0..0, (data.len() as u16).to_be_bytes());
-                }
-                4 => {
-                    if data.len() > u32::MAX as usize {
-                        signal_port_exit(&handle, id, atom("einval"));
-                        return Ok(());
-                    }
-                    data.splice(0..0, (data.len() as u32).to_be_bytes());
-                }
-                _ => {
-                    signal_badsig(&handle, id);
-                    return Ok(());
-                }
-            }
-        }
-        if command_bytes(&handle, &data).is_err() {
-            signal_badsig(&handle, id);
-        }
+        output_command(runtime, &handle, id, from, command[1]);
         return Ok(());
     }
     if command.len() == 2 && command[0] == atom("connect") {

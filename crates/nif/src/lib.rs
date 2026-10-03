@@ -6,8 +6,13 @@ mod iterators;
 mod resources;
 mod terms;
 
-pub use extras::{SentMessage, VmHooks, set_vm_hooks, take_test_messages};
-pub use resources::{resource_down, resource_stop};
+pub use extras::{
+    SelectMessage, SelectRequest, SentMessage, VmHooks, set_vm_hooks, take_test_messages,
+};
+pub use resources::{
+    enif_keep_resource, enif_release_resource, resource_down, resource_stop, resource_stop_data,
+    resource_type_name,
+};
 
 // C ABI entry points implemented by shim.c and resolved by dynamically loaded NIFs.
 pub const C_SHIM_EXPORTS: &[&str] = &[
