@@ -2352,6 +2352,12 @@ pub(crate) fn try_remote_send(
         if node == local || node == "nonode@nohost" {
             return Ok(false);
         }
+        // Port of erts/emulator/beam/dist.c (`erts_send` remote destination handling), OTP-29.1.1.
+        // A send to a remote registered name on a non-distributed node is a successful
+        // best-effort send; there is no distribution controller to queue it through.
+        if !node_tables::lock().alive {
+            return Ok(true);
+        }
         let control = control(
             6,
             vec![
@@ -2370,6 +2376,10 @@ pub(crate) fn try_remote_send(
         if target_node == local || target_node == "nonode@nohost" {
             return Ok(false);
         }
+        // Port of erts/emulator/beam/dist.c (`erts_send` remote destination handling), OTP-29.1.1.
+        if !node_tables::lock().alive {
+            return Ok(true);
+        }
         let control = control(33, vec![local_pid_owned(ctx.pid()), target_owned]);
         queue_outgoing(process, ctx, &target_node, control, Some(owned(message)?))?;
         return Ok(true);
@@ -2386,6 +2396,10 @@ pub(crate) fn try_remote_send(
     let local = node_tables::lock().local_name.clone();
     if node == &local || node == "nonode@nohost" {
         return Ok(false);
+    }
+    // Port of erts/emulator/beam/dist.c (`erts_send` remote destination handling), OTP-29.1.1.
+    if !node_tables::lock().alive {
+        return Ok(true);
     }
     let control = OwnedTerm::tuple(vec![
         OwnedTerm::Int(2),
@@ -2782,9 +2796,7 @@ pub(crate) fn name_node_tuple(target: Term) -> Result<Option<(String, String)>, 
     let (OwnedTerm::Atom(name), OwnedTerm::Atom(node)) = (&parts[0], &parts[1]) else {
         return Ok(None);
     };
-    if !node_tables::is_node_name(node) && node != "nonode@nohost" {
-        return Ok(None);
-    }
+    // Port of erts/emulator/beam/bif.c:2614-2626 (`do_send` accepts every arity-two atom tuple as a remote destination), OTP-29.1.1.
     Ok(Some((name.clone(), node.clone())))
 }
 
@@ -3000,6 +3012,39 @@ fn badarg() -> VmError {
 mod tests {
     use super::*;
     use crate::node_tables::DistState;
+
+    const SEND_TO_MISSING_NODES: &str = r#"
+-module(dist_missing_send_diff).
+-export([run/0]).
+run() ->
+    Small = {unregistered_small, node()} ! small,
+    Big = {unregistered_big, node()} ! lists:duplicate(4096, payload),
+    Remote = {'unregistered_remote', abc@boromir} ! remote_payload,
+    ExportFun = [fun blipp:blapp/7],
+    MissingNode = {dummy, dummy@dummy} ! ExportFun,
+    {Small, length(Big), Remote, MissingNode}.
+"#;
+
+    #[test]
+    fn sends_to_missing_registered_names_match_otp() {
+        let Ok(reference) = arinsal_difftest::RefErl::start() else {
+            eprintln!(
+                "erl unavailable; skipping missing distribution destination differential test"
+            );
+            return;
+        };
+        let beam = reference
+            .compile_named("dist_missing_send_diff", SEND_TO_MISSING_NODES, &[])
+            .unwrap();
+        reference.load("dist_missing_send_diff", &beam).unwrap();
+        let expected = reference.call("dist_missing_send_diff", "run", &[]);
+        let mut vm = crate::Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("dist_missing_send_diff", "run", &[], 2, None)
+            .unwrap();
+        assert_eq!(expected, arinsal_difftest::CallResult::Ok(actual.term));
+    }
 
     #[test]
     fn dist_state_starts_empty_with_connection_caches() {

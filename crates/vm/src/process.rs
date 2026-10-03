@@ -4246,7 +4246,9 @@ impl Process {
             );
             return Ok(value);
         }
-        let target = if let Some(name) = crate::dist::local_reg_name(target)? {
+        let local_name = crate::dist::local_reg_name(target)?;
+        let local_name_tuple = local_name.is_some();
+        let target = if let Some(name) = local_name {
             name
         } else {
             target
@@ -4326,6 +4328,11 @@ impl Process {
                     value,
                     target,
                 );
+                // Port of erts/emulator/beam/dist.c (`erts_send` registered-name handling), OTP-29.1.1.
+                // A local {Name, Node} send silently drops the message when Name is absent.
+                if local_name_tuple {
+                    return Ok(value);
+                }
             }
             pid
         } else {
