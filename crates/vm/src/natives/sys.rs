@@ -1017,6 +1017,9 @@ fn system_info(
         // Port of erts/emulator/beam/erl_bif_info.c:3547-3548, OTP-29.1.1.
         Some("system_logger") => Some(Ok(system_logger(process))),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
+        // Port of erts/emulator/beam/erl_bif_info.c:3448-3449, OTP-29.1.1.
+        // Arinsal's loaded BEAM select instructions use the jump-table dispatch path.
+        Some("beam_jump_table") => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
         // Port of erts/emulator/beam/erl_bif_info.c:3370-3376, OTP-29.1.1.
         Some("lock_checking") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         // Port of erts/emulator/beam/erl_bif_info.c:2888-2889, OTP-29.1.1.
@@ -4141,6 +4144,29 @@ mod tests {
     /// Tests that change or read the process-global scheduler flags run one
     /// at a time; the flags are shared by every test in this binary.
     static SCHEDULER_FLAGS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn beam_jump_table_system_info_matches_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping BEAM jump-table differential test");
+            return;
+        };
+        let beam = reference
+            .compile_named(
+                "beam_jump_table_probe",
+                "-module(beam_jump_table_probe). -export([run/0]). run() -> erlang:system_info(beam_jump_table).",
+                &[],
+            )
+            .unwrap();
+        reference.load("beam_jump_table_probe", &beam).unwrap();
+        let expected = reference.call("beam_jump_table_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("beam_jump_table_probe", "run", &[], 1, None)
+            .unwrap_or_else(|error| panic!("BEAM jump-table VM error: {error:?}"));
+        assert_eq!(expected, CallResult::Ok(actual.term));
+    }
 
     #[test]
     fn all_scheduler_state_matches_otp() {

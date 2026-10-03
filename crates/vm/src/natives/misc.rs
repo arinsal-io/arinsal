@@ -311,6 +311,9 @@ pub(crate) fn profile_process_event(
     let Some(target) = Term::pid(*id, *serial).and_then(arinsal_sched::Pid::from_term) else {
         return;
     };
+    if ctx.pid() == target {
+        return;
+    }
     let Some(pid) = ctx.pid().to_term().and_then(|pid| to_owned(pid).ok()) else {
         return;
     };

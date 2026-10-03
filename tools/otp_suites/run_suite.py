@@ -155,6 +155,7 @@ def parse_results(logdir: pathlib.Path, suite: str) -> tuple[dict[str, tuple[str
             save()
             case_ref = line.split(None, 1)[1].strip()
             current_module, _, current = case_ref.partition(":")
+            current = current.strip("'")
         elif line.startswith("=result        "):
             pending = line.split(None, 1)[1].strip()
         elif pending is not None and line.startswith("="):
@@ -173,7 +174,7 @@ def parse_elapsed(logdir: pathlib.Path, suite: str) -> dict[str, float]:
         for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("=case          "):
                 module, _, case = line.split(None, 1)[1].strip().partition(":")
-                current = case if module == suite + "_SUITE" else None
+                current = case.strip("'") if module == suite + "_SUITE" else None
             elif line.startswith("=elapsed       ") and current:
                 try:
                     out[current] = float(line.split(None, 1)[1].rstrip("s"))
@@ -205,7 +206,9 @@ def erl_reference(name: str, build: pathlib.Path, limit: int, use_cache: bool) -
     path = ERL_CACHE / f"{name}-{erl_cache_key(name)}.json"
     if use_cache and path.is_file():
         d = json.loads(path.read_text())
-        return d["rc"], {k: tuple(v) for k, v in d["cases"].items()}, d["meta"], d["elapsed"]
+        cases = {k.strip("'"): tuple(v) for k, v in d["cases"].items()}
+        elapsed = {k.strip("'"): value for k, value in d["elapsed"].items()}
+        return d["rc"], cases, d["meta"], elapsed
     with tempfile.TemporaryDirectory(prefix=f"otp-{name}-erl-") as ed:
         erl_dir = pathlib.Path(ed)
         erc, eout = run_one("erl", name, erl_dir, build, limit)
