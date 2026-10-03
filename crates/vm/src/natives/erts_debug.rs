@@ -19,7 +19,6 @@ static INTERNAL_STATE: AtomicBool = AtomicBool::new(false);
 pub(crate) fn internal_state_enabled() -> bool {
     INTERNAL_STATE.load(Ordering::Relaxed)
 }
-static DEBUGGER_SUPPORT: AtomicBool = AtomicBool::new(false);
 static JIT_ASM_DUMP: AtomicBool = AtomicBool::new(false);
 static TEST_LONG_GC_SLEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static UNIQUE_MONOTONIC_INTEGER_STATE: std::sync::atomic::AtomicU64 =
@@ -1842,7 +1841,7 @@ fn internal_state_get(
         Some("force_heap_frags" | "scheduler_dump" | "hashmap_collision_bonanza") => {
             Ok(atom("false"))
         }
-        Some("debugger_support") => Ok(atom(if DEBUGGER_SUPPORT.load(Ordering::Relaxed) {
+        Some("debugger_support") => Ok(atom(if crate::trace_bp::debugger_supported() {
             "true"
         } else {
             "false"
@@ -2333,7 +2332,7 @@ fn internal_state_set(
             return Ok(atom("ok"));
         }
         Some("debugger_support") if value == atom("true") => {
-            DEBUGGER_SUPPORT.store(true, Ordering::Relaxed);
+            crate::trace_bp::enable_debugger_support();
             return Ok(atom("ok"));
         }
         Some("debugger_support") => return Ok(atom("badarg")),
