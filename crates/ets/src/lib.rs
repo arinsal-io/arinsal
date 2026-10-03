@@ -4237,6 +4237,43 @@ impl Registry {
         }
     }
 
+    /// Return the number of live tables in this registry.
+    pub fn table_count(&self) -> usize {
+        self.tables
+            .iter()
+            .filter(|slot| slot.table.is_some())
+            .count()
+    }
+
+    /// Count external pid, port, and reference terms retained by all table objects.
+    pub fn external_identity_counts(&self) -> HashMap<(Atom, u32), usize> {
+        let mut counts = HashMap::new();
+        for slot in &self.tables {
+            let Some(table) = &slot.table else {
+                continue;
+            };
+            let table = table.read();
+            let mut heap = VecHeap::new();
+            if let Ok(objects) = table.tab2list(&mut heap) {
+                for object in objects {
+                    count_external_identities(object, &mut counts);
+                }
+            }
+        }
+        counts
+    }
+
+    /// Count external identities retained by compiled match programs.
+    pub fn match_program_identity_counts(&self) -> HashMap<(Atom, u32), usize> {
+        let mut counts = HashMap::new();
+        for program in self.match_programs.values() {
+            for (node, count) in program.external_identity_counts() {
+                *counts.entry(node).or_default() += count;
+            }
+        }
+        counts
+    }
+
     /// Create a table and reserve its name if requested.
     pub fn create(&mut self, options: TableOptions) -> Result<Tid, EtsError> {
         if options.named_table && self.names.contains_key(&options.name) {
@@ -4334,6 +4371,12 @@ impl Registry {
     pub fn match_program(&self, reference: Term) -> Option<&match_spec::MatchProgram> {
         self.match_programs
             .get(&match_spec::MatchProgram::reference_id(reference)?)
+    }
+
+    /// Release a compiled match program after its last continuation is consumed.
+    pub fn release_match_program(&mut self, reference: Term) -> bool {
+        match_spec::MatchProgram::reference_id(reference)
+            .is_some_and(|id| self.match_programs.remove(&id).is_some())
     }
 
     /// Remove a table from the registry.
@@ -4472,6 +4515,35 @@ impl Registry {
         self.owned_tables.entry(new_owner).or_default().insert(tid);
         self.get_mut(tid)?.options.owner = new_owner;
         Ok(())
+    }
+}
+
+fn count_external_identities(term: Term, counts: &mut HashMap<(Atom, u32), usize>) {
+    let mut pending = vec![term];
+    while let Some(term) = pending.pop() {
+        match term.classify() {
+            TermKind::Pid | TermKind::Port | TermKind::Ref => match term.identity() {
+                Some(Identity::Pid { node, creation, .. })
+                | Some(Identity::Port { node, creation, .. })
+                | Some(Identity::Ref { node, creation, .. })
+                    if node != arinsal_term::atoms::NONAME =>
+                {
+                    *counts.entry((node, creation)).or_default() += 1;
+                }
+                _ => {}
+            },
+            TermKind::Tuple | TermKind::Record | TermKind::List => {
+                if let Some(elements) = term_sequence(term) {
+                    pending.extend(elements);
+                }
+            }
+            TermKind::Map => {
+                if let Some(pairs) = arinsal_term::record_map_pairs(term) {
+                    pending.extend(pairs.into_iter().flat_map(|(key, value)| [key, value]));
+                }
+            }
+            _ => {}
+        }
     }
 }
 

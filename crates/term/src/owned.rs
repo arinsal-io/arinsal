@@ -1,7 +1,7 @@
 //! Heap-independent ETF values, built without calling ETF encoding or decoding.
 use crate::{
-    ExportEntry, FLOAT, FunEntry, FunRef, HeapAlloc, Identity, NEG_BIG, Node, POS_BIG, Term,
-    TermBuilder, TermError, TermKind, global_atoms,
+    ExportEntry, FLOAT, FunEntry, FunRef, HeapAlloc, Identity, MagicRef, NEG_BIG, Node, POS_BIG,
+    Term, TermBuilder, TermError, TermKind, global_atoms,
 };
 use arinsal_etf::OwnedTerm;
 use num_bigint::{BigInt, Sign};
@@ -76,8 +76,17 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     node,
                     creation,
                     ids,
-                } if node == "nonode@nohost" && *creation == 0 && ids.len() == 3 => {
-                    values.push(builder.local_ref([ids[0], ids[1], ids[2]])?);
+                } if node == "nonode@nohost" && *creation == 0 && ids.len() <= 3 => {
+                    if ids.as_slice().get(2) == Some(&u32::MAX) {
+                        let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
+                        let owner = MagicRef::live_by_id(id)
+                            .unwrap_or_else(|| MagicRef::new_with_id(id, ()));
+                        values.push(builder.magic_ref(owner)?);
+                    } else {
+                        let mut local_ids = [0; 3];
+                        local_ids[..ids.len()].copy_from_slice(ids);
+                        values.push(builder.local_ref(local_ids)?);
+                    }
                 }
                 OwnedTerm::Pid {
                     node,

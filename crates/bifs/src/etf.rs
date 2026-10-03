@@ -1209,7 +1209,7 @@ fn parse_step(
                 if matches!(tag, 101 | 114 | 90) && !(1..=5).contains(&count) {
                     return Err(BifError::BADARG);
                 }
-                let (node_term, node_name) = r.atom(safe, &mut ctx)?;
+                let (node_term, _) = r.atom(safe, &mut ctx)?;
                 let node = node_term.as_atom().unwrap();
                 let identity = if tag == 103 || tag == 88 {
                     let id = r.u32()?;
@@ -1230,6 +1230,13 @@ fn parse_step(
                         return Err(BifError::BADARG);
                     }
                     (id, 0, creation, Vec::new())
+                } else if tag == 101 {
+                    let id = r.u32()?;
+                    let creation = r.u8()? as u32;
+                    if id >= (1 << 18) || creation > 3 {
+                        return Err(BifError::BADARG);
+                    }
+                    (0, 0, creation, vec![id])
                 } else {
                     let creation = if tag == 90 { r.u32()? } else { r.u8()? as u32 };
                     if tag != 90 && creation > 3 {
@@ -1246,13 +1253,6 @@ fn parse_step(
                     (0, 0, creation, ids)
                 };
                 let (id, serial, creation, ids) = identity;
-                if matches!(tag, 101 | 114 | 90)
-                    && node_name != "nonode@nohost"
-                    && ids.len() != 3
-                    && ids.len() != 5
-                {
-                    return Err(BifError::Unsupported("external reference width"));
-                }
                 let t = if ctx.is_none() {
                     Term::NIL
                 } else if tag == 103 || tag == 88 {
@@ -1270,15 +1270,25 @@ fn parse_step(
                         built(&mut ctx, |b| b.external_port(Node::new(node, creation), id))?
                     }
                 } else if node == arinsal_term::atoms::NONAME && creation == 0 {
-                    let mut local = [0; 3];
-                    for (slot, value) in local.iter_mut().zip(ids) {
-                        *slot = value;
+                    let magic_owner = if ids.len() == 3 && ids[2] == u32::MAX {
+                        let id = u64::from(ids[0]) | (u64::from(ids[1]) << 32);
+                        Some(
+                            arinsal_term::MagicRef::live_by_id(id)
+                                .unwrap_or_else(|| arinsal_term::MagicRef::new_with_id(id, ())),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(owner) = magic_owner {
+                        built(&mut ctx, |b| b.magic_ref(owner))?
+                    } else {
+                        let mut local = [0; 3];
+                        for (slot, value) in local.iter_mut().zip(ids) {
+                            *slot = value;
+                        }
+                        built(&mut ctx, |b| b.local_ref(local))?
                     }
-                    built(&mut ctx, |b| b.local_ref(local))?
                 } else {
-                    if ids.len() != 3 && ids.len() != 5 {
-                        return Err(BifError::Unsupported("external reference width"));
-                    }
                     built(&mut ctx, |b| {
                         b.external_ref(Node::new(node, creation), &ids)
                     })?

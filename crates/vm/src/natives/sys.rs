@@ -60,13 +60,14 @@ pub(crate) fn initialize_statistics_origins() -> StatisticsOrigins {
 /// Record a collection and acknowledge persistent-term literals this process may hold.
 pub(crate) fn after_collection(
     process: &mut Process,
-    _live_x: usize,
+    live_x: usize,
     collections: u64,
     words_reclaimed: u64,
 ) {
     let flags = runtime_state(process);
     flags.gc_count.fetch_add(collections, Ordering::Relaxed);
     flags.gc_words.fetch_add(words_reclaimed, Ordering::Relaxed);
+    snapshot_process(process, live_x);
 }
 
 /// Handle one phase of a literal-copy request after earlier signals have drained.
@@ -994,6 +995,27 @@ fn system_info(
     match name {
         Some("alloc_util_allocators") => Some(allocator_names(process)),
         Some("allocator") => Some(all_allocator_options(process)),
+        // Port of erts/emulator/beam/erl_bif_info.c:2942, OTP-29.1.1.
+        Some("process_count") => Some(non_neg(process, process_count(process) as u64)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3521, OTP-29.1.1.
+        Some("atom_count") => Some(non_neg(process, global_atoms().len() as u64)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3524-3529, OTP-29.1.1.
+        Some("tolerant_timeofday") => Some(Ok(atom("disabled"))),
+        // Port of erts/emulator/beam/erl_bif_info.c:3515, OTP-29.1.1.
+        Some("ets_count") => Some(non_neg(
+            process,
+            process
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.ets.read().unwrap().table_count())
+                .unwrap_or(0) as u64,
+        )),
+        // Port of erts/emulator/beam/erl_bif_info.c:2949-2954, OTP-29.1.1.
+        Some("info" | "procs" | "loaded" | "dist") => {
+            Some(system_info_dump(vm, process, name.unwrap()))
+        }
+        // Port of erts/emulator/beam/erl_bif_info.c:3547-3548, OTP-29.1.1.
+        Some("system_logger") => Some(Ok(system_logger(process))),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         // Port of erts/emulator/beam/erl_bif_info.c:3370-3376, OTP-29.1.1.
         Some("lock_checking") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
@@ -1116,6 +1138,86 @@ fn allocator_names(process: &mut Process) -> Result<Term, VmError> {
             tail: Box::new(O::Nil),
         },
     )
+}
+
+fn process_count(process: &Process) -> usize {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return 1;
+    };
+    let Ok(scheduler) = runtime.scheduler() else {
+        return 1;
+    };
+    runtime
+        .processes
+        .lock()
+        .map(|pids| pids.iter().filter(|pid| scheduler.lookup(**pid)).count())
+        .unwrap_or(1)
+}
+
+fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Term, VmError> {
+    use arinsal_etf::OwnedTerm as O;
+
+    let dump = match selector {
+        "info" => format!("Arinsal emulator\nProcesses: {}\n", process_count(process)),
+        "procs" => {
+            let Some(runtime) = process.runtime.as_ref() else {
+                return owned_system_info(process, O::Binary(Vec::new()));
+            };
+            let Ok(scheduler) = runtime.scheduler() else {
+                return owned_system_info(process, O::Binary(Vec::new()));
+            };
+            let pids = runtime
+                .processes
+                .lock()
+                .map_err(|_| badarg())?
+                .iter()
+                .copied()
+                .filter(|pid| scheduler.lookup(*pid))
+                .collect::<Vec<_>>();
+            let mut dump = String::new();
+            for pid in pids {
+                use std::fmt::Write as _;
+                let _ = writeln!(dump, "{pid:?}");
+            }
+            dump
+        }
+        "loaded" => {
+            let mut dump = String::new();
+            for module in vm.modules.iter() {
+                use std::fmt::Write as _;
+                let _ = writeln!(dump, "{}", module.name);
+            }
+            dump
+        }
+        "dist" => {
+            let tables = crate::node_tables::lock();
+            let mut dump = String::new();
+            for entry in tables.entries.values().filter(|entry| entry.connected) {
+                use std::fmt::Write as _;
+                let _ = writeln!(dump, "{} ({})", entry.name, entry.connection_id);
+            }
+            dump
+        }
+        _ => unreachable!("system_info_dump only handles info and procs"),
+    };
+    owned_system_info(process, O::Binary(dump.into_bytes()))
+}
+
+pub(crate) fn system_logger(process: &Process) -> Term {
+    let mut current = runtime_state(process)
+        .system_logger
+        .lock()
+        .expect("system logger");
+    if let Some(pid) = arinsal_sched::Pid::from_term(*current)
+        && process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.scheduler().ok())
+            .is_some_and(|scheduler| !scheduler.lookup(pid))
+    {
+        *current = atom("logger");
+    }
+    *current
 }
 
 // Port of erts/emulator/beam/erl_alloc.c:1708-1840 (handle_args), OTP-29.1.1.
@@ -2133,9 +2235,9 @@ pub(crate) fn snapshot_process(process: &mut Process, _live_x: usize) {
         .total_heap_size_words()
         .saturating_mul(word)
         .saturating_add(extra) as u64;
-    let used_words =
-        process.heap.used_words() + process.heap.old_used_words() + process.heap.stack_words();
-    let used = used_words.saturating_mul(word).saturating_add(extra) as u64;
+    // Port of erts/emulator/beam/erl_alloc.c:2190-2303 (memory category reporting), OTP-29.1.1:
+    // ERTS accounts process heap blocks, including each block's unused tail.
+    let used = capacity;
     process._persistent_terms.store().set_process_memory(
         &process._persistent_terms,
         capacity,

@@ -500,6 +500,55 @@ fn external_identities_and_copy() {
 }
 
 #[test]
+fn external_reference_id_counts_survive_copy_and_compare() {
+    use arinsal_term::{Identity, Node, exact_eq, global_atoms};
+    let node = Node::new(global_atoms().intern("refs@host").unwrap(), 7);
+    for ids in [
+        &[4711][..],
+        &[4711, 0],
+        &[4711, 0, 0],
+        &[1, 2, 3, 4],
+        &[1, 2, 3, 4, 5],
+    ] {
+        let mut source = VecHeap::new();
+        let external = TermBuilder::new(&mut source)
+            .external_ref(node.clone(), ids)
+            .unwrap();
+        assert!(
+            matches!(external.identity(), Some(Identity::Ref { ids: actual, .. }) if actual == ids)
+        );
+        let mut target = VecHeap::new();
+        let copied = copy_term(external, &mut target).unwrap();
+        assert!(exact_eq(external, copied));
+        let owned = to_owned(copied).unwrap();
+        assert!(matches!(owned, OwnedTerm::Ref { ids: ref actual, .. } if actual == ids));
+    }
+}
+
+#[test]
+fn serialized_magic_reference_recovers_its_identity_after_owner_collection() {
+    use arinsal_term::{Identity, MagicRef};
+    let id = 0x1_0000_0000;
+    let external = OwnedTerm::Ref {
+        node: "nonode@nohost".into(),
+        creation: 0,
+        ids: vec![id as u32, (id >> 32) as u32, u32::MAX],
+    };
+    let mut heap = VecHeap::new();
+    let reference = from_owned(&external, &mut heap).unwrap();
+    assert!(reference.is_magic_ref());
+    assert!(matches!(
+        reference.identity(),
+        Some(Identity::Ref { ids, .. }) if ids == [id as u32, (id >> 32) as u32, u32::MAX]
+    ));
+    assert!(matches!(
+        to_owned(reference).unwrap(),
+        OwnedTerm::Ref { ref ids, .. } if *ids == [id as u32, (id >> 32) as u32, u32::MAX]
+    ));
+    assert_eq!(MagicRef::live_by_id(id).unwrap().id(), id);
+}
+
+#[test]
 fn fun_layout_copy_and_conversion() {
     use arinsal_term::{ExportEntry, FunEntry, FunRef, global_atoms};
     let module = global_atoms().intern("erlang").unwrap();

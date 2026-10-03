@@ -1594,13 +1594,32 @@ fn internal_state_tuple_get(
         ("binary_info", OwnedTerm::Binary(_) | OwnedTerm::BitString { .. }) => {
             Ok(Some(atom("heap_binary")))
         }
-        ("magic_ref", _) => Ok(Some(atom(
-            if selector_value.is_some_and(Term::is_magic_ref) {
-                "true"
-            } else {
-                "false"
-            },
-        ))),
+        ("magic_ref", _) => {
+            let Some(reference) = selector_value.filter(|term| term.is_magic_ref()) else {
+                return Ok(Some(atom("false")));
+            };
+            let Some(arinsal_term::Identity::Ref { ids, .. }) = reference.identity() else {
+                return Ok(Some(atom("false")));
+            };
+            let Some(id) = ids
+                .first()
+                .zip(ids.get(1))
+                .map(|(lo, hi)| u64::from(*lo) | (u64::from(*hi) << 32))
+            else {
+                return Ok(Some(atom("false")));
+            };
+            let Some(owner) = arinsal_term::MagicRef::live_by_id(id) else {
+                return Ok(Some(atom("false")));
+            };
+            if owner.is_external_only() {
+                return Ok(Some(atom("true")));
+            }
+            let address = std::sync::Arc::as_ptr(&owner) as usize;
+            let references = std::sync::Arc::strong_count(&owner).saturating_sub(1);
+            let address = int(process, address)?;
+            let references = int(process, references)?;
+            tuple(process, &[address, references, atom("true")]).map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -1700,7 +1719,68 @@ fn node_and_dist_references(process: &mut Process) -> Result<Term, VmError> {
         process,
         &[local_reference, Term::small(1).unwrap(), local_owners],
     )?;
-    let node_references = list(process, &[node_ref_entry])?;
+    let mut node_reference_entries = vec![node_ref_entry];
+    let (ets_identity_counts, match_identity_counts, timer_identity_counts) =
+        process.runtime.as_ref().map_or_else(
+            || (HashMap::new(), HashMap::new(), HashMap::new()),
+            |runtime| {
+                let ets = runtime.ets.read().unwrap();
+                let timers = runtime.timers.lock().unwrap();
+                let mut timer_counts = HashMap::new();
+                for (id, message) in runtime.timer_messages.lock().unwrap().iter() {
+                    if timers.contains_key(id) {
+                        count_owned_external_identities(message, &mut timer_counts);
+                    }
+                }
+                (
+                    ets.external_identity_counts(),
+                    ets.match_program_identity_counts(),
+                    timer_counts,
+                )
+            },
+        );
+    let mut counts = HashMap::new();
+    for (key, count) in ets_identity_counts {
+        counts.entry(key).or_insert([0, 0, 0])[0] = count;
+    }
+    for (key, count) in match_identity_counts {
+        counts.entry(key).or_insert([0, 0, 0])[1] = count;
+    }
+    for (key, count) in timer_identity_counts {
+        counts.entry(key).or_insert([0, 0, 0])[2] = count;
+    }
+    for ((node, creation), [ets_count, binary_count, timer_count]) in counts {
+        if ets_count == 0 && binary_count == 0 && timer_count == 0
+            || node == arinsal_term::atoms::NONAME
+        {
+            continue;
+        }
+        let node_id = tuple(
+            process,
+            &[Term::atom(node), Term::small(i64::from(creation)).unwrap()],
+        )?;
+        let mut categories = Vec::new();
+        if ets_count > 0 {
+            let count_term = int(process, ets_count)?;
+            categories.push(tuple(process, &[atom("ets"), count_term])?);
+        }
+        if binary_count > 0 {
+            let count_term = int(process, binary_count)?;
+            categories.push(tuple(process, &[atom("binary"), count_term])?);
+        }
+        if timer_count > 0 {
+            let count_term = int(process, timer_count)?;
+            categories.push(tuple(process, &[atom("timer"), count_term])?);
+        }
+        let count = ets_count + binary_count + timer_count;
+        let count_term = int(process, count)?;
+        let categories = list(process, &categories)?;
+        let owner_id = tuple(process, &[atom("system"), undefined])?;
+        let owner = tuple(process, &[owner_id, categories])?;
+        let owners = list(process, &[owner])?;
+        node_reference_entries.push(tuple(process, &[node_id, count_term, owners])?);
+    }
+    let node_references = list(process, &node_reference_entries)?;
     let node_owner = tuple(process, &[atom("node"), local_reference])?;
     let node_reference = tuple(process, &[atom("node"), Term::small(1).unwrap()])?;
     let node_owners = list(process, &[node_reference])?;
@@ -1714,6 +1794,35 @@ fn node_and_dist_references(process: &mut Process) -> Result<Term, VmError> {
     let node_pair = tuple(process, &[atom("node_references"), node_references])?;
     let dist_pair = tuple(process, &[atom("dist_references"), dist_entries])?;
     tuple(process, &[node_pair, dist_pair])
+}
+
+fn count_owned_external_identities(
+    term: &OwnedTerm,
+    counts: &mut HashMap<(arinsal_term::Atom, u32), usize>,
+) {
+    let mut pending = vec![term];
+    while let Some(term) = pending.pop() {
+        match term {
+            OwnedTerm::Pid { node, creation, .. }
+            | OwnedTerm::Port { node, creation, .. }
+            | OwnedTerm::Ref { node, creation, .. }
+                if node != "nonode@nohost" =>
+            {
+                if let Ok(node) = global_atoms().intern(node) {
+                    *counts.entry((node, *creation)).or_default() += 1;
+                }
+            }
+            OwnedTerm::Tuple(items) => pending.extend(items),
+            OwnedTerm::List { elems, tail } => {
+                pending.extend(elems);
+                pending.push(tail);
+            }
+            OwnedTerm::Map(pairs) => {
+                pending.extend(pairs.iter().flat_map(|(key, value)| [key, value]));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Port of erl_bif_info.c:make_link_list for the current process, OTP-29.1.1.

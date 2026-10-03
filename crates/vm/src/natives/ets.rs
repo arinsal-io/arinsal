@@ -762,6 +762,10 @@ fn call_inner(
             | (EtsBif::MatchSpecCompile, _)
             | (
                 EtsBif::Select | EtsBif::SelectReverse | EtsBif::Match | EtsBif::MatchObject,
+                1
+            )
+            | (
+                EtsBif::Select | EtsBif::SelectReverse | EtsBif::Match | EtsBif::MatchObject,
                 3
             )
     );
@@ -1392,10 +1396,11 @@ fn call_inner(
             let page = table
                 .select_chunk_continue(program, state, &mut heap)
                 .map_err(err)?;
+            let keep_program = page.continuation.is_some();
             let rows = TermBuilder::new(&mut heap)
                 .list_from_iter(page.rows)
                 .map_err(|_| badarg())?;
-            if let Some(next) = page.continuation {
+            let result = if let Some(next) = page.continuation {
                 let next = next.to_term(&table, &mut heap).map_err(err)?;
                 TermBuilder::new(&mut heap)
                     .tuple(&[rows, next])
@@ -1408,7 +1413,12 @@ fn call_inner(
                 TermBuilder::new(&mut heap)
                     .tuple(&[rows, atom("$end_of_table")])
                     .map_err(|_| badarg())
+            }?;
+            drop(table);
+            if !keep_program {
+                registry.exclusive()?.release_match_program(reference);
             }
+            Ok(result)
         }
         (EtsBif::MatchSpecCompile, [spec]) => {
             let program = MatchProgram::compile(*spec).map_err(err)?;

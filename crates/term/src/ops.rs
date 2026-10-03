@@ -767,6 +767,7 @@ fn exact_number_eq(a: Term, b: Term) -> bool {
     }
 }
 fn exact_ref_eq(a: Term, b: Term) -> bool {
+    // Port of erts/emulator/beam/utils.c:1325-1355 (reference equality), OTP-29.1.1.
     fn fields(term: Term) -> (crate::Atom, u32, [u32; 5], usize) {
         let header = term.header().unwrap();
         // SAFETY: a live reference's header identifies its initialized words.
@@ -789,18 +790,22 @@ fn exact_ref_eq(a: Term, b: Term) -> bool {
                 (crate::atoms::NONAME, 0, 3)
             }
             crate::EXTERNAL_REF => {
-                // SAFETY: word one retains the Node, followed by packed ids.
+                // SAFETY: the external-ref payload retains the Node and stores its id count.
                 let node = unsafe { &*(*ptr.add(1) as *const crate::Node) };
-                let count = if header >> 6 == 4 { 3 } else { 5 };
-                for (i, id) in ids.iter_mut().enumerate().take(count) {
-                    // SAFETY: count is derived from the external ref header.
-                    let word = unsafe { *ptr.add(3 + i / 2) };
-                    *id = if i % 2 == 0 {
-                        word as u32
-                    } else {
-                        (word >> 32) as u32
-                    };
-                }
+                // SAFETY: the live reference header bounds its count and packed ids.
+                let count = unsafe {
+                    let count = (*ptr.add(3) as u32) as usize;
+                    for (i, id) in ids.iter_mut().enumerate().take(count) {
+                        let index = i + 1;
+                        let word = *ptr.add(3 + index / 2);
+                        *id = if index % 2 == 0 {
+                            word as u32
+                        } else {
+                            (word >> 32) as u32
+                        };
+                    }
+                    count
+                };
                 (node.name, node.creation, count)
             }
             _ => unreachable!(),

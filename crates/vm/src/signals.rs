@@ -2245,10 +2245,8 @@ fn call_resolved(
             // A dead pid gets a ref but no timer entry; an unresolved name can
             // become registered before its timer expires.
             let id = rt.next_ref();
-            let mut message = Message::copy_from(*message)?;
-            if matches!(entry, SignalBif::StartTimer3 | SignalBif::StartTimer4) {
-                message = message.with_timer_id(id);
-            }
+            let timer_message = arinsal_term::to_owned(*message).ok();
+            let message = Message::copy_from(*message)?.with_timer_id(id);
             // Port of erts/emulator/beam/erl_hl_timer.c (setup_bif_timer), OTP-29.1.1: a timer for a
             // process that does not exist is never created.
             if let Some(pid) = pid
@@ -2263,7 +2261,12 @@ fn call_resolved(
                     let runtime = rt.clone();
                     let name = registered_name.expect("resolved timer name");
                     ctx.schedule_resolved_timer(ms, message, false, move || {
-                        runtime.names.lock().unwrap().get(&name).copied()
+                        let target = runtime.names.lock().unwrap().get(&name).copied();
+                        if target.is_none() {
+                            runtime.timers.lock().unwrap().remove(&id);
+                            runtime.timer_messages.lock().unwrap().remove(&id);
+                        }
+                        target
                     })
                 }
             } else {
@@ -2273,12 +2276,20 @@ fn call_resolved(
                     let runtime = rt.clone();
                     let name = registered_name.expect("resolved timer name");
                     ctx.schedule_resolved_timer(ms, message, true, move || {
-                        runtime.names.lock().unwrap().get(&name).copied()
+                        let target = runtime.names.lock().unwrap().get(&name).copied();
+                        if target.is_none() {
+                            runtime.timers.lock().unwrap().remove(&id);
+                            runtime.timer_messages.lock().unwrap().remove(&id);
+                        }
+                        target
                     })
                 }
             }
             .map_err(|error| VmError::Unsupported(format!("timer: {error}")))?;
             rt.timers.lock().unwrap().insert(id, timer);
+            if let Some(message) = timer_message {
+                rt.timer_messages.lock().unwrap().insert(id, message);
+            }
             // The timer belongs to its receiving process (erts keeps it in the receiver's
             // bif-timer tree) and is cancelled when that process exits; name-addressed timers
             // have no owner.
@@ -2320,6 +2331,7 @@ fn call_resolved(
                         scheduler.cancel_timer_async(timer, move |remaining| {
                             runtime.timer_owners.lock().unwrap().remove(&id);
                             runtime.timers.lock().unwrap().remove(&id);
+                            runtime.timer_messages.lock().unwrap().remove(&id);
                             let value = remaining.map_or_else(
                                 || OwnedTerm::atom("false"),
                                 |ms| {
@@ -2342,6 +2354,7 @@ fn call_resolved(
                     } else {
                         rt.timer_owners.lock().unwrap().remove(&id);
                         rt.timers.lock().unwrap().remove(&id);
+                        rt.timer_messages.lock().unwrap().remove(&id);
                         let term = OwnedTerm::Tuple(vec![
                             OwnedTerm::atom("cancel_timer"),
                             reference,
@@ -2356,15 +2369,18 @@ fn call_resolved(
                     scheduler.cancel_timer_async(timer, move |_| {
                         runtime.timer_owners.lock().unwrap().remove(&id);
                         runtime.timers.lock().unwrap().remove(&id);
+                        runtime.timer_messages.lock().unwrap().remove(&id);
                     });
                 } else {
                     rt.timer_owners.lock().unwrap().remove(&id);
                     rt.timers.lock().unwrap().remove(&id);
+                    rt.timer_messages.lock().unwrap().remove(&id);
                 }
                 return Ok(atom("ok"));
             }
             rt.timer_owners.lock().unwrap().remove(&id);
             let timer = rt.timers.lock().unwrap().remove(&id);
+            rt.timer_messages.lock().unwrap().remove(&id);
             access_timer_sync(process, ctx, *reference, timer, true, options.info)
         }
         (SignalBif::ReadTimer1, [reference]) | (SignalBif::ReadTimer2, [reference, _]) => {
