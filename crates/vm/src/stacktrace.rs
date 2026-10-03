@@ -708,6 +708,12 @@ pub(super) fn build(
     let native_pc = p.cold.as_ref().map_or(0, |cold| cold.native_call_pc);
     if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
         set_native_top(&mut raw, native_pc);
+    } else if let Some(pc) = p.native_pc
+        && crate::native_bridge::is_native_function_at(pc)
+    {
+        // A process suspended inside native code: `p.module`/`p.ip` still hold the last
+        // interpreter position, so the current function comes from its native resume pc.
+        set_native_top(&mut raw, pc);
     }
     build_saved(p, &mut raw)
 }
@@ -770,27 +776,19 @@ pub(super) fn build_saved(p: &mut Process, raw: &mut RawTrace) -> Result<Term, V
         .native_top
         .and_then(|pc| crate::native_function_at(pc).map(|native| (native, pc)))
     {
-        let pc = &pc;
-        let native = &native;
-        let location = native
-            .line_at(*pc)
-            .and_then(|(file, line)| {
-                current
-                    .line_file_terms
-                    .get(file)
-                    .copied()
-                    .map(|file| (file, u64::from(line)))
-            })
-            .or_else(|| {
-                native.file.as_deref().and_then(|file| {
-                    let line = native.line?;
-                    current
-                        .line_file_terms
-                        .get(file)
-                        .copied()
-                        .map(|file| (file, u64::from(line)))
+        // The frame's own file term: `raw.module` is only the last interpreter module.
+        let location = crate::native_bridge::native_stack_frame_at(pc).and_then(|frame| {
+            let line = frame.line?;
+            frame
+                .file_term
+                .or_else(|| {
+                    frame
+                        .file
+                        .as_deref()
+                        .and_then(|file| current.line_file_terms.get(file).copied())
                 })
-            });
+                .map(|file| (file, u64::from(line)))
+        });
         (
             native.module_atom,
             native.function_atom,

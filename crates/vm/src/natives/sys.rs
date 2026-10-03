@@ -1053,6 +1053,33 @@ fn system_info(
         Some("schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.schedulers_total as u64)
         })),
+        // Port of erts/emulator/beam/erl_bif_info.c:3258-3335 (schedulers_state, schedulers_active),
+        // OTP-29.1.1.
+        Some("schedulers_active") => {
+            Some(non_neg(process, normal_schedulers_active(process) as u64))
+        }
+        Some("schedulers_state") => {
+            let (total, online) = with_flags(process, |flags| {
+                (
+                    flags.schedulers_total as i64,
+                    flags.schedulers_online as i64,
+                )
+            });
+            let active = normal_schedulers_active(process) as i64;
+            Some(owned_system_info(
+                process,
+                arinsal_etf::OwnedTerm::Tuple(vec![
+                    arinsal_etf::OwnedTerm::Int(total),
+                    arinsal_etf::OwnedTerm::Int(online),
+                    arinsal_etf::OwnedTerm::Int(active),
+                ]),
+            ))
+        }
+        // Port of erts/emulator/beam/erl_bif_info.c:3338 (run_queues = erts_no_run_queues), OTP-29.1.1:
+        // one run queue per scheduler.
+        Some("run_queues") => Some(read_flags(process, |process, flags| {
+            non_neg(process, flags.schedulers_total as u64)
+        })),
         // Port of erts/emulator/beam/erl_bif_info.c:3283-3324 (`all_schedulers_state`), OTP-29.1.1.
         Some("all_schedulers_state") => Some(all_schedulers_state(process)),
         // Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
@@ -4090,6 +4117,17 @@ fn scheduler_stats(
         .as_ref()
         .and_then(|runtime| runtime.scheduler().ok())
         .map(|scheduler| scheduler.stats())
+}
+
+/// Active normal schedulers: all online ones unless multi scheduling is blocked.
+// Port of erts/emulator/beam/erl_process.c:8130-8152 (erts_schedulers_state), OTP-29.1.1.
+pub(crate) fn normal_schedulers_active(process: &Process) -> usize {
+    let online = with_flags(process, |flags| flags.schedulers_online);
+    if multi_scheduling_state(process, |state| state.any_blocked()) {
+        1
+    } else {
+        online
+    }
 }
 
 fn all_schedulers_state(process: &mut Process) -> Result<Term, VmError> {

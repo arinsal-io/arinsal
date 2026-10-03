@@ -513,6 +513,7 @@ impl Vm {
             seen_epoch: 0,
             beamasm_targets: beamasm_integration::NativeTargetCache::new(code_scope),
             code_scope,
+            code_ix: crate::code_ix::for_scope(code_scope),
             registers: SharedTable::new(Vec::new()),
             native_fns: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
@@ -813,6 +814,10 @@ impl Vm {
             .filter_map(|name| loaded.get(name).map(|id| (name.clone(), *id)))
             .collect();
         let mut on_load = Vec::new();
+        // Port of erts/emulator/beam/beam_bif_load.c:422 and 511-548 (finish_loading:
+        // erts_start_staging_code_ix, then end and commit in staging_epilogue), OTP-29.1.1: the
+        // exports of every module in this load become active together.
+        let staging = beamasm_integration::start_staging(self.code_scope);
         if let Some(code) = shared.as_deref_mut() {
             for (module, registers, mut meta) in prepared {
                 let name = module.name.clone();
@@ -840,6 +845,7 @@ impl Vm {
                     code.deleted.remove(&name);
                 }
             }
+            drop(staging);
             code.epoch
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
             self.sync_shared(code);
@@ -873,6 +879,7 @@ impl Vm {
                 }
                 self.deleted.remove(&name);
             }
+            drop(staging);
         }
         Ok(on_load)
     }
@@ -1139,6 +1146,7 @@ impl Vm {
             seen_epoch: 0,
             beamasm_targets: beamasm_integration::NativeTargetCache::new(code_scope),
             code_scope,
+            code_ix: crate::code_ix::for_scope(code_scope),
             registers: SharedTable::new(Vec::new()),
             native_fns: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),

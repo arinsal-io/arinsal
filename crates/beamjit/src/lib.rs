@@ -2504,7 +2504,6 @@ struct MapLookupSpec {
     destination: MoveArg,
     fail: u32,
     helper: MapLookupHelper,
-    stable_map: bool,
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-393 and 511-539, OTP-29.1.1.
@@ -2515,9 +2514,9 @@ fn emit_map_lookup(
     use arinsal_a64::enc::Gpr;
 
     assembler.emit_raw(|encoder| {
-        if !spec.stable_map {
-            raw_load_arg(encoder, spec.map, Gpr::x(24))?;
-        }
+        // x24 holds the process's code index (active_code_ix); the map goes in a scratch
+        // register.
+        raw_load_arg(encoder, spec.map, Gpr::x(10))?;
         raw_load_arg(encoder, spec.key, Gpr::x(11))?;
         encoder.mov_const(Gpr::x(12), u64::from(spec.hash))?;
         encoder.mov_const(Gpr::x(13), u64::from(spec.hashed))?;
@@ -2529,7 +2528,7 @@ fn emit_map_lookup(
         }
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(24))?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(10))?;
         encoder.mov_reg(Gpr::x(3), Gpr::x(11))?;
         encoder.mov_reg(Gpr::x(4), Gpr::x(12))?;
         encoder.mov_reg(Gpr::x(5), Gpr::x(13))?;
@@ -3568,7 +3567,6 @@ fn emit_op(
                     destination: raw_move_arg(args.get(destination_at), beam, env)?,
                     fail: n(0)?,
                     helper: env.map_lookup_helper(),
-                    stable_map: false,
                 },
             )?;
             Ok(())

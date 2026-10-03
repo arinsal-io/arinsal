@@ -398,6 +398,9 @@ pub(crate) type DirectEts = fn(&mut Process, &[Term]) -> Option<Term>;
 
 /// Direct entry for `ets:function/arity`, if it has one.
 pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<DirectEts> {
+    if module == "erlang" && function == "system_info" && arity == 1 {
+        return Some(direct_system_info);
+    }
     if module != "ets" {
         return None;
     }
@@ -407,6 +410,24 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
         ("insert", 2) => Some(direct_insert),
         _ => None,
     }
+}
+
+/// `erlang:system_info(scheduler_id)` from the generated code: the process knows its scheduler,
+/// as erts reads `c_p->scheduler_data`. Every other item takes the scheduler path.
+// Port of erts/emulator/beam/erl_bif_info.c:2784 (system_info scheduler_id), OTP-29.1.1.
+fn direct_system_info(process: &mut Process, args: &[Term]) -> Option<Term> {
+    static SCHEDULER_ID: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    let scheduler_id = *SCHEDULER_ID.get_or_init(|| {
+        Term::atom(
+            arinsal_term::global_atoms()
+                .intern("scheduler_id")
+                .expect("built-in atom"),
+        )
+    });
+    if args.first().copied() != Some(scheduler_id) || process.scheduler_id == 0 {
+        return None;
+    }
+    Term::small(i64::from(process.scheduler_id))
 }
 
 fn direct_caller(process: &Process) -> Option<Term> {

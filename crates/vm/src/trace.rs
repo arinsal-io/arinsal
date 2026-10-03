@@ -368,6 +368,141 @@ fn new_port_tracing() -> &'static NewPortTracing {
     TRACING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Pids of processes with `process_flag(sensitive, true)` (erts `F_SENSITIVE`).
+fn sensitive_set() -> &'static Mutex<std::collections::HashSet<(usize, Pid)>> {
+    static SET: OnceLock<Mutex<std::collections::HashSet<(usize, Pid)>>> = OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+static SENSITIVE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets or clears the sensitive flag of `pid`; returns the previous value.
+// Port of erts/emulator/beam/bif.c:2173 (process_flag sensitive), OTP-29.1.1.
+pub(crate) fn set_sensitive(process: &Process, pid: Pid, on: bool) -> bool {
+    let mut set = sensitive_set().lock().unwrap();
+    let key = (scope(process), pid);
+    let old = if on {
+        !set.insert(key)
+    } else {
+        set.remove(&key)
+    };
+    SENSITIVE_COUNT.store(set.len(), Ordering::Relaxed);
+    old
+}
+
+/// Whether `pid` is sensitive (`ERTS_IS_PROC_SENSITIVE`).
+pub(crate) fn is_sensitive(process: &Process, pid: Pid) -> bool {
+    SENSITIVE_COUNT.load(Ordering::Relaxed) != 0
+        && sensitive_set()
+            .lock()
+            .unwrap()
+            .contains(&(scope(process), pid))
+}
+
+/// One entry of a process's `save_calls` buffer.
+// Port of erts/emulator/beam/erl_trace.c:70 (exp_send, exp_receive, exp_timeout), OTP-29.1.1.
+#[derive(Clone, Copy)]
+pub(crate) enum SavedCall {
+    Mfa(arinsal_term::Atom, arinsal_term::Atom, u8),
+    Send,
+    Receive,
+    Timeout,
+}
+
+/// The circular `save_calls` buffer (`struct saved_calls`).
+pub(crate) struct SavedCalls {
+    len: usize,
+    cur: usize,
+    n: usize,
+    ct: Vec<Option<SavedCall>>,
+}
+
+/// Whether `process` has a `save_calls` buffer (`ERTS_PROC_GET_SAVED_CALLS_BUF`).
+#[inline(always)]
+pub(crate) fn saves_calls(process: &Process) -> bool {
+    process
+        .cold
+        .as_ref()
+        .is_some_and(|cold| cold.saved_calls.is_some())
+}
+
+/// Replaces the `save_calls` buffer of `process` and returns the old length.
+// Port of erts/emulator/beam/bif.c:1907-1950 (process_flag save_calls), OTP-29.1.1.
+pub(crate) fn set_save_calls(process: &mut Process, len: usize) -> usize {
+    let new = (len != 0).then(|| SavedCalls {
+        len,
+        cur: 0,
+        n: 0,
+        ct: vec![None; len],
+    });
+    let cold = process.cold_mut();
+    let old = std::mem::replace(&mut cold.saved_calls, new);
+    let was = old.as_ref().map_or(0, |scb| scb.len);
+    if (was != 0) != (len != 0) {
+        // ERTS_VBUMP_ALL_REDS: reschedule at once so native code runs with the code index
+        // that matches the new setting (ERTS_SAVE_CALLS_CODE_IX or the active one).
+        process.reductions = 0;
+        process.force_yield = true;
+    }
+    was
+}
+
+/// Drops the buffer of an exiting process.
+pub(crate) fn clear_save_calls(process: &mut Process) {
+    if let Some(cold) = process.cold.as_mut() {
+        cold.saved_calls = None;
+    }
+}
+
+/// Records a call in the buffer of `process`, unless it is sensitive.
+// Port of erts/emulator/beam/erl_trace.c:1409 (save_calls), OTP-29.1.1.
+pub(crate) fn save_call(process: &mut Process, call: SavedCall) {
+    if process
+        .self_pid
+        .is_some_and(|pid| is_sensitive(process, pid))
+    {
+        return;
+    }
+    let Some(scb) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.saved_calls.as_mut())
+    else {
+        return;
+    };
+    scb.ct[scb.cur] = Some(call);
+    scb.cur += 1;
+    if scb.cur >= scb.len {
+        scb.cur = 0;
+    }
+    if scb.n < scb.len {
+        scb.n += 1;
+    }
+}
+
+/// Saved calls, newest first.
+pub(crate) fn saved_calls(process: &Process) -> Option<Vec<SavedCall>> {
+    let scb = process.cold.as_ref()?.saved_calls.as_ref()?;
+    Some(
+        (0..scb.n)
+            .filter_map(|i| {
+                let j = (scb.cur + scb.len - i - 1) % scb.len;
+                scb.ct[j]
+            })
+            .collect(),
+    )
+}
+
+/// Records the `erlang:send/2` export a process saving calls dispatches `send` through.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-625 (emit_send dispatches through
+// BIF_TRAP_EXPORT(BIF_send_2)), OTP-29.1.1.
+pub(crate) fn save_call_send_export(process: &mut Process) {
+    let atoms = arinsal_term::global_atoms();
+    if let (Ok(m), Ok(f)) = (atoms.intern("erlang"), atoms.intern("send")) {
+        save_call(process, SavedCall::Mfa(m, f, 2));
+    }
+}
+
 /// Whether any process is traced at all.
 pub(crate) fn active() -> bool {
     enabled().load(Ordering::Relaxed)
@@ -934,7 +1069,7 @@ fn replace_session_flags(process: &Process, session: u64, pid: Pid, flags: u64, 
 }
 
 pub(crate) fn flags(process: &Process, pid: Pid) -> u64 {
-    if !enabled().load(Ordering::Relaxed) {
+    if !enabled().load(Ordering::Relaxed) || is_sensitive(process, pid) {
         return 0;
     }
     table()
@@ -1028,6 +1163,15 @@ pub(crate) fn event_match_spec(
 pub(crate) fn event_session_refs(process: &Process, event: &str) -> Vec<(String, i64)> {
     let _ = event;
     session_refs(process)
+}
+
+/// Trace flags of `pid` in `session` that generate events: none for a sensitive process.
+// Port of erts/emulator/beam/erl_trace.c:3798 (erts_sum_all_trace_flags), OTP-29.1.1.
+pub(crate) fn active_session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
+    if is_sensitive(process, pid) {
+        return 0;
+    }
+    session_flags(process, session, pid)
 }
 
 pub(crate) fn session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
@@ -1264,6 +1408,7 @@ pub(crate) fn tracer(process: &Process, pid: Pid) -> Option<Tracer> {
 }
 
 pub(crate) fn clear(process: &Process, pid: Pid) {
+    set_sensitive(process, pid, false);
     let mut entries = table().lock().unwrap();
     entries.retain(|(runtime, _, subject), _| *runtime != scope(process) || *subject != pid);
     let processes_active = !entries.is_empty();
@@ -1481,6 +1626,11 @@ fn call_event_scope(
         HIT_META,
     };
     let pid = ctx.pid();
+    // Port of erts/emulator/beam/beam_bp.c:1004 (erts_generic_breakpoint), OTP-29.1.1: a
+    // sensitive process runs no session breakpoint.
+    if is_sensitive(process, pid) {
+        return Ok(Vec::new());
+    }
     let arity = args.len() as u8;
     let hits = crate::trace_bp::hits(process, module, function, arity);
     if hits.is_empty() {
@@ -1498,7 +1648,7 @@ fn call_event_scope(
     };
     for hit in hits {
         let mut bp_flags = hit.flags & site_flags;
-        let flags = session_flags(process, hit.session, pid);
+        let flags = active_session_flags(process, hit.session, pid);
         // Port of erts/emulator/beam/beam_bp.c:1017-1060 (do_session_breakpoint), OTP-29.1.1.
         let acc_flags = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
         if bp_flags & (HIT_LOCAL | HIT_GLOBAL | acc_flags) != 0 && flags & CALL == 0 {
@@ -1517,7 +1667,7 @@ fn call_event_scope(
             )?;
             // The match specification may have changed the silent state.
             let call_was_enabled = flags & CALL != 0;
-            let flags = session_flags(process, hit.session, pid);
+            let flags = active_session_flags(process, hit.session, pid);
             let silent = flags & SILENT != 0;
             let mut extra = outcome.extra;
             if call_was_enabled && !silent && !outcome.suppress_call {
@@ -1546,7 +1696,7 @@ fn call_event_scope(
             if !silent {
                 let return_to = !outcome.suppress_call
                     && local_hit
-                    && session_flags(process, hit.session, pid) & RETURN_TO != 0;
+                    && active_session_flags(process, hit.session, pid) & RETURN_TO != 0;
                 if outcome.return_trace || outcome.exception_trace || return_to {
                     actions.push(CallActions {
                         session: hit.session,
@@ -2355,7 +2505,7 @@ pub(crate) fn native_return_events(
             };
             Some(meta)
         } else {
-            let flags = session_flags(process, action.session, pid);
+            let flags = active_session_flags(process, action.session, pid);
             if flags & CALL == 0 || flags & SILENT != 0 {
                 continue;
             }
@@ -2428,7 +2578,7 @@ pub(crate) fn return_event(
         };
         Some(meta)
     } else {
-        let flags = session_flags(process, session, ctx.pid());
+        let flags = active_session_flags(process, session, ctx.pid());
         if flags & CALL == 0 || flags & SILENT != 0 {
             return Ok(());
         }
@@ -2563,7 +2713,7 @@ pub(crate) fn bif_return_events(
             process.cold_mut().bif_return_to.push(action.session);
         }
         if action.return_to && outcome.is_ok() {
-            let flags = session_flags(process, action.session, pid);
+            let flags = active_session_flags(process, action.session, pid);
             if flags & RETURN_TO != 0 && flags & SILENT == 0 {
                 let target = caller_mfa_name(vm, process, site);
                 emit_return_to(vm, process, ctx, action.session, target)?;
@@ -2603,7 +2753,7 @@ pub(crate) fn return_to_event(
     ctx: &mut RunCtx<'_, Message>,
     session: u64,
 ) -> Result<(), VmError> {
-    let flags = session_flags(process, session, ctx.pid());
+    let flags = active_session_flags(process, session, ctx.pid());
     if flags & RETURN_TO == 0 || flags & SILENT != 0 {
         return Ok(());
     }
@@ -2633,7 +2783,7 @@ pub(crate) fn unwound_return_to(
             continue;
         }
         done.push(*session);
-        let flags = session_flags(process, *session, pid);
+        let flags = active_session_flags(process, *session, pid);
         if flags & RETURN_TO == 0 || flags & SILENT != 0 {
             continue;
         }
@@ -2800,7 +2950,9 @@ pub(crate) fn spawned(
         .lock()
         .unwrap()
         .iter()
-        .filter(|((owner, _, pid), _)| *owner == runtime && *pid == parent)
+        .filter(|((owner, _, pid), _)| {
+            *owner == runtime && *pid == parent && !is_sensitive(process, parent)
+        })
         .map(|((_, session, _), entry)| (*session, entry.clone()))
         .collect::<Vec<_>>();
     for (session, entry) in entries {
@@ -2870,6 +3022,9 @@ pub(crate) fn spawn_interested(process: &Process, parent: Pid) -> bool {
 // Port of erts/emulator/beam/erl_proc_sig_queue.c:618-655, OTP-29.1.1.
 pub(crate) fn linked(process: &Process, from: Pid, to: Pid) {
     for (source, target) in [(from, to), (to, from)] {
+        if is_sensitive(process, source) {
+            continue;
+        }
         let source_entries = table()
             .lock()
             .unwrap()
@@ -2972,6 +3127,9 @@ pub(crate) fn traces_sends(process: &Process) -> bool {
     let Some(pid) = process.self_pid else {
         return false;
     };
+    if is_sensitive(process, pid) {
+        return false;
+    }
     table()
         .lock()
         .unwrap()
@@ -3001,7 +3159,7 @@ fn emit_filtered_without_ctx(
     fields: &[Term],
     session: Option<u64>,
 ) {
-    if !enabled().load(Ordering::Relaxed) {
+    if !enabled().load(Ordering::Relaxed) || is_sensitive(process, subject) {
         return;
     }
     let entries = table()
@@ -3163,7 +3321,7 @@ fn emit_filtered(
     session: Option<u64>,
     match_args: Option<&[Term]>,
 ) {
-    if !enabled().load(Ordering::Relaxed) {
+    if !enabled().load(Ordering::Relaxed) || is_sensitive(process, subject) {
         return;
     }
     let entries = table()

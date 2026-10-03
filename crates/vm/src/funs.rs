@@ -949,6 +949,12 @@ impl Vm {
             atom_name(Term::atom(module_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
         let function =
             atom_name(Term::atom(function_atom)).ok_or_else(|| self.exception(p, "badarg"))?;
+        if crate::trace::saves_calls(p) {
+            crate::trace::save_call(
+                p,
+                crate::trace::SavedCall::Mfa(module_atom, function_atom, arity as u8),
+            );
+        }
         if module == "erlang" && function == "apply" && arity == 3 {
             // Port of erts/emulator/beam/beam_common.c:1445-1450 (apply), OTP-29.1.1.
             return self.apply_bif(p, 3, tail, dealloc, ctx);

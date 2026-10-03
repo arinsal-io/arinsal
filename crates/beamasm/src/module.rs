@@ -614,7 +614,9 @@ impl BeamModuleAssembler {
         }
         self.code.emit(|e| {
             e.mov_const(Gpr::x(13), entry as u64)?;
-            e.ldr_uoff(Gpr::x(14), Gpr::x(13), 0)?;
+            // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:388-403
+            // (emit_setup_dispatchable_call), OTP-29.1.1.
+            e.ldr_regoff(Gpr::x(14), Gpr::x(13), Gpr::x(24), 3)?;
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), Gpr::x(13))
         })?;

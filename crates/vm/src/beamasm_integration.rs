@@ -98,6 +98,8 @@ impl NativeTargetCache {
 #[derive(Clone)]
 pub(crate) struct DispatchTarget {
     slot: Arc<arinsal_beamasm::bif::ExportEntry>,
+    /// Code scope whose code indexes select the slot's address; zero for scope-free slots.
+    scope: u64,
     pub module: String,
     pub function: String,
     pub module_atom: arinsal_term::Atom,
@@ -124,6 +126,9 @@ struct ScopeExports {
     // Exports with a global call breakpoint: their callers go through the export
     // trampoline, whose interpreted export entry is the breakpoint.
     global_breakpoints: std::collections::HashSet<Mfa>,
+    // A load holds the staging area open: changes go to the staging code index and its
+    // commit makes them active.
+    staging_open: bool,
 }
 
 #[derive(Default)]
@@ -158,6 +163,7 @@ pub(crate) fn new_code_scope() -> u64 {
 /// Forgets the export state of a node whose code is gone.
 pub(crate) fn release_code_scope(scope: u64) {
     crate::native_bridge::unregister_native_scope(scope);
+    crate::code_ix::release_scope(scope);
     let Ok(mut registry) = dispatch_registry().write() else {
         return;
     };
@@ -178,6 +184,7 @@ fn fragments() -> Option<&'static DispatchFragments> {
                 crate::native_helpers::arinsal_beamasm_export_trampoline as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_call_light_bif_shared as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_exception_resolver as *const () as usize,
+                crate::native_helpers::arinsal_beamasm_save_calls_export as *const () as usize,
             )
             .ok()
         })
@@ -186,6 +193,7 @@ fn fragments() -> Option<&'static DispatchFragments> {
 
 fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usize>> {
     let trampoline = fragments()?.export_trampoline();
+    let save_calls = fragments()?.save_calls_export();
     let mut registry = dispatch_registry().write().ok()?;
     let mut identities = Vec::with_capacity(module.imports.len());
     for (index, import) in module.imports.iter().enumerate() {
@@ -206,7 +214,11 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 (import.class(), import.native_bits())
             };
             Arc::new(DispatchTarget {
-                slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(address)),
+                // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
+                slot: Arc::new(arinsal_beamasm::bif::ExportEntry::with_save_calls(
+                    address, save_calls,
+                )),
+                scope,
                 trap_entry: crate::bif_traps::traps(&import.module, &import.function, import.arity),
                 direct_ets: crate::natives::ets::direct_entry(
                     &import.module,
@@ -233,6 +245,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
 /// Returns the dispatch slot that runs the BIF `module:function/arity` from its stub body.
 fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     let trampoline = fragments()?.export_trampoline();
+    let save_calls = fragments()?.save_calls_export();
     let mut registry = dispatch_registry().write().ok()?;
     let key = (module.to_owned(), function.to_owned(), arity);
     let module_atom = global_atoms().get(module)?;
@@ -241,7 +254,10 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         let bif = arinsal_bifs::lookup(module, function, arity);
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
         Arc::new(DispatchTarget {
-            slot: Arc::new(arinsal_beamasm::bif::ExportEntry::new(trampoline)),
+            slot: Arc::new(arinsal_beamasm::bif::ExportEntry::with_save_calls(
+                trampoline, save_calls,
+            )),
+            scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
             direct_ets: crate::natives::ets::direct_entry(module, function, arity),
             module: module.to_owned(),
@@ -260,10 +276,16 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
 }
 
 fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, usize)]) {
-    let Ok(mut registry) = dispatch_registry().write() else {
-        return;
-    };
-    let exports = registry.scopes.entry(scope).or_default();
+    staged(scope, |exports| {
+        publish_module_exports(exports, module, native);
+    });
+}
+
+fn publish_module_exports(
+    exports: &mut ScopeExports,
+    module: &arinsal_loader::Module,
+    native: &[(Mfa, usize)],
+) {
     exports
         .target_indices
         .retain(|(name, _, _), _| name != &module.name);
@@ -279,7 +301,74 @@ fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, u
     for (mfa, address) in native {
         exports.native_targets.insert(mfa.clone(), *address);
     }
-    refresh_import_slots(exports);
+}
+
+/// Opens the staging area of `scope` for a load; changes to its exports stay invisible to
+/// running code until the returned guard commits them.
+// Port of erts/emulator/beam/code_ix.c:120-129 (erts_start_staging_code_ix), OTP-29.1.1.
+pub(crate) fn start_staging(scope: u64) -> StagingGuard {
+    let Ok(mut registry) = dispatch_registry().write() else {
+        return StagingGuard { scope: None };
+    };
+    let exports = registry.scopes.entry(scope).or_default();
+    if exports.staging_open {
+        // A nested load joins the open staging area and leaves its commit to the outer one.
+        return StagingGuard { scope: None };
+    }
+    stage_exports(exports, &crate::code_ix::for_scope(scope));
+    exports.staging_open = true;
+    StagingGuard { scope: Some(scope) }
+}
+
+/// Ends a staging area opened by [`start_staging`] and commits it when dropped.
+pub(crate) struct StagingGuard {
+    scope: Option<u64>,
+}
+
+impl Drop for StagingGuard {
+    // Port of erts/emulator/beam/code_ix.c:131-171 (erts_end_staging_code_ix,
+    // erts_commit_staging_code_ix), OTP-29.1.1.
+    fn drop(&mut self) {
+        let Some(scope) = self.scope else {
+            return;
+        };
+        let mut registry = dispatch_registry()
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let exports = registry.scopes.entry(scope).or_default();
+        exports.staging_open = false;
+        crate::code_ix::for_scope(scope).commit();
+    }
+}
+
+/// Copies every export's active address into the staging code index.
+// Port of erts/emulator/beam/export.c:100-106 (export_stage) and 277-280
+// (export_start_staging), OTP-29.1.1.
+fn stage_exports(exports: &ScopeExports, code_ix: &crate::code_ix::CodeIndexes) {
+    let (active, staging) = (code_ix.active(), code_ix.staging());
+    for entry in exports.imports.values() {
+        entry.slot.stage(active, staging);
+    }
+}
+
+/// Applies `change` to the exports of `scope` in the staging code index. Outside a load's
+/// staging area the change is staged and committed on its own, like the code changes erts
+/// makes under the code modification permission (delete_module, trace patterns).
+fn staged(scope: u64, change: impl FnOnce(&mut ScopeExports)) {
+    let Ok(mut registry) = dispatch_registry().write() else {
+        return;
+    };
+    let exports = registry.scopes.entry(scope).or_default();
+    let code_ix = crate::code_ix::for_scope(scope);
+    let own_staging = !exports.staging_open;
+    if own_staging {
+        stage_exports(exports, &code_ix);
+    }
+    change(exports);
+    refresh_import_slots(exports, code_ix.staging());
+    if own_staging {
+        code_ix.commit();
+    }
 }
 
 /// Sends native callers of a deleted module's exports to the export trampoline, whose
@@ -287,34 +376,44 @@ fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, u
 // Port of erts/emulator/beam/beam_bif_load.c:679-720 (delete_module_1: export addresses
 // point at the error handler stub), OTP-29.1.1.
 pub(crate) fn unpublish_module_exports(scope: u64, name: &str) {
-    let Ok(mut registry) = dispatch_registry().write() else {
+    if !has_scope(scope) {
         return;
-    };
-    let Some(exports) = registry.scopes.get_mut(&scope) else {
-        return;
-    };
-    exports
-        .target_indices
-        .retain(|(module, _, _), _| module != name);
-    exports
-        .native_targets
-        .retain(|(module, _, _), _| module != name);
-    refresh_import_slots(exports);
+    }
+    staged(scope, |exports| {
+        exports
+            .target_indices
+            .retain(|(module, _, _), _| module != name);
+        exports
+            .native_targets
+            .retain(|(module, _, _), _| module != name);
+    });
 }
 
 fn unpublish_module(scope: u64, native: &[(Mfa, usize)]) {
-    let Ok(mut registry) = dispatch_registry().write() else {
+    // Only exports still entering this version need a staged change.
+    let current = dispatch_registry().read().is_ok_and(|registry| {
+        registry.scopes.get(&scope).is_some_and(|exports| {
+            native
+                .iter()
+                .any(|(mfa, address)| exports.native_targets.get(mfa) == Some(address))
+        })
+    });
+    if !current {
         return;
-    };
-    let Some(exports) = registry.scopes.get_mut(&scope) else {
-        return;
-    };
-    for (mfa, address) in native {
-        if exports.native_targets.get(mfa) == Some(address) {
-            exports.native_targets.remove(mfa);
-        }
     }
-    refresh_import_slots(exports);
+    staged(scope, |exports| {
+        for (mfa, address) in native {
+            if exports.native_targets.get(mfa) == Some(address) {
+                exports.native_targets.remove(mfa);
+            }
+        }
+    });
+}
+
+fn has_scope(scope: u64) -> bool {
+    dispatch_registry()
+        .read()
+        .is_ok_and(|registry| registry.scopes.contains_key(&scope))
 }
 
 // Port of erts/emulator/beam/beam_bp.c:1180-1230 (erts_set_trace_pattern: a global
@@ -330,14 +429,29 @@ fn import_slot_address(exports: &ScopeExports, mfa: &Mfa, trampoline: usize) -> 
         .unwrap_or(trampoline)
 }
 
-fn refresh_import_slots(exports: &ScopeExports) {
+/// Writes every import slot's address in code index `ix` from the export tables.
+fn refresh_import_slots(exports: &ScopeExports, ix: usize) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
     for entry in exports.imports.values() {
         let mfa = (entry.module.clone(), entry.function.clone(), entry.arity);
         entry
             .slot
-            .update(import_slot_address(exports, &mfa, trampoline));
+            .set_address(ix, import_slot_address(exports, &mfa, trampoline));
     }
+}
+
+/// The address a process saving calls continues with after recording the call of the export
+/// with `identity`: the export's address in its node's active code index.
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:141-147 (emit_dispatch_save_calls_export:
+// "Keep going with the actual code index"), OTP-29.1.1.
+pub(crate) fn save_calls_continuation(identity: usize) -> usize {
+    target_for_identity(identity).map_or_else(
+        || fragments().map_or(0, DispatchFragments::export_trampoline),
+        |target| {
+            let active = crate::code_ix::for_scope(target.scope).active();
+            target.slot.address(active)
+        },
+    )
 }
 
 /// Routes native callers of an export through its interpreted entry, `target`, while a
@@ -350,22 +464,34 @@ pub(crate) fn set_global_breakpoint(
     target: usize,
     enabled: bool,
 ) {
-    let Ok(mut registry) = dispatch_registry().write() else {
-        return;
-    };
-    let exports = registry.scopes.entry(scope).or_default();
     let mfa = (module.to_owned(), function.to_owned(), arity);
-    let changed = if enabled {
-        exports.global_breakpoints.insert(mfa.clone())
-    } else {
-        exports.global_breakpoints.remove(&mfa)
+    let set_target = |exports: &mut ScopeExports| {
+        if let Some(index) = exports.target_indices.get_mut(&mfa) {
+            *index = target;
+        }
     };
-    if let Some(index) = exports.target_indices.get_mut(&mfa) {
-        *index = target;
+    let routed = dispatch_registry().read().is_ok_and(|registry| {
+        registry
+            .scopes
+            .get(&scope)
+            .is_some_and(|exports| exports.global_breakpoints.contains(&mfa))
+    });
+    if routed == enabled {
+        if let Ok(mut registry) = dispatch_registry().write() {
+            set_target(registry.scopes.entry(scope).or_default());
+        }
+        return;
     }
-    if changed {
-        refresh_import_slots(exports);
-    }
+    // Port of erts/emulator/beam/beam_bp.c:1180-1230 (erts_set_trace_pattern), OTP-29.1.1:
+    // rerouting the export's callers is a staged code change.
+    staged(scope, |exports| {
+        if enabled {
+            exports.global_breakpoints.insert(mfa.clone());
+        } else {
+            exports.global_breakpoints.remove(&mfa);
+        }
+        set_target(exports);
+    });
 }
 
 /// Descriptor addressed directly by the native export slot.

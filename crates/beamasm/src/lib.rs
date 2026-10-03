@@ -83,7 +83,15 @@ pub struct SchedulerRegisters {
     /// Operands of a `bs_match` command for its runtime hook. They are kept out of the X
     /// register array, whose registers above the command's live count may still be in use.
     pub match_staging: [u64; 4],
+    /// Code index loaded into `active_code_ix` (x24) on every entry into native code:
+    /// the node's active code index, or `ERTS_SAVE_CALLS_CODE_IX` for a process saving calls.
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp:236-247, OTP-29.1.1.
+    pub active_code_ix: u64,
 }
+
+/// Offset of `SchedulerRegisters::active_code_ix`, read by the native entry trampoline.
+pub const ACTIVE_CODE_IX_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, active_code_ix);
+const _: () = assert!(ACTIVE_CODE_IX_OFFSET == 16480);
 
 impl Default for SchedulerRegisters {
     fn default() -> Self {
@@ -92,6 +100,7 @@ impl Default for SchedulerRegisters {
             f_reg_array: [0.0; 1024],
             tmp_mem: [0; 8],
             match_staging: [0; 4],
+            active_code_ix: 0,
         }
     }
 }
