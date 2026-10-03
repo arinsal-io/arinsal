@@ -111,7 +111,8 @@ impl Index<usize> for WordBlock {
     }
 }
 
-fn flat_key_cmp(a: Term, b: Term) -> Ordering {
+/// Order of flatmap keys (`erts_cmp_flatmap_keys`), also the order of record fields.
+pub fn flat_key_cmp(a: Term, b: Term) -> Ordering {
     exact_flat_key_cmp(a, b, true)
 }
 

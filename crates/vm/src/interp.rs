@@ -1,6 +1,7 @@
 //! VM interp implementation.
 
 use super::*;
+use arinsal_term::Atom;
 
 fn tuple_arity(term: Term) -> Option<usize> {
     match term.classify() {
@@ -13,89 +14,353 @@ fn tuple_arity(term: Term) -> Option<usize> {
     }
 }
 
-/// Port of erts/emulator/beam/erl_record.c:254-343 (native record creation), OTP-29.1.1.
+/// `{Tag, Value}` error trap raised by the native record operations.
+fn record_trap(p: &mut Process, tag: &str, value: Term) -> VmError {
+    match crate::exceptions::tuple(p, &[crate::signals::atom(tag), value]) {
+        Ok(reason) => VmError::Trap(crate::exceptions::Trap::error(reason)),
+        Err(error) => error,
+    }
+}
+
+/// `{{Module, Name}, Field}`, the value of `badfield` and `novalue` record errors.
+// Port of erts/emulator/beam/erl_record.c:325-331, OTP-29.1.1.
+fn record_field_value(
+    p: &mut Process,
+    module: Atom,
+    name: Atom,
+    field: Atom,
+) -> Result<Term, VmError> {
+    let id = crate::exceptions::tuple(p, &[Term::atom(module), Term::atom(name)])?;
+    crate::exceptions::tuple(p, &[id, Term::atom(field)])
+}
+
+fn record_branch(p: &mut Process, fail: Arg) {
+    p.ip = fail.value() as usize;
+}
+
+fn has_label(fail: Arg) -> bool {
+    fail.kind() == Arg::LABEL && fail.value() != u32::MAX as u64
+}
+
+/// Field/value pairs sorted by atom index, the order of a record's stored keys.
+fn sorted_pairs(mut pairs: Vec<(Atom, Term)>) -> Vec<(Atom, Term)> {
+    pairs.sort_by_key(|(field, _)| field.0);
+    pairs
+}
+
+/// Port of erts/emulator/beam/erl_record.c:254-379 (erl_create_local_native_record,
+/// erl_create_native_record), :381-468 (erl_update_native_record), OTP-29.1.1.
 fn execute_put_record(
-    process: &mut Process,
+    vm: &Vm,
+    p: &mut Process,
     module: &Module,
     op: &GenericOp,
 ) -> Result<(), VmError> {
-    let id = process.read(op.args[1])?;
+    let id = p.read(op.args[1])?;
     let source_arg = op.args[2];
-    let source_before_gc = process.read(source_arg)?;
+    let source = p.read(source_arg)?;
     let destination = module.arg(op, 3);
     let live = module.arg(op, 4).value() as usize;
     let updates = module.arg(op, 5);
-    let record_name = if source_before_gc == Term::NIL {
-        id.as_atom()
-            .ok_or_else(|| VmError::Unsupported("invalid native record id".into()))?
-    } else {
-        source_before_gc
-            .record_snapshot()
-            .map(|snapshot| snapshot.name)
-            .ok_or_else(|| VmError::Unsupported("invalid native record source".into()))?
-    };
-    let definition = module
-        .records
-        .iter()
-        .find(|record| arinsal_term::global_atoms().text(record_name) == Some(record.name.as_str()))
-        .ok_or_else(|| VmError::Unsupported("native record definition not found".into()))?;
-    let module_atom = arinsal_term::global_atoms()
-        .intern(&module.name)
-        .map_err(|_| VmError::Unsupported("native record module atom limit".into()))?;
-    let required = 9 + 3 * definition.fields.len();
-    process.ensure(required, live)?;
-    let source = process.read(source_arg)?;
+    let atoms = arinsal_term::global_atoms();
     let update_args = &module.lists[updates.value() as usize];
     if !update_args.len().is_multiple_of(2) {
         return Err(VmError::Unsupported(
             "invalid native record update list".into(),
         ));
     }
-    let mut changes = Vec::with_capacity(update_args.len() / 2);
-    for pair in update_args.as_chunks::<2>().0 {
-        let field = process
-            .read(pair[0])?
-            .as_atom()
-            .ok_or_else(|| VmError::Unsupported("invalid native record field name".into()))?;
-        changes.push((field, process.read(pair[1])?));
-    }
-    let name_atom = record_name;
-    let record = if source == Term::NIL {
-        let mut values = Vec::with_capacity(definition.fields.len());
-        for (name, default) in &definition.fields {
-            let field = arinsal_term::global_atoms()
-                .intern(name)
-                .map_err(|_| VmError::Unsupported("native record field atom limit".into()))?;
-            let value = match default {
-                Some(default) => {
-                    arinsal_term::from_owned(default, &mut FragmentingHeap(&mut process.heap))
-                        .map_err(|_| {
-                            VmError::Unsupported("native record default allocation".into())
-                        })?
-                }
-                None => Term::NIL,
-            };
-            values.push((field, value));
+    let read_pairs = |p: &mut Process| -> Result<Vec<(Atom, Term)>, VmError> {
+        let mut pairs = Vec::with_capacity(update_args.len() / 2);
+        for pair in update_args.as_chunks::<2>().0 {
+            let field = p
+                .read(pair[0])?
+                .as_atom()
+                .ok_or_else(|| VmError::Unsupported("invalid native record field name".into()))?;
+            pairs.push((field, p.read(pair[1])?));
         }
-        for (field, value) in changes {
-            let Some((_, current)) = values.iter_mut().find(|(name, _)| *name == field) else {
-                return Err(VmError::Unsupported("unknown native record field".into()));
-            };
-            *current = value;
-        }
-        TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
-            .native_record(module_atom, name_atom, definition.is_exported, &values)
-            .map_err(|_| VmError::Unsupported("native record allocation".into()))?
-    } else {
+        Ok(sorted_pairs(pairs))
+    };
+    if source != Term::NIL {
         let snapshot = source
             .record_snapshot()
             .ok_or_else(|| VmError::Unsupported("invalid native record source".into()))?;
-        TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
-            .update_native_record(&snapshot, &changes)
-            .map_err(|_| VmError::Unsupported("native record update".into()))?
+        // The source is the only operand the collector may not know about.
+        let slot = live;
+        if let Some(register) = p.x.get_mut(slot) {
+            *register = source;
+        }
+        p.ensure(2 + snapshot.fields.len(), live + 1)?;
+        let source = p.x.get(slot).copied().unwrap_or(source);
+        let snapshot = source
+            .record_snapshot()
+            .ok_or_else(|| VmError::Unsupported("invalid native record source".into()))?;
+        let pairs = read_pairs(p)?;
+        let mut keys = snapshot.fields.clone();
+        keys.sort_by_key(|field| field.0);
+        let mut next = 0;
+        for key in &keys {
+            if pairs.get(next).is_some_and(|(field, _)| field == key) {
+                next += 1;
+            }
+        }
+        if let Some((field, _)) = pairs.get(next) {
+            let value = record_field_value(p, snapshot.module, snapshot.name, *field)?;
+            return Err(record_trap(p, "badfield", value));
+        }
+        let record = TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+            .update_native_record(&snapshot, &pairs)
+            .map_err(|_| VmError::Unsupported("native record update".into()))?;
+        p.write(destination, record)?;
+        p.ip += 1;
+        return Ok(());
+    }
+    // Local records name the record by an atom; external ones by `{Module, Name}`.
+    let (definition_module, module_atom, name_atom) = match id.classify() {
+        TermKind::Tuple => {
+            let elements = arinsal_term::term_sequence(id)
+                .filter(|elements| elements.len() == 2)
+                .ok_or_else(|| VmError::Unsupported("invalid native record id".into()))?;
+            let (Some(module_atom), Some(name_atom)) =
+                (elements[0].as_atom(), elements[1].as_atom())
+            else {
+                return Err(VmError::Unsupported("invalid native record id".into()));
+            };
+            let exported = atoms
+                .text(module_atom)
+                .and_then(|text| vm.loaded.get(text))
+                .map(|index| &*vm.modules[*index])
+                .filter(|defining| {
+                    defining.records.iter().any(|record| {
+                        record.is_exported && atoms.text(name_atom) == Some(record.name.as_str())
+                    })
+                });
+            let Some(defining) = exported else {
+                return Err(record_trap(p, "badrecord", id));
+            };
+            (defining, module_atom, name_atom)
+        }
+        _ => {
+            let name_atom = id
+                .as_atom()
+                .ok_or_else(|| VmError::Unsupported("invalid native record id".into()))?;
+            let module_atom = atoms
+                .intern(&module.name)
+                .map_err(|_| VmError::Unsupported("native record module atom limit".into()))?;
+            (module, module_atom, name_atom)
+        }
     };
-    process.write(destination, record)?;
-    process.ip += 1;
+    let definition = definition_module
+        .records
+        .iter()
+        .find(|record| atoms.text(name_atom) == Some(record.name.as_str()))
+        .ok_or_else(|| VmError::Unsupported("native record definition not found".into()))?;
+    p.ensure(9 + 3 * definition.fields.len(), live)?;
+    let pairs = read_pairs(p)?;
+    let mut declared = Vec::with_capacity(definition.fields.len());
+    for (index, (name, default)) in definition.fields.iter().enumerate() {
+        let field = atoms
+            .intern(name)
+            .map_err(|_| VmError::Unsupported("native record field atom limit".into()))?;
+        declared.push((field, index, default));
+    }
+    let mut order: Vec<usize> = (0..declared.len()).collect();
+    order.sort_by_key(|&index| declared[index].0.0);
+    let mut values = vec![Term::NIL; declared.len()];
+    let mut next = 0;
+    let mut missing = None;
+    for index in order {
+        let (field, _, default) = declared[index];
+        if pairs.get(next).is_some_and(|(given, _)| *given == field) {
+            values[index] = pairs[next].1;
+            next += 1;
+        } else if let Some(default) = default {
+            values[index] = arinsal_term::from_owned(default, &mut FragmentingHeap(&mut p.heap))
+                .map_err(|_| VmError::Unsupported("native record default allocation".into()))?;
+        } else if missing.is_none() {
+            // A field without a default must be given; the error is delayed so that
+            // `badfield` outranks it.
+            missing = Some(field);
+        }
+    }
+    if let Some((field, _)) = pairs.get(next) {
+        let value = record_field_value(p, module_atom, name_atom, *field)?;
+        return Err(record_trap(p, "badfield", value));
+    }
+    if let Some(field) = missing {
+        let value = record_field_value(p, module_atom, name_atom, field)?;
+        return Err(record_trap(p, "novalue", value));
+    }
+    let fields: Vec<(Atom, Term)> = declared
+        .iter()
+        .map(|(field, index, _)| (*field, values[*index]))
+        .collect();
+    let record = TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+        .native_record(module_atom, name_atom, definition.is_exported, &fields)
+        .map_err(|_| VmError::Unsupported("native record allocation".into()))?;
+    p.write(destination, record)?;
+    p.ip += 1;
+    Ok(())
+}
+
+/// Port of erts/emulator/beam/jit/arm/instr_records.cpp:47-71 (is_native_record), :73-115
+/// (is_record_accessible), OTP-29.1.1.
+fn execute_record_test(p: &mut Process, module: &Module, op: &GenericOp) -> Result<(), VmError> {
+    let fail = op.args[0];
+    let source = p.read(op.args[1])?;
+    let passed = match source.record_snapshot() {
+        None => false,
+        Some(snapshot) if op.opcode() == Opcode::IsNativeRecord => {
+            Some(Term::atom(snapshot.module)) == p.read(op.args[2]).ok()
+                && Some(Term::atom(snapshot.name)) == p.read(module.arg(op, 3)).ok()
+        }
+        Some(snapshot) => {
+            let scope = p.read(op.args[2])?;
+            let external = scope
+                .as_atom()
+                .and_then(|scope| arinsal_term::global_atoms().text(scope))
+                == Some("external");
+            snapshot.is_exported
+                || (!external
+                    && arinsal_term::global_atoms().text(snapshot.module)
+                        == Some(module.name.as_str()))
+        }
+    };
+    if passed {
+        p.ip += 1;
+    } else {
+        record_branch(p, fail);
+    }
+    Ok(())
+}
+
+/// Port of erts/emulator/beam/erl_record.c:223-252 (erl_get_record_elements), OTP-29.1.1.
+fn execute_get_record_elements(
+    p: &mut Process,
+    module: &Module,
+    op: &GenericOp,
+) -> Result<(), VmError> {
+    let fail = op.args[0];
+    let source = p.read(op.args[1])?;
+    let Some(snapshot) = source.record_snapshot() else {
+        record_branch(p, fail);
+        return Ok(());
+    };
+    let args = &module.lists[op.args[2].value() as usize];
+    let mut wanted = Vec::with_capacity(args.len() / 2);
+    for pair in args.as_chunks::<2>().0 {
+        let field = p
+            .read(pair[0])?
+            .as_atom()
+            .ok_or_else(|| VmError::Unsupported("invalid native record field name".into()))?;
+        wanted.push((field, pair[1]));
+    }
+    wanted.sort_by_key(|(field, _)| field.0);
+    let mut keys: Vec<(Atom, Term)> = snapshot
+        .fields
+        .iter()
+        .copied()
+        .zip(sorted_values_in_declaration_order(&snapshot))
+        .collect();
+    keys.sort_by_key(|(field, _)| field.0);
+    let mut next = 0;
+    let mut found = Vec::with_capacity(wanted.len());
+    for (key, value) in keys {
+        if let Some((field, destination)) = wanted.get(next)
+            && *field == key
+        {
+            found.push((*destination, value));
+            next += 1;
+        }
+    }
+    if next < wanted.len() {
+        record_branch(p, fail);
+        return Ok(());
+    }
+    for (destination, value) in found {
+        p.write(destination, value)?;
+    }
+    p.ip += 1;
+    Ok(())
+}
+
+/// Values of a snapshot in declaration order (`values` is in sorted storage order).
+fn sorted_values_in_declaration_order(snapshot: &arinsal_term::RecordSnapshot) -> Vec<Term> {
+    let mut sorted: Vec<Atom> = snapshot.fields.clone();
+    sorted.sort_by_key(|field| field.0);
+    snapshot
+        .fields
+        .iter()
+        .map(|field| {
+            let slot = sorted.iter().position(|key| key == field).unwrap_or(0);
+            snapshot.values[slot]
+        })
+        .collect()
+}
+
+/// Port of erts/emulator/beam/erl_record.c:470-578 (erl_get_local_record_field,
+/// erl_get_record_field), OTP-29.1.1.
+fn execute_get_record_field(
+    p: &mut Process,
+    op: &GenericOp,
+    module: &Module,
+) -> Result<(), VmError> {
+    let fail = op.args[0];
+    let source = p.read(op.args[1])?;
+    let id = p.read(op.args[2])?;
+    let field = p
+        .read(module.arg(op, 3))?
+        .as_atom()
+        .ok_or_else(|| VmError::Unsupported("invalid native record field name".into()))?;
+    let destination = module.arg(op, 4);
+    let atoms = arinsal_term::global_atoms();
+    enum Outcome {
+        Value(Term),
+        BadRecord,
+        BadField(Atom, Atom),
+    }
+    let outcome = match source.record_snapshot() {
+        None => Outcome::BadRecord,
+        Some(snapshot) => {
+            let matches_id = if id.classify() == TermKind::Tuple {
+                let elements = arinsal_term::term_sequence(id).unwrap_or_default();
+                let named = elements.len() == 2
+                    && elements[0].as_atom() == Some(snapshot.module)
+                    && elements[1].as_atom() == Some(snapshot.name);
+                named && snapshot.is_exported
+            } else {
+                id.as_atom()
+                    .is_some_and(|name| atoms.text(name) == Some("_") || name == snapshot.name)
+            };
+            if !matches_id {
+                Outcome::BadRecord
+            } else {
+                match snapshot.fields.iter().position(|key| *key == field) {
+                    Some(_) => {
+                        let values = sorted_values_in_declaration_order(&snapshot);
+                        let index = snapshot
+                            .fields
+                            .iter()
+                            .position(|key| *key == field)
+                            .unwrap_or(0);
+                        Outcome::Value(values[index])
+                    }
+                    None => Outcome::BadField(snapshot.module, snapshot.name),
+                }
+            }
+        }
+    };
+    match outcome {
+        Outcome::Value(value) => {
+            p.write(destination, value)?;
+            p.ip += 1;
+        }
+        _ if has_label(fail) => record_branch(p, fail),
+        Outcome::BadRecord => return Err(record_trap(p, "badrecord", source)),
+        Outcome::BadField(record_module, record_name) => {
+            let value = record_field_value(p, record_module, record_name, field)?;
+            return Err(record_trap(p, "badfield", value));
+        }
+    }
     Ok(())
 }
 
@@ -3946,7 +4211,14 @@ impl Vm {
                     let mut native_target = None;
                     match opcode {
                         Opcode::FuncInfo => return Err(self.exception(p, "function_clause")),
-                        Opcode::PutRecord => execute_put_record(p, module, &op)?,
+                        Opcode::PutRecord => execute_put_record(self, p, module, &op)?,
+                        Opcode::IsNativeRecord | Opcode::IsRecordAccessible => {
+                            execute_record_test(p, module, &op)?
+                        }
+                        Opcode::GetRecordElements => {
+                            execute_get_record_elements(p, module, &op)?
+                        }
+                        Opcode::GetRecordField => execute_get_record_field(p, &op, module)?,
                         Opcode::OnLoad => {
                             // The opcode marks the module's on_load entry for the loader;
                             // code metadata retains that entry while execution advances past it.
@@ -4130,7 +4402,12 @@ impl Vm {
                             }
                         }
                         Opcode::IsAnyNativeRecord => {
-                            Self::branch(p, a)?;
+                            // Port of erts/emulator/beam/erl_record.c:214, OTP-29.1.1.
+                            if p.read(b)?.classify() == TermKind::Record {
+                                p.ip += 1;
+                            } else {
+                                Self::branch(p, a)?;
+                            }
                         }
                         Opcode::IsTuple
                         | Opcode::IsNil

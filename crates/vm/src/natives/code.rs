@@ -339,9 +339,28 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                 info_list(process, functions)
             }
             // Port of erts/emulator/beam/erl_bif_info.c:5772 (nifs_in_module), OTP-29.1.1.
-            // No NIFs are loaded for these modules, so the list is empty.
-            "nifs" => info_list(process, []),
+            "nifs" => {
+                let mut nifs = Vec::new();
+                // Natively backed stubs of modules that never ran load_nif are not NIFs in erts.
+                let loaded = vm.loaded_nifs.contains(module.name.as_str());
+                for (entry, function, arity) in module.functions.iter().rev() {
+                    if loaded
+                        && matches!(
+                            module.code.get(entry.saturating_add(1)),
+                            Some(arinsal_loader::Instr::NativeBody { .. })
+                        )
+                    {
+                        nifs.push(make_tuple(
+                            process,
+                            &[atom(function), Term::small(i64::from(*arity)).unwrap()],
+                        )?);
+                    }
+                }
+                info_list(process, nifs)
+            }
             "native" => Ok(Term::atom(atoms::FALSE)),
+            // Port of erts/emulator/beam/erl_bif_info.c:5817-5823 (native_addresses), OTP-29.1.1.
+            "native_addresses" => info_list(process, []),
             // Port of erts/emulator/beam/erl_bif_info.c:5866 (attributes_for_module)
             // and :5889 (compilation_info_for_module), OTP-29.1.1.
             "attributes" | "compile" => {

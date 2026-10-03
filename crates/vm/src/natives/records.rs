@@ -139,13 +139,23 @@ fn update(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     if changes.is_empty() {
         return Ok(args[0]);
     }
-    for (key, _) in &changes {
-        if !snapshot
-            .fields
-            .contains(&key.as_atom().unwrap_or(Atom(u32::MAX)))
+    // The first key left over after matching the sorted keys against the record's own is
+    // the reported bad field.
+    let mut changes = changes;
+    changes.sort_by(|a, b| arinsal_term::flat_key_cmp(a.0, b.0));
+    let mut keys = snapshot.fields.clone();
+    keys.sort_by_key(|field| field.0);
+    let mut next = 0;
+    for key in keys {
+        if changes
+            .get(next)
+            .is_some_and(|(candidate, _)| candidate.as_atom() == Some(key))
         {
-            return Err(badfield(process, snapshot.module, snapshot.name, *key));
+            next += 1;
         }
+    }
+    if let Some((key, _)) = changes.get(next) {
+        return Err(badfield(process, snapshot.module, snapshot.name, *key));
     }
     TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
         .update_native_record(

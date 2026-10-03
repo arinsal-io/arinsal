@@ -33,12 +33,12 @@ pub use copy::{
     copy_term_preserving_sharing_with_cache,
 };
 pub use fun::{ExportEntry, FunEntry, FunRef};
-pub use gc::{FragmentAlloc, FragmentIndex, GcStats};
+pub use gc::{FragmentAlloc, FragmentIndex, GcStats, ScratchMark};
 pub use hamt::{boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_node_children};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
 pub use heap::{
     AdoptError, CP_WORDS, FrameLayout, HeapAlloc, LiteralArea, NATIVE_SPILL_WORDS, ProcessHeap,
-    S_REDZONE, S_RESERVED, StackWord, TermBuilder, VecHeap,
+    S_REDZONE, S_RESERVED, StackWord, TermBuilder, VecHeap, flat_key_cmp,
 };
 pub use identity::{Identity, Node};
 pub use internal_hash::{internal_hash, internal_salted_hash};

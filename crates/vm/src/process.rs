@@ -1890,6 +1890,36 @@ impl Executor {
                                         Err(VmError::Exception { reason, frame }) => {
                                             legacy_exception_trap(process, &reason, &frame)?
                                         }
+                                        // Port of erts/emulator/beam/beam_common.c:1568
+                                        // (erts_hibernate), OTP-29.1.1: apply(erlang, hibernate, _)
+                                        // discarded the stack like a direct call.
+                                        Err(VmError::Unsupported(_))
+                                            if hibernate_stopped(process, ctx.pid()) =>
+                                        {
+                                            if hibernate_resumes_in_place(process, ctx.pid()) {
+                                                process.drain(ctx)?;
+                                                if process.inbox.is_empty() {
+                                                    hibernate_collect(process, ctx.pid())?;
+                                                }
+                                                process.cold_mut().native_retry = Some(target_pc);
+                                                process.native_pc = Some(code_ptr);
+                                                break Ok(RunState::Wait { timeout_ms: None });
+                                            }
+                                            process.native_pc = None;
+                                            if let Some(cold) = process.cold.as_mut() {
+                                                cold.native_continuation_resume = false;
+                                            }
+                                            process.drain(ctx)?;
+                                            if process.inbox.is_empty() {
+                                                hibernate_collect(process, ctx.pid())?;
+                                                if let Some(runtime) = process.runtime.clone() {
+                                                    runtime.mark_hibernating(ctx.pid(), true);
+                                                }
+                                                break Ok(RunState::Wait { timeout_ms: None });
+                                            }
+                                            self.install_apply(process, ctx)?;
+                                            continue;
+                                        }
                                         Err(error) => return Err(error),
                                     };
                                     // Port of erts/emulator/beam/beam_common.c:1345-1427
@@ -2312,6 +2342,10 @@ impl Executor {
                                                 // hibernate/0 keeps its stack: after the wakeup the
                                                 // native call is retried and returns `ok` in place.
                                                 if hibernate_resumes_in_place(process, ctx.pid()) {
+                                                    process.drain(ctx)?;
+                                                    if process.inbox.is_empty() {
+                                                        hibernate_collect(process, ctx.pid())?;
+                                                    }
                                                     let cold = process.cold_mut();
                                                     cold.native_retry = Some(target_pc);
                                                     process.native_pc = Some(code_ptr);
@@ -2906,16 +2940,18 @@ fn hibernate_resumes_in_place(process: &Process, pid: Pid) -> bool {
 /// arguments in X0..X2. Run after the BIF has unwound so no caller keeps stale terms.
 // Port of erts/emulator/beam/beam_common.c:1584-1592 (erts_hibernate), OTP-29.1.1.
 fn hibernate_collect(process: &mut Process, pid: Pid) -> Result<(), VmError> {
-    if hibernate_resumes_in_place(process, pid) {
-        return Ok(());
-    }
-    // erts_hibernate sets `c_p->arity = 3`: X0..X2 are the only live registers while
-    // the process waits.
-    process.gc_live = 3;
+    // hibernate/0 reaches erts_hibernate with arity 0: no X register is live and the
+    // stack stays a root. hibernate/3 keeps apply(M, F, A) in X0..X2.
+    let live = if hibernate_resumes_in_place(process, pid) {
+        0
+    } else {
+        3
+    };
+    process.gc_live = live;
     if !process.gc_enabled {
         return Ok(());
     }
-    process.garbage_collect_hibernate(3).map(|_| ())
+    process.garbage_collect_hibernate(live).map(|_| ())
 }
 
 fn hibernate_stopped(process: &Process, pid: Pid) -> bool {

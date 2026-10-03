@@ -670,17 +670,18 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
                 if c != Ordering::Equal {
                     return c;
                 }
+                // Port of erts/emulator/beam/erl_record.c:696-769, OTP-29.1.1.
                 for i in 0..av.len() {
-                    let ai = av.original_index(i).unwrap();
-                    let bi = bv.original_index(i).unwrap();
+                    let ai = av.sorted_index(i).unwrap();
+                    let bi = bv.sorted_index(i).unwrap();
                     let c = node_order(av.key(ai).unwrap(), bv.key(bi).unwrap());
                     if c != Ordering::Equal {
                         return c;
                     }
                 }
                 for i in (0..av.len()).rev() {
-                    let ai = av.original_index(i).unwrap();
-                    let bi = bv.original_index(i).unwrap();
+                    let ai = av.sorted_index(i).unwrap();
+                    let bi = bv.sorted_index(i).unwrap();
                     pending.push((av.value(ai).unwrap(), bv.value(bi).unwrap(), exact));
                 }
                 Ordering::Equal
@@ -1012,8 +1013,7 @@ pub fn exact_eq(a: Term, b: Term) -> bool {
                         return false;
                     }
                     for i in 0..av.len() {
-                        let (ai, bi) =
-                            (av.original_index(i).unwrap(), bv.original_index(i).unwrap());
+                        let (ai, bi) = (av.sorted_index(i).unwrap(), bv.sorted_index(i).unwrap());
                         if node_order(av.key(ai).unwrap(), bv.key(bi).unwrap()) != Ordering::Equal {
                             return false;
                         }
