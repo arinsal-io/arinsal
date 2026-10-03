@@ -71,6 +71,33 @@ fn erl_debugger_plus_d_enables_otp_support() {
 }
 
 #[test]
+fn erl_debugger_internal_state_toggle_enables_support() {
+    let _serial = serial_test();
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping debugger internal-state differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named(
+            "erl_debugger_internal_state_fixture",
+            "-module(erl_debugger_internal_state_fixture). -export([run/0]). run() -> false = erts_debug:set_internal_state(available_internal_state, true), ok = erts_debug:set_internal_state(debugger_support, true), Supported = erl_debugger:supported(), Internal = erts_debug:get_internal_state(debugger_support), true = erts_debug:set_internal_state(available_internal_state, false), {Internal, Supported}.",
+            &[],
+        )
+        .expect("compile debugger internal-state fixture");
+    reference
+        .load("erl_debugger_internal_state_fixture", &beam)
+        .expect("load OTP fixture");
+    let expected = reference.call("erl_debugger_internal_state_fixture", "run", &[]);
+    let mut vm = Vm::new([]);
+    let actual = vm
+        .load_bytes(&beam)
+        .and_then(|_| vm.eval_scheduled("erl_debugger_internal_state_fixture", "run", &[], 1, None))
+        .unwrap_or_else(|error| panic!("debugger internal-state toggle: {error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
+    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
+}
+
+#[test]
 fn erl_debugger_line_metadata_loads_from_beam_debug_info() {
     let _serial = serial_test();
     let Ok(reference) = RefErl::start() else {
@@ -254,7 +281,7 @@ compact_fun(Fun) -> Fun.
         .expect("load OTP's preloaded breakpoint wrapper");
     vm.load_bytes(&beam).expect("load debugger hit fixture");
     let actual = vm
-        .eval_scheduled("erl_debugger_active_fixture", "run", &[], 1, None)
+        .eval_scheduled("erl_debugger_active_fixture", "run", &[], 8, None)
         .unwrap_or_else(|error| panic!("run debugger hit fixture: {error}"));
     let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
     assert_ne!(

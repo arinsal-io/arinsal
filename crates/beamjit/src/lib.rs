@@ -1398,7 +1398,17 @@ pub fn compile_parsed_module_with_env_and_funcs(
     env: &impl ModuleEnv,
     function_allowlist: Option<&str>,
 ) -> Result<CompiledModule, CompileError> {
-    let specialized = beamops::transform_module(beam);
+    compile_parsed_module_with_options(beam, env, function_allowlist, false)
+}
+
+/// Compile a parsed module with the OTP line-breakpoint rewrite enabled when requested.
+pub fn compile_parsed_module_with_options(
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+    function_allowlist: Option<&str>,
+    line_breakpoints: bool,
+) -> Result<CompiledModule, CompileError> {
+    let specialized = beamops::transform_module_with_line_breakpoints(beam, line_breakpoints);
     let mut candidates = Vec::new();
     let mut unported = Vec::new();
 

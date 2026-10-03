@@ -368,7 +368,7 @@ impl SharedCode {
         meta: Option<CodeMeta>,
     ) -> usize {
         self.exports.note_module(&module);
-        alloc_slot(
+        let id = alloc_slot(
             &mut SlotTable {
                 modules: &mut self.modules,
                 registers: &mut self.registers,
@@ -379,7 +379,9 @@ impl SharedCode {
             module,
             registers,
             meta,
-        )
+        );
+        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
+        id
     }
 
     pub(crate) fn release(&mut self, id: usize) {
@@ -576,9 +578,12 @@ impl Vm {
         let previous = self.loaded.get(&name).copied();
         let id = self.alloc_local(module, registers, Some(meta));
         self.loaded.insert(name.clone(), id);
-        if let Some(native) =
-            beamasm_integration::compile(bytes, &self.modules[id], self.code_scope)
-        {
+        if let Some(native) = beamasm_integration::compile(
+            bytes,
+            &self.modules[id],
+            self.code_scope,
+            crate::trace_bp::line_breakpoints_instrumented(),
+        ) {
             native.publish(&self.modules[id]);
             if let Some(meta) = self.code_meta[id].as_mut() {
                 Arc::make_mut(meta).beamasm = Some(native);
@@ -593,6 +598,7 @@ impl Vm {
     }
 
     pub(crate) fn release_module_slot(&mut self, id: usize) {
+        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
         if self.module_live.get(id).copied() == Some(true) {
             arinsal_pterm::store_for(self.code_scope)
                 .retire_module_area(self.modules[id].literal_area());
@@ -624,6 +630,7 @@ impl Vm {
             registers,
             meta,
         );
+        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
         self.beamasm_targets.register_module(id, &self.modules[id]);
         id
     }
@@ -683,9 +690,12 @@ impl Vm {
         if compile_native {
             // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1),
             // compile after the module body and its exported entries are resolved.
-            if let Some(native) =
-                beamasm_integration::compile(bytes, &self.modules[id], self.code_scope)
-            {
+            if let Some(native) = beamasm_integration::compile(
+                bytes,
+                &self.modules[id],
+                self.code_scope,
+                crate::trace_bp::line_breakpoints_instrumented(),
+            ) {
                 native.publish(&self.modules[id]);
                 if let Some(meta) = self.code_meta[id].as_mut() {
                     Arc::make_mut(meta).beamasm = Some(native);
@@ -795,8 +805,12 @@ impl Vm {
                 let name = module.name.clone();
                 let pending = meta.on_load.is_some();
                 if let Some(bytes) = meta.beam_bytes.as_deref()
-                    && let Some(native) =
-                        beamasm_integration::compile(bytes, &module, self.code_scope)
+                    && let Some(native) = beamasm_integration::compile(
+                        bytes,
+                        &module,
+                        self.code_scope,
+                        crate::trace_bp::line_breakpoints_instrumented(),
+                    )
                 {
                     native.publish(&module);
                     meta.beamasm = Some(native);
@@ -821,8 +835,12 @@ impl Vm {
                 let name = module.name.clone();
                 let pending = meta.on_load.is_some();
                 if let Some(bytes) = meta.beam_bytes.as_deref()
-                    && let Some(native) =
-                        beamasm_integration::compile(bytes, &module, self.code_scope)
+                    && let Some(native) = beamasm_integration::compile(
+                        bytes,
+                        &module,
+                        self.code_scope,
+                        crate::trace_bp::line_breakpoints_instrumented(),
+                    )
                 {
                     native.publish(&module);
                     meta.beamasm = Some(native);
@@ -1129,9 +1147,12 @@ impl Vm {
                     Some(CodeMeta::from_beam(&beam, Some(&bytes))),
                 );
                 code.loaded.insert(module_name.clone(), id);
-                if let Some(native) =
-                    beamasm_integration::compile(&bytes, &code.modules[id], code.code_scope)
-                {
+                if let Some(native) = beamasm_integration::compile(
+                    &bytes,
+                    &code.modules[id],
+                    code.code_scope,
+                    crate::trace_bp::line_breakpoints_instrumented(),
+                ) {
                     native.publish(&code.modules[id]);
                     if let Some(meta) = code.code_meta[id].as_mut() {
                         Arc::make_mut(meta).beamasm = Some(native);

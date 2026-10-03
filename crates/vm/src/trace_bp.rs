@@ -650,7 +650,7 @@ fn scope(process: &Process) -> usize {
     process
         .runtime
         .as_ref()
-        .map_or(0, |runtime| std::sync::Arc::as_ptr(runtime) as usize)
+        .map_or(0, |runtime| runtime.code_scope as usize)
 }
 
 // Runtime-scoped breakpoint entries must not keep the global gate enabled
@@ -803,6 +803,13 @@ pub(crate) fn debugger_supported() -> bool {
     DEBUGGER_SUPPORT.load(Ordering::Acquire)
 }
 
+/// Enable debugger BIFs after the emulator's internal debugger flag is set.
+///
+/// Port of erts/emulator/beam/erl_bif_info.c:5470-5475, OTP-29.1.1.
+pub(crate) fn enable_debugger_support() {
+    DEBUGGER_SUPPORT.store(true, Ordering::Release);
+}
+
 pub(crate) fn line_breakpoints_instrumented() -> bool {
     debugger_supported() && LINE_BREAKPOINT_INSTRUMENTATION.load(Ordering::Acquire)
 }
@@ -815,6 +822,14 @@ type LineKey = (usize, usize, u32);
 fn line_breakpoints() -> &'static Mutex<HashMap<LineKey, bool>> {
     static BREAKPOINTS: OnceLock<Mutex<HashMap<LineKey, bool>>> = OnceLock::new();
     BREAKPOINTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Forget line sites when a module slot is reused for another code generation.
+pub(crate) fn clear_module_line_breakpoints(runtime: u64, module_id: usize) {
+    line_breakpoints()
+        .lock()
+        .unwrap()
+        .retain(|(scope, id, _), _| *scope != runtime as usize || *id != module_id);
 }
 
 type DebugBreakKey = (usize, String, String, Option<i64>);

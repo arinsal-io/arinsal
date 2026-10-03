@@ -44,17 +44,30 @@ include!(concat!(env!("OUT_DIR"), "/specific_ops.rs"));
 
 /// Rewrites one function's generic instruction slice into specific operations.
 pub fn transform_function(instructions: &[Instr]) -> Vec<SpecificOp> {
-    transform_with_context(instructions, None)
+    transform_with_options(instructions, None, false)
 }
 
 /// Rewrites one function with module metadata needed by OTP predicates.
 pub fn transform_function_in_module(instructions: &[Instr], beam: &BeamFile) -> Vec<SpecificOp> {
-    transform_with_context(instructions, Some(beam))
+    transform_with_options(instructions, Some(beam), false)
 }
 
 /// Splits a module at `func_info` boundaries and rewrites each function.
 pub fn transform_module(beam: &BeamFile) -> Vec<Vec<SpecificOp>> {
-    let transformed = transform_function_in_module(&beam.code.instructions, beam);
+    transform_module_with_line_breakpoints(beam, false)
+}
+
+/// Splits a module and applies rewrites configured for OTP debugger instrumentation.
+// Port of erts/emulator/beam/predicates.tab:168, OTP-29.1.1.
+pub fn transform_module_with_line_breakpoints(
+    beam: &BeamFile,
+    instrument_line_breakpoints: bool,
+) -> Vec<Vec<SpecificOp>> {
+    let transformed = transform_with_options(
+        &beam.code.instructions,
+        Some(beam),
+        instrument_line_breakpoints,
+    );
     let mut functions = Vec::new();
     let mut current = Vec::new();
     for op in transformed {
@@ -69,7 +82,11 @@ pub fn transform_module(beam: &BeamFile) -> Vec<Vec<SpecificOp>> {
     functions
 }
 
-fn transform_with_context(instructions: &[Instr], beam: Option<&BeamFile>) -> Vec<SpecificOp> {
+fn transform_with_options(
+    instructions: &[Instr],
+    beam: Option<&BeamFile>,
+    instrument_line_breakpoints: bool,
+) -> Vec<SpecificOp> {
     let rules = rules();
     let raw = instructions
         .iter()
@@ -111,7 +128,9 @@ fn transform_with_context(instructions: &[Instr], beam: Option<&BeamFile>) -> Ve
             };
             let mut replacement = None;
             for rule in rules.get(&stream[at].name).into_iter().flatten() {
-                if let Some((consumed, produced)) = apply_rule(rule, stream, at, beam) {
+                if let Some((consumed, produced)) =
+                    apply_rule(rule, stream, at, beam, instrument_line_breakpoints)
+                {
                     replacement = Some((consumed, produced));
                     break;
                 }
@@ -653,6 +672,7 @@ fn apply_rule(
     code: &[Node],
     at: usize,
     beam: Option<&BeamFile>,
+    instrument_line_breakpoints: bool,
 ) -> Option<(usize, Vec<Node>)> {
     if at + rule.patterns.len() > code.len() {
         return None;
@@ -724,7 +744,7 @@ fn apply_rule(
         }
     }
     for pred in &rule.predicates {
-        if !eval_predicate(pred, &bindings, beam) {
+        if !eval_predicate(pred, &bindings, beam, instrument_line_breakpoints) {
             return None;
         }
     }
@@ -1164,6 +1184,7 @@ fn eval_predicate(
     pred: &Predicate,
     bindings: &[(String, Operand)],
     beam: Option<&BeamFile>,
+    instrument_line_breakpoints: bool,
 ) -> bool {
     let get = |name: &str| {
         bindings
@@ -1190,7 +1211,9 @@ fn eval_predicate(
             operand_integer(y) == operand_integer(x).and_then(|v| v.checked_add(1))
         }),
         Predicate::Never => false,
-        Predicate::Call(name, args) => eval_c_predicate(name, args, bindings, beam),
+        Predicate::Call(name, args) => {
+            eval_c_predicate(name, args, bindings, beam, instrument_line_breakpoints)
+        }
     }
 }
 
@@ -1200,6 +1223,7 @@ fn eval_c_predicate(
     args: &[String],
     bindings: &[(String, Operand)],
     beam: Option<&BeamFile>,
+    instrument_line_breakpoints: bool,
 ) -> bool {
     // Ports of erts/emulator/beam/predicates.tab:24-166, OTP-29.1.1. These inspect
     // the module's import and atom tables, so rules without module context fail closed.
@@ -1230,7 +1254,7 @@ fn eval_c_predicate(
         Some((module, function, import.arity))
     };
     match name {
-        "instrumenting_line_breakpoints" => false,
+        "instrumenting_line_breakpoints" => instrument_line_breakpoints,
         "use_jump_tab" if args.len() == 3 => {
             let size = integer(&args[0]).unwrap_or_default();
             let min_size = integer(&args[2]).unwrap_or_default();

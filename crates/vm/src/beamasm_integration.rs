@@ -7,7 +7,7 @@ use arinsal_beamasm::{
     guard::{GuardHelper, GuardHelper3},
 };
 use arinsal_beamjit::{
-    BifMfaHelper, MapLookupHelper, ModuleEnv, compile_parsed_module_with_env_and_funcs,
+    BifMfaHelper, MapLookupHelper, ModuleEnv, compile_parsed_module_with_options,
 };
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use std::collections::HashMap;
@@ -1040,6 +1040,7 @@ pub(crate) fn compile(
     bytes: &[u8],
     module: &arinsal_loader::Module,
     scope: u64,
+    line_breakpoints: bool,
 ) -> Option<Arc<CompiledVersion>> {
     if !enabled() {
         return None;
@@ -1075,10 +1076,11 @@ pub(crate) fn compile(
     if trace {
         eprintln!("arinsal boot: beamasm compiling {}", beam.module);
     }
-    let compiled = match compile_parsed_module_with_env_and_funcs(
+    let compiled = match compile_parsed_module_with_options(
         &beam,
         &env,
         function_allowlist.as_deref(),
+        line_breakpoints,
     ) {
         Ok(compiled) => compiled,
         Err(error) => {
