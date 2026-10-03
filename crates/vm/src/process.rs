@@ -2254,7 +2254,9 @@ impl Executor {
             } else {
                 0
             };
-            let live_x = live_x.max(native_live);
+            // A pending exception handler reads x0-x3 even when the module's own register
+            // count is lower (`gc_live` is 4 from handler entry until it runs).
+            let live_x = live_x.max(native_live).max(process.gc_live);
             if crate::native_bridge::return_trace_enabled() && process.native_pc.is_some() {
                 eprintln!(
                     "[sched-save-native] live_x={live_x} x_len={} x0={:#x} module={} native_pc={:?}",
@@ -5420,6 +5422,9 @@ impl Vm {
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
         let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
         *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
+        if module == "erl_init" && function == "start" && simulation_seed.is_none() {
+            crate::natives::env::install_boot_signals(&runtime)?;
+        }
         let mut process = Process::with_spawn_registers(args.len(), 0);
         process.module = module_id;
         process.ip = ip;

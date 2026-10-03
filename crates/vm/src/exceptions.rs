@@ -788,6 +788,9 @@ pub(super) fn resume(
         p.x[1] = trap.reason;
         p.x[2] = trace;
         p.x[3] = class_term(trap.class)?;
+        // The handler's try_case/catch_end read x0-x3, so a switch-out before it runs
+        // (reductions exhausted by the failing BIF) must root all four.
+        p.gc_live = 4;
         // mix_loop1: keep the class for a later raise/2. See Opcode::Raise.
         p.exc_class = Some(trap.class);
         return Ok(None);
