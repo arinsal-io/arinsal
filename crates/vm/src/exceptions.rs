@@ -457,8 +457,13 @@ pub(super) fn system_flag(
     let Some(depth) = value.as_small().filter(|depth| *depth >= 0) else {
         return Err(VmError::Trap(Trap::error(atom("badarg")?)));
     };
-    let old = *depth_limit;
-    *depth_limit = (depth as usize).min(64);
+    let requested = (depth as usize).min(64);
+    let old = process.runtime.as_ref().map_or(*depth_limit, |runtime| {
+        runtime
+            .backtrace_depth
+            .swap(requested, std::sync::atomic::Ordering::AcqRel)
+    });
+    *depth_limit = requested;
     Ok(Term::small(old as i64).expect("depth is small"))
 }
 

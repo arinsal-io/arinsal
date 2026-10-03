@@ -2639,7 +2639,7 @@ fn trace_mask(process: &Process, pid: Pid) -> u64 {
 
 // Port of erts/emulator/beam/erl_process.h:1740 (F_TRACE_FLAG), OTP-29.1.1.
 // Timestamp type occupies the low 3 bits (`ERTS_TRACE_TS_TYPE_BITS`).
-fn trace_flag_bit(name: &str) -> Option<u64> {
+pub(crate) fn trace_flag_bit(name: &str) -> Option<u64> {
     let bit = |n: u32| 1u64 << (3 + n);
     Some(match name {
         "send" => crate::trace::SEND,
@@ -3215,27 +3215,6 @@ fn compile_trace_pattern(pattern: Term, event: Option<bool>) -> Result<(), VmErr
     }
 }
 
-fn unsupported_trace_action(term: &arinsal_etf::OwnedTerm) -> Option<&'static str> {
-    match term {
-        arinsal_etf::OwnedTerm::Tuple(fields) => {
-            if let Some(arinsal_etf::OwnedTerm::Atom(name)) = fields.first()
-                && name == "caller_line"
-            {
-                return Some("caller_line trace action is not implemented");
-            }
-            fields.iter().find_map(unsupported_trace_action)
-        }
-        arinsal_etf::OwnedTerm::List { elems, tail } => elems
-            .iter()
-            .find_map(unsupported_trace_action)
-            .or_else(|| unsupported_trace_action(tail)),
-        arinsal_etf::OwnedTerm::Map(entries) => entries.iter().find_map(|(key, value)| {
-            unsupported_trace_action(key).or_else(|| unsupported_trace_action(value))
-        }),
-        _ => None,
-    }
-}
-
 // Port of erts/emulator/beam/erl_bif_trace.c:465-468 and 2523-2603
 // (change_on_load_trace_pattern), OTP-29.1.1.
 fn trace_pattern_on_load(
@@ -3281,9 +3260,6 @@ fn trace_pattern_on_load(
     if on && pattern != atom("true") && pattern != Term::NIL {
         compile_trace_pattern(pattern, None)?;
         let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
-        if let Some(message) = unsupported_trace_action(&owned) {
-            return Err(VmError::Unsupported(message.into()));
-        }
         match_spec = Some(owned);
     }
     crate::trace_bp::change_on_load(process, session, on, &names, match_spec);
@@ -3383,9 +3359,6 @@ fn trace_pattern(
             if pattern != atom("true") && pattern != Term::NIL {
                 compile_trace_pattern(pattern, Some(event == "receive"))?;
                 let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
-                if let Some(message) = unsupported_trace_action(&owned) {
-                    return Err(VmError::Unsupported(message.into()));
-                }
                 match_spec = Some(owned);
             }
             (true, match_spec)
@@ -3487,9 +3460,6 @@ fn trace_pattern(
     } else {
         compile_trace_pattern(pattern, None)?;
         let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
-        if let Some(message) = unsupported_trace_action(&owned) {
-            return Err(VmError::Unsupported(message.into()));
-        }
         match_spec = Some(owned);
         crate::trace_bp::BreakOp::Set
     };
