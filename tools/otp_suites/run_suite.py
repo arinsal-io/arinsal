@@ -29,6 +29,7 @@ def run(cmd: list[str], timeout: int, **kwargs: object) -> subprocess.CompletedP
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
         check=False,
         **kwargs,
     )
@@ -58,7 +59,7 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
     ei_lib = next((root / "lib").glob("erl_interface-*/lib"), None)
     # macOS already declares sys_nerr/sys_errlist with const-qualified types;
     # use the system strerror() instead of port_test.c's legacy fallback.
-    defs = "-DHAVE_ISFINITE -DHAVE_UNISTD_H -DHAVE_STRERROR" if name == "port" else "-DHAVE_ISFINITE -DHAVE_UNISTD_H"
+    defs = "-DHAVE_ISFINITE -DHAVE_UNISTD_H -DHAVE_STRERROR" if name in {"port", "port_bif"} else "-DHAVE_ISFINITE -DHAVE_UNISTD_H"
     erts_internal = next(root.glob("erts-*/include/internal"), root / "usr/include/internal")
     values = {
         "CC": "clang", "LD": "clang", "SHLIB_LD": "clang",
@@ -98,6 +99,28 @@ def suite_dir(name: str) -> pathlib.Path:
     raise ValueError(f"suite not found: {name}_SUITE.erl")
 
 
+def referenced_suite_sources(name: str) -> list[pathlib.Path]:
+    """Find suite modules called by this suite and recursively by its helpers."""
+    sources: dict[str, pathlib.Path] = {}
+    root_module = f"{name}_SUITE"
+    pending = [root_module]
+    while pending:
+        module = pending.pop()
+        if module in sources:
+            continue
+        source = suite_dir(module.removesuffix("_SUITE")) / f"{module}.erl"
+        sources[module] = source
+        text = source.read_text(encoding="utf-8", errors="replace")
+        for referenced in re.findall(r"\b([a-z][A-Za-z0-9_]*_SUITE):[A-Za-z0-9_']+", text):
+            if referenced not in sources:
+                try:
+                    suite_dir(referenced.removesuffix("_SUITE"))
+                except ValueError:
+                    continue
+                pending.append(referenced)
+    return [source for module, source in sorted(sources.items()) if module != root_module]
+
+
 def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limit: int, beamasm: bool = False, extra: str = "") -> tuple[int, str]:
     logdir.mkdir(parents=True, exist_ok=True)
     original = suite_dir(name)
@@ -107,16 +130,27 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
         build_native(name, directory)
         # Precompile with erlc so both runtimes load the same .beam files; otherwise ct
         # compiles the suite inside the runtime under test (minutes in the interpreter).
+        helper_suites = referenced_suite_sources(name)
         sources = sorted(str(p) for p in directory.glob("*.erl") if p.name == f"{name}_SUITE.erl" or not p.name.endswith("_SUITE.erl"))
+        sources.extend(map(str, helper_suites))
         if sources:
-            cp = run(["erlc", "-W0", "+debug_info", "-I", str(directory), "-I", str(HELPERS), "-pa", str(build), "-o", str(directory), *sources], 600)
+            include_dirs = {directory, HELPERS, *(pathlib.Path(source).parent for source in helper_suites)}
+            include_args = [arg for include in sorted(include_dirs) for arg in ("-I", str(include))]
+            cp = run(["erlc", "-W0", "+debug_info", *include_args, "-pa", str(build), "-o", str(directory), *sources], 600)
             if cp.returncode:
+                if helper_suites:
+                    raise RuntimeError(f"suite/helper compile failed ({cp.returncode}):\n{cp.stdout[-4000:]}")
                 print(f"erlc warning for {name}: {cp.stdout[-800:]}", file=sys.stderr, flush=True)
+            for helper in helper_suites:
+                if not (directory / f"{helper.stem}.beam").is_file():
+                    raise RuntimeError(f"helper suite did not compile: {helper.name}")
         expr = (
             "R=ct:run_test([{dir,\"" + str(directory) + "\"},{suite," + name
             + "_SUITE},{logdir,\"" + str(logdir) + "\"}" + extra + "]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
         )
-        cmd = [exe, "-noshell", "-pa", str(build), "-pa", str(directory), "-eval", expr]
+        # `-noinput` must follow `-noshell`: user_sup applies repeated user
+        # configuration flags in order, and a later `-noshell` restores cooked input.
+        cmd = [exe, "-noshell", "-noinput", "-pa", str(build), "-pa", str(directory), "-eval", expr]
         env = os.environ.copy()
         if beamasm:
             env["ARINSAL_BEAMASM"] = "1"
@@ -186,11 +220,12 @@ def parse_elapsed(logdir: pathlib.Path, suite: str) -> dict[str, float]:
 
 # The erl reference result only changes with the vendored suite sources, so it is cached
 # outside the repo and keyed by a hash of those sources.
-ERL_CACHE = pathlib.Path(os.environ.get("ARINSAL_ERL_CACHE", pathlib.Path.home() / ".cache/arinsal/otp-suites"))
+ERL_CACHE = pathlib.Path(os.environ.get("ARINSAL_ERL_CACHE", pathlib.Path(tempfile.gettempdir()) / "arinsal/otp-suites"))
 
 
 def erl_cache_key(name: str) -> str:
     h = hashlib.sha256()
+    h.update(pathlib.Path(__file__).read_bytes())
     base = suite_dir(name)
     files = [base / f"{name}_SUITE.erl", *sorted(HELPERS.glob("*.erl"))]
     data = base / f"{name}_SUITE_data"

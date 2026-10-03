@@ -1190,6 +1190,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
         whereis_port: Some(nif_whereis_port_hook),
         port_alive: Some(nif_port_alive_hook),
         port_command: Some(nif_port_command_hook),
+        is_process_alive: Some(nif_is_process_alive),
         thread_type: Some(nif_thread_type),
         current_process_exiting: Some(crate::dirty::current_process_exiting),
         ..arinsal_nif::VmHooks::default()
@@ -1203,6 +1204,19 @@ fn nif_thread_type() -> std::ffi::c_int {
         SchedulerType::DirtyCpu => 2,
         SchedulerType::DirtyIo => 3,
     }
+}
+
+fn nif_is_process_alive(caller: Term, target: Term) -> bool {
+    let (Some(caller), Some(target)) = (Pid::from_term(caller), Pid::from_term(target)) else {
+        return false;
+    };
+    NIF_HUBS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&caller)
+        .and_then(|hub| hub.scheduler.upgrade())
+        .is_some_and(|scheduler| scheduler.lookup(target))
 }
 
 fn nif_send_hook(target: Term, message: Term) -> bool {
