@@ -193,6 +193,7 @@ dependencies = [
  "arc-swap",
  "arinsal-difftest",
  "arinsal-etf",
+ "arinsal-maps",
  "arinsal-term",
  "crossbeam-utils",
  "num-bigint",

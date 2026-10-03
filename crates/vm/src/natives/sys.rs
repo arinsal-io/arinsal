@@ -718,11 +718,15 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
 // (erts_internal_term_to_string_2), OTP-29.1.1.
 // boot_loop2: init formats fatal boot errors before io_lib is available.
 fn display(term: Term) -> Result<Term, VmError> {
+    display_match_spec(term)?;
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
+}
+
+pub(crate) fn display_match_spec(term: Term) -> Result<(), VmError> {
     let owned = arinsal_term::to_owned(term).map_err(|_| badarg())?;
     let rendered = print_otp_term(&owned, i32::MAX as usize);
     write!(std::io::stdout().lock(), "{rendered}\r\n")
-        .map_err(|error| VmError::Unsupported(format!("display write: {error}")))?;
-    Ok(Term::atom(arinsal_term::atoms::TRUE))
+        .map_err(|error| VmError::Unsupported(format!("display write: {error}")))
 }
 
 fn term_to_string(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
@@ -1044,6 +1048,10 @@ fn system_info(
         Some("fullsweep_after") => Some(read_flags(process, |process, flags| {
             tagged(process, "fullsweep_after", u64::from(flags.fullsweep_after))
         })),
+        // Port of erts/emulator/beam/erl_bif_info.c:2884-2885, OTP-29.1.1.
+        Some("trace_control_word") => {
+            Some(Term::small(trace_control_word_value(process)).ok_or_else(badarg))
+        }
         Some("min_heap_size") => Some(read_flags(process, |process, flags| {
             tagged(process, "min_heap_size", flags.min_heap_size as u64)
         })),
@@ -2283,7 +2291,7 @@ fn system_flag(
         "min_bin_vheap_size" => heap_minimum(process, args[1], false),
         "max_heap_size" => max_heap_flag(process, args[1]),
         "debug_flags" => Ok(atom("true")),
-        "backtrace_depth" => backtrace_depth(vm, args[1]),
+        "backtrace_depth" => backtrace_depth(vm, process, args[1]),
         "trace_control_word" => trace_control_word(process, args[1]),
         "sequential_tracer" => crate::seq_trace::set_system_tracer(vm, process, args[1]),
         "reset_seq_trace" => {
@@ -3121,20 +3129,37 @@ fn heap_minimum(process: &Process, value: Term, heap: bool) -> Result<Term, VmEr
     })
 }
 
-fn backtrace_depth(vm: &mut Vm, value: Term) -> Result<Term, VmError> {
+fn backtrace_depth(vm: &mut Vm, process: &Process, value: Term) -> Result<Term, VmError> {
     let requested = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
-    let previous = vm.backtrace_depth;
-    vm.backtrace_depth = (requested as usize).min(64);
+    let requested = (requested as usize).min(64);
+    let previous = process
+        .runtime
+        .as_ref()
+        .map_or(vm.backtrace_depth, |runtime| {
+            runtime.backtrace_depth.swap(requested, Ordering::AcqRel)
+        });
+    vm.backtrace_depth = requested;
     Term::small(previous as i64).ok_or_else(badarg)
 }
 
 fn trace_control_word(process: &Process, value: Term) -> Result<Term, VmError> {
-    let requested = value.as_small().ok_or_else(badarg)?;
+    let requested = value
+        .as_small()
+        .filter(|value| (0..=i64::from(u32::MAX)).contains(value))
+        .ok_or_else(badarg)?;
     with_flags(process, |flags| {
         let previous = flags.trace_word;
         flags.trace_word = requested;
         Term::small(previous).ok_or_else(badarg)
     })
+}
+
+pub(crate) fn trace_control_word_value(process: &Process) -> i64 {
+    with_flags(process, |flags| flags.trace_word)
+}
+
+pub(crate) fn set_trace_control_word_value(process: &Process, value: i64) {
+    with_flags(process, |flags| flags.trace_word = value);
 }
 
 fn outstanding_limit(process: &Process, value: Term) -> Result<Term, VmError> {

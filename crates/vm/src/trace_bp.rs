@@ -59,6 +59,8 @@ pub(crate) struct MatchSpec {
     pub(crate) uses_process_dump: bool,
     /// The spec calls `{caller}` or `{caller_line}`.
     pub(crate) uses_caller: bool,
+    /// The spec calls `{current_stacktrace}`.
+    pub(crate) uses_current_stacktrace: bool,
     program: OnceLock<Result<arinsal_ets::match_spec::MatchProgram, ()>>,
 }
 
@@ -67,7 +69,7 @@ impl MatchSpec {
         fn uses(term: &OwnedTerm, name: &str) -> bool {
             match term {
                 OwnedTerm::Tuple(fields) => {
-                    matches!(fields.as_slice(), [OwnedTerm::Atom(atom)] if atom == name)
+                    matches!(fields.first(), Some(OwnedTerm::Atom(atom)) if atom == name)
                         || fields.iter().any(|field| uses(field, name))
                 }
                 OwnedTerm::List { elems, tail } => {
@@ -82,6 +84,7 @@ impl MatchSpec {
         Self {
             uses_process_dump: uses(&source, "process_dump"),
             uses_caller: uses(&source, "caller") || uses(&source, "caller_line"),
+            uses_current_stacktrace: uses(&source, "current_stacktrace"),
             source,
             program: OnceLock::new(),
         }

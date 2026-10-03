@@ -15,7 +15,7 @@ use arinsal_term::{
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 
 /// Raises the error of a native call to an undefined function that has no error handler
@@ -703,6 +703,8 @@ impl AliasTable {
 /// Shared interpreter and scheduler handles for a set of local processes.
 pub(crate) struct Runtime {
     pub(crate) statistics: crate::natives::sys::StatisticsState,
+    /// Node-wide backtrace depth shared by scheduler VM replicas.
+    pub(crate) backtrace_depth: AtomicUsize,
     code: Arc<Mutex<SharedCode>>,
     /// The node's code scope, which keys its native code registries.
     pub(crate) code_scope: u64,
@@ -5410,6 +5412,7 @@ impl Vm {
         assert_eq!(port_ids.reserve(), Some(0));
         let runtime = Arc::new(Runtime {
             statistics: crate::natives::sys::StatisticsState::new(self.statistics_origins),
+            backtrace_depth: AtomicUsize::new(8),
             code: Arc::clone(&code),
             code_scope: self.code_scope,
             processes: Mutex::new(std::collections::HashSet::new()),

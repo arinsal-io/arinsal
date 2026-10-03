@@ -3,7 +3,7 @@
 use crate::{Process, Vm, VmError, process::Message};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx};
-use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned, global_atoms};
+use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned, global_atoms, to_owned};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -91,20 +91,34 @@ struct CallMatchContext {
     /// `{process_dump}`, and the heaps holding binaries built from it.
     dump: Option<Vec<u8>>,
     dump_heaps: RefCell<Vec<VecHeap>>,
-    silent: Cell<bool>,
+    silent: Cell<Option<bool>>,
     return_trace: Cell<bool>,
     exception_trace: Cell<bool>,
+    trace_control_word: Cell<i64>,
     caller: Option<Term>,
+    caller_line: Option<Term>,
+    current_stacktraces: Vec<(VecHeap, Term)>,
+    trace_actions: RefCell<Vec<(String, VecHeap, Vec<Term>)>>,
 }
 
 impl CallMatchContext {
-    fn new(caller: Option<Term>, dump: Option<Vec<u8>>) -> Self {
+    fn new(
+        caller: Option<Term>,
+        caller_line: Option<Term>,
+        current_stacktraces: Vec<(VecHeap, Term)>,
+        dump: Option<Vec<u8>>,
+        trace_control_word: i64,
+    ) -> Self {
         Self {
             message: RefCell::new(None),
-            silent: Cell::new(false),
+            silent: Cell::new(None),
             return_trace: Cell::new(false),
             exception_trace: Cell::new(false),
+            trace_control_word: Cell::new(trace_control_word),
             caller,
+            caller_line,
+            current_stacktraces,
+            trace_actions: RefCell::new(Vec::new()),
             dump,
             dump_heaps: RefCell::new(Vec::new()),
         }
@@ -117,9 +131,17 @@ impl CallMatchContext {
         let (_heap, term) = self.message.borrow_mut().take()?;
         copy_term(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)).ok()
     }
+
+    fn take_trace_actions(&self) -> Vec<(String, VecHeap, Vec<Term>)> {
+        std::mem::take(&mut *self.trace_actions.borrow_mut())
+    }
 }
 
 impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
+    fn trace_control_word(&self) -> Option<Term> {
+        Term::small(self.trace_control_word.get())
+    }
+
     fn trace_operation(
         &self,
         name: &str,
@@ -128,21 +150,77 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
         match name {
             "message" => {
                 let value = *arguments.first().ok_or(arinsal_ets::EtsError::BadArg)?;
+                // Port of erts/emulator/beam/erl_db_util.c:1622-1626 and :4857-4893,
+                // OTP-29.1.1: `message` returns its value to the match runner, while `true`
+                // means no extra trace payload. Later message actions replace earlier ones.
+                if value == crate::signals::atom("true") {
+                    *self.message.borrow_mut() = None;
+                    return Ok(value);
+                }
                 let mut heap = VecHeap::new();
                 let copy = copy_term(value, &mut heap)?;
                 *self.message.borrow_mut() = Some((heap, copy));
                 Ok(value)
             }
+            "set_tcw" => {
+                let value = arguments
+                    .first()
+                    .and_then(|value| value.as_small())
+                    .ok_or(arinsal_ets::EtsError::BadArg)?;
+                let previous = self.trace_control_word.get();
+                self.trace_control_word.set(value);
+                Term::small(previous).ok_or(arinsal_ets::EtsError::BadArg)
+            }
             "silent" => {
-                self.silent.set(true);
+                match arguments.first().copied() {
+                    Some(value) if value == crate::signals::atom("true") => {
+                        self.silent.set(Some(true));
+                    }
+                    Some(value) if value == crate::signals::atom("false") => {
+                        self.silent.set(Some(false));
+                    }
+                    _ => {}
+                }
+                Ok(crate::signals::atom("true"))
+            }
+            "display" => {
+                // Port of erts/emulator/beam/erl_db_util.c:5091-5115 (dmc_display and
+                // matchDisplay), OTP-29.1.1.
+                let value = *arguments.first().ok_or(arinsal_ets::EtsError::BadArg)?;
+                crate::natives::sys::display_match_spec(value)
+                    .map_err(|_| arinsal_ets::EtsError::Unsupported("match-spec display"))?;
+                Ok(crate::signals::atom("true"))
+            }
+            "enable_trace" | "disable_trace" | "trace" => {
+                let mut heap = VecHeap::new();
+                let copied = arguments
+                    .iter()
+                    .map(|&argument| copy_term(argument, &mut heap))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.trace_actions
+                    .borrow_mut()
+                    .push((name.to_owned(), heap, copied));
                 Ok(crate::signals::atom("true"))
             }
             "caller" => Ok(self
                 .caller
                 .unwrap_or_else(|| crate::signals::atom("undefined"))),
-            "caller_line" => Err(arinsal_ets::EtsError::Unsupported(
-                "caller_line trace action",
-            )),
+            "caller_line" => Ok(self
+                .caller_line
+                .unwrap_or_else(|| crate::signals::atom("undefined"))),
+            "current_stacktrace" => {
+                let depth = arguments
+                    .first()
+                    .and_then(|value| value.as_small())
+                    .and_then(|depth| usize::try_from(depth).ok())
+                    .unwrap_or_else(|| self.current_stacktraces.len().saturating_sub(1));
+                self.current_stacktraces
+                    .get(depth.min(self.current_stacktraces.len().saturating_sub(1)))
+                    .map(|(_, term)| *term)
+                    .ok_or(arinsal_ets::EtsError::Unsupported(
+                        "current stacktrace context",
+                    ))
+            }
             "return_trace" => {
                 self.return_trace.set(true);
                 Ok(crate::signals::atom("true"))
@@ -406,6 +484,181 @@ pub(crate) fn session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
         .map_or(0, |entry| entry.flags)
 }
 
+fn set_session_flags(
+    process: &Process,
+    session: u64,
+    pid: Pid,
+    clear: u64,
+    set: u64,
+    tracer: Option<Tracer>,
+) -> bool {
+    let key = (scope(process), session, pid);
+    let mut entries = table().lock().unwrap();
+    let Some(entry) = entries.get_mut(&key) else {
+        return false;
+    };
+    entry.flags = (entry.flags & !clear) | set;
+    if let Some(tracer) = tracer {
+        entry.tracer = tracer;
+    }
+    if entry.flags == 0 {
+        entries.remove(&key);
+    }
+    enabled().store(!entries.is_empty(), Ordering::Relaxed);
+    true
+}
+
+fn trace_action_target(process: &Process, current: Pid, value: Term) -> Option<Pid> {
+    if let Some(pid) = Pid::from_term(value) {
+        return Some(pid);
+    }
+    let owned = to_owned(value).ok()?;
+    let OwnedTerm::Atom(name) = &owned else {
+        return None;
+    };
+    process
+        .runtime
+        .as_ref()?
+        .names
+        .lock()
+        .unwrap()
+        .get(name)
+        .copied()
+        .or_else(|| (name == "self").then_some(current))
+}
+
+fn trace_action_flags(value: Term) -> Option<(u64, Option<Tracer>)> {
+    let mut flags = 0;
+    let mut tracer = None;
+    let owned = to_owned(value).ok()?;
+    let values = match &owned {
+        OwnedTerm::Atom(name) => {
+            if name == "all" {
+                return crate::natives::proc::trace_flag_bit("all").map(|bits| (bits, None));
+            }
+            std::slice::from_ref(&owned)
+        }
+        OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.as_slice(),
+        _ => return None,
+    };
+    for flag in values {
+        if let OwnedTerm::Atom(name) = flag {
+            flags |= crate::natives::proc::trace_flag_bit(name)?;
+            continue;
+        }
+        match flag {
+            OwnedTerm::Tuple(fields)
+                if fields.len() == 2
+                    && fields.first() == Some(&OwnedTerm::Atom("tracer".into())) =>
+            {
+                let OwnedTerm::Pid {
+                    node,
+                    id,
+                    serial,
+                    creation,
+                } = &fields[1]
+                else {
+                    return None;
+                };
+                if node != "nonode@nohost" || *creation != 0 {
+                    return None;
+                }
+                tracer = Some(Tracer::Pid(Pid::from_term(Term::pid(*id, *serial)?)?));
+            }
+            _ => return None,
+        }
+    }
+    Some((flags, tracer))
+}
+
+fn apply_match_trace_action(
+    process: &Process,
+    session: u64,
+    current: Pid,
+    name: &str,
+    args: &[Term],
+) -> bool {
+    let (target, clear, set, tracer) = match (name, args) {
+        ("enable_trace", [flag]) => {
+            let Some((flags, tracer)) = trace_action_flags(*flag) else {
+                return false;
+            };
+            (current, 0, flags, tracer)
+        }
+        ("enable_trace", [target, flag]) => {
+            let (Some(target), Some((flags, tracer))) = (
+                trace_action_target(process, current, *target),
+                trace_action_flags(*flag),
+            ) else {
+                return false;
+            };
+            (target, 0, flags, tracer)
+        }
+        ("disable_trace", [flag]) => {
+            let Some((flags, _)) = trace_action_flags(*flag) else {
+                return false;
+            };
+            (current, flags, 0, None)
+        }
+        ("disable_trace", [target, flag]) => {
+            let (Some(target), Some((flags, _))) = (
+                trace_action_target(process, current, *target),
+                trace_action_flags(*flag),
+            ) else {
+                return false;
+            };
+            (target, flags, 0, None)
+        }
+        ("trace", [disable, enable]) => {
+            let (Some((clear, _)), Some((set, tracer))) =
+                (trace_action_flags(*disable), trace_action_flags(*enable))
+            else {
+                return false;
+            };
+            (current, clear, set, tracer)
+        }
+        ("trace", [target, disable, enable]) => {
+            let (Some(target), Some((clear, _)), Some((set, tracer))) = (
+                trace_action_target(process, current, *target),
+                trace_action_flags(*disable),
+                trace_action_flags(*enable),
+            ) else {
+                return false;
+            };
+            (target, clear, set, tracer)
+        }
+        _ => return false,
+    };
+    if set_session_flags(process, session, target, clear, set, tracer.clone()) {
+        return true;
+    }
+    if set == 0 {
+        return true;
+    }
+    // Port of erts/emulator/beam/erl_db_util.c:2868-2901 (matchEnableTrace and matchTrace2),
+    // OTP-29.1.1: enabling another process inherits the tracee's session tracer.
+    let Some(tracer) = tracer
+        .or_else(|| process_tracer(process, session, current))
+        .or_else(|| session_tracer(process, session))
+    else {
+        return false;
+    };
+    replace_session_flags(process, session, target, set, tracer);
+    true
+}
+
+// Port of erts/emulator/beam/erl_db_util.c:3007-3018 (matchSilent), OTP-29.1.1.
+fn set_session_silent(process: &Process, session: u64, pid: Pid, silent: bool) {
+    let mut entries = table().lock().unwrap();
+    if let Some(entry) = entries.get_mut(&(scope(process), session, pid)) {
+        if silent {
+            entry.flags |= SILENT;
+        } else {
+            entry.flags &= !SILENT;
+        }
+    }
+}
+
 // Port of erts/emulator/beam/erl_trace.c:559-582, OTP-29.1.1.
 pub(crate) fn configure_new_processes(
     process: &Process,
@@ -519,8 +772,10 @@ pub(crate) fn call_event(
     }
     let mut actions = Vec::new();
     for pattern in patterns {
-        let flags = session_flags(process, pattern.session, pid);
+        let mut flags = session_flags(process, pattern.session, pid);
+        let call_was_enabled = flags & CALL != 0;
         let mut extra = None;
+        let mut trace_actions = Vec::new();
         let mut return_trace = false;
         let mut exception_trace = false;
         if let Some(spec) = pattern.match_spec.as_ref() {
@@ -528,6 +783,11 @@ pub(crate) fn call_event(
                 crate::natives::proc::process_dump(Some(&*vm), process, ctx).ok()
             } else {
                 None
+            };
+            let current_stacktraces = if spec.uses_current_stacktrace {
+                current_stacktraces(vm, process)?
+            } else {
+                Vec::new()
             };
             // Port of erts/emulator/beam/erl_trace.c:1266-1267, OTP-29.1.1.
             let against = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
@@ -544,13 +804,17 @@ pub(crate) fn call_event(
                         .map_err(|_| ())
                 })
                 .map_err(|()| VmError::Unsupported("invalid trace match specification".into()))?;
+            let (caller, caller_line) = if spec.uses_caller {
+                caller_info(process, vm, module, function)?
+            } else {
+                (None, None)
+            };
             let context = CallMatchContext::new(
-                if spec.uses_caller {
-                    caller_mfa(process, vm)?
-                } else {
-                    None
-                },
+                caller,
+                caller_line,
+                current_stacktraces,
                 dump,
+                crate::natives::sys::trace_control_word_value(process),
             );
             let result = program
                 .run_with_context(
@@ -561,9 +825,15 @@ pub(crate) fn call_event(
                 .map_err(|error| {
                     VmError::Unsupported(format!("trace match spec execution: {error:?}"))
                 })?;
-            if context.silent.get() {
-                continue;
+            crate::natives::sys::set_trace_control_word_value(
+                process,
+                context.trace_control_word.get(),
+            );
+            trace_actions = context.take_trace_actions();
+            if let Some(silent) = context.silent.get() {
+                set_session_silent(process, pattern.session, pid, silent);
             }
+            flags = session_flags(process, pattern.session, pid);
             return_trace = context.return_trace.get();
             exception_trace = context.exception_trace.get();
             // Port of erts/emulator/beam/erl_trace.c:1293-1297 (erts_call_trace), OTP-29.1.1.
@@ -583,7 +853,9 @@ pub(crate) fn call_event(
             }
             extra = context.take_message(process);
         }
-        if flags & CALL != 0 && flags & SILENT == 0 {
+        // Port of erts/emulator/beam/erl_trace.c:1293-1297 (erts_call_trace), OTP-29.1.1.
+        // Match trace actions change later calls, while `silent` controls this emission too.
+        if call_was_enabled && flags & SILENT == 0 {
             emit_call_event(
                 vm,
                 process,
@@ -599,6 +871,12 @@ pub(crate) fn call_event(
                 },
                 Some(pattern.session),
             )?;
+        }
+        // Port of erts/emulator/beam/erl_trace.c:1270-1302 (erts_call_trace), OTP-29.1.1:
+        // the current event uses the pre-match tracer and flags; match trace actions affect
+        // later events from the tracee.
+        for (name, _heap, arguments) in trace_actions {
+            let _ = apply_match_trace_action(process, pattern.session, pid, &name, &arguments);
         }
         let return_to = local && session_flags(process, pattern.session, pid) & RETURN_TO != 0;
         if return_trace || exception_trace || return_to {
@@ -699,14 +977,114 @@ fn emit_call_event(
     Ok(actions)
 }
 
-fn caller_mfa(process: &mut Process, vm: &Vm) -> Result<Option<Term>, VmError> {
-    let Some(module) = vm.modules.get(process.module) else {
-        return Ok(None);
+// Port of erts/emulator/beam/erl_db_util.c:5335-5370 (matchCaller and matchCallerLine),
+// OTP-29.1.1.
+fn caller_info(
+    process: &mut Process,
+    vm: &Vm,
+    target_module: &str,
+    target_function: &str,
+) -> Result<(Option<Term>, Option<Term>), VmError> {
+    let direct_caller = if let Some(module) = vm.modules.get(process.module)
+        && let Some((function, arity)) = module.function_at(process.ip)
+        && (module.name != target_module || function != target_function)
+        && !function.starts_with('-')
+        && module.line_term_at(process.ip).is_some()
+    {
+        Some((module, function.to_owned(), arity, process.ip))
+    } else {
+        None
     };
-    let Some((function, arity)) = module.function_at(process.ip) else {
-        return Ok(None);
+    let caller = {
+        let mut index = 0;
+        loop {
+            let Some(word) = process.heap.stack_get(index) else {
+                if let Some(caller) = direct_caller {
+                    break caller;
+                }
+                return Ok((None, None));
+            };
+            let raw_address = word.tagged_word() as usize;
+            if let Some(native) =
+                crate::native_bridge::native_stack_frame_at(raw_address.saturating_sub(1))
+            {
+                if native.module_atom
+                    != global_atoms()
+                        .intern(target_module)
+                        .map_err(|_| VmError::Unsupported("caller module atom".into()))?
+                    || native.function_atom
+                        != global_atoms()
+                            .intern(target_function)
+                            .map_err(|_| VmError::Unsupported("caller function atom".into()))?
+                {
+                    let mfa = [
+                        Term::atom(native.module_atom),
+                        Term::atom(native.function_atom),
+                        Term::small(i64::from(native.arity))
+                            .ok_or_else(|| VmError::Unsupported("caller arity".into()))?,
+                    ];
+                    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                    let caller = TermBuilder::new(&mut heap)
+                        .tuple(&mfa)
+                        .map_err(|error| VmError::Unsupported(format!("caller MFA: {error:?}")))?;
+                    let caller_line =
+                        if let (Some(file), Some(line)) = (native.file_term, native.line) {
+                            let line = Term::small(i64::from(line))
+                                .ok_or_else(|| VmError::Unsupported("caller line".into()))?;
+                            let source = TermBuilder::new(&mut heap).tuple(&[file, line]).map_err(
+                                |error| {
+                                    VmError::Unsupported(format!("caller source line: {error:?}"))
+                                },
+                            )?;
+                            Some(
+                                TermBuilder::new(&mut heap)
+                                    .tuple(&[mfa[0], mfa[1], mfa[2], source])
+                                    .map_err(|error| {
+                                        VmError::Unsupported(format!("caller line: {error:?}"))
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
+                    return Ok((Some(caller), caller_line));
+                }
+                index += 1;
+                continue;
+            }
+            let Some((handler, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
+                index += 1;
+                continue;
+            };
+            let Some(module) = vm.modules.get(module_id) else {
+                index += 1;
+                continue;
+            };
+            if handler {
+                index += 1;
+                continue;
+            }
+            if ip == module.return_trace_ip {
+                index += 6;
+                continue;
+            }
+            if ip == module.return_to_trace_ip {
+                index += 2;
+                continue;
+            }
+            let call_site = ip.saturating_sub(1);
+            let Some((function, arity)) = module.function_at(call_site) else {
+                index += 1;
+                continue;
+            };
+            if function.starts_with('-') || function == "module_info" {
+                index += 1;
+                continue;
+            }
+            break (module, function.to_owned(), arity, call_site);
+        }
     };
-    let values = [
+    let (module, function, arity, call_site) = caller;
+    let mfa = [
         Term::atom(
             global_atoms()
                 .intern(&module.name)
@@ -714,15 +1092,70 @@ fn caller_mfa(process: &mut Process, vm: &Vm) -> Result<Option<Term>, VmError> {
         ),
         Term::atom(
             global_atoms()
-                .intern(function)
+                .intern(&function)
                 .map_err(|_| VmError::Unsupported("caller function atom".into()))?,
         ),
         Term::small(i64::from(arity)).ok_or_else(|| VmError::Unsupported("caller arity".into()))?,
     ];
-    let tuple = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .tuple(&values)
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let caller = TermBuilder::new(&mut heap)
+        .tuple(&mfa)
         .map_err(|error| VmError::Unsupported(format!("caller MFA: {error:?}")))?;
-    Ok(Some(tuple))
+    let caller_line = if let Some((file, line)) = module.line_term_at(call_site) {
+        let line = Term::small(i64::try_from(line).unwrap_or(i64::MAX))
+            .ok_or_else(|| VmError::Unsupported("caller line".into()))?;
+        let source = TermBuilder::new(&mut heap)
+            .tuple(&[file, line])
+            .map_err(|error| VmError::Unsupported(format!("caller source line: {error:?}")))?;
+        let values = [mfa[0], mfa[1], mfa[2], source];
+        Some(
+            TermBuilder::new(&mut heap)
+                .tuple(&values)
+                .map_err(|error| VmError::Unsupported(format!("caller line: {error:?}")))?,
+        )
+    } else {
+        None
+    };
+    Ok((Some(caller), caller_line))
+}
+
+// Port of erts/emulator/beam/erl_db_util.c:5375-5421 (matchCurrentStacktrace), OTP-29.1.1.
+fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, Term)>, VmError> {
+    // Reserve one slot beyond OTP's MAX_BACKTRACE_SIZE for the current frame, which is
+    // removed before the caller prefixes are built below.
+    let trace = crate::stacktrace::build(&vm.modules, process, None, 65)?;
+    let owned = to_owned(trace)
+        .map_err(|error| VmError::Unsupported(format!("match stacktrace copy: {error:?}")))?;
+    let OwnedTerm::List { elems, .. } = &owned else {
+        return Err(VmError::Unsupported(
+            "match stacktrace is not a list".into(),
+        ));
+    };
+    // Port of erts/emulator/beam/erl_db_util.c:5375-5421 (matchCurrentStacktrace),
+    // OTP-29.1.1: the match-spec operation reports the tracee's saved callers, excluding the
+    // current interpreter/JIT position used as the top frame by the general stacktrace builder.
+    let callers = elems.get(1..).unwrap_or_default();
+    // Port of erts/emulator/beam/error.h:206 (MAX_BACKTRACE_SIZE), OTP-29.1.1. Capture once
+    // at the runtime maximum, then apply each match-spec's requested depth to the saved callers.
+    let backtrace_depth = process
+        .runtime
+        .as_ref()
+        .map_or(vm.backtrace_depth, |runtime| {
+            runtime.backtrace_depth.load(Ordering::Acquire)
+        });
+    let maximum = backtrace_depth.min(callers.len());
+    let mut traces = Vec::with_capacity(maximum + 1);
+    for depth in 0..=maximum {
+        let trace = OwnedTerm::List {
+            elems: callers[..depth].to_vec(),
+            tail: Box::new(OwnedTerm::Nil),
+        };
+        let mut heap = VecHeap::new();
+        let term = from_owned(&trace, &mut heap)
+            .map_err(|error| VmError::Unsupported(format!("match stacktrace build: {error:?}")))?;
+        traces.push((heap, term));
+    }
+    Ok(traces)
 }
 
 /// Runs a native entry breakpoint with the scheduler context that owns its trace callbacks.
@@ -1638,16 +2071,28 @@ fn emit_filtered(
                         Ok(program) => program,
                         Err(_) => continue,
                     };
-                let context = CallMatchContext::new(None, dump);
+                let context = CallMatchContext::new(
+                    None,
+                    None,
+                    Vec::new(),
+                    dump,
+                    crate::natives::sys::trace_control_word_value(process),
+                );
                 let result = program.run_with_context(
                     against,
                     &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
                     &context,
                 );
-                if context.silent.get()
-                    || !result.is_ok_and(|result| {
-                        result.is_some_and(|value| value != crate::signals::atom("false"))
-                    })
+                crate::natives::sys::set_trace_control_word_value(
+                    process,
+                    context.trace_control_word.get(),
+                );
+                if let Some(silent) = context.silent.get() {
+                    set_session_silent(process, session, subject, silent);
+                }
+                if !result.is_ok_and(|result| {
+                    result.is_some_and(|value| value != crate::signals::atom("false"))
+                }) || session_flags(process, session, subject) & SILENT != 0
                 {
                     continue;
                 }
@@ -2037,6 +2482,46 @@ mod tests {
         trace_pattern_diff(
             "trace_t3a_return",
             "-module(trace_t3a_return). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> f(), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_return,f,0}, [{'_',[],[{return_trace}]}],[local]), P ! go, receive {trace,P,return_from,{trace_t3a_return,f,0},ok} -> ok after 1000 -> missing end. f() -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_message_true_omits_extra_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3a_message_true",
+            "-module(trace_t3a_message_true). -export([run/0]). run() -> Parent=self(), P=spawn(fun() -> receive go -> f(a,a), Parent ! done end end), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_message_true,f,2}, [{'_',[],[{message,4711},{message,true}]}],[local]), P ! go, receive {trace,P,call,{trace_t3a_message_true,f,[a,a]}} -> receive done -> ok after 1000 -> no_done end; Other -> Other after 1000 -> missing end. f(_,_) -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_silent_flag_updates_match_otp() {
+        trace_pattern_diff(
+            "trace_t3a_silent_flag",
+            "-module(trace_t3a_silent_flag). -export([run/0,f/1]). run() -> Parent=self(), P=spawn(fun() -> receive go -> trace_t3a_silent_flag:f(start), trace_t3a_silent_flag:f(c), trace_t3a_silent_flag:f(stop), trace_t3a_silent_flag:f(d), Parent ! done end end), erlang:trace(P,true,[call,silent]), erlang:trace_pattern({trace_t3a_silent_flag,f,1}, [{[start],[],[{silent,false},{message,start}]},{[stop],[],[{silent,true},{message,stop}]},{['$1'],[],[{message,'$1'}]}],[global]), P ! go, receive done -> flush([]) end. flush(A) -> receive {trace,_,call,Call,Extra} -> flush([{Call,Extra}|A]); {trace,_,call,Call} -> flush([{Call,none}|A]) after 20 -> lists:reverse(A) end. f(_) -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_silent_global_match_spec_matches_suite() {
+        trace_pattern_diff(
+            "trace_t3a_silent_global_suite",
+            "-module(trace_t3a_silent_global_suite). -export([run/0,runner/1,f1/1]).\nrun() -> Parent=self(), P=spawn(trace_t3a_silent_global_suite,runner,[Parent]), erlang:trace(P,true,[call,silent]), erlang:trace_pattern({trace_t3a_silent_global_suite,f1,1}, [{[start],[],[{silent,false},{message,start}]},{[stop],[],[{silent,true},{message,stop}]},{[miss],[],[{silent,neither_true_nor_false},{message,miss}]},{['$1'],[],[{message,'$1'}]}],[global]), P ! go, receive done -> flush([]) end.\nrunner(Parent) -> receive go -> trace_t3a_silent_global_suite:f1(a), trace_t3a_silent_global_suite:f1(miss), trace_t3a_silent_global_suite:f1(b), trace_t3a_silent_global_suite:f1(start), trace_t3a_silent_global_suite:f1(c), f1(d), trace_t3a_silent_global_suite:f1(miss), trace_t3a_silent_global_suite:f1(e), trace_t3a_silent_global_suite:f1(stop), trace_t3a_silent_global_suite:f1(f), Parent ! done end.\nflush(A) -> receive {trace,_,call,Call,Extra} -> flush([{call,Call,Extra}|A]); {trace,_,call,Call} -> flush([{call,Call,none}|A]) after 20 -> lists:reverse(A) end.\nf1(_) -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_silent_local_match_spec_matches_suite() {
+        trace_pattern_diff(
+            "trace_t3a_silent_local_suite",
+            "-module(trace_t3a_silent_local_suite). -export([run/0,runner/1,f1/1]).\nrun() -> Parent=self(), P=spawn(trace_t3a_silent_local_suite,runner,[Parent]), erlang:trace(P,true,[call,silent]), erlang:trace_pattern({trace_t3a_silent_local_suite,f1,1}, [{[start],[],[{silent,false},{message,start}]},{[stop],[],[{silent,true},{message,stop}]},{['$1'],[],[{message,'$1'}]}],[local]), P ! go, receive done -> flush([]) end.\nrunner(Parent) -> receive go -> trace_t3a_silent_local_suite:f1(a), f1(b), trace_t3a_silent_local_suite:f1(start), trace_t3a_silent_local_suite:f1(c), f1(d), f1(stop), trace_t3a_silent_local_suite:f1(e), f1(f), Parent ! done end.\nflush(A) -> receive {trace,_,call,Call,Extra} -> flush([{call,Call,Extra}|A]); {trace,_,call,Call} -> flush([{call,Call,none}|A]) after 20 -> lists:reverse(A) end.\nf1(_) -> ok.",
+        );
+    }
+
+    #[test]
+    fn trace_pattern_caller_line_matches_otp() {
+        trace_pattern_diff(
+            "trace_t3a_caller_line",
+            "-module(trace_t3a_caller_line). -export([run/0,runner/1,f2/0,f3/0]).\nrun() -> Parent=self(), P=spawn(trace_t3a_caller_line,runner,[Parent]), erlang:trace(P,true,[call]), erlang:trace_pattern({trace_t3a_caller_line,f2,0}, [{[],[],[{message,{caller_line}}]}],[global]), P ! go, receive {trace,P,call,{trace_t3a_caller_line,f2,[]},Caller} -> Caller after 1000 -> missing end.\nrunner(Parent) -> receive go -> f3(), Parent ! done end.\nf3() -> trace_t3a_caller_line:f2(), ok.\nf2() -> ok.",
         );
     }
 

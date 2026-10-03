@@ -97,6 +97,7 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
     struct TestContext<'a, C> {
         inner: &'a C,
         flags: Cell<u8>,
+        trace_control_word: Cell<Option<Term>>,
     }
     impl<C: MatchContext> MatchContext for TestContext<'_, C> {
         fn self_pid(&self) -> Option<Term> {
@@ -106,7 +107,7 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
             self.inner.node_name()
         }
         fn trace_control_word(&self) -> Option<Term> {
-            self.inner.trace_control_word()
+            self.trace_control_word.get()
         }
         fn node_of(&self, term: Term) -> Option<Term> {
             self.inner.node_of(term)
@@ -114,6 +115,16 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
         fn trace_operation(&self, name: &str, arguments: &[Term]) -> Result<Term, EtsError> {
             match name {
                 "message" => Ok(arguments[0]),
+                "set_tcw" => {
+                    let previous = self
+                        .trace_control_word
+                        .get()
+                        .and_then(Term::as_small)
+                        .unwrap_or(0);
+                    self.trace_control_word.set(arguments.first().copied());
+                    Term::small(previous).ok_or(EtsError::BadArg)
+                }
+                "set_seq_token" => Ok(truth(true)),
                 "caller" | "caller_line" => {
                     Ok(Term::atom(global_atoms().intern("undefined").unwrap()))
                 }
@@ -162,6 +173,7 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
     let test_context = TestContext {
         inner: context,
         flags: Cell::new(0),
+        trace_control_word: Cell::new(context.trace_control_word()),
     };
     let result = program
         .run_with_context(against, dst, &test_context)?
@@ -708,7 +720,9 @@ fn validate_expr(
         {
             arity == 0
         }
-        "current_stacktrace" if trace && !guard => arity == 0 || arity == 1,
+        "current_stacktrace" if trace && !guard => {
+            arity == 0 || (arity == 1 && elements[1].as_small().is_some_and(|depth| depth >= 0))
+        }
         "enable_trace" | "disable_trace" if trace && !guard => arity == 1 || arity == 2,
         "trace" if trace && !guard => arity == 2 || arity == 3,
         _ => false,
@@ -1338,7 +1352,7 @@ fn integral_float_to_bigint(value: f64) -> Result<BigInt, EtsError> {
     })
 }
 
-fn map_get(key: Term, map: Term, scratch: &mut VecHeap) -> Result<Option<Term>, EtsError> {
+fn map_get(key: Term, map: Term, _scratch: &mut VecHeap) -> Result<Option<Term>, EtsError> {
     if map.classify() != TermKind::Map {
         return Err(EtsError::BadArg);
     }
@@ -1346,17 +1360,9 @@ fn map_get(key: Term, map: Term, scratch: &mut VecHeap) -> Result<Option<Term>, 
     if let Some(flat) = unsafe { map.flatmap_ref() } {
         return Ok(flat.get(key));
     }
-    let owned = to_owned(map)?;
-    let OwnedTerm::Map(pairs) = &owned else {
-        return Err(EtsError::BadArg);
-    };
-    for (stored_key, stored_value) in pairs {
-        let candidate = from_owned(stored_key, scratch)?;
-        if exact_eq(candidate, key) {
-            return Ok(Some(from_owned(stored_value, scratch)?));
-        }
-    }
-    Ok(None)
+    // Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_maps_get), OTP-29.1.1.
+    // Keep HAMT lookups logarithmic instead of decoding and scanning the whole map per key.
+    arinsal_maps::get(map, key).map_err(|_| EtsError::BadArg)
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:5592, OTP-29.1.1 (dmc_expr).
@@ -1491,7 +1497,13 @@ fn eval<C: MatchContext>(
         "+" | "-" | "*" => {
             if args.len() == 1 {
                 if name == "+" {
-                    a
+                    // Port of erts/emulator/beam/erl_db_util.c:572-858 (guard_tab), OTP-29.1.1:
+                    // the unary plus BIF accepts numbers only, even though it returns them intact.
+                    if integer(a).is_some() || float(a).is_some() {
+                        a
+                    } else {
+                        return Err(EtsError::BadArg);
+                    }
                 } else if let Some(n) = integer(a) {
                     boxed_int(-n, scratch)?
                 } else {

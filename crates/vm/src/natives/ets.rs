@@ -585,10 +585,25 @@ fn lookup_pair<H: HeapAlloc>(heap: &mut H, key: Term, objects: Vec<Term>) -> Res
         .map_err(|_| badarg())
 }
 
-struct ProcessMatchContext(Term);
+struct ProcessMatchContext(Term, Term, Term);
 impl arinsal_ets::match_spec::MatchContext for ProcessMatchContext {
     fn self_pid(&self) -> Option<Term> {
         Some(self.0)
+    }
+
+    fn trace_control_word(&self) -> Option<Term> {
+        Some(self.1)
+    }
+
+    fn trace_operation(
+        &self,
+        name: &str,
+        _arguments: &[Term],
+    ) -> Result<Term, arinsal_ets::EtsError> {
+        match name {
+            "get_seq_token" => Ok(self.2),
+            _ => Err(arinsal_ets::EtsError::BadArg),
+        }
     }
 }
 
@@ -699,13 +714,17 @@ fn call_inner(
             Some(value) if Some(value) == ETS_ATOMS.get("trace").copied() => MatchDialect::Trace,
             _ => return Err(badarg()),
         };
+        let seq_token = crate::seq_trace::get_token_term(process, ctx.pid())?;
+        let trace_control_word =
+            Term::small(crate::natives::sys::trace_control_word_value(process))
+                .ok_or_else(badarg)?;
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
         return arinsal_ets::match_spec::match_spec_test(
             *against,
             *specification,
             dialect,
             &mut heap,
-            &ProcessMatchContext(caller),
+            &ProcessMatchContext(caller, trace_control_word, seq_token),
         )
         .map_err(err);
     }
