@@ -554,7 +554,19 @@ impl Vm {
                     && arinsal_spec::bif_lookup(module, function, arity as u8).is_some() =>
             {
                 let site = (usize::MAX - 1, p.ip);
-                self.trace_native_call_named(p, run, module, function, arity, site)
+                self.trace_native_call_named(
+                    p,
+                    run,
+                    module,
+                    function,
+                    arity,
+                    site,
+                    if tail {
+                        crate::trace::StackScan::AfterFrame
+                    } else {
+                        crate::trace::StackScan::None
+                    },
+                )
             }
             _ => None,
         };
@@ -786,7 +798,7 @@ impl Vm {
         if self.unloaded_on_load(p, module) {
             return self.call_undefined_function_with_ctx(p, module, function, arity, tail, ctx);
         }
-        let module_id = match self.load_named(module) {
+        let module_id = match self.load_named_traced(p, module) {
             Ok(id) => id,
             Err(_) if self.should_autoload(p, module) => {
                 // mix_loop1: OTP calls error_handler:undefined_function/3, which

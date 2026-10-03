@@ -648,51 +648,40 @@ pub(super) fn resume(
     let mut frame_start = 0;
     let mut handler = None;
     let mut index = 0;
+    // Sessions with a return_to frame on the unwound stack: the catching function gets their
+    // return_to event.
+    let mut return_to_sessions: Vec<u64> = p
+        .cold
+        .as_mut()
+        .map(|cold| std::mem::take(&mut cold.bif_return_to))
+        .unwrap_or_default();
     while index < p.heap.stack_words() {
         // Port of beam_common.c:600-614 (`is_CP`/`erts_inspect_frame`), OTP-29.1.1.
         if let Some(word) = p.heap.stack_get(index) {
             let address = word.tagged_word() as usize;
             if address == crate::native_bridge::native_trace_return_address() {
-                let function_pc = p
-                    .heap
-                    .stack_get(index + 2)
-                    .and_then(Term::as_small)
-                    .unwrap_or(0) as usize;
-                let action_count = p
-                    .heap
-                    .stack_get(index + 3)
-                    .and_then(Term::as_small)
-                    .and_then(|count| usize::try_from(count).ok())
-                    .unwrap_or(0);
-                let frame_words = 4usize.saturating_add(action_count.saturating_mul(2));
-                if let Some(function) = crate::native_function_at(function_pc) {
+                let (function_pc, actions, frame_words) =
+                    crate::trace::native_frame_actions(p, index + 2);
+                if let Some(function) = crate::native_function_at(function_pc)
+                    && let Some(trace_ctx) = ctx.as_deref_mut()
+                {
                     let class_reason = trace_class_reason(p, trap.class, trap.reason)?;
-                    for action_index in 0..action_count {
-                        let session = p
-                            .heap
-                            .stack_get(index + 4 + action_index * 2)
-                            .and_then(Term::as_small);
-                        let flags = p
-                            .heap
-                            .stack_get(index + 5 + action_index * 2)
-                            .and_then(Term::as_small);
-                        let (Some(session), Some(flags)) = (session, flags) else {
-                            continue;
-                        };
-                        crate::trace::native_return_event(
-                            p,
-                            &function,
-                            crate::trace::NativeTraceAction {
-                                session: session as u64,
-                                return_trace: flags & 1 != 0,
-                                exception_trace: flags & 2 != 0,
-                                return_to: flags & 4 != 0,
-                            },
-                            class_reason,
-                            true,
-                        );
-                    }
+                    crate::trace::native_return_events(
+                        vm,
+                        p,
+                        trace_ctx,
+                        &function,
+                        &actions,
+                        class_reason,
+                        true,
+                    )?;
                 }
+                return_to_sessions.extend(
+                    actions
+                        .iter()
+                        .filter(|action| action.return_to)
+                        .map(|action| action.session),
+                );
                 frame_start = index + frame_words;
                 index += frame_words;
                 continue;
@@ -715,8 +704,22 @@ pub(super) fn resume(
             && let Some(handler) =
                 crate::native_bridge::next_catch(p, trap.class, trap.reason, trace)
         {
-            if let crate::native_bridge::CatchHandler::Native(handler) = handler {
-                p.native_pc = Some(handler);
+            let target = match handler {
+                crate::native_bridge::CatchHandler::Native(handler) => {
+                    p.native_pc = Some(handler);
+                    crate::native_function_at(handler)
+                        .map(|function| (function.module, function.function, function.arity))
+                }
+                crate::native_bridge::CatchHandler::Interpreted => {
+                    vm.modules.get(p.module).and_then(|module| {
+                        module.function_at(p.ip).map(|(function, arity)| {
+                            (module.name.clone(), function.to_owned(), arity)
+                        })
+                    })
+                }
+            };
+            if let Some(trace_ctx) = ctx.as_deref_mut() {
+                crate::trace::unwound_return_to(vm, p, trace_ctx, &return_to_sessions, target)?;
             }
             return Ok(None);
         }
@@ -736,6 +739,11 @@ pub(super) fn resume(
             });
             if let Some((return_trace, _)) = special {
                 let width = if return_trace { 6 } else { 2 };
+                if !return_trace
+                    && let Some(session) = p.heap.stack_get(index + 1).and_then(Term::as_small)
+                {
+                    return_to_sessions.push(session as u64);
+                }
                 if return_trace
                     && let (
                         Some(frame_module),
@@ -750,7 +758,8 @@ pub(super) fn resume(
                         p.heap.stack_get(index + 4).and_then(Term::as_small),
                         p.heap.stack_get(index + 5).and_then(Term::as_small),
                     )
-                    && exception != 0
+                    && exception & 1 != 0
+                    && exception & 2 == 0
                     && let Some(trace_ctx) = ctx.as_deref_mut()
                 {
                     let class_reason = trace_class_reason(p, trap.class, trap.reason)?;
@@ -798,6 +807,16 @@ pub(super) fn resume(
         p.gc_live = 4;
         // mix_loop1: keep the class for a later raise/2. See Opcode::Raise.
         p.exc_class = Some(trap.class);
+        if !return_to_sessions.is_empty()
+            && let Some(trace_ctx) = ctx
+        {
+            let target = vm.modules.get(module).and_then(|loaded| {
+                loaded
+                    .function_at(ip)
+                    .map(|(function, arity)| (loaded.name.clone(), function.to_owned(), arity))
+            });
+            crate::trace::unwound_return_to(vm, p, trace_ctx, &return_to_sessions, target)?;
+        }
         return Ok(None);
     }
     if trap.class == Class::Throw {

@@ -12,14 +12,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-// Port of erts/emulator/beam/beam_bp.c:55-66 (ERTS_BPF_*), OTP-29.1.1. Call time, call memory
-// and debug breakpoints are not stored here: the first two are not supported, debug
-// breakpoints live in `debug_breakpoints`.
+// Port of erts/emulator/beam/beam_bp.c:55-66 (ERTS_BPF_*), OTP-29.1.1. Debug breakpoints are
+// not stored here, they live in `debug_breakpoints`.
 const BPF_LOCAL_TRACE: u32 = 0x01;
 const BPF_META_TRACE: u32 = 0x02;
 const BPF_COUNT: u32 = 0x04;
 const BPF_COUNT_ACTIVE: u32 = 0x08;
+const BPF_TIME_TRACE: u32 = 0x20;
+pub(crate) const BPF_TIME_TRACE_ACTIVE: u32 = 0x40;
 const BPF_GLOBAL_TRACE: u32 = 0x80;
+const BPF_MEM_TRACE: u32 = 0x100;
+pub(crate) const BPF_MEM_TRACE_ACTIVE: u32 = 0x200;
 const BPF_ALL: u32 = 0x3FF;
 
 /// Port of erts/emulator/beam/beam_bp.h:104-109 (enum erts_break_op), OTP-29.1.1.
@@ -39,6 +42,8 @@ pub(crate) struct TracePatternFlags {
     pub(crate) local: bool,
     pub(crate) meta: bool,
     pub(crate) call_count: bool,
+    pub(crate) call_time: bool,
+    pub(crate) call_memory: bool,
 }
 
 /// A function matched by a trace pattern (erts BpFunction).
@@ -102,17 +107,150 @@ impl MatchSpec {
     }
 }
 
+/// Port of erts/emulator/beam/beam_bp.h:63-66 (BpMetaTracer), OTP-29.1.1. Trace frames refer to
+/// it by `id`, a small integer in the meta range of the session ids, so a frame outlives the
+/// breakpoint like erts' copy of the tracer in the frame does.
+pub(crate) struct MetaTracer {
+    pub(crate) id: u64,
+    tracer: Mutex<crate::trace::Tracer>,
+}
+
+impl MetaTracer {
+    pub(crate) fn tracer(&self) -> crate::trace::Tracer {
+        self.tracer.lock().unwrap().clone()
+    }
+
+    /// The tracer module asked to remove the tracer (`am_remove`), or it is gone.
+    pub(crate) fn clear(&self) {
+        *self.tracer.lock().unwrap() = crate::trace::Tracer::Default;
+    }
+}
+
+/// First id of the meta tracer range: below the session range, above any counter.
+const META_ID_BASE: u64 = 1 << 57;
+
+/// Whether a trace frame's session id names a meta tracer.
+pub(crate) fn is_meta_id(id: u64) -> bool {
+    id & META_ID_BASE != 0 && id & (META_ID_BASE << 1) == 0
+}
+
+fn meta_registry() -> &'static Mutex<HashMap<u64, Arc<MetaTracer>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<MetaTracer>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn new_meta_tracer(tracer: crate::trace::Tracer) -> Arc<MetaTracer> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = META_ID_BASE | NEXT.fetch_add(1, Ordering::Relaxed);
+    let meta = Arc::new(MetaTracer {
+        id,
+        tracer: Mutex::new(tracer),
+    });
+    meta_registry().lock().unwrap().insert(id, meta.clone());
+    meta
+}
+
+/// The meta tracer a trace frame names.
+pub(crate) fn meta_tracer_by_id(id: u64) -> Option<Arc<MetaTracer>> {
+    meta_registry().lock().unwrap().get(&id).cloned()
+}
+
+/// Port of erts/emulator/beam/beam_bp.h:30-40 (bp_pid_timem_bucket_t, BpTimemTrace),
+/// OTP-29.1.1: per-process call count and accumulated time (nanoseconds) or memory (words)
+/// of one function. erts keeps one hash per scheduler to avoid contention; one lock suffices
+/// here.
+pub(crate) struct TimemTrace {
+    /// One bucket map per shard of the process table, like erts' hash per scheduler: processes
+    /// running in parallel do not contend on one lock.
+    shards: [Mutex<TimemInner>; TIMEM_SHARDS],
+}
+
+const TIMEM_SHARDS: usize = 16;
+
+struct TimemInner {
+    buckets: HashMap<Pid, (i64, i64), FastHash>,
+    /// Counting calls: cleared by `pause`, so no call a scheduler already saw as active is
+    /// counted after the pause returned (erts waits for thread progress instead).
+    counting: bool,
+}
+
+impl Default for TimemTrace {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| {
+                Mutex::new(TimemInner {
+                    buckets: HashMap::default(),
+                    counting: true,
+                })
+            }),
+        }
+    }
+}
+
+impl TimemTrace {
+    fn shard(&self, pid: Pid) -> &Mutex<TimemInner> {
+        &self.shards[crate::process::pid_table_index(pid) as usize % TIMEM_SHARDS]
+    }
+
+    // Port of erts/emulator/beam/beam_bp.c:1990-2008 (bp_hash_accum). A call (`count` of one) is
+    // dropped while the trace is paused.
+    fn accum(&self, pid: Pid, count: i64, accumulator: i64) {
+        let mut inner = self.shard(pid).lock().unwrap();
+        if count != 0 && !inner.counting {
+            return;
+        }
+        let bucket = inner.buckets.entry(pid).or_default();
+        bucket.0 += count;
+        bucket.1 += accumulator;
+    }
+
+    // Port of erts/emulator/beam/beam_bp.c:2012-2016 (bp_hash_reset); also resumes counting.
+    fn reset(&self) {
+        for shard in &self.shards {
+            let mut inner = shard.lock().unwrap();
+            inner.buckets.clear();
+            inner.counting = true;
+        }
+    }
+
+    fn pause(&self) {
+        for shard in &self.shards {
+            shard.lock().unwrap().counting = false;
+        }
+    }
+
+    /// `(pid, count, accumulator)` of every process that called the function.
+    pub(crate) fn snapshot(&self) -> Vec<(Pid, i64, i64)> {
+        self.shards
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .lock()
+                    .unwrap()
+                    .buckets
+                    .iter()
+                    .map(|(pid, (count, accumulator))| (*pid, *count, *accumulator))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+}
+
 /// Port of erts/emulator/beam/beam_bp.h:75-83 (GenericBpData), OTP-29.1.1.
 #[derive(Clone, Default)]
 struct GenericBpData {
     flags: u32,
     local_ms: Option<Arc<MatchSpec>>,
     meta_ms: Option<Arc<MatchSpec>>,
+    meta_tracer: Option<Arc<MetaTracer>>,
     count: Option<Arc<AtomicU64>>,
+    time: Option<Arc<TimemTrace>>,
+    memory: Option<Arc<TimemTrace>>,
 }
 
 /// Port of erts/emulator/beam/beam_bp.h:85-94 (GenericBp), OTP-29.1.1: one per trace session
 /// and function. Runtime and code scope tag the VM instance the function belongs to.
+#[derive(Clone)]
 struct GenericBp {
     runtime: usize,
     code: u64,
@@ -120,13 +258,102 @@ struct GenericBp {
     data: [GenericBpData; 2],
 }
 
+/// A small, fast hasher for the short keys of the traced call path (FNV-1a); the table is not
+/// exposed to untrusted keys that could collide on purpose.
+#[derive(Default)]
+pub(crate) struct FnvHasher(u64);
+
+impl std::hash::Hasher for FnvHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub(crate) type FastHash = std::hash::BuildHasherDefault<FnvHasher>;
+
 /// The breakpoints of one function, by module, name and arity; borrowed-key lookups keep the
 /// traced call path allocation free.
-type BpTable = HashMap<String, HashMap<String, HashMap<u8, Vec<GenericBp>>>>;
+type BpTable =
+    HashMap<String, HashMap<String, HashMap<u8, Vec<GenericBp>, FastHash>, FastHash>, FastHash>;
 
-fn breakpoints() -> &'static RwLock<BpTable> {
-    static TABLE: OnceLock<RwLock<BpTable>> = OnceLock::new();
-    TABLE.get_or_init(|| RwLock::new(HashMap::new()))
+/// The breakpoint table as readers see it: an immutable snapshot that writers replace
+/// wholesale. Calls only clone the snapshot pointer, so a writer building a new table (which
+/// can take milliseconds with a breakpoint on every function) never stalls running processes.
+// Port of the idea of erts/emulator/beam/beam_bp.c (staging and active breakpoint indices,
+// writers publish with a code barrier, readers never lock), OTP-29.1.1.
+struct BpTables {
+    current: RwLock<Arc<BpTable>>,
+    writer: Mutex<()>,
+}
+
+impl BpTables {
+    fn read(&self) -> std::sync::LockResult<Arc<BpTable>> {
+        Ok(self.current.read().unwrap().clone())
+    }
+
+    /// A copy-on-write handle: the table is copied when first modified and published when the
+    /// handle is dropped; handles are serialized.
+    fn write(&self) -> std::sync::LockResult<BpWriteGuard<'_>> {
+        let guard = self.writer.lock().unwrap();
+        let base = self.current.read().unwrap().clone();
+        Ok(BpWriteGuard {
+            tables: self,
+            _guard: guard,
+            base,
+            copy: None,
+        })
+    }
+}
+
+struct BpWriteGuard<'a> {
+    tables: &'a BpTables,
+    _guard: std::sync::MutexGuard<'a, ()>,
+    base: Arc<BpTable>,
+    copy: Option<BpTable>,
+}
+
+impl std::ops::Deref for BpWriteGuard<'_> {
+    type Target = BpTable;
+
+    fn deref(&self) -> &BpTable {
+        self.copy.as_ref().unwrap_or(&self.base)
+    }
+}
+
+impl std::ops::DerefMut for BpWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut BpTable {
+        let base = &self.base;
+        self.copy.get_or_insert_with(|| (**base).clone())
+    }
+}
+
+impl Drop for BpWriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(copy) = self.copy.take() {
+            *self.tables.current.write().unwrap() = Arc::new(copy);
+        }
+    }
+}
+
+fn breakpoints() -> &'static BpTables {
+    static TABLE: OnceLock<BpTables> = OnceLock::new();
+    TABLE.get_or_init(|| BpTables {
+        current: RwLock::new(Arc::new(HashMap::default())),
+        writer: Mutex::new(()),
+    })
 }
 
 /// Port of erts/emulator/beam/beam_bp.h:230-238 (erts_active_bp_ix, erts_staging_bp_ix),
@@ -167,6 +394,7 @@ fn code_scope(process: &Process) -> u64 {
 }
 
 fn update_active(table: &BpTable) {
+    BP_EPOCH.fetch_add(1, Ordering::AcqRel);
     active().store(
         table
             .values()
@@ -201,14 +429,15 @@ pub(crate) fn module_code_changed(code: u64, module: &str) {
     update_active(&table);
 }
 
-/// Port of erts/emulator/beam/beam_bp.c (set_function_break), OTP-29.1.1, for the staging
-/// copy of one session's breakpoint of one function.
+/// Port of erts/emulator/beam/beam_bp.c:2145-2295 (set_function_break), OTP-29.1.1, for the
+/// staging copy of one session's breakpoint of one function.
 fn set_function_break(
     bps: &mut Vec<GenericBp>,
     tag: (usize, u64, u64),
     match_spec: Option<&Arc<MatchSpec>>,
     break_flags: u32,
     count_op: BreakOp,
+    tracer: Option<&crate::trace::Tracer>,
 ) {
     let ix = staging_bp_ix();
     let (runtime, code, session) = tag;
@@ -238,7 +467,12 @@ fn set_function_break(
     };
     let bp = &mut bps[index].data[ix];
     let common = break_flags & bp.flags;
-    if common & BPF_COUNT != 0 {
+    // Only one kind of breakpoint is set per call, so the chain mirrors erts' else-if.
+    if common & (BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE) != 0 {
+        // The old match specification is replaced below.
+    } else if common & BPF_META_TRACE != 0 {
+        // The old match specification and tracer are replaced below.
+    } else if common & BPF_COUNT != 0 {
         if count_op == BreakOp::Pause {
             bp.flags &= !BPF_COUNT_ACTIVE;
         } else {
@@ -248,18 +482,49 @@ fn set_function_break(
             }
         }
         return;
+    } else if common & BPF_TIME_TRACE != 0 {
+        if count_op == BreakOp::Pause {
+            bp.flags &= !BPF_TIME_TRACE_ACTIVE;
+            if let Some(time) = &bp.time {
+                time.pause();
+            }
+        } else {
+            bp.flags |= BPF_TIME_TRACE_ACTIVE;
+            if let Some(time) = &bp.time {
+                time.reset();
+            }
+        }
+        return;
+    } else if common & BPF_MEM_TRACE != 0 {
+        if count_op == BreakOp::Pause {
+            bp.flags &= !BPF_MEM_TRACE_ACTIVE;
+            if let Some(memory) = &bp.memory {
+                memory.pause();
+            }
+        } else {
+            bp.flags |= BPF_MEM_TRACE_ACTIVE;
+            if let Some(memory) = &bp.memory {
+                memory.reset();
+            }
+        }
+        return;
     }
     if break_flags & (BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE) != 0 {
         bp.local_ms = match_spec.cloned();
     } else if break_flags & BPF_META_TRACE != 0 {
         bp.meta_ms = match_spec.cloned();
+        bp.meta_tracer = Some(new_meta_tracer(tracer.cloned().unwrap_or_default()));
     } else if break_flags & BPF_COUNT != 0 {
         bp.count = Some(Arc::new(AtomicU64::new(0)));
+    } else if break_flags & BPF_TIME_TRACE != 0 {
+        bp.time = Some(Arc::new(TimemTrace::default()));
+    } else if break_flags & BPF_MEM_TRACE != 0 {
+        bp.memory = Some(Arc::new(TimemTrace::default()));
     }
     bp.flags |= break_flags;
 }
 
-/// Port of erts/emulator/beam/beam_bp.c (clear_function_break_session), OTP-29.1.1.
+/// Port of erts/emulator/beam/beam_bp.c:2332-2362 (clear_function_break_session), OTP-29.1.1.
 fn clear_function_break(bps: &mut [GenericBp], tag: (usize, u64, u64), break_flags: u32) {
     let ix = staging_bp_ix();
     let (runtime, code, session) = tag;
@@ -275,14 +540,25 @@ fn clear_function_break(bps: &mut [GenericBp], tag: (usize, u64, u64), break_fla
         return;
     }
     bp.flags &= !break_flags;
-    if common & (BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE) != 0 {
+    // erts keeps the global trace's match specification in the export entry, apart from the
+    // code breakpoint's; here both live in one field, which stays while the other kind is set.
+    if common & (BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE) != 0
+        && bp.flags & (BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE) == 0
+    {
         bp.local_ms = None;
     }
     if common & BPF_META_TRACE != 0 {
         bp.meta_ms = None;
+        bp.meta_tracer = None;
     }
     if common & BPF_COUNT != 0 {
         bp.count = None;
+    }
+    if common & BPF_TIME_TRACE != 0 {
+        bp.time = None;
+    }
+    if common & BPF_MEM_TRACE != 0 {
+        bp.memory = None;
     }
 }
 
@@ -343,16 +619,20 @@ fn commit_and_consolidate(table: &mut BpTable, functions: &[BpFunction]) {
 
 /// Set or clear the breakpoints of one session in the matched functions.
 // Port of erts/emulator/beam/erl_bif_trace.c:2621-2725 (erts_set_trace_pattern), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)] // The arguments of erts_set_trace_pattern.
 pub(crate) fn set_trace_pattern(
     process: &Process,
     session: u64,
     functions: &[BpFunction],
     match_spec: Option<OwnedTerm>,
+    meta_match_spec: Option<OwnedTerm>,
     on: BreakOp,
     flags: TracePatternFlags,
+    meta_tracer: &crate::trace::Tracer,
 ) {
     let tag = (scope(process), code_scope(process), session);
     let match_spec = match_spec.map(|source| Arc::new(MatchSpec::new(source)));
+    let meta_match_spec = meta_match_spec.map(|source| Arc::new(MatchSpec::new(source)));
     let mut table = breakpoints().write().unwrap();
     // First the code breakpoints ("local" tracing).
     for function in functions {
@@ -373,13 +653,41 @@ pub(crate) fn set_trace_pattern(
                         match_spec.as_ref(),
                         BPF_LOCAL_TRACE,
                         BreakOp::Nop,
+                        None,
                     );
                 }
                 if flags.meta {
-                    set_function_break(bps, tag, match_spec.as_ref(), BPF_META_TRACE, BreakOp::Nop);
+                    set_function_break(
+                        bps,
+                        tag,
+                        meta_match_spec.as_ref(),
+                        BPF_META_TRACE,
+                        BreakOp::Nop,
+                        Some(meta_tracer),
+                    );
                 }
                 if flags.call_count {
-                    set_function_break(bps, tag, None, BPF_COUNT | BPF_COUNT_ACTIVE, on);
+                    set_function_break(bps, tag, None, BPF_COUNT | BPF_COUNT_ACTIVE, on, None);
+                }
+                if flags.call_time {
+                    set_function_break(
+                        bps,
+                        tag,
+                        None,
+                        BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE,
+                        on,
+                        None,
+                    );
+                }
+                if flags.call_memory {
+                    set_function_break(
+                        bps,
+                        tag,
+                        None,
+                        BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE,
+                        on,
+                        None,
+                    );
                 }
             }
         } else {
@@ -391,6 +699,12 @@ pub(crate) fn set_trace_pattern(
             }
             if flags.call_count {
                 clear_function_break(bps, tag, BPF_COUNT | BPF_COUNT_ACTIVE);
+            }
+            if flags.call_time {
+                clear_function_break(bps, tag, BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE);
+            }
+            if flags.call_memory {
+                clear_function_break(bps, tag, BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE);
             }
         }
     }
@@ -409,6 +723,7 @@ pub(crate) fn set_trace_pattern(
                 match_spec.as_ref(),
                 BPF_GLOBAL_TRACE,
                 BreakOp::Nop,
+                None,
             );
         } else if on == BreakOp::Nop && flags.breakpoint {
             // Turning off breakpoint tracing leaves global tracing alone.
@@ -444,26 +759,22 @@ pub(crate) fn clear_session(process: &Process, session: u64) {
         .remove(&(runtime, session));
 }
 
-/// The trace data of one session's breakpoint that fires on a call.
-pub(crate) struct Pattern {
+/// The active breakpoint data of one session in a function that is called.
+pub(crate) struct Hit {
     pub(crate) session: u64,
-    pub(crate) match_spec: Option<Arc<MatchSpec>>,
+    pub(crate) flags: u32,
+    pub(crate) count: Option<Arc<AtomicU64>>,
+    pub(crate) local_ms: Option<Arc<MatchSpec>>,
+    pub(crate) meta_ms: Option<Arc<MatchSpec>>,
+    pub(crate) meta_tracer: Option<Arc<MetaTracer>>,
+    pub(crate) time: Option<Arc<TimemTrace>>,
+    pub(crate) memory: Option<Arc<TimemTrace>>,
 }
 
-/// The sessions tracing a call: local (code breakpoint) or global (export) call trace.
-// Port of erts/emulator/beam/beam_bp.c:1017-1060 (do_session_breakpoint), OTP-29.1.1.
-pub(crate) fn matching(
-    process: &Process,
-    module: &str,
-    function: &str,
-    arity: u8,
-    local: bool,
-) -> Vec<Pattern> {
-    let wanted = if local {
-        BPF_LOCAL_TRACE
-    } else {
-        BPF_GLOBAL_TRACE
-    };
+/// The sessions with a breakpoint in a function.
+// Port of erts/emulator/beam/beam_bp.c:994-1015 (erts_generic_breakpoint, the GenericBp loop),
+// OTP-29.1.1.
+pub(crate) fn hits(process: &Process, module: &str, function: &str, arity: u8) -> Vec<Hit> {
     let table = breakpoints().read().unwrap();
     let ix = active_bp_ix();
     function_bps(
@@ -474,12 +785,93 @@ pub(crate) fn matching(
         function,
         arity,
     )
-    .filter(|g| g.data[ix].flags & wanted != 0)
-    .map(|g| Pattern {
-        session: g.session,
-        match_spec: g.data[ix].local_ms.clone(),
+    .filter(|g| g.data[ix].flags != 0)
+    .map(|g| {
+        let data = &g.data[ix];
+        Hit {
+            session: g.session,
+            flags: data.flags,
+            count: if data.flags & BPF_COUNT_ACTIVE != 0 {
+                data.count.clone()
+            } else {
+                None
+            },
+            local_ms: data.local_ms.clone(),
+            meta_ms: data.meta_ms.clone(),
+            meta_tracer: data.meta_tracer.clone(),
+            time: data.time.clone(),
+            memory: data.memory.clone(),
+        }
     })
     .collect()
+}
+
+/// `Hit::flags` bits: global call trace of the export entry.
+pub(crate) const HIT_GLOBAL: u32 = BPF_GLOBAL_TRACE;
+/// `Hit::flags` bits: local call trace of the code breakpoint.
+pub(crate) const HIT_LOCAL: u32 = BPF_LOCAL_TRACE;
+/// `Hit::flags` bits: meta trace.
+pub(crate) const HIT_META: u32 = BPF_META_TRACE;
+/// `Hit::flags` bits: an active call counter.
+pub(crate) const HIT_COUNT_ACTIVE: u32 = BPF_COUNT_ACTIVE;
+
+/// Whether a call of the function would do nothing for this process: every breakpoint on it is
+/// a call trace of a session that does not trace the process' calls (erts_generic_breakpoint
+/// then only skips the session).
+// Port of erts/emulator/beam/beam_bp.c:1017-1060 (do_session_breakpoint), OTP-29.1.1.
+pub(crate) fn is_inert(
+    process: &Process,
+    pid: Pid,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> bool {
+    if debug_breakpoint_enabled(process, module, function, arity)
+        || crate::trace::return_to_enabled(process)
+    {
+        return false;
+    }
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    let acc = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
+    function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        module,
+        function,
+        arity,
+    )
+    .all(|g| {
+        let flags = g.data[ix].flags;
+        let session_calls = BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE | acc;
+        flags & !session_calls & (BPF_META_TRACE | BPF_COUNT_ACTIVE) == 0
+            && (flags & session_calls == 0
+                || crate::trace::session_flags(process, g.session, pid) & crate::trace::CALL == 0)
+    })
+}
+
+/// The functions among `functions` that have a breakpoint of any session: clearing, pausing or
+/// restarting a breakpoint only concerns them.
+pub(crate) fn with_breakpoints(process: &Process, functions: Vec<BpFunction>) -> Vec<BpFunction> {
+    let table = breakpoints().read().unwrap();
+    let runtime = scope(process);
+    let code = code_scope(process);
+    functions
+        .into_iter()
+        .filter(|function| {
+            function_bps(
+                &table,
+                runtime,
+                code,
+                &function.module,
+                &function.function,
+                function.arity,
+            )
+            .next()
+            .is_some()
+        })
+        .collect()
 }
 
 /// True while some runtime holds a function breakpoint; keeps untraced BIF calls on the fast path.
@@ -526,26 +918,47 @@ pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: 
     }
 }
 
-pub(crate) fn info(
-    process: &Process,
-    module: &str,
-    function: &str,
-    arity: u8,
-    item: &str,
-) -> Option<OwnedTerm> {
-    info_session(process, 0, module, function, arity, item)
+/// What `trace_info` reports about one function of one session.
+pub(crate) struct FunctionInfo {
+    /// Breakpoint flags of the session restricted to the ones the key asks for.
+    pub(crate) got: u32,
+    pub(crate) local_ms: Option<OwnedTerm>,
+    pub(crate) meta_ms: Option<OwnedTerm>,
+    pub(crate) meta: crate::trace::Tracer,
+    pub(crate) count: u64,
+    /// `(pid, count, nanoseconds)` per process, when call_time is set.
+    pub(crate) time: Option<Vec<(Pid, i64, i64)>>,
+    /// `(pid, count, words)` per process, when call_memory is set.
+    pub(crate) memory: Option<Vec<(Pid, i64, i64)>>,
+    /// An active call_time or call_memory counter was asked for: erts traps the caller until
+    /// the schedulers have stopped touching the counters.
+    pub(crate) counters_active: bool,
 }
 
-pub(crate) fn info_session(
+/// `want` bits of `function_info`.
+pub(crate) const WANT_TRACE: u32 = BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE;
+pub(crate) const WANT_META: u32 = BPF_META_TRACE;
+pub(crate) const WANT_COUNT: u32 = BPF_COUNT;
+pub(crate) const WANT_TIME: u32 = BPF_TIME_TRACE;
+pub(crate) const WANT_MEMORY: u32 = BPF_MEM_TRACE;
+pub(crate) const GOT_GLOBAL: u32 = BPF_GLOBAL_TRACE;
+pub(crate) const GOT_LOCAL: u32 = BPF_LOCAL_TRACE;
+pub(crate) const GOT_META: u32 = BPF_META_TRACE;
+pub(crate) const GOT_COUNT: u32 = BPF_COUNT;
+pub(crate) const GOT_TIME: u32 = BPF_TIME_TRACE;
+pub(crate) const GOT_MEMORY: u32 = BPF_MEM_TRACE;
+
+// Port of erts/emulator/beam/erl_bif_trace.c:1793-1850 (function_is_traced) and
+// erts/emulator/beam/beam_bp.c:1418-1486 (erts_is_trace_break, erts_is_mtrace_break,
+// erts_is_count_break, erts_is_time_break, erts_is_memory_break), OTP-29.1.1.
+pub(crate) fn function_info(
     process: &Process,
     session: u64,
     module: &str,
     function: &str,
     arity: u8,
-    item: &str,
-) -> Option<OwnedTerm> {
-    // Port of erts/emulator/beam/erl_bif_trace.c:1793-1850 (function_is_traced) and
-    // 2132-2230 (trace_info_func_epilogue), OTP-29.1.1.
+    want: u32,
+) -> FunctionInfo {
     let table = breakpoints().read().unwrap();
     let ix = active_bp_ix();
     let bp = function_bps(
@@ -560,57 +973,34 @@ pub(crate) fn info_session(
     .map(|g| g.data[ix].clone())
     .unwrap_or_default();
     drop(table);
-    let false_atom = || OwnedTerm::Atom("false".into());
-    let traced = || {
-        if bp.flags & BPF_GLOBAL_TRACE != 0 {
-            OwnedTerm::Atom("global".into())
-        } else if bp.flags & BPF_LOCAL_TRACE != 0 {
-            OwnedTerm::Atom("local".into())
-        } else {
-            false_atom()
-        }
-    };
-    // An untraced function reports `{match_spec, false}`; a traced one without a match
-    // specification reports `[]`.
-    let match_spec = || {
-        if bp.flags & (BPF_GLOBAL_TRACE | BPF_LOCAL_TRACE) != 0 {
-            bp.local_ms
-                .as_deref()
-                .map_or(OwnedTerm::Nil, |spec| spec.source.clone())
-        } else {
-            false_atom()
-        }
-    };
-    let call_count = || match &bp.count {
-        Some(count) if bp.flags & BPF_COUNT != 0 => {
-            OwnedTerm::Int(count.load(Ordering::Relaxed) as i64)
-        }
-        _ => false_atom(),
-    };
-    match item {
-        "traced" => Some(traced()),
-        "match_spec" => Some(match_spec()),
-        "meta" | "meta_match_spec" | "call_memory" | "call_time" => Some(false_atom()),
-        "call_count" => Some(call_count()),
-        "all" => {
-            let values = [
-                ("traced", traced()),
-                ("match_spec", match_spec()),
-                ("meta", false_atom()),
-                ("meta_match_spec", false_atom()),
-                ("call_memory", false_atom()),
-                ("call_time", false_atom()),
-                ("call_count", call_count()),
-            ];
-            Some(OwnedTerm::List {
-                elems: values
-                    .into_iter()
-                    .map(|(key, value)| OwnedTerm::Tuple(vec![OwnedTerm::Atom(key.into()), value]))
-                    .collect(),
-                tail: Box::new(OwnedTerm::Nil),
-            })
-        }
-        _ => None,
+    let mut got = bp.flags & want;
+    if got & BPF_GLOBAL_TRACE != 0 {
+        got = BPF_GLOBAL_TRACE;
+    }
+    let source = |spec: &Option<Arc<MatchSpec>>| spec.as_deref().map(|spec| spec.source.clone());
+    FunctionInfo {
+        got,
+        counters_active: bp.flags
+            & ((BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE)
+                & ((want & BPF_TIME_TRACE) << 1 | (want & BPF_MEM_TRACE) << 1))
+            != 0,
+        local_ms: source(&bp.local_ms),
+        meta_ms: source(&bp.meta_ms),
+        meta: bp
+            .meta_tracer
+            .as_ref()
+            .map(|meta| meta.tracer())
+            .unwrap_or_default(),
+        count: bp
+            .count
+            .as_ref()
+            .map_or(0, |count| count.load(Ordering::Relaxed)),
+        time: (got & BPF_TIME_TRACE != 0)
+            .then(|| bp.time.as_ref().map(|bdt| bdt.snapshot()))
+            .flatten(),
+        memory: (got & BPF_MEM_TRACE != 0)
+            .then(|| bp.memory.as_ref().map(|bdt| bdt.snapshot()))
+            .flatten(),
     }
 }
 
@@ -700,12 +1090,15 @@ fn clear_scope(runtime: usize) {
 
 /// Session state of `trace_pattern(on_load, ...)`: the pattern applied to every module when it
 /// is loaded.
-// Port of erts/emulator/beam/erl_bif_trace.c:2523-2603 (change_on_load_trace_pattern), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_bif_trace.c:2523-2603 (change_on_load_trace_pattern) and
+// erts/emulator/beam/erl_trace.h (ErtsTraceSession on_load_* fields), OTP-29.1.1.
 #[derive(Clone, Default)]
 pub(crate) struct OnLoadPattern {
-    /// Subset of `local`, `call_count`; empty means a global call trace.
-    pub flags: Vec<String>,
+    pub is_on: bool,
+    pub flags: TracePatternFlags,
     pub match_spec: Option<OwnedTerm>,
+    pub meta_match_spec: Option<OwnedTerm>,
+    pub meta_tracer: crate::trace::Tracer,
 }
 
 fn on_load_patterns() -> &'static Mutex<HashMap<(usize, u64), OnLoadPattern>> {
@@ -713,64 +1106,83 @@ fn on_load_patterns() -> &'static Mutex<HashMap<(usize, u64), OnLoadPattern>> {
     ON_LOAD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Apply `trace_pattern(on_load, ...)` to a session. `on` is false for a `false` pattern.
+/// Apply `trace_pattern(on_load, ...)` to a session.
 pub(crate) fn change_on_load(
     process: &Process,
     session: u64,
-    on: bool,
-    flags: &[String],
+    on: BreakOp,
+    mut flags: TracePatternFlags,
     match_spec: Option<OwnedTerm>,
+    meta_tracer: &crate::trace::Tracer,
 ) {
-    let breakpoint = |names: &[String]| names.iter().any(|n| n == "local" || n == "call_count");
-    let key = (scope(process), session);
     let mut map = on_load_patterns().lock().unwrap();
-    let new_flags: Vec<String> = flags.iter().filter(|n| *n != "global").cloned().collect();
-    let new_breakpoint = breakpoint(&new_flags);
-    let Some(current) = map.get_mut(&key) else {
-        // Off -> on; turning an absent pattern off changes nothing.
-        if on {
-            map.insert(
-                key,
-                OnLoadPattern {
-                    flags: new_flags,
-                    match_spec,
-                },
-            );
-        }
-        return;
-    };
-    let current_breakpoint = breakpoint(&current.flags);
-    if current_breakpoint && new_breakpoint {
-        // Breakpoint trace -> breakpoint trace: merge or subtract the flags.
-        if on {
-            for name in new_flags {
-                if !current.flags.contains(&name) {
-                    current.flags.push(name);
-                }
-            }
-        } else {
-            current.flags.retain(|name| !new_flags.contains(name));
-            if !breakpoint(&current.flags) {
-                map.remove(&key);
-                return;
-            }
-        }
-        if flags.iter().any(|n| n == "local") || !flags.iter().any(|n| n == "call_count") {
-            current.match_spec = match_spec;
-        }
-    } else if !current_breakpoint && !new_breakpoint {
-        if on {
-            current.match_spec = match_spec;
-        } else {
-            map.remove(&key);
-        }
-    } else if on {
-        // Switching between global and breakpoint trace replaces the pattern.
-        *current = OnLoadPattern {
-            flags: new_flags,
-            match_spec,
-        };
+    let s = map.entry((scope(process), session)).or_default();
+    if flags.local || !flags.breakpoint {
+        s.match_spec = match_spec.clone();
     }
+    if flags.meta {
+        s.meta_match_spec = match_spec;
+        s.meta_tracer = meta_tracer.clone();
+    } else if !flags.breakpoint {
+        s.meta_match_spec = None;
+        s.meta_tracer = crate::trace::Tracer::Default;
+    }
+    let on_set = on == BreakOp::Set;
+    let on_any = on != BreakOp::Nop;
+    if s.flags.breakpoint && flags.breakpoint {
+        // Breakpoint trace -> breakpoint trace.
+        if on_any {
+            s.flags.local |= flags.local;
+            s.flags.meta |= flags.meta;
+            s.flags.call_count |= on_set && flags.call_count;
+            s.flags.call_time |= on_set && flags.call_time;
+            s.flags.call_memory |= on_set && flags.call_memory;
+        } else {
+            s.flags.local &= !flags.local;
+            s.flags.meta &= !flags.meta;
+            s.flags.call_count &= !flags.call_count;
+            s.flags.call_time &= !flags.call_time;
+            s.flags.call_memory &= !flags.call_memory;
+            s.flags.breakpoint = s.flags.local
+                | s.flags.meta
+                | s.flags.call_count
+                | s.flags.call_time
+                | s.flags.call_memory;
+            if !s.flags.breakpoint {
+                s.is_on = on_any;
+            }
+        }
+    } else if !s.flags.breakpoint && !flags.breakpoint {
+        // Global call trace -> global call trace.
+        s.is_on = on_any;
+    } else if s.flags.breakpoint && !flags.breakpoint {
+        // Breakpoint trace -> global call trace.
+        if on_any {
+            s.flags = flags;
+            s.is_on = on_any;
+        }
+    } else if on_any {
+        // Global call trace -> breakpoint trace.
+        if !on_set {
+            flags.call_count = false;
+            flags.call_time = false;
+            flags.call_memory = false;
+        }
+        flags.breakpoint =
+            flags.local | flags.meta | flags.call_count | flags.call_time | flags.call_memory;
+        s.flags = flags;
+        s.is_on = flags.breakpoint;
+    }
+}
+
+/// Whether any session of this runtime has an active on_load pattern.
+pub(crate) fn any_on_load_pattern(process: &Process) -> bool {
+    let runtime = scope(process);
+    on_load_patterns()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|((owner, _), pattern)| *owner == runtime && pattern.is_on)
 }
 
 pub(crate) fn on_load_pattern(process: &Process, session: u64) -> Option<OnLoadPattern> {
@@ -778,6 +1190,7 @@ pub(crate) fn on_load_pattern(process: &Process, session: u64) -> Option<OnLoadP
         .lock()
         .unwrap()
         .get(&(scope(process), session))
+        .filter(|pattern| pattern.is_on)
         .cloned()
 }
 
@@ -788,7 +1201,7 @@ pub(crate) fn on_load_patterns_of(process: &Process) -> Vec<(u64, OnLoadPattern)
         .lock()
         .unwrap()
         .iter()
-        .filter(|((owner, _), _)| *owner == runtime)
+        .filter(|((owner, _), pattern)| *owner == runtime && pattern.is_on)
         .map(|((_, session), pattern)| (*session, pattern.clone()))
         .collect()
 }
@@ -940,4 +1353,262 @@ pub(crate) fn line_breakpoint_enabled(process: &Process, module_id: usize, line:
         .get(&(scope(process), module_id, line))
         .copied()
         .unwrap_or(false)
+}
+
+/// Per-process call time or call memory state of one session.
+// Port of erts/emulator/beam/beam_bp.h:75-83 (process_breakpoint_trace_t), OTP-29.1.1. `ci` names
+// the function that currently accumulates, by id (`func_id`).
+#[derive(Clone)]
+pub(crate) struct ProcBpTrace {
+    pub(crate) session: u64,
+    pub(crate) ci: Option<u32>,
+    pub(crate) accumulator: i64,
+    /// Adjustment for GC and messages on the heap (call_memory only).
+    pub(crate) allocated: i64,
+    /// The counters of function `.0` as of breakpoint epoch `.2`: a tight loop of calls would
+    /// otherwise look the same function up by name on every call and return.
+    cache: Option<(u32, u64, Arc<TimemTrace>)>,
+}
+
+/// Incremented whenever breakpoints change; invalidates `ProcBpTrace::cache`.
+static BP_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+type FuncName = (String, String, u8);
+
+/// Function ids: nested by name so a lookup does not allocate.
+#[derive(Default)]
+struct FuncIds {
+    names: Vec<FuncName>,
+    ids: HashMap<String, FunctionIds, FastHash>,
+}
+
+type FunctionIds = HashMap<String, HashMap<u8, u32, FastHash>, FastHash>;
+
+fn func_ids() -> &'static RwLock<FuncIds> {
+    static IDS: OnceLock<RwLock<FuncIds>> = OnceLock::new();
+    IDS.get_or_init(|| RwLock::new(FuncIds::default()))
+}
+
+/// A small id of a function, stored in trace frames in place of erts' `ErtsCodeInfo` pointer.
+pub(crate) fn func_id(module: &str, function: &str, arity: u8) -> u32 {
+    if let Some(id) = func_ids()
+        .read()
+        .unwrap()
+        .ids
+        .get(module)
+        .and_then(|functions| functions.get(function))
+        .and_then(|arities| arities.get(&arity))
+    {
+        return *id;
+    }
+    let mut ids = func_ids().write().unwrap();
+    let id = ids.names.len() as u32;
+    ids.names
+        .push((module.to_owned(), function.to_owned(), arity));
+    ids.ids
+        .entry(module.to_owned())
+        .or_default()
+        .entry(function.to_owned())
+        .or_default()
+        .insert(arity, id);
+    id
+}
+
+fn func_name(id: u32) -> Option<FuncName> {
+    func_ids().read().unwrap().names.get(id as usize).cloned()
+}
+
+// Port of erts/emulator/beam/beam_bp.c:2410-2442 (get_time_break, get_memory_break,
+// check_break), OTP-29.1.1.
+fn timem_break(process: &Process, session: u64, id: u32, memory: bool) -> Option<Arc<TimemTrace>> {
+    let (module, function, arity) = func_name(id)?;
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    let bp = function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        &module,
+        &function,
+        arity,
+    )
+    .find(|g| g.session == session)
+    .map(|g| &g.data[ix])?;
+    if memory {
+        (bp.flags & BPF_MEM_TRACE != 0).then(|| bp.memory.clone())?
+    } else {
+        (bp.flags & BPF_TIME_TRACE != 0).then(|| bp.time.clone())?
+    }
+}
+
+/// The call time or memory counters of function `id`, from the session's per-process cache.
+fn cached_timem_break(
+    process: &mut Process,
+    session: u64,
+    id: u32,
+    memory: bool,
+) -> Option<Arc<TimemTrace>> {
+    let epoch = BP_EPOCH.load(Ordering::Acquire);
+    if let Some((cached_id, cached_epoch, bdt)) = pbt_list(process, memory)
+        .iter()
+        .find(|pbt| pbt.session == session)
+        .and_then(|pbt| pbt.cache.as_ref())
+        && *cached_id == id
+        && *cached_epoch == epoch
+    {
+        return Some(bdt.clone());
+    }
+    let found = timem_break(process, session, id, memory)?;
+    if let Some(pbt) = pbt_list(process, memory)
+        .iter_mut()
+        .find(|pbt| pbt.session == session)
+    {
+        pbt.cache = Some((id, epoch, found.clone()));
+    }
+    Some(found)
+}
+
+fn pbt_list(process: &mut Process, memory: bool) -> &mut Vec<ProcBpTrace> {
+    let cold = process.cold_mut();
+    if memory {
+        &mut cold.call_memory
+    } else {
+        &mut cold.call_time
+    }
+}
+
+/// The adjustment the session's `call_memory` state holds, `None` before its first call.
+pub(crate) fn call_memory_adjustment(process: &mut Process, session: u64) -> Option<i64> {
+    pbt_list(process, true)
+        .iter()
+        .find(|pbt| pbt.session == session)
+        .map(|pbt| pbt.allocated)
+}
+
+/// Account a call of `ci` and the time or memory used since the previous call; returns the
+/// function the process was accounted to before.
+// Port of erts/emulator/beam/beam_bp.c:1277-1334 (erts_trace_call_acc), OTP-29.1.1.
+pub(crate) fn trace_call_acc(
+    process: &mut Process,
+    pid: Pid,
+    session: u64,
+    memory: bool,
+    ci: u32,
+    accum: i64,
+    bdt: &TimemTrace,
+) -> Option<u32> {
+    let known = pbt_list(process, memory)
+        .iter()
+        .find(|pbt| pbt.session == session)
+        .map(|pbt| (pbt.ci, pbt.accumulator));
+    match known {
+        None => {
+            // First call of the process to an instrumented function.
+            pbt_list(process, memory).push(ProcBpTrace {
+                session,
+                ci: None,
+                accumulator: 0,
+                allocated: 0,
+                cache: None,
+            });
+        }
+        Some((Some(previous), accumulator)) => {
+            // Add time/allocation to the previous code; none if its breakpoint was removed.
+            if let Some(previous_bdt) = cached_timem_break(process, session, previous, memory) {
+                previous_bdt.accum(pid, 0, accum - accumulator);
+            }
+        }
+        // The caller is not call_time traced.
+        Some((None, _)) => {}
+    }
+    bdt.accum(pid, 1, 0);
+    let pbt = pbt_list(process, memory)
+        .iter_mut()
+        .find(|pbt| pbt.session == session)
+        .expect("pbt exists");
+    let prev = pbt.ci.replace(ci);
+    pbt.accumulator = accum;
+    prev
+}
+
+/// The frame of a traced call returns: account the time or memory to the function entered
+/// from.
+// Port of erts/emulator/beam/beam_bp.c:1352-1415 (erts_call_trace_return), OTP-29.1.1.
+pub(crate) fn call_trace_return(
+    process: &mut Process,
+    pid: Pid,
+    session: u64,
+    bp_flags: u32,
+    prev: Option<u32>,
+) {
+    if bp_flags & BPF_TIME_TRACE_ACTIVE != 0 {
+        let found = pbt_list(process, false)
+            .iter()
+            .find(|pbt| pbt.session == session)
+            .map(|pbt| (pbt.ci, pbt.accumulator));
+        if let Some((ci, accumulator)) = found {
+            let time = arinsal_bifs::monotonic_time_nanos() as i64;
+            // Might have been removed by trace_pattern(false).
+            if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, session, ci, false)) {
+                bdt.accum(pid, 0, time - accumulator);
+            }
+            let pbt = pbt_list(process, false)
+                .iter_mut()
+                .find(|pbt| pbt.session == session)
+                .expect("pbt exists");
+            pbt.ci = prev;
+            pbt.accumulator = time;
+        }
+    }
+    if bp_flags & BPF_MEM_TRACE_ACTIVE != 0 {
+        let found = pbt_list(process, true)
+            .iter()
+            .find(|pbt| pbt.session == session)
+            .map(|pbt| (pbt.ci, pbt.accumulator, pbt.allocated));
+        if let Some((ci, accumulator, allocated)) = found {
+            let words = process.allocated_words(allocated);
+            if let Some(bdt) = ci.and_then(|ci| cached_timem_break(process, session, ci, true)) {
+                bdt.accum(pid, 0, words - accumulator);
+            }
+            let pbt = pbt_list(process, true)
+                .iter_mut()
+                .find(|pbt| pbt.session == session)
+                .expect("pbt exists");
+            pbt.ci = prev;
+            pbt.accumulator = words;
+        }
+    }
+}
+
+/// A process is scheduled in or out: restart or close the running time slice of its call_time
+/// accounting.
+// Port of erts/emulator/beam/beam_bp.c:2017-2073 (erts_schedule_time_break), OTP-29.1.1.
+pub(crate) fn schedule_time_break(process: &mut Process, pid: Pid, out: bool) {
+    let now = arinsal_bifs::monotonic_time_nanos() as i64;
+    let entries = pbt_list(process, false).clone();
+    if out {
+        // When a process is scheduled out, add its delta to the previous breakpoint.
+        for pbt in &entries {
+            if let Some(ci) = pbt.ci
+                && let Some(bdt) = timem_break(process, pbt.session, ci, false)
+            {
+                bdt.accum(pid, 0, now - pbt.accumulator);
+            }
+        }
+    } else {
+        // When a process is scheduled in, remove the previous timestamp.
+        for pbt in pbt_list(process, false).iter_mut() {
+            pbt.accumulator = now;
+        }
+    }
+}
+
+/// Adjust the memory accounting of a process (heap words freed by GC or received).
+// Port of erts/emulator/beam/beam_bp.h:240-254 (erts_adjust_memory_break), OTP-29.1.1.
+pub(crate) fn adjust_memory_break(process: &mut Process, adjustment: i64) {
+    if let Some(cold) = process.cold.as_mut() {
+        for pbt in &mut cold.call_memory {
+            pbt.allocated += adjustment;
+        }
+    }
 }

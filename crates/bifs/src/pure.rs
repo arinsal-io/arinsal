@@ -511,6 +511,11 @@ fn make_ref(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     let id = next_ref_id();
     Term::local_ref(ctx.heap, [id as u32, (id >> 32) as u32, 0]).map_err(|_| BifError::SystemLimit)
 }
+/// The next strictly monotonic unique integer, as `erlang:unique_integer([monotonic])`.
+// Port of erts/emulator/beam/erl_bif_info.c (erts_raw_get_unique_monotonic_integer), OTP-29.1.1.
+pub fn next_unique_monotonic() -> i64 {
+    -(1_i64 << 59) + NEXT_UNIQUE.fetch_add(1, AtomicOrdering::Relaxed) as i64
+}
 fn unique_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut positive = false;
     if let Some(options) = args.first() {

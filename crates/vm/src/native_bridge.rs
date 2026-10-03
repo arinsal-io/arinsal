@@ -409,6 +409,12 @@ pub(crate) fn is_native_function_at(address: usize) -> bool {
     address < function.end
 }
 
+/// A word the interpreter returns into by continuing native code: a native return address, or
+/// the stub of a traced native function's return frame.
+pub(crate) fn is_native_continuation(address: usize) -> bool {
+    address == native_trace_return_address() || is_native_function_at(address)
+}
+
 pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> {
     if !arinsal_term::may_be_native_code_pointer(address) {
         return None;

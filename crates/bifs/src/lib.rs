@@ -30,7 +30,8 @@ mod unicode;
 pub use etf::{DecodeWalk, EncodeWalk};
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, IolistSizeWalk, IolistWalk, binary_bytes,
-    bitstring_bit_len, copy_binary_range, copy_bitstring_range, next_ref_id, singleton_bitstring,
+    bitstring_bit_len, copy_binary_range, copy_bitstring_range, next_ref_id, next_unique_monotonic,
+    singleton_bitstring,
 };
 pub use time::{monotonic_time_milliseconds, monotonic_time_nanos};
 

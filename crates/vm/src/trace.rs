@@ -38,15 +38,19 @@ struct Entry {
     tracer: Tracer,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) enum Tracer {
+    #[default]
     Default,
     Pid(Pid),
     Port(u64),
-    Module { module: String, state: OwnedTerm },
+    Module {
+        module: String,
+        state: OwnedTerm,
+    },
 }
 
-type TraceTable = HashMap<(usize, u64, Pid), Entry>;
+type TraceTable = HashMap<(usize, u64, Pid), Entry, crate::trace_bp::FastHash>;
 
 struct TraceEvent<'a> {
     flags: u64,
@@ -68,10 +72,22 @@ struct CallEvent<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CallActions {
+    /// Session id, or the id of a meta tracer (`trace_bp::is_meta_id`).
     pub(crate) session: u64,
     pub(crate) return_trace: bool,
     pub(crate) exception_trace: bool,
     pub(crate) return_to: bool,
+    /// A `call_time`/`call_memory` return frame.
+    pub(crate) acc: Option<CallAcc>,
+}
+
+/// Port of erts/emulator/beam/beam_bp.c:1126-1150 (the call acc trace frame), OTP-29.1.1.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CallAcc {
+    /// `BPF_TIME_TRACE_ACTIVE` and `BPF_MEM_TRACE_ACTIVE` bits of the breakpoint.
+    pub(crate) flags: u32,
+    /// The function the process was accounted to before this call (`trace_bp::func_id`).
+    pub(crate) prev: Option<u32>,
 }
 
 /// Return actions recorded for a native entry frame.
@@ -81,6 +97,73 @@ pub(crate) struct NativeTraceAction {
     pub(crate) return_trace: bool,
     pub(crate) exception_trace: bool,
     pub(crate) return_to: bool,
+    pub(crate) acc: Option<CallAcc>,
+}
+
+impl NativeTraceAction {
+    /// The flags word of the action in a native trace frame: bit 0 return_trace, 1
+    /// exception_trace, 2 return_to, 3 call time/memory frame with its breakpoint flags from
+    /// bit 4 and the previous function id plus one from bit 16.
+    fn flags_word(&self) -> i64 {
+        let mut flags = i64::from(self.return_trace)
+            | (i64::from(self.exception_trace) << 1)
+            | (i64::from(self.return_to) << 2);
+        if let Some(acc) = self.acc {
+            flags |= 8
+                | (i64::from(acc.flags) << 4)
+                | (acc.prev.map_or(0, |prev| i64::from(prev) + 1) << 16);
+        }
+        flags
+    }
+
+    fn from_words(session: i64, flags: i64) -> Self {
+        Self {
+            session: session as u64,
+            return_trace: flags & 1 != 0,
+            exception_trace: flags & 2 != 0,
+            return_to: flags & 4 != 0,
+            acc: (flags & 8 != 0).then(|| CallAcc {
+                flags: ((flags >> 4) & 0xFFF) as u32,
+                prev: match flags >> 16 {
+                    0 => None,
+                    prev => Some(prev as u32 - 1),
+                },
+            }),
+        }
+    }
+}
+
+/// The traced function's pc and the actions of the native trace frame whose function pc word
+/// is at stack index `pc_index` (the frame starts two words earlier), with the frame's size.
+pub(crate) fn native_frame_actions(
+    process: &Process,
+    pc_index: usize,
+) -> (usize, Vec<NativeTraceAction>, usize) {
+    let function_pc = process
+        .heap
+        .stack_get(pc_index)
+        .and_then(Term::as_small)
+        .unwrap_or(0) as usize;
+    let count = process
+        .heap
+        .stack_get(pc_index + 1)
+        .and_then(Term::as_small)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    let actions = (0..count)
+        .filter_map(|action| {
+            let session = process
+                .heap
+                .stack_get(pc_index + 2 + action * 2)?
+                .as_small()?;
+            let flags = process
+                .heap
+                .stack_get(pc_index + 3 + action * 2)?
+                .as_small()?;
+            Some(NativeTraceAction::from_words(session, flags))
+        })
+        .collect();
+    (function_pc, actions, 4 + count * 2)
 }
 
 struct CallMatchContext {
@@ -91,6 +174,7 @@ struct CallMatchContext {
     /// `{process_dump}`, and the heaps holding binaries built from it.
     dump: Option<Vec<u8>>,
     dump_heaps: RefCell<Vec<VecHeap>>,
+    /// `{silent, Bool}` ran: the new silent state of the process in the session.
     silent: Cell<Option<bool>>,
     return_trace: Cell<bool>,
     exception_trace: Cell<bool>,
@@ -248,9 +332,23 @@ impl arinsal_ets::match_spec::MatchContext for CallMatchContext {
     }
 }
 
-fn table() -> &'static Mutex<TraceTable> {
-    static TABLE: OnceLock<Mutex<TraceTable>> = OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+/// The trace table: calls only read it, trace flag changes write it.
+struct TraceTableLock(std::sync::RwLock<TraceTable>);
+
+impl TraceTableLock {
+    /// Exclusive access (the name keeps the call sites of the former mutex).
+    fn lock(&self) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, TraceTable>> {
+        self.0.write()
+    }
+
+    fn read(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, TraceTable>> {
+        self.0.read()
+    }
+}
+
+fn table() -> &'static TraceTableLock {
+    static TABLE: OnceLock<TraceTableLock> = OnceLock::new();
+    TABLE.get_or_init(|| TraceTableLock(std::sync::RwLock::new(HashMap::default())))
 }
 
 /// Whether any process is traced at all.
@@ -400,7 +498,7 @@ pub(crate) fn flags(process: &Process, pid: Pid) -> u64 {
         return 0;
     }
     table()
-        .lock()
+        .read()
         .unwrap()
         .iter()
         .filter(|((runtime, _, subject), _)| *runtime == scope(process) && *subject == pid)
@@ -478,7 +576,7 @@ pub(crate) fn event_match_spec(
 
 pub(crate) fn session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
     table()
-        .lock()
+        .read()
         .unwrap()
         .get(&(scope(process), session, pid))
         .map_or(0, |entry| entry.flags)
@@ -765,130 +863,589 @@ pub(crate) fn call_event(
     args: &[Term],
     local: bool,
 ) -> Result<Vec<CallActions>, VmError> {
+    call_event_scope(vm, process, ctx, module, function, args, local, false)
+}
+
+/// Call event of a BIF reached through its export entry.
+// Port of erts/emulator/beam/emu/bif_instrs.tab:237 (is_bif_traced), OTP-29.1.1: a traced BIF
+// dispatches through the export trampoline and then the BIF stub's code, so both global and
+// local breakpoints fire.
+pub(crate) fn bif_call_event(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    module: &str,
+    function: &str,
+    args: &[Term],
+    scan: StackScan,
+) -> Result<Vec<CallActions>, VmError> {
+    let actions = call_event_scope(vm, process, ctx, module, function, args, false, true)?;
+    Ok(dedupe_return_frames(vm, process, actions, scan))
+}
+
+/// Outcome of running a trace match specification for a call.
+struct CallMatch {
+    /// The result was `false` or no clause matched: only the call message is dropped.
+    suppress_call: bool,
+    return_trace: bool,
+    exception_trace: bool,
+    extra: Option<Term>,
+    /// `enable_trace`, `disable_trace` and `trace` calls, applied after the call event.
+    trace_actions: Vec<(String, VecHeap, Vec<Term>)>,
+}
+
+/// Run the match specification of a traced call, if any.
+// Port of erts/emulator/beam/erl_trace.c:1263-1297 (erts_call_trace, PAM program), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)] // The call and its match program are separate inputs.
+fn run_call_match(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    spec: Option<&std::sync::Arc<crate::trace_bp::MatchSpec>>,
+    session: u64,
+    (module, function): (&str, &str),
+    args: &[Term],
+) -> Result<CallMatch, VmError> {
+    let Some(spec) = spec else {
+        return Ok(CallMatch {
+            suppress_call: false,
+            return_trace: false,
+            exception_trace: false,
+            extra: None,
+            trace_actions: Vec::new(),
+        });
+    };
+    let dump = if spec.uses_process_dump {
+        crate::natives::proc::process_dump(Some(&*vm), process, ctx).ok()
+    } else {
+        None
+    };
+    // Port of erts/emulator/beam/erl_trace.c:1266-1267, OTP-29.1.1.
+    let against = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .list_from_iter(args.iter().copied())
+        .map_err(|error| VmError::Unsupported(format!("trace subject: {error:?}")))?;
+    let program = spec
+        .program(|source| {
+            let specification = from_owned(
+                source,
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            )
+            .map_err(|_| ())?;
+            arinsal_ets::match_spec::MatchProgram::compile_trace(specification).map_err(|_| ())
+        })
+        .map_err(|()| VmError::Unsupported("invalid trace match specification".into()))?;
+    let current_stacktraces = if spec.uses_current_stacktrace {
+        current_stacktraces(vm, process)?
+    } else {
+        Vec::new()
+    };
+    let (caller, caller_line) = if spec.uses_caller {
+        caller_info(process, vm, module, function)?
+    } else {
+        (None, None)
+    };
+    let context = CallMatchContext::new(
+        caller,
+        caller_line,
+        current_stacktraces,
+        dump,
+        crate::natives::sys::trace_control_word_value(process),
+    );
+    let result = program
+        .run_with_context(
+            against,
+            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &context,
+        )
+        .map_err(|error| VmError::Unsupported(format!("trace match spec execution: {error:?}")))?;
+    crate::natives::sys::set_trace_control_word_value(process, context.trace_control_word.get());
+    if let Some(silent) = context.silent.get() {
+        set_session_silent(process, session, ctx.pid(), silent);
+    }
+    // Port of erts/emulator/beam/erl_trace.c:1293-1297 (erts_call_trace), OTP-29.1.1.
+    // A false result (`{message,false}`) only drops the call message;
+    // {return_trace} and {exception_trace} still apply.
+    let suppress_call = result.is_none_or(|result| result == crate::signals::atom("false"));
+    Ok(CallMatch {
+        suppress_call,
+        return_trace: context.return_trace.get(),
+        exception_trace: context.exception_trace.get(),
+        extra: if suppress_call {
+            None
+        } else {
+            context.take_message(process)
+        },
+        trace_actions: context.take_trace_actions(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // Shared body of the call and BIF call events.
+fn call_event_scope(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    module: &str,
+    function: &str,
+    args: &[Term],
+    local: bool,
+    bif: bool,
+) -> Result<Vec<CallActions>, VmError> {
+    use crate::trace_bp::{
+        BPF_MEM_TRACE_ACTIVE, BPF_TIME_TRACE_ACTIVE, HIT_COUNT_ACTIVE, HIT_GLOBAL, HIT_LOCAL,
+        HIT_META,
+    };
     let pid = ctx.pid();
-    let patterns = crate::trace_bp::matching(process, module, function, args.len() as u8, local);
-    if patterns.is_empty() {
+    let arity = args.len() as u8;
+    let hits = crate::trace_bp::hits(process, module, function, arity);
+    if hits.is_empty() {
         return Ok(Vec::new());
     }
     let mut actions = Vec::new();
-    for pattern in patterns {
-        let mut flags = session_flags(process, pattern.session, pid);
-        let call_was_enabled = flags & CALL != 0;
-        let mut extra = None;
-        let mut trace_actions = Vec::new();
-        let mut return_trace = false;
-        let mut exception_trace = false;
-        if let Some(spec) = pattern.match_spec.as_ref() {
-            let dump = if spec.uses_process_dump {
-                crate::natives::proc::process_dump(Some(&*vm), process, ctx).ok()
-            } else {
-                None
-            };
-            let current_stacktraces = if spec.uses_current_stacktrace {
-                current_stacktraces(vm, process)?
-            } else {
-                Vec::new()
-            };
-            // Port of erts/emulator/beam/erl_trace.c:1266-1267, OTP-29.1.1.
-            let against = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                .list_from_iter(args.iter().copied())
-                .map_err(|error| VmError::Unsupported(format!("trace subject: {error:?}")))?;
-            let program = spec
-                .program(|source| {
-                    let specification = from_owned(
-                        source,
-                        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-                    )
-                    .map_err(|_| ())?;
-                    arinsal_ets::match_spec::MatchProgram::compile_trace(specification)
-                        .map_err(|_| ())
-                })
-                .map_err(|()| VmError::Unsupported("invalid trace match specification".into()))?;
-            let (caller, caller_line) = if spec.uses_caller {
-                caller_info(process, vm, module, function)?
-            } else {
-                (None, None)
-            };
-            let context = CallMatchContext::new(
-                caller,
-                caller_line,
-                current_stacktraces,
-                dump,
-                crate::natives::sys::trace_control_word_value(process),
-            );
-            let result = program
-                .run_with_context(
-                    against,
-                    &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-                    &context,
-                )
-                .map_err(|error| {
-                    VmError::Unsupported(format!("trace match spec execution: {error:?}"))
-                })?;
-            crate::natives::sys::set_trace_control_word_value(
-                process,
-                context.trace_control_word.get(),
-            );
-            trace_actions = context.take_trace_actions();
-            if let Some(silent) = context.silent.get() {
-                set_session_silent(process, pattern.session, pid, silent);
-            }
-            flags = session_flags(process, pattern.session, pid);
-            return_trace = context.return_trace.get();
-            exception_trace = context.exception_trace.get();
-            // Port of erts/emulator/beam/erl_trace.c:1293-1297 (erts_call_trace), OTP-29.1.1.
-            // A false result (`{message,false}`) only drops the call message;
-            // {return_trace} and {exception_trace} still apply.
-            let suppress_call = result.is_none_or(|result| result == crate::signals::atom("false"));
-            if suppress_call {
-                if return_trace || exception_trace {
-                    actions.push(CallActions {
-                        session: pattern.session,
-                        return_trace,
-                        exception_trace,
-                        return_to: false,
-                    });
-                }
-                continue;
-            }
-            extra = context.take_message(process);
-        }
-        // Port of erts/emulator/beam/erl_trace.c:1293-1297 (erts_call_trace), OTP-29.1.1.
-        // Match trace actions change later calls, while `silent` controls this emission too.
-        if call_was_enabled && flags & SILENT == 0 {
-            emit_call_event(
+    // The export entry holds the global call trace, the function's code the others; a traced
+    // BIF dispatches through both.
+    let site_flags = if bif {
+        u32::MAX
+    } else if local {
+        !HIT_GLOBAL
+    } else {
+        HIT_GLOBAL
+    };
+    for hit in hits {
+        let mut bp_flags = hit.flags & site_flags;
+        let flags = session_flags(process, hit.session, pid);
+        // Port of erts/emulator/beam/beam_bp.c:1017-1060 (do_session_breakpoint), OTP-29.1.1.
+        let acc_flags = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
+        if bp_flags & (HIT_LOCAL | HIT_GLOBAL | acc_flags) != 0 && flags & CALL == 0 {
+            // The session does not trace calls of this process.
+            bp_flags &= !(HIT_LOCAL | HIT_GLOBAL | acc_flags);
+        } else if bp_flags & (HIT_LOCAL | HIT_GLOBAL) != 0 {
+            let local_hit = bp_flags & HIT_LOCAL != 0;
+            let outcome = run_call_match(
                 vm,
                 process,
                 ctx,
-                CallEvent {
-                    pid,
-                    module,
-                    function,
-                    args,
-                    flags,
-                    extra,
-                    actions: (return_trace, exception_trace),
-                },
-                Some(pattern.session),
+                hit.local_ms.as_ref(),
+                hit.session,
+                (module, function),
+                args,
             )?;
+            // The match specification may have changed the silent state.
+            let call_was_enabled = flags & CALL != 0;
+            let flags = session_flags(process, hit.session, pid);
+            let silent = flags & SILENT != 0;
+            let mut extra = outcome.extra;
+            if call_was_enabled && !silent && !outcome.suppress_call {
+                emit_call_event(
+                    vm,
+                    process,
+                    ctx,
+                    CallEvent {
+                        pid,
+                        module,
+                        function,
+                        args,
+                        flags,
+                        extra: extra.take(),
+                        actions: (outcome.return_trace, outcome.exception_trace),
+                    },
+                    Some(hit.session),
+                )?;
+            }
+            // Port of erts/emulator/beam/erl_trace.c:1270-1302 (erts_call_trace), OTP-29.1.1:
+            // the current event uses the pre-match tracer and flags; match trace actions affect
+            // later events from the tracee.
+            for (name, _heap, arguments) in outcome.trace_actions {
+                let _ = apply_match_trace_action(process, hit.session, pid, &name, &arguments);
+            }
+            if !silent {
+                let return_to = !outcome.suppress_call
+                    && local_hit
+                    && session_flags(process, hit.session, pid) & RETURN_TO != 0;
+                if outcome.return_trace || outcome.exception_trace || return_to {
+                    actions.push(CallActions {
+                        session: hit.session,
+                        return_trace: outcome.return_trace,
+                        exception_trace: outcome.exception_trace,
+                        return_to,
+                        acc: None,
+                    });
+                }
+            }
         }
-        // Port of erts/emulator/beam/erl_trace.c:1270-1302 (erts_call_trace), OTP-29.1.1:
-        // the current event uses the pre-match tracer and flags; match trace actions affect
-        // later events from the tracee.
-        for (name, _heap, arguments) in trace_actions {
-            let _ = apply_match_trace_action(process, pattern.session, pid, &name, &arguments);
+        if bp_flags & HIT_META != 0
+            && let Some(meta) = hit.meta_tracer.as_ref()
+        {
+            // Meta trace: fixed flags, independent of the process flags.
+            let outcome = run_call_match(
+                vm,
+                process,
+                ctx,
+                hit.meta_ms.as_ref(),
+                hit.session,
+                (module, function),
+                args,
+            )?;
+            {
+                if !outcome.suppress_call {
+                    emit_meta_call_event(
+                        vm,
+                        process,
+                        ctx,
+                        meta,
+                        module,
+                        function,
+                        args,
+                        outcome.extra,
+                    )?;
+                }
+                // The call event uses the pre-match state; trace actions affect later events.
+                for (name, _heap, arguments) in outcome.trace_actions {
+                    let _ = apply_match_trace_action(process, hit.session, pid, &name, &arguments);
+                }
+                if outcome.return_trace || outcome.exception_trace {
+                    actions.push(CallActions {
+                        session: meta.id,
+                        return_trace: outcome.return_trace,
+                        exception_trace: outcome.exception_trace,
+                        return_to: false,
+                        acc: None,
+                    });
+                }
+            }
         }
-        let return_to = local && session_flags(process, pattern.session, pid) & RETURN_TO != 0;
-        if return_trace || exception_trace || return_to {
+        // Port of erts/emulator/beam/beam_bp.c:1090-1092 (ERTS_BPF_COUNT_ACTIVE), OTP-29.1.1.
+        if bp_flags & HIT_COUNT_ACTIVE != 0
+            && let Some(count) = hit.count.as_ref()
+        {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if bp_flags & acc_flags != 0 {
+            let ci = crate::trace_bp::func_id(module, function, arity);
+            let mut prev = None;
+            if bp_flags & BPF_TIME_TRACE_ACTIVE != 0
+                && let Some(bdt) = hit.time.as_ref()
+            {
+                let time = arinsal_bifs::monotonic_time_nanos() as i64;
+                prev = crate::trace_bp::trace_call_acc(
+                    process,
+                    pid,
+                    hit.session,
+                    false,
+                    ci,
+                    time,
+                    bdt,
+                );
+            }
+            if bp_flags & BPF_MEM_TRACE_ACTIVE != 0
+                && let Some(bdt) = hit.memory.as_ref()
+            {
+                let adjustment = crate::trace_bp::call_memory_adjustment(process, hit.session);
+                // The initial call of a process starts counting from zero.
+                let allocated =
+                    if adjustment.is_none() && is_initial_call(process, module, function, arity) {
+                        0
+                    } else {
+                        process.allocated_words(adjustment.unwrap_or(0))
+                    };
+                prev = crate::trace_bp::trace_call_acc(
+                    process,
+                    pid,
+                    hit.session,
+                    true,
+                    ci,
+                    allocated,
+                    bdt,
+                );
+            }
             actions.push(CallActions {
-                session: pattern.session,
-                return_trace,
-                exception_trace,
-                return_to,
+                session: hit.session,
+                return_trace: false,
+                exception_trace: false,
+                return_to: false,
+                acc: Some(CallAcc {
+                    flags: bp_flags & acc_flags,
+                    prev,
+                }),
             });
         }
     }
     Ok(actions)
+}
+
+/// Whether `module:function/arity` is the initial call of the process.
+fn is_initial_call(process: &Process, module: &str, function: &str, arity: u8) -> bool {
+    process.cold.as_ref().is_some_and(|cold| {
+        cold.initial_call
+            .as_ref()
+            .is_some_and(|(m, f, a)| m == module && f == function && *a == arity)
+    })
+}
+
+/// The call event of a meta trace: fixed `call` and `timestamp` flags.
+// Port of erts/emulator/beam/erl_trace.c:1213-1260 (erts_call_trace, meta trace branch),
+// OTP-29.1.1.
+#[allow(clippy::too_many_arguments)] // The call and its tracer are separate inputs.
+fn emit_meta_call_event(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    meta: &crate::trace_bp::MetaTracer,
+    module: &str,
+    function: &str,
+    args: &[Term],
+    extra: Option<Term>,
+) -> Result<(), VmError> {
+    let mfa = call_mfa_term(process, module, function, args, false)?;
+    emit_meta(vm, process, ctx, meta, "call", &[mfa], extra, true);
+    Ok(())
+}
+
+/// Send a trace event of the traced process to a meta tracer.
+#[allow(clippy::too_many_arguments)] // The event and its meta tracer are separate inputs.
+fn emit_meta(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    meta: &crate::trace_bp::MetaTracer,
+    name: &str,
+    fields: &[Term],
+    extra: Option<Term>,
+    remove_dead: bool,
+) {
+    let subject = ctx.pid();
+    let Some(subject_term) = subject.to_term() else {
+        return;
+    };
+    let tracer = meta.tracer();
+    // Port of erts/emulator/nifs/common/erl_tracer_nif.c:127-155 (enabled): a dead tracer is
+    // removed, and nothing is traced when tracer and tracee are the same.
+    match &tracer {
+        Tracer::Default => return,
+        Tracer::Pid(pid) => {
+            let alive = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.scheduler().ok())
+                .is_some_and(|scheduler| scheduler.lookup(*pid));
+            if !alive {
+                if remove_dead {
+                    meta.clear();
+                }
+                return;
+            }
+        }
+        Tracer::Port(id) => {
+            let alive = process
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(id));
+            if !alive {
+                if remove_dead {
+                    meta.clear();
+                }
+                return;
+            }
+        }
+        Tracer::Module { module, state } => {
+            let Some(state) =
+                from_owned(state, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)).ok()
+            else {
+                return;
+            };
+            crate::natives::nif::refresh_hub(process, ctx);
+            let status = crate::natives::nif::invoke_tracer(
+                vm,
+                process,
+                module,
+                "enabled",
+                &[crate::signals::atom("trace_status"), state, subject_term],
+            );
+            if status == Some(crate::signals::atom("remove")) {
+                if remove_dead {
+                    meta.clear();
+                }
+                return;
+            }
+            if status != Some(crate::signals::atom("trace")) {
+                return;
+            }
+        }
+    }
+    let entry = Entry {
+        flags: CALL | TIMESTAMP,
+        tracer,
+    };
+    deliver(
+        Some(vm),
+        process,
+        ctx,
+        subject,
+        subject_term,
+        &entry,
+        name,
+        fields,
+        extra,
+    );
+}
+
+/// A trace frame at the top of the stack.
+enum SpecialFrame {
+    /// A return_trace, exception_trace or call time/memory frame.
+    Trace,
+    /// A return_to frame of a session.
+    ReturnTo(u64),
+}
+
+/// Where a traced call looks for the trace frames already on the stack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StackScan {
+    /// The return address of the call is on top: no trace frame is (a BIF call).
+    None,
+    /// The run of trace frames on top of the stack (a call to Erlang code).
+    Top,
+    /// The current function's frame is dropped by the tail call: the run of trace frames
+    /// below it.
+    AfterFrame,
+}
+
+/// The trace frames on top of the stack, innermost first, up to the first real return address.
+// Port of erts/emulator/beam/beam_bp.c:938-980 (fixup_cp_before_trace), OTP-29.1.1.
+fn special_frames(
+    vm: &Vm,
+    process: &Process,
+    first_only: bool,
+    skip_frame: bool,
+) -> Vec<SpecialFrame> {
+    let trace_stub = crate::native_bridge::native_trace_return_address();
+    let bridge = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
+    let mut frames = Vec::new();
+    let mut index = 0;
+    if skip_frame {
+        // Skip the Y registers up to the frame's own return address.
+        while let Some(word) = process.heap.stack_get(index) {
+            if word.tagged_word() as usize == trace_stub
+                || matches!(crate::stacktrace::decode_tag(word), Some((false, _, _)))
+                || crate::native_bridge::is_native_function_at(word.tagged_word() as usize)
+            {
+                break;
+            }
+            index += 1;
+        }
+    }
+    while let Some(word) = process.heap.stack_get(index) {
+        if first_only && !frames.is_empty() {
+            break;
+        }
+        if word.tagged_word() as usize == bridge {
+            // The bridge from native code into the interpreter is no real return address.
+            index += 1;
+            continue;
+        }
+        if word.tagged_word() as usize == trace_stub {
+            let (_, actions, words) = native_frame_actions(process, index + 2);
+            frames.push(SpecialFrame::Trace);
+            for action in actions.iter().filter(|action| action.return_to) {
+                frames.push(SpecialFrame::ReturnTo(action.session));
+            }
+            index += words;
+            continue;
+        }
+        let Some((false, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
+            break;
+        };
+        let Some(module) = vm.modules.get(module_id) else {
+            break;
+        };
+        if ip == module.return_trace_ip {
+            frames.push(SpecialFrame::Trace);
+            index += 6;
+        } else if ip == module.return_to_trace_ip {
+            let session = process.heap.stack_get(index + 1).and_then(Term::as_small);
+            frames.push(SpecialFrame::ReturnTo(session.unwrap_or(-1) as u64));
+            index += 2;
+        } else {
+            break;
+        }
+    }
+    frames
+}
+
+/// Drop the return_to frames a session already has on top of the stack, and the call time or
+/// memory frames that would sit on another trace frame: tail recursion must not grow the stack.
+// Port of erts/emulator/beam/beam_bp.c:1181-1250 (do_call_trace, return_to_trace) and
+// :1119-1150 (do_session_breakpoint, call acc frame), OTP-29.1.1.
+pub(crate) fn dedupe_return_frames(
+    vm: &Vm,
+    process: &Process,
+    actions: Vec<CallActions>,
+    scan: StackScan,
+) -> Vec<CallActions> {
+    if actions.is_empty() {
+        return actions;
+    }
+    // Only return_to frames need the whole run of trace frames; the rest only the top one.
+    let first_only = !actions.iter().any(|action| action.return_to);
+    // A BIF is never tail called: the loader keeps the caller's frame, so the return address
+    // of the call is on top of the stack and no trace frame is.
+    // Port of erts/emulator/beam/ops.tab (call_ext_last/call_ext_only to a BIF), OTP-29.1.1.
+    let mut frames = match scan {
+        StackScan::None => Vec::new(),
+        StackScan::Top => special_frames(vm, process, first_only, false),
+        StackScan::AfterFrame => special_frames(vm, process, first_only, true),
+    };
+    let mut actions = actions;
+    for action in &mut actions {
+        if action.return_to {
+            if frames
+                .iter()
+                .any(|frame| matches!(frame, SpecialFrame::ReturnTo(session) if *session == action.session))
+            {
+                action.return_to = false;
+            } else {
+                frames.insert(0, SpecialFrame::ReturnTo(action.session));
+            }
+        }
+        if action.return_trace || action.exception_trace {
+            frames.insert(0, SpecialFrame::Trace);
+        }
+        if action.acc.is_some() {
+            if frames.is_empty() {
+                frames.insert(0, SpecialFrame::Trace);
+            } else {
+                action.acc = None;
+            }
+        }
+    }
+    actions
+        .into_iter()
+        .filter(|action| {
+            action.return_to
+                || action.return_trace
+                || action.exception_trace
+                || action.acc.is_some()
+        })
+        .collect()
+}
+
+/// The frame of a call time/memory accounted call returns.
+// Port of erts/emulator/beam/emu/trace_instrs.tab:54-70 (i_call_trace_return), OTP-29.1.1.
+pub(crate) fn call_acc_return(
+    process: &mut Process,
+    pid: Pid,
+    session: u64,
+    bp_flags: u32,
+    prev: Option<u32>,
+) {
+    // Port of erts/emulator/beam/beam_bp.c:1352-1365 (erts_call_trace_return): a session that
+    // no longer traces the process has no state to update.
+    if !table()
+        .lock()
+        .unwrap()
+        .contains_key(&(scope(process), session, pid))
+    {
+        return;
+    }
+    crate::trace_bp::call_trace_return(process, pid, session, bp_flags, prev);
 }
 
 /// Capture the process dump up front when a match specification uses `{process_dump}`.
@@ -932,32 +1489,7 @@ fn emit_call_event(
         extra,
         actions,
     } = event;
-    let mut values = vec![
-        Term::atom(
-            global_atoms()
-                .intern(module)
-                .map_err(|_| VmError::Unsupported("module atom".into()))?,
-        ),
-        Term::atom(
-            global_atoms()
-                .intern(function)
-                .map_err(|_| VmError::Unsupported("function atom".into()))?,
-        ),
-    ];
-    if flags & ARITY != 0 {
-        values.push(
-            Term::small(args.len() as i64)
-                .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
-        );
-    } else {
-        let args = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-            .list_from_iter(args.iter().copied())
-            .map_err(|error| VmError::Unsupported(format!("trace args: {error:?}")))?;
-        values.push(args);
-    }
-    let call = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .tuple(&values)
-        .map_err(|error| VmError::Unsupported(format!("trace call: {error:?}")))?;
+    let call = call_mfa_term(process, module, function, args, flags & ARITY != 0)?;
     let fields = if let Some(extra) = extra {
         vec![call, extra]
     } else {
@@ -975,6 +1507,43 @@ fn emit_call_event(
         None,
     );
     Ok(actions)
+}
+
+/// The `{M, F, Args}` (or `{M, F, Arity}`) tuple of a call event.
+// Port of erts/emulator/beam/erl_trace.c:1330-1350 (erts_call_trace, mfa_tuple), OTP-29.1.1.
+fn call_mfa_term(
+    process: &mut Process,
+    module: &str,
+    function: &str,
+    args: &[Term],
+    arity_only: bool,
+) -> Result<Term, VmError> {
+    let mut values = vec![
+        Term::atom(
+            global_atoms()
+                .intern(module)
+                .map_err(|_| VmError::Unsupported("module atom".into()))?,
+        ),
+        Term::atom(
+            global_atoms()
+                .intern(function)
+                .map_err(|_| VmError::Unsupported("function atom".into()))?,
+        ),
+    ];
+    if arity_only {
+        values.push(
+            Term::small(args.len() as i64)
+                .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
+        );
+    } else {
+        let args = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .list_from_iter(args.iter().copied())
+            .map_err(|error| VmError::Unsupported(format!("trace args: {error:?}")))?;
+        values.push(args);
+    }
+    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .tuple(&values)
+        .map_err(|error| VmError::Unsupported(format!("trace call: {error:?}")))
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:5335-5370 (matchCaller and matchCallerLine),
@@ -1176,9 +1745,9 @@ pub(crate) fn executor_native_call_event(
         &args,
         true,
     )?;
+    let actions = dedupe_return_frames(vm, process, actions, StackScan::Top);
     Ok(actions
         .into_iter()
-        .filter(|action| action.return_trace || action.exception_trace || action.return_to)
         // Port of erts/emulator/beam/beam_bp.c (do_call_trace: MATCH_SET_RX_TRACE), OTP-29.1.1:
         // an exception_trace frame also reports a normal return, like return_trace.
         .map(|action| NativeTraceAction {
@@ -1186,8 +1755,43 @@ pub(crate) fn executor_native_call_event(
             return_trace: action.return_trace || action.exception_trace,
             exception_trace: action.exception_trace,
             return_to: action.return_to,
+            acc: action.acc,
         })
         .collect())
+}
+
+/// The traced native functions a return passes through, innermost first, and the address that
+/// execution continues at.
+pub(crate) type PoppedNativeFrames = (Vec<(usize, Vec<NativeTraceAction>)>, Term);
+
+/// Pop the native trace frames a return passes through. The frame's stub word is already
+/// dropped: the saved caller is at stack index 0 and the traced function's pc follows. A caller
+/// that is itself a trace frame returns through it right away; its stub word is the slot that
+/// was just dropped. `drop_words` removes words from the stack.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195, OTP-29.1.1.
+pub(crate) fn pop_native_trace_frames(
+    process: &mut Process,
+    mut drop_words: impl FnMut(&mut Process, usize),
+) -> Option<PoppedNativeFrames> {
+    let trace_stub = crate::native_bridge::native_trace_return_address();
+    let mut frames = Vec::new();
+    loop {
+        let saved_caller = process.heap.stack_get(0)?;
+        let (function_pc, actions, _) = native_frame_actions(process, 1);
+        if crate::native_function_at(function_pc).is_none() {
+            return if frames.is_empty() {
+                None
+            } else {
+                Some((frames, saved_caller))
+            };
+        }
+        let cleanup = 4usize.saturating_add(actions.len() * 2);
+        drop_words(process, cleanup);
+        frames.push((function_pc, actions));
+        if saved_caller.tagged_word() as usize != trace_stub {
+            return Some((frames, saved_caller));
+        }
+    }
 }
 
 /// Saves native return and exception actions until the traced function exits.
@@ -1219,108 +1823,103 @@ pub(crate) fn push_native_trace_frame(
         process.heap.stack_set(index, value);
     }
     for (index, action) in actions.iter().enumerate() {
-        let flags = u8::from(action.return_trace)
-            | (u8::from(action.exception_trace) << 1)
-            | (u8::from(action.return_to) << 2);
         process.heap.stack_set(
             4 + index * 2,
             Term::small(action.session as i64).unwrap_or(Term::NIL),
         );
         process.heap.stack_set(
             5 + index * 2,
-            Term::small(i64::from(flags)).unwrap_or(Term::NIL),
+            Term::small(action.flags_word()).unwrap_or(Term::NIL),
         );
     }
     process.sync_native_header();
     Ok(())
 }
 
-/// Emit the trace event attached to a native return frame.
-// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195, OTP-29.1.1.
-pub(crate) fn native_return_event(
+/// Emit the trace events of the actions of a native trace frame that is left by a return, or
+/// by an exception when `exception` is set.
+// Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195 and
+// erts/emulator/beam/beam_common.c:622-640 (next_catch), OTP-29.1.1.
+pub(crate) fn native_return_events(
+    vm: &mut Vm,
     process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
     function: &crate::NativeFunction,
-    action: NativeTraceAction,
+    actions: &[NativeTraceAction],
     value: Term,
     exception: bool,
-) {
-    if (exception && !action.exception_trace) || (!exception && !action.return_trace) {
-        return;
+) -> Result<(), VmError> {
+    let pid = ctx.pid();
+    let mut mfa = None;
+    // The frames pop innermost first: the last action pushed its frames last.
+    for action in actions.iter().rev() {
+        if let Some(acc) = action.acc {
+            // Frames left by an exception do no accounting.
+            if !exception {
+                call_acc_return(process, pid, action.session, acc.flags, acc.prev);
+            }
+            continue;
+        }
+        if (exception && !action.exception_trace) || (!exception && !action.return_trace) {
+            continue;
+        }
+        let meta = if crate::trace_bp::is_meta_id(action.session) {
+            let Some(meta) = crate::trace_bp::meta_tracer_by_id(action.session) else {
+                continue;
+            };
+            Some(meta)
+        } else {
+            let flags = session_flags(process, action.session, pid);
+            if flags & CALL == 0 || flags & SILENT != 0 {
+                continue;
+            }
+            None
+        };
+        let mfa = match mfa {
+            Some(mfa) => mfa,
+            None => {
+                let built = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    .tuple(&[
+                        Term::atom(
+                            global_atoms()
+                                .intern(&function.module)
+                                .map_err(|_| VmError::Unsupported("trace module atom".into()))?,
+                        ),
+                        Term::atom(
+                            global_atoms()
+                                .intern(&function.function)
+                                .map_err(|_| VmError::Unsupported("trace function atom".into()))?,
+                        ),
+                        Term::small(i64::from(function.arity))
+                            .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
+                    ])
+                    .map_err(|error| VmError::Unsupported(format!("trace MFA: {error:?}")))?;
+                mfa = Some(built);
+                built
+            }
+        };
+        let name = if exception {
+            "exception_from"
+        } else {
+            "return_from"
+        };
+        if let Some(meta) = meta {
+            emit_meta(vm, process, ctx, &meta, name, &[mfa, value], None, false);
+        } else {
+            emit_filtered(
+                Some(vm),
+                process,
+                ctx,
+                pid,
+                CALL,
+                name,
+                &[mfa, value],
+                Some(action.session),
+                None,
+            );
+        }
     }
-    let Some(runtime) = process.runtime.clone() else {
-        return;
-    };
-    let self_pid = process.header.self_pid;
-    let Some(pid) = runtime
-        .processes
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .find(|pid| {
-            pid.to_term()
-                .is_some_and(|term| term.tagged_word() == self_pid)
-        })
-    else {
-        return;
-    };
-    let Some(entry) = table()
-        .lock()
-        .unwrap()
-        .get(&(scope(process), action.session, pid))
-        .filter(|entry| entry.flags & CALL != 0 && entry.flags & SILENT == 0)
-        .cloned()
-    else {
-        return;
-    };
-    let Tracer::Pid(tracer) = entry.tracer else {
-        return;
-    };
-    let Ok(module) = global_atoms().intern(&function.module) else {
-        return;
-    };
-    let Ok(name) = global_atoms().intern(&function.function) else {
-        return;
-    };
-    let Some(arity) = Term::small(i64::from(function.arity)) else {
-        return;
-    };
-    let Ok(mfa) = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&[
-        Term::atom(module),
-        Term::atom(name),
-        arity,
-    ]) else {
-        return;
-    };
-    let Some(tracee) = pid.to_term() else {
-        return;
-    };
-    let event = if exception {
-        TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&[
-            crate::signals::atom("trace"),
-            tracee,
-            crate::signals::atom("exception_from"),
-            mfa,
-            value,
-        ])
-    } else {
-        TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&[
-            crate::signals::atom("trace"),
-            tracee,
-            crate::signals::atom("return_from"),
-            mfa,
-            value,
-        ])
-    };
-    let Ok(event) = event else {
-        return;
-    };
-    let Ok(message) = Message::copy_from(event) else {
-        return;
-    };
-    if let Ok(scheduler) = runtime.scheduler() {
-        let _ = scheduler.send(pid, tracer, message);
-    }
+    Ok(())
 }
 
 // Port of erts/emulator/beam/erl_trace.c:1095-1180 (return and exception events), OTP-29.1.1.
@@ -1336,10 +1935,19 @@ pub(crate) fn return_event(
     exception: bool,
     exception_class_and_reason: Option<Term>,
 ) -> Result<(), VmError> {
-    let flags = session_flags(process, session, ctx.pid());
-    if flags & CALL == 0 || flags & SILENT != 0 {
-        return Ok(());
-    }
+    let meta = if crate::trace_bp::is_meta_id(session) {
+        // Meta trace ignores the process flags, `silent` included.
+        let Some(meta) = crate::trace_bp::meta_tracer_by_id(session) else {
+            return Ok(());
+        };
+        Some(meta)
+    } else {
+        let flags = session_flags(process, session, ctx.pid());
+        if flags & CALL == 0 || flags & SILENT != 0 {
+            return Ok(());
+        }
+        None
+    };
     let Some((module_name, function_name, arity)) = vm.modules.get(module_id).and_then(|module| {
         module
             .function_at(entry_ip)
@@ -1367,6 +1975,15 @@ pub(crate) fn return_event(
     } else {
         vec![mfa, value]
     };
+    if let Some(meta) = meta {
+        let name = if exception {
+            "exception_from"
+        } else {
+            "return_from"
+        };
+        emit_meta(vm, process, ctx, &meta, name, &fields, None, false);
+        return Ok(());
+    }
     emit_filtered(
         Some(vm),
         process,
@@ -1398,11 +2015,9 @@ pub(crate) fn bif_return_events(
     function: &str,
     arity: u8,
     outcome: Result<Term, Term>,
+    site: Option<(usize, usize)>,
 ) -> Result<(), VmError> {
-    if actions
-        .iter()
-        .all(|action| !action.return_trace && !action.exception_trace)
-    {
+    if actions.is_empty() {
         return Ok(());
     }
     let atom_of = |name: &str| {
@@ -1411,14 +2026,25 @@ pub(crate) fn bif_return_events(
             .map(Term::atom)
             .map_err(|_| VmError::Unsupported("trace return atom".into()))
     };
-    let mfa = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .tuple(&[
-            atom_of(module)?,
-            atom_of(function)?,
-            Term::small(i64::from(arity)).unwrap_or(Term::NIL),
-        ])
-        .map_err(|error| VmError::Unsupported(format!("trace return MFA: {error:?}")))?;
-    for action in actions {
+    // Only call time and memory frames: no event carries the MFA.
+    let mfa = if actions.iter().any(|action| action.acc.is_none()) {
+        TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .tuple(&[
+                atom_of(module)?,
+                atom_of(function)?,
+                Term::small(i64::from(arity)).unwrap_or(Term::NIL),
+            ])
+            .map_err(|error| VmError::Unsupported(format!("trace return MFA: {error:?}")))?
+    } else {
+        Term::NIL
+    };
+    let pid = ctx.pid();
+    // The frames pop innermost first: the last action pushed its frames last.
+    for action in actions.iter().rev() {
+        if let Some(acc) = action.acc {
+            call_acc_return(process, pid, action.session, acc.flags, acc.prev);
+            continue;
+        }
         let (name, wanted, value) = match outcome {
             Ok(value) => (
                 "return_from",
@@ -1428,20 +2054,59 @@ pub(crate) fn bif_return_events(
             Err(class_and_reason) => ("exception_from", action.exception_trace, class_and_reason),
         };
         if wanted {
-            emit_filtered(
-                Some(vm),
-                process,
-                ctx,
-                ctx.pid(),
-                CALL,
-                name,
-                &[mfa, value],
-                Some(action.session),
-                None,
-            );
+            if crate::trace_bp::is_meta_id(action.session) {
+                if let Some(meta) = crate::trace_bp::meta_tracer_by_id(action.session) {
+                    emit_meta(vm, process, ctx, &meta, name, &[mfa, value], None, false);
+                }
+            } else {
+                emit_filtered(
+                    Some(vm),
+                    process,
+                    ctx,
+                    pid,
+                    CALL,
+                    name,
+                    &[mfa, value],
+                    Some(action.session),
+                    None,
+                );
+            }
+        }
+        if action.return_to && outcome.is_err() {
+            // The unwinding to a catch reports the return_to of the catching function.
+            process.cold_mut().bif_return_to.push(action.session);
+        }
+        if action.return_to && outcome.is_ok() {
+            let flags = session_flags(process, action.session, pid);
+            if flags & RETURN_TO != 0 && flags & SILENT == 0 {
+                let target = caller_mfa_name(vm, process, site);
+                emit_return_to(vm, process, ctx, action.session, target)?;
+            }
         }
     }
     Ok(())
+}
+
+/// The function a traced BIF call returns to: the one that holds the call site.
+fn caller_mfa_name(
+    vm: &Vm,
+    process: &Process,
+    site: Option<(usize, usize)>,
+) -> Option<(String, String, u8)> {
+    let (module_id, ip) = match site {
+        // An interpreted `apply` names its instruction in the running module.
+        Some((id, ip)) if id == usize::MAX - 1 => (process.module, ip),
+        Some(site) => site,
+        None => (process.module, process.ip),
+    };
+    if module_id == usize::MAX {
+        // A native call site: the pc names the caller's native function.
+        let function = crate::native_function_at(ip)?;
+        return Some((function.module, function.function, function.arity));
+    }
+    let module = vm.modules.get(module_id)?;
+    let (function, arity) = module.function_at(ip)?;
+    Some((module.name.clone(), function.to_owned(), arity))
 }
 
 // Port of erts/emulator/beam/beam_bp.c:1242-1268 and
@@ -1462,6 +2127,33 @@ pub(crate) fn return_to_event(
     // nested between it and the real caller.
     let target = return_to_target(vm, process, 1);
     emit_return_to(vm, process, ctx, session, target)
+}
+
+/// The catching function gets the `return_to` event of every session that had a return_to
+/// frame on the unwound stack.
+// Port of erts/emulator/beam/beam_common.c:585-700 (next_catch, have_return_to_trace),
+// OTP-29.1.1.
+pub(crate) fn unwound_return_to(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    sessions: &[u64],
+    target: Option<(String, String, u8)>,
+) -> Result<(), VmError> {
+    let pid = ctx.pid();
+    let mut done = Vec::new();
+    for session in sessions {
+        if done.contains(session) {
+            continue;
+        }
+        done.push(*session);
+        let flags = session_flags(process, *session, pid);
+        if flags & RETURN_TO == 0 || flags & SILENT != 0 {
+            continue;
+        }
+        emit_return_to(vm, process, ctx, *session, target.clone())?;
+    }
+    Ok(())
 }
 
 /// Emits the `return_to` event of a traced native return that resumes at `caller`.
@@ -1872,34 +2564,8 @@ fn emit_filtered_without_ctx(
             crate::signals::atom(name),
         ]);
         values.extend_from_slice(fields);
-        if entry.flags & TIMESTAMP != 0 {
-            let micros = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros();
-            values.push(
-                TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                    .tuple(&[
-                        Term::small((micros / 1_000_000 / 1_000_000) as i64).unwrap_or(Term::NIL),
-                        Term::small((micros / 1_000_000 % 1_000_000) as i64).unwrap_or(Term::NIL),
-                        Term::small((micros % 1_000_000) as i64).unwrap_or(Term::NIL),
-                    ])
-                    .unwrap_or(Term::NIL),
-            );
-        } else if entry.flags & (MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0 {
-            static START: OnceLock<std::time::Instant> = OnceLock::new();
-            values.push(
-                Term::small(
-                    i64::try_from(
-                        START
-                            .get_or_init(std::time::Instant::now)
-                            .elapsed()
-                            .as_nanos(),
-                    )
-                    .unwrap_or(i64::MAX),
-                )
-                .unwrap_or(Term::NIL),
-            );
+        if let Some(stamp) = timestamp_term(process, entry.flags) {
+            values.push(stamp);
         }
         // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253 (enif_make_tuple_from_array
         // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
@@ -2099,105 +2765,128 @@ fn emit_filtered(
                 extra = context.take_message(process);
             }
         }
-        if let Tracer::Module { module, state } = &entry.tracer {
-            let Some(vm) = vm.as_deref_mut() else {
-                continue;
-            };
-            emit_module(
-                vm,
-                process,
-                Some(ctx),
-                module,
-                state,
-                TraceEvent {
-                    flags: entry.flags,
-                    tracee: subject_term,
-                    name,
-                    fields,
-                    extra,
-                },
-            );
-            continue;
-        }
-        let mut values = Vec::with_capacity(3 + fields.len() + 1);
-        values.extend([
-            crate::signals::atom(
-                if entry.flags & (TIMESTAMP | MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0
-                {
-                    "trace_ts"
-                } else {
-                    "trace"
-                },
-            ),
+        deliver(
+            vm.as_deref_mut(),
+            process,
+            ctx,
+            subject,
             subject_term,
-            crate::signals::atom(name),
-        ]);
-        values.extend_from_slice(fields);
-        if let Some(extra) = extra {
-            values.push(extra);
-        }
-        if entry.flags & SCHEDULER_ID != 0 {
-            values.push(
-                Term::small(ctx.scheduler_id().unwrap_or(0) as i64)
-                    .unwrap_or(crate::signals::atom("undefined")),
-            );
-        }
-        if entry.flags & TIMESTAMP != 0 {
-            let micros = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros();
-            let stamp = [
-                micros / 1_000_000 / 1_000_000,
-                micros / 1_000_000 % 1_000_000,
-                micros % 1_000_000,
-            ]
-            .map(|value| Term::small(value as i64).unwrap_or(Term::NIL));
-            if let Ok(tuple) =
-                TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                    .tuple(&stamp)
-            {
-                values.push(tuple);
-            }
-        } else if entry.flags & (MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0 {
-            static START: OnceLock<std::time::Instant> = OnceLock::new();
-            let stamp = Term::small(
-                i64::try_from(
-                    START
-                        .get_or_init(std::time::Instant::now)
-                        .elapsed()
-                        .as_nanos(),
-                )
-                .unwrap_or(i64::MAX),
-            )
-            .unwrap_or(Term::NIL);
-            values.push(stamp);
-        }
-        // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253 (enif_make_tuple_from_array
-        // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
-        // the event, so the tuple may land in a heap fragment.
-        let Ok(event) =
-            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&values)
-        else {
-            return;
-        };
-        let Ok(message) = Message::copy_from(event) else {
-            return;
-        };
-        match entry.tracer {
-            Tracer::Default => continue,
-            Tracer::Pid(pid) if pid == subject => continue,
-            Tracer::Pid(pid) => {
-                let _ = ctx.send(pid, message);
-            }
-            Tracer::Port(id) => {
-                if let Some(port) = Term::port(id) {
-                    let _ = crate::port::send_message(process, port, event);
-                }
-            }
-            Tracer::Module { .. } => unreachable!(),
-        }
+            &entry,
+            name,
+            fields,
+            extra,
+        );
     }
+}
+
+/// Send one trace event to the tracer of `entry`.
+// Port of erts/emulator/nifs/common/erl_tracer_nif.c:204-260 (trace) and
+// erts/emulator/beam/erl_trace.c:3150-3260 (send_to_tracer_nif), OTP-29.1.1.
+#[allow(clippy::too_many_arguments)] // The event and its tracer are separate inputs.
+fn deliver(
+    vm: Option<&mut Vm>,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    subject: Pid,
+    subject_term: Term,
+    entry: &Entry,
+    name: &str,
+    fields: &[Term],
+    extra: Option<Term>,
+) {
+    if let Tracer::Module { module, state } = &entry.tracer {
+        let Some(vm) = vm else {
+            return;
+        };
+        emit_module(
+            vm,
+            process,
+            Some(ctx),
+            module,
+            state,
+            TraceEvent {
+                flags: entry.flags,
+                tracee: subject_term,
+                name,
+                fields,
+                extra,
+            },
+        );
+        return;
+    }
+    let mut values = Vec::with_capacity(3 + fields.len() + 1);
+    values.extend([
+        crate::signals::atom(
+            if entry.flags & (TIMESTAMP | MONOTONIC_TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP) != 0 {
+                "trace_ts"
+            } else {
+                "trace"
+            },
+        ),
+        subject_term,
+        crate::signals::atom(name),
+    ]);
+    values.extend_from_slice(fields);
+    if let Some(extra) = extra {
+        values.push(extra);
+    }
+    if entry.flags & SCHEDULER_ID != 0 {
+        values.push(
+            Term::small(ctx.scheduler_id().unwrap_or(0) as i64)
+                .unwrap_or(crate::signals::atom("undefined")),
+        );
+    }
+    if let Some(stamp) = timestamp_term(process, entry.flags) {
+        values.push(stamp);
+    }
+    // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253 (enif_make_tuple_from_array
+    // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
+    // the event, so the tuple may land in a heap fragment.
+    let Ok(event) =
+        TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&values)
+    else {
+        return;
+    };
+    let Ok(message) = Message::copy_from(event) else {
+        return;
+    };
+    match &entry.tracer {
+        Tracer::Default => {}
+        Tracer::Pid(pid) if *pid == subject => {}
+        Tracer::Pid(pid) => {
+            let _ = ctx.send(*pid, message);
+        }
+        Tracer::Port(id) => {
+            if let Some(port) = Term::port(*id) {
+                let _ = crate::port::send_message(process, port, event);
+            }
+        }
+        Tracer::Module { .. } => unreachable!(),
+    }
+}
+
+/// The timestamp field of a trace message for the timestamp flags in `flags`.
+// Port of erts/emulator/beam/erl_trace.c:3221-3234 and :2970-3010 (patch_ts, erts_trace_ts):
+// `timestamp` wins over `strict_monotonic_timestamp`, which wins over `monotonic_timestamp`.
+fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
+    if flags & (TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP | MONOTONIC_TIMESTAMP) == 0 {
+        return None;
+    }
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    if flags & TIMESTAMP != 0 {
+        let now = arinsal_bifs::lookup("erlang", "now", 0)?;
+        return now(&mut arinsal_bifs::Ctx::new(&mut heap), &[]).ok();
+    }
+    let monotonic = TermBuilder::new(&mut heap)
+        .int_from_i128(arinsal_bifs::monotonic_time_nanos())
+        .ok()?;
+    if flags & STRICT_MONOTONIC_TIMESTAMP != 0 {
+        let unique = TermBuilder::new(&mut heap)
+            .int_from_i64(arinsal_bifs::next_unique_monotonic())
+            .ok()?;
+        return TermBuilder::new(&mut heap).tuple(&[monotonic, unique]).ok();
+    }
+    Some(monotonic)
 }
 
 fn emit_module(
@@ -2266,7 +2955,8 @@ fn emit_module(
 
 pub(crate) fn create_session(process: &Process, name: String, tracer: Tracer) -> (u64, i64) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    let id = 0x7000_0000_0000_0000 | NEXT.fetch_add(1, Ordering::Relaxed).max(1);
+    // Session ids stay below 2^59 so trace frames can keep them in small integers.
+    let id = (1 << 58) | NEXT.fetch_add(1, Ordering::Relaxed).max(1);
     let weak_id = process
         .runtime
         .as_ref()
@@ -2755,32 +3445,26 @@ mod tests {
                 exported: true,
             }],
             None,
+            None,
             crate::trace_bp::BreakOp::Set,
             crate::trace_bp::TracePatternFlags::default(),
+            &Tracer::Default,
         );
-        assert_eq!(
-            crate::trace_bp::info_session(
-                &process,
+        let traced = |process: &Process| {
+            crate::trace_bp::function_info(
+                process,
                 session.0,
                 "trace_test",
                 "function",
                 0,
-                "traced"
-            ),
-            Some(arinsal_etf::OwnedTerm::Atom("global".into()))
-        );
+                crate::trace_bp::WANT_TRACE,
+            )
+            .got
+        };
+        assert_eq!(traced(&process), crate::trace_bp::GOT_GLOBAL);
         assert!(destroy_session(&process, session.0));
         crate::trace_bp::clear_session(&process, session.0);
-        assert!(
-            crate::trace_bp::info_session(
-                &process,
-                session.0,
-                "trace_test",
-                "function",
-                0,
-                "traced"
-            ) == Some(arinsal_etf::OwnedTerm::Atom("false".into()))
-        );
+        assert_eq!(traced(&process), 0);
         assert!(!destroy_session(&process, session.0));
     }
 

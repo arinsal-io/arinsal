@@ -230,6 +230,13 @@ impl MessageQueue {
         self.entries.get(index).map(|entry| &entry.term)
     }
 
+    /// Whether the message's data lives on the receiver's heap (no off-heap fragment holds it).
+    pub(crate) fn is_on_heap(&self, index: usize) -> bool {
+        self.entries
+            .get(index)
+            .is_some_and(|entry| entry.fragment.as_ref().is_none_or(|f| f.heap.is_none()))
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Term> {
         self.entries.iter().map(|entry| &entry.term)
     }
@@ -965,6 +972,42 @@ struct Executor {
 pub(crate) const REMOTE_SEND_NEEDS_CONTEXT: &str = "remote send requires a scheduler context";
 
 impl Executor {
+    /// Emit the trace events of the native frames a return left, and their return_to events
+    /// for the caller at `resume_pc`.
+    fn emit_native_return_frames(
+        &mut self,
+        process: &mut Process,
+        ctx: &mut RunCtx<'_, Message>,
+        frames: Vec<(usize, Vec<crate::trace::NativeTraceAction>)>,
+        value: Term,
+        resume_pc: usize,
+    ) -> Result<(), VmError> {
+        for (function_pc, actions) in frames {
+            let Some(function) = crate::native_function_at(function_pc) else {
+                continue;
+            };
+            crate::trace::native_return_events(
+                &mut self.vm,
+                process,
+                ctx,
+                &function,
+                &actions,
+                value,
+                false,
+            )?;
+            for action in actions.iter().filter(|action| action.return_to) {
+                crate::trace::native_return_to_event(
+                    &mut self.vm,
+                    process,
+                    ctx,
+                    action.session,
+                    resume_pc,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn run(
         &mut self,
         process: &mut Process,
@@ -985,6 +1028,10 @@ impl Executor {
             "in",
             running_fields,
         );
+        // Port of erts/emulator/beam/erl_process.c:10541-10543 (trace_schedule_in), OTP-29.1.1.
+        if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
+            crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
+        }
         self.vm.sync_module(process.module);
         if process.native_pc.is_some() && process.reductions <= 0 {
             process.reductions = budget.min(i32::MAX as u32) as i32;
@@ -1161,6 +1208,36 @@ impl Executor {
                         process.force_yield = false;
                         break Ok(RunState::Yield);
                     }
+                    if process.native_pc
+                        == Some(crate::native_bridge::native_trace_return_address())
+                    {
+                        // The interpreter returned into a traced native function's return
+                        // frame: finish the frame here, as the stub does for native returns.
+                        // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:152-195,
+                        // OTP-29.1.1.
+                        process.native_pc = None;
+                        let value = process.x[0];
+                        let popped = crate::trace::pop_native_trace_frames(process, |p, words| {
+                            p.heap.release_stack(words);
+                        });
+                        let Some((frames, caller)) = popped else {
+                            break Err(VmError::Unsupported("native trace frame".into()));
+                        };
+                        let resume_pc = caller.tagged_word() as usize;
+                        self.emit_native_return_frames(process, ctx, frames, value, resume_pc)?;
+                        let bridge =
+                            arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
+                        if resume_pc == bridge {
+                            if !resume_after_native_return(process) {
+                                break Ok(RunState::Done(process.x[0]));
+                            }
+                        } else {
+                            process.cold_mut().native_continuation_resume = true;
+                            process.cold_mut().native_resume_live = 2;
+                            process.native_pc = Some(resume_pc);
+                        }
+                        continue;
+                    }
                     if let Some(code_ptr) = process.native_pc.take() {
                         crate::beamasm_integration::count_native_call();
                         // Native receives look at the private queue only; fetch what arrived.
@@ -1314,15 +1391,11 @@ impl Executor {
                                 {
                                     // A traced native return: its return_from events are out
                                     // and its frame is gone; resume_pc is the caller.
-                                    let sessions =
-                                        std::mem::take(&mut process.cold_mut().native_return_to);
-                                    for session in sessions {
-                                        crate::trace::native_return_to_event(
-                                            &mut self.vm,
-                                            process,
-                                            ctx,
-                                            session,
-                                            resume_pc,
+                                    if let Some((frames, value)) =
+                                        process.cold_mut().native_return_events.take()
+                                    {
+                                        self.emit_native_return_frames(
+                                            process, ctx, frames, value, resume_pc,
                                         )?;
                                     }
                                     let bridge = arinsal_beamasm::rt::arinsal_enter_native_return
@@ -1537,13 +1610,6 @@ impl Executor {
                                     {
                                         *destination = crate::native_hooks::from_raw(raw);
                                     }
-                                    crate::trace_bp::increment(
-                                        process,
-                                        &function.module,
-                                        &function.function,
-                                        function.arity,
-                                        true,
-                                    );
                                     let actions = crate::trace::executor_native_call_event(
                                         &mut self.vm,
                                         process,
@@ -1894,11 +1960,34 @@ impl Executor {
                                             process.x.get(1).copied().unwrap_or(Term::NIL),
                                             process.x.get(2).copied().unwrap_or(Term::NIL),
                                         ];
-                                        if (export.trap_entry
+                                        let traps_here = export.trap_entry
                                             || process
                                                 .cold
                                                 .as_ref()
-                                                .is_some_and(|cold| cold.bif_trap.is_some()))
+                                                .is_some_and(|cold| cold.bif_trap.is_some());
+                                        // A traced trapping BIF reports its call once, when it is
+                                        // first entered, and its return when it finishes.
+                                        // Port of erts/emulator/beam/beam_bp.c:321-330
+                                        // (erts_export_is_bif_traced), OTP-29.1.1.
+                                        let trap_traced = if traps_here
+                                            && crate::bif_traps::traps(
+                                                &export.module,
+                                                &export.function,
+                                                export.arity,
+                                            ) {
+                                            self.vm.trace_native_call_named(
+                                                process,
+                                                ctx,
+                                                &export.module,
+                                                &export.function,
+                                                usize::from(export.arity),
+                                                (usize::MAX, call_site_pc),
+                                                crate::trace::StackScan::None,
+                                            )
+                                        } else {
+                                            None
+                                        };
+                                        if traps_here
                                             && let Some(trapped) = crate::bif_traps::execute_named(
                                                 process,
                                                 &export.module,
@@ -1909,7 +1998,7 @@ impl Executor {
                                                 Some(ctx),
                                             )
                                         {
-                                            match trapped {
+                                            let outcome = match trapped {
                                                 Ok(crate::bif_traps::TrapResult::Yield {
                                                     ..
                                                 }) => {
@@ -1934,7 +2023,46 @@ impl Executor {
                                                     "failed trapping BIF without exception".into(),
                                                 ))),
                                                 Err(error) => Some(Err(error)),
+                                            };
+                                            if let (Some((module, function, args)), Some(result)) =
+                                                (&trap_traced, &outcome)
+                                            {
+                                                let reduced = match result {
+                                                    Ok(value) => Some(Ok(*value)),
+                                                    Err(VmError::Exception { reason, frame }) => {
+                                                        legacy_exception_trap(
+                                                            process, reason, frame,
+                                                        )
+                                                        .ok()
+                                                        .and_then(|trap| {
+                                                            crate::exceptions::trace_class_reason(
+                                                                process,
+                                                                trap.class,
+                                                                trap.reason,
+                                                            )
+                                                            .ok()
+                                                        })
+                                                        .map(Err)
+                                                    }
+                                                    Err(VmError::Trap(trap)) => {
+                                                        crate::exceptions::trace_class_reason(
+                                                            process,
+                                                            trap.class,
+                                                            trap.reason,
+                                                        )
+                                                        .ok()
+                                                        .map(Err)
+                                                    }
+                                                    Err(_) => None,
+                                                };
+                                                if let Some(reduced) = reduced {
+                                                    self.vm.trace_native_return_outcome(
+                                                        process, ctx, module, function, args,
+                                                        reduced,
+                                                    );
+                                                }
                                             }
+                                            outcome
                                         } else {
                                             // The BIF runs at the native call site (erts c_p->i).
                                             let (module_before, ip_before) =
@@ -1947,6 +2075,7 @@ impl Executor {
                                                 &export.function,
                                                 usize::from(export.arity),
                                                 (usize::MAX, call_site_pc),
+                                                crate::trace::StackScan::None,
                                             );
                                             let result = self.vm.dispatch_native(
                                                 process,
@@ -2494,6 +2623,10 @@ impl Executor {
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
             || matches!(result, Err(VmError::Yield | VmError::Dirty(_)))
         {
+            // Port of erts/emulator/beam/erl_process.c:10556-10560 (trace_schedule_out).
+            if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
+                crate::trace_bp::schedule_time_break(process, ctx.pid(), true);
+            }
             crate::trace::emit(
                 Some(&mut self.vm),
                 process,
@@ -2669,7 +2802,7 @@ fn resume_after_native_return(process: &mut Process) -> bool {
             process.heap.release_stack(1);
             continue;
         }
-        if crate::native_bridge::is_native_function_at(raw) {
+        if crate::native_bridge::is_native_continuation(raw) {
             process.heap.release_stack(1);
             process.cold_mut().native_continuation_resume = true;
             process.cold_mut().native_resume_live = 2;
@@ -4327,9 +4460,11 @@ impl Process {
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                     let sender = from;
+                    let before = self.allocated_words(0);
                     let new_prio_len =
                         self.inbox
                             .push_message(message, data, &mut self.heap, old_prio_len)?;
+                    self.uncount_message_words(before);
                     let trace_index = if priority {
                         old_prio_len
                     } else {
@@ -4356,9 +4491,11 @@ impl Process {
                     let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+                    let before = self.allocated_words(0);
                     let new_prio_len =
                         self.inbox
                             .push_message(message, data, &mut self.heap, old_prio_len)?;
+                    self.uncount_message_words(before);
                     self.cold_mut().prio_len = new_prio_len;
                     if priority {
                         let priority_term =
@@ -4720,6 +4857,23 @@ impl Process {
         Ok(stats)
     }
 
+    /// A message copied onto the heap when it was sent is counted by `call_memory` when it is
+    /// received, not when it arrives.
+    // Port of erts/emulator/beam/erl_message.c:659 (erts_adjust_memory_break(pp, -sz)),
+    // OTP-29.1.1.
+    fn uncount_message_words(&mut self, allocated_before: i64) {
+        if self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| !cold.call_memory.is_empty())
+        {
+            let delta = self.allocated_words(0) - allocated_before;
+            if delta > 0 {
+                crate::trace_bp::adjust_memory_break(self, -delta);
+            }
+        }
+    }
+
     fn collect_roots(
         &mut self,
         live_x: usize,
@@ -4777,6 +4931,16 @@ impl Process {
                 "gc_minor_start"
             };
             self.trace_gc(pid, start_tag, min_free);
+        }
+        // Port of erts/emulator/beam/erl_gc.c:823-825 (garbage_collect), OTP-29.1.1: the words
+        // allocated so far stay counted by call_memory after the collection resets the heap.
+        if self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| !cold.call_memory.is_empty())
+        {
+            let allocated = self.allocated_words(0);
+            crate::trace_bp::adjust_memory_break(self, allocated);
         }
         let stats = if hibernate {
             self.heap

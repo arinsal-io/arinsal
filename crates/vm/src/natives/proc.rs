@@ -2990,24 +2990,8 @@ fn trace_session_info(
         };
         return make_tuple(process, &[item, value]);
     }
-    if let Some((module, function, arity)) = trace_mfa(spec) {
-        let key = atom_name(item).unwrap_or_default();
-        // Port of erts/emulator/beam/erl_bif_trace.c:2152-2160 (trace_info_func), OTP-29.1.1:
-        // a function that does not exist reports `undefined`, not `false`.
-        if !function_exists(vm, &module, &function, arity) {
-            return make_tuple(process, &[item, atom("undefined")]);
-        }
-        let value = match crate::trace_bp::info_session(
-            process, session, &module, &function, arity, &key,
-        ) {
-            Some(value) => arinsal_term::from_owned(
-                &value,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-            )
-            .unwrap_or_else(|_| atom("undefined")),
-            None => atom("undefined"),
-        };
-        return make_tuple(process, &[item, value]);
+    if let Some(mfa) = trace_mfa(spec) {
+        return trace_info_function(vm, process, session, mfa, item);
     }
     let Some(pid) = Pid::from_term(spec) else {
         return Ok(atom("undefined"));
@@ -3094,22 +3078,8 @@ fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<
         };
         return make_tuple(process, &[item, value]);
     }
-    if let Some((module, function, arity)) = trace_mfa(spec) {
-        let key = atom_name(item).unwrap_or_default();
-        // Port of erts/emulator/beam/erl_bif_trace.c:2152-2160 (trace_info_func), OTP-29.1.1:
-        // a function that does not exist reports `undefined`, not `false`.
-        if !function_exists(vm, &module, &function, arity) {
-            return make_tuple(process, &[item, atom("undefined")]);
-        }
-        let value = match crate::trace_bp::info(process, &module, &function, arity, &key) {
-            Some(value) => arinsal_term::from_owned(
-                &value,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-            )
-            .unwrap_or_else(|_| atom("undefined")),
-            None => Term::NIL,
-        };
-        return make_tuple(process, &[item, value]);
+    if let Some(mfa) = trace_mfa(spec) {
+        return trace_info_function(vm, process, 0, mfa, item);
     }
     let Some(pid) = Pid::from_term(spec) else {
         return Ok(atom("undefined"));
@@ -3153,6 +3123,191 @@ fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<
         _ => return Ok(atom("undefined")),
     };
     Ok(value)
+}
+
+/// The tracer of a `{meta, Tracer}` or `{meta, Module, State}` trace_pattern flag.
+// Port of erts/emulator/beam/erl_trace.c:3090-3129 (erts_term_to_tracer), OTP-29.1.1.
+fn meta_tracer_from_term(vm: &Vm, flag: Term) -> Result<crate::trace::Tracer, VmError> {
+    // SAFETY: The flag list stays rooted for this BIF call.
+    let tuple = unsafe { flag.tuple_ref() }.ok_or_else(badarg)?;
+    let fields = (0..tuple.len())
+        .map(|index| tuple.get(index).ok_or_else(badarg))
+        .collect::<Result<Vec<_>, _>>()?;
+    let from_state = |term: Term| {
+        if let Some(pid) = Pid::from_term(term) {
+            Ok(crate::trace::Tracer::Pid(pid))
+        } else if let Some(id) = term.as_port() {
+            Ok(crate::trace::Tracer::Port(id))
+        } else {
+            Err(badarg())
+        }
+    };
+    match fields.as_slice() {
+        [prefix, tracer] if atom_name(*prefix).as_deref() == Some("meta") => from_state(*tracer),
+        [prefix, module, state]
+            if atom_name(*prefix).as_deref() == Some("meta") && module.as_atom().is_some() =>
+        {
+            module_tracer(vm, *module, *state)
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// `trace_info({M,F,A}, Key)` of a session.
+// Port of erts/emulator/beam/erl_bif_trace.c:1913-1960 (trace_info_func) and 2132-2290
+// (trace_info_func_epilogue), OTP-29.1.1.
+fn trace_info_function(
+    vm: &Vm,
+    process: &mut Process,
+    session: u64,
+    (module, function, arity): (String, String, u8),
+    item: Term,
+) -> Result<Term, VmError> {
+    use crate::trace_bp::{
+        GOT_COUNT, GOT_GLOBAL, GOT_LOCAL, GOT_MEMORY, GOT_META, GOT_TIME, WANT_COUNT, WANT_MEMORY,
+        WANT_META, WANT_TIME, WANT_TRACE,
+    };
+    let key = atom_name(item).unwrap_or_default();
+    let want = match key.as_str() {
+        "traced" | "match_spec" => WANT_TRACE,
+        "meta" | "meta_match_spec" => WANT_META,
+        "call_count" => WANT_COUNT,
+        "call_time" => WANT_TIME,
+        "call_memory" => WANT_MEMORY,
+        "all" => WANT_TRACE | WANT_META | WANT_COUNT | WANT_TIME | WANT_MEMORY,
+        _ => return Err(badarg()),
+    };
+    // A function that does not exist reports `undefined`, an untraced one `false`.
+    if !function_exists(vm, &module, &function, arity) {
+        return make_tuple(process, &[item, atom("undefined")]);
+    }
+    let info = crate::trace_bp::function_info(process, session, &module, &function, arity, want);
+    if info.counters_active {
+        // erts traps the caller until the schedulers have stopped updating the counters:
+        // a scheduling round here gives other processes the chance to run in between.
+        // Port of erts/emulator/beam/erl_bif_trace.c:1960-1990 (trace_info_func,
+        // erts_prepare_timem_trace_info), OTP-29.1.1.
+        process.force_yield = true;
+    }
+    if info.got == 0 {
+        return make_tuple(process, &[item, atom("false")]);
+    }
+    let owned = |process: &mut Process, term: &arinsal_etf::OwnedTerm| {
+        arinsal_term::from_owned(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .map_err(|_| badarg())
+    };
+    let (traced, mut match_spec) = if info.got & GOT_GLOBAL != 0 {
+        (atom("global"), Term::NIL)
+    } else if info.got & GOT_LOCAL != 0 {
+        (atom("local"), Term::NIL)
+    } else {
+        (atom("false"), atom("false"))
+    };
+    if let Some(spec) = &info.local_ms {
+        match_spec = owned(process, spec)?;
+    }
+    let tracer_term = |process: &mut Process, tracer: crate::trace::Tracer| match tracer {
+        crate::trace::Tracer::Default => Ok(atom("false")),
+        tracer => trace_tracer_term(process, tracer),
+    };
+    let meta_match_spec = |process: &mut Process| -> Result<Term, VmError> {
+        if info.got & GOT_META == 0 {
+            return Ok(atom("false"));
+        }
+        match &info.meta_ms {
+            Some(spec) => owned(process, spec),
+            None => Ok(Term::NIL),
+        }
+    };
+    let call_count = |process: &mut Process| -> Result<Term, VmError> {
+        if info.got & GOT_COUNT == 0 {
+            return Ok(atom("false"));
+        }
+        arinsal_term::TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .int_from_i64(info.count as i64)
+            .map_err(|_| badarg())
+    };
+    // Port of erts/emulator/beam/beam_bp.c:1664-1736 (erts_build_timem_info).
+    let call_time = |process: &mut Process| -> Result<Term, VmError> {
+        let Some(entries) = info.time.as_ref().filter(|_| info.got & GOT_TIME != 0) else {
+            return Ok(atom("false"));
+        };
+        let mut tuples = Vec::new();
+        for (pid, count, nanos) in entries {
+            let micros = nanos / 1000;
+            let tuple = make_tuple(
+                process,
+                &[
+                    pid.to_term().ok_or_else(badarg)?,
+                    Term::small(*count).ok_or_else(badarg)?,
+                    Term::small(micros / 1_000_000).ok_or_else(badarg)?,
+                    Term::small(micros % 1_000_000).ok_or_else(badarg)?,
+                ],
+            )?;
+            tuples.push(tuple);
+        }
+        make_list(process, tuples)
+    };
+    let call_memory = |process: &mut Process| -> Result<Term, VmError> {
+        let Some(entries) = info.memory.as_ref().filter(|_| info.got & GOT_MEMORY != 0) else {
+            return Ok(atom("false"));
+        };
+        let mut tuples = Vec::new();
+        for (pid, count, words) in entries {
+            let words = arinsal_term::TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(
+                &mut process.heap,
+            ))
+            .int_from_i64(*words)
+            .map_err(|_| badarg())?;
+            let tuple = make_tuple(
+                process,
+                &[
+                    pid.to_term().ok_or_else(badarg)?,
+                    Term::small(*count).ok_or_else(badarg)?,
+                    words,
+                ],
+            )?;
+            tuples.push(tuple);
+        }
+        make_list(process, tuples)
+    };
+    let value = match key.as_str() {
+        "traced" => traced,
+        "match_spec" => match_spec,
+        "meta" => {
+            // Backwards compatibility: no meta tracer is `[]`.
+            match tracer_term(process, info.meta.clone())? {
+                term if term == atom("false") => Term::NIL,
+                term => term,
+            }
+        }
+        "meta_match_spec" => meta_match_spec(process)?,
+        "call_count" => call_count(process)?,
+        "call_time" => call_time(process)?,
+        "call_memory" => call_memory(process)?,
+        _ => {
+            let meta = tracer_term(process, info.meta.clone())?;
+            let meta_match_spec = meta_match_spec(process)?;
+            let call_count = call_count(process)?;
+            let call_time = call_time(process)?;
+            let call_memory = call_memory(process)?;
+            let entries = [
+                ("traced", traced),
+                ("match_spec", match_spec),
+                ("meta", meta),
+                ("meta_match_spec", meta_match_spec),
+                ("call_memory", call_memory),
+                ("call_time", call_time),
+                ("call_count", call_count),
+            ];
+            let mut pairs = Vec::new();
+            for (key, value) in entries {
+                pairs.push(make_tuple(process, &[atom(key), value])?);
+            }
+            make_list(process, pairs)?
+        }
+    };
+    make_tuple(process, &[item, value])
 }
 
 /// Count the functions of the current code of the selected modules.
@@ -3215,105 +3370,84 @@ fn compile_trace_pattern(pattern: Term, event: Option<bool>) -> Result<(), VmErr
     }
 }
 
-// Port of erts/emulator/beam/erl_bif_trace.c:465-468 and 2523-2603
-// (change_on_load_trace_pattern), OTP-29.1.1.
-fn trace_pattern_on_load(
-    process: &mut Process,
-    session: u64,
-    pattern: Term,
-    flags: Term,
-) -> Result<Term, VmError> {
-    let owned_flags = arinsal_term::to_owned(flags).map_err(|_| badarg())?;
-    let names = match &owned_flags {
-        arinsal_etf::OwnedTerm::Nil => Vec::new(),
-        arinsal_etf::OwnedTerm::List { elems, tail }
-            if tail.as_ref() == &arinsal_etf::OwnedTerm::Nil =>
-        {
-            let mut names = Vec::new();
-            for flag in elems {
-                match flag {
-                    arinsal_etf::OwnedTerm::Atom(name)
-                        if matches!(name.as_str(), "local" | "global" | "call_count") =>
-                    {
-                        names.push(name.clone());
-                    }
-                    arinsal_etf::OwnedTerm::Tuple(_) => {
-                        return Err(VmError::Unsupported(
-                            "meta tracing requires the tracer callback hook".into(),
-                        ));
-                    }
-                    _ => return Err(badarg()),
-                }
-            }
-            names
-        }
-        _ => return Err(badarg()),
-    };
-    if names.iter().any(|n| n == "global") && names.len() > 1 {
-        return Err(badarg());
-    }
-    if pattern == atom("pause") || pattern == atom("restart") {
-        return Err(badarg());
-    }
-    let on = pattern != atom("false");
-    let mut match_spec = None;
-    if on && pattern != atom("true") && pattern != Term::NIL {
-        compile_trace_pattern(pattern, None)?;
-        let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
-        match_spec = Some(owned);
-    }
-    crate::trace_bp::change_on_load(process, session, on, &names, match_spec);
-    Ok(Term::small(0).expect("zero matches"))
-}
-
 /// `trace_info(on_load, Key)` of a session.
 // Port of erts/emulator/beam/erl_bif_trace.c:2292-2420 (trace_info_on_load), OTP-29.1.1.
 fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result<Term, VmError> {
-    let state = crate::trace_bp::on_load_pattern(process, session);
-    let Some(state) = state else {
+    let Some(state) = crate::trace_bp::on_load_pattern(process, session) else {
         return make_tuple(process, &[item, atom("false")]);
     };
-    let local = state.flags.iter().any(|n| n == "local");
-    let breakpoint = local || state.flags.iter().any(|n| n == "call_count");
-    let traced = if !breakpoint {
-        "global"
-    } else if local {
-        "local"
-    } else {
-        "false"
-    };
-    let match_spec = |process: &mut Process| -> Result<Term, VmError> {
-        if !breakpoint || local {
-            match &state.match_spec {
-                Some(ms) => arinsal_term::from_owned(
-                    ms,
-                    &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-                )
-                .map_err(|_| badarg()),
-                None => Ok(Term::NIL),
-            }
-        } else {
-            Ok(atom("false"))
+    let flags = state.flags;
+    let owned = |process: &mut Process, term: &Option<arinsal_etf::OwnedTerm>| match term {
+        Some(term) => {
+            arinsal_term::from_owned(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .map_err(|_| badarg())
         }
+        None => Ok(Term::NIL),
     };
-    let call_count = atom(if state.flags.iter().any(|n| n == "call_count") {
-        "true"
+    let traced = if !flags.breakpoint {
+        atom("global")
+    } else if flags.local {
+        atom("local")
     } else {
-        "false"
-    });
+        atom("false")
+    };
+    let bool_atom = |value: bool| atom(if value { "true" } else { "false" });
     let value = match atom_name(item).as_deref() {
-        Some("traced") => atom(traced),
-        Some("match_spec") => match_spec(process)?,
-        Some("meta" | "meta_match_spec" | "call_time" | "call_memory") => atom("false"),
-        Some("call_count") => call_count,
+        Some("traced") => traced,
+        Some("match_spec") => {
+            if !flags.breakpoint || flags.local {
+                owned(process, &state.match_spec)?
+            } else {
+                atom("false")
+            }
+        }
+        Some("meta") => {
+            if flags.meta {
+                match state.meta_tracer.clone() {
+                    crate::trace::Tracer::Default => atom("false"),
+                    tracer => trace_tracer_term(process, tracer)?,
+                }
+            } else {
+                atom("false")
+            }
+        }
+        Some("meta_match_spec") => {
+            if flags.meta {
+                owned(process, &state.meta_match_spec)?
+            } else {
+                atom("false")
+            }
+        }
+        Some("call_count") => bool_atom(flags.call_count),
+        Some("call_time") => bool_atom(flags.call_time),
+        Some("call_memory") => bool_atom(flags.call_memory),
         Some("all") => {
-            let ms = match_spec(process)?;
+            let mut match_spec = if flags.local || !flags.breakpoint {
+                Term::NIL
+            } else {
+                atom("false")
+            };
+            if state.match_spec.is_some() {
+                match_spec = owned(process, &state.match_spec)?;
+            }
+            let mut meta_match_spec = if flags.meta { Term::NIL } else { atom("false") };
+            if state.meta_match_spec.is_some() {
+                meta_match_spec = owned(process, &state.meta_match_spec)?;
+            }
+            let meta = if flags.meta {
+                match state.meta_tracer.clone() {
+                    crate::trace::Tracer::Default => atom("false"),
+                    tracer => trace_tracer_term(process, tracer)?,
+                }
+            } else {
+                atom("false")
+            };
             let entries = [
-                ("traced", atom(traced)),
-                ("match_spec", ms),
-                ("meta", atom("false")),
-                ("meta_match_spec", atom("false")),
-                ("call_count", call_count),
+                ("traced", traced),
+                ("match_spec", match_spec),
+                ("meta", meta),
+                ("meta_match_spec", meta_match_spec),
+                ("call_count", bool_atom(flags.call_count)),
             ];
             let mut pairs = Vec::new();
             for (key, value) in entries {
@@ -3366,8 +3500,81 @@ fn trace_pattern(
         crate::trace::set_event_pattern(process, session, &event, enabled, match_spec);
         return Ok(Term::small(1).expect("one event pattern"));
     }
+    let flag_values = list(flags).ok_or_else(badarg)?;
+    // Port of erts/emulator/beam/erl_bif_trace.c:344-420 (trace_pattern flag list), OTP-29.1.1.
+    let session_tracer_nil = matches!(
+        crate::trace::session_tracer(process, session),
+        None | Some(crate::trace::Tracer::Default)
+    );
+    let mut names: Vec<String> = Vec::new();
+    let mut meta_tracer: Option<crate::trace::Tracer> = None;
+    let mut is_global = false;
+    for flag in flag_values {
+        if flag.classify() == TermKind::Tuple && session_tracer_nil {
+            meta_tracer = Some(meta_tracer_from_term(vm, flag)?);
+            names.push("meta".into());
+            continue;
+        }
+        let name = atom_name(flag).ok_or_else(badarg)?;
+        match name.as_str() {
+            "local" | "call_count" | "call_time" | "call_memory" if !is_global => {}
+            "meta" if !is_global => {
+                if meta_tracer.is_none() {
+                    meta_tracer = Some(match crate::trace::session_tracer(process, session) {
+                        None | Some(crate::trace::Tracer::Default) => {
+                            crate::trace::Tracer::Pid(process.self_pid.ok_or_else(badarg)?)
+                        }
+                        Some(tracer) => tracer,
+                    });
+                }
+            }
+            "global" if names.is_empty() => is_global = true,
+            _ => return Err(badarg()),
+        }
+        names.push(name);
+    }
+    // Port of erts/emulator/beam/erl_bif_trace.c:334-475 (trace_pattern), OTP-29.1.1.
+    let trace_flags = crate::trace_bp::TracePatternFlags {
+        breakpoint: names.iter().any(|name| name != "global"),
+        local: names.iter().any(|name| name == "local"),
+        meta: names.iter().any(|name| name == "meta"),
+        call_count: names.iter().any(|name| name == "call_count"),
+        call_time: names.iter().any(|name| name == "call_time"),
+        call_memory: names.iter().any(|name| name == "call_memory"),
+    };
+    let mut match_spec = None;
+    let on = if pattern == atom("false") {
+        crate::trace_bp::BreakOp::Nop
+    } else if pattern == atom("true") || pattern == Term::NIL {
+        crate::trace_bp::BreakOp::Set
+    } else if pattern == atom("restart") {
+        crate::trace_bp::BreakOp::Restart
+    } else if pattern == atom("pause") {
+        crate::trace_bp::BreakOp::Pause
+    } else {
+        compile_trace_pattern(pattern, None)?;
+        let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
+        match_spec = Some(owned);
+        crate::trace_bp::BreakOp::Set
+    };
+    if match_spec.is_some()
+        && !trace_flags.local
+        && !trace_flags.meta
+        && (trace_flags.call_count || trace_flags.call_time || trace_flags.call_memory)
+    {
+        return Err(badarg());
+    }
     if atom_name(spec).as_deref() == Some("on_load") {
-        return trace_pattern_on_load(process, session, pattern, flags);
+        // Port of erts/emulator/beam/erl_bif_trace.c:465-468, OTP-29.1.1.
+        crate::trace_bp::change_on_load(
+            process,
+            session,
+            on,
+            trace_flags,
+            match_spec,
+            &meta_tracer.unwrap_or_default(),
+        );
+        return Ok(Term::small(0).expect("zero matches"));
     }
     let owned_spec = arinsal_term::to_owned(spec).map_err(|_| badarg())?;
     let arinsal_etf::OwnedTerm::Tuple(spec_fields) = &owned_spec else {
@@ -3399,85 +3606,44 @@ fn trace_pattern(
         };
         Some(u8::try_from(*arity).map_err(|_| badarg())?)
     };
-    let owned_flags = arinsal_term::to_owned(flags).map_err(|_| badarg())?;
-    let no_flags = Vec::new();
-    let flag_values = match &owned_flags {
-        arinsal_etf::OwnedTerm::Nil => &no_flags,
-        arinsal_etf::OwnedTerm::List { elems, tail }
-            if tail.as_ref() == &arinsal_etf::OwnedTerm::Nil =>
-        {
-            elems
-        }
-        _ => return Err(badarg()),
-    };
-    let mut names = Vec::new();
-    let mut meta = None;
-    for flag in flag_values {
-        if let arinsal_etf::OwnedTerm::Atom(name) = flag {
-            let name = name.clone();
-            if !matches!(name.as_str(), "local" | "global" | "call_count") {
-                return Err(badarg());
-            }
-            if name == "global" && !names.is_empty()
-                || name != "global" && names.iter().any(|n| n == "global")
-            {
-                return Err(badarg());
-            }
-            names.push(name);
-        } else if let arinsal_etf::OwnedTerm::Tuple(fields) = flag {
-            if fields.len() != 2
-                || fields.first() != Some(&arinsal_etf::OwnedTerm::Atom("meta".into()))
-            {
-                return Err(badarg());
-            }
-            meta = Some(fields[1].clone());
-            names.push("meta".into());
-        } else {
-            return Err(badarg());
-        }
-    }
-    if meta.is_some() {
-        return Err(VmError::Unsupported(
-            "meta tracing requires the tracer callback hook".into(),
-        ));
-    }
-    // Port of erts/emulator/beam/erl_bif_trace.c:334-475 (trace_pattern), OTP-29.1.1.
-    let flags = crate::trace_bp::TracePatternFlags {
-        breakpoint: names.iter().any(|name| name != "global"),
-        local: names.iter().any(|name| name == "local"),
-        meta: names.iter().any(|name| name == "meta"),
-        call_count: names.iter().any(|name| name == "call_count"),
-    };
-    let mut match_spec = None;
-    let on = if pattern == atom("false") {
-        crate::trace_bp::BreakOp::Nop
-    } else if pattern == atom("true") || pattern == Term::NIL {
-        crate::trace_bp::BreakOp::Set
-    } else if pattern == atom("restart") {
-        crate::trace_bp::BreakOp::Restart
-    } else if pattern == atom("pause") {
-        crate::trace_bp::BreakOp::Pause
-    } else {
-        compile_trace_pattern(pattern, None)?;
-        let owned = arinsal_term::to_owned(pattern).map_err(|_| badarg())?;
-        match_spec = Some(owned);
-        crate::trace_bp::BreakOp::Set
-    };
-    if match_spec.is_some() && !flags.local && !flags.meta && flags.call_count {
-        return Err(badarg());
-    }
     let functions = bp_functions(vm, &module, &function, arity);
-    crate::trace_bp::set_trace_pattern(process, session, &functions, match_spec, on, flags);
-    vm.refresh_trace_pattern(process, &module, &function, arity);
+    // Port of erts/emulator/beam/erl_bif_trace.c:2661-2725 (erts_set_trace_pattern): the count
+    // is of the matched functions; only clearing, pausing and restarting skip the ones that
+    // have no breakpoint.
+    let matched = functions.len();
+    let matched_exported = functions
+        .iter()
+        .filter(|function| function.exported)
+        .count();
+    let functions = if on == crate::trace_bp::BreakOp::Set {
+        functions
+    } else {
+        crate::trace_bp::with_breakpoints(process, functions)
+    };
+    crate::trace_bp::set_trace_pattern(
+        process,
+        session,
+        &functions,
+        match_spec.clone(),
+        match_spec,
+        on,
+        trace_flags,
+        &meta_tracer.unwrap_or_default(),
+    );
+    vm.refresh_trace_functions(process, &functions);
+    if trace_flags.breakpoint {
+        // erts suspends the caller until a code barrier passed: every scheduler ran code
+        // since the breakpoints changed.
+        // Port of erts/emulator/beam/erl_bif_trace.c:507-515 (erts_schedule_code_barrier),
+        // OTP-29.1.1.
+        process.force_yield = true;
+    }
     // Port of erts/emulator/beam/erl_bif_trace.c:2712-2716, OTP-29.1.1: breakpoints count the
     // matched functions, global tracing the matched export entries.
-    let count = if flags.breakpoint {
-        functions.len()
+    let count = if trace_flags.breakpoint {
+        matched
     } else {
-        functions
-            .iter()
-            .filter(|function| function.exported)
-            .count()
+        matched_exported
     };
     Term::small(count as i64).ok_or_else(badarg)
 }

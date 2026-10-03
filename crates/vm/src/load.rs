@@ -1001,6 +1001,39 @@ impl Vm {
         }
     }
 
+    /// Patch the code of exactly these functions after their breakpoints changed.
+    pub(crate) fn refresh_trace_functions(
+        &mut self,
+        process: &Process,
+        functions: &[crate::trace_bp::BpFunction],
+    ) {
+        let mut by_module: HashMap<&str, std::collections::HashSet<(&str, u8)>> = HashMap::new();
+        for function in functions {
+            by_module
+                .entry(function.module.as_str())
+                .or_default()
+                .insert((function.function.as_str(), function.arity));
+        }
+        let targets = self
+            .modules
+            .iter()
+            .enumerate()
+            .filter_map(|(module_id, module)| {
+                let wanted = by_module.get(module.name.as_str())?;
+                let targets = module
+                    .functions
+                    .iter()
+                    .filter(|(_, function, arity)| wanted.contains(&(function.as_str(), *arity)))
+                    .map(|(start, function, arity)| (start + 1, function.clone(), *arity))
+                    .collect::<Vec<_>>();
+                Some((module_id, targets))
+            })
+            .collect::<Vec<_>>();
+        for (module_id, functions) in targets {
+            self.patch_trace_functions(module_id, &functions, process);
+        }
+    }
+
     pub(crate) fn refresh_trace_pattern(
         &mut self,
         process: &Process,
@@ -1109,6 +1142,22 @@ impl Vm {
         vm.sync_shared(&code.lock().unwrap());
         vm
     }
+    /// `load_named` for a call that loads a missing module: the `trace_pattern(on_load, ...)`
+    /// patterns of the calling process's runtime apply to a module this call loaded.
+    // Port of erts/emulator/beam/beam_bif_load.c:944-975 (set_on_load_trace_pattern), OTP-29.1.1.
+    pub(crate) fn load_named_traced(
+        &mut self,
+        process: &Process,
+        name: &str,
+    ) -> Result<usize, VmError> {
+        let was_loaded = self.loaded.contains_key(name);
+        let id = self.load_named(name)?;
+        if !was_loaded && crate::trace_bp::any_on_load_pattern(process) {
+            crate::natives::code::apply_on_load_patterns(self, process, name);
+        }
+        Ok(id)
+    }
+
     pub(crate) fn load_named(&mut self, name: &str) -> Result<usize, VmError> {
         self.sync_code_epoch();
         if let Some(&id) = self.loaded.get(name) {
