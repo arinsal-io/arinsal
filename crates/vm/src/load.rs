@@ -35,6 +35,11 @@ fn next_epoch_base() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32
 }
 
+/// Key of `loaded_nifs`: NIF libraries are tracked per code instance, like erts' `Module.curr.nif`.
+pub(crate) fn nif_key(name: &str, id: usize) -> String {
+    format!("{name}#{id}")
+}
+
 pub(crate) struct SharedCode {
     pub(crate) coverage_mode: arinsal_loader::CoverageMode,
     pub(crate) code_scope: u64,
@@ -385,6 +390,14 @@ impl SharedCode {
     }
 
     pub(crate) fn release(&mut self, id: usize) {
+        // Port of erts/emulator/beam/erl_nif.c (erts_unload_nif on purge), OTP-29.1.1: a NIF
+        // library belongs to its code instance, so purging it lets a later load bind again.
+        if self.module_live.get(id).copied() == Some(true)
+            && let Some(module) = self.modules.get(id)
+        {
+            let key = nif_key(&module.name, id);
+            self.loaded_nifs.remove(&key);
+        }
         if self.module_live.get(id).copied() == Some(true) {
             arinsal_pterm::store_for(self.code_scope)
                 .retire_module_area(self.modules[id].literal_area());

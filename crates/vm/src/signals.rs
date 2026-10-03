@@ -1815,7 +1815,12 @@ fn call_resolved(
                 if name == "undefined" {
                     return Err(badarg("register/2"));
                 }
-                let rt = runtime(process)?;
+                let rt = std::sync::Arc::clone(
+                    process
+                        .runtime
+                        .as_ref()
+                        .ok_or_else(|| badarg("register/2"))?,
+                );
                 if let Some(pid) = Pid::from_term(*pid) {
                     if !rt.scheduler()?.lookup(pid) {
                         return Err(badarg("register/2"));
@@ -1866,13 +1871,27 @@ fn call_resolved(
                     "register",
                     &[atom(&name)],
                 );
+                if let Some(id) = pid.as_port() {
+                    crate::trace::emit_port_event(
+                        &rt,
+                        id,
+                        crate::trace::PORTS,
+                        "register",
+                        &[atom(&name)],
+                    );
+                }
                 Ok(atom("true"))
             })
         }
         (SignalBif::Unregister1, [name]) => {
             let name = atom_name(*name).ok_or_else(|| badarg("unregister/1"));
             name.and_then(|name| {
-                let rt = runtime(process)?;
+                let rt = std::sync::Arc::clone(
+                    process
+                        .runtime
+                        .as_ref()
+                        .ok_or_else(|| badarg("unregister/1"))?,
+                );
                 let removed_pid = rt.names.lock().unwrap().remove(&name);
                 let removed_port = rt.port_names.lock().unwrap().remove(&name);
                 if removed_pid.is_none() && removed_port.is_none() {
@@ -1888,6 +1907,15 @@ fn call_resolved(
                     "unregister",
                     &[atom(&name)],
                 );
+                if let Some(id) = removed_port {
+                    crate::trace::emit_port_event(
+                        &rt,
+                        id,
+                        crate::trace::PORTS,
+                        "unregister",
+                        &[atom(&name)],
+                    );
+                }
                 Ok(atom("true"))
             })
         }

@@ -739,7 +739,10 @@ pub(crate) fn set_trace_pattern(
 // Port of erts/emulator/beam/erl_bif_trace.c:2727-2760 (prepare_clear_all_trace_pattern) and
 // 1352-1375, OTP-29.1.1.
 pub(crate) fn clear_session(process: &Process, session: u64) {
-    let runtime = scope(process);
+    clear_session_scope(scope(process), session);
+}
+
+pub(crate) fn clear_session_scope(runtime: usize, session: u64) {
     let mut table = breakpoints().write().unwrap();
     table.retain(|_, functions| {
         functions.retain(|_, arities| {
@@ -1002,6 +1005,31 @@ pub(crate) fn function_info(
             .then(|| bp.memory.as_ref().map(|bdt| bdt.snapshot()))
             .flatten(),
     }
+}
+
+/// Trace sessions with an active pattern on the specified function.
+// Port of erts/emulator/beam/erl_bif_trace.c:2427-2468 (trace_info_sessions), OTP-29.1.1.
+pub(crate) fn sessions_for_function(
+    process: &Process,
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Vec<u64> {
+    let table = breakpoints().read().unwrap();
+    let ix = active_bp_ix();
+    let mut sessions = function_bps(
+        &table,
+        scope(process),
+        code_scope(process),
+        module,
+        function,
+        arity,
+    )
+    .filter_map(|bp| (bp.data[ix].flags != 0).then_some(bp.session))
+    .collect::<Vec<_>>();
+    sessions.sort_unstable();
+    sessions.dedup();
+    sessions
 }
 
 /// Which breakpoints the function needs: a code breakpoint (`local`) and/or an export

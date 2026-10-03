@@ -121,6 +121,9 @@ pub(crate) struct ProcessCold {
     pub(crate) debug_wait_completion: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether this process currently has a runnable profile activation.
     pub(crate) profile_active: bool,
+    /// One-based id of the scheduler running this process, like `erts_get_scheduler_id()`
+    /// for events raised outside a scheduler context (GC trace).
+    pub(crate) scheduler_id: usize,
     /// Number of priority messages at the front of the private mailbox.
     pub(crate) prio_len: usize,
     /// Saved ordinary-message cursor while a newly arrived priority section is scanned.
