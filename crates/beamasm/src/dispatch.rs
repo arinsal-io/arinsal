@@ -40,6 +40,25 @@ pub const SEND_DISPATCH_IDENTITY: usize = usize::MAX - 0xF1;
 /// Identity sent through the light-BIF fragment to hand a native entry breakpoint to the
 /// executor, which owns the VM and run context that tracer modules and meta tracing need.
 pub const BREAKPOINT_DISPATCH_IDENTITY: usize = usize::MAX - 0xF5;
+/// Top byte of the identity a native line-breakpoint site sends through the light-BIF
+/// fragment; bits 32..48 hold the live X register count and bits 0..32 the source line.
+const LINE_BREAKPOINT_TAG: usize = 0xF8 << 56;
+
+/// Identity of an enabled `i_line_breakpoint_trampoline` hit at `line` with `live` X registers.
+// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:257-350, OTP-29.1.1: erts passes
+// the live count in a register and recovers the line from the pc; here both ride in the
+// trap identity so the executor needs no per-site table.
+pub const fn line_breakpoint_identity(line: u32, live: u16) -> usize {
+    LINE_BREAKPOINT_TAG | (live as usize) << 32 | line as usize
+}
+
+/// Decodes [`line_breakpoint_identity`] into `(line, live)`.
+pub const fn decode_line_breakpoint_identity(identity: usize) -> Option<(u32, u16)> {
+    if identity >> 56 != 0xF8 {
+        return None;
+    }
+    Some((identity as u32, (identity >> 32) as u16))
+}
 /// `target_pc` of the exit a traced native return takes so the executor can emit its
 /// `return_to` event; `resume_pc` is the caller continuation.
 pub const RETURN_TO_DISPATCH_IDENTITY: usize = usize::MAX - 0xF6;

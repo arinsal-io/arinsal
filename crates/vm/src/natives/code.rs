@@ -706,7 +706,7 @@ fn beamfile_module_md5(process: &mut Process, binary: Term) -> Result<Term, VmEr
     from_owned(&OwnedTerm::Binary(md5.to_vec()), &mut heap).map_err(|_| system_limit())
 }
 
-// Port of erts/emulator/beam/beam_bif_load.c:1275-1380, OTP-29.1.1.
+// Port of erts/emulator/beam/beam_bif_load.c:1275-1450, OTP-29.1.1.
 fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, VmError> {
     let name = module_name(module).ok_or_else(badarg)?;
     let id = vm.loaded.get(&name).copied().ok_or_else(badarg)?;
@@ -723,8 +723,86 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
     if !has_debug {
         return Ok(atom("none"));
     }
-    // DbgB is retained, but Arinsal has no debug_line location table to map its entries.
-    make_list(process, [])
+    let module = &vm.modules[id];
+    let beam = &vm.code_meta[id].as_ref().ok_or_else(badarg)?.beam;
+    let items = beam.debug_items().unwrap_or_default();
+    // Items without an `i_debug_line` (never instrumented) have no location and are skipped.
+    let line_of = |index: usize| {
+        module
+            .debug_line_items
+            .iter()
+            .find(|(item, _)| *item as usize == index)
+            .map(|(_, line)| *line)
+    };
+    let owned_term = |term: &arinsal_beam::DebugTerm| -> Result<OwnedTerm, VmError> {
+        use arinsal_beam::DebugTerm;
+        Ok(match term {
+            DebugTerm::Int(value) => OwnedTerm::Int(*value),
+            DebugTerm::Atom(atom) => {
+                OwnedTerm::Atom(beam.atom(*atom).ok_or_else(badarg)?.to_owned())
+            }
+            DebugTerm::Nil => OwnedTerm::Nil,
+            DebugTerm::Literal(index) => beam.literal(*index).map_err(|_| badarg())?,
+            DebugTerm::X(_) | DebugTerm::Y(_) => return Err(badarg()),
+        })
+    };
+    let list = |elems: Vec<OwnedTerm>| OwnedTerm::List {
+        elems,
+        tail: Box::new(OwnedTerm::Nil),
+    };
+    let mut result = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(line) = line_of(index) else {
+            continue;
+        };
+        let frame_size = match item.frame_size {
+            arinsal_beam::DebugFrameSize::None => OwnedTerm::Atom("none".into()),
+            arinsal_beam::DebugFrameSize::Entry => OwnedTerm::Atom("entry".into()),
+            arinsal_beam::DebugFrameSize::Words(words) => OwnedTerm::Int(i64::from(words)),
+        };
+        let mut vars = Vec::new();
+        for (name, value) in &item.vars {
+            let value = match value {
+                arinsal_beam::DebugTerm::X(register) => OwnedTerm::Tuple(vec![
+                    OwnedTerm::Atom("x".into()),
+                    OwnedTerm::Int(i64::from(*register)),
+                ]),
+                arinsal_beam::DebugTerm::Y(register) => OwnedTerm::Tuple(vec![
+                    OwnedTerm::Atom("y".into()),
+                    OwnedTerm::Int(i64::from(*register)),
+                ]),
+                other => {
+                    OwnedTerm::Tuple(vec![OwnedTerm::Atom("value".into()), owned_term(other)?])
+                }
+            };
+            vars.push(OwnedTerm::Tuple(vec![owned_term(name)?, value]));
+        }
+        let mut calls = Vec::new();
+        for call in &item.calls {
+            calls.push(match call {
+                arinsal_beam::DebugCall::Remote(module, function, arity) => OwnedTerm::Tuple(vec![
+                    owned_term(module)?,
+                    owned_term(function)?,
+                    OwnedTerm::Int(i64::from(*arity)),
+                ]),
+                arinsal_beam::DebugCall::Local(function, arity) => OwnedTerm::Tuple(vec![
+                    owned_term(function)?,
+                    OwnedTerm::Int(i64::from(*arity)),
+                ]),
+                arinsal_beam::DebugCall::Variable(name) => owned_term(name)?,
+            });
+        }
+        result.push(OwnedTerm::Tuple(vec![
+            OwnedTerm::Int(i64::from(line)),
+            OwnedTerm::Map(vec![
+                (OwnedTerm::Atom("frame_size".into()), frame_size),
+                (OwnedTerm::Atom("vars".into()), list(vars)),
+                (OwnedTerm::Atom("calls".into()), list(calls)),
+            ]),
+        ]));
+    }
+    let mut heap = FragmentingHeap(&mut process.heap);
+    from_owned(&list(result), &mut heap).map_err(|_| system_limit())
 }
 
 fn delete(vm: &mut Vm, name: &str) -> Result<Term, VmError> {

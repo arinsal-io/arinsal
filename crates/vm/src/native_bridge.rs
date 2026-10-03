@@ -137,6 +137,14 @@ pub(crate) fn interpreted_catch(index: u32) -> Option<(usize, usize)> {
     }
 }
 
+/// Native handler address of a catch-table index, if it names native code.
+pub(crate) fn native_catch(index: u32) -> Option<usize> {
+    match catch_table().read().ok()?.get(&index).copied()? {
+        CatchTarget::Native(address) => Some(address),
+        CatchTarget::Interpreted { .. } => None,
+    }
+}
+
 pub(crate) enum CatchHandler {
     Native(usize),
     Interpreted,

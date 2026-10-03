@@ -1115,3 +1115,185 @@ mod tests {
         assert!(compact(&mut r).is_err());
     }
 }
+
+/// Frame size recorded for a debug item.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DebugFrameSize {
+    /// No frame (`none`).
+    None,
+    /// The frame has not been allocated yet (`entry`).
+    Entry,
+    /// Number of Y registers.
+    Words(u32),
+}
+
+/// A variable name or value stored in a debug item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DebugTerm {
+    /// Small integer.
+    Int(i64),
+    /// One-based atom index.
+    Atom(u32),
+    /// The empty list.
+    Nil,
+    /// X register.
+    X(u32),
+    /// Y register.
+    Y(u32),
+    /// Zero-based literal index.
+    Literal(u32),
+}
+
+/// One call recorded by a debug item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DebugCall {
+    /// `{Module, Function, Arity}`; module and function are atoms or variable-name literals.
+    Remote(DebugTerm, DebugTerm, u32),
+    /// `{Function, Arity}`.
+    Local(DebugTerm, u32),
+    /// Call of a variable, named by a literal binary.
+    Variable(DebugTerm),
+}
+
+/// One entry of the `DbgB` chunk written by `+beam_debug_info`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugItem {
+    /// Stack frame size at the instrumentation point.
+    pub frame_size: DebugFrameSize,
+    /// Variable names with the register or value holding each.
+    pub vars: Vec<(DebugTerm, DebugTerm)>,
+    /// Calls reachable from the instrumentation point.
+    pub calls: Vec<DebugCall>,
+}
+
+const BEAM_DEBUG_INFO_VERSION: u32 = 1;
+const MAX_ARG: u64 = 255;
+
+impl BeamFile {
+    /// Decodes the `DbgB` chunk. `None` when it is absent, has another version, or is malformed.
+    // Port of erts/emulator/beam/beam_file.c:887-1057 (parse_debug_chunk_data), OTP-29.1.1.
+    // erts rejects the whole module on a malformed chunk; here the chunk is ignored.
+    pub fn debug_items(&self) -> Option<Vec<DebugItem>> {
+        let (_, data) = self.other_chunks.iter().find(|(id, _)| id == b"DbgB")?;
+        let mut r = Reader::new(data, "DbgB");
+        if r.u32().ok()? != BEAM_DEBUG_INFO_VERSION {
+            return None;
+        }
+        let mut count = i32::from_be_bytes(r.take(4).ok()?.try_into().ok()?);
+        let mut total = i32::from_be_bytes(r.take(4).ok()?.try_into().ok()?);
+        if count < 0 || total < 0 {
+            return None;
+        }
+        let call_opcode = Opcode::Call as u8;
+        let mut items: Vec<DebugItem> = Vec::new();
+        let mut last_entry = i64::MAX;
+        while count > 0 || total > 0 {
+            if r.u8().ok()? != call_opcode {
+                return None;
+            }
+            let entry =
+                match operand(&mut r, self.atoms.len(), self.literals.len(), None, 0).ok()? {
+                    Operand::U(entry) => i64::try_from(entry).ok()?,
+                    _ => return None,
+                };
+            let argument = operand(&mut r, self.atoms.len(), self.literals.len(), None, 0).ok()?;
+            if entry == 0 {
+                if count == 0 {
+                    return None;
+                }
+                count -= 1;
+                last_entry = entry;
+                let frame_size = match argument {
+                    Operand::Nil => DebugFrameSize::None,
+                    Operand::Atom(atom) if self.atom(atom) == Some("entry") => {
+                        DebugFrameSize::Entry
+                    }
+                    Operand::U(words) => DebugFrameSize::Words(u32::try_from(words).ok()?),
+                    _ => return None,
+                };
+                items.push(DebugItem {
+                    frame_size,
+                    vars: Vec::new(),
+                    calls: Vec::new(),
+                });
+                continue;
+            }
+            if entry < last_entry {
+                return None;
+            }
+            last_entry = entry;
+            let Operand::List(terms) = argument else {
+                return None;
+            };
+            total -= i32::try_from(terms.len()).ok()?;
+            if total < 0 {
+                return None;
+            }
+            let item = items.last_mut()?;
+            match entry {
+                1 => {
+                    if terms.len() % 2 != 0 {
+                        return None;
+                    }
+                    for pair in terms.chunks(2) {
+                        let name = match &pair[0] {
+                            Operand::Int(value) => DebugTerm::Int(*value),
+                            Operand::U(value) => DebugTerm::Int(i64::try_from(*value).ok()?),
+                            Operand::Literal(index) => DebugTerm::Literal(*index),
+                            _ => return None,
+                        };
+                        item.vars.push((name, debug_value(&pair[1])?));
+                    }
+                }
+                2 => item.calls = debug_calls(&terms)?,
+                _ => {}
+            }
+        }
+        Some(items)
+    }
+}
+
+fn debug_value(operand: &Operand) -> Option<DebugTerm> {
+    Some(match operand {
+        Operand::Int(value) => DebugTerm::Int(*value),
+        Operand::U(value) => DebugTerm::Int(i64::try_from(*value).ok()?),
+        Operand::Atom(atom) => DebugTerm::Atom(*atom),
+        Operand::Nil => DebugTerm::Nil,
+        Operand::X(index) => DebugTerm::X(*index),
+        Operand::Y(index) => DebugTerm::Y(*index),
+        Operand::Literal(index) => DebugTerm::Literal(*index),
+        _ => return None,
+    })
+}
+
+// Port of erts/emulator/beam/beam_file.c:818-885 (parse_debug_chunk_calls) and
+// beam_bif_load.c:1400-1440 (code_get_debug_info_1), OTP-29.1.1.
+fn debug_calls(terms: &[Operand]) -> Option<Vec<DebugCall>> {
+    let name = |operand: &Operand| match operand {
+        Operand::Atom(atom) => Some(DebugTerm::Atom(*atom)),
+        Operand::Literal(index) => Some(DebugTerm::Literal(*index)),
+        _ => None,
+    };
+    let mut calls = Vec::new();
+    let mut index = 0;
+    while index < terms.len() {
+        match &terms[index] {
+            Operand::U(value) if *value <= MAX_ARG => {
+                let module = name(terms.get(index + 1)?)?;
+                let function = name(terms.get(index + 2)?)?;
+                calls.push(DebugCall::Remote(module, function, *value as u32));
+                index += 3;
+            }
+            Operand::U(value) if *value <= 2 * MAX_ARG + 1 => {
+                let function = name(terms.get(index + 1)?)?;
+                calls.push(DebugCall::Local(function, (*value - (MAX_ARG + 1)) as u32));
+                index += 2;
+            }
+            other => {
+                calls.push(DebugCall::Variable(name(other)?));
+                index += 1;
+            }
+        }
+    }
+    Some(calls)
+}

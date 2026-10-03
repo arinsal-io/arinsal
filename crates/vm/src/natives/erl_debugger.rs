@@ -255,6 +255,12 @@ fn breakpoint(
         );
     }
     crate::trace_bp::set_line_breakpoint(process, id, line, enable == atom("true"));
+    crate::beamasm_integration::patch_native_line_breakpoint(
+        vm.code_scope,
+        &module,
+        line,
+        enable == atom("true"),
+    );
     Ok(atom("ok"))
 }
 
@@ -361,8 +367,9 @@ fn stack_frames(process: &mut Process, pid_term: Term, max_size: Term) -> Result
     let pid = inspect_pid(process, pid_term)?;
     let max_size = nonnegative(max_size)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let hibernation = hibernation_arity(&runtime, pid);
     let Some(frames) = runtime.inspect_suspended(pid, |target, modules| {
-        inspect_frames(target, modules, max_size)
+        inspect_frames(target, modules, max_size, hibernation)
     }) else {
         return Ok(atom("running"));
     };
@@ -388,8 +395,9 @@ fn peek_stack_frame_slot(
     let slot = nonnegative(slot_term)?;
     let max_size = nonnegative(max_size_term)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
+    let hibernation = hibernation_arity(&runtime, pid);
     let Some(value) = runtime.inspect_suspended(pid, |target, modules| {
-        inspect_frames(target, modules, max_size)
+        inspect_frames(target, modules, max_size, hibernation)
             .iter()
             .find(|frame_info| frame_number(frame_info) == Some(frame))
             .and_then(|frame| frame_slots(frame).get(slot).cloned())
@@ -455,24 +463,105 @@ fn nonnegative(term: Term) -> Result<usize, VmError> {
     .map_err(|_| badarg())
 }
 
-// Port of erts/emulator/beam/erl_debugger.c:503-602, OTP-29.1.1.
+/// Code position of the frame being assembled by [`inspect_frames`].
+#[derive(Clone, Copy)]
+enum FramePc {
+    Interpreted { module: usize, ip: usize },
+    Native(usize),
+}
+
+/// Arity of the `erlang:hibernate` call a hibernating process is parked in.
+fn hibernation_arity(runtime: &crate::process::Runtime, pid: Pid) -> Option<u8> {
+    runtime
+        .hibernating
+        .lock()
+        .unwrap()
+        .get(&pid)
+        .map(|cont| if cont.resume_in_place { 0 } else { 3 })
+}
+
+// Port of erts/emulator/beam/erl_debugger.c:754-855 (erl_debugger_stack_frames_2), OTP-29.1.1.
 fn inspect_frames(
     process: &Process,
     modules: &[std::sync::Arc<arinsal_loader::Module>],
     max_size: usize,
+    hibernation: Option<u8>,
 ) -> Vec<O> {
     let mut frames = Vec::new();
-    let mut module = process.module;
-    let mut ip = process.ip;
+    if let Some(arity) = hibernation {
+        // erts: the process waits at beam_run_process, whose function is `rp->current`
+        // (erlang:hibernate) and whose stack has been discarded.
+        frames.push(O::Tuple(vec![
+            O::Int(1),
+            O::Map(vec![
+                (
+                    O::Atom("function".into()),
+                    O::Tuple(vec![
+                        O::Atom("erlang".into()),
+                        O::Atom("hibernate".into()),
+                        O::Int(i64::from(arity)),
+                    ]),
+                ),
+                (O::Atom("line".into()), O::Atom("undefined".into())),
+            ]),
+            O::Map(vec![
+                (O::Atom("code".into()), integer(1)),
+                (
+                    O::Atom("slots".into()),
+                    O::List {
+                        elems: Vec::new(),
+                        tail: Box::new(O::Nil),
+                    },
+                ),
+            ]),
+        ]));
+        frames.push(O::Tuple(vec![
+            O::Int(0),
+            O::Atom("<terminate process normally>".into()),
+            O::Map(vec![
+                (O::Atom("code".into()), integer(1)),
+                (
+                    O::Atom("slots".into()),
+                    O::List {
+                        elems: Vec::new(),
+                        tail: Box::new(O::Nil),
+                    },
+                ),
+            ]),
+        ]));
+        return frames;
+    }
+    let mut current = match process.native_pc {
+        Some(address) => FramePc::Native(address),
+        None => FramePc::Interpreted {
+            module: process.module,
+            ip: process.ip,
+        },
+    };
+    // Only the top frame, the current pc, is not a return address.
+    let mut current_is_return = false;
     let mut slots = Vec::new();
     let mut stack_index = 0;
     while let Some(word) = process.heap.stack_get(stack_index) {
+        stack_index += 1;
+        let raw = word.tagged_word() as usize;
         // The interpreter-to-native bridge return address has no erts counterpart: the
-        // interpreted continuation that follows it is the frame's CP.
-        if word.tagged_word() as usize
-            == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize
-        {
-            stack_index += 1;
+        // continuation that follows it is the frame's CP.
+        if raw == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize {
+            continue;
+        }
+        if crate::native_bridge::is_native_function_at(raw) {
+            push_frame(&mut frames, modules, current, &slots, current_is_return);
+            slots.clear();
+            current = FramePc::Native(raw);
+            current_is_return = true;
+            continue;
+        }
+        if let Some(handler) = crate::stacktrace::native_catch_address(word) {
+            slots.push(O::Tuple(vec![
+                O::Atom("catch".into()),
+                function_info_native(handler, false),
+            ]));
             continue;
         }
         if let Some((handler, next_module, next_ip)) = crate::stacktrace::decode_tag(word) {
@@ -482,17 +571,19 @@ fn inspect_frames(
                     function_info(modules, next_module, next_ip),
                 ]));
             } else {
-                push_frame(&mut frames, modules, module, ip, &slots, true);
+                push_frame(&mut frames, modules, current, &slots, current_is_return);
                 slots.clear();
-                module = next_module;
-                ip = next_ip;
+                current = FramePc::Interpreted {
+                    module: next_module,
+                    ip: next_ip,
+                };
+                current_is_return = true;
             }
         } else {
             slots.push(limit_term(word, max_size));
         }
-        stack_index += 1;
     }
-    push_frame(&mut frames, modules, module, ip, &slots, false);
+    push_frame(&mut frames, modules, current, &slots, current_is_return);
     frames.push(O::Tuple(vec![
         O::Int(-1),
         O::Atom("<terminate process normally>".into()),
@@ -516,14 +607,100 @@ fn inspect_frames(
     frames
 }
 
+/// Function info of a native pc; a return address is moved back into its call instruction.
+// Port of erts/emulator/beam/erl_debugger.c:660-716 (stack_frame_fun_info), OTP-29.1.1.
+fn function_info_native(address: usize, is_return_address: bool) -> O {
+    if is_return_address && crate::beamasm_integration::is_line_breakpoint_return(address) {
+        // erts: the return address lies in the shared trampoline, which has no MFA.
+        return O::Atom("<breakpoint>".into());
+    }
+    let lookup = if is_return_address {
+        address.wrapping_sub(1)
+    } else {
+        address
+    };
+    let Some(frame) = crate::native_bridge::native_stack_frame_at(lookup) else {
+        return O::Atom("unknown function".into());
+    };
+    let atoms = arinsal_term::global_atoms();
+    let text = |atom| atoms.text(atom).unwrap_or("?").to_owned();
+    let wrapper = text(frame.module_atom) == "erts_internal"
+        && text(frame.function_atom) == "breakpoint"
+        && frame.arity == 4;
+    O::Map(vec![
+        (
+            O::Atom("function".into()),
+            O::Tuple(vec![
+                O::Atom(text(frame.module_atom)),
+                O::Atom(text(frame.function_atom)),
+                O::Int(i64::from(frame.arity)),
+            ]),
+        ),
+        (
+            O::Atom("line".into()),
+            frame
+                .line
+                .filter(|_| !wrapper)
+                .map_or(O::Atom("undefined".into()), |line| O::Int(i64::from(line))),
+        ),
+    ])
+}
+
+/// erts leaves the unwritten stack slots of `erts_internal:breakpoint/4` holding -1.
+fn uninitialized_slots_as_erts(slots: &[O]) -> Vec<O> {
+    slots
+        .iter()
+        .map(|slot| match slot {
+            O::Tuple(fields)
+                if fields.len() == 2
+                    && fields[0] == O::Atom("value".into())
+                    && fields[1] == O::Nil =>
+            {
+                O::Tuple(vec![O::Atom("value".into()), O::Int(-1)])
+            }
+            slot => slot.clone(),
+        })
+        .collect()
+}
+
 fn push_frame(
     frames: &mut Vec<O>,
     modules: &[std::sync::Arc<arinsal_loader::Module>],
-    module_index: usize,
-    ip: usize,
+    pc: FramePc,
     slots: &[O],
     return_address: bool,
 ) {
+    let (module_index, ip) = match pc {
+        FramePc::Native(address) => {
+            let wrapper = crate::native_bridge::native_stack_frame_at(address).is_some_and(|f| {
+                let atoms = arinsal_term::global_atoms();
+                atoms.text(f.module_atom) == Some("erts_internal")
+                    && atoms.text(f.function_atom) == Some("breakpoint")
+                    && f.arity == 4
+            });
+            let slots = if wrapper {
+                uninitialized_slots_as_erts(slots)
+            } else {
+                slots.to_vec()
+            };
+            frames.push(O::Tuple(vec![
+                O::Int(-1),
+                function_info_native(address, return_address),
+                O::Map(vec![
+                    (O::Atom("code".into()), integer(address)),
+                    (
+                        O::Atom("slots".into()),
+                        O::List {
+                            elems: slots,
+                            tail: Box::new(O::Nil),
+                        },
+                    ),
+                ]),
+            ]));
+            return;
+        }
+        FramePc::Interpreted { module, ip } => (module, ip),
+    };
     let (function, code_ptr) = modules
         .get(module_index)
         .map(|module| {
@@ -534,7 +711,18 @@ fn push_frame(
                 ) {
                 O::Atom("<breakpoint>".into())
             } else {
-                function_info(modules, module_index, ip)
+                // Port of erts/emulator/beam/erl_debugger.c:671-690 (stack_frame_fun_info),
+                // OTP-29.1.1: a return address is looked up one word back, inside the
+                // call, so that a debug line right after the call is not taken.
+                function_info(
+                    modules,
+                    module_index,
+                    if return_address {
+                        ip.saturating_sub(1)
+                    } else {
+                        ip
+                    },
+                )
             };
             let code_ptr = module.code.as_ptr().wrapping_add(ip) as usize;
             (function, code_ptr)
@@ -546,19 +734,7 @@ fn push_frame(
                 .function_at(ip)
                 .is_some_and(|(name, arity)| name == "breakpoint" && arity == 4)
     }) {
-        slots
-            .iter()
-            .map(|slot| match slot {
-                O::Tuple(fields)
-                    if fields.len() == 2
-                        && fields[0] == O::Atom("value".into())
-                        && fields[1] == O::Nil =>
-                {
-                    O::Tuple(vec![O::Atom("value".into()), O::Int(-1)])
-                }
-                slot => slot.clone(),
-            })
-            .collect()
+        uninitialized_slots_as_erts(slots)
     } else {
         slots.to_vec()
     };

@@ -394,6 +394,14 @@ pub static PORTED_OPS: &[PortedOp] = &[
         emitter: EmitterKind::Metadata,
     },
     PortedOp {
+        name: "i_debug_line",
+        emitter: EmitterKind::Metadata,
+    },
+    PortedOp {
+        name: "i_line_breakpoint_trampoline",
+        emitter: EmitterKind::Metadata,
+    },
+    PortedOp {
         name: "i_move",
         emitter: EmitterKind::Move,
     },
@@ -3123,6 +3131,50 @@ fn emit_op(
                     env.light_bif_fragment(),
                     arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY,
                 )
+            }
+            "i_debug_line" => {
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3203-3222, OTP-29.1.1.
+                count(3)?;
+                let line = beam
+                    .lines
+                    .as_ref()
+                    .and_then(|table| {
+                        n(0).ok()?
+                            .checked_sub(1)
+                            .and_then(|index| table.items.get(index as usize))
+                    })
+                    .and_then(|item| u32::try_from(item.line).ok())
+                    .unwrap_or(0);
+                let live = u16::try_from(n(2)?)
+                    .map_err(|_| EmitError::Operand("debug line live exceeds u16".into()))?;
+                assembler.emit_i_debug_line(line, live)?;
+                // Each i_debug_line is a distinct line-table entry, duplicates included
+                // (asm_load.c:714-737).
+                if line != 0 {
+                    let file = beam
+                        .lines
+                        .as_ref()
+                        .and_then(|table| {
+                            let item = table.items.get(n(0).ok()?.checked_sub(1)? as usize)?;
+                            if item.name_index == 0 {
+                                None
+                            } else {
+                                table
+                                    .names
+                                    .get(item.name_index as usize - 1)
+                                    .filter(|name| !name.is_empty())
+                                    .cloned()
+                            }
+                        })
+                        .unwrap_or_else(|| format!("{}.erl", beam.module));
+                    assembler.record_line(file, line);
+                }
+                Ok(())
+            }
+            "i_line_breakpoint_trampoline" => {
+                // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:337-348, OTP-29.1.1.
+                count(0)?;
+                assembler.emit_i_line_breakpoint_trampoline(env.light_bif_fragment())
             }
             "i_test_yield" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.

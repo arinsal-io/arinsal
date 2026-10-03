@@ -2116,9 +2116,12 @@ impl Vm {
                     if module_index >= 1 << 26 {
                         return Err(debug_line_system_limit());
                     }
+                    // The frame's own return address is the instruction after the cleanup
+                    // (emu: $SAVE_CONTINUATION_POINTER($NEXT_INSTRUCTION)); the call below
+                    // returns to the cleanup itself.
                     if !p.heap.stack_set(
                         0,
-                        crate::stacktrace::continuation_tag(module_index as usize, offset + 1)?,
+                        crate::stacktrace::continuation_tag(module_index as usize, offset + 2)?,
                     ) {
                         return Err(debug_line_system_limit());
                     }

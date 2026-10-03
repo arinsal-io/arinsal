@@ -403,6 +403,8 @@ pub struct Module {
     pub line_breakpoints_supported: bool,
     /// Retained compiler debug points as `(instruction, line, live-register-count)`.
     pub debug_line_points: Vec<(usize, u32, u16)>,
+    /// `(DbgB item index, line)` of each debug line probe, in code order.
+    pub debug_line_items: Vec<(u32, u32)>,
     /// Synthetic `error_handler:breakpoint/3` import used by debug breakpoints.
     pub debug_breakpoint_import: u32,
     // ---- vm_funs ----
@@ -448,6 +450,7 @@ impl Clone for Module {
             coverage_probes: self.coverage_probes.clone(),
             line_breakpoints_supported: self.line_breakpoints_supported,
             debug_line_points: self.debug_line_points.clone(),
+            debug_line_items: self.debug_line_items.clone(),
             debug_breakpoint_import: self.debug_breakpoint_import,
             funs: self.funs.iter().map(FunSlot::clone).collect(),
             _literals: Arc::clone(&self._literals),
@@ -1119,6 +1122,7 @@ pub fn load_with_instrumentations(
     let mut functions = Vec::new();
     let mut function_atoms = Vec::new();
     let mut debug_line_points = Vec::new();
+    let mut debug_line_items = Vec::new();
     let mut notify_breakpoint_stub = None;
     let mut coverage_probes = Vec::new();
     let mut counter_lines = Vec::new();
@@ -1307,6 +1311,11 @@ pub fn load_with_instrumentations(
                 {
                     let point_ip = code.len();
                     debug_line_points.push((point_ip, location, live));
+                    if let Some(Operand::U(index)) = instruction.args.get(2)
+                        && let Some(index) = index.checked_sub(1)
+                    {
+                        debug_line_items.push((index as u32, location));
+                    }
                     Some((
                         Instr::DebugLine {
                             line: location,
@@ -1590,6 +1599,7 @@ pub fn load_with_instrumentations(
         coverage_probes,
         line_breakpoints_supported: has_debug_line,
         debug_line_points,
+        debug_line_items,
         debug_breakpoint_import,
         // ---- vm_funs ----
         funs,

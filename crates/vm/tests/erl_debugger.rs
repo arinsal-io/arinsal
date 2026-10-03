@@ -290,3 +290,97 @@ compact_fun(Fun) -> Fun.
     );
     assert_eq!(expected, actual.term);
 }
+
+/// Runs `module:run/0` of `source` (compiled with `+beam_debug_info`) on OTP with `+D` and
+/// on Arinsal, and asserts both return the same term.
+fn assert_debugger_fixture_matches_otp(module: &str, source: &str) {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping debugger differential test");
+        return;
+    };
+    let beam = reference
+        .compile_named(
+            module,
+            source,
+            &[arinsal_etf::OwnedTerm::Atom("beam_debug_info".into())],
+        )
+        .expect("compile debugger fixture");
+    let dir = std::env::temp_dir().join(format!("erl_debugger_{}_{module}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temporary BEAM directory");
+    std::fs::write(dir.join(format!("{module}.beam")), &beam).expect("write BEAM file");
+    let result_path = dir.join("result.etf");
+    let eval = format!(
+        "ok = file:write_file(\"{}\", term_to_binary({module}:run())), halt().",
+        result_path.display()
+    );
+    let output = Command::new("timeout")
+        .args([
+            "30",
+            "erl",
+            "+D",
+            "-noshell",
+            "-pa",
+            dir.to_str().unwrap(),
+            "-eval",
+            &eval,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run OTP debugger fixture");
+    let expected_bytes = std::fs::read(&result_path).unwrap_or_default();
+    std::fs::remove_dir_all(&dir).expect("remove temporary directory");
+    assert!(
+        output.status.success(),
+        "OTP debugger fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected = arinsal_etf::decode(&expected_bytes).expect("decode OTP result");
+
+    let preloaded = reference
+        .eval("element(2, code:get_object_code(erts_internal))")
+        .expect("read OTP's preloaded breakpoint wrapper");
+    let arinsal_etf::OwnedTerm::Binary(preloaded) = &preloaded else {
+        panic!("OTP erts_internal object code was not a binary");
+    };
+    let mut vm = Vm::new_with_debugger_flags([], true, true);
+    vm.load_bytes(preloaded).expect("load breakpoint wrapper");
+    vm.load_bytes(&beam).expect("load debugger fixture");
+    let actual = vm
+        .eval_scheduled(module, "run", &[], 8, None)
+        .unwrap_or_else(|error| panic!("run debugger fixture: {error}"));
+    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
+    assert_eq!(expected, actual.term);
+}
+
+/// Every line breakpoint of a function with more live X registers than the register cache
+/// holds must hit, resume and restore all arguments in native code (line hits restore through
+/// the code emitted after the trampoline).
+#[test]
+fn erl_debugger_line_hits_restore_many_live_xregs_match_otp() {
+    let _serial = serial_test();
+    let source = r#"-module(erl_debugger_xregs_fixture).
+-export([run/0, many/9]).
+run() ->
+    ok = erl_debugger:toggle_instrumentations(#{line_breakpoint => true}),
+    {ok, Session} = erl_debugger:register(self()),
+    ok = erl_debugger:breakpoint(erl_debugger_xregs_fixture, 23, true),
+    Parent = self(),
+    Worker = spawn(fun() ->
+        Parent ! {result, many(3, 1, 2, 3, 4, 5, 6, 7, 8)} end),
+    loop(Session, Worker, []).
+loop(Session, Worker, Hits) ->
+    receive
+        {debugger_event, Session, {breakpoint, Worker, MFA, Line, Resume}} ->
+            Resume(),
+            loop(Session, Worker, [{MFA, Line} | Hits]);
+        {result, Result} ->
+            {Result, lists:reverse(Hits)}
+    after 5000 -> timeout
+    end.
+many(0, A, B, C, D, E, F, G, H) ->
+    A + B + C + D + E + F + G + H;
+many(N, A, B, C, D, E, F, G, H) ->
+    many(N - 1, A + 1, B, C, D, E, F, G, H + A).
+"#;
+    assert_debugger_fixture_matches_otp("erl_debugger_xregs_fixture", source);
+}

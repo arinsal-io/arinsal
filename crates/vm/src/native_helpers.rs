@@ -757,7 +757,9 @@ fn invoke_dispatch_bif(
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
-    if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY {
+    if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
+        || arinsal_beamasm::dispatch::decode_line_breakpoint_identity(identity).is_some()
+    {
         // The breakpoint traps like a BIF so the executor delivers its trace events.
         process.header.i = identity as *const u8 as *const _;
         process.header.freason = 1 << 10;

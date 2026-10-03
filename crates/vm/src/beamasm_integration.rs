@@ -510,6 +510,10 @@ pub(crate) struct CompiledVersion {
     scope: u64,
     memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
     trace_breakpoints: Vec<(Mfa, usize, u32)>,
+    // Line breakpoint patch sites: source line, branch word offset, original branch.
+    line_breakpoints: Vec<(u32, usize, u32)>,
+    // Return addresses of enabled line-breakpoint hits, ascending.
+    line_breakpoint_returns: Vec<(usize, usize)>,
     // Function, arity, call-NIF identity and the patch word that enables its body.
     nif_patches: Vec<(String, u8, usize, usize)>,
     literal_heap: Option<Box<VecHeap>>,
@@ -548,6 +552,57 @@ pub(crate) fn patch_native_breakpoint(
             let instruction = if enabled { 0xd503_201f_u32 } else { *branch };
             if let Ok(mut memory) = version.memory.lock() {
                 let _ = memory.write_bytes(*offset, &instruction.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// The address standing for the instrumented function in the stack frame of a native
+/// line-breakpoint hit whose breakpoint call returns to `address`; `None` when `address` is
+/// not such a return address.
+pub(crate) fn line_breakpoint_site(address: usize) -> Option<usize> {
+    let versions = compiled_versions().read().ok()?;
+    versions
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find_map(|version| {
+            if !(version.code_start..version.code_end).contains(&address) {
+                return None;
+            }
+            let index = version
+                .line_breakpoint_returns
+                .binary_search_by_key(&address, |(resume, _)| *resume)
+                .ok()?;
+            Some(version.line_breakpoint_returns[index].1)
+        })
+}
+
+/// Whether `address` is the return address of a native line-breakpoint hit, the
+/// continuation that restores the registers spilled for `erts_internal:breakpoint/4`.
+pub(crate) fn is_line_breakpoint_return(address: usize) -> bool {
+    line_breakpoint_site(address).is_some()
+}
+
+/// Enable or disable the native line-breakpoint sites of `line` in `module`.
+// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:337-348, OTP-29.1.1: the `b next`
+// that skips the trampoline is rewritten to a NOP when the breakpoint is enabled.
+pub(crate) fn patch_native_line_breakpoint(scope: u64, module: &str, line: u32, enabled: bool) {
+    let Ok(mut versions) = compiled_versions().write() else {
+        return;
+    };
+    versions.retain(|version| version.strong_count() != 0);
+    for version in versions
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|version| version.scope == scope && version.module == module)
+    {
+        for &(site_line, offset, branch) in &version.line_breakpoints {
+            if site_line != line {
+                continue;
+            }
+            let instruction = if enabled { 0xd503_201f_u32 } else { branch };
+            if let Ok(mut memory) = version.memory.lock() {
+                let _ = memory.write_bytes(offset, &instruction.to_le_bytes());
             }
         }
     }
@@ -1299,6 +1354,13 @@ pub(crate) fn compile(
         scope,
         memory: std::sync::Mutex::new(compiled.native.memory),
         trace_breakpoints,
+        line_breakpoints: compiled.native.line_breakpoints.clone(),
+        line_breakpoint_returns: compiled
+            .native
+            .line_breakpoint_returns
+            .iter()
+            .map(|(resume, site)| (code_start + resume, code_start + site))
+            .collect(),
         nif_patches,
         literal_heap: Some(literal_heap),
         _module_literals: module.literal_area(),
