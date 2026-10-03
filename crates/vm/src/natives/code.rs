@@ -513,26 +513,22 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
 
 /// Apply every session's `trace_pattern(on_load, ...)` to a freshly loaded module.
 // Port of erts/emulator/beam/beam_bif_load.c:944-975 (set_on_load_trace_pattern), OTP-29.1.1.
-fn apply_on_load_patterns(vm: &mut Vm, process: &Process, name: &str) {
+pub(crate) fn apply_on_load_patterns(vm: &mut Vm, process: &Process, name: &str) {
     let patterns = crate::trace_bp::on_load_patterns_of(process);
     if patterns.is_empty() {
         return;
     }
     let functions = crate::natives::proc::bp_functions(vm, name, "_", None);
     for (session, on_load) in patterns {
-        let flags = crate::trace_bp::TracePatternFlags {
-            breakpoint: !on_load.flags.is_empty(),
-            local: on_load.flags.iter().any(|flag| flag == "local"),
-            meta: on_load.flags.iter().any(|flag| flag == "meta"),
-            call_count: on_load.flags.iter().any(|flag| flag == "call_count"),
-        };
         crate::trace_bp::set_trace_pattern(
             process,
             session,
             &functions,
             on_load.match_spec,
+            on_load.meta_match_spec,
             crate::trace_bp::BreakOp::Set,
-            flags,
+            on_load.flags,
+            &on_load.meta_tracer,
         );
     }
     vm.refresh_trace_pattern(process, name, "_", None);

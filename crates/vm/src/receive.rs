@@ -487,9 +487,27 @@ impl Process {
     ) -> Result<(), VmError> {
         let removed = self.receive_cursor;
         let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+        // Port of erts/emulator/beam/erl_message.c:975 (erts_save_message_in_proc,
+        // erts_adjust_message_break), OTP-29.1.1: a message that was copied onto the heap is
+        // counted by call_memory when it is received.
+        let on_heap_words = if self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| !cold.call_memory.is_empty())
+            && self.inbox.is_on_heap(removed)
+        {
+            self.inbox
+                .get(removed)
+                .map_or(0, |term| arinsal_term::size_object(*term))
+        } else {
+            0
+        };
         let (removed_message, new_prio_len) =
             self.inbox
                 .remove_to_heap_with_token(removed, &mut self.heap, old_prio_len)?;
+        if on_heap_words != 0 {
+            crate::trace_bp::adjust_memory_break(self, on_heap_words as i64);
+        }
         self.cold_mut().prio_len = new_prio_len;
         let (term, token) = removed_message
             .ok_or_else(|| VmError::Unsupported("remove_message without current message".into()))?;

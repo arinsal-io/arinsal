@@ -633,59 +633,26 @@ pub extern "C" fn arinsal_beamasm_native_trace_return(header: *mut ProcessHeader
     let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
-    let Some(saved_caller) = process.heap.stack_get(0) else {
-        return 0;
-    };
-    let Some(function_pc) = process.heap.stack_get(1).and_then(Term::as_small) else {
-        return saved_caller.tagged_word();
-    };
-    let Some(action_count) = process.heap.stack_get(2).and_then(Term::as_small) else {
-        return saved_caller.tagged_word();
-    };
-    let Some(function) = crate::native_function_at(function_pc as usize) else {
-        return saved_caller.tagged_word();
-    };
     let value = process.x[0];
-    let mut return_to = Vec::new();
-    for index in 0..usize::try_from(action_count).unwrap_or(0) {
-        let session = process
+    let Some((frames, saved_caller)) =
+        crate::trace::pop_native_trace_frames(process, |p, words| {
+            p.heap.set_stack_pointer(p.header.stop.wrapping_add(words));
+            p.sync_native_header();
+        })
+    else {
+        return process
             .heap
-            .stack_get(3 + index * 2)
-            .and_then(Term::as_small);
-        let flags = process
-            .heap
-            .stack_get(4 + index * 2)
-            .and_then(Term::as_small);
-        let (Some(session), Some(flags)) = (session, flags) else {
-            continue;
-        };
-        if flags & 4 != 0 {
-            return_to.push(session as u64);
-        }
-        crate::trace::native_return_event(
-            process,
-            &function,
-            crate::trace::NativeTraceAction {
-                session: session as u64,
-                return_trace: flags & 1 != 0,
-                exception_trace: flags & 2 != 0,
-                return_to: flags & 4 != 0,
-            },
-            value,
-            false,
-        );
-    }
-    let cleanup = 4usize.saturating_add(usize::try_from(action_count).unwrap_or(0) * 2);
-    process
-        .heap
-        .set_stack_pointer(process.header.stop.wrapping_add(cleanup));
-    process.sync_native_header();
+            .stack_get(0)
+            .map_or(0, |word| word.tagged_word());
+    };
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    if !return_to.is_empty() {
-        // Port of erts/emulator/beam/emu/trace_instrs.tab:73-105 (i_return_to_trace),
-        // OTP-29.1.1: the return_to event needs the scheduler's tracer context, so the
-        // return leaves native code like a trapped call and resumes at the caller.
-        process.cold_mut().native_return_to = return_to;
+    if frames.iter().any(|(_, actions)| !actions.is_empty()) {
+        // The return events need the scheduler's tracer context (and the return_to event the
+        // caller), so the return leaves native code like a trapped call and resumes at the
+        // caller.
+        // Port of erts/emulator/beam/emu/trace_instrs.tab:25-105 (return_trace,
+        // i_return_to_trace), OTP-29.1.1.
+        process.cold_mut().native_return_events = Some((frames, value));
         registers.tmp_mem[0] = arinsal_beamasm::dispatch::RETURN_TO_DISPATCH_IDENTITY as u64;
         registers.tmp_mem[1] = saved_caller.tagged_word();
         registers.tmp_mem[3] = 2;

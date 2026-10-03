@@ -99,6 +99,10 @@ pub struct Process {
 // The scheduler transfers exclusive ownership of each Process between workers.
 unsafe impl Send for Process {}
 const _: () = assert!(std::mem::offset_of!(Process, header) == 0);
+/// The traced native functions a return left, innermost first with their trace actions, and the
+/// returned value.
+pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceAction>)>, Term);
+
 #[derive(Default)]
 pub(crate) struct ProcessCold {
     /// The last slice ended because the process is suspended, not because it waits in a
@@ -131,8 +135,12 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait: Option<Option<u64>>,
     /// Export dispatch to redo after the process wakes from a parked native BIF call.
     pub(crate) native_retry: Option<usize>,
-    /// Sessions whose `return_to` event a traced native return handed to the executor.
-    pub(crate) native_return_to: Vec<u64>,
+    /// The traced function (by pc), actions and return value of a native trace frame whose
+    /// return events the executor emits.
+    pub(crate) native_return_events: Option<NativeReturnEvents>,
+    /// Sessions whose return_to frame a traced BIF raised through; the exception's catch
+    /// reports their return_to events.
+    pub(crate) bif_return_to: Vec<u64>,
     /// Pc of the native instruction that raised the exception being dispatched (0 if none).
     pub(crate) native_error_pc: usize,
     /// The current apply comes from native code, whose call site names the caller frame.
@@ -142,6 +150,11 @@ pub(crate) struct ProcessCold {
     /// Native code ran `timeout` while tracing is active; the executor emits the receive event.
     pub(crate) native_timeout_trace: bool,
     pub(crate) traced_native_call: Option<(usize, usize, Vec<crate::trace::CallActions>)>,
+    /// Call time and call memory accounting of the process, per trace session.
+    // Port of erts/emulator/beam/erl_process.h (ERTS_PSD_CALL_TIME_BP, ERTS_PSD_CALL_MEMORY_BP),
+    // OTP-29.1.1.
+    pub(crate) call_time: Vec<crate::trace_bp::ProcBpTrace>,
+    pub(crate) call_memory: Vec<crate::trace_bp::ProcBpTrace>,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
     pub(crate) native_call_pc: usize,
     /// `error_info` of the current native exception (erts keeps it with the stack trace).
@@ -335,6 +348,13 @@ impl Process {
         self.header.hend = hend;
         self.header.high_water = self.heap.high_water_ptr();
         self.header.fcalls = self.reductions;
+    }
+
+    /// Words allocated by the process since its last collection, plus `adjustment`.
+    // Port of erts/emulator/beam/beam_bp.c:989-992 (get_allocated_words), OTP-29.1.1.
+    pub(crate) fn allocated_words(&self, adjustment: i64) -> i64 {
+        let info = self.heap.gc_info_words();
+        adjustment + info.heap_size as i64 - info.recent_size as i64 + info.mbuf_size as i64
     }
 
     pub(crate) fn cold_mut(&mut self) -> &mut ProcessCold {

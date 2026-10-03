@@ -495,6 +495,15 @@ fn spawn_mfa_with_priority(
         child.x[index] = arinsal_term::copy_term_litopt(term, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn argument: {error:?}")))?;
     }
+    // The argument list itself is copied onto the new heap too, before its elements move to
+    // the X registers: call_memory counts its cells (erts copies the whole `args` list).
+    // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process), OTP-29.1.1.
+    if !args.is_empty() {
+        let copied = child.x[..args.len()].to_vec();
+        arinsal_term::TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut child.heap))
+            .list_from_iter(copied)
+            .map_err(|error| VmError::Unsupported(format!("spawn argument list: {error:?}")))?;
+    }
     let rt = parent
         .runtime
         .clone()

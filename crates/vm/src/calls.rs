@@ -323,14 +323,26 @@ impl Vm {
         let (module, function) = (module.to_owned(), function.to_owned());
         let args = p.x[..arity].to_vec();
         // A native import that missed (dynamic natives) already emitted the call event.
+        let mut site = None;
         let actions = match p
             .cold
             .as_mut()
             .and_then(|cold| cold.traced_native_call.take())
         {
-            Some((_, _, actions)) => actions,
-            None => crate::trace::call_event(self, p, ctx, &module, &function, &args, false)
-                .unwrap_or_default(),
+            Some((site_module, site_ip, actions)) => {
+                site = Some((site_module, site_ip));
+                actions
+            }
+            None => crate::trace::bif_call_event(
+                self,
+                p,
+                ctx,
+                &module,
+                &function,
+                &args,
+                crate::trace::StackScan::None,
+            )
+            .unwrap_or_default(),
         };
         let (result, reductions) = untraced(p);
         let outcome = match result {
@@ -352,6 +364,7 @@ impl Vm {
                 &function,
                 arity as u8,
                 outcome,
+                site,
             );
         }
         (result, reductions)
@@ -381,10 +394,12 @@ impl Vm {
             &function,
             arity,
             (caller_module, caller_ip),
+            crate::trace::StackScan::None,
         )
     }
 
     /// `trace_native_call` for a caller that knows the callee name, keyed by its call site.
+    #[allow(clippy::too_many_arguments)] // The call site and its stack scan accompany the MFA.
     pub(crate) fn trace_native_call_named(
         &mut self,
         p: &mut Process,
@@ -393,6 +408,7 @@ impl Vm {
         function: &str,
         arity: usize,
         site: (usize, usize),
+        scan: crate::trace::StackScan,
     ) -> Option<(String, String, Vec<Term>)> {
         if !crate::trace_bp::any_pattern()
             || !crate::trace_bp::selects(module, function, arity as u8)
@@ -405,8 +421,9 @@ impl Vm {
             |cold| matches!(&cold.traced_native_call, Some((m, ip, _)) if (*m, *ip) == site),
         );
         if !resumed {
-            let actions = crate::trace::call_event(self, p, ctx, &module, &function, &args, false)
-                .unwrap_or_default();
+            let actions =
+                crate::trace::bif_call_event(self, p, ctx, &module, &function, &args, scan)
+                    .unwrap_or_default();
             p.cold_mut().traced_native_call = Some((site.0, site.1, actions));
         }
         Some((module, function, args))
@@ -426,22 +443,41 @@ impl Vm {
         {
             return;
         }
-        let Some((_, _, actions)) = p
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.traced_native_call.take())
-        else {
-            return;
-        };
         let outcome = match result {
             Ok(value) => Ok(*value),
             Err(VmError::Trap(trap)) => {
                 match exceptions::trace_class_reason(p, trap.class, trap.reason) {
                     Ok(pair) => Err(pair),
-                    Err(_) => return,
+                    Err(_) => {
+                        p.cold_mut().traced_native_call = None;
+                        return;
+                    }
                 }
             }
-            Err(_) => return,
+            Err(_) => {
+                p.cold_mut().traced_native_call = None;
+                return;
+            }
+        };
+        self.trace_native_return_outcome(p, ctx, module, function, args, outcome);
+    }
+
+    /// `trace_native_return` for an outcome already reduced to a value or a class and reason.
+    pub(crate) fn trace_native_return_outcome(
+        &mut self,
+        p: &mut Process,
+        ctx: &mut arinsal_sched::RunCtx<'_, process::Message>,
+        module: &str,
+        function: &str,
+        args: &[Term],
+        outcome: Result<Term, Term>,
+    ) {
+        let Some((site_module, site_ip, actions)) = p
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.traced_native_call.take())
+        else {
+            return;
         };
         let _ = crate::trace::bif_return_events(
             self,
@@ -452,6 +488,7 @@ impl Vm {
             function,
             args.len() as u8,
             outcome,
+            Some((site_module, site_ip)),
         );
     }
 
@@ -466,7 +503,9 @@ impl Vm {
                     p.heap.release_stack(1);
                     continue;
                 }
-                if crate::native_bridge::is_native_function_at(word) {
+                if crate::native_bridge::is_native_continuation(word) {
+                    // A native return address, or the stub of a traced native function's
+                    // return frame, which finishes the frame when entered.
                     p.heap.release_stack(1);
                     p.cold_mut().native_continuation_resume = true;
                     p.cold_mut().native_resume_live = 2;
@@ -872,7 +911,7 @@ impl Vm {
                 tail,
             );
         }
-        let target_module = match self.load_named(module_name) {
+        let target_module = match self.load_named_traced(p, module_name) {
             Ok(id) => id,
             // mix_loop1: same autoload as apply/3. See call_undefined_function.
             Err(_) if self.should_autoload(p, module_name) => {

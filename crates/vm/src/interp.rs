@@ -1157,26 +1157,48 @@ fn push_trace_frames(
     return_to_ip: usize,
     actions: &[crate::trace::CallActions],
 ) -> Result<(), VmError> {
-    for action in actions.iter().rev().filter(|action| action.return_to) {
-        if !reserve_trace_stack(process, 2)? {
-            return Err(VmError::Unsupported("return_to trace stack".into()));
-        }
-        process
-            .heap
-            .stack_set(0, trace_continuation(module_id, return_to_ip)?);
-        process.heap.stack_set(
-            1,
-            Term::small(
-                i64::try_from(action.session)
-                    .map_err(|_| VmError::Unsupported("trace session stack value".into()))?,
-            )
-            .ok_or_else(|| VmError::Unsupported("trace session stack value".into()))?,
-        );
-    }
+    let small = |value: usize| {
+        Term::small(
+            i64::try_from(value)
+                .map_err(|_| VmError::Unsupported("trace frame stack value".into()))?,
+        )
+        .ok_or_else(|| VmError::Unsupported("trace frame stack value".into()))
+    };
     for action in actions {
-        if !action.return_trace && !action.exception_trace {
-            continue;
+        // Port of erts/emulator/beam/beam_bp.c:1213-1244 (do_call_trace): the return_to frame
+        // goes below the return_trace frame of the same action.
+        if action.return_to {
+            if !reserve_trace_stack(process, 2)? {
+                return Err(VmError::Unsupported("return_to trace stack".into()));
+            }
+            process
+                .heap
+                .stack_set(0, trace_continuation(module_id, return_to_ip)?);
+            process.heap.stack_set(
+                1,
+                Term::small(
+                    i64::try_from(action.session)
+                        .map_err(|_| VmError::Unsupported("trace session stack value".into()))?,
+                )
+                .ok_or_else(|| VmError::Unsupported("trace session stack value".into()))?,
+            );
         }
+        // The sixth word holds the trace frame flags: bit 0 exception_trace, bit 1 a call
+        // time/memory accounting frame with its breakpoint flags above.
+        let frame = if action.return_trace || action.exception_trace {
+            Some((module_id, entry_ip, usize::from(action.exception_trace)))
+        } else {
+            action.acc.map(|acc| {
+                (
+                    module_id,
+                    acc.prev.map_or(0, |prev| prev as usize + 1),
+                    2 | ((acc.flags as usize) << 2),
+                )
+            })
+        };
+        let Some((module, entry, flags)) = frame else {
+            continue;
+        };
         if !reserve_trace_stack(process, 6)? {
             return Err(VmError::Unsupported("call trace stack".into()));
         }
@@ -1184,23 +1206,16 @@ fn push_trace_frames(
             .heap
             .stack_set(0, trace_continuation(module_id, return_trace_ip)?);
         for (index, value) in [
-            module_id,
-            entry_ip,
+            module,
+            entry,
             (action.session >> 32) as usize,
             action.session as u32 as usize,
-            usize::from(action.exception_trace),
+            flags,
         ]
         .into_iter()
         .enumerate()
         {
-            process.heap.stack_set(
-                index + 1,
-                Term::small(
-                    i64::try_from(value)
-                        .map_err(|_| VmError::Unsupported("trace frame stack value".into()))?,
-                )
-                .ok_or_else(|| VmError::Unsupported("trace frame stack value".into()))?,
-            );
+            process.heap.stack_set(index + 1, small(value)?);
         }
     }
     Ok(())
@@ -1230,19 +1245,28 @@ fn trace_breakpoint_call(
     arity: u8,
     local: bool,
 ) -> Result<Vec<crate::trace::CallActions>, VmError> {
-    crate::trace_bp::increment(process, &vm.modules[module_id].name, function, arity, local);
     let Some(ctx) = ctx else {
+        crate::trace_bp::increment(process, &vm.modules[module_id].name, function, arity, local);
         return Ok(Vec::new());
     };
+    // A breakpoint that does nothing for this process returns at once.
+    if let Some(pid) = process.self_pid
+        && crate::trace_bp::is_inert(process, pid, &vm.modules[module_id].name, function, arity)
+    {
+        return Ok(Vec::new());
+    }
     process.gc_live = usize::from(arity);
     let args = process.x[..usize::from(arity)].to_vec();
     let module_name = vm.modules[module_id].name.clone();
     let actions = crate::trace::call_event(vm, process, ctx, &module_name, function, &args, local)?;
+    let actions =
+        crate::trace::dedupe_return_frames(vm, process, actions, crate::trace::StackScan::Top);
     let trace_words = actions
         .iter()
         .map(|action| {
             usize::from(action.return_to) * 2
-                + usize::from(action.return_trace || action.exception_trace) * 5
+                + usize::from(action.return_trace || action.exception_trace || action.acc.is_some())
+                    * 5
         })
         .sum();
     if trace_words != 0 {
@@ -1535,7 +1559,7 @@ impl Vm {
                     }
                     cp = p.heap.stack_get(0).map_or(0, Term::tagged_word);
                 }
-                if crate::native_bridge::is_native_function_at(cp as usize) {
+                if crate::native_bridge::is_native_continuation(cp as usize) {
                     if crate::native_bridge::return_trace_enabled() {
                         eprintln!(
                             "[interp-native-return] CP={cp:#x} x0={:#x} E={:#x}",
@@ -1859,7 +1883,7 @@ impl Vm {
                 Instr::ReturnTrace => {
                     // The handler reloads the heap cursor below: publish pending allocations first.
                     sync_cursor(p, htop, &mut heap_dirty);
-                    let (Some(module), Some(entry), Some(session_high), Some(session_low), Some(_exception)) = (
+                    let (Some(module), Some(entry), Some(session_high), Some(session_low), Some(frame_flags)) = (
                         p.heap.stack_get(0).and_then(Term::as_small),
                         p.heap.stack_get(1).and_then(Term::as_small),
                         p.heap.stack_get(2).and_then(Term::as_small),
@@ -1869,7 +1893,20 @@ impl Vm {
                         return Err(VmError::Unsupported("return trace frame".into()));
                     };
                     let session = ((session_high as u64) << 32) | session_low as u32 as u64;
-                    if let Some(trace_ctx) = ctx.as_deref_mut() {
+                    if frame_flags & 2 != 0 {
+                        // Port of erts/emulator/beam/emu/trace_instrs.tab:54-70
+                        // (i_call_trace_return), OTP-29.1.1.
+                        sync_cursor(p, htop, &mut heap_dirty);
+                        if let Some(trace_ctx) = ctx.as_deref() {
+                            crate::trace::call_acc_return(
+                                p,
+                                trace_ctx.pid(),
+                                session,
+                                (frame_flags >> 2) as u32,
+                                (entry > 0).then(|| entry as u32 - 1),
+                            );
+                        }
+                    } else if let Some(trace_ctx) = ctx.as_deref_mut() {
                         // Port of erts/emulator/beam/emu/trace_instrs.tab:25-70, OTP-29.1.1.
                         sync_cursor(p, htop, &mut heap_dirty);
                         crate::trace::return_event(
@@ -4472,12 +4509,13 @@ mod trace_frame_tests {
     #[test]
     fn return_trace_frame_preserves_wide_session_ids() {
         let mut process = Process::new();
-        let session = 0x7000_0000_0000_0001;
+        let session = (1 << 58) | 1;
         let actions = [crate::trace::CallActions {
             session,
             return_trace: true,
             exception_trace: true,
             return_to: false,
+            acc: None,
         }];
         push_trace_frames(&mut process, 3, 7, 11, 13, &actions).unwrap();
         assert_eq!(process.heap.stack_get(1).and_then(Term::as_small), Some(3));
