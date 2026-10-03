@@ -281,6 +281,16 @@ fn nodes(process: &mut Process, types: Term, options: Option<Term>) -> Result<Te
         }
     }
     drop(tables);
+    if want_known {
+        for node in arinsal_term::Node::live_nodes() {
+            let Some(name) = global_atoms().text(node.name) else {
+                continue;
+            };
+            if name != "nonode@nohost" && !entries.iter().any(|(known, _, _)| known == name) {
+                entries.push((name.to_owned(), node_tables::NodeKind::Known, None));
+            }
+        }
+    }
     if entries.is_empty() {
         return Ok(Term::NIL);
     }

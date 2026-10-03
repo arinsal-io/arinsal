@@ -101,8 +101,7 @@ pub struct Message {
     /// When set, the receiver inserts this into the priority section of its
     /// private message queue (OTP 28+ priority messages).
     priority: bool,
-    /// The VM reference id of a `start_timer` timeout, so an in-flight expiry keeps its
-    /// reference even after the timer was cancelled.
+    /// The VM timer id carried until delivery so expiry and cancellation release its message.
     timer_id: Option<u64>,
 }
 
@@ -721,6 +720,7 @@ pub(crate) struct Runtime {
     aliases: AliasTable,
     pub(crate) timers: Mutex<HashMap<u64, arinsal_sched::TimerRef>>,
     pub(crate) timer_owners: Mutex<HashMap<u64, Pid>>,
+    pub(crate) timer_messages: Mutex<HashMap<u64, arinsal_etf::OwnedTerm>>,
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
@@ -876,6 +876,12 @@ impl Runtime {
                 .filter_map(|id| timers.remove(id))
                 .collect::<Vec<_>>()
         };
+        {
+            let mut messages = self.timer_messages.lock().unwrap();
+            for id in ids {
+                messages.remove(&id);
+            }
+        }
         if let Ok(scheduler) = self.scheduler() {
             for timer in timers {
                 // Port of erts/emulator/beam/erl_hl_timer.c (erts_cancel_bif_timers), OTP-29.1.1:
@@ -3735,6 +3741,7 @@ impl Process {
         if let Some(id) = id {
             timers.remove(&id);
             runtime.timer_owners.lock().unwrap().remove(&id);
+            runtime.timer_messages.lock().unwrap().remove(&id);
         }
         id
     }
@@ -4941,7 +4948,12 @@ fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, re
     let Some(runtime) = process.runtime.clone() else {
         return;
     };
-    let logger = {
+    let destination = crate::natives::sys::system_logger(process);
+    let logger = if destination == crate::signals::atom("undefined") {
+        None
+    } else if let Some(pid) = Pid::from_term(destination) {
+        Some(pid)
+    } else {
         let names = runtime.names.lock().unwrap();
         names
             .get("logger")
@@ -5565,6 +5577,7 @@ impl Vm {
             aliases: AliasTable::new(),
             timers: Mutex::new(HashMap::new()),
             timer_owners: Mutex::new(HashMap::new()),
+            timer_messages: Mutex::new(HashMap::new()),
             next_trace_weak_id: AtomicU64::new(0),
             ports: Mutex::new(HashMap::new()),
             system_monitor: Mutex::new(None),

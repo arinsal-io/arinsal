@@ -3,14 +3,14 @@
 use crate::EtsError;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{
-    HeapAlloc, Term, TermBuilder, TermKind, VecHeap, cmp, copy_term, exact_eq, from_owned,
-    global_atoms, to_owned,
+    Atom, HeapAlloc, Identity, Term, TermBuilder, TermKind, VecHeap, cmp, copy_term, exact_eq,
+    from_owned, global_atoms, to_owned,
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 struct Clause {
@@ -759,6 +759,43 @@ fn validate_construct(
 }
 
 impl MatchProgram {
+    /// Count external identities retained by a compiled program.
+    pub fn external_identity_counts(&self) -> HashMap<(Atom, u32), usize> {
+        let mut counts = HashMap::new();
+        let mut pending = Vec::new();
+        for clause in &self.clauses {
+            pending.push(clause.head);
+            pending.extend(clause.guards.iter().copied());
+            pending.extend(clause.body.iter().copied());
+        }
+        while let Some(term) = pending.pop() {
+            match term.classify() {
+                TermKind::Pid | TermKind::Port | TermKind::Ref => match term.identity() {
+                    Some(Identity::Pid { node, creation, .. })
+                    | Some(Identity::Port { node, creation, .. })
+                    | Some(Identity::Ref { node, creation, .. })
+                        if node != arinsal_term::atoms::NONAME =>
+                    {
+                        *counts.entry((node, creation)).or_default() += 1;
+                    }
+                    _ => {}
+                },
+                TermKind::Tuple | TermKind::Record | TermKind::List => {
+                    if let Some(items) = arinsal_term::term_sequence(term) {
+                        pending.extend(items);
+                    }
+                }
+                TermKind::Map => {
+                    if let Some(pairs) = arinsal_term::record_map_pairs(term) {
+                        pending.extend(pairs.into_iter().flat_map(|(key, value)| [key, value]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        counts
+    }
+
     /// Compile an ETS `match` or `match_object` head without guards.
     pub fn from_pattern(pattern: Term, whole_object: bool) -> Result<Self, EtsError> {
         let mut heap = VecHeap::new();

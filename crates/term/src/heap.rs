@@ -1364,19 +1364,22 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(p, 2))
     }
     /// Construct an external ordinary or pid reference.
+    // Port of erts/emulator/beam/erl_term.h:1142-1161 (ExternalThing layout), OTP-29.1.1.
     pub fn external_ref(&mut self, node: Arc<Node>, ids: &[u32]) -> Result<Term, TermError> {
         check_external_ref(ids)?;
-        let words = 3 + ids.len().div_ceil(2);
+        let words = 3 + (ids.len() + 1).div_ceil(2);
         let p = self.words(words)?;
-        // SAFETY: words includes external header and all packed u32 fields.
+        // SAFETY: words includes the external head and packed 32-bit count and ids.
         unsafe {
             *p = (((words - 1) as u64) << 6) | EXTERNAL_REF;
             *p.add(1) = Arc::as_ptr(&node) as u64;
             *p.add(2) = 0;
+            *p.add(3) = ids.len() as u64;
             for (i, id) in ids.iter().enumerate() {
-                let slot = p.add(3 + i / 2);
-                if i % 2 == 0 {
-                    *slot = *id as u64;
+                let index = i + 1;
+                let slot = p.add(3 + index / 2);
+                if index % 2 == 0 {
+                    *slot |= *id as u64;
                 } else {
                     *slot |= (*id as u64) << 32;
                 }

@@ -16,8 +16,36 @@ pub struct Node {
 impl Node {
     /// Create a node-table entry.
     pub fn new(name: Atom, creation: u32) -> Arc<Self> {
-        Arc::new(Self { name, creation })
+        let node = Arc::new(Self { name, creation });
+        live_node_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::downgrade(&node));
+        node
     }
+
+    /// Return node identities retained by live external terms.
+    pub fn live_nodes() -> Vec<Arc<Self>> {
+        let mut registry = live_node_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut nodes = Vec::new();
+        registry.retain(|entry| {
+            if let Some(node) = entry.upgrade() {
+                nodes.push(node);
+                true
+            } else {
+                false
+            }
+        });
+        nodes
+    }
+}
+
+fn live_node_registry() -> &'static std::sync::Mutex<Vec<std::sync::Weak<Node>>> {
+    static NODES: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Weak<Node>>>> =
+        std::sync::OnceLock::new();
+    NODES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 /// Process identifier, port, or ordinary reference decoded from a tagged term.
@@ -112,17 +140,22 @@ impl Term {
                         })
                     }
                     _ => {
-                        let count = if header >> 6 == 4 { 3 } else { 5 };
-                        let mut ids = Vec::with_capacity(count);
-                        for i in 0..count {
-                            // SAFETY: ref header includes 2 or 3 packed data words.
-                            let word = unsafe { *p.add(3 + i / 2) };
-                            ids.push(if i % 2 == 0 {
-                                word as u32
-                            } else {
-                                (word >> 32) as u32
-                            });
-                        }
+                        // OTP packs the ETF arity before the 32-bit ids in the data words.
+                        // SAFETY: the live reference header bounds its count and packed ids.
+                        let ids = unsafe {
+                            let count = (*p.add(3) as u32) as usize;
+                            (0..count)
+                                .map(|i| {
+                                    let index = i + 1;
+                                    let word = *p.add(3 + index / 2);
+                                    if index % 2 == 0 {
+                                        word as u32
+                                    } else {
+                                        (word >> 32) as u32
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        };
                         Some(Identity::Ref {
                             node: node.name,
                             creation: node.creation,
@@ -142,7 +175,7 @@ pub(crate) fn node_order(a: Atom, b: Atom) -> std::cmp::Ordering {
 
 /// Return a typed error if an external identity cannot fit the OTP layout.
 pub(crate) fn check_external_ref(ids: &[u32]) -> Result<(), TermError> {
-    if ids.len() == 3 || ids.len() == 5 {
+    if (1..=5).contains(&ids.len()) {
         Ok(())
     } else {
         Err(TermError::BadArg)

@@ -45,7 +45,7 @@
 | `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
 | `gc_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
 | `guard_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
-| `hash_SUITE` | 29 | 27/29 | 21/29 | 6 | 0 | test_phash2_with_large_bin: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.375.0>}]}}}, unknown_location; test_phash2_with_short_list: failed testcase_aborted; test_phash2_with_short_tuple: failed testcase_aborted; test_phash2_with_small_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_with_42, 20000}}}}; test_phash2_with_tiny_bin: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tuple, 20000}}}}; test_phash2_with_tiny_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tiny, 20000}}}} |
+| `hash_SUITE` | 29 | 27/29 | 19/29 | 8 | 0 | test_phash2_with_large_bin: auto_skipped {failed, {ct_framework,end_tc, {testcase_aborted, {arinsal_case_timeout, test_phash2_with_short_tuple,20000}}}}; test_phash2_with_large_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout, test_phash2_with_short_list,20000}}}}; test_phash2_with_short_list: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_list, 20000}}}}; test_phash2_with_short_tuple: failed testcase_aborted; test_phash2_with_small_unaligned_sub_binary: failed testcase_aborted; test_phash2_with_super_large_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout, test_phash2_with_tiny_bin,20000}}}}; test_phash2_with_tiny_bin: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tuple, 20000}}}}; test_phash2_with_tiny_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tiny, 20000}}}} |
 | `hash_property_test_SUITE` | 3 | 0/3 | 0/3 | 0 | 0 | none |
 | `hello_SUITE` | 1 | 1/1 | 0/1 | 1 | 0 | hello: failed {badarg |
 | `hibernate_SUITE` | 10 | 10/10 | 7/10 | 3 | 0 | dynamic_call: failed {'EXIT',error}, unknown_location; in_place: failed {{badmatch,false}; no_heap: failed {{badmatch,[{heap_size,4},{total_heap_size,24}]} |
@@ -64,7 +64,7 @@
 | `native_record_SUITE` | 10 | 9/10 | 1/10 | 8 | 0 | create: failed {'EXIT',error}, unknown_location; errors: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.212.0>}]}}}, unknown_location; explicit_module_name: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.185.0>}]}}}, unknown_location; external_term_format: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.201.0>}]}}}, unknown_location; gc: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.195.0>}]}}}, unknown_location; gh_11398: failed {{badmatch,#native_record_SUITE:exp{a = 1}}; records_module: failed {{badmatch, #native_record_SUITE:b{x = foo,y = none,z = none}}; term_order: failed {{badmatch,false} |
 | `nested_SUITE` | 4 | 4/4 | 4/4 | 0 | 0 | none |
 | `nif_SUITE` | 80 | 0/80 | 0/80 | 0 | -6 | first failure: failed: {check_io_debug,error,undef}, [{nif_SUITE,basic}] |
-| `node_container_SUITE` | 20 | 12/20 | 5/20 | 7 | 0 | ets_refc: failed {{badmatch,0}; magic_ref: failed {{badmatch,true}; match_spec_refc: failed {{badmatch,0}; node_table_gc: failed {{badmatch,false}; ref_eq: failed {badarg,mk_ref,[{"nonode@nohost",0},[4711]]}; term_to_binary_to_term_eq: failed {badarg,mk_ref,[{"nonode@nohost",0},[4711]]}; timer_refc: failed {{badmatch,0} |
+| `node_container_SUITE` | 20 | 12/20 | 12/20 | 0 | 0 | none |
 | `nofrag_SUITE` | 5 | 5/5 | 4/5 | 1 | -9 | debug_breakpoint: failed dont_execute_me |
 | `num_bif_SUITE` | 11 | 11/11 | 11/11 | 0 | 0 | none |
 | `op_SUITE` | 12 | 12/12 | 10/12 | 2 | 0 | complex_relop: failed testcase_aborted; relop: failed testcase_aborted |
@@ -88,7 +88,7 @@
 | `small_SUITE` | 13 | 13/13 | 13/13 | 0 | 0 | none |
 | `smoke_test_SUITE` | 3 | 2/3 | 1/3 | 1 | 0 | jump_table: failed {badarg |
 | `statistics_SUITE` | 18 | 18/18 | 18/18 | 0 | 0 | none |
-| `system_info_SUITE` | 12 | 10/12 | 3/12 | 7 | 0 | atom_count: failed {{badmatch,false}; ets_count: failed {badarg; memory: failed {{badmatch,false}; misc_smoke_tests: failed {badarg; process_count: failed {{badmatch,0}; procs_bug: failed {badarg; system_logger: failed {badarg |
+| `system_info_SUITE` | 12 | 10/12 | 10/12 | 0 | 0 | none |
 | `system_profile_SUITE` | 6 | 6/6 | 3/6 | 3 | 0 | dont_profile_profiler: failed {{badmatch,true}; runnable_ports: failed {{badmatch,false}; scheduler: failed {{badmatch,false} |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | -9 | first failure: failed: {not_alive, |
 | `timer_bif_SUITE` | 23 | 20/23 | 20/23 | 0 | 0 | none |
