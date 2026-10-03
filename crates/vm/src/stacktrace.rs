@@ -50,7 +50,8 @@ impl<'a> TraceHeap<'a> {
         trace.capacity = words;
         if let Some(block) = HeapAlloc::alloc(trace.heap, words) {
             trace.block = block;
-            trace.block_end = Some(trace.heap.used_words());
+            // A detached heap hands out blocks outside the young heap; there is no top to trim.
+            trace.block_end = (!trace.heap.is_detached()).then(|| trace.heap.used_words());
         } else {
             trace.block = trace.heap.gc_fragment(words);
         }

@@ -15,6 +15,7 @@ mod ops;
 mod owned;
 pub mod ptab;
 mod record;
+mod record_table;
 mod region;
 pub mod validate;
 mod views;
@@ -33,7 +34,7 @@ pub use copy::{
     copy_term_preserving_sharing_with_cache,
 };
 pub use fun::{ExportEntry, FunEntry, FunRef};
-pub use gc::{FragmentAlloc, FragmentIndex, GcStats, ScratchMark};
+pub use gc::{FragmentAlloc, FragmentIndex, GcStats};
 pub use hamt::{boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_node_children};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
 pub use heap::{
@@ -55,6 +56,10 @@ pub use ops::{
 };
 pub use owned::{from_owned, to_owned};
 pub use record::{RecordRef, RecordSnapshot, record_map_pairs, term_sequence};
+pub use record_table::{
+    delete_module_record_definitions, drop_record_scope, find_record_definition_in,
+    put_record_definition, set_record_scope,
+};
 pub use region::{
     BuiltList, DEFAULT_REGION_LIST_CONS, GrowingList, RegionBuilder, RegionRoots,
     SEND_COPY_LIMIT_WORDS, SharedRoot, is_region_term, region_owner, seal_for_send,

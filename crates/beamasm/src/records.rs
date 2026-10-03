@@ -24,22 +24,30 @@ const TMP3: Gpr = Gpr::x(10);
 const TAG_BOXED: u16 = 2;
 const HEADER_MASK: u16 = 0x3f;
 const HEADER_RECORD: u16 = 0x1c;
-const STAGED_ARGS: u32 = 6;
+/// Scratch X register of OTP (`SCRATCH_X_REG`): a destination whose value is not wanted.
+const SCRATCH_X: u32 = 1023;
+/// Top of the key staging area of `get_record_elements`, which has no live count.
+const ELEMENTS_STAGING_TOP: u32 = 1020;
 
 // These entries map logical XREG4/5 to their caller-saved hardware registers.
 const fn logical_xreg(index: u8) -> Gpr {
     Gpr::x(index)
 }
 
-/// Runtime helper for `get_record_field` and `get_local_record_field`.
-pub type GetRecordFieldHook = extern "C" fn(*mut ProcessHeader, u64, u64, u64) -> u64;
-/// Runtime helper for record creation, receiving staged operands in scheduler registers.
+/// Runtime helper for `get_record_field` and `get_local_record_field`: process, record, id,
+/// field and a flag that is nonzero when a failure must raise instead of returning zero.
+pub type GetRecordFieldHook = extern "C" fn(*mut ProcessHeader, u64, u64, u64, u64) -> u64;
+/// Runtime helper for record creation: process, registers, id (or definition literal), live
+/// registers, staged word count and the first staged X register. Zero means an error was set.
 pub type CreateNativeRecordHook =
     extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64, u64) -> u64;
-/// Runtime helper for record element extraction; zero means the operation failed.
+/// Runtime helper for record element extraction: process, registers, record, key count and
+/// the first staged X register, which holds the keys on entry and the values on success.
+/// Zero means the operation failed.
 pub type GetRecordElementsHook =
     extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64) -> u64;
-/// Runtime helper for native record updates, receiving staged operands in scheduler registers.
+/// Runtime helper for native record updates, same arguments as [`CreateNativeRecordHook`] but
+/// receiving the source record.
 pub type UpdateNativeRecordHook =
     extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, u64, u64, u64, u64) -> u64;
 
@@ -126,14 +134,17 @@ impl BeamModuleAssembler {
             self.code.emit(|e| e.ldr_uoff(TMP2, TMP3, 40))?;
             self.code.tbz(TMP2, 6, fail)?;
         } else {
-            let module = self.source_reg(current_module)?;
+            // Accessible when exported or defined by the current module: the module
+            // comparison only counts when the record is not exported.
+            let module = self.source_reg_into(current_module, TMP)?;
+            let accessible = self.code.new_label();
             self.code.emit(|e| e.ldr_uoff(TMP2, TMP3, 40))?;
-            self.code.emit(|e| e.cmp_imm(TMP2, 0x4b, false))?;
-            self.code.b_cond(Cond::Ne, fail)?;
+            self.code.tbnz(TMP2, 6, accessible)?;
             self.code.emit(|e| e.ldr_uoff(TMP2, TMP3, 24))?;
             self.code
                 .emit(|e| e.cmp_reg(TMP2, module, arinsal_a64::enc::Shift::Lsl, 0))?;
             self.code.b_cond(Cond::Ne, fail)?;
+            self.code.bind(accessible)?;
         }
         Ok(())
     }
@@ -153,7 +164,9 @@ impl BeamModuleAssembler {
             let value = self.source_reg(value)?;
             self.code.emit(|e| e.mov_reg(register, value))?;
         }
-        self.code.emit(|e| e.mov_reg(Gpr::x(0), C_P))?;
+        // With a failure label the helper only reports failure; without one it raises.
+        let raise = u64::from(fail == 0);
+        self.code.emit(|e| e.mov_const(Gpr::x(4), raise))?;
         let helper = if is_immediate_id(id) {
             runtime.get_local_field
         } else {
@@ -162,14 +175,13 @@ impl BeamModuleAssembler {
         emit_record_runtime(
             self,
             helper as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3)],
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
             6,
             Update::HEAP_ALLOC,
             Update::HEAP_ALLOC,
         )?;
-        let has_fail = fail != 0;
-        let fail = self.label(fail);
-        if has_fail {
+        if fail != 0 {
+            let fail = self.label(fail);
             self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
             self.code.b_cond(Cond::Eq, fail)?;
         } else {
@@ -183,7 +195,7 @@ impl BeamModuleAssembler {
     }
 
     /// Creates a local native record from the supplied staged values.
-    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:151-180, OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:145-180, OTP-29.1.1.
     pub fn emit_i_create_local_native_record(
         &mut self,
         definition: ArgVal,
@@ -192,12 +204,11 @@ impl BeamModuleAssembler {
         args: &[ArgVal],
         runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        validate_live(live)?;
         self.emit_create(definition, dst, live, args, runtime.create_local)
     }
 
     /// Creates a native record by its record ID.
-    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:182-216, OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:182-207, OTP-29.1.1.
     pub fn emit_i_create_native_record(
         &mut self,
         id: ArgVal,
@@ -206,28 +217,39 @@ impl BeamModuleAssembler {
         args: &[ArgVal],
         runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        validate_live(live)?;
         self.emit_create(id, dst, live, args, runtime.create)
     }
 
-    /// Extracts the requested original-order fields into their X registers.
-    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:117-149, OTP-29.1.1.
+    /// Extracts the requested fields into their destination registers. `keys` are sorted by
+    /// the loader (`map_key_sort`) and `dsts` holds the destination of each key.
+    // Port of erts/emulator/beam/jit/arm/instr_records.cpp:117-143, OTP-29.1.1.
     pub fn emit_i_get_record_elements(
         &mut self,
         fail: u32,
         src: ArgVal,
-        _size: u32,
-        args: &[ArgVal],
+        keys: &[ArgVal],
+        dsts: &[ArgVal],
         runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        self.stage_args(args)?;
+        if keys.len() != dsts.len() || keys.is_empty() {
+            return Err(ModuleError::InvalidOperand(
+                "get_record_elements needs one destination per key",
+            ));
+        }
+        let base = ELEMENTS_STAGING_TOP
+            .checked_sub(keys.len() as u32)
+            .filter(|base| *base > 6)
+            .ok_or(ModuleError::InvalidOperand(
+                "too many native record elements",
+            ))?;
+        self.stage_args(keys, base)?;
         let source = self.source_reg(src)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(1), SCHEDULER_REGS))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), source))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(1), SCHEDULER_REGS))?;
         self.code
-            .emit(|e| e.mov_const(Gpr::x(3), args.len() as u64))?;
+            .emit(|e| e.mov_const(Gpr::x(3), keys.len() as u64))?;
         self.code
-            .emit(|e| e.mov_const(Gpr::x(4), STAGED_ARGS as u64))?;
+            .emit(|e| e.mov_const(Gpr::x(4), u64::from(base)))?;
         emit_record_runtime(
             self,
             runtime.get_elements as usize,
@@ -238,6 +260,15 @@ impl BeamModuleAssembler {
         )?;
         let fail = self.label(fail);
         self.code.tbz(Gpr::w(0), 0, fail)?;
+        for (index, dst) in dsts.iter().copied().enumerate() {
+            if matches!(dst, ArgVal::XMemory(SCRATCH_X)) {
+                continue;
+            }
+            let offset = (base + index as u32) * 8;
+            self.code
+                .emit(|e| e.ldr_uoff(Gpr::x(0), SCHEDULER_REGS, offset))?;
+            self.store_record_result(dst)?;
+        }
         Ok(())
     }
 
@@ -251,16 +282,17 @@ impl BeamModuleAssembler {
         args: &[ArgVal],
         runtime: RecordRuntime,
     ) -> Result<(), ModuleError> {
-        validate_live(live)?;
-        self.stage_args(args)?;
+        let base = live.max(6);
+        self.stage_args(args, base)?;
         let source = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), SCHEDULER_REGS))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), source))?;
-        self.code.emit(|e| e.mov_const(Gpr::x(3), live as u64))?;
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(4), args.len() as u64))?;
         self.code
-            .emit(|e| e.mov_const(Gpr::x(5), STAGED_ARGS as u64))?;
+            .emit(|e| e.mov_const(Gpr::x(5), u64::from(base)))?;
         emit_record_runtime(
             self,
             runtime.update as usize,
@@ -284,20 +316,22 @@ impl BeamModuleAssembler {
         args: &[ArgVal],
         hook: CreateNativeRecordHook,
     ) -> Result<(), ModuleError> {
-        self.stage_args(args)?;
+        let base = live.max(6);
+        self.stage_args(args, base)?;
         let id = self.source_reg(id)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), SCHEDULER_REGS))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(2), id))?;
-        self.code.emit(|e| e.mov_const(Gpr::x(3), live as u64))?;
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(3), u64::from(live)))?;
         self.code
             .emit(|e| e.mov_const(Gpr::x(4), args.len() as u64))?;
         self.code
-            .emit(|e| e.mov_const(Gpr::x(5), STAGED_ARGS as u64))?;
+            .emit(|e| e.mov_const(Gpr::x(5), u64::from(base)))?;
         emit_record_runtime(
             self,
             hook as usize,
             &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4), Gpr::x(5)],
-            live as usize,
+            6,
             Update::HEAP_ALLOC
                 .union(Update::X_REGS)
                 .union(Update::REDUCTIONS),
@@ -317,15 +351,16 @@ impl BeamModuleAssembler {
         self.store_record_result(dst)
     }
 
-    fn stage_args(&mut self, args: &[ArgVal]) -> Result<(), ModuleError> {
-        if args.len() > 1018 {
+    /// Stores operands as consecutive words of the scheduler X register array from `base`.
+    fn stage_args(&mut self, args: &[ArgVal], base: u32) -> Result<(), ModuleError> {
+        if args.len() + base as usize > 1022 {
             return Err(ModuleError::InvalidOperand(
-                "too many native record operands",
+                "native record operands exceed scheduler register capacity",
             ));
         }
         for (index, arg) in args.iter().copied().enumerate() {
             let value = self.source_reg(arg)?;
-            let offset = (STAGED_ARGS as usize + index) * 8;
+            let offset = (base as usize + index) * 8;
             let offset = u32::try_from(offset)
                 .map_err(|_| ModuleError::InvalidOperand("record operand offset overflow"))?;
             self.code
@@ -334,11 +369,17 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    /// Writes x0 to an X or Y register.
     fn store_record_result(&mut self, dst: ArgVal) -> Result<(), ModuleError> {
         match dst {
             ArgVal::X(index) if index < 6 => {
                 self.code
                     .emit(|e| e.mov_reg(X[index as usize], Gpr::x(0)))?;
+                Ok(())
+            }
+            ArgVal::XMemory(index) if index < 1024 => {
+                self.code
+                    .emit(|e| e.str_uoff(Gpr::x(0), SCHEDULER_REGS, index * 8))?;
                 Ok(())
             }
             ArgVal::Y(index) => {
@@ -394,13 +435,4 @@ fn is_immediate_id(id: ArgVal) -> bool {
         ArgVal::Literal(term) => !matches!(term & 7, 1 | 2),
         _ => false,
     }
-}
-
-fn validate_live(live: u32) -> Result<(), ModuleError> {
-    if live > 6 {
-        return Err(ModuleError::InvalidOperand(
-            "live X register count must not exceed six",
-        ));
-    }
-    Ok(())
 }

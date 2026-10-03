@@ -837,6 +837,7 @@ fn delete(vm: &mut Vm, name: &str) -> Result<Term, VmError> {
             }));
         };
         code.old.insert(name.to_owned(), current);
+        crate::load::retract_module_records(code.code_scope, name);
         code.deleted.insert(name.to_owned());
         code.module_files.remove(name);
         code.epoch
@@ -855,6 +856,7 @@ fn delete(vm: &mut Vm, name: &str) -> Result<Term, VmError> {
             }));
         };
         vm.old.insert(name.to_owned(), current);
+        crate::load::retract_module_records(vm.code_scope, name);
         vm.deleted.insert(name.to_owned());
         vm.module_files.remove(name);
     }
@@ -991,6 +993,7 @@ fn finish_on_load(vm: &mut Vm, name: &str, keep: bool) -> Result<Term, VmError> 
             if let Some(previous) = code.loaded.insert(name.to_owned(), id) {
                 code.old.insert(name.to_owned(), previous);
             }
+            crate::load::activate_module_records(code.code_scope, &code.modules[id]);
             code.deleted.remove(name);
         }
         code.epoch
@@ -1003,6 +1006,7 @@ fn finish_on_load(vm: &mut Vm, name: &str, keep: bool) -> Result<Term, VmError> 
             if let Some(previous) = vm.loaded.insert(name.to_owned(), id) {
                 vm.old.insert(name.to_owned(), previous);
             }
+            crate::load::activate_module_records(vm.code_scope, &vm.modules[id]);
             vm.deleted.remove(name);
         }
     }

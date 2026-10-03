@@ -120,6 +120,17 @@ pub trait ModuleEnv {
     fn bs_match_helper(&self) -> arinsal_beamasm::bs_match::BsMatchHelper;
     /// Runtime callbacks for map creation and updates.
     fn map_runtime(&self) -> arinsal_beamasm::map::MapRuntime;
+    /// Runtime callbacks of the native record instructions.
+    fn record_runtime(&self) -> arinsal_beamasm::records::RecordRuntime {
+        arinsal_beamasm::records::RecordRuntime {
+            get_field: unused_record_field,
+            get_local_field: unused_record_field,
+            create_local: unused_record_create,
+            create: unused_record_create,
+            get_elements: unused_record_elements,
+            update: unused_record_create,
+        }
+    }
     /// Runtime hook calling a plain BIF by export identity.
     fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {
         unused_bif_identity
@@ -238,6 +249,37 @@ extern "C" fn unused_bif_identity(
     0
 }
 
+extern "C" fn unused_record_field(
+    _p: *mut ProcessHeader,
+    _s: u64,
+    _i: u64,
+    _f: u64,
+    _r: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn unused_record_create(
+    _p: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _id: u64,
+    _live: u64,
+    _count: u64,
+    _base: u64,
+) -> u64 {
+    0
+}
+
+extern "C" fn unused_record_elements(
+    _p: *mut ProcessHeader,
+    _registers: *mut SchedulerRegisters,
+    _src: u64,
+    _count: u64,
+    _base: u64,
+) -> u64 {
+    0
+}
+
 extern "C" fn unused_bs_match_cmd(_process: *mut ProcessHeader, _kind: u64, _live: u64) -> u64 {
     0
 }
@@ -337,6 +379,7 @@ enum EmitterKind {
     Float,
     Receive,
     Bif,
+    Records,
 }
 
 /// Operations that have an emitter in the current module assembler slice.
@@ -873,6 +916,30 @@ pub static PORTED_OPS: &[PortedOp] = &[
     PortedOp {
         name: "is_native_record",
         emitter: EmitterKind::Guard,
+    },
+    PortedOp {
+        name: "is_record_accessible",
+        emitter: EmitterKind::Guard,
+    },
+    PortedOp {
+        name: "get_record_field",
+        emitter: EmitterKind::Records,
+    },
+    PortedOp {
+        name: "i_get_record_elements",
+        emitter: EmitterKind::Records,
+    },
+    PortedOp {
+        name: "i_create_local_native_record",
+        emitter: EmitterKind::Records,
+    },
+    PortedOp {
+        name: "i_create_native_record",
+        emitter: EmitterKind::Records,
+    },
+    PortedOp {
+        name: "i_update_native_record",
+        emitter: EmitterKind::Records,
     },
     PortedOp {
         name: "is_int_in_range",
@@ -1747,6 +1814,12 @@ fn supports_extended_x(name: &str) -> bool {
             | "i_new_small_map_lit"
             | "update_record"
             | "update_record_in_place"
+            | "i_create_local_native_record"
+            | "i_create_native_record"
+            | "i_update_native_record"
+            | "i_get_record_elements"
+            | "get_record_field"
+            | "is_record_accessible"
             | "i_bif1"
             | "i_bif2"
             | "i_bif3"
@@ -1898,8 +1971,15 @@ fn spilled_destinations(op: &SpecificOp, beam: &BeamFile) -> BTreeSet<u32> {
         "i_bs_get_position" | "bs_get_tail" => {
             positions.insert(1);
         }
-        "i_bif1" | "i_bif2" | "i_bif3" | "nofail_bif1" | "nofail_bif2" => {
+        "i_bif1" | "i_bif2" | "i_bif3" | "nofail_bif1" | "nofail_bif2" | "get_record_field" => {
             positions.extend(operands.len().checked_sub(1));
+        }
+        "i_create_local_native_record" | "i_create_native_record" | "i_update_native_record" => {
+            positions.insert(1);
+        }
+        "i_get_record_elements" => {
+            // Fail Src Size, then key/destination pairs.
+            positions.extend((4..operands.len()).step_by(2));
         }
         _ => {}
     }
@@ -1929,6 +2009,12 @@ fn uses_emitter_spills(name: &str) -> bool {
             | "i_new_small_map_lit"
             | "update_record"
             | "update_record_in_place"
+            | "i_create_local_native_record"
+            | "i_create_native_record"
+            | "i_update_native_record"
+            | "i_get_record_elements"
+            | "get_record_field"
+            | "is_record_accessible"
             | "i_bif1"
             | "i_bif2"
             | "i_bif3"
@@ -3472,6 +3558,31 @@ fn emit_op(
                         count(4)?;
                         assembler.emit_is_native_record(fail, source, value(2)?, value(3)?)?;
                     }
+                    "is_record_accessible" => {
+                        // Port of erts/emulator/beam/jit/arm/instr_records.cpp:73-115, OTP-29.1.1.
+                        count(3)?;
+                        let external = matches!(
+                            args.get(2),
+                            Some(SpecificOperand::Atom(index)) if beam.atom(*index) == Some("external")
+                        );
+                        let module = beam
+                            .atoms
+                            .iter()
+                            .position(|atom| *atom == beam.module)
+                            .and_then(|position| u32::try_from(position + 1).ok())
+                            .ok_or_else(|| {
+                                EmitError::Operand(
+                                    "module name is not in the atom table".to_owned(),
+                                )
+                            })?;
+                        let module = env.atom(beam, module).map_err(EmitError::Operand)?;
+                        assembler.emit_is_record_accessible(
+                            fail,
+                            source,
+                            external,
+                            ArgVal::Immediate(module),
+                        )?;
+                    }
                     "is_list" => assembler.emit_is_list(source, fail)?,
                     "is_nonempty_list" => assembler.emit_is_nonempty_list(source, fail)?,
                     "is_nil" => assembler.emit_is_nil(source, fail)?,
@@ -3774,6 +3885,93 @@ fn emit_op(
                 value(bif_at + 1)?,
                 env.bif_identity_helper(),
             )
+        }
+        EmitterKind::Records => {
+            // Port of erts/emulator/beam/jit/arm/instr_records.cpp:117-274, OTP-29.1.1.
+            let runtime = env.record_runtime();
+            // Key/value pairs, sorted in flatmap key order like the loader's `map_key_sort`.
+            let sorted_pairs = |first: usize| -> Result<Vec<(ArgVal, ArgVal)>, EmitError> {
+                let size = usize::try_from(n(first - 1)?)
+                    .map_err(|_| EmitError::Operand("record operand size overflow".to_owned()))?;
+                if size % 2 != 0 || args.len() != first + size {
+                    return Err(EmitError::Operand(format!("{} size mismatch", op.name())));
+                }
+                let mut pairs = Vec::with_capacity(size / 2);
+                for pair in args[first..].as_chunks::<2>().0 {
+                    let key = arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)?;
+                    let ArgVal::Immediate(key_word) = key else {
+                        return Err(EmitError::Operand(
+                            "native record field names must be atoms".to_owned(),
+                        ));
+                    };
+                    pairs.push((key_word, key, arg(Some(&pair[1]), beam, env)?));
+                }
+                let words: Vec<u64> = pairs.iter().map(|(word, _, _)| *word).collect();
+                let order = env.sort_map_keys(&words).map_err(EmitError::Operand)?;
+                Ok(order
+                    .into_iter()
+                    .map(|index| (pairs[index].1, pairs[index].2))
+                    .collect())
+            };
+            match op.name() {
+                "get_record_field" => {
+                    count(5)?;
+                    assembler.emit_get_record_field(
+                        n(0)?,
+                        value(1)?,
+                        value(2)?,
+                        value(3)?,
+                        value(4)?,
+                        runtime,
+                    )
+                }
+                "i_get_record_elements" => {
+                    count_at_least(args, 3, op.name())?;
+                    let pairs = sorted_pairs(3)?;
+                    let keys: Vec<ArgVal> = pairs.iter().map(|(key, _)| *key).collect();
+                    let dsts: Vec<ArgVal> = pairs.iter().map(|(_, dst)| *dst).collect();
+                    assembler.emit_i_get_record_elements(n(0)?, value(1)?, &keys, &dsts, runtime)
+                }
+                "i_create_local_native_record" | "i_create_native_record" => {
+                    count_at_least(args, 4, op.name())?;
+                    let staged: Vec<ArgVal> = sorted_pairs(4)?
+                        .into_iter()
+                        .flat_map(|(key, val)| [key, val])
+                        .collect();
+                    if op.name() == "i_create_local_native_record" {
+                        assembler.emit_i_create_local_native_record(
+                            value(0)?,
+                            value(1)?,
+                            n(2)?,
+                            &staged,
+                            runtime,
+                        )
+                    } else {
+                        assembler.emit_i_create_native_record(
+                            value(0)?,
+                            value(1)?,
+                            n(2)?,
+                            &staged,
+                            runtime,
+                        )
+                    }
+                }
+                "i_update_native_record" => {
+                    count_at_least(args, 4, op.name())?;
+                    let staged: Vec<ArgVal> = sorted_pairs(4)?
+                        .into_iter()
+                        .flat_map(|(key, val)| [key, val])
+                        .collect();
+                    assembler.emit_i_update_native_record(
+                        value(0)?,
+                        value(1)?,
+                        n(2)?,
+                        &staged,
+                        runtime,
+                    )
+                }
+                _ => return Err(EmitError::Operand(format!("unknown op {}", op.name()))),
+            }
         }
         EmitterKind::Receive => {
             // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:25-295, OTP-29.1.1.

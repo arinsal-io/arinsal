@@ -411,6 +411,30 @@ impl SharedCode {
     }
 }
 
+/// Port of erts/emulator/beam/erl_record.c:171-193 (erts_record_put,
+/// erts_record_module_delete), OTP-29.1.1: make the record definitions of the code that
+/// becomes current for its module the canonical ones, replacing those of the previous code.
+pub(crate) fn activate_module_records(scope: u64, module: &Module) {
+    arinsal_term::delete_module_record_definitions(scope, module.name_atom);
+    let atoms = global_atoms();
+    for (record, cons) in module.records.iter().zip(&module.record_defs) {
+        let (Ok(name), Some((definition, _))) =
+            (atoms.intern(&record.name), crate::lists::split(*cons))
+        else {
+            continue;
+        };
+        arinsal_term::put_record_definition(scope, module.name_atom, name, *cons, definition);
+    }
+}
+
+/// Port of erts/emulator/beam/beam_bif_load.c:2451 (erts_record_module_delete) at the point
+/// where the current code of `module` becomes old.
+pub(crate) fn retract_module_records(scope: u64, module: &str) {
+    if let Ok(atom) = global_atoms().intern(module) {
+        arinsal_term::delete_module_record_definitions(scope, atom);
+    }
+}
+
 // VM load implementation.
 
 impl Vm {
@@ -592,6 +616,7 @@ impl Vm {
         let previous = self.loaded.get(&name).copied();
         let id = self.alloc_local(module, registers, Some(meta));
         self.loaded.insert(name.clone(), id);
+        activate_module_records(self.code_scope, &self.modules[id]);
         if let Some(native) = beamasm_integration::compile(
             bytes,
             &self.modules[id],
@@ -739,6 +764,7 @@ impl Vm {
                     Some(CodeMeta::from_beam(beam, None)),
                 );
                 code.loaded.insert(name.clone(), id);
+                activate_module_records(code.code_scope, &code.modules[id]);
                 code.known_modules.insert(name);
                 code.epoch
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -770,6 +796,7 @@ impl Vm {
         let name = module.name.clone();
         let id = self.alloc_local(module, registers, None);
         self.loaded.insert(name.clone(), id);
+        activate_module_records(self.code_scope, &self.modules[id]);
         self.known_modules.insert(name);
         id
     }
@@ -842,6 +869,7 @@ impl Vm {
                     if let Some(previous) = code.loaded.insert(name.clone(), id) {
                         code.old.insert(name.clone(), previous);
                     }
+                    activate_module_records(code.code_scope, &code.modules[id]);
                     code.deleted.remove(&name);
                 }
             }
@@ -869,8 +897,10 @@ impl Vm {
                 if pending {
                     if let Some(previous) = previous.get(&name) {
                         self.loaded.insert(name.clone(), *previous);
+                        activate_module_records(self.code_scope, &self.modules[*previous]);
                     } else {
                         self.loaded.remove(&name);
+                        retract_module_records(self.code_scope, &name);
                     }
                     self.pending_on_load.insert(name.clone(), id);
                     on_load.push(name.clone());
@@ -1217,6 +1247,7 @@ impl Vm {
                     Some(CodeMeta::from_beam(&beam, Some(&bytes))),
                 );
                 code.loaded.insert(module_name.clone(), id);
+                activate_module_records(code.code_scope, &code.modules[id]);
                 if let Some(native) = beamasm_integration::compile(
                     &bytes,
                     &code.modules[id],

@@ -2,6 +2,7 @@
 use crate::bits::{ExternalBinary, WritableBinary, binary_data, owner_adjustment};
 use crate::identity::check_external_ref;
 use crate::record::RecordSnapshot;
+use crate::record_table::RecordLayout;
 use crate::{
     ARITY, Atom, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry,
     FLOAT, FunEntry, HEAP_BITS, MAP, MAX_SMALL, MIN_SMALL, NEG_BIG, Node, POS_BIG, RECORD, REF,
@@ -242,6 +243,8 @@ pub struct ProcessHeap {
     pub(crate) bin_vheap_size: u64,
     pub(crate) heap_grow: bool,
     pub(crate) native_allocation: bool,
+    /// Allocations go to `owners.detached` (see [`ProcessHeap::begin_detached`]).
+    pub(crate) detached: bool,
     pub(crate) fragments: Vec<Fragment>,
     /// Total word capacity in process heap fragments (`mbuf_sz` in erts).
     /// Words in heap fragments (u32 keeps the hot heap struct within 128 bytes).
@@ -318,6 +321,8 @@ pub(crate) struct HeapOwners {
     pub(crate) old_exports: Vec<Arc<ExportEntry>>,
     pub(crate) old_magic: Vec<Arc<crate::MagicRef>>,
     pub(crate) old_writable_refs: Vec<Term>,
+    /// Heap that receives all allocations while the heap is detached.
+    pub(crate) detached: Option<Box<VecHeap>>,
 }
 
 #[derive(Default)]
@@ -374,6 +379,7 @@ impl ProcessHeap {
             bin_vheap_size: 46_422,
             heap_grow: false,
             native_allocation: false,
+            detached: false,
             fragments: Vec::new(),
             fragment_words: 0,
             owners: LazyOwners::default(),
@@ -498,6 +504,15 @@ impl ProcessHeap {
     }
     /// Allocate a side fragment when a BIF cannot collect at this point.
     pub fn heap_fragment(&mut self, words: usize) -> *mut u64 {
+        if self.detached
+            && let Some(ptr) = self
+                .owners
+                .detached
+                .as_deref_mut()
+                .and_then(|heap| heap.alloc(words))
+        {
+            return ptr;
+        }
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(words).unwrap_or(u32::MAX));
@@ -662,6 +677,9 @@ impl Default for ProcessHeap {
 impl HeapAlloc for ProcessHeap {
     #[inline]
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        if self.detached {
+            return self.owners.detached.as_deref_mut()?.alloc(words);
+        }
         let limit = if self.native_allocation {
             self.heap_limit_words()
         } else {
@@ -677,6 +695,11 @@ impl HeapAlloc for ProcessHeap {
         Some(ptr)
     }
     fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_binary(binary);
+        }
         // Port of erts/emulator/beam/erl_message.h:85 (OH_OVERHEAD), OTP-29.1.1.
         self.bin_vheap = self.bin_vheap.saturating_add((binary.len() / 8) as u64);
         self.off_heap_binary_bytes = self
@@ -685,6 +708,11 @@ impl HeapAlloc for ProcessHeap {
         self.owners.off_heap.push(binary);
     }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_writable_binary(binary);
+        }
         self.bin_vheap = self
             .bin_vheap
             .saturating_add((binary.capacity() / 8) as u64);
@@ -695,6 +723,11 @@ impl HeapAlloc for ProcessHeap {
         true
     }
     fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_external_binary(binary);
+        }
         self.owners.external.push(binary);
         Ok(())
     }
@@ -702,15 +735,35 @@ impl HeapAlloc for ProcessHeap {
         true
     }
     fn retain_node(&mut self, node: Arc<Node>) {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_node(node);
+        }
         self.owners.nodes.push(node);
     }
     fn retain_fun(&mut self, entry: Arc<FunEntry>) {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_fun(entry);
+        }
         self.owners.funs.push(entry);
     }
     fn retain_export(&mut self, entry: Arc<ExportEntry>) {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_export(entry);
+        }
         self.owners.exports.push(entry);
     }
     fn retain_magic(&mut self, owner: Arc<crate::MagicRef>) {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_magic(owner);
+        }
         self.owners.magic.push(owner);
     }
     fn supports_magic(&self) -> bool {
@@ -1205,9 +1258,10 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         Ok(Term::from_ptr(p, 2))
     }
-    /// Port of erts/emulator/beam/erl_record.c:701-779, OTP-29.1.1.
-    /// Construct a native record and its tuple-tagged definition.
-    /// Fields are supplied in definition order and stored in atom-index order.
+    /// Port of erts/emulator/beam/erl_record.c:701-779 (records_create_4), OTP-29.1.1.
+    /// Construct a native record, reusing the canonical definition of its module when one
+    /// matches (`erts_canonical_record_def`). Fields are supplied in definition order and
+    /// stored in atom-index order.
     pub fn native_record(
         &mut self,
         module: Atom,
@@ -1215,53 +1269,63 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         exported: bool,
         fields: &[(Atom, Term)],
     ) -> Result<Term, TermError> {
-        if fields.len() > (1 << 24) - 2 {
-            return Err(TermError::SystemLimit);
-        }
-        let mut sorted: Vec<(usize, Atom, Term)> = fields
+        let layout = RecordLayout::new(module, name, exported, fields.iter().map(|(k, _)| *k))?;
+        let definition = match crate::record_table::canonical_definition(&layout) {
+            Some(canonical) => canonical,
+            None => self.record_definition_tuple(&layout)?,
+        };
+        let values: Vec<_> = layout
+            .sorted
             .iter()
-            .enumerate()
-            .map(|(i, (k, v))| (i, *k, *v))
+            .map(|(original_index, _)| fields[*original_index].1)
             .collect();
-        sorted.sort_by_key(|(_, key, _)| key.0);
-        if sorted.windows(2).any(|pair| pair[0].1 == pair[1].1) {
-            return Err(TermError::BadArg);
-        }
-        let bool_term = Term::atom(if exported {
-            crate::atoms::TRUE
-        } else {
-            crate::atoms::FALSE
-        });
-        let mut temp = vec![0_u64; 4 + fields.len()];
-        temp[0] = ((3 + fields.len()) as u64) << 6;
-        temp[1] = Term::atom(module).bits();
-        temp[2] = Term::atom(name).bits();
-        temp[3] = bool_term.bits();
-        for (i, (key, _)) in fields.iter().enumerate() {
-            temp[4 + i] = Term::atom(*key).bits();
-        }
-        let hash = crate::make_hash2(Term::from_ptr(temp.as_mut_ptr(), 2));
-        let mut order = vec![Term::NIL; fields.len()];
-        for (sorted_index, (original_index, _, _)) in sorted.iter().enumerate() {
-            // Port of erts/emulator/beam/erl_record.c:761, OTP-29.1.1.
-            order[*original_index] = Term::small(sorted_index as i64).unwrap();
-        }
+        self.native_record_instance(definition, &values)
+    }
+    /// Port of erts/emulator/beam/beam_file.c:1100-1310 (parse_record_chunk), OTP-29.1.1.
+    /// Build the literal `[Definition | DefaultValues]` cons of one compiler-emitted record:
+    /// the definition tuple and a tuple of default values in atom-index order, where
+    /// `None` (a field without default) is stored as `catch(0)`.
+    pub fn native_record_literal(
+        &mut self,
+        module: Atom,
+        name: Atom,
+        exported: bool,
+        fields: &[(Atom, Option<Term>)],
+    ) -> Result<Term, TermError> {
+        let layout = RecordLayout::new(module, name, exported, fields.iter().map(|(k, _)| *k))?;
+        let definition = self.record_definition_tuple(&layout)?;
+        let defaults: Vec<_> = layout
+            .sorted
+            .iter()
+            .map(|(original_index, _)| fields[*original_index].1.unwrap_or(Term::catch(0)))
+            .collect();
+        let defaults = self.tuple(&defaults)?;
+        self.cons(definition, defaults)
+    }
+    fn record_definition_tuple(&mut self, layout: &RecordLayout) -> Result<Term, TermError> {
+        let count = layout.sorted.len();
+        let order: Vec<Term> = layout
+            .order
+            .iter()
+            .map(|index| Term::small(*index as i64).unwrap_or(Term::NIL))
+            .collect();
         let order = self.tuple(&order)?;
-        let def = self.words(6 + fields.len())?;
+        let def = self.words(6 + count)?;
         // SAFETY: definition tuple has header and 5 fields plus field keys.
         unsafe {
-            *def = ((5 + fields.len()) as u64) << 6 | ARITY;
+            *def = ((5 + count) as u64) << 6 | ARITY;
             *def.add(1) = order.bits();
-            *def.add(2) = Term::small(hash as i64).unwrap().bits();
-            *def.add(3) = Term::atom(module).bits();
-            *def.add(4) = Term::atom(name).bits();
-            *def.add(5) = bool_term.bits();
-            for (i, (_, key, _)) in sorted.iter().enumerate() {
+            *def.add(2) = Term::small(i64::from(layout.hash))
+                .unwrap_or(Term::NIL)
+                .bits();
+            *def.add(3) = Term::atom(layout.module).bits();
+            *def.add(4) = Term::atom(layout.name).bits();
+            *def.add(5) = layout.exported_term().bits();
+            for (i, (_, key)) in layout.sorted.iter().enumerate() {
                 *def.add(6 + i) = Term::atom(*key).bits();
             }
         }
-        let values: Vec<_> = sorted.iter().map(|(_, _, value)| *value).collect();
-        self.native_record_instance(Term::from_ptr(def, 2), &values)
+        Ok(Term::from_ptr(def, 2))
     }
     /// Copy a native record with selected field replacements.
     pub fn update_native_record(
@@ -1290,7 +1354,8 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         }
         self.native_record_instance(snapshot.definition, &values)
     }
-    fn native_record_instance(
+    /// Build an instance of `definition` from field values in atom-index order.
+    pub fn native_record_instance(
         &mut self,
         definition: Term,
         values: &[Term],
