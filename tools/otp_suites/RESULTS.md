@@ -18,7 +18,7 @@
 | `bs_match_int_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
 | `bs_match_misc_SUITE` | 20 | 20/20 | 20/20 | 0 | -9 | first failure:  |
 | `bs_match_tail_SUITE` | 4 | 4/4 | 4/4 | 0 | 0 | none |
-| `bs_utf_SUITE` | 8 | 8/8 | 6/8 | 2 | -9 | utf8_illegal_sequences: failed testcase_aborted; utf8_roundtrip: failed testcase_aborted |
+| `bs_utf_SUITE` | 8 | 8/8 | 6/8 | 2 | 0 | utf8_illegal_sequences: failed testcase_aborted; utf8_roundtrip: failed {badarg |
 | `busy_port_SUITE` | 18 | 18/18 | 6/18 | 12 | 0 | async_nopar_nosuspend_abort_cleanup: failed got_data_when_busy; async_par_nosuspend_abort_cleanup: failed got_data_when_busy; hard_busy_driver: failed {unexpected_value, {status,waiting}, expected, {status,suspended}}; io_to_busy: failed {test_case_failed, {bad_exit, {'EXIT',<0.173.0>, {{case_clause,undefined}; scheduling_busy_link: failed did_not_get_port_data; scheduling_delay_busy: failed {badarg; scheduling_delay_busy_nosuspend: failed did_not_get_port_data; send_3: failed {{badmatch,ok}; soft_busy_driver: failed {unexpected_value, {status,waiting}, expected, {status,suspended}}; sync_nopar_nosuspend_abort_cleanup: failed {'EXIT', {badarg; sync_par_nosuspend_abort_cleanup: failed {'EXIT', {badarg; trap_exit: failed {{badmatch,{status,waiting}} |
 | `call_trace_SUITE` | 14 | 14/14 | 14/14 | 0 | 0 | none |
 | `code_SUITE` | 29 | 27/29 | 26/29 | 1 | 0 | code_permission_gc: failed {{badmatch, {error, {load_failed, "Failed to load NIF library: 'dlopen(/var/folders/v5/w846m1655ylfpfnhmtgfbnvm0000gn/T/otp-code-source-pn9j10zk/test/code_SUITE_data/erts_test_sync… |
