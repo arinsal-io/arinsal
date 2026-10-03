@@ -148,8 +148,12 @@ enum Continuation {
 
 #[derive(Clone, Debug)]
 pub(super) enum BifArgs {
-    Inline { values: [Term; 4], len: u8 },
-    Owned(Box<OwnedTerm>),
+    Inline {
+        values: [Term; 4],
+        len: u8,
+    },
+    /// Shared so a rebuilt trace never deep-clones a deeply nested argument.
+    Owned(Arc<OwnedTerm>),
 }
 
 impl BifArgs {
@@ -169,7 +173,7 @@ impl BifArgs {
                     .map_err(|error| VmError::Unsupported(format!("exception arg {error:?}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::Owned(Box::new(OwnedTerm::List {
+        Ok(Self::Owned(Arc::new(OwnedTerm::List {
             elems,
             tail: Box::new(OwnedTerm::Nil),
         })))
@@ -190,7 +194,7 @@ impl BifArgs {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Self::Owned(Box::new(OwnedTerm::List {
+                Ok(Self::Owned(Arc::new(OwnedTerm::List {
                     elems,
                     tail: Box::new(OwnedTerm::Nil),
                 })))

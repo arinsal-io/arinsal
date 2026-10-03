@@ -1,12 +1,13 @@
 //! Process-wide OS environment and signal BIFs.
 
 use crate::process::Message;
+use crate::process::Runtime;
 use crate::{Process, Vm, VmError};
-use arinsal_sched::{Pid, RunCtx, Scheduler};
+use arinsal_sched::RunCtx;
 use arinsal_term::{ProcessHeap, Term, TermBuilder, TermKind, global_atoms};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 pub(crate) type Environment = Vec<(OsString, OsString)>;
 static ENVIRONMENT: OnceLock<RwLock<Environment>> = OnceLock::new();
@@ -251,10 +252,10 @@ fn unsetenv(_process: &mut Process, name: Term) -> Result<Term, VmError> {
     Ok(atom("true"))
 }
 
+/// Runtime that receives a handled signal; the server pid is resolved per delivery.
 #[derive(Clone)]
 struct SignalTarget {
-    scheduler: Arc<Scheduler<Process>>,
-    pid: Pid,
+    runtime: Weak<Runtime>,
 }
 
 static SIGNAL_TARGETS: OnceLock<Mutex<HashMap<i32, SignalTarget>>> = OnceLock::new();
@@ -264,27 +265,28 @@ fn targets() -> &'static Mutex<HashMap<i32, SignalTarget>> {
     SIGNAL_TARGETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn signal_server(process: &Process, _ctx: &RunCtx<'_, Message>) -> Result<SignalTarget, VmError> {
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let pid = runtime
-        .names
-        .lock()
-        .unwrap()
-        .get("erl_signal_server")
-        .copied()
-        .ok_or_else(badarg)?;
-    if !runtime.scheduler()?.lookup(pid) {
-        return Err(badarg());
+/// Port of erts/emulator/sys/unix/sys.c:815 (erts_sys_unix_later_init), OTP-29.1.1: SIGTERM and
+/// SIGUSR1 are handled from boot and reported to `erl_signal_server`.
+pub(crate) fn install_boot_signals(runtime: &Arc<Runtime>) -> Result<(), VmError> {
+    ensure_signal_reader()?;
+    for signal_num in [libc::SIGTERM, libc::SIGUSR1] {
+        targets().lock().unwrap().insert(
+            signal_num,
+            SignalTarget {
+                runtime: Arc::downgrade(runtime),
+            },
+        );
+        install_disposition(
+            signal_num,
+            signal_handler as *const () as libc::sighandler_t,
+        )?;
     }
-    Ok(SignalTarget {
-        scheduler: runtime.scheduler()?,
-        pid,
-    })
+    Ok(())
 }
 
 fn set_signal(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, Message>,
     signal: Term,
     action: Term,
 ) -> Result<Term, VmError> {
@@ -304,9 +306,14 @@ fn set_signal(
         "sigstop" => libc::SIGSTOP,
         "sigtstp" => libc::SIGTSTP,
         "sigwinch" => libc::SIGWINCH,
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        "siginfo" => libc::SIGINFO,
         _ => return Err(badarg()),
     };
-    let server = signal_server(process, ctx)?;
+    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+    let server = SignalTarget {
+        runtime: Arc::downgrade(runtime),
+    };
     if action == atom("handle") {
         // POSIX cannot catch SIGSTOP; erts accepts the request and the kernel keeps stopping.
         // Port of erts/emulator/sys/unix/sys.c:754 (erts_set_signal), OTP-29.1.1.
@@ -321,7 +328,10 @@ fn set_signal(
     } else if action == atom("default") || action == atom("ignore") {
         targets().lock().unwrap().remove(&signal_num);
         if signal_num != libc::SIGSTOP {
-            let handler = if action == atom("default") {
+            // erts ignores SIGCHLD safely because erl_child_setup reaps port children; here the
+            // VM waits for them itself, and SIG_IGN would auto-reap them (waitpid -> ECHILD).
+            // The default disposition of SIGCHLD already discards the signal.
+            let handler = if action == atom("default") || signal_num == libc::SIGCHLD {
                 libc::SIG_DFL
             } else {
                 libc::SIG_IGN
@@ -446,7 +456,26 @@ fn deliver_signal(target: SignalTarget, signal: i32) {
         libc::SIGSTOP => "sigstop",
         libc::SIGTSTP => "sigtstp",
         libc::SIGWINCH => "sigwinch",
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        libc::SIGINFO => "siginfo",
         _ => return,
+    };
+    // Port of erts/emulator/sys/unix/sys.c:594 (signal_notify_requested), OTP-29.1.1: the
+    // server is looked up per signal and a missing one drops it.
+    let Some(runtime) = target.runtime.upgrade() else {
+        return;
+    };
+    let Some(pid) = runtime
+        .names
+        .lock()
+        .unwrap()
+        .get("erl_signal_server")
+        .copied()
+    else {
+        return;
+    };
+    let Ok(scheduler) = runtime.scheduler() else {
+        return;
     };
     let mut heap = ProcessHeap::with_words(8);
     let message = TermBuilder::new(&mut heap)
@@ -454,6 +483,6 @@ fn deliver_signal(target: SignalTarget, signal: i32) {
         .ok()
         .and_then(|term| Message::copy_from(term).ok());
     if let Some(message) = message {
-        let _ = target.scheduler.send(target.pid, target.pid, message);
+        let _ = scheduler.send(pid, pid, message);
     }
 }
