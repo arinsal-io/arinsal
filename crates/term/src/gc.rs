@@ -505,6 +505,16 @@ fn prefetch_term(term: Term) {
     let _ = term;
 }
 
+/// Allocation state captured by [`ProcessHeap::scratch_mark`].
+#[derive(Clone, Copy, Debug)]
+pub struct ScratchMark {
+    young: usize,
+    old_htop: usize,
+    htop: usize,
+    fragments: usize,
+    fragment_words: u32,
+}
+
 impl ProcessHeap {
     /// Maximum heap, stack, and fragment words inspected by literal GC checks.
     // Port of erts/emulator/beam/beam_bif_load.c:976 (`erts_check_copy_literals_gc_need_max_reds`), OTP-29.1.1.
@@ -645,6 +655,34 @@ impl ProcessHeap {
     /// Allocate a heap fragment and return its pointer after it enters the owner list.
     pub fn gc_fragment(&mut self, words: usize) -> *mut u64 {
         self.heap_fragment(words)
+    }
+
+    /// Mark the allocation state so scratch terms built for a reply can be dropped.
+    pub fn scratch_mark(&self) -> ScratchMark {
+        ScratchMark {
+            young: self.words.as_ptr() as usize,
+            old_htop: self.old_htop,
+            htop: self.htop,
+            fragments: self.fragments.len(),
+            fragment_words: self.fragment_words,
+        }
+    }
+
+    /// Drop everything allocated since `mark`, unless a collection ran meanwhile.
+    ///
+    /// erts builds `process_info` replies in the message's own heap fragment, so a
+    /// parked (hibernated) target never accumulates them.
+    pub fn scratch_release(&mut self, mark: &ScratchMark) {
+        if self.words.as_ptr() as usize != mark.young
+            || self.old_htop != mark.old_htop
+            || self.fragments.len() < mark.fragments
+            || self.htop < mark.htop
+        {
+            return;
+        }
+        self.fragments.truncate(mark.fragments);
+        self.fragment_words = mark.fragment_words;
+        self.htop = mark.htop;
     }
 
     /// Total words in the contiguous young heap and stack allocation.
@@ -1047,6 +1085,8 @@ impl ProcessHeap {
     ) -> Result<GcStats, TermError> {
         self.request_full_sweep();
         let stats = self.collect(roots, extra, 0)?;
+        self.fragments.clear();
+        self.fragment_words = 0;
         let exact = self
             .htop
             .saturating_add(S_RESERVED)
