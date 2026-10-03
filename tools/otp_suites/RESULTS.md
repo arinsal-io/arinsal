@@ -89,7 +89,7 @@
 | `smoke_test_SUITE` | 3 | 2/3 | 1/3 | 1 | 0 | jump_table: failed {badarg |
 | `statistics_SUITE` | 18 | 18/18 | 18/18 | 0 | 0 | none |
 | `system_info_SUITE` | 12 | 10/12 | 3/12 | 7 | 0 | atom_count: failed {{badmatch,false}; ets_count: failed {badarg; memory: failed {{badmatch,false}; misc_smoke_tests: failed {badarg; process_count: failed {{badmatch,0}; procs_bug: failed {badarg; system_logger: failed {badarg |
-| `system_profile_SUITE` | 6 | 6/6 | 3/6 | 3 | 0 | dont_profile_profiler: failed {{badmatch,true}; runnable_ports: failed {{badmatch,false}; scheduler: failed {{badmatch,false} |
+| `system_profile_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | runnable_ports: failed {{badmatch,false}; scheduler: failed {{badmatch,false} |
 | `time_SUITE` | 18 | 16/18 | 16/18 | 0 | -9 | first failure: failed: {not_alive, |
 | `timer_bif_SUITE` | 23 | 20/23 | 20/23 | 0 | 0 | none |
 | `trace_SUITE` | 39 | 34/39 | 33/39 | 1 | -9 | suspend: failed testcase_aborted |

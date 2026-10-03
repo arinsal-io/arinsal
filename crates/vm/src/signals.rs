@@ -1974,6 +1974,9 @@ fn call_resolved(
                         &[pid_term],
                     );
                 }
+                if let Some(runtime) = process.runtime.as_ref() {
+                    runtime.update_published_link(ctx.pid(), pid, false);
+                }
                 let _ = ctx.signal(pid, Signal::Unlink(0));
                 wake_for_procs_trace(process, ctx, pid);
                 atom("true")
@@ -2041,6 +2044,8 @@ fn call_resolved(
                         .tuple(&[tag, ref_term, atom("process"), object, reason])
                         .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
                     process.inbox.push_back(down);
+                } else {
+                    rt.update_published_monitored_by(pid, ctx.pid(), id, true);
                 }
             } else {
                 let object = monitor_object(process, name.as_deref(), *target)?;
@@ -2161,6 +2166,9 @@ fn call_resolved(
                 .as_mut()
                 .and_then(|cold| cold.monitors.remove(&id))
             {
+                if let Some(runtime) = process.runtime.as_ref() {
+                    runtime.update_published_monitored_by(pid, ctx.pid(), id, false);
+                }
                 if !flush || !ctx.cancel_pending_monitor(pid, id) {
                     let _ = ctx.signal(pid, Signal::Demonitor(id));
                 }
@@ -3021,9 +3029,11 @@ fn link_opt(
         "link",
         &[linked_term],
     );
+    let mut linked = true;
     match ctx.signal(pid, Signal::Link) {
         Ok(()) => {}
         Err(arinsal_sched::Error::NoProcess) => {
+            linked = false;
             // The target exited between the lookup and the signal: like erts, keep the link
             // and let a `noproc` link exit from the target dissolve it.
             // Port of erts/emulator/beam/bif.c:180-183 (link_opt), OTP-29.1.1.
@@ -3035,6 +3045,9 @@ fn link_opt(
         }
         Err(arinsal_sched::Error::Capacity) => return Err(system_limit()),
         Err(_) => return Err(badarg("link")),
+    }
+    if linked {
+        runtime(process)?.update_published_link(ctx.pid(), pid, true);
     }
     wake_for_procs_trace(process, ctx, pid);
     Ok(atom("true"))

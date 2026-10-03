@@ -1868,8 +1868,13 @@ fn internal_monitor_list(process: &mut Process) -> Result<Term, VmError> {
         .monitors
         .iter()
         .map(|(&id, &pid)| {
-            let tag = cold.monitor_tags.get(&id).cloned();
-            (id, pid, tag)
+            let extra = cold
+                .monitor_names
+                .get(&id)
+                .cloned()
+                .map(OwnedTerm::Atom)
+                .or_else(|| cold.monitor_tags.get(&id).cloned());
+            (id, pid, extra)
         })
         .collect::<Vec<_>>();
     let targets = cold

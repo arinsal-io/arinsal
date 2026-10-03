@@ -862,6 +862,54 @@ impl MultiScheduling {
 }
 
 impl Runtime {
+    /// Keep the relation snapshot visible to process introspection in step with local signals.
+    pub(crate) fn update_published_link(&self, owner: Pid, peer: Pid, linked: bool) {
+        let mut published = self.published.lock().unwrap();
+        let slot = published.entry(peer).or_insert(Published {
+            status: "runnable",
+            hibernating: false,
+            links: Vec::new(),
+            monitors: Vec::new(),
+            monitored_by: Vec::new(),
+        });
+        if linked {
+            if !slot.links.contains(&owner) {
+                slot.links.push(owner);
+            }
+        } else {
+            slot.links.retain(|pid| *pid != owner);
+        }
+    }
+
+    /// Publish a local monitor relation before the target next runs its signal queue.
+    pub(crate) fn update_published_monitored_by(
+        &self,
+        target: Pid,
+        origin: Pid,
+        id: u64,
+        on: bool,
+    ) {
+        let mut published = self.published.lock().unwrap();
+        let slot = published.entry(target).or_insert(Published {
+            status: "runnable",
+            hibernating: false,
+            links: Vec::new(),
+            monitors: Vec::new(),
+            monitored_by: Vec::new(),
+        });
+        if on {
+            if !slot
+                .monitored_by
+                .iter()
+                .any(|(reference, _)| *reference == id)
+            {
+                slot.monitored_by.push((id, origin));
+            }
+        } else {
+            slot.monitored_by.retain(|(reference, _)| *reference != id);
+        }
+    }
+
     pub(crate) fn cancel_owned_timers(&self, owner: Pid) {
         let ids = {
             let mut owners = self.timer_owners.lock().unwrap();
