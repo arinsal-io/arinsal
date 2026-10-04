@@ -865,6 +865,67 @@ pub(crate) fn emit_port_event_scoped(
     }
 }
 
+/// Emit a process trace event whose cause is a port operation rather than a process instruction.
+pub(crate) fn emit_external_process_event(
+    runtime: &crate::process::Runtime,
+    subject: Pid,
+    class: u64,
+    name: &str,
+    fields: &[Term],
+) -> bool {
+    if !enabled().load(Ordering::Relaxed) {
+        return false;
+    }
+    let entries = table()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((owner, _, pid), entry)| {
+            *owner == scope_runtime(runtime) && *pid == subject && entry.flags & class != 0
+        })
+        .map(|(_, entry)| entry.clone())
+        .collect::<Vec<_>>();
+    let Some(subject_term) = subject.to_term() else {
+        return false;
+    };
+    let Ok(scheduler) = runtime.scheduler() else {
+        return false;
+    };
+    let mut traced = false;
+    for entry in entries {
+        let Tracer::Pid(tracer) = entry.tracer else {
+            continue;
+        };
+        if tracer == subject {
+            continue;
+        }
+        let mut heap = VecHeap::new();
+        let mut values = Vec::with_capacity(fields.len() + 3);
+        values.extend([
+            crate::signals::atom("trace"),
+            subject_term,
+            crate::signals::atom(name),
+        ]);
+        let Ok(fields) = fields
+            .iter()
+            .map(|field| copy_term(*field, &mut heap))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            continue;
+        };
+        values.extend(fields);
+        let Ok(event) = TermBuilder::new(&mut heap).tuple(&values) else {
+            continue;
+        };
+        let Ok(message) = Message::copy_from(event) else {
+            continue;
+        };
+        let _ = scheduler.send(subject, tracer, message);
+        traced = true;
+    }
+    traced
+}
+
 pub(crate) fn traced_port_by_other(
     vm: &Vm,
     process: &mut Process,

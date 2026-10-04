@@ -72,7 +72,7 @@
 | `persistent_term_SUITE` | 22 | 22/22 | 22/22 | 0 | 0 | none |
 | `port_SUITE` | 74 | 68/74 | 67/74 | 1 | 0 | port_setget_data: failed testcase_aborted |
 | `port_bif_SUITE` | 9 | 9/9 | 4/9 | 5 | 0 | busy_options: failed {{badmatch,false}; connect: failed {badarg; control: failed {badarg; port_info1: failed {{badmatch,false}; port_info2: failed {badarg |
-| `port_trace_SUITE` | 21 | 21/21 | 1/21 | 20 | 0 | call: failed {{badmatch,[]}; command: failed {{badmatch,[]}; connect: failed {{badmatch,[]}; control: failed {{badmatch,[]}; driver_output_term: failed {{badmatch,[]}; driver_send_term: failed {{badmatch,[]}; failure: failed {{badmatch,[]}; failure_atom: failed {{badmatch,[]}; failure_eof: failed {{badmatch,[]}; failure_posix: failed {{badmatch,[]}; open_close: failed {{badmatch,[]}; output: failed {{badmatch,[]}; output2: failed {{badmatch,[]}; output_binary: failed {{badmatch,[]}; output_term: failed {{badmatch,[]}; outputv: failed {{badmatch,[]}; port_specs: failed {{badmatch,undefined}; ports: failed {{badmatch,[]}; send_term: failed {{badmatch,[]}; set_timer: failed {{badmatch,[]} |
+| `port_trace_SUITE` | 21 | 21/21 | 21/21 | 0 | 0 | none |
 | `prim_eval_SUITE` | 1 | 1/1 | 0/1 | 1 | 1 | 'ERL-365': missing |
 | `process_SUITE` | 104 | 70/104 | 70/104 | 0 | 0 | none |
 | `process_max_heap_size_SUITE` | 1 | 1/1 | 0/1 | 1 | 0 | immediate_termination: failed {{badmatch, {{a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a… |

@@ -617,9 +617,53 @@ fn event_message(
     };
     let mut heap = ProcessHeap::with_words(24);
     if let Ok(msg) = TermBuilder::new(&mut heap).tuple(&[port, event]) {
-        trace_port_send(scheduler, trace_scope, port_id, owner, msg);
+        // terminate_port traces the `closed` atom even though the delivered message is
+        // `{Port, closed}` (io.c:3755, OTP-29.1.1).
+        trace_port_send(
+            scheduler,
+            trace_scope,
+            port_id,
+            owner,
+            if event == atom("closed") { event } else { msg },
+        );
         publish(scheduler, owner, port, msg);
     }
+}
+
+fn connected_message(
+    runtime: &crate::process::Runtime,
+    scheduler: &Scheduler<Process>,
+    owner: Pid,
+    port_id: u64,
+    trace_scope: usize,
+    deliver: bool,
+) {
+    // Port of erts/emulator/beam/io.c:2324-2410 (set_port_connected), OTP-29.1.1.
+    let Some(port) = Term::port(port_id) else {
+        return;
+    };
+    let mut heap = ProcessHeap::with_words(24);
+    let Ok(message) = TermBuilder::new(&mut heap).tuple(&[port, atom("connected")]) else {
+        return;
+    };
+    trace_port_send(scheduler, trace_scope, port_id, owner, message);
+    if !deliver {
+        return;
+    }
+    let traced = crate::trace::emit_external_process_event(
+        runtime,
+        owner,
+        crate::trace::RECEIVE,
+        "receive",
+        &[message],
+    );
+    let Ok(mut envelope) = Message::copy_from(message) else {
+        return;
+    };
+    if traced {
+        envelope = envelope.with_receive_traced();
+    }
+    let _ = scheduler.send(owner, owner, envelope);
 }
 
 fn trace_port_send(
@@ -629,6 +673,7 @@ fn trace_port_send(
     receiver: Pid,
     message: Term,
 ) {
+    // Port of erts/emulator/beam/erl_trace.c:2221 (trace_port_send), OTP-29.1.1.
     if let Some(receiver) = receiver.to_term() {
         crate::trace::emit_port_event_scoped(
             trace_scope,
@@ -1355,29 +1400,52 @@ impl arinsal_drv::PortHost for DrvHost {
         port: &arinsal_drv::DriverPort,
         to: Option<u64>,
         term: &OwnedTerm,
+        trace: bool,
     ) -> bool {
         let Some(handle) = self.handle(port.id()) else {
             return false;
         };
         let target = to.map_or_else(|| handle.owner_pid(), Pid::from_data);
-        if !handle.scheduler.lookup(target) {
-            return false;
-        }
         let mut heap = VecHeap::new();
         let Ok(built) = from_owned(term, &mut heap) else {
             return false;
         };
-        trace_port_send(
-            &handle.scheduler,
-            handle.trace_scope,
-            port.id(),
-            target,
-            built,
-        );
+        let exists = handle.scheduler.lookup(target);
+        if trace && let Some(receiver) = target.to_term() {
+            crate::trace::emit_port_event_scoped(
+                handle.trace_scope,
+                &handle.scheduler,
+                port.id(),
+                crate::trace::SEND,
+                if exists {
+                    "send"
+                } else {
+                    "send_to_non_existing_process"
+                },
+                &[built, receiver],
+            );
+        }
+        if !exists {
+            return false;
+        }
         let Ok(message) = Message::copy_from(built) else {
             return false;
         };
         handle.scheduler.send(target, target, message).is_ok()
+    }
+
+    fn trace_timeout(&self, port: &arinsal_drv::DriverPort) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        // Port of erts/emulator/beam/erl_port_task.c:1770, OTP-29.1.1.
+        crate::trace::emit_port_event(
+            &runtime,
+            port.id(),
+            crate::trace::RECEIVE,
+            "receive",
+            &[atom("timeout")],
+        );
     }
 
     fn connected(&self, port: &arinsal_drv::DriverPort) -> u64 {
@@ -2936,15 +3004,13 @@ fn port_command(
                 }
             })
             .collect::<Vec<_>>();
-        let bytes = pieces
-            .iter()
-            .flat_map(|piece| match piece {
-                arinsal_drv::IoPiece::Copied(bytes) | arinsal_drv::IoPiece::Refc(bytes) => {
-                    bytes.iter().copied()
-                }
-            })
-            .collect::<Vec<_>>();
-        trace_command_received_data(process, ctx.pid(), id, data, &bytes);
+        trace_command_received(
+            process,
+            ctx.pid(),
+            id,
+            &pieces,
+            drv_port.outputv_trace_segments(&pieces),
+        );
         if !drv_port.output(&pieces, packed_pid(ctx.pid())) {
             return Err(badarg());
         }
@@ -3020,6 +3086,7 @@ fn trace_command_received(
     caller: Pid,
     id: u64,
     pieces: &[arinsal_drv::IoPiece<'_>],
+    outputv_segments: Option<Vec<Vec<u8>>>,
 ) {
     let Some(runtime) = process.runtime.as_ref() else {
         return;
@@ -3027,19 +3094,34 @@ fn trace_command_received(
     let Some(caller) = caller.to_term() else {
         return;
     };
-    let bytes = pieces
-        .iter()
-        .flat_map(|piece| match piece {
-            arinsal_drv::IoPiece::Copied(bytes) | arinsal_drv::IoPiece::Refc(bytes) => {
-                bytes.iter().copied()
-            }
-        })
-        .collect::<Vec<_>>();
     let mut heap = VecHeap::new();
-    let Ok(bytes) = TermBuilder::new(&mut heap).binary(&bytes) else {
-        return;
+    let data = if let Some(segments) = outputv_segments {
+        let mut binaries = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let Ok(binary) = TermBuilder::new(&mut heap).binary(&segment) else {
+                return;
+            };
+            binaries.push(binary);
+        }
+        let Ok(list) = TermBuilder::new(&mut heap).list_from_iter(binaries) else {
+            return;
+        };
+        list
+    } else {
+        let bytes = pieces
+            .iter()
+            .flat_map(|piece| match piece {
+                arinsal_drv::IoPiece::Copied(bytes) | arinsal_drv::IoPiece::Refc(bytes) => {
+                    bytes.iter().copied()
+                }
+            })
+            .collect::<Vec<_>>();
+        let Ok(binary) = TermBuilder::new(&mut heap).binary(&bytes) else {
+            return;
+        };
+        binary
     };
-    let Ok(command) = TermBuilder::new(&mut heap).tuple(&[atom("command"), bytes]) else {
+    let Ok(command) = TermBuilder::new(&mut heap).tuple(&[atom("command"), data]) else {
         return;
     };
     let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, command]) else {
@@ -3060,7 +3142,8 @@ fn trace_command_received_data(process: &Process, caller: Pid, id: u64, data: Te
         matches!(&owned, arinsal_etf::OwnedTerm::List { elems, tail }
             if **tail == arinsal_etf::OwnedTerm::Nil
                 && !elems.is_empty()
-                && elems.iter().all(|item| matches!(item, arinsal_etf::OwnedTerm::Binary(_))))
+                && elems.iter().all(|item| matches!(item, arinsal_etf::OwnedTerm::Binary(_)))
+        )
     });
     let data = if binary_list {
         copy_term(data, &mut heap)
@@ -3255,17 +3338,10 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
         return Err(badarg());
     }
     let old_owner = handle.owner_pid();
-    if notify.is_none()
-        && let (Some(from), Some(target)) = (process.self_pid, pid.to_term())
-    {
-        let mut heap = VecHeap::new();
-        if let Ok(message) = TermBuilder::new(&mut heap).tuple(&[atom("connect"), target]) {
-            trace_port_receive_term(process, from, id, message);
-        }
-    }
     handle.links.lock().unwrap().insert(pid);
     *handle.owner.lock().unwrap() = pid;
-    if old_owner != pid
+    if notify.is_none()
+        && old_owner != pid
         && let Some(pid_term) = pid.to_term()
     {
         crate::trace::emit_port_event(
@@ -3276,10 +3352,40 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
             &[pid_term],
         );
     }
+    if notify.is_none()
+        && let Some(from) = process.self_pid
+        && let Some(target) = pid.to_term()
+    {
+        let mut heap = VecHeap::new();
+        if let Ok(message) = TermBuilder::new(&mut heap).tuple(&[atom("connect"), target]) {
+            trace_port_receive_term(process, from, id, message);
+        }
+    }
     let scheduler = runtime.scheduler()?;
     if let Some(from) = notify.or(process.self_pid) {
-        // io.c:2351 (set_port_connected): `{Port, connected}` goes to the `From` of the signal.
-        event_message(&scheduler, from, id, handle.trace_scope, atom("connected"));
+        // Port of erts/emulator/beam/io.c:2324-2351 and 3304-3332 (set_port_connected,
+        // deliver_result), OTP-29.1.1. `port_connect/2` traces the result but only
+        // `! {connect, ...}` queues it.
+        connected_message(
+            runtime,
+            &scheduler,
+            from,
+            id,
+            handle.trace_scope,
+            notify.is_some(),
+        );
+    }
+    if notify.is_none()
+        && old_owner != pid
+        && let Some(port) = Term::port(id)
+    {
+        crate::trace::emit_external_process_event(
+            runtime,
+            pid,
+            crate::trace::PROCS,
+            "getting_linked",
+            &[port],
+        );
     }
     Ok(atom("true"))
 }
@@ -3432,6 +3538,15 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     }
     drop(links);
     drop(ports);
+    if !linked {
+        crate::trace::emit_external_process_event(
+            runtime,
+            pid,
+            crate::trace::PROCS,
+            "unlink",
+            &[port],
+        );
+    }
     if let Some(pid_term) = pid.to_term() {
         crate::trace::emit_port_event(
             runtime,
@@ -3608,7 +3723,13 @@ fn output_command(
             })
             .collect::<Vec<_>>();
         if let Some(process) = tracer {
-            trace_command_received(process, from, id, &pieces);
+            trace_command_received(
+                process,
+                from,
+                id,
+                &pieces,
+                drv_port.outputv_trace_segments(&pieces),
+            );
         }
         if !drv_port.output(&pieces, packed_pid(from))
             && runtime.ports.lock().unwrap().contains_key(&id)
@@ -3622,7 +3743,13 @@ fn output_command(
         return;
     };
     if let Some(process) = tracer {
-        trace_command_received(process, from, id, &[arinsal_drv::IoPiece::Copied(&data)]);
+        trace_command_received(
+            process,
+            from,
+            id,
+            &[arinsal_drv::IoPiece::Copied(&data)],
+            None,
+        );
     }
     if let Some((2, hdr)) = handle.framing {
         match hdr {
