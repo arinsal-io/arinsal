@@ -3879,7 +3879,19 @@ impl Runtime {
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
     ) -> Result<Pid, VmError> {
-        self.spawn_mfa_scheduled(module, function, args, false)
+        self.spawn_mfa_scheduled(module, function, args, false, None)
+    }
+
+    /// Create a distributed child with its remote link installed before it can run.
+    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1.
+    pub(crate) fn spawn_mfa_unscheduled_linked(
+        self: &Arc<Self>,
+        module: &str,
+        function: &str,
+        args: &[arinsal_etf::OwnedTerm],
+        linker: Pid,
+    ) -> Result<Pid, VmError> {
+        self.spawn_mfa_scheduled(module, function, args, false, Some(linker))
     }
 
     fn spawn_mfa_scheduled(
@@ -3888,6 +3900,7 @@ impl Runtime {
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
         scheduled: bool,
+        linker: Option<Pid>,
     ) -> Result<Pid, VmError> {
         let (module_id, ip) = {
             let code = self.code.lock().unwrap();
@@ -3912,6 +3925,9 @@ impl Runtime {
         child.cold_mut().group_leader = None;
         child.cold_mut().initial_call =
             Some((module.to_owned(), function.to_owned(), args.len() as u8));
+        if let Some(linker) = linker {
+            child.cold_mut().links.insert(linker);
+        }
         if let Some(arity) = u8::try_from(args.len()).ok()
             && (arinsal_bifs::lookup(module, function, arity).is_some()
                 || arinsal_spec::bif_lookup(module, function, arity).is_some())
@@ -3955,13 +3971,19 @@ impl Process {
                     }
                 }
                 Payload::Signal(Signal::Link) => {
-                    self.cold_mut().links.insert(from);
+                    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
+                    // (erts_proc_exit_handle_signal), OTP-29.1.1: a link reaching an
+                    // exiting process is rejected with `noproc`.
+                    if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
+                        let _ = ctx.signal(from, Signal::ExitLinked(reason));
+                    }
                 }
-                Payload::Signal(Signal::Unlink(_)) => {
+                Payload::Signal(Signal::Unlink(id)) => {
                     if let Some(cold) = self.cold.as_mut() {
                         cold.links.remove(&from);
                         cold.prio_links.remove(&from);
                     }
+                    let _ = ctx.signal(from, Signal::UnlinkAckSignal(id));
                 }
                 Payload::Signal(Signal::LiteralAreaCopy {
                     request, requester, ..
@@ -4229,6 +4251,9 @@ impl Process {
             return;
         };
         for pid in cold.links {
+            if cold.unlinking.values().any(|unlinking| *unlinking == pid) {
+                continue;
+            }
             if self.runtime.as_ref().is_some_and(|runtime| {
                 crate::dist::forward_link_exit_if_proxy(runtime, pid, ctx.pid(), reason)
             }) {
@@ -4653,12 +4678,13 @@ impl Process {
                         std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
                     }
                 }
-                Payload::Signal(arinsal_sched::Signal::Unlink(_)) => {
+                Payload::Signal(arinsal_sched::Signal::Unlink(id)) => {
                     if let Some(cold) = self.cold.as_mut() {
                         cold.links.remove(&from);
                         cold.prio_links.remove(&from);
                     }
                     self.trace_getting_unlinked(ctx, from);
+                    let _ = ctx.signal(from, arinsal_sched::Signal::UnlinkAckSignal(id));
                 }
                 Payload::Signal(arinsal_sched::Signal::Monitor(reference)) => {
                     self.cold_mut().monitored_by.insert(reference, from);
@@ -4771,6 +4797,15 @@ impl Process {
                     // unlink-ack id is the wakeup for a queued request.
                     if id != 0 {
                         crate::signals::handle_request(self, ctx, id)?;
+                    }
+                }
+                Payload::Signal(arinsal_sched::Signal::UnlinkAckSignal(id)) => {
+                    if let Some(cold) = self.cold.as_mut()
+                        && cold.unlinking.get(&id) == Some(&from)
+                    {
+                        cold.unlinking.remove(&id);
+                        cold.links.remove(&from);
+                        cold.prio_links.remove(&from);
                     }
                 }
                 Payload::Signal(arinsal_sched::Signal::Alias(_))
@@ -5474,6 +5509,7 @@ impl Task for Process {
     fn reap_signals(&mut self, pid: Pid, events: Vec<Event<Message>>) {
         let mut monitors = Vec::new();
         let mut links = Vec::new();
+        let mut unlink_acks = Vec::new();
         let mut literal_replies = Vec::new();
         for event in events {
             match event.payload {
@@ -5483,7 +5519,10 @@ impl Task for Process {
                 // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
                 // OTP-29.1.1: a link that reaches a process after its exit handling gets `noproc`.
                 Payload::Signal(Signal::Link) => links.push(event.from),
-                Payload::Signal(Signal::Unlink(_)) => links.retain(|from| *from != event.from),
+                Payload::Signal(Signal::Unlink(id)) => {
+                    links.retain(|from| *from != event.from);
+                    unlink_acks.push((event.from, id));
+                }
                 Payload::Signal(Signal::Demonitor(reference)) => {
                     monitors.retain(|(id, _)| *id != reference);
                 }
@@ -5499,7 +5538,11 @@ impl Task for Process {
                 _ => {}
             }
         }
-        if monitors.is_empty() && literal_replies.is_empty() && links.is_empty() {
+        if monitors.is_empty()
+            && literal_replies.is_empty()
+            && links.is_empty()
+            && unlink_acks.is_empty()
+        {
             return;
         }
         let Ok(scheduler) = self
@@ -5515,6 +5558,9 @@ impl Task for Process {
         };
         for (requester, reply) in literal_replies {
             let _ = scheduler.send(pid, requester, reply);
+        }
+        for (requester, id) in unlink_acks {
+            let _ = scheduler.signal(pid, requester, Signal::UnlinkAckSignal(id));
         }
         for linker in links {
             if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
