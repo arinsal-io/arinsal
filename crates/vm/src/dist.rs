@@ -1585,21 +1585,25 @@ fn handle_spawn_request(
             _ => return Err(badarg()),
         };
         let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-        if let Ok(child) = runtime.spawn_mfa_unscheduled(module, function, &args) {
+        let watcher = (monitor || link)
+            .then(|| remote_proxy(handle, &from))
+            .transpose()?;
+        let child = if link {
+            let watcher = watcher.ok_or_else(badarg)?;
+            runtime.spawn_mfa_unscheduled_linked(module, function, &args, watcher)
+        } else {
+            runtime.spawn_mfa_unscheduled(module, function, &args)
+        };
+        if let Ok(child) = child {
             result = local_pid_owned(child);
             child_to_schedule = Some(child);
-            let watcher = remote_proxy(handle, &from)?;
             let scheduler = runtime.scheduler()?;
             if monitor && let Some(ref_id) = remote_ref_id(&reference) {
                 remember_remote_monitor_ref(handle, ref_id, &reference, true)?;
+                let watcher = watcher.ok_or_else(badarg)?;
                 scheduler
                     .signal(watcher, child, Signal::Monitor(ref_id))
                     .map_err(|error| VmError::Unsupported(format!("spawn monitor arm: {error}")))?;
-            }
-            if link {
-                scheduler
-                    .signal(watcher, child, Signal::Link)
-                    .map_err(|error| VmError::Unsupported(format!("spawn link arm: {error}")))?;
             }
         }
     }
@@ -1698,8 +1702,18 @@ fn handle_spawn_request_port(
         OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => elems.clone(),
         _ => return Err(badarg()),
     };
+    let watcher = if monitor || link {
+        Some(remote_proxy(handle, &from)?)
+    } else {
+        None
+    };
     let spawn_result = if spawn_opts_acceptable(options) {
-        runtime.spawn_mfa_unscheduled(mod_name, fun_name, &arg_list)
+        if link {
+            let watcher = watcher.ok_or_else(badarg)?;
+            runtime.spawn_mfa_unscheduled_linked(mod_name, fun_name, &arg_list, watcher)
+        } else {
+            runtime.spawn_mfa_unscheduled(mod_name, fun_name, &arg_list)
+        }
     } else {
         Err(VmError::Unsupported("bad spawn options".into()))
     };
@@ -1724,7 +1738,7 @@ fn handle_spawn_request_port(
             if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
                 eprintln!("DIST_SPAWN_MONITOR_REF {ref_id} {reference:?}");
             }
-            let watcher = remote_proxy(handle, &from)?;
+            let watcher = watcher.ok_or_else(badarg)?;
             if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
                 eprintln!("DIST_SPAWN_MONITOR_WATCHER {watcher:?} child={child:?}");
             }
@@ -1735,13 +1749,6 @@ fn handle_spawn_request_port(
             if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
                 eprintln!("DIST_SPAWN_MONITOR_ARMED");
             }
-        }
-        if link {
-            let watcher = remote_proxy(handle, &from)?;
-            runtime
-                .scheduler()?
-                .signal(watcher, child, Signal::Link)
-                .map_err(|error| VmError::Unsupported(format!("spawn link arm: {error}")))?;
         }
     }
     let flags = if matches!(result, OwnedTerm::Pid { .. }) {

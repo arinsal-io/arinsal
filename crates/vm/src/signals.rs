@@ -1970,10 +1970,11 @@ fn call_resolved(
         (SignalBif::Unlink1, [pid]) => {
             let pid = Pid::from_term(*pid).ok_or_else(|| badarg("unlink/1"));
             pid.map(|pid| {
-                if let Some(cold) = process.cold.as_mut() {
-                    cold.links.remove(&pid);
-                    cold.prio_links.remove(&pid);
-                }
+                let id = process
+                    .runtime
+                    .as_ref()
+                    .map_or(1, |runtime| runtime.next_ref());
+                process.cold_mut().unlinking.insert(id, pid);
                 if let Some(pid_term) = pid.to_term() {
                     crate::trace::emit(
                         Some(vm),
@@ -1988,7 +1989,7 @@ fn call_resolved(
                 if let Some(runtime) = process.runtime.as_ref() {
                     runtime.update_published_link(ctx.pid(), pid, false);
                 }
-                let _ = ctx.signal(pid, Signal::Unlink(0));
+                let _ = ctx.signal(pid, Signal::Unlink(id));
                 wake_for_procs_trace(process, ctx, pid);
                 atom("true")
             })

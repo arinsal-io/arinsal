@@ -112,6 +112,8 @@ pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceA
 pub(crate) struct ProcessCold {
     /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
     pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
+    /// Link halves retained until the matching unlink acknowledgement arrives.
+    pub(crate) unlinking: std::collections::BTreeMap<u64, arinsal_sched::Pid>,
     /// The last slice ended because the process is suspended, not because it waits in a
     /// receive: it stays active (runnable once resumed).
     pub(crate) suspend_parked: bool,

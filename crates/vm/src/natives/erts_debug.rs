@@ -747,22 +747,6 @@ fn instructions(process: &mut Process) -> Result<Term, VmError> {
     list(process, &names)
 }
 
-/// Retry the calling BIF on a scheduler of `wanted` type unless it already runs on one.
-///
-/// Port of erts/emulator/beam/erl_bif_info.c / bif.c (`erts_schedule_bif` and the static
-/// dirty BIF table `erts_dirty_bif.tab`), OTP-29.1.1.
-fn on_scheduler(ctx: &RunCtx<'_, Message>, wanted: SchedulerType) -> Result<(), VmError> {
-    if ctx.scheduler_type() == wanted {
-        return Ok(());
-    }
-    Err(match wanted {
-        SchedulerType::DirtyCpu => VmError::Dirty(DirtyKind::Cpu),
-        SchedulerType::DirtyIo => VmError::Dirty(DirtyKind::Io),
-        // A dirty job returns to a normal scheduler when it yields.
-        SchedulerType::Normal => VmError::Yield,
-    })
-}
-
 fn scheduler_type_atom(kind: SchedulerType) -> Term {
     atom(match kind {
         SchedulerType::Normal => "normal",
@@ -921,10 +905,11 @@ fn dirty_test(
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.scheduler().ok());
-    let kind = match ctx.scheduler_type() {
-        SchedulerType::Normal => None,
-        SchedulerType::DirtyCpu => Some(DirtyKind::Cpu),
-        SchedulerType::DirtyIo => Some(DirtyKind::Io),
+    let kind = match scheduler {
+        "normal" => None,
+        "dirty_cpu" => Some(DirtyKind::Cpu),
+        "dirty_io" => Some(DirtyKind::Io),
+        _ => return Err(badarg()),
     };
     let result = match kind {
         None => {
@@ -955,13 +940,12 @@ fn dirty(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let (scheduler, wanted) = match arg_name(args[0]).as_deref() {
-        Some("normal") => ("normal", SchedulerType::Normal),
-        Some("dirty_cpu") => ("dirty_cpu", SchedulerType::DirtyCpu),
-        Some("dirty_io") => ("dirty_io", SchedulerType::DirtyIo),
+    let scheduler = match arg_name(args[0]).as_deref() {
+        Some("normal") => "normal",
+        Some("dirty_cpu") => "dirty_cpu",
+        Some("dirty_io") => "dirty_io",
         _ => return Err(badarg()),
     };
-    on_scheduler(ctx, wanted)?;
     dirty_test(process, ctx, scheduler, args[1], args[2])
 }
 
@@ -1212,10 +1196,8 @@ fn build(
         }
         ("erts_debug", "instructions", 0) => instructions(process),
         ("erts_debug", "dirty", 3) => dirty(process, ctx, args),
-        ("erts_debug", "dirty_cpu", 2) => on_scheduler(ctx, SchedulerType::DirtyCpu)
-            .and_then(|()| dirty_test(process, ctx, "dirty_cpu", args[0], args[1])),
-        ("erts_debug", "dirty_io", 2) => on_scheduler(ctx, SchedulerType::DirtyIo)
-            .and_then(|()| dirty_test(process, ctx, "dirty_io", args[0], args[1])),
+        ("erts_debug", "dirty_cpu", 2) => dirty_test(process, ctx, "dirty_cpu", args[0], args[1]),
+        ("erts_debug", "dirty_io", 2) => dirty_test(process, ctx, "dirty_io", args[0], args[1]),
         ("erts_debug", "unaligned_bitstring", 2) => unaligned_bitstring(process, args),
         ("erts_internal", "gather_alloc_histograms", 1) => {
             gather_allocator_info(process, ctx, args[0], false)
