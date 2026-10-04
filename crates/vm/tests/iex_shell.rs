@@ -176,6 +176,16 @@ fn iex_shell_pty_banner_and_prompts_match_otp() {
     assert_success(&reference, "OTP IEx PTY");
     assert_success(&arinsal, "Arinsal IEx PTY");
     assert_eq!(arinsal.status.code(), reference.status.code());
+    // Keep this check on the captured PTY stream: normalized() drops a final
+    // unterminated prompt because System.halt can race its rendering.
+    assert!(
+        reference
+            .stdout
+            .windows(b"iex(2)> ".len())
+            .any(|window| window == b"iex(2)> "),
+        "OTP PTY lacks its second prompt: {}",
+        String::from_utf8_lossy(&reference.stdout)
+    );
     let reference = normalized(&reference.stdout);
     let arinsal = normalized(&arinsal.stdout);
     assert!(reference.contains("Interactive Elixir"));
@@ -186,11 +196,14 @@ fn iex_shell_pty_banner_and_prompts_match_otp() {
         "iex(1)> ",
         "IO.puts(:pty_ok)",
         "pty_ok",
-        "iex(2)> ",
     ] {
         assert!(reference.contains(marker), "OTP PTY lacks {marker:?}");
         assert!(arinsal.contains(marker), "Arinsal PTY lacks {marker:?}");
     }
+    assert!(
+        arinsal.contains("iex(2)> "),
+        "Arinsal PTY lacks its second prompt"
+    );
 }
 
 #[test]
