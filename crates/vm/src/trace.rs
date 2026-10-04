@@ -1293,8 +1293,38 @@ fn trace_action_flags(value: Term) -> Option<(u64, Option<Tracer>)> {
     Some((flags, tracer))
 }
 
+// Port of erts/emulator/beam/erl_trace.c:3374-3390 (erts_is_tracer_enabled), OTP-29.1.1.
+fn match_trace_tracer_alive(
+    vm: &mut Vm,
+    process: &mut Process,
+    tracee: Pid,
+    tracer: &Tracer,
+) -> bool {
+    match tracer {
+        Tracer::Default => true,
+        Tracer::Pid(pid) => process.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .scheduler()
+                .is_ok_and(|scheduler| scheduler.lookup(*pid))
+        }),
+        Tracer::Port(port) => process
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(port)),
+        Tracer::Module {
+            module,
+            state,
+            instance,
+        } => module_tracer_alive(vm, process, module, state, instance, tracee.to_term()),
+    }
+}
+
+// Port of erts/emulator/beam/erl_db_util.c:251-267,3023-3090
+// (set_match_trace and do_trace), OTP-29.1.1: the resolved session tracer is installed on the
+// tracee, a nil tracer clears trace flags, and an inactive tracer rejects the update.
 fn apply_match_trace_action(
-    process: &Process,
+    vm: &mut Vm,
+    process: &mut Process,
     session: u64,
     current: Pid,
     name: &str,
@@ -1337,7 +1367,14 @@ fn apply_match_trace_action(
             else {
                 return false;
             };
-            (current, clear, set, tracer)
+            let tracer = tracer
+                .or_else(|| process_tracer(process, session, current))
+                .or_else(|| session_tracer(process, session));
+            if tracer.is_none() {
+                (current, u64::MAX, 0, None)
+            } else {
+                (current, clear, set, tracer)
+            }
         }
         ("trace", [target, disable, enable]) => {
             let (Some(target), Some((clear, _)), Some((set, tracer))) = (
@@ -1347,10 +1384,22 @@ fn apply_match_trace_action(
             ) else {
                 return false;
             };
-            (target, clear, set, tracer)
+            let tracer = tracer
+                .or_else(|| process_tracer(process, session, current))
+                .or_else(|| session_tracer(process, session));
+            if tracer.is_none() {
+                (target, u64::MAX, 0, None)
+            } else {
+                (target, clear, set, tracer)
+            }
         }
         _ => return false,
     };
+    if let Some(tracer) = tracer.as_ref()
+        && !match_trace_tracer_alive(vm, process, target, tracer)
+    {
+        return false;
+    }
     let applied = set_session_flags(process, session, target, clear, set, tracer.clone());
     if applied {
         return true;
@@ -1715,7 +1764,7 @@ fn call_event_scope(
             // the current event uses the pre-match tracer and flags; match trace actions affect
             // later events from the tracee.
             for (name, _heap, arguments) in outcome.trace_actions {
-                let _ = apply_match_trace_action(process, hit.session, pid, &name, &arguments);
+                let _ = apply_match_trace_action(vm, process, hit.session, pid, &name, &arguments);
             }
             if !silent {
                 let return_to = !outcome.suppress_call
@@ -1760,7 +1809,8 @@ fn call_event_scope(
                 }
                 // The call event uses the pre-match state; trace actions affect later events.
                 for (name, _heap, arguments) in outcome.trace_actions {
-                    let _ = apply_match_trace_action(process, hit.session, pid, &name, &arguments);
+                    let _ =
+                        apply_match_trace_action(vm, process, hit.session, pid, &name, &arguments);
                 }
                 if outcome.return_trace || outcome.exception_trace {
                     actions.push(CallActions {
@@ -4413,6 +4463,22 @@ mod tests {
         trace_pattern_diff(
             "trace_t5_empty_flags",
             "-module(trace_t5_empty_flags). -export([run/0,f/1]). f(X) -> X. run() -> Me=self(), T=spawn(fun() -> receive {go,From} -> erlang:trace(From,true,[call]), erlang:trace_pattern({trace_t5_empty_flags,f,1},[],[]), From ! armed, receive stop -> ok end end end), T!{go,Me}, receive armed -> ok end, trace_t5_empty_flags:f(1), receive {trace,Me,call,{trace_t5_empty_flags,f,[1]}} -> T!stop, ok after 1000 -> timeout end.",
+        );
+    }
+
+    #[test]
+    fn match_trace_action_updates_tracee_before_next_receive() {
+        trace_pattern_diff(
+            "trace_t3_match_action_order",
+            "-module(trace_t3_match_action_order). -export([run/0,control/3]). run() -> Parent=self(), Tracee=spawn(fun() -> receive stop -> Parent!done end end), 1=erlang:trace(Tracee,true,['receive',{tracer,Parent}]), 1=erlang:trace_pattern({trace_t3_match_action_order,control,3},[{['$1','$2','$3'],[],[{trace,'$1','$2','$3'}]}],[{meta,Parent}]), _Controller=spawn(fun() -> control(Tracee,['receive'],[]), Tracee!stop end), receive done -> ok after 1000 -> timeout end, Result=receive {trace,Tracee,'receive',stop} -> unexpected after 0 -> quiet end, erlang:trace_pattern({trace_t3_match_action_order,control,3},false,[meta]), Result. control(_,_,_) -> ok.",
+        );
+    }
+
+    #[test]
+    fn match_trace_action_does_not_restore_a_dead_tracer() {
+        trace_pattern_diff(
+            "trace_t3_dead_tracer_action",
+            "-module(trace_t3_dead_tracer_action). -export([run/0,f/1]). run() -> Self=self(), TFun=fun F() -> receive M -> Self!M, F() end end, {Tracer,MRef}=spawn_monitor(TFun), MetaTracer=spawn_link(TFun), 1=erlang:trace_pattern({trace_t3_dead_tracer_action,f,1},[{'_',[],[{message,false},{trace,[],[call,{const,{tracer,Tracer}}]}]}],[{meta,MetaTracer}]), f(1), {tracer,Tracer}=erlang:trace_info(self(),tracer), exit(Tracer,stop), receive {'DOWN',MRef,_,_,_} -> ok end, f(2), Result=erlang:trace_info(self(),tracer), erlang:trace_pattern({trace_t3_dead_tracer_action,f,1},false,[meta]), Result. f(_) -> ok.",
         );
     }
 
