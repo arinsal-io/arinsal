@@ -1072,11 +1072,14 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module, function.function, function.arity));
     }
-    // A process suspended inside native code: `module`/`ip` are its last interpreter position.
-    if let Some(function) = process
+    // A process in native code (a receive wait, a yield) is at a native address;
+    // `module`/`ip` only describe its interpreter state.
+    // A process woken in native code handles its signals before the native entry takes
+    // `native_pc`; its position is then still in `c_p->i`, which interpreted slices clear.
+    let native_position = process
         .native_pc
-        .and_then(crate::native_bridge::native_function_at)
-    {
+        .or_else(|| Some(process.header.i as usize).filter(|&pc| pc != 0));
+    if let Some(function) = native_position.and_then(crate::native_bridge::native_function_at) {
         return Ok((function.module, function.function, function.arity));
     }
     if let Some(vm) = vm {
@@ -1390,17 +1393,6 @@ pub(crate) fn fulfill_request(
                 &[atom("system_task_test"), request_id, atom("true")],
             )
         }
-        // Port of erts/emulator/beam/bif.c:2247 (exec_process_flag_3), OTP-29.1.1.
-        crate::signals::RemoteOp::ProcessFlag { value } => {
-            let result = match value {
-                Some(value) => {
-                    let value = Term::small(value).ok_or_else(badarg)?;
-                    flag(process, "save_calls", value).unwrap_or_else(|_| atom("badarg"))
-                }
-                None => atom("badarg"),
-            };
-            make_tuple(process, &[reference, result])
-        }
         crate::signals::RemoteOp::Display => {
             eprintln!("process {:?}: backtrace", ctx.pid());
             make_tuple(process, &[reference, atom("true")])
@@ -1441,9 +1433,7 @@ pub(crate) fn failure_reply(
         crate::signals::RemoteOp::Info { .. } => {
             make_tuple(process, &[reference, atom("undefined")])
         }
-        crate::signals::RemoteOp::GroupLeader { .. }
-        | crate::signals::RemoteOp::Display
-        | crate::signals::RemoteOp::ProcessFlag { .. } => {
+        crate::signals::RemoteOp::GroupLeader { .. } | crate::signals::RemoteOp::Display => {
             make_tuple(process, &[reference, atom("badarg")])
         }
         crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("false")]),
@@ -1816,34 +1806,14 @@ fn call_values(
                 Ok(previous)
             }
             ("process_flag", [target, name, value]) if module == "erts_internal" => {
-                if Pid::from_term(*target) == Some(ctx.pid()) {
-                    let name = atom_name(*name).ok_or_else(badarg)?;
-                    if name != "save_calls" {
-                        return Ok(atom("badarg"));
-                    }
-                    return flag(process, &name, *value).or_else(|_| Ok(atom("badarg")));
+                if Pid::from_term(*target) != Some(ctx.pid()) {
+                    return Err(badarg());
                 }
-                // Port of erts/emulator/beam/bif.c:2262-2303 (erts_internal_process_flag_3):
-                // another process runs the flag change as an rpc request and replies to a ref.
-                let Some(pid) = Pid::from_term(*target) else {
-                    return Ok(atom("badtype"));
-                };
-                if !live(process, pid)? {
-                    return Ok(atom("badtype"));
+                let name = atom_name(*name).ok_or_else(badarg)?;
+                if name != "save_calls" {
+                    return Err(badarg());
                 }
-                let value = (atom_name(*name).as_deref() == Some("save_calls"))
-                    .then(|| value.as_small().filter(|n| (0..=10_000).contains(n)))
-                    .flatten();
-                match crate::signals::submit(
-                    process,
-                    ctx,
-                    pid,
-                    crate::signals::RemoteOp::ProcessFlag { value },
-                    None,
-                )? {
-                    crate::signals::Submit::Sent(id) => crate::signals::reference(process, id),
-                    crate::signals::Submit::Dead => Ok(atom("badtype")),
-                }
+                flag(process, &name, *value)
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),

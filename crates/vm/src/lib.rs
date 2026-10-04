@@ -24,6 +24,7 @@ mod proc_create;
 mod funs;
 mod lists;
 mod process;
+pub use beamasm_integration::{interp_native_starts, interp_slices};
 pub use process::ScheduledResult;
 mod inet_drv;
 // g_inet_udp

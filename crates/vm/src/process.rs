@@ -1072,7 +1072,6 @@ impl Executor {
             "in",
             running_fields,
         );
-        process.trace_dirty_nif_sends(&mut self.vm, ctx);
         // Port of erts/emulator/beam/erl_process.c:10541-10543 (trace_schedule_in), OTP-29.1.1.
         if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
             crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
@@ -1081,13 +1080,15 @@ impl Executor {
         if process.native_pc.is_some() && process.reductions <= 0 {
             process.reductions = budget.min(i32::MAX as u32) as i32;
         }
-        // The entry process starts its function natively only on its first run; later runs
-        // continue wherever its interpreted or native continuation is.
-        let first_run = process.entry && !std::mem::replace(&mut process.entry_started, true);
+        // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
+        // export's code address), OTP-29.1.1: every process starts its function natively on
+        // its first run; later runs continue wherever its interpreted or native continuation is.
+        let first_run = !std::mem::replace(&mut process.entry_started, true);
         if first_run
             && process.native_pc.is_none()
             && let Some(module) = self.vm.modules.get(process.module)
             && let Some((function, arity)) = module.function_at(process.ip)
+            && module.entry_arity.get(process.ip).copied().unwrap_or(0) != 0
             && let Some(native) =
                 crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
         {
@@ -1209,7 +1210,6 @@ impl Executor {
                         && scheduler_class(ctx.scheduler_type()) == class
                     {
                         process.cold_mut().native_dirty_nif = None;
-                        process.cold_mut().native_dirty_mfa = None;
                         match crate::native_helpers::run_static_nif(process, identity) {
                             Ok(value) => {
                                 process.x[0] = value;
@@ -1617,8 +1617,10 @@ impl Executor {
                                         self.vm.apply_fixed(process, 4, true, 0, Some(ctx));
                                     process.cold_mut().native_apply = false;
                                     match result? {
-                                        crate::ImportOutcome::Jump(_)
-                                        | crate::ImportOutcome::Advanced => {}
+                                        crate::ImportOutcome::Jump(_) => {
+                                            self.vm.enter_native_at_jump(process)
+                                        }
+                                        crate::ImportOutcome::Advanced => {}
                                         crate::ImportOutcome::Yield => {
                                             if process.native_pc.is_some()
                                                 && native_transfer_continues(process, ctx)
@@ -1762,8 +1764,10 @@ impl Executor {
                                     let trap = match result {
                                         Ok(outcome) => {
                                             match outcome {
-                                                crate::ImportOutcome::Jump(_)
-                                                | crate::ImportOutcome::Advanced => {}
+                                                crate::ImportOutcome::Jump(_) => {
+                                                    self.vm.enter_native_at_jump(process)
+                                                }
+                                                crate::ImportOutcome::Advanced => {}
                                                 crate::ImportOutcome::Yield => {
                                                     if process.native_pc.is_some()
                                                         && native_transfer_continues(process, ctx)
@@ -2431,8 +2435,10 @@ impl Executor {
                                                     }
                                                 };
                                                 match outcome {
-                                                    crate::ImportOutcome::Jump(_)
-                                                    | crate::ImportOutcome::Advanced => {}
+                                                    crate::ImportOutcome::Jump(_) => {
+                                                        self.vm.enter_native_at_jump(process)
+                                                    }
+                                                    crate::ImportOutcome::Advanced => {}
                                                     crate::ImportOutcome::Yield => {
                                                         if process.native_pc.is_some()
                                                             && native_transfer_continues(
@@ -2474,6 +2480,7 @@ impl Executor {
                                     process.module = module_id;
                                     process.ip = target_ip;
                                     process.tick();
+                                    self.vm.enter_native_at_jump(process);
                                 } else {
                                     let saved = process.x[..usize::from(export.arity)].to_vec();
                                     let outcome = match self.vm.call_undefined_function(
@@ -2498,8 +2505,10 @@ impl Executor {
                                         }
                                     };
                                     match outcome {
-                                        crate::ImportOutcome::Jump(_)
-                                        | crate::ImportOutcome::Advanced => {}
+                                        crate::ImportOutcome::Jump(_) => {
+                                            self.vm.enter_native_at_jump(process)
+                                        }
+                                        crate::ImportOutcome::Advanced => {}
                                         crate::ImportOutcome::Yield => {
                                             if process.native_pc.is_some()
                                                 && native_transfer_continues(process, ctx)
@@ -2822,6 +2831,8 @@ impl Executor {
         process.receive_cursor = 0;
         process.receive_deadline = None;
         process.receive_deadline_ms = None;
+        // erts resumes a hibernated process at the export address of apply/3 too.
+        self.vm.enter_native_at_jump(process);
         Ok(())
     }
 }
@@ -4315,23 +4326,6 @@ impl Process {
         }
     }
 
-    fn trace_dirty_nif_sends(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>) {
-        let sends = std::mem::take(&mut self.cold_mut().dirty_nif_sends);
-        let Some(sender) = self.self_pid else {
-            return;
-        };
-        for (target, message) in sends {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut self.heap);
-            let (Ok(target), Ok(message)) = (
-                arinsal_term::from_owned(&target, &mut heap),
-                arinsal_term::from_owned(&message, &mut heap),
-            ) else {
-                continue;
-            };
-            self.trace_send(Some(vm), Some(&mut *ctx), sender, "send", message, target);
-        }
-    }
-
     /// Send with an optional OTP 28+ `[priority]` request.
     // Port of erts/emulator/beam/erl_message.c / bif.c send with priority, OTP-29.1.1.
     pub(crate) fn send_message_prio(
@@ -4554,7 +4548,6 @@ impl Process {
     ) -> Result<(), VmError> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6032 (private queue fetch), OTP-29.1.1.
         ctx.fetch_pending();
-        self.outer_unfetched = false;
         if self.gc_enabled
             && self
                 .cold
@@ -4640,30 +4633,18 @@ impl Process {
                     }
                 }
                 Payload::Signal(arinsal_sched::Signal::Link) => {
-                    let existing = self
-                        .cold
-                        .as_ref()
-                        .is_some_and(|cold| cold.links.contains(&from));
-                    if self.final_exit_reason.is_some() && !existing {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
-                        // (erts_proc_exit_handle_signal), OTP-29.1.1.
-                        if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
-                            let _ = ctx.signal(from, arinsal_sched::Signal::ExitLinked(reason));
-                        }
-                    } else {
-                        self.cold_mut().links.insert(from);
-                        if let Some(linker) = from.to_term() {
-                            // Port of erts/emulator/beam/erl_proc_sig_queue.c:8585-8589, OTP-29.1.1.
-                            crate::trace::emit(
-                                None,
-                                self,
-                                ctx,
-                                ctx.pid(),
-                                crate::trace::PROCS,
-                                "getting_linked",
-                                &[linker],
-                            );
-                        }
+                    self.cold_mut().links.insert(from);
+                    if let Some(linker) = from.to_term() {
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8585-8589, OTP-29.1.1.
+                        crate::trace::emit(
+                            None,
+                            self,
+                            ctx,
+                            ctx.pid(),
+                            crate::trace::PROCS,
+                            "getting_linked",
+                            &[linker],
+                        );
                     }
                 }
                 // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
@@ -4709,11 +4690,6 @@ impl Process {
                             cold.prio_links.remove(&from);
                             cold.links.remove(&from)
                         });
-                    if linked_exit && !was_linked {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4674-4687,
-                        // OTP-29.1.1: an exit from a link already removed by unlink is stale.
-                        continue;
-                    }
                     let reason = message.into_receiver(self)?;
                     if reason == crate::signals::atom("kill") && !linked_exit {
                         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
@@ -5037,7 +5013,13 @@ impl Process {
             .as_ref()
             .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
         {
-            self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
+            let mut size = self.heap.total_heap_size_words();
+            if self.spill_only_gc {
+                // erts would not collect here: generated code checks only the heap gap, so
+                // message fragments are not judged until a real collection.
+                size -= self.heap.fragment_words();
+            }
+            self.max_heap_peak = self.max_heap_peak.max(size);
         }
         let (indices, mut roots) = self.inbox.gc_root_snapshot();
         let mailbox_len = roots.len();
@@ -5139,11 +5121,12 @@ impl Process {
                 pending.roots_mut().copy_from_slice(&roots[apply_end..]);
             }
         }
-        if self.max_heap_peak != 0
-            || self
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
+        if !self.spill_only_gc
+            && (self.max_heap_peak != 0
+                || self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire)))
         {
             self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }

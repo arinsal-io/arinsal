@@ -140,21 +140,6 @@ fn disarm(state: &mut FdState, dir: usize) {
     }
 }
 
-fn claim_driver_ready(state: &mut FdState, dir: usize, reg: u64, owner_id: u64) -> bool {
-    let slot = &mut state.dirs[dir];
-    if slot.reg != Some(reg)
-        || !slot
-            .owner
-            .as_ref()
-            .is_some_and(|owner| owner.id() == owner_id)
-    {
-        return false;
-    }
-    slot.reg = None;
-    slot.running = true;
-    true
-}
-
 /// Port of erl_check_io.c:878 (deselect): drop `mode` (all when zero); an entry without
 /// events leaves the table (`ERTS_EV_TYPE_NONE`).
 fn deselect(table: &mut HashMap<i32, FdState>, fd: i32, mode: c_int) {
@@ -611,7 +596,7 @@ fn nif_mode_text(mode: c_int) -> String {
 /// A poll registration fired: run `ready_input`/`ready_output` of the owner, then
 /// re-arm the event if it is still selected (`erts_io_notify_port_task_executed`).
 pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
-    let (owner, nif_message) = {
+    let owner = {
         let mut table = table();
         let Some(state) = table.get_mut(&fd) else {
             return;
@@ -619,48 +604,31 @@ pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
         if state.dirs[dir].reg != Some(reg) {
             return;
         }
+        state.dirs[dir].reg = None;
         if let Some(nif) = state.nif.as_mut() {
             // erl_check_io.c:2121 (`ERTS_EV_TYPE_NIF` in erts_check_io): the selection is
             // one-shot; the prepared message goes to its recipient.
-            state.dirs[dir].reg = None;
             state.events &= !DIRS[dir];
             let message = nif.messages[dir].take();
-            (None, message)
-        } else {
-            let Some(owner) = state.dirs[dir].owner.clone() else {
-                return;
-            };
-            (Some(owner), None)
+            drop(table);
+            if let Some(message) = message {
+                message.deliver();
+            }
+            return;
         }
-    };
-    if let Some(message) = nif_message {
-        message.deliver();
-        return;
-    }
-    let Some(owner) = owner else {
-        return;
-    };
-    let active = owner.serialized(|| {
-        let mut table = table();
-        let Some(state) = table.get_mut(&fd) else {
-            return false;
+        let Some(owner) = state.dirs[dir].owner.clone() else {
+            return;
         };
         if !owner.live() {
             // erl_check_io.c:1884 (stale_drv_select): the port died with the fd selected.
             report_stale(&owner, DIRS[dir]);
             deselect(&mut table, fd, DIRS[dir]);
-            return false;
+            return;
         }
-        if !claim_driver_ready(state, dir, reg, owner.id()) {
-            return false;
-        }
-        drop(table);
-        owner.run_io(dir, fd);
-        true
-    });
-    if !active {
-        return;
-    }
+        state.dirs[dir].running = true;
+        owner
+    };
+    owner.run_io(dir, fd);
     let mut table = table();
     if let Some(state) = table.get_mut(&fd) {
         state.dirs[dir].running = false;
@@ -722,26 +690,5 @@ impl DriverPort {
                 "Driver does not implement stop_select callback (event={fd}, private=0x0)!\n"
             )),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ready_claim_rejects_a_registration_deselected_while_waiting_for_port_lock() {
-        let mut state = FdState {
-            events: READ,
-            ..FdState::default()
-        };
-        state.dirs[0].reg = Some(19);
-
-        disarm(&mut state, 0);
-        state.events &= !READ;
-
-        assert!(!claim_driver_ready(&mut state, 0, 19, 7));
-        assert_eq!(state.dirs[0].reg, None);
-        assert!(!state.dirs[0].running);
     }
 }

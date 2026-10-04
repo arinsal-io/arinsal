@@ -623,6 +623,8 @@ static MODULES: AtomicU64 = AtomicU64::new(0);
 static NATIVE: AtomicU64 = AtomicU64::new(0);
 static UNPORTED: AtomicU64 = AtomicU64::new(0);
 static NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
+static INTERP_SLICES: AtomicU64 = AtomicU64::new(0);
+static INTERP_NATIVE_STARTS: AtomicU64 = AtomicU64::new(0);
 static NATIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
 static CALL_UNPORTED: AtomicU64 = AtomicU64::new(0);
 static PRINTED: AtomicBool = AtomicBool::new(false);
@@ -1545,6 +1547,25 @@ fn raw_word(term: Term) -> u64 {
 pub(crate) fn count_native_call() {
     NATIVE_CALLS.fetch_add(1, Ordering::Relaxed);
 }
+/// Counts an interpreter slice; `at_native_entry` marks one that started at a function entry
+/// which has native code (a process that erts would have started natively).
+pub(crate) fn count_interp_slice(at_native_entry: bool) {
+    INTERP_SLICES.fetch_add(1, Ordering::Relaxed);
+    if at_native_entry {
+        INTERP_NATIVE_STARTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Interpreter slices that began at a function entry with native code.
+pub fn interp_native_starts() -> u64 {
+    INTERP_NATIVE_STARTS.load(Ordering::Relaxed)
+}
+
+/// Interpreter slices run so far.
+pub fn interp_slices() -> u64 {
+    INTERP_SLICES.load(Ordering::Relaxed)
+}
+
 pub(crate) fn count_native_yield() {
     NATIVE_YIELDS.fetch_add(1, Ordering::Relaxed);
 }
@@ -1559,11 +1580,13 @@ pub(crate) fn print_stats() {
         return;
     }
     eprintln!(
-        "ARINSAL_BEAMASM_STATS modules={} native_functions={} unported_functions={} native_calls={} native_yields={} call_unported={}",
+        "ARINSAL_BEAMASM_STATS modules={} native_functions={} unported_functions={} native_calls={} interp_slices={} interp_native_starts={} native_yields={} call_unported={}",
         MODULES.load(Ordering::Relaxed),
         NATIVE.load(Ordering::Relaxed),
         UNPORTED.load(Ordering::Relaxed),
         NATIVE_CALLS.load(Ordering::Relaxed),
+        INTERP_SLICES.load(Ordering::Relaxed),
+        INTERP_NATIVE_STARTS.load(Ordering::Relaxed),
         NATIVE_YIELDS.load(Ordering::Relaxed),
         CALL_UNPORTED.load(Ordering::Relaxed)
     );

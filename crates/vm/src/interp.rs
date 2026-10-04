@@ -1685,6 +1685,24 @@ impl Vm {
         Ok(process.receive_cursor >= process.inbox.len())
     }
 
+    /// After an apply left the process at an interpreted jump target, enter that function's
+    /// native code if it has any, as erts jumps to the export's code address.
+    // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-317, OTP-29.1.1.
+    pub(crate) fn enter_native_at_jump(&mut self, p: &mut Process) {
+        if !crate::beamasm_integration::enabled() {
+            return;
+        }
+        let Some(module) = self.modules.get(p.module) else {
+            return;
+        };
+        if let Some(native) = self
+            .beamasm_targets
+            .function_for_target(p.module, module, p.ip)
+        {
+            p.native_pc = Some(native.start);
+        }
+    }
+
     pub(crate) fn run_slice(
         &mut self,
         p: &mut Process,
@@ -1722,6 +1740,8 @@ impl Vm {
         budget: u32,
     ) -> Result<RunState, VmError> {
         self.sync_code_epoch();
+        // The interpreter is the process's position now, not the last native address.
+        p.header.i = std::ptr::null();
         // A migrated process may already be inside a module this replica has
         // not copied yet. Sync only when the id is past the local table.
         self.sync_module(p.module);
@@ -1741,6 +1761,14 @@ impl Vm {
             let mut registers = p.fr.to_vec();
             registers.resize(need_fr, 0.0);
             p.fr = registers.into_boxed_slice();
+        }
+        if crate::beamasm_integration::enabled() {
+            let module = &self.modules[module_id];
+            let at_native_entry = self
+                .beamasm_targets
+                .function_for_target(module_id, module, p.ip)
+                .is_some();
+            crate::beamasm_integration::count_interp_slice(at_native_entry);
         }
         let mut base = self.modules[module_id].code.as_ptr();
         let mut ip = {

@@ -236,16 +236,10 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
-    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (i_loop_rec: fetch the outer queue
-    // when the private one is exhausted), OTP-29.1.1.
-    match process.inbox.get(process.receive_cursor) {
-        Some(message) => crate::native_hooks::raw(*message),
-        None if process.outer_unfetched => {
-            process.outer_unfetched = false;
-            u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH)
-        }
-        None => 0,
-    }
+    process
+        .inbox
+        .get(process.receive_cursor)
+        .map_or(0, |message| crate::native_hooks::raw(*message))
 }
 
 /// Removes the current message from the mailbox (`remove_message`).
@@ -583,11 +577,6 @@ fn trap_to_dirty_nif(
     identity: usize,
     class: arinsal_bifs::SchedulerClass,
 ) -> u64 {
-    let caller_mfa = process
-        .native_pc
-        .and_then(crate::native_function_at)
-        .map(|function| (function.module, function.function, function.arity));
-    process.cold_mut().native_dirty_mfa = caller_mfa;
     process.cold_mut().native_dirty_nif = Some((identity, 0, class));
     process.header.i =
         arinsal_beamasm::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as *const u8 as *const _;
@@ -736,7 +725,8 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     for index in 6..synced {
         process.x[index] = crate::native_hooks::from_raw(registers.x_reg_array[index]);
     }
-    if process.ensure(need_words, live).is_err() {
+    let result = process.ensure_for_native(need_words, live);
+    if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
@@ -789,9 +779,6 @@ fn invoke_dispatch_bif(
                 crate::process::REMOTE_SEND_NEEDS_CONTEXT.into(),
             ))
         } else {
-            // The message may be addressed to this very process; it sits in the scheduler's
-            // outer queue until the next fetch.
-            process.outer_unfetched = true;
             process.send_message(process.x[0], process.x[1])
         };
         match result {
