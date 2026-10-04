@@ -97,6 +97,8 @@ pub struct Process {
     pub(crate) entry: bool,
     /// A dist send that suspended must yield even if the queue drains before return.
     pub(crate) force_yield: bool,
+    /// Native code sent a message since the scheduler last fetched the outer signal queue.
+    pub(crate) outer_unfetched: bool,
 }
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
@@ -445,6 +447,7 @@ impl Process {
             exc_class: None,
             entry: false,
             force_yield: false,
+            outer_unfetched: false,
         };
         process.sync_header();
         #[cfg(feature = "pf-mem-counters")]

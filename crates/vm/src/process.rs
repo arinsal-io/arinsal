@@ -4535,6 +4535,7 @@ impl Process {
     ) -> Result<(), VmError> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:6032 (private queue fetch), OTP-29.1.1.
         ctx.fetch_pending();
+        self.outer_unfetched = false;
         if self.gc_enabled
             && self
                 .cold
@@ -4620,18 +4621,30 @@ impl Process {
                     }
                 }
                 Payload::Signal(arinsal_sched::Signal::Link) => {
-                    self.cold_mut().links.insert(from);
-                    if let Some(linker) = from.to_term() {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8585-8589, OTP-29.1.1.
-                        crate::trace::emit(
-                            None,
-                            self,
-                            ctx,
-                            ctx.pid(),
-                            crate::trace::PROCS,
-                            "getting_linked",
-                            &[linker],
-                        );
+                    let existing = self
+                        .cold
+                        .as_ref()
+                        .is_some_and(|cold| cold.links.contains(&from));
+                    if self.final_exit_reason.is_some() && !existing {
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426
+                        // (erts_proc_exit_handle_signal), OTP-29.1.1.
+                        if let Ok(reason) = Message::copy_from(crate::signals::atom("noproc")) {
+                            let _ = ctx.signal(from, arinsal_sched::Signal::ExitLinked(reason));
+                        }
+                    } else {
+                        self.cold_mut().links.insert(from);
+                        if let Some(linker) = from.to_term() {
+                            // Port of erts/emulator/beam/erl_proc_sig_queue.c:8585-8589, OTP-29.1.1.
+                            crate::trace::emit(
+                                None,
+                                self,
+                                ctx,
+                                ctx.pid(),
+                                crate::trace::PROCS,
+                                "getting_linked",
+                                &[linker],
+                            );
+                        }
                     }
                 }
                 // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
@@ -4677,6 +4690,11 @@ impl Process {
                             cold.prio_links.remove(&from);
                             cold.links.remove(&from)
                         });
+                    if linked_exit && !was_linked {
+                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4674-4687,
+                        // OTP-29.1.1: an exit from a link already removed by unlink is stale.
+                        continue;
+                    }
                     let reason = message.into_receiver(self)?;
                     if reason == crate::signals::atom("kill") && !linked_exit {
                         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782

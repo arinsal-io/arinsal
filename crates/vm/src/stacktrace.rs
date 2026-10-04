@@ -304,6 +304,11 @@ pub(super) fn capture(
             continue;
         };
         let raw_address = word.tagged_word() as usize;
+        if raw_address == crate::native_bridge::native_continuation_return_address() {
+            // The bridge CP returns to the interpreter and has no BEAM stack frame.
+            index += 1;
+            continue;
+        }
         if raw_address == crate::native_bridge::native_trace_return_address() {
             // Port of erts/emulator/beam/beam_common.c:803-815 (save_stacktrace), OTP-29.1.1:
             // trace frames are skipped; the caller's own continuation follows the frame.
@@ -376,10 +381,19 @@ pub(super) fn set_native_top(raw: &mut RawTrace, pc: usize) {
 }
 
 /// Preserve an explicit `raise/3` stacktrace with its class across `try/after`.
-pub(super) fn save_explicit(raw: &mut RawTrace, class: Class, trace: Term) -> Result<(), VmError> {
+pub(super) fn save_explicit(
+    raw: &mut RawTrace,
+    class: Class,
+    trace: Term,
+    depth: usize,
+) -> Result<(), VmError> {
     raw.class = Some(class);
-    raw.explicit =
-        Some(to_owned(trace).map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")))?);
+    let mut explicit =
+        to_owned(trace).map_err(|e| VmError::Unsupported(format!("exception stack {e:?}")))?;
+    if let OwnedTerm::List { elems, .. } = &mut explicit {
+        elems.truncate(depth.max(1));
+    }
+    raw.explicit = Some(explicit);
     raw.top = None;
     raw.module = None;
     raw.continuations.clear();

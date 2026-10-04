@@ -236,10 +236,16 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
-    process
-        .inbox
-        .get(process.receive_cursor)
-        .map_or(0, |message| crate::native_hooks::raw(*message))
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp (i_loop_rec: fetch the outer queue
+    // when the private one is exhausted), OTP-29.1.1.
+    match process.inbox.get(process.receive_cursor) {
+        Some(message) => crate::native_hooks::raw(*message),
+        None if process.outer_unfetched => {
+            process.outer_unfetched = false;
+            u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH)
+        }
+        None => 0,
+    }
 }
 
 /// Removes the current message from the mailbox (`remove_message`).
@@ -778,6 +784,9 @@ fn invoke_dispatch_bif(
                 crate::process::REMOTE_SEND_NEEDS_CONTEXT.into(),
             ))
         } else {
+            // The message may be addressed to this very process; it sits in the scheduler's
+            // outer queue until the next fetch.
+            process.outer_unfetched = true;
             process.send_message(process.x[0], process.x[1])
         };
         match result {

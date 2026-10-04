@@ -260,6 +260,10 @@ pub(crate) fn native_trace_return_address() -> usize {
     arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize
 }
 
+pub(crate) fn native_continuation_return_address() -> usize {
+    arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize
+}
+
 /// Register a native code range for GC continuation recognition and stack traces.
 pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str> {
     if info.start >= info.end {

@@ -1390,6 +1390,17 @@ pub(crate) fn fulfill_request(
                 &[atom("system_task_test"), request_id, atom("true")],
             )
         }
+        // Port of erts/emulator/beam/bif.c:2247 (exec_process_flag_3), OTP-29.1.1.
+        crate::signals::RemoteOp::ProcessFlag { value } => {
+            let result = match value {
+                Some(value) => {
+                    let value = Term::small(value).ok_or_else(badarg)?;
+                    flag(process, "save_calls", value).unwrap_or_else(|_| atom("badarg"))
+                }
+                None => atom("badarg"),
+            };
+            make_tuple(process, &[reference, result])
+        }
         crate::signals::RemoteOp::Display => {
             eprintln!("process {:?}: backtrace", ctx.pid());
             make_tuple(process, &[reference, atom("true")])
@@ -1430,7 +1441,9 @@ pub(crate) fn failure_reply(
         crate::signals::RemoteOp::Info { .. } => {
             make_tuple(process, &[reference, atom("undefined")])
         }
-        crate::signals::RemoteOp::GroupLeader { .. } | crate::signals::RemoteOp::Display => {
+        crate::signals::RemoteOp::GroupLeader { .. }
+        | crate::signals::RemoteOp::Display
+        | crate::signals::RemoteOp::ProcessFlag { .. } => {
             make_tuple(process, &[reference, atom("badarg")])
         }
         crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("false")]),
@@ -1803,14 +1816,34 @@ fn call_values(
                 Ok(previous)
             }
             ("process_flag", [target, name, value]) if module == "erts_internal" => {
-                if Pid::from_term(*target) != Some(ctx.pid()) {
-                    return Err(badarg());
+                if Pid::from_term(*target) == Some(ctx.pid()) {
+                    let name = atom_name(*name).ok_or_else(badarg)?;
+                    if name != "save_calls" {
+                        return Ok(atom("badarg"));
+                    }
+                    return flag(process, &name, *value).or_else(|_| Ok(atom("badarg")));
                 }
-                let name = atom_name(*name).ok_or_else(badarg)?;
-                if name != "save_calls" {
-                    return Err(badarg());
+                // Port of erts/emulator/beam/bif.c:2262-2303 (erts_internal_process_flag_3):
+                // another process runs the flag change as an rpc request and replies to a ref.
+                let Some(pid) = Pid::from_term(*target) else {
+                    return Ok(atom("badtype"));
+                };
+                if !live(process, pid)? {
+                    return Ok(atom("badtype"));
                 }
-                flag(process, &name, *value)
+                let value = (atom_name(*name).as_deref() == Some("save_calls"))
+                    .then(|| value.as_small().filter(|n| (0..=10_000).contains(n)))
+                    .flatten();
+                match crate::signals::submit(
+                    process,
+                    ctx,
+                    pid,
+                    crate::signals::RemoteOp::ProcessFlag { value },
+                    None,
+                )? {
+                    crate::signals::Submit::Sent(id) => crate::signals::reference(process, id),
+                    crate::signals::Submit::Dead => Ok(atom("badtype")),
+                }
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),

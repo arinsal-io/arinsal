@@ -1018,8 +1018,12 @@ fn system_info(
         Some("system_logger") => Some(Ok(system_logger(process))),
         Some("debug_compiled") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         // Port of erts/emulator/beam/erl_bif_info.c:3448-3449, OTP-29.1.1.
-        // Arinsal's loaded BEAM select instructions use the jump-table dispatch path.
         Some("beam_jump_table") => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
+        // Port of erts/emulator/beam/erl_bif_info.c:3019, OTP-29.1.1.
+        Some("system_architecture") => Some(owned_system_info(
+            process,
+            arinsal_etf::OwnedTerm::charlist(&system_architecture()),
+        )),
         // Port of erts/emulator/beam/erl_bif_info.c:3370-3376, OTP-29.1.1.
         Some("lock_checking") => Some(Ok(Term::atom(arinsal_term::atoms::FALSE))),
         // Port of erts/emulator/beam/erl_bif_info.c:2888-2889, OTP-29.1.1.
@@ -1145,6 +1149,22 @@ fn system_info(
         _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
         _ => None,
     }
+}
+
+fn system_architecture() -> String {
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        "x86" => "i686",
+        other => other,
+    };
+    let platform = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        other => other,
+    };
+    format!("{architecture}-{platform}")
 }
 
 fn allocator_names(process: &mut Process) -> Result<Term, VmError> {
@@ -4869,6 +4889,47 @@ mod tests {
                 .unwrap();
             assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
         }
+    }
+
+    #[test]
+    fn jit_system_info_selectors_match_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping JIT system_info selector test");
+            return;
+        };
+        let selector = OwnedTerm::atom("beam_jump_table");
+        let expected = reference.call("erlang", "system_info", std::slice::from_ref(&selector));
+        let mut heap = VecHeap::new();
+        let input = from_owned(&selector, &mut heap).unwrap();
+        let actual = system_info(&Vm::new([]), &mut Process::new(), None, input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected, CallResult::Ok(to_owned(actual).unwrap()));
+
+        // The result lives on the process heap, so the process must outlive `to_owned`.
+        let mut process = Process::new();
+        let selector = OwnedTerm::atom("system_architecture");
+        let expected = reference.call("erlang", "system_info", std::slice::from_ref(&selector));
+        let mut heap = VecHeap::new();
+        let input = from_owned(&selector, &mut heap).unwrap();
+        let actual = system_info(&Vm::new([]), &mut process, None, input)
+            .unwrap()
+            .unwrap();
+        let CallResult::Ok(OwnedTerm::List {
+            elems: ref expected,
+            ..
+        }) = expected
+        else {
+            panic!("OTP system_architecture was not a string");
+        };
+        let actual = to_owned(actual).unwrap();
+        let OwnedTerm::List {
+            elems: ref actual, ..
+        } = actual
+        else {
+            panic!("Arinsal system_architecture was not a string");
+        };
+        assert!(expected.starts_with(actual), "{actual:?} / {expected:?}");
     }
 
     #[test]
