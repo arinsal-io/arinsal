@@ -85,7 +85,20 @@ scenario(63) ->
 scenario(64) ->
     Alias=alias([priority]), Srv=spawn(fun priority_echoer/0),
     self() ! old, repeat_priority_calls(Alias,Srv,50,25),
-    receive old -> ok end.
+    receive old -> ok end;
+scenario(65) ->
+    0=process_flag(save_calls,8),
+    save_calls_outer(),
+    {last_calls,Calls}=process_info(self(),last_calls),
+    8=process_flag(save_calls,0), Calls;
+scenario(66) ->
+    erlang:yield(), self_send_then_poll(self());
+scenario(67) ->
+    register(self_poll, self()), erlang:yield(),
+    R = self_send_then_poll(self_poll), unregister(self_poll), R.
+self_send_then_poll(To) -> To ! hef, receive X -> X after 0 -> none end.
+save_calls_outer() -> save_calls_inner().
+save_calls_inner() -> ok.
 send_priority_replies(_Ref,0) -> ok;
 send_priority_replies(Ref,N) ->
     erlang:send(Ref,{wrapped,Ref,N},[priority]), send_priority_replies(Ref,N-1).
@@ -116,7 +129,7 @@ fn process_bif_scenarios_match_otp_29() {
     };
     let beam = reference.compile_named("proc_bifs", SOURCE, &[]).unwrap();
     reference.load("proc_bifs", &beam).unwrap();
-    for scenario in 0..65 {
+    for scenario in 0..68 {
         let expected = reference.call("proc_bifs", "scenario", &[OwnedTerm::Int(scenario)]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();

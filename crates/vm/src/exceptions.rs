@@ -625,6 +625,11 @@ pub(super) fn resume(
             stack: OwnedTerm::Nil,
         }))));
     }
+    let backtrace_depth = p.runtime.as_ref().map_or(vm.backtrace_depth, |runtime| {
+        runtime
+            .backtrace_depth
+            .load(std::sync::atomic::Ordering::Acquire)
+    });
     let trace = if let Some(trace) = trap.trace {
         // OTP's raise/3 accepts an empty explicit stacktrace; it needs no raw
         // handle because materializing that handle would return the same nil.
@@ -633,15 +638,15 @@ pub(super) fn resume(
         } else if empty_trace_class(trace).is_some() || stacktrace::is_saved(trace) {
             trace
         } else {
-            save_explicit(p, trace, trap.class)?
+            save_explicit(p, trace, trap.class, backtrace_depth)?
         }
     } else {
-        save_raw(vm, p, vm.backtrace_depth, trap.class, trap.top.as_ref())?
+        save_raw(vm, p, backtrace_depth, trap.class, trap.top.as_ref())?
     };
     let trace = if trap.raw_rethrow && trap.reason == atom("function_clause")? {
         let cooked = materialize(p, trace)?;
         let stripped = strip_top_location(p, cooked)?;
-        save_explicit(p, stripped, trap.class)?
+        save_explicit(p, stripped, trap.class, backtrace_depth)?
     } else {
         trace
     };
@@ -867,9 +872,14 @@ fn save_raw(
     stacktrace::store(p, raw)
 }
 
-fn save_explicit(p: &mut Process, trace: Term, class: Class) -> Result<Term, VmError> {
+fn save_explicit(
+    p: &mut Process,
+    trace: Term,
+    class: Class,
+    depth: usize,
+) -> Result<Term, VmError> {
     let mut raw = stacktrace::RawTrace::default();
-    stacktrace::save_explicit(&mut raw, class, trace)?;
+    stacktrace::save_explicit(&mut raw, class, trace, depth)?;
     stacktrace::store(p, raw)
 }
 

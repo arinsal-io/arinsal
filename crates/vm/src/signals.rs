@@ -2536,6 +2536,9 @@ pub(crate) enum RemoteOp {
         async_request: Option<Message>,
         kill: bool,
     },
+    /// `erts_internal:process_flag/3` on another process (erts `exec_process_flag_3`): the new
+    /// `save_calls` limit, or `None` for any flag or value `process_flag_aux` rejects.
+    ProcessFlag { value: Option<i64> },
     /// `erts_internal:request_system_task/3,4` `system_task_test` (erts `ERTS_PSTT_TEST`).
     SystemTaskTest { request_id: Message },
 }
@@ -3045,7 +3048,10 @@ fn link_opt(
     if pid == ctx.pid() {
         return Ok(atom("true"));
     }
-    if !runtime(process)?.scheduler()?.lookup(pid) {
+    let runtime_state = runtime(process)?;
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426, OTP-29.1.1: a late link to
+    // an exiting process is answered with `noproc`, independently of its final exit reason.
+    if !runtime_state.scheduler()?.lookup(pid) || runtime_state.remote_status(pid) == "exiting" {
         return link_noproc(process, pid, priority);
     }
     crate::trace::linked(process, ctx.pid(), pid);

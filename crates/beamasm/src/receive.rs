@@ -19,6 +19,10 @@ pub type RecvMarkerClearHook = extern "C" fn(*mut ProcessHeader, u64);
 /// Runtime callback which restores a saved mailbox position for a reference.
 pub type RecvMarkerUseHook = extern "C" fn(*mut ProcessHeader, u64);
 /// Runtime callback which peeks the next message, returning zero for an empty queue.
+/// Value the `i_loop_rec` hook returns when native code must yield so the scheduler fetches the
+/// outer signal queue (no term word equals it).
+pub const LOOP_REC_FETCH: u16 = 1;
+
 pub type LoopRecHook = extern "C" fn(*mut ProcessHeader) -> u64;
 /// Runtime callback which removes the current message and returns reductions left.
 pub type RemoveMessageHook = extern "C" fn(*mut ProcessHeader, i32, usize) -> i32;
@@ -154,9 +158,23 @@ impl BeamModuleAssembler {
     /// Peeks the next message and branches to the wait label when the queue is empty.
     // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:109-238 and instr_msg.cpp:127-133, OTP-29.1.1
     pub fn emit_i_loop_rec(&mut self, wait: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
+        let start = self.code.new_label();
+        let message = self.code.new_label();
+        self.code.bind(start)?;
         self.emit_runtime_hook_with(hooks.loop_rec as usize, &[], 6, crate::Update::NONE)?;
         let wait = self.label(wait);
         self.code.cbz(Gpr::x(0), wait)?;
+        // `LOOP_REC_FETCH`: the private queue is empty but the outer signal queue may hold
+        // messages. erts fetches it inline (erts_proc_sig_receive_helper); the scheduler's
+        // queues are out of native code's reach, so leave and run this `loop_rec` again.
+        self.code
+            .emit(|e| e.subs_imm(Gpr::x(9), Gpr::x(0), LOOP_REC_FETCH, false))?;
+        self.code.b_cond(Cond::Ne, message)?;
+        self.code.adr(Gpr::x(8), start)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
+        self.emit_yield_live(0)?;
+        self.code.b(self.yield_label)?;
+        self.code.bind(message)?;
         self.code.emit(|e| e.mov_reg(XREG0, Gpr::x(0)))?;
         Ok(())
     }
