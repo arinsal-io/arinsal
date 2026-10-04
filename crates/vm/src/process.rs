@@ -1072,6 +1072,7 @@ impl Executor {
             "in",
             running_fields,
         );
+        process.trace_dirty_nif_sends(&mut self.vm, ctx);
         // Port of erts/emulator/beam/erl_process.c:10541-10543 (trace_schedule_in), OTP-29.1.1.
         if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
             crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
@@ -1208,6 +1209,7 @@ impl Executor {
                         && scheduler_class(ctx.scheduler_type()) == class
                     {
                         process.cold_mut().native_dirty_nif = None;
+                        process.cold_mut().native_dirty_mfa = None;
                         match crate::native_helpers::run_static_nif(process, identity) {
                             Ok(value) => {
                                 process.x[0] = value;
@@ -4310,6 +4312,23 @@ impl Process {
                 event,
                 &[value, target],
             ),
+        }
+    }
+
+    fn trace_dirty_nif_sends(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>) {
+        let sends = std::mem::take(&mut self.cold_mut().dirty_nif_sends);
+        let Some(sender) = self.self_pid else {
+            return;
+        };
+        for (target, message) in sends {
+            let mut heap = arinsal_bifs::FragmentingHeap(&mut self.heap);
+            let (Ok(target), Ok(message)) = (
+                arinsal_term::from_owned(&target, &mut heap),
+                arinsal_term::from_owned(&message, &mut heap),
+            ) else {
+                continue;
+            };
+            self.trace_send(Some(vm), Some(&mut *ctx), sender, "send", message, target);
         }
     }
 

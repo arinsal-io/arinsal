@@ -583,6 +583,11 @@ fn trap_to_dirty_nif(
     identity: usize,
     class: arinsal_bifs::SchedulerClass,
 ) -> u64 {
+    let caller_mfa = process
+        .native_pc
+        .and_then(crate::native_function_at)
+        .map(|function| (function.module, function.function, function.arity));
+    process.cold_mut().native_dirty_mfa = caller_mfa;
     process.cold_mut().native_dirty_nif = Some((identity, 0, class));
     process.header.i =
         arinsal_beamasm::dispatch::DIRTY_NIF_DISPATCH_IDENTITY as *const u8 as *const _;

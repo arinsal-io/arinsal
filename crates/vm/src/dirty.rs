@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arinsal_sched::{DirtyJob, DirtyKind};
-use arinsal_term::{ProcessHeap, Term};
+use arinsal_term::{ProcessHeap, Term, to_owned};
 
 use crate::Process;
 use crate::natives::nif::PendingNif;
@@ -33,6 +33,11 @@ enum DirtyDone {
     Bif(DirtyBifResult, ProcessHeap),
 }
 
+struct DirtyJobOutput {
+    result: Box<dyn Any>,
+    nif_sends: Vec<(arinsal_etf::OwnedTerm, arinsal_etf::OwnedTerm)>,
+}
+
 // erts shadow processes allocate in heap fragments; this is the first fragment's size.
 const SHADOW_HEAP_WORDS: usize = 256;
 
@@ -54,6 +59,8 @@ thread_local! {
     /// Exit flag of the process whose dirty job runs on this thread.
     static JOB_EXIT_FLAG: std::cell::RefCell<Option<Arc<AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
+    static JOB_NIF_SENDS: std::cell::RefCell<Option<Vec<(arinsal_etf::OwnedTerm, arinsal_etf::OwnedTerm)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Whether the process whose dirty job runs on this thread is exiting; NIF hook for
@@ -71,10 +78,27 @@ pub(crate) fn current_process_exiting() -> bool {
 fn with_exit_flag(flag: Arc<AtomicBool>, job: DirtyJob) -> DirtyJob {
     Box::new(move || {
         let previous = JOB_EXIT_FLAG.with(|slot| slot.replace(Some(flag)));
+        let previous_sends = JOB_NIF_SENDS.with(|slot| slot.replace(Some(Vec::new())));
         let result = job();
+        let nif_sends = JOB_NIF_SENDS.with(|slot| {
+            let sends = slot.replace(previous_sends.clone());
+            sends.unwrap_or_default()
+        });
         JOB_EXIT_FLAG.with(|slot| *slot.borrow_mut() = previous);
-        result
+        Box::new(DirtyJobOutput { result, nif_sends }) as Box<dyn Any>
     })
+}
+
+/// Preserve NIF send trace events until the dirty shadow heap has returned to its process.
+pub(crate) fn record_nif_send(target: Term, message: Term) {
+    let (Ok(target), Ok(message)) = (to_owned(target), to_owned(message)) else {
+        return;
+    };
+    JOB_NIF_SENDS.with(|slot| {
+        if let Some(sends) = slot.borrow_mut().as_mut() {
+            sends.push((target, message));
+        }
+    });
 }
 
 /// A static NIF body as a dirty job.
@@ -136,6 +160,10 @@ impl Process {
 
     /// Take back a finished dirty job: its shadow heap becomes part of the process heap.
     pub(crate) fn finish_dirty_job(&mut self, result: Box<dyn Any>) {
+        let Ok(result) = result.downcast::<DirtyJobOutput>() else {
+            return;
+        };
+        let DirtyJobOutput { result, nif_sends } = *result;
         let Ok(done) = result.downcast::<DirtyDone>() else {
             return;
         };
@@ -154,6 +182,7 @@ impl Process {
             // A shadow heap never has a stack or an old generation.
             unreachable!("dirty job shadow heap is standalone");
         }
+        self.cold_mut().dirty_nif_sends.extend(nif_sends);
         if let Some(result) = slot {
             self.cold_mut().dirty_bif = Some(DirtyBif::Done(result));
         }

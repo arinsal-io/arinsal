@@ -176,6 +176,10 @@ pub(crate) struct ProcessCold {
     /// Static NIF identity, native return point and target scheduler class of a NIF call
     /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
+    /// Erlang caller MFA kept while a native dirty NIF has no interpreter instruction pointer.
+    pub(crate) native_dirty_mfa: Option<(String, String, u8)>,
+    /// NIF `enif_send` trace events collected while a dirty shadow process ran.
+    pub(crate) dirty_nif_sends: Vec<(arinsal_etf::OwnedTerm, arinsal_etf::OwnedTerm)>,
     /// Return address and call site of the native call that `native_retry` redoes.
     pub(crate) native_retry_site: Option<(usize, usize)>,
     /// The interpreter returned only to hand control to `native_pc`; the slice continues.

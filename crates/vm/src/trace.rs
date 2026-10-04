@@ -3301,10 +3301,26 @@ pub(crate) fn running_mfa(
             None => ("ets", "delete_trap", 1),
             Some(_) => ("ets", "internal_delete_all", 2),
         });
+    let dirty_nif = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.native_dirty_mfa.clone());
+    let native = process
+        .native_pc
+        .and_then(crate::native_function_at)
+        .map(|function| (function.module, function.function, function.arity));
     let (module, function, arity) = if let Some(trap) = ets_trap {
-        trap
+        (trap.0.to_owned(), trap.1.to_owned(), trap.2)
     } else if let Some(continuation) = continuation {
-        continuation
+        (
+            continuation.0.to_owned(),
+            continuation.1.to_owned(),
+            continuation.2,
+        )
+    } else if let Some((module, function, arity)) = dirty_nif {
+        (module, function, arity)
+    } else if let Some((module, function, arity)) = native {
+        (module, function, arity)
     } else {
         let Some(module) = vm.modules.get(process.module) else {
             return Ok(None);
@@ -3312,18 +3328,18 @@ pub(crate) fn running_mfa(
         let Some((function, arity)) = module.function_at(process.ip) else {
             return Ok(None);
         };
-        (&*module.name, function, arity)
+        (module.name.clone(), function.to_owned(), arity)
     };
     let tuple = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .tuple(&[
             Term::atom(
                 global_atoms()
-                    .intern(module)
+                    .intern(&module)
                     .map_err(|_| VmError::Unsupported("running module atom".into()))?,
             ),
             Term::atom(
                 global_atoms()
-                    .intern(function)
+                    .intern(&function)
                     .map_err(|_| VmError::Unsupported("running function atom".into()))?,
             ),
             Term::small(i64::from(arity))

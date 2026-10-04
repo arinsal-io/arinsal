@@ -1189,12 +1189,26 @@ fn install_hub_for(process: &Process, pid: Pid) {
         whereis_pid: Some(nif_whereis_pid_hook),
         whereis_port: Some(nif_whereis_port_hook),
         port_alive: Some(nif_port_alive_hook),
+        process_alive: Some(nif_process_alive_hook),
         port_command: Some(nif_port_command_hook),
         is_process_alive: Some(nif_is_process_alive),
         thread_type: Some(nif_thread_type),
         current_process_exiting: Some(crate::dirty::current_process_exiting),
         ..arinsal_nif::VmHooks::default()
     });
+}
+
+// Port of erts/emulator/beam/erl_nif.c:2321 (enif_is_process_alive), OTP-29.1.1.
+fn nif_process_alive_hook(pid: Term) -> bool {
+    let Some(pid) = Pid::from_term(pid) else {
+        return false;
+    };
+    HUB.with(|hub| {
+        hub.borrow()
+            .as_ref()
+            .and_then(|hub| hub.runtime.upgrade())
+            .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid))
+    })
 }
 
 // Port of erts/emulator/beam/erl_nif.c:3593 (enif_thread_type), OTP-29.1.1.
@@ -1229,10 +1243,14 @@ fn nif_send_hook(target: Term, message: Term) -> bool {
     let Some(scheduler) = hub.scheduler.upgrade() else {
         return false;
     };
-    let Ok(message) = Message::copy_from(message) else {
+    let message_term = message;
+    let Ok(message) = Message::copy_from(message_term) else {
         return false;
     };
     let sent = scheduler.send(hub.pid, pid, message).is_ok();
+    if sent {
+        crate::dirty::record_nif_send(target, message_term);
+    }
     if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
         eprintln!("resource_send from={:?} to={:?} sent={sent}", hub.pid, pid);
     }
