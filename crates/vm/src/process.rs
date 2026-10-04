@@ -103,6 +103,8 @@ pub struct Message {
     priority: bool,
     /// The VM timer id carried until delivery so expiry and cancellation release its message.
     timer_id: Option<u64>,
+    /// The port connected handshake traces receipt before unblocking the recipient.
+    receive_traced: bool,
 }
 
 struct MessageFragment {
@@ -431,6 +433,7 @@ impl Message {
                 fragment: None,
                 priority: false,
                 timer_id: None,
+                receive_traced: false,
             });
         }
         // Port of erts/emulator/beam/erl_message.c:824 (erts_send_message),
@@ -445,6 +448,7 @@ impl Message {
                 fragment: None,
                 priority: false,
                 timer_id: None,
+                receive_traced: false,
             });
         }
         let mut fragment =
@@ -459,6 +463,7 @@ impl Message {
             })),
             priority: false,
             timer_id: None,
+            receive_traced: false,
         })
     }
 
@@ -494,6 +499,7 @@ impl Message {
             })),
             priority: false,
             timer_id: None,
+            receive_traced: false,
         })
     }
 
@@ -516,6 +522,11 @@ impl Message {
     /// Mark this envelope for priority insertion at the receiver.
     pub(crate) fn with_priority(mut self) -> Self {
         self.priority = true;
+        self
+    }
+
+    pub(crate) fn with_receive_traced(mut self) -> Self {
+        self.receive_traced = true;
         self
     }
 
@@ -4365,6 +4376,14 @@ impl Process {
             .self_pid
             .ok_or_else(|| VmError::Unsupported("send requires a scheduled process".into()))?;
         if target.as_port().is_some() {
+            crate::trace::emit_process(
+                vm.as_deref_mut(),
+                self,
+                sender,
+                crate::trace::SEND,
+                "send",
+                &[value, target],
+            );
             crate::port::send_message(self, target, value)?;
             return Ok(value);
         }
@@ -4606,6 +4625,7 @@ impl Process {
             };
             match payload {
                 Payload::Message(message) => {
+                    let receive_traced = message.receive_traced;
                     let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
@@ -4620,7 +4640,8 @@ impl Process {
                     } else {
                         self.inbox.len().saturating_sub(1)
                     };
-                    if let Some(term) = self.inbox.get(trace_index).copied()
+                    if !receive_traced
+                        && let Some(term) = self.inbox.get(trace_index).copied()
                         && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
                     {
                         crate::trace::receive_event(None, self, ctx, term, Some(sender));

@@ -542,7 +542,10 @@ pub trait PortHost: Send + Sync {
         port: &DriverPort,
         to: Option<u64>,
         term: &arinsal_etf::OwnedTerm,
+        trace: bool,
     ) -> bool;
+    /// Trace `timeout` immediately before the driver callback runs.
+    fn trace_timeout(&self, _port: &DriverPort) {}
     /// Process-table data of the connected process (`ERTS_PORT_GET_CONNECTED`).
     fn connected(&self, port: &DriverPort) -> u64;
     /// Port of io.c:5203 (set_busy_port): `ERTS_PTS_FLG_BUSY_PORT`.
@@ -828,6 +831,19 @@ impl DriverPort {
         }
         self.clear_caller();
         true
+    }
+
+    /// Return the `outputv` segments represented by this output, when the driver uses `outputv`.
+    ///
+    /// Port of erts/emulator/beam/io.c:1380 and erl_trace.c:2172, OTP-29.1.1.
+    pub fn outputv_trace_segments(&self, pieces: &[IoPiece<'_>]) -> Option<Vec<Vec<u8>>> {
+        self.driver.callbacks.outputv?;
+        Some(
+            vec_segments(pieces)
+                .into_iter()
+                .map(|segment| segment.bytes)
+                .collect(),
+        )
     }
 
     fn call_outputv(&self, outputv: OutputvFn, pieces: &[IoPiece<'_>]) {

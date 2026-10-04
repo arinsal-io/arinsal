@@ -185,6 +185,7 @@ impl DriverPort {
         self.start_task();
         self.add_reds(REDS_TIMEOUT);
         if let Some(callback) = self.driver.callbacks.timeout {
+            self.host.trace_timeout(self);
             let started = std::time::Instant::now();
             call1(callback, self.data());
             self.host

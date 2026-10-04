@@ -149,7 +149,10 @@ impl DriverPort {
             },
             None => None,
         };
-        c_int::from(self.host.deliver_term(self, target, term))
+        c_int::from(
+            self.host
+                .deliver_term(self, target, term, self.caller_data().is_some()),
+        )
     }
 
     /// Port of io.c:7006 (do_driver_monitor_process): `-1` without a
