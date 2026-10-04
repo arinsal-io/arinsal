@@ -65,6 +65,8 @@ pub struct Process {
     pub(crate) gc_live: usize,
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
     pub(crate) max_heap_peak: usize,
+    /// A collection running only to make room for the native spill area, not for erts' need.
+    pub(crate) spill_only_gc: bool,
     pub(crate) reductions: i32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_enabled: bool,
@@ -97,8 +99,6 @@ pub struct Process {
     pub(crate) entry: bool,
     /// A dist send that suspended must yield even if the queue drains before return.
     pub(crate) force_yield: bool,
-    /// Native code sent a message since the scheduler last fetched the outer signal queue.
-    pub(crate) outer_unfetched: bool,
 }
 // SAFETY: ProcessHeader pointers refer only to this process's stable heap/code allocations.
 // The scheduler transfers exclusive ownership of each Process between workers.
@@ -176,10 +176,6 @@ pub(crate) struct ProcessCold {
     /// Static NIF identity, native return point and target scheduler class of a NIF call
     /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,
-    /// Erlang caller MFA kept while a native dirty NIF has no interpreter instruction pointer.
-    pub(crate) native_dirty_mfa: Option<(String, String, u8)>,
-    /// NIF `enif_send` trace events collected while a dirty shadow process ran.
-    pub(crate) dirty_nif_sends: Vec<(arinsal_etf::OwnedTerm, arinsal_etf::OwnedTerm)>,
     /// Return address and call site of the native call that `native_retry` redoes.
     pub(crate) native_retry_site: Option<(usize, usize)>,
     /// The interpreter returned only to hand control to `native_pc`; the slice continues.
@@ -430,6 +426,7 @@ impl Process {
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
+            spill_only_gc: false,
             reductions: 4000,
             reductions_used: 0,
             gc_enabled: true,
@@ -451,7 +448,6 @@ impl Process {
             exc_class: None,
             entry: false,
             force_yield: false,
-            outer_unfetched: false,
         };
         process.sync_header();
         #[cfg(feature = "pf-mem-counters")]
@@ -466,6 +462,16 @@ impl Process {
     }
     #[cold]
     #[inline(never)]
+    /// `ensure` for generated code's checked gap. The native spill area is our own scratch
+    /// space; erts has none, so a collection that exists only for it is not a real GC and
+    /// must not trip the max_heap_size kill (erl_gc.c:1197 judges real collections only).
+    pub(crate) fn ensure_for_native(&mut self, words: usize, live: usize) -> Result<(), VmError> {
+        let erts_need = words.saturating_sub(arinsal_term::NATIVE_SPILL_WORDS);
+        self.spill_only_gc = self.heap.free_words() >= erts_need && !self.heap.bin_vheap_gc_due();
+        let result = self.ensure(words, live);
+        self.spill_only_gc = false;
+        result
+    }
     pub(crate) fn ensure(&mut self, words: usize, live: usize) -> Result<(), VmError> {
         self.ensure_roots(words, live, true)
     }

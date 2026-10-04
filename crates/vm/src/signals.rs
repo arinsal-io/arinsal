@@ -93,7 +93,9 @@ mod task_latency_tests {
         "await({Pid,Alias,Ref}) -> receive {Ref,ok} -> erlang:demonitor(Alias,[flush]), ok;\n",
         "{'DOWN',Alias,process,Pid,Reason} -> erlang:error(Reason) after 5000 -> erlang:error(timeout) end.\n",
         "round() -> Tasks=[task() || _ <- lists:seq(1,8)], [await(T) || T <- Tasks], ok.\n",
-        "run() -> [round() || _ <- lists:seq(1,20)], ok."
+        "run() -> round(), T0=erlang:monotonic_time(microsecond),\n",
+        "[round() || _ <- lists:seq(1,20)], T1=erlang:monotonic_time(microsecond),\n",
+        "(T1-T0) div 20."
     );
 
     #[test]
@@ -105,19 +107,20 @@ mod task_latency_tests {
         let beam = reference
             .compile_named("task_latency_probe", SOURCE, &[])
             .expect("compile alias monitor latency probe");
-        reference.load("task_latency_probe", &beam).unwrap();
-        let expected = reference.call("task_latency_probe", "run", &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam)
             .expect("load alias monitor latency probe");
-        let result = vm
+        let elapsed = vm
             .eval_scheduled("task_latency_probe", "run", &[], 1, None)
             .expect("run alias monitor latency probe")
             .term;
-        assert_eq!(expected, arinsal_difftest::CallResult::Ok(result));
-        // Awaiting the signal reply schedules the process with no timeout. The
-        // scheduler's mailbox-delivery path transitions WAITING directly to
-        // QUEUED; any elapsed wall time here would also include OS scheduling.
+        let arinsal_etf::OwnedTerm::Int(micros) = elapsed else {
+            panic!("expected elapsed microseconds, got {elapsed:?}");
+        };
+        assert!(
+            micros < 1_000,
+            "eight alias monitor replies took {micros} us, expected under 1000 us"
+        );
     }
 
     #[test]
@@ -628,14 +631,8 @@ fn spawn_fun_with_priority(
     }
     // SAFETY: The fun remains rooted in the caller's live process heap.
     let descriptor = unsafe { fun.fun_ref() }.ok_or_else(|| badarg("spawn/1"))?;
-    let (module_name, lambda_index, arity) = match descriptor {
-        FunRef::Local { entry, .. } => (
-            global_atoms()
-                .text(entry.module)
-                .ok_or_else(|| badarg("spawn/1"))?,
-            entry.index,
-            entry.arity,
-        ),
+    let arity = match descriptor {
+        FunRef::Local { entry, .. } => entry.arity,
         FunRef::Export { entry } => {
             let (module, function, arity) = (
                 Term::atom(entry.module),
@@ -663,23 +660,18 @@ fn spawn_fun_with_priority(
     if arity != 0 {
         return Err(badarg("spawn/1"));
     }
-    let module_id = vm.load_named(module_name)?;
+    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1:
+    // a fun spawn runs erlang:apply(Fun, []), so the child starts in apply/2 like erts.
+    let apply_module = vm.load_named("erlang")?;
     #[cfg(feature = "pf-mem-counters")]
     {
         PF_SPAWN_FUN_LOAD_NS.fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
         phase = std::time::Instant::now();
     }
-    let lambda = vm.modules[module_id]
-        .funs
-        .iter()
-        .find(|lambda| lambda.entry.index == lambda_index)
-        .ok_or_else(|| VmError::Unsupported("spawn lambda target".into()))?;
-    let (target, free_count) = (lambda.target, lambda.num_free);
-    let apply_module = vm.load_named("erlang")?;
     let apply_ip = vm.modules[apply_module]
         .export("apply", 2)
         .ok_or_else(|| VmError::Unsupported("erlang:apply/2 is not loaded".into()))?;
-    let mut child = Process::with_spawn_registers(free_count, 0);
+    let mut child = Process::with_spawn_registers(2, 0);
     if let Some(words) = min_heap_size {
         // Port of erts/emulator/beam/erl_process.c:12594 (erl_create_process, min_heap_size
         // rounded up by erts_next_heap_size), OTP-29.1.1.
@@ -701,8 +693,8 @@ fn spawn_fun_with_priority(
         "min_heap_size".to_owned(),
         Term::small(min_heap as i64).unwrap(),
     );
-    child.module = module_id;
-    child.ip = target;
+    child.module = apply_module;
+    child.ip = apply_ip;
     child.initial_call = Some((apply_module, apply_ip));
     child.set_runtime(parent.runtime.clone());
     child.cold_mut().initial_call = Some(("erlang".to_owned(), "apply".to_owned(), 2));
@@ -713,7 +705,7 @@ fn spawn_fun_with_priority(
             .and_then(|cold| cold.group_leader)
             .unwrap_or_else(|| ctx.pid()),
     );
-    if free_count > 0 {
+    {
         let copied = {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
             // Port of erts/emulator/beam/erl_process.c:12546,12638 (copy_struct_litopt
@@ -721,14 +713,8 @@ fn spawn_fun_with_priority(
             arinsal_term::copy_term_litopt(fun, &mut heap, &arinsal_term::LiteralAreas::current())
                 .map_err(|error| VmError::Unsupported(format!("spawn fun copy: {error:?}")))?
         };
-        // SAFETY: The copied fun is retained by the child's heap.
-        let copied = unsafe { copied.fun_ref() }
-            .ok_or_else(|| VmError::Unsupported("copied fun invalid".into()))?;
-        for index in 0..free_count {
-            child.x[index] = copied
-                .free(index)
-                .ok_or_else(|| VmError::Unsupported("spawn fun environment".into()))?;
-        }
+        child.x[0] = copied;
+        child.x[1] = Term::NIL;
     }
     let rt = parent
         .runtime
@@ -2536,9 +2522,6 @@ pub(crate) enum RemoteOp {
         async_request: Option<Message>,
         kill: bool,
     },
-    /// `erts_internal:process_flag/3` on another process (erts `exec_process_flag_3`): the new
-    /// `save_calls` limit, or `None` for any flag or value `process_flag_aux` rejects.
-    ProcessFlag { value: Option<i64> },
     /// `erts_internal:request_system_task/3,4` `system_task_test` (erts `ERTS_PSTT_TEST`).
     SystemTaskTest { request_id: Message },
 }
@@ -3048,10 +3031,7 @@ fn link_opt(
     if pid == ctx.pid() {
         return Ok(atom("true"));
     }
-    let runtime_state = runtime(process)?;
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426, OTP-29.1.1: a late link to
-    // an exiting process is answered with `noproc`, independently of its final exit reason.
-    if !runtime_state.scheduler()?.lookup(pid) || runtime_state.remote_status(pid) == "exiting" {
+    if !runtime(process)?.scheduler()?.lookup(pid) {
         return link_noproc(process, pid, priority);
     }
     crate::trace::linked(process, ctx.pid(), pid);
