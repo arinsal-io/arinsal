@@ -35,6 +35,8 @@ pub type SelectHook = fn(SelectRequest) -> i32;
 pub type WhereisPortHook = fn(Term) -> Option<Term>;
 /// Whether a port term denotes a live local port.
 pub type PortAliveHook = fn(Term) -> bool;
+/// Whether a local process term still names a live process.
+pub type ProcessAliveHook = fn(Term) -> bool;
 /// `enif_port_command`: sender pid, port, data.
 pub type PortCommandHook = fn(Option<Term>, Term, Term) -> bool;
 /// Resource process monitor registration callback.
@@ -53,6 +55,8 @@ pub struct VmHooks {
     pub whereis_port: Option<WhereisPortHook>,
     /// Whether a port is alive.
     pub port_alive: Option<PortAliveHook>,
+    /// Whether a local process is alive.
+    pub process_alive: Option<ProcessAliveHook>,
     /// Send a command to a port.
     pub port_command: Option<PortCommandHook>,
     /// Register a process monitor for a native resource.
@@ -129,7 +133,7 @@ pub extern "C" fn enif_clear_env(e: *mut ErlNifEnv) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_send(
-    _: *mut ErlNifEnv,
+    e: *mut ErlNifEnv,
     pid: *const Term,
     _msg_env: *mut ErlNifEnv,
     msg: Term,
@@ -137,6 +141,17 @@ pub extern "C" fn enif_send(
     if pid.is_null() {
         return 0;
     };
+    // Port of erts/emulator/beam/erl_nif.c:883-886 (enif_send), OTP-29.1.1: only a process
+    // environment (`c_p`) fails once its process exits; a NULL env is a plain thread.
+    if !e.is_null() && env_pid(e).is_some() {
+        let exiting = hooks()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .current_process_exiting;
+        if exiting.is_some_and(|exiting| exiting()) {
+            return 0;
+        }
+    }
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
     let to = load(pid);
     if to.as_pid().is_none() {
