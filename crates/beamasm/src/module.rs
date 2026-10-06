@@ -170,6 +170,7 @@ pub struct BeamModuleAssembler {
 pub const FUNC_INFO_BYTES: usize = 4;
 /// `tmp_mem[6]`: the native pc an exception is attributed to.
 const NATIVE_ERROR_PC_SLOT: u32 = 16_432;
+const TRAP_RETURN_SLOT: u32 = crate::TRAP_RETURN_OFFSET as u32;
 /// Low bit of a recorded native error pc that is a call's return address (code is 4-aligned).
 pub const RETURN_SITE_TAG: usize = 1;
 
@@ -388,8 +389,11 @@ impl BeamModuleAssembler {
         // events and resumes after this call with every argument register intact.
         // The helper identifies the traced function by the trampoline's continuation address
         // (x2), so a breakpoint with nothing to do for this process resumes natively.
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
+        // The executor resumes behind this call itself: no trap return.
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(13), identity as u64)?;
+            e.str_uoff(Gpr::xzr(), SCHEDULER_REGS, TRAP_RETURN_SLOT)
+        })?;
         self.code.adr(Gpr::x(14), next)?;
         self.emit_runtime_fragment(fragment, &[Gpr::x(13), Gpr::x(14)])?;
         self.code.bind(next)?;
@@ -447,7 +451,16 @@ impl BeamModuleAssembler {
                 crate::dispatch::line_breakpoint_identity(line, live) as u64,
             )
         })?;
-        let resume = self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:312-318
+        // (i_line_breakpoint_cleanup), OTP-29.1.1: `erts_internal:breakpoint/4` returns to
+        // the cleanup below, which needs nothing but the spilled registers on E.
+        let cleanup = self.code.new_label();
+        self.code.adr(Gpr::x(9), cleanup)?;
+        self.code
+            .emit(|e| e.str_uoff(Gpr::x(9), SCHEDULER_REGS, TRAP_RETURN_SLOT))?;
+        self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
+        let resume = self.code.offset();
+        self.code.bind(cleanup)?;
         // Resumed here with the spilled registers on top of the stack.
         for index in 0..u32::from(live) {
             let offset = index * 8;
@@ -659,10 +672,16 @@ impl BeamModuleAssembler {
         self.code.adr(Gpr::x(9), call)?;
         self.code
             .emit(|e| e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
+        let done = self.code.new_label();
+        self.code.adr(Gpr::x(9), done)?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, TRAP_RETURN_SLOT)?;
+            e.mov_const(Gpr::x(13), identity as u64)
+        })?;
         self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
         self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
+        // A trapping BIF's target returns here with its result in XREG0.
+        self.code.bind(done)?;
         Ok(())
     }
 
@@ -677,8 +696,12 @@ impl BeamModuleAssembler {
         self.emit_yield_live(2)?;
         self.code.b(self.yield_label)?;
         self.code.bind(call)?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
+        let done = self.code.new_label();
+        self.code.adr(Gpr::x(9), done)?;
+        self.code.emit(|e| {
+            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, TRAP_RETURN_SLOT)?;
+            e.mov_const(Gpr::x(13), identity as u64)
+        })?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), Gpr::x(13))?;
@@ -688,6 +711,8 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.ldr_uoff(Gpr::x(9), C_P, 40))?;
         self.error_if_nonzero(Gpr::x(9))?;
         self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
+        // A trapping send's target returns here with its result in XREG0.
+        self.code.bind(done)?;
         Ok(())
     }
 
@@ -756,20 +781,6 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    fn emit_redundant_bridge_cp_pop(&mut self) -> Result<(), ModuleError> {
-        let keep = self.code.new_label();
-        let bridge = arinsal_enter_native_return as *const () as u64;
-        self.code.emit(|e| {
-            e.ldr_uoff(Gpr::x(9), E, 0)?;
-            e.mov_const(Gpr::x(10), bridge)?;
-            e.cmp_reg(Gpr::x(9), Gpr::x(10), arinsal_a64::enc::Shift::Lsl, 0)
-        })?;
-        self.code.b_cond(Cond::Ne, keep)?;
-        self.code.emit(|e| e.add_imm(E, E, 8, false))?;
-        self.code.bind(keep)?;
-        Ok(())
-    }
-
     fn call_unported(&mut self, target_pc: usize) -> Result<(), ModuleError> {
         let continuation = self.code.new_label();
         self.code.emit(|e| {
@@ -794,7 +805,6 @@ impl BeamModuleAssembler {
             e.ret(Gpr::x(30))
         })?;
         self.code.bind(continuation)?;
-        self.emit_redundant_bridge_cp_pop()?;
         Ok(())
     }
 

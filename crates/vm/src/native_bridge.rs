@@ -256,6 +256,12 @@ fn register_bridge_continuation() -> Result<(), &'static str> {
     })
 }
 
+/// The native exit bridge: the return address of a call without a native caller, erts'
+/// `beam_normal_exit`.
+pub(crate) fn bridge_return_address() -> usize {
+    arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize
+}
+
 pub(crate) fn native_trace_return_address() -> usize {
     arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize
 }
@@ -548,22 +554,20 @@ pub fn run_native(
     };
     process.ensure(1 + arinsal_term::S_RESERVED, live)?;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    if !resuming_continuation && !process.heap.reserve_stack(1) {
-        return Err(VmError::Unsupported(
-            "native bridge continuation stack is full".into(),
-        ));
-    }
-    if !resuming_continuation {
-        // This reserved bridge CP stays beneath the native frame CP. Tail calls
-        // through the export trampoline add their interpreter-return CP above it.
-        let bridge_cp = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
-        if !process
-            .heap
-            .stack_set(0, native_continuation_term(bridge_cp))
-        {
-            return Err(VmError::Unsupported(
-                "native bridge continuation stack update failed".into(),
-            ));
+    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),
+    // OTP-29.1.1: a call the scheduler performs for native code (fun/apply, BIF traps,
+    // breakpoint handlers) pops the caller's continuation into LR, so the callee's frame
+    // holds that one CP. With no native caller (a new process) LR is the exit bridge,
+    // erts' `beam_normal_exit`.
+    registers.entry_return = 0;
+    if !resuming_continuation
+        && native_function_at(code_address).is_some_and(|function| function.start == code_address)
+        && let Some(word) = process.heap.stack_get(0)
+    {
+        let raw = word.tagged_word() as usize;
+        if raw == bridge_return_address() || is_native_continuation(raw) {
+            process.heap.release_stack(1);
+            registers.entry_return = raw as u64;
         }
     }
     let code_ptr = code_address as *const std::ffi::c_void;
@@ -829,8 +833,9 @@ pub fn run_native(
             let bridge_return =
                 arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
             if resume == bridge_return {
-                // The native function has returned into the bridge. Let the normal
-                // return path pop this bridge CP and continue its interpreter caller.
+                // The native function has returned into the exit bridge: the normal
+                // return path continues with what lies below (an interpreter caller,
+                // or nothing when the process is done).
                 process.native_pc = None;
                 ExitReason::Returned
             } else {

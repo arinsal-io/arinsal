@@ -87,11 +87,31 @@ pub struct SchedulerRegisters {
     /// the node's active code index, or `ERTS_SAVE_CALLS_CODE_IX` for a process saving calls.
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:236-247, OTP-29.1.1.
     pub active_code_ix: u64,
+    /// Return address the next native entry starts with in `x30`; zero means the exit
+    /// bridge. The entry trampoline consumes it.
+    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only), OTP-29.1.1:
+    // a call entered from the scheduler gets its caller's continuation in LR, like any other
+    // call, so the callee's frame holds that one CP.
+    pub entry_return: u64,
+    /// Return address a trapping BIF call site leaves for the shared helper fragment: the
+    /// point after the call where XREG0 holds the result, as after any Erlang call. The trap
+    /// target returns there directly, so it is the address the fragment pushes as CP.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1: erts pushes the
+    // call site's return address, behind which the BIF result is in XREG0.
+    pub trap_return: u64,
 }
 
 /// Offset of `SchedulerRegisters::active_code_ix`, read by the native entry trampoline.
 pub const ACTIVE_CODE_IX_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, active_code_ix);
 const _: () = assert!(ACTIVE_CODE_IX_OFFSET == 16480);
+
+/// Offset of `SchedulerRegisters::entry_return`, read by the native entry trampoline.
+pub const ENTRY_RETURN_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, entry_return);
+const _: () = assert!(ENTRY_RETURN_OFFSET == 16488);
+
+/// Offset of `SchedulerRegisters::trap_return`, read by the shared helper fragment.
+pub const TRAP_RETURN_OFFSET: usize = std::mem::offset_of!(SchedulerRegisters, trap_return);
+const _: () = assert!(TRAP_RETURN_OFFSET == 16496);
 
 impl Default for SchedulerRegisters {
     fn default() -> Self {
@@ -101,6 +121,8 @@ impl Default for SchedulerRegisters {
             tmp_mem: [0; 8],
             match_staging: [0; 4],
             active_code_ix: 0,
+            entry_return: 0,
+            trap_return: 0,
         }
     }
 }

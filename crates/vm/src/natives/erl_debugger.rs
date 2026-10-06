@@ -542,15 +542,15 @@ fn inspect_frames(
     let mut current_is_return = false;
     let mut slots = Vec::new();
     let mut stack_index = 0;
+    // The bottom frame's return address is the exit bridge (erts' `beam_normal_exit`) once the
+    // process runs; a process that has not run yet has an empty stack.
+    let mut reached_exit = false;
     while let Some(word) = process.heap.stack_get(stack_index) {
         stack_index += 1;
         let raw = word.tagged_word() as usize;
-        // The interpreter-to-native bridge return address has no erts counterpart: the
-        // continuation that follows it is the frame's CP.
-        if raw == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize {
-            continue;
-        }
-        if crate::native_bridge::is_native_function_at(raw) {
+        let normal_exit = raw == crate::native_bridge::bridge_return_address();
+        reached_exit |= normal_exit;
+        if normal_exit || crate::native_bridge::is_native_function_at(raw) {
             push_frame(&mut frames, modules, current, &slots, current_is_return);
             slots.clear();
             current = FramePc::Native(raw);
@@ -584,6 +584,10 @@ fn inspect_frames(
         }
     }
     push_frame(&mut frames, modules, current, &slots, current_is_return);
+    if reached_exit {
+        renumber_frames(&mut frames);
+        return frames;
+    }
     frames.push(O::Tuple(vec![
         O::Int(-1),
         O::Atom("<terminate process normally>".into()),
@@ -598,18 +602,28 @@ fn inspect_frames(
             ),
         ]),
     ]));
+    renumber_frames(&mut frames);
+    frames
+}
+
+/// erts numbers frames from the bottom of the stack.
+fn renumber_frames(frames: &mut [O]) {
     let frame_count = frames.len();
     for (position, frame) in frames.iter_mut().enumerate() {
         if let O::Tuple(fields) = frame {
             fields[0] = O::Int((frame_count - position - 1) as i64);
         }
     }
-    frames
 }
 
 /// Function info of a native pc; a return address is moved back into its call instruction.
 // Port of erts/emulator/beam/erl_debugger.c:660-716 (stack_frame_fun_info), OTP-29.1.1.
 fn function_info_native(address: usize, is_return_address: bool) -> O {
+    if address == crate::native_bridge::bridge_return_address() {
+        // Port of erts/emulator/beam/erl_process.c:14938-14953
+        // (erts_internal_fun_description_from_pc), OTP-29.1.1.
+        return O::Atom("<terminate process normally>".into());
+    }
     if is_return_address && crate::beamasm_integration::is_line_breakpoint_return(address) {
         // erts: the return address lies in the shared trampoline, which has no MFA.
         return O::Atom("<breakpoint>".into());

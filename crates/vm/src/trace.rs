@@ -2227,13 +2227,14 @@ fn special_frames(
     skip_frame: bool,
 ) -> Vec<SpecialFrame> {
     let trace_stub = crate::native_bridge::native_trace_return_address();
-    let bridge = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
+    let bridge = crate::native_bridge::bridge_return_address();
     let mut frames = Vec::new();
     let mut index = 0;
     if skip_frame {
         // Skip the Y registers up to the frame's own return address.
         while let Some(word) = process.heap.stack_get(index) {
             if word.tagged_word() as usize == trace_stub
+                || word.tagged_word() as usize == bridge
                 || matches!(crate::stacktrace::decode_tag(word), Some((false, _, _)))
                 || crate::native_bridge::is_native_function_at(word.tagged_word() as usize)
             {
@@ -2245,11 +2246,6 @@ fn special_frames(
     while let Some(word) = process.heap.stack_get(index) {
         if first_only && !frames.is_empty() {
             break;
-        }
-        if word.tagged_word() as usize == bridge {
-            // The bridge from native code into the interpreter is no real return address.
-            index += 1;
-            continue;
         }
         if word.tagged_word() as usize == trace_stub {
             let (_, actions, words) = native_frame_actions(process, index + 2);

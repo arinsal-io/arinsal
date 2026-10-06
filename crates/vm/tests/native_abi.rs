@@ -514,6 +514,10 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
     // SAFETY: The value is the registered raw CP just pushed above.
     let continuation = unsafe { process.heap.stack_get(0).unwrap().raw_bits() };
     assert_eq!(continuation, entry as u64);
+    // A native CP on top of the stack is the continuation a scheduler-made call returns to
+    // (erts' i_apply_only pops it into LR); entered without one, the function returns to
+    // the exit bridge.
+    assert!(process.heap.release_stack(1));
 
     let mut registers = SchedulerRegisters::default();
     let exit = run_native(&mut process, &mut registers, entry).unwrap();

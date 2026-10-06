@@ -1,8 +1,7 @@
 //! Raw stacktraces at every `backtrace_depth` must hold the same frames as erts when
 //! code runs under `erl_eval`, `apply/3`, funs, tail calls and spawned processes.
-//! Under BeamAsm, an interpreter-to-native call leaves a bridge CP above the caller's
-//! real continuation; counting it against `max_depth` (beam_common.c:883, OTP-29.1.1)
-//! lost one frame per bridge at each limited depth.
+//! Each frame holds exactly one CP, so every continuation counts once against `max_depth`
+//! (beam_common.c:883, OTP-29.1.1).
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

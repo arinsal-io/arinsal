@@ -648,8 +648,8 @@ impl Vm {
         tail: bool,
     ) -> Result<ImportOutcome, VmError> {
         if !tail {
-            // Native exports use this interpreter CP after run_native removes
-            // its bridge CP and copies XREG0 back to the process register file.
+            // A native export returns to the exit bridge, which resumes this
+            // interpreter CP with XREG0 copied back to the process register file.
             calls::push_continuation(p, p.module, p.ip + 1, arity)?;
         }
         p.module = module;
