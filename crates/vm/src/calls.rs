@@ -831,6 +831,26 @@ impl Vm {
                 arity,
                 (class, native_bits),
             ) {
+                let result = match result {
+                    Err(VmError::Trap(mut trap))
+                        if trap.class == arinsal_bifs::Class::Error
+                            && trap.top.is_none()
+                            && trap.trace.is_none()
+                            && !(module_name == "erlang" && function_name == "error") =>
+                    {
+                        // Port of erts/emulator/beam/beam_common.c:880-930 (save_stacktrace),
+                        // OTP-29.1.1. The BIF error path reaches it from BIF_ERROR, including
+                        // erts_debug:set_internal_state_2 in erl_bif_info.c:5036.
+                        trap.top = Some(crate::stacktrace::TopFrame::Bif {
+                            module: import.module_atom,
+                            function: import.function_atom,
+                            args: crate::stacktrace::BifArgs::from_terms(&p.x[..arity])?,
+                            info: crate::stacktrace::BifErrorInfo::Plain,
+                        });
+                        Err(VmError::Trap(trap))
+                    }
+                    other => other,
+                };
                 if let Some((module, function, args)) = traced {
                     self.trace_native_return(p, run, &module, &function, &args, &result);
                 }
