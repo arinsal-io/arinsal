@@ -69,11 +69,11 @@ use arinsal_term::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 pub(crate) use calls::ImportOutcome;
 pub(crate) use interp::{RunState, gc_stress_enabled};
-pub(crate) use load::{CodeMeta, ExportIndex, SharedCode, SharedTable};
+pub(crate) use load::{CodeMeta, CodeTables};
 pub(crate) use native_bridge::native_function_for;
 pub use native_bridge::{
     NativeFunction, NativeLine, arinsal_native_raise, native_function_at, register_native_function,
@@ -120,13 +120,15 @@ mod boot_loop1_shared_tests {
             )
             .unwrap();
         let parsed = arinsal_beam::parse(&beam).unwrap();
-        let shared = Arc::new(Mutex::new(SharedCode::blank()));
-        let mut first = Vm::shared_replica(Arc::clone(&shared), &[]);
-        let mut second = Vm::shared_replica(Arc::clone(&shared), &[]);
+        let scope = beamasm_integration::new_code_scope();
+        let mut first = Vm::shared_replica(scope, &[]);
+        let mut second = Vm::shared_replica(scope, &[]);
         let id = first.load_beam(&parsed).unwrap();
         second.sync_module(id);
-        assert_eq!(second.modules[id].name, "boot_loop1_shared");
-        assert_eq!(shared.lock().unwrap().modules.len(), id + 1);
+        assert_eq!(second.code.modules[id].name, "boot_loop1_shared");
+        assert_eq!(first.code_ix.active_tables().modules.len(), id + 1);
+        drop((first, second));
+        beamasm_integration::release_code_scope(scope);
     }
 }
 
@@ -207,36 +209,20 @@ pub struct Vm {
     paths: Vec<PathBuf>,
     pub(crate) statistics_origins: crate::natives::sys::StatisticsOrigins,
     pub(crate) otp_root: Option<PathBuf>,
-    pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
-    loaded: SharedTable<HashMap<String, usize>>,
-    old: SharedTable<HashMap<String, usize>>,
-    pending_on_load: SharedTable<HashMap<String, usize>>,
+    /// The code tables of `erts_active_code_ix()` this VM reads (see [`Vm::refresh_code`]).
+    pub(crate) code: Arc<CodeTables>,
+    /// Cache of the node's append-only NIF body table.
+    native_fns: Arc<Vec<arinsal_bifs::BifFn>>,
     purge_state: Arc<crate::natives::code::PurgeState>,
-    deleted: SharedTable<std::collections::HashSet<String>>,
-    code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
-    code_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
-    seen_epoch: u64,
     beamasm_targets: beamasm_integration::NativeTargetCache,
     /// Identity of this node's code (erts' code index state); native registries are per scope.
     pub(crate) code_scope: u64,
-    /// Code indexes of this node (`code_ix.c`).
+    /// Code indexes and per-index code tables of this node (`code_ix.c`).
     pub(crate) code_ix: Arc<crate::code_ix::CodeIndexes>,
-    registers: SharedTable<Vec<(usize, usize)>>,
-    native_fns: SharedTable<Vec<arinsal_bifs::BifFn>>,
-    loaded_nifs: SharedTable<std::collections::HashSet<String>>,
-    shared: Option<Arc<Mutex<SharedCode>>>,
+    /// A scheduler's VM; the node's own VM owns the code scope.
+    replica: bool,
     // ---- vm_exc ----
     backtrace_depth: usize,
-    // g_code_fix: global export index, reclaimable module slots, code-server filenames.
-    exports: SharedTable<ExportIndex>,
-    free_ids: SharedTable<Vec<usize>>,
-    module_live: SharedTable<Vec<bool>>,
-    module_files: SharedTable<HashMap<String, arinsal_etf::OwnedTerm>>,
-    condemned: SharedTable<Vec<usize>>,
-    // g_code_fix: a module entry survives purge, so later delete_module stays true.
-    known_modules: SharedTable<HashSet<String>>,
-    // Mode applies to modules loaded after code:set_coverage_mode/1.
-    pub(crate) coverage_mode: arinsal_loader::CoverageMode,
 }
 
 #[test]
@@ -310,7 +296,7 @@ impl Drop for Vm {
     fn drop(&mut self) {
         beamasm_integration::print_stats();
         // Scheduler replicas share their node's scope; the node's own VM owns it.
-        if self.shared.is_none() {
+        if !self.replica {
             beamasm_integration::release_code_scope(self.code_scope);
         }
     }

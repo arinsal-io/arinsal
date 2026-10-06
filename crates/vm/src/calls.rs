@@ -289,6 +289,7 @@ impl Vm {
         let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
         if crate::trace::saves_calls(p)
             && let Some(import) = self
+                .code
                 .modules
                 .get(module_id)
                 .and_then(|module| module.imports.get(import))
@@ -306,6 +307,7 @@ impl Vm {
             return untraced(p);
         }
         let Some(entry) = self
+            .code
             .modules
             .get(module_id)
             .and_then(|module| module.imports.get(import))
@@ -400,7 +402,7 @@ impl Vm {
         if !crate::trace_bp::any_pattern() {
             return None;
         }
-        let entry = self.modules.get(caller_module)?.imports.get(import)?;
+        let entry = self.code.modules.get(caller_module)?.imports.get(import)?;
         let (module, function) = (entry.module.clone(), entry.function.clone());
         self.trace_native_call_named(
             p,
@@ -541,6 +543,7 @@ impl Vm {
     }
     pub(crate) fn import_class(&self, module: usize, index: usize) -> Result<ImportClass, VmError> {
         let import = self
+            .code
             .modules
             .get(module)
             .and_then(|module| module.imports.get(index))
@@ -563,18 +566,18 @@ impl Vm {
             }
             import.set_class(class);
         }
-        Ok(self.modules[module].imports[index].class())
+        Ok(self.code.modules[module].imports[index].class())
     }
-    /// Return the import's cached code destination for the current code epoch.
+    /// Return the import's cached code destination for the current code tables generation.
     // Port of erts/emulator/beam/emu/macros.tab:175-185, OTP-29.1.1.
     pub(crate) fn cached_import_jump(
         &self,
         caller: usize,
         index: usize,
     ) -> Option<(usize, usize, *const Instr)> {
-        let import = self.modules.get(caller)?.imports.get(index)?;
-        let (id, epoch, target, code) = import.resolved()?;
-        if epoch != self.seen_epoch || code.is_null() {
+        let import = self.code.modules.get(caller)?.imports.get(index)?;
+        let (id, generation, target, code) = import.resolved()?;
+        if generation != self.code_generation() || code.is_null() {
             return None;
         }
         Some((id, target, code))
@@ -582,7 +585,7 @@ impl Vm {
     /// Pure BIF or static NIF bound into this import slot.
     #[inline(always)]
     pub(crate) fn pure_bif(&self, module: usize, index: usize) -> Option<arinsal_bifs::BifFn> {
-        let import = self.modules.get(module)?.imports.get(index)?;
+        let import = self.code.modules.get(module)?.imports.get(index)?;
         if import.class() != ImportClass::Pure {
             return None;
         }
@@ -598,7 +601,7 @@ impl Vm {
         error: arinsal_bifs::BifError,
     ) -> VmError {
         let args = p.x[..arity].to_vec();
-        let import = &self.modules[module].imports[index];
+        let import = &self.code.modules[module].imports[index];
         exceptions::bif_error_with_atoms(
             p,
             &import.module,
@@ -618,6 +621,7 @@ impl Vm {
         arity: u8,
     ) {
         let Some(export) = self
+            .code
             .modules
             .get(target_module)
             .and_then(|module| module.export_slot(function, arity))
@@ -627,7 +631,11 @@ impl Vm {
         // SAFETY: `export` points at an `ExportSlot` inside this VM's module
         // table. The slot stays allocated for the life of that module entry.
         unsafe {
-            self.modules[caller].imports[index].resolve(target_module, self.seen_epoch, export);
+            self.code.modules[caller].imports[index].resolve(
+                target_module,
+                self.code_generation(),
+                export,
+            );
         }
     }
     pub(crate) fn jump_import(
@@ -694,7 +702,7 @@ impl Vm {
             Ok(value) => value,
             Err(error) => {
                 let args = p.x[..arity].to_vec();
-                let import = &self.modules[p.module].imports[index];
+                let import = &self.code.modules[p.module].imports[index];
                 return Err(exceptions::bif_error_with_atoms(
                     p,
                     &import.module,
@@ -731,7 +739,7 @@ impl Vm {
     ) -> Result<ImportOutcome, VmError> {
         p.gc_live = arity;
         if crate::trace::saves_calls(p)
-            && let Some(import) = self.modules[p.module].imports.get(index)
+            && let Some(import) = self.code.modules[p.module].imports.get(index)
         {
             crate::trace::save_call(
                 p,
@@ -768,7 +776,7 @@ impl Vm {
         // Pure BIF: one tag load and one indirect call. No name copy, no
         // argument Vec, no family scan. Code reload does not retarget a BIF.
         if class == ImportClass::Pure {
-            let bif = self.modules[p.module].imports[index]
+            let bif = self.code.modules[p.module].imports[index]
                 .bif_fn()
                 .ok_or_else(|| VmError::Unsupported("pure BIF".into()))?;
             return self.finish_bif(p, index, arity, tail, bif, ctx);
@@ -786,7 +794,7 @@ impl Vm {
         mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
         class: ImportClass,
     ) -> Result<ImportOutcome, VmError> {
-        self.sync_code_epoch();
+        self.refresh_code();
         if class == ImportClass::Remote
             && let Some((module, ip, code)) = self.cached_import_jump(p.module, index)
         {
@@ -795,7 +803,8 @@ impl Vm {
         // The caller's module stays alive for this call, so the MFA strings
         // are borrowed. A reload of some other module cannot free them.
         let caller_module = Arc::clone(
-            self.modules
+            self.code
+                .modules
                 .get(p.module)
                 .ok_or_else(|| VmError::Unsupported(format!("import {index}")))?,
         );
@@ -867,6 +876,7 @@ impl Vm {
                         calls::push_continuation(p, caller_module_id, caller_ip + 1, arity)?;
                     }
                     let target = self
+                        .code
                         .modules
                         .get(p.module)
                         .and_then(|module| module.code.get(p.ip))
@@ -907,14 +917,14 @@ impl Vm {
                 module_name, function_name, import_arity
             )));
         }
-        if let Some(&target_module) = self.loaded.get(module_name)
-            && self.modules[target_module]
+        if let Some(&target_module) = self.code.loaded.get(module_name)
+            && self.code.modules[target_module]
                 .export_slot(function_name, import_arity)
                 .is_some()
         {
             self.remember_export(p.module, index, target_module, function_name, import_arity);
             let (ip, code) = {
-                let slot = self.modules[target_module]
+                let slot = self.code.modules[target_module]
                     .export_slot(function_name, import_arity)
                     .ok_or_else(|| VmError::Exception {
                         reason: "undef".into(),
@@ -924,7 +934,7 @@ impl Vm {
             };
             return self.jump_import(p, target_module, ip, code, arity, tail);
         }
-        if self.pending_on_load.contains_key(module_name) {
+        if self.code.pending_on_load.contains_key(module_name) {
             return Err(VmError::Trap(exceptions::Trap::error(signals::atom(
                 "undef",
             ))));
@@ -932,7 +942,7 @@ impl Vm {
         // mix_loop3: `code:delete` drops the current version. The next call
         // goes through `error_handler`, which `code:ensure_loaded`s the beam
         // now first on the path (protocol consolidation).
-        if self.deleted.contains(module_name) {
+        if self.code.deleted.contains(module_name) {
             if self.should_autoload(p, module_name) {
                 return self.call_undefined_function(
                     p,
@@ -972,7 +982,7 @@ impl Vm {
             }
             Err(error) => return Err(error),
         };
-        if self.modules[target_module]
+        if self.code.modules[target_module]
             .export_slot(function_name, import_arity)
             .is_none()
         {
@@ -994,7 +1004,7 @@ impl Vm {
         }
         self.remember_export(p.module, index, target_module, function_name, import_arity);
         let (ip, code) = {
-            let slot = self.modules[target_module]
+            let slot = self.code.modules[target_module]
                 .export_slot(function_name, import_arity)
                 .ok_or_else(|| VmError::Exception {
                     reason: "undef".into(),

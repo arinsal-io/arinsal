@@ -1083,7 +1083,7 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         return Ok((function.module, function.function, function.arity));
     }
     if let Some(vm) = vm {
-        let module = vm.modules.get(process.module).ok_or_else(badarg)?;
+        let module = vm.code.modules.get(process.module).ok_or_else(badarg)?;
         let (function, arity) = module.function_at(process.ip).unwrap_or(("undefined", 0));
         return Ok((module.name.clone(), function.to_owned(), arity));
     }
@@ -1135,7 +1135,7 @@ fn backtrace_text(
         return Ok(Vec::new());
     }
     match vm {
-        Some(vm) => Ok(backtrace_with(&vm.modules, process, running)),
+        Some(vm) => Ok(backtrace_with(&vm.code.modules, process, running)),
         None => {
             let runtime = process.runtime.clone().ok_or_else(badarg)?;
             Ok(runtime.with_modules(|modules| backtrace_with(modules, process, running)))
@@ -1254,7 +1254,7 @@ fn backtrace_with(
 fn current_stacktrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, VmError> {
     let depth = vm.map(|vm| vm.backtrace_depth).unwrap_or(8);
     if let Some(vm) = vm {
-        return crate::stacktrace::build(&vm.modules, process, None, depth);
+        return crate::stacktrace::build(&vm.code.modules, process, None, depth);
     }
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     runtime.with_modules(|modules| crate::stacktrace::build(modules, process, None, depth))
@@ -2945,7 +2945,7 @@ fn trace(
     flags: Term,
 ) -> Result<Term, VmError> {
     // A tracer module may have been loaded by another scheduler just now.
-    vm.sync_code_epoch();
+    vm.refresh_code();
     let on = if how == atom("true") {
         true
     } else if how == atom("false") {
@@ -3240,9 +3240,10 @@ fn module_tracer(vm: &Vm, module: Term, state: Term) -> Result<crate::trace::Tra
     }
     let state = arinsal_term::to_owned(state).map_err(|_| badarg())?;
     let instance = vm
+        .code
         .loaded
         .get(&module)
-        .and_then(|&id| vm.modules.get(id))
+        .and_then(|&id| vm.code.modules.get(id))
         .cloned()
         .ok_or_else(badarg)?;
     Ok(crate::trace::Tracer::Module {
@@ -3897,11 +3898,12 @@ fn trace_info_function(
 /// Count the functions of the current code of the selected modules.
 // Port of erts/emulator/beam/erl_bif_trace.c:1594-1640 (erts_set_trace_pattern), OTP-29.1.1.
 fn matched_functions(vm: &Vm, module: &str, function: &str, arity: Option<u8>) -> usize {
-    vm.modules
+    vm.code
+        .modules
         .iter()
         .enumerate()
         .filter(|(id, loaded)| {
-            (module == "_" || loaded.name == module) && vm.loaded.get(&loaded.name) == Some(id)
+            (module == "_" || loaded.name == module) && vm.code.loaded.get(&loaded.name) == Some(id)
         })
         .flat_map(|(_, loaded)| loaded.functions.iter())
         .filter(|(_, name, n)| {
@@ -4053,7 +4055,7 @@ fn trace_pattern(
     flags: Term,
 ) -> Result<Term, VmError> {
     // Patch the current code of every module, including loads this scheduler's VM has not seen.
-    vm.sync_code_epoch();
+    vm.refresh_code();
     if let Some(event) = atom_name(spec)
         && matches!(event.as_str(), "send" | "receive")
     {
@@ -4240,11 +4242,12 @@ pub(crate) fn bp_functions(
     function: &str,
     arity: Option<u8>,
 ) -> Vec<crate::trace_bp::BpFunction> {
-    vm.modules
+    vm.code
+        .modules
         .iter()
         .enumerate()
         .filter(|(id, loaded)| {
-            (module == "_" || loaded.name == module) && vm.loaded.get(&loaded.name) == Some(id)
+            (module == "_" || loaded.name == module) && vm.code.loaded.get(&loaded.name) == Some(id)
         })
         .flat_map(|(_, loaded)| {
             loaded
@@ -4379,8 +4382,8 @@ fn fun_info_mfa(vm: &Vm, process: &mut Process, fun: Term) -> Result<Term, VmErr
                 .text(entry.module)
                 .ok_or_else(badarg)?
                 .to_string();
-            let function = vm.loaded.get(&module_name).and_then(|&id| {
-                vm.modules[id]
+            let function = vm.code.loaded.get(&module_name).and_then(|&id| {
+                vm.code.modules[id]
                     .funs
                     .iter()
                     .find(|slot| slot.entry.index == entry.index)
@@ -4388,7 +4391,7 @@ fn fun_info_mfa(vm: &Vm, process: &mut Process, fun: Term) -> Result<Term, VmErr
             });
             let name = function
                 .and_then(|(id, target)| {
-                    vm.modules[id]
+                    vm.code.modules[id]
                         .function_at(target)
                         .map(|(name, _)| name.to_owned())
                 })

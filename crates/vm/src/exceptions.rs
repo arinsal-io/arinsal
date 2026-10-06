@@ -525,7 +525,7 @@ pub(super) fn execute(vm: &Vm, p: &mut Process, op: Opcode, a: Arg, b: Arg) -> R
         }
         Opcode::IfEnd => return Err(VmError::Trap(Trap::error(atom("if_clause")?))),
         Opcode::FuncInfo => {
-            let module: &Module = &vm.modules[p.module];
+            let module: &Module = &vm.code.modules[p.module];
             let (_, arity) = module.function_at(p.ip).unwrap_or(("?", 0));
             let args = p.x[..usize::from(arity)].to_vec();
             let args = list(p, &args)?;
@@ -711,7 +711,7 @@ pub(super) fn resume(
                         .map(|function| (function.module, function.function, function.arity))
                 }
                 crate::native_bridge::CatchHandler::Interpreted => {
-                    vm.modules.get(p.module).and_then(|module| {
+                    vm.code.modules.get(p.module).and_then(|module| {
                         module.function_at(p.ip).map(|(function, arity)| {
                             (module.name.clone(), function.to_owned(), arity)
                         })
@@ -732,7 +732,7 @@ pub(super) fn resume(
             continue;
         };
         if !is_handler {
-            let special = vm.modules.get(module).and_then(|module| {
+            let special = vm.code.modules.get(module).and_then(|module| {
                 if ip == module.return_trace_ip {
                     Some((true, module))
                 } else if ip == module.return_to_trace_ip {
@@ -814,7 +814,7 @@ pub(super) fn resume(
         if !return_to_sessions.is_empty()
             && let Some(trace_ctx) = ctx
         {
-            let target = vm.modules.get(module).and_then(|loaded| {
+            let target = vm.code.modules.get(module).and_then(|loaded| {
                 loaded
                     .function_at(ip)
                     .map(|(function, arity)| (loaded.name.clone(), function.to_owned(), arity))
@@ -863,7 +863,7 @@ fn save_raw(
         &mut raw,
         Some(class),
         top,
-        &vm.modules,
+        &vm.code.modules,
         (p.module, p.ip),
         &p.heap,
         depth,

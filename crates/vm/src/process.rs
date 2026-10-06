@@ -1,6 +1,6 @@
 //! Scheduler adapter and message envelopes for BEAM processes.
 
-use crate::{Process, RunState, SharedCode, Vm, VmError};
+use crate::{Process, RunState, Vm, VmError};
 use arinsal_beam::{BeamFile, Operand};
 use arinsal_beamasm::SchedulerRegisters;
 use arinsal_pterm::RetiredArea;
@@ -722,7 +722,8 @@ pub(crate) struct Runtime {
     pub(crate) statistics: crate::natives::sys::StatisticsState,
     /// Node-wide backtrace depth shared by scheduler VM replicas.
     pub(crate) backtrace_depth: AtomicUsize,
-    code: Arc<Mutex<SharedCode>>,
+    /// The node's code indexes and their code tables.
+    code: Arc<crate::code_ix::CodeIndexes>,
     /// The node's code scope, which keys its native code registries.
     pub(crate) code_scope: u64,
     pub(crate) processes: Mutex<std::collections::HashSet<Pid>>,
@@ -1087,6 +1088,9 @@ impl Executor {
         if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
             crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
         }
+        // A process runs with the code index active when it is scheduled in.
+        // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247, OTP-29.1.1.
+        self.vm.refresh_code();
         self.vm.sync_module(process.module);
         if process.native_pc.is_some() && process.reductions <= 0 {
             process.reductions = budget.min(i32::MAX as u32) as i32;
@@ -1097,7 +1101,7 @@ impl Executor {
         let first_run = !std::mem::replace(&mut process.entry_started, true);
         if first_run
             && process.native_pc.is_none()
-            && let Some(module) = self.vm.modules.get(process.module)
+            && let Some(module) = self.vm.code.modules.get(process.module)
             && let Some((function, arity)) = module.function_at(process.ip)
             && module.entry_arity.get(process.ip).copied().unwrap_or(0) != 0
             && let Some(native) =
@@ -1105,7 +1109,7 @@ impl Executor {
         {
             process.native_pc = Some(native.start);
         }
-        let (mut need_x, need_fr) = self.vm.registers[process.module];
+        let (mut need_x, need_fr) = self.vm.code.registers[process.module];
         if crate::beamasm_integration::enabled() {
             need_x = need_x.max(8);
         }
@@ -1548,7 +1552,7 @@ impl Executor {
                                     }
                                     let handler =
                                         self.vm.load_named("erts_internal").is_ok_and(|id| {
-                                            self.vm.modules[id].functions.iter().any(
+                                            self.vm.code.modules[id].functions.iter().any(
                                                 |(_, name, arity)| {
                                                     name == "breakpoint" && *arity == 4
                                                 },
@@ -1983,7 +1987,7 @@ impl Executor {
                                 let Some(export) =
                                     crate::beamasm_integration::export_dispatch(target_pc)
                                 else {
-                                    if let Some(m) = self.vm.modules.get(process.module)
+                                    if let Some(m) = self.vm.code.modules.get(process.module)
                                         && target_pc < m.code.len()
                                     {
                                         process.ip = target_pc;
@@ -2003,7 +2007,7 @@ impl Executor {
                                 process.gc_live = usize::from(export.arity);
                                 // Like call_import_general: code loaded by another scheduler must be
                                 // visible to the BIF (function_exported/3, module_loaded/1, ...).
-                                self.vm.sync_code_epoch();
+                                self.vm.refresh_code();
                                 if matches!(
                                     export.class,
                                     arinsal_loader::ImportClass::Native
@@ -2410,7 +2414,13 @@ impl Executor {
                                         continue;
                                     }
                                 }
-                                let module_id = match self.vm.loaded.get(&export.module).copied() {
+                                let module_id = match self
+                                    .vm
+                                    .code
+                                    .loaded
+                                    .get(&export.module)
+                                    .copied()
+                                {
                                     Some(module_id) => module_id,
                                     // Like call_import: a module with -on_load is loaded through
                                     // the error handler and code server, which run its on_load.
@@ -2482,7 +2492,7 @@ impl Executor {
                                     export.arity,
                                 )
                                 .or_else(|| {
-                                    self.vm.modules[module_id]
+                                    self.vm.code.modules[module_id]
                                         .export_slot(&export.function, export.arity)
                                         .map(arinsal_loader::ExportSlot::target)
                                 });
@@ -2640,7 +2650,7 @@ impl Executor {
                                 eprintln!("arinsal boot: exception {reason} at {frame}");
                             }
                             let mut trap = crate::exceptions::from_legacy(&reason)?;
-                            let arity = self.vm.modules[process.module]
+                            let arity = self.vm.code.modules[process.module]
                                 .function_at(process.ip)
                                 .map(|(_, arity)| arity)
                                 .unwrap_or(0);
@@ -2658,8 +2668,8 @@ impl Executor {
                             ctx.pid(),
                             self.vm.frame_name(process),
                             process.ip,
-                            self.vm.modules[process.module].lines.get(process.ip),
-                            self.vm.modules[process.module].code.get(process.ip),
+                            self.vm.code.modules[process.module].lines.get(process.ip),
+                            self.vm.code.modules[process.module].code.get(process.ip),
                             trap.class,
                             arinsal_term::to_owned(trap.reason)
                         );
@@ -2682,7 +2692,7 @@ impl Executor {
             result,
             Ok(RunState::Yield | RunState::Wait { .. }) | Err(VmError::Yield | VmError::Dirty(_))
         ) {
-            let (live_x, live_fr) = self.vm.registers[process.module];
+            let (live_x, live_fr) = self.vm.code.registers[process.module];
             // A native continuation keeps the live X registers of its yield site, which the
             // interpreted module's register count does not bound.
             let native_live = if process.native_pc.is_some() {
@@ -2701,7 +2711,7 @@ impl Executor {
                     "[sched-save-native] live_x={live_x} x_len={} x0={:#x} module={} native_pc={:?}",
                     self.x.len(),
                     self.x.first().map_or(0, |term| term.tagged_word()),
-                    self.vm.modules[process.module].name,
+                    self.vm.code.modules[process.module].name,
                     process.native_pc
                 );
             }
@@ -2867,12 +2877,12 @@ fn switched_out_live(process: &Process) -> usize {
     .min(process.x.len())
 }
 
-/// Return address, native code generation, code epoch and the owning module.
+/// Return address, native code generation, code tables generation and the owning module.
 type CallerModuleEntry = (usize, u64, u64, Option<usize>);
 
 thread_local! {
     /// Direct-mapped memo of `native_caller_module`, keyed by return address and validated
-    /// against the native code generation and the code snapshot epoch.
+    /// against the native code generation and the code tables generation.
     static CALLER_MODULE_CACHE: std::cell::RefCell<[CallerModuleEntry; 256]> =
         const { std::cell::RefCell::new([(0, 0, 0, None); 256]) };
 }
@@ -2882,12 +2892,12 @@ thread_local! {
 fn native_caller_module(vm: &Vm, resume_pc: usize) -> Option<usize> {
     let generation = crate::native_bridge::native_registry_generation();
     // A running on_load changes the answer without touching the native code table.
-    let memo = vm.pending_on_load.is_empty();
+    let memo = vm.code.pending_on_load.is_empty();
     let slot = (resume_pc >> 2) & 255;
     if memo {
         let hit = CALLER_MODULE_CACHE.with(|cache| {
             let entry = cache.borrow()[slot];
-            (entry.0 == resume_pc && entry.1 == generation && entry.2 == vm.seen_epoch)
+            (entry.0 == resume_pc && entry.1 == generation && entry.2 == vm.code_generation())
                 .then_some(entry.3)
         });
         if let Some(found) = hit {
@@ -2898,20 +2908,20 @@ fn native_caller_module(vm: &Vm, resume_pc: usize) -> Option<usize> {
         // The pc names exactly one code instance: the one being loaded, the old one or the
         // current one (a reload runs the new on_load while the previous code is current).
         [
-            vm.pending_on_load.get(&caller.module),
-            vm.loaded.get(&caller.module),
-            vm.old.get(&caller.module),
+            vm.code.pending_on_load.get(&caller.module),
+            vm.code.loaded.get(&caller.module),
+            vm.code.old.get(&caller.module),
         ]
         .into_iter()
         .flatten()
         .copied()
         .find(|id| vm.native_code_contains(*id, resume_pc))
-        .or_else(|| vm.loaded.get(&caller.module).copied())
+        .or_else(|| vm.code.loaded.get(&caller.module).copied())
     })
     .flatten();
     if memo {
         CALLER_MODULE_CACHE.with(|cache| {
-            cache.borrow_mut()[slot] = (resume_pc, generation, vm.seen_epoch, found);
+            cache.borrow_mut()[slot] = (resume_pc, generation, vm.code_generation(), found);
         });
     }
     found
@@ -2959,7 +2969,7 @@ pub(crate) fn pid_table_index(pid: Pid) -> u32 {
 
 pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError> {
     let module_id = vm.load_named("erlang")?;
-    let entry = vm.modules[module_id]
+    let entry = vm.code.modules[module_id]
         .functions
         .iter()
         .find(|(_, name, arity)| name == "apply" && *arity == 3)
@@ -3388,7 +3398,7 @@ impl Runtime {
             if self.suspend_total_of(pid) == 0 {
                 return None;
             }
-            let code = self.code.lock().unwrap();
+            let code = self.code.active_tables();
             Some(inspect(target, &code.modules))
         })?
     }
@@ -3878,7 +3888,7 @@ impl Runtime {
         &self,
         body: impl FnOnce(&[Arc<arinsal_loader::Module>]) -> R,
     ) -> R {
-        let code = self.code.lock().unwrap();
+        let code = self.code.active_tables();
         body(&code.modules)
     }
 
@@ -3914,7 +3924,7 @@ impl Runtime {
         linker: Option<Pid>,
     ) -> Result<Pid, VmError> {
         let (module_id, ip) = {
-            let code = self.code.lock().unwrap();
+            let code = self.code.active_tables();
             let module_id = *code
                 .loaded
                 .get(module)
@@ -5428,9 +5438,8 @@ pub(crate) fn with_replica_vm<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Vm)
             .position(|(cached_key, _)| *cached_key == key)
             .map(|index| slot.swap_remove(index).1)
     });
-    let mut vm =
-        cached.unwrap_or_else(|| Vm::shared_replica(Arc::clone(&runtime.code), &runtime.paths));
-    vm.sync_code_epoch();
+    let mut vm = cached.unwrap_or_else(|| Vm::shared_replica(runtime.code_scope, &runtime.paths));
+    vm.refresh_code();
     let result = f(&mut vm);
     TRACER_REPLICAS.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -5456,7 +5465,7 @@ fn with_executor<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Executor) -> R) 
                 key,
                 Executor {
                     owner: Arc::downgrade(runtime),
-                    vm: Vm::shared_replica(Arc::clone(&runtime.code), &runtime.paths),
+                    vm: Vm::shared_replica(runtime.code_scope, &runtime.paths),
                     x: Box::new([]),
                     fr: Box::new([]),
                     native_registers: SchedulerRegisters::default(),
@@ -5901,17 +5910,7 @@ impl Vm {
         priority: arinsal_sched::Priority,
     ) -> Result<Pid, VmError> {
         let module_id = self.load_named(module)?;
-        {
-            // Executors already running system processes spawned earlier keep the epoch
-            // counter they were created with; a fresh counter would leave them comparing
-            // against a dead one and re-synchronizing (and copying tables) on every load.
-            let mut code = runtime.code.lock().unwrap();
-            let epoch = Arc::clone(&code.epoch);
-            *code = self.snapshot_shared();
-            epoch.fetch_add(1, Ordering::AcqRel);
-            code.epoch = epoch;
-        }
-        let ip = self.modules[module_id]
+        let ip = self.code.modules[module_id]
             .export(function, 0)
             .ok_or_else(|| VmError::Load(format!("{module}:{function}/0 is not exported")))?;
         let mut process = Process::with_spawn_registers(0, 0);
@@ -5964,7 +5963,7 @@ impl Vm {
     ) -> Result<ScheduledResult, VmError> {
         initialize_feature_defaults(arinsal_pterm::store_for(self.code_scope))?;
         let module_id = self.load_named(module)?;
-        let ip = self.modules[module_id]
+        let ip = self.code.modules[module_id]
             .export(function, args.len() as u8)
             .ok_or_else(|| {
                 VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
@@ -5972,7 +5971,7 @@ impl Vm {
                 )))
             })?;
         let (sender, receiver) = mpsc::channel();
-        let code = Arc::new(Mutex::new(self.snapshot_shared()));
+        let code = Arc::clone(&self.code_ix);
         let port_layout = PtabLayout::new(1 << 20);
         set_port_table_layout(port_layout);
         let port_ids = PtabIdRing::new(1 << 20);
@@ -6149,8 +6148,8 @@ impl Vm {
         while arinsal_pterm::store_for(self.code_scope).has_retired() {
             std::thread::park_timeout(std::time::Duration::from_millis(1));
         }
-        let shared = code.lock().unwrap();
-        self.sync_shared(&shared);
+        drop(code);
+        self.refresh_code();
         result
     }
 }

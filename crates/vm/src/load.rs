@@ -26,33 +26,27 @@ impl<T: Clone> std::ops::DerefMut for SharedTable<T> {
     }
 }
 
-/// First epoch of a new code snapshot. Modules outlive the snapshot that loaded
-/// them (their import caches point into that snapshot's other modules), so
-/// epochs must never repeat across snapshots: a repeat would validate a cache
-/// entry that points into another snapshot's freed or foreign code.
-fn next_epoch_base() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32
-}
-
 /// Key of `loaded_nifs`: NIF libraries are tracked per code instance, like erts' `Module.curr.nif`.
 pub(crate) fn nif_key(name: &str, id: usize) -> String {
     format!("{name}#{id}")
 }
 
-pub(crate) struct SharedCode {
-    pub(crate) coverage_mode: arinsal_loader::CoverageMode,
+/// The code tables of one code index: module.c `module_tables[ix]` (current, old and on_load
+/// instances by module), export.c's export table and the instances' code and ranges.
+// Port of erts/emulator/beam/module.c:47 (module_tables), export.c (export_tables) and
+// beam_ranges.c:58 (r), OTP-29.1.1.
+#[derive(Clone)]
+pub(crate) struct CodeTables {
     pub(crate) code_scope: u64,
+    /// The published version of these tables; see [`crate::code_ix::next_generation`].
+    pub(crate) generation: u64,
     pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
     pub(crate) loaded: SharedTable<HashMap<String, usize>>,
     pub(crate) old: SharedTable<HashMap<String, usize>>,
     pub(crate) pending_on_load: SharedTable<HashMap<String, usize>>,
-    pub(crate) purge_state: Arc<crate::natives::code::PurgeState>,
     pub(crate) deleted: SharedTable<std::collections::HashSet<String>>,
     pub(crate) code_meta: SharedTable<Vec<Option<Arc<CodeMeta>>>>,
-    pub(crate) epoch: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) registers: SharedTable<Vec<(usize, usize)>>,
-    pub(crate) native_fns: SharedTable<Vec<arinsal_bifs::BifFn>>,
     pub(crate) loaded_nifs: SharedTable<std::collections::HashSet<String>>,
     // g_code_fix
     pub(crate) exports: SharedTable<ExportIndex>,
@@ -60,7 +54,7 @@ pub(crate) struct SharedCode {
     pub(crate) module_live: SharedTable<Vec<bool>>,
     pub(crate) module_files: SharedTable<HashMap<String, arinsal_etf::OwnedTerm>>,
     pub(crate) condemned: SharedTable<Vec<usize>>,
-    // g_code_fix
+    // g_code_fix: a module entry survives purge, so later delete_module stays true.
     pub(crate) known_modules: SharedTable<HashSet<String>>,
 }
 
@@ -87,7 +81,7 @@ fn bind_import_targets(module: &mut Module) {
     }
 }
 
-fn bind_static_nifs(module: &mut Module, native_fns: &mut Vec<arinsal_bifs::BifFn>) {
+fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) {
     // Classify every import before the module is shared, including modules
     // that have no static NIF body.
     bind_import_targets(module);
@@ -115,10 +109,9 @@ fn bind_static_nifs(module: &mut Module, native_fns: &mut Vec<arinsal_bifs::BifF
         else {
             continue;
         };
-        let Ok(index) = u32::try_from(native_fns.len()) else {
+        let Some(index) = code_ix.push_native_fn(native) else {
             continue;
         };
-        native_fns.push(native);
         if let Some(body) = module.code.get_mut(entry.saturating_add(1)) {
             *body = Instr::NativeBody { index };
         }
@@ -302,11 +295,10 @@ struct SlotTable<'a> {
 // g_code_fix
 fn alloc_slot(
     table: &mut SlotTable<'_>,
-    module: Module,
+    stored: Arc<Module>,
     regs: (usize, usize),
     meta: Option<CodeMeta>,
 ) -> usize {
-    let stored = Arc::new(module);
     if let Some(id) = table.free_ids.pop() {
         table.modules[id] = stored;
         table.registers[id] = regs;
@@ -340,22 +332,18 @@ fn release_slot(
     free_ids.push(id);
 }
 
-impl SharedCode {
-    #[cfg(test)]
-    pub(crate) fn blank() -> Self {
+impl CodeTables {
+    pub(crate) fn new(code_scope: u64) -> Self {
         Self {
-            coverage_mode: arinsal_loader::CoverageMode::None,
-            code_scope: beamasm_integration::new_code_scope(),
+            code_scope,
+            generation: crate::code_ix::next_generation(),
             modules: SharedTable::new(Vec::new()),
             loaded: SharedTable::new(HashMap::new()),
             old: SharedTable::new(HashMap::new()),
             pending_on_load: SharedTable::new(HashMap::new()),
-            purge_state: Arc::default(),
             deleted: SharedTable::new(std::collections::HashSet::new()),
             code_meta: SharedTable::new(Vec::new()),
-            epoch: Arc::new(std::sync::atomic::AtomicU64::new(next_epoch_base())),
             registers: SharedTable::new(Vec::new()),
-            native_fns: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
             exports: SharedTable::new(ExportIndex::new()),
             free_ids: SharedTable::new(Vec::new()),
@@ -366,9 +354,10 @@ impl SharedCode {
         }
     }
 
-    fn alloc(
+    /// Adds a module instance and returns its id.
+    pub(crate) fn alloc(
         &mut self,
-        module: Module,
+        module: Arc<Module>,
         registers: (usize, usize),
         meta: Option<CodeMeta>,
     ) -> usize {
@@ -389,7 +378,18 @@ impl SharedCode {
         id
     }
 
+    /// Makes instance `id` the current code of `name` and returns the instance it replaces.
+    pub(crate) fn make_current(&mut self, name: &str, id: usize) -> Option<usize> {
+        let previous = self.loaded.insert(name.to_owned(), id);
+        activate_module_records(self.code_scope, &self.modules[id]);
+        self.deleted.remove(name);
+        self.known_modules.insert(name.to_owned());
+        previous
+    }
+
+    /// Frees the slot of a purged instance.
     pub(crate) fn release(&mut self, id: usize) {
+        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
         // Port of erts/emulator/beam/erl_nif.c (erts_unload_nif on purge), OTP-29.1.1: a NIF
         // library belongs to its code instance, so purging it lets a later load bind again.
         if self.module_live.get(id).copied() == Some(true)
@@ -397,8 +397,6 @@ impl SharedCode {
         {
             let key = nif_key(&module.name, id);
             self.loaded_nifs.remove(&key);
-        }
-        if self.module_live.get(id).copied() == Some(true) {
             arinsal_pterm::store_for(self.code_scope)
                 .retire_module_area(self.modules[id].literal_area());
         }
@@ -444,8 +442,9 @@ impl Vm {
         module: &str,
         name: &str,
     ) -> Option<&arinsal_beam::NativeRecord> {
-        let id = *self.loaded.get(module)?;
-        self.modules
+        let id = *self.code.loaded.get(module)?;
+        self.code
+            .modules
             .get(id)?
             .records
             .iter()
@@ -459,25 +458,24 @@ impl Vm {
         function_atom: Atom,
         arity: u8,
     ) -> Result<(usize, usize), VmError> {
-        self.exports
-            .entries
-            .entry((module_atom, function_atom, arity))
-            .or_insert(false);
+        // Port of erts/emulator/beam/export.c:228-242 (erts_export_get_or_make_stub), OTP-29.1.1.
+        let key = (module_atom, function_atom, arity);
+        if !self.code.exports.entries.contains_key(&key) {
+            self.code_ix.update_active(|tables| {
+                tables.exports.entries.entry(key).or_insert(false);
+            });
+        }
         let module_name = global_atoms()
             .text(module_atom)
             .ok_or_else(|| VmError::Load("invalid module atom".into()))?;
         let module_id = self.load_named(module_name)?;
-        let module = &self.modules[module_id];
+        let module = &self.code.modules[module_id];
         let Some(export) = module.export_slot_atom(function_atom, arity) else {
             return Err(VmError::Trap(crate::exceptions::Trap::error(
                 crate::signals::atom("undef"),
             )));
         };
-        let target = export.target();
-        self.exports
-            .entries
-            .insert((module_atom, function_atom, arity), true);
-        Ok((module_id, target))
+        Ok((module_id, export.target()))
     }
 
     /// Construct a VM. Explicit paths precede the current directory and OTP libraries.
@@ -507,7 +505,6 @@ impl Vm {
         paths: impl IntoIterator<Item = PathBuf>,
         otp: PathBuf,
     ) -> Self {
-        let statistics_origins = crate::natives::sys::initialize_statistics_origins();
         let mut paths: Vec<PathBuf> = paths.into_iter().collect();
         paths.push(PathBuf::from("."));
         paths.push(PathBuf::from("bench/out/ebin"));
@@ -522,37 +519,38 @@ impl Vm {
         }
         paths.push(otp.join("lib/erts-17.1/ebin"));
         let code_scope = beamasm_integration::new_code_scope();
+        Self::for_code_scope(paths, Some(otp), code_scope, false)
+    }
+
+    fn for_code_scope(
+        paths: Vec<PathBuf>,
+        otp_root: Option<PathBuf>,
+        code_scope: u64,
+        replica: bool,
+    ) -> Self {
+        let code_ix = crate::code_ix::for_scope(code_scope);
         Self {
             paths,
-            statistics_origins,
-            otp_root: Some(otp),
-            modules: SharedTable::new(Vec::new()),
-            loaded: SharedTable::new(HashMap::new()),
-            old: SharedTable::new(HashMap::new()),
-            pending_on_load: SharedTable::new(HashMap::new()),
-            purge_state: Arc::default(),
-            deleted: SharedTable::new(std::collections::HashSet::new()),
-            code_meta: SharedTable::new(Vec::new()),
-            code_epoch: None,
-            seen_epoch: 0,
+            statistics_origins: if replica {
+                crate::natives::sys::StatisticsOrigins::now()
+            } else {
+                crate::natives::sys::initialize_statistics_origins()
+            },
+            otp_root,
+            code: code_ix.active_tables(),
+            native_fns: code_ix.native_fns(),
+            purge_state: Arc::clone(&code_ix.purge_state),
             beamasm_targets: beamasm_integration::NativeTargetCache::new(code_scope),
             code_scope,
-            code_ix: crate::code_ix::for_scope(code_scope),
-            registers: SharedTable::new(Vec::new()),
-            native_fns: SharedTable::new(Vec::new()),
-            loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
-            shared: None,
-            // ---- vm_exc ----
+            code_ix,
+            replica,
             backtrace_depth: 8,
-            // g_code_fix
-            exports: SharedTable::new(ExportIndex::new()),
-            free_ids: SharedTable::new(Vec::new()),
-            module_live: SharedTable::new(Vec::new()),
-            module_files: SharedTable::new(HashMap::new()),
-            condemned: SharedTable::new(Vec::new()),
-            known_modules: SharedTable::new(HashSet::new()),
-            coverage_mode: arinsal_loader::CoverageMode::None,
         }
+    }
+
+    /// A scheduler's VM over the code of the node with code scope `code_scope`.
+    pub(crate) fn shared_replica(code_scope: u64, paths: &[PathBuf]) -> Self {
+        Self::for_code_scope(paths.to_vec(), None, code_scope, true)
     }
 
     /// Construct a VM with OTP's debugger startup flags applied before any module is loaded.
@@ -572,24 +570,63 @@ impl Vm {
     /// `module_info(exports)` on a booted node.
     pub fn note_beam_exports(&mut self, bytes: &[u8]) -> Result<(), VmError> {
         let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        if let Some(shared) = self.shared.clone() {
-            let mut code = shared.lock().unwrap();
-            code.exports.note_beam(&beam);
-            self.sync_shared(&code);
-        } else {
-            self.exports.note_beam(&beam);
-        }
+        let staging = self.code_ix.start_staging();
+        staging.with(|tables| tables.exports.note_beam(&beam));
+        drop(staging);
+        self.refresh_code();
         Ok(())
     }
 
     /// Live module versions. A purged version is omitted once its slot can be reused.
     pub fn module_storage_count(&self) -> usize {
-        self.module_live.iter().filter(|live| **live).count()
+        self.code.module_live.iter().filter(|live| **live).count()
     }
 
     /// Module-table length, including slots retained for reuse after a purge.
     pub fn module_table_len(&self) -> usize {
-        self.modules.len()
+        self.code.modules.len()
+    }
+
+    /// The coverage mode modules loaded now get (`code:get_coverage_mode/0`).
+    pub(crate) fn coverage_mode(&self) -> arinsal_loader::CoverageMode {
+        self.code_ix.coverage_mode()
+    }
+
+    pub(crate) fn set_coverage_mode(&mut self, mode: arinsal_loader::CoverageMode) {
+        self.code_ix.set_coverage_mode(mode);
+    }
+
+    /// Prepares a module instance from a parsed BEAM file: loader, fun identities, static NIFs.
+    fn prepare_module(&self, beam: &BeamFile, bytes: Option<&[u8]>) -> Result<Module, VmError> {
+        let mut module = arinsal_loader::load_with_instrumentations(
+            beam,
+            self.coverage_mode(),
+            crate::trace_bp::line_breakpoints_instrumented(),
+        )
+        .map_err(|e| VmError::Load(e.to_string()))?;
+        if let Some(bytes) = bytes {
+            funs::set_module_uniq(&mut module, bytes)?;
+        }
+        bind_static_nifs(&mut module, &self.code_ix);
+        Ok(module)
+    }
+
+    /// Compiles `module` with BeamAsm into `meta` when `bytes` are known.
+    // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
+    // body and its exported entries are resolved.
+    fn compile_native(&self, module: &Module, meta: &mut CodeMeta) {
+        let Some(bytes) = meta.beam_bytes.as_deref() else {
+            return;
+        };
+        if let Some(native) = beamasm_integration::compile(
+            bytes,
+            module,
+            self.code_scope,
+            crate::trace_bp::line_breakpoints_instrumented(),
+        ) {
+            native.publish(module);
+            meta.beamasm = Some(native);
+        }
     }
 
     /// Install the next version of a module, reclaiming a purged predecessor.
@@ -599,104 +636,36 @@ impl Vm {
     /// every generation.
     pub fn load_next_version(&mut self, bytes: &[u8]) -> Result<(), VmError> {
         let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        let mut module = arinsal_loader::load_with_instrumentations(
-            &beam,
-            self.coverage_mode,
-            crate::trace_bp::line_breakpoints_instrumented(),
-        )
-        .map_err(|e| VmError::Load(e.to_string()))?;
-        funs::set_module_uniq(&mut module, bytes)?;
-        bind_static_nifs(&mut module, &mut self.native_fns);
+        let module = Arc::new(self.prepare_module(&beam, Some(bytes))?);
         let name = module.name.clone();
-        if let Some(old_id) = self.old.remove(&name) {
-            self.release_module_slot(old_id);
-        }
         let registers = process::register_requirements(&beam);
-        let meta = CodeMeta::from_beam(&beam, Some(bytes));
-        let previous = self.loaded.get(&name).copied();
-        let id = self.alloc_local(module, registers, Some(meta));
-        self.loaded.insert(name.clone(), id);
-        activate_module_records(self.code_scope, &self.modules[id]);
-        if let Some(native) = beamasm_integration::compile(
-            bytes,
-            &self.modules[id],
-            self.code_scope,
-            crate::trace_bp::line_breakpoints_instrumented(),
-        ) {
-            native.publish(&self.modules[id]);
-            if let Some(meta) = self.code_meta[id].as_mut() {
-                Arc::make_mut(meta).beamasm = Some(native);
+        let mut meta = CodeMeta::from_beam(&beam, Some(bytes));
+        let staging = self.code_ix.start_staging();
+        staging.with(|tables| {
+            if let Some(old_id) = tables.old.remove(&name) {
+                tables.release(old_id);
             }
-        }
-        if let Some(previous) = previous {
-            self.old.insert(name.clone(), previous);
-        }
-        self.deleted.remove(&name);
-        self.known_modules.insert(name);
+        });
+        self.compile_native(&module, &mut meta);
+        let id = staging.with(|tables| {
+            let id = tables.alloc(module, registers, Some(meta));
+            if let Some(previous) = tables.make_current(&name, id) {
+                tables.old.insert(name.clone(), previous);
+            }
+            id
+        });
+        drop(staging);
+        self.refresh_code();
+        self.register_native_targets(id);
         Ok(())
     }
 
-    pub(crate) fn release_module_slot(&mut self, id: usize) {
-        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
-        if self.module_live.get(id).copied() == Some(true) {
-            arinsal_pterm::store_for(self.code_scope)
-                .retire_module_area(self.modules[id].literal_area());
-        }
-        release_slot(
-            &mut self.module_live,
-            &mut self.code_meta,
-            &mut self.free_ids,
-            id,
-        );
-    }
-
-    pub(crate) fn alloc_local(
-        &mut self,
-        module: Module,
-        registers: (usize, usize),
-        meta: Option<CodeMeta>,
-    ) -> usize {
-        self.exports.note_module(&module);
-        let id = alloc_slot(
-            &mut SlotTable {
-                modules: &mut self.modules,
-                registers: &mut self.registers,
-                code_meta: &mut self.code_meta,
-                live: &mut self.module_live,
-                free_ids: &mut self.free_ids,
-            },
-            module,
-            registers,
-            meta,
-        );
-        crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
-        self.beamasm_targets.register_module(id, &self.modules[id]);
-        id
-    }
-
-    pub(crate) fn snapshot_shared(&self) -> SharedCode {
-        SharedCode {
-            coverage_mode: self.coverage_mode,
-            code_scope: self.code_scope,
-            modules: self.modules.clone(),
-            loaded: self.loaded.clone(),
-            old: self.old.clone(),
-            pending_on_load: self.pending_on_load.clone(),
-            purge_state: Arc::clone(&self.purge_state),
-            deleted: self.deleted.clone(),
-            code_meta: self.code_meta.clone(),
-            epoch: Arc::new(std::sync::atomic::AtomicU64::new(next_epoch_base())),
-            registers: self.registers.clone(),
-            native_fns: self.native_fns.clone(),
-            loaded_nifs: self.loaded_nifs.clone(),
-            exports: self.exports.clone(),
-            free_ids: self.free_ids.clone(),
-            module_live: self.module_live.clone(),
-            module_files: self.module_files.clone(),
-            condemned: self.condemned.clone(),
-            known_modules: self.known_modules.clone(),
+    fn register_native_targets(&mut self, id: usize) {
+        if let Some(module) = self.code.modules.get(id) {
+            self.beamasm_targets.register_module(id, module);
         }
     }
+
     /// Load bytes without executing module-level code.
     pub fn load_bytes(&mut self, bytes: &[u8]) -> Result<usize, VmError> {
         self.load_bytes_internal(bytes, true)
@@ -712,94 +681,56 @@ impl Vm {
         compile_native: bool,
     ) -> Result<usize, VmError> {
         let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        if let Some(&id) = self.loaded.get(&beam.module) {
-            return Ok(id);
-        }
-        let mut module = arinsal_loader::load_with_instrumentations(
-            &beam,
-            self.coverage_mode,
-            crate::trace_bp::line_breakpoints_instrumented(),
-        )
-        .map_err(|e| VmError::Load(e.to_string()))?;
-        funs::set_module_uniq(&mut module, bytes)?;
-        bind_static_nifs(&mut module, &mut self.native_fns);
-        let registers = process::register_requirements(&beam);
-        let id = self.insert_module(module, registers);
-        self.code_meta[id] = Some(Arc::new(CodeMeta::from_beam(&beam, Some(bytes))));
-        if compile_native {
-            // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1),
-            // compile after the module body and its exported entries are resolved.
-            if let Some(native) = beamasm_integration::compile(
-                bytes,
-                &self.modules[id],
-                self.code_scope,
-                crate::trace_bp::line_breakpoints_instrumented(),
-            ) {
-                native.publish(&self.modules[id]);
-                if let Some(meta) = self.code_meta[id].as_mut() {
-                    Arc::make_mut(meta).beamasm = Some(native);
-                }
-            }
-        }
-        Ok(id)
+        self.load_current(&beam, Some(bytes), compile_native, None)
     }
     /// Load a parsed module.
     pub fn load_beam(&mut self, beam: &BeamFile) -> Result<usize, VmError> {
-        if let Some(shared) = self.shared.clone() {
-            let mut code = shared.lock().unwrap();
-            if !code.loaded.contains_key(&beam.module) {
-                // boot_loop1: prepared code must be published before another
-                // scheduler replica can use the module index.
-                let mut module = arinsal_loader::load_with_instrumentations(
-                    beam,
-                    self.coverage_mode,
-                    crate::trace_bp::line_breakpoints_instrumented(),
-                )
-                .map_err(|e| VmError::Load(e.to_string()))?;
-                bind_static_nifs(&mut module, &mut code.native_fns);
-                let name = module.name.clone();
-                let id = code.alloc(
-                    module,
-                    process::register_requirements(beam),
-                    Some(CodeMeta::from_beam(beam, None)),
-                );
-                code.loaded.insert(name.clone(), id);
-                activate_module_records(code.code_scope, &code.modules[id]);
-                code.known_modules.insert(name);
-                code.epoch
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
-            self.sync_shared(&code);
-            return self
-                .loaded
-                .get(&beam.module)
-                .copied()
-                .ok_or_else(|| VmError::Load(format!("module {} not found", beam.module)));
-        }
-        if let Some(&id) = self.loaded.get(&beam.module) {
+        self.load_current(beam, None, false, None)
+    }
+
+    /// Loads `beam` as the current code of its module unless it already has current code,
+    /// staging it and committing the staging code index.
+    fn load_current(
+        &mut self,
+        beam: &BeamFile,
+        bytes: Option<&[u8]>,
+        compile_native: bool,
+        file: Option<(&str, &Path)>,
+    ) -> Result<usize, VmError> {
+        self.refresh_code();
+        if let Some(&id) = self.code.loaded.get(&beam.module) {
             return Ok(id);
         }
-        let mut module = arinsal_loader::load_with_instrumentations(
-            beam,
-            self.coverage_mode,
-            crate::trace_bp::line_breakpoints_instrumented(),
-        )
-        .map_err(|e| VmError::Load(e.to_string()))?;
-        bind_static_nifs(&mut module, &mut self.native_fns);
+        let module = Arc::new(self.prepare_module(beam, bytes)?);
         let registers = process::register_requirements(beam);
-        let id = self.insert_module(module, registers);
-        self.code_meta[id] = Some(Arc::new(CodeMeta::from_beam(beam, None)));
+        let mut meta = CodeMeta::from_beam(beam, bytes);
+        let staging = self.code_ix.start_staging();
+        // Another scheduler may have loaded the module since this one looked.
+        if let Some(id) = staging.with(|tables| tables.loaded.get(&beam.module).copied()) {
+            staging.abort();
+            self.refresh_code();
+            return Ok(id);
+        }
+        if compile_native {
+            self.compile_native(&module, &mut meta);
+        }
+        let name = module.name.clone();
+        let id = staging.with(|tables| {
+            let id = tables.alloc(module, registers, Some(meta));
+            tables.make_current(&name, id);
+            if let Some((requested, path)) = file {
+                tables
+                    .module_files
+                    .insert(requested.to_owned(), path_charlist(path));
+            }
+            id
+        });
+        drop(staging);
+        self.refresh_code();
+        self.register_native_targets(id);
         Ok(id)
     }
-    pub(crate) fn insert_module(&mut self, module: Module, registers: (usize, usize)) -> usize {
-        // g_code_fix: reuse a purged slot instead of appending forever.
-        let name = module.name.clone();
-        let id = self.alloc_local(module, registers, None);
-        self.loaded.insert(name.clone(), id);
-        activate_module_records(self.code_scope, &self.modules[id]);
-        self.known_modules.insert(name);
-        id
-    }
+
     pub(crate) fn publish_prepared(
         &mut self,
         prepared: Vec<(Module, (usize, usize), CodeMeta)>,
@@ -820,135 +751,55 @@ impl Vm {
         if prepared.len() > 1 && prepared.iter().any(|(_, _, meta)| meta.on_load.is_some()) {
             return Err(("system_limit", names));
         }
-        self.sync_code_epoch();
-        let shared_arc = self.shared.clone();
-        let mut shared = shared_arc.as_ref().map(|code| code.lock().unwrap());
-        let (loaded, old) = if let Some(code) = shared.as_deref() {
-            (&code.loaded, &code.old)
-        } else {
-            (&self.loaded, &self.old)
-        };
-        let not_purged: Vec<_> = names
-            .iter()
-            .filter(|name| loaded.contains_key(*name) && old.contains_key(*name))
-            .cloned()
-            .collect();
+        // Port of erts/emulator/beam/beam_bif_load.c:422 and 511-548 (finish_loading:
+        // erts_start_staging_code_ix, then end and commit in staging_epilogue, or
+        // erts_abort_staging_code_ix), OTP-29.1.1: the modules of this load become current
+        // together.
+        let staging = self.code_ix.start_staging();
+        let not_purged: Vec<_> = staging.with(|tables| {
+            names
+                .iter()
+                .filter(|name| tables.loaded.contains_key(*name) && tables.old.contains_key(*name))
+                .cloned()
+                .collect()
+        });
         if !not_purged.is_empty() {
+            staging.abort();
             return Err(("not_purged", not_purged));
         }
-        let previous: HashMap<_, _> = names
-            .iter()
-            .filter_map(|name| loaded.get(name).map(|id| (name.clone(), *id)))
-            .collect();
         let mut on_load = Vec::new();
-        // Port of erts/emulator/beam/beam_bif_load.c:422 and 511-548 (finish_loading:
-        // erts_start_staging_code_ix, then end and commit in staging_epilogue), OTP-29.1.1: the
-        // exports of every module in this load become active together.
-        let staging = beamasm_integration::start_staging(self.code_scope);
-        if let Some(code) = shared.as_deref_mut() {
-            for (module, registers, mut meta) in prepared {
-                let name = module.name.clone();
-                let pending = meta.on_load.is_some();
-                if let Some(bytes) = meta.beam_bytes.as_deref()
-                    && let Some(native) = beamasm_integration::compile(
-                        bytes,
-                        &module,
-                        self.code_scope,
-                        crate::trace_bp::line_breakpoints_instrumented(),
-                    )
-                {
-                    native.publish(&module);
-                    meta.beamasm = Some(native);
-                }
-                let id = code.alloc(module, registers, Some(meta));
-                code.known_modules.insert(name.clone());
+        let mut ids = Vec::new();
+        for (module, registers, mut meta) in prepared {
+            let name = module.name.clone();
+            let pending = meta.on_load.is_some();
+            self.compile_native(&module, &mut meta);
+            let module = Arc::new(module);
+            ids.push(staging.with(|tables| {
+                let id = tables.alloc(module, registers, Some(meta));
+                tables.known_modules.insert(name.clone());
                 if pending {
-                    code.pending_on_load.insert(name.clone(), id);
-                    on_load.push(name);
-                } else {
-                    if let Some(previous) = code.loaded.insert(name.clone(), id) {
-                        code.old.insert(name.clone(), previous);
-                    }
-                    activate_module_records(code.code_scope, &code.modules[id]);
-                    code.deleted.remove(&name);
+                    tables.pending_on_load.insert(name.clone(), id);
+                } else if let Some(previous) = tables.make_current(&name, id) {
+                    tables.old.insert(name.clone(), previous);
                 }
+                id
+            }));
+            if pending {
+                on_load.push(name);
             }
-            drop(staging);
-            code.epoch
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            self.sync_shared(code);
-        } else {
-            for (module, registers, mut meta) in prepared {
-                let name = module.name.clone();
-                let pending = meta.on_load.is_some();
-                if let Some(bytes) = meta.beam_bytes.as_deref()
-                    && let Some(native) = beamasm_integration::compile(
-                        bytes,
-                        &module,
-                        self.code_scope,
-                        crate::trace_bp::line_breakpoints_instrumented(),
-                    )
-                {
-                    native.publish(&module);
-                    meta.beamasm = Some(native);
-                }
-                let id = self.insert_module(module, registers);
-                self.code_meta[id] = Some(Arc::new(meta));
-                if pending {
-                    if let Some(previous) = previous.get(&name) {
-                        self.loaded.insert(name.clone(), *previous);
-                        activate_module_records(self.code_scope, &self.modules[*previous]);
-                    } else {
-                        self.loaded.remove(&name);
-                        retract_module_records(self.code_scope, &name);
-                    }
-                    self.pending_on_load.insert(name.clone(), id);
-                    on_load.push(name.clone());
-                } else if let Some(previous) = previous.get(&name) {
-                    self.old.insert(name.clone(), *previous);
-                }
-                self.deleted.remove(&name);
-            }
-            drop(staging);
+        }
+        drop(staging);
+        self.refresh_code();
+        for id in ids {
+            self.register_native_targets(id);
         }
         Ok(on_load)
     }
-    // Port of erts/emulator/beam/code_ix.c:142 (erts_commit_staging_code_ix), OTP-29.1.1.
-    // Publish a generation by swapping table handles; readers retain their snapshot Arcs.
-    pub(crate) fn sync_shared(&mut self, shared: &SharedCode) {
-        self.coverage_mode = shared.coverage_mode;
-        self.modules = shared.modules.clone();
-        self.registers = shared.registers.clone();
-        self.native_fns = shared.native_fns.clone();
-        self.loaded_nifs = shared.loaded_nifs.clone();
-        self.loaded = shared.loaded.clone();
-        self.old = shared.old.clone();
-        self.pending_on_load = shared.pending_on_load.clone();
-        self.purge_state = Arc::clone(&shared.purge_state);
-        self.deleted = shared.deleted.clone();
-        self.code_meta = shared.code_meta.clone();
-        self.exports = shared.exports.clone();
-        self.free_ids = shared.free_ids.clone();
-        self.module_live = shared.module_live.clone();
-        self.module_files = shared.module_files.clone();
-        self.condemned = shared.condemned.clone();
-        self.known_modules = shared.known_modules.clone();
-        self.seen_epoch = shared.epoch.load(std::sync::atomic::Ordering::Acquire);
-    }
 
-    pub(crate) fn set_coverage_mode(&mut self, mode: arinsal_loader::CoverageMode) {
-        self.coverage_mode = mode;
-        if let Some(shared) = self.shared.clone() {
-            let mut code = shared.lock().unwrap();
-            code.coverage_mode = mode;
-            code.epoch
-                .fetch_add(1, std::sync::atomic::Ordering::Release);
-            self.sync_shared(&code);
-        }
-    }
     /// Whether `address` lies in the native code of module instance `id`.
     pub(crate) fn native_code_contains(&self, id: usize, address: usize) -> bool {
-        self.code_meta
+        self.code
+            .code_meta
             .get(id)
             .and_then(|meta| meta.as_ref())
             .and_then(|meta| meta.beamasm.as_ref())
@@ -958,32 +809,45 @@ impl Vm {
             })
     }
 
-    pub(crate) fn sync_code_epoch(&mut self) {
-        if let Some(epoch) = &self.code_epoch
-            && epoch.load(std::sync::atomic::Ordering::Acquire) != self.seen_epoch
-        {
-            let shared = self.shared.as_ref().unwrap().clone();
-            self.sync_shared(&shared.lock().unwrap());
-        }
-    }
-    pub(crate) fn sync_module(&mut self, id: usize) {
-        if (id >= self.modules.len() || id >= self.registers.len())
-            && let Some(shared) = self.shared.clone()
-        {
-            self.sync_shared(&shared.lock().unwrap());
+    /// Makes this VM read the tables of `erts_active_code_ix()`. A VM keeps the tables it
+    /// looked at last until its next code access point, like erts' processes keep the code
+    /// index they were scheduled in with.
+    pub(crate) fn refresh_code(&mut self) {
+        if self.code.generation != self.code_ix.active_generation() {
+            self.code = self.code_ix.active_tables();
+            self.native_fns = self.code_ix.native_fns();
         }
     }
 
-    /// Patch the breakpoints of several functions of one module, cloning and publishing the
-    /// module once: a per-function clone and code epoch bump made `return_to` (which touches
-    /// every loaded function) take minutes.
+    /// Generation of the tables this VM reads; interpreter caches are valid only within it.
+    pub(crate) fn code_generation(&self) -> u64 {
+        self.code.generation
+    }
+
+    pub(crate) fn sync_module(&mut self, id: usize) {
+        if id >= self.code.modules.len() || id >= self.code.registers.len() {
+            self.refresh_code();
+        }
+    }
+
+    /// NIF body `index` of a `NativeBody` instruction.
+    pub(crate) fn native_fn(&self, index: usize) -> Option<arinsal_bifs::BifFn> {
+        match self.native_fns.get(index) {
+            Some(native) => Some(*native),
+            None => self.code_ix.native_fns().get(index).copied(),
+        }
+    }
+
+    /// Patch the breakpoints of several functions of one module, publishing the module once:
+    /// a per-function publication made `return_to` (which touches every loaded function) take
+    /// minutes.
     pub(crate) fn patch_trace_functions(
         &mut self,
         module_id: usize,
         targets: &[(usize, String, u8)],
         process: &Process,
     ) {
-        let Some(module) = self.modules.get(module_id) else {
+        let Some(module) = self.code.modules.get(module_id).cloned() else {
             return;
         };
         let mut local_patches = Vec::new();
@@ -993,7 +857,7 @@ impl Vm {
                 crate::trace_bp::breakpoint_kinds(process, &module.name, function, *arity);
             if self
                 .beamasm_targets
-                .function_for_target(module_id, module, *entry)
+                .function_for_target(module_id, &module, *entry)
                 .is_some()
             {
                 crate::beamasm_integration::patch_native_breakpoint(
@@ -1026,29 +890,31 @@ impl Vm {
                 }
             }
         }
-        let changed = !local_patches.is_empty()
-            && self
-                .modules
-                .get_mut(module_id)
-                .is_some_and(|module| Arc::make_mut(module).set_trace_breakpoints(&local_patches));
-        // Import caches hold the old export target; a new epoch forces re-resolution.
-        if !changed && !exports_retargeted {
+        let patched = (!local_patches.is_empty())
+            .then(|| {
+                let mut patched = Module::clone(&module);
+                patched
+                    .set_trace_breakpoints(&local_patches)
+                    .then(|| Arc::new(patched))
+            })
+            .flatten();
+        if patched.is_none() && !exports_retargeted {
             return;
         }
-        let Some(module) = self.modules.get(module_id) else {
-            return;
-        };
-        self.beamasm_targets.register_module(module_id, module);
-        if let Some(shared) = self.shared.clone() {
-            let mut shared = shared.lock().unwrap();
-            shared.modules[module_id] = Arc::clone(module);
-            self.seen_epoch = shared
-                .epoch
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                + 1;
-        } else {
-            self.seen_epoch = self.seen_epoch.wrapping_add(1);
-        }
+        // Breakpoints patch code that every code index shares; the new table generations also
+        // make import caches holding the old export target resolve again.
+        self.code_ix.patch_all(|tables| {
+            if let Some(patched) = &patched
+                && tables
+                    .modules
+                    .get(module_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &module))
+            {
+                tables.modules[module_id] = Arc::clone(patched);
+            }
+        });
+        self.refresh_code();
+        self.register_native_targets(module_id);
     }
 
     /// Patch the code of exactly these functions after their breakpoints changed.
@@ -1065,6 +931,7 @@ impl Vm {
                 .insert((function.function.as_str(), function.arity));
         }
         let targets = self
+            .code
             .modules
             .iter()
             .enumerate()
@@ -1092,6 +959,7 @@ impl Vm {
         arity: Option<u8>,
     ) {
         let targets = self
+            .code
             .modules
             .iter()
             .enumerate()
@@ -1116,6 +984,7 @@ impl Vm {
 
     pub(crate) fn refresh_all_trace_breakpoints(&mut self, process: &Process) {
         let targets = self
+            .code
             .modules
             .iter()
             .enumerate()
@@ -1135,7 +1004,7 @@ impl Vm {
 
     /// The module is not current, `code_server` is up, and its beam has `-on_load`.
     pub(crate) fn unloaded_on_load(&self, process: &Process, name: &str) -> bool {
-        if self.loaded.contains_key(name) || !self.should_autoload(process, name) {
+        if self.code.loaded.contains_key(name) || !self.should_autoload(process, name) {
             return false;
         }
         let file = format!("{name}.beam");
@@ -1158,41 +1027,6 @@ impl Vm {
         }
         false
     }
-    pub(crate) fn shared_replica(code: Arc<Mutex<SharedCode>>, paths: &[PathBuf]) -> Self {
-        let purge_state = Arc::clone(&code.lock().unwrap().purge_state);
-        let code_scope = code.lock().unwrap().code_scope;
-        let mut vm = Self {
-            paths: paths.to_vec(),
-            statistics_origins: crate::natives::sys::StatisticsOrigins::now(),
-            otp_root: None,
-            modules: SharedTable::new(Vec::new()),
-            loaded: SharedTable::new(HashMap::new()),
-            old: SharedTable::new(HashMap::new()),
-            pending_on_load: SharedTable::new(HashMap::new()),
-            purge_state,
-            deleted: SharedTable::new(std::collections::HashSet::new()),
-            code_meta: SharedTable::new(Vec::new()),
-            code_epoch: Some(Arc::clone(&code.lock().unwrap().epoch)),
-            seen_epoch: 0,
-            beamasm_targets: beamasm_integration::NativeTargetCache::new(code_scope),
-            code_scope,
-            code_ix: crate::code_ix::for_scope(code_scope),
-            registers: SharedTable::new(Vec::new()),
-            native_fns: SharedTable::new(Vec::new()),
-            loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
-            shared: Some(Arc::clone(&code)),
-            backtrace_depth: 8,
-            exports: SharedTable::new(ExportIndex::new()),
-            free_ids: SharedTable::new(Vec::new()),
-            module_live: SharedTable::new(Vec::new()),
-            module_files: SharedTable::new(HashMap::new()),
-            condemned: SharedTable::new(Vec::new()),
-            known_modules: SharedTable::new(HashSet::new()),
-            coverage_mode: arinsal_loader::CoverageMode::None,
-        };
-        vm.sync_shared(&code.lock().unwrap());
-        vm
-    }
     /// `load_named` for a call that loads a missing module: the `trace_pattern(on_load, ...)`
     /// patterns of the calling process's runtime apply to a module this call loaded.
     // Port of erts/emulator/beam/beam_bif_load.c:944-975 (set_on_load_trace_pattern), OTP-29.1.1.
@@ -1201,7 +1035,7 @@ impl Vm {
         process: &Process,
         name: &str,
     ) -> Result<usize, VmError> {
-        let was_loaded = self.loaded.contains_key(name);
+        let was_loaded = self.code.loaded.contains_key(name);
         let id = self.load_named(name)?;
         if !was_loaded && crate::trace_bp::any_on_load_pattern(process) {
             crate::natives::code::apply_on_load_patterns(self, process, name);
@@ -1210,82 +1044,30 @@ impl Vm {
     }
 
     pub(crate) fn load_named(&mut self, name: &str) -> Result<usize, VmError> {
-        self.sync_code_epoch();
-        if let Some(&id) = self.loaded.get(name) {
+        self.refresh_code();
+        if let Some(&id) = self.code.loaded.get(name) {
             return Ok(id);
         }
-        if self.deleted.contains(name) || self.pending_on_load.contains_key(name) {
+        if self.code.deleted.contains(name) || self.code.pending_on_load.contains_key(name) {
             return Err(VmError::Load(format!("module {name} not found")));
         }
-        if let Some(shared) = self.shared.clone() {
-            let mut code = shared.lock().unwrap();
-            if !code.loaded.contains_key(name) {
-                let file = format!("{name}.beam");
-                let path = self
-                    .paths
-                    .iter()
-                    .map(|dir| dir.join(&file))
-                    .find(|path| path.is_file())
-                    .ok_or_else(|| VmError::Load(format!("module {name} not found")))?;
-                if crate::calls::trace_boot_enabled() {
-                    eprintln!("arinsal boot: load {}", path.display());
-                }
-                let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
-                let beam = arinsal_beam::parse(&bytes).map_err(|e| VmError::Load(e.to_string()))?;
-                let mut module = arinsal_loader::load_with_instrumentations(
-                    &beam,
-                    self.coverage_mode,
-                    crate::trace_bp::line_breakpoints_instrumented(),
-                )
-                .map_err(|e| VmError::Load(e.to_string()))?;
-                funs::set_module_uniq(&mut module, &bytes)?;
-                bind_static_nifs(&mut module, &mut code.native_fns);
-                let module_name = module.name.clone();
-                let id = code.alloc(
-                    module,
-                    process::register_requirements(&beam),
-                    Some(CodeMeta::from_beam(&beam, Some(&bytes))),
-                );
-                code.loaded.insert(module_name.clone(), id);
-                activate_module_records(code.code_scope, &code.modules[id]);
-                if let Some(native) = beamasm_integration::compile(
-                    &bytes,
-                    &code.modules[id],
-                    code.code_scope,
-                    crate::trace_bp::line_breakpoints_instrumented(),
-                ) {
-                    native.publish(&code.modules[id]);
-                    if let Some(meta) = code.code_meta[id].as_mut() {
-                        Arc::make_mut(meta).beamasm = Some(native);
-                    }
-                }
-                code.known_modules.insert(module_name);
-                code.module_files
-                    .insert(name.to_owned(), path_charlist(&path));
-                code.epoch
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
-            self.sync_shared(&code);
-            return self
-                .loaded
-                .get(name)
-                .copied()
-                .ok_or_else(|| VmError::Load(format!("module {name} not found")));
-        }
         let file = format!("{name}.beam");
-        for dir in &self.paths {
-            let path = dir.join(&file);
-            if path.is_file() {
-                if crate::calls::trace_boot_enabled() {
-                    eprintln!("arinsal boot: load {}", path.display());
-                }
-                let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
-                let id = self.load_bytes_internal(&bytes, true)?;
-                self.module_files
-                    .insert(name.to_owned(), path_charlist(&path));
-                return Ok(id);
-            }
+        let path = self
+            .paths
+            .iter()
+            .map(|dir| dir.join(&file))
+            .find(|path| path.is_file())
+            .ok_or_else(|| VmError::Load(format!("module {name} not found")))?;
+        if crate::calls::trace_boot_enabled() {
+            eprintln!("arinsal boot: load {}", path.display());
         }
-        Err(VmError::Load(format!("module {name} not found")))
+        let bytes = std::fs::read(&path).map_err(|e| VmError::Load(e.to_string()))?;
+        let beam = arinsal_beam::parse(&bytes).map_err(|e| VmError::Load(e.to_string()))?;
+        self.load_current(&beam, Some(&bytes), true, Some((name, &path)))?;
+        self.code
+            .loaded
+            .get(name)
+            .copied()
+            .ok_or_else(|| VmError::Load(format!("module {name} not found")))
     }
 }

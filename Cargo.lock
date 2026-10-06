@@ -408,6 +408,7 @@ dependencies = [
 name = "arinsal-vm"
 version = "0.0.1"
 dependencies = [
+ "arc-swap",
  "arinsal-a64",
  "arinsal-alloc",
  "arinsal-args",

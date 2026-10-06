@@ -126,9 +126,6 @@ struct ScopeExports {
     // Exports with a global call breakpoint: their callers go through the export
     // trampoline, whose interpreted export entry is the breakpoint.
     global_breakpoints: std::collections::HashSet<Mfa>,
-    // A load holds the staging area open: changes go to the staging code index and its
-    // commit makes them active.
-    staging_open: bool,
 }
 
 #[derive(Default)]
@@ -304,48 +301,16 @@ fn publish_module_exports(
     }
 }
 
-/// Opens the staging area of `scope` for a load; changes to its exports stay invisible to
-/// running code until the returned guard commits them.
-// Port of erts/emulator/beam/code_ix.c:120-129 (erts_start_staging_code_ix), OTP-29.1.1.
-pub(crate) fn start_staging(scope: u64) -> StagingGuard {
-    let Ok(mut registry) = dispatch_registry().write() else {
-        return StagingGuard { scope: None };
-    };
-    let exports = registry.scopes.entry(scope).or_default();
-    if exports.staging_open {
-        // A nested load joins the open staging area and leaves its commit to the outer one.
-        return StagingGuard { scope: None };
-    }
-    stage_exports(exports, &crate::code_ix::for_scope(scope));
-    exports.staging_open = true;
-    StagingGuard { scope: Some(scope) }
-}
-
-/// Ends a staging area opened by [`start_staging`] and commits it when dropped.
-pub(crate) struct StagingGuard {
-    scope: Option<u64>,
-}
-
-impl Drop for StagingGuard {
-    // Port of erts/emulator/beam/code_ix.c:131-171 (erts_end_staging_code_ix,
-    // erts_commit_staging_code_ix), OTP-29.1.1.
-    fn drop(&mut self) {
-        let Some(scope) = self.scope else {
-            return;
-        };
-        let mut registry = dispatch_registry()
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        let exports = registry.scopes.entry(scope).or_default();
-        exports.staging_open = false;
-        crate::code_ix::for_scope(scope).commit();
-    }
-}
-
-/// Copies every export's active address into the staging code index.
+/// Copies every export's active address of `scope` into the staging code index when the
+/// node opens a staging area.
 // Port of erts/emulator/beam/export.c:100-106 (export_stage) and 277-280
 // (export_start_staging), OTP-29.1.1.
-fn stage_exports(exports: &ScopeExports, code_ix: &crate::code_ix::CodeIndexes) {
+pub(crate) fn stage_dispatch(scope: u64) {
+    let Ok(mut registry) = dispatch_registry().write() else {
+        return;
+    };
+    let exports = registry.scopes.entry(scope).or_default();
+    let code_ix = crate::code_ix::for_scope(scope);
     let (active, staging) = (code_ix.active(), code_ix.staging());
     for entry in exports.imports.values() {
         entry.slot.stage(active, staging);
@@ -356,20 +321,16 @@ fn stage_exports(exports: &ScopeExports, code_ix: &crate::code_ix::CodeIndexes) 
 /// staging area the change is staged and committed on its own, like the code changes erts
 /// makes under the code modification permission (delete_module, trace patterns).
 fn staged(scope: u64, change: impl FnOnce(&mut ScopeExports)) {
+    let code_ix = crate::code_ix::for_scope(scope);
+    let staging = code_ix.start_staging();
     let Ok(mut registry) = dispatch_registry().write() else {
         return;
     };
     let exports = registry.scopes.entry(scope).or_default();
-    let code_ix = crate::code_ix::for_scope(scope);
-    let own_staging = !exports.staging_open;
-    if own_staging {
-        stage_exports(exports, &code_ix);
-    }
     change(exports);
-    refresh_import_slots(exports, code_ix.staging());
-    if own_staging {
-        code_ix.commit();
-    }
+    refresh_import_slots(exports, staging.ix());
+    drop(registry);
+    drop(staging);
 }
 
 /// Sends native callers of a deleted module's exports to the export trampoline, whose

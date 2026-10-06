@@ -668,7 +668,7 @@ fn spawn_fun_with_priority(
         PF_SPAWN_FUN_LOAD_NS.fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
         phase = std::time::Instant::now();
     }
-    let apply_ip = vm.modules[apply_module]
+    let apply_ip = vm.code.modules[apply_module]
         .export("apply", 2)
         .ok_or_else(|| VmError::Unsupported("erlang:apply/2 is not loaded".into()))?;
     let mut child = Process::with_spawn_registers(2, 0);
@@ -1169,7 +1169,8 @@ fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool 
     if registered {
         return true;
     }
-    vm.modules
+    vm.code
+        .modules
         .get(process.module)
         .is_some_and(|module| names.iter().any(|name| module.name == *name))
 }
@@ -1299,11 +1300,11 @@ fn request_system_task(
             let module = arg0
                 .and_then(atom_name)
                 .ok_or_else(|| badarg("request_system_task"))?;
-            vm.sync_code_epoch();
-            let old = vm.old.get(&module).copied();
+            vm.refresh_code();
+            let old = vm.code.old.get(&module).copied();
             let op = RemoteOp::CheckProcessCode {
                 module: old,
-                native: old.and_then(|old| crate::load::native_code_range(&vm.code_meta, old)),
+                native: old.and_then(|old| crate::load::native_code_range(&vm.code.code_meta, old)),
                 async_request: Some(Message::copy_from(req_id)?),
                 kill: false,
             };

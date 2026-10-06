@@ -1099,9 +1099,10 @@ fn tracer_instance_current(
     module: &str,
     instance: &std::sync::Arc<arinsal_loader::Module>,
 ) -> bool {
-    vm.loaded
+    vm.code
+        .loaded
         .get(module)
-        .and_then(|&id| vm.modules.get(id))
+        .and_then(|&id| vm.code.modules.get(id))
         .is_some_and(|current| std::sync::Arc::ptr_eq(current, instance))
 }
 
@@ -2124,7 +2125,7 @@ fn special_frames(
         let Some((false, module_id, ip)) = crate::stacktrace::decode_tag(word) else {
             break;
         };
-        let Some(module) = vm.modules.get(module_id) else {
+        let Some(module) = vm.code.modules.get(module_id) else {
             break;
         };
         if ip == module.return_trace_ip {
@@ -2325,7 +2326,7 @@ fn caller_info(
     target_module: &str,
     target_function: &str,
 ) -> Result<(Option<Term>, Option<Term>), VmError> {
-    let direct_caller = if let Some(module) = vm.modules.get(process.module)
+    let direct_caller = if let Some(module) = vm.code.modules.get(process.module)
         && let Some((function, arity)) = module.function_at(process.ip)
         && (module.name != target_module || function != target_function)
         && !function.starts_with('-')
@@ -2395,7 +2396,7 @@ fn caller_info(
                 index += 1;
                 continue;
             };
-            let Some(module) = vm.modules.get(module_id) else {
+            let Some(module) = vm.code.modules.get(module_id) else {
                 index += 1;
                 continue;
             };
@@ -2463,7 +2464,7 @@ fn caller_info(
 fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, Term)>, VmError> {
     // Reserve one slot beyond OTP's MAX_BACKTRACE_SIZE for the current frame, which is
     // removed before the caller prefixes are built below.
-    let trace = crate::stacktrace::build(&vm.modules, process, None, 65)?;
+    let trace = crate::stacktrace::build(&vm.code.modules, process, None, 65)?;
     let owned = to_owned(trace)
         .map_err(|error| VmError::Unsupported(format!("match stacktrace copy: {error:?}")))?;
     let OwnedTerm::List { elems, .. } = &owned else {
@@ -2719,11 +2720,13 @@ pub(crate) fn return_event(
         }
         None
     };
-    let Some((module_name, function_name, arity)) = vm.modules.get(module_id).and_then(|module| {
-        module
-            .function_at(entry_ip)
-            .map(|(function, arity)| (module.name.clone(), function.to_owned(), arity))
-    }) else {
+    let Some((module_name, function_name, arity)) =
+        vm.code.modules.get(module_id).and_then(|module| {
+            module
+                .function_at(entry_ip)
+                .map(|(function, arity)| (module.name.clone(), function.to_owned(), arity))
+        })
+    else {
         return Ok(());
     };
     let module = Term::atom(
@@ -2875,7 +2878,7 @@ fn caller_mfa_name(
         let function = crate::native_function_at(ip)?;
         return Some((function.module, function.function, function.arity));
     }
-    let module = vm.modules.get(module_id)?;
+    let module = vm.code.modules.get(module_id)?;
     let (function, arity) = module.function_at(ip)?;
     Some((module.name.clone(), function.to_owned(), arity))
 }
@@ -2977,7 +2980,7 @@ fn return_to_target(vm: &Vm, process: &Process, start: usize) -> Option<(String,
             index += 1;
             continue;
         }
-        let Some(module) = vm.modules.get(module_id) else {
+        let Some(module) = vm.code.modules.get(module_id) else {
             index += 1;
             continue;
         };
@@ -3417,7 +3420,7 @@ pub(crate) fn running_mfa(
     } else if let Some(continuation) = continuation {
         continuation
     } else {
-        let Some(module) = vm.modules.get(process.module) else {
+        let Some(module) = vm.code.modules.get(process.module) else {
             return Ok(None);
         };
         let Some((function, arity)) = module.function_at(process.ip) else {

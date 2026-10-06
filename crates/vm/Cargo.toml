@@ -48,6 +48,7 @@ arinsal-packet.workspace = true
 arinsal-difftest = { workspace = true, optional = true }
 libc = "0.2"
 mio = { version = "1", features = ["os-poll", "os-ext"] }
+arc-swap = "1.9.2"
 
 [dev-dependencies]
 arinsal-beamjit = { path = "../beamjit" }

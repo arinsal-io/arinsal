@@ -297,9 +297,9 @@ fn info_list(
 
 fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let name = module_name(args[0]).ok_or_else(badarg)?;
-    let id = vm.loaded.get(&name).copied().ok_or_else(badarg)?;
-    let module = &vm.modules[id];
-    let meta = vm.code_meta[id].as_ref().ok_or_else(badarg)?;
+    let id = vm.code.loaded.get(&name).copied().ok_or_else(badarg)?;
+    let module = &vm.code.modules[id];
+    let meta = vm.code.code_meta[id].as_ref().ok_or_else(badarg)?;
     let value = |field: &str, process: &mut Process| -> Result<Term, VmError> {
         match field {
             "module" => Ok(args[0]),
@@ -314,7 +314,7 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     .map(|export| (export.function.as_str(), export.arity))
                     .collect();
                 let mut exports = Vec::new();
-                for (module_name, function, arity) in vm.exports.order.iter().rev() {
+                for (module_name, function, arity) in vm.code.exports.order.iter().rev() {
                     if module_name != &name || !exported.contains(&(function.as_str(), *arity)) {
                         continue;
                     }
@@ -342,7 +342,7 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
             "nifs" => {
                 let mut nifs = Vec::new();
                 // Natively backed stubs of modules that never ran load_nif are not NIFs in erts.
-                let loaded = vm.loaded_nifs.contains(module.name.as_str());
+                let loaded = vm.code.loaded_nifs.contains(module.name.as_str());
                 for (entry, function, arity) in module.functions.iter().rev() {
                     if loaded
                         && matches!(
@@ -443,7 +443,7 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // a malformed module is `{error, badfile}` before finish_loading.
     let Ok(mut module) = arinsal_loader::load_with_instrumentations(
         &beam,
-        vm.coverage_mode,
+        vm.coverage_mode(),
         crate::trace_bp::line_breakpoints_instrumented(),
     ) else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
@@ -482,7 +482,7 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
             None => {
                 let mut module = match arinsal_loader::load_with_instrumentations(
                     beam,
-                    vm.coverage_mode,
+                    vm.coverage_mode(),
                     crate::trace_bp::line_breakpoints_instrumented(),
                 ) {
                     Ok(module) => module,
@@ -554,10 +554,10 @@ pub(crate) fn apply_on_load_patterns(vm: &mut Vm, process: &Process, name: &str)
 }
 
 fn check_process_code(vm: &Vm, process: &Process, name: &str) -> bool {
-    let Some(&old) = vm.old.get(name) else {
+    let Some(&old) = vm.code.old.get(name) else {
         return false;
     };
-    process.references_code(old, crate::load::native_code_range(&vm.code_meta, old))
+    process.references_code(old, crate::load::native_code_range(&vm.code.code_meta, old))
 }
 
 // Port of erts/emulator/beam/erl_bif_coverage.c:50-116, OTP-29.1.1.
@@ -585,8 +585,12 @@ fn coverage_mode_from(term: Term) -> Option<CoverageMode> {
 
 fn coverage_module(vm: &Vm, module: Term) -> Result<&arinsal_loader::Module, VmError> {
     let name = module_name(module).ok_or_else(badarg)?;
-    let id = vm.loaded.get(&name).copied().ok_or_else(badarg)?;
-    vm.modules.get(id).map(AsRef::as_ref).ok_or_else(badarg)
+    let id = vm.code.loaded.get(&name).copied().ok_or_else(badarg)?;
+    vm.code
+        .modules
+        .get(id)
+        .map(AsRef::as_ref)
+        .ok_or_else(badarg)
 }
 
 fn coverage_count(value: u64, flags: bool) -> Term {
@@ -724,11 +728,11 @@ fn beamfile_module_md5(process: &mut Process, binary: Term) -> Result<Term, VmEr
 // Port of erts/emulator/beam/beam_bif_load.c:1275-1450, OTP-29.1.1.
 fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, VmError> {
     let name = module_name(module).ok_or_else(badarg)?;
-    let id = vm.loaded.get(&name).copied().ok_or_else(badarg)?;
-    if vm.modules.get(id).is_none() || vm.code_meta.get(id).is_none() {
+    let id = vm.code.loaded.get(&name).copied().ok_or_else(badarg)?;
+    if vm.code.modules.get(id).is_none() || vm.code.code_meta.get(id).is_none() {
         return Err(badarg());
     }
-    let has_debug = vm.code_meta[id].as_ref().is_some_and(|meta| {
+    let has_debug = vm.code.code_meta[id].as_ref().is_some_and(|meta| {
         meta.beam.other_chunks.iter().any(|(chunk, bytes)| {
             chunk == b"DbgB"
                 && bytes.len() >= 12
@@ -738,8 +742,8 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
     if !has_debug {
         return Ok(atom("none"));
     }
-    let module = &vm.modules[id];
-    let beam = &vm.code_meta[id].as_ref().ok_or_else(badarg)?.beam;
+    let module = &vm.code.modules[id];
+    let beam = &vm.code.code_meta[id].as_ref().ok_or_else(badarg)?.beam;
     let items = beam.debug_items().unwrap_or_default();
     // Items without an `i_debug_line` (never instrumented) have no location and are skipped.
     let line_of = |index: usize| {
@@ -820,48 +824,48 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
     from_owned(&list(result), &mut heap).map_err(|_| system_limit())
 }
 
+// Port of erts/emulator/beam/beam_bif_load.c:679-745 (delete_module_1), OTP-29.1.1.
 fn delete(vm: &mut Vm, name: &str) -> Result<Term, VmError> {
-    vm.sync_code_epoch();
-    if let Some(shared) = vm.shared.clone() {
-        let mut code = shared.lock().unwrap();
-        if code.old.contains_key(name) {
-            return Err(badarg());
-        }
-        let Some(current) = code.loaded.remove(name) else {
-            // Port of erts/emulator/beam/beam_bif_load.c:679 (delete_module_1), OTP-29.1.1.
-            // The module entry remains after purge, so a later delete is still true.
-            return Ok(atom(if code.known_modules.contains(name) {
-                "true"
-            } else {
-                "undefined"
-            }));
-        };
-        code.old.insert(name.to_owned(), current);
-        crate::load::retract_module_records(code.code_scope, name);
-        code.deleted.insert(name.to_owned());
-        code.module_files.remove(name);
-        code.epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        vm.sync_shared(&code);
-    } else {
-        if vm.old.contains_key(name) {
-            return Err(badarg());
-        }
-        let Some(current) = vm.loaded.remove(name) else {
-            // Port of erts/emulator/beam/beam_bif_load.c:679 (delete_module_1), OTP-29.1.1.
-            return Ok(atom(if vm.known_modules.contains(name) {
-                "true"
-            } else {
-                "undefined"
-            }));
-        };
-        vm.old.insert(name.to_owned(), current);
-        crate::load::retract_module_records(vm.code_scope, name);
-        vm.deleted.insert(name.to_owned());
-        vm.module_files.remove(name);
+    enum Outcome {
+        NotPurged,
+        Undefined,
+        Deleted,
     }
-    crate::beamasm_integration::unpublish_module_exports(vm.code_scope, name);
-    Ok(atom("true"))
+    let staging = vm.code_ix.start_staging();
+    let outcome = staging.with(|tables| {
+        if tables.old.contains_key(name) {
+            return Outcome::NotPurged;
+        }
+        if let Some(current) = tables.loaded.remove(name) {
+            tables.old.insert(name.to_owned(), current);
+            crate::load::retract_module_records(tables.code_scope, name);
+            tables.deleted.insert(name.to_owned());
+            tables.module_files.remove(name);
+            Outcome::Deleted
+        } else if tables.known_modules.contains(name) {
+            // The module entry remains after purge, so a later delete is still true.
+            Outcome::Deleted
+        } else {
+            Outcome::Undefined
+        }
+    });
+    let result = match outcome {
+        Outcome::NotPurged => {
+            staging.abort();
+            Err(badarg())
+        }
+        Outcome::Undefined => {
+            staging.abort();
+            Ok(atom("undefined"))
+        }
+        Outcome::Deleted => {
+            crate::beamasm_integration::unpublish_module_exports(vm.code_scope, name);
+            drop(staging);
+            Ok(atom("true"))
+        }
+    };
+    vm.refresh_code();
+    result
 }
 
 fn module_id_referenced(
@@ -880,7 +884,7 @@ fn purge(
     name: &str,
     phase: &str,
 ) -> Result<Term, VmError> {
-    vm.sync_code_epoch();
+    vm.refresh_code();
     let state = std::sync::Arc::clone(&vm.purge_state);
     match phase {
         "prepare" | "prepare_on_load" if state.is_prepared() => return Err(badarg()),
@@ -889,126 +893,77 @@ fn purge(
         _ => return Err(badarg()),
     }
     let mut resume = Vec::new();
-    let result = if let Some(shared) = vm.shared.clone() {
-        let mut code = shared.lock().unwrap();
-        let result = match phase {
-            "prepare" | "prepare_on_load" => {
+    // Purging changes the old code of the active code index in place (erts_rwlock_old_code).
+    let result = match phase {
+        "prepare" | "prepare_on_load" => {
+            let old = vm.code_ix.update_active(|tables| {
                 if phase == "prepare_on_load"
-                    && let Some(id) = code.pending_on_load.remove(name)
+                    && let Some(id) = tables.pending_on_load.remove(name)
                 {
-                    code.old.insert(name.to_owned(), id);
+                    tables.old.insert(name.to_owned(), id);
                 }
-                let old = code.old.get(name).copied();
-                if let Some(id) = old {
-                    state.prepare(name, id, &code.modules[id]);
-                }
-                old.is_some()
+                tables.old.get(name).copied()
+            });
+            vm.refresh_code();
+            if let Some(id) = old {
+                state.prepare(name, id, &vm.code.modules[id]);
             }
-            "abort" => {
-                resume = state.finish(true);
-                false
-            }
-            _ => {
-                // g_code_fix: drop the old version's slot once nothing references it.
-                let pending = std::mem::take(&mut *code.condemned);
+            old.is_some()
+        }
+        "abort" => {
+            resume = state.finish(true);
+            false
+        }
+        _ => {
+            // g_code_fix: drop the old version's slot once nothing references it.
+            let removed = vm.code_ix.update_active(|tables| {
+                let pending = std::mem::take(&mut *tables.condemned);
                 let mut keep = Vec::new();
                 for id in pending {
-                    if module_id_referenced(process, &code.code_meta, id) {
+                    if module_id_referenced(process, &tables.code_meta, id) {
                         keep.push(id);
                     } else {
-                        code.release(id);
+                        tables.release(id);
                     }
                 }
-                let removed = code.old.remove(name);
+                let removed = tables.old.remove(name);
                 if let Some(id) = removed {
-                    if module_id_referenced(process, &code.code_meta, id) {
+                    if module_id_referenced(process, &tables.code_meta, id) {
                         keep.push(id);
                     } else {
-                        code.release(id);
+                        tables.release(id);
                     }
                 }
-                *code.condemned = keep;
-                resume = state.finish(false);
+                *tables.condemned = keep;
                 removed.is_some()
-            }
-        };
-        code.epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        vm.sync_shared(&code);
-        result
-    } else {
-        match phase {
-            "prepare" | "prepare_on_load" => {
-                if phase == "prepare_on_load"
-                    && let Some(id) = vm.pending_on_load.remove(name)
-                {
-                    vm.old.insert(name.to_owned(), id);
-                }
-                let old = vm.old.get(name).copied();
-                if let Some(id) = old {
-                    state.prepare(name, id, &vm.modules[id]);
-                }
-                old.is_some()
-            }
-            "abort" => {
-                resume = state.finish(true);
-                false
-            }
-            _ => {
-                // g_code_fix: drop the old version's slot once nothing references it.
-                let pending = std::mem::take(&mut *vm.condemned);
-                let mut keep = Vec::new();
-                for id in pending {
-                    if module_id_referenced(process, &vm.code_meta, id) {
-                        keep.push(id);
-                    } else {
-                        vm.release_module_slot(id);
-                    }
-                }
-                let removed = vm.old.remove(name);
-                if let Some(id) = removed {
-                    if module_id_referenced(process, &vm.code_meta, id) {
-                        keep.push(id);
-                    } else {
-                        vm.release_module_slot(id);
-                    }
-                }
-                *vm.condemned = keep;
-                resume = state.finish(false);
-                removed.is_some()
-            }
+            });
+            vm.refresh_code();
+            resume = state.finish(false);
+            removed
         }
     };
     resume_pending_lambda_callers(process, ctx, resume);
     Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
 }
 
+// Port of erts/emulator/beam/beam_bif_load.c:822-900 (erts_internal_finish_after_on_load_2),
+// OTP-29.1.1.
 fn finish_on_load(vm: &mut Vm, name: &str, keep: bool) -> Result<Term, VmError> {
-    vm.sync_code_epoch();
-    if let Some(shared) = vm.shared.clone() {
-        let mut code = shared.lock().unwrap();
-        let id = *code.pending_on_load.get(name).ok_or_else(badarg)?;
-        if keep {
-            code.pending_on_load.remove(name);
-            if let Some(previous) = code.loaded.insert(name.to_owned(), id) {
-                code.old.insert(name.to_owned(), previous);
+    vm.refresh_code();
+    if !vm.code.pending_on_load.contains_key(name) {
+        return Err(badarg());
+    }
+    if keep {
+        let staging = vm.code_ix.start_staging();
+        staging.with(|tables| {
+            if let Some(id) = tables.pending_on_load.remove(name)
+                && let Some(previous) = tables.make_current(name, id)
+            {
+                tables.old.insert(name.to_owned(), previous);
             }
-            crate::load::activate_module_records(code.code_scope, &code.modules[id]);
-            code.deleted.remove(name);
-        }
-        code.epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-        vm.sync_shared(&code);
-    } else {
-        let id = *vm.pending_on_load.get(name).ok_or_else(badarg)?;
-        if keep {
-            vm.pending_on_load.remove(name);
-            if let Some(previous) = vm.loaded.insert(name.to_owned(), id) {
-                vm.old.insert(name.to_owned(), previous);
-            }
-            crate::load::activate_module_records(vm.code_scope, &vm.modules[id]);
-            vm.deleted.remove(name);
-        }
+        });
+        drop(staging);
+        vm.refresh_code();
     }
     Ok(atom("true"))
 }
@@ -1059,6 +1014,7 @@ fn literal_collector(vm: &Vm, process: &Process, pid: Pid) -> bool {
         .is_some_and(|runtime| *runtime.literal_collector.lock().unwrap() == Some(pid));
     registered
         || vm
+            .code
             .modules
             .get(process.module)
             .is_some_and(|module| module.name == "erts_literal_area_collector")
@@ -1183,11 +1139,11 @@ fn call_values(
         ("code", "coverage_support", 0) => Some(Ok(Term::atom(atoms::TRUE))),
         ("code", "set_coverage_mode", 1) => Some((|| {
             let next = coverage_mode_from(args[0]).ok_or_else(badarg)?;
-            let previous = vm.coverage_mode;
+            let previous = vm.coverage_mode();
             vm.set_coverage_mode(next);
             Ok(coverage_mode_atom(previous))
         })()),
-        ("code", "get_coverage_mode", 0) => Some(Ok(coverage_mode_atom(vm.coverage_mode))),
+        ("code", "get_coverage_mode", 0) => Some(Ok(coverage_mode_atom(vm.coverage_mode()))),
         ("code", "get_coverage_mode", 1) => Some((|| {
             let module = coverage_module(vm, args[0])?;
             Ok(coverage_mode_atom(
@@ -1208,14 +1164,19 @@ fn call_values(
         ("erlang", "finish_loading", 1) => Some(finish(vm, process, args)),
         ("erlang", "module_loaded", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
-            Ok(Term::atom(if vm.loaded.contains_key(&name) {
+            Ok(Term::atom(if vm.code.loaded.contains_key(&name) {
                 atoms::TRUE
             } else {
                 atoms::FALSE
             }))
         })()),
         ("erlang", "loaded", 0) => Some({
-            let modules = vm.loaded.keys().map(|name| atom(name)).collect::<Vec<_>>();
+            let modules = vm
+                .code
+                .loaded
+                .keys()
+                .map(|name| atom(name))
+                .collect::<Vec<_>>();
             make_list(process, modules)
         }),
         ("erlang", "pre_loaded", 0) => Some(make_list(
@@ -1255,17 +1216,18 @@ fn call_values(
                 .filter(|n| (0..=255).contains(n))
                 .ok_or_else(badarg)? as u8;
             let result = vm
+                .code
                 .loaded
                 .get(&name)
-                .is_some_and(|id| vm.modules[*id].export_slot(&function, arity).is_some());
+                .is_some_and(|id| vm.code.modules[*id].export_slot(&function, arity).is_some());
             Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
         })()),
         ("erlang", "get_module_info", 1) => Some(module_info(vm, process, args)),
         ("erlang", "get_module_info", 2) => Some(module_info(vm, process, args)),
         ("erlang", "check_old_code", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
-            vm.sync_code_epoch();
-            Ok(Term::atom(if vm.old.contains_key(&name) {
+            vm.refresh_code();
+            Ok(Term::atom(if vm.code.old.contains_key(&name) {
                 atoms::TRUE
             } else {
                 atoms::FALSE
@@ -1297,7 +1259,7 @@ fn call_values(
         })()),
         ("erts_internal", "check_process_code", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
-            vm.sync_code_epoch();
+            vm.refresh_code();
             Ok(Term::atom(if check_process_code(vm, process, &name) {
                 atoms::TRUE
             } else {
@@ -1333,12 +1295,13 @@ fn call_values(
             let Some(name) = module_name(args[0]) else {
                 return Some(Err(badarg()));
             };
-            vm.sync_code_epoch();
+            vm.refresh_code();
             let id = match vm
+                .code
                 .pending_on_load
                 .get(&name)
                 .copied()
-                .or_else(|| vm.loaded.get(&name).copied())
+                .or_else(|| vm.code.loaded.get(&name).copied())
             {
                 Some(id) => id,
                 // The NIF family's loader calls this after `load_named`,
@@ -1348,14 +1311,14 @@ fn call_values(
                     Err(_) => return Some(Err(badarg())),
                 },
             };
-            let Some((function, arity)) = vm.code_meta[id]
+            let Some((function, arity)) = vm.code.code_meta[id]
                 .as_ref()
                 .and_then(|meta| meta.on_load.clone())
             else {
                 return Some(Err(badarg()));
             };
-            let Some(target) = vm.modules[id].export(&function, arity).or_else(|| {
-                vm.modules[id]
+            let Some(target) = vm.code.modules[id].export(&function, arity).or_else(|| {
+                vm.code.modules[id]
                     .functions
                     .iter()
                     .find(|(_, fname, a)| *fname == function && *a == arity)
@@ -1519,7 +1482,7 @@ mod tests {
             .unwrap();
 
         let mut vm = Vm::new([]);
-        vm.coverage_mode = CoverageMode::FunctionCounters;
+        vm.set_coverage_mode(CoverageMode::FunctionCounters);
         loaded(&mut vm, &beam);
         vm.eval(module, "run", &[]).unwrap();
         let mut process = Process::new();
@@ -1557,7 +1520,7 @@ mod tests {
             .unwrap();
 
         let mut vm = Vm::new([]);
-        vm.coverage_mode = CoverageMode::LineCounters;
+        vm.set_coverage_mode(CoverageMode::LineCounters);
         loaded(&mut vm, &beam);
         vm.eval(module, "run", &[]).unwrap();
         let mut process = Process::new();
@@ -1646,7 +1609,7 @@ mod tests {
             .eval("code:get_coverage(function, code_bifs_function_flags)")
             .unwrap();
         let mut vm = Vm::new([]);
-        vm.coverage_mode = CoverageMode::Function;
+        vm.set_coverage_mode(CoverageMode::Function);
         loaded(&mut vm, &beam);
         vm.eval(module, "run", &[]).unwrap();
         let mut process = Process::new();
@@ -1695,7 +1658,7 @@ mod tests {
             OwnedTerm::Atom("v2".into())
         );
         assert_eq!(
-            vm.old.contains_key("arinsal_hot_versions"),
+            vm.code.old.contains_key("arinsal_hot_versions"),
             reference.call(
                 "erlang",
                 "check_old_code",
@@ -1733,7 +1696,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         );
-        assert!(!vm.loaded.contains_key("arinsal_hot_delete"));
+        assert!(!vm.code.loaded.contains_key("arinsal_hot_delete"));
     }
 
     #[test]
@@ -1873,7 +1836,7 @@ mod tests {
                 }
             ])
         );
-        assert!(!vm.loaded.contains_key("arinsal_hot_onload"));
+        assert!(!vm.code.loaded.contains_key("arinsal_hot_onload"));
         // Running the on_load code itself goes through erlang:call_on_load_function/1
         // (covered by tests/nif_dynamic.rs); here only the pending/commit protocol is checked.
         finish_on_load(&mut vm, "arinsal_hot_onload", true).unwrap();
@@ -2270,8 +2233,8 @@ mod boot_loop1_tests {
         let mut vm = Vm::new([]);
         let actual = finish(&mut vm, &mut process, &[list]).unwrap();
         assert_eq!(to_owned(actual).unwrap(), expected);
-        assert!(vm.loaded.contains_key("boot_loop1_batch_a"));
-        assert!(vm.loaded.contains_key("boot_loop1_batch_b"));
+        assert!(vm.code.loaded.contains_key("boot_loop1_batch_a"));
+        assert!(vm.code.loaded.contains_key("boot_loop1_batch_b"));
         for path in paths {
             std::fs::remove_file(path).unwrap();
         }

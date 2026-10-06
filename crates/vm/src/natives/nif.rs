@@ -532,7 +532,7 @@ pub(crate) fn invoke_tracer(
 ) -> Option<Term> {
     // Port of erts/emulator/beam/erl_trace.c:3017-3060 (load_tracer_nif): only the module's
     // current code can supply the tracer NIFs, not an old or purged instance.
-    let module = vm.modules.get(*vm.loaded.get(module)?)?;
+    let module = vm.code.modules.get(*vm.code.loaded.get(module)?)?;
     let arity = u8::try_from(args.len()).ok()?;
     let entry = module
         .functions
@@ -542,15 +542,16 @@ pub(crate) fn invoke_tracer(
         Instr::NativeBody { index } => *index as usize,
         _ => return None,
     };
-    let native = *vm.native_fns.get(index)?;
+    let native = vm.native_fn(index)?;
     calls::call_bif(&mut process.heap, native, args).ok()
 }
 
 pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {
     let Some(module) = vm
+        .code
         .loaded
         .get(module_name)
-        .and_then(|&id| vm.modules.get(id))
+        .and_then(|&id| vm.code.modules.get(id))
     else {
         return false;
     };
@@ -571,18 +572,14 @@ fn trampolines() -> &'static [BifFn] {
     TABLE
 }
 
-/// Publish the NIF table and the library bound for `key` to the shared code. Only that key is
-/// added: a replica's copy of `loaded_nifs` may predate a purge, which must stay purged.
+/// Binds the NIF library `key` to its module instance in the active code index; the patched
+/// `NativeBody` instructions are code shared by every code index.
+// Port of erts/emulator/beam/erl_nif.c:4748 (load_nif: `module_p->curr.nif`), OTP-29.1.1.
 fn publish(vm: &mut Vm, key: &str) {
-    if let Some(shared) = &vm.shared {
-        let mut code = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-        code.native_fns.clone_from(&vm.native_fns);
-        code.loaded_nifs.insert(key.to_owned());
-        // Other schedulers copy `native_fns` only when the epoch changes.
-        // The patched `NativeBody` instructions are already visible.
-        code.epoch
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
+    vm.code_ix.update_active(|tables| {
+        tables.loaded_nifs.insert(key.to_owned());
+    });
+    vm.refresh_code();
 }
 
 fn patch_native(module: &arinsal_loader::Module, entry: usize, index: u32) -> Result<(), VmError> {
@@ -602,10 +599,9 @@ fn patch_native(module: &arinsal_loader::Module, entry: usize, index: u32) -> Re
 }
 
 fn push_native(vm: &mut Vm, function: BifFn) -> Result<u32, VmError> {
-    let index = u32::try_from(vm.native_fns.len())
-        .map_err(|_| VmError::Unsupported("native table".into()))?;
-    vm.native_fns.push(function);
-    Ok(index)
+    vm.code_ix
+        .push_native_fn(function)
+        .ok_or_else(|| VmError::Unsupported("native table".into()))
 }
 
 fn nif_open_error(
@@ -658,6 +654,7 @@ fn validate_image(
     image: &arinsal_nif::NifImage,
 ) -> Result<Vec<(usize, usize)>, String> {
     let module = vm
+        .code
         .modules
         .get(module_id)
         .ok_or_else(|| format!("module {caller} is not loaded"))?;
@@ -728,7 +725,7 @@ fn install_dynamic(
             .copied()
             .ok_or_else(|| VmError::Unsupported("dynamic NIF trampoline".into()))?;
         let index = push_native(vm, function)?;
-        patch_native(&vm.modules[module_id], *entry, index)?;
+        patch_native(&vm.code.modules[module_id], *entry, index)?;
         bind_native_code(vm, module_id, *entry, function)?;
     }
     Ok(())
@@ -743,6 +740,7 @@ fn bind_native_code(
     function: BifFn,
 ) -> Result<(), VmError> {
     let Some(version) = vm
+        .code
         .code_meta
         .get(module_id)
         .and_then(|meta| meta.as_ref())
@@ -750,7 +748,7 @@ fn bind_native_code(
     else {
         return Ok(());
     };
-    let Some((_, name, arity)) = vm.modules[module_id]
+    let Some((_, name, arity)) = vm.code.modules[module_id]
         .functions
         .iter()
         .find(|(start, _, _)| *start == entry)
@@ -767,7 +765,7 @@ fn bind_native_code(
 }
 
 fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
-    let functions = vm.modules[module_id].functions.clone();
+    let functions = vm.code.modules[module_id].functions.clone();
     let enabled = functions
         .iter()
         .find_map(|(entry, name, arity)| (name == "enabled" && *arity == 3).then_some(*entry));
@@ -780,10 +778,10 @@ fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
         ));
     };
     let enabled_index = push_native(vm, tracer_enabled)?;
-    patch_native(&vm.modules[module_id], enabled, enabled_index)?;
+    patch_native(&vm.code.modules[module_id], enabled, enabled_index)?;
     bind_native_code(vm, module_id, enabled, tracer_enabled)?;
     let trace_index = push_native(vm, tracer_trace)?;
-    patch_native(&vm.modules[module_id], trace, trace_index)?;
+    patch_native(&vm.code.modules[module_id], trace, trace_index)?;
     bind_native_code(vm, module_id, trace, tracer_trace)?;
     Ok(())
 }
@@ -824,9 +822,10 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     };
     bytes.extend(b".so");
     // The caller's code (and its native version) may have been loaded by another scheduler.
-    vm.sync_code_epoch();
+    vm.refresh_code();
     let mut caller_id = process.module;
     let caller = vm
+        .code
         .modules
         .get(caller_id)
         .map(|module| module.name.clone())
@@ -834,7 +833,7 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     // Port of erts/emulator/beam/erl_nif.c:4736 (erts_load_nif: the caller is the code being
     // loaded, `modp->on_load`, while its on_load function runs), OTP-29.1.1. A reloaded module's
     // on_load can execute the previous version's native code, which names the wrong instance.
-    if let Some(&pending) = vm.pending_on_load.get(&caller) {
+    if let Some(&pending) = vm.code.pending_on_load.get(&caller) {
         caller_id = pending;
     }
     if caller == "erlang" {
@@ -845,6 +844,7 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
         );
     }
     if vm
+        .code
         .loaded_nifs
         .contains(&crate::load::nif_key(&caller, caller_id))
     {
@@ -873,7 +873,6 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     };
     if loaded == atom("ok") {
         let key = crate::load::nif_key(&caller, caller_id);
-        vm.loaded_nifs.insert(key.clone());
         publish(vm, &key);
     }
     Ok(loaded)
@@ -898,12 +897,12 @@ fn call_on_load(vm: &mut Vm, process: &mut Process, module: Term) -> Result<Term
     let name = atom_name(module).ok_or_else(badarg)?;
     // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1: the
     // function of the code instance being loaded runs, not the still current previous version.
-    vm.sync_code_epoch();
-    let id = match vm.pending_on_load.get(&name).copied() {
+    vm.refresh_code();
+    let id = match vm.code.pending_on_load.get(&name).copied() {
         Some(id) => id,
         None => vm.load_named(&name).map_err(|_| badarg())?,
     };
-    let entry = vm.modules[id]
+    let entry = vm.code.modules[id]
         .functions
         .iter()
         .find_map(|(entry, function, arity)| {
@@ -916,8 +915,8 @@ fn call_on_load(vm: &mut Vm, process: &mut Process, module: Term) -> Result<Term
     // `call_import` advances `ip` by one. The BEAM `on_load` opcode is only a
     // marker; skip that unsupported instruction and land on the real body.
     let mut landing = entry;
-    if let Some(Instr::Unsupported(reason)) = vm.modules[id].code.get(entry + 1)
-        && vm.modules[id]
+    if let Some(Instr::Unsupported(reason)) = vm.code.modules[id].code.get(entry + 1)
+        && vm.code.modules[id]
             .unsupported_reasons
             .get(*reason as usize)
             .is_some_and(|text| text.contains("on_load"))
@@ -1444,6 +1443,7 @@ fn call_values(
     }
     if module == "erl_tracer"
         && vm
+            .code
             .loaded_nifs
             .iter()
             .any(|key| key.starts_with("erl_tracer#"))

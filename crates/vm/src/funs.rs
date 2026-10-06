@@ -25,7 +25,7 @@ pub(super) fn make_fun(
     index: u32,
     dst: Arg,
     env: u32,
-    code_epoch: u64,
+    code_generation: u64,
 ) -> Result<(), VmError> {
     let slot = module
         .funs
@@ -48,7 +48,7 @@ pub(super) fn make_fun(
     let value = TermBuilder::new(&mut p.heap)
         .local_fun(Arc::clone(&slot.entry), &free)
         .map_err(|e| VmError::Unsupported(format!("fun allocation {e:?}")))?;
-    slot.set_dispatch(0, p.module, module.code.as_ptr() as usize, code_epoch);
+    slot.set_dispatch(0, p.module, module.code.as_ptr() as usize, code_generation);
     p.write(dst, value)
 }
 
@@ -203,7 +203,7 @@ impl Vm {
                     Err(error) => return Some(Err(error)),
                 };
                 p.module = module_id;
-                p.ip = self.modules[module_id]
+                p.ip = self.code.modules[module_id]
                     .export(function, arity as u8)
                     .unwrap_or(0);
                 p.x[..arity].copy_from_slice(args);
@@ -256,7 +256,7 @@ impl Vm {
         tail: bool,
         ctx: Option<&mut RunCtx<'_, Message>>,
     ) -> Result<Option<ImportOutcome>, VmError> {
-        let import = self.modules[p.module]
+        let import = self.code.modules[p.module]
             .imports
             .get(index)
             .ok_or_else(|| VmError::Unsupported(format!("import {index}")))?;
@@ -316,16 +316,18 @@ impl Vm {
         match view.unwrap() {
             FunRef::Local { entry, free_vars } => {
                 // Port of erts/emulator/beam/beam_common.c:1621-1624 (call_fun), OTP-29.1.1.
-                self.sync_code_epoch();
-                let cached = entry.get_dispatch(0).and_then(|(id, target, code, epoch)| {
-                    if self.code_epoch.is_some() && epoch == self.seen_epoch {
-                        return Some((id, target, code));
-                    }
-                    let module = self.modules.get(id)?;
-                    (self.module_live.get(id) == Some(&true)
-                        && module.code.as_ptr() as usize == code)
-                        .then_some((id, target, code))
-                });
+                self.refresh_code();
+                let cached = entry
+                    .get_dispatch(0)
+                    .and_then(|(id, target, code, generation)| {
+                        if generation == self.code_generation() {
+                            return Some((id, target, code));
+                        }
+                        let module = self.code.modules.get(id)?;
+                        (self.code.module_live.get(id) == Some(&true)
+                            && module.code.as_ptr() as usize == code)
+                            .then_some((id, target, code))
+                    });
                 let resolved = match cached {
                     Some(cached) if !self.purge_state.pending(cached.0) => Some(cached),
                     // A cached target in code pending purge is re-resolved: the fun
@@ -422,10 +424,11 @@ impl Vm {
             ("erts_code_purger".to_owned(), "pending_purge_lambda")
         } else {
             let handler = error_handler_module(p);
-            let ready = self
-                .loaded
-                .get(&handler)
-                .is_some_and(|id| self.modules[*id].export("undefined_lambda", 3).is_some());
+            let ready = self.code.loaded.get(&handler).is_some_and(|id| {
+                self.code.modules[*id]
+                    .export("undefined_lambda", 3)
+                    .is_some()
+            });
             if !ready {
                 return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
                     global_atoms()
@@ -460,11 +463,11 @@ impl Vm {
     ) -> Result<Option<(usize, usize, usize)>, VmError> {
         let name = atom_name(Term::atom(entry.module))
             .ok_or_else(|| VmError::Unsupported("lambda module atom".into()))?;
-        let found = [self.loaded.get(&name), self.old.get(&name)]
+        let found = [self.code.loaded.get(&name), self.code.old.get(&name)]
             .into_iter()
             .flatten()
             .find_map(|&id| {
-                self.modules[id]
+                self.code.modules[id]
                     .funs
                     .iter()
                     .find(|slot| {
@@ -478,7 +481,7 @@ impl Vm {
             // Port of erts/emulator/beam/beam_common.c:1702-1712 (call_fun), OTP-29.1.1:
             // current code without this fun is `badfun`; no current code goes to
             // `error_handler:undefined_lambda/3`.
-            if self.loaded.contains_key(&name) {
+            if self.code.loaded.contains_key(&name) {
                 let reason = badfun_reason(p, arity)?;
                 return Err(VmError::Trap(exceptions::Trap::error(reason)));
             }
@@ -488,13 +491,13 @@ impl Vm {
             0,
             module_id,
             target,
-            self.modules[module_id].code.as_ptr() as usize,
-            self.seen_epoch,
+            self.code.modules[module_id].code.as_ptr() as usize,
+            self.code_generation(),
         );
         Ok(Some((
             module_id,
             target,
-            self.modules[module_id].code.as_ptr() as usize,
+            self.code.modules[module_id].code.as_ptr() as usize,
         )))
     }
 
@@ -642,7 +645,7 @@ impl Vm {
         // apply may otherwise enter a synchronous fast path for the same MFA.
         // A trap through `apply` is keyed by the caller's import when it has one, so a
         // static call and its apply re-execution resume the same continuation.
-        let trap_key = self.modules[p.module]
+        let trap_key = self.code.modules[p.module]
             .imports
             .iter()
             .position(|import| {
@@ -817,7 +820,7 @@ impl Vm {
                 });
             }
         };
-        let Some(target) = self.modules[module_id].export(function, arity as u8) else {
+        let Some(target) = self.code.modules[module_id].export(function, arity as u8) else {
             // Port of erts/emulator/beam/beam_common.c (call_error_handler).
             if self.should_autoload(p, module) {
                 return self
@@ -835,7 +838,10 @@ impl Vm {
         p.ip = target;
         p.tick();
         Ok(ImportOutcome::Jump(
-            self.modules[module_id].code.as_ptr().wrapping_add(target),
+            self.code.modules[module_id]
+                .code
+                .as_ptr()
+                .wrapping_add(target),
         ))
     }
 
@@ -845,7 +851,7 @@ impl Vm {
     /// autoloads the consolidated beam. Port of
     /// `error_handler:undefined_function/3`, OTP-29.1.1.
     pub(super) fn should_autoload(&self, p: &Process, module: &str) -> bool {
-        if module == "error_handler" || self.pending_on_load.contains_key(module) {
+        if module == "error_handler" || self.code.pending_on_load.contains_key(module) {
             return false;
         }
         p.runtime
@@ -895,10 +901,11 @@ impl Vm {
         // not autoload the handler. Port of erts/emulator/beam/beam_common.c
         // (`call_error_handler`), OTP-29.1.1.
         let handler = error_handler_module(p);
-        let ready = self
-            .loaded
-            .get(&handler)
-            .is_some_and(|id| self.modules[*id].export("undefined_function", 3).is_some());
+        let ready = self.code.loaded.get(&handler).is_some_and(|id| {
+            self.code.modules[*id]
+                .export("undefined_function", 3)
+                .is_some()
+        });
         if !ready {
             return Err(VmError::Exception {
                 reason: "undef".into(),
@@ -1182,11 +1189,11 @@ impl Vm {
     /// Port of erts/emulator/beam/erl_fun.c:37 (erts_get_fun_mfa), OTP-29.1.1.
     fn fun_function_name(&self, entry: &arinsal_term::FunEntry) -> Option<String> {
         let module = atom_name(Term::atom(entry.module))?;
-        let (id, target) = [self.loaded.get(&module), self.old.get(&module)]
+        let (id, target) = [self.code.loaded.get(&module), self.code.old.get(&module)]
             .into_iter()
             .flatten()
             .find_map(|&id| {
-                self.modules[id]
+                self.code.modules[id]
                     .funs
                     .iter()
                     .find(|slot| {
@@ -1199,7 +1206,7 @@ impl Vm {
         if self.purge_state.pending(id) {
             return None;
         }
-        self.modules[id]
+        self.code.modules[id]
             .function_at(target)
             .map(|(name, _)| name.to_owned())
     }
