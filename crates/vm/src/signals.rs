@@ -1140,6 +1140,7 @@ fn access_timer_sync(
         Waiter {
             id,
             kind: WaitKind::Info,
+            save: process.inbox.len(),
         },
     );
     *guard = TimerAccess::Parked {
@@ -2537,6 +2538,9 @@ pub(crate) enum RemoteOp {
     },
     /// `erts_internal:request_system_task/3,4` `system_task_test` (erts `ERTS_PSTT_TEST`).
     SystemTaskTest { request_id: Message },
+    /// `ERTS_PSTT_PRIO_SIG`: a system task without reply whose only purpose is to elevate
+    /// the target's priority until it has handled its incoming signals.
+    PrioSig,
 }
 
 /// How the caller extracts the reply once it is in the mailbox.
@@ -2569,6 +2573,12 @@ pub(crate) struct Pending {
 struct Waiter {
     id: u64,
     kind: WaitKind,
+    /// Mailbox length when the request was sent: the reply is queued after it.
+    ///
+    /// Port of erts/emulator/beam/erl_proc_sig_queue.c:3398 (erts_msgq_set_save_end),
+    /// OTP-29.1.1: the wait skips the messages that predate the request instead of
+    /// rescanning them on every retry.
+    save: usize,
 }
 
 /// Runtime address plus pid. Simulations reuse pid numbers, and tests run in parallel.
@@ -2688,13 +2698,12 @@ pub(crate) fn poll(process: &mut Process, caller: Pid) -> Result<Option<Term>, V
         let Some(waiter) = tables.waiters.get(&slot) else {
             return Ok(None);
         };
-        (waiter.id, waiter.kind)
+        (waiter.id, waiter.kind, waiter.save)
     };
-    let (id, kind) = waiter;
+    let (id, kind, save) = waiter;
     let Some(index) = process
         .inbox
-        .iter()
-        .position(|term| reply_inner(*term, id, kind).is_some())
+        .position_from(save, |term| reply_inner(*term, id, kind).is_some())
     else {
         return Err(await_reply());
     };
@@ -2793,6 +2802,10 @@ fn submit_from(
         id
     };
     let slot_of = scope(process);
+    let elevates = matches!(
+        op,
+        RemoteOp::GroupLeader { .. } | RemoteOp::Info { .. } | RemoteOp::Display | RemoteOp::Alive
+    );
     {
         let mut tables = tables().lock().unwrap();
         // Port of erts/emulator/beam/erl_proc_sig_queue.c (signals to an exiting process are
@@ -2807,9 +2820,14 @@ fn submit_from(
             None => queues.plain.push_back(pending),
         }
         if let Some(kind) = wait {
-            tables
-                .waiters
-                .insert((slot_of, ctx.pid()), Waiter { id, kind });
+            tables.waiters.insert(
+                (slot_of, ctx.pid()),
+                Waiter {
+                    id,
+                    kind,
+                    save: process.inbox.len(),
+                },
+            );
         }
     }
     let sent = match priority {
@@ -2817,7 +2835,16 @@ fn submit_from(
         None => ctx.signal(target, Signal::UnlinkAck(id)),
     };
     match sent {
-        Ok(()) => Ok(Submit::Sent(id)),
+        Ok(()) => {
+            // Port of erts/emulator/beam/erl_proc_sig_queue.c:3012, 3062, 3183, 3423
+            // (erts_proc_sig_send_group_leader, _is_alive_request, _process_info_request,
+            // _rpc_request_prio), OTP-29.1.1: these senders elevate the receiver's signal
+            // handling priority to their own.
+            if elevates && priority.is_none() {
+                elevate_sig_handling_prio(process, ctx, slot_of, target)?;
+            }
+            Ok(Submit::Sent(id))
+        }
         Err(arinsal_sched::Error::NoProcess) => {
             let mut tables = tables().lock().unwrap();
             if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
@@ -2830,6 +2857,52 @@ fn submit_from(
             Ok(Submit::Dead)
         }
         Err(error) => Err(VmError::Unsupported(format!("request signal: {error}"))),
+    }
+}
+
+/// Raise `target`'s priority to the caller's user priority while it handles incoming signals.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:1275 (maybe_elevate_sig_handling_prio) and
+/// erl_process.c:11678 (erts_sig_prio), OTP-29.1.1. The elevation is a reply-less system task
+/// at the caller's priority; the scheduler notifies a dirty signal handler when the target
+/// executes dirty.
+fn elevate_sig_handling_prio(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    slot_of: usize,
+    target: Pid,
+) -> Result<(), VmError> {
+    let min_prio = crate::natives::proc::user_priority(process);
+    match ctx.process_priority(target) {
+        Some(other) if sys_index(other) > sys_index(min_prio) => {}
+        _ => return Ok(()),
+    }
+    let id = runtime(process)?.next_ref();
+    {
+        let mut tables = tables().lock().unwrap();
+        if tables.exited.contains(&(slot_of, target)) {
+            return Ok(());
+        }
+        tables.requests.entry((slot_of, target)).or_default().sys[sys_index(min_prio)].push_back(
+            Pending {
+                id,
+                from: ctx.pid(),
+                op: RemoteOp::PrioSig,
+            },
+        );
+    }
+    match ctx.signal_sys_task(target, Signal::UnlinkAck(id), min_prio) {
+        Ok(()) => Ok(()),
+        Err(arinsal_sched::Error::NoProcess) => {
+            let mut tables = tables().lock().unwrap();
+            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
+                queues.sys[sys_index(min_prio)].retain(|pending| pending.id != id);
+            }
+            Ok(())
+        }
+        Err(error) => Err(VmError::Unsupported(format!(
+            "signal priority task: {error}"
+        ))),
     }
 }
 
@@ -2880,6 +2953,10 @@ pub(crate) fn reply_request(
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (handle_process_info), OTP-29.1.1: the
     // reply to a process_info request is built in the reply message's own heap fragment, not
     // on the target's heap, which a parked target would never collect.
+    // Port of erts/emulator/beam/erl_process.c:11028 (ERTS_PSTT_PRIO_SIG): nothing to run.
+    if matches!(pending.op, RemoteOp::PrioSig) {
+        return Ok(());
+    }
     let detached = matches!(pending.op, RemoteOp::Info { .. });
     if detached {
         process.heap.begin_detached();
@@ -2959,6 +3036,9 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         }
     }
     for pending in pending {
+        if matches!(pending.op, RemoteOp::PrioSig) {
+            continue;
+        }
         let Ok(reply) = crate::natives::proc::failure_reply(process, pending.id, pending.op) else {
             continue;
         };

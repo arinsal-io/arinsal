@@ -1847,6 +1847,12 @@ impl<T: Task> Inner<T> {
             .sys_priority
             .fetch_min(priority.index() as u8, Ordering::AcqRel);
         self.deliver(from, to, payload, None, remaining)?;
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:1275
+        // (maybe_elevate_sig_handling_prio), OTP-29.1.1: a dirty target cannot run at the
+        // elevated priority, so its matching dirty signal handler is notified.
+        if Self::in_dirty_state(&process) {
+            self.notify_dirty_signal_handler(&process, Some(priority));
+        }
         if priority.index() < before.index() && process.dirty.load(Ordering::Acquire) == 0 {
             let item = Scheduled::new(process.clone(), None);
             if process.state.load(Ordering::Acquire) == QUEUED {
@@ -2788,6 +2794,7 @@ pub struct RunCtx<'a, M: Send + 'static> {
 }
 
 trait ContextOps<M: Send + 'static> {
+    fn process_priority(&self, pid: Pid) -> Option<Priority>;
     fn deliver(
         &mut self,
         from: Pid,
@@ -3148,6 +3155,10 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     pub fn sys_task_run(&self) -> bool {
         self.sys_task_run
     }
+    /// User priority of a live process.
+    pub fn process_priority(&self, pid: Pid) -> Option<Priority> {
+        self.inner.process_priority(pid)
+    }
     /// Send a control signal that carries a system task requested at `priority`.
     ///
     /// The target runs at least at `priority` until it has handled the signal, even
@@ -3410,6 +3421,12 @@ impl<T: Task> Runner<'_, T> {
 }
 
 impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
+    fn process_priority(&self, pid: Pid) -> Option<Priority> {
+        let process = self.inner.table.lookup(pid)?;
+        Some(Priority::from_index(
+            process.user_priority.load(Ordering::Acquire),
+        ))
+    }
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8893
     // (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1: the task cell is the
     // main process lock, taken with a try-lock.
