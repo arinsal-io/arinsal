@@ -4,6 +4,35 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{VecHeap, from_owned};
 use arinsal_vm::Vm;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::time::Duration;
+
+fn multicast_probe() -> Result<(), String> {
+    let group = Ipv4Addr::new(224, 0, 0, 1);
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|error| format!("could not bind probe socket: {error}"))?;
+    socket
+        .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+        .map_err(|error| format!("could not join 224.0.0.1: {error}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .map_err(|error| format!("could not set probe timeout: {error}"))?;
+
+    let payload = b"arinsal multicast probe";
+    let port = socket
+        .local_addr()
+        .map_err(|error| format!("could not read probe socket address: {error}"))?
+        .port();
+    socket
+        .send_to(payload, (group, port))
+        .map_err(|error| format!("could not send multicast probe: {error}"))?;
+    let mut received = [0; 64];
+    match socket.recv_from(&mut received) {
+        Ok((length, _)) if &received[..length] == payload => Ok(()),
+        Ok(_) => Err("received a different packet instead of the probe".into()),
+        Err(error) => Err(format!("no multicast packet arrived: {error}")),
+    }
+}
 
 fn source() -> &'static str {
     r#"
@@ -92,7 +121,7 @@ exchange(Opts, Payload) ->
 connected() ->
     {ok, A} = gen_udp:open(0, udp([binary, {active, false}, {ip, {127,0,0,1}}])),
     {ok, Port} = inet:port(A),
-    {ok, B} = gen_udp:open(0, udp([binary, {active, false}])),
+    {ok, B} = gen_udp:open(0, udp([binary, {active, false}, {ip, {127,0,0,1}}])),
     ok = gen_udp:connect(B, {127,0,0,1}, Port),
     {ok, {{127,0,0,1}, Peer}} = inet:peername(B),
     ok = gen_udp:send(B, <<"con">>),
@@ -332,6 +361,13 @@ fn gen_udp_matches_erts() {
         .expect("load reference module");
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load arinsal module");
+    let multicast_available = match multicast_probe() {
+        Ok(()) => true,
+        Err(reason) => {
+            eprintln!("skipping inet_udp mcast differential case: {reason}");
+            false
+        }
+    };
     for case in [
         "open",
         "passive",
@@ -355,6 +391,9 @@ fn gen_udp_matches_erts() {
         "udp6drv",
         "stress",
     ] {
+        if case == "mcast" && !multicast_available {
+            continue;
+        }
         let input = OwnedTerm::Atom(case.into());
         let expected = reference.call("inet_udp_diff", "run", std::slice::from_ref(&input));
         let mut heap = VecHeap::new();
