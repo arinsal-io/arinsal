@@ -1,0 +1,19 @@
+[package]
+name = "jit-backend-adr"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+arinsal-beam = { path = "../../../crates/beam" }
+arinsal-loader = { path = "../../../crates/loader" }
+adr-jit-copy = { path = "jit_copy" }
+cranelift-assembler-x64 = "=0.136.1"
+cranelift-codegen = "=0.136.1"
+cranelift-frontend = "=0.136.1"
+cranelift-jit = "=0.136.1"
+cranelift-module = "=0.136.1"
+object = "=0.39.1"
+libc = "=0.2.189"

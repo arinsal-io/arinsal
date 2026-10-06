@@ -1,0 +1,15 @@
+[package]
+name = "safety-research"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+arinsal-term = { path = "../../../crates/term" }
+
+[dev-dependencies]
+arinsal-etf = { path = "../../../crates/etf" }
+
+[features]
+borrow-fail = []

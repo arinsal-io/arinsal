@@ -1,0 +1,77 @@
+application:get_env/2 removed|lib/kernel/src/application.erl delegates to application_controller:get_env/2
+application:load/1 removed|lib/kernel/src/application.erl implements load/1 via load1/2 and application_controller
+binary:bin_to_list/1 removed|lib/stdlib/src/binary.erl implements this in Erlang
+binary:bin_to_list/3 removed|lib/stdlib/src/binary.erl implements this in Erlang
+code:get_mode/0 removed|lib/kernel/src/code.erl delegates to code_server:get_mode/0
+code:priv_dir/1 removed|lib/kernel/src/code.erl calls code_server:call/1 with a priv_dir request
+erlang:get_cookie/0 removed|erts/preloaded/src/erlang.erl delegates to auth:get_cookie/0
+erlang:get_cookie/1 removed|erts/preloaded/src/erlang.erl validates the node then delegates to auth:get_cookie/1
+erlang:halt/0 removed|erts/preloaded/src/erlang.erl calls erlang:halt/2
+erlang:halt/1 removed|erts/preloaded/src/erlang.erl validates the status then calls erlang:halt/2
+erlang:is_alive/0 removed|erts/preloaded/src/erlang.erl checks erlang:node/0 and erts_internal:dynamic_node_name/0
+erlang:memory/0 removed|erts/preloaded/src/erlang.erl uses system_info allocator and memory_internal requests
+erlang:memory/1 removed|erts/preloaded/src/erlang.erl uses system_info allocator and memory_internal requests
+erlang:set_cookie/2 removed|erts/preloaded/src/erlang.erl validates args then delegates to auth:set_cookie/2
+ets:all/0 removed|lib/stdlib/src/ets.erl gathers ets:internal_request_all/0 replies
+ets:repair_continuation/2 removed|lib/stdlib/src/ets.erl repairs continuation tuples in Erlang
+ets:select_delete/2 removed|lib/stdlib/src/ets.erl dispatches internal_delete_all/2 or ets:internal_select_delete/2
+ets:tab2list/1 removed|lib/stdlib/src/ets.erl enumerates table slots in Erlang
+filename:join/1 kept-pending: forced-JIT prim_file crash when the real filename.erl runs (++/2 path); separate JIT task
+os:getenv/0 removed|lib/kernel/src/os.erl maps over os:env/0 in Erlang
+os:perf_counter/1 removed|lib/kernel/src/os.erl converts os:perf_counter/0 with erlang:convert_time_unit/3
+os:type/0 removed|lib/kernel/src/os.erl reads erlang:system_info(os_type)
+os:version/0 removed|lib/kernel/src/os.erl reads erlang:system_info(os_version)
+unicode:characters_to_binary/3 removed|lib/stdlib/src/unicode.erl implements encoding conversion in Erlang
+erlang:open_port/2 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl:7985 delegates to erts_internal:open_port/2.
+erlang:port_close/1 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl:12108 delegates to erts_internal:port_close/1.
+erlang:port_command/2 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl:11948 delegates to erts_internal:port_command/3.
+erlang:port_command/3 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl:12007 delegates to erts_internal:port_command/3.
+erlang:port_connect/2 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl:12064 delegates to erts_internal:port_connect/2.
+erlang:port_info/1 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl:12260 delegates to erts_internal:port_info/1.
+erlang:port_info/2 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl:12314 delegates to erts_internal:port_info/2.
+erts_internal:port_command/2 removed|OTP-29.1.1 erts_internal.erl exports /3 only; bif.tab registers /3, not /2.
+erts_internal:open_port/2 kept|C BIF in OTP-29.1.1 bif.tab; erl_bif_port.c:60 implements it.
+erts_internal:port_command/3 kept|Static C BIF in OTP-29.1.1 bif.tab; erl_bif_port.c:168 implements it.
+erts_internal:port_close/1 kept|Static C BIF in OTP-29.1.1 bif.tab; erl_bif_port.c:384 implements it.
+erts_internal:port_connect/2 kept|Static C BIF in OTP-29.1.1 bif.tab; erl_bif_port.c:438 implements it.
+erts_internal:port_info/1 kept|Static C BIF in OTP-29.1.1 bif.tab; erl_bif_port.c:486 implements it.
+erts_internal:port_info/2 kept|Static C BIF in OTP-29.1.1 bif.tab; erl_bif_port.c:543 implements it.
+erlang:alias/0 removed|OTP 29.1.1 erlang.erl delegates to alias/1 NIF
+erlang:garbage_collect/0 removed|OTP 29.1.1 erlang.erl delegates to erts_internal:garbage_collect/1
+erlang:garbage_collect/1 removed|OTP 29.1.1 erlang.erl delegates to garbage_collect/2 and preserves error info
+erlang:garbage_collect/2 removed|OTP 29.1.1 erlang.erl wrapper validates options and delegates to erts_internal BIFs
+erlang:group_leader/2 removed|OTP 29.1.1 erlang.erl wraps erts_internal:group_leader/2,3 signals
+erlang:hibernate/0 kept|OTP 29.1.1 ops.tab:669-673 lowers this special instruction; native handler is required for hibernation
+erlang:process_display/2 removed|OTP 29.1.1 erlang.erl wraps erts_internal:process_display/2
+erlang:process_flag/3 removed|OTP 29.1.1 erlang.erl wraps erts_internal:process_flag/3
+erlang:send_nosuspend/2 removed|OTP 29.1.1 erlang.erl delegates to send_nosuspend/3
+erlang:send_nosuspend/3 removed|OTP 29.1.1 erlang.erl delegates to erlang:send/3
+erlang:suspend_process/1 removed|OTP 29.1.1 erlang.erl delegates to erts_internal:suspend_process/2
+erlang:suspend_process/2 removed|OTP 29.1.1 erlang.erl wraps erts_internal:suspend_process/2
+erlang:yield/0 kept|OTP 29.1.1 ops.tab:661-666 lowers this special instruction; handler supplies instruction result
+erlang:spawn/1 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn/3
+erlang:spawn/2 removed|OTP 29.1.1 erlang.erl local-node wrapper delegates to spawn/3
+erlang:spawn/4 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_opt/5
+erlang:spawn_link/1 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_link/3
+erlang:spawn_link/2 removed|OTP 29.1.1 erlang.erl local-node wrapper delegates to spawn_link/3
+erlang:spawn_link/4 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_opt/5 with link option
+erlang:spawn_monitor/1 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_opt/4
+erlang:spawn_monitor/2 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_opt/4
+erlang:spawn_monitor/3 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_opt/4
+erlang:spawn_monitor/4 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_opt/5
+erlang:spawn_opt/2 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_opt/4
+erlang:spawn_opt/3 removed|OTP 29.1.1 erlang.erl local-node wrapper delegates to spawn_opt/5
+erlang:spawn_opt/5 removed|OTP 29.1.1 erlang.erl wrapper delegates to spawn_request/5 or spawn_opt/4
+code:all_loaded/0 removed|OTP-29.1.1 lib/kernel/src/code.erl delegates to code_server:all_loaded/0.
+code:delete/1 removed|OTP-29.1.1 lib/kernel/src/code.erl delegates to code_server; erlang:delete_module/1 remains the runtime primitive.
+code:is_loaded/1 removed|OTP-29.1.1 lib/kernel/src/code.erl delegates to code_server:is_loaded/1.
+code:load_binary/3 removed|OTP-29.1.1 lib/kernel/src/code.erl wrapper around prepare_loading and code_server loading.
+code:purge/1 removed|OTP-29.1.1 lib/kernel/src/code.erl delegates purge coordination to code_server.
+code:soft_purge/1 removed|OTP-29.1.1 lib/kernel/src/code.erl delegates purge coordination to code_server.
+code:which/1 removed|OTP-29.1.1 lib/kernel/src/code.erl resolves through code_server and the code path.
+erlang:check_process_code/2 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl wrapper calls erts_internal:check_process_code/3.
+erlang:check_process_code/3 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl wrapper calls erts_internal:check_process_code/3.
+erlang:load_module/2 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl wrapper calls prepare_loading/2 and finish_loading/1.
+erlang:prepare_loading/2 removed|OTP-29.1.1 erts/preloaded/src/erlang.erl wrapper normalizes compressed BEAM then calls erts_internal:prepare_loading/2.
+erts_internal:check_process_code/3 removed|OTP-29.1.1 erts/preloaded/src/erts_internal.erl Erlang wrapper uses request_system_task and check_process_code/1; BIF-side /1 retained.
+filename:join/1 removed|OTP-29.1.1 lib/stdlib/src/filename.erl Use the Erlang implementation; native shortcut removed for forced-JIT coverage.

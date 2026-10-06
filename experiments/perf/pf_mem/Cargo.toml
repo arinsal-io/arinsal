@@ -1,0 +1,11 @@
+[package]
+name = "pf-mem-prototypes"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+arinsal-term = { path = "../../../crates/term" }
+arinsal-vm = { path = "../../../crates/vm" }
+arinsal-sched = { path = "../../../crates/sched" }

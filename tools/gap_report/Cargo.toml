@@ -1,0 +1,20 @@
+[package]
+name = "gap-report"
+description = "Generate the observed OTP boot and tooling implementation gap report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arinsal-bifs.workspace = true
+arinsal-nif-file.workspace = true
+arinsal-nif-tty.workspace = true
+arinsal-nif-buffer.workspace = true
+arinsal-nif-zlib.workspace = true
+arinsal-nif-socket.workspace = true
+arinsal-re.workspace = true
+arinsal-vm.workspace = true

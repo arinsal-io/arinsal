@@ -1,0 +1,15 @@
+   623  <arinsal_vm::Vm>::run_slice_inner
+   348  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+   237  __findenv_locked
+   135  arinsal_vm::signals::call
+    95  arinsal_sched::run_one::<arinsal_vm::proc_create::Process>
+    71  _xzm_free
+    69  mach_absolute_time
+    52  ???
+    49  arinsal_vm::interp::exec_hot
+    39  _tlv_get_addr
+    38  arinsal_term::ops::exact_eq
+    37  _platform_memcmp
+    36  _platform_memmove
+    35  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>
+    35  arinsal_vm::jit_hook::run

@@ -1,0 +1,26 @@
+[package]
+name = "arinsal-opt"
+description = "Typed SSA optimizing tier for resolved BEAM regions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arinsal-loader.workspace = true
+arinsal-spec.workspace = true
+arinsal-term.workspace = true
+arinsal-jit.workspace = true
+cranelift-codegen = "=0.136.1"
+cranelift-frontend = "=0.136.1"
+cranelift-jit = "=0.136.1"
+cranelift-module = "=0.136.1"
+
+[dev-dependencies]
+arinsal-beam.workspace = true
+arinsal-difftest.workspace = true
+arinsal-etf.workspace = true
+arinsal-vm = { path = "../vm", features = ["difftest"] }
