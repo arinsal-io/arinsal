@@ -215,7 +215,10 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
         let mfa = (import.module.clone(), import.function.clone(), import.arity);
         let key = (module.name.clone(), index as u32, mfa.clone());
         let exports = registry.scopes.entry(scope).or_default();
-        let address = import_slot_address(exports, &mfa, trampoline);
+        // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1:
+        // an export starts at the trampoline; the loader publishes its resolved
+        // address only in the staging code index before that index becomes active.
+        let address = trampoline;
         let entry = Arc::clone(exports.imports.entry(key).or_insert_with(|| {
             // A module can be compiled before the VM classified its imports.
             let (class, bits) = if import.class() == arinsal_loader::ImportClass::Fresh {

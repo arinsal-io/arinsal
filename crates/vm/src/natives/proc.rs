@@ -4,6 +4,7 @@ use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{FunRef, Identity, Term, TermBuilder, TermKind, global_atoms};
+use std::sync::atomic::Ordering;
 
 fn atom(name: &str) -> Term {
     Term::atom(global_atoms().intern(name).expect("short built-in atom"))
@@ -1265,7 +1266,12 @@ fn backtrace_with(
 }
 
 fn current_stacktrace(vm: Option<&Vm>, process: &mut Process) -> Result<Term, VmError> {
-    let depth = vm.map(|vm| vm.backtrace_depth).unwrap_or(8);
+    // Port of erts/emulator/beam/erl_bif_info.c:2397-2404 (current_stacktrace), OTP-29.1.1:
+    // erts reads the runtime-wide limit, shared by every scheduler.
+    let depth = process.runtime.as_ref().map_or_else(
+        || vm.map(|vm| vm.backtrace_depth).unwrap_or(8),
+        |runtime| runtime.backtrace_depth.load(Ordering::Acquire),
+    );
     if let Some(vm) = vm {
         return crate::stacktrace::build(&vm.code.modules, process, None, depth);
     }

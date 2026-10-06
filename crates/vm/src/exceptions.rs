@@ -920,3 +920,124 @@ fn strip_top_location(p: &mut Process, trace: Term) -> Result<Term, VmError> {
 pub(super) fn from_legacy(reason: &str) -> Result<Trap, VmError> {
     Ok(Trap::error(atom(reason)?))
 }
+
+#[cfg(test)]
+mod tail_apply_exception_stacktrace_matches_otp {
+    use crate::VmError;
+    use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
+    use arinsal_etf::OwnedTerm;
+    use arinsal_term::{Term, VecHeap, from_owned};
+
+    fn trim_trace(term: &OwnedTerm) -> OwnedTerm {
+        match term {
+            OwnedTerm::Tuple(items) => OwnedTerm::Tuple(items.iter().map(trim_trace).collect()),
+            OwnedTerm::List { elems, tail } => {
+                let trace = elems.first().is_some_and(
+                    |term| matches!(term, OwnedTerm::Tuple(items) if items.len() == 4),
+                );
+                OwnedTerm::List {
+                    elems: if trace {
+                        elems
+                            .iter()
+                            .take_while(|term| {
+                                matches!(term,
+                                    OwnedTerm::Tuple(items)
+                                        if matches!(&items[0], OwnedTerm::Atom(module)
+                                            if module.starts_with("vm_exc_") || module == "erlang"))
+                            })
+                            .cloned()
+                            .collect()
+                    } else {
+                        elems.iter().map(trim_trace).collect()
+                    },
+                    tail: tail.clone(),
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    fn call_scheduled(vm: &mut crate::Vm, function: &str, args: &[OwnedTerm]) -> CallResult {
+        let mut heap = VecHeap::new();
+        let inputs = args
+            .iter()
+            .map(|arg| from_owned(arg, &mut heap).expect("test argument"))
+            .collect::<Vec<Term>>();
+        match vm.eval_scheduled("vm_exc_apply", function, &inputs, 2, Some(0xA991)) {
+            Ok(result) => CallResult::Ok(result.term),
+            Err(VmError::Raised(raised)) => CallResult::Exception {
+                class: format!("{:?}", raised.class).to_lowercase(),
+                reason: raised.reason,
+                stack_top: Some(raised.stack),
+            },
+            Err(error) => CallResult::TransportError(error.to_string()),
+        }
+    }
+
+    #[test]
+    fn run() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping tail apply exception differential test");
+            return;
+        };
+        let source = r#"
+-module(vm_exc_apply).
+-export([run/1, stack/2, fail/1, export_apply/0, export_apply2/0, fixed_badarg/0,
+         fixed_badargs/0]).
+run(Type) -> stack([], Type).
+stack([_|Rest], Type) -> stack(Rest, Type), ok;
+stack([], Type) -> fail(Type).
+fail(apply_last) -> apply(erlang, error, [oops, [apply_last]]);
+fail(double_apply_last) ->
+    apply(id(erlang), id(apply), [id(erlang), id(error), id([oops, [double_apply_last]])]);
+fail(multi_apply_last) ->
+    apply(id(erlang), id(apply), [id(erlang), id(apply),
+          [id(erlang), id(apply), [id(erlang), id(error), id([oops, [multi_apply_last]])]]]).
+id(Value) -> Value.
+export_apply() ->
+    Apply = fun erlang:apply/3,
+    Apply(erlang, apply, [erlang, error, [oops, [export_apply]]]).
+export_apply2() ->
+    apply(fun erlang:apply/3, [erlang, error, [oops, [export_apply2]]]).
+fixed_badarg() ->
+    Bad = {},
+    try Bad:baz(a,b) catch C:R:S -> {C,R,S} end.
+fixed_badargs() ->
+    Bad = id({}),
+    [(catch Bad:baz(a,b)), (catch baz:Bad(c,d)),
+     (catch apply(Bad,baz,[e,f])), (catch apply(baz,Bad,[g,h]))].
+"#;
+        let beam = reference
+            .compile_named("vm_exc_apply", source, &[])
+            .unwrap();
+        reference.load("vm_exc_apply", &beam).unwrap();
+        let mut vm = crate::Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+
+        for type_name in ["apply_last", "double_apply_last", "multi_apply_last"] {
+            let args = [OwnedTerm::atom(type_name)];
+            let expected = trim_call_result(reference.call("vm_exc_apply", "run", &args));
+            let actual = trim_call_result(call_scheduled(&mut vm, "run", &args));
+            assert!(
+                compare(&expected, &actual, CompareMode::Exact).is_ok(),
+                "{type_name}: expected {expected:?}, actual {actual:?}"
+            );
+        }
+    }
+
+    fn trim_call_result(result: CallResult) -> CallResult {
+        match result {
+            CallResult::Ok(value) => CallResult::Ok(trim_trace(&value)),
+            CallResult::Exception {
+                class,
+                reason,
+                stack_top,
+            } => CallResult::Exception {
+                class,
+                reason: trim_trace(&reason),
+                stack_top: stack_top.as_ref().map(trim_trace),
+            },
+            other => other,
+        }
+    }
+}

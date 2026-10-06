@@ -138,3 +138,38 @@ fn process_bif_scenarios_match_otp_29() {
         );
     }
 }
+
+#[test]
+fn current_stacktrace_uses_runtime_backtrace_depth() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping runtime backtrace-depth differential test");
+        return;
+    };
+    let source = r#"
+-module(proc_bifs_backtrace_depth).
+-export([run/0]).
+run() ->
+    _ = erlang:system_flag(backtrace_depth, 2),
+    Parent = self(),
+    [spawn(fun() -> Parent ! trace_a() end) || _ <- lists:seq(1, 32)],
+    lists:all(fun(Value) -> Value end, collect(32, [])).
+trace_a() -> trace_b().
+trace_b() -> trace_c().
+trace_c() -> trace_d().
+trace_d() -> length(element(2, process_info(self(), current_stacktrace))) =< 2.
+collect(0, Values) -> lists:sort(Values);
+collect(Count, Values) -> receive Value -> collect(Count - 1, [Value | Values]) end.
+"#;
+    let beam = reference
+        .compile_named("proc_bifs_backtrace_depth", source, &[])
+        .unwrap();
+    reference.load("proc_bifs_backtrace_depth", &beam).unwrap();
+    let expected = reference.call("proc_bifs_backtrace_depth", "run", &[]);
+
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("proc_bifs_backtrace_depth", "run", &[], 8, Some(0xB7D))
+        .unwrap();
+    assert_eq!(expected, CallResult::Ok(actual.term));
+}
