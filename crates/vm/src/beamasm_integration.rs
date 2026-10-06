@@ -706,6 +706,14 @@ impl CompiledVersion {
             .any(|native| native.function == function && native.arity == arity)
     }
 
+    /// Start address of this version's native code for `function/arity`.
+    pub(crate) fn native_function_start(&self, function: &str, arity: u8) -> Option<usize> {
+        self.native_functions
+            .iter()
+            .find(|native| native.function == function && native.arity == arity)
+            .map(|native| native.start)
+    }
+
     /// Makes native entries of `function/arity` run the NIF `entry` loaded by `load_nif`.
     // Port of erts/emulator/beam/erl_nif.c:5050-5260 (patch_call_nif_early and the load_nif
     // finishers), OTP-29.1.1.
@@ -1323,8 +1331,12 @@ pub(crate) fn compile(
     let Some(code_end) = compiled
         .native
         .memory
-        .block_size(0)
-        .and_then(|size| code_start.checked_add(size))
+        .blocks()
+        .iter()
+        .filter_map(|block| block.offset.checked_add(block.size))
+        .chain([compiled.native.memory.used()])
+        .max()
+        .and_then(|end| code_start.checked_add(end))
     else {
         if lifetime_trace_enabled() {
             eprintln!(

@@ -3420,8 +3420,11 @@ pub(crate) fn running_mfa(
             None => ("ets", "delete_trap", 1),
             Some(_) => ("ets", "internal_delete_all", 2),
         });
+    let dirty_bif = process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa);
     let (module, function, arity) = if let Some(trap) = ets_trap {
         trap
+    } else if let Some(bif) = dirty_bif {
+        bif
     } else if let Some(continuation) = continuation {
         continuation
     } else {

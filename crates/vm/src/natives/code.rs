@@ -466,6 +466,14 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
 }
 
 fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+    // The loader resumed after its code barrier: commit and return (ERTS_BIF_YIELD_RETURN).
+    if let Some(staged) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.finish_loading_commit.take())
+    {
+        return finish_commit(vm, process, staged);
+    }
     let Some(codes) = args.first().and_then(|term| list(*term)) else {
         return Err(badarg());
     };
@@ -503,22 +511,14 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
     {
         return Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
     }
-    let loaded_names: Vec<String> = prepared_modules
-        .iter()
-        .map(|(module, _, _)| module.name.clone())
-        .collect();
-    let published = vm.publish_prepared(prepared_modules);
-    if published.is_ok() {
-        for name in &loaded_names {
-            crate::trace_bp::module_code_changed(vm.code_scope, name);
-            apply_on_load_patterns(vm, process, name);
-        }
-    }
-    match published {
-        Ok(on_load) if on_load.is_empty() => Ok(atom("ok")),
-        Ok(on_load) => {
-            let names = make_list(process, on_load.iter().map(|name| atom(name)))?;
-            make_tuple(process, &[atom("on_load"), names])
+    match vm.stage_prepared(prepared_modules) {
+        // Port of erts/emulator/beam/beam_bif_load.c:539-571 (staging_epilogue), OTP-29.1.1:
+        // after erts_end_staging_code_ix the loader is suspended until every scheduler passed
+        // a code barrier, so processes that were already runnable keep running the previous
+        // code; commit_code_ix then commits and resumes the loader, which returns the result.
+        Ok(staged) => {
+            process.cold_mut().finish_loading_commit = Some(staged);
+            Err(VmError::Yield)
         }
         Err(("system_limit", _)) => {
             Err(VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
@@ -527,6 +527,27 @@ fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
             let names = make_list(process, modules.iter().map(|name| atom(name)))?;
             make_tuple(process, &[atom(reason), names])
         }
+    }
+}
+
+/// The commit half of `finish_loading/1` (beam_bif_load.c:301 commit_code_ix and the result
+/// of staging_epilogue).
+fn finish_commit(
+    vm: &mut Vm,
+    process: &mut Process,
+    staged: crate::load::StagedLoad,
+) -> Result<Term, VmError> {
+    let loaded_names = staged.names.clone();
+    let on_load = vm.commit_staged(staged);
+    for name in &loaded_names {
+        crate::trace_bp::module_code_changed(vm.code_scope, name);
+        apply_on_load_patterns(vm, process, name);
+    }
+    if on_load.is_empty() {
+        Ok(atom("ok"))
+    } else {
+        let names = make_list(process, on_load.iter().map(|name| atom(name)))?;
+        make_tuple(process, &[atom("on_load"), names])
     }
 }
 
@@ -1386,7 +1407,16 @@ mod tests {
             .map(|index| process.heap.stack_get(index).unwrap())
             .collect::<Vec<_>>();
         let list = make_list(&mut process, prepared).unwrap();
-        to_owned(finish(vm, &mut process, &[list]).unwrap()).unwrap()
+        to_owned(finish_now(vm, &mut process, &[list])).unwrap()
+    }
+
+    /// Runs `finish_loading/1` as the scheduler does: the loader yields at its code barrier
+    /// and its rescheduled call commits.
+    pub(super) fn finish_now(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Term {
+        match finish(vm, process, args) {
+            Err(VmError::Yield) => finish(vm, process, args).unwrap(),
+            other => other.unwrap(),
+        }
     }
 
     fn zero_coverage_counts(term: &OwnedTerm) -> OwnedTerm {
@@ -2231,7 +2261,7 @@ mod boot_loop1_tests {
             .collect::<Vec<_>>();
         let list = make_list(&mut process, prepared).unwrap();
         let mut vm = Vm::new([]);
-        let actual = finish(&mut vm, &mut process, &[list]).unwrap();
+        let actual = super::tests::finish_now(&mut vm, &mut process, &[list]);
         assert_eq!(to_owned(actual).unwrap(), expected);
         assert!(vm.code.loaded.contains_key("boot_loop1_batch_a"));
         assert!(vm.code.loaded.contains_key("boot_loop1_batch_b"));

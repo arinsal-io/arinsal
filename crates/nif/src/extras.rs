@@ -129,7 +129,7 @@ pub extern "C" fn enif_clear_env(e: *mut ErlNifEnv) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_send(
-    _: *mut ErlNifEnv,
+    env: *mut ErlNifEnv,
     pid: *const Term,
     _msg_env: *mut ErlNifEnv,
     msg: Term,
@@ -142,7 +142,19 @@ pub extern "C" fn enif_send(
     if to.as_pid().is_none() {
         return 0;
     };
-    if let Some(hook) = hooks().lock().unwrap().send {
+    let (send, thread_type, exiting) = {
+        let hooks = hooks().lock().unwrap();
+        (hooks.send, hooks.thread_type, hooks.current_process_exiting)
+    };
+    // Port of erts/emulator/beam/erl_nif.c:860-885 (enif_send: a process-bound env on a dirty
+    // scheduler whose process is exiting sends nothing), OTP-29.1.1.
+    if !env.is_null()
+        && thread_type.is_some_and(|thread_type| thread_type() > ERL_NIF_THR_NORMAL_SCHEDULER)
+        && exiting.is_some_and(|exiting| exiting())
+    {
+        return 0;
+    }
+    if let Some(hook) = send {
         return i32::from(hook(to, msg));
     };
     let mut heap = VecHeap::new();
@@ -531,6 +543,8 @@ pub extern "C" fn enif_thread_type() -> c_int {
 }
 /// `ERL_NIF_THR_UNDEFINED` from erl_nif.h.
 const ERL_NIF_THR_UNDEFINED: c_int = 0;
+/// `ERL_NIF_THR_NORMAL_SCHEDULER` from erl_nif.h; dirty scheduler types are larger.
+const ERL_NIF_THR_NORMAL_SCHEDULER: c_int = 1;
 
 pub(crate) fn retain_exports() {
     let exports: &[usize] = &[

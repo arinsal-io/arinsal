@@ -2639,6 +2639,18 @@ fn scope(process: &Process) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether `pid` of the runtime at `runtime` already began its exit.
+// Port of erts/emulator/beam/erl_nif.c:2323 (enif_is_process_alive: erts_proc_lookup),
+// OTP-29.1.1: erts removes an exiting process from the process table while its dirty NIF
+// still runs; this scheduler keeps the entry until the NIF returns, so exit start decides.
+pub(crate) fn has_begun_exit(runtime: &std::sync::Arc<crate::process::Runtime>, pid: Pid) -> bool {
+    tables()
+        .lock()
+        .unwrap()
+        .exited
+        .contains(&(std::sync::Arc::as_ptr(runtime) as usize, pid))
+}
+
 fn tables() -> &'static Mutex<Tables> {
     static TABLES: std::sync::OnceLock<Mutex<Tables>> = std::sync::OnceLock::new();
     TABLES.get_or_init(|| {
@@ -2931,8 +2943,18 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
     let mut pending = pending;
     if let Some(cold) = process.cold.as_mut() {
         for task in std::mem::take(&mut cold.delayed_gc) {
-            if let crate::proc_create::DelayedGc::Request(request) = task {
-                pending.push_back(request);
+            match task {
+                crate::proc_create::DelayedGc::Request(request) => pending.push_back(request),
+                // Port of erts/emulator/beam/erl_process.c:11039-11041 (cleanup_sys_tasks),
+                // OTP-29.1.1: a saved literal-area copy task of an exiting process answers `ok`.
+                crate::proc_create::DelayedGc::Literal {
+                    request, requester, ..
+                } => {
+                    let _ = crate::natives::sys::reply_exiting_literal_area(
+                        process, ctx, request, requester,
+                    );
+                }
+                crate::proc_create::DelayedGc::Collect => {}
             }
         }
     }

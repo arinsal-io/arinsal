@@ -311,7 +311,7 @@ fn process_info(
                 // Suspend count wins over the waiting/runnable/running atom the
                 // caller (local BIF or remote request) passed in.
                 if let Some(runtime) = process.runtime.as_ref()
-                    && runtime.suspend_total_of(pid) > 0
+                    && runtime.suspend_active(pid)
                 {
                     atom(runtime.remote_status(pid))
                 } else {
@@ -1058,6 +1058,11 @@ fn native_call_site(process: &Process) -> Option<(crate::native_bridge::NativeFu
 }
 
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
+    if let Some((module, function, arity)) =
+        process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
+    {
+        return Ok((module.to_owned(), function.to_owned(), arity));
+    }
     // A trapped BIF reports its continuation export, as erts does.
     if let Some((module, rest)) = process
         .cold

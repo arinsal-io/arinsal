@@ -420,7 +420,7 @@ fn loaded_native_function_returns_x0_and_gc_preserves_its_cp() {
     })
     .unwrap();
 
-    vm.load_bytes(&beam).unwrap();
+    vm.load_bytes_interpreted(&beam).unwrap();
     let result = vm
         .eval_scheduled("native_abi_test", "bridge", &[], 1, None)
         .unwrap();

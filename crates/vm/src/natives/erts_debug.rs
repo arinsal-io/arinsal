@@ -926,7 +926,8 @@ fn dirty_test(
                 scheduler: scheduler_handle,
                 exiting: process.dirty_exit_flag(),
             };
-            process.dirty_bif(kind, move |heap| {
+            let function = if busy { "dirty_cpu" } else { "dirty_io" };
+            process.dirty_bif(kind, ("erts_debug", function, 2), move |heap| {
                 dirty_test_body(&env, heap, busy, operation, value)
             })?
         }

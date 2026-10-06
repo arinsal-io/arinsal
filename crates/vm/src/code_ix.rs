@@ -38,6 +38,9 @@ struct Permission {
     /// `erts_end_staging_code_ix`).
     work: Option<CodeTables>,
     aborted: bool,
+    /// Ticket of a staging area that ended (`erts_end_staging_code_ix`) and waits for its code
+    /// barrier before the commit; `work` holds its tables and the permission stays taken.
+    ended: Option<u64>,
 }
 
 /// One node's code index state (`the_active_code_index`, `the_staging_code_index`).
@@ -93,6 +96,20 @@ impl CodeIndexes {
         let me = std::thread::current().id();
         let mut permission = self.lock_permission();
         loop {
+            // The stager of an ended staging area is suspended until its code barrier; a
+            // seizer that comes first completes the barrier and commit on its behalf
+            // (beam_bif_load.c:301 commit_code_ix) instead of blocking its scheduler thread,
+            // which may be the one that has to resume the stager.
+            if permission.ended.take().is_some() {
+                let tables = permission.work.take();
+                permission.owner = None;
+                permission.depth = 0;
+                permission.aborted = false;
+                if let Some(tables) = tables {
+                    self.commit_tables(tables);
+                }
+                self.released.notify_all();
+            }
             match permission.owner {
                 Some(owner) if owner == me => {
                     permission.depth += 1;
@@ -145,7 +162,38 @@ impl CodeIndexes {
         }
         Staging {
             code: Arc::clone(self),
+            ended: false,
         }
+    }
+
+    /// Commits the ended staging area `ticket` unless a seizer already did, and releases the
+    /// code modification permission.
+    // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1.
+    fn commit_ended(&self, ticket: u64) {
+        let mut permission = self.lock_permission();
+        if permission.ended != Some(ticket) {
+            return;
+        }
+        permission.ended = None;
+        permission.owner = None;
+        permission.depth = 0;
+        permission.aborted = false;
+        if let Some(tables) = permission.work.take() {
+            self.commit_tables(tables);
+        }
+        drop(permission);
+        self.released.notify_all();
+    }
+
+    /// Publishes `tables` as the staging code index's tables and makes that index active.
+    // Port of erts/emulator/beam/code_ix.c:142-171 (erts_commit_staging_code_ix), OTP-29.1.1.
+    fn commit_tables(&self, mut tables: CodeTables) {
+        tables.generation = next_generation();
+        let tables = Arc::new(tables);
+        self.tables[self.staging()].store(Arc::clone(&tables));
+        self.commit();
+        // The oldest code index is only read again once staging copies into it.
+        self.tables[self.staging()].store(tables);
     }
 
     /// Changes the active tables in place under the code modification permission, the way
@@ -274,6 +322,29 @@ impl CodeIndexes {
 /// (`erts_commit_staging_code_ix`) unless [`Staging::abort`] was called.
 pub(crate) struct Staging {
     code: Arc<CodeIndexes>,
+    /// Set by [`Staging::end`]: the commit is left to the returned [`EndedStaging`].
+    ended: bool,
+}
+
+/// A staging area after `erts_end_staging_code_ix`, still holding the code modification
+/// permission until its commit. Dropping it commits (`commit_code_ix`), which also happens
+/// when its stager exits while suspended, as erts commits without resuming an exiting stager.
+pub(crate) struct EndedStaging {
+    code: Arc<CodeIndexes>,
+    ticket: u64,
+}
+
+impl EndedStaging {
+    /// Makes the staged code active: the code barrier of the stager passed.
+    pub(crate) fn commit(self) {
+        drop(self);
+    }
+}
+
+impl Drop for EndedStaging {
+    fn drop(&mut self) {
+        self.code.commit_ended(self.ticket);
+    }
 }
 
 impl Staging {
@@ -297,6 +368,31 @@ impl Staging {
         self.code.staging()
     }
 
+    /// Ends staging without committing (`erts_end_staging_code_ix`): running code keeps the
+    /// active code index until the returned area commits after the stager's code barrier.
+    /// A staging area nested in an outer one, or an aborted one, finishes as on drop.
+    // Port of erts/emulator/beam/beam_bif_load.c:539-571 (staging_epilogue), OTP-29.1.1.
+    pub(crate) fn end(mut self) -> Option<EndedStaging> {
+        static TICKETS: AtomicU64 = AtomicU64::new(1);
+        {
+            let mut permission = self.code.lock_permission();
+            if permission.depth != 1 || permission.aborted || permission.work.is_none() {
+                return None;
+            }
+            let ticket = TICKETS.fetch_add(1, Ordering::Relaxed);
+            // The permission now belongs to the suspended stager, not to this thread, so
+            // other processes on this scheduler never join the ended staging area.
+            permission.owner = None;
+            permission.depth = 0;
+            permission.ended = Some(ticket);
+            self.ended = true;
+            Some(EndedStaging {
+                code: Arc::clone(&self.code),
+                ticket,
+            })
+        }
+    }
+
     /// Discards every change of this staging area.
     // Port of erts/emulator/beam/code_ix.c:173-182 (erts_abort_staging_code_ix), OTP-29.1.1.
     pub(crate) fn abort(self) {
@@ -308,6 +404,9 @@ impl Drop for Staging {
     // Port of erts/emulator/beam/code_ix.c:131-171 (erts_end_staging_code_ix,
     // erts_commit_staging_code_ix), OTP-29.1.1.
     fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
         let committed = {
             let mut permission = self.code.lock_permission();
             if permission.depth == 1 && !permission.aborted {
@@ -316,13 +415,8 @@ impl Drop for Staging {
                 None
             }
         };
-        if let Some(mut tables) = committed {
-            tables.generation = next_generation();
-            let tables = Arc::new(tables);
-            self.code.tables[self.code.staging()].store(Arc::clone(&tables));
-            self.code.commit();
-            // The oldest code index is only read again once staging copies into it.
-            self.code.tables[self.code.staging()].store(tables);
+        if let Some(tables) = committed {
+            self.code.commit_tables(tables);
         }
         self.code.release();
     }
