@@ -211,13 +211,13 @@ fn breakpoint(
     if enable != atom("true") && enable != atom("false") {
         return Err(badarg());
     }
-    let Some(&id) = vm.loaded.get(&module) else {
+    let Some(&id) = vm.code.loaded.get(&module) else {
         return result_error(
             process,
             O::Tuple(vec![O::Atom("badkey".into()), O::Atom(module)]),
         );
     };
-    let Some(code) = vm.modules.get(id) else {
+    let Some(code) = vm.code.modules.get(id) else {
         return result_error(
             process,
             O::Tuple(vec![O::Atom("badkey".into()), O::Atom(module)]),
@@ -272,7 +272,7 @@ fn breakpoints(
     function: Option<(Term, Term)>,
 ) -> Result<Term, VmError> {
     let module_name = atom_text(module_term).ok_or_else(badarg)?;
-    let Some(&id) = vm.loaded.get(&module_name) else {
+    let Some(&id) = vm.code.loaded.get(&module_name) else {
         return if function.is_some() {
             result_error(
                 process,
@@ -282,7 +282,7 @@ fn breakpoints(
             result_error(process, O::Atom("badkey".into()))
         };
     };
-    let code = vm.modules.get(id).ok_or_else(badarg)?;
+    let code = vm.code.modules.get(id).ok_or_else(badarg)?;
     if let Some((function, arity)) = function {
         let function = atom_text(function).ok_or_else(badarg)?;
         let arity = arity.as_small().ok_or_else(badarg)?;
@@ -943,12 +943,13 @@ fn debug_breakpoint(
         }
     }
     let matches = vm
+        .code
         .loaded
         .values()
         .copied()
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .filter_map(|id| vm.modules.get(id))
+        .filter_map(|id| vm.code.modules.get(id))
         .flat_map(|code| {
             code.functions
                 .iter()

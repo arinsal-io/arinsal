@@ -300,7 +300,7 @@ pub(crate) fn execute(
     args: [Term; 3],
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<TrapResult, VmError>> {
-    let import_info = vm.modules.get(process.module).and_then(|module| {
+    let import_info = vm.code.modules.get(process.module).and_then(|module| {
         module.imports.get(import).map(|import| {
             (
                 import.module.as_str(),

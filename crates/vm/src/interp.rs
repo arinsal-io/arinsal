@@ -127,8 +127,8 @@ fn execute_put_record(
             };
             let exported = atoms
                 .text(module_atom)
-                .and_then(|text| vm.loaded.get(text))
-                .map(|index| &*vm.modules[*index])
+                .and_then(|text| vm.code.loaded.get(text))
+                .map(|index| &*vm.code.modules[*index])
                 .filter(|defining| {
                     defining.records.iter().any(|record| {
                         record.is_exported && atoms.text(name_atom) == Some(record.name.as_str())
@@ -1511,18 +1511,30 @@ fn trace_breakpoint_call(
     local: bool,
 ) -> Result<Vec<crate::trace::CallActions>, VmError> {
     let Some(ctx) = ctx else {
-        crate::trace_bp::increment(process, &vm.modules[module_id].name, function, arity, local);
+        crate::trace_bp::increment(
+            process,
+            &vm.code.modules[module_id].name,
+            function,
+            arity,
+            local,
+        );
         return Ok(Vec::new());
     };
     // A breakpoint that does nothing for this process returns at once.
     if let Some(pid) = process.self_pid
-        && crate::trace_bp::is_inert(process, pid, &vm.modules[module_id].name, function, arity)
+        && crate::trace_bp::is_inert(
+            process,
+            pid,
+            &vm.code.modules[module_id].name,
+            function,
+            arity,
+        )
     {
         return Ok(Vec::new());
     }
     process.gc_live = usize::from(arity);
     let args = process.x[..usize::from(arity)].to_vec();
-    let module_name = vm.modules[module_id].name.clone();
+    let module_name = vm.code.modules[module_id].name.clone();
     let actions = crate::trace::call_event(vm, process, ctx, &module_name, function, &args, local)?;
     let actions =
         crate::trace::dedupe_return_frames(vm, process, actions, crate::trace::StackScan::Top);
@@ -1543,8 +1555,8 @@ fn trace_breakpoint_call(
         process,
         module_id,
         entry_ip,
-        vm.modules[module_id].return_trace_ip,
-        vm.modules[module_id].return_to_trace_ip,
+        vm.code.modules[module_id].return_trace_ip,
+        vm.code.modules[module_id].return_to_trace_ip,
         &actions,
     )?;
     Ok(actions)
@@ -1597,7 +1609,7 @@ impl Vm {
             return Err(VmError::Unsupported(format!("BIF {frame}")));
         }
         let module_id = self.load_named(module)?;
-        let ip = self.modules[module_id]
+        let ip = self.code.modules[module_id]
             .export(function, args.len() as u8)
             .ok_or_else(|| VmError::Exception {
                 reason: "undef".into(),
@@ -1623,7 +1635,7 @@ impl Vm {
                 }
                 Err(VmError::ExceptionInfo { reason, info, .. }) => {
                     let mut trap = exceptions::from_legacy(&reason)?;
-                    let arity = self.modules[process.module]
+                    let arity = self.code.modules[process.module]
                         .function_at(process.ip)
                         .map(|(_, arity)| arity)
                         .unwrap_or(0);
@@ -1646,7 +1658,7 @@ impl Vm {
         })
     }
     pub(crate) fn frame_name(&self, p: &Process) -> String {
-        let module = &self.modules[p.module];
+        let module = &self.code.modules[p.module];
         let (name, arity) = module.function_at(p.ip).unwrap_or(("?", 0));
         format!("{}:{name}/{arity}", module.name)
     }
@@ -1692,7 +1704,7 @@ impl Vm {
         if !crate::beamasm_integration::enabled() {
             return;
         }
-        let Some(module) = self.modules.get(p.module) else {
+        let Some(module) = self.code.modules.get(p.module) else {
             return;
         };
         if let Some(native) = self
@@ -1711,7 +1723,7 @@ impl Vm {
     ) -> Result<RunState, VmError> {
         let result = self.run_slice_inner(p, ctx, budget);
         result.map_err(|error| {
-            let Some(module) = self.modules.get(p.module) else {
+            let Some(module) = self.code.modules.get(p.module) else {
                 return error;
             };
             let Some(&instr) = module.code.get(p.ip) else {
@@ -1739,19 +1751,19 @@ impl Vm {
         mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
         budget: u32,
     ) -> Result<RunState, VmError> {
-        self.sync_code_epoch();
+        self.refresh_code();
         // The interpreter is the process's position now, not the last native address.
         p.header.i = std::ptr::null();
         // A migrated process may already be inside a module this replica has
         // not copied yet. Sync only when the id is past the local table.
         self.sync_module(p.module);
         let mut module_id = p.module;
-        if module_id >= self.modules.len() {
+        if module_id >= self.code.modules.len() {
             return Err(VmError::Unsupported(format!(
                 "process module {module_id} is not loaded on this scheduler"
             )));
         }
-        let (need_x, need_fr) = self.registers[module_id];
+        let (need_x, need_fr) = self.code.registers[module_id];
         if p.x.len() < need_x {
             let mut registers = p.x.to_vec();
             registers.resize(need_x, Term::NIL);
@@ -1763,14 +1775,14 @@ impl Vm {
             p.fr = registers.into_boxed_slice();
         }
         if crate::beamasm_integration::enabled() {
-            let module = &self.modules[module_id];
+            let module = &self.code.modules[module_id];
             let at_native_entry = self
                 .beamasm_targets
                 .function_for_target(module_id, module, p.ip)
                 .is_some();
             crate::beamasm_integration::count_interp_slice(at_native_entry);
         }
-        let mut base = self.modules[module_id].code.as_ptr();
+        let mut base = self.code.modules[module_id].code.as_ptr();
         let mut ip = {
             // SAFETY: Export indices are resolved to this code allocation by the loader.
             unsafe { base.add(p.ip) }
@@ -1890,12 +1902,12 @@ impl Vm {
                 // The caller module may have been published after this slice
                 // started, on another scheduler. `base` is replaced immediately.
                 self.sync_module(module_id);
-                if module_id >= self.modules.len() {
+                if module_id >= self.code.modules.len() {
                     return Err(VmError::Unsupported(format!(
                         "return to missing module {module_id}"
                     )));
                 }
-                base = self.modules[module_id].code.as_ptr();
+                base = self.code.modules[module_id].code.as_ptr();
                 p.heap.release_stack(1);
                 depth -= 1;
                 // SAFETY: The popped continuation occupied the first stack word.
@@ -1906,8 +1918,8 @@ impl Vm {
             }};
         }
         let mut regs_module = usize::MAX;
-        let mut module_handle = self.modules[module_id].clone();
-        let mut module_epoch = self.seen_epoch;
+        let mut module_handle = self.code.modules[module_id].clone();
+        let mut module_generation = self.code_generation();
         let mut handle_module = module_id;
         loop {
             if p.gc_enabled && p.gc_deferred {
@@ -1917,7 +1929,7 @@ impl Vm {
                 depth = p.heap.stack_words();
                 x = p.x.as_mut_ptr();
             }
-            if module_epoch != self.seen_epoch || handle_module != module_id {
+            if module_generation != self.code_generation() || handle_module != module_id {
                 let same_module = handle_module == module_id;
                 let active_offset = if same_module {
                     // SAFETY: `ip` is within the active module code allocation.
@@ -1925,21 +1937,21 @@ impl Vm {
                 } else {
                     0
                 };
-                module_handle = self.modules[module_id].clone();
+                module_handle = self.code.modules[module_id].clone();
                 if same_module {
                     base = module_handle.code.as_ptr();
                     // SAFETY: Breakpoint patching preserves instruction offsets.
                     ip = base.wrapping_add(active_offset);
                 }
-                module_epoch = self.seen_epoch;
+                module_generation = self.code_generation();
                 handle_module = module_id;
             }
             // Register windows change only when the process enters another module.
             if regs_module != module_id {
-                (x, fr) = ensure_register_file(self.registers[module_id], p);
+                (x, fr) = ensure_register_file(self.code.registers[module_id], p);
                 regs_module = module_id;
             }
-            let arity_ptr = self.modules[module_id].entry_arity.as_ptr();
+            let arity_ptr = self.code.modules[module_id].entry_arity.as_ptr();
             // Skip the fast loop when the next opcode is not in it. A cold
             // streak would otherwise pay a call that returns immediately.
             // SAFETY: `ip` addresses this module's code, which ends with CodeEnd.
@@ -1963,7 +1975,7 @@ impl Vm {
                         #[cfg(feature = "instr-count")]
                         count_stats: std::ptr::addr_of_mut!(p.stats),
                         #[cfg(any(feature = "validate-terms", debug_assertions))]
-                        module: std::ptr::from_ref(&self.modules[module_id]),
+                        module: std::ptr::from_ref(&self.code.modules[module_id]),
                     },
                 );
                 ip = cursor.ip;
@@ -1980,7 +1992,7 @@ impl Vm {
                 }
             }
             // ---- processes and messages ----
-            let module = &self.modules[module_id];
+            let module = &self.code.modules[module_id];
             // SAFETY: The instruction pointer belongs to this module's code allocation.
             let offset = unsafe { ip.offset_from(base) } as usize;
             debug_assert!(
@@ -2104,8 +2116,8 @@ impl Vm {
                                 )?;
                                 module_id = p.module;
                                 self.sync_module(module_id);
-                                base = self.modules[module_id].code.as_ptr();
-                                module_handle = self.modules[module_id].clone();
+                                base = self.code.modules[module_id].code.as_ptr();
+                                module_handle = self.code.modules[module_id].clone();
                                 x = p.x.as_mut_ptr();
                                 fr = p.fr.as_mut_ptr();
                                 reds = p.reductions;
@@ -2123,7 +2135,7 @@ impl Vm {
                                     ImportOutcome::Jump(target) => {
                                         if let Some(native) = self.beamasm_targets.function_for_target(
                                             module_id,
-                                            &self.modules[module_id],
+                                            &self.code.modules[module_id],
                                             instruction_offset(base, target),
                                         ) {
                                             sync_cursor(p, htop, &mut heap_dirty);
@@ -2252,13 +2264,13 @@ impl Vm {
                 }
                 Instr::NativeBody { index } => {
                     sync_cursor(p, htop, &mut heap_dirty);
-                    let Some(native) = self.native_fns.get(index as usize).copied() else {
+                    let Some(native) = self.native_fn(index as usize) else {
                         return Err(VmError::Unsupported(format!(
                             "native function index {index}"
                         )));
                     };
                     // SAFETY: `ip` remains within the active module code allocation.
-                    let arity = self.modules[module_id]
+                    let arity = self.code.modules[module_id]
                         .function_at(unsafe { ip.offset_from(base) } as usize)
                         .map(|(_, arity)| arity as usize)
                         .ok_or_else(|| VmError::Unsupported("native function entry".into()))?;
@@ -2270,7 +2282,7 @@ impl Vm {
                     // import dispatch used to refresh on every call.
                     if let Some(run) = &mut ctx {
                         natives::refresh_hub(p, run);
-                        if self.modules[module_id].name == "prim_tty" {
+                        if self.code.modules[module_id].name == "prim_tty" {
                             natives::tty::note_caller(p, run);
                         }
                     }
@@ -2297,11 +2309,11 @@ impl Vm {
                         Err(error) => {
                             // SAFETY: The native body is executing inside this module's code.
                             let function_offset = unsafe { ip.offset_from(base) } as usize;
-                            let (function, _) = self.modules[module_id]
+                            let (function, _) = self.code.modules[module_id]
                                 .function_at(function_offset)
                                 .unwrap_or(("?", arity as u8));
                             let arguments = p.x[..arity].to_vec();
-                            let current_module = &self.modules[module_id];
+                            let current_module = &self.code.modules[module_id];
                             let function_atom = current_module
                                 .function_atom_at(function_offset)
                                 .map(|(atom, _)| atom)
@@ -2489,8 +2501,8 @@ impl Vm {
                     )?;
                     module_id = p.module;
                     self.sync_module(module_id);
-                    base = self.modules[module_id].code.as_ptr();
-                    module_handle = self.modules[module_id].clone();
+                    base = self.code.modules[module_id].code.as_ptr();
+                    module_handle = self.code.modules[module_id].clone();
                     x = p.x.as_mut_ptr();
                     fr = p.fr.as_mut_ptr();
                     reds = p.reductions;
@@ -2505,7 +2517,7 @@ impl Vm {
                         ImportOutcome::Jump(target) => {
                             if let Some(native) = self.beamasm_targets.function_for_target(
                                 module_id,
-                                &self.modules[module_id],
+                                &self.code.modules[module_id],
                                 // SAFETY: The import target belongs to the active module.
                                 instruction_offset(base, target),
                             ) {
@@ -2787,7 +2799,7 @@ impl Vm {
                     x = p.x.as_mut_ptr();
                     fr = p.fr.as_mut_ptr();
                     module_id = p.module;
-                    base = self.modules[module_id].code.as_ptr();
+                    base = self.code.modules[module_id].code.as_ptr();
                     reds = p.reductions;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
@@ -2826,7 +2838,7 @@ impl Vm {
                         let target_ip = unsafe { target.offset_from(base) } as usize;
                         if let Some(native) = self.beamasm_targets.function_for_target(
                             module_id,
-                            &self.modules[module_id],
+                            &self.code.modules[module_id],
                             target_ip,
                         ) {
                             sync_cursor(p, htop, &mut heap_dirty);
@@ -3799,7 +3811,7 @@ impl Vm {
                 // ---- vm_funs ----
                 Instr::MakeFun { index, dst, env } => {
                     sync_cursor(p, htop, &mut heap_dirty);
-                    funs::make_fun(p, module, index, dst, env, self.seen_epoch)?;
+                    funs::make_fun(p, module, index, dst, env, self.code_generation())?;
                     (htop, stop) = p.heap.heap_cursor();
                     depth = p.heap.stack_words();
                 }
@@ -3834,7 +3846,7 @@ impl Vm {
                     // call_fun may grow X to hold the closure environment.
                     x = p.x.as_mut_ptr();
                     module_id = p.module;
-                    base = self.modules[module_id].code.as_ptr();
+                    base = self.code.modules[module_id].code.as_ptr();
                     reds = p.reductions;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
@@ -3875,7 +3887,7 @@ impl Vm {
                         ctx.as_deref_mut(),
                     )?;
                     module_id = p.module;
-                    base = self.modules[module_id].code.as_ptr();
+                    base = self.code.modules[module_id].code.as_ptr();
                     reds = p.reductions;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
@@ -3903,7 +3915,7 @@ impl Vm {
                     p.reductions = reds;
                     exceptions::execute(self, p, op, a, b)?;
                     module_id = p.module;
-                    base = self.modules[module_id].code.as_ptr();
+                    base = self.code.modules[module_id].code.as_ptr();
                     (htop, stop) = p.heap.heap_cursor();
                     depth = p.heap.stack_words();
                     reds = p.reductions;
@@ -4773,7 +4785,7 @@ impl Vm {
                         }
                     }
                     module_id = p.module;
-                    base = self.modules[module_id].code.as_ptr();
+                    base = self.code.modules[module_id].code.as_ptr();
                     reds = p.reductions;
                     depth = p.heap.stack_words();
                     (htop, stop) = p.heap.heap_cursor();
@@ -4801,7 +4813,7 @@ impl Vm {
                         if let Some((target_module, target_ip)) = native_target
                             && let Some(native) = self.beamasm_targets.function_for_target(
                                 target_module,
-                                &self.modules[target_module],
+                                &self.code.modules[target_module],
                                 target_ip,
                             )
                         {

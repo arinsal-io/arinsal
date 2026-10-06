@@ -1213,7 +1213,7 @@ fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Te
         }
         "loaded" => {
             let mut dump = String::new();
-            for module in vm.modules.iter() {
+            for module in vm.code.modules.iter() {
                 use std::fmt::Write as _;
                 let _ = writeln!(dump, "{}", module.name);
             }
@@ -2277,7 +2277,8 @@ pub(crate) fn snapshot_process(process: &mut Process, _live_x: usize) {
 }
 
 fn code_bytes(vm: &Vm) -> u64 {
-    vm.modules
+    vm.code
+        .modules
         .iter()
         .map(|module| {
             let code = std::mem::size_of_val(module.code.as_ref());

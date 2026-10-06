@@ -114,7 +114,7 @@ impl Vm {
     ) -> Result<BifOpOutcome, VmError> {
         let [a, b, c] = op.args;
         let (index, first, arity, dst, fast) = {
-            let module = &self.modules[p.module];
+            let module = &self.code.modules[p.module];
             let (index, first, arity, dst) = match opcode {
                 Opcode::GcBif1 => (c.value() as usize, 3, 1, module.arg(&op, 4)),
                 Opcode::GcBif2 => (c.value() as usize, 3, 2, module.arg(&op, 5)),
@@ -139,7 +139,7 @@ impl Vm {
         };
         let mut regs = [Arg::NONE; 3];
         {
-            let module = &self.modules[p.module];
+            let module = &self.code.modules[p.module];
             for (i, reg) in regs.iter_mut().enumerate().take(arity) {
                 *reg = module.arg(&op, first + i);
             }
@@ -174,14 +174,14 @@ impl Vm {
         let class = self.import_class(p.module, index)?;
         let args = &stored[..arity];
         let (result, bif_reductions) = if class == ImportClass::Pure {
-            let bif = self.modules[p.module].imports[index]
+            let bif = self.code.modules[p.module].imports[index]
                 .bif_fn()
                 .ok_or_else(|| VmError::Unsupported("pure BIF".into()))?;
             let (result, reductions) = calls::call_bif_metered(&mut p.heap, bif, args);
             let result = match result {
                 Ok(value) => Ok(value),
                 Err(error) => {
-                    let import = &self.modules[p.module].imports[index];
+                    let import = &self.code.modules[p.module].imports[index];
                     Err(exceptions::bif_error_with_atoms(
                         p,
                         &import.module,
@@ -195,7 +195,7 @@ impl Vm {
             };
             (result, reductions)
         } else {
-            let caller_module = Arc::clone(&self.modules[p.module]);
+            let caller_module = Arc::clone(&self.code.modules[p.module]);
             let import = &caller_module.imports[index];
             let module_name = import.module.as_str();
             let function_name = import.function.as_str();
