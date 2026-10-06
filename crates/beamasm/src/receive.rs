@@ -78,25 +78,7 @@ impl BeamModuleAssembler {
             6,
             crate::Update::HEAP_ALLOC,
         )?;
-        match dst {
-            ArgVal::X(index) if index < 6 => {
-                self.code.emit(|e| {
-                    e.mov_reg(Gpr::x([25, 26, 27, 28, 15, 16][index as usize]), Gpr::x(0))
-                })?;
-                Ok(())
-            }
-            ArgVal::Y(index) => {
-                let offset = index
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code
-                    .emit(|e| e.str_uoff(Gpr::x(0), Gpr::x(20), offset))?;
-                Ok(())
-            }
-            _ => Err(ModuleError::InvalidOperand(
-                "receive marker destination must be X or Y",
-            )),
-        }
+        self.store_operand(dst, Gpr::x(0))
     }
 
     /// Binds a receive marker to a reference.
@@ -168,9 +150,8 @@ impl BeamModuleAssembler {
             hooks.remove_message as usize,
             &[Gpr::x(22), Gpr::x(24)],
             6,
-            // erts passes HTOP/E by value because seq_trace_output builds into heap
-            // fragments; the hook allocates the `receive` event on the process heap, so
-            // the heap and stack cursors must be published and reloaded around it.
+            // erts passes HTOP/E by value; the hook runs process-heap code (message
+            // accounting, seq_trace), so the cursors are published and reloaded around it.
             crate::Update::HEAP_ALLOC,
         )?;
         self.code.emit(|e| e.mov_reg(FCALLS, Gpr::w(0)))?;

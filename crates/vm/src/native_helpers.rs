@@ -725,7 +725,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     for index in 6..synced {
         process.x[index] = crate::native_hooks::from_raw(registers.x_reg_array[index]);
     }
-    let result = process.ensure_for_native(need_words, live);
+    let result = process.ensure(need_words, live);
     if result.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
     }

@@ -1766,382 +1766,11 @@ pub fn missing_ops(ops: &[SpecificOp]) -> Vec<String> {
     let mut missing = BTreeSet::new();
     let mut ordered = Vec::new();
     for op in ops {
-        let unsupported_register = !supports_extended_x(op.name())
-            && op.operands().iter().any(contains_unsupported_x_register);
-        if (!known.contains(op.name()) || unsupported_register)
-            && missing.insert(op.name().to_owned())
-        {
+        if !known.contains(op.name()) && missing.insert(op.name().to_owned()) {
             ordered.push(op.name().to_owned());
         }
     }
     ordered
-}
-
-fn supports_extended_x(name: &str) -> bool {
-    matches!(
-        name,
-        "badmatch"
-            | "case_end"
-            | "try_case_end"
-            | "badrecord"
-            | "i_move"
-            | "move"
-            | "store_two_values"
-            | "load_two_xregs"
-            | "move_trim"
-            | "move_call_last"
-            | "move_two_trim"
-            | "move_call_ext_last"
-            | "swap"
-            | "swap2"
-            | "swap3"
-            | "swap4"
-            | "put_list"
-            | "put_tuple2"
-            | "get_list"
-            | "get_hd"
-            | "get_tl"
-            | "load_tuple_ptr"
-            | "get_tuple_element"
-            | "i_get_tuple_element"
-            | "get_two_tuple_elements"
-            | "get_map_elements"
-            | "i_bs_match"
-            | "bs_get_integer2"
-            | "new_map"
-            | "update_map_assoc"
-            | "update_map_exact"
-            | "i_new_small_map_lit"
-            | "update_record"
-            | "update_record_in_place"
-            | "i_create_local_native_record"
-            | "i_create_native_record"
-            | "i_update_native_record"
-            | "i_get_record_elements"
-            | "get_record_field"
-            | "is_record_accessible"
-            | "i_bif1"
-            | "i_bif2"
-            | "i_bif3"
-            | "nofail_bif1"
-            | "nofail_bif2"
-            | "i_m_div"
-            | "i_make_fun3"
-            | "i_bs_start_match3"
-            | "i_bs_match_test_heap"
-            | "i_bs_get_position"
-            | "bs_set_position"
-            | "bs_get_tail"
-            | "i_bs_get_binary2"
-            | "i_bs_get_bin_and_tail"
-            | "i_bs_get_utf8"
-            | "i_bs_get_utf16"
-            | "i_bs_get_float2"
-            | "i_bs_match_string"
-            | "i_bs_skip_bits2"
-            | "i_bs_create_bin"
-            | "i_length_setup"
-            | "i_length"
-            | "i_plus"
-            | "i_minus"
-            | "i_times"
-            | "i_mul_add"
-            | "i_int_div"
-            | "i_rem"
-            | "i_band"
-            | "i_bor"
-            | "i_bxor"
-            | "i_bsl"
-            | "i_bsr"
-            | "i_bnot"
-            | "i_unary_minus"
-            | "bif_and"
-            | "bif_or"
-            | "bif_not"
-            | "bif_hd"
-            | "bif_tl"
-            | "bif_element"
-            | "bif_node"
-            | "bif_bit_size"
-            | "bif_byte_size"
-            | "bif_tuple_size"
-            | "bif_map_get"
-            | "bif_is_map_key"
-            | "bif_max"
-            | "bif_min"
-            | "bif_map_size"
-            | "bif_is_eq_exact"
-            | "bif_is_ne_exact"
-            | "bif_is_ge"
-            | "bif_is_lt"
-            | "bif_length"
-            | "bif_self"
-            | "self"
-            | "bif_abs"
-            | "i_select_val_lins"
-            | "i_select_val_bins"
-            | "i_select_val2"
-            | "i_select_tuple_arity"
-            | "i_select_tuple_arity2"
-            | "i_get_map_element"
-            | "i_get_map_element_hash"
-            | "i_get_map_elements"
-            | "node"
-            | "get_tuple_element_swap"
-            | "fconv"
-            | "fload"
-            | "fstore"
-            | "is_any_native_record"
-            | "is_native_record"
-            | "i_bs_skip_utf8"
-            | "i_bs_skip_utf16"
-            | "i_bs_validate_unicode_retract"
-            | "i_rem_div"
-            | "i_div_rem"
-            | "get_float2"
-            | "i_is_tagged_tuple_ff"
-            | "i_is_tuple_of_arity_ff"
-            | "is_ge_ge"
-            | "is_ge_lt"
-            | "i_perf_counter"
-            | "i_call_fun2"
-            | "i_call_fun2_last"
-            | "i_jump_on_val"
-            | "i_jump_on_val_zero"
-            | "get"
-            | "i_get"
-            | "i_get_hash"
-    ) || is_inline_guard(name)
-}
-
-/// Stack words native code may borrow below E; must match `arinsal_term::NATIVE_SPILL_WORDS`,
-/// which the runtime keeps free while generated code runs.
-const NATIVE_SPILL_WORDS: u32 = 72;
-
-/// Leaves an operation with more extended X operands than the spill area to the interpreter.
-fn check_spill_count(count: u32) -> Result<(), EmitError> {
-    if count > NATIVE_SPILL_WORDS {
-        return Err(EmitError::Operand(format!(
-            "{count} extended X registers exceed the native spill area"
-        )));
-    }
-    Ok(())
-}
-
-/// The `[]` term word.
-const NIL_TERM: u64 = 0x3b;
-
-/// Extended X registers an emitter-spilled operation only writes (never reads).
-fn spilled_destinations(op: &SpecificOp, beam: &BeamFile) -> BTreeSet<u32> {
-    let operands = op.operands();
-    let mut positions = BTreeSet::new();
-    match op.name() {
-        "i_bs_match" | "i_bs_match_test_heap" => {
-            let mut at = if op.name() == "i_bs_match_test_heap" {
-                4
-            } else {
-                2
-            };
-            while let Some(SpecificOperand::Atom(index)) = operands.get(at) {
-                let name = index
-                    .checked_sub(1)
-                    .and_then(|index| beam.atoms.get(index as usize))
-                    .map(String::as_str);
-                let (width, dst) = match name {
-                    Some("ensure_exactly" | "skip") => (2, None),
-                    Some("ensure_at_least") => (3, None),
-                    Some("integer" | "binary") => (6, Some(at + 5)),
-                    Some("get_tail") => (4, Some(at + 3)),
-                    Some("=:=") => (4, None),
-                    _ => break,
-                };
-                positions.extend(dst);
-                at += width;
-            }
-        }
-        "bs_get_integer2" => {
-            positions.insert(6);
-        }
-        "i_bs_get_binary2" => {
-            positions.insert(5);
-        }
-        "i_bs_start_match3" => {
-            positions.insert(3);
-        }
-        "i_bs_get_position" | "bs_get_tail" => {
-            positions.insert(1);
-        }
-        "i_bif1" | "i_bif2" | "i_bif3" | "nofail_bif1" | "nofail_bif2" | "get_record_field" => {
-            positions.extend(operands.len().checked_sub(1));
-        }
-        "i_create_local_native_record" | "i_create_native_record" | "i_update_native_record" => {
-            positions.insert(1);
-        }
-        "i_get_record_elements" => {
-            // Fail Src Size, then key/destination pairs.
-            positions.extend((4..operands.len()).step_by(2));
-        }
-        _ => {}
-    }
-    let mut written = BTreeSet::new();
-    let mut read = BTreeSet::new();
-    for (position, operand) in operands.iter().enumerate() {
-        if let SpecificOperand::X(register) = operand {
-            if positions.contains(&position) {
-                written.insert(*register);
-            } else {
-                read.insert(*register);
-            }
-        }
-    }
-    written.retain(|register| !read.contains(register));
-    written
-}
-
-fn uses_emitter_spills(name: &str) -> bool {
-    matches!(
-        name,
-        "i_bs_match"
-            | "bs_get_integer2"
-            | "new_map"
-            | "update_map_assoc"
-            | "update_map_exact"
-            | "i_new_small_map_lit"
-            | "update_record"
-            | "update_record_in_place"
-            | "i_create_local_native_record"
-            | "i_create_native_record"
-            | "i_update_native_record"
-            | "i_get_record_elements"
-            | "get_record_field"
-            | "is_record_accessible"
-            | "i_bif1"
-            | "i_bif2"
-            | "i_bif3"
-            | "nofail_bif1"
-            | "nofail_bif2"
-            | "i_bs_start_match3"
-            | "i_bs_match_test_heap"
-            | "i_bs_get_position"
-            | "bs_set_position"
-            | "bs_get_tail"
-            | "i_bs_get_binary2"
-            | "i_bs_create_bin"
-            | "get_map_elements"
-            | "i_get_map_elements"
-            | "i_m_div"
-            | "i_make_fun3"
-            | "get"
-            | "i_get"
-            | "i_get_hash"
-            | "i_plus"
-            | "i_minus"
-            | "i_times"
-            | "i_mul_add"
-            | "i_int_div"
-            | "i_rem"
-            | "i_band"
-            | "i_bor"
-            | "i_bxor"
-            | "i_bsl"
-            | "i_bsr"
-            | "i_bnot"
-            | "i_unary_minus"
-            | "bif_and"
-            | "bif_or"
-            | "bif_not"
-            | "bif_hd"
-            | "bif_tl"
-            | "bif_element"
-            | "bif_node"
-            | "bif_bit_size"
-            | "bif_byte_size"
-            | "bif_tuple_size"
-            | "bif_map_get"
-            | "bif_is_map_key"
-            | "bif_max"
-            | "bif_min"
-            | "bif_map_size"
-            | "bif_is_eq_exact"
-            | "bif_is_ne_exact"
-            | "bif_is_ge"
-            | "bif_is_lt"
-            | "bif_length"
-            | "bif_self"
-            | "self"
-            | "i_length"
-            | "i_bs_skip_bits2"
-            | "i_bs_get_utf8"
-            | "i_bs_get_utf16"
-            | "i_bs_get_float2"
-            | "i_bs_match_string"
-            | "i_bs_get_bin_and_tail"
-            | "node"
-            | "get_tuple_element_swap"
-            | "fconv"
-            | "fload"
-            | "fstore"
-            | "is_any_native_record"
-            | "is_native_record"
-            | "i_bs_skip_utf8"
-            | "i_bs_skip_utf16"
-            | "i_bs_validate_unicode_retract"
-            | "i_rem_div"
-            | "i_div_rem"
-            | "get_float2"
-            | "i_is_tagged_tuple_ff"
-            | "i_is_tuple_of_arity_ff"
-            | "is_ge_ge"
-            | "is_ge_lt"
-            | "i_perf_counter"
-            | "bif_abs"
-    )
-}
-
-fn is_inline_guard(name: &str) -> bool {
-    matches!(
-        name,
-        "is_integer"
-            | "is_atom"
-            | "is_float"
-            | "is_boolean"
-            | "is_binary"
-            | "is_bitstring"
-            | "is_number"
-            | "is_pid"
-            | "is_port"
-            | "is_reference"
-            | "is_function"
-            | "is_function2"
-            | "is_list"
-            | "is_nonempty_list"
-            | "is_nil"
-            | "is_map"
-            | "is_tuple"
-            | "i_is_tuple"
-            | "i_test_arity"
-            | "test_arity"
-            | "is_tagged_tuple"
-            | "i_is_tuple_of_arity"
-            | "i_is_tagged_tuple"
-            | "is_eq_exact"
-            | "is_ne_exact"
-            | "is_eq"
-            | "is_ne"
-            | "is_lt"
-            | "is_ge"
-            | "is_int_in_range"
-            | "is_in_range"
-            | "is_int_ge"
-    )
-}
-
-fn contains_unsupported_x_register(operand: &SpecificOperand) -> bool {
-    match operand {
-        SpecificOperand::X(index) => *index >= 6,
-        SpecificOperand::List(values) => values.iter().any(contains_unsupported_x_register),
-        _ => false,
-    }
 }
 
 /// Compile all `.beam` files under one or more directories and print a coverage summary.
@@ -2322,14 +1951,23 @@ fn fun_call_tag(value: Option<&SpecificOperand>, beam: &BeamFile) -> Result<FunC
     }
 }
 
+/// `ArgXRegister(index)`: cached below 6, otherwise in the scheduler's X register array.
+fn x_register(index: u32) -> Result<ArgVal, String> {
+    match index {
+        0..6 => Ok(ArgVal::X(index as u8)),
+        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-259 (getXRef), OTP-29.1.1.
+        6..1024 => Ok(ArgVal::XMemory(index)),
+        _ => Err("X register index exceeds scheduler register array".to_owned()),
+    }
+}
+
 fn arg(
     value: Option<&SpecificOperand>,
     beam: &BeamFile,
     env: &impl ModuleEnv,
 ) -> Result<ArgVal, String> {
     match value.ok_or_else(|| "missing operand".to_owned())? {
-        SpecificOperand::X(index) if *index < 6 => Ok(ArgVal::X(*index as u8)),
-        SpecificOperand::X(_) => Err("X register index exceeds assembler cache".to_owned()),
+        SpecificOperand::X(index) => x_register(*index),
         SpecificOperand::Y(index) => Ok(ArgVal::Y(*index)),
         SpecificOperand::Label(index) => Ok(ArgVal::Label(*index)),
         SpecificOperand::Atom(index) => env.atom(beam, *index).map(ArgVal::Immediate),
@@ -2348,246 +1986,12 @@ fn arg(
     }
 }
 
-fn select_source_arg(
-    value: Option<&SpecificOperand>,
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<ArgVal, String> {
-    match value {
-        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-259
-        // (getXRef), OTP-29.1.1.
-        Some(SpecificOperand::X(index)) if (6..1024).contains(index) => Ok(ArgVal::XMemory(*index)),
-        _ => arg(value, beam, env),
-    }
-}
-
-#[derive(Clone, Copy)]
-enum MoveArg {
-    X(u32),
-    Value(ArgVal),
-}
-
-fn move_arg(
-    value: Option<&SpecificOperand>,
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<MoveArg, String> {
-    match value.ok_or_else(|| "missing operand".to_owned())? {
-        SpecificOperand::X(index) => Ok(MoveArg::X(*index)),
-        operand => arg(Some(operand), beam, env).map(MoveArg::Value),
-    }
-}
-
-fn emit_extended_move(
-    assembler: &mut BeamModuleAssembler,
-    source: Option<&SpecificOperand>,
-    destination: Option<&SpecificOperand>,
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<(), arinsal_beamasm::module::ModuleError> {
-    use arinsal_a64::enc::Gpr;
-
-    let source = move_arg(source, beam, env)
-        .map_err(|_| arinsal_beamasm::module::ModuleError::InvalidOperand("invalid move source"))?;
-    let destination = move_arg(destination, beam, env).map_err(|_| {
-        arinsal_beamasm::module::ModuleError::InvalidOperand("invalid move destination")
-    })?;
-    let high_register = matches!(source, MoveArg::X(index) if index >= 6)
-        || matches!(destination, MoveArg::X(index) if index >= 6);
-    if !high_register {
-        let source = match source {
-            MoveArg::X(index) => ArgVal::X(index as u8),
-            MoveArg::Value(value) => value,
-        };
-        let destination = match destination {
-            MoveArg::X(index) => ArgVal::X(index as u8),
-            MoveArg::Value(value) => value,
-        };
-        return assembler.move_(source, destination);
-    }
-
-    let source_offset = match source {
-        MoveArg::X(index) if index >= 6 => Some(register_offset(index)?),
-        _ => None,
-    };
-    let destination_offset = match destination {
-        MoveArg::X(index) if index >= 6 => Some(register_offset(index)?),
-        _ => None,
-    };
-    assembler.emit_raw(|encoder| {
-        if let Some(offset) = source_offset {
-            encoder.ldr_uoff(Gpr::x(8), Gpr::x(19), offset)?;
-        } else {
-            let source_register = match source {
-                MoveArg::X(index) => Gpr::x([25, 26, 27, 28, 15, 16][index as usize]),
-                MoveArg::Value(ArgVal::Y(index)) => {
-                    let offset = index
-                        .checked_mul(8)
-                        .ok_or(arinsal_a64::enc::EncodeError::InvalidRegister(Gpr::x(31)))?;
-                    encoder.ldr_uoff(Gpr::x(8), Gpr::x(20), offset)?;
-                    Gpr::x(8)
-                }
-                MoveArg::Value(ArgVal::Immediate(value) | ArgVal::Literal(value)) => {
-                    encoder.mov_const(Gpr::x(8), value)?;
-                    Gpr::x(8)
-                }
-                MoveArg::Value(ArgVal::Export(value)) => {
-                    encoder.mov_const(Gpr::x(8), u64::from(value))?;
-                    Gpr::x(8)
-                }
-                MoveArg::Value(ArgVal::Label(_)) => {
-                    return Err(arinsal_a64::enc::EncodeError::InvalidRegister(Gpr::x(31)));
-                }
-                MoveArg::Value(_) => {
-                    return Err(arinsal_a64::enc::EncodeError::InvalidRegister(Gpr::x(31)));
-                }
-            };
-            if source_register != Gpr::x(8) {
-                encoder.mov_reg(Gpr::x(8), source_register)?;
-            }
-        }
-
-        if let Some(offset) = destination_offset {
-            encoder.str_uoff(Gpr::x(8), Gpr::x(19), offset)?;
-        } else {
-            match destination {
-                MoveArg::X(index) => {
-                    encoder.mov_reg(Gpr::x([25, 26, 27, 28, 15, 16][index as usize]), Gpr::x(8))?;
-                }
-                MoveArg::Value(ArgVal::Y(index)) => {
-                    let offset = index
-                        .checked_mul(8)
-                        .ok_or(arinsal_a64::enc::EncodeError::InvalidRegister(Gpr::x(31)))?;
-                    encoder.str_uoff(Gpr::x(8), Gpr::x(20), offset)?;
-                }
-                _ => return Err(arinsal_a64::enc::EncodeError::InvalidRegister(Gpr::x(31))),
-            }
-        }
-        Ok(())
-    })?;
-    Ok(())
-}
-
-fn register_offset(index: u32) -> Result<u32, arinsal_beamasm::module::ModuleError> {
-    if index >= 1024 {
-        return Err(arinsal_beamasm::module::ModuleError::InvalidOperand(
-            "X register index exceeds scheduler register array",
-        ));
-    }
-    index
-        .checked_mul(8)
-        .ok_or(arinsal_beamasm::module::ModuleError::InvalidOperand(
-            "X register offset overflow",
-        ))
-}
-
-fn validate_extended_x(args: &[SpecificOperand]) -> Result<(), EmitError> {
-    for operand in args {
-        match operand {
-            SpecificOperand::X(index) if *index >= 1024 => {
-                return Err(EmitError::Operand(
-                    "X register index exceeds scheduler register array".to_owned(),
-                ));
-            }
-            SpecificOperand::List(items) => validate_extended_x(items)?,
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-fn has_extended_x(args: &[SpecificOperand]) -> bool {
-    args.iter().any(|operand| match operand {
-        SpecificOperand::X(index) => *index >= 6,
-        SpecificOperand::List(items) => has_extended_x(items),
-        _ => false,
-    })
-}
-
-fn collect_extended_x(args: &[SpecificOperand], indexes: &mut BTreeSet<u32>) {
-    for operand in args {
-        match operand {
-            SpecificOperand::X(index) if *index >= 6 => {
-                indexes.insert(*index);
-            }
-            SpecificOperand::List(items) => collect_extended_x(items, indexes),
-            _ => {}
-        }
-    }
-}
-
-fn remap_spilled_x(operand: &mut SpecificOperand, spills: &BTreeMap<u32, u32>, count: u32) {
-    match operand {
-        SpecificOperand::X(index) if *index >= 6 => {
-            if let Some(slot) = spills.get(index) {
-                *operand = SpecificOperand::Y(*slot);
-            }
-        }
-        SpecificOperand::Y(index) => *index = index.saturating_add(count),
-        SpecificOperand::List(items) => {
-            for item in items {
-                remap_spilled_x(item, spills, count);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn raw_move_arg(
-    operand: Option<&SpecificOperand>,
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<MoveArg, EmitError> {
-    move_arg(operand, beam, env).map_err(EmitError::Operand)
-}
-
-fn raw_load_arg(
-    encoder: &mut arinsal_a64::enc::Emitter,
-    source: MoveArg,
-    destination: arinsal_a64::enc::Gpr,
-) -> Result<(), arinsal_a64::enc::EncodeError> {
-    use arinsal_a64::enc::{EncodeError, Gpr};
-    match source {
-        MoveArg::X(index) if index < 6 => encoder.mov_reg(
-            destination,
-            Gpr::x([25, 26, 27, 28, 15, 16][index as usize]),
-        ),
-        MoveArg::X(index) => encoder.ldr_uoff(destination, Gpr::x(19), index.saturating_mul(8)),
-        MoveArg::Value(ArgVal::Y(index)) => {
-            encoder.ldr_uoff(destination, Gpr::x(20), index.saturating_mul(8))
-        }
-        MoveArg::Value(ArgVal::Immediate(value) | ArgVal::Literal(value)) => {
-            encoder.mov_const(destination, value)
-        }
-        MoveArg::Value(ArgVal::Export(value)) => encoder.mov_const(destination, u64::from(value)),
-        _ => Err(EncodeError::InvalidRegister(Gpr::x(31))),
-    }
-}
-
-fn raw_store_arg(
-    encoder: &mut arinsal_a64::enc::Emitter,
-    destination: MoveArg,
-    source: arinsal_a64::enc::Gpr,
-) -> Result<(), arinsal_a64::enc::EncodeError> {
-    use arinsal_a64::enc::{EncodeError, Gpr};
-    match destination {
-        MoveArg::X(index) if index < 6 => {
-            encoder.mov_reg(Gpr::x([25, 26, 27, 28, 15, 16][index as usize]), source)
-        }
-        MoveArg::X(index) => encoder.str_uoff(source, Gpr::x(19), index.saturating_mul(8)),
-        MoveArg::Value(ArgVal::Y(index)) => {
-            encoder.str_uoff(source, Gpr::x(20), index.saturating_mul(8))
-        }
-        _ => Err(EncodeError::InvalidRegister(Gpr::x(31))),
-    }
-}
-
 struct MapLookupSpec {
-    map: MoveArg,
-    key: MoveArg,
+    map: ArgVal,
+    key: ArgVal,
     hash: u32,
     hashed: bool,
-    destination: MoveArg,
+    destination: ArgVal,
     fail: u32,
     helper: MapLookupHelper,
 }
@@ -2599,11 +2003,10 @@ fn emit_map_lookup(
 ) -> Result<(), EmitError> {
     use arinsal_a64::enc::Gpr;
 
+    // x24 holds the process's code index (active_code_ix); the map goes in a scratch register.
+    assembler.mov_arg_to_reg(Gpr::x(10), spec.map)?;
+    assembler.mov_arg_to_reg(Gpr::x(11), spec.key)?;
     assembler.emit_raw(|encoder| {
-        // x24 holds the process's code index (active_code_ix); the map goes in a scratch
-        // register.
-        raw_load_arg(encoder, spec.map, Gpr::x(10))?;
-        raw_load_arg(encoder, spec.key, Gpr::x(11))?;
         encoder.mov_const(Gpr::x(12), u64::from(spec.hash))?;
         encoder.mov_const(Gpr::x(13), u64::from(spec.hashed))?;
         encoder.str_uoff(Gpr::x(20), Gpr::x(21), 8)?;
@@ -2634,122 +2037,7 @@ fn emit_map_lookup(
     // Preserve XREG0: it can remain live as an input across this lookup.
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390, OTP-29.1.1.
     assembler.branch_if_zero_register(Gpr::x(14), spec.fail)?;
-    assembler.emit_raw(|encoder| raw_store_arg(encoder, spec.destination, Gpr::x(14)))?;
-    Ok(())
-}
-
-fn emit_extended_put_list(
-    assembler: &mut BeamModuleAssembler,
-    args: &[SpecificOperand],
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<(), EmitError> {
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:707-722, OTP-29.1.1.
-    use arinsal_a64::enc::Gpr;
-    validate_extended_x(args)?;
-    let head = raw_move_arg(args.first(), beam, env)?;
-    let tail = raw_move_arg(args.get(1), beam, env)?;
-    let destination = raw_move_arg(args.get(2), beam, env)?;
-    assembler.emit_raw(|encoder| {
-        raw_load_arg(encoder, head, Gpr::x(8))?;
-        raw_load_arg(encoder, tail, Gpr::x(9))?;
-        encoder.stp_post(Gpr::x(8), Gpr::x(9), Gpr::x(23), 16)?;
-        encoder.sub_imm(Gpr::x(10), Gpr::x(23), 15, false)?;
-        raw_store_arg(encoder, destination, Gpr::x(10))
-    })?;
-    Ok(())
-}
-
-fn emit_extended_put_tuple(
-    assembler: &mut BeamModuleAssembler,
-    args: &[SpecificOperand],
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<(), EmitError> {
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:794-872, OTP-29.1.1.
-    use arinsal_a64::enc::Gpr;
-    let Some(SpecificOperand::List(elements)) = args.get(1) else {
-        return Err(EmitError::Operand(
-            "put_tuple2 expects an element list".to_owned(),
-        ));
-    };
-    validate_extended_x(args)?;
-    let destination = raw_move_arg(args.first(), beam, env)?;
-    let elements = elements
-        .iter()
-        .map(|element| raw_move_arg(Some(element), beam, env))
-        .collect::<Result<Vec<_>, _>>()?;
-    let tuple_words = u64::try_from(elements.len())
-        .map_err(|_| EmitError::Operand("tuple arity overflow".to_owned()))?;
-    let tagged_offset = tuple_words
-        .checked_add(1)
-        .and_then(|words| words.checked_mul(8))
-        .and_then(|bytes| bytes.checked_sub(2))
-        .ok_or_else(|| EmitError::Operand("tuple size overflow".to_owned()))?;
-    assembler.emit_raw(|encoder| {
-        encoder.mov_const(Gpr::x(8), tuple_words << 6)?;
-        encoder.str_post(Gpr::x(8), Gpr::x(23), 8)?;
-        for element in elements {
-            raw_load_arg(encoder, element, Gpr::x(8))?;
-            encoder.str_post(Gpr::x(8), Gpr::x(23), 8)?;
-        }
-        encoder.mov_const(Gpr::x(9), tagged_offset)?;
-        encoder.sub_reg(
-            Gpr::x(10),
-            Gpr::x(23),
-            Gpr::x(9),
-            arinsal_a64::enc::Shift::Lsl,
-            0,
-        )?;
-        raw_store_arg(encoder, destination, Gpr::x(10))
-    })?;
-    Ok(())
-}
-
-fn emit_extended_get_list(
-    assembler: &mut BeamModuleAssembler,
-    args: &[SpecificOperand],
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-) -> Result<(), EmitError> {
-    use arinsal_a64::enc::Gpr;
-    validate_extended_x(args)?;
-    let source = raw_move_arg(args.first(), beam, env)?;
-    let head = raw_move_arg(args.get(1), beam, env)?;
-    let tail = raw_move_arg(args.get(2), beam, env)?;
-    let same_destination = args.get(1) == args.get(2);
-    assembler.emit_raw(|encoder| {
-        raw_load_arg(encoder, source, Gpr::x(8))?;
-        encoder.and_imm(Gpr::x(9), Gpr::x(8), !7)?;
-        if same_destination {
-            encoder.ldr_uoff(Gpr::x(10), Gpr::x(9), 8)?;
-            raw_store_arg(encoder, tail, Gpr::x(10))
-        } else {
-            encoder.ldp(Gpr::x(10), Gpr::x(11), Gpr::x(9), 0)?;
-            raw_store_arg(encoder, head, Gpr::x(10))?;
-            raw_store_arg(encoder, tail, Gpr::x(11))
-        }
-    })?;
-    Ok(())
-}
-
-fn emit_extended_list_field(
-    assembler: &mut BeamModuleAssembler,
-    args: &[SpecificOperand],
-    beam: &BeamFile,
-    env: &impl ModuleEnv,
-    offset: u32,
-) -> Result<(), EmitError> {
-    use arinsal_a64::enc::Gpr;
-    validate_extended_x(args)?;
-    let source = raw_move_arg(args.first(), beam, env)?;
-    let destination = raw_move_arg(args.get(1), beam, env)?;
-    assembler.emit_raw(|encoder| {
-        raw_load_arg(encoder, source, Gpr::x(8))?;
-        encoder.and_imm(Gpr::x(9), Gpr::x(8), !7)?;
-        encoder.ldr_uoff(Gpr::x(10), Gpr::x(9), offset)?;
-        raw_store_arg(encoder, destination, Gpr::x(10))
-    })?;
+    assembler.mov_reg_to_arg(spec.destination, Gpr::x(14))?;
     Ok(())
 }
 
@@ -2779,7 +2067,7 @@ fn small_or_arg(
         Some(SpecificOperand::Unsigned(_)) => Err(EmitError::Operand(
             "unsigned operand does not fit a small integer".to_owned(),
         )),
-        other => select_source_arg(other, beam, env).map_err(EmitError::Operand),
+        other => arg(other, beam, env).map_err(EmitError::Operand),
     }
 }
 
@@ -2867,113 +2155,8 @@ fn emit_op(
     beam: &BeamFile,
     env: &impl ModuleEnv,
 ) -> Result<(), EmitError> {
-    let mut remapped_args = op.operands().to_vec();
-    let mut guard_spill_bytes = 0_u32;
-    if ported(op.name()) == Some(EmitterKind::Guard)
-        && is_inline_guard(op.name())
-        && has_extended_x(op.operands())
-    {
-        validate_extended_x(op.operands())?;
-        let mut indexes = BTreeSet::new();
-        collect_extended_x(op.operands(), &mut indexes);
-        let spills = indexes
-            .iter()
-            .enumerate()
-            .map(|(slot, index)| (*index, slot as u32))
-            .collect::<BTreeMap<_, _>>();
-        let count = u32::try_from(spills.len())
-            .map_err(|_| EmitError::Operand("too many spilled X registers".to_owned()))?;
-        check_spill_count(count)?;
-        guard_spill_bytes = count
-            .checked_mul(8)
-            .ok_or_else(|| EmitError::Operand("guard spill size overflow".to_owned()))?;
-        assembler.emit_raw(|encoder| {
-            use arinsal_a64::enc::Gpr;
-            encoder.sub_imm(Gpr::x(20), Gpr::x(20), guard_spill_bytes as u16, false)?;
-            for (index, slot) in &spills {
-                encoder.ldr_uoff(Gpr::x(8), Gpr::x(19), index * 8)?;
-                encoder.str_uoff(Gpr::x(8), Gpr::x(20), slot * 8)?;
-            }
-            Ok(())
-        })?;
-        for operand in &mut remapped_args {
-            remap_spilled_x(operand, &spills, count);
-        }
-    }
-    let mut emitter_spills = BTreeMap::new();
-    let mut emitter_spill_bytes = 0_u32;
-    if uses_emitter_spills(op.name()) && has_extended_x(op.operands()) {
-        validate_extended_x(op.operands())?;
-        let mut indexes = BTreeSet::new();
-        collect_extended_x(op.operands(), &mut indexes);
-        emitter_spills = indexes
-            .iter()
-            .enumerate()
-            .map(|(slot, index)| (*index, slot as u32))
-            .collect();
-        let count = u32::try_from(emitter_spills.len())
-            .map_err(|_| EmitError::Operand("too many spilled X registers".to_owned()))?;
-        check_spill_count(count)?;
-        emitter_spill_bytes = count
-            .checked_mul(8)
-            .ok_or_else(|| EmitError::Operand("emitter spill size overflow".to_owned()))?;
-        // The stack slots are GC roots while the operation runs. A register the operation only
-        // writes is dead on entry and may still hold a word from before an earlier collection,
-        // so its slot starts as NIL instead of a copy.
-        let destinations = spilled_destinations(op, beam);
-        assembler.emit_raw(|encoder| {
-            use arinsal_a64::enc::Gpr;
-            encoder.sub_imm(Gpr::x(20), Gpr::x(20), emitter_spill_bytes as u16, false)?;
-            for (index, slot) in &emitter_spills {
-                if destinations.contains(index) {
-                    encoder.mov_const(Gpr::x(8), NIL_TERM)?;
-                } else {
-                    encoder.ldr_uoff(Gpr::x(8), Gpr::x(19), index * 8)?;
-                }
-                encoder.str_uoff(Gpr::x(8), Gpr::x(20), slot * 8)?;
-            }
-            Ok(())
-        })?;
-        for operand in &mut remapped_args {
-            remap_spilled_x(operand, &emitter_spills, count);
-        }
-    }
-    // A failure label leaves the instruction without running its epilogue, so branches that
-    // leave a spilled operation go through a stub that releases the spill slots first.
-    let mut restore_stubs: Vec<(u32, u32)> = Vec::new();
-    if guard_spill_bytes != 0 || emitter_spill_bytes != 0 {
-        for operand in &mut remapped_args {
-            if let SpecificOperand::Label(id) = operand
-                && *id != 0
-            {
-                let fresh = assembler.fresh_label_id();
-                restore_stubs.push((*id, fresh));
-                *id = fresh;
-            }
-        }
-    }
-    let args = if guard_spill_bytes == 0 {
-        if emitter_spill_bytes == 0 {
-            op.operands()
-        } else {
-            &remapped_args
-        }
-    } else {
-        &remapped_args
-    };
-    // Error instructions only read their value operand, so it may live above the register cache.
-    let extended_sources = matches!(
-        op.name(),
-        "badmatch" | "case_end" | "try_case_end" | "badrecord"
-    );
-    let value = |index| {
-        if extended_sources {
-            select_source_arg(args.get(index), beam, env)
-        } else {
-            arg(args.get(index), beam, env)
-        }
-        .map_err(EmitError::Operand)
-    };
+    let args = op.operands();
+    let value = |index| arg(args.get(index), beam, env).map_err(EmitError::Operand);
     let count = |expected| {
         if args.len() == expected {
             Ok(())
@@ -3002,21 +2185,12 @@ fn emit_op(
         let mut triples = Vec::with_capacity(size / 2 * 3);
         for pair in args[3..].as_chunks::<2>().0 {
             triples.push(arg(Some(&pair[0]), beam, env).map_err(EmitError::Operand)?);
-            triples.push(match &pair[1] {
-                SpecificOperand::X(index) if *index >= 6 => ArgVal::XMemory(*index),
-                other => arg(Some(other), beam, env).map_err(EmitError::Operand)?,
-            });
+            triples.push(arg(Some(&pair[1]), beam, env).map_err(EmitError::Operand)?);
             triples.push(ArgVal::Immediate(0));
         }
         let result =
             assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
-        return finish_emitter_spills(
-            assembler,
-            &emitter_spills,
-            emitter_spill_bytes,
-            &restore_stubs,
-            result,
-        );
+        return result.map_err(|error| EmitError::Assembler(format!("{error:?}")));
     }
     if op.name() == "i_get_map_elements" {
         count_at_least(args, 3, op.name())?;
@@ -3030,117 +2204,11 @@ fn emit_op(
         // Port of erts/emulator/beam/jit/arm/instr_map.cpp:391-490, OTP-29.1.1.
         let triples = args[3..]
             .iter()
-            .enumerate()
-            .map(|(position, operand)| match operand {
-                // Destinations above the register cache live in the X register array.
-                SpecificOperand::X(index) if position % 3 == 1 && *index >= 6 => {
-                    Ok(ArgVal::XMemory(*index))
-                }
-                _ => arg(Some(operand), beam, env).map_err(EmitError::Operand),
-            })
+            .map(|operand| arg(Some(operand), beam, env).map_err(EmitError::Operand))
             .collect::<Result<Vec<_>, _>>()?;
         let result =
             assembler.emit_i_get_map_elements(n(0)?, value(1)?, &triples, env.map_runtime());
-        return finish_emitter_spills(
-            assembler,
-            &emitter_spills,
-            emitter_spill_bytes,
-            &restore_stubs,
-            result,
-        );
-    }
-    if has_extended_x(args) {
-        match op.name() {
-            "swap" | "swap2" | "swap3" | "swap4" => {
-                validate_extended_x(args)?;
-                let pair_count = match op.name() {
-                    "swap" => 1,
-                    "swap2" => 2,
-                    "swap3" => 3,
-                    _ => 4,
-                };
-                count(pair_count + 1)?;
-                for index in 0..pair_count {
-                    let left = raw_move_arg(args.get(index), beam, env)?;
-                    let right = raw_move_arg(args.get(index + 1), beam, env)?;
-                    assembler.emit_raw(|encoder| {
-                        use arinsal_a64::enc::Gpr;
-                        raw_load_arg(encoder, left, Gpr::x(8))?;
-                        raw_load_arg(encoder, right, Gpr::x(9))?;
-                        raw_store_arg(encoder, left, Gpr::x(9))?;
-                        raw_store_arg(encoder, right, Gpr::x(8))
-                    })?;
-                }
-                return Ok(());
-            }
-            "put_list" => {
-                count(3)?;
-                return emit_extended_put_list(assembler, args, beam, env);
-            }
-            "put_tuple2" => {
-                count(2)?;
-                return emit_extended_put_tuple(assembler, args, beam, env);
-            }
-            "get_list" => {
-                count(3)?;
-                return emit_extended_get_list(assembler, args, beam, env);
-            }
-            "get_hd" => {
-                count(2)?;
-                return emit_extended_list_field(assembler, args, beam, env, 0);
-            }
-            "get_tl" => {
-                count(2)?;
-                return emit_extended_list_field(assembler, args, beam, env, 8);
-            }
-            "load_tuple_ptr" => {
-                count(1)?;
-                validate_extended_x(args)?;
-                let source = raw_move_arg(args.first(), beam, env)?;
-                assembler.emit_raw(|encoder| {
-                    use arinsal_a64::enc::Gpr;
-                    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:351-354, OTP-29.1.1:
-                    // the untagged pointer goes to ARG1; the X register keeps the tagged tuple.
-                    raw_load_arg(encoder, source, Gpr::x(8))?;
-                    encoder.and_imm(Gpr::x(0), Gpr::x(8), !7)
-                })?;
-                return Ok(());
-            }
-            "get_tuple_element" | "i_get_tuple_element" => {
-                count(3)?;
-                validate_extended_x(args)?;
-                let source = raw_move_arg(args.first(), beam, env)?;
-                let destination = raw_move_arg(args.get(2), beam, env)?;
-                let offset = tuple_byte_offset(args.get(1))?;
-                assembler.emit_raw(|encoder| {
-                    use arinsal_a64::enc::Gpr;
-                    raw_load_arg(encoder, source, Gpr::x(8))?;
-                    encoder.and_imm(Gpr::x(9), Gpr::x(8), !7)?;
-                    encoder.ldr_uoff(Gpr::x(10), Gpr::x(9), offset)?;
-                    raw_store_arg(encoder, destination, Gpr::x(10))
-                })?;
-                return Ok(());
-            }
-            "get_two_tuple_elements" => {
-                count(4)?;
-                validate_extended_x(args)?;
-                let source = raw_move_arg(args.first(), beam, env)?;
-                let first = raw_move_arg(args.get(2), beam, env)?;
-                let second = raw_move_arg(args.get(3), beam, env)?;
-                let offset = tuple_byte_offset(args.get(1))?;
-                assembler.emit_raw(|encoder| {
-                    use arinsal_a64::enc::Gpr;
-                    raw_load_arg(encoder, source, Gpr::x(8))?;
-                    encoder.and_imm(Gpr::x(9), Gpr::x(8), !7)?;
-                    encoder.ldr_uoff(Gpr::x(10), Gpr::x(9), offset)?;
-                    encoder.ldr_uoff(Gpr::x(11), Gpr::x(9), offset.saturating_add(8))?;
-                    raw_store_arg(encoder, first, Gpr::x(10))?;
-                    raw_store_arg(encoder, second, Gpr::x(11))
-                })?;
-                return Ok(());
-            }
-            _ => {}
-        }
+        return result.map_err(|error| EmitError::Assembler(format!("{error:?}")));
     }
     // Guard-context arithmetic branches to its failure label instead of raising.
     assembler.set_arith_fail(0);
@@ -3274,8 +2342,7 @@ fn emit_op(
         },
         EmitterKind::Move => {
             count(2)?;
-            emit_extended_move(assembler, args.first(), args.get(1), beam, env)?;
-            Ok(())
+            assembler.move_(value(0)?, value(1)?)
         }
         EmitterKind::Swap => {
             count(2)?;
@@ -3307,24 +2374,13 @@ fn emit_op(
         }
         EmitterKind::LengthSetup => {
             count(3)?;
-            let live = n(1)?;
-            emit_extended_move(
-                assembler,
-                args.get(2),
-                Some(&SpecificOperand::X(live)),
-                beam,
-                env,
-            )
+            let live = x_register(n(1)?).map_err(EmitError::Operand)?;
+            assembler.move_(value(2)?, live)
         }
         EmitterKind::Length => {
             count(3)?;
-            let live = n(1)?;
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-339, OTP-29.1.1.
-            let source = if live >= 6 {
-                ArgVal::XMemory(live)
-            } else {
-                ArgVal::X(live as u8)
-            };
+            let source = x_register(n(1)?).map_err(EmitError::Operand)?;
             assembler.emit_bif_length(n(0)?, source, value(2)?, env.guard_helper())
         }
         EmitterKind::Allocate => {
@@ -3631,17 +2687,6 @@ fn emit_op(
                     }
                 }
             }
-            if guard_spill_bytes != 0 {
-                emit_restore_stubs(assembler, &restore_stubs, guard_spill_bytes)?;
-                assembler.emit_raw(|encoder| {
-                    encoder.add_imm(
-                        arinsal_a64::enc::Gpr::x(20),
-                        arinsal_a64::enc::Gpr::x(20),
-                        guard_spill_bytes as u16,
-                        false,
-                    )
-                })?;
-            }
             Ok(())
         }
         EmitterKind::PairedRangeGuard => {
@@ -3671,11 +2716,11 @@ fn emit_op(
             emit_map_lookup(
                 assembler,
                 MapLookupSpec {
-                    map: raw_move_arg(args.get(1), beam, env)?,
-                    key: raw_move_arg(args.get(key_at), beam, env)?,
+                    map: value(1)?,
+                    key: value(key_at)?,
                     hash: hash_at.map(&n).transpose()?.unwrap_or(0),
                     hashed,
-                    destination: raw_move_arg(args.get(destination_at), beam, env)?,
+                    destination: value(destination_at)?,
                     fail: n(0)?,
                     helper: env.map_lookup_helper(),
                 },
@@ -4233,7 +3278,7 @@ fn emit_op(
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:402-423, OTP-29.1.1.
                 let tag = fun_call_tag(args.first(), beam)?;
                 let arity = n(1)?.min(u8::MAX as u32) as u8;
-                let func = select_source_arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
+                let func = arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
                 assembler.emit_i_call_fun2(tag, arity, func, env.fun_resolver())
             }
             "i_call_fun2_last" => {
@@ -4241,7 +3286,7 @@ fn emit_op(
                 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:425-455, OTP-29.1.1.
                 let tag = fun_call_tag(args.first(), beam)?;
                 let arity = n(1)?.min(u8::MAX as u32) as u8;
-                let func = select_source_arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
+                let func = arg(args.get(2), beam, env).map_err(EmitError::Operand)?;
                 assembler.emit_i_call_fun2_last(tag, arity, func, n(3)?, env.fun_resolver())
             }
             "send" => {
@@ -4270,14 +3315,12 @@ fn emit_op(
                     .dispatch_export(entry, true)
                     .map_err(EmitError::from);
             }
-            let module = raw_move_arg(args.first(), beam, env)?;
-            let function = raw_move_arg(args.get(1), beam, env)?;
             let arity = n(2)?;
             let helper = env.bif_mfa_helper();
+            assembler.mov_arg_to_reg(arinsal_a64::enc::Gpr::x(12), value(0)?)?;
+            assembler.mov_arg_to_reg(arinsal_a64::enc::Gpr::x(13), value(1)?)?;
             assembler.emit_raw(|encoder| {
                 use arinsal_a64::enc::Gpr;
-                raw_load_arg(encoder, module, Gpr::x(12))?;
-                raw_load_arg(encoder, function, Gpr::x(13))?;
                 encoder.str_uoff(Gpr::x(20), Gpr::x(21), 8)?;
                 encoder.str_uoff(Gpr::x(23), Gpr::x(21), 0)?;
                 encoder.str_uoff(Gpr::w(22), Gpr::x(21), 32)?;
@@ -4435,31 +3478,18 @@ fn emit_op(
         EmitterKind::Fused => match op.name() {
             "store_two_values" | "load_two_xregs" => {
                 count(4)?;
-                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:602-630, OTP-29.1.1: both
-                // sources are loaded before either destination is written, so the pair is a
-                // parallel move (`load_two_xregs x10 x11 x11 x0` must read the old X11).
-                let source1 = raw_move_arg(args.first(), beam, env)?;
-                let destination1 = raw_move_arg(args.get(1), beam, env)?;
-                let source2 = raw_move_arg(args.get(2), beam, env)?;
-                let destination2 = raw_move_arg(args.get(3), beam, env)?;
-                assembler.emit_raw(|encoder| {
-                    use arinsal_a64::enc::Gpr;
-                    raw_load_arg(encoder, source1, Gpr::x(8))?;
-                    raw_load_arg(encoder, source2, Gpr::x(9))?;
-                    raw_store_arg(encoder, destination1, Gpr::x(8))?;
-                    raw_store_arg(encoder, destination2, Gpr::x(9))
-                })
+                assembler.emit_store_two_values(value(0)?, value(1)?, value(2)?, value(3)?)
             }
             "move_trim" => {
                 count(3)?;
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:559-600, OTP-29.1.1.
-                emit_extended_move(assembler, args.first(), args.get(1), beam, env)?;
+                assembler.move_(value(0)?, value(1)?)?;
                 assembler.trim(n(2)?, 0)
             }
             "move_call_last" => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:83-115, OTP-29.1.1.
-                emit_extended_move(assembler, args.first(), args.get(1), beam, env)?;
+                assembler.move_(value(0)?, value(1)?)?;
                 assembler.call_last(n(2)?, n(3)?)
             }
             "put_list_deallocate" => {
@@ -4470,97 +3500,21 @@ fn emit_op(
             }
             "move_two_trim" => {
                 count(5)?;
-                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:521-557, OTP-29.1.1.
-                use arinsal_a64::enc::Gpr;
-                let MoveArg::Value(ArgVal::Y(source1)) = move_arg(args.first(), beam, env)
-                    .map_err(|_| EmitError::Operand("invalid first move_two_trim source".into()))?
-                else {
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:521-557, OTP-29.1.1: both
+                // Y sources are read before either destination is written, then the frame is
+                // trimmed.
+                if !matches!((value(0)?, value(2)?), (ArgVal::Y(_), ArgVal::Y(_))) {
                     return Err(EmitError::Operand(
                         "move_two_trim sources must be Y registers".into(),
                     ));
-                };
-                let MoveArg::Value(ArgVal::Y(source2)) =
-                    move_arg(args.get(2), beam, env).map_err(|_| {
-                        EmitError::Operand("invalid second move_two_trim source".into())
-                    })?
-                else {
-                    return Err(EmitError::Operand(
-                        "move_two_trim sources must be Y registers".into(),
-                    ));
-                };
-                let destination1 = move_arg(args.get(1), beam, env).map_err(|_| {
-                    EmitError::Operand("invalid first move_two_trim destination".into())
-                })?;
-                let destination2 = move_arg(args.get(3), beam, env).map_err(|_| {
-                    EmitError::Operand("invalid second move_two_trim destination".into())
-                })?;
-                let source1_offset = source1.checked_mul(8).ok_or_else(|| {
-                    EmitError::Operand("move_two_trim source offset overflow".into())
-                })?;
-                let source2_offset = source2.checked_mul(8).ok_or_else(|| {
-                    EmitError::Operand("move_two_trim source offset overflow".into())
-                })?;
-                let destination_offset = |destination: MoveArg| -> Result<(bool, u32), EmitError> {
-                    match destination {
-                        MoveArg::X(index) if index >= 6 => Ok((false, register_offset(index)?)),
-                        MoveArg::Value(ArgVal::Y(index)) => Ok((
-                            true,
-                            index.checked_mul(8).ok_or_else(|| {
-                                EmitError::Operand(
-                                    "move_two_trim destination offset overflow".into(),
-                                )
-                            })?,
-                        )),
-                        MoveArg::X(_) | MoveArg::Value(ArgVal::X(_)) => Ok((false, u32::MAX)),
-                        _ => Err(EmitError::Operand(
-                            "move_two_trim destination must be a register".into(),
-                        )),
-                    }
-                };
-                let first_offset = destination_offset(destination1)?;
-                let second_offset = destination_offset(destination2)?;
-                assembler.emit_raw(|encoder| {
-                    encoder.ldr_uoff(Gpr::x(8), Gpr::x(20), source1_offset)?;
-                    encoder.ldr_uoff(Gpr::x(10), Gpr::x(20), source2_offset)?;
-                    for (value, destination, (is_y, offset)) in [
-                        (Gpr::x(8), destination1, first_offset),
-                        (Gpr::x(10), destination2, second_offset),
-                    ] {
-                        match destination {
-                            MoveArg::X(index) if index < 6 => {
-                                encoder.mov_reg(
-                                    Gpr::x([25, 26, 27, 28, 15, 16][index as usize]),
-                                    value,
-                                )?;
-                            }
-                            MoveArg::X(_) => encoder.str_uoff(value, Gpr::x(19), offset)?,
-                            MoveArg::Value(ArgVal::Y(_)) if is_y => {
-                                encoder.str_uoff(value, Gpr::x(20), offset)?;
-                            }
-                            MoveArg::Value(ArgVal::X(index)) if index < 6 => {
-                                encoder.mov_reg(
-                                    Gpr::x([25, 26, 27, 28, 15, 16][index as usize]),
-                                    value,
-                                )?;
-                            }
-                            MoveArg::Value(ArgVal::X(_)) => {
-                                encoder.str_uoff(value, Gpr::x(19), offset)?
-                            }
-                            _ => {
-                                return Err(arinsal_a64::enc::EncodeError::InvalidRegister(
-                                    Gpr::x(31),
-                                ));
-                            }
-                        }
-                    }
-                    Ok(())
-                })?;
+                }
+                assembler.emit_store_two_values(value(0)?, value(1)?, value(2)?, value(3)?)?;
                 assembler.trim(n(4)?, 0)
             }
             "move_call_ext_last" => {
                 count(4)?;
                 // Port of erts/emulator/beam/jit/arm/ops.tab:852 and instr_call.cpp:175-200, OTP-29.1.1.
-                emit_extended_move(assembler, args.first(), args.get(1), beam, env)?;
+                assembler.move_(value(0)?, value(1)?)?;
                 let import = n(2)?;
                 let entry = env.export_entry(beam, import).map_err(EmitError::Operand)?;
                 assembler.deallocate(n(3)?)?;
@@ -4788,8 +3742,7 @@ fn emit_op(
                 .chain(payload.as_chunks::<2>().0.iter().map(|pair| pair[1]))
                 .collect::<Vec<_>>();
             if matches!(ported(op.name()), Some(EmitterKind::SelectVal)) {
-                let source =
-                    select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
+                let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
                 if op.name() == "i_select_val_lins" {
                     assembler.emit_i_select_val_lins(source, value(1)?, size, &pairs)
                 } else {
@@ -4811,14 +3764,13 @@ fn emit_op(
                     assembler.emit_i_select_val_bins(source, value(1)?, size, &pairs)
                 }
             } else {
-                let source =
-                    select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
+                let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
                 assembler.emit_i_select_tuple_arity(source, value(1)?, size, &pairs)
             }
         }
         EmitterKind::SelectVal2 | EmitterKind::SelectTupleArity2 => {
             count(6)?;
-            let src = select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
+            let src = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
             let fail = value(1)?;
             let is_tuple_arity = matches!(ported(op.name()), Some(EmitterKind::SelectTupleArity2));
             let first = if is_tuple_arity {
@@ -4894,7 +3846,7 @@ fn emit_op(
                 .iter()
                 .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                 .collect::<Result<Vec<_>, _>>()?;
-            let source = select_source_arg(args.first(), beam, env).map_err(EmitError::Operand)?;
+            let source = arg(args.first(), beam, env).map_err(EmitError::Operand)?;
             if op.name() == "i_jump_on_val" {
                 assembler.emit_i_jump_on_val(source, value(1)?, base, size_at, &targets)
             } else {
@@ -5167,62 +4119,6 @@ fn emit_op(
             }
         }
     };
-    finish_emitter_spills(
-        assembler,
-        &emitter_spills,
-        emitter_spill_bytes,
-        &restore_stubs,
-        result,
-    )
-}
-
-/// Emits the out-of-line exits that release `bytes` of spill slots before branching to the
-/// original failure labels, and skips them on the fall-through path.
-fn emit_restore_stubs(
-    assembler: &mut BeamModuleAssembler,
-    stubs: &[(u32, u32)],
-    bytes: u32,
-) -> Result<(), EmitError> {
-    if stubs.is_empty() {
-        return Ok(());
-    }
-    let done = assembler.fresh_label_id();
-    assembler.jump(done)?;
-    for (original, fresh) in stubs {
-        assembler.emit_i_entry_label(*fresh)?;
-        assembler.emit_raw(|encoder| {
-            encoder.add_imm(
-                arinsal_a64::enc::Gpr::x(20),
-                arinsal_a64::enc::Gpr::x(20),
-                bytes as u16,
-                false,
-            )
-        })?;
-        assembler.jump(*original)?;
-    }
-    assembler.emit_i_entry_label(done)?;
-    Ok(())
-}
-
-/// Copies spilled X registers back and releases their stack slots after an emitter ran.
-fn finish_emitter_spills(
-    assembler: &mut BeamModuleAssembler,
-    spills: &BTreeMap<u32, u32>,
-    spill_bytes: u32,
-    stubs: &[(u32, u32)],
-    result: Result<(), arinsal_beamasm::module::ModuleError>,
-) -> Result<(), EmitError> {
-    if spill_bytes != 0 && result.is_ok() {
-        emit_restore_stubs(assembler, stubs, spill_bytes)?;
-        assembler.emit_raw(|encoder| {
-            use arinsal_a64::enc::Gpr;
-            for (index, slot) in spills {
-                encoder.ldr_uoff(Gpr::x(8), Gpr::x(20), slot * 8)?;
-                encoder.str_uoff(Gpr::x(8), Gpr::x(19), index * 8)?;
-            }
-            encoder.add_imm(Gpr::x(20), Gpr::x(20), spill_bytes as u16, false)
-        })?;
-    }
     result.map_err(|error| EmitError::Assembler(format!("{error:?}")))
 }
 

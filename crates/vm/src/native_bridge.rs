@@ -546,10 +546,7 @@ pub fn run_native(
     } else {
         resume_live as usize - 1
     };
-    process.ensure_for_native(
-        1 + arinsal_term::S_RESERVED + arinsal_term::NATIVE_SPILL_WORDS,
-        live,
-    )?;
+    process.ensure(1 + arinsal_term::S_RESERVED, live)?;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     if !resuming_continuation && !process.heap.reserve_stack(1) {
         return Err(VmError::Unsupported(

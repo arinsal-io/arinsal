@@ -283,9 +283,6 @@ pub const S_REDZONE: usize = CP_WORDS * 3;
 /// Minimum free gap kept between the young heap and Erlang stack.
 // Port of erts/emulator/beam/erl_vm.h:120, OTP-29.1.1.
 pub const S_RESERVED: usize = CP_WORDS + S_REDZONE;
-/// Stack words BeamAsm code may borrow below E to address X registers past the register
-/// cache as stack slots. Native heap checks and native-mode runtime allocation keep them free.
-pub const NATIVE_SPILL_WORDS: usize = 72;
 /// Rarely touched virtual binary heap state, kept out of the hot `ProcessHeap`.
 pub(crate) struct VheapCold {
     pub(crate) old: u64,
@@ -412,20 +409,17 @@ impl ProcessHeap {
     /// Young heap allocation boundary, leaving the native stack redzone unused.
     // Port of erts/emulator/beam/erl_process.h:990-998, OTP-29.1.1.
     pub fn heap_limit_words(&self) -> usize {
-        self.htop.max(
-            self.stop
-                .saturating_sub(crate::S_REDZONE + NATIVE_SPILL_WORDS),
-        )
+        self.htop.max(self.stop.saturating_sub(crate::S_REDZONE))
     }
     /// Whether generated code is running on this heap (set by the native bridge).
     pub fn native_active(&self) -> bool {
         self.native_allocation
     }
-    /// Words an allocation must leave free below the stack: the native redzone and spill
-    /// area while generated code is active, none otherwise.
+    /// Words an allocation must leave free below the stack: the native redzone while
+    /// generated code is active, none otherwise.
     pub fn allocation_reserve(&self) -> usize {
         if self.native_allocation {
-            crate::S_REDZONE + NATIVE_SPILL_WORDS
+            crate::S_REDZONE
         } else {
             0
         }

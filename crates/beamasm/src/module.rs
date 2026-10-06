@@ -965,13 +965,9 @@ impl BeamModuleAssembler {
     pub fn move_(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
         let reg = match dst {
             ArgVal::X(i) if i < 6 => XREGS[i as usize],
-            ArgVal::Y(i) => {
+            ArgVal::Y(_) | ArgVal::XMemory(_) => {
                 let source = self.source_reg(src)?;
-                let offset = i
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.str_uoff(source, E, offset))?;
-                return Ok(());
+                return self.store_operand(dst, source);
             }
             _ => return Err(ModuleError::InvalidOperand("destination must be X or Y")),
         };
@@ -983,12 +979,7 @@ impl BeamModuleAssembler {
                 let label = self.label(id);
                 self.code.adr(reg, label)?;
             }
-            ArgVal::Y(i) => {
-                let offset = i
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.ldr_uoff(reg, E, offset))?;
-            }
+            ArgVal::Y(_) | ArgVal::XMemory(_) => self.load_operand(src, reg)?,
             _ => {
                 return Err(ModuleError::InvalidOperand(
                     "X register index must be below 6",
@@ -996,6 +987,40 @@ impl BeamModuleAssembler {
             }
         }
         Ok(())
+    }
+
+    /// Loads any source operand (cached X, X array, Y, immediate, literal, export or label)
+    /// into `dst`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1757-1762 (mov_arg(Gp, ArgVal)), OTP-29.1.1.
+    pub fn mov_arg_to_reg(&mut self, dst: Gpr, src: ArgVal) -> Result<(), ModuleError> {
+        let reg = self.source_reg_into(src, dst)?;
+        if reg != dst {
+            self.code.emit(|e| e.mov_reg(dst, reg))?;
+        }
+        Ok(())
+    }
+
+    /// Stores `src` into a register operand (cached X, X array or Y).
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1764-1767 (mov_arg(ArgVal, Gp)), OTP-29.1.1.
+    pub fn mov_reg_to_arg(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
+        self.store_operand(dst, src)
+    }
+
+    /// Parallel move of two values: both sources are read before either destination is
+    /// written (`load_two_xregs x10 x11 x11 x0` must read the old X11).
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:602-630 (emit_store_two_values,
+    // emit_load_two_xregs), OTP-29.1.1.
+    pub fn emit_store_two_values(
+        &mut self,
+        src1: ArgVal,
+        dst1: ArgVal,
+        src2: ArgVal,
+        dst2: ArgVal,
+    ) -> Result<(), ModuleError> {
+        self.mov_arg_to_reg(TMP, src1)?;
+        self.mov_arg_to_reg(Gpr::x(10), src2)?;
+        self.store_operand(dst1, TMP)?;
+        self.store_operand(dst2, Gpr::x(10))
     }
 
     pub(super) fn source_reg(&mut self, src: ArgVal) -> Result<Gpr, ModuleError> {
@@ -1251,6 +1276,7 @@ impl BeamModuleAssembler {
         match arg {
             ArgVal::X(i) if i < 6 => Ok(arg),
             ArgVal::Y(_) => Ok(arg),
+            ArgVal::XMemory(i) if i < 1024 => Ok(arg),
             _ => Err(ModuleError::InvalidOperand(
                 "swap operands must be X or Y registers",
             )),
@@ -1258,8 +1284,25 @@ impl BeamModuleAssembler {
     }
 
     fn load_register(&mut self, src: ArgVal, dst: Gpr) -> Result<(), ModuleError> {
+        self.load_operand(src, dst)
+    }
+
+    pub(super) fn store_register(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
+        self.store_operand(dst, src)
+    }
+
+    /// Loads an X register (cached or in the scheduler register array) or a Y slot into `dst`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-276 (getXRef, getYRef), OTP-29.1.1.
+    pub(super) fn load_operand(&mut self, src: ArgVal, dst: Gpr) -> Result<(), ModuleError> {
         match src {
-            ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(dst, XREGS[i as usize]))?,
+            ArgVal::X(i) if i < 6 => {
+                if dst != XREGS[i as usize] {
+                    self.code.emit(|e| e.mov_reg(dst, XREGS[i as usize]))?;
+                }
+            }
+            ArgVal::XMemory(i) if i < 1024 => {
+                self.code.emit(|e| e.ldr_uoff(dst, SCHEDULER_REGS, i * 8))?;
+            }
             ArgVal::Y(i) => {
                 let offset = i
                     .checked_mul(8)
@@ -1268,16 +1311,25 @@ impl BeamModuleAssembler {
             }
             _ => {
                 return Err(ModuleError::InvalidOperand(
-                    "swap operands must be X or Y registers",
+                    "operand must be an X or Y register",
                 ));
             }
         }
         Ok(())
     }
 
-    pub(super) fn store_register(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
+    /// Stores `src` into an X register (cached or in the scheduler register array) or a Y slot.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:252-276 (getXRef, getYRef), OTP-29.1.1.
+    pub(super) fn store_operand(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
         match dst {
-            ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(XREGS[i as usize], src))?,
+            ArgVal::X(i) if i < 6 => {
+                if src != XREGS[i as usize] {
+                    self.code.emit(|e| e.mov_reg(XREGS[i as usize], src))?;
+                }
+            }
+            ArgVal::XMemory(i) if i < 1024 => {
+                self.code.emit(|e| e.str_uoff(src, SCHEDULER_REGS, i * 8))?;
+            }
             ArgVal::Y(i) => {
                 let offset = i
                     .checked_mul(8)
@@ -1286,7 +1338,7 @@ impl BeamModuleAssembler {
             }
             _ => {
                 return Err(ModuleError::InvalidOperand(
-                    "swap operands must be X or Y registers",
+                    "destination must be an X or Y register",
                 ));
             }
         }

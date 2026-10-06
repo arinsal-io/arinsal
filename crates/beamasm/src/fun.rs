@@ -43,13 +43,13 @@ fn fun_register(arity: u8) -> ArgVal {
 }
 
 impl BeamModuleAssembler {
-    /// Register that receives a new fun term; Y destinations go through a scratch register.
+    /// Register that receives a new fun term; memory destinations go through a scratch register.
     fn fun_destination(&self, dst: ArgVal) -> Result<(Gpr, bool), ModuleError> {
         match dst {
             ArgVal::X(index) if index < 6 => Ok((XREGS[index as usize], false)),
-            ArgVal::Y(_) => Ok((Gpr::x(8), true)),
+            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok((Gpr::x(8), true)),
             _ => Err(ModuleError::InvalidOperand(
-                "fun destination must be an X register below 6 or a Y register",
+                "fun destination must be an X or Y register",
             )),
         }
     }

@@ -529,7 +529,7 @@ impl BeamModuleAssembler {
                 Gpr::x(10 + 5),
                 Gpr::x(10 + 6),
             ][index as usize]),
-            ArgVal::Y(_) => Ok(Gpr::x(17)),
+            ArgVal::Y(_) | ArgVal::XMemory(_) => Ok(Gpr::x(17)),
             _ => Err(ModuleError::InvalidOperand(
                 "guard BIF destination must be X or Y",
             )),
@@ -544,12 +544,7 @@ impl BeamModuleAssembler {
                     self.code.emit(|e| e.mov_reg(target, result))?;
                 }
             }
-            ArgVal::Y(index) => {
-                let offset = index
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.str_uoff(result, Gpr::x(20), offset))?;
-            }
+            ArgVal::Y(_) | ArgVal::XMemory(_) => self.store_operand(destination, result)?,
             _ => {
                 return Err(ModuleError::InvalidOperand(
                     "guard BIF destination must be X or Y",
@@ -1531,10 +1526,14 @@ fn exact_immediate_operand(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64)> {
 
 fn small_comparison_immediate(lhs: ArgVal, rhs: ArgVal) -> Option<(ArgVal, u64, bool)> {
     match (lhs, rhs) {
-        (ArgVal::X(_) | ArgVal::Y(_), ArgVal::Immediate(word)) if word & 15 == 15 => {
+        (ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_), ArgVal::Immediate(word))
+            if word & 15 == 15 =>
+        {
             Some((lhs, word, false))
         }
-        (ArgVal::Immediate(word), ArgVal::X(_) | ArgVal::Y(_)) if word & 15 == 15 => {
+        (ArgVal::Immediate(word), ArgVal::X(_) | ArgVal::XMemory(_) | ArgVal::Y(_))
+            if word & 15 == 15 =>
+        {
             Some((rhs, word, true))
         }
         _ => None,
