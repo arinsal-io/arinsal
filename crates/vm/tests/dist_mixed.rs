@@ -15,12 +15,7 @@ fn serial_test() -> MutexGuard<'static, ()> {
 }
 
 fn short_hostname() -> String {
-    std::env::var("HOSTNAME")
-        .unwrap_or_else(|_| "local".into())
-        .split('.')
-        .next()
-        .expect("HOSTNAME is non-empty")
-        .to_owned()
+    "localhost".to_owned()
 }
 
 fn otp_root() -> std::ffi::OsString {
@@ -121,6 +116,7 @@ fn start_erl() -> (ErlNode, String, String, String) {
     let node = format!("dm_e{suffix}");
     let cookie = format!("dm_cookie_{suffix}");
     let host = short_hostname();
+    let local_node = format!("{node}@{host}");
     let expression = "Port=open_port({fd,0,1},[eof]), register(echo,self()), Loop=fun Again() -> receive {Port,eof} -> halt(0); {get_alias,From} -> From ! {remote_alias,erlang:alias()}, Again(); {alias_roundtrip,From,Msg} -> From ! {alias_ack,Msg}, Again(); {From,Msg,Alias} -> Reply={self(),Msg,Port,make_ref()}, From ! {pid,Reply}, {mixed_receiver,node(From)} ! {name,Reply}, Alias ! {alias,Reply}, Again() end end, Loop().";
     let mut child = Command::new("timeout")
         .args([
@@ -129,7 +125,7 @@ fn start_erl() -> (ErlNode, String, String, String) {
             "erl",
             "-noshell",
             "-sname",
-            &node,
+            &local_node,
             "-setcookie",
             &cookie,
             "-eval",
@@ -169,6 +165,7 @@ fn arinsal_eval_with_dist_buffer(
 ) -> String {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
     let node = format!("dm_a{}", unique_suffix(id));
+    let local_node = format!("{node}@{host}");
     let binary = std::env::current_exe()
         .expect("current test executable")
         .parent()
@@ -190,7 +187,7 @@ fn arinsal_eval_with_dist_buffer(
     let output = command
         .args([
             "-sname",
-            &node,
+            &local_node,
             "-setcookie",
             cookie,
             "-eval",
@@ -215,6 +212,7 @@ fn arinsal_eval_with_dist_buffer(
 fn start_arinsal_server(cookie: &str, host: &str) -> (ArinsalNode, String) {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
     let node = format!("dm_s{}", unique_suffix(id));
+    let local_node = format!("{node}@{host}");
     let binary = std::env::current_exe()
         .expect("current test executable")
         .parent()
@@ -232,7 +230,7 @@ fn start_arinsal_server(cookie: &str, host: &str) -> (ArinsalNode, String) {
             binary.to_str().expect("UTF-8 arinsal path"),
             "-noshell",
             "-sname",
-            &node,
+            &local_node,
             "-setcookie",
             cookie,
             "-eval",
@@ -264,6 +262,7 @@ fn start_arinsal_server(cookie: &str, host: &str) -> (ArinsalNode, String) {
 fn otp_eval(cookie: &str, expression: &str) -> String {
     let id = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
     let node = format!("dm_o{}", unique_suffix(id));
+    let local_node = format!("{node}@localhost");
     let output = Command::new("timeout")
         .args([
             "--kill-after=3",
@@ -271,7 +270,7 @@ fn otp_eval(cookie: &str, expression: &str) -> String {
             "erl",
             "-noshell",
             "-sname",
-            &node,
+            &local_node,
             "-setcookie",
             cookie,
             "-eval",
