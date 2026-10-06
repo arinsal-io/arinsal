@@ -566,3 +566,87 @@ fn caller_module(target: usize, label: u32) -> arinsal_beamasm::module::Finalize
 const fn tagged_small(value: u64) -> u64 {
     (value << 4) | 0xf
 }
+
+fn erlc_fixture(file: &str) -> Vec<u8> {
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("beamjit-xmem");
+    fs::create_dir_all(&root).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(file);
+    let output = Command::new("erlc")
+        .arg("-o")
+        .arg(&root)
+        .arg(&source)
+        .output()
+        .expect("erlc must be installed for the BEAM integration test");
+    assert!(
+        output.status.success(),
+        "erlc {file} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stem = file.rsplit_once('.').unwrap().0;
+    fs::read(root.join(format!("{stem}.beam"))).unwrap()
+}
+
+fn extended_x_ops(bytes: &[u8]) -> std::collections::BTreeSet<String> {
+    fn extended(operand: &arinsal_beamops::SpecificOperand) -> bool {
+        match operand {
+            arinsal_beamops::SpecificOperand::X(index) => *index >= 6,
+            arinsal_beamops::SpecificOperand::List(items) => items.iter().any(extended),
+            _ => false,
+        }
+    }
+    let beam = arinsal_beam::parse(bytes).unwrap();
+    arinsal_beamops::transform_module(&beam)
+        .iter()
+        .flatten()
+        .filter(|op| op.operands().iter().any(extended))
+        .map(|op| op.name().to_owned())
+        .collect()
+}
+
+/// The X6+ fixtures (compiled natively by `vm/tests/asm_corpus.rs` and run against `erl` by
+/// `vm/tests/jit_xmem.rs`) keep operands above the register cache in every op family listed.
+#[test]
+fn extended_x_fixtures_cover_op_families() {
+    for (file, required) in [
+        (
+            "jit_xmem.erl",
+            &[
+                "i_plus",
+                "i_bxor",
+                "put_tuple2",
+                "put_list",
+                "get_list",
+                "i_get_tuple_element",
+                "i_select_val_lins",
+                "i_bs_create_bin",
+                "update_record",
+                "case_end",
+                "load_two_xregs",
+            ][..],
+        ),
+        (
+            "jit_xmem_asm.S",
+            &[
+                "swap",
+                "store_two_values",
+                "i_call_fun2",
+                "recv_marker_reserve",
+                "recv_marker_bind",
+                "recv_marker_use",
+                "raise",
+            ][..],
+        ),
+    ] {
+        let bytes = erlc_fixture(file);
+        let used = extended_x_ops(&bytes);
+        eprintln!("{file}: {} specific ops use X6+: {used:?}", used.len());
+        for name in required {
+            assert!(
+                used.contains(*name),
+                "{file}: {name} does not use X6+ ({used:?})"
+            );
+        }
+    }
+}

@@ -282,6 +282,8 @@ fn emit(
     event: SeqEvent,
 ) {
     // Port of erts/emulator/beam/erl_trace.c:964-1024 (seq_trace_output_generic), OTP-29.1.1.
+    // The event is built in a local heap (erts' `local_heap`), never on the process heap:
+    // the receive event is emitted inside remove_message, after a test_heap reserved space.
     if process
         .self_pid
         .is_some_and(|pid| crate::trace::is_sensitive(process, pid))
@@ -289,42 +291,27 @@ fn emit(
         return;
     }
     let target = tracer().lock().unwrap().clone();
-    let Some(target_term) = from_owned(
-        &target,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-    )
-    .ok() else {
+    let mut scratch = arinsal_term::VecHeap::new();
+    let Some(target_term) = from_owned(&target, &mut scratch).ok() else {
         return;
     };
-    let Some(sender) = from_owned(
-        &event.sender,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-    )
-    .ok() else {
+    let Some(sender) = from_owned(&event.sender, &mut scratch).ok() else {
         return;
     };
-    let Some(receiver) = from_owned(
-        &event.receiver,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-    )
-    .ok() else {
+    let Some(receiver) = from_owned(&event.receiver, &mut scratch).ok() else {
         return;
     };
-    let Some(info) = from_owned(
-        &event.info,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-    )
-    .ok() else {
+    let Some(info) = from_owned(&event.info, &mut scratch).ok() else {
         return;
     };
-    let serial = TermBuilder::new(&mut process.heap).tuple(&[
+    let serial = TermBuilder::new(&mut scratch).tuple(&[
         Term::small(token.previous as i64).unwrap_or(Term::NIL),
         Term::small(token.serial as i64).unwrap_or(Term::NIL),
     ]);
     let Ok(serial) = serial else {
         return;
     };
-    let detail = TermBuilder::new(&mut process.heap).tuple(&[
+    let detail = TermBuilder::new(&mut scratch).tuple(&[
         crate::signals::atom(event.kind),
         serial,
         sender,
@@ -335,10 +322,7 @@ fn emit(
         return;
     };
     let mut values = vec![crate::signals::atom("seq_trace"), Term::NIL, detail];
-    let Ok(label) = from_owned(
-        &token.label,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-    ) else {
+    let Ok(label) = from_owned(&token.label, &mut scratch) else {
         return;
     };
     values[1] = label;
@@ -353,7 +337,7 @@ fn emit(
             micros % 1_000_000,
         ]
         .map(|n| Term::small(n as i64).unwrap_or(Term::NIL));
-        if let Ok(stamp) = TermBuilder::new(&mut process.heap).tuple(&stamp) {
+        if let Ok(stamp) = TermBuilder::new(&mut scratch).tuple(&stamp) {
             values.push(stamp);
         }
     } else if token.flags & STRICT_MONOTONIC != 0 {
@@ -365,7 +349,7 @@ fn emit(
         let time = Term::small(i64::try_from(nanos).unwrap_or(i64::MAX)).unwrap_or(Term::NIL);
         let serial =
             Term::small(unique().fetch_add(1, Ordering::Relaxed) as i64).unwrap_or(Term::NIL);
-        if let Ok(stamp) = TermBuilder::new(&mut process.heap).tuple(&[time, serial]) {
+        if let Ok(stamp) = TermBuilder::new(&mut scratch).tuple(&[time, serial]) {
             values.push(stamp);
         }
     } else if token.flags & MONOTONIC != 0 {
@@ -376,7 +360,7 @@ fn emit(
             .as_nanos();
         values.push(Term::small(i64::try_from(nanos).unwrap_or(i64::MAX)).unwrap_or(Term::NIL));
     }
-    let Ok(event) = TermBuilder::new(&mut process.heap).tuple(&values) else {
+    let Ok(event) = TermBuilder::new(&mut scratch).tuple(&values) else {
         return;
     };
     if let Some(target_pid) = Pid::from_term(target_term)
@@ -395,11 +379,7 @@ fn emit(
         && let OwnedTerm::Tuple(parts) = &target
         && parts.len() == 2
         && let OwnedTerm::Atom(module) = &parts[0]
-        && let Some(state) = from_owned(
-            &parts[1],
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-        )
-        .ok()
+        && let Some(state) = from_owned(&parts[1], &mut scratch).ok()
     {
         if let Some(ctx) = ctx {
             crate::natives::nif::refresh_hub(process, ctx);
@@ -435,7 +415,7 @@ fn emit(
                 crate::signals::atom("monotonic"),
             ));
         }
-        let Ok(opts) = TermBuilder::new(&mut process.heap).flatmap_from_pairs(&opts) else {
+        let Ok(opts) = TermBuilder::new(&mut scratch).flatmap_from_pairs(&opts) else {
             return;
         };
         let _ = crate::natives::nif::invoke_tracer(

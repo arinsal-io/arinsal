@@ -428,23 +428,7 @@ impl BeamModuleAssembler {
     }
 
     fn store_bif_result(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
-        match dst {
-            ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(XREGS[i as usize], src))?,
-            ArgVal::Y(i) => self.code.emit(|e| {
-                e.str_uoff(
-                    src,
-                    E,
-                    i.checked_mul(8)
-                        .ok_or(arinsal_a64::enc::EncodeError::InvalidRegister(E))?,
-                )
-            })?,
-            _ => {
-                return Err(ModuleError::InvalidOperand(
-                    "BIF destination must be X or Y",
-                ));
-            }
-        }
-        Ok(())
+        self.store_operand(dst, src)
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:47-65, OTP-29.1.1

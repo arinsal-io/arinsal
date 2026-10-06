@@ -855,24 +855,6 @@ impl BeamModuleAssembler {
     }
 
     fn store_result(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
-        match dst {
-            ArgVal::X(i) if i < 6 => self
-                .code
-                .emit(|e| e.mov_reg(Gpr::x([25, 26, 27, 28, 15, 16][i as usize]), src))?,
-            ArgVal::Y(i) => self.code.emit(|e| {
-                e.str_uoff(
-                    src,
-                    Gpr::x(20),
-                    i.checked_mul(8)
-                        .ok_or(arinsal_a64::enc::EncodeError::InvalidRegister(Gpr::x(31)))?,
-                )
-            })?,
-            _ => {
-                return Err(ModuleError::InvalidOperand(
-                    "arithmetic destination must be X or Y",
-                ));
-            }
-        }
-        Ok(())
+        self.store_operand(dst, src)
     }
 }

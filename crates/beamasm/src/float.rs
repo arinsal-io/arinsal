@@ -130,19 +130,15 @@ impl BeamModuleAssembler {
             ArgVal::X(index) if index < 6 => {
                 Gpr::x(if index < 4 { 25 + index } else { 11 + index })
             }
-            ArgVal::Y(index) => {
-                let bytes = index
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("Y offset overflow"))?;
+            ArgVal::Y(_) | ArgVal::XMemory(_) => {
                 self.code
                     .emit(|e| e.add_imm(Gpr::x(9), HTOP, TAG_PRIMARY_BOXED as u16, false))?;
                 self.code.emit(|e| {
                     e.mov_const(Gpr::x(10), HEADER_FLONUM)?;
                     e.str_post(Gpr::x(10), HTOP, 8)?;
-                    e.str_d_post(src, HTOP, 8)?;
-                    e.str_uoff(Gpr::x(9), Gpr::x(20), bytes)
+                    e.str_d_post(src, HTOP, 8)
                 })?;
-                return Ok(());
+                return self.store_operand(destination, Gpr::x(9));
             }
             _ => {
                 return Err(ModuleError::InvalidOperand(

@@ -30,7 +30,7 @@ const SCRATCH: [Gpr; 6] = [
 ];
 const NIL: u64 = 0x3b;
 const TAG_BOXED: u64 = 2;
-const RESERVED_WORDS: u32 = (arinsal_term::S_RESERVED + arinsal_term::NATIVE_SPILL_WORDS) as u32;
+const RESERVED_WORDS: u32 = arinsal_term::S_RESERVED as u32;
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:137-149 and erl_vm.h:120, OTP-29.1.1.
 const MAX_LIVE_X_REGS: u32 = 1027;
 
@@ -492,16 +492,6 @@ impl BeamModuleAssembler {
     }
 
     fn store_arg(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
-        match dst {
-            ArgVal::X(i) if i < 6 => self.code.emit(|e| e.mov_reg(XREGS[i as usize], src))?,
-            ArgVal::Y(i) => {
-                let offset = i
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("Y register offset overflow"))?;
-                self.code.emit(|e| e.str_uoff(src, E, offset))?;
-            }
-            _ => return Err(ModuleError::InvalidOperand("destination must be X or Y")),
-        }
-        Ok(())
+        self.store_operand(dst, src)
     }
 }

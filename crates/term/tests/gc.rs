@@ -1,8 +1,7 @@
 use arinsal_term::{
-    ExportEntry, FunEntry, NATIVE_SPILL_WORDS, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term,
-    TermBuilder, VecHeap, copy_term, exact_eq, global_atoms, make_hash2, match_position,
-    set_match_position, size_object, to_owned, writable_bytes_mut, writable_capacity,
-    writable_extend_private,
+    ExportEntry, FunEntry, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term, TermBuilder, VecHeap,
+    copy_term, exact_eq, global_atoms, make_hash2, match_position, set_match_position, size_object,
+    to_owned, writable_bytes_mut, writable_capacity, writable_extend_private,
 };
 use arinsal_term::{ExternalBinary, MagicRef};
 use std::sync::Arc;
@@ -17,7 +16,7 @@ impl Drop for DropCounter {
 
 #[test]
 fn process_heap_allocator_leaves_the_native_stack_redzone() {
-    let reserve = S_REDZONE + NATIVE_SPILL_WORDS;
+    let reserve = S_REDZONE;
     let words = reserve + 16;
     let mut heap = ProcessHeap::with_words(words);
     assert_eq!(S_REDZONE, 3);

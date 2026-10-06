@@ -65,8 +65,6 @@ pub struct Process {
     pub(crate) gc_live: usize,
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
     pub(crate) max_heap_peak: usize,
-    /// A collection running only to make room for the native spill area, not for erts' need.
-    pub(crate) spill_only_gc: bool,
     pub(crate) reductions: i32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_enabled: bool,
@@ -428,7 +426,6 @@ impl Process {
             entry_started: false,
             gc_live: 0,
             max_heap_peak: 0,
-            spill_only_gc: false,
             reductions: 4000,
             reductions_used: 0,
             gc_enabled: true,
@@ -464,16 +461,6 @@ impl Process {
     }
     #[cold]
     #[inline(never)]
-    /// `ensure` for generated code's checked gap. The native spill area is our own scratch
-    /// space; erts has none, so a collection that exists only for it is not a real GC and
-    /// must not trip the max_heap_size kill (erl_gc.c:1197 judges real collections only).
-    pub(crate) fn ensure_for_native(&mut self, words: usize, live: usize) -> Result<(), VmError> {
-        let erts_need = words.saturating_sub(arinsal_term::NATIVE_SPILL_WORDS);
-        self.spill_only_gc = self.heap.free_words() >= erts_need && !self.heap.bin_vheap_gc_due();
-        let result = self.ensure(words, live);
-        self.spill_only_gc = false;
-        result
-    }
     pub(crate) fn ensure(&mut self, words: usize, live: usize) -> Result<(), VmError> {
         self.ensure_roots(words, live, true)
     }

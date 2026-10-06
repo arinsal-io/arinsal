@@ -2566,16 +2566,21 @@ pub(crate) fn pop_native_trace_frames(
     }
 }
 
-/// Saves native return and exception actions until the traced function exits.
+/// Saves native return and exception actions until the traced function exits; `live` is
+/// the traced function's arity, the X registers that are roots if a collection is needed.
 pub(crate) fn push_native_trace_frame(
     process: &mut Process,
     return_address: usize,
     actions: &[NativeTraceAction],
+    live: usize,
 ) -> Result<(), VmError> {
     if actions.is_empty() {
         return Ok(());
     }
     let frame_words = 4usize.saturating_add(actions.len().saturating_mul(2));
+    // Port of erts/emulator/beam/beam_bp.c:1206-1219 (erts_generic_breakpoint), OTP-29.1.1:
+    // collect with the function's arguments as roots when the trace frames do not fit.
+    process.ensure(frame_words, live)?;
     let Some(old_cp) = process.heap.stack_get(0) else {
         return Err(VmError::Unsupported(
             "native trace continuation missing".into(),

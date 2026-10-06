@@ -1573,6 +1573,10 @@ impl Executor {
                                             "native line breakpoint site is unregistered: {resume_pc:#x}"
                                         ))
                                     })?;
+                                    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:276-292
+                                    // (emit_i_line_breakpoint_trampoline_shared), OTP-29.1.1:
+                                    // collect when the spilled registers and S_RESERVED do not fit.
+                                    process.ensure(live + 2 + arinsal_term::S_RESERVED, live)?;
                                     if !process.heap.reserve_stack(1)
                                         || !process.heap.stack_set(
                                             0,
@@ -1694,7 +1698,7 @@ impl Executor {
                                         &function,
                                     )?;
                                     crate::trace::push_native_trace_frame(
-                                        process, resume_pc, &actions,
+                                        process, resume_pc, &actions, arity,
                                     )?;
                                     process.cold_mut().native_continuation_resume = true;
                                     process.native_pc = Some(resume_pc);
@@ -5102,13 +5106,7 @@ impl Process {
             .as_ref()
             .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
         {
-            let mut size = self.heap.total_heap_size_words();
-            if self.spill_only_gc {
-                // erts would not collect here: generated code checks only the heap gap, so
-                // message fragments are not judged until a real collection.
-                size -= self.heap.fragment_words();
-            }
-            self.max_heap_peak = self.max_heap_peak.max(size);
+            self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }
         let (indices, mut roots) = self.inbox.gc_root_snapshot();
         let mailbox_len = roots.len();
@@ -5210,12 +5208,11 @@ impl Process {
                 pending.roots_mut().copy_from_slice(&roots[apply_end..]);
             }
         }
-        if !self.spill_only_gc
-            && (self.max_heap_peak != 0
-                || self
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire)))
+        if self.max_heap_peak != 0
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
         {
             self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }

@@ -105,16 +105,7 @@ impl BeamModuleAssembler {
     }
 
     fn store_x(&mut self, dst: ArgVal, src: Gpr) -> Result<(), ModuleError> {
-        match dst {
-            ArgVal::XMemory(index) => {
-                let offset = index
-                    .checked_mul(8)
-                    .ok_or(ModuleError::InvalidOperand("X register offset overflow"))?;
-                self.code.emit(|e| e.str_uoff(src, Gpr::x(19), offset))?;
-                Ok(())
-            }
-            _ => self.store_register(dst, src),
-        }
+        self.store_operand(dst, src)
     }
 
     fn emit_bs_runtime_hook(

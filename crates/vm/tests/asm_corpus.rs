@@ -411,3 +411,55 @@ fn otp_and_elixir_corpus_compiles_with_beamasm() {
         issues.len()
     );
 }
+
+/// erts BeamAsm reaches every X register through getXRef (beam_asm.hpp:252-259, OTP-29.1.1),
+/// so operands above the register cache never send a function to the interpreter. The
+/// fixtures keep X6+ operands in most op families; `jit_xmem.rs` runs them against `erl`.
+#[test]
+fn extended_x_fixtures_compile_with_beamasm() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("asm_corpus_xmem");
+    std::fs::create_dir_all(&root).unwrap();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../beamjit/tests/fixtures");
+    for (file, module) in [
+        ("jit_xmem.erl", "jit_xmem"),
+        ("jit_xmem_asm.S", "jit_xmem_asm"),
+    ] {
+        let output = std::process::Command::new("erlc")
+            .arg("-o")
+            .arg(&root)
+            .arg(fixtures.join(file))
+            .output()
+            .expect("erlc must be on PATH");
+        assert!(
+            output.status.success(),
+            "erlc {file}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(root.join(format!("{module}.beam"))).unwrap();
+        let beam = arinsal_beam::parse(&bytes).unwrap();
+        let loaded = arinsal_loader::load(&beam).unwrap();
+        let env = CorpusEnv::new(&loaded);
+        let compiled = compile_module_with_env(&bytes, &env).unwrap();
+        let unported = compiled
+            .unported
+            .iter()
+            .map(|function| {
+                format!(
+                    "{}/{}: {:?} ({})",
+                    function.name,
+                    function.arity,
+                    function.reason,
+                    function.missing_ops.join(",")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            unported.is_empty(),
+            "{file}: interpreter fallbacks {unported:#?}"
+        );
+        assert!(
+            !compiled.functions.is_empty(),
+            "{file}: no native functions"
+        );
+    }
+}
