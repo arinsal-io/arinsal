@@ -1411,6 +1411,9 @@ pub(crate) fn fulfill_request(
             make_tuple(process, &[reference, atom("true")])
         }
         crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("true")]),
+        crate::signals::RemoteOp::PrioSig => Err(VmError::Unsupported(
+            "priority signal task has no reply".into(),
+        )),
         crate::signals::RemoteOp::CheckProcessCode {
             module,
             native,
@@ -1450,6 +1453,9 @@ pub(crate) fn failure_reply(
             make_tuple(process, &[reference, atom("badarg")])
         }
         crate::signals::RemoteOp::Alive => make_tuple(process, &[reference, atom("false")]),
+        crate::signals::RemoteOp::PrioSig => Err(VmError::Unsupported(
+            "priority signal task has no reply".into(),
+        )),
         crate::signals::RemoteOp::Collect { request_id, .. } => {
             let request_id = request_id.decode_into(process)?;
             gc_message(process, request_id, false)

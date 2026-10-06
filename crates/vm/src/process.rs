@@ -239,6 +239,19 @@ impl MessageQueue {
             .is_some_and(|entry| entry.fragment.as_ref().is_none_or(|f| f.heap.is_none()))
     }
 
+    /// Index of the first message at or after `start` that matches.
+    pub(crate) fn position_from(
+        &self,
+        start: usize,
+        mut matches: impl FnMut(&Term) -> bool,
+    ) -> Option<usize> {
+        let start = start.min(self.entries.len());
+        self.entries
+            .range(start..)
+            .position(|entry| matches(&entry.term))
+            .map(|offset| start + offset)
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Term> {
         self.entries.iter().map(|entry| &entry.term)
     }
