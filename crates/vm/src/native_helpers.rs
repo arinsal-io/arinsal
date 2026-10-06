@@ -609,7 +609,7 @@ pub extern "C" fn arinsal_beamasm_export_trampoline(
     identity: u64,
 ) -> u64 {
     // THE_NON_VALUE raises, 1 hands the call to the interpreter, any term word is the result.
-    invoke_dispatch_bif(header, identity as usize, true).unwrap_or(1)
+    invoke_dispatch_bif(header, identity as usize, 0, true).unwrap_or(1)
 }
 
 /// Records the remote call of a process saving calls (the export entry is `identity`) and
@@ -637,8 +637,10 @@ pub extern "C" fn arinsal_beamasm_save_calls_export(
 pub extern "C" fn arinsal_beamasm_call_light_bif_shared(
     header: *mut ProcessHeader,
     identity: u64,
+    site: u64,
 ) -> u64 {
-    invoke_dispatch_bif(header, identity as usize, false).unwrap_or(0)
+    // `site` is only meaningful for the breakpoint trampoline; other callers leave x2 alone.
+    invoke_dispatch_bif(header, identity as usize, site as usize, false).unwrap_or(0)
 }
 
 /// Reads the active process dictionary for native `i_get` instructions.
@@ -766,12 +768,22 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
 fn invoke_dispatch_bif(
     header: *mut ProcessHeader,
     identity: usize,
+    site: usize,
     export_call: bool,
 ) -> Option<u64> {
     let (process, registers) = crate::native_hooks::process_and_registers(header)?;
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
+    if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
+        && !export_call
+        && crate::trace::native_breakpoint_is_noop(process, site)
+    {
+        // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95 (call erts_generic_breakpoint
+        // from the trampoline fragment), OTP-29.1.1: nothing to report, so the call goes on in
+        // native code with every register as it was.
+        return Some(0);
+    }
     if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
         || arinsal_beamasm::dispatch::decode_line_breakpoint_identity(identity).is_some()
     {

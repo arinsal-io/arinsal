@@ -382,12 +382,16 @@ impl BeamModuleAssembler {
         let next = self.code.new_label();
         self.code.b(next)?;
         // Port of erts/emulator/beam/jit/arm/instr_trace.cpp:62-95, OTP-29.1.1: erts calls
-        // erts_generic_breakpoint from the fragment. Here the breakpoint traps through the
-        // light-BIF fragment so the executor, which owns the VM and run context, delivers
-        // the events and resumes after this call with every argument register intact.
+        // erts_generic_breakpoint from the fragment. The helper behind the light-BIF fragment
+        // does the same for a breakpoint that needs no trace event (it counts and returns);
+        // any other traps so the executor, which owns the VM and run context, delivers the
+        // events and resumes after this call with every argument register intact.
+        // The helper identifies the traced function by the trampoline's continuation address
+        // (x2), so a breakpoint with nothing to do for this process resumes natively.
         self.code
             .emit(|e| e.mov_const(Gpr::x(13), identity as u64))?;
-        self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
+        self.code.adr(Gpr::x(14), next)?;
+        self.emit_runtime_fragment(fragment, &[Gpr::x(13), Gpr::x(14)])?;
         self.code.bind(next)?;
         if self
             .trace_breakpoints

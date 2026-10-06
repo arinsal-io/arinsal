@@ -167,6 +167,8 @@ pub(crate) struct ProcessCold {
     // OTP-29.1.1.
     pub(crate) call_time: Vec<crate::trace_bp::ProcBpTrace>,
     pub(crate) call_memory: Vec<crate::trace_bp::ProcBpTrace>,
+    /// Meta tracers named by return frames on the stack, one entry per frame.
+    pub(crate) meta_frames: Vec<std::sync::Arc<crate::trace_bp::MetaTracer>>,
     /// Native call site of the BIF being executed (erts `c_p->i`), 0 outside such a call.
     pub(crate) native_call_pc: usize,
     /// `error_info` of the current native exception (erts keeps it with the stack trace).

@@ -487,22 +487,22 @@ fn spawn_mfa_with_priority(
             .and_then(|cold| cold.group_leader)
             .unwrap_or_else(|| ctx.pid()),
     );
-    // Port of erts/emulator/beam/erl_process.c:12546,12638 (spawn arguments are
-    // copied with size_object_litopt/copy_struct_litopt), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: the whole `args`
+    // list is copied with size_object_litopt/copy_struct_litopt, its elements then move to the
+    // X registers), OTP-29.1.1. The list cells stay on the child heap, where call_memory counts
+    // them.
     let literals = arinsal_term::LiteralAreas::current();
-    for (index, term) in args.iter().copied().enumerate() {
+    let copied_args = {
         let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
-        child.x[index] = arinsal_term::copy_term_litopt(term, &mut heap, &literals)
-            .map_err(|error| VmError::Unsupported(format!("spawn argument: {error:?}")))?;
-    }
-    // The argument list itself is copied onto the new heap too, before its elements move to
-    // the X registers: call_memory counts its cells (erts copies the whole `args` list).
-    // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process), OTP-29.1.1.
-    if !args.is_empty() {
-        let copied = child.x[..args.len()].to_vec();
-        arinsal_term::TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut child.heap))
-            .list_from_iter(copied)
-            .map_err(|error| VmError::Unsupported(format!("spawn argument list: {error:?}")))?;
+        arinsal_term::copy_term_litopt(mfa.2, &mut heap, &literals)
+            .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?
+    };
+    for (index, term) in list(copied_args)
+        .ok_or_else(|| badarg("erlang:spawn/3"))?
+        .into_iter()
+        .enumerate()
+    {
+        child.x[index] = term;
     }
     let rt = parent
         .runtime

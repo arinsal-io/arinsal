@@ -23,6 +23,15 @@ pub(crate) const MONOTONIC_TIMESTAMP: u64 = 4;
 pub(crate) const CALL: u64 = 1 << 10;
 pub(crate) const ARITY: u64 = 1 << 15;
 pub(crate) const RETURN_TO: u64 = 1 << 16;
+
+/// Set once any process flags include `return_to`; until then no table scan can find one.
+static RETURN_TO_USED: AtomicBool = AtomicBool::new(false);
+
+fn note_return_to(flags: u64) {
+    if flags & RETURN_TO != 0 {
+        RETURN_TO_USED.store(true, Ordering::Relaxed);
+    }
+}
 pub(crate) const SILENT: u64 = 1 << 17;
 pub(crate) const FIRST_LINK: u64 = 1 << 9;
 pub(crate) const GARBAGE_COLLECTION: u64 = 1 << 14;
@@ -606,6 +615,7 @@ pub(crate) fn configure_session(
         });
     let before = entry.flags;
     if how_on {
+        note_return_to(flags);
         entry.flags |= flags;
         entry.tracer = tracer.clone();
     } else {
@@ -1139,6 +1149,7 @@ fn module_tracer_alive(
 // Port of erts/emulator/beam/erl_process.c:12692-12705, OTP-29.1.1.
 fn replace_session_flags(process: &Process, session: u64, pid: Pid, flags: u64, tracer: Tracer) {
     let key = (scope(process), session, pid);
+    note_return_to(flags);
     let mut table = table().lock().unwrap();
     if flags == 0 {
         table.remove(&key);
@@ -1166,9 +1177,12 @@ pub(crate) fn flags(process: &Process, pid: Pid) -> u64 {
 }
 
 pub(crate) fn return_to_enabled(process: &Process) -> bool {
+    if !RETURN_TO_USED.load(Ordering::Relaxed) {
+        return false;
+    }
     let runtime = scope(process);
     table()
-        .lock()
+        .read()
         .unwrap()
         .iter()
         .any(|((owner, _, _), entry)| *owner == runtime && entry.flags & RETURN_TO != 0)
@@ -1260,6 +1274,9 @@ pub(crate) fn active_session_flags(process: &Process, session: u64, pid: Pid) ->
 }
 
 pub(crate) fn session_flags(process: &Process, session: u64, pid: Pid) -> u64 {
+    if !enabled().load(Ordering::Relaxed) {
+        return 0;
+    }
     table()
         .read()
         .unwrap()
@@ -1280,6 +1297,7 @@ fn set_session_flags(
     let Some(entry) = entries.get_mut(&key) else {
         return false;
     };
+    note_return_to(set);
     entry.flags = (entry.flags & !clear) | set;
     if let Some(tracer) = tracer {
         entry.tracer = tracer;
@@ -2579,6 +2597,17 @@ fn current_stacktraces(vm: &Vm, process: &mut Process) -> Result<Vec<(VecHeap, T
     Ok(traces)
 }
 
+/// Runs the breakpoint of the native function that contains `site` when it needs no trace
+/// event or frame for this process: counts the call and returns true. Otherwise nothing has
+/// changed and the executor must run the breakpoint.
+// Port of erts/emulator/beam/beam_bp.c:994-1015 (erts_generic_breakpoint, the GenericBp loop
+// as the trampoline fragment calls it without leaving the scheduler loop), OTP-29.1.1.
+pub(crate) fn native_breakpoint_is_noop(process: &Process, site: usize) -> bool {
+    process
+        .self_pid
+        .is_some_and(|pid| crate::trace_bp::native_breakpoint_noop(process, pid, site))
+}
+
 /// Runs a native entry breakpoint with the scheduler context that owns its trace callbacks.
 // Port of erts/emulator/beam/beam_bp.c (erts_generic_breakpoint), OTP-29.1.1.
 pub(crate) fn executor_native_call_event(
@@ -2690,6 +2719,11 @@ pub(crate) fn push_native_trace_frame(
         );
     }
     process.sync_native_header();
+    for action in actions {
+        if crate::trace_bp::is_meta_id(action.session) && action.return_trace {
+            crate::trace_bp::hold_meta_frame(process, action.session);
+        }
+    }
     Ok(())
 }
 
@@ -2776,12 +2810,47 @@ pub(crate) fn native_return_events(
             );
         }
     }
+    // The frame is gone: its meta tracers may be freed.
+    for action in actions {
+        if crate::trace_bp::is_meta_id(action.session) && action.return_trace {
+            crate::trace_bp::release_meta_frame(process, action.session);
+        }
+    }
     Ok(())
 }
 
 // Port of erts/emulator/beam/erl_trace.c:1095-1180 (return and exception events), OTP-29.1.1.
 #[allow(clippy::too_many_arguments)] // The special stack frame carries these exact ERTS return fields.
 pub(crate) fn return_event(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    session: u64,
+    module_id: usize,
+    entry_ip: usize,
+    value: Term,
+    exception: bool,
+    exception_class_and_reason: Option<Term>,
+) -> Result<(), VmError> {
+    let result = return_event_inner(
+        vm,
+        process,
+        ctx,
+        session,
+        module_id,
+        entry_ip,
+        value,
+        exception,
+        exception_class_and_reason,
+    );
+    if crate::trace_bp::is_meta_id(session) {
+        crate::trace_bp::release_meta_frame(process, session);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // The special stack frame carries these exact ERTS return fields.
+fn return_event_inner(
     vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,

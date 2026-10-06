@@ -1482,6 +1482,9 @@ fn push_trace_frames(
         {
             process.heap.stack_set(index + 1, small(value)?);
         }
+        if crate::trace_bp::is_meta_id(action.session) {
+            crate::trace_bp::hold_meta_frame(process, action.session);
+        }
     }
     Ok(())
 }
@@ -1520,18 +1523,6 @@ fn trace_breakpoint_call(
         );
         return Ok(Vec::new());
     };
-    // A breakpoint that does nothing for this process returns at once.
-    if let Some(pid) = process.self_pid
-        && crate::trace_bp::is_inert(
-            process,
-            pid,
-            &vm.code.modules[module_id].name,
-            function,
-            arity,
-        )
-    {
-        return Ok(Vec::new());
-    }
     process.gc_live = usize::from(arity);
     let args = process.x[..usize::from(arity)].to_vec();
     let module_name = vm.code.modules[module_id].name.clone();
