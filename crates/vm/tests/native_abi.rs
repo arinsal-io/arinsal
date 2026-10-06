@@ -13,6 +13,83 @@ static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 #[cfg(target_arch = "aarch64")]
+fn no_line_info_module_compiles_fully_native_and_matches_otp() {
+    const CHILD: &str = "ARINSAL_NO_LINE_INFO_CHILD";
+    const MODULE: &str = "native_no_line_info_test";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&std::fs::read(path).unwrap()).unwrap();
+        let actual = vm.eval_scheduled(MODULE, "run", &[], 1, None).unwrap();
+        println!("RESULT:{}", actual.text);
+        return;
+    }
+
+    let _serial = NATIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = std::env::temp_dir().join(format!("arinsal-no-line-info-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("native_no_line_info_test.erl");
+    std::fs::write(
+        &source,
+        "-module(native_no_line_info_test).\n-export([run/0, first/1, second/1]).\nrun() -> {first(19), second(23)}.\nfirst(X) -> X + 1.\nsecond(X) -> X * 2.\n",
+    )
+    .unwrap();
+    let output = Command::new("erlc")
+        .args(["+no_line_info", "-o"])
+        .arg(&dir)
+        .arg(&source)
+        .output()
+        .expect("erlc must be installed for the BEAM integration test");
+    assert!(
+        output.status.success(),
+        "erlc +no_line_info failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let beam_path = dir.join(format!("{MODULE}.beam"));
+    let beam = std::fs::read(&beam_path).unwrap();
+    let reference = RefErl::start().expect("OTP 29.1.1 is required for this test");
+    reference.load(MODULE, &beam).unwrap();
+    let expected = match reference.call(MODULE, "run", &[]) {
+        CallResult::Ok(term) => format!("{term}"),
+        other => panic!("OTP no-line-info call failed: {other:?}"),
+    };
+
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "no_line_info_module_compiles_fully_native_and_matches_otp",
+            "--nocapture",
+        ])
+        .env(CHILD, &beam_path)
+        .env("ARINSAL_BEAMASM", "1")
+        .env("ARINSAL_BEAMASM_MODULES", MODULE)
+        .env("ARINSAL_BEAMASM_VALIDATE", "1")
+        .env("ARINSAL_BEAMASM_STATS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "no-line-info child failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("native_functions=") && stderr.contains("unported_functions=0"),
+        "module did not compile all functions natively: {stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let actual = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("RESULT:"))
+        .expect("child prints the scheduled result");
+    assert_eq!(actual, expected);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
 fn native_try_end_keeps_success_value_for_fun_call() {
     const CHILD: &str = "ARINSAL_NATIVE_TRY_END_CHILD";
     const MODULE: &str = "native_try_end_test";

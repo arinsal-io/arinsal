@@ -310,27 +310,40 @@ fn rules() -> &'static HashMap<String, Vec<Rule>> {
     })
 }
 
+// Port of erts/emulator/beam/beam_file.c:2493-2580 (beamcodereader_next), OTP-29.1.1.
 fn inject_function_starts(raw: Vec<Node>) -> Vec<Node> {
     let mut code = Vec::with_capacity(raw.len() + raw.len() / 20);
     let mut index = 0;
     while index < raw.len() {
-        if index + 2 < raw.len()
-            && raw[index].name == "label"
-            && raw[index + 1].name == "line"
-            && raw[index + 2].name == "func_info"
+        let line_index = index + 1;
+        let func_info_index = if raw.get(line_index).is_some_and(|node| node.name == "line") {
+            line_index + 1
+        } else {
+            line_index
+        };
+        if raw.get(index).is_some_and(|node| node.name == "label")
+            && raw
+                .get(func_info_index)
+                .is_some_and(|node| node.name == "func_info")
             && raw[index].args.len() == 1
-            && raw[index + 1].args.len() == 1
-            && raw[index + 2].args.len() == 3
+            && raw
+                .get(line_index)
+                .is_none_or(|node| node.name != "line" || node.args.len() == 1)
+            && raw[func_info_index].args.len() == 3
         {
             let mut args = raw[index].args.clone();
-            args.extend(raw[index + 1].args.clone());
-            args.extend(raw[index + 2].args.clone());
+            if func_info_index == line_index {
+                args.push(Operand::Nil);
+            } else {
+                args.extend(raw[line_index].args.clone());
+            }
+            args.extend(raw[func_info_index].args.clone());
             code.push(Node {
                 name: "int_func_start".into(),
                 args,
                 offset: raw[index].offset,
             });
-            index += 3;
+            index = func_info_index + 1;
         } else {
             code.push(raw[index].clone());
             index += 1;
@@ -1701,6 +1714,35 @@ fn make_op(name: &str, args: Vec<SpecificOperand>) -> SpecificOp {
 mod tests {
     use super::*;
     use arinsal_spec::Opcode;
+
+    #[test]
+    fn function_start_without_line_injects_nil_location() {
+        let output = inject_function_starts(vec![
+            Node {
+                name: "label".into(),
+                args: vec![Operand::U(1)],
+                offset: 0,
+            },
+            Node {
+                name: "func_info".into(),
+                args: vec![Operand::Atom(1), Operand::Atom(2), Operand::U(0)],
+                offset: 2,
+            },
+        ]);
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].name, "int_func_start");
+        assert!(matches!(
+            output[0].args.as_slice(),
+            [
+                Operand::U(1),
+                Operand::Nil,
+                Operand::Atom(1),
+                Operand::Atom(2),
+                Operand::U(0)
+            ]
+        ));
+    }
 
     #[test]
     fn move_rewrites_to_i_move_without_losing_register_kinds() {
