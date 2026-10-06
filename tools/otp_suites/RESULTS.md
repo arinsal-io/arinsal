@@ -84,7 +84,7 @@
 | `scheduler_SUITE` | 25 | 11/25 | 0/25 | 11 | -9 | bound_process: missing; equal: failed {badarg; equal_with_high: missing; equal_with_high_max: missing; equal_with_part_time_high: failed {badarg; many_low: failed {badarg; otp_16446: missing; reader_groups: missing; scheduler_suspend_basic: missing; simultaneously_change_schedulers_online: missing; simultaneously_change_schedulers_online_with_exits: missing |
 | `send_term_SUITE` | 1 | 1/1 | 1/1 | 0 | 0 | none |
 | `sensitive_SUITE` | 12 | 12/12 | 10/12 | 2 | 0 | call_trace: failed {{badmatch; meta_trace: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.201.0>}]}}}, unknown_location |
-| `signal_SUITE` | 39 | 22/39 | 21/39 | 2 | 0 | dirty_signal_handling: failed {{badmatch; unlink_exit: failed {test_case_failed, {not_alive_unexpected_exit_reason,bye}} |
+| `signal_SUITE` | 39 | 8/39 | 20/39 | 1 | 0 | dirty_signal_handling_race_dirty_access: failed testcase_aborted_or_killed, unknown_location |
 | `small_SUITE` | 13 | 13/13 | 13/13 | 0 | 0 | none |
 | `smoke_test_SUITE` | 3 | 2/3 | 1/3 | 1 | 0 | jump_table: failed {badarg |
 | `statistics_SUITE` | 18 | 18/18 | 18/18 | 0 | 0 | none |

@@ -1431,6 +1431,24 @@ impl Executor {
                         match outcome {
                             arinsal_beamasm::ExitReason::Yield => {
                                 crate::beamasm_integration::count_native_yield();
+                                if process.cold.as_mut().is_some_and(|cold| {
+                                    std::mem::take(&mut cold.native_signal_fetch)
+                                }) {
+                                    // Native `loop_rec` reached the end of the inner queue with
+                                    // signals in the outer one. Port of
+                                    // erts/emulator/beam/erl_proc_sig_queue.c:7730
+                                    // (erts_proc_sig_receive_helper), OTP-29.1.1: fetch and
+                                    // handle them within this slice (the drain before re-entry
+                                    // below), then rerun the `loop_rec`.
+                                    if process
+                                        .cold
+                                        .as_ref()
+                                        .is_some_and(|cold| cold.signal_probe.is_none())
+                                    {
+                                        process.cold_mut().signal_probe = ctx.signal_probe();
+                                    }
+                                    continue;
+                                }
                                 if let Some(timeout_ms) = process
                                     .cold
                                     .as_mut()
