@@ -1984,11 +1984,11 @@ fn call_values(
                 trace(vm, process, ctx, session, *spec, *how, *flags)
             }
             ("trace_pattern", [spec, pattern, flags]) if module == "erts_internal" => {
-                trace_pattern(vm, process, 0, *spec, *pattern, *flags)
+                trace_pattern(vm, process, ctx, 0, *spec, *pattern, *flags)
             }
             ("trace_pattern", [session, spec, pattern, flags]) if module == "erts_internal" => {
                 let session = trace_session_id(process, *session).ok_or_else(badarg)?;
-                trace_pattern(vm, process, session, *spec, *pattern, *flags)
+                trace_pattern(vm, process, ctx, session, *spec, *pattern, *flags)
             }
             ("trace_session_create", [name, tracer, options]) if module == "erts_internal" => {
                 trace_session_create(vm, process, ctx, *name, *tracer, *options)
@@ -2005,7 +2005,7 @@ fn call_values(
                 Ok(atom(if destroyed { "true" } else { "false" }))
             }
             ("trace_info", [spec, item]) if module == "erlang" => {
-                trace_info(vm, process, *spec, *item)
+                trace_info(vm, process, ctx, *spec, *item)
             }
             ("trace_info", [session, spec, item]) if module == "erts_internal" => {
                 let session = if atom_name(*session).as_deref() == Some("any") {
@@ -2013,7 +2013,7 @@ fn call_values(
                 } else {
                     trace_session_id(process, *session).ok_or_else(badarg)?
                 };
-                trace_session_info(vm, process, session, *spec, *item)
+                trace_session_info(vm, process, ctx, session, *spec, *item)
             }
             ("fun_info_mfa", [fun]) if module == "erlang" => fun_info_mfa(vm, process, *fun),
             _ => {
@@ -3370,6 +3370,7 @@ fn trace_session_refs_term(
 fn trace_session_info(
     vm: &Vm,
     process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
     session: u64,
     spec: Term,
     item: Term,
@@ -3498,7 +3499,7 @@ fn trace_session_info(
         return make_tuple(process, &[item, value]);
     }
     if let Some(mfa) = trace_mfa(spec) {
-        return trace_info_function(vm, process, session, mfa, item);
+        return trace_info_function(vm, process, ctx, session, mfa, item);
     }
     if let Some(port) = spec.as_port() {
         if port != 0 && !crate::port::is_live(process, port) {
@@ -3583,7 +3584,13 @@ fn trace_session_info(
     make_tuple(process, &[item, value])
 }
 
-fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<Term, VmError> {
+fn trace_info(
+    vm: &Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    spec: Term,
+    item: Term,
+) -> Result<Term, VmError> {
     if atom_name(spec).as_deref() == Some("on_load") {
         return trace_info_on_load(process, 0, item);
     }
@@ -3642,7 +3649,7 @@ fn trace_info(vm: &Vm, process: &mut Process, spec: Term, item: Term) -> Result<
         return make_tuple(process, &[item, value]);
     }
     if let Some(mfa) = trace_mfa(spec) {
-        return trace_info_function(vm, process, 0, mfa, item);
+        return trace_info_function(vm, process, ctx, 0, mfa, item);
     }
     if let Some(port) = spec.as_port() {
         if port != 0 && !crate::port::is_live(process, port) {
@@ -3754,9 +3761,13 @@ fn meta_tracer_from_term(vm: &Vm, flag: Term) -> Result<crate::trace::Tracer, Vm
 /// `trace_info({M,F,A}, Key)` of a session.
 // Port of erts/emulator/beam/erl_bif_trace.c:1913-1960 (trace_info_func) and 2132-2290
 // (trace_info_func_epilogue), OTP-29.1.1.
+/// Code barriers `trace_info` waits for (the initial one and one per `trace_info_finisher` phase).
+const TRACE_INFO_BARRIERS: usize = 3;
+
 fn trace_info_function(
     vm: &Vm,
     process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
     session: u64,
     (module, function, arity): (String, String, u8),
     item: Term,
@@ -3791,13 +3802,17 @@ fn trace_info_function(
     if !function_exists(vm, &module, &function, arity) {
         return make_tuple(process, &[item, atom("undefined")]);
     }
-    let info = crate::trace_bp::function_info(process, session, &module, &function, arity, want);
+    let mut info =
+        crate::trace_bp::function_info(process, session, &module, &function, arity, want);
     if info.counters_active {
-        // erts traps the caller until the schedulers have stopped updating the counters:
-        // a scheduling round here gives other processes the chance to run in between.
-        // Port of erts/emulator/beam/erl_bif_trace.c:1960-1990 (trace_info_func,
-        // erts_prepare_timem_trace_info), OTP-29.1.1.
-        process.force_yield = true;
+        // erts stages the breakpoint data without the active counters and waits for a code
+        // barrier per phase, so no scheduler updates a counter while it is collected.
+        // Port of erts/emulator/beam/erl_bif_trace.c:1960-2070 (trace_info_func,
+        // trace_info_finisher phases 0-2), OTP-29.1.1.
+        for _ in 0..TRACE_INFO_BARRIERS {
+            ctx.block_thread_progress(std::time::Duration::ZERO);
+        }
+        info = crate::trace_bp::function_info(process, session, &module, &function, arity, want);
     }
     if info.got == 0 {
         return make_tuple(process, &[item, atom("false")]);
@@ -4074,6 +4089,7 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
 fn trace_pattern(
     vm: &mut Vm,
     process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
     session: u64,
     spec: Term,
     pattern: Term,
@@ -4109,6 +4125,11 @@ fn trace_pattern(
             (true, match_spec)
         };
         crate::trace::set_event_pattern(process, session, &event, enabled, match_spec);
+        // stage_trace_event_pattern is neither local nor global: the commit and consolidate
+        // stages wait, plus the initial barrier.
+        for _ in 0..3 {
+            ctx.block_thread_progress(std::time::Duration::ZERO);
+        }
         return Ok(Term::small(1).expect("one event pattern"));
     }
     let flag_values = list(flags).ok_or_else(badarg)?;
@@ -4231,7 +4252,15 @@ fn trace_pattern(
     } else {
         crate::trace_bp::with_breakpoints(process, functions)
     };
-    crate::trace_bp::set_trace_pattern(
+    // Port of erts/emulator/beam/erl_bif_trace.c:507-515, 535-570 and 2842-2925 (trace_pattern,
+    // smp_bp_finisher, erts_finish_breakpointing), OTP-29.1.1: the caller stays suspended while
+    // the breakpoints are staged, installed, committed, uninstalled and consolidated, with a
+    // code barrier before each stage.
+    let staging = crate::trace_bp::seize_staging(ctx);
+    let barrier = |ctx: &mut RunCtx<'_, Message>| {
+        ctx.block_thread_progress(std::time::Duration::ZERO);
+    };
+    crate::trace_bp::stage_trace_pattern(
         process,
         session,
         &functions,
@@ -4241,14 +4270,22 @@ fn trace_pattern(
         trace_flags,
         &meta_tracer.unwrap_or_default(),
     );
-    vm.refresh_trace_functions(process, &functions);
-    if trace_flags.breakpoint {
-        // erts suspends the caller until a code barrier passed: every scheduler ran code
-        // since the breakpoints changed.
-        // Port of erts/emulator/beam/erl_bif_trace.c:507-515 (erts_schedule_code_barrier),
-        // OTP-29.1.1.
-        process.force_yield = true;
+    barrier(ctx);
+    if on != crate::trace_bp::BreakOp::Nop {
+        // Stage 0: code for the new breakpoints, which are still disabled.
+        crate::trace_bp::with_install_view(|| vm.refresh_trace_functions(process, &functions));
+        barrier(ctx);
     }
+    // Stage 1: switch the active breakpoint data.
+    crate::trace_bp::commit_staged();
+    barrier(ctx);
+    // Stage 2: remove the code of disabled breakpoints.
+    vm.refresh_trace_functions(process, &functions);
+    barrier(ctx);
+    // Stage 3: make the staged data equal to the active one.
+    crate::trace_bp::consolidate_staged(&functions);
+    barrier(ctx);
+    drop(staging);
     // Port of erts/emulator/beam/erl_bif_trace.c:2712-2716, OTP-29.1.1: breakpoints count the
     // matched functions, global tracing the matched export entries.
     let count = if trace_flags.breakpoint {

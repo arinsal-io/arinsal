@@ -134,9 +134,17 @@ pub(crate) fn is_meta_id(id: u64) -> bool {
     id & META_ID_BASE != 0 && id & (META_ID_BASE << 1) == 0
 }
 
-fn meta_registry() -> &'static Mutex<HashMap<u64, Arc<MetaTracer>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<MetaTracer>>>> = OnceLock::new();
+/// The registry only maps ids to live tracers: an entry goes away with its last holder (the
+/// breakpoints that use the tracer and the processes with a return frame naming it).
+fn meta_registry() -> &'static Mutex<HashMap<u64, std::sync::Weak<MetaTracer>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, std::sync::Weak<MetaTracer>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl Drop for MetaTracer {
+    fn drop(&mut self) {
+        meta_registry().lock().unwrap().remove(&self.id);
+    }
 }
 
 fn new_meta_tracer(tracer: crate::trace::Tracer) -> Arc<MetaTracer> {
@@ -146,13 +154,42 @@ fn new_meta_tracer(tracer: crate::trace::Tracer) -> Arc<MetaTracer> {
         id,
         tracer: Mutex::new(tracer),
     });
-    meta_registry().lock().unwrap().insert(id, meta.clone());
+    meta_registry()
+        .lock()
+        .unwrap()
+        .insert(id, Arc::downgrade(&meta));
     meta
 }
 
 /// The meta tracer a trace frame names.
 pub(crate) fn meta_tracer_by_id(id: u64) -> Option<Arc<MetaTracer>> {
-    meta_registry().lock().unwrap().get(&id).cloned()
+    meta_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// A return frame naming the meta tracer `id` was pushed on `process`: the frame keeps the
+/// tracer alive like erts' copy of the tracer in the frame does.
+// Port of erts/emulator/beam/beam_bp.c:1213-1244 (do_call_trace, ERTS_TRACER_COPY of the meta
+// tracer into the frame), OTP-29.1.1.
+pub(crate) fn hold_meta_frame(process: &mut Process, id: u64) {
+    if let Some(meta) = meta_tracer_by_id(id) {
+        process.cold_mut().meta_frames.push(meta);
+    }
+}
+
+/// The return frame of the meta tracer `id` is gone.
+// Port of erts/emulator/beam/beam_bp.c:1352-1415 (erts_call_trace_return, ERTS_TRACER_CLEAR),
+// OTP-29.1.1.
+pub(crate) fn release_meta_frame(process: &mut Process, id: u64) {
+    let Some(cold) = process.cold.as_mut() else {
+        return;
+    };
+    if let Some(index) = cold.meta_frames.iter().rposition(|meta| meta.id == id) {
+        cold.meta_frames.swap_remove(index);
+    }
 }
 
 /// Port of erts/emulator/beam/beam_bp.h:30-40 (bp_pid_timem_bucket_t, BpTimemTrace),
@@ -169,9 +206,6 @@ const TIMEM_SHARDS: usize = 16;
 
 struct TimemInner {
     buckets: HashMap<Pid, (i64, i64), FastHash>,
-    /// Counting calls: cleared by `pause`, so no call a scheduler already saw as active is
-    /// counted after the pause returned (erts waits for thread progress instead).
-    counting: bool,
 }
 
 impl Default for TimemTrace {
@@ -180,7 +214,6 @@ impl Default for TimemTrace {
             shards: std::array::from_fn(|_| {
                 Mutex::new(TimemInner {
                     buckets: HashMap::default(),
-                    counting: true,
                 })
             }),
         }
@@ -192,30 +225,20 @@ impl TimemTrace {
         &self.shards[crate::process::pid_table_index(pid) as usize % TIMEM_SHARDS]
     }
 
-    // Port of erts/emulator/beam/beam_bp.c:1990-2008 (bp_hash_accum). A call (`count` of one) is
-    // dropped while the trace is paused.
+    // Port of erts/emulator/beam/beam_bp.c:1990-2008 (bp_hash_accum). Pausing only clears the
+    // ACTIVE flag of the breakpoint data; the trace_pattern code barrier guarantees no call
+    // that saw the flag set is still being counted.
     fn accum(&self, pid: Pid, count: i64, accumulator: i64) {
         let mut inner = self.shard(pid).lock().unwrap();
-        if count != 0 && !inner.counting {
-            return;
-        }
         let bucket = inner.buckets.entry(pid).or_default();
         bucket.0 += count;
         bucket.1 += accumulator;
     }
 
-    // Port of erts/emulator/beam/beam_bp.c:2012-2016 (bp_hash_reset); also resumes counting.
+    // Port of erts/emulator/beam/beam_bp.c:2012-2016 (bp_hash_reset).
     fn reset(&self) {
         for shard in &self.shards {
-            let mut inner = shard.lock().unwrap();
-            inner.buckets.clear();
-            inner.counting = true;
-        }
-    }
-
-    fn pause(&self) {
-        for shard in &self.shards {
-            shard.lock().unwrap().counting = false;
+            shard.lock().unwrap().buckets.clear();
         }
     }
 
@@ -344,6 +367,8 @@ impl Drop for BpWriteGuard<'_> {
     fn drop(&mut self) {
         if let Some(copy) = self.copy.take() {
             *self.tables.current.write().unwrap() = Arc::new(copy);
+            // Readers that cached the old table under the epoch bumped before the publish.
+            BP_EPOCH.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -485,9 +510,6 @@ fn set_function_break(
     } else if common & BPF_TIME_TRACE != 0 {
         if count_op == BreakOp::Pause {
             bp.flags &= !BPF_TIME_TRACE_ACTIVE;
-            if let Some(time) = &bp.time {
-                time.pause();
-            }
         } else {
             bp.flags |= BPF_TIME_TRACE_ACTIVE;
             if let Some(time) = &bp.time {
@@ -498,9 +520,6 @@ fn set_function_break(
     } else if common & BPF_MEM_TRACE != 0 {
         if count_op == BreakOp::Pause {
             bp.flags &= !BPF_MEM_TRACE_ACTIVE;
-            if let Some(memory) = &bp.memory {
-                memory.pause();
-            }
         } else {
             bp.flags |= BPF_MEM_TRACE_ACTIVE;
             if let Some(memory) = &bp.memory {
@@ -588,11 +607,23 @@ fn function_entry<'a>(
         .or_default()
 }
 
-/// Commit the staged breakpoints of the given functions and consolidate them.
-// Port of erts/emulator/beam/beam_bp.c:562-569 (erts_commit_staged_bp) and the consolidation
-// step of erts/emulator/beam/erl_bif_trace.c (erts_finish_breakpointing), OTP-29.1.1.
-fn commit_and_consolidate(table: &mut BpTable, functions: &[BpFunction]) {
+/// Make the staged breakpoint data active.
+// Port of erts/emulator/beam/beam_bp.c:562-569 (erts_commit_staged_bp), OTP-29.1.1.
+pub(crate) fn commit_staged() {
+    let table = breakpoints().write().unwrap();
     ACTIVE_BP_IX.store(staging_bp_ix(), Ordering::Release);
+    update_active(&table);
+}
+
+/// Copy the active data of `functions` to the staging area and unlink disabled breakpoints.
+// Port of erts/emulator/beam/erl_bif_trace.c (erts_finish_breakpointing case 3,
+// erts_consolidate_all_bp_data), OTP-29.1.1.
+pub(crate) fn consolidate_staged(functions: &[BpFunction]) {
+    let mut table = breakpoints().write().unwrap();
+    consolidate_functions(&mut table, functions);
+}
+
+fn consolidate_functions(table: &mut BpTable, functions: &[BpFunction]) {
     for function in functions {
         let Some(arities) = table
             .get_mut(&function.module)
@@ -617,10 +648,69 @@ fn commit_and_consolidate(table: &mut BpTable, functions: &[BpFunction]) {
     update_active(table);
 }
 
+thread_local! {
+    /// While set, `breakpoint_kinds` also counts breakpoints that are only staged: the install
+    /// stage of erts_finish_breakpointing enables code for them before they are committed.
+    static INSTALL_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `patch` with the install view of `breakpoint_kinds`.
+pub(crate) fn with_install_view<R>(patch: impl FnOnce() -> R) -> R {
+    INSTALL_VIEW.with(|view| view.set(true));
+    let result = patch();
+    INSTALL_VIEW.with(|view| view.set(false));
+    result
+}
+
+/// Serializes staged breakpoint changes like erts' code modification permission: a waiter
+/// keeps passing code barriers so the holder's barriers can complete.
+// Port of erts/emulator/beam/code_ix.c:378 (erts_try_seize_code_mod_permission), OTP-29.1.1.
+pub(crate) fn seize_staging(
+    ctx: &mut arinsal_sched::RunCtx<'_, crate::process::Message>,
+) -> std::sync::MutexGuard<'static, ()> {
+    static STAGING: Mutex<()> = Mutex::new(());
+    loop {
+        match STAGING.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => return error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                ctx.block_thread_progress(std::time::Duration::ZERO)
+            }
+        }
+    }
+}
+
 /// Set or clear the breakpoints of one session in the matched functions.
 // Port of erts/emulator/beam/erl_bif_trace.c:2621-2725 (erts_set_trace_pattern), OTP-29.1.1.
 #[allow(clippy::too_many_arguments)] // The arguments of erts_set_trace_pattern.
 pub(crate) fn set_trace_pattern(
+    process: &Process,
+    session: u64,
+    functions: &[BpFunction],
+    match_spec: Option<OwnedTerm>,
+    meta_match_spec: Option<OwnedTerm>,
+    on: BreakOp,
+    flags: TracePatternFlags,
+    meta_tracer: &crate::trace::Tracer,
+) {
+    stage_trace_pattern(
+        process,
+        session,
+        functions,
+        match_spec,
+        meta_match_spec,
+        on,
+        flags,
+        meta_tracer,
+    );
+    commit_staged();
+    consolidate_staged(functions);
+}
+
+/// Stage the breakpoints of one session in the matched functions; nothing is active until
+/// `commit_staged`.
+#[allow(clippy::too_many_arguments)] // The arguments of erts_set_trace_pattern.
+pub(crate) fn stage_trace_pattern(
     process: &Process,
     session: u64,
     functions: &[BpFunction],
@@ -732,7 +822,6 @@ pub(crate) fn set_trace_pattern(
             clear_function_break(bps, tag, BPF_GLOBAL_TRACE);
         }
     }
-    commit_and_consolidate(&mut table, functions);
 }
 
 /// Remove all breakpoints owned by a destroyed trace session.
@@ -818,40 +907,126 @@ pub(crate) const HIT_META: u32 = BPF_META_TRACE;
 /// `Hit::flags` bits: an active call counter.
 pub(crate) const HIT_COUNT_ACTIVE: u32 = BPF_COUNT_ACTIVE;
 
-/// Whether a call of the function would do nothing for this process: every breakpoint on it is
-/// a call trace of a session that does not trace the process' calls (erts_generic_breakpoint
-/// then only skips the session).
-// Port of erts/emulator/beam/beam_bp.c:1017-1060 (do_session_breakpoint), OTP-29.1.1.
-pub(crate) fn is_inert(
-    process: &Process,
-    pid: Pid,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> bool {
-    if debug_breakpoint_enabled(process, module, function, arity)
+/// The breakpoints a native trampoline hit finds in its function, for one runtime and code
+/// scope; valid while no breakpoint and no native code changed.
+struct SiteBreakpoints {
+    site: usize,
+    runtime: usize,
+    code: u64,
+    epoch: u64,
+    generation: u64,
+    bps: Vec<SiteBp>,
+}
+
+struct SiteBp {
+    session: u64,
+    /// Active flags without the export entry's global trace, which a code entry never runs.
+    flags: u32,
+    count: Option<Arc<AtomicU64>>,
+}
+
+const SITE_CACHE_SIZE: usize = 64;
+
+thread_local! {
+    /// Direct-mapped, per scheduler thread: a hit costs two atomic loads and a compare.
+    static SITE_CACHE: std::cell::RefCell<[Option<Arc<SiteBreakpoints>>; SITE_CACHE_SIZE]> =
+        const { std::cell::RefCell::new([const { None }; SITE_CACHE_SIZE]) };
+}
+
+fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoints>> {
+    let runtime = scope(process);
+    let code = code_scope(process);
+    let slot = (site >> 2) % SITE_CACHE_SIZE;
+    let epoch = BP_EPOCH.load(Ordering::Acquire);
+    let generation = crate::native_bridge::native_registry_generation();
+    if let Some(found) = SITE_CACHE.with(|cache| {
+        cache.borrow()[slot]
+            .as_ref()
+            .filter(|entry| {
+                entry.site == site
+                    && entry.runtime == runtime
+                    && entry.code == code
+                    && entry.epoch == epoch
+                    && entry.generation == generation
+            })
+            .cloned()
+    }) {
+        return Some(found);
+    }
+    let ix = active_bp_ix();
+    let table = breakpoints().current.read().unwrap();
+    let bps = crate::native_bridge::with_native_function_at(site, |function| {
+        function_bps(
+            &table,
+            runtime,
+            code,
+            &function.module,
+            &function.function,
+            function.arity,
+        )
+        .map(|g| SiteBp {
+            session: g.session,
+            flags: g.data[ix].flags & !BPF_GLOBAL_TRACE,
+            count: g.data[ix].count.clone(),
+        })
+        .collect::<Vec<_>>()
+    })?;
+    drop(table);
+    let entry = Arc::new(SiteBreakpoints {
+        site,
+        runtime,
+        code,
+        epoch,
+        generation,
+        bps,
+    });
+    SITE_CACHE.with(|cache| cache.borrow_mut()[slot] = Some(entry.clone()));
+    Some(entry)
+}
+
+/// Native-code `erts_generic_breakpoint` of the trampoline at `site`: whether every breakpoint
+/// on the function only counts calls for this process. When so, the counters are incremented
+/// and the call proceeds without a trace event; otherwise nothing is touched.
+// Port of erts/emulator/beam/beam_bp.c:994-1060 (erts_generic_breakpoint, do_session_breakpoint),
+// OTP-29.1.1.
+pub(crate) fn native_breakpoint_noop(process: &Process, pid: Pid, site: usize) -> bool {
+    if crate::trace::is_sensitive(process, pid) {
+        return true;
+    }
+    let Some(entry) = site_breakpoints(process, site) else {
+        return false;
+    };
+    let acc = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
+    // The debug and return_to checks need the function name, but only when one is in use.
+    if DEBUG_BREAKPOINTS_USED.load(Ordering::Relaxed)
+        && crate::native_bridge::with_native_function_at(site, |function| {
+            debug_breakpoint_enabled(
+                process,
+                &function.module,
+                &function.function,
+                function.arity,
+            )
+        })
+        .unwrap_or(true)
         || crate::trace::return_to_enabled(process)
     {
         return false;
     }
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
-    let acc = BPF_TIME_TRACE_ACTIVE | BPF_MEM_TRACE_ACTIVE;
-    function_bps(
-        &table,
-        scope(process),
-        code_scope(process),
-        module,
-        function,
-        arity,
-    )
-    .all(|g| {
-        let flags = g.data[ix].flags;
-        let session_calls = BPF_LOCAL_TRACE | BPF_GLOBAL_TRACE | acc;
-        flags & !session_calls & (BPF_META_TRACE | BPF_COUNT_ACTIVE) == 0
-            && (flags & session_calls == 0
-                || crate::trace::session_flags(process, g.session, pid) & crate::trace::CALL == 0)
-    })
+    if !entry.bps.iter().all(|bp| {
+        bp.flags & BPF_META_TRACE == 0
+            && (bp.flags & (BPF_LOCAL_TRACE | acc) == 0
+                || crate::trace::session_flags(process, bp.session, pid) & crate::trace::CALL == 0)
+    }) {
+        return false;
+    }
+    for bp in &entry.bps {
+        if bp.flags & BPF_COUNT_ACTIVE != 0
+            && let Some(count) = &bp.count
+        {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    true
 }
 
 /// The functions among `functions` that have a breakpoint of any session: clearing, pausing or
@@ -1055,7 +1230,10 @@ pub(crate) fn breakpoint_kinds(
         function,
         arity,
     ) {
-        let flags = g.data[ix].flags;
+        let mut flags = g.data[ix].flags;
+        if INSTALL_VIEW.with(std::cell::Cell::get) {
+            flags |= g.data[staging_bp_ix()].flags;
+        }
         local |= flags & !BPF_GLOBAL_TRACE != 0;
         global |= flags & BPF_GLOBAL_TRACE != 0;
     }
@@ -1276,6 +1454,9 @@ pub(crate) fn clear_module_line_breakpoints(runtime: u64, module_id: usize) {
         .retain(|(scope, id, _), _| *scope != runtime as usize || *id != module_id);
 }
 
+/// Set once a debug breakpoint was enabled; until then no table scan can find one.
+static DEBUG_BREAKPOINTS_USED: AtomicBool = AtomicBool::new(false);
+
 type DebugBreakKey = (usize, String, String, Option<i64>);
 fn debug_breakpoints() -> &'static Mutex<HashMap<DebugBreakKey, bool>> {
     static BREAKPOINTS: OnceLock<Mutex<HashMap<DebugBreakKey, bool>>> = OnceLock::new();
@@ -1289,6 +1470,9 @@ pub(crate) fn set_debug_breakpoint(
     arity: Option<i64>,
     enabled: bool,
 ) {
+    if enabled {
+        DEBUG_BREAKPOINTS_USED.store(true, Ordering::Relaxed);
+    }
     debug_breakpoints()
         .lock()
         .unwrap()
@@ -1301,6 +1485,9 @@ pub(crate) fn debug_breakpoint_enabled(
     function: &str,
     arity: u8,
 ) -> bool {
+    if !DEBUG_BREAKPOINTS_USED.load(Ordering::Relaxed) {
+        return false;
+    }
     debug_breakpoints()
         .lock()
         .unwrap()
