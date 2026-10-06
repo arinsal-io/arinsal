@@ -626,6 +626,11 @@ pub struct NifLibrary {
     halt_calls: Arc<HaltCalls>,
 }
 impl NifLibrary {
+    /// Module name exported by this NIF library.
+    pub fn module_name(&self) -> &str {
+        &self.module
+    }
+
     /// Return name, arity, address, and dirty flags for each entry.
     pub fn functions(&self) -> Vec<(String, u32, NifFn, u32)> {
         self.functions

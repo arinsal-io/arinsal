@@ -132,6 +132,59 @@ run(Path) -> erlang:load_nif(Path, []).
 f() -> erlang:nif_error(undef).
 "#;
 
+const TRACE_NIF_SOURCE: &str = r#"
+#include <unistd.h>
+#include "erl_nif.h"
+static ERL_NIF_TERM send_wait(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid pid;
+    ERL_NIF_TERM result;
+    (void)argc;
+    if (!enif_get_local_pid(env, argv[0], &pid)) return enif_make_badarg(env);
+    result = enif_make_tuple2(env, enif_make_atom(env, "ok"), enif_make_pid(env, &pid));
+    if (!enif_send(env, &pid, NULL, result)) return enif_make_badarg(env);
+    sleep(2);
+    return result;
+}
+static ErlNifFunc funcs[] = {{"send_wait", 1, send_wait, ERL_NIF_DIRTY_JOB_IO_BOUND}};
+ERL_NIF_INIT(dirty_nif_trace, funcs, NULL, NULL, NULL, NULL)
+"#;
+
+const TRACE_ERL_SOURCE: &str = r#"
+-module(dirty_nif_trace).
+-export([run/0, trace_run/1, send_wait/1]).
+-nifs([send_wait/1]).
+send_wait(_) -> erlang:nif_error(undef).
+
+trace_run(Path) ->
+    ok = erlang:load_nif(Path, []),
+    Parent = self(),
+    Rcvr = spawn(fun() -> receive {ok, Self} -> Parent ! {Self, received} end end),
+    Sndr = spawn(fun() ->
+        receive {Parent, go} -> ok end,
+        {ok, Rcvr} = send_wait(Rcvr),
+        Parent ! {self(), sent}
+    end),
+    1 = erlang:trace(Sndr, true, [send, running]),
+    Sndr ! {Parent, go},
+    trace_sequence(Sndr, undefined).
+
+trace_sequence(Pid, LastIn) ->
+    receive
+        {trace, Pid, in, MFA} -> trace_sequence(Pid, MFA);
+        {trace, Pid, out, _MFA} -> trace_sequence(Pid, LastIn);
+        {trace, Pid, send, _Message, _To} ->
+            {trace, Pid, out, {erts_internal, dirty_nif_finalizer, 1}} = recv_trace(Pid),
+            {trace, Pid, in, {erts_internal, dirty_nif_finalizer, 1}} = recv_trace(Pid),
+            {dirty_nif_trace, send_wait, 1} = LastIn,
+            {LastIn, send, out, in}
+    end.
+
+recv_trace(Pid) ->
+    receive
+        M when element(1, M) =:= trace, element(2, M) =:= Pid -> M
+    end.
+"#;
+
 fn otp_include() -> PathBuf {
     let output = Command::new("erl")
         .args([
@@ -160,7 +213,7 @@ fn compile_so(dir: &Path, name: &str, source: &str) -> PathBuf {
     object
 }
 
-fn check(module: &str, c_source: &str, erl_source: &str) {
+fn check_entry(module: &str, c_source: &str, erl_source: &str, entry: &str) {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping dirty NIF differential test");
         return;
@@ -170,7 +223,10 @@ fn check(module: &str, c_source: &str, erl_source: &str) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let object = compile_so(&dir, module, c_source);
-    let source = format!("{erl_source}\nrun() -> run(\"{}\").\n", object.display());
+    let source = format!(
+        "{erl_source}\nrun() -> {entry}(\"{}\").\n",
+        object.display()
+    );
     let bytes = erl.compile_named(module, &source, &[]).unwrap();
     std::fs::write(dir.join(format!("{module}.beam")), &bytes).unwrap();
     erl.load(module, &bytes).unwrap();
@@ -187,6 +243,10 @@ fn check(module: &str, c_source: &str, erl_source: &str) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn check(module: &str, c_source: &str, erl_source: &str) {
+    check_entry(module, c_source, erl_source, "run");
+}
+
 #[test]
 fn dirty_nifs_and_scheduled_continuations_match_erts() {
     check("dirty_nif", NIF_SOURCE, ERL_SOURCE);
@@ -195,4 +255,14 @@ fn dirty_nifs_and_scheduled_continuations_match_erts() {
 #[test]
 fn illegal_dirty_flags_fail_load_like_erts() {
     check("dirty_nif_bad", BAD_SOURCE, BAD_ERL_SOURCE);
+}
+
+#[test]
+fn dirty_nif_send_trace_sequence_matches_erts() {
+    check_entry(
+        "dirty_nif_trace",
+        TRACE_NIF_SOURCE,
+        TRACE_ERL_SOURCE,
+        "trace_run",
+    );
 }

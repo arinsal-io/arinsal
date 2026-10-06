@@ -401,11 +401,12 @@ pub(crate) fn set_sensitive(process: &Process, pid: Pid, on: bool) -> bool {
 
 /// Whether `pid` is sensitive (`ERTS_IS_PROC_SENSITIVE`).
 pub(crate) fn is_sensitive(process: &Process, pid: Pid) -> bool {
+    is_sensitive_scoped(scope(process), pid)
+}
+
+fn is_sensitive_scoped(owner: usize, pid: Pid) -> bool {
     SENSITIVE_COUNT.load(Ordering::Relaxed) != 0
-        && sensitive_set()
-            .lock()
-            .unwrap()
-            .contains(&(scope(process), pid))
+        && sensitive_set().lock().unwrap().contains(&(owner, pid))
 }
 
 /// One entry of a process's `save_calls` buffer.
@@ -585,6 +586,45 @@ fn scope(process: &Process) -> usize {
 
 fn scope_runtime(runtime: &crate::process::Runtime) -> usize {
     runtime as *const crate::process::Runtime as usize
+}
+
+/// Emit a dirty NIF `enif_send` trace event while the scheduler has released the task cell.
+///
+/// Port of erts/emulator/beam/erl_nif.c:1005 (trace_send), OTP-29.1.1.
+pub(crate) fn emit_dirty_send(
+    runtime: &crate::process::Runtime,
+    subject: Pid,
+    target: Term,
+    message: Term,
+) {
+    emit_external_process_event(runtime, subject, SEND, "send", &[message, target]);
+}
+
+/// Emit dirty scheduler status while the scheduler has released the task cell.
+///
+/// Port of erts/emulator/beam/erl_process.c:10508-10570 (trace_schedule_in/out), OTP-29.1.1.
+pub(crate) fn emit_dirty_running(
+    runtime: &crate::process::Runtime,
+    subject: Pid,
+    event_name: &str,
+    module: &str,
+    function: &str,
+    arity: u8,
+) {
+    let (Ok(module), Ok(function), Some(arity)) = (
+        global_atoms().intern(module),
+        global_atoms().intern(function),
+        Term::small(i64::from(arity)),
+    ) else {
+        return;
+    };
+    let mut heap = VecHeap::new();
+    let Ok(mfa) =
+        TermBuilder::new(&mut heap).tuple(&[Term::atom(module), Term::atom(function), arity])
+    else {
+        return;
+    };
+    emit_external_process_event(runtime, subject, RUNNING, event_name, &[mfa]);
 }
 
 #[cfg(test)]
@@ -3575,7 +3615,14 @@ pub(crate) fn running_mfa(
             Some(_) => ("ets", "internal_delete_all", 2),
         });
     let dirty_bif = process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa);
-    let (module, function, arity) = if let Some(trap) = ets_trap {
+    let dirty_finalizer = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.nif_pending.as_ref())
+        .and_then(crate::natives::nif::PendingNif::finalizer_mfa);
+    let (module, function, arity) = if let Some(finalizer) = dirty_finalizer {
+        finalizer
+    } else if let Some(trap) = ets_trap {
         trap
     } else if let Some(bif) = dirty_bif {
         bif
