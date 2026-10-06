@@ -1104,10 +1104,25 @@ impl Executor {
             && let Some(module) = self.vm.code.modules.get(process.module)
             && let Some((function, arity)) = module.function_at(process.ip)
             && module.entry_arity.get(process.ip).copied().unwrap_or(0) != 0
-            && let Some(native) =
-                crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
+            // The entry belongs to the module instance the process was spawned in; another
+            // loaded version of the same module (old or current) has its own code. A module
+            // loaded for the interpreter only may have native functions registered separately.
+            && let Some(start) = match self
+                .vm
+                .code
+                .code_meta
+                .get(process.module)
+                .and_then(|meta| meta.as_ref())
+                .and_then(|meta| meta.beamasm.as_ref())
+            {
+                Some(version) => version.native_function_start(function, arity),
+                None => {
+                    crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
+                        .map(|native| native.start)
+                }
+            }
         {
-            process.native_pc = Some(native.start);
+            process.native_pc = Some(start);
         }
         let (mut need_x, need_fr) = self.vm.code.registers[process.module];
         if crate::beamasm_integration::enabled() {
@@ -3434,6 +3449,20 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// Whether `target` is suspended: a suspend signal still queued behind its running (for
+    /// example dirty) execution does not show yet.
+    // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status: a process with
+    // ERTS_PSFLG_RUNNING reports `running` before the suspend signal is handled), OTP-29.1.1.
+    pub(crate) fn suspend_active(&self, target: Pid) -> bool {
+        self.suspend_total_of(target) > 0
+            && !self
+                .suspend_outstanding
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|((_, queued_target), count)| *queued_target == target && *count > 0)
+    }
+
     /// True while some async suspend of `target` is not yet active; later suspends queue
     /// behind it, as the suspend signals do in erts.
     fn has_outstanding_suspends(&self, target: Pid) -> bool {
@@ -3806,7 +3835,7 @@ impl Runtime {
     }
 
     pub(crate) fn note_status(&self, pid: Pid, status: &'static str) {
-        let suspended = self.suspend_total_of(pid) > 0;
+        let suspended = self.suspend_active(pid);
         let mut published = self.published.lock().unwrap();
         let slot = published.entry(pid).or_insert(Published {
             status,
@@ -3841,7 +3870,7 @@ impl Runtime {
     }
 
     pub(crate) fn remote_status(&self, pid: Pid) -> &'static str {
-        if self.suspend_total_of(pid) > 0 {
+        if self.suspend_active(pid) {
             return "suspended";
         }
         self.published

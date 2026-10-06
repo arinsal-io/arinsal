@@ -122,6 +122,8 @@ pub(crate) struct ProcessCold {
     pub(crate) dirty_exit_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// A dirty BIF call waiting for its dirty job, or the job's result.
     pub(crate) dirty_bif: Option<crate::dirty::DirtyBif>,
+    /// Export of the dirty BIF that is scheduled or running; `current_function` reports it.
+    pub(crate) dirty_bif_mfa: Option<(&'static str, &'static str, u8)>,
     /// Result of a static dirty NIF executed as a dirty job.
     pub(crate) static_nif_done: Option<Result<Term, arinsal_bifs::BifError>>,
     /// Completion latch for `erts_debug:set_internal_state(wait, ...)`.
@@ -190,6 +192,9 @@ pub(crate) struct ProcessCold {
     /// Result of a published `persistent_term` update, returned when the yielded
     /// updater runs again (erts resumes the suspended updater after `table_updater`).
     pub(crate) persistent_update_result: Option<Term>,
+    /// Modules a suspended `finish_loading/1` staged; they commit when it is rescheduled
+    /// after its code barrier, or when the loader exits first.
+    pub(crate) finish_loading_commit: Option<crate::load::StagedLoad>,
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<EtsFree>,

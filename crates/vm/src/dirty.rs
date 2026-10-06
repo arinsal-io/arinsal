@@ -166,13 +166,18 @@ impl Process {
     pub(crate) fn dirty_bif(
         &mut self,
         kind: DirtyKind,
+        mfa: (&'static str, &'static str, u8),
         body: impl FnOnce(&mut ProcessHeap) -> DirtyBifResult + Send + 'static,
     ) -> Result<DirtyBifResult, crate::VmError> {
         if let Some(DirtyBif::Done(result)) =
             self.cold.as_mut().and_then(|cold| cold.dirty_bif.take())
         {
+            self.cold_mut().dirty_bif_mfa = None;
             return Ok(result);
         }
+        // Port of erts/emulator/beam/bif.c:5760 (erts_schedule_bif sets `c_p->i` to the BIF's
+        // export), OTP-29.1.1: while the job is scheduled or runs the process is "in" the BIF.
+        self.cold_mut().dirty_bif_mfa = Some(mfa);
         self.cold_mut().dirty_bif = Some(DirtyBif::Job(kind, Box::new(body)));
         Err(crate::VmError::Dirty(kind))
     }

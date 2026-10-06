@@ -435,6 +435,17 @@ pub(crate) fn retract_module_records(scope: u64, module: &str) {
 
 // VM load implementation.
 
+/// Modules of `erlang:finish_loading/1` staged in an ended staging area, waiting for the
+/// loader's code barrier before the commit.
+pub(crate) struct StagedLoad {
+    /// `None` when the staging area was nested in an outer one, which commits it.
+    ended: Option<crate::code_ix::EndedStaging>,
+    ids: Vec<usize>,
+    /// Names of the staged modules.
+    pub(crate) names: Vec<String>,
+    on_load: Vec<String>,
+}
+
 impl Vm {
     /// Resolve a native record definition from the active module version.
     pub(crate) fn native_record_definition(
@@ -731,10 +742,12 @@ impl Vm {
         Ok(id)
     }
 
-    pub(crate) fn publish_prepared(
+    /// Stages the prepared modules of `erlang:finish_loading/1` and ends staging; the
+    /// returned load commits through [`Vm::commit_staged`] once the loader's code barrier passed.
+    pub(crate) fn stage_prepared(
         &mut self,
         prepared: Vec<(Module, (usize, usize), CodeMeta)>,
-    ) -> Result<Vec<String>, (&'static str, Vec<String>)> {
+    ) -> Result<StagedLoad, (&'static str, Vec<String>)> {
         let names: Vec<_> = prepared
             .iter()
             .map(|(module, _, _)| module.name.clone())
@@ -788,12 +801,26 @@ impl Vm {
                 on_load.push(name);
             }
         }
-        drop(staging);
+        Ok(StagedLoad {
+            ended: staging.end(),
+            ids,
+            names,
+            on_load,
+        })
+    }
+
+    /// Commits a load of [`Vm::stage_prepared`] (unless a concurrent code change already
+    /// did) and starts reading the new active code; returns the modules with `on_load`.
+    // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1.
+    pub(crate) fn commit_staged(&mut self, staged: StagedLoad) -> Vec<String> {
+        if let Some(ended) = staged.ended {
+            ended.commit();
+        }
         self.refresh_code();
-        for id in ids {
+        for id in staged.ids {
             self.register_native_targets(id);
         }
-        Ok(on_load)
+        staged.on_load
     }
 
     /// Whether `address` lies in the native code of module instance `id`.

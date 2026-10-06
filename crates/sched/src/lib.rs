@@ -5037,6 +5037,15 @@ fn run_one<'a, T: Task>(
                 if inner.online_schedulers.load(Ordering::Acquire) == 1 {
                     inner.enqueue(next, true);
                 } else {
+                    // Port of erts/emulator/beam/erl_process.c:9603 (one FIFO run queue per
+                    // scheduler and priority), OTP-29.1.1: processes this slice enqueued on
+                    // the run queue (spawned, woken) were queued before the yielding process,
+                    // so they join the local deques ahead of it.
+                    for priority in 0..local.queues.len() {
+                        while let Some(found) = inner.run_queues[local.worker_id][priority].pop() {
+                            local.queues[priority].push(found);
+                        }
+                    }
                     local.record_queued(&next.process, local.worker_id, true);
                     local.queues[next.process.priority().index()].push(next);
                 }

@@ -1209,13 +1209,22 @@ fn nif_is_process_alive(caller: Term, target: Term) -> bool {
     let (Some(caller), Some(target)) = (Pid::from_term(caller), Pid::from_term(target)) else {
         return false;
     };
-    NIF_HUBS
+    let hub = NIF_HUBS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap()
         .get(&caller)
-        .and_then(|hub| hub.scheduler.upgrade())
+        .cloned();
+    let Some(hub) = hub else {
+        return false;
+    };
+    hub.scheduler
+        .upgrade()
         .is_some_and(|scheduler| scheduler.lookup(target))
+        && !hub
+            .runtime
+            .upgrade()
+            .is_some_and(|runtime| crate::signals::has_begun_exit(&runtime, target))
 }
 
 fn nif_send_hook(target: Term, message: Term) -> bool {
