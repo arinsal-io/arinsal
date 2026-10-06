@@ -397,6 +397,7 @@ impl CodeTables {
         {
             let key = nif_key(&module.name, id);
             self.loaded_nifs.remove(&key);
+            crate::natives::nif::unload_instance(self.code_scope, id);
             arinsal_pterm::store_for(self.code_scope)
                 .retire_module_area(self.modules[id].literal_area());
         }
@@ -884,7 +885,12 @@ impl Vm {
                 crate::trace_bp::breakpoint_kinds(process, &module.name, function, *arity);
             if self
                 .beamasm_targets
-                .function_for_target(module_id, &module, *entry)
+                .function_for_target(
+                    module_id,
+                    &module,
+                    native_code_range(&self.code.code_meta, module_id),
+                    *entry,
+                )
                 .is_some()
             {
                 crate::beamasm_integration::patch_native_breakpoint(

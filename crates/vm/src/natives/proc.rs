@@ -1047,7 +1047,9 @@ fn dictionary_lookup(selector: Term) -> Option<(Term, Term)> {
 }
 
 /// The native function and source location a native caller is executing a BIF at.
-fn native_call_site(process: &Process) -> Option<(crate::native_bridge::NativeFunction, usize)> {
+pub(crate) fn native_call_site(
+    process: &Process,
+) -> Option<(crate::native_bridge::NativeFunction, usize)> {
     let pc = process.cold.as_ref()?.native_call_pc;
     if pc == 0 {
         return None;

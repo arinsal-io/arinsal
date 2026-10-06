@@ -619,6 +619,118 @@ fn erl_tracer_enabled_and_trace_match_erts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// OTP's `tracer_SUITE` tracer NIF (`tracer_test.c` and `tracer_test.erl`).
+fn otp_tracer_test(erl: &RefErl, dir: &Path) {
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/otp/erts/emulator/test");
+    let source = std::fs::read_to_string(suite.join("tracer_SUITE_data/tracer_test.c"))
+        .expect("tracer_test.c");
+    compile_so(dir, "tracer_test", &source);
+    // The module uses the preprocessor (`?MODULE`), so erlc compiles it.
+    let status = Command::new("erlc")
+        .arg("-o")
+        .arg(dir)
+        .arg(suite.join("tracer_test.erl"))
+        .status()
+        .expect("erlc");
+    assert!(status.success(), "erlc tracer_test.erl");
+    let bytes = std::fs::read(dir.join("tracer_test.beam")).expect("tracer_test.beam");
+    erl.load("tracer_test", &bytes).unwrap();
+}
+
+// Port of erts/emulator/beam/erl_trace.c:1037-1160 and :1194-1240 (erts_call_trace and the
+// return events), erl_nif.c:4744-4772 (erts_load_nif caller) and beam_bif_load.c:2254-2258
+// (purge unloads the NIF library), OTP-29.1.1.
+#[test]
+fn tracer_module_return_trace_and_nif_reload_cycles_match_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping tracer module reload differential test");
+        return;
+    };
+    let dir = work_dir("tracer_reload");
+    otp_tracer_test(&erl, &dir);
+    let source = format!(
+        r#"
+        -module(nifdyn_tracer_reload).
+        -export([run/0, call_test/1]).
+        run() ->
+            Dir = "{}",
+            true = code:add_patha(Dir),
+            First = cycle(Dir),
+            Calls = calls(),
+            %% More load/purge cycles than the runtime has NIF trampolines.
+            Cycles = lists:usort([cycle(Dir) || _ <- lists:seq(1, 100)]),
+            Config = spawn(fun F() -> receive {{get, P}} -> P ! Dir, F() end end),
+            register(tracer_test_config, Config),
+            OnLoad = lists:usort([on_load_cycle() || _ <- lists:seq(1, 12)]),
+            unregister(tracer_test_config),
+            exit(Config, kill),
+            purge(),
+            {{First, Calls, Cycles, OnLoad}}.
+        call_test(Arg) -> Arg.
+        purge() ->
+            case erlang:module_loaded(tracer_test) of
+                true ->
+                    code:purge(tracer_test),
+                    true = code:delete(tracer_test),
+                    code:purge(tracer_test);
+                false -> ok
+            end.
+        status() ->
+            try tracer_test:enabled(trace_status, self(), {{#{{}}, self(), []}})
+            catch Class:_ -> Class
+            end.
+        cycle(Dir) ->
+            purge(),
+            Before = status(),
+            Load = tracer_test:load(Dir),
+            Tracee = spawn(fun() -> receive _ -> ok end end),
+            Trace = try erlang:trace(Tracee, true, [procs, {{tracer, tracer_test, {{#{{}}, self(), []}}}}])
+                    catch Class:Reason -> {{Class, Reason}}
+                    end,
+            exit(Tracee, kill),
+            {{Before, Load, Trace}}.
+        on_load_cycle() ->
+            Autoloaded = status(),
+            {{module, tracer_test}} = code:load_file(tracer_test),
+            Reloaded = status(),
+            false = code:purge(tracer_test),
+            true = code:delete(tracer_test),
+            false = code:purge(tracer_test),
+            {{Autoloaded, Reloaded}}.
+        calls() ->
+            Self = self(),
+            Tracee = spawn(fun F() -> receive A when is_function(A) -> A(), F() end end),
+            1 = erlang:trace_pattern({{nifdyn_tracer_reload, call_test, 1}}, [{{'_', [], [{{return_trace}}]}}], [local]),
+            Events = [begin
+                          State = {{#{{call => Mode}}, Self, []}},
+                          1 = erlang:trace(Tracee, true, [call, {{tracer, tracer_test, State}}]),
+                          Tracee ! fun() -> call_test(Mode), Self ! done end,
+                          receive done -> ok end,
+                          Ref = erlang:trace_delivered(Tracee),
+                          receive {{trace_delivered, Tracee, Ref}} -> ok end,
+                          1 = erlang:trace(Tracee, false, [call]),
+                          {{Mode, flush()}}
+                      end || Mode <- [trace, discard]],
+            erlang:trace_pattern({{nifdyn_tracer_reload, call_test, 1}}, false, [local]),
+            exit(Tracee, kill),
+            Events.
+        flush() ->
+            receive
+                {{Tag, {{_, _, _}}, _, Data, Opts}} -> [{{Tag, Data, Opts}} | flush()]
+            after 0 -> []
+            end.
+        "#,
+        dir.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_tracer_reload", &source);
+    assert_eq!(
+        scheduled_cli(&dir, "nifdyn_tracer_reload"),
+        reference(&erl, "nifdyn_tracer_reload"),
+        "nifdyn_tracer_reload:run/0"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn nif_api2_case(test_name: &str, body: &str) {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping {test_name}");

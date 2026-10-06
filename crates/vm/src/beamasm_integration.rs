@@ -23,6 +23,8 @@ pub(crate) struct NativeTargetCache {
     targets: Vec<Vec<Option<crate::NativeFunction>>>,
     generations: Vec<u64>,
     module_identities: Vec<usize>,
+    /// Native code range each cached module instance was resolved against.
+    ranges: Vec<Option<(usize, usize)>>,
 }
 
 impl NativeTargetCache {
@@ -32,6 +34,7 @@ impl NativeTargetCache {
             targets: Vec::new(),
             generations: Vec::new(),
             module_identities: Vec::new(),
+            ranges: Vec::new(),
         }
     }
 
@@ -57,10 +60,13 @@ impl NativeTargetCache {
         }
     }
 
+    /// The native function entered at interpreted `target` of module instance `module_id`,
+    /// whose native code (when it has a version of its own) spans `range`.
     pub(crate) fn function_for_target(
         &mut self,
         module_id: usize,
         module: &arinsal_loader::Module,
+        range: Option<(usize, usize)>,
         target: usize,
     ) -> Option<crate::NativeFunction> {
         // Only a function entry enters native code at the function's start; any other
@@ -78,9 +84,16 @@ impl NativeTargetCache {
             self.register_module(module_id, module);
         }
         let generation = crate::native_bridge::native_registry_generation();
-        if self.generations.get(module_id).copied()? != generation {
-            // One registry pass per module: a lookup per function would be quadratic.
+        if self.generations.get(module_id).copied()? != generation
+            || self.ranges.get(module_id).copied().flatten() != range
+        {
+            // One registry pass per module: a lookup per function would be quadratic. An old
+            // instance of the module may still be registered (a reused module id can even
+            // reuse the `Module` address), so only this instance's own code counts.
             let mut natives = crate::native_bridge::native_functions_of(self.scope, &module.name);
+            if let Some((start, end)) = range {
+                natives.retain(|_, native| start <= native.start && native.start < end);
+            }
             let cache = self.targets.get_mut(module_id)?;
             cache.clear();
             cache.extend(
@@ -90,6 +103,10 @@ impl NativeTargetCache {
                     .map(|(_, function, arity)| natives.remove(&(function.clone(), *arity))),
             );
             self.generations[module_id] = generation;
+            if self.ranges.len() <= module_id {
+                self.ranges.resize(module_id + 1, None);
+            }
+            self.ranges[module_id] = range;
         }
         self.targets.get(module_id)?.get(index)?.clone()
     }

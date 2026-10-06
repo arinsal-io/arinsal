@@ -1707,10 +1707,12 @@ impl Vm {
         let Some(module) = self.code.modules.get(p.module) else {
             return;
         };
-        if let Some(native) = self
-            .beamasm_targets
-            .function_for_target(p.module, module, p.ip)
-        {
+        if let Some(native) = self.beamasm_targets.function_for_target(
+            p.module,
+            module,
+            crate::load::native_code_range(&self.code.code_meta, p.module),
+            p.ip,
+        ) {
             p.native_pc = Some(native.start);
         }
     }
@@ -1778,7 +1780,12 @@ impl Vm {
             let module = &self.code.modules[module_id];
             let at_native_entry = self
                 .beamasm_targets
-                .function_for_target(module_id, module, p.ip)
+                .function_for_target(
+                    module_id,
+                    module,
+                    crate::load::native_code_range(&self.code.code_meta, module_id),
+                    p.ip,
+                )
                 .is_some();
             crate::beamasm_integration::count_interp_slice(at_native_entry);
         }
@@ -2136,6 +2143,7 @@ impl Vm {
                                         if let Some(native) = self.beamasm_targets.function_for_target(
                                             module_id,
                                             &self.code.modules[module_id],
+                                            crate::load::native_code_range(&self.code.code_meta, module_id),
                                             instruction_offset(base, target),
                                         ) {
                                             sync_cursor(p, htop, &mut heap_dirty);
@@ -2518,6 +2526,7 @@ impl Vm {
                             if let Some(native) = self.beamasm_targets.function_for_target(
                                 module_id,
                                 &self.code.modules[module_id],
+                                crate::load::native_code_range(&self.code.code_meta, module_id),
                                 // SAFETY: The import target belongs to the active module.
                                 instruction_offset(base, target),
                             ) {
@@ -2839,6 +2848,7 @@ impl Vm {
                         if let Some(native) = self.beamasm_targets.function_for_target(
                             module_id,
                             &self.code.modules[module_id],
+                            crate::load::native_code_range(&self.code.code_meta, module_id),
                             target_ip,
                         ) {
                             sync_cursor(p, htop, &mut heap_dirty);
@@ -2876,7 +2886,12 @@ impl Vm {
                     unsafe { *stop = cp.raw_bits() };
                     if let Some(native) =
                         self.beamasm_targets
-                            .function_for_target(module_id, module, target as usize)
+                            .function_for_target(
+                                module_id,
+                                module,
+                                crate::load::native_code_range(&self.code.code_meta, module_id),
+                                target as usize,
+                            )
                     {
                         // Keep this BEAM continuation below run_native's bridge
                         // CP; native return copies XREG0 back before resuming it.
@@ -2909,7 +2924,12 @@ impl Vm {
                     stop = unsafe { stop.add(dealloc as usize) };
                     if let Some(native) =
                         self.beamasm_targets
-                            .function_for_target(module_id, module, target as usize)
+                            .function_for_target(
+                                module_id,
+                                module,
+                                crate::load::native_code_range(&self.code.code_meta, module_id),
+                                target as usize,
+                            )
                     {
                         // Tail calls reuse the existing caller CP; run_native
                         // supplies only the temporary bridge CP for this entry.
@@ -4814,6 +4834,7 @@ impl Vm {
                             && let Some(native) = self.beamasm_targets.function_for_target(
                                 target_module,
                                 &self.code.modules[target_module],
+                                crate::load::native_code_range(&self.code.code_meta, target_module),
                                 target_ip,
                             )
                         {

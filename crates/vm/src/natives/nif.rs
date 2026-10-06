@@ -26,6 +26,25 @@ const TRAMPOLINES: usize = 160;
 struct DynSlot {
     library: Arc<arinsal_nif::NifLibrary>,
     index: usize,
+    /// The code scope and module instance the library is bound to.
+    owner: (u64, usize),
+}
+
+/// Unload the NIF library bound to module instance `id` of `scope`, freeing its trampolines.
+// Port of erts/emulator/beam/beam_bif_load.c:2254-2258 (purge complete) and
+// erts/emulator/beam/erl_nif.c:5334-5360 (erts_unload_nif), OTP-29.1.1: purging a code instance
+// unloads its library; `unload` runs once no NIF call of it is still in flight.
+pub(crate) fn unload_instance(scope: u64, id: usize) {
+    let released = {
+        let mut slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
+        slots
+            .iter_mut()
+            .filter(|slot| slot.as_ref().is_some_and(|slot| slot.owner == (scope, id)))
+            .filter_map(Option::take)
+            .collect::<Vec<_>>()
+    };
+    // The library's `unload` callback runs outside the slot lock.
+    drop(released);
 }
 
 static SLOTS: Mutex<Vec<Option<DynSlot>>> = Mutex::new(Vec::new());
@@ -705,23 +724,35 @@ fn install_dynamic(
     library: Arc<arinsal_nif::NifLibrary>,
     binds: &[(usize, usize)],
 ) -> Result<(), VmError> {
-    let start = {
+    let owner = (vm.code_scope, module_id);
+    let assigned = {
         let mut slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
-        if slots.len() + binds.len() > TRAMPOLINES {
+        // Trampolines of purged libraries are reused.
+        let free = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, used)| used.is_none().then_some(slot))
+            .chain(slots.len()..TRAMPOLINES)
+            .take(binds.len())
+            .collect::<Vec<_>>();
+        if free.len() < binds.len() {
             return Err(VmError::Unsupported("dynamic NIF table is full".into()));
         }
-        let start = slots.len();
-        for (_, index) in binds {
-            slots.push(Some(DynSlot {
+        for (&slot, (_, index)) in free.iter().zip(binds) {
+            if slot >= slots.len() {
+                slots.resize_with(slot + 1, || None);
+            }
+            slots[slot] = Some(DynSlot {
                 library: Arc::clone(&library),
                 index: *index,
-            }));
+                owner,
+            });
         }
-        start
+        free
     };
-    for (offset, (entry, _)) in binds.iter().enumerate() {
+    for (&slot, (entry, _)) in assigned.iter().zip(binds) {
         let function = trampolines()
-            .get(start + offset)
+            .get(slot)
             .copied()
             .ok_or_else(|| VmError::Unsupported("dynamic NIF trampoline".into()))?;
         let index = push_native(vm, function)?;
@@ -823,19 +854,51 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     bytes.extend(b".so");
     // The caller's code (and its native version) may have been loaded by another scheduler.
     vm.refresh_code();
-    let mut caller_id = process.module;
-    let caller = vm
-        .code
-        .modules
-        .get(caller_id)
-        .map(|module| module.name.clone())
-        .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
-    // Port of erts/emulator/beam/erl_nif.c:4736 (erts_load_nif: the caller is the code being
-    // loaded, `modp->on_load`, while its on_load function runs), OTP-29.1.1. A reloaded module's
-    // on_load can execute the previous version's native code, which names the wrong instance.
-    if let Some(&pending) = vm.code.pending_on_load.get(&caller) {
-        caller_id = pending;
+    // Port of erts/emulator/beam/erl_nif.c:4744-4772 (erts_load_nif), OTP-29.1.1: the library
+    // binds to the module whose code called load_nif (`erts_find_function_from_pc`); a pending
+    // on_load instance takes it, and a call from old code is refused. Native code does not keep
+    // `process.module` current, so its call site names the caller.
+    let (caller, caller_instance) = match crate::natives::proc::native_call_site(process) {
+        Some((function, pc)) => {
+            let instance = [
+                vm.code.pending_on_load.get(&function.module),
+                vm.code.loaded.get(&function.module),
+                vm.code.old.get(&function.module),
+            ]
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|&id| {
+                crate::load::native_code_range(&vm.code.code_meta, id)
+                    .is_some_and(|(start, end)| (start..end).contains(&pc))
+            });
+            (function.module, instance)
+        }
+        None => {
+            let name = vm
+                .code
+                .modules
+                .get(process.module)
+                .map(|module| module.name.clone())
+                .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
+            (name, Some(process.module))
+        }
+    };
+    if caller_instance.is_some() && caller_instance == vm.code.old.get(&caller).copied() {
+        return error_reason(
+            process,
+            "old_code",
+            &format!("Calling load_nif from old module '{caller}' not allowed"),
+        );
     }
+    let caller_id = vm
+        .code
+        .pending_on_load
+        .get(&caller)
+        .or_else(|| vm.code.loaded.get(&caller))
+        .copied()
+        .or(caller_instance)
+        .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
     if caller == "erlang" {
         return error_reason(
             process,
