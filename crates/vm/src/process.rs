@@ -1712,13 +1712,26 @@ impl Executor {
                                     continue;
                                 }
                                 if target_pc == arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY {
-                                    let value = process.send_message_prio(
+                                    let value = match process.send_message_prio(
                                         Some(&mut self.vm),
                                         Some(ctx),
                                         process.x[0],
                                         process.x[1],
                                         false,
-                                    )?;
+                                    ) {
+                                        Ok(value) => value,
+                                        // Port of erts/emulator/beam/bif.c:2581 (SEND_YIELD): a
+                                        // busy port suspended the sender; the send is redone
+                                        // when it is resumed.
+                                        Err(VmError::Trap(_))
+                                            if crate::port::take_busy_suspend() =>
+                                        {
+                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_pc = Some(code_ptr);
+                                            break Ok(RunState::Wait { timeout_ms: None });
+                                        }
+                                        Err(error) => return Err(error),
+                                    };
                                     process.x[0] = value;
                                     if !resume_after_native_return(process) {
                                         break Ok(RunState::Done(value));
@@ -4394,7 +4407,7 @@ impl Process {
                 "send",
                 &[value, target],
             );
-            crate::port::send_message(self, target, value)?;
+            crate::port::process_send(self, target, value)?;
             return Ok(value);
         }
         // Port of erts/emulator/beam/erl_message.c (`erts_send` / remote_send), OTP-29.1.1.
@@ -4439,7 +4452,7 @@ impl Process {
                     "badarg",
                 )))
             })?;
-            crate::port::send_message(self, port, value)?;
+            crate::port::process_send(self, port, value)?;
             crate::trace::emit_process(
                 vm.as_deref_mut(),
                 self,
@@ -4640,7 +4653,7 @@ impl Process {
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                     let sender = from;
-                    let before = self.allocated_words(0);
+                    let before = self.message_words_before();
                     let new_prio_len =
                         self.inbox
                             .push_message(message, data, &mut self.heap, old_prio_len)?;
@@ -4672,7 +4685,7 @@ impl Process {
                     let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
-                    let before = self.allocated_words(0);
+                    let before = self.message_words_before();
                     let new_prio_len =
                         self.inbox
                             .push_message(message, data, &mut self.heap, old_prio_len)?;
@@ -5052,11 +5065,21 @@ impl Process {
     /// received, not when it arrives.
     // Port of erts/emulator/beam/erl_message.c:659 (erts_adjust_memory_break(pp, -sz)),
     // OTP-29.1.1.
-    fn uncount_message_words(&mut self, allocated_before: i64) {
-        if self
-            .cold
+    /// Allocated words before a message is queued, only when call_memory tracing needs it:
+    /// summing the heap fragments for every message made draining a long queue quadratic.
+    fn message_words_before(&self) -> Option<i64> {
+        self.cold
             .as_ref()
             .is_some_and(|cold| !cold.call_memory.is_empty())
+            .then(|| self.allocated_words(0))
+    }
+
+    fn uncount_message_words(&mut self, allocated_before: Option<i64>) {
+        if let Some(allocated_before) = allocated_before
+            && self
+                .cold
+                .as_ref()
+                .is_some_and(|cold| !cold.call_memory.is_empty())
         {
             let delta = self.allocated_words(0) - allocated_before;
             if delta > 0 {

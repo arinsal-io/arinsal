@@ -409,7 +409,7 @@ export! {
     /// Port of io.c:5203 (set_busy_port).
     fn set_busy_port(port: *mut c_void, on: c_int) {
         if let Some(port) = port_of(port) {
-            port.host.set_busy(&port, on != 0);
+            port.set_busy_port(on != 0);
         }
     }
 

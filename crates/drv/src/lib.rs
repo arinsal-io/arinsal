@@ -21,6 +21,7 @@ mod hooks;
 mod linebuf;
 mod lock;
 mod poll;
+pub mod port_task;
 mod select;
 mod task;
 mod timer;
@@ -548,8 +549,15 @@ pub trait PortHost: Send + Sync {
     fn trace_timeout(&self, _port: &DriverPort) {}
     /// Process-table data of the connected process (`ERTS_PORT_GET_CONNECTED`).
     fn connected(&self, port: &DriverPort) -> u64;
-    /// Port of io.c:5203 (set_busy_port): `ERTS_PTS_FLG_BUSY_PORT`.
+    /// Port of io.c:5203 (set_busy_port): `ERTS_PTS_FLG_BUSY_PORT` changed.
     fn set_busy(&self, port: &DriverPort, on: bool);
+    /// Port of erl_process.c:9413 (erts_resume_processes): resume the processes
+    /// (process-table data) that were suspended on the busy port.
+    fn resume_processes(&self, port: &DriverPort, pids: Vec<u64>);
+    /// `profile_runnable_port`: the port became runnable (`active`) or inactive.
+    fn profile_runnable_port(&self, _port: &DriverPort, _active: bool) {}
+    /// `trace_sched_ports`: the port is scheduled in or out.
+    fn trace_sched_port(&self, _port: &DriverPort, _scheduled_in: bool) {}
     /// Port of io.c:7006 (do_driver_monitor_process): monitor process `pid` for
     /// `port` under `monitor`. `false` when the process does not exist. When it
     /// exits the VM calls [`DriverPort::process_exit`].
@@ -576,6 +584,8 @@ const SFLG_SOFT_EOF: u32 = 2;
 const SFLG_LINEBUF_IO: u32 = 4;
 const SFLG_TERMINATING: u32 = 8;
 const SFLG_STARTED: u32 = 16;
+/// `stop` is running: unlike a closing port, it may still output (io.c:3698).
+const SFLG_STOPPING: u32 = 32;
 
 /// The driver side of one port (`Port` fields used by drivers in erts).
 pub struct DriverPort {
@@ -605,6 +615,8 @@ pub struct DriverPort {
     os_pid: AtomicI64,
     /// An `open_port` is waiting for `erl_drv_init_ack`.
     async_open: std::sync::atomic::AtomicBool,
+    /// `prt->sched`: the port's task queues and scheduling flags.
+    sched: port_task::PortSched,
 }
 
 /// Set in `DriverPort::caller` while a callback has a caller (pid data 0 is a valid pid).
@@ -658,6 +670,7 @@ impl DriverPort {
             msgq_limits: Mutex::new(ext::MSGQ_LIMITS_DEFAULT),
             os_pid: AtomicI64::new(-1),
             async_open: std::sync::atomic::AtomicBool::new(false),
+            sched: port_task::PortSched::default(),
         });
         registry()
             .lock()
@@ -1012,11 +1025,14 @@ impl DriverPort {
         if previous & SFLG_STARTED != 0
             && let Some(stop) = self.driver.callbacks.stop
         {
+            self.state.fetch_or(SFLG_STOPPING, Ordering::AcqRel);
             // SAFETY: drv_data came from start and stop runs once.
             unsafe { stop(self.data()) };
+            self.state.fetch_and(!SFLG_STOPPING, Ordering::AcqRel);
         }
         registry().lock().unwrap().remove(&(self.handle() as usize));
         self.release_resources();
+        self.sched_free();
         true
     }
 
@@ -1032,7 +1048,7 @@ impl DriverPort {
     /// Port of io.c:6381 (driver_output2).
     fn output2(&self, header: &[u8], data: Option<&[u8]>) -> c_int {
         let state = self.state.load(Ordering::Acquire);
-        if state & SFLG_TERMINATING != 0 {
+        if state & (SFLG_TERMINATING | SFLG_STOPPING) == SFLG_TERMINATING {
             return 0;
         }
         let binary = state & SFLG_BINARY_IO != 0;

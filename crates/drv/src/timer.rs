@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::task::{self, Task, call1};
+use crate::task::call1;
 use crate::{DriverPort, REDS_TIMEOUT};
 
 /// `c_p->common.timer` of a port (`ERTS_PTMR_NONE`, a timer, `ERTS_PTMR_TIMEDOUT`).
@@ -113,10 +113,8 @@ impl DriverPort {
         let epoch = self.timer_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         if tmo == 0 {
             *timer = PortTimer::TimedOut { epoch };
-            task::schedule(Task::Timeout {
-                port: Arc::downgrade(self),
-                epoch,
-            });
+            drop(timer);
+            self.schedule_timeout(epoch);
             return;
         }
         // get_timeout_pos: one tick beyond the requested time.
@@ -161,35 +159,29 @@ impl DriverPort {
         let mut timer = self.timer.lock().unwrap();
         if matches!(*timer, PortTimer::Armed { epoch: g, .. } if g == epoch) {
             *timer = PortTimer::TimedOut { epoch };
-            task::schedule(Task::Timeout {
-                port: Arc::downgrade(self),
-                epoch,
-            });
+            drop(timer);
+            self.schedule_timeout(epoch);
         }
     }
 
     /// Port of erl_port_task.c:1760 (ERTS_PORT_TASK_TIMEOUT) with the default callback of
-    /// io.c:7535 (no_timeout_callback).
-    pub(crate) fn run_timeout(&self, epoch: u64) {
-        let _guard = self.guard();
+    /// io.c:7535 (no_timeout_callback), run by the port executor with the port locked.
+    /// Returns the reductions of the task.
+    pub(crate) fn run_timeout_task(&self, epoch: u64) -> i32 {
         {
             let mut timer = self.timer.lock().unwrap();
             if !matches!(*timer, PortTimer::TimedOut { epoch: g } if g == epoch) {
-                return; // cancelled or replaced while queued
+                return 0; // cancelled or replaced while queued
             }
             *timer = PortTimer::None;
         }
         if !self.live() {
-            return;
+            return REDS_TIMEOUT;
         }
-        self.start_task();
-        self.add_reds(REDS_TIMEOUT);
         if let Some(callback) = self.driver.callbacks.timeout {
             self.host.trace_timeout(self);
-            let started = std::time::Instant::now();
             call1(callback, self.data());
-            self.host
-                .task_done(self, "timeout", started.elapsed().as_nanos() as u64);
         }
+        REDS_TIMEOUT
     }
 }

@@ -1987,12 +1987,22 @@ pub(crate) fn native_send3(
         _ => return Err(badarg()),
     };
     let mut want_priority = false;
+    let mut nosuspend = false;
     for option in &names {
         match option {
-            OwnedTerm::Atom(name) if name == "nosuspend" || name == "noconnect" => {}
+            OwnedTerm::Atom(name) if name == "nosuspend" => nosuspend = true,
+            OwnedTerm::Atom(name) if name == "noconnect" => {}
             OwnedTerm::Atom(name) if name == "priority" => want_priority = true,
             _ => return Err(badarg()),
         }
+    }
+    if nosuspend {
+        // Port of erts/emulator/beam/bif.c:2390 (send_3): a busy port gives `nosuspend`.
+        let (sent, busy) = crate::port::send_nosuspend(|| {
+            process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)
+        });
+        sent?;
+        return Ok(atom(if busy { "nosuspend" } else { "ok" }));
     }
     // Local priority delivery needs the process send path (alias + flag).
     process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)?;

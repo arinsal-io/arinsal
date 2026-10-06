@@ -1069,6 +1069,12 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
     {
         return Ok((module.to_owned(), function.to_owned(), arity));
     }
+    // A send suspended on a busy port yields to the send/2 export (bif.c:2581 SEND_YIELD).
+    if process.cold.as_ref().and_then(|cold| cold.native_retry)
+        == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY)
+    {
+        return Ok(("erlang".to_owned(), "send".to_owned(), 2));
+    }
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module, function.function, function.arity));
     }

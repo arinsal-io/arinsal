@@ -1419,12 +1419,23 @@ pub(crate) fn native_send3(
 ) -> Result<Term, VmError> {
     let options = list(args[2]).ok_or_else(|| badarg("erlang:send/3"))?;
     let mut want_priority = false;
+    let mut nosuspend = false;
     for option in &options {
         if *option == atom("priority") {
             want_priority = true;
-        } else if *option != atom("nosuspend") && *option != atom("noconnect") {
+        } else if *option == atom("nosuspend") {
+            nosuspend = true;
+        } else if *option != atom("noconnect") {
             return Err(badarg("erlang:send/3"));
         }
+    }
+    if nosuspend {
+        // Port of erts/emulator/beam/bif.c:2390 (send_3): a busy port gives `nosuspend`.
+        let (sent, busy) = crate::port::send_nosuspend(|| {
+            process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)
+        });
+        sent?;
+        return Ok(atom(if busy { "nosuspend" } else { "ok" }));
     }
     process.send_message_prio(Some(vm), Some(ctx), args[0], args[1], want_priority)?;
     Ok(atom("ok"))

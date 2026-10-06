@@ -19,6 +19,8 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+mod drv_sig;
+
 // Port of erts/emulator/beam/erl_bif_port.c:824 (open_port defaults), OTP-29.1.1.
 const DEFAULT_HIGH: usize = 8192;
 const DEFAULT_LOW: usize = 4096;
@@ -103,6 +105,63 @@ fn write_port_exec_config(
 thread_local! {
     /// Set when `port_command` must suspend the caller and retry the call.
     static BUSY_SUSPEND: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
+    /// `erlang:send/3` with `[nosuspend]` is sending (`ERTS_PORT_SIG_FLG_NOSUSPEND`).
+    static SEND_NOSUSPEND: Cell<bool> = const { Cell::new(false) };
+    /// A nosuspend send found the port busy: `send/3` returns `nosuspend`.
+    static SEND_BUSY_NOSUSPEND: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run a send of `erlang:send/3` with `[nosuspend]`; `true` when a port was busy and the
+/// message was not sent.
+pub(crate) fn send_nosuspend<R>(send: impl FnOnce() -> R) -> (R, bool) {
+    SEND_NOSUSPEND.with(|flag| flag.set(true));
+    SEND_BUSY_NOSUSPEND.with(|flag| flag.set(false));
+    let result = send();
+    SEND_NOSUSPEND.with(|flag| flag.set(false));
+    (result, SEND_BUSY_NOSUSPEND.with(|flag| flag.replace(false)))
+}
+
+/// `Port ! Message` from a running process: port of erts/emulator/beam/bif.c:2560
+/// (erts_send to an internal port). A busy port suspends the sender: either the send is
+/// redone after the suspension (nothing sent) or the process yields after it.
+pub(crate) fn process_send(
+    process: &mut Process,
+    port: Term,
+    message: Term,
+) -> Result<(), VmError> {
+    let nosuspend = SEND_NOSUSPEND.with(Cell::get);
+    match send_from_process(process, port, message, nosuspend)? {
+        PortSend::Sent => Ok(()),
+        PortSend::SentSuspended => {
+            // SEND_YIELD_RETURN: the send is done; the process leaves the scheduler.
+            process.force_yield = true;
+            Ok(())
+        }
+        PortSend::Busy if nosuspend => {
+            SEND_BUSY_NOSUSPEND.with(|flag| flag.set(true));
+            Ok(())
+        }
+        PortSend::Busy => {
+            // SEND_YIELD: the suspended send is redone when the port is no longer busy.
+            BUSY_SUSPEND.with(|flag| flag.set(true));
+            Err(badarg())
+        }
+    }
+}
+
+/// `true` when `target` names a local port (by id or registered name).
+pub(crate) fn is_port_target(process: &Process, target: Term) -> bool {
+    if target.as_port().is_some() {
+        return true;
+    }
+    target
+        .as_atom()
+        .and_then(|name| global_atoms().text(name))
+        .zip(process.runtime.as_ref())
+        .is_some_and(|(name, runtime)| runtime.port_names.lock().unwrap().contains_key(name))
 }
 
 /// True once, when the running BIF asked to suspend on a busy port.
@@ -1058,6 +1117,7 @@ struct DriverIoFlags {
 
 /// `ERL_DRV_FLAG_USE_INIT_ACK`.
 const ERL_DRV_FLAG_USE_INIT_ACK: i32 = 1 << 3;
+const ERL_DRV_FLAG_NO_BUSY_MSGQ: i32 = 1 << 2;
 
 /// Port of erts/emulator/beam/io.c:542 (erts_open_driver) for a dynamically loaded
 /// driver, with the state flags erl_bif_port.c:1140 sets after `start`.
@@ -1086,18 +1146,24 @@ fn start_dyn_driver(
     install_poll_backend();
     let host = DrvHost {
         runtime: Arc::downgrade(&runtime),
+        own: Arc::downgrade(&handle),
     };
     let drv_port = arinsal_drv::DriverPort::new(Arc::clone(&driver), port_id, Box::new(host));
     let _ = handle.driver.set(Arc::clone(&drv_port));
     if let Some(handle_id) = handle_id {
         crate::ddll::port_opened(handle_id, &drv_port);
     }
-    // Port of io.c:683: the message queue limits are set before `start`.
-    let (low, high) = io.msgq.unwrap_or((
-        arinsal_drv::BUSY_MSGQ_DISABLED,
-        arinsal_drv::BUSY_MSGQ_DISABLED,
-    ));
-    drv_port.set_msgq_limits(low, high);
+    // Port of io.c:318 and io.c:683: drivers without ERL_DRV_FLAG_NO_BUSY_MSGQ have a busy
+    // port message queue; open_port limits are set before `start`.
+    if let Some((low, high)) = io.msgq {
+        drv_port.set_msgq_limits(low, high);
+    } else if driver.flags() & ERL_DRV_FLAG_NO_BUSY_MSGQ != 0 {
+        drv_port.set_msgq_limits(
+            arinsal_drv::BUSY_MSGQ_DISABLED,
+            arinsal_drv::BUSY_MSGQ_DISABLED,
+        );
+    }
+    drv_port.set_parallelism(io.parallelism);
     runtime
         .ports
         .lock()
@@ -1159,6 +1225,9 @@ fn packed_pid(pid: Pid) -> u64 {
 /// `PortHost` for a dynamically loaded driver port.
 struct DrvHost {
     runtime: Weak<crate::process::Runtime>,
+    /// The port itself: `stop` still delivers output after the port left the table
+    /// (io.c:3698 terminate_port runs after erts_deliver_port_exit unlinked it).
+    own: Weak<PortHandle>,
 }
 
 impl DrvHost {
@@ -1170,6 +1239,7 @@ impl DrvHost {
             .unwrap()
             .get(&id)
             .cloned()
+            .or_else(|| self.own.upgrade())
     }
 }
 
@@ -1458,16 +1528,36 @@ impl arinsal_drv::PortHost for DrvHost {
         let Some(handle) = self.handle(port.id()) else {
             return;
         };
-        let woken = {
-            let mut st = handle.state.lock().unwrap();
-            st.busy_port = on;
-            if !on && !st.busy_msgq {
-                std::mem::take(&mut st.suspended)
-            } else {
-                Vec::new()
-            }
+        handle.state.lock().unwrap().busy_port = on;
+    }
+
+    // Port of erts/emulator/beam/erl_port_task.c:107 (profile_runnable_port), OTP-29.1.1.
+    fn profile_runnable_port(&self, port: &arinsal_drv::DriverPort, active: bool) {
+        let Some(handle) = self.handle(port.id()) else {
+            return;
         };
-        wake_suspended(&handle.scheduler, woken);
+        crate::natives::misc::profile_port_event(
+            &handle.scheduler,
+            handle.owner_pid(),
+            port.id(),
+            active,
+        );
+    }
+
+    // Port of erts/emulator/beam/erl_process.c:9413 (erts_resume_processes), OTP-29.1.1.
+    fn resume_processes(&self, _port: &arinsal_drv::DriverPort, pids: Vec<u64>) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        let Ok(scheduler) = runtime.scheduler() else {
+            return;
+        };
+        for pid in pids {
+            let pid = Pid::from_data(pid);
+            if runtime.resume_internal(pid) {
+                let _ = scheduler.signal(pid, pid, arinsal_sched::Signal::UnlinkAck(u64::MAX));
+            }
+        }
     }
 
     // Port of erts/emulator/beam/io.c:7006 (do_driver_monitor_process), OTP-29.1.1.
@@ -1560,6 +1650,7 @@ impl arinsal_drv::PortHost for DrvHost {
             port_id,
             Box::new(DrvHost {
                 runtime: self.runtime.clone(),
+                own: Arc::downgrade(&handle),
             }),
         );
         drv_port.adopt(drv_data);
@@ -1685,6 +1776,7 @@ pub(crate) fn log_error_for(runtime: &Weak<crate::process::Runtime>, text: &str)
     arinsal_drv::PortHost::log_error(
         &DrvHost {
             runtime: runtime.clone(),
+            own: Weak::new(),
         },
         text,
     );
@@ -2205,6 +2297,56 @@ fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
     }
 }
 
+/// Port of erts/emulator/beam/io.c:1186-1200 (erts_schedule_proc2port_signal with a
+/// reply reference): no reply can be queued yet, so the receive that waits for it starts
+/// at the end of the message queue (`erts_msgq_set_save_end`).
+/// The reply can already be here when the port task ran first: the receive then starts at it.
+fn set_save_end(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    reference: Term,
+) -> Result<(), VmError> {
+    let Some(id) = crate::signals::ref_id(reference) else {
+        return Ok(());
+    };
+    process.drain(ctx)?;
+    let len = process.inbox.len();
+    let start = process.receive_cursor.min(len);
+    let reply = (start..len).find(|&index| {
+        process
+            .inbox
+            .get(index)
+            .and_then(|message| tuple(*message))
+            .is_some_and(|parts| parts.len() == 2 && crate::signals::ref_id(parts[0]) == Some(id))
+    });
+    process.receive_cursor = reply.unwrap_or(len);
+    if let Some(cold) = process.cold.as_mut() {
+        cold.priority_resume_cursor = None;
+    }
+    Ok(())
+}
+
+/// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend) with a busy port: `false`
+/// when the port stopped being busy, and the operation is to be retried at once.
+fn suspend_on_busy(
+    process: &Process,
+    handle: &PortHandle,
+    drv: &arinsal_drv::DriverPort,
+    pid: Pid,
+) -> bool {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return false;
+    };
+    // Suspended before it is queued on the port, so a resume racing with this cannot be lost.
+    runtime.suspend_internal(pid);
+    if !drv.save_suspend_process(packed_pid(pid)) {
+        runtime.resume_internal(pid);
+        return false;
+    }
+    crate::natives::erts_debug::notify_busy_port(process, pid, handle.id);
+    true
+}
+
 fn refresh_busy(st: &mut PortState, limits: &BusyLimits) -> Vec<Pid> {
     // Port of erts/emulator/sys/unix/sys_drivers.c:1479 (ready_output low watermark), OTP-29.1.1.
     if limits.port_enabled && st.busy_port && st.outq.len() < limits.port_low {
@@ -2700,7 +2842,12 @@ pub(crate) fn family(
         ("port_command", [port, data, _]) if module == "erts_internal" => {
             port_command(process, ctx, *port, *data, args)
         }
-        ("port_close", [port]) if module == "erts_internal" => close(process, *port),
+        ("port_close", [port]) if module == "erts_internal" => {
+            port_close(process, ctx.pid(), *port).and_then(|result| {
+                set_save_end(process, ctx, result)?;
+                Ok(result)
+            })
+        }
         ("port_connect", [port, pid]) if module == "erts_internal" => {
             connect(process, *port, *pid, None)
         }
@@ -2708,7 +2855,10 @@ pub(crate) fn family(
         // Spawn and fd ports have no driver control. The internal BIF returns the
         // atom `badarg`; `erlang:port_control/3` turns that atom into an exception.
         ("port_control", [port, op, data]) if module == "erts_internal" => {
-            port_control(process, ctx.pid(), *port, *op, *data)
+            port_control(process, ctx.pid(), *port, *op, *data).and_then(|result| {
+                set_save_end(process, ctx, result)?;
+                Ok(result)
+            })
         }
         // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
         // Spawn/fd/inet ports here have no driver call path; return the atom `badarg`.
@@ -2867,7 +3017,7 @@ fn io_pieces(term: Term, out: &mut Vec<(Vec<u8>, bool)>) -> Option<()> {
 fn driver_control(
     process: &mut Process,
     caller: Pid,
-    drv_port: &arinsal_drv::DriverPort,
+    drv_port: &Arc<arinsal_drv::DriverPort>,
     op: Term,
     data: Term,
 ) -> Result<Term, VmError> {
@@ -2879,57 +3029,7 @@ fn driver_control(
         return Ok(atom("badarg"));
     }
     let bytes = pieces.into_iter().flat_map(|(b, _)| b).collect::<Vec<_>>();
-    trace_port_receive_indexed(process, caller, drv_port.id(), "control", opcode, &bytes);
-    let started = std::time::Instant::now();
-    let reply = drv_port.control(opcode, &bytes, packed_pid(caller));
-    if let (Some(port), Some(runtime)) = (Term::port(drv_port.id()), process.runtime.as_ref()) {
-        crate::natives::erts_debug::after_port_task(
-            runtime,
-            port,
-            caller,
-            "proc_sig",
-            started.elapsed().as_nanos() as u64,
-        );
-    }
-    let Some(reply) = reply else {
-        return Ok(atom("badarg"));
-    };
-    if let Some(handle) = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.ports.lock().unwrap().get(&drv_port.id()).cloned())
-        && let Some(port) = Term::port(drv_port.id())
-    {
-        let response = match &reply {
-            arinsal_drv::ControlReply::Nil => &[][..],
-            arinsal_drv::ControlReply::Binary(bytes) | arinsal_drv::ControlReply::List(bytes) => {
-                bytes.as_slice()
-            }
-        };
-        let mut trace_heap = VecHeap::new();
-        if let Ok(binary) = TermBuilder::new(&mut trace_heap).binary(response)
-            && let Ok(control) = TermBuilder::new(&mut trace_heap).tuple(&[atom("control"), binary])
-            && let Ok(message) = TermBuilder::new(&mut trace_heap).tuple(&[port, control])
-        {
-            trace_port_send(
-                &handle.scheduler,
-                handle.trace_scope,
-                drv_port.id(),
-                caller,
-                message,
-            );
-        }
-    }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    match reply {
-        arinsal_drv::ControlReply::Nil => Ok(Term::NIL),
-        arinsal_drv::ControlReply::Binary(bytes) => builder.binary(&bytes),
-        arinsal_drv::ControlReply::List(bytes) => {
-            builder.list_from_iter(bytes.iter().map(|b| Term::small(*b as i64).unwrap()))
-        }
-    }
-    .map_err(|_| badarg())
+    drv_sig::control(process, caller, drv_port, opcode, bytes)
 }
 
 /// Next local port id for `open_port`, or `system_limit` when the port table is full.
@@ -2939,7 +3039,7 @@ fn notsup() -> VmError {
 }
 
 fn port_command(
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     port: Term,
     data: Term,
@@ -2975,46 +3075,38 @@ fn port_command(
             }
         }
     }
-    if let Some(drv_port) = handle.driver.get() {
-        // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for a loaded driver.
-        {
-            let mut st = handle.state.lock().unwrap();
-            let soft_busy = drv_port.driver().flags() & ERL_DRV_FLAG_SOFT_BUSY != 0;
-            let forced = force && soft_busy;
-            if st.busy_port && !forced {
-                if nosuspend {
-                    return Ok(atom("false"));
+    if let Some(drv_port) = handle.driver.get().cloned() {
+        // Port of erts/emulator/beam/erl_bif_port.c:168 (erts_internal_port_command_3).
+        let flags = drv_sig::OutputFlags {
+            bang: false,
+            nosuspend,
+            force,
+        };
+        loop {
+            let pid = ctx.pid();
+            match drv_sig::output(process, pid, &handle, &drv_port, pid, data, flags, true) {
+                drv_sig::PortOp::Done => return Ok(atom("true")),
+                drv_sig::PortOp::Dropped | drv_sig::PortOp::Badarg => return Ok(atom("badarg")),
+                drv_sig::PortOp::Busy if nosuspend => return Ok(atom("false")),
+                drv_sig::PortOp::Busy => {
+                    if suspend_on_busy(process, &handle, &drv_port, pid) {
+                        BUSY_SUSPEND.with(|flag| flag.set(true));
+                        return Err(badarg());
+                    }
                 }
-                st.suspended.push(ctx.pid());
-                drop(st);
-                crate::natives::erts_debug::notify_busy_port(process, ctx.pid(), id);
-                BUSY_SUSPEND.with(|flag| flag.set(true));
-                return Err(badarg());
+                drv_sig::PortOp::BusyScheduled(reference)
+                | drv_sig::PortOp::Scheduled(reference) => {
+                    return match reference {
+                        Some(reference) => {
+                            let reference = drv_sig::reference_term(process, reference)?;
+                            set_save_end(process, ctx, reference)?;
+                            Ok(reference)
+                        }
+                        None => Ok(atom("true")),
+                    };
+                }
             }
         }
-        let mut pieces = Vec::new();
-        io_pieces(data, &mut pieces).ok_or_else(badarg)?;
-        let pieces = pieces
-            .iter()
-            .map(|(bytes, refc)| {
-                if *refc {
-                    arinsal_drv::IoPiece::Refc(bytes)
-                } else {
-                    arinsal_drv::IoPiece::Copied(bytes)
-                }
-            })
-            .collect::<Vec<_>>();
-        trace_command_received(
-            process,
-            ctx.pid(),
-            id,
-            &pieces,
-            drv_port.outputv_trace_segments(&pieces),
-        );
-        if !drv_port.output(&pieces, packed_pid(ctx.pid())) {
-            return Err(badarg());
-        }
-        return Ok(atom("true"));
     }
     let mut framed = iodata(data).ok_or_else(badarg)?;
     if handle.inet {
@@ -3188,9 +3280,23 @@ fn trace_port_receive_indexed(
     index: u32,
     data: &[u8],
 ) {
-    if process.runtime.is_none() {
-        return;
+    if let Some(runtime) = process.runtime.as_ref() {
+        trace_port_receive_indexed_rt(runtime, caller, id, name, index, data);
     }
+}
+
+/// `trace_port_receive(prt, caller, Name, Index, Data)` (erl_trace.c) without a process.
+fn trace_port_receive_indexed_rt(
+    runtime: &crate::process::Runtime,
+    caller: Pid,
+    id: u64,
+    name: &str,
+    index: u32,
+    data: &[u8],
+) {
+    let Some(caller) = caller.to_term() else {
+        return;
+    };
     let mut heap = VecHeap::new();
     let Ok(data) = TermBuilder::new(&mut heap).binary(data) else {
         return;
@@ -3203,7 +3309,10 @@ fn trace_port_receive_indexed(
     let Ok(message) = TermBuilder::new(&mut heap).tuple(&[atom(name), arg]) else {
         return;
     };
-    trace_port_receive_term(process, caller, id, message);
+    let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, message]) else {
+        return;
+    };
+    crate::trace::emit_port_event(runtime, id, crate::trace::RECEIVE, "receive", &[event]);
 }
 
 // Port of erts/emulator/sys/unix/sys_drivers.c:1039 (stop), OTP-29.1.1.
@@ -3283,6 +3392,40 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
     }
 }
 
+// Port of erts/emulator/beam/erl_bif_port.c:233 (erts_internal_port_close_1), OTP-29.1.1.
+fn port_close(process: &mut Process, caller: Pid, port: Term) -> Result<Term, VmError> {
+    if let Some(id) = port.as_port()
+        && let Some(handle) = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
+        && let Some(drv) = handle.driver.get().cloned()
+    {
+        if let Some(caller_term) = caller.to_term()
+            && let Some(runtime) = process.runtime.as_ref()
+        {
+            let mut heap = VecHeap::new();
+            if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller_term, atom("close")]) {
+                crate::trace::emit_port_event(
+                    runtime,
+                    id,
+                    crate::trace::RECEIVE,
+                    "receive",
+                    &[event],
+                );
+            }
+        }
+        let normal = OwnedTerm::Atom("normal".into());
+        return match drv_sig::exit(process, caller, &handle, &drv, false, caller, normal, true) {
+            Ok(Some(reference)) => drv_sig::reference_term(process, reference),
+            Ok(None) => Ok(atom("true")),
+            // erl_bif_port.c:405: a dropped close answers `badarg`.
+            Err(_) => Ok(atom("badarg")),
+        };
+    }
+    close(process, port)
+}
+
 /// Close a runtime port selected by its internal id.
 pub(crate) fn close_by_id(
     process: &Process,
@@ -3310,6 +3453,16 @@ pub(crate) fn exit_port(
     let Some(runtime) = process.runtime.as_ref() else {
         return Ok(());
     };
+    let handle = runtime.ports.lock().unwrap().get(&id).cloned();
+    if let Some(handle) = handle
+        && let Some(drv) = handle.driver.get().cloned()
+    {
+        let reason = to_owned(reason).map_err(|_| badarg())?;
+        let pid = ctx.pid();
+        // An exit signal to a port that is gone is dropped (bif.c:1794).
+        let _ = drv_sig::exit(process, pid, &handle, &drv, false, pid, reason, false);
+        return Ok(());
+    }
     crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
     let scheduler = runtime.scheduler()?;
     let Some(removed) = remove_and_notify(runtime, id, &scheduler, ctx.pid(), reason) else {
@@ -3523,6 +3676,19 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
         return Ok(!linked);
     };
+    if !linked {
+        // The unlinking process traces `unlink` when it sends the signal (bif.c unlink_1).
+        crate::trace::emit_external_process_event(
+            runtime,
+            pid,
+            crate::trace::PROCS,
+            "unlink",
+            &[port],
+        );
+    }
+    if let Some(drv) = handle.driver.get().cloned() {
+        return Ok(drv_sig::link(runtime, &handle, &drv, pid, linked) || !linked);
+    }
     // Termination removes the port from the table and drains `links` in one critical section
     // of the table lock (`remove_and_notify`); taking the locks in the same order makes this
     // registration either visible to it or refused.
@@ -3538,15 +3704,6 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     }
     drop(links);
     drop(ports);
-    if !linked {
-        crate::trace::emit_external_process_event(
-            runtime,
-            pid,
-            crate::trace::PROCS,
-            "unlink",
-            &[port],
-        );
-    }
     if let Some(pid_term) = pid.to_term() {
         crate::trace::emit_port_event(
             runtime,
@@ -3807,15 +3964,64 @@ pub(crate) fn nif_port_command(
 }
 
 pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Result<(), VmError> {
+    send_message_inner(process, port, message, false).map(|_| ())
+}
+
+/// Outcome of `Port ! Message` from a process (erts_send to a port, bif.c:2560).
+pub(crate) enum PortSend {
+    /// Sent or dropped: the send is complete.
+    Sent,
+    /// Sent, and the sender is now suspended on the busy port (`SEND_YIELD_RETURN`).
+    SentSuspended,
+    /// Nothing was sent: the port is busy (`SEND_YIELD`). The sender is suspended
+    /// unless `nosuspend` was given.
+    Busy,
+}
+
+/// `Port ! Message` from process code; `nosuspend` is `erlang:send/3` with `[nosuspend]`.
+pub(crate) fn send_from_process(
+    process: &mut Process,
+    port: Term,
+    message: Term,
+    nosuspend: bool,
+) -> Result<PortSend, VmError> {
+    loop {
+        match send_message_inner(process, port, message, nosuspend)? {
+            (PortSend::Busy, Some((handle, drv))) if !nosuspend => {
+                let pid = process.self_pid.ok_or_else(badarg)?;
+                if suspend_on_busy(process, &handle, &drv, pid) {
+                    return Ok(PortSend::Busy);
+                }
+            }
+            (PortSend::SentSuspended, Some((handle, drv))) => {
+                let pid = process.self_pid.ok_or_else(badarg)?;
+                if suspend_on_busy(process, &handle, &drv, pid) {
+                    return Ok(PortSend::SentSuspended);
+                }
+                return Ok(PortSend::Sent);
+            }
+            (outcome, _) => return Ok(outcome),
+        }
+    }
+}
+
+type DrvTarget = Option<(Arc<PortHandle>, Arc<arinsal_drv::DriverPort>)>;
+
+fn send_message_inner(
+    process: &Process,
+    port: Term,
+    message: Term,
+    nosuspend: bool,
+) -> Result<(PortSend, DrvTarget), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     // A message to a dead local port is dropped (erts_port_command DROPPED).
     let Some(handle) = runtime.ports.lock().unwrap().get(&id).cloned() else {
-        return Ok(());
+        return Ok(sent());
     };
     let Some(parts) = tuple(message) else {
         signal_badsig(&handle, id);
-        return Ok(());
+        return Ok(sent());
     };
     // Port of erts/emulator/beam/io.c:3991 (erts_port_command): the first element names the
     // connected process (checked per operation), not necessarily the sender.
@@ -3826,13 +4032,36 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
     };
     let Some(from) = from else {
         signal_badsig(&handle, id);
-        return Ok(());
+        return Ok(sent());
     };
     let from_connected = *handle.owner.lock().unwrap() == from;
+    let drv = handle.driver.get().cloned();
+    if let Some(drv) = &drv
+        && (parts[1] == atom("close")
+            || tuple(parts[1]).is_some_and(|command| {
+                command.len() == 2 && command[0] == atom("connect") && command[1].as_pid().is_some()
+            }))
+    {
+        // Port of erts/emulator/beam/io.c:3975 (erts_port_command): `close` and `connect`
+        // are port signals checked against the connected process when they execute.
+        let sender = process.self_pid.unwrap_or(from);
+        if from_connected {
+            trace_port_receive_term(process, from, id, parts[1]);
+        }
+        if parts[1] == atom("close") {
+            let normal = OwnedTerm::Atom("normal".into());
+            let _ = drv_sig::exit(process, sender, &handle, drv, true, from, normal, false);
+        } else {
+            let command = tuple(parts[1]).unwrap_or_default();
+            let pid = Pid::from_term(command[1]).ok_or_else(badarg)?;
+            drv_sig::connect(process, sender, &handle, drv, from, pid);
+        }
+        return Ok(sent());
+    }
     if parts[1] == atom("close") {
         if !from_connected {
             signal_badsig(&handle, id);
-            return Ok(());
+            return Ok(sent());
         }
         trace_port_receive_term(process, from, id, parts[1]);
         if handle.os_pid == 0 {
@@ -3845,9 +4074,9 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
                 atom("closed"),
             );
             if close_inner(process, port, false).is_err() {
-                return Ok(());
+                return Ok(sent());
             }
-            return Ok(());
+            return Ok(sent());
         }
         let notify_now = {
             let mut state = handle.state.lock().unwrap();
@@ -3870,25 +4099,48 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
         } else {
             poke(&handle);
         }
-        return Ok(());
+        return Ok(sent());
     }
     let Some(command) = tuple(parts[1]) else {
         signal_badsig(&handle, id);
-        return Ok(());
+        return Ok(sent());
     };
-    if command.len() == 2 && command[0] == atom("command") && !from_connected {
+    if command.len() == 2 && command[0] == atom("command") && !from_connected && drv.is_none() {
         // io.c:1887 (erts_port_output, bang op): only the connected process may command.
         signal_badsig(&handle, id);
-        return Ok(());
+        return Ok(sent());
+    }
+    if command.len() == 2
+        && command[0] == atom("command")
+        && let Some(drv_port) = drv
+    {
+        // Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `Port ! {Pid, {command, D}}`.
+        let flags = drv_sig::OutputFlags {
+            bang: true,
+            nosuspend,
+            force: false,
+        };
+        let sender = process.self_pid.unwrap_or(from);
+        return Ok(
+            match drv_sig::output(
+                process, sender, &handle, &drv_port, from, command[1], flags, false,
+            ) {
+                drv_sig::PortOp::Busy => (PortSend::Busy, Some((handle, drv_port))),
+                drv_sig::PortOp::BusyScheduled(_) => {
+                    (PortSend::SentSuspended, Some((handle, drv_port)))
+                }
+                _ => sent(),
+            },
+        );
     }
     if command.len() == 2 && command[0] == atom("command") {
         output_command(runtime, &handle, id, from, command[1], Some(process));
-        return Ok(());
+        return Ok(sent());
     }
     if command.len() == 2 && command[0] == atom("connect") {
         if !from_connected || command[1].as_pid().is_none() {
             signal_badsig(&handle, id);
-            return Ok(());
+            return Ok(sent());
         }
         trace_port_receive_term(process, from, id, parts[1]);
         if connect(process, port, command[1], Some(from)).is_err()
@@ -3896,10 +4148,14 @@ pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Resu
         {
             signal_badsig(&handle, id);
         }
-        return Ok(());
+        return Ok(sent());
     }
     signal_badsig(&handle, id);
-    Ok(())
+    Ok(sent())
+}
+
+fn sent() -> (PortSend, DrvTarget) {
+    (PortSend::Sent, None)
 }
 
 /// Send an ETF encoded trace event through the tracer port's command channel.
