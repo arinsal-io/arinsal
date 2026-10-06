@@ -854,23 +854,34 @@ fn save_raw(
     class: Class,
     top: Option<&stacktrace::TopFrame>,
 ) -> Result<Term, VmError> {
+    // Port of erts/emulator/beam/beam_common.c:885 (`save_stacktrace`), OTP-29.1.1:
+    // `erts_backtrace_depth` is runtime-wide, so a process resumed by another scheduler
+    // must use the same limit as the scheduler that handled `system_flag/2`.
+    let depth = p.runtime.as_ref().map_or(depth, |runtime| {
+        runtime
+            .backtrace_depth
+            .load(std::sync::atomic::Ordering::Acquire)
+    });
     let error_pc = p
         .cold
         .as_deref_mut()
         .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
+    let native_pc =
+        Some(error_pc).filter(|&pc| pc != 0 && crate::native_bridge::is_native_function_at(pc));
     let mut raw = stacktrace::RawTrace::default();
     stacktrace::capture(
         &mut raw,
         Some(class),
         top,
         &vm.code.modules,
-        (p.module, p.ip),
+        stacktrace::Current {
+            module: p.module,
+            ip: p.ip,
+            native_pc,
+        },
         &p.heap,
         depth,
     )?;
-    if error_pc != 0 && crate::native_bridge::is_native_function_at(error_pc) {
-        stacktrace::set_native_top(&mut raw, error_pc);
-    }
     stacktrace::store(p, raw)
 }
 

@@ -241,19 +241,32 @@ enum StoredTopFrame {
     CurrentArgsWithInfo(Option<OwnedTerm>, Box<OwnedTerm>),
 }
 
+/// Where the exception was raised: erts' `s->pc` (save_stacktrace's `pc`).
+pub(super) struct Current {
+    /// Last interpreter module and instruction.
+    pub(super) module: usize,
+    pub(super) ip: usize,
+    /// Raising pc inside native code, when the process was executing there.
+    pub(super) native_pc: Option<usize>,
+}
+
 /// Port of erts/emulator/beam/beam_common.c:781 (gather_stacktrace), OTP-29.1.1.
 pub(super) fn capture(
     raw: &mut RawTrace,
     class: Option<Class>,
     top: Option<&TopFrame>,
     modules: &[Arc<Module>],
-    current: (usize, usize),
+    current: Current,
     heap: &ProcessHeap,
     depth: usize,
 ) -> Result<(), VmError> {
     // Port of beam_common.c:600-614 (`erts_inspect_frame`) and beam_common.h:301-315,
     // OTP-29.1.1: continuations are raw CP words resolved back to code metadata.
-    let (module, ip) = current;
+    let Current {
+        module,
+        ip,
+        native_pc,
+    } = current;
     raw.class = class;
     raw.explicit = None;
     raw.top = top
@@ -294,6 +307,21 @@ pub(super) fn capture(
     let mut previous = Some((module, ip));
     // Native return addresses share erts' single `prev`, so the two trackers reset each other.
     let mut previous_native: Option<usize> = None;
+    if let Some(pc) = native_pc {
+        let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
+        if pc & tag != 0 {
+            // Port of erts/emulator/beam/beam_common.c:791-835 (gather_stacktrace), OTP-29.1.1:
+            // the raising pc is the call's return address and seeds `prev`, so the identical
+            // continuation is skipped before it can take a `max_depth` slot; the pc's line is
+            // looked up inside the call instruction.
+            let address = pc & !tag;
+            raw.native_top = Some(address - 1);
+            previous_native = Some(address);
+            previous = None;
+        } else {
+            raw.native_top = Some(pc);
+        }
+    }
     let mut index = 0;
     while index < heap.stack_words() {
         if raw.continuations.len() + 1 >= raw.depth {
@@ -313,6 +341,14 @@ pub(super) fn capture(
                 .and_then(|count| usize::try_from(count).ok())
                 .unwrap_or(0);
             index += 4usize.saturating_add(action_count.saturating_mul(2));
+            continue;
+        }
+        if raw_address == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize {
+            // The interpreter-to-native bridge CP sits in the native callee's CP slot while the
+            // caller's real continuation lies beneath it; erts has only that one CP, so the
+            // bridge word is not a frame of its own (beam_common.c:803-840, OTP-29.1.1).
+            // Recording it would use up a `max_depth` slot that `build_saved` then drops.
+            index += 1;
             continue;
         }
         if raw_address & 3 == 0 && arinsal_term::may_be_native_code_pointer(raw_address) {
@@ -354,25 +390,6 @@ pub(super) fn capture(
         index += 1;
     }
     Ok(())
-}
-
-/// Records the native function and pc at which the exception was raised.
-pub(super) fn set_native_top(raw: &mut RawTrace, pc: usize) {
-    let tag = arinsal_beamasm::module::RETURN_SITE_TAG;
-    if pc & tag != 0 {
-        // Port of erts/emulator/beam/beam_common.c:792-835 (save_stacktrace), OTP-29.1.1:
-        // the raising pc is the call's return address, so the identical continuation is not
-        // recorded again; its line is looked up inside the call instruction.
-        let site = (pc & !tag) - 1;
-        if matches!(raw.continuations.first(),
-            Some(Continuation::Native(address)) if *address == site)
-        {
-            raw.continuations.remove(0);
-        }
-        raw.native_top = Some(site);
-        return;
-    }
-    raw.native_top = Some(pc);
 }
 
 /// Preserve an explicit `raise/3` stacktrace with its class across `try/after`.
@@ -695,29 +712,31 @@ pub(super) fn build(
     top: Option<&TopFrame>,
     depth: usize,
 ) -> Result<Term, VmError> {
+    // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
+    let native_pc = p.cold.as_ref().map_or(0, |cold| cold.native_call_pc);
+    let native_pc = if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
+        Some(native_pc)
+    } else {
+        // A process suspended inside native code: `p.module`/`p.ip` still hold the last
+        // interpreter position, so the current function comes from its native resume pc.
+        p.native_pc
+            .or_else(|| Some(p.header.i as usize).filter(|&pc| pc != 0))
+            .filter(|&pc| crate::native_bridge::is_native_function_at(pc))
+    };
     let mut raw = RawTrace::default();
     capture(
         &mut raw,
         None,
         top,
         modules,
-        (p.module, p.ip),
+        Current {
+            module: p.module,
+            ip: p.ip,
+            native_pc,
+        },
         &p.heap,
         depth,
     )?;
-    // A process inside a native BIF call raises at that call's pc, as in `exceptions.rs`.
-    let native_pc = p.cold.as_ref().map_or(0, |cold| cold.native_call_pc);
-    if native_pc != 0 && crate::native_bridge::is_native_function_at(native_pc) {
-        set_native_top(&mut raw, native_pc);
-    } else if let Some(pc) = p
-        .native_pc
-        .or_else(|| Some(p.header.i as usize).filter(|&pc| pc != 0))
-        && crate::native_bridge::is_native_function_at(pc)
-    {
-        // A process suspended inside native code: `p.module`/`p.ip` still hold the last
-        // interpreter position, so the current function comes from its native resume pc.
-        set_native_top(&mut raw, pc);
-    }
     build_saved(p, &mut raw)
 }
 
