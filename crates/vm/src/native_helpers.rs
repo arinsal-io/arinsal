@@ -231,15 +231,32 @@ pub extern "C" fn arinsal_beamasm_recv_marker_use(header: *mut ProcessHeader, re
     }
 }
 
-/// Peeks the message at the save pointer; zero means there is none (`i_loop_rec`).
+/// Peeks the message at the save pointer (`i_loop_rec`). Zero means the process waits;
+/// [`arinsal_beamasm::receive::LOOP_REC_FETCH`] that the outer signal queue must be fetched
+/// first.
+// Port of erts/emulator/beam/jit/arm/instr_msg.cpp:131-176 (emit_i_loop_rec_shared peek)
+// and erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper),
+// OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
-    process
-        .inbox
-        .get(process.receive_cursor)
-        .map_or(0, |message| crate::native_hooks::raw(*message))
+    if let Some(message) = process.inbox.get(process.receive_cursor) {
+        return crate::native_hooks::raw(*message);
+    }
+    // The inner queue is exhausted. Signals sent since the last fetch (by this process or
+    // any other) wait in the outer queue; the scheduler fetches and handles them. A process
+    // without a probe yet fetches once, which installs it.
+    let pending = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.signal_probe.as_ref())
+        .is_none_or(arinsal_sched::SignalProbe::has_pending);
+    if !pending {
+        return 0;
+    }
+    process.cold_mut().native_signal_fetch = true;
+    u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH)
 }
 
 /// Removes the current message from the mailbox (`remove_message`).

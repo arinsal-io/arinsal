@@ -20,6 +20,10 @@ pub type RecvMarkerClearHook = extern "C" fn(*mut ProcessHeader, u64);
 pub type RecvMarkerUseHook = extern "C" fn(*mut ProcessHeader, u64);
 /// Runtime callback which peeks the next message, returning zero for an empty queue.
 pub type LoopRecHook = extern "C" fn(*mut ProcessHeader) -> u64;
+/// Value the `i_loop_rec` hook returns when the private queue is exhausted but signals wait in
+/// the outer queue: native code schedules out at the `loop_rec` so the scheduler fetches and
+/// handles them with its context, then reruns the instruction (no term word equals it).
+pub const LOOP_REC_FETCH: u16 = 1;
 /// Runtime callback which removes the current message and returns reductions left.
 pub type RemoveMessageHook = extern "C" fn(*mut ProcessHeader, i32, usize) -> i32;
 /// Runtime callback which advances the saved mailbox pointer.
@@ -134,11 +138,35 @@ impl BeamModuleAssembler {
     }
 
     /// Peeks the next message and branches to the wait label when the queue is empty.
-    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:109-238 and instr_msg.cpp:127-133, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:106-238 (emit_i_loop_rec_shared,
+    // emit_i_loop_rec), OTP-29.1.1.
     pub fn emit_i_loop_rec(&mut self, wait: u32, hooks: ReceiveHooks) -> Result<(), ModuleError> {
+        let entry = self.code.new_label();
+        let schedule_out = self.code.new_label();
+        let done = self.code.new_label();
+        self.code.bind(entry)?;
+        // erts checks reductions before peeking and schedules out at the `loop_rec` itself.
+        self.code.emit(|e| e.cmp_imm(FCALLS, 0, false))?;
+        self.code.b_cond(Cond::Le, schedule_out)?;
         self.emit_runtime_hook_with(hooks.loop_rec as usize, &[], 6, crate::Update::NONE)?;
+        // Any word above the sentinel is a message.
+        self.code
+            .emit(|e| e.cmp_imm(Gpr::x(0), LOOP_REC_FETCH, false))?;
+        self.code.b_cond(Cond::Hi, done)?;
+        // The inner queue is empty: erts calls erts_proc_sig_receive_helper, which charges
+        // four reductions per fetch (erl_proc_sig_queue.c:7770).
+        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 4, false))?;
         let wait = self.label(wait);
         self.code.cbz(Gpr::x(0), wait)?;
+        // Signals wait in the outer queue. Their handling needs the scheduler context, which
+        // this runtime keeps on the scheduler side, so the fetch runs there and the process
+        // re-enters at `entry` within the same slice (`emit_i_loop_rec_shared` restarts too).
+        self.code.bind(schedule_out)?;
+        self.code.adr(Gpr::x(8), entry)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
+        self.emit_yield_live(0)?;
+        self.code.b(self.yield_label)?;
+        self.code.bind(done)?;
         self.code.emit(|e| e.mov_reg(XREG0, Gpr::x(0)))?;
         Ok(())
     }

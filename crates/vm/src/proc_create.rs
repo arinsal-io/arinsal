@@ -175,6 +175,10 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait_timeout: Option<u64>,
     /// The pending native wait belongs to a receive without clauses.
     pub(crate) native_wait_self: bool,
+    /// Native `loop_rec` scheduled out so the scheduler fetches the outer signal queue.
+    pub(crate) native_signal_fetch: bool,
+    /// Tells native `loop_rec` whether the outer signal queue holds anything to fetch.
+    pub(crate) signal_probe: Option<arinsal_sched::SignalProbe>,
     /// Static NIF identity, native return point and target scheduler class of a NIF call
     /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,

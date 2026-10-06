@@ -525,6 +525,38 @@ impl Clock for VirtualClock {
     }
 }
 
+/// Lock-free view of whether signals wait in one process's outer signal queue, for code that
+/// runs the process without its [`RunCtx`] (native receive). It does not keep the process
+/// alive; a probe of an exited process reports nothing pending.
+// Port of erts/emulator/beam/erl_process.h:1291 (ERTS_PSFLG_MSG_SIG_IN_Q), OTP-29.1.1.
+#[derive(Clone)]
+pub struct SignalProbe(std::sync::Weak<dyn PendingInput>);
+
+impl SignalProbe {
+    /// Whether the outer signal queue holds unfetched signals.
+    pub fn has_pending(&self) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|process| process.has_pending_input())
+    }
+}
+
+impl std::fmt::Debug for SignalProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalProbe").finish_non_exhaustive()
+    }
+}
+
+trait PendingInput: Send + Sync {
+    fn has_pending_input(&self) -> bool;
+}
+
+impl<T: Task> PendingInput for Process<T> {
+    fn has_pending_input(&self) -> bool {
+        self.input.has_pending()
+    }
+}
+
 struct TaskCell<T: Task> {
     task: T,
     private: Private<Event<T::Message>>,
@@ -2764,6 +2796,7 @@ trait ContextOps<M: Send + 'static> {
         remaining: u32,
     ) -> Result<bool, Error>;
     fn flush(&mut self, remaining: u32);
+    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe>;
     fn total_reductions(&self) -> u64;
     fn scheduler_stats(&self) -> SchedulerStats;
     fn set_msacc_enabled(&mut self, enabled: bool);
@@ -2878,6 +2911,11 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Whether events wait in this process's shared input queue.
     pub fn has_pending_input(&self) -> bool {
         self.input.has_pending()
+    }
+    /// A handle that tells, without this context, whether signals wait in this process's
+    /// shared input queue.
+    pub fn signal_probe(&mut self) -> Option<SignalProbe> {
+        self.inner.signal_probe(self.pid)
     }
     /// Configure the receiver's parallel sender buffers for off heap mailboxes.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694, OTP-29.1.1.
@@ -3727,6 +3765,11 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 self.bounce_monitors(to, lost, remaining);
             }
         }
+    }
+    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe> {
+        let process = self.lookup(pid)?;
+        let process: Arc<dyn PendingInput> = process;
+        Some(SignalProbe(Arc::downgrade(&process)))
     }
     fn total_reductions(&self) -> u64 {
         if self.inner.sim.is_some() {
