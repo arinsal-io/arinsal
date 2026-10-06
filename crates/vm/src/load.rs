@@ -880,6 +880,7 @@ impl Vm {
         };
         let mut local_patches = Vec::new();
         let mut global_patches = Vec::new();
+        let mut native_patches = Vec::new();
         for (entry, function, arity) in targets {
             let (local, global) =
                 crate::trace_bp::breakpoint_kinds(process, &module.name, function, *arity);
@@ -893,34 +894,35 @@ impl Vm {
                 )
                 .is_some()
             {
-                crate::beamasm_integration::patch_native_breakpoint(
-                    self.code_scope,
-                    &module.name,
-                    function,
-                    *arity,
-                    local,
-                );
+                native_patches.push((function.as_str(), *arity, local));
             }
             if module.breakpoint_originals.contains_key(entry) != local {
                 local_patches.push((*entry, local));
             }
             global_patches.push((function.as_str(), *arity, global));
         }
+        crate::beamasm_integration::patch_native_breakpoints(
+            self.code_scope,
+            &module.name,
+            &native_patches,
+        );
         let mut exports_retargeted = false;
+        let global_patches = global_patches
+            .into_iter()
+            .map(|(function, arity, global)| ((function, arity), global))
+            .collect::<HashMap<_, _>>();
         for (index, export) in module.exports.iter().enumerate() {
-            for &(function, arity, global) in &global_patches {
-                if export.function == function && export.arity == arity {
-                    module.set_global_trace_breakpoint(index, global);
-                    exports_retargeted = true;
-                    crate::beamasm_integration::set_global_breakpoint(
-                        self.code_scope,
-                        &module.name,
-                        function,
-                        arity,
-                        export.target(),
-                        global,
-                    );
-                }
+            if let Some(&global) = global_patches.get(&(export.function.as_str(), export.arity)) {
+                module.set_global_trace_breakpoint(index, global);
+                exports_retargeted = true;
+                crate::beamasm_integration::set_global_breakpoint(
+                    self.code_scope,
+                    &module.name,
+                    &export.function,
+                    export.arity,
+                    export.target(),
+                    global,
+                );
             }
         }
         let patched = (!local_patches.is_empty())

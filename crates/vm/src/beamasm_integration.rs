@@ -637,32 +637,38 @@ pub(crate) struct CompiledVersion {
     lambda_entries: Vec<Arc<arinsal_term::FunEntry>>,
 }
 
-/// Enable or remove native entry breakpoints for a traced function.
+/// Enable or remove native entry breakpoints for traced functions of one module.
 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250, OTP-29.1.1.
-pub(crate) fn patch_native_breakpoint(
-    scope: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-    enabled: bool,
-) {
-    let Ok(mut versions) = compiled_versions().write() else {
+// Batched per module: a per-function call rescanned every version's breakpoint table, which made
+// a `{'_','_','_'}` trace pattern quadratic in the loaded code.
+pub(crate) fn patch_native_breakpoints(scope: u64, module: &str, wanted: &[(&str, u8, bool)]) {
+    if wanted.is_empty() {
+        return;
+    }
+    let Ok(versions) = compiled_versions().read() else {
         return;
     };
-    versions.retain(|version| version.strong_count() != 0);
+    let wanted = wanted
+        .iter()
+        .map(|&(function, arity, enabled)| ((function, arity), enabled))
+        .collect::<HashMap<_, _>>();
     for version in versions
         .iter()
         .filter_map(Weak::upgrade)
-        .filter(|version| version.scope == scope)
+        .filter(|version| version.scope == scope && version.module == module)
     {
+        let Ok(mut memory) = version.memory.lock() else {
+            continue;
+        };
         for ((owner, name, found_arity), offset, branch) in &version.trace_breakpoints {
-            if owner != module || name != function || *found_arity != arity {
+            if owner != module {
                 continue;
             }
+            let Some(&enabled) = wanted.get(&(name.as_str(), *found_arity)) else {
+                continue;
+            };
             let instruction = if enabled { 0xd503_201f_u32 } else { *branch };
-            if let Ok(mut memory) = version.memory.lock() {
-                let _ = memory.write_bytes(*offset, &instruction.to_le_bytes());
-            }
+            let _ = memory.write_bytes(*offset, &instruction.to_le_bytes());
         }
     }
 }

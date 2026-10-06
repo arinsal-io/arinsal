@@ -5321,7 +5321,21 @@ impl Process {
             {
                 return true;
             }
-            if in_native(term.tagged_word() as usize) {
+            let word = term.tagged_word() as usize;
+            if in_native(word) {
+                return true;
+            }
+            // A native trace frame keeps the traced function's native return address as a small
+            // integer, three words below its marker (see `trace::push_native_trace_frame`); the
+            // process returns into that code once the traced function exits.
+            if word == crate::trace::native_trace_marker()
+                && self
+                    .heap
+                    .stack_get(index + 2)
+                    .and_then(Term::as_small)
+                    .and_then(|address| usize::try_from(address).ok())
+                    .is_some_and(in_native)
+            {
                 return true;
             }
         }
@@ -6352,6 +6366,28 @@ mod layout_tests {
             arinsal_term::to_owned(term).unwrap(),
             arinsal_etf::OwnedTerm::Tuple(vec![arinsal_etf::OwnedTerm::Int(17)])
         );
+    }
+
+    #[test]
+    fn check_process_code_sees_the_return_address_of_a_native_trace_frame() {
+        // A traced native function leaves its return address on the stack as a small integer;
+        // a purge of the code it returns into has to find it.
+        let mut process = Process::new();
+        let range = (0x4000_usize, 0x5000_usize);
+        let marker = crate::trace::native_trace_marker();
+        assert!(process.heap.reserve_stack(4));
+        let words = [
+            crate::proc_create::native_continuation_term(marker),
+            Term::NIL,
+            Term::small(0x4468).unwrap(),
+            Term::small(0).unwrap(),
+        ];
+        for (index, word) in words.into_iter().enumerate() {
+            process.heap.stack_set(index, word);
+        }
+        assert!(process.references_code(usize::MAX, Some(range)));
+        assert!(!process.references_code(usize::MAX, Some((0x8000, 0x9000))));
+        assert!(!process.references_code(usize::MAX, None));
     }
 
     #[test]
