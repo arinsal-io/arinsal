@@ -2675,6 +2675,11 @@ pub(crate) fn pop_native_trace_frames(
     }
 }
 
+/// The continuation word that starts a native trace frame on the stack.
+pub(crate) fn native_trace_marker() -> usize {
+    arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize
+}
+
 /// Saves native return and exception actions until the traced function exits; `live` is
 /// the traced function's arity, the X registers that are roots if a collection is needed.
 pub(crate) fn push_native_trace_frame(
@@ -2698,7 +2703,7 @@ pub(crate) fn push_native_trace_frame(
     if !process.heap.reserve_stack(frame_words) {
         return Err(VmError::Unsupported("native trace stack limit".into()));
     }
-    let trace_stub = arinsal_beamasm::rt::arinsal_enter_native_trace_return as *const () as usize;
+    let trace_stub = native_trace_marker();
     let metadata = [
         crate::proc_create::native_continuation_term(trace_stub),
         old_cp,
