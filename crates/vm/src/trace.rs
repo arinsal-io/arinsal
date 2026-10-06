@@ -1789,6 +1789,10 @@ fn call_event_scope(
         if bp_flags & (HIT_LOCAL | HIT_GLOBAL | acc_flags) != 0 && flags & CALL == 0 {
             // The session does not trace calls of this process.
             bp_flags &= !(HIT_LOCAL | HIT_GLOBAL | acc_flags);
+        } else if bp_flags & (HIT_LOCAL | HIT_GLOBAL) != 0
+            && !session_call_enabled(vm, process, ctx, hit.session, pid)
+        {
+            bp_flags &= !(HIT_LOCAL | HIT_GLOBAL);
         } else if bp_flags & (HIT_LOCAL | HIT_GLOBAL) != 0 {
             let local_hit = bp_flags & HIT_LOCAL != 0;
             let outcome = run_call_match(
@@ -1845,6 +1849,12 @@ fn call_event_scope(
         }
         if bp_flags & HIT_META != 0
             && let Some(meta) = hit.meta_tracer.as_ref()
+            // Port of erts/emulator/beam/erl_trace.c:1211-1240 (erts_call_trace, meta branch),
+            // OTP-29.1.1: `remove` clears the meta tracer of the breakpoint.
+            && module_call_enabled(vm, process, ctx, &meta.tracer(), pid).unwrap_or_else(|| {
+                meta.clear();
+                false
+            })
         {
             // Meta trace: fixed flags, independent of the process flags.
             let outcome = run_call_match(
@@ -1942,6 +1952,76 @@ fn call_event_scope(
         }
     }
     Ok(actions)
+}
+
+/// Whether the process tracer of `session` wants the call event of `pid`, removing a tracer
+/// module that answers `remove`.
+// Port of erts/emulator/beam/erl_trace.c:1194-1210 (erts_call_trace, process tracer branch) and
+// :3305-3371 (is_tracer_ref_enabled), OTP-29.1.1: `trace_status` and then `call` are asked
+// before the match specification runs, so a discarded call pushes no return trace frame.
+fn session_call_enabled(
+    vm: &Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    session: u64,
+    pid: Pid,
+) -> bool {
+    let tracer = table()
+        .read()
+        .unwrap()
+        .get(&(scope(process), session, pid))
+        .map(|entry| entry.tracer.clone());
+    let Some(tracer) = tracer else {
+        return false;
+    };
+    match module_call_enabled(vm, process, ctx, &tracer, pid) {
+        Some(enabled) => enabled,
+        None => {
+            // The tracee is the current process, so the tracer is removed right away.
+            replace_session_flags(process, session, pid, 0, Tracer::Default);
+            false
+        }
+    }
+}
+
+/// `Some(enabled)` for the call event of `pid`, or `None` when a tracer module answers
+/// `trace_status` with `remove` (or no longer has its NIFs).
+// Port of erts/emulator/beam/erl_trace.c:3270-3303 (call_enabled_tracer), OTP-29.1.1.
+fn module_call_enabled(
+    vm: &Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    tracer: &Tracer,
+    pid: Pid,
+) -> Option<bool> {
+    let Tracer::Module { module, state, .. } = tracer else {
+        return Some(true);
+    };
+    let (Some(tracee), Ok(state)) = (
+        pid.to_term(),
+        from_owned(state, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)),
+    ) else {
+        return Some(false);
+    };
+    crate::natives::nif::refresh_hub(process, ctx);
+    let status = crate::natives::nif::invoke_tracer(
+        vm,
+        process,
+        module,
+        "enabled",
+        &[crate::signals::atom("trace_status"), state, tracee],
+    );
+    if status.is_none_or(|status| status == crate::signals::atom("remove")) {
+        return None;
+    }
+    let call = crate::natives::nif::invoke_tracer(
+        vm,
+        process,
+        module,
+        "enabled",
+        &[crate::signals::atom("call"), state, tracee],
+    );
+    Some(call == Some(crate::signals::atom("trace")))
 }
 
 /// Whether `module:function/arity` is the initial call of the process.
@@ -3715,15 +3795,24 @@ fn emit_module(
         return;
     };
     let tag = crate::signals::atom(event.name);
-    let action = crate::natives::nif::invoke_tracer(
-        vm,
-        process,
-        module,
-        "enabled",
-        &[tag, state, event.tracee],
-    );
-    if action != Some(crate::signals::atom("trace")) {
-        return;
+    // Port of erts/emulator/beam/erl_trace.c:1037-1160 (erts_trace_return_to, erts_trace_return,
+    // erts_trace_exception), OTP-29.1.1: return events go to trace/5 without asking enabled/3;
+    // their call event already did.
+    // The call event itself was asked about before its match specification ran.
+    if !matches!(
+        event.name,
+        "call" | "return_from" | "exception_from" | "return_to"
+    ) {
+        let action = crate::natives::nif::invoke_tracer(
+            vm,
+            process,
+            module,
+            "enabled",
+            &[tag, state, event.tracee],
+        );
+        if action != Some(crate::signals::atom("trace")) {
+            return;
+        }
     }
     let data = event.fields.first().copied().unwrap_or(Term::NIL);
     let mut options = Vec::new();

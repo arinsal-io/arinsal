@@ -949,6 +949,9 @@ fn purge(
                 }
                 let removed = tables.old.remove(name);
                 if let Some(id) = removed {
+                    // Port of erts/emulator/beam/beam_bif_load.c:2254-2258, OTP-29.1.1: the
+                    // purged instance's NIF library is unloaded even while its slot lingers.
+                    crate::natives::nif::unload_instance(tables.code_scope, id);
                     if module_id_referenced(process, &tables.code_meta, id) {
                         keep.push(id);
                     } else {
