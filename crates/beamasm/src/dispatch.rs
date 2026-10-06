@@ -331,10 +331,20 @@ fn emit_helper_fragment(
     code.emit(|encoder| {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:533-540, OTP-29.1.1.
         // The context switch resumes at c_p->i; its caller continuation stays on E.
-        encoder.ldr_uoff(Gpr::x(17), Gpr::sp(), 8)?;
+        // That continuation is the call site's trap return, where the trap target
+        // returns its result in XREG0; sites without one resume behind this call.
+        encoder.ldr_uoff(Gpr::x(17), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
+        encoder.str_uoff(Gpr::xzr(), Gpr::x(19), crate::TRAP_RETURN_OFFSET as u32)?;
+        Ok(())
+    })?;
+    let continuation = code.new_label();
+    code.cbnz(Gpr::x(17), continuation)?;
+    code.emit(|encoder| encoder.ldr_uoff(Gpr::x(17), Gpr::sp(), 8))?;
+    code.bind(continuation)?;
+    code.emit(|encoder| {
         encoder.str_pre(Gpr::x(17), Gpr::x(20), -8)?;
         encoder.ldr_uoff(Gpr::x(1), Gpr::x(21), 72)?;
-        encoder.ldr_uoff(Gpr::x(2), Gpr::sp(), 8)?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(17))?;
         encoder.mov_reg(Gpr::x(9), Gpr::xzr())?;
         encoder.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
         encoder.mov_const(Gpr::x(0), 2)

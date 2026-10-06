@@ -1235,14 +1235,17 @@ fn backtrace_with(
         let raw = word.tagged_word() as usize;
         let native_return = raw & 3 == 0 && crate::native_bridge::is_native_function_at(raw);
         let continuation = matches!(crate::stacktrace::decode_tag(word), Some((false, _, _)));
-        let bridge = raw == arinsal_beamasm::rt::arinsal_enter_native_return as *const () as usize;
-        if bridge {
-            // The native-to-interpreter bridge frame has no erts counterpart.
-            continue;
-        }
-        if native_return || continuation {
+        // Port of erts/emulator/beam/erl_process.c:14938-14953
+        // (erts_internal_fun_description_from_pc), OTP-29.1.1: the exit bridge is the
+        // return address of a process's first call, erts' `beam_normal_exit`.
+        let normal_exit = raw == crate::native_bridge::bridge_return_address();
+        if native_return || continuation || normal_exit {
             let slot = base.wrapping_add(index * 8);
-            let description = pc_description(modules, word, native_return);
+            let description = if normal_exit {
+                "<terminate process normally>".into()
+            } else {
+                pc_description(modules, word, native_return)
+            };
             let _ = writeln!(
                 text,
                 "\n{slot:#018x} Return addr {raw:#018x} ({description})"

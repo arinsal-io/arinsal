@@ -82,7 +82,6 @@ pub use native_bridge::{
 pub use proc_create::Process;
 #[cfg(feature = "instr-count")]
 pub(crate) use proc_create::ProcessStats;
-pub(crate) use proc_create::native_continuation_term;
 
 #[cfg(test)]
 mod boot_loop1_shared_tests {

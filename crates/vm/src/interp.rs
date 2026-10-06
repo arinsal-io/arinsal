@@ -2884,8 +2884,8 @@ impl Vm {
                                 target as usize,
                             )
                     {
-                        // Keep this BEAM continuation below run_native's bridge
-                        // CP; native return copies XREG0 back before resuming it.
+                        // An interpreter continuation is no native return address: the
+                        // callee returns to the exit bridge, which resumes it with XREG0.
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.module = module_id;
                         p.ip = target as usize;
@@ -2922,8 +2922,8 @@ impl Vm {
                                 target as usize,
                             )
                     {
-                        // Tail calls reuse the existing caller CP; run_native
-                        // supplies only the temporary bridge CP for this entry.
+                        // Tail calls reuse the existing caller CP; an interpreted one is
+                        // resumed through the exit bridge the callee returns to.
                         sync_cursor(p, htop, &mut heap_dirty);
                         p.module = module_id;
                         p.ip = target as usize;

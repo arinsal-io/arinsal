@@ -193,6 +193,13 @@ core::arch::global_asm!(
     "add x30, x30, _arinsal_enter_native_return@PAGEOFF",
     // Runtime error fragments use this slot after runtime hooks replace x30.
     "str x30, [x19, #16416]",
+    // A call entered from the scheduler returns to its caller's continuation, so the
+    // callee's frame holds that real CP instead of the bridge (`entry_return`).
+    "ldr x9, [x19, #16488]",
+    "cbz x9, 1f",
+    "mov x30, x9",
+    "str xzr, [x19, #16488]",
+    "1:",
     // Port of erts/emulator/beam/jit/arm/process_main.cpp:284-288, OTP-29.1.1.
     // A scheduler re-entry can target a BIF continuation, whose result is in XREG0.
     "ldr x0, [x19]",
