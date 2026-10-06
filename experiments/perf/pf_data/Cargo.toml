@@ -1,0 +1,12 @@
+[package]
+name = "pf-data-probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arinsal-ets = { path = "../../../crates/ets" }
+arinsal-bifs = { path = "../../../crates/bifs" }
+arinsal-maps = { path = "../../../crates/maps" }
+arinsal-term = { path = "../../../crates/term" }
+
+[workspace]
