@@ -10,6 +10,23 @@ const CHILD_MODULE: &str = "ARINSAL_NATIVE_REGRESS_MODULE";
 const MODULE: &str = "native_regress_test";
 const GC_MODULE: &str = "native_regress_gc";
 const FRAMES_MODULE: &str = "native_regress_frames";
+const BIF_FRAMES_MODULE: &str = "native_bif_frames";
+
+const BIF_FRAMES_SOURCE: &str = r#"-module(native_bif_frames).
+-export([run/0]).
+
+frames([{M, F, A, Info}, {CallerM, CallerF, CallerA, _} | _]) ->
+    [{M, F, A, Info}, {CallerM, CallerF, CallerA}].
+set_state() ->
+    try erts_debug:set_internal_state(foo, foo)
+    catch Class:Reason:Stack -> {Class, Reason, frames(Stack)} end.
+run() ->
+    Dirty1 = try erts_debug:dirty_cpu(reschedule, 1001)
+             catch Class1:Reason1:Stack1 -> {Class1, Reason1, frames(Stack1)} end,
+    Dirty2 = try erts_debug:dirty_cpu(reschedule, 1001)
+             catch Class2:Reason2:Stack2 -> {Class2, Reason2, frames(Stack2)} end,
+    [Dirty1, Dirty2, set_state(), set_state()].
+"#;
 
 // A failing BIF is the top frame and the calling function the next one, including BIFs
 // the scheduler runs for native code (spawn/3) and BIF calls in tail position.
@@ -338,5 +355,20 @@ fn native_bif_error_frames_match_otp() {
         FRAMES_MODULE,
         &[],
         false,
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn native_lazy_debug_bif_frames_match_otp() {
+    if run_child_case() {
+        return;
+    }
+    assert_native_matches(
+        "native_lazy_debug_bif_frames_match_otp",
+        BIF_FRAMES_MODULE,
+        BIF_FRAMES_SOURCE,
+        BIF_FRAMES_MODULE,
+        &[],
     );
 }
