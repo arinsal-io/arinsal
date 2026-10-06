@@ -47,3 +47,17 @@ impl Drop for ReentrantGuard<'_> {
         }
     }
 }
+
+impl ReentrantLock {
+    /// `erts_port_trylock`: `None` when another thread holds the lock.
+    pub(crate) fn try_lock(&self) -> Option<ReentrantGuard<'_>> {
+        let me = thread::current().id();
+        let mut state = self.state.lock().unwrap();
+        match state.0 {
+            None => *state = (Some(me), 1),
+            Some(owner) if owner == me => state.1 += 1,
+            Some(_) => return None,
+        }
+        Some(ReentrantGuard(self))
+    }
+}

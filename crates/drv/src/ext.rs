@@ -223,6 +223,12 @@ impl DriverPort {
         let mut limits = self.msgq_limits.lock().unwrap();
         let mut new_low = low.as_deref().copied().unwrap_or(BUSY_MSGQ_READ_ONLY);
         let mut new_high = high.as_deref().copied().unwrap_or(BUSY_MSGQ_READ_ONLY);
+        let written = limits.enabled
+            && new_low != BUSY_MSGQ_DISABLED
+            && new_high != BUSY_MSGQ_DISABLED
+            && (new_low != BUSY_MSGQ_READ_ONLY || new_high != BUSY_MSGQ_READ_ONLY);
+        let disabled =
+            limits.enabled && (new_low == BUSY_MSGQ_DISABLED || new_high == BUSY_MSGQ_DISABLED);
         if !limits.enabled {
             (new_low, new_high) = (BUSY_MSGQ_DISABLED, BUSY_MSGQ_DISABLED);
         } else if new_low == BUSY_MSGQ_DISABLED || new_high == BUSY_MSGQ_DISABLED {
@@ -246,6 +252,13 @@ impl DriverPort {
                 }
                 limits.high = new_high;
             }
+        }
+        let (cur_low, cur_high) = (limits.low, limits.high);
+        drop(limits);
+        if disabled {
+            self.bpq_disabled();
+        } else if written {
+            self.bpq_limits_written(cur_low, cur_high);
         }
         if let Some(low) = low {
             *low = new_low;

@@ -774,7 +774,11 @@ fn invoke_dispatch_bif(
         }
         process.reductions = process.header.fcalls;
         // Traced sends run in the scheduler, which evaluates send trace patterns.
-        let result = if crate::trace::traces_sends(process) {
+        // A port send may suspend the sender on a busy port (bif.c:2581): the scheduler
+        // runs it, as it can park and redo the send.
+        let result = if crate::trace::traces_sends(process)
+            || crate::port::is_port_target(process, process.x[0])
+        {
             Err(crate::VmError::Unsupported(
                 crate::process::REMOTE_SEND_NEEDS_CONTEXT.into(),
             ))

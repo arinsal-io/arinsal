@@ -9,18 +9,16 @@
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use crate::asyncq::Job;
-use crate::{DriverPort, DrvFn1, DrvFn2};
+use crate::{DrvFn1, DrvFn2};
 
 /// A unit of work for the executor.
 pub(crate) enum Task {
     /// The poller reported registration `reg` of `fd` (`dir` 0 = input, 1 = output).
     Ready { fd: i32, dir: usize, reg: u64 },
-    /// The port timer `epoch` expired.
-    Timeout { port: Weak<DriverPort>, epoch: u64 },
     /// An async job finished on its worker thread.
     AsyncReady(Job),
 }
@@ -50,11 +48,6 @@ pub(crate) fn schedule(task: Task) {
 fn run(task: Task) {
     match task {
         Task::Ready { fd, dir, reg } => crate::select::ready(fd, dir, reg),
-        Task::Timeout { port, epoch } => {
-            if let Some(port) = port.upgrade() {
-                port.run_timeout(epoch);
-            }
-        }
         Task::AsyncReady(job) => job.ready(),
     }
 }
