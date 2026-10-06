@@ -118,9 +118,30 @@ impl Process {
             let mut pending = cold.nif_pending.take()?;
             // The job runs on this thread; NIF services find the process through the hub.
             crate::natives::nif::refresh_hub_native(self);
+            let runtime = self.runtime.clone();
+            let pid = self.self_pid;
+            let (module, function, arity) = pending.trace_mfa();
+            let module = module.to_owned();
+            let function = function.to_owned();
             return Some(Box::new(move || {
                 let mut heap = shadow_heap();
+                if let (Some(runtime), Some(pid)) = (&runtime, pid) {
+                    let _ = crate::natives::nif::with_dirty_trace_emission(|| {
+                        crate::trace::emit_dirty_running(
+                            runtime, pid, "in", &module, &function, arity,
+                        );
+                    });
+                }
                 pending.run_dirty(&mut heap);
+                if let (Some(runtime), Some(pid)) = (&runtime, pid) {
+                    let (module, function, arity) =
+                        pending.finalizer_mfa().expect("dirty callback completes");
+                    let _ = crate::natives::nif::with_dirty_trace_emission(|| {
+                        crate::trace::emit_dirty_running(
+                            runtime, pid, "out", module, function, arity,
+                        );
+                    });
+                }
                 Box::new(DirtyDone::Nif(pending, heap)) as Box<dyn Any>
             }));
         }

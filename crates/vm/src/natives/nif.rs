@@ -235,6 +235,33 @@ thread_local! {
     static HUB: std::cell::RefCell<Option<Hub>> = const { std::cell::RefCell::new(None) };
     /// Runtime whose scheduler `HUB` refers to, so a repeated install can be skipped.
     static HUB_RUNTIME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Prevents sends made by a trace callback from recursively tracing that callback.
+    static DIRTY_TRACE_EMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct DirtyTraceEmissionGuard;
+
+impl Drop for DirtyTraceEmissionGuard {
+    fn drop(&mut self) {
+        DIRTY_TRACE_EMISSION.set(false);
+    }
+}
+
+/// Run a dirty-scheduler trace callback without recursively tracing sends it makes.
+pub(crate) fn with_dirty_trace_emission<R>(run: impl FnOnce() -> R) -> Option<R> {
+    let entered = DIRTY_TRACE_EMISSION.with(|emitting| {
+        if emitting.get() {
+            false
+        } else {
+            emitting.set(true);
+            true
+        }
+    });
+    if !entered {
+        return None;
+    }
+    let _guard = DirtyTraceEmissionGuard;
+    Some(run())
 }
 
 fn atom(name: &str) -> Term {
@@ -424,6 +451,23 @@ impl PendingNif {
     /// Whether a dirty job already executed this call.
     pub(crate) fn is_done(&self) -> bool {
         self.done.is_some()
+    }
+
+    /// Internal continuation MFA selected after this dirty callback returns.
+    pub(crate) fn finalizer_mfa(&self) -> Option<(&'static str, &'static str, u8)> {
+        match self.done.as_ref()? {
+            Ok(_) => Some(("erts_internal", "dirty_nif_finalizer", 1)),
+            Err(_) => Some(("erts_internal", "dirty_nif_exception", 1)),
+        }
+    }
+
+    /// MFA of the NIF entry or continuation that this dirty job invokes.
+    pub(crate) fn trace_mfa(&self) -> (&str, &str, u8) {
+        (
+            self.library.module_name(),
+            &self.function.name,
+            self.function.arity as u8,
+        )
     }
 
     /// Execute the call on the current dirty scheduler without the process: results are
@@ -1300,9 +1344,21 @@ fn nif_send_hook(target: Term, message: Term) -> bool {
     let Some(scheduler) = hub.scheduler.upgrade() else {
         return false;
     };
+    let trace_message = message;
     let Ok(message) = Message::copy_from(message) else {
         return false;
     };
+    let deliverable = scheduler.lookup(pid);
+    let dirty_scheduler = arinsal_sched::current_scheduler_type() != SchedulerType::Normal;
+    if deliverable
+        && dirty_scheduler
+        && let Some(runtime) = hub.runtime.upgrade()
+    {
+        // Port of erts/emulator/beam/erl_nif.c:1005 (trace_send), OTP-29.1.1.
+        let _ = with_dirty_trace_emission(|| {
+            crate::trace::emit_dirty_send(&runtime, hub.pid, target, trace_message)
+        });
+    }
     let sent = scheduler.send(hub.pid, pid, message).is_ok();
     if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
         eprintln!("resource_send from={:?} to={:?} sent={sent}", hub.pid, pid);
