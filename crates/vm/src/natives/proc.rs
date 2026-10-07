@@ -3060,6 +3060,8 @@ fn trace(
         | crate::trace::PORTS
         | crate::trace::SCHEDULER_ID;
     let port_mask = mask & PORT_FLAGS;
+    let had_return_to =
+        mask & crate::trace::RETURN_TO != 0 && crate::trace::return_to_enabled(process);
     // Port of erts/emulator/beam/erl_bif_trace.c:853-863 and 1103-1108 (start_trace), OTP-29.1.1:
     // a tracee keeps a live tracer; such tracees are skipped and not counted.
     let apply = |process: &mut Process, pid: Pid| {
@@ -3216,7 +3218,12 @@ fn trace(
             _ => return Err(badarg()),
         }
     };
-    if mask & crate::trace::RETURN_TO != 0 {
+    // Port of erts/emulator/beam/erl_bif_trace.c:890-1168 (erts_internal_trace_3), OTP-29.1.1.
+    // Return instructions read process flags directly in erts; refresh code only when the
+    // runtime-wide need for return-to instrumentation changes.
+    if mask & crate::trace::RETURN_TO != 0
+        && had_return_to != crate::trace::return_to_enabled(process)
+    {
         vm.refresh_all_trace_breakpoints(process);
     }
     Term::small(matches as i64).ok_or_else(badarg)
@@ -4327,10 +4334,11 @@ pub(crate) fn bp_functions(
                 .filter(|(_, name, n)| {
                     (function == "_" || *name == function) && arity.is_none_or(|a| a == *n)
                 })
-                .map(|(_, name, n)| crate::trace_bp::BpFunction {
+                .map(|(entry, name, n)| crate::trace_bp::BpFunction {
                     module: loaded.name.clone(),
                     function: name.clone(),
                     arity: *n,
+                    entry: entry + 1,
                     exported: loaded
                         .exports
                         .iter()

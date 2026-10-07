@@ -958,30 +958,28 @@ impl Vm {
         process: &Process,
         functions: &[crate::trace_bp::BpFunction],
     ) {
-        let mut by_module: HashMap<&str, std::collections::HashSet<(&str, u8)>> = HashMap::new();
+        // Port of erts/emulator/beam/beam_bp.c:183-260 (erts_bp_match_functions), OTP-29.1.1:
+        // each matched breakpoint carries its function entry, so refreshing it must not rescan
+        // every loaded function to recover the same MFA.
+        let mut by_module: HashMap<usize, Vec<(usize, String, u8)>> = HashMap::new();
         for function in functions {
-            by_module
-                .entry(function.module.as_str())
-                .or_default()
-                .insert((function.function.as_str(), function.arity));
+            let Some(&module_id) = self.code.loaded.get(&function.module) else {
+                continue;
+            };
+            if self
+                .code
+                .modules
+                .get(module_id)
+                .is_some_and(|module| module.name == function.module)
+            {
+                by_module.entry(module_id).or_default().push((
+                    function.entry,
+                    function.function.clone(),
+                    function.arity,
+                ));
+            }
         }
-        let targets = self
-            .code
-            .modules
-            .iter()
-            .enumerate()
-            .filter_map(|(module_id, module)| {
-                let wanted = by_module.get(module.name.as_str())?;
-                let targets = module
-                    .functions
-                    .iter()
-                    .filter(|(_, function, arity)| wanted.contains(&(function.as_str(), *arity)))
-                    .map(|(start, function, arity)| (start + 1, function.clone(), *arity))
-                    .collect::<Vec<_>>();
-                Some((module_id, targets))
-            })
-            .collect::<Vec<_>>();
-        for (module_id, functions) in targets {
+        for (module_id, functions) in by_module {
             self.patch_trace_functions(module_id, &functions, process);
         }
     }
