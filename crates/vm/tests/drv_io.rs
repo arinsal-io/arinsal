@@ -71,7 +71,7 @@ fn io_driver_matches_erl() {
     };
     drop(erl);
     assert!(
-        matches!(&expected, OwnedTerm::Map(entries) if entries.len() == 16),
+        matches!(&expected, OwnedTerm::Map(entries) if entries.len() == 17),
         "erl reference run failed: {}",
         pretty(&expected)
     );

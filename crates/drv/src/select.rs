@@ -34,8 +34,10 @@ struct Dir {
     owner: Option<Arc<DriverPort>>,
     /// Registration in the poll set (`active_events`).
     reg: Option<u64>,
-    /// A ready callback runs (`is_iotask_active`); the event is re-armed after it.
-    running: bool,
+    /// The ready task running or queued (`is_iotask_active`); the event is re-armed after it.
+    running: Option<u64>,
+    /// `ready_input`/`ready_output` has acquired the port lock and entered the callback.
+    executing: bool,
 }
 
 /// A message `enif_select` prepared for one direction (`struct erts_nif_select_event`).
@@ -100,7 +102,7 @@ fn next_registration() -> u64 {
 /// rejected the descriptor (`ERTS_POLL_EV_NVAL`).
 fn arm_dir(fd: i32, state: &mut FdState, dir: usize) -> bool {
     let slot = &mut state.dirs[dir];
-    if state.events & DIRS[dir] == 0 || slot.reg.is_some() || slot.running {
+    if state.events & DIRS[dir] == 0 || slot.reg.is_some() || slot.running.is_some() {
         return true;
     }
     let id = next_registration();
@@ -133,6 +135,11 @@ fn arm(fd: i32, state: &mut FdState, dir: usize) {
 }
 
 fn disarm(state: &mut FdState, dir: usize) {
+    // erl_check_io.c:1161-1164 (`abort_tasks`): deselection cancels a ready task
+    // that has been scheduled but has not acquired the port lock yet.
+    if !state.dirs[dir].executing {
+        state.dirs[dir].running = None;
+    }
     if let Some(id) = state.dirs[dir].reg.take()
         && let Some(backend) = poll::backend()
     {
@@ -625,23 +632,49 @@ pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
             deselect(&mut table, fd, DIRS[dir]);
             return;
         }
-        state.dirs[dir].running = true;
+        state.dirs[dir].running = Some(reg);
         owner
     };
-    owner.run_io(dir, fd);
+    owner.run_io(dir, fd, reg);
     let mut table = table();
-    if let Some(state) = table.get_mut(&fd) {
-        state.dirs[dir].running = false;
+    if let Some(state) = table.get_mut(&fd)
+        && state.dirs[dir].running == Some(reg)
+    {
+        state.dirs[dir].running = None;
+        state.dirs[dir].executing = false;
         arm(fd, state, dir);
     }
+}
+
+/// Whether a scheduled ready task still owns the selected direction after taking the
+/// port lock (`abort_tasks` in erl_check_io.c:662-682).
+pub(crate) fn begin_io_task(port: &DriverPort, fd: i32, dir: usize, reg: u64) -> bool {
+    let mut table = table();
+    table.get_mut(&fd).is_some_and(|state| {
+        let current = io_task_matches(state, dir, reg)
+            && !state.dirs[dir].executing
+            && state.events & DIRS[dir] != 0
+            && state.dirs[dir]
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.id == port.id);
+        if current {
+            state.dirs[dir].executing = true;
+        }
+        current
+    })
+}
+
+fn io_task_matches(state: &FdState, dir: usize, reg: u64) -> bool {
+    state.dirs[dir].running == Some(reg)
 }
 
 impl DriverPort {
     /// Port of erl_port_task.c:1776 (ERTS_PORT_TASK_INPUT/OUTPUT) with the default
     /// callbacks of io.c:7517 (no_ready_input_callback/no_ready_output_callback).
-    pub(crate) fn run_io(self: &Arc<Self>, dir: usize, fd: i32) {
+    pub(crate) fn run_io(self: &Arc<Self>, dir: usize, fd: i32, reg: u64) {
         let _guard = self.guard();
-        if !self.live() {
+        if !self.live() || !begin_io_task(self, fd, dir, reg) {
             return;
         }
         self.start_task();
@@ -690,5 +723,37 @@ impl DriverPort {
                 "Driver does not implement stop_select callback (event={fd}, private=0x0)!\n"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FdState, READ, disarm, io_task_matches};
+
+    #[test]
+    fn deselect_cancels_a_queued_ready_callback() {
+        let mut state = FdState {
+            events: READ,
+            ..FdState::default()
+        };
+        state.dirs[0].running = Some(17);
+
+        assert!(io_task_matches(&state, 0, 17));
+        disarm(&mut state, 0);
+        assert!(!io_task_matches(&state, 0, 17));
+    }
+
+    #[test]
+    fn deselect_keeps_an_executing_callback_serialized() {
+        let mut state = FdState {
+            events: READ,
+            ..FdState::default()
+        };
+        state.dirs[0].running = Some(17);
+        state.dirs[0].executing = true;
+
+        disarm(&mut state, 0);
+        assert!(io_task_matches(&state, 0, 17));
+        assert!(state.dirs[0].running.is_some());
     }
 }

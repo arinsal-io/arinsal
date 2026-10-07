@@ -557,7 +557,7 @@ pub trait PortHost: Send + Sync {
     /// `profile_runnable_port`: the port became runnable (`active`) or inactive.
     fn profile_runnable_port(&self, _port: &DriverPort, _active: bool) {}
     /// `trace_sched_ports`: the port is scheduled in or out.
-    fn trace_sched_port(&self, _port: &DriverPort, _scheduled_in: bool) {}
+    fn trace_sched_port(&self, _port: &DriverPort, _scheduled_in: bool, _where: Option<&str>) {}
     /// Port of io.c:7006 (do_driver_monitor_process): monitor process `pid` for
     /// `port` under `monitor`. `false` when the process does not exist. When it
     /// exits the VM calls [`DriverPort::process_exit`].

@@ -4471,7 +4471,11 @@ impl Process {
                 "send",
                 &[value, target],
             );
-            crate::port::process_send(self, target, value)?;
+            if let Some(ctx) = ctx.as_deref_mut() {
+                crate::port::process_send_in(self, ctx, target, value)?;
+            } else {
+                crate::port::process_send(self, target, value)?;
+            }
             return Ok(value);
         }
         // Port of erts/emulator/beam/erl_message.c (`erts_send` / remote_send), OTP-29.1.1.
@@ -4516,7 +4520,11 @@ impl Process {
                     "badarg",
                 )))
             })?;
-            crate::port::process_send(self, port, value)?;
+            if let Some(ctx) = ctx.as_deref_mut() {
+                crate::port::process_send_in(self, ctx, port, value)?;
+            } else {
+                crate::port::process_send(self, port, value)?;
+            }
             crate::trace::emit_process(
                 vm.as_deref_mut(),
                 self,
@@ -5578,6 +5586,18 @@ impl Task for Process {
     }
 
     fn run(&mut self, ctx: &mut RunCtx<'_, Message>, budget: u32) -> RunOutcome {
+        // Port of erts/emulator/beam/erl_trace.c:704-716 (trace_sched), OTP-29.1.1.
+        let trace_scheduling = crate::trace::running_procs_enabled();
+        if trace_scheduling {
+            crate::trace::emit_process(
+                None,
+                self,
+                ctx.pid(),
+                crate::trace::RUNNING_PROCS,
+                "in",
+                &[],
+            );
+        }
         ctx.set_parallel_signal_buffers(self.message_queue_data() == MessageQueueData::OffHeap);
         // Records built or decoded while this process runs use its node's canonical definitions.
         arinsal_term::set_record_scope(
@@ -5593,6 +5613,16 @@ impl Task for Process {
             // Port of erts/emulator/beam/erl_process.c (erts_continue_exit_process): the exited
             // process frees its heap and off-heap list, dropping its refc binary references.
             self.heap = ProcessHeap::new();
+        }
+        if trace_scheduling {
+            crate::trace::emit_process(
+                None,
+                self,
+                ctx.pid(),
+                crate::trace::RUNNING_PROCS,
+                "out",
+                &[],
+            );
         }
         outcome
     }

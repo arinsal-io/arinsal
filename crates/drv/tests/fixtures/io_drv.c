@@ -18,6 +18,8 @@ typedef struct {
     int out_fires;
     int leak;
     int slice;
+    int output_slice;
+    int output_slice_calls;
     long timer_ms;
 } State;
 
@@ -74,6 +76,8 @@ static void io_output(ErlDrvData data, char *buf, ErlDrvSizeT len) {
     State *st = (State *)data;
     if (write(st->wfd, buf, len) < 0)
         driver_output(st->port, "writefail", 9);
+    if (st->output_slice && erl_drv_consume_timeslice(st->port, 50))
+        st->output_slice_calls++;
 }
 
 static void say(State *st, const char *text) {
@@ -221,6 +225,12 @@ static ErlDrvSSizeT io_control(ErlDrvData data, unsigned int cmd, char *buf, Erl
     case 30:
         st->slice = 1;
         return reply(rbuf, rlen, "%ld", driver_set_timer(st->port, 1), 0);
+    case 31:
+        st->output_slice = 1;
+        st->output_slice_calls = 0;
+        return reply(rbuf, rlen, "%ld", 1, 0);
+    case 32:
+        return reply(rbuf, rlen, "%ld", st->output_slice_calls, 0);
     case 40: /* select a descriptor that is not open */
         return reply(rbuf, rlen, "%ld", driver_select(st->port, (ErlDrvEvent)(long)9999, ERL_DRV_READ, 1), 0);
     case 50:
