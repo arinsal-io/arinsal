@@ -412,7 +412,7 @@ pub struct Module {
     // ---- vm_funs ----
     /// Local lambda entries retained by closures.
     pub funs: Vec<FunSlot>,
-    _literals: Arc<VecHeap>,
+    _literals: LiteralArea,
     /// Module literals by BEAM literal index, in this module's literal area. Native code
     /// of the module refers to these same terms, like erts' single literal area per module.
     literal_terms: Arc<HashMap<u32, Term>>,
@@ -456,9 +456,28 @@ impl Clone for Module {
             debug_line_items: self.debug_line_items.clone(),
             debug_breakpoint_import: self.debug_breakpoint_import,
             funs: self.funs.iter().map(FunSlot::clone).collect(),
-            _literals: Arc::clone(&self._literals),
+            _literals: self._literals.clone(),
             literal_terms: Arc::clone(&self.literal_terms),
         }
+    }
+}
+
+/// A module's literal heap, shared by every clone of the module and by its native code.
+/// Purge hands the heap to the literal-area release queue and empties the slot, so the module
+/// table entry and native code no longer keep literal refc binaries alive.
+// Port of erts/emulator/beam/beam_bif_load.c (erts_internal:purge_module_2 -> literal area
+// queued for release, erts_queue_release_literals), OTP-29.1.1.
+#[derive(Clone)]
+pub struct LiteralArea(Arc<std::sync::Mutex<Option<Arc<VecHeap>>>>);
+
+impl LiteralArea {
+    fn new(heap: VecHeap) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(Arc::new(heap)))))
+    }
+
+    /// Removes the literal heap from the module; `None` when it was already released.
+    pub fn take(&self) -> Option<Arc<VecHeap>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 
@@ -520,8 +539,8 @@ pub struct CoverageProbe {
 }
 impl Module {
     /// Retain this code version's literal heap for process root scanning.
-    pub fn literal_area(&self) -> Arc<VecHeap> {
-        Arc::clone(&self._literals)
+    pub fn literal_area(&self) -> LiteralArea {
+        self._literals.clone()
     }
 
     /// The literal-area term of BEAM literal `index`, if an instruction of the module uses it.
@@ -1629,7 +1648,7 @@ pub fn load_with_instrumentations(
         debug_breakpoint_import,
         // ---- vm_funs ----
         funs,
-        _literals: Arc::new(literals),
+        _literals: LiteralArea::new(literals),
         literal_terms: Arc::new(literal_terms),
     })
 }
