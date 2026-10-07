@@ -767,7 +767,9 @@ impl HeapAlloc for ProcessHeap {
 
 /// Growable heap whose separately allocated chunks never move.
 pub struct VecHeap {
-    chunks: Vec<Box<[UnsafeCell<u64>]>>,
+    // Each chunk reserves its full capacity up front and never grows past it, so words
+    // handed out stay put; only words actually allocated are initialized.
+    chunks: Vec<Vec<UnsafeCell<u64>>>,
     off_heap: Vec<Arc<Vec<u8>>>,
     writable: Vec<Arc<WritableBinary>>,
     external: Vec<Arc<ExternalBinary>>,
@@ -825,7 +827,7 @@ impl VecHeap {
     pub fn contains(&self, ptr: *const u64) -> bool {
         let address = ptr as usize;
         self.chunks.iter().any(|c| {
-            address >= c.as_ptr() as usize && address < (c.as_ptr() as usize + c.len() * 8)
+            address >= c.as_ptr() as usize && address < (c.as_ptr() as usize + c.capacity() * 8)
         })
     }
     /// Address ranges occupied by initialized or reserved heap chunks.
@@ -834,7 +836,7 @@ impl VecHeap {
             .iter()
             .map(|chunk| {
                 let start = chunk.as_ptr() as usize;
-                (start, start.saturating_add(chunk.len() * 8))
+                (start, start.saturating_add(chunk.capacity() * 8))
             })
             .collect()
     }
@@ -849,7 +851,7 @@ impl Drop for VecHeap {
         for chunk in &self.chunks {
             if self.is_literal_area() {
                 let start = chunk.as_ptr() as usize;
-                crate::literal::unregister(start, start + chunk.len() * 8);
+                crate::literal::unregister(start, start + chunk.capacity() * 8);
             }
             #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
@@ -858,10 +860,12 @@ impl Drop for VecHeap {
 }
 impl HeapAlloc for VecHeap {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        if self.chunks.is_empty() || self.used.checked_add(words)? > self.chunks.last()?.len() {
+        let needed = self.used.checked_add(words)?;
+        if self.chunks.is_empty() || needed > self.chunks.last()?.capacity() {
             let size = self.next_chunk_words().max(words);
-            self.chunks
-                .push((0..size).map(|_| UnsafeCell::new(0)).collect());
+            // erts hands out heap words uninitialized (erl_alloc.c); reserving without
+            // zeroing keeps a short-lived heap from touching its whole first chunk.
+            self.chunks.push(Vec::with_capacity(size));
             self.used = 0;
             let literal_bit = self.chunk_words & LITERAL_HEAP_BIT;
             self.chunk_words = self.next_chunk_words().saturating_mul(2) | literal_bit;
@@ -869,15 +873,18 @@ impl HeapAlloc for VecHeap {
                 && let Some(chunk) = self.chunks.last()
             {
                 let start = chunk.as_ptr() as usize;
-                crate::literal::register(start, start + chunk.len() * 8);
+                crate::literal::register(start, start + chunk.capacity() * 8);
             }
             // g_asan: literal areas and other VecHeaps stay address-stable.
             #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             if let Some(chunk) = self.chunks.last() {
-                crate::validate::note_stable_range(chunk.as_ptr() as usize, chunk.len() * 8);
+                crate::validate::note_stable_range(chunk.as_ptr() as usize, chunk.capacity() * 8);
             }
         }
-        let chunk = self.chunks.last()?;
+        let chunk = self.chunks.last_mut()?;
+        let end = self.used + words;
+        // Within the reserved capacity: the buffer does not move.
+        chunk.resize_with(end, || UnsafeCell::new(0));
         // SAFETY: checked against chunk length above.
         let ptr = unsafe { chunk.as_ptr().add(self.used).cast::<u64>().cast_mut() };
         self.used += words;

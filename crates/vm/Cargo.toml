@@ -45,6 +45,7 @@ arinsal-a64 = { path = "../a64" }
 arinsal-beamjit = { path = "../beamjit" }
 arinsal-sched.workspace = true
 arinsal-packet.workspace = true
+smallvec = "1.15.1"
 arinsal-difftest = { workspace = true, optional = true }
 libc = "0.2"
 mio = { version = "1", features = ["os-poll", "os-ext"] }

@@ -263,6 +263,25 @@ impl HashStorage {
         }
     }
 
+    /// The live object at `key` in a set table, for an update in place.
+    ///
+    /// Port of erts/emulator/beam/erl_db_hash.c:3872 (db_lookup_dbterm_hash), OTP-29.1.1.
+    pub(super) fn find_mut(&mut self, key: Term, keypos: usize) -> Option<&mut StoredTerm> {
+        let hval = ets_hash(key);
+        let slot = self.slot_index(hval >> 1);
+        let mut next = self.segment_bucket_mut(slot).head.as_deref_mut();
+        while let Some(node) = next {
+            if !node.pseudo_deleted
+                && node.hvalue == hval >> 1
+                && arinsal_term::exact_eq(node.object.key(keypos), key)
+            {
+                return Some(&mut node.object);
+            }
+            next = node.next.as_deref_mut();
+        }
+        None
+    }
+
     /// Return the first live key in OTP's bucket order.
     ///
     /// Port of erts/emulator/beam/erl_db_hash.c:4173-4194, OTP-29.1.1.

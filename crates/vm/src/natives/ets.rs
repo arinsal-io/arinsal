@@ -6,7 +6,7 @@ use crate::{Process, Vm, VmError};
 use arinsal_ets::match_spec::MatchDialect;
 use arinsal_ets::match_spec::MatchProgram;
 use arinsal_ets::{
-    BigCounterOp, ElementLookup, EtsError, Heir, Protection, SelectContinuation, Table,
+    BigCounterOp, CounterOp, ElementLookup, EtsError, Heir, Protection, SelectContinuation, Table,
     TableOptions, TableType, Tid, WriteConcurrency,
 };
 use arinsal_sched::{Pid, RunCtx};
@@ -330,6 +330,56 @@ fn position(term: Term) -> Option<usize> {
     Some(usize::try_from(value).unwrap_or(0))
 }
 
+/// Parse an update_counter `Incr | Op | [Op]` whose operands are all small integers, for
+/// [`Table::update_counter_in_place`]; `None` leaves the call to the general path. The flag
+/// is set when the result is a single counter rather than a list.
+// Port of erts/emulator/beam/erl_db.c:1517-1529 (do_update_counter, the UpdateOp forms),
+// OTP-29.1.1.
+fn small_counter_ops(
+    keypos: usize,
+    operation: Term,
+) -> Option<(smallvec::SmallVec<[CounterOp; 4]>, bool)> {
+    if let Some(increment) = operation.as_small() {
+        let op = CounterOp {
+            position: keypos + 1,
+            increment,
+            threshold: None,
+        };
+        return Some((smallvec::smallvec![op], true));
+    }
+    let parse = |entry: Term| -> Option<CounterOp> {
+        let items = tuple_items(entry)?;
+        let threshold = match items.as_slice() {
+            [_, _] => None,
+            [_, _, threshold, warp] => Some((threshold.as_small()?, warp.as_small()?)),
+            _ => return None,
+        };
+        Some(CounterOp {
+            position: position(items[0])?,
+            increment: items[1].as_small()?,
+            threshold,
+        })
+    };
+    let single = operation.classify() == TermKind::Tuple;
+    let ops = update_list(operation, parse)
+        .into_iter()
+        .collect::<Option<smallvec::SmallVec<_>>>()?;
+    Some((ops, single))
+}
+
+/// Return the counters of an in-place update in the shape the operation asked for.
+fn counter_results<H: HeapAlloc>(
+    heap: &mut H,
+    values: &[Term],
+    single: bool,
+) -> Result<Term, VmError> {
+    if single {
+        values.first().copied().ok_or_else(badarg)
+    } else {
+        output_list(heap, values.to_vec())
+    }
+}
+
 /// Parse `Op | [Op]` for update_element/update_counter. A malformed entry or an
 /// improper tail ends the list with `None`, as the erts verification loop stops there.
 fn update_list<T>(spec: Term, mut parse: impl FnMut(Term) -> Option<T>) -> Vec<Option<T>> {
@@ -408,6 +458,7 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
         ("lookup", 2) => Some(direct_lookup),
         ("member", 2) => Some(direct_member),
         ("insert", 2) => Some(direct_insert),
+        ("update_counter", 3 | 4) => Some(direct_update_counter),
         _ => None,
     }
 }
@@ -481,6 +532,20 @@ fn direct_lookup(process: &mut Process, args: &[Term]) -> Option<Term> {
             return None;
         }
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        // Port of erts/emulator/beam/erl_db_hash.c:1492 (db_get_hash) and
+        // erl_db_tree.c:1046 (db_get_tree), OTP-29.1.1: a set holds at most one object,
+        // consed straight onto the process heap.
+        if matches!(
+            table.options.table_type,
+            TableType::Set | TableType::OrderedSet
+        ) {
+            let found = table.lookup_one(key, &mut heap).ok()?;
+            let mut builder = TermBuilder::new(&mut heap);
+            return match found {
+                Some(object) => builder.cons(object, Term::NIL).ok(),
+                None => Some(Term::NIL),
+            };
+        }
         let values = table.lookup(key, &mut heap).ok()?;
         output_list(&mut heap, values).ok()
     })
@@ -531,6 +596,34 @@ fn direct_insert(process: &mut Process, args: &[Term]) -> Option<Term> {
         }
         table.insert_prepared(prepared);
         Some(boolean_term(true))
+    })
+}
+
+/// `ets:update_counter/3,4` on small counters, updated in place under the table lock.
+// Port of erts/emulator/beam/erl_db.c:1494-1728 (do_update_counter, ets_update_counter_3/4),
+// OTP-29.1.1.
+fn direct_update_counter(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let caller = direct_caller(process)?;
+    let (key, operation, default) = (args[1], args[2], args.get(3).copied());
+    with_cached_table(process, args[0], |shared, options, process| {
+        let (operations, single) = small_counter_ops(options.keypos, operation)?;
+        // erl_db.c:1718-1726: a malformed default fails even when the key exists.
+        if let Some(default) = default
+            && tuple_items(default)?.len() < options.keypos
+        {
+            return None;
+        }
+        let values = {
+            let mut table = shared.write();
+            if table.is_detached() || !allowed(&table, caller, true) {
+                return None;
+            }
+            table.update_counter_in_place(key, &operations)?
+        };
+        // The counters are immediates: only a result list needs the heap, and the process
+        // heap grows rather than fail, so the update is never redone.
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        counter_results(&mut heap, &values, single).ok()
     })
 }
 
@@ -1596,6 +1689,11 @@ fn call_inner(
                 return Err(badarg_cause("access"));
             }
             let default = default_object(&table, args.get(3).copied())?;
+            if let Some((operations, single)) = small_counter_ops(table.options.keypos, *operation)
+                && let Some(values) = table.update_counter_in_place(*key, &operations)
+            {
+                return counter_results(&mut heap, &values, single);
+            }
             // Port of erts/emulator/beam/erl_db.c:1505-1603 (do_update_counter), OTP-29.1.1.
             // An integer increments the element after the key; a list returns a list.
             let parse = |entry: Term| -> Option<BigCounterOp> {

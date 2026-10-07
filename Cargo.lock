@@ -441,6 +441,7 @@ dependencies = [
  "mio",
  "num-bigint",
  "num-traits",
+ "smallvec",
 ]
 
 [[package]]
