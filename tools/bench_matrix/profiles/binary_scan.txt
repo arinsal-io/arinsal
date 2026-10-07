@@ -1,0 +1,15 @@
+  1402  <arinsal_vm::Vm>::run_slice_inner
+   461  arinsal_vm::jit_hook::jit_step
+   375  arinsal_vm::interp::exec_hot
+   215  arinsal_bits::match_uint_be
+   149  _tlv_get_addr
+    73  <arinsal_term::Term as arinsal_bits::MatchOps>::ensure_at_least
+    65  <arinsal_bits::Cursor>::read_u64
+    48  <arinsal_term::Term as arinsal_bits::MatchOps>::ensure_exactly
+    44  ???
+    42  <arinsal_vm::Vm>::sync_module
+    28  arinsal_vm::jit_hook::sync_stack
+    20  core::ptr::drop_glue::<[arinsal_beam::Operand]>
+    14  core::ptr::drop_glue::<alloc::vec::Vec<arinsal_beam::Instr>>
+    13  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     9  mach_absolute_time

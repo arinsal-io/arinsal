@@ -1,0 +1,18 @@
+[package]
+name = "arinsal-packet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arinsal-bifs.workspace = true
+arinsal-etf.workspace = true
+arinsal-term.workspace = true
+num-traits.workspace = true
+
+[dev-dependencies]
+arinsal-difftest.workspace = true
+
+[lints]
+workspace = true

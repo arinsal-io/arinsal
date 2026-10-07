@@ -1,0 +1,15 @@
+   561  __findenv_locked
+   495  <arinsal_vm::Vm>::run_slice_inner
+   229  <arinsal_ets::Table>::lookup::<arinsal_bifs::FragmentingHeap>
+   150  <arinsal_ets::Table>::put_hashed
+   142  _xzm_free
+   127  <arinsal_ets::hash::HashStorage>::maybe_grow
+    99  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+    84  _platform_memset_pattern16
+    61  core::ptr::drop_glue::<arinsal_ets::hash::HashDbTerm>
+    55  <arinsal_term::heap::ProcessHeap>::heap_fragment
+    55  arinsal_vm::interp::exec_hot
+    52  arinsal_vm::jit_hook::jit_step
+    48  _tlv_get_addr
+    48  _xzm_xzone_malloc
+    46  arinsal_vm::natives::ets::call_inner

@@ -1,0 +1,21 @@
+[package]
+name = "difftest-runner"
+description = "Command line differential test runner for Arinsal and OTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+full-etf = ["arinsal-difftest/full-etf"]
+
+[[bin]]
+name = "difftest"
+path = "src/main.rs"
+
+[dependencies]
+arinsal-difftest.workspace = true
+arinsal-vm = { workspace = true, features = ["difftest"] }

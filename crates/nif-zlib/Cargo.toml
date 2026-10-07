@@ -1,0 +1,19 @@
+[package]
+name = "arinsal-nif-zlib"
+description = "OTP 29.1.1 zlib and zstd native operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arinsal-bifs.workspace = true
+arinsal-term.workspace = true
+arinsal-etf.workspace = true
+num-traits.workspace = true
+libc = "0.2.175"
+libz-sys = { version = "1.1.29", default-features = false, features = ["libc", "stock-zlib"] }
+zstd-sys = { version = "=2.1.0", default-features = false, features = ["experimental"] }

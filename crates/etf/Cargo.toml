@@ -1,0 +1,19 @@
+[package]
+name = "arinsal-etf"
+description = "Erlang External Term Format on owned Rust values"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+num-bigint.workspace = true
+num-traits.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

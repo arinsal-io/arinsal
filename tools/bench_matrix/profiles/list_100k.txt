@@ -1,0 +1,15 @@
+  1909  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+   215  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>
+   169  <hashbrown::map::HashMap<usize, (), std::hash::random::RandomState>>::insert
+   116  <arinsal_vm::Vm>::run_slice_inner
+   104  arinsal_term::native_code::is_native_code_pointer
+    54  __findenv_locked
+    51  <arinsal_vm::proc_create::Process>::refresh_code_refs
+    27  _tlv_get_addr
+    24  <arinsal_vm::Vm>::call_fun_term
+    21  arinsal_vm::jit_hook::run
+    20  DYLD-STUB$$malloc
+    20  <arinsal_term::gc::Copier>::scan_space
+    17  _free
+    14  <arinsal_vm::jit_hook::JitHook>::on_entry
+    13  _platform_memmove

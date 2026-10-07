@@ -1,0 +1,16 @@
+[package]
+name = "arinsal-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arinsal-term.workspace = true
+crossbeam-deque = "0.8.6"
+crossbeam-epoch = "0.9.18"
+crossbeam-queue = "0.3.14"
+libc = "0.2.189"
+
+[lints]
+workspace = true

@@ -1,0 +1,107 @@
+# OTP 29.1.1 suite pilot results
+
+| Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |
+|---|---:|---:|---:|---:|---:|---|
+| `after_SUITE` | 9 | 9/9 | 8/9 | 1 | 0 | receive_after_errors: failed {'EXIT', {no_answer_from_tc_supervisor, {test_server,tc_supervisor_req,2,[]}}}, unknown_location |
+| `alloc_SUITE` | 13 | 1/13 | 0/13 | 1 | 0 | set_dyn_param: failed {{badmatch,notsup} |
+| `async_ports_SUITE` | 1 | 1/1 | 1/1 | 0 | 0 | none |
+| `atomics_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `beam_SUITE` | 12 | 12/12 | 10/12 | 2 | 0 | heap_sizes: failed {badarg; select_val: failed {function_clause |
+| `beam_literals_SUITE` | 14 | 14/14 | 13/14 | 1 | 0 | matching_more_bigs: failed {{badmatch,other} |
+| `bif_SUITE` | 34 | 29/34 | 26/34 | 3 | 0 | group_leader_prio: failed timeout; group_leader_prio_dirty: failed timeout; verify_middle_queue_save: failed testcase_aborted |
+| `big_SUITE` | 23 | 23/23 | 18/23 | 5 | -11 | otp_6692: missing; properties: missing; reductions: missing; system_limit: missing; toobig: missing |
+| `binary_SUITE` | 55 | 42/55 | 39/55 | 3 | -6 | error_after_yield: missing; is_binary_test: missing; local_ext: missing |
+| `bs_bincomp_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `bs_bit_binaries_SUITE` | 11 | 11/11 | 11/11 | 0 | 0 | none |
+| `bs_construct_SUITE` | 31 | 30/31 | 28/31 | 2 | 0 | error_info: failed {{badmatch, {badarg, {3,binary,type,some_atom}, <<"segment 3 of type 'binary': expected a binary but got: some_atom">>}}; reductions: failed {if_clause |
+| `bs_match_bin_SUITE` | 9 | 9/9 | 9/9 | 0 | 0 | none |
+| `bs_match_int_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
+| `bs_match_misc_SUITE` | 20 | 20/20 | 20/20 | 0 | -9 | first failure:  |
+| `bs_match_tail_SUITE` | 4 | 4/4 | 4/4 | 0 | 0 | none |
+| `bs_utf_SUITE` | 8 | 8/8 | 6/8 | 2 | 0 | utf8_illegal_sequences: failed testcase_aborted; utf8_roundtrip: failed {badarg |
+| `busy_port_SUITE` | 18 | 18/18 | 6/18 | 12 | 0 | async_nopar_nosuspend_abort_cleanup: failed got_data_when_busy; async_par_nosuspend_abort_cleanup: failed got_data_when_busy; hard_busy_driver: failed {unexpected_value, {status,waiting}, expected, {status,suspended}}; io_to_busy: failed {test_case_failed, {bad_exit, {'EXIT',<0.173.0>, {{case_clause,undefined}; scheduling_busy_link: failed did_not_get_port_data; scheduling_delay_busy: failed {badarg; scheduling_delay_busy_nosuspend: failed did_not_get_port_data; send_3: failed {{badmatch,ok}; soft_busy_driver: failed {unexpected_value, {status,waiting}, expected, {status,suspended}}; sync_nopar_nosuspend_abort_cleanup: failed {'EXIT', {badarg; sync_par_nosuspend_abort_cleanup: failed {'EXIT', {badarg; trap_exit: failed {{badmatch,{status,waiting}} |
+| `call_trace_SUITE` | 14 | 14/14 | 14/14 | 0 | 0 | none |
+| `code_SUITE` | 29 | 27/29 | 26/29 | 1 | 0 | code_permission_gc: failed {{badmatch, {error, {load_failed, "Failed to load NIF library: 'dlopen(/var/folders/v5/w846m1655ylfpfnhmtgfbnvm0000gn/T/otp-code-source-pn9j10zk/test/code_SUITE_data/erts_test_sync… |
+| `code_parallel_load_SUITE` | 2 | 2/2 | 2/2 | 0 | 0 | none |
+| `counters_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `crypto_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `ddll_SUITE` | 26 | 26/26 | 26/26 | 0 | 0 | none |
+| `decode_packet_SUITE` | 10 | 10/10 | 9/10 | 1 | -9 | neg: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.174.0>}]}}}, unknown_location |
+| `dirty_bif_SUITE` | 13 | 8/13 | 5/13 | 3 | -9 | code_purge: failed {{badmatch,{undef,[{blipp,blapp,[],[]}]}}; dirty_bif_multischedule_exception: failed {{badmatch; otp_15688: failed testcase_aborted |
+| `dirty_nif_SUITE` | 25 | 10/25 | 4/25 | 6 | 0 | code_purge: failed {{badmatch,{undef,[{blipp,blapp,[],[]}]}}; dirty_call_while_terminated: failed {{badmatch,timeout}; dirty_nif_send_traced: failed {{badmatch,{trace,<0.227.0>,out_exited,0}}; literal_area: failed {{busy_literal_area_collecor_timout,5000}; nif_whereis: failed {{badmatch,false}; nif_whereis_parallel: failed {{badmatch,false} |
+| `distribution_SUITE` | 56 | 11/56 | 11/56 | 0 | 0 | none |
+| `driver_SUITE` | 50 | 40/50 | 10/50 | 31 | -6 | async_blast: missing; caller: missing; consume_timeslice: missing; driver_monitor: missing; driver_system_info_base_ver: missing; driver_system_info_current_ver: missing; driver_system_info_prev_ver: missing; env: missing; erl_errno_id: missing; invalid_extended_marker_drv: missing; ioq_exit_ready_async: missing; ioq_exit_ready_input: missing; ioq_exit_ready_input_async: missing; ioq_exit_ready_output: missing; ioq_exit_ready_output_async: missing; ioq_exit_timeout: missing; ioq_exit_timeout_async: missing; larger_major_vsn_drv: missing; larger_minor_vsn_drv: missing; many_events: missing; missing_callbacks: missing; otp_6879: missing; otp_9302: missing; peek_non_existing_queue: missing; poll_pipe: missing; smaller_major_vsn_drv: missing; smaller_minor_vsn_drv: missing; thr_free_drv: missing; thr_msg_blast: missing; thread_mseg_alloc_cache_clean: missing; zero_extended_marker_garb_drv: missing |
+| `dump_SUITE` | 5 | 0/5 | 0/5 | 0 | 0 | none |
+| `efile_SUITE` | 2 | 0/2 | 0/2 | 0 | 0 | none |
+| `erl_debugger_SUITE` | 28 | 27/28 | 21/28 | 6 | -9 | test_bps_work_with_large_number_of_live_xregs: failed {'EXIT', {system_limit, {erlang,apply, [many_live_xregs,many_args, [10,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18, 19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34, 35,36,37,38,…; test_hitting_bp_stops_and_notifies_debugger_process: failed {{timeout_receiving, "{ debugger_event , Session , { breakpoint , _ , { foo , go , 1 } , 7 , _ } }", {next_message, {executed,<0.280.0>,{foo,go,1},{line,7}}}}; test_stack_frames_returns_frames: failed {{timeout_receiving,"{ sync , P }", {next_message, {debugger_event,21, {breakpoint,<0.346.0>, {call_stacks,three_levels,2}, 5,#Fun<erts_internal.0.84522871>}}}}; test_stack_frames_returns_running_if_not_suspended: failed {{badmatch,running}; test_stack_frames_returns_y_regs_controlled_by_size: failed {{badkey,0}; test_stack_frames_works_with_hibernate: failed {{badmatch,normal} |
+| `erl_drv_thread_SUITE` | 3 | 0/3 | 0/3 | 0 | -9 | first failure: failed: {test_case_failed, |
+| `erl_link_SUITE` | 16 | 6/16 | 4/16 | 2 | 0 | links: failed {{badmatch,[{erl_link,process,<0.170.0>,linked,170}]}; process_monitors: failed {{badmatch,[]} |
+| `erts_debug_SUITE` | 8 | 7/8 | 7/8 | 0 | 0 | none |
+| `estone_SUITE` | 1 | 1/1 | 1/1 | 0 | 0 | none |
+| `ets_SUITE` | 162 | 160/162 | 124/162 | 36 | -9 | bound_maps: missing; compress_magic_ref: missing; delete_large_tab: failed {test_case_failed,failed}; delete_unfix_race: missing; doctests: missing; error_info: missing; ets_all: missing; evil_rename: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; evil_update_counter: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; exit_large_table_owner: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; exit_many_large_table_owner: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; exit_many_many_tables_owner: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; exit_many_tables_owner: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; heavy_concurrent: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; heir: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; insert_trap_delete: failed {{badmatch,#Ref<0.9440.248.1163154217>}; massive_ets_all: missing; match_heavy: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; memory: failed {{badmatch,{146,2623,2623,2623}}; ms_excessive_nesting: missing; otp_9423: missing; partly_bound: failed {{badmatch,false}; racy_rename: missing; smp_select_delete: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; t_delete_all_objects_trap: failed {test_case_failed,"No trap detected"}; t_match_spec_run: failed {test_case_failed,"TRACE MATCH FAILED"}; t_select_delete: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; tabfile_ext4: failed {'EXIT',no_answer_from_tc_supervisor}, unknown_location; take: missing; test_decentralized_counters_setting: missing; test_table_memory_concurrency: missing; test_table_size_concurrency: missing; test_throughput_benchmark: missing; types: failed {{badmatch, {binary; whereis_table: missing; write_concurrency: failed {{badmatch,false} |
+| `evil_SUITE` | 9 | 9/9 | 9/9 | 0 | 0 | none |
+| `exception_SUITE` | 16 | 14/16 | 13/16 | 1 | 0 | backtrace_depth: failed {bad_depth |
+| `float_SUITE` | 15 | 14/15 | 14/15 | 0 | 0 | none |
+| `fun_SUITE` | 18 | 17/18 | 17/18 | 0 | 0 | none |
+| `gc_SUITE` | 10 | 10/10 | 10/10 | 0 | 0 | none |
+| `guard_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `hash_SUITE` | 29 | 27/29 | 21/29 | 6 | 0 | test_phash2_with_large_bin: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.375.0>}]}}}, unknown_location; test_phash2_with_short_list: failed testcase_aborted; test_phash2_with_short_tuple: failed testcase_aborted; test_phash2_with_small_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_with_42, 20000}}}}; test_phash2_with_tiny_bin: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tuple, 20000}}}}; test_phash2_with_tiny_unaligned_sub_binary: auto_skipped {failed, {ct_framework,init_tc, {testcase_aborted, {arinsal_case_timeout,test_phash2_deep_tiny, 20000}}}} |
+| `hash_property_test_SUITE` | 3 | 0/3 | 0/3 | 0 | 0 | none |
+| `hello_SUITE` | 1 | 1/1 | 0/1 | 1 | 0 | hello: failed {badarg |
+| `hibernate_SUITE` | 10 | 10/10 | 7/10 | 3 | 0 | dynamic_call: failed {'EXIT',error}, unknown_location; in_place: failed {{badmatch,false}; no_heap: failed {{badmatch,[{heap_size,4},{total_heap_size,24}]} |
+| `iovec_SUITE` | 13 | 13/13 | 13/13 | 0 | 0 | none |
+| `jit_SUITE` | 6 | 2/6 | 1/6 | 1 | 0 | named_labels: auto_skipped {failed, {jit_SUITE,init_per_testcase, {badarg |
+| `lcnt_SUITE` | 5 | 0/5 | 0/5 | 0 | 0 | none |
+| `list_bif_SUITE` | 9 | 8/9 | 8/9 | 0 | 0 | none |
+| `lttng_SUITE` | 9 | 0/9 | 0/9 | 0 | 0 | none |
+| `map_SUITE` | 64 | 63/64 | 62/64 | 1 | 0 | t_tracing: failed {{badmatch,timeout} |
+| `match_spec_SUITE` | 30 | 28/30 | 11/30 | 17 | 0 | caller_and_return_to: failed {test_case_failed, {got_unexpected, {trace,<0.365.0>,call, {match_spec_SUITE,do_put,[test]}, {match_spec_SUITE,do_put,1}}}}; destructive_in_test_bif: failed {badarith; maps: failed testcase_aborted; ms_trace2: failed {badarg; ms_trace3: failed {badarg; ms_trace_dead: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.396.0>}]}}}, unknown_location; silent: failed {test_case_failed,timeout}; silent_no_ms: failed {test_case_failed,timeout}; test_1: failed {test_case_failed, {got_unexpected, {trace,<0.309.0>,call, {match_spec_SUITE,f2,[a,a]}, true}}}; test_3: failed {test_case_failed, {got_unexpected, {trace,<0.320.0>,call, {match_spec_SUITE,f2,[a,a]}}}}; test_4a: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.322.0>}]}}}, unknown_location; test_4b: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.331.0>}]}}}, unknown_location; test_5a: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.340.0>}]}}}, unknown_location; test_5b: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.349.0>}]}}}, unknown_location; test_6: failed {test_case_failed,{noerror,0}}; trace_control_word: failed {badarg; unary_plus: failed {{badmatch,{ok,true,[],[]}} |
+| `message_queue_data_SUITE` | 5 | 4/5 | 3/5 | 1 | 0 | change_to_off_heap: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.185.0>}]}}}, unknown_location |
+| `module_info_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | native: failed {badarg; nifs: failed {{badmatch,false} |
+| `monitor_SUITE` | 25 | 16/25 | 16/25 | 0 | 0 | none |
+| `mtx_SUITE` | 22 | 22/22 | 20/22 | 2 | 0 | hammer_sched_freqread_tryrwlock: failed testcase_aborted; hammer_sched_freqread_tryrwlock_check: failed testcase_aborted |
+| `multi_load_SUITE` | 3 | 3/3 | 3/3 | 0 | 0 | none |
+| `native_record_SUITE` | 10 | 9/10 | 1/10 | 8 | 0 | create: failed {'EXIT',error}, unknown_location; errors: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.212.0>}]}}}, unknown_location; explicit_module_name: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.185.0>}]}}}, unknown_location; external_term_format: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.201.0>}]}}}, unknown_location; gc: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.195.0>}]}}}, unknown_location; gh_11398: failed {{badmatch,#native_record_SUITE:exp{a = 1}}; records_module: failed {{badmatch, #native_record_SUITE:b{x = foo,y = none,z = none}}; term_order: failed {{badmatch,false} |
+| `nested_SUITE` | 4 | 4/4 | 4/4 | 0 | 0 | none |
+| `nif_SUITE` | 80 | 0/80 | 0/80 | 0 | 0 | none |
+| `node_container_SUITE` | 20 | 12/20 | 5/20 | 7 | 0 | ets_refc: failed {{badmatch,0}; magic_ref: failed {{badmatch,true}; match_spec_refc: failed {{badmatch,0}; node_table_gc: failed {{badmatch,false}; ref_eq: failed {badarg,mk_ref,[{"nonode@nohost",0},[4711]]}; term_to_binary_to_term_eq: failed {badarg,mk_ref,[{"nonode@nohost",0},[4711]]}; timer_refc: failed {{badmatch,0} |
+| `nofrag_SUITE` | 5 | 5/5 | 4/5 | 1 | -9 | debug_breakpoint: failed dont_execute_me |
+| `num_bif_SUITE` | 11 | 11/11 | 11/11 | 0 | 0 | none |
+| `op_SUITE` | 12 | 12/12 | 10/12 | 2 | 0 | complex_relop: failed testcase_aborted; relop: failed testcase_aborted |
+| `os_signal_SUITE` | 10 | 10/10 | 0/10 | 10 | -30 | set_unset: missing; t_sigalrm: missing; t_sigchld: missing; t_sigchld_fork: missing; t_sighup: failed {badarg; t_siginfo: missing; t_sigterm: missing; t_sigusr1: missing; t_sigusr2: missing; t_sigwinch: missing |
+| `persistent_term_SUITE` | 22 | 22/22 | 22/22 | 0 | 0 | none |
+| `port_SUITE` | 74 | 68/74 | 67/74 | 1 | 0 | port_setget_data: failed testcase_aborted |
+| `port_bif_SUITE` | 9 | 9/9 | 4/9 | 5 | 0 | busy_options: failed {{badmatch,false}; connect: failed {badarg; control: failed {badarg; port_info1: failed {{badmatch,false}; port_info2: failed {badarg |
+| `port_trace_SUITE` | 21 | 21/21 | 21/21 | 0 | 0 | none |
+| `prim_eval_SUITE` | 1 | 1/1 | 0/1 | 1 | 1 | 'ERL-365': missing |
+| `process_SUITE` | 104 | 70/104 | 70/104 | 0 | 0 | none |
+| `process_max_heap_size_SUITE` | 1 | 1/1 | 0/1 | 1 | 0 | immediate_termination: failed {{badmatch, {{a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a… |
+| `pseudoknot_SUITE` | 1 | 1/1 | 1/1 | 0 | 0 | none |
+| `receive_SUITE` | 14 | 12/14 | 12/14 | 0 | 0 | none |
+| `ref_SUITE` | 5 | 4/5 | 4/5 | 0 | 0 | none |
+| `register_SUITE` | 1 | 1/1 | 1/1 | 0 | 0 | none |
+| `save_calls_SUITE` | 2 | 2/2 | 1/2 | 1 | -9 | save_calls_1: failed {{bad_generator,false} |
+| `scheduler_SUITE` | 25 | 11/25 | 0/25 | 11 | -9 | bound_process: missing; equal: failed {badarg; equal_with_high: missing; equal_with_high_max: missing; equal_with_part_time_high: failed {badarg; many_low: failed {badarg; otp_16446: missing; reader_groups: missing; scheduler_suspend_basic: missing; simultaneously_change_schedulers_online: missing; simultaneously_change_schedulers_online_with_exits: missing |
+| `send_term_SUITE` | 1 | 1/1 | 1/1 | 0 | 0 | none |
+| `sensitive_SUITE` | 12 | 12/12 | 10/12 | 2 | 0 | call_trace: failed {{badmatch; meta_trace: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.201.0>}]}}}, unknown_location |
+| `signal_SUITE` | 39 | 8/39 | 20/39 | 1 | 0 | dirty_signal_handling_race_dirty_access: failed testcase_aborted_or_killed, unknown_location |
+| `small_SUITE` | 13 | 13/13 | 13/13 | 0 | 0 | none |
+| `smoke_test_SUITE` | 3 | 2/3 | 1/3 | 1 | 0 | jump_table: failed {badarg |
+| `statistics_SUITE` | 18 | 18/18 | 18/18 | 0 | 0 | none |
+| `system_info_SUITE` | 12 | 10/12 | 3/12 | 7 | 0 | atom_count: failed {{badmatch,false}; ets_count: failed {badarg; memory: failed {{badmatch,false}; misc_smoke_tests: failed {badarg; process_count: failed {{badmatch,0}; procs_bug: failed {badarg; system_logger: failed {badarg |
+| `system_profile_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | runnable_ports: failed {{badmatch,false}; scheduler: failed {{badmatch,false} |
+| `time_SUITE` | 18 | 16/18 | 16/18 | 0 | -9 | first failure: failed: {not_alive, |
+| `timer_bif_SUITE` | 23 | 20/23 | 20/23 | 0 | 0 | none |
+| `trace_SUITE` | 39 | 34/39 | 33/39 | 1 | -9 | suspend: failed testcase_aborted |
+| `trace_bif_SUITE` | 7 | 7/7 | 3/7 | 4 | 0 | trace_bif_local: failed {test_case_failed, "Expected: {trace,<0.233.0>,call,{erlang,time,[]}},\nGot: timeout\n"}; trace_bif_return: failed {test_case_failed,"Got timeout\n"}; trace_bif_timestamp: failed {{badmatch,19454399541}; trace_bif_timestamp_local: failed {test_case_failed,"Got timeout\n"} |
+| `trace_call_count_SUITE` | 5 | 5/5 | 3/5 | 2 | 0 | combo: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.218.0>}]}}}, unknown_location; info: failed {{badmatch, {all |
+| `trace_call_memory_SUITE` | 12 | 12/12 | 0/12 | 12 | 0 | basic: failed {badarg; big_words: failed {badarg; conflict_traces: failed {badarg; delayed_gc: failed {badarg; late_trace: failed {badarg; message: failed {badarg; on_load: failed {badarg; parallel_map: failed {badarg; skip: failed {badarg; spawn_memory: failed {badarg; spawn_memory_lambda: failed {badarg; trace_all: failed {badarg |
+| `trace_call_time_SUITE` | 17 | 17/17 | 0/17 | 17 | -5 | apply_bif_bug: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; basic: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; bif: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; called_function: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; catch_crash: missing; combo: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; dead_tracer: missing; disable_ongoing: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; info: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; nif: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; on_and_off: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; pause_and_restart: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; reset: missing; return_stop: missing; scheduling: auto_skipped {failed, {trace_call_time_SUITE,init_per_testcase, {badarg; trace_info_killed: missing; trace_info_noblock: missing |
+| `trace_local_SUITE` | 25 | 25/25 | 25/25 | 0 | -9 | first failure: |
+| `trace_meta_SUITE` | 8 | 8/8 | 0/8 | 8 | -5 | basic: failed {badarg; combo: missing; info: missing; nosilent: missing; on_and_off: missing; return: missing; stack_grow: missing; tracer: missing |
+| `trace_nif_SUITE` | 6 | 6/6 | 4/6 | 2 | 0 | trace_nif_meta: failed {badarg; trace_nif_return: failed {'EXIT',error}, unknown_location |
+| `trace_port_SUITE` | 10 | 10/10 | 0/10 | 10 | 0 | call_trace: failed {'EXIT',badsig}, unknown_location; default_tracer: failed {{badmatch,{flags,[send]}}; gc: failed {'EXIT',badsig}, unknown_location; process_events: failed {'EXIT',badsig}, unknown_location; receive_trace: failed {'EXIT',badsig}, unknown_location; receive_trace_non_scheduler: failed {'EXIT',badsig}, unknown_location; return_trace: failed {'EXIT',badsig}, unknown_location; schedule: failed {'EXIT',badsig}, unknown_location; send: failed {'EXIT',badsig}, unknown_location; tracer_port_crash: failed badsig |
+| `trace_session_SUITE` | 20 | 19/20 | 5/20 | 14 | 0 | destroy: failed {badarg; is_bif_traced: failed {test_case_failed,"Unexpected messages: timeout"}; meta: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.180.0>}]}}}, unknown_location; ms_enable_flags: failed {badarg; negative: failed {{badmatch,1}; on_load: failed {{badmatch,timeout}; procs: failed {test_case_failed, "Unexpected messages: {<0.209.0>,{trace,<0.212.0>,getting_linked,<0.206.0>}}"}; return_to: failed {test_case_failed,"Unexpected messages: timeout"}; system_monitor_info: failed {badarg; system_monitor_long_msgq: failed {badarg; test_set_on_first_spawn: failed {test_case_failed, "Unexpected messages: {<0.227.0>,\n {trace,<0.229.0>,spawn,<0.230.0>,\n {erlang,apply,\n …; test_set_on_link: failed {test_case_failed,"Unexpected messages: timeout"}; test_set_on_spawn: failed {test_case_failed, "Unexpected messages: {<0.218.0>,\n {trace,<0.220.0>,spawn,<0.221.0>,\n {erlang,apply,\n …; timem_basic: failed {badarg |
+| `tracer_SUITE` | 21 | 21/21 | 0/21 | 21 | 0 | call: failed {badarg; call_return: failed {badarg; exit: failed {badarg; gc_end: failed {badarg; gc_start: failed {badarg; getting_linked: failed {badarg; getting_unlinked: failed {badarg; in: failed {badarg; invalid_tracers: failed {'EXIT', {noproc, {gen_server,call, [ct_hooks_lock,{release,<0.353.0>}]}}}, unknown_location; link: failed {badarg; load: failed {undef; out: failed {badarg; recv: failed {badarg; register: failed {badarg; reload: failed {undef; send: failed {badarg; seq_trace: failed {badarg; spawn: failed {badarg; unlink: failed {badarg; unload: failed {badarg; unregister: failed {badarg |
+| `tuple_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
+| `unique_SUITE` | 2 | 1/2 | 1/2 | 0 | 0 | none |
