@@ -4191,14 +4191,15 @@ impl<T: Task> Scheduler<T> {
             })
             .is_ok()
     }
-    /// Whether the task is queued on or executing on a dirty scheduler.
+    /// Whether the task is currently executing on a dirty scheduler.
     ///
-    /// Port of erts/emulator/beam/erl_process.h (`ERTS_PROC_IN_DIRTY_STATE`), OTP-29.1.1.
+    /// Port of erts/emulator/beam/erl_process.c:9216
+    /// (`erts_internal_is_process_executing_dirty_1`), OTP-29.1.1.
     pub fn is_executing_dirty(&self, pid: Pid) -> bool {
-        self.inner.table.lookup(pid).is_some_and(|process| {
-            process.dirty.load(Ordering::Acquire) != 0
-                || process.dirty_runner.load(Ordering::Acquire) != 0
-        })
+        self.inner
+            .table
+            .lookup(pid)
+            .is_some_and(|process| process.dirty_runner.load(Ordering::Acquire) != 0)
     }
     /// Number of dirty CPU and dirty I/O scheduler threads.
     pub fn dirty_scheduler_counts(&self) -> (usize, usize) {
@@ -4835,6 +4836,34 @@ mod spawn_request_tests {
         scheduler.schedule_unscheduled(child).unwrap();
         assert!(scheduler.step());
         assert_eq!(observed.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod dirty_state_tests {
+    use super::*;
+
+    struct Idle;
+
+    impl Task for Idle {
+        type Message = ();
+
+        fn run(&mut self, _ctx: &mut RunCtx<'_, ()>, _: u32) -> RunOutcome {
+            RunOutcome::Wait { timeout_ms: None }
+        }
+    }
+
+    #[test]
+    fn executing_dirty_excludes_queued_dirty_work() {
+        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
+        let pid = scheduler.spawn(Idle).unwrap();
+        let process = scheduler.inner.table.lookup(pid).unwrap();
+        process.dirty.store(1, Ordering::Release);
+
+        assert!(!scheduler.is_executing_dirty(pid));
+
+        process.dirty_runner.store(1, Ordering::Release);
+        assert!(scheduler.is_executing_dirty(pid));
     }
 }
 

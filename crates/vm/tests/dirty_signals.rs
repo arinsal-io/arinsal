@@ -114,7 +114,9 @@ exit_kill(Sleep) ->
 info(Sleep) ->
     P = start(Sleep),
     T0 = now_ms(),
-    Info = process_info(P, [status, trap_exit, priority, message_queue_len, links]),
+    %% `status` is a transient scheduler observation. It can be `runnable` on
+    %% Arinsal and `running` on OTP while both answer the request during the NIF.
+    Info = process_info(P, [trap_exit, priority, message_queue_len, links]),
     Fast = fast(T0),
     {Info, Fast, slept(P)}.
 
