@@ -188,6 +188,9 @@ pub(crate) struct ProcessCold {
     pub(crate) native_retry_site: Option<(usize, usize)>,
     /// The interpreter returned only to hand control to `native_pc`; the slice continues.
     pub(crate) native_transfer: bool,
+    /// A system task woke the process while it was executing; it runs at the next scheduling
+    /// point instead.
+    pub(crate) sys_tasks_deferred: bool,
     /// Native continuation to install after an interpreted external call returns.
     pub(crate) native_resume_after_call: Option<usize>,
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
@@ -229,8 +232,9 @@ pub(crate) struct ProcessCold {
     /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
     pub(crate) delayed_gc: Vec<DelayedGc>,
     /// Set while the process handles its signals before executing code (erts
-    /// `ERTS_PSFLG_RUNNING_SYS`), where a potentially long GC request moves the process to a
-    /// dirty CPU scheduler instead of collecting on the normal one.
+    /// `ERTS_PSFLG_RUNNING_SYS`): the only place system tasks execute (erl_process.c
+    /// execute_sys_tasks), as no Erlang, native or BIF code is half-way done; a potentially
+    /// long GC request there moves the process to a dirty CPU scheduler.
     pub(crate) sys_task_point: bool,
     /// A potentially long GC request waits in `delayed_gc` for a dirty CPU scheduler.
     pub(crate) dirty_sys_gc: bool,

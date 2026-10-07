@@ -1237,8 +1237,10 @@ impl Executor {
                 if ctx.sys_task_run() {
                     process.cold_mut().sys_task_point = true;
                     let drained = process.drain(ctx);
+                    let executed =
+                        drained.and_then(|()| crate::signals::execute_sys_tasks(process, ctx));
                     process.cold_mut().sys_task_point = false;
-                    drained?;
+                    executed?;
                 }
                 loop {
                     // A caught exception re-enters this loop without replenishing its process slice.
@@ -2863,8 +2865,9 @@ impl Executor {
         if runtime.suspend_total_of(pid) > 0 {
             process.cold_mut().sys_task_point = true;
             let drained = process.drain(ctx);
+            let executed = drained.and_then(|()| crate::signals::execute_sys_tasks(process, ctx));
             process.cold_mut().sys_task_point = false;
-            drained?;
+            executed?;
             // The resumer's wake-up signal may have been consumed by the drain above: re-check
             // so a resume racing with this suspension is not lost (otherwise the process
             // waits forever).
@@ -5337,6 +5340,21 @@ impl Process {
             None if self.module == module && !self.heap.native_active() => return true,
             _ => {}
         }
+        // Port of erts/emulator/beam/beam_bif_load.c:1171 and erl_nfunc_sched.h:120
+        // (erts_check_nfunc_in_area), OTP-29.1.1: a native call that is redone when the process wakes (a parked BIF, a
+        // NIF waiting for a dirty scheduler) keeps its return address outside the stack.
+        if let Some(cold) = self.cold.as_deref() {
+            let retry = cold
+                .native_retry
+                .and(cold.native_retry_site)
+                .is_some_and(|(resume, site)| in_native(resume) || in_native(site));
+            let dirty = cold
+                .native_dirty_nif
+                .is_some_and(|(_, resume, _)| in_native(resume));
+            if retry || dirty {
+                return true;
+            }
+        }
         for index in 0..self.heap.stack_words() {
             let Some(term) = self.heap.stack_get(index) else {
                 continue;
@@ -5895,7 +5913,12 @@ impl Process {
         ctx: &mut RunCtx<'_, Message>,
         budget: u32,
     ) -> Result<RunState, VmError> {
-        let result = with_executor(runtime, |executor| executor.run(self, ctx, budget));
+        let mut result = with_executor(runtime, |executor| executor.run(self, ctx, budget));
+        if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
+            && let Err(error) = crate::signals::reschedule_deferred_sys_tasks(self, ctx)
+        {
+            result = Err(error);
+        }
         if self
             .cold
             .as_ref()
