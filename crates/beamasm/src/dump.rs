@@ -122,9 +122,11 @@ pub fn write_global_note(directory: &Path) -> Result<(), DumpError> {
 }
 
 fn safe_module_name(module: &str) -> Result<&str, DumpError> {
-    if !module
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'@')
+    // Elixir module names contain dots; a name made only of dots would escape the directory.
+    if module.bytes().all(|byte| byte == b'.')
+        || !module
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'@' | b'.'))
     {
         return Err(DumpError("invalid module name for dump path".to_owned()));
     }
