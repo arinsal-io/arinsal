@@ -2644,6 +2644,16 @@ impl Requests {
         self.plain.is_empty() && self.sys.iter().all(VecDeque::is_empty)
     }
 
+    /// The highest-priority queued check_process_code task.
+    fn take_check_process_code(&mut self) -> Option<Pending> {
+        self.sys.iter_mut().find_map(|queue| {
+            let index = queue
+                .iter()
+                .position(|pending| matches!(pending.op, RemoteOp::CheckProcessCode { .. }))?;
+            queue.remove(index)
+        })
+    }
+
     /// Port of erts/emulator/beam/erl_process.c:10646 (fetch_sys_task), OTP-29.1.1:
     /// highest priority first; a waiting low-priority task runs after `RESCHEDULE_LOW`
     /// normal ones (erl_process.h:373).
@@ -2981,7 +2991,33 @@ pub(crate) fn handle_request(
             .iter()
             .position(|pending| pending.id == id)
             .and_then(|index| queues.plain.remove(index));
-        let Some(pending) = plain.or_else(|| queues.fetch_sys_task()) else {
+        // Port of erts/emulator/beam/erl_process.c:10368 (erts_schedule runs
+        // execute_sys_tasks only while the process is scheduled in and not executing),
+        // OTP-29.1.1: a system task woken in the middle of a BIF, a receive or native code
+        // waits for the next scheduling point. check_process_code in particular must see the
+        // process' continuation, which a half-done native call keeps outside its stack.
+        let at_point = process
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.sys_task_point);
+        let dirty_cpc = if plain.is_none() && !at_point {
+            if queues.sys.iter().any(|queue| !queue.is_empty()) {
+                process.cold_mut().sys_tasks_deferred = true;
+            }
+            // Port of erts/emulator/beam/erl_process.c:11255 (dispatch_system_task),
+            // OTP-29.1.1: check_process_code of a process executing dirty is run by the dirty
+            // signal handler on its behalf; the other tasks wait for the process.
+            if !ctx.dirty_running() {
+                return Ok(());
+            }
+            let Some(pending) = queues.take_check_process_code() else {
+                return Ok(());
+            };
+            Some(pending)
+        } else {
+            None
+        };
+        let Some(pending) = plain.or(dirty_cpc).or_else(|| queues.fetch_sys_task()) else {
             return Ok(());
         };
         if queues.is_empty() {
@@ -2989,6 +3025,15 @@ pub(crate) fn handle_request(
         }
         pending
     };
+    run_request(process, ctx, pending)
+}
+
+/// Run one fetched request: a GC request may be saved or moved to a dirty scheduler first.
+fn run_request(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    pending: Pending,
+) -> Result<(), VmError> {
     // Port of erts/emulator/beam/erl_process.c:10831 (save_gc_task), OTP-29.1.1:
     // a garbage_collect request waits (reply included) until GC is enabled again.
     if !process.gc_enabled && matches!(pending.op, RemoteOp::Collect { .. }) {
@@ -3029,6 +3074,67 @@ fn potentially_long_gc(process: &Process, major: bool) -> bool {
         size += words.old_heap_size;
     }
     size >= POTENTIALLY_LONG_GC_HSIZE
+}
+
+/// Port of erts/emulator/beam/erl_process.c:10803 (execute_sys_tasks), OTP-29.1.1: run the
+/// system tasks queued for the process at its scheduling point.
+pub(crate) fn execute_sys_tasks(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<(), VmError> {
+    process.cold_mut().sys_tasks_deferred = false;
+    loop {
+        let pending = {
+            let mut tables = tables().lock().unwrap();
+            let slot = (scope(process), ctx.pid());
+            let Some(queues) = tables.requests.get_mut(&slot) else {
+                return Ok(());
+            };
+            let Some(pending) = queues.fetch_sys_task() else {
+                return Ok(());
+            };
+            if queues.is_empty() {
+                tables.requests.remove(&slot);
+            }
+            pending
+        };
+        run_request(process, ctx, pending)?;
+    }
+}
+
+/// Wakes the process again for system tasks deferred during this slice, so that it reaches a
+/// scheduling point that runs them (erts keeps ERTS_PSFLG_ACTIVE_SYS set).
+pub(crate) fn reschedule_deferred_sys_tasks(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<(), VmError> {
+    if !process
+        .cold
+        .as_ref()
+        .is_some_and(|cold| cold.sys_tasks_deferred)
+    {
+        return Ok(());
+    }
+    let priority = {
+        let tables = tables().lock().unwrap();
+        let Some(queues) = tables.requests.get(&(scope(process), ctx.pid())) else {
+            process.cold_mut().sys_tasks_deferred = false;
+            return Ok(());
+        };
+        let Some(index) = queues.sys.iter().position(|queue| !queue.is_empty()) else {
+            process.cold_mut().sys_tasks_deferred = false;
+            return Ok(());
+        };
+        [
+            Priority::Max,
+            Priority::High,
+            Priority::Normal,
+            Priority::Low,
+        ][index]
+    };
+    // No plain request has this id: the wakeup fetches the next system task.
+    ctx.signal_sys_task(ctx.pid(), Signal::UnlinkAck(u64::MAX), priority)
+        .map_err(|error| VmError::Unsupported(format!("system task wakeup: {error}")))
 }
 
 /// Run a queued request and send its reply.

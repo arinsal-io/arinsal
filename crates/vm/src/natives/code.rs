@@ -2061,6 +2061,47 @@ mod tests {
         compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
     }
 
+    /// A process whose native code is inside a BIF that handles signals (demonitor with
+    /// flush) still references its module: erts runs check_process_code only at the
+    /// process' scheduling point.
+    #[test]
+    fn cpc_sees_process_inside_signal_handling_bif() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping CPC mid-BIF differential test");
+            return;
+        };
+        let busy_source = "-module(arinsal_cpc_busy). -export([loop/1]). loop(0) -> done; loop(N) -> erlang:demonitor(make_ref(), [flush]), loop(N - 1).";
+        let old = reference
+            .compile_named("arinsal_cpc_busy", busy_source, &[])
+            .unwrap();
+        let control = reference
+            .compile_named(
+                "arinsal_cpc_busy_control",
+                "-module(arinsal_cpc_busy_control). -export([run/1]). run(Bin) -> Pid = spawn(arinsal_cpc_busy, loop, [1 bsl 40]), receive after 20 -> ok end, Prep = erlang:prepare_loading(arinsal_cpc_busy, Bin), ok = erlang:finish_loading([Prep]), Res = check(Pid, 300, {0, 0}), exit(Pid, kill), Res. check(_, 0, Acc) -> Acc; check(Pid, N, {T, F}) -> case erlang:check_process_code(Pid, arinsal_cpc_busy) of true -> check(Pid, N - 1, {T + 1, F}); false -> check(Pid, N - 1, {T, F + 1}) end.",
+                &[],
+            )
+            .unwrap();
+        reference.load("arinsal_cpc_busy", &old).unwrap();
+        reference
+            .load("arinsal_cpc_busy_control", &control)
+            .unwrap();
+        let expected = reference.call(
+            "arinsal_cpc_busy_control",
+            "run",
+            &[OwnedTerm::Binary(old.clone())],
+        );
+
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&old).unwrap();
+        vm.load_bytes(&control).unwrap();
+        let mut heap = arinsal_term::VecHeap::new();
+        let binary = from_owned(&OwnedTerm::Binary(old), &mut heap).unwrap();
+        let result = vm
+            .eval_scheduled("arinsal_cpc_busy_control", "run", &[binary], 2, None)
+            .unwrap();
+        compare(&CallResult::Ok(result.term), &expected, CompareMode::Exact).unwrap();
+    }
+
     #[test]
     fn code_load_binary_on_load_success_and_failure_match_erl() {
         let Ok(reference) = RefErl::start() else {
