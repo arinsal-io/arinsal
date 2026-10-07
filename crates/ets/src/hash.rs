@@ -458,6 +458,48 @@ impl HashStorage {
         removed
     }
 
+    /// Unlink every live object for which `predicate` holds while walking the buckets once.
+    ///
+    /// Port of erts/emulator/beam/erl_db_hash.c:2723 (db_select_delete_hash), OTP-29.1.1:
+    /// erts frees matching objects during the traversal and shrinks the table afterwards.
+    pub(super) fn delete_where<E>(
+        &mut self,
+        mut predicate: impl FnMut(&StoredTerm) -> Result<bool, E>,
+    ) -> Result<usize, E> {
+        let mut removed = 0;
+        let mut failure = None;
+        'slots: for slot in 0..self.nactive {
+            let mut link = &mut self.segment_bucket_mut(slot).head;
+            while let Some(mut node) = link.take() {
+                let selected = if node.pseudo_deleted {
+                    Ok(false)
+                } else {
+                    predicate(&node.object)
+                };
+                match selected {
+                    Ok(true) => {
+                        *link = node.next.take();
+                        removed += 1;
+                    }
+                    Ok(false) => {
+                        *link = Some(node);
+                        link = &mut link.as_mut().unwrap().next;
+                    }
+                    Err(error) => {
+                        *link = Some(node);
+                        failure = Some(error);
+                        break 'slots;
+                    }
+                }
+            }
+        }
+        self.size -= removed;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(removed),
+        }
+    }
+
     /// Port of erts/emulator/beam/erl_db_hash.c:3973-3984, OTP-29.1.1.
     pub(super) fn retain_fixed_delete(&mut self, object: StoredTerm) {
         self.deleted.push(object);
@@ -480,8 +522,22 @@ impl HashStorage {
 
     /// Port of erts/emulator/beam/erl_db_hash.c:1990-2010, OTP-29.1.1.
     pub(super) fn ordered(&self, keypos: usize) -> Vec<&StoredTerm> {
-        let mut objects: Vec<_> = self.values().collect();
-        self.sort_ordered(&mut objects, keypos);
+        // Buckets already are in slot order, so only each short chain needs sorting.
+        let _ = keypos;
+        let mut objects: Vec<&StoredTerm> = Vec::new();
+        for slot in 0..self.nactive {
+            let start = objects.len();
+            objects.extend(
+                HashIter {
+                    next: self.segment_bucket(slot).head.as_deref(),
+                }
+                .map(|node| &node.object),
+            );
+            if objects.len() - start > 1 {
+                objects[start..]
+                    .sort_unstable_by_key(|object| (object.group_order, u64::MAX - object.order));
+            }
+        }
         objects
     }
 
@@ -516,18 +572,6 @@ impl HashStorage {
             .map(|node| &node.object)
             .min_by_key(|object| (object.group_order, u64::MAX - object.order))
         })
-    }
-
-    /// Port of erts/emulator/beam/erl_db_hash.c:1990-2010, OTP-29.1.1.
-    pub(super) fn sort_ordered(&self, objects: &mut Vec<&StoredTerm>, keypos: usize) {
-        objects.sort_unstable_by_key(|object| {
-            (
-                self.slot_index(object.hvalue),
-                object.group_order,
-                u64::MAX - object.order,
-            )
-        });
-        let _ = keypos;
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3411-3444, OTP-29.1.1.

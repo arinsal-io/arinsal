@@ -3,7 +3,7 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_gaps_diff).
--export([all_tables/0, run_r/0, stats/0, errors/0]).
+-export([all_tables/0, run_r/0, stats/0, errors/0, select_delete_large/0]).
 
 all_tables() ->
     Named = ets:new(gap_named, [named_table, public, set]),
@@ -172,6 +172,14 @@ recv(Tag) ->
         {Tag, Value} -> Value
     after 2000 -> timeout
     end.
+
+select_delete_large() ->
+    Table = ets:new(gap_select_delete, [set]),
+    true = ets:insert(Table, [{I, I rem 7} || I <- lists:seq(1, 2048)]),
+    Spec = [{{'$1', '$2'}, [{'>', '$1', 1000}], [true]}],
+    Before = ets:select_count(Table, Spec),
+    Deleted = ets:select_delete(Table, Spec),
+    {Before, Deleted, lists:sort(ets:tab2list(Table))}.
 "#;
 
 #[test]
@@ -200,6 +208,11 @@ fn ets_error_cases_match_otp_29() {
         text.starts_with("{6") || text.starts_with("{7"),
         "expected at least 40 error cases, got {text}"
     );
+}
+
+#[test]
+fn select_delete_large_hash_table_matches_otp_29() {
+    assert_same("select_delete_large");
 }
 
 fn assert_same(function: &str) -> CallResult {

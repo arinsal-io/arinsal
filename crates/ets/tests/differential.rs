@@ -5,7 +5,7 @@ use arinsal_ets::{
     WriteConcurrency,
     match_spec::{MatchContext, MatchDialect, MatchProgram, match_spec_test},
 };
-use arinsal_term::{Term, VecHeap, from_owned, global_atoms, to_owned};
+use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms, to_owned};
 
 fn atom(name: &str) -> OwnedTerm {
     OwnedTerm::atom(name)
@@ -2282,15 +2282,23 @@ fn trace_operations_are_validated_and_dispatched() {
         let mut source = VecHeap::new();
         let term = from_owned(&spec, &mut source).unwrap();
         assert!(MatchProgram::compile(term).is_err(), "ETS accepted {name}");
-        let program = MatchProgram::compile_trace(term).unwrap();
+        let program =
+            MatchProgram::compile_trace(term).unwrap_or_else(|error| panic!("{name}: {error:?}"));
         let mut output = VecHeap::new();
-        let result = program
-            .run_with_context(Term::small(1).unwrap(), &mut output, &tracer)
+        // The trace argument list `[1]`.
+        let arguments = TermBuilder::new(&mut output)
+            .list_from_slice(&[Term::small(1).unwrap()])
             .unwrap();
-        assert_eq!(
-            result,
-            Some(Term::atom(global_atoms().intern("true").unwrap()))
-        );
+        let result = program
+            .run_with_context(arguments, &mut output, &tracer)
+            .unwrap();
+        // `{message, X}` returns X; every other form leaves `true` as the result.
+        let expected = if name == "message" {
+            Term::small(1).unwrap()
+        } else {
+            Term::atom(global_atoms().intern("true").unwrap())
+        };
+        assert_eq!(result, Some(expected));
     }
     assert_eq!(tracer.0.lock().unwrap().len(), forms.len());
 }

@@ -359,22 +359,41 @@ impl Node {
         root: &Option<Box<Self>>,
         state: &mut RangeSelection<'_, H>,
     ) -> Result<(), EtsError> {
+        Self::select_range_checked(root, state, true, true)
+    }
+
+    // A subtree whose parent key is inside a bound needs no further test against it, so the
+    // interior of the range costs one object run per key like erts's in-order walk.
+    fn select_range_checked<H: HeapAlloc>(
+        root: &Option<Box<Self>>,
+        state: &mut RangeSelection<'_, H>,
+        check_below: bool,
+        check_above: bool,
+    ) -> Result<(), EtsError> {
         let Some(node) = root else { return Ok(()) };
         let key = node.object.key(state.keypos);
-        let below = state.bounds.is_below(key);
-        let above = state.bounds.is_above(key);
-        let first = if state.reverse {
-            &node.right
+        let below = check_below && state.bounds.is_below(key);
+        let above = check_above && state.bounds.is_above(key);
+        // Keys left of `node` are below `key`, so they are inside the upper bound once `key` is.
+        let (left_below, left_above) = (check_below, above);
+        let (right_below, right_above) = (below, check_above);
+        let (first, first_checks, second, second_checks) = if state.reverse {
+            (
+                &node.right,
+                (right_below, right_above),
+                &node.left,
+                (left_below, left_above),
+            )
         } else {
-            &node.left
-        };
-        let second = if state.reverse {
-            &node.left
-        } else {
-            &node.right
+            (
+                &node.left,
+                (left_below, left_above),
+                &node.right,
+                (right_below, right_above),
+            )
         };
         if if state.reverse { !above } else { !below } {
-            Self::select_range(first, state)?;
+            Self::select_range_checked(first, state, first_checks.0, first_checks.1)?;
         }
         if state.out.len() >= state.limit {
             return Ok(());
@@ -383,7 +402,7 @@ impl Node {
             && !above
             && let Some(result) = state
                 .program
-                .run(node.object.copy_out(state.dst)?, state.dst)?
+                .run(node.object.term_for_filter(state.dst)?, state.dst)?
         {
             state.out.push(result);
         }
@@ -391,7 +410,7 @@ impl Node {
             return Ok(());
         }
         if if state.reverse { !below } else { !above } {
-            Self::select_range(second, state)?;
+            Self::select_range_checked(second, state, second_checks.0, second_checks.1)?;
         }
         Ok(())
     }

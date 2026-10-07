@@ -1377,12 +1377,34 @@ impl StoredTerm {
         }
         self.copy_out(scratch)
     }
+
+    fn term_for_filter<H: HeapAlloc>(&self, scratch: &mut H) -> Result<Term, EtsError> {
+        if self.inline_pair.is_none() && !self.compressed_elements.iter().any(Option::is_some) {
+            return Ok(self.term);
+        }
+        self.term_for_match(scratch)
+    }
 }
 
 fn key_of(object: Term, keypos: usize) -> Result<Term, EtsError> {
     // SAFETY: the caller holds the source heap live throughout this call.
     let tuple = unsafe { object.tuple_ref() }.ok_or(EtsError::BadArg)?;
     tuple.get(keypos - 1).ok_or(EtsError::BadArg)
+}
+
+/// Next value of a small-integer counter after one operation, when neither the operands nor
+/// the result need a bignum.
+fn small_counter_step(old: Term, operation: &BigCounterOp) -> Option<i64> {
+    let old = old.as_small()?;
+    let increment = operation.increment.to_i64()?;
+    let mut next = old.checked_add(increment)?;
+    if let Some((threshold, reset)) = &operation.threshold {
+        let threshold = threshold.to_i64()?;
+        if (increment >= 0 && next > threshold) || (increment < 0 && next < threshold) {
+            next = reset.to_i64()?;
+        }
+    }
+    Some(next)
 }
 
 fn global_true() -> Atom {
@@ -1756,10 +1778,19 @@ impl Matched<'_> {
         }
     }
 
-    fn copy_out<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
+    /// The object as a term that outlives this handle: a borrowed table object stays in
+    /// the table, an owned snapshot (CA-tree) is copied into `dst`.
+    fn term_outliving<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
         match self {
-            Self::Borrowed(object) => object.copy_out(dst),
+            Self::Borrowed(object) => object.term_for_filter(dst),
             Self::Owned(object) => object.copy_out(dst),
+        }
+    }
+
+    fn term_for_filter<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
+        match self {
+            Self::Borrowed(object) => object.term_for_filter(dst),
+            Self::Owned(object) => object.term_for_filter(dst),
         }
     }
 }
@@ -2540,6 +2571,29 @@ impl Table {
             self.put_hashed(object, hash, single);
         }
         Ok(true)
+    }
+
+    /// First object stored under `key`, without collecting the whole bucket.
+    fn matching_first(&self, key: Term) -> Result<Option<Matched<'_>>, EtsError> {
+        match &self.storage {
+            Storage::Ordered(root) => {
+                Ok(Node::get(root, key, self.options.keypos).map(Matched::Borrowed))
+            }
+            Storage::CATree(tree) => tree
+                .matching(key)
+                .map(|objects| objects.into_iter().next().map(Matched::Owned)),
+            Storage::Hash(storage) => {
+                let hash = ets_hash(key);
+                Ok(storage
+                    .objects_hash(hash)
+                    .iter()
+                    .find(|object| {
+                        object.hvalue == (hash >> 1)
+                            && exact_eq(object.key(self.options.keypos), key)
+                    })
+                    .map(|node| Matched::Borrowed(&node.object)))
+            }
+        }
     }
 
     fn matching(&self, key: Term) -> Result<Vec<Matched<'_>>, EtsError> {
@@ -3416,11 +3470,11 @@ impl Table {
 
     /// The elements of `default` with the key element replaced, as
     /// `db_lookup_dbterm` inserts it (erl_db_hash.c, erl_db_tree.c), OTP-29.1.1.
-    fn default_object(
+    fn default_object<H: HeapAlloc>(
         &self,
         key: Term,
         default: Term,
-        heap: &mut VecHeap,
+        heap: &mut H,
     ) -> Result<Vec<Term>, EtsError> {
         // SAFETY: the caller holds the default term heap through insertion.
         let tuple = unsafe { default.tuple_ref() }.ok_or(EtsError::BadArgCause("default"))?;
@@ -3473,10 +3527,13 @@ impl Table {
         ) {
             return Err(EtsError::BadArgCause("table_type"));
         }
-        let mut heap = VecHeap::new();
-        let mut values = if let Some(found) = self.matching(key)?.first() {
-            let current = found.copy_out(&mut heap)?;
-            // SAFETY: current is owned by the local heap until the insertion ends.
+        // ObjectHeap allocates exactly what is asked; a VecHeap would zero a 1024-word chunk
+        // for every counter bump.
+        let mut heap = ObjectHeap::new();
+        let mut values = if let Some(found) = self.matching_first(key)? {
+            // The stored object stays alive until the replacement is inserted.
+            let current = found.term_outliving(&mut heap)?;
+            // SAFETY: current is owned by the table or the local heap until the insertion ends.
             unsafe { current.tuple_ref() }
                 .ok_or(EtsError::BadArg)?
                 .iter()
@@ -3503,6 +3560,13 @@ impl Table {
         }
         let mut results = Vec::with_capacity(operations.len());
         for operation in operations.iter().flatten() {
+            if let Some(small) = small_counter_step(values[operation.position - 1], operation)
+                && let Some(next) = Term::small(small)
+            {
+                values[operation.position - 1] = next;
+                results.push(next);
+                continue;
+            }
             let old = integer_value(values[operation.position - 1]).ok_or(EtsError::BadArg)?;
             let mut next = old + &operation.increment;
             if let Some((threshold, set_value)) = &operation.threshold
@@ -3553,7 +3617,7 @@ impl Table {
             let mut results = Vec::new();
             for object in objects {
                 if let Some(result) =
-                    program.run_with_context(object.copy_out(dst)?, dst, context)?
+                    program.run_with_context(object.term_for_filter(dst)?, dst, context)?
                 {
                     results.push(result);
                 }
@@ -3573,7 +3637,9 @@ impl Table {
         }
         let mut results = Vec::new();
         for object in objects {
-            if let Some(result) = program.run_with_context(object.copy_out(dst)?, dst, context)? {
+            if let Some(result) =
+                program.run_with_context(object.term_for_filter(dst)?, dst, context)?
+            {
                 results.push(result);
             }
         }
@@ -3723,7 +3789,7 @@ impl Table {
                         let key = object.key(self.options.keypos);
                         continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
                         if let Some(result) =
-                            program.run_with_context(object.copy_out(dst)?, dst, context)?
+                            program.run_with_context(object.term_for_filter(dst)?, dst, context)?
                         {
                             rows.push(result);
                         }
@@ -3741,7 +3807,7 @@ impl Table {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
                     if let Some(result) =
-                        program.run_with_context(object.copy_out(dst)?, dst, context)?
+                        program.run_with_context(object.term_for_filter(dst)?, dst, context)?
                     {
                         rows.push(result);
                     }
@@ -3858,7 +3924,7 @@ impl Table {
             }
             let mut results = Vec::new();
             for object in objects {
-                if let Some(result) = program.run(object.copy_out(dst)?, dst)? {
+                if let Some(result) = program.run(object.term_for_filter(dst)?, dst)? {
                     results.push(result);
                 }
                 if results.len() >= limit {
@@ -3880,7 +3946,7 @@ impl Table {
         }
         let mut results = Vec::new();
         for object in objects {
-            let candidate = object.term_for_match(dst)?;
+            let candidate = object.term_for_filter(dst)?;
             if let Some(result) = program.run(candidate, dst)? {
                 results.push(result);
             }
@@ -3942,7 +4008,7 @@ impl Table {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
                     if program
-                        .run(object.copy_out(&mut scratch)?, &mut scratch)?
+                        .run(object.term_for_filter(&mut scratch)?, &mut scratch)?
                         .is_some_and(|value| exact_eq(value, true_atom))
                     {
                         continuation.total += 1;
@@ -3957,7 +4023,7 @@ impl Table {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
                     if program
-                        .run(object.copy_out(&mut scratch)?, &mut scratch)?
+                        .run(object.term_for_filter(&mut scratch)?, &mut scratch)?
                         .is_some_and(|value| exact_eq(value, true_atom))
                     {
                         continuation.total += 1;
@@ -3973,7 +4039,7 @@ impl Table {
                 while continuation.slot < storage.nactive {
                     for object in storage.slot_ordered(continuation.slot, false) {
                         if program
-                            .run(object.copy_out(&mut scratch)?, &mut scratch)?
+                            .run(object.term_for_filter(&mut scratch)?, &mut scratch)?
                             .is_some_and(|value| exact_eq(value, true_atom))
                         {
                             continuation.total += 1;
@@ -3996,26 +4062,125 @@ impl Table {
     }
 
     /// Count objects selected by a match specification.
+    // Port of erts/emulator/beam/erl_db_hash.c:2525 (db_select_count_hash),
+    // erl_db_tree.c:1800 (db_select_count_tree), OTP-29.1.1.
     pub fn select_count(&self, program: &match_spec::MatchProgram) -> Result<usize, EtsError> {
         let mut heap = VecHeap::new();
         let true_atom = Term::atom(global_true());
-        Ok(self
-            .select(program, false, &mut heap)?
-            .into_iter()
-            .filter(|&result| exact_eq(result, true_atom))
-            .count())
+        let mut count = 0;
+        if let Some(key) = program.exact_key_pattern(self.options.keypos) {
+            for object in self.matching(key)? {
+                let term = object.term_for_filter(&mut heap)?;
+                if program
+                    .run(term, &mut heap)?
+                    .is_some_and(|result| exact_eq(result, true_atom))
+                {
+                    count += 1;
+                }
+            }
+            return Ok(count);
+        }
+        let visit = |object: &StoredTerm| -> Result<(), EtsError> {
+            let term = object.term_for_filter(&mut heap)?;
+            if program
+                .run(term, &mut heap)?
+                .is_some_and(|result| exact_eq(result, true_atom))
+            {
+                count += 1;
+            }
+            Ok(())
+        };
+        match &self.storage {
+            Storage::Hash(storage) => storage.values().try_for_each(visit)?,
+            Storage::Ordered(root) => {
+                let mut objects = Vec::new();
+                Node::walk(root, &mut objects);
+                objects.into_iter().try_for_each(visit)?;
+            }
+            Storage::CATree(tree) => {
+                for term in tree.walk(false, &mut heap)? {
+                    if program
+                        .run(term, &mut heap)?
+                        .is_some_and(|result| exact_eq(result, true_atom))
+                    {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 
     /// Delete objects selected by a match specification and return the count.
+    // Port of erts/emulator/beam/erl_db_hash.c:2723 (db_select_delete_hash),
+    // erl_db_tree.c:2217 (db_select_delete_tree), OTP-29.1.1.
     pub fn select_delete(&mut self, program: &match_spec::MatchProgram) -> Result<usize, EtsError> {
         let mut heap = VecHeap::new();
         let mut selected = Vec::new();
-        for object in self.tab2list(&mut heap)? {
-            if program
-                .run(object, &mut heap)?
-                .is_some_and(|result| exact_eq(result, Term::atom(global_true())))
-            {
-                selected.push(object);
+        let true_atom = Term::atom(global_true());
+        if let Some(key) = program.exact_key_pattern(self.options.keypos) {
+            for object in self.matching(key)? {
+                let term = object.term_for_filter(&mut heap)?;
+                if program
+                    .run(term, &mut heap)?
+                    .is_some_and(|result| exact_eq(result, true_atom))
+                {
+                    selected.push(copy_term(term, &mut heap)?);
+                }
+            }
+            for object in selected.iter().copied() {
+                self.delete_object(object)?;
+            }
+            return Ok(selected.len());
+        }
+        if self.fixed == 0
+            && let Storage::Hash(storage) = &mut self.storage
+        {
+            let removed = storage.delete_where(|object| {
+                let term = object.term_for_filter(&mut heap)?;
+                Ok::<_, EtsError>(
+                    program
+                        .run(term, &mut heap)?
+                        .is_some_and(|result| exact_eq(result, true_atom)),
+                )
+            });
+            storage.shrink_after_delete(self.options.keypos);
+            return removed;
+        }
+        match &self.storage {
+            Storage::Hash(storage) => {
+                for object in storage.values() {
+                    let term = object.term_for_filter(&mut heap)?;
+                    if program
+                        .run(term, &mut heap)?
+                        .is_some_and(|result| exact_eq(result, true_atom))
+                    {
+                        selected.push(copy_term(term, &mut heap)?);
+                    }
+                }
+            }
+            Storage::Ordered(root) => {
+                let mut objects = Vec::new();
+                Node::walk(root, &mut objects);
+                for object in objects {
+                    let term = object.term_for_filter(&mut heap)?;
+                    if program
+                        .run(term, &mut heap)?
+                        .is_some_and(|result| exact_eq(result, true_atom))
+                    {
+                        selected.push(copy_term(term, &mut heap)?);
+                    }
+                }
+            }
+            Storage::CATree(tree) => {
+                for term in tree.walk(false, &mut heap)? {
+                    if program
+                        .run(term, &mut heap)?
+                        .is_some_and(|result| exact_eq(result, true_atom))
+                    {
+                        selected.push(term);
+                    }
+                }
             }
         }
         let count = selected.len();
