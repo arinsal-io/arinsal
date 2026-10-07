@@ -106,6 +106,11 @@ fn resume_waiters(runtime: &Runtime, pids: Vec<Pid>) {
     }
 }
 
+/// Resumes `pid` after an internal suspend, rescheduling it when no suspend remains.
+pub(crate) fn resume_suspended(runtime: &Runtime, pid: Pid) {
+    resume_waiters(runtime, vec![pid]);
+}
+
 /// Gives up a permission handed to `pid` that it has not taken yet, so it goes to the next
 /// waiter.
 // Port of erts/emulator/beam/code_ix.c:430-445 (erts_reject_code_permissions), OTP-29.1.1.
@@ -616,7 +621,7 @@ fn finish_commit(
     let loaded_names = staged.names.clone();
     let on_load = vm.commit_staged(staged);
     for name in &loaded_names {
-        crate::trace_bp::module_code_changed(vm.code_scope, name);
+        crate::trace_bp::module_code_changed(process, vm.code_scope, name);
         apply_on_load_patterns(vm, process, name);
     }
     if on_load.is_empty() {
@@ -1350,7 +1355,7 @@ fn call_values(
             let result = delete(vm, &name);
             release_code_load_permission(process, Some(ctx.pid()));
             if matches!(result, Ok(term) if term == atom("true")) {
-                crate::trace_bp::module_code_changed(vm.code_scope, &name);
+                crate::trace_bp::module_code_changed(process, vm.code_scope, &name);
             }
             result
         })()),

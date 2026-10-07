@@ -777,6 +777,8 @@ pub(crate) struct Runtime {
     pub(crate) ever_suspended: AtomicBool,
     /// The code modification permission (`code_ix.c` `code_mod_permission`) of this node.
     pub(crate) code_mod_permission: Mutex<crate::natives::code::CodeModPermission>,
+    /// This node's breakpoint tables and active breakpoint index.
+    pub(crate) breakpoints: Arc<crate::trace_bp::BpNode>,
     /// Suspend-monitor pauses of receive and BIF timers (`erts_pause_proc_timer`).
     pub(crate) pauses: Mutex<HashMap<Pid, TimerPause>>,
     pub(crate) published: Mutex<HashMap<Pid, Published>>,
@@ -2102,6 +2104,7 @@ impl Executor {
                                     && crate::beamasm_integration::dispatch_bif(target_pc)
                                         .is_some()
                                     && crate::trace_bp::selects(
+                                        process,
                                         &export.module,
                                         &export.function,
                                         export.arity,
@@ -4168,6 +4171,7 @@ impl Process {
                 crate::natives::code::release_code_mod_permission(runtime);
             }
         }
+        crate::natives::proc::trace_finish_process_exit(vm, self, ctx);
         crate::trace::emit(
             Some(vm),
             self,
@@ -6259,6 +6263,7 @@ impl Vm {
             suspend_total: Mutex::new(HashMap::new()),
             ever_suspended: AtomicBool::new(false),
             code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
+            breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
             pauses: Mutex::new(HashMap::new()),
             published: Mutex::new(HashMap::new()),
             hibernating: Mutex::new(HashMap::new()),

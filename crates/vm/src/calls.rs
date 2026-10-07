@@ -333,7 +333,7 @@ impl Vm {
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
         let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
         if !crate::trace_bp::any_pattern()
-            || !crate::trace_bp::selects(module, function, arity as u8)
+            || !crate::trace_bp::selects(p, module, function, arity as u8)
         {
             return untraced(p);
         }
@@ -428,7 +428,7 @@ impl Vm {
         scan: crate::trace::StackScan,
     ) -> Option<(String, String, Vec<Term>)> {
         if !crate::trace_bp::any_pattern()
-            || !crate::trace_bp::selects(module, function, arity as u8)
+            || !crate::trace_bp::selects(p, module, function, arity as u8)
         {
             return None;
         }

@@ -718,3 +718,79 @@ fn thread_progress_block_and_statistics_do_not_deadlock() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// A later operation waits for every slice that was running when it was scheduled, and does
+/// not block the scheduler that scheduled it.
+struct LaterWaiter {
+    spinner: bool,
+    bound: bool,
+    spinning: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+    scheduled: Arc<AtomicBool>,
+    fired: Arc<AtomicBool>,
+}
+
+impl Task for LaterWaiter {
+    type Message = u32;
+    fn run(&mut self, ctx: &mut RunCtx<u32>, _: u32) -> RunOutcome {
+        if !self.bound {
+            self.bound = true;
+            ctx.bind_scheduler(if self.spinner { 1 } else { 2 });
+            return RunOutcome::Yield;
+        }
+        if self.spinner {
+            self.spinning.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            return RunOutcome::Exit(0);
+        }
+        if !self.spinning.load(Ordering::Acquire) {
+            return RunOutcome::Yield;
+        }
+        let fired = Arc::clone(&self.fired);
+        ctx.thread_progress_later(move || fired.store(true, Ordering::Release));
+        self.scheduled.store(true, Ordering::Release);
+        RunOutcome::Exit(0)
+    }
+}
+
+#[test]
+fn thread_progress_later_waits_for_running_slices_without_blocking() {
+    let sched = Scheduler::new(Config {
+        workers: 2,
+        max_processes: 16,
+        ..Config::default()
+    });
+    let spinning = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let scheduled = Arc::new(AtomicBool::new(false));
+    let fired = Arc::new(AtomicBool::new(false));
+    for spinner in [true, false] {
+        sched
+            .spawn(LaterWaiter {
+                spinner,
+                bound: false,
+                spinning: Arc::clone(&spinning),
+                release: Arc::clone(&release),
+                scheduled: Arc::clone(&scheduled),
+                fired: Arc::clone(&fired),
+            })
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !scheduled.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "later operation never scheduled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !fired.load(Ordering::Acquire),
+        "later operation ran while an older slice was still running"
+    );
+    release.store(true, Ordering::Release);
+    while !fired.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "later operation never ran");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}

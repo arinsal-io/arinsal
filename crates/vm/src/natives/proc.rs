@@ -1982,44 +1982,72 @@ fn call_values(
             ("processes_next", [iterator]) if module == "erlang" => {
                 erlang_processes_next(process, ctx, *iterator)
             }
+            // Port of erts/emulator/beam/erl_bif_trace.c:889-918 (erts_internal_trace_3/4),
+            // OTP-29.1.1.
             ("trace", [spec, how, flags]) if module == "erts_internal" || module == "erlang" => {
-                trace(vm, process, ctx, 0, *spec, *how, *flags)
+                let (spec, how, flags) = (*spec, *how, *flags);
+                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
+                    trace(vm, process, ctx, 0, spec, how, flags)
+                })
             }
             ("trace", [session, spec, how, flags]) if module == "erts_internal" => {
-                let session = trace_session_id(process, *session).ok_or_else(badarg)?;
-                trace(vm, process, ctx, session, *spec, *how, *flags)
+                let (session, spec, how, flags) = (*session, *spec, *how, *flags);
+                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
+                    let session = trace_session_id(process, session).ok_or_else(badarg)?;
+                    trace(vm, process, ctx, session, spec, how, flags)
+                })
             }
+            // Port of erts/emulator/beam/erl_bif_trace.c:302-331 (erts_internal_trace_pattern_3/4),
+            // OTP-29.1.1.
             ("trace_pattern", [spec, pattern, flags]) if module == "erts_internal" => {
-                trace_pattern(vm, process, ctx, 0, *spec, *pattern, *flags)
+                let (spec, pattern, flags) = (*spec, *pattern, *flags);
+                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
+                    trace_pattern(vm, process, ctx, 0, spec, pattern, flags)
+                })
             }
             ("trace_pattern", [session, spec, pattern, flags]) if module == "erts_internal" => {
-                let session = trace_session_id(process, *session).ok_or_else(badarg)?;
-                trace_pattern(vm, process, ctx, session, *spec, *pattern, *flags)
+                let (session, spec, pattern, flags) = (*session, *spec, *pattern, *flags);
+                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
+                    let session = trace_session_id(process, session).ok_or_else(badarg)?;
+                    trace_pattern(vm, process, ctx, session, spec, pattern, flags)
+                })
             }
             ("trace_session_create", [name, tracer, options]) if module == "erts_internal" => {
                 trace_session_create(vm, process, ctx, *name, *tracer, *options)
             }
+            // Port of erts/emulator/beam/erl_bif_trace.c:1278-1322
+            // (erts_internal_trace_session_destroy_1), OTP-29.1.1.
             ("trace_session_destroy", [session]) if module == "erts_internal" => {
                 let session_term = *session;
-                let session = trace_session_id(process, *session).ok_or_else(badarg)?;
-                let destroyed = crate::trace::destroy_session(process, session);
-                if destroyed {
-                    crate::natives::erts_debug::session_destroyed(process, session_term);
-                    crate::trace_bp::clear_session(process, session);
-                    vm.refresh_all_trace_breakpoints(process);
-                }
-                Ok(atom(if destroyed { "true" } else { "false" }))
+                with_code_mod_permission(vm, process, ctx, |vm, process, _| {
+                    let session = trace_session_id(process, session_term).ok_or_else(badarg)?;
+                    let destroyed = crate::trace::destroy_session(process, session);
+                    if destroyed {
+                        crate::natives::erts_debug::session_destroyed(process, session_term);
+                        crate::trace_bp::clear_session(process, session);
+                        vm.refresh_all_trace_breakpoints(process);
+                    }
+                    Ok(atom(if destroyed { "true" } else { "false" }))
+                })
             }
+            // Port of erts/emulator/beam/erl_bif_trace.c:1386-1435 (trace_info_2,
+            // erts_internal_trace_info_3), OTP-29.1.1.
             ("trace_info", [spec, item]) if module == "erlang" => {
-                trace_info(vm, process, ctx, *spec, *item)
+                let (spec, item) = (*spec, *item);
+                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
+                    trace_info(vm, process, ctx, spec, item)
+                })
             }
             ("trace_info", [session, spec, item]) if module == "erts_internal" => {
-                let session = if atom_name(*session).as_deref() == Some("any") {
-                    0
-                } else {
-                    trace_session_id(process, *session).ok_or_else(badarg)?
-                };
-                trace_session_info(vm, process, ctx, session, *spec, *item)
+                let (session, spec, item) = (*session, *spec, *item);
+                with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
+                    let session = if atom_name(session).as_deref() == Some("any") {
+                        0
+                    } else {
+                        trace_session_id(process, session).ok_or_else(badarg)?
+                    };
+                    trace_session_info(vm, process, ctx, session, spec, item)
+                })
             }
             ("fun_info_mfa", [fun]) if module == "erlang" => fun_info_mfa(vm, process, *fun),
             _ => {
@@ -3816,8 +3844,22 @@ fn trace_info_function(
         // barrier per phase, so no scheduler updates a counter while it is collected.
         // Port of erts/emulator/beam/erl_bif_trace.c:1960-2070 (trace_info_func,
         // trace_info_finisher phases 0-2), OTP-29.1.1.
-        for _ in 0..TRACE_INFO_BARRIERS {
-            ctx.block_thread_progress(std::time::Duration::ZERO);
+        // Resumed after the last barrier, the caller builds the result again
+        // (bif_trace_info_finish_trap).
+        let waited = process
+            .cold
+            .as_mut()
+            .and_then(|cold| {
+                cold.trace_finish
+                    .take_if(|finish| finish.stages.is_empty() && finish.result.is_none())
+            })
+            .is_some();
+        if !waited {
+            wait_code_barriers(
+                process,
+                ctx,
+                crate::trace_bp::TraceFinish::wait(TRACE_INFO_BARRIERS, None),
+            )?;
         }
         info = crate::trace_bp::function_info(process, session, &module, &function, arity, want);
     }
@@ -4093,6 +4135,181 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
     make_tuple(process, &[item, value])
 }
 
+/// Runs a trace BIF holding the code modification permission. A caller that is not given
+/// the permission is suspended and retries the call once it is handed over; a caller
+/// suspended between the code barriers of a breakpoint update continues it instead.
+// Port of erts/emulator/beam/erl_bif_trace.c:302-331, 889-918, 1386-1435 (seize, yield and
+// release around trace_pattern, trace, trace_info), OTP-29.1.1.
+fn with_code_mod_permission(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    body: impl FnOnce(&mut Vm, &mut Process, &mut RunCtx<'_, Message>) -> Result<Term, VmError>,
+) -> Result<Term, VmError> {
+    let pid = ctx.pid();
+    let runtime = process.runtime.clone();
+    if let Some(finish) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.trace_finish.take())
+    {
+        // Resumed by the code barrier: the permission is still ours.
+        let finish = advance_trace_finish(vm, process, ctx, finish, true)?;
+        if let Some(result) = finish.result {
+            if let Some(runtime) = &runtime {
+                crate::natives::code::release_code_mod_permission(runtime);
+            }
+            return Term::small(result).ok_or_else(badarg);
+        }
+        // bif_trace_info_finish_trap: build the result again, without waiting.
+        process.cold_mut().trace_finish = Some(finish);
+    } else if let Some(runtime) = &runtime
+        && !crate::natives::code::try_seize_code_mod_permission(runtime, pid)
+    {
+        return Err(VmError::Yield);
+    }
+    let result = body(vm, process, ctx);
+    let pending = match process.cold.as_mut() {
+        Some(cold) => {
+            if cold
+                .trace_finish
+                .as_ref()
+                .is_some_and(|finish| finish.stages.is_empty() && finish.result.is_none())
+            {
+                cold.trace_finish = None;
+            }
+            cold.trace_finish.is_some()
+        }
+        None => false,
+    };
+    if !pending && let Some(runtime) = &runtime {
+        crate::natives::code::release_code_mod_permission(runtime);
+    }
+    result
+}
+
+/// Waits for a code barrier: the caller is suspended until every scheduler passed thread
+/// progress, without blocking this scheduler. Returns false when the wait already happened
+/// (no runtime to resume the caller, so it blocks).
+// Port of erts/emulator/beam/code_ix.c:556 (erts_schedule_code_barrier) with the caller
+// suspended like erl_bif_trace.c:509-516 (trace_pattern) and resumed like :575-581
+// (smp_bp_finisher), OTP-29.1.1.
+fn suspend_for_code_barrier(process: &Process, ctx: &mut RunCtx<'_, Message>) -> bool {
+    let Some(runtime) = process.runtime.clone() else {
+        ctx.block_thread_progress(std::time::Duration::ZERO);
+        return false;
+    };
+    let pid = ctx.pid();
+    runtime.suspend_internal(pid);
+    ctx.thread_progress_later(move || crate::natives::code::resume_suspended(&runtime, pid));
+    true
+}
+
+/// [`advance_trace_finish`] for an update that only waits for code barriers.
+fn wait_code_barriers(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    mut finish: crate::trace_bp::TraceFinish,
+) -> Result<crate::trace_bp::TraceFinish, VmError> {
+    debug_assert!(
+        finish
+            .stages
+            .iter()
+            .all(|stage| *stage == crate::trace_bp::FinishStage::Wait)
+    );
+    loop {
+        if suspend_for_code_barrier(process, ctx) {
+            process.cold_mut().trace_finish = Some(finish);
+            return Err(VmError::Yield);
+        }
+        if finish.stages.pop_front().is_none() {
+            return Ok(finish);
+        }
+    }
+}
+
+/// Runs the stages of a breakpoint update, each after a code barrier. Yields with the
+/// update parked in the caller while it waits; returns the update once every stage ran and
+/// the last barrier passed.
+// Port of erts/emulator/beam/erl_bif_trace.c:535-590 (smp_bp_finisher) and 2052-2100
+// (trace_info_finisher), OTP-29.1.1.
+fn advance_trace_finish(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    mut finish: crate::trace_bp::TraceFinish,
+    mut barrier_passed: bool,
+) -> Result<crate::trace_bp::TraceFinish, VmError> {
+    loop {
+        if !barrier_passed && suspend_for_code_barrier(process, ctx) {
+            process.cold_mut().trace_finish = Some(finish);
+            return Err(VmError::Yield);
+        }
+        barrier_passed = false;
+        let Some(stage) = finish.stages.pop_front() else {
+            return Ok(finish);
+        };
+        run_finish_stage(vm, process, &finish.functions, stage);
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_trace.c:2842-2935 (erts_finish_breakpointing), OTP-29.1.1.
+fn run_finish_stage(
+    vm: &mut Vm,
+    process: &Process,
+    functions: &[crate::trace_bp::BpFunction],
+    stage: crate::trace_bp::FinishStage,
+) {
+    use crate::trace_bp::FinishStage;
+    match stage {
+        FinishStage::Install => {
+            vm.refresh_code();
+            crate::trace_bp::with_install_view(|| vm.refresh_trace_functions(process, functions));
+        }
+        FinishStage::Commit => crate::trace_bp::commit_staged(process),
+        FinishStage::Uninstall => {
+            vm.refresh_code();
+            vm.refresh_trace_functions(process, functions);
+        }
+        FinishStage::Consolidate => crate::trace_bp::consolidate_staged(process, functions),
+        FinishStage::Wait => {}
+    }
+}
+
+/// An exiting caller of a trace BIF finishes its breakpoint update, which erts' finisher
+/// completes without the caller, and releases the code modification permission.
+// Port of erts/emulator/beam/erl_bif_trace.c:535-590 (smp_bp_finisher skips resuming an
+// exiting caller) and 2016-2050 (trace_info_trap_destructor), OTP-29.1.1.
+pub(crate) fn trace_finish_process_exit(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) {
+    let Some(mut finish) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.trace_finish.take())
+    else {
+        return;
+    };
+    // The exit path has no later resume, so the barriers between breakpoint stages block;
+    // a caller that only waits (trace_info) just gives up.
+    finish
+        .stages
+        .retain(|stage| *stage != crate::trace_bp::FinishStage::Wait);
+    let staged = !finish.stages.is_empty();
+    while let Some(stage) = finish.stages.pop_front() {
+        ctx.block_thread_progress(std::time::Duration::ZERO);
+        run_finish_stage(vm, process, &finish.functions, stage);
+    }
+    if staged {
+        ctx.block_thread_progress(std::time::Duration::ZERO);
+    }
+    if let Some(runtime) = &process.runtime {
+        crate::natives::code::release_code_mod_permission(runtime);
+    }
+}
+
 fn trace_pattern(
     vm: &mut Vm,
     process: &mut Process,
@@ -4134,10 +4351,9 @@ fn trace_pattern(
         crate::trace::set_event_pattern(process, session, &event, enabled, match_spec);
         // stage_trace_event_pattern is neither local nor global: the commit and consolidate
         // stages wait, plus the initial barrier.
-        for _ in 0..3 {
-            ctx.block_thread_progress(std::time::Duration::ZERO);
-        }
-        return Ok(Term::small(1).expect("one event pattern"));
+        let finish =
+            wait_code_barriers(process, ctx, crate::trace_bp::TraceFinish::wait(3, Some(1)))?;
+        return Term::small(finish.result.unwrap_or(1)).ok_or_else(badarg);
     }
     let flag_values = list(flags).ok_or_else(badarg)?;
     // Port of erts/emulator/beam/erl_bif_trace.c:344-420 (trace_pattern flag list), OTP-29.1.1.
@@ -4263,10 +4479,6 @@ fn trace_pattern(
     // smp_bp_finisher, erts_finish_breakpointing), OTP-29.1.1: the caller stays suspended while
     // the breakpoints are staged, installed, committed, uninstalled and consolidated, with a
     // code barrier before each stage.
-    let staging = crate::trace_bp::seize_staging(ctx);
-    let barrier = |ctx: &mut RunCtx<'_, Message>| {
-        ctx.block_thread_progress(std::time::Duration::ZERO);
-    };
     crate::trace_bp::stage_trace_pattern(
         process,
         session,
@@ -4277,22 +4489,6 @@ fn trace_pattern(
         trace_flags,
         &meta_tracer.unwrap_or_default(),
     );
-    barrier(ctx);
-    if on != crate::trace_bp::BreakOp::Nop {
-        // Stage 0: code for the new breakpoints, which are still disabled.
-        crate::trace_bp::with_install_view(|| vm.refresh_trace_functions(process, &functions));
-        barrier(ctx);
-    }
-    // Stage 1: switch the active breakpoint data.
-    crate::trace_bp::commit_staged();
-    barrier(ctx);
-    // Stage 2: remove the code of disabled breakpoints.
-    vm.refresh_trace_functions(process, &functions);
-    barrier(ctx);
-    // Stage 3: make the staged data equal to the active one.
-    crate::trace_bp::consolidate_staged(&functions);
-    barrier(ctx);
-    drop(staging);
     // Port of erts/emulator/beam/erl_bif_trace.c:2712-2716, OTP-29.1.1: breakpoints count the
     // matched functions, global tracing the matched export entries.
     let count = if trace_flags.breakpoint {
@@ -4300,7 +4496,14 @@ fn trace_pattern(
     } else {
         matched_exported
     };
-    Term::small(count as i64).ok_or_else(badarg)
+    let finish = crate::trace_bp::TraceFinish::breakpoints(
+        functions,
+        on != crate::trace_bp::BreakOp::Nop,
+        count as i64,
+    );
+    let finish = advance_trace_finish(vm, process, ctx, finish, false)?;
+    let count = finish.result.unwrap_or(count as i64);
+    Term::small(count).ok_or_else(badarg)
 }
 
 /// The functions of the current code of the selected modules.
