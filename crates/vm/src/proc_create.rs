@@ -238,6 +238,9 @@ pub(crate) struct ProcessCold {
     pub(crate) sys_task_point: bool,
     /// A potentially long GC request waits in `delayed_gc` for a dirty CPU scheduler.
     pub(crate) dirty_sys_gc: bool,
+    /// erts `F_DIRTY_MAJOR_GC` / `F_DIRTY_MINOR_GC`: a potentially long collection the
+    /// process started itself waits for a dirty CPU scheduler.
+    pub(crate) dirty_gc: Option<DirtyGc>,
     /// erts `F_HAVE_BLCKD_MSCHED | F_HAVE_BLCKD_NMSCHED`: this process holds a
     /// multi-scheduling block of its runtime.
     pub(crate) have_blocked_multi_scheduling: bool,
@@ -636,6 +639,15 @@ pub(crate) struct NativeBifError {
     /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
     pub(crate) freason: u64,
     pub(crate) fvalue: u64,
+}
+
+/// Kind of a collection scheduled on a dirty CPU scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirtyGc {
+    /// erts `F_DIRTY_MAJOR_GC`.
+    Major,
+    /// erts `F_DIRTY_MINOR_GC`.
+    Minor,
 }
 
 /// A garbage-collection request saved while `F_DISABLE_GC` was set.

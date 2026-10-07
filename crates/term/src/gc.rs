@@ -17,6 +17,15 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+/// Location and sizes of an abandoned young heap.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AbandonedHeap {
+    start: usize,
+    used: usize,
+    high_water: usize,
+    block_words: usize,
+}
+
 /// Counters for one collection. The caller may add them to process totals.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GcStats {
@@ -89,6 +98,8 @@ struct Copier<'a> {
     young_scan: usize,
     old_scan: usize,
     fragment_ranges: Vec<(usize, usize)>,
+    /// Mature part of an abandoned young heap; a minor collection promotes it.
+    abandoned_mature: (usize, usize),
     young_words: usize,
     promoted_words: usize,
     sub_bits: Vec<Term>,
@@ -119,7 +130,12 @@ impl Copier<'_> {
             }
         }
 
-        let promote = !self.major && in_young && address < young_start + self.from.high_water * 8;
+        let promote = !self.major
+            && if in_young {
+                address < young_start + self.from.high_water * 8
+            } else {
+                address >= self.abandoned_mature.0 && address < self.abandoned_mature.1
+            };
         // SAFETY: The source is in an owned, live heap or fragment. Collection
         // has exclusive process access, and source and destination do not overlap.
         unsafe {
@@ -676,13 +692,113 @@ impl ProcessHeap {
     }
 
     /// Young heap capacity in words, for `process_info(heap_size)`.
+    // erts `HEAP_SIZE(p)` keeps the size of an abandoned heap until the delayed collection.
     pub fn heap_size_words(&self) -> usize {
-        self.words.len()
+        self.abandoned_heap()
+            .map_or(self.words.len(), |abandoned| abandoned.block_words)
     }
 
     /// Young heap, old heap, and fragment capacity in words.
     pub fn total_heap_size_words(&self) -> usize {
-        self.words.len() + self.old_words.len() + self.fragment_words as usize
+        self.heap_size_words() + self.old_words.len() + self.fragment_words as usize
+    }
+
+    /// The young heap a delayed collection abandoned, if any (erts `p->abandoned_heap`).
+    pub(crate) fn abandoned_heap(&self) -> Option<AbandonedHeap> {
+        self.fragments.iter().find_map(|fragment| match fragment {
+            crate::heap::Fragment::Abandoned {
+                block,
+                used,
+                high_water,
+            } => Some(AbandonedHeap {
+                start: block.as_ptr() as usize,
+                used: *used,
+                high_water: *high_water,
+                block_words: block.len(),
+            }),
+            _ => None,
+        })
+    }
+
+    /// Words below the high-water mark that the next minor collection promotes.
+    // Port of erts/emulator/beam/erl_gc.c:1446-1458 (minor_collection mature_size with
+    // get_orig_heap), OTP-29.1.1.
+    fn mature_words(&self) -> usize {
+        self.abandoned_heap()
+            .map_or(self.high_water, |abandoned| abandoned.high_water)
+    }
+
+    /// Words the young generation uses: heap, fragments and an abandoned heap.
+    // Port of erts/emulator/beam/erl_gc.c:606-644 (young_gen_usage), OTP-29.1.1.
+    pub fn young_gen_usage(&self) -> usize {
+        let abandoned = self.abandoned_heap().map_or(0, |abandoned| abandoned.used);
+        self.htop
+            .saturating_add(self.fragment_words as usize)
+            .saturating_add(abandoned)
+    }
+
+    /// Satisfy `need` words without collecting: the young heap is abandoned and a fresh
+    /// heap fragment with the stack copied into it becomes the young heap. Objects stay
+    /// where they are until the next collection.
+    // Port of erts/emulator/beam/erl_gc.c:500-582 (delay_garbage_collection), OTP-29.1.1.
+    pub fn delay_collection(&mut self, need: usize) {
+        // erl_gc.c:497 (ERTS_DELAY_GC_EXTRA_FREE).
+        const DELAY_GC_EXTRA_FREE: usize = 40;
+        if need == 0 {
+            return;
+        }
+        let stack = self.stack_words();
+        let words = stack + need + DELAY_GC_EXTRA_FREE + S_RESERVED;
+        let mut next =
+            crate::heap::WordBlock::new(words, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
+        let next_stop = words - stack;
+        let stack_move = MoveRange {
+            old_start: self.words.as_ptr() as usize + self.stop * 8,
+            old_end: self.words.as_ptr() as usize + self.words.len() * 8,
+            new_start: next.as_ptr() as usize + next_stop * 8,
+        };
+        let code_ranges = crate::native_code::native_code_ranges();
+        let code_ranges = code_ranges
+            .as_deref()
+            .map_or(&[][..], |ranges| ranges.as_slice());
+        // Port of erl_gc.c:520 (copy_erlang_stack): frame pointers move with the stack.
+        for (destination, &word) in next.words_mut()[next_stop..]
+            .iter_mut()
+            .zip(&self.words.words()[self.stop..])
+        {
+            *destination = match classify_stack_word(word, stack_move, code_ranges) {
+                StackWord::FramePtr(address) => rebase_address(address, stack_move) as u64,
+                StackWord::Term(_) | StackWord::ReturnAddr(_) => word,
+            };
+        }
+        if self.frame_pointer != 0 {
+            self.frame_pointer = rebase_address(self.frame_pointer, stack_move);
+        }
+        // erl_gc.c:563 (erts_write_heap_filler): no stale stack words stay in the hole.
+        let used = self.htop;
+        self.words.words_mut()[used..].fill(0);
+        let abandoned = std::mem::replace(&mut self.words, next);
+        if self.abandoned_heap().is_some() {
+            // Port of erl_gc.c:546-558: the active heap already is a fragment; it joins
+            // the mbuf list.
+            self.fragment_words = self
+                .fragment_words
+                .saturating_add(u32::try_from(used).unwrap_or(u32::MAX));
+            self.fragments.push(crate::heap::Fragment::Used {
+                block: abandoned,
+                used,
+            });
+        } else {
+            self.fragments.push(crate::heap::Fragment::Abandoned {
+                block: abandoned,
+                used,
+                high_water: self.high_water,
+            });
+        }
+        self.htop = 0;
+        self.stop = next_stop;
+        // Port of erl_gc.c:578-581: the high-water mark points into the current heap.
+        self.high_water = 0;
     }
 
     /// Old generation capacity in words.
@@ -703,14 +819,20 @@ impl ProcessHeap {
     /// Allocated and block sizes behind `process_info(garbage_collection_info)`.
     // Port of erts/emulator/beam/erl_gc.c:3650-3728 (erts_process_gc_info), OTP-29.1.1.
     pub fn gc_info_words(&self) -> GcInfoWords {
+        let abandoned = self.abandoned_heap();
         GcInfoWords {
             old_heap_block_size: self.old_words.len(),
-            heap_block_size: self.words.len(),
-            mbuf_size: self.fragments.iter().map(|fragment| fragment.len()).sum(),
-            recent_size: self.high_water,
+            heap_block_size: self.heap_size_words(),
+            mbuf_size: self
+                .fragments
+                .iter()
+                .filter(|fragment| !matches!(fragment, crate::heap::Fragment::Abandoned { .. }))
+                .map(|fragment| fragment.len())
+                .sum(),
+            recent_size: abandoned.map_or(self.high_water, |abandoned| abandoned.high_water),
             stack_size: self.words.len() - self.stop,
             old_heap_size: self.old_htop,
-            heap_size: self.htop,
+            heap_size: abandoned.map_or(self.htop, |abandoned| abandoned.used),
         }
     }
 
@@ -747,7 +869,7 @@ impl ProcessHeap {
     /// Whether the next collection is a full sweep.
     /// Port of erts/emulator/beam/erl_gc.c:787 (minor/major choice in `erts_garbage_collect_nobump`), OTP-29.1.1.
     pub fn collection_is_major(&self) -> bool {
-        let promote_bound = self.old_htop.saturating_add(self.high_water);
+        let promote_bound = self.old_htop.saturating_add(self.mature_words());
         self.minor_since_major >= self.fullsweep_after
             || (!self.old_words.is_empty() && promote_bound > self.old_words.len())
     }
@@ -758,7 +880,7 @@ impl ProcessHeap {
     /// OTP-29.1.1. erts traces the failed minor attempt before the major one.
     pub fn minor_falls_back_to_major(&self) -> bool {
         !self.collection_is_major()
-            && ((self.old_words.is_empty() && self.high_water == 0)
+            && ((self.old_words.is_empty() && self.mature_words() == 0)
                 || (!self.old_words.is_empty()
                     && self.owners.vheap.old_size <= self.owners.vheap.old))
     }
@@ -878,7 +1000,13 @@ impl ProcessHeap {
         min_free: usize,
     ) -> Result<GcStats, TermError> {
         let start = Instant::now();
-        let fragments = self.fragment_words as usize;
+        let abandoned = self.abandoned_heap();
+        let abandoned_mature = abandoned.map_or((0, 0), |abandoned| {
+            (abandoned.start, abandoned.start + abandoned.high_water * 8)
+        });
+        let mature_words = self.mature_words();
+        let fragments = (self.fragment_words as usize)
+            .saturating_add(abandoned.map_or(0, |abandoned| abandoned.used));
         let mut fragment_ranges = self
             .fragments
             .iter()
@@ -916,7 +1044,7 @@ impl ProcessHeap {
             size_before.max(min_free.saturating_add(S_RESERVED))
         });
         let mut capacity = next_heap_size(new_sz, 0, self.min_heap_size as usize)?;
-        if major && self.heap_grow && capacity == self.words.len() {
+        if major && self.heap_grow && capacity == self.heap_size_words() {
             capacity = next_heap_size(capacity, 1, self.min_heap_size as usize)?;
         }
         let mut next = ProcessHeap::with_words(capacity);
@@ -952,7 +1080,7 @@ impl ProcessHeap {
         next.owners.vheap.old = if major { 0 } else { self.owners.vheap.old };
         if !major {
             next.old_words = std::mem::take(&mut self.old_words);
-            if next.old_words.is_empty() && self.high_water > 0 {
+            if next.old_words.is_empty() && mature_words > 0 {
                 // Port of erl_gc.c:1471 (`erts_next_heap_size(size_before, 1)`):
                 // the first old heap is one step larger than the mature data.
                 let old_capacity = next_heap_size(source_words, 1, 0)?;
@@ -991,6 +1119,7 @@ impl ProcessHeap {
             young_scan: 0,
             old_scan,
             fragment_ranges,
+            abandoned_mature,
             young_words: 0,
             promoted_words: 0,
             sub_bits: Vec::new(),
