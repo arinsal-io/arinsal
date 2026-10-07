@@ -946,6 +946,15 @@ fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Runs a blocking wait of a scheduler thread on another thread without holding back thread
+/// progress; the caller must not hold locks that a thread blocking progress needs.
+///
+/// Port of erts/emulator/beam/erl_thr_progress.c:884 (erts_thr_progress_prepare_wait) and
+/// :913 (erts_thr_progress_finalize_wait), OTP-29.1.1.
+pub fn thread_progress_wait<R>(wait: impl FnOnce() -> R) -> R {
+    progress_wait(wait)
+}
+
 impl ProgressGuard {
     fn block_for(&mut self, duration: Duration) {
         let mut state = self.progress.state.lock().unwrap();

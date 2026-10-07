@@ -3892,13 +3892,21 @@ fn emit_op(
                     let ctx = value(1)?;
                     let fail = n(0)?;
                     let mut at = 2;
+                    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2916-2940 (Need, Live) and
+                    // beam_jit_bs.cpp:366-528 (beam_jit_opt_bsm_segments), OTP-29.1.1: the heap
+                    // test of `i_bs_match_test_heap` is a plain `emit_gc_test` with `Live`, run
+                    // only once every command has matched. `Live` is the live count after the
+                    // match, so X registers at or above it may still be live at the fail label
+                    // and must not be touched before a command can fail. The commands that
+                    // allocate here reserve and collect in their own runtime call, so the test
+                    // covers only `Need` and stays trailing.
+                    let mut trailing_heap_test = None;
                     if op.name() == "i_bs_match_test_heap" {
-                        // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2916-2940 (Need, Live).
                         count_at_least(args, 4, op.name())?;
                         let need =
                             count_or_allocation_words(args.get(2)).map_err(EmitError::Operand)?;
                         if need != 0 {
-                            assembler.emit_gc_test_preserve(need, n(3)?, ctx, env.gc_hook())?;
+                            trailing_heap_test = Some((need, n(3)?));
                         }
                         at = 4;
                     }
@@ -3988,6 +3996,9 @@ fn emit_op(
                                 )));
                             }
                         }
+                    }
+                    if let Some((need, live)) = trailing_heap_test {
+                        assembler.emit_test_heap(need, live, env.gc_hook())?;
                     }
                     Ok(())
                 }

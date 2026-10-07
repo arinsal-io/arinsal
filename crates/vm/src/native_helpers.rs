@@ -1836,18 +1836,9 @@ pub extern "C" fn arinsal_beamasm_bs_match(
         .set_frame_pointer(registers.tmp_mem[2] as usize);
     let context = crate::native_hooks::from_raw(context);
     let value = crate::native_hooks::from_raw(value);
-    if std::env::var_os("XDBGB").is_some() {
-        eprintln!("XDBGB op={op} value={:#x}", value.tagged_word());
-    }
     let result = match op {
         0 => heap_only(process, context, arinsal_bits::start_match).flatten(),
-        3 => {
-            let r = heap_only(process, context, arinsal_bits::get_position);
-            if std::env::var_os("XDBGB").is_some() {
-                eprintln!("XDBGB getpos={:?}", r.map(|t| t.tagged_word()));
-            }
-            r
-        }
+        3 => heap_only(process, context, arinsal_bits::get_position),
         4 => arinsal_bits::set_position_term(context, value).then_some(Term::NIL),
         6 => {
             let bits = value

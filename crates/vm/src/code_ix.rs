@@ -112,10 +112,21 @@ impl CodeIndexes {
                     return false;
                 }
                 _ => {
-                    permission = self
-                        .released
-                        .wait(permission)
-                        .unwrap_or_else(|error| error.into_inner());
+                    // The thread that runs a queued process still waits here for the owner
+                    // thread or for an ended staging area's commit, which its stager makes
+                    // only after its code barrier (block_thread_progress). The waiting thread
+                    // must not hold back that thread progress, and drops the permission lock
+                    // before re-entering it.
+                    // Port of erts/emulator/beam/erl_thr_progress.c:884-913
+                    // (erts_thr_progress_prepare_wait / finalize_wait), OTP-29.1.1.
+                    arinsal_sched::thread_progress_wait(|| {
+                        drop(
+                            self.released
+                                .wait(permission)
+                                .unwrap_or_else(|error| error.into_inner()),
+                        );
+                    });
+                    permission = self.lock_permission();
                 }
             }
         }
