@@ -345,7 +345,7 @@ pub(crate) fn execute_named(
     import: usize,
     arity: usize,
     mut args: [Term; 3],
-    mut ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+    ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<TrapResult, VmError>> {
     let gc_enabled_on_entry = process.gc_enabled;
     let pending_site = process
@@ -434,17 +434,6 @@ pub(crate) fn execute_named(
     }
     let resumed = state.is_some();
     let result = handler(process, &args[..arity], state.as_ref(), pid, gc_was_enabled);
-    if module_name == "erts_debug"
-        && function_name == "set_internal_state"
-        && args
-            .get(1)
-            .and_then(|term| term.as_atom())
-            .and_then(|atom| global_atoms().text(atom))
-            == Some("false")
-        && let Some(run) = ctx.as_deref_mut()
-    {
-        crate::natives::code::wake_code_mod_permission_waiter(process, run);
-    }
     Some(match result {
         Err(error) => {
             process.cold_mut().bif_trap = None;
@@ -592,17 +581,21 @@ fn code_permission(
     let pid = pid.ok_or(BifError::Unsupported(
         "code_mod_permission requires a scheduler",
     ))?;
-    if process
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime| crate::natives::try_code_mod_permission(runtime, pid, acquire))
-    {
+    let Some(runtime) = process.runtime.clone() else {
+        return Err(BifError::Unsupported(
+            "code_mod_permission requires a runtime",
+        ));
+    };
+    // Port of erts/emulator/beam/erl_bif_info.c:5385-5400, OTP-29.1.1.
+    if !acquire {
+        crate::natives::code::release_code_mod_permission(&runtime);
+    }
+    if !acquire || crate::natives::code::try_seize_code_mod_permission(&runtime, pid) {
         return Ok(TrapResult::Done {
             value: Term::atom(global_atoms().intern("true").unwrap()),
             reductions: 1,
         });
     }
-    crate::natives::code::wait_for_code_mod_permission(process, pid);
     Ok(TrapResult::Yield {
         continuation: CODE_PERMISSION_CONTINUATION,
         state: MagicRef::new(acquire),

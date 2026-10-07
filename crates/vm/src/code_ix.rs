@@ -39,7 +39,7 @@ struct Permission {
     work: Option<CodeTables>,
     aborted: bool,
     /// Ticket of a staging area that ended (`erts_end_staging_code_ix`) and waits for its code
-    /// barrier before the commit; `work` holds its tables and the permission stays taken.
+    /// barrier before the commit; `work` holds its tables until the stager commits them.
     ended: Option<u64>,
 }
 
@@ -89,42 +89,33 @@ impl CodeIndexes {
         self.tables[self.active()].load().generation
     }
 
-    /// Takes the code modification permission, waiting while another thread holds it.
-    /// Returns whether this thread already held it.
-    // Port of erts/emulator/beam/code_ix.c:251-300 (try_seize_code_mod_permission), OTP-29.1.1.
-    fn seize(&self) -> bool {
+    /// Takes the staging tables for this thread, waiting while another thread holds them.
+    /// While an ended staging area waits for its commit only callers that change code in
+    /// place (`join_ended`) get them: a new staging area waits for that commit, which the
+    /// stager makes once its code barrier passed, never another thread on its behalf.
+    /// Returns whether this thread already held them.
+    // Port of erts/emulator/beam/code_ix.c:214-290 (try_seize_code_permission), OTP-29.1.1.
+    // Processes queue on the process-based code modification permission
+    // (natives/code.rs) before they get here; this only orders the threads that run them.
+    fn seize(&self, join_ended: bool) -> bool {
         let me = std::thread::current().id();
         let mut permission = self.lock_permission();
         loop {
-            // The stager of an ended staging area is suspended until its code barrier; a
-            // seizer that comes first completes the barrier and commit on its behalf
-            // (beam_bif_load.c:301 commit_code_ix) instead of blocking its scheduler thread,
-            // which may be the one that has to resume the stager.
-            if permission.ended.take().is_some() {
-                let tables = permission.work.take();
-                permission.owner = None;
-                permission.depth = 0;
-                permission.aborted = false;
-                if let Some(tables) = tables {
-                    self.commit_tables(tables);
-                }
-                self.released.notify_all();
-            }
             match permission.owner {
                 Some(owner) if owner == me => {
                     permission.depth += 1;
                     return true;
                 }
-                Some(_) => {
+                None if join_ended || permission.ended.is_none() => {
+                    permission.owner = Some(me);
+                    permission.depth = 1;
+                    return false;
+                }
+                _ => {
                     permission = self
                         .released
                         .wait(permission)
                         .unwrap_or_else(|error| error.into_inner());
-                }
-                None => {
-                    permission.owner = Some(me);
-                    permission.depth = 1;
-                    return false;
                 }
             }
         }
@@ -135,8 +126,11 @@ impl CodeIndexes {
         permission.depth = permission.depth.saturating_sub(1);
         if permission.depth == 0 {
             permission.owner = None;
-            permission.work = None;
-            permission.aborted = false;
+            // The tables of an ended staging area stay until its commit.
+            if permission.ended.is_none() {
+                permission.work = None;
+                permission.aborted = false;
+            }
             drop(permission);
             self.released.notify_all();
         }
@@ -154,7 +148,7 @@ impl CodeIndexes {
     // Port of erts/emulator/beam/code_ix.c:120-129 (erts_start_staging_code_ix), module.c
     // (module_start_staging) and export.c:277-280 (export_start_staging), OTP-29.1.1.
     pub(crate) fn start_staging(self: &Arc<Self>) -> Staging {
-        let nested = self.seize();
+        let nested = self.seize(false);
         if !nested {
             let copy = CodeTables::clone(&self.active_tables());
             self.lock_permission().work = Some(copy);
@@ -166,19 +160,26 @@ impl CodeIndexes {
         }
     }
 
-    /// Commits the ended staging area `ticket` unless a seizer already did, and releases the
-    /// code modification permission.
+    /// Commits the ended staging area `ticket` and lets threads stage again.
     // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1.
     fn commit_ended(&self, ticket: u64) {
         let mut permission = self.lock_permission();
+        // A thread changing code in place also changes the ended tables: wait for it.
+        while permission.owner.is_some() {
+            permission = self
+                .released
+                .wait(permission)
+                .unwrap_or_else(|error| error.into_inner());
+        }
         if permission.ended != Some(ticket) {
             return;
         }
         permission.ended = None;
-        permission.owner = None;
-        permission.depth = 0;
         permission.aborted = false;
-        if let Some(tables) = permission.work.take() {
+        let tables = permission.work.take();
+        // Commit under the lock: no thread may copy the active tables into a new staging
+        // area before they are the committed ones.
+        if let Some(tables) = tables {
             self.commit_tables(tables);
         }
         drop(permission);
@@ -201,22 +202,34 @@ impl CodeIndexes {
     /// old code (beam_bif_load.c:2112-2330), binding a NIF library to the current instance
     /// (erl_nif.c:4748) and export stubs (export.c:228-242). Inside this thread's own staging
     /// area the change goes to the staging tables, which it commits next.
-    pub(crate) fn update_active<R>(&self, change: impl FnOnce(&mut CodeTables) -> R) -> R {
-        let nested = self.seize();
-        let work = if nested {
-            self.lock_permission().work.take()
-        } else {
-            None
+    pub(crate) fn update_active<R>(&self, mut change: impl FnMut(&mut CodeTables) -> R) -> R {
+        let nested = self.seize(true);
+        let (work, ended) = {
+            let mut permission = self.lock_permission();
+            let ended = permission.ended.is_some();
+            (
+                (nested || ended).then(|| permission.work.take()).flatten(),
+                ended,
+            )
         };
-        let result = if let Some(mut work) = work {
-            let result = change(&mut work);
-            self.lock_permission().work = Some(work);
-            result
-        } else {
-            let mut tables = CodeTables::clone(&self.tables[self.active()].load());
-            let result = change(&mut tables);
-            self.publish_everywhere(tables);
-            result
+        let result = match work {
+            Some(mut work) if !ended => {
+                let result = change(&mut work);
+                self.lock_permission().work = Some(work);
+                result
+            }
+            work => {
+                let mut tables = CodeTables::clone(&self.tables[self.active()].load());
+                let result = change(&mut tables);
+                self.publish_everywhere(tables);
+                // An ended staging area commits a copy of the active tables made before this
+                // change: it takes the change too.
+                if let Some(mut work) = work {
+                    change(&mut work);
+                    self.lock_permission().work = Some(work);
+                }
+                result
+            }
         };
         self.release();
         result
@@ -225,7 +238,7 @@ impl CodeIndexes {
     /// Applies a change of code memory, which every code index shares (breakpoints and NIF
     /// bodies are patched in place in erts), to the active tables and an open staging area.
     pub(crate) fn patch_all(&self, mut change: impl FnMut(&mut CodeTables)) {
-        self.seize();
+        self.seize(true);
         let mut tables = CodeTables::clone(&self.tables[self.active()].load());
         change(&mut tables);
         self.publish_everywhere(tables);
@@ -380,12 +393,15 @@ impl Staging {
                 return None;
             }
             let ticket = TICKETS.fetch_add(1, Ordering::Relaxed);
-            // The permission now belongs to the suspended stager, not to this thread, so
-            // other processes on this scheduler never join the ended staging area.
+            // The stager keeps the process-based code modification permission until the
+            // commit; the thread is free for other processes, which may change code in
+            // place but not stage before the commit.
             permission.owner = None;
             permission.depth = 0;
             permission.ended = Some(ticket);
             self.ended = true;
+            drop(permission);
+            self.code.released.notify_all();
             Some(EndedStaging {
                 code: Arc::clone(&self.code),
                 ticket,

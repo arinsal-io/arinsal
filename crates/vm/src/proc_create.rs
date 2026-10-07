@@ -228,6 +228,12 @@ pub(crate) struct ProcessCold {
     /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
     /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
     pub(crate) delayed_gc: Vec<DelayedGc>,
+    /// Set while the process handles its signals before executing code (erts
+    /// `ERTS_PSFLG_RUNNING_SYS`), where a potentially long GC request moves the process to a
+    /// dirty CPU scheduler instead of collecting on the normal one.
+    pub(crate) sys_task_point: bool,
+    /// A potentially long GC request waits in `delayed_gc` for a dirty CPU scheduler.
+    pub(crate) dirty_sys_gc: bool,
     /// erts `F_HAVE_BLCKD_MSCHED | F_HAVE_BLCKD_NMSCHED`: this process holds a
     /// multi-scheduling block of its runtime.
     pub(crate) have_blocked_multi_scheduling: bool,

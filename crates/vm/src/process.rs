@@ -1224,8 +1224,21 @@ impl Executor {
                 }
                 // Port of erts/emulator/beam/erl_process.c:10318-10372 (ERTS_PSFLG_RUNNING_SYS:
                 // handle signals and execute system tasks before Erlang code), OTP-29.1.1.
-                if ctx.sys_task_run() {
+                // Port of erts/emulator/beam/erl_process.c:10363-10372 and 11018-11040
+                // (a dirty scheduler executes the dirty GC system task, then the process
+                // returns to a normal scheduler), OTP-29.1.1.
+                if ctx.scheduler_type().is_dirty()
+                    && process.cold.as_ref().is_some_and(|cold| cold.dirty_sys_gc)
+                {
+                    process.cold_mut().dirty_sys_gc = false;
                     process.drain(ctx)?;
+                    break 'execution Ok(RunState::Yield);
+                }
+                if ctx.sys_task_run() {
+                    process.cold_mut().sys_task_point = true;
+                    let drained = process.drain(ctx);
+                    process.cold_mut().sys_task_point = false;
+                    drained?;
                 }
                 loop {
                     // A caught exception re-enters this loop without replenishing its process slice.
@@ -2848,7 +2861,10 @@ impl Executor {
         };
         let pid = ctx.pid();
         if runtime.suspend_total_of(pid) > 0 {
-            process.drain(ctx)?;
+            process.cold_mut().sys_task_point = true;
+            let drained = process.drain(ctx);
+            process.cold_mut().sys_task_point = false;
+            drained?;
             // The resumer's wake-up signal may have been consumed by the drain above: re-check
             // so a resume racing with this suspension is not lost (otherwise the process
             // waits forever).
@@ -4132,7 +4148,20 @@ impl Process {
     /// Process exit up to the release of owned ETS tables.
     fn exit_stage1(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.final_exit_reason = Some(reason);
-        crate::natives::code::code_mod_permission_process_exit(self, ctx.pid(), ctx);
+        crate::natives::code::code_mod_permission_process_exit(self, ctx.pid());
+        // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1:
+        // the code barrier of a loader commits and releases the code modification permission
+        // even when the suspended loader exits.
+        if let Some(staged) = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.finish_loading_commit.take())
+        {
+            vm.commit_staged(staged);
+            if let Some(runtime) = &self.runtime {
+                crate::natives::code::release_code_mod_permission(runtime);
+            }
+        }
         crate::trace::emit(
             Some(vm),
             self,

@@ -810,8 +810,8 @@ impl Vm {
         })
     }
 
-    /// Commits a load of [`Vm::stage_prepared`] (unless a concurrent code change already
-    /// did) and starts reading the new active code; returns the modules with `on_load`.
+    /// Commits a load of [`Vm::stage_prepared`] and starts reading the new active code;
+    /// returns the modules with `on_load`.
     // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1.
     pub(crate) fn commit_staged(&mut self, staged: StagedLoad) -> Vec<String> {
         if let Some(ended) = staged.ended {
