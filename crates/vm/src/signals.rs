@@ -124,6 +124,51 @@ mod task_latency_tests {
     }
 
     #[test]
+    fn priority_monitor_and_sync_suspend_match_erts_under_busy_low_priority_targets() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping monitor/suspend priority differential test");
+            return;
+        };
+        let source = r#"
+-module(sig_prio_mon_probe).
+-export([monitor_busy/0, suspend_busy/0]).
+spin() -> spin().
+monitor_busy() ->
+    process_flag(priority, high),
+    Pid = spawn_opt(fun() -> receive stop -> ok end end, [{priority, low}]),
+    Ref = erlang:monitor(process, Pid),
+    Pid ! stop,
+    receive {'DOWN', Ref, process, Pid, normal} -> ok after 5000 -> timeout end.
+suspend_busy() ->
+    process_flag(priority, high),
+    Pid = spawn_opt(fun spin/0, [{priority, low}]),
+    Ref = erlang:monitor(process, Pid),
+    true = erlang:suspend_process(Pid),
+    true = erlang:resume_process(Pid),
+    exit(Pid, kill),
+    receive {'DOWN', Ref, process, Pid, killed} -> ok after 5000 -> timeout end.
+"#;
+        let beam = reference
+            .compile_named("sig_prio_mon_probe", source, &[])
+            .expect("compile monitor/suspend priority probe");
+        reference.load("sig_prio_mon_probe", &beam).unwrap();
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam)
+            .expect("load monitor/suspend priority probe");
+
+        for function in ["monitor_busy", "suspend_busy"] {
+            let expected = match reference.call("sig_prio_mon_probe", function, &[]) {
+                arinsal_difftest::CallResult::Ok(term) => term,
+                failure => panic!("erts {function} failed: {failure:?}"),
+            };
+            let actual = vm
+                .eval_scheduled("sig_prio_mon_probe", function, &[], 2, None)
+                .unwrap_or_else(|error| panic!("Arinsal {function} failed: {error:?}"));
+            assert_eq!(actual.term, expected, "{function} differs from erts");
+        }
+    }
+
+    #[test]
     fn spawn_opt_scheduler_bindings_are_accepted_for_each_online_scheduler() {
         let Ok(reference) = RefErl::start() else {
             eprintln!("erl unavailable; skipping spawn scheduler option differential test");
@@ -2904,6 +2949,18 @@ fn elevate_sig_handling_prio(
             "signal priority task: {error}"
         ))),
     }
+}
+
+/// Raise a target's signal handling priority from a process BIF outside this module.
+///
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:1275 (`maybe_elevate_sig_handling_prio`),
+/// OTP-29.1.1.
+pub(crate) fn elevate_for_signal_request(
+    process: &Process,
+    ctx: &mut RunCtx<'_, Message>,
+    target: Pid,
+) -> Result<(), VmError> {
+    elevate_sig_handling_prio(process, ctx, scope(process), target)
 }
 
 /// Run the request whose wakeup is `id`, if it is still queued for this process.

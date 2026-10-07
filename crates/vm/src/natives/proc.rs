@@ -2202,6 +2202,10 @@ fn suspend_process(
             ready: crate::process::Message::copy_from(ready)?,
             exited: crate::process::Message::copy_from(exited)?,
         });
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:3192-3233
+        // (`erts_proc_sig_send_sync_suspend`), OTP-29.1.1: prioritize the target after queuing
+        // the synchronous or tagged suspend reply request.
+        crate::signals::elevate_for_signal_request(process, ctx, target_pid)?;
         if sync {
             return Ok(tag);
         }
