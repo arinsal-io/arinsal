@@ -384,6 +384,26 @@ fn sensitive_set() -> &'static Mutex<std::collections::HashSet<(usize, Pid)>> {
 }
 
 static SENSITIVE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RUNNING_PROCS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether any trace session requests process scheduler transitions.
+pub(crate) fn running_procs_enabled() -> bool {
+    RUNNING_PROCS_ENABLED.load(Ordering::Relaxed)
+}
+
+fn refresh_running_procs_enabled() {
+    let process_entries = table().read().unwrap();
+    let process_active = process_entries
+        .values()
+        .any(|entry| entry.flags & RUNNING_PROCS != 0);
+    drop(process_entries);
+    let future_active = new_process_tracing()
+        .lock()
+        .unwrap()
+        .values()
+        .any(|(flags, _)| flags & RUNNING_PROCS != 0);
+    RUNNING_PROCS_ENABLED.store(process_active || future_active, Ordering::Relaxed);
+}
 
 /// Sets or clears the sensitive flag of `pid`; returns the previous value.
 // Port of erts/emulator/beam/bif.c:2173 (process_flag sensitive), OTP-29.1.1.
@@ -668,6 +688,8 @@ pub(crate) fn configure_session(
         !table.is_empty() || !port_table().lock().unwrap().is_empty(),
         Ordering::Relaxed,
     );
+    drop(table);
+    refresh_running_procs_enabled();
     before
 }
 
@@ -1202,6 +1224,7 @@ fn replace_session_flags(process: &Process, session: u64, pid: Pid, flags: u64, 
         processes_active || !port_table().lock().unwrap().is_empty(),
         Ordering::Relaxed,
     );
+    refresh_running_procs_enabled();
 }
 
 pub(crate) fn flags(process: &Process, pid: Pid) -> u64 {
@@ -1574,6 +1597,8 @@ pub(crate) fn configure_new_processes(
     if *current == 0 {
         tracing.remove(&key);
     }
+    drop(tracing);
+    refresh_running_procs_enabled();
 }
 
 pub(crate) fn new_process_flags(process: &Process, session: u64) -> u64 {
@@ -1610,6 +1635,7 @@ pub(crate) fn clear(process: &Process, pid: Pid) {
         processes_active || !port_table().lock().unwrap().is_empty(),
         Ordering::Relaxed,
     );
+    refresh_running_procs_enabled();
 }
 
 /// Keep only the `exiting` flag of an exiting process's trace entries, so its scheduling
@@ -1630,6 +1656,7 @@ pub(crate) fn retain_exiting(process: &Process, pid: Pid) {
         processes_active || !port_table().lock().unwrap().is_empty(),
         Ordering::Relaxed,
     );
+    refresh_running_procs_enabled();
 }
 
 /// Remove process and future-process tracing owned by a dying tracer.
@@ -1674,6 +1701,7 @@ pub(crate) fn tracer_exited(process: &Process, pid: Pid) {
         !table().lock().unwrap().is_empty() || !port_table().lock().unwrap().is_empty(),
         Ordering::Relaxed,
     );
+    refresh_running_procs_enabled();
 }
 
 /// Port of erts/emulator/beam/beam_bp.c:1115-1285 (generic entry breakpoint), OTP-29.1.1.
@@ -4132,6 +4160,7 @@ fn destroy_session_key(runtime: usize, session: u64) -> bool {
     drop(ports);
     drop(entries);
     enabled().store(any_entries, Ordering::Relaxed);
+    refresh_running_procs_enabled();
     existed
 }
 

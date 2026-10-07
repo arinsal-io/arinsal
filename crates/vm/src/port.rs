@@ -132,8 +132,28 @@ pub(crate) fn process_send(
     port: Term,
     message: Term,
 ) -> Result<(), VmError> {
+    process_send_inner(process, None, port, message)
+}
+
+/// `Port ! Message` with its running process scheduler context.
+// Port of erts/emulator/beam/io.c:923-1055 (try_imm_drv_call), OTP-29.1.1.
+pub(crate) fn process_send_in(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    port: Term,
+    message: Term,
+) -> Result<(), VmError> {
+    process_send_inner(process, Some(ctx), port, message)
+}
+
+fn process_send_inner(
+    process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, Message>>,
+    port: Term,
+    message: Term,
+) -> Result<(), VmError> {
     let nosuspend = SEND_NOSUSPEND.with(Cell::get);
-    match send_from_process(process, port, message, nosuspend)? {
+    match send_from_process(process, port, message, nosuspend, ctx)? {
         PortSend::Sent => Ok(()),
         PortSend::SentSuspended => {
             // SEND_YIELD_RETURN: the send is done; the process leaves the scheduler.
@@ -1244,6 +1264,26 @@ impl DrvHost {
 }
 
 impl arinsal_drv::PortHost for DrvHost {
+    // Port of erts/emulator/beam/erl_trace.c:2299-2324 (trace_sched_ports_where), OTP-29.1.1.
+    fn trace_sched_port(
+        &self,
+        port: &arinsal_drv::DriverPort,
+        scheduled_in: bool,
+        where_: Option<&str>,
+    ) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        let where_term = where_.map_or_else(|| Term::small(0).unwrap(), crate::signals::atom);
+        crate::trace::emit_port_event(
+            &runtime,
+            port.id(),
+            crate::trace::RUNNING_PORTS,
+            if scheduled_in { "in" } else { "out" },
+            &[where_term],
+        );
+    }
+
     fn task_done(&self, port: &arinsal_drv::DriverPort, op: &str, elapsed_ns: u64) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
@@ -3084,7 +3124,17 @@ fn port_command(
         };
         loop {
             let pid = ctx.pid();
-            match drv_sig::output(process, pid, &handle, &drv_port, pid, data, flags, true) {
+            match drv_sig::output(
+                process,
+                Some(ctx),
+                pid,
+                &handle,
+                &drv_port,
+                pid,
+                data,
+                flags,
+                true,
+            ) {
                 drv_sig::PortOp::Done => return Ok(atom("true")),
                 drv_sig::PortOp::Dropped | drv_sig::PortOp::Badarg => return Ok(atom("badarg")),
                 drv_sig::PortOp::Busy if nosuspend => return Ok(atom("false")),
@@ -3964,7 +4014,7 @@ pub(crate) fn nif_port_command(
 }
 
 pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Result<(), VmError> {
-    send_message_inner(process, port, message, false).map(|_| ())
+    send_message_inner(process, port, message, false, None).map(|_| ())
 }
 
 /// Outcome of `Port ! Message` from a process (erts_send to a port, bif.c:2560).
@@ -3984,9 +4034,10 @@ pub(crate) fn send_from_process(
     port: Term,
     message: Term,
     nosuspend: bool,
+    mut ctx: Option<&mut RunCtx<'_, Message>>,
 ) -> Result<PortSend, VmError> {
     loop {
-        match send_message_inner(process, port, message, nosuspend)? {
+        match send_message_inner(process, port, message, nosuspend, ctx.as_deref_mut())? {
             (PortSend::Busy, Some((handle, drv))) if !nosuspend => {
                 let pid = process.self_pid.ok_or_else(badarg)?;
                 if suspend_on_busy(process, &handle, &drv, pid) {
@@ -4012,6 +4063,7 @@ fn send_message_inner(
     port: Term,
     message: Term,
     nosuspend: bool,
+    ctx: Option<&mut RunCtx<'_, Message>>,
 ) -> Result<(PortSend, DrvTarget), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -4123,7 +4175,7 @@ fn send_message_inner(
         let sender = process.self_pid.unwrap_or(from);
         return Ok(
             match drv_sig::output(
-                process, sender, &handle, &drv_port, from, command[1], flags, false,
+                process, ctx, sender, &handle, &drv_port, from, command[1], flags, false,
             ) {
                 drv_sig::PortOp::Busy => (PortSend::Busy, Some((handle, drv_port))),
                 drv_sig::PortOp::BusyScheduled(_) => {

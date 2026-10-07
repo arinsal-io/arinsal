@@ -186,6 +186,15 @@ body(Dir) ->
         port_close(Q),
         R
     end)(),
+    %% timeslice accounting while port_command invokes output immediately
+    S16 = (fun() ->
+        Q = open(),
+        "1" = ctl(Q, 31),
+        [true = port_command(Q, "") || _ <- lists:seq(1, 10)],
+        Count = ctl(Q, 32),
+        port_close(Q),
+        Count
+    end)(),
     %% a port that dies with its fd still selected
     S15 = (fun() ->
         Q = open(),
@@ -204,4 +213,4 @@ body(Dir) ->
     #{select_read => S1, select_again => S1b, select_twice => S2, select_write => S3,
       use_stop_select => S4, use_no_callback => S5, use_unknown => S6, eof => S7,
       bad_fd => S8, steal => S9, timers => S10, timer_on_close => S11, async => S12,
-      async_free => S13, timeslice => S14, stale => S15}.
+      async_free => S13, timeslice => S14, stale => S15, output_timeslice => S16}.

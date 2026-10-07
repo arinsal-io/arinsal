@@ -11,6 +11,7 @@ use arinsal_drv::port_task::{
     ImmFail, PT_FLG_ASYNC_NOSUSPEND, PT_FLG_NOSUSPEND, PT_FLG_WAIT_BUSY, PTS_FLG_BUSY_PORT,
     PTS_FLG_EXIT, PTS_FLG_PARALLELISM, PTS_FLGS_BUSY, PTS_FLGS_FORCE_SCHEDULE_OP, ProcSig, SigOp,
 };
+use arinsal_sched::RunCtx;
 
 // Port of erts/emulator/beam/erl_port.h:362-381 (ERTS_PORT_REDS_*), OTP-29.1.1.
 const CONTEXT_REDS: i32 = 4000;
@@ -134,6 +135,7 @@ fn call_driver_output(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn output(
     process: &Process,
+    ctx: Option<&mut RunCtx<'_, Message>>,
     caller: Pid,
     handle: &Arc<PortHandle>,
     drv: &Arc<DriverPort>,
@@ -182,10 +184,21 @@ pub(crate) fn output(
     let tracer = if flags.bang { from } else { caller };
     trace_command_received(process, tracer, handle.id, &views, segments);
     if try_call {
-        match drv.try_imm_call(invalid_flags, asynchronous) {
+        let reductions_left = ctx
+            .as_deref()
+            .map_or((CONTEXT_REDS / 10) as u32, |ctx| ctx.remaining());
+        match drv.try_imm_call(invalid_flags, asynchronous, "command", reductions_left) {
             Ok(imm) => {
+                // Port of erts/emulator/beam/io.c:1005-1055 (try_imm_drv_call and
+                // finalize_imm_drv_call), OTP-29.1.1.
+                trace_immediate_process(process, caller, "out");
                 call_driver_output(handle, drv, flags.bang, caller, from, &pieces);
+                let reductions_used = imm.reductions_used();
                 drop(imm);
+                trace_immediate_process(process, caller, "in");
+                if let Some(ctx) = ctx {
+                    ctx.consume(reductions_used);
+                }
                 return PortOp::Done;
             }
             Err(ImmFail::InvalidPort) => return PortOp::Dropped,
@@ -266,6 +279,15 @@ pub(crate) fn output(
     PortOp::Scheduled(reference)
 }
 
+// Port of erts/emulator/beam/io.c:1005-1055 (try_imm_drv_call and
+// finalize_imm_drv_call), OTP-29.1.1.
+fn trace_immediate_process(process: &Process, pid: Pid, name: &str) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    crate::trace::emit_external_process_event(runtime, pid, crate::trace::RUNNING_PROCS, name, &[]);
+}
+
 /// Queue `op` as a port task (`erts_schedule_proc2port_signal`).
 fn schedule(drv: &Arc<DriverPort>, caller: Pid, op: impl FnOnce(SigOp) -> i32 + Send + 'static) {
     let _ = drv.schedule_signal(ProcSig {
@@ -282,9 +304,10 @@ fn imm_or_schedule(
     drv: &Arc<DriverPort>,
     caller: Pid,
     asynchronous: bool,
+    where_: &'static str,
     op: impl FnOnce(SigOp) -> i32 + Send + 'static,
 ) -> Result<bool, ()> {
-    match drv.try_imm_call(0, asynchronous) {
+    match drv.try_imm_call(0, asynchronous, where_, (CONTEXT_REDS / 10) as u32) {
         Ok(imm) => {
             op(SigOp::Exec);
             drop(imm);
@@ -310,7 +333,7 @@ pub(crate) fn control(
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let sched_flags = drv.sched_flags();
     if sched_flags & PTS_FLGS_FORCE_SCHEDULE_OP == 0 {
-        match drv.try_imm_call(0, false) {
+        match drv.try_imm_call(0, false, "control", (CONTEXT_REDS / 10) as u32) {
             Ok(imm) => {
                 let reply = call_driver_control(&runtime, drv, caller, op, &bytes);
                 drop(imm);
@@ -454,7 +477,7 @@ pub(crate) fn exit(
 ) -> Result<Option<u64>, VmError> {
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let closed_to = bang.then_some(from);
-    match drv.try_imm_call(0, !want_ref) {
+    match drv.try_imm_call(0, !want_ref, "close", (CONTEXT_REDS / 10) as u32) {
         Ok(imm) => {
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
@@ -500,7 +523,7 @@ pub(crate) fn connect(
         return;
     };
     let task_handle = Arc::clone(handle);
-    let _ = imm_or_schedule(drv, caller, true, move |op| {
+    let _ = imm_or_schedule(drv, caller, true, "connect", move |op| {
         // Port of erts/emulator/beam/io.c:2366 (port_sig_connect), OTP-29.1.1.
         if op != SigOp::Exec {
             return REDS_CONNECT;
@@ -542,34 +565,41 @@ pub(crate) fn link(
 ) -> bool {
     let task_runtime = Arc::clone(runtime);
     let task_handle = Arc::clone(handle);
-    imm_or_schedule(drv, pid, true, move |op| {
-        let handle = &task_handle;
-        let live = op == SigOp::Exec && task_runtime.ports.lock().unwrap().contains_key(&handle.id);
-        if linked {
-            // Port of erts/emulator/beam/io.c:2669 (port_sig_link), OTP-29.1.1.
-            if live {
-                handle.links.lock().unwrap().insert(pid);
-                trace_link(&task_runtime, handle.id, pid, "getting_linked");
-            } else if let (Some(port), Ok(reason)) =
-                (Term::port(handle.id), Message::copy_from(atom("noproc")))
-                && let Ok(port) = Message::copy_from(port)
-            {
-                let _ = handle.scheduler.signal(
-                    pid,
-                    pid,
-                    arinsal_sched::Signal::PortExit { port, reason },
-                );
+    imm_or_schedule(
+        drv,
+        pid,
+        true,
+        if linked { "link" } else { "unlink" },
+        move |op| {
+            let handle = &task_handle;
+            let live =
+                op == SigOp::Exec && task_runtime.ports.lock().unwrap().contains_key(&handle.id);
+            if linked {
+                // Port of erts/emulator/beam/io.c:2669 (port_sig_link), OTP-29.1.1.
+                if live {
+                    handle.links.lock().unwrap().insert(pid);
+                    trace_link(&task_runtime, handle.id, pid, "getting_linked");
+                } else if let (Some(port), Ok(reason)) =
+                    (Term::port(handle.id), Message::copy_from(atom("noproc")))
+                    && let Ok(port) = Message::copy_from(port)
+                {
+                    let _ = handle.scheduler.signal(
+                        pid,
+                        pid,
+                        arinsal_sched::Signal::PortExit { port, reason },
+                    );
+                }
+                REDS_LINK
+            } else {
+                // Port of erts/emulator/beam/io.c:2507 (port_sig_unlink), OTP-29.1.1.
+                if live {
+                    handle.links.lock().unwrap().remove(&pid);
+                    trace_link(&task_runtime, handle.id, pid, "getting_unlinked");
+                }
+                REDS_UNLINK
             }
-            REDS_LINK
-        } else {
-            // Port of erts/emulator/beam/io.c:2507 (port_sig_unlink), OTP-29.1.1.
-            if live {
-                handle.links.lock().unwrap().remove(&pid);
-                trace_link(&task_runtime, handle.id, pid, "getting_unlinked");
-            }
-            REDS_UNLINK
-        }
-    })
+        },
+    )
     .is_ok()
 }
 

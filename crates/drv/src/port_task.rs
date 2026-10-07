@@ -166,6 +166,8 @@ pub enum ImmFail {
 pub struct ImmCall<'a> {
     port: &'a DriverPort,
     _guard: crate::ReentrantGuard<'a>,
+    where_: &'static str,
+    reds_before: i32,
     /// Scheduling flags read when the call started.
     pub sched_flags: u32,
 }
@@ -181,7 +183,21 @@ impl Drop for ImmCall<'_> {
         if act & (PTS_FLG_IN_RUNQ | PTS_FLG_EXEC) == 0 {
             self.port.host.profile_runnable_port(self.port, false);
         }
-        self.port.host.trace_sched_port(self.port, false);
+        self.port
+            .host
+            .trace_sched_port(self.port, false, Some(self.where_));
+    }
+}
+
+impl ImmCall<'_> {
+    /// Reductions added by the driver callback during this immediate call.
+    // Port of erts/emulator/beam/io.c:1022-1055 (finalize_imm_drv_call), OTP-29.1.1.
+    pub fn reductions_used(&self) -> u32 {
+        self.port
+            .reds
+            .load(Ordering::Acquire)
+            .saturating_sub(self.reds_before)
+            .max(0) as u32
     }
 }
 
@@ -605,6 +621,8 @@ impl DriverPort {
         &self,
         invalid_flags: u32,
         asynchronous: bool,
+        where_: &'static str,
+        reductions_left: u32,
     ) -> Result<ImmCall<'_>, ImmFail> {
         let mut invalid = PTS_FLGS_FORCE_SCHEDULE_OP | invalid_flags;
         if asynchronous {
@@ -639,10 +657,14 @@ impl DriverPort {
         if act & (PTS_FLG_IN_RUNQ | PTS_FLG_EXEC) == 0 {
             self.host.profile_runnable_port(self, true);
         }
-        self.host.trace_sched_port(self, true);
+        let reds_before = CONTEXT_REDS.saturating_sub(reductions_left as i32);
+        self.reds.store(reds_before, Ordering::Release);
+        self.host.trace_sched_port(self, true, Some(where_));
         Ok(ImmCall {
             port: self,
             _guard: guard,
+            where_,
+            reds_before,
             sched_flags: act,
         })
     }
@@ -805,7 +827,7 @@ fn finalize_exec(port: &DriverPort) -> bool {
             Err(current) => act = current,
         }
     }
-    port.host.trace_sched_port(port, false);
+    port.host.trace_sched_port(port, false, None);
     if act & (PTS_FLG_EXEC_IMM | PTS_FLG_HAVE_TASKS) == 0 {
         port.host.profile_runnable_port(port, false);
     }
@@ -905,7 +927,7 @@ fn select_task_for_exec(port: &DriverPort) -> Option<Arc<PortTask>> {
 fn execute(port: &Arc<DriverPort>) {
     prepare_exec(port);
     let guard = port.guard();
-    port.host.trace_sched_port(port, true);
+    port.host.trace_sched_port(port, true, None);
     // erl_port_task.c:1730-1735: ERTS_PORT_REDS_EXECUTE, then the virtual reductions of
     // `begin_handle_tasks` before the first task.
     port.reds
