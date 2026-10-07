@@ -3255,7 +3255,21 @@ fn link_opt(
     );
     let mut linked = true;
     match ctx.signal(pid, Signal::Link) {
-        Ok(()) => {}
+        Ok(()) => {
+            if let Some(linker) = ctx.pid().to_term() {
+                // Port of erts/emulator/beam/erl_process.c:12899-12901, OTP-29.1.1.
+                // Preserve the link-time trace flags across a later trace BIF.
+                crate::trace::emit(
+                    Some(vm),
+                    process,
+                    ctx,
+                    pid,
+                    crate::trace::PROCS,
+                    "getting_linked",
+                    &[linker],
+                );
+            }
+        }
         Err(arinsal_sched::Error::NoProcess) => {
             linked = false;
             // The target exited between the lookup and the signal: like erts, keep the link

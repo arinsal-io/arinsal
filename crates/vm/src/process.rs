@@ -4804,18 +4804,6 @@ impl Process {
                 }
                 Payload::Signal(arinsal_sched::Signal::Link) => {
                     self.cold_mut().links.insert(from);
-                    if let Some(linker) = from.to_term() {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:8585-8589, OTP-29.1.1.
-                        crate::trace::emit(
-                            None,
-                            self,
-                            ctx,
-                            ctx.pid(),
-                            crate::trace::PROCS,
-                            "getting_linked",
-                            &[linker],
-                        );
-                    }
                 }
                 // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
                 Payload::Signal(arinsal_sched::Signal::ProcSigBlock(milliseconds)) => {
