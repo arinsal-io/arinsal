@@ -2051,7 +2051,18 @@ fn internal_state_get(
                 .int_from_i128(-576_460_752_303_423_488)
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
         }
-        Some("nbalance") => Ok(Term::small(0).unwrap()),
+        // Port of erts/emulator/beam/erl_process.c:5538 (erts_debug_nbalance),
+        // OTP-29.1.1.
+        Some("nbalance") => {
+            let checks = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.scheduler().ok())
+                .map_or(0, |scheduler| scheduler.balance_checks());
+            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                .int_from_i128(i128::from(checks))
+                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+        }
         Some("monitoring_nodes") => {
             let Some(runtime) = &process.runtime else {
                 return Ok(Term::NIL);

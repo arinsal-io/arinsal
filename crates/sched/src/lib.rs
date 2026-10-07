@@ -58,6 +58,7 @@
 //! sched.advance_ms(10);
 //! ```
 
+mod balance;
 mod mailbox;
 mod timer;
 
@@ -435,6 +436,8 @@ pub struct Config {
     pub dirty_cpu_schedulers: usize,
     /// Dirty I/O scheduler threads (`+SDio`); erts defaults to ten.
     pub dirty_io_schedulers: usize,
+    /// Compact load on as few run queues as possible (`+scl`); erts defaults to true.
+    pub compact_load: bool,
 }
 
 impl Default for Config {
@@ -447,6 +450,8 @@ impl Default for Config {
             runnext_limit: 3,
             dirty_cpu_schedulers: available.max(1),
             dirty_io_schedulers: 10,
+            // Port of erts/emulator/beam/erl_init.c:803 (erts_sched_compact_load), OTP-29.1.1.
+            compact_load: true,
         }
     }
 }
@@ -596,6 +601,8 @@ struct Process<T: Task> {
     /// One plus the dirty thread slot executing this process, 0 when not executing dirty.
     /// Port of erl_process.h (`ERTS_PSFLG_DIRTY_RUNNING`), OTP-29.1.1.
     dirty_runner: AtomicUsize,
+    /// Priority level whose run queue length counts this queued process.
+    queued_prio: AtomicU8,
     cell: Mutex<TaskCell<T>>,
 }
 
@@ -700,6 +707,7 @@ impl<T: Task> ProcessTable<T> {
             wait_timer_worker: AtomicUsize::new(0),
             dirty: AtomicU8::new(0),
             dirty_runner: AtomicUsize::new(0),
+            queued_prio: AtomicU8::new(0),
             cell: Mutex::new(TaskCell {
                 task,
                 private: Private::default(),
@@ -796,17 +804,39 @@ struct Scheduled<T: Task> {
     inherited: Option<u32>,
     /// `run_epoch` of the process when this entry was queued.
     epoch: u64,
+    /// Port of erts/emulator/beam/erl_process.h (`Process.schedule_count`), OTP-29.1.1:
+    /// times the entry reaches the head of the normal queue before it runs.
+    schedule_count: u8,
 }
 
 impl<T: Task> Scheduled<T> {
     fn new(process: Arc<Process<T>>, inherited: Option<u32>) -> Self {
         let epoch = process.run_epoch.load(Ordering::Acquire);
+        // Port of erts/emulator/beam/erl_process.c:3957 (enqueue_process), OTP-29.1.1.
+        let schedule_count = if process.priority() == Priority::Low {
+            balance::RESCHEDULE_LOW
+        } else {
+            1
+        };
         Self {
             process,
             inherited,
             epoch,
+            schedule_count,
         }
     }
+
+    /// Run queue priority queue of this entry: low priority processes share the normal
+    /// queue (erl_process.c:3961, enqueue_process).
+    fn queue(&self) -> usize {
+        queue_index(self.process.priority().index())
+    }
+}
+
+/// Port of erts/emulator/beam/erl_process.c:3961 (enqueue_process), OTP-29.1.1: the low
+/// priority level has no queue of its own.
+fn queue_index(priority: usize) -> usize {
+    priority.min(balance::PRIORITY_NORMAL)
 }
 
 struct TimerService<M> {
@@ -817,11 +847,11 @@ struct TimerService<M> {
 
 struct LocalInit<T: Task> {
     worker_id: usize,
+    balance: Arc<balance::Balance>,
     timer_service: TimerService<T::Message>,
     queues: [Worker<Scheduled<T>>; 4],
     runnext: Option<Scheduled<T>>,
     streak: u8,
-    normal_runs: u8,
     message_slabs: Vec<Vec<Event<T::Message>>>,
     pid_cache: Vec<Option<(Pid, Arc<Process<T>>)>>,
     pending_waits: Vec<PendingWait<T>>,
@@ -846,11 +876,11 @@ impl<T: Task> LocalInit<T> {
     fn into_local(self) -> Local<T> {
         Local {
             worker_id: self.worker_id,
+            balance: self.balance,
             timer_service: Rc::new(RefCell::new(self.timer_service)),
             queues: self.queues,
             runnext: self.runnext,
             streak: self.streak,
-            normal_runs: self.normal_runs,
             pinned_turn: false,
             message_slabs: self.message_slabs,
             pid_cache: self.pid_cache,
@@ -1037,6 +1067,8 @@ struct Inner<T: Task> {
     msb_switch: Condvar,
     /// The `erts_dirty_process_signal_handler` processes and their notification message.
     dirty_signal_handlers: OnceLock<DirtySignalHandlers<T::Message>>,
+    /// Run queue balancing statistics and migration paths.
+    balance: Arc<balance::Balance>,
 }
 
 /// Normal, high and max priority dirty signal handler processes.
@@ -1073,8 +1105,42 @@ struct DirtyPool<T: Task> {
 }
 
 struct DirtyQueue<T: Task> {
-    by_priority: [VecDeque<Arc<Process<T>>>; 4],
+    /// Queued processes with their `schedule_count`; low priority shares the normal queue.
+    by_priority: [VecDeque<(Arc<Process<T>>, u8)>; 4],
     len: usize,
+}
+
+impl<T: Task> DirtyQueue<T> {
+    /// Port of erts/emulator/beam/erl_process.c:3951 (enqueue_process), OTP-29.1.1.
+    fn push(&mut self, process: Arc<Process<T>>) {
+        let priority = process.priority().index();
+        let schedule_count = if priority == balance::PRIORITY_LOW {
+            balance::RESCHEDULE_LOW
+        } else {
+            1
+        };
+        self.by_priority[queue_index(priority)].push_back((process, schedule_count));
+        self.len += 1;
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:4040 (check_requeue_process) and
+    /// erl_process.c:9988-10020 (pick_next_process), OTP-29.1.1.
+    fn pop(&mut self) -> Option<Arc<Process<T>>> {
+        let queue = self
+            .by_priority
+            .iter_mut()
+            .find(|queue| !queue.is_empty())?;
+        loop {
+            let (process, mut schedule_count) = queue.pop_front()?;
+            schedule_count = schedule_count.saturating_sub(1);
+            if schedule_count > 0 && !queue.is_empty() {
+                queue.push_back((process, schedule_count));
+                continue;
+            }
+            self.len -= 1;
+            return Some(process);
+        }
+    }
 }
 
 /// Active ns, microstate ns, and run queue length per dirty pool (CPU, then I/O).
@@ -1202,9 +1268,7 @@ impl<T: Task> Inner<T> {
             return;
         }
         {
-            let mut queue = pool.queue.lock().unwrap();
-            queue.by_priority[process.priority().index()].push_back(process);
-            queue.len += 1;
+            pool.queue.lock().unwrap().push(process);
         }
         // Offline dirty CPU threads also wait on this condvar, so wake them all.
         pool.ready.notify_all();
@@ -1474,19 +1538,173 @@ impl<T: Task> Inner<T> {
             sim.lock().unwrap().queue.push_back(item);
         } else if let Some(worker) = item.process.bound_worker() {
             self.record_queued(&item.process, worker, already_active);
-            self.pinned_injectors[worker][item.process.priority().index()].push(item);
+            self.pinned_injectors[worker][item.queue()].push(item);
             self.work_epoch.fetch_add(1, Ordering::SeqCst);
             self.wake_scheduler(worker);
         } else {
-            let scheduler = self.select_run_queue(&item.process);
+            let scheduler = self.enqueue_run_queue(&item.process);
             self.push_run_queue(scheduler, item, already_active);
         }
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:6656-6672 (select_enqueue_run_queue for
+    /// the normal queue), OTP-29.1.1: the process's run queue, unless the migration paths
+    /// tell it to emigrate.
+    fn enqueue_run_queue(&self, process: &Process<T>) -> usize {
+        let runq = self.select_run_queue(process);
+        if self.scheduling_blocked.load(Ordering::Acquire) {
+            return runq;
+        }
+        match self
+            .balance
+            .check_emigration_need(runq, process.priority().index())
+        {
+            Some(to) if to < self.online_schedulers.load(Ordering::Acquire) => to,
+            _ => runq,
+        }
+    }
+
+    /// The entry is the process's live run queue entry, not a stale duplicate.
+    fn is_current_entry(item: &Scheduled<T>) -> bool {
+        item.process.run_epoch.load(Ordering::Acquire) == item.epoch
+            && item.process.state.load(Ordering::Acquire) == QUEUED
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:4115 (immigrate), OTP-29.1.1: for each
+    /// priority this run queue immigrates, move one process of that priority from the
+    /// source run queue when check_immigration_need says so.
+    fn immigrate(&self, local: &mut Local<T>) {
+        let id = local.worker_id;
+        let paths = self.balance.migration_paths();
+        let mp = &paths[id];
+        for prio in 0..balance::PRIO_LEVELS {
+            if mp.flags & balance::flg_immigrate(prio) == 0 {
+                continue;
+            }
+            let Some(from) = self.balance.check_immigration_need(id, mp, prio) else {
+                continue;
+            };
+            if from == id || from >= self.stealers.len() {
+                continue;
+            }
+            let queue = queue_index(prio);
+            let Some(item) = self.take_queued(from, queue) else {
+                continue;
+            };
+            if item.process.priority().index() != prio {
+                // Low and normal share the queue; erts skips entries of the other level
+                // and leaves them in the source run queue.
+                self.run_queues[from][queue].push(item);
+                continue;
+            }
+            if Self::is_current_entry(&item) {
+                local.migrate_queued(&item.process, id);
+            }
+            local.queues[queue].push(item);
+        }
+    }
+
+    /// Take the oldest entry of priority queue `queue` of run queue `rq`.
+    fn take_queued(&self, rq: usize, queue: usize) -> Option<Scheduled<T>> {
+        for _ in 0..8 {
+            match self.stealers[rq][queue].steal() {
+                Steal::Success(found) => return Some(found),
+                Steal::Empty => break,
+                Steal::Retry => {}
+            }
+        }
+        self.run_queues[rq][queue].pop()
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:4640 (try_steal_task), OTP-29.1.1: an
+    /// active run queue that ran out of work steals from the inactive run queues first and
+    /// then from the other active ones, starting after its own index.
+    fn try_steal_task(&self, local: &mut Local<T>) -> Option<Scheduled<T>> {
+        let id = local.worker_id;
+        let (active, used) = self.balance.no_runqs();
+        let used = used
+            .min(self.online_schedulers.load(Ordering::Acquire))
+            .clamp(1, self.stealers.len());
+        let active = active.min(used);
+        if id >= active {
+            return None;
+        }
+        if active < used {
+            let no = used - active;
+            let stop = active + id % no;
+            let mut vix = stop;
+            loop {
+                if let Some(found) = self.try_steal_task_from_victim(local, vix) {
+                    return Some(found);
+                }
+                vix += 1;
+                if vix >= used {
+                    vix = active;
+                }
+                if vix == stop {
+                    break;
+                }
+            }
+        }
+        let mut vix = id;
+        loop {
+            vix += 1;
+            if vix >= active {
+                vix = 0;
+            }
+            if vix == id {
+                break;
+            }
+            if let Some(found) = self.try_steal_task_from_victim(local, vix) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:4468 (try_steal_task_from_victim),
+    /// OTP-29.1.1: steal half of the highest priority queue of the victim, at least one
+    /// and at most 100 processes, run the first and queue the rest here.
+    fn try_steal_task_from_victim(&self, local: &mut Local<T>, vix: usize) -> Option<Scheduled<T>> {
+        let id = local.worker_id;
+        let rq = &self.balance.rqs[vix];
+        for queue in 0..PROC_QUEUES {
+            let mut len = rq.len(queue);
+            if queue == balance::PRIORITY_NORMAL {
+                len += rq.len(balance::PRIORITY_LOW);
+            }
+            if len <= 0
+                && self.stealers[vix][queue].is_empty()
+                && self.run_queues[vix][queue].is_empty()
+            {
+                continue;
+            }
+            let max = (len.max(0) as usize).div_ceil(2).clamp(1, 100);
+            let mut first = None;
+            for _ in 0..max {
+                let Some(found) = self.take_queued(vix, queue) else {
+                    break;
+                };
+                if first.is_none() {
+                    first = Some(found);
+                } else {
+                    if Self::is_current_entry(&found) {
+                        local.migrate_queued(&found.process, id);
+                    }
+                    local.queues[queue].push(found);
+                }
+            }
+            if first.is_some() {
+                return first;
+            }
+        }
+        None
     }
 
     /// Enqueue an unbound process on `scheduler`'s run queue.
     fn push_run_queue(&self, scheduler: usize, item: Scheduled<T>, already_active: bool) {
         self.record_queued(&item.process, scheduler, already_active);
-        self.run_queues[scheduler][item.process.priority().index()].push(item);
+        self.run_queues[scheduler][item.queue()].push(item);
         // Publish the queue change before a parker's final epoch check.
         self.work_epoch.fetch_add(1, Ordering::SeqCst);
         self.wake_scheduler(scheduler);
@@ -1509,7 +1727,7 @@ impl<T: Task> Inner<T> {
         item.process
             .scheduler_id
             .store(scheduler, Ordering::Relaxed);
-        let scheduler = self.select_run_queue(&item.process);
+        let scheduler = self.enqueue_run_queue(&item.process);
         self.push_run_queue(scheduler, item, false);
     }
 
@@ -1535,6 +1753,8 @@ impl<T: Task> Inner<T> {
             );
         }
         process.scheduler_id.store(worker, Ordering::Relaxed);
+        self.balance
+            .enqueued(process.priority().index(), &process.queued_prio, worker);
     }
 
     fn record_running(&self, process: &Process<T>, worker: usize) {
@@ -1542,6 +1762,7 @@ impl<T: Task> Inner<T> {
             .scheduler_id
             .load(Ordering::Relaxed)
             .min(self.worker_counts.len() - 1);
+        self.balance.dequeued(&process.queued_prio, previous);
         if previous == worker {
             self.worker_counts[worker]
                 .0
@@ -1573,8 +1794,9 @@ impl<T: Task> Inner<T> {
             .load(Ordering::Acquire)
             .then(|| self.scheduling_blocker.load(Ordering::Acquire))
             .filter(|blocker| *blocker < online);
-        let target_of =
-            || blocker.unwrap_or_else(|| self.next_queue.fetch_add(1, Ordering::Relaxed) % online);
+        // Port of erts/emulator/beam/erl_process.c:5503 (change_no_used_runqs evacuation
+        // target `qix % used`), OTP-29.1.1.
+        let target = blocker.unwrap_or(local.worker_id % online);
         // Port of erts/emulator/beam/erl_process.c:4305 (evacuate_run_queue), OTP-29.1.1.
         let worker = local.worker_id;
         let mut moved = Vec::new();
@@ -1588,9 +1810,10 @@ impl<T: Task> Inner<T> {
         }
         moved.extend(local.runnext.take());
         for item in moved {
-            let target = target_of();
-            local.migrate_queued(&item.process, target);
-            self.run_queues[target][item.process.priority().index()].push(item);
+            if Self::is_current_entry(&item) {
+                local.migrate_queued(&item.process, target);
+            }
+            self.run_queues[target][item.queue()].push(item);
             self.work_epoch.fetch_add(1, Ordering::SeqCst);
             self.wake_scheduler(target);
         }
@@ -1746,20 +1969,21 @@ impl<T: Task> Inner<T> {
     /// erl_process.c:3859 (chk_wake_sched), OTP-29.1.1: wake one sleeping scheduler of an
     /// online run queue other than `current`, searching downwards from `current`.
     fn wake_scheduler_on_empty_runq(&self, current: usize) {
-        let online = self
-            .online_schedulers
-            .load(Ordering::Acquire)
-            .clamp(1, self.parked.len());
         if self.scheduling_blocked.load(Ordering::Acquire) {
             return;
         }
-        let active = online as isize;
+        let (active, used) = self.balance.no_runqs();
+        let used = used
+            .min(self.online_schedulers.load(Ordering::Acquire))
+            .clamp(1, self.parked.len());
+        let active = active.min(used) as isize;
         let mut index = current as isize;
         let mut stop = index;
         if index >= active {
             index = active;
             stop = active;
         }
+        // Try to wake a scheduler on an active run queue.
         loop {
             index -= 1;
             if index < 0 {
@@ -1771,14 +1995,33 @@ impl<T: Task> Inner<T> {
             if index == stop {
                 break;
             }
-            let candidate = index as usize;
-            if self.parked[candidate].load(Ordering::SeqCst)
-                && self.run_queues[candidate].iter().all(SegQueue::is_empty)
-            {
-                self.wake_worker(candidate);
+            if self.chk_wake_sched(current, index as usize, false) {
                 return;
             }
         }
+        if (active as usize) < used {
+            // Try to activate a new run queue and wake its scheduler.
+            self.chk_wake_sched(current, active as usize, true);
+        }
+    }
+
+    /// Port of erts/emulator/beam/erl_process.c:3858 (chk_wake_sched), OTP-29.1.1.
+    fn chk_wake_sched(&self, current: usize, ix: usize, activate: bool) -> bool {
+        if current == ix {
+            return false;
+        }
+        if activate && self.balance.try_inc_no_active_runqs(ix + 1) {
+            self.balance.rqs[ix]
+                .flags
+                .fetch_and(!balance::FLG_INACTIVE, Ordering::AcqRel);
+        }
+        if self.parked[ix].load(Ordering::SeqCst)
+            && self.run_queues[ix].iter().all(SegQueue::is_empty)
+        {
+            self.wake_worker(ix);
+            return true;
+        }
+        false
     }
 
     fn wake_worker(&self, worker: usize) {
@@ -1867,7 +2110,7 @@ impl<T: Task> Inner<T> {
             if process.state.load(Ordering::Acquire) == QUEUED {
                 // The proxy entry is not counted in run queue lengths: the process is
                 // already counted where its first entry sits.
-                let queue = priority.index();
+                let queue = queue_index(priority.index());
                 if let Some(sim) = &self.sim {
                     sim.lock().unwrap().queue.push_back(item);
                 } else if let Some(worker) = process.bound_worker() {
@@ -2039,10 +2282,14 @@ impl<T: Task> Inner<T> {
             && item.process.bound_worker().is_none()
             && self.sim.is_none()
             && self.online_schedulers.load(Ordering::Acquire) > 1
-            && self.select_run_queue(&item.process) == local.worker_id
         {
-            local.record_queued(&item.process, local.worker_id, false);
-            local.push_next(item);
+            let scheduler = self.enqueue_run_queue(&item.process);
+            if scheduler == local.worker_id {
+                local.record_queued(&item.process, local.worker_id, false);
+                local.push_next(item);
+            } else {
+                self.push_run_queue(scheduler, item, false);
+            }
             return;
         }
         self.enqueue(item, false);
@@ -2527,11 +2774,11 @@ struct PendingWait<T: Task> {
 
 struct Local<T: Task> {
     worker_id: usize,
+    balance: Arc<balance::Balance>,
     timer_service: Rc<RefCell<TimerService<T::Message>>>,
     queues: [Worker<Scheduled<T>>; 4],
     runnext: Option<Scheduled<T>>,
     streak: u8,
-    normal_runs: u8,
     /// The previous pick took a bound process ahead of equal-priority shared work.
     pinned_turn: bool,
     message_slabs: Vec<Vec<Event<T::Message>>>,
@@ -2640,6 +2887,8 @@ impl<T: Task> Local<T> {
     fn record_queued(&mut self, process: &Process<T>, worker: usize, already_active: bool) {
         process.scheduler_id.store(worker, Ordering::Relaxed);
         self.adjust_metric(worker, QUEUE_COUNT_UNIT as i64 + i64::from(!already_active));
+        self.balance
+            .enqueued(process.priority().index(), &process.queued_prio, worker);
     }
 
     fn record_running(&mut self, process: &Process<T>, worker: usize) {
@@ -2647,6 +2896,7 @@ impl<T: Task> Local<T> {
             .scheduler_id
             .load(Ordering::Relaxed)
             .min(self.metric_deltas.len() - 1);
+        self.balance.dequeued(&process.queued_prio, previous);
         self.adjust_metric(previous, -(QUEUE_COUNT_UNIT as i64 + 1));
         self.adjust_metric(worker, 1);
         process.scheduler_id.store(worker, Ordering::Relaxed);
@@ -2667,6 +2917,8 @@ impl<T: Task> Local<T> {
             .min(self.metric_deltas.len() - 1);
         self.adjust_metric(previous, -(QUEUE_COUNT_UNIT as i64 + 1));
         self.adjust_metric(target, QUEUE_COUNT_UNIT as i64 + 1);
+        self.balance
+            .migrated(&process.queued_prio, previous, target);
         process.scheduler_id.store(target, Ordering::Relaxed);
     }
 
@@ -2686,29 +2938,10 @@ impl<T: Task> Local<T> {
         *entry = Some((pid, process.clone()));
         Some(process)
     }
-    fn order(&self) -> [usize; 4] {
-        if self.normal_runs >= 8 {
-            [0, 1, 3, 2]
-        } else {
-            [0, 1, 2, 3]
-        }
-    }
-    fn picked(&mut self, priority: usize) {
-        // Port of erts/emulator/beam/erl_process.c:9603, OTP-29.1.1.
-        // Low-priority processes share the normal queue and are rescheduled less often.
-        if priority == 2 {
-            self.normal_runs = self.normal_runs.saturating_add(1);
-        } else if priority == 3 {
-            self.normal_runs = 0;
-        }
-    }
     /// Highest priority (lowest index) with runnable local work.
     fn best_priority(&self) -> Option<usize> {
         let queued = (0..self.queues.len()).find(|&priority| !self.queues[priority].is_empty());
-        let next = self
-            .runnext
-            .as_ref()
-            .map(|item| item.process.priority().index());
+        let next = self.runnext.as_ref().map(|item| item.queue());
         match (queued, next) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -2716,7 +2949,7 @@ impl<T: Task> Local<T> {
     }
     fn push_next(&mut self, item: Scheduled<T>) {
         if let Some(displaced) = self.runnext.replace(item) {
-            self.queues[displaced.process.priority().index()].push(displaced);
+            self.queues[displaced.queue()].push(displaced);
         }
     }
     fn pop(&mut self, limit: u8) -> Option<Scheduled<T>> {
@@ -2724,17 +2957,42 @@ impl<T: Task> Local<T> {
             && let Some(next) = self.runnext.take()
         {
             self.streak += 1;
-            self.picked(next.process.priority().index());
             return Some(next);
         }
         self.streak = 0;
-        for priority in self.order() {
-            if let Some(item) = self.queues[priority].pop() {
-                self.picked(priority);
+        for priority in 0..PROC_QUEUES {
+            let queue = &self.queues[priority];
+            if let Some(item) =
+                pop_requeue(|| queue.pop(), |item| queue.push(item), || queue.is_empty())
+            {
                 return Some(item);
             }
         }
         None
+    }
+}
+
+/// Process priority queues of a run queue: max, high and normal (shared with low).
+const PROC_QUEUES: usize = balance::PRIORITY_NORMAL + 1;
+
+/// Take the next entry of a priority queue.
+///
+/// Port of erts/emulator/beam/erl_process.c:4040 (check_requeue_process), OTP-29.1.1: a
+/// low priority entry goes back to the tail until it has reached the head
+/// `RESCHEDULE_LOW` times, unless it is the only entry.
+fn pop_requeue<T: Task>(
+    mut pop: impl FnMut() -> Option<Scheduled<T>>,
+    mut push: impl FnMut(Scheduled<T>),
+    is_empty: impl Fn() -> bool,
+) -> Option<Scheduled<T>> {
+    loop {
+        let mut item = pop()?;
+        item.schedule_count = item.schedule_count.saturating_sub(1);
+        if item.schedule_count > 0 && !is_empty() {
+            push(item);
+            continue;
+        }
+        return Some(item);
     }
 }
 
@@ -3960,6 +4218,7 @@ impl<T: Task> Scheduler<T> {
         let dirty_io = config.dirty_io_schedulers.max(1);
         let simulated = rng.is_some();
         let workers = if simulated { 1 } else { config.workers };
+        let balance = Arc::new(balance::Balance::new(workers, workers, config.compact_load));
         let now = clock.now_ms();
         let timer_commands: Vec<_> = (0..workers).map(|_| Arc::new(SegQueue::new())).collect();
         let canceled_timers: Vec<_> = (0..workers).map(|_| Arc::new(SegQueue::new())).collect();
@@ -3970,6 +4229,7 @@ impl<T: Task> Scheduler<T> {
             stealers.push(std::array::from_fn(|i| queues[i].stealer()));
             locals.push(LocalInit {
                 worker_id,
+                balance: balance.clone(),
                 timer_service: TimerService {
                     wheel: Wheel::new(now),
                     commands: timer_commands[worker_id].clone(),
@@ -3978,7 +4238,6 @@ impl<T: Task> Scheduler<T> {
                 queues,
                 runnext: None,
                 streak: 0,
-                normal_runs: 0,
                 message_slabs: Vec::new(),
                 pid_cache: Vec::new(),
                 pending_waits: Vec::new(),
@@ -4062,6 +4321,7 @@ impl<T: Task> Scheduler<T> {
             }),
             msb_switch: Condvar::new(),
             dirty_signal_handlers: OnceLock::new(),
+            balance,
         });
         let mut threads = Vec::new();
         if !simulated {
@@ -4318,11 +4578,25 @@ impl<T: Task> Scheduler<T> {
         if online == 0 || online > self.inner.config.workers {
             return false;
         }
-        self.inner
-            .online_schedulers
-            .store(online, Ordering::Release);
+        let previous = self.inner.online_schedulers.swap(online, Ordering::AcqRel);
+        // Port of erts/emulator/beam/erl_process.c:4226 (resume_run_queue), OTP-29.1.1.
+        // Simulation keeps one run queue for all configured schedulers.
+        let rqs = &self.inner.balance.rqs;
+        for rq in &rqs[previous.min(online).min(rqs.len())..online.min(rqs.len())] {
+            rq.reset_statistics();
+        }
+        if !self.inner.scheduling_blocked.load(Ordering::Acquire) {
+            // Port of erts/emulator/beam/erl_process.c:8383,8421 (erts_set_schedulers_online),
+            // OTP-29.1.1.
+            self.inner.balance.change_no_used_runqs(online);
+        }
         self.wake_all_workers();
         true
+    }
+
+    /// Completed run queue balance checks (`erts_debug:get_internal_state(nbalance)`).
+    pub fn balance_checks(&self) -> u64 {
+        self.inner.balance.checks()
     }
 
     /// Return the number of scheduler workers owned by this runtime.
@@ -4348,7 +4622,17 @@ impl<T: Task> Scheduler<T> {
         self.inner
             .scheduling_blocked
             .store(blocked, Ordering::Release);
+        // Port of erts/emulator/beam/erl_process.c:8559,8630 (erts_block_multi_scheduling),
+        // OTP-29.1.1.
+        self.inner.balance.change_no_used_runqs(if blocked {
+            1
+        } else {
+            self.inner.online_schedulers.load(Ordering::Acquire)
+        });
         if !blocked {
+            for rq in &self.inner.balance.rqs {
+                rq.reset_statistics();
+            }
             self.wake_all_workers();
             self.inner.msb_switch.notify_all();
             for pool in &self.inner.dirty {
@@ -5081,6 +5365,15 @@ fn run_one<'a, T: Task>(
         result
     };
     let consumed = u64::from(budget.saturating_sub(remaining));
+    if dirty.is_none() {
+        // Port of erts/emulator/beam/erl_process.c:10200 (ERTS_PROC_REDUCTIONS_EXECUTED
+        // with the user priority), OTP-29.1.1.
+        let worker = local.as_deref().map_or(worker_id, |local| local.worker_id);
+        inner.balance.rqs[worker.min(inner.balance.rqs.len() - 1)].reductions_executed(
+            usize::from(process.user_priority.load(Ordering::Relaxed)),
+            consumed as i64,
+        );
+    }
     if dirty.is_some() {
         // Dirty schedulers keep no reduction or normal run queue counters.
     } else if let Some(local) = local.as_deref_mut() {
@@ -5132,8 +5425,20 @@ fn run_one<'a, T: Task>(
             if process.bound_worker().is_some() {
                 inner.enqueue(next, true);
             } else if let Some(local) = local.as_deref_mut() {
+                let emigrate = if inner.scheduling_blocked.load(Ordering::Acquire) {
+                    None
+                } else {
+                    // Port of erts/emulator/beam/erl_process.c:6668 (schedule_out_process
+                    // checks emigration), OTP-29.1.1.
+                    inner
+                        .balance
+                        .check_emigration_need(local.worker_id, process.priority().index())
+                        .filter(|&to| to < inner.online_schedulers.load(Ordering::Acquire))
+                };
                 if inner.online_schedulers.load(Ordering::Acquire) == 1 {
                     inner.enqueue(next, true);
+                } else if let Some(to) = emigrate {
+                    inner.push_run_queue(to, next, true);
                 } else {
                     // Port of erts/emulator/beam/erl_process.c:9603 (one FIFO run queue per
                     // scheduler and priority), OTP-29.1.1: processes this slice enqueued on
@@ -5145,7 +5450,7 @@ fn run_one<'a, T: Task>(
                         }
                     }
                     local.record_queued(&next.process, local.worker_id, true);
-                    local.queues[next.process.priority().index()].push(next);
+                    local.queues[next.queue()].push(next);
                 }
             } else {
                 inner.enqueue(next, true);
@@ -5347,6 +5652,18 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         inner.poll_pending_waits(&mut local);
         local.set_msacc_state(MsaccState::Other);
         inner.flush_local_metrics(&mut local);
+        // Port of erts/emulator/beam/erl_process.c:9812-9822 (check_activities_to_run:
+        // check_balance and immigrate), OTP-29.1.1.
+        if inner.balance.rqs[id]
+            .check_balance_reds
+            .load(Ordering::Relaxed)
+            <= 0
+        {
+            inner.balance.check_balance(id);
+        }
+        if inner.balance.path_flags(id) & balance::IMMIGRATE_QMASK != 0 {
+            inner.immigrate(&mut local);
+        }
         // Processes enqueued on this run queue from other threads join the local deques in
         // arrival order, so the local queue is this scheduler's whole run queue.
         for priority in 0..local.queues.len() {
@@ -5381,13 +5698,18 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         // other work, so a yielding bound process alternates with equal-priority work and
         // never runs ahead of higher-priority work.
         let other = local.best_priority();
-        for priority in local.order() {
+        for priority in 0..PROC_QUEUES {
             if let Some(other) = other
                 && (other < priority || (other == priority && local.pinned_turn))
             {
                 break;
             }
-            item = inner.pinned_injectors[id][priority].pop();
+            let pinned = &inner.pinned_injectors[id][priority];
+            item = pop_requeue(
+                || pinned.pop(),
+                |item| pinned.push(item),
+                || pinned.is_empty(),
+            );
             if item.is_some() {
                 break;
             }
@@ -5401,34 +5723,10 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
             item = local.runnext.take();
         }
         if item.is_none() {
-            // Port of erts/emulator/beam/erl_process.c:4640 (try_steal_task), OTP-29.1.1: an empty
-            // run queue steals from the other online run queues, starting after its own index.
+            // Port of erts/emulator/beam/erl_process.c:4640 (try_steal_task), OTP-29.1.1.
             let limit = inner.config.workers.div_ceil(2) as u32;
             if inner.searching.fetch_add(1, Ordering::AcqRel) < limit {
-                let online = inner
-                    .online_schedulers
-                    .load(Ordering::Acquire)
-                    .clamp(1, inner.stealers.len());
-                'victims: for offset in 1..online {
-                    let victim = (id + offset) % online;
-                    if victim == id {
-                        continue;
-                    }
-                    for priority in local.order() {
-                        if let Steal::Success(found) = inner.stealers[victim][priority]
-                            .steal_batch_and_pop(&local.queues[priority])
-                        {
-                            local.picked(priority);
-                            item = Some(found);
-                            break 'victims;
-                        }
-                        if let Some(found) = inner.run_queues[victim][priority].pop() {
-                            local.picked(priority);
-                            item = Some(found);
-                            break 'victims;
-                        }
-                    }
-                }
+                item = inner.try_steal_task(&mut local);
             }
             inner.searching.fetch_sub(1, Ordering::AcqRel);
         }
@@ -5500,6 +5798,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         local.set_msacc_state(MsaccState::Sleep);
         local.set_wall_enabled(false);
         inner.waiting_schedulers.fetch_add(1, Ordering::Relaxed);
+        inner.balance.set_waiting(id, true);
         // Port of erts/emulator/beam/erl_process.c:3065 (sched_spin_wait), OTP-29.1.1: spin
         // before sleeping so a wakeup that comes soon costs no system call.
         let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
@@ -5521,6 +5820,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
             thread::park();
         }
         inner.waiting_schedulers.fetch_sub(1, Ordering::Relaxed);
+        inner.balance.set_waiting(id, false);
         inner.parked[id].store(false, Ordering::SeqCst);
     }
     OWNER_TIMER_SERVICES.with(|services| {
@@ -5592,10 +5892,8 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
                 if index < pool.online.load(Ordering::Acquire)
                     && queue.len != 0
                     && inner.dirty_may_execute(kind, index)
-                    && let Some(process) =
-                        queue.by_priority.iter_mut().find_map(VecDeque::pop_front)
+                    && let Some(process) = queue.pop()
                 {
-                    queue.len -= 1;
                     break process;
                 }
                 queue = pool
