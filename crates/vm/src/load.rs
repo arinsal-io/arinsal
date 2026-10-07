@@ -399,8 +399,9 @@ impl CodeTables {
             let key = nif_key(&module.name, id);
             self.loaded_nifs.remove(&key);
             crate::natives::nif::unload_instance(self.code_scope, id);
-            arinsal_pterm::store_for(self.code_scope)
-                .retire_module_area(self.modules[id].literal_area());
+            if let Some(area) = self.modules[id].literal_area().take() {
+                arinsal_pterm::store_for(self.code_scope).retire_module_area(area);
+            }
         }
         release_slot(
             &mut self.module_live,

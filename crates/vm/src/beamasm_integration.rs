@@ -628,7 +628,7 @@ pub(crate) struct CompiledVersion {
     nif_patches: Vec<(String, u8, usize, usize)>,
     literal_heap: Option<Box<VecHeap>>,
     // The module's literal area, which native code refers to directly.
-    _module_literals: Arc<VecHeap>,
+    _module_literals: arinsal_loader::LiteralArea,
     native_functions: Vec<crate::NativeFunction>,
     native_targets: Vec<(Mfa, usize)>,
     code_start: usize,
