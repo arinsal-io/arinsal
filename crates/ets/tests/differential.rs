@@ -2669,3 +2669,106 @@ fn empty_trace_body_against_otp_29() {
         );
     }
 }
+
+/// The in-place small counter update must agree with the general path, and must leave the
+/// table untouched whenever it declines.
+#[test]
+fn in_place_counter_update_matches_general_path() {
+    let op = |position, increment, threshold| CounterOp {
+        position,
+        increment,
+        threshold,
+    };
+    let near_max = arinsal_term::MAX_SMALL - 1;
+    let cases: Vec<(Vec<CounterOp>, bool)> = vec![
+        (vec![op(2, 1, None)], true),
+        (vec![op(3, -7, None)], true),
+        (vec![op(2, 1, None), op(2, 1, None), op(3, -1, None)], true),
+        (vec![op(2, 10, Some((5, 0)))], true),
+        (vec![op(3, -50, Some((-5, 7)))], true),
+        (vec![], true),
+        // Declined: key position, past the tuple, a non-integer element, small overflow.
+        (vec![op(1, 1, None)], false),
+        (vec![op(2, 1, None), op(9, 1, None)], false),
+        (vec![op(4, 1, None)], false),
+        (vec![op(5, near_max, None)], false),
+    ];
+    for kind in [TableType::Set, TableType::OrderedSet] {
+        for (pair, (operations, applies)) in [true, false]
+            .into_iter()
+            .flat_map(|pair| cases.iter().map(move |case| (pair, case)))
+        {
+            let mut registry = Registry::new();
+            let fast_tid = registry.create(options(kind)).unwrap();
+            let slow_tid = registry.create(options(kind)).unwrap();
+            let mut input = VecHeap::new();
+            let key = from_owned(&atom("k"), &mut input).unwrap();
+            let object = if pair {
+                from_owned(&tuple(vec![atom("k"), int(1)]), &mut input).unwrap()
+            } else {
+                let elements = vec![
+                    atom("k"),
+                    int(1),
+                    int(40),
+                    OwnedTerm::Binary(b"bin".to_vec()),
+                    int(near_max - 1),
+                ];
+                from_owned(&tuple(elements), &mut input).unwrap()
+            };
+            registry
+                .get_mut(slow_tid)
+                .unwrap()
+                .insert(&[object])
+                .unwrap();
+            let mut fast = registry.get_mut(fast_tid).unwrap();
+            fast.insert(&[object]).unwrap();
+            let mut output = VecHeap::new();
+            let before = fast.lookup(key, &mut output).unwrap();
+            let in_place = fast.update_counter_in_place(key, operations);
+            let fast_rows = fast.lookup(key, &mut output).unwrap();
+            let owned = |terms: &[Term]| -> Vec<OwnedTerm> {
+                terms.iter().map(|term| to_owned(*term).unwrap()).collect()
+            };
+            let width = if pair { 2 } else { 5 };
+            let applicable = *applies && operations.iter().all(|op| op.position <= width);
+            match in_place {
+                Some(values) => {
+                    assert!(
+                        applicable,
+                        "{kind:?} pair={pair} {operations:?} applied in place"
+                    );
+                    let mut slow = registry.get_mut(slow_tid).unwrap();
+                    let expected = slow.update_counter(key, operations, None).unwrap();
+                    let slow_rows = slow.lookup(key, &mut output).unwrap();
+                    assert_eq!(owned(&values), owned(&expected));
+                    assert_eq!(owned(&fast_rows), owned(&slow_rows));
+                }
+                None => {
+                    assert!(!applicable, "{kind:?} pair={pair} {operations:?} declined");
+                    assert_eq!(owned(&fast_rows), owned(&before));
+                }
+            }
+        }
+    }
+    let mut registry = Registry::new();
+    let tid = registry.create(options(TableType::Bag)).unwrap();
+    let mut table = registry.get_mut(tid).unwrap();
+    let mut input = VecHeap::new();
+    let key = from_owned(&atom("k"), &mut input).unwrap();
+    let object = from_owned(&tuple(vec![atom("k"), int(1)]), &mut input).unwrap();
+    table.insert(&[object]).unwrap();
+    assert!(
+        table
+            .update_counter_in_place(key, &[op(2, 1, None)])
+            .is_none()
+    );
+    drop(table);
+    let missing = from_owned(&atom("missing"), &mut input).unwrap();
+    let set = registry.create(options(TableType::Set)).unwrap();
+    let mut table = registry.get_mut(set).unwrap();
+    assert!(
+        table
+            .update_counter_in_place(missing, &[op(2, 1, None)])
+            .is_none()
+    );
+}

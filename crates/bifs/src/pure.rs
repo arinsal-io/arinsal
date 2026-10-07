@@ -308,6 +308,9 @@ fn bool_value(term: Term) -> Result<bool, BifError> {
 }
 
 pub(super) fn integer(ctx: &mut Ctx<'_>, value: usize) -> Result<Term, BifError> {
+    if let Some(small) = i64::try_from(value).ok().and_then(Term::small) {
+        return Ok(small);
+    }
     TermBuilder::new(&mut Heap(ctx.heap))
         .int_from_i128(value as i128)
         .map_err(|_| BifError::SystemLimit)

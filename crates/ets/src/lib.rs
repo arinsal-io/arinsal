@@ -1150,6 +1150,35 @@ impl StoredTerm {
         unsafe { self.term.tuple_ref().unwrap().get(keypos - 1).unwrap() }
     }
 
+    /// Overwrite the immediate element at zero-based `index` with another immediate, as
+    /// erts writes a counter into the stored tuple when its size does not change.
+    ///
+    /// Port of erts/emulator/beam/erl_db_util.c:3278 (db_do_update_element, the immediate
+    /// case), OTP-29.1.1.
+    fn set_immediate_element(&mut self, index: usize, value: Term) -> bool {
+        if value.is_pointer() || self.tuple_element(index).is_none_or(Term::is_pointer) {
+            return false;
+        }
+        if let Some(pair) = self.inline_pair.as_mut() {
+            pair[index] = value;
+            return true;
+        }
+        if !self.compressed_elements.is_empty() || !self.term.is_pointer() {
+            return false;
+        }
+        // The tuple lives in one of this object's own allocations: find its words by address.
+        let header = (self.term.tagged_word() & !7) as usize;
+        let word = header + (index + 1) * 8;
+        for allocation in &mut self.heap.words {
+            let start = allocation.as_ptr() as usize;
+            if (start..start + allocation.len() * 8).contains(&word) {
+                allocation[(word - start) / 8] = value.tagged_word();
+                return true;
+            }
+        }
+        false
+    }
+
     fn tuple_element(&self, index: usize) -> Option<Term> {
         if let Some(pair) = self.inline_pair {
             return pair.get(index).copied();
@@ -3509,6 +3538,67 @@ impl Table {
             })
             .collect::<Vec<_>>();
         self.update_counter_big(key, &operations, default)
+    }
+
+    /// Apply counter operations in place when every operand, counter and result is a small
+    /// integer, which needs no copy of the object; returns `None`, with the table untouched,
+    /// when any operation needs [`Table::update_counter_big`] (a missing key, an error, a
+    /// bignum, a CA tree or compressed object).
+    ///
+    /// Port of erts/emulator/beam/erl_db.c:1494-1690 (do_update_counter), OTP-29.1.1.
+    pub fn update_counter_in_place(
+        &mut self,
+        key: Term,
+        operations: &[CounterOp],
+    ) -> Option<smallvec::SmallVec<[Term; 4]>> {
+        if !matches!(
+            self.options.table_type,
+            TableType::Set | TableType::OrderedSet
+        ) {
+            return None;
+        }
+        let keypos = self.options.keypos;
+        let object = match &mut self.storage {
+            Storage::Hash(storage) => storage.find_mut(key, keypos)?,
+            Storage::Ordered(root) => Node::get_mut(root, key, keypos)?,
+            Storage::CATree(_) => return None,
+        };
+        if !object.compressed_elements.is_empty() {
+            return None;
+        }
+        // Verify every operation first, as erts never rolls back a partial update.
+        let mut updated: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::new();
+        let mut results = smallvec::SmallVec::new();
+        for operation in operations {
+            // A position past the tuple has no element below and takes the general path.
+            if operation.position == keypos || operation.position == 0 {
+                return None;
+            }
+            let index = operation.position - 1;
+            let old = match updated.iter().rev().find(|(at, _)| *at == index) {
+                Some(&(_, value)) => value,
+                None => object.tuple_element(index)?.as_small()?,
+            };
+            let mut next = old.checked_add(operation.increment)?;
+            if let Some((threshold, reset)) = operation.threshold
+                && (if operation.increment < 0 {
+                    next < threshold
+                } else {
+                    next > threshold
+                })
+            {
+                next = reset;
+            }
+            results.push(Term::small(next)?);
+            updated.push((index, next));
+        }
+        for (index, value) in updated {
+            if !object.set_immediate_element(index, Term::small(value)?) {
+                debug_assert!(false, "verified counter element is not writable in place");
+                return None;
+            }
+        }
+        Some(results)
     }
 
     /// Atomically apply arbitrary precision counter operations. A `None` entry is a

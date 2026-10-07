@@ -255,6 +255,25 @@ impl Node {
         None
     }
 
+    /// The object at `key`, for an update in place.
+    ///
+    /// Port of erts/emulator/beam/erl_db_tree.c:3388 (find_node), OTP-29.1.1.
+    pub(super) fn get_mut(
+        root: &mut Option<Box<Self>>,
+        key: Term,
+        keypos: usize,
+    ) -> Option<&mut StoredTerm> {
+        let mut node = root.as_deref_mut();
+        while let Some(current) = node {
+            match cmp(key, current.object.key(keypos)) {
+                Ordering::Equal => return Some(&mut current.object),
+                Ordering::Less => node = current.left.as_deref_mut(),
+                Ordering::Greater => node = current.right.as_deref_mut(),
+            }
+        }
+        None
+    }
+
     /// Port of erts/emulator/beam/erl_db_tree.c:3396 (slot_search), OTP-29.1.1.
     pub(super) fn nth(root: &Option<Box<Self>>, index: usize) -> Option<&StoredTerm> {
         let mut node = root.as_deref()?;

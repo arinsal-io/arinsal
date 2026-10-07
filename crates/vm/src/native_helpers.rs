@@ -863,15 +863,14 @@ fn invoke_dispatch_bif(
     if let Some(direct) = export.direct_ets
         && !crate::trace_bp::any_pattern()
     {
-        let arity = usize::from(export.arity);
-        let mut args = [Term::NIL; 3];
-        for (destination, raw) in args
-            .iter_mut()
-            .zip(registers.x_reg_array.iter().copied())
-            .take(arity)
-        {
-            *destination = crate::native_hooks::from_raw(raw);
-        }
+        let arity = usize::from(export.arity).min(4);
+        let args = [
+            registers.x_reg_array[0],
+            registers.x_reg_array[1],
+            registers.x_reg_array[2],
+            registers.x_reg_array[3],
+        ]
+        .map(crate::native_hooks::from_raw);
         if let Some(value) = direct(process, &args[..arity]) {
             process.reductions = process.header.fcalls;
             if export_call {
@@ -901,7 +900,7 @@ fn invoke_dispatch_bif(
         arinsal_loader::ImportClass::Native
             | arinsal_loader::ImportClass::Dynamic
             | arinsal_loader::ImportClass::Fun
-    ) || crate::bif_traps::traps(&export.module, &export.function, export.arity)
+    ) || export.trap_entry
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif trace trampolines),
         // OTP-29.1.1: a traced BIF runs in the executor, which has the trace context.
         || (crate::trace_bp::any_pattern()
@@ -917,7 +916,7 @@ fn invoke_dispatch_bif(
         process.sync_native_header();
         return None;
     }
-    let (bif, arity) = crate::beamasm_integration::dispatch_bif(identity)?;
+    let (bif, arity) = (export.bif?, export.arity);
     process.reductions = process.header.fcalls;
     if export_call {
         charge_bif_reductions(process, 1);
@@ -937,14 +936,27 @@ fn invoke_dispatch_bif(
     {
         *destination = crate::native_hooks::from_raw(raw);
     }
-    let mut args = registers.x_reg_array[..arity]
-        .iter()
-        .copied()
-        .map(crate::native_hooks::from_raw)
-        .collect::<Vec<_>>();
-    let (mut result, reductions) = crate::calls::call_bif_metered(&mut process.heap, bif, &args);
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif), OTP-29.1.1:
+    // the BIF reads its arguments from the register file; no per-call allocation.
+    let mut inline_args = [Term::NIL; 8];
+    let mut overflow_args = Vec::new();
+    let args: &mut [Term] = if arity <= inline_args.len() {
+        for (destination, raw) in inline_args.iter_mut().zip(&registers.x_reg_array[..arity]) {
+            *destination = crate::native_hooks::from_raw(*raw);
+        }
+        &mut inline_args[..arity]
+    } else {
+        overflow_args.extend(
+            registers.x_reg_array[..arity]
+                .iter()
+                .copied()
+                .map(crate::native_hooks::from_raw),
+        );
+        &mut overflow_args
+    };
+    let (mut result, reductions) = crate::calls::call_bif_metered(&mut process.heap, bif, args);
     charge_bif_reductions(process, reductions);
-    if crate::calls::gc_after_bif(process, &mut args, &mut result).is_err() {
+    if crate::calls::gc_after_bif(process, args, &mut result).is_err() {
         crate::native_hooks::set_error(process, "system_limit");
         publish_dispatch_x(process, registers);
         process.sync_native_header();
@@ -972,7 +984,7 @@ fn invoke_dispatch_bif(
             Some(value)
         }
         Err(error) => {
-            set_native_bif_error(process, &export.module, &export.function, &args, error);
+            set_native_bif_error(process, &export.module, &export.function, args, error);
             publish_dispatch_x(process, registers);
             process.sync_native_header();
             Some(0)
@@ -1007,13 +1019,10 @@ pub extern "C" fn arinsal_beamasm_bif_by_identity(
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
-    let args = [first, second, third]
-        .into_iter()
-        .take(usize::from(arity))
-        .map(crate::native_hooks::from_raw)
-        .collect::<Vec<_>>();
+    let all_args = [first, second, third].map(crate::native_hooks::from_raw);
+    let args = &all_args[..usize::from(arity).min(all_args.len())];
     process.reductions = process.header.fcalls;
-    let (result, reductions) = crate::calls::call_bif_metered(&mut process.heap, bif, &args);
+    let (result, reductions) = crate::calls::call_bif_metered(&mut process.heap, bif, args);
     charge_bif_reductions(process, reductions);
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     process.sync_native_header();
@@ -1024,7 +1033,7 @@ pub extern "C" fn arinsal_beamasm_bif_by_identity(
             // arguments are the top frame), OTP-29.1.1.
             match crate::beamasm_integration::export_dispatch(identity as usize) {
                 Some(export) => {
-                    set_native_bif_error(process, &export.module, &export.function, &args, error)
+                    set_native_bif_error(process, &export.module, &export.function, args, error)
                 }
                 None => set_light_bif_error(process, error),
             }

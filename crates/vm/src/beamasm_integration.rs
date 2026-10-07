@@ -122,7 +122,7 @@ pub(crate) struct DispatchTarget {
     pub module_atom: arinsal_term::Atom,
     pub function_atom: arinsal_term::Atom,
     pub arity: u8,
-    bif: Option<arinsal_bifs::BifFn>,
+    pub bif: Option<arinsal_bifs::BifFn>,
     pub class: arinsal_loader::ImportClass,
     pub native_bits: usize,
     /// The BIF has a continuation entry in `bif_traps`; others skip that table on every call.

@@ -105,8 +105,10 @@ pub fn make_hash2(term: Term) -> u32 {
         return hash;
     }
     let mut hash = 0_u32;
-    let mut stack = vec![Job::Visit(term)];
-    let mut xors = Vec::new();
+    // erts keeps the work stack on the C stack until it outgrows its default size
+    // (erl_term_hashing.c:1003 DECLARE_ESTACK, global.h:322 DEF_ESTACK_SIZE), OTP-29.1.1.
+    let mut stack: smallvec::SmallVec<[Job; 16]> = smallvec::smallvec![Job::Visit(term)];
+    let mut xors: smallvec::SmallVec<[u32; 4]> = smallvec::SmallVec::new();
     while let Some(job) = stack.pop() {
         match job {
             Job::Reset => hash = 0,
