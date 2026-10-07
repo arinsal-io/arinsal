@@ -53,12 +53,10 @@ pub(crate) enum Tracer {
     Default,
     Pid(Pid),
     Port(u64),
-    /// `instance` is the module code whose NIFs were bound when the tracer was set; once the
-    /// module is deleted, purged or reloaded the tracer is gone (erts_tracer_nif_clear).
+    /// `erts_tracer_nif_clear` invalidates callback lookup by module when code changes.
     Module {
         module: String,
         state: OwnedTerm,
-        instance: std::sync::Arc<arinsal_loader::Module>,
     },
 }
 
@@ -1040,11 +1038,9 @@ pub(crate) fn traced_port_by_other(
             .scheduler()
             .is_ok_and(|scheduler| scheduler.lookup(tracer)),
         Tracer::Port(tracer) => runtime.ports.lock().unwrap().contains_key(&tracer),
-        Tracer::Module {
-            module,
-            state,
-            instance,
-        } => module_tracer_alive(vm, process, &module, &state, &instance, Term::port(port)),
+        Tracer::Module { module, state } => {
+            module_tracer_alive(vm, process, &module, &state, Term::port(port))
+        }
     }
 }
 
@@ -1157,25 +1153,10 @@ pub(crate) fn traced_by_other(
             .scheduler()
             .is_ok_and(|scheduler| scheduler.lookup(tracer)),
         Tracer::Port(id) => runtime.ports.lock().unwrap().contains_key(&id),
-        Tracer::Module {
-            module,
-            state,
-            instance,
-        } => module_tracer_alive(vm, process, &module, &state, &instance, pid.to_term()),
+        Tracer::Module { module, state } => {
+            module_tracer_alive(vm, process, &module, &state, pid.to_term())
+        }
     }
-}
-
-/// Whether `instance` is still the current code of `module`.
-fn tracer_instance_current(
-    vm: &Vm,
-    module: &str,
-    instance: &std::sync::Arc<arinsal_loader::Module>,
-) -> bool {
-    vm.code
-        .loaded
-        .get(module)
-        .and_then(|&id| vm.code.modules.get(id))
-        .is_some_and(|current| std::sync::Arc::ptr_eq(current, instance))
 }
 
 /// Whether a module tracer still answers `enabled(trace_status, ...)` with `trace` or `discard`.
@@ -1186,15 +1167,11 @@ fn module_tracer_alive(
     process: &mut Process,
     module: &str,
     state: &OwnedTerm,
-    instance: &std::sync::Arc<arinsal_loader::Module>,
     tracee: Option<Term>,
 ) -> bool {
     let Some(tracee) = tracee else {
         return false;
     };
-    if !tracer_instance_current(vm, module, instance) {
-        return false;
-    }
     let Ok(state) = from_owned(state, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)) else {
         return false;
     };
@@ -1203,6 +1180,7 @@ fn module_tracer_alive(
         process,
         module,
         "enabled",
+        None,
         &[crate::signals::atom("trace_status"), state, tracee],
     );
     result == Some(crate::signals::atom("trace")) || result == Some(crate::signals::atom("discard"))
@@ -1454,11 +1432,9 @@ fn match_trace_tracer_alive(
             .runtime
             .as_ref()
             .is_some_and(|runtime| runtime.ports.lock().unwrap().contains_key(port)),
-        Tracer::Module {
-            module,
-            state,
-            instance,
-        } => module_tracer_alive(vm, process, module, state, instance, tracee.to_term()),
+        Tracer::Module { module, state } => {
+            module_tracer_alive(vm, process, module, state, tracee.to_term())
+        }
     }
 }
 
@@ -2095,6 +2071,7 @@ fn module_call_enabled(
         process,
         module,
         "enabled",
+        None,
         &[crate::signals::atom("trace_status"), state, tracee],
     );
     if status.is_none_or(|status| status == crate::signals::atom("remove")) {
@@ -2105,6 +2082,7 @@ fn module_call_enabled(
         process,
         module,
         "enabled",
+        Some("enabled_call"),
         &[crate::signals::atom("call"), state, tracee],
     );
     Some(call == Some(crate::signals::atom("trace")))
@@ -2196,6 +2174,7 @@ fn emit_meta(
                 process,
                 module,
                 "enabled",
+                None,
                 &[crate::signals::atom("trace_status"), state, subject_term],
             );
             if status == Some(crate::signals::atom("remove")) {
@@ -3541,12 +3520,7 @@ fn emit_filtered_without_ctx(
         return;
     };
     for entry in entries {
-        if let Tracer::Module {
-            module,
-            state,
-            instance,
-        } = &entry.tracer
-        {
+        if let Tracer::Module { module, state } = &entry.tracer {
             let event = TraceEvent {
                 flags: entry.flags,
                 tracee: subject_term,
@@ -3555,10 +3529,10 @@ fn emit_filtered_without_ctx(
                 extra: None,
             };
             if let Some(vm) = vm.as_deref_mut() {
-                emit_module(vm, process, None, module, state, instance, event);
+                emit_module(vm, process, None, module, state, event);
             } else if let Some(runtime) = process.runtime.clone() {
                 crate::process::with_replica_vm(&runtime, |vm| {
-                    emit_module(vm, process, None, module, state, instance, event);
+                    emit_module(vm, process, None, module, state, event);
                 });
             }
             continue;
@@ -3817,12 +3791,7 @@ fn deliver(
     fields: &[Term],
     extra: Option<Term>,
 ) {
-    if let Tracer::Module {
-        module,
-        state,
-        instance,
-    } = &entry.tracer
-    {
+    if let Tracer::Module { module, state } = &entry.tracer {
         let event = TraceEvent {
             flags: entry.flags,
             tracee: subject_term,
@@ -3831,11 +3800,11 @@ fn deliver(
             extra,
         };
         if let Some(vm) = vm {
-            emit_module(vm, process, Some(ctx), module, state, instance, event);
+            emit_module(vm, process, Some(ctx), module, state, event);
         } else if let Some(runtime) = process.runtime.clone() {
             // Receive tracing runs inside signal handling, which has no Vm of its own.
             crate::process::with_replica_vm(&runtime, |vm| {
-                emit_module(vm, process, Some(ctx), module, state, instance, event);
+                emit_module(vm, process, Some(ctx), module, state, event);
             });
         }
         return;
@@ -3921,12 +3890,8 @@ fn emit_module(
     ctx: Option<&mut RunCtx<'_, Message>>,
     module: &str,
     owned_state: &OwnedTerm,
-    instance: &std::sync::Arc<arinsal_loader::Module>,
     event: TraceEvent<'_>,
 ) {
-    if !tracer_instance_current(vm, module, instance) {
-        return;
-    }
     let scheduler_id = ctx
         .as_ref()
         .and_then(|ctx| ctx.scheduler_id())
@@ -3955,6 +3920,7 @@ fn emit_module(
             process,
             module,
             "enabled",
+            tracer_enabled_callback(event.flags),
             &[tag, state, event.tracee],
         );
         if action != Some(crate::signals::atom("trace")) {
@@ -4009,8 +3975,57 @@ fn emit_module(
         process,
         module,
         "trace",
+        tracer_trace_callback(event.flags),
         &[tag, state, event.tracee, data, options],
     );
+}
+
+// Port of erts/emulator/beam/erl_trace.c:732-763, 829-840, 1457-1472 and 1400-1410,
+// OTP-29.1.1: the callback type is selected from the trace class, independently of the event tag.
+fn tracer_enabled_callback(flags: u64) -> Option<&'static str> {
+    Some(if flags & SEND != 0 {
+        "enabled_send"
+    } else if flags & RECEIVE != 0 {
+        "enabled_receive"
+    } else if flags & CALL != 0 {
+        "enabled_call"
+    } else if flags & RUNNING_PROCS != 0 {
+        "enabled_running_procs"
+    } else if flags & RUNNING_PORTS != 0 {
+        "enabled_running_ports"
+    } else if flags & GARBAGE_COLLECTION != 0 {
+        "enabled_garbage_collection"
+    } else if flags & PROCS != 0 {
+        "enabled_procs"
+    } else if flags & PORTS != 0 {
+        "enabled_ports"
+    } else {
+        return None;
+    })
+}
+
+// Port of erts/emulator/beam/erl_trace.c:755-763, 829-840, 1457-1472 and 1400-1410,
+// OTP-29.1.1: the callback type is selected from the trace class, independently of the event tag.
+fn tracer_trace_callback(flags: u64) -> Option<&'static str> {
+    Some(if flags & SEND != 0 {
+        "trace_send"
+    } else if flags & RECEIVE != 0 {
+        "trace_receive"
+    } else if flags & CALL != 0 {
+        "trace_call"
+    } else if flags & RUNNING_PROCS != 0 {
+        "trace_running_procs"
+    } else if flags & RUNNING_PORTS != 0 {
+        "trace_running_ports"
+    } else if flags & GARBAGE_COLLECTION != 0 {
+        "trace_garbage_collection"
+    } else if flags & PROCS != 0 {
+        "trace_procs"
+    } else if flags & PORTS != 0 {
+        "trace_ports"
+    } else {
+        return None;
+    })
 }
 
 pub(crate) fn create_session(process: &Process, name: String, tracer: Tracer) -> (u64, i64) {

@@ -731,6 +731,141 @@ fn tracer_module_return_trace_and_nif_reload_cycles_match_erts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Port of erts/emulator/beam/erl_trace.c:3017-3060 and :3150-3260 (load_tracer_nif and
+// send_to_tracer_nif), OTP-29.1.1: tracer callbacks resolve from the current module after reload.
+#[test]
+fn tracer_reload_uses_new_nif_callbacks_like_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping tracer NIF reload differential test");
+        return;
+    };
+    let dir = work_dir("tracer_nif_callback_reload");
+    for (version, marker) in [("v1", "old_nif"), ("v2", "new_nif")] {
+        compile_so(
+            &dir,
+            &format!("nifdyn_tracer_pin_{version}"),
+            &format!(
+                r#"
+                #include "erl_nif.h"
+                static ERL_NIF_TERM enabled(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{
+                    (void)argc;
+                    if (enif_is_identical(argv[0], enif_make_atom(env, "trace_status")))
+                        return enif_make_atom(env, "trace");
+                    return enif_make_atom(env, "discard");
+                }}
+                static ERL_NIF_TERM trace(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{
+                    ErlNifPid pid;
+                    (void)argc;
+                    if (enif_get_local_pid(env, argv[1], &pid)) {{
+                        ERL_NIF_TERM message = enif_make_tuple4(
+                            env, enif_make_atom(env, "{marker}"), enif_make_atom(env, "generic"),
+                            argv[0], argv[3]);
+                        enif_send(env, &pid, NULL, message);
+                    }}
+                    return enif_make_atom(env, "ok");
+                }}
+                static ERL_NIF_TERM enabled_send(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{
+                    (void)argc;
+                    return enif_is_identical(argv[0], enif_make_atom(env, "send"))
+                        ? enif_make_atom(env, "trace") : enif_make_atom(env, "discard");
+                }}
+                static ERL_NIF_TERM trace_send(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{
+                    ErlNifPid pid;
+                    (void)argc;
+                    if (enif_get_local_pid(env, argv[1], &pid)) {{
+                        ERL_NIF_TERM message = enif_make_tuple4(
+                            env, enif_make_atom(env, "{marker}"), enif_make_atom(env, "specialized"),
+                            argv[0], argv[3]);
+                        enif_send(env, &pid, NULL, message);
+                    }}
+                    return enif_make_atom(env, "ok");
+                }}
+                static ErlNifFunc funcs[] = {{
+                    {{"enabled", 3, enabled, 0}}, {{"trace", 5, trace, 0}},
+                    {{"enabled_send", 3, enabled_send, 0}}, {{"trace_send", 5, trace_send, 0}}
+                }};
+                static int upgrade(ErlNifEnv* env, void** priv, void** old_priv, ERL_NIF_TERM info) {{
+                    (void)env; (void)priv; (void)old_priv; (void)info;
+                    return 0;
+                }}
+                ERL_NIF_INIT(nifdyn_tracer_pin, funcs, NULL, NULL, upgrade, NULL)
+                "#
+            ),
+        );
+        let source = format!(
+            r#"
+            -module(nifdyn_tracer_pin).
+            -on_load(load/0).
+            -export([load/0, enabled/3, trace/5, enabled_send/3, trace_send/5]).
+            -nifs([enabled/3, trace/5, enabled_send/3, trace_send/5]).
+            load() -> erlang:load_nif("{}", []).
+            enabled(_, _, _) -> erlang:nif_error(undef).
+            trace(_, _, _, _, _) -> erlang:nif_error(undef).
+            enabled_send(_, _, _) -> erlang:nif_error(undef).
+            trace_send(_, _, _, _, _) -> erlang:nif_error(undef).
+            "#,
+            dir.join(format!("nifdyn_tracer_pin_{version}")).display()
+        );
+        let beam = erl
+            .compile_named("nifdyn_tracer_pin", &source, &[])
+            .unwrap_or_else(|error| panic!("compile tracer {version}: {error}"));
+        std::fs::write(dir.join(format!("nifdyn_tracer_pin_{version}.beam")), beam).unwrap();
+    }
+    std::fs::copy(
+        dir.join("nifdyn_tracer_pin_v2.beam"),
+        dir.join("nifdyn_tracer_pin.beam"),
+    )
+    .unwrap();
+    let runner = format!(
+        r#"
+            -module(nifdyn_tracer_pin_runner).
+            -export([run/0]).
+            run() ->
+                V1 = {},
+                {{module, nifdyn_tracer_pin}} = load(V1),
+                Parent = self(),
+                Session = trace:session_create(tracer_reload, {{nifdyn_tracer_pin, Parent}}, []),
+                Tracee = spawn(fun Loop() -> receive Msg -> Parent ! Msg, Loop() end end),
+                1 = trace:process(Session, Tracee, true, [send]),
+                Tracee ! before_reload,
+                Old = receive {{old_nif, specialized, send, before_reload}} -> old_nif after 1000 -> timeout end,
+                V2 = {},
+                {{module, nifdyn_tracer_pin}} = load(V2),
+                Tracee ! after_reload,
+                New = receive {{new_nif, specialized, send, after_reload}} -> new_nif after 1000 -> timeout end,
+                exit(Tracee, kill),
+                trace:session_destroy(Session),
+                {{Old, New}}.
+        load(Bin) ->
+            Prepared = erlang:prepare_loading(nifdyn_tracer_pin, Bin),
+            {{on_load, [nifdyn_tracer_pin]}} = erlang:finish_loading([Prepared]),
+            ok = erlang:call_on_load_function(nifdyn_tracer_pin),
+            true = erlang:finish_after_on_load(nifdyn_tracer_pin, true),
+            {{module, nifdyn_tracer_pin}}.
+        "#,
+        byte_binary(&std::fs::read(dir.join("nifdyn_tracer_pin_v1.beam")).unwrap()),
+        byte_binary(&std::fs::read(dir.join("nifdyn_tracer_pin_v2.beam")).unwrap())
+    );
+    compile_beam(&erl, &dir, "nifdyn_tracer_pin_runner", &runner);
+    assert_eq!(
+        scheduled(&dir, "nifdyn_tracer_pin_runner"),
+        reference(&erl, "nifdyn_tracer_pin_runner"),
+        "tracer callbacks after NIF reload"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn byte_binary(bytes: &[u8]) -> String {
+    format!(
+        "<<{}>>",
+        bytes
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 fn nif_api2_case(test_name: &str, body: &str) {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping {test_name}");

@@ -210,8 +210,8 @@ pub struct Vm {
     pub(crate) otp_root: Option<PathBuf>,
     /// The code tables of `erts_active_code_ix()` this VM reads (see [`Vm::refresh_code`]).
     pub(crate) code: Arc<CodeTables>,
-    /// Cache of the node's append-only NIF body table.
-    native_fns: Arc<Vec<arinsal_bifs::BifFn>>,
+    /// Cache of the node's NIF body slots.
+    native_fns: Arc<Vec<Option<arinsal_bifs::BifFn>>>,
     purge_state: Arc<crate::natives::code::PurgeState>,
     beamasm_targets: beamasm_integration::NativeTargetCache,
     /// Identity of this node's code (erts' code index state); native registries are per scope.

@@ -395,6 +395,7 @@ impl CodeTables {
         if self.module_live.get(id).copied() == Some(true)
             && let Some(module) = self.modules.get(id)
         {
+            crate::code_ix::for_scope(self.code_scope).release_native_fns(module);
             let key = nif_key(&module.name, id);
             self.loaded_nifs.remove(&key);
             crate::natives::nif::unload_instance(self.code_scope, id);
@@ -861,8 +862,8 @@ impl Vm {
     /// NIF body `index` of a `NativeBody` instruction.
     pub(crate) fn native_fn(&self, index: usize) -> Option<arinsal_bifs::BifFn> {
         match self.native_fns.get(index) {
-            Some(native) => Some(*native),
-            None => self.code_ix.native_fns().get(index).copied(),
+            Some(native) => *native,
+            None => self.code_ix.native_fns().get(index).copied().flatten(),
         }
     }
 

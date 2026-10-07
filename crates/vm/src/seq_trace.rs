@@ -393,6 +393,7 @@ fn emit(
             process,
             module,
             "enabled",
+            None,
             &[tag, state, tracee],
         );
         if action != Some(crate::signals::atom("trace")) {
@@ -423,6 +424,7 @@ fn emit(
             process,
             module,
             "trace",
+            None,
             &[tag, state, label, detail, opts],
         );
     }

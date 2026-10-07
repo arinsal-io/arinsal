@@ -23,6 +23,106 @@ use crate::{Process, Vm, VmError};
 
 const TRAMPOLINES: usize = 160;
 
+const TRACER_FUNCTIONS: &[(&str, u8)] = &[
+    ("trace", 5),
+    ("enabled", 3),
+    ("trace_send", 5),
+    ("trace_receive", 5),
+    ("trace_call", 5),
+    ("trace_running_procs", 5),
+    ("trace_running_ports", 5),
+    ("trace_garbage_collection", 5),
+    ("trace_procs", 5),
+    ("trace_ports", 5),
+    ("enabled_send", 3),
+    ("enabled_receive", 3),
+    ("enabled_call", 3),
+    ("enabled_running_procs", 3),
+    ("enabled_running_ports", 3),
+    ("enabled_garbage_collection", 3),
+    ("enabled_procs", 3),
+    ("enabled_ports", 3),
+];
+
+struct CachedTracerCallbacks {
+    generation: u64,
+    callbacks: HashMap<(String, u8), BifFn>,
+}
+
+static TRACER_CALLBACKS: OnceLock<Mutex<HashMap<(u64, String), CachedTracerCallbacks>>> =
+    OnceLock::new();
+
+fn tracer_callbacks() -> &'static Mutex<HashMap<(u64, String), CachedTracerCallbacks>> {
+    TRACER_CALLBACKS.get_or_init(Default::default)
+}
+
+/// Drops cached callback pointers when a scope publishes new active code.
+// Port of erts/emulator/beam/code_ix.c:169 and erl_trace.c:3553-3596
+// (erts_tracer_nif_clear), OTP-29.1.1.
+pub(crate) fn invalidate_tracer_callbacks(scope: u64) {
+    tracer_callbacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain(|(cached_scope, _), _| *cached_scope != scope);
+}
+
+fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Option<BifFn> {
+    let code = vm.code_ix.active_tables();
+    let generation = code.generation;
+    let key = (vm.code_scope, module_name.to_owned());
+    {
+        let cache = tracer_callbacks()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(cached) = cache.get(&key)
+            && cached.generation == generation
+        {
+            return cached.callbacks.get(&(function.to_owned(), arity)).copied();
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_trace.c:3017-3060 (load_tracer_nif), OTP-29.1.1.
+    let mut callbacks = HashMap::new();
+    if let Some(module) = code
+        .loaded
+        .get(module_name)
+        .and_then(|&id| code.modules.get(id))
+    {
+        let native_fns = vm.code_ix.native_fns();
+        for &(name, expected_arity) in TRACER_FUNCTIONS {
+            let Some(entry) = module
+                .functions
+                .iter()
+                .find_map(|(entry, found, found_arity)| {
+                    (found == name && *found_arity == expected_arity).then_some(*entry)
+                })
+            else {
+                continue;
+            };
+            let Some(Instr::NativeBody { index }) =
+                entry.checked_add(1).and_then(|body| module.code.get(body))
+            else {
+                continue;
+            };
+            if let Some(callback) = native_fns.get(*index as usize).copied().flatten() {
+                callbacks.insert((name.to_owned(), expected_arity), callback);
+            }
+        }
+    }
+    let selected = callbacks.get(&(function.to_owned(), arity)).copied();
+    tracer_callbacks()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            key,
+            CachedTracerCallbacks {
+                generation,
+                callbacks,
+            },
+        );
+    selected
+}
+
 struct DynSlot {
     library: Arc<arinsal_nif::NifLibrary>,
     index: usize,
@@ -591,43 +691,19 @@ pub(crate) fn invoke_tracer(
     process: &mut Process,
     module: &str,
     function: &str,
+    specialized: Option<&str>,
     args: &[Term],
 ) -> Option<Term> {
-    // Port of erts/emulator/beam/erl_trace.c:3017-3060 (load_tracer_nif): only the module's
-    // current code can supply the tracer NIFs, not an old or purged instance.
-    let module = vm.code.modules.get(*vm.code.loaded.get(module)?)?;
     let arity = u8::try_from(args.len()).ok()?;
-    let entry = module
-        .functions
-        .iter()
-        .find_map(|(entry, name, found)| (name == function && *found == arity).then_some(*entry))?;
-    let index = match module.code.get(entry.checked_add(1)?)? {
-        Instr::NativeBody { index } => *index as usize,
-        _ => return None,
-    };
-    let native = vm.native_fn(index)?;
+    let native = specialized
+        .and_then(|specialized| tracer_callback(vm, module, specialized, arity))
+        .or_else(|| tracer_callback(vm, module, function, arity))?;
     calls::call_bif(&mut process.heap, native, args).ok()
 }
 
 pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {
-    let Some(module) = vm
-        .code
-        .loaded
-        .get(module_name)
-        .and_then(|&id| vm.code.modules.get(id))
-    else {
-        return false;
-    };
-    [("enabled", 3), ("trace", 5)]
-        .into_iter()
-        .all(|(name, arity)| {
-            module
-                .functions
-                .iter()
-                .find(|(_, found, found_arity)| found == name && *found_arity == arity)
-                .and_then(|(entry, _, _)| module.code.get(entry.checked_add(1)?))
-                .is_some_and(|instruction| matches!(instruction, Instr::NativeBody { .. }))
-        })
+    tracer_callback(vm, module_name, "enabled", 3).is_some()
+        && tracer_callback(vm, module_name, "trace", 5).is_some()
 }
 
 fn trampolines() -> &'static [BifFn] {
