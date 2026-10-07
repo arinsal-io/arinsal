@@ -3348,7 +3348,7 @@ pub(crate) fn spawned(
             replace_session_flags(process, session, child, child_flags, entry.tracer);
         }
     }
-    if linked && let Some(parent_term) = parent.to_term() {
+    if let Some(parent_term) = parent.to_term() {
         emit(
             Some(vm),
             process,
@@ -3358,15 +3358,17 @@ pub(crate) fn spawned(
             "spawned",
             &[parent_term, mfa],
         );
-        emit(
-            Some(vm),
-            process,
-            ctx,
-            child,
-            PROCS,
-            "getting_linked",
-            &[parent_term],
-        );
+        if linked {
+            emit(
+                Some(vm),
+                process,
+                ctx,
+                child,
+                PROCS,
+                "getting_linked",
+                &[parent_term],
+            );
+        }
     }
 }
 
