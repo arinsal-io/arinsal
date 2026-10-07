@@ -1,0 +1,17 @@
+[package]
+name = "pf-exec-probe"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+cranelift-codegen = "=0.136.1"
+cranelift-frontend = "=0.136.1"
+cranelift-jit = "=0.136.1"
+cranelift-module = "=0.136.1"
+arinsal-beam = { path = "../../../crates/beam" }
+arinsal-loader = { path = "../../../crates/loader" }
+arinsal-jit = { path = "../../../crates/jit" }
+libc = "=0.2.189"

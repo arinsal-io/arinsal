@@ -1,0 +1,1037 @@
+//! OTP 29.1.1 `re` BIFs using the patched PCRE2 engine.
+//!
+//! PCRE2's loop counter is retained in `ar_re_match`; matching resumes there
+//! synchronously until scheduler support can pass a reduction budget.
+
+use std::cell::Cell;
+use std::ffi::c_void;
+use std::ptr;
+use std::sync::Arc;
+
+use arinsal_bifs::{BifError, BifFn, Ctx};
+use arinsal_etf::OwnedTerm as O;
+use arinsal_term::{
+    ExportEntry, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder, from_owned, to_owned,
+};
+use num_traits::ToPrimitive;
+
+const ANCHORED: u32 = 0x8000_0000;
+const NO_UTF_CHECK: u32 = 0x4000_0000;
+const UTF: u32 = 0x0008_0000;
+const DUPNAMES: u32 = 0x40;
+const INFO_BSR: u32 = 3;
+const INFO_CAPTURES: u32 = 4;
+const INFO_NAME_COUNT: u32 = 17;
+const INFO_NAME_SIZE: u32 = 18;
+const INFO_NAME_TABLE: u32 = 19;
+const INFO_NEWLINE: u32 = 20;
+const UNSET: usize = usize::MAX;
+thread_local! {
+    static LOOP_BUDGET: Cell<i32> = const { Cell::new(1_000_000) };
+    static LAST_LOOP_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Set the PCRE2 loop budget used between synchronous restarts.
+///
+/// A scheduler can use this knob with the patched engine until BIF yielding is available.
+pub fn set_loop_budget(limit: i32) -> Result<(), BifError> {
+    if limit <= 0 {
+        return Err(BifError::BADARG);
+    }
+    LOOP_BUDGET.with(|budget| budget.set(limit));
+    Ok(())
+}
+
+/// PCRE2 loop iterations consumed by the last match on this thread.
+pub fn last_loop_count() -> u64 {
+    LAST_LOOP_COUNT.with(Cell::get)
+}
+
+#[repr(C)]
+struct MatchResult {
+    rc: i32,
+    loops_consumed: u64,
+}
+
+unsafe extern "C" {
+    fn ar_re_compile(
+        pattern: *const u8,
+        len: usize,
+        options: u32,
+        newline: u32,
+        bsr: u32,
+        error: *mut i32,
+        offset: *mut usize,
+    ) -> *mut c_void;
+    fn ar_re_code_free(code: *mut c_void);
+    fn ar_re_info_u32(code: *const c_void, what: u32, out: *mut u32) -> i32;
+    fn ar_re_info_ptr(code: *const c_void, what: u32, out: *mut *const u8) -> i32;
+    fn ar_re_error_message(code: i32, out: *mut u8, cap: usize) -> i32;
+    fn ar_re_version(out: *mut u8) -> i32;
+    fn ar_re_serialize(code: *const c_void, out: *mut *mut u8, len: *mut usize) -> i32;
+    fn ar_re_serial_free(bytes: *mut u8);
+    fn ar_re_deserialize(bytes: *const u8, len: usize, code: *mut *mut c_void) -> i32;
+    fn ar_re_capture_name(code: *const c_void, name: *const u8) -> i32;
+    fn ar_re_capture_name_range(
+        code: *const c_void,
+        name: *const u8,
+        first: *mut *const u8,
+        last: *mut *const u8,
+    ) -> i32;
+    fn ar_re_match(
+        code: *const c_void,
+        subject: *const u8,
+        len: usize,
+        offset: usize,
+        options: u32,
+        match_limit: i32,
+        depth_limit: i32,
+        ovector: *mut usize,
+        ovec_count: u32,
+        loop_budget: i32,
+    ) -> MatchResult;
+}
+
+struct Code(*mut c_void);
+impl Drop for Code {
+    fn drop(&mut self) {
+        // SAFETY: this pointer came from PCRE2 and is owned by this wrapper.
+        unsafe { ar_re_code_free(self.0) }
+    }
+}
+impl Code {
+    fn info(&self, what: u32) -> u32 {
+        let mut value = 0;
+        // SAFETY: `self.0` is a live PCRE2 code and `value` is writable.
+        let rc = unsafe { ar_re_info_u32(self.0, what, &mut value) };
+        assert_eq!(rc, 0, "PCRE2 pattern info");
+        value
+    }
+    fn serialize(&self) -> Result<Vec<u8>, BifError> {
+        let mut data = ptr::null_mut();
+        let mut len = 0;
+        // SAFETY: the output pointers are writable and PCRE2 owns the returned buffer.
+        let rc = unsafe { ar_re_serialize(self.0, &mut data, &mut len) };
+        if rc != 1 {
+            return Err(BifError::SystemLimit);
+        }
+        // SAFETY: successful serialization returned `len` initialized bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data, len).to_vec() };
+        // SAFETY: `data` was allocated by `pcre2_serialize_encode`.
+        unsafe { ar_re_serial_free(data) };
+        Ok(bytes)
+    }
+    fn names(&self) -> Vec<(Vec<u8>, u32)> {
+        let count = self.info(INFO_NAME_COUNT) as usize;
+        if count == 0 {
+            return Vec::new();
+        }
+        let size = self.info(INFO_NAME_SIZE) as usize;
+        let mut table = ptr::null();
+        // SAFETY: PCRE2 writes the table pointer for this live code.
+        let rc = unsafe { ar_re_info_ptr(self.0, INFO_NAME_TABLE, &mut table) };
+        assert_eq!(rc, 0);
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: PCRE2's name table has `count` entries of `size` bytes.
+            let entry = unsafe { std::slice::from_raw_parts(table.add(i * size), size) };
+            let end = entry[2..].iter().position(|b| *b == 0).unwrap_or(size - 2);
+            out.push((
+                entry[2..2 + end].to_vec(),
+                u32::from_be_bytes([0, 0, entry[0], entry[1]]),
+            ));
+        }
+        out
+    }
+}
+
+/// Return the native implementation of an OTP `re` BIF.
+pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
+    if module != "re" {
+        return None;
+    }
+    Some(match (name, arity) {
+        ("version", 0) => version,
+        ("compile", 1) => compile_1,
+        ("compile", 2) => compile_2,
+        ("run", 2) => run_2,
+        ("run", 3) => run_3,
+        ("internal_run", 4) => internal_run_4,
+        ("inspect", 2) => inspect,
+        ("import", 1) => import,
+        _ => return None,
+    })
+}
+
+struct Heap<'a>(&'a mut dyn HeapAlloc);
+impl HeapAlloc for Heap<'_> {
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        self.0.alloc(words)
+    }
+    fn retain_binary(&mut self, value: Arc<Vec<u8>>) {
+        self.0.retain_binary(value)
+    }
+    fn retain_writable_binary(
+        &mut self,
+        value: Arc<arinsal_term::WritableBinary>,
+    ) -> Result<(), arinsal_term::TermError> {
+        self.0.retain_writable_binary(value)
+    }
+    fn supports_writable_binary(&self) -> bool {
+        self.0.supports_writable_binary()
+    }
+    fn retain_magic(&mut self, value: Arc<MagicRef>) {
+        self.0.retain_magic(value)
+    }
+    fn supports_magic(&self) -> bool {
+        self.0.supports_magic()
+    }
+    fn retain_node(&mut self, value: Arc<Node>) {
+        self.0.retain_node(value)
+    }
+    fn retain_fun(&mut self, value: Arc<FunEntry>) {
+        self.0.retain_fun(value)
+    }
+    fn retain_export(&mut self, value: Arc<ExportEntry>) {
+        self.0.retain_export(value)
+    }
+}
+fn call(
+    ctx: &mut Ctx<'_>,
+    args: &[Term],
+    op: impl FnOnce(&[O]) -> Result<O, BifError>,
+) -> Result<Term, BifError> {
+    let args = args
+        .iter()
+        .map(|term| to_owned(*term).map_err(|_| BifError::BADARG))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = op(&args)?;
+    from_owned(&result, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)
+}
+fn atom(name: &str) -> O {
+    O::atom(name)
+}
+fn pair(a: O, b: O) -> O {
+    O::Tuple(vec![a, b])
+}
+fn success(value: O) -> O {
+    pair(atom("ok"), value)
+}
+fn error(value: O) -> O {
+    pair(atom("error"), value)
+}
+fn atom_name(value: &O) -> Option<&str> {
+    if let O::Atom(s) = value {
+        Some(s)
+    } else {
+        None
+    }
+}
+fn number(value: &O) -> Option<i64> {
+    match value {
+        O::Int(n) => Some(*n),
+        O::BigInt(n) => n.to_i64(),
+        _ => None,
+    }
+}
+fn list(value: &O) -> Result<&[O], BifError> {
+    match value {
+        O::Nil => Ok(&[]),
+        O::List { elems, tail } if **tail == O::Nil => Ok(elems),
+        _ => Err(BifError::BADARG),
+    }
+}
+fn iodata(value: &O, unicode: bool) -> Result<Vec<u8>, BifError> {
+    let mut out = Vec::new();
+    fn append(value: &O, unicode: bool, out: &mut Vec<u8>) -> Result<(), BifError> {
+        match value {
+            O::Binary(bytes) => out.extend(bytes),
+            O::Nil => (),
+            O::List { elems, tail } => {
+                for item in elems {
+                    append(item, unicode, out)?;
+                }
+                if **tail != O::Nil {
+                    append(tail, unicode, out)?;
+                }
+            }
+            O::Int(n) => {
+                if unicode {
+                    let ch = u32::try_from(*n)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .ok_or(BifError::BADARG)?;
+                    let mut buf = [0; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                } else {
+                    out.push(u8::try_from(*n).map_err(|_| BifError::BADARG)?);
+                }
+            }
+            _ => return Err(BifError::BADARG),
+        }
+        Ok(())
+    }
+    append(value, unicode, &mut out)?;
+    Ok(out)
+}
+
+#[derive(Default)]
+struct Options {
+    compile: u32,
+    match_flags: u32,
+    newline: u32,
+    bsr: u32,
+    unicode: bool,
+    global: bool,
+    report_errors: bool,
+    export: bool,
+    unique_compile: bool,
+    unique_exec: bool,
+    offset: usize,
+    match_limit: i32,
+    depth_limit: i32,
+    capture: Option<(O, CaptureType)>,
+}
+#[derive(Clone, Copy)]
+enum CaptureType {
+    Index,
+    List,
+    Binary,
+}
+fn options(value: &O) -> Result<Options, BifError> {
+    // Port of erts/emulator/beam/erl_bif_re.c:310-530 (parse_options), OTP-29.1.1.
+    let mut result = Options {
+        match_limit: -1,
+        depth_limit: -1,
+        ..Options::default()
+    };
+    for item in list(value)? {
+        if let O::Tuple(fields) = item {
+            let key = fields.first().and_then(atom_name).ok_or(BifError::BADARG)?;
+            match (key, fields.as_slice()) {
+                ("capture", [_, spec]) => {
+                    result.capture = Some((spec.clone(), CaptureType::Index));
+                    result.unique_exec = true;
+                }
+                ("capture", [_, spec, ty]) => {
+                    let kind = match atom_name(ty) {
+                        Some("index") => CaptureType::Index,
+                        Some("list") => CaptureType::List,
+                        Some("binary") => CaptureType::Binary,
+                        _ => return Err(BifError::BADARG),
+                    };
+                    result.capture = Some((spec.clone(), kind));
+                    result.unique_exec = true;
+                }
+                ("offset", [_, n]) => {
+                    result.offset = usize::try_from(number(n).ok_or(BifError::BADARG)?)
+                        .map_err(|_| BifError::BADARG)?;
+                    if result.offset > i32::MAX as usize {
+                        return Err(BifError::BADARG);
+                    }
+                    result.unique_exec = true;
+                }
+                ("match_limit", [_, n]) => {
+                    result.match_limit = i32::try_from(number(n).ok_or(BifError::BADARG)?)
+                        .map_err(|_| BifError::BADARG)?;
+                    if result.match_limit < 0 {
+                        return Err(BifError::BADARG);
+                    }
+                    result.unique_exec = true;
+                }
+                ("match_limit_recursion", [_, n]) => {
+                    result.depth_limit = i32::try_from(number(n).ok_or(BifError::BADARG)?)
+                        .map_err(|_| BifError::BADARG)?;
+                    if result.depth_limit < 0 {
+                        return Err(BifError::BADARG);
+                    }
+                    result.unique_exec = true;
+                }
+                ("newline", [_, value]) => {
+                    result.newline = match atom_name(value) {
+                        Some("cr") => 1,
+                        Some("lf") => 2,
+                        Some("crlf") => 3,
+                        Some("any") => 4,
+                        Some("anycrlf") => 5,
+                        Some("nul") => 6,
+                        _ => return Err(BifError::BADARG),
+                    }
+                }
+                _ => return Err(BifError::BADARG),
+            }
+            continue;
+        }
+        let name = atom_name(item).ok_or(BifError::BADARG)?;
+        match name {
+            "anchored" => {
+                result.compile |= ANCHORED;
+                result.match_flags |= ANCHORED;
+            }
+            "caseless" => result.compile |= 0x8,
+            "dollar_endonly" => result.compile |= 0x10,
+            "dotall" => result.compile |= 0x20,
+            "dupnames" => result.compile |= DUPNAMES,
+            "extended" => result.compile |= 0x80,
+            "firstline" => result.compile |= 0x100,
+            "multiline" => result.compile |= 0x400,
+            "never_utf" => result.compile |= 0x1000,
+            "no_auto_capture" => result.compile |= 0x2000,
+            "no_start_optimize" => result.compile |= 0x10000,
+            "ucp" => result.compile |= 0x20000,
+            "ungreedy" => result.compile |= 0x40000,
+            "unicode" => {
+                result.compile |= UTF;
+                result.unicode = true;
+            }
+            "notbol" => result.match_flags |= 1,
+            "noteol" => result.match_flags |= 2,
+            "notempty" => result.match_flags |= 4,
+            "notempty_atstart" => result.match_flags |= 8,
+            "bsr_unicode" => result.bsr = 1,
+            "bsr_anycrlf" => result.bsr = 2,
+            "global" => result.global = true,
+            "report_errors" => result.report_errors = true,
+            "export" => result.export = true,
+            _ => return Err(BifError::BADARG),
+        }
+        match name {
+            "caseless" | "dollar_endonly" | "dotall" | "dupnames" | "extended" | "firstline"
+            | "multiline" | "never_utf" | "no_auto_capture" | "no_start_optimize" | "ucp"
+            | "ungreedy" | "unicode" | "export" => result.unique_compile = true,
+            "notbol" | "noteol" | "notempty" | "notempty_atstart" | "global" | "report_errors" => {
+                result.unique_exec = true
+            }
+            _ => (),
+        }
+    }
+    Ok(result)
+}
+fn compile_code(pattern: &[u8], opts: &Options) -> Result<Code, (i32, usize)> {
+    let mut error = 0;
+    let mut offset = 0;
+    // SAFETY: pointers cover the given byte slice; PCRE2 owns the returned code.
+    let code = unsafe {
+        ar_re_compile(
+            pattern.as_ptr(),
+            pattern.len(),
+            opts.compile,
+            opts.newline,
+            opts.bsr,
+            &mut error,
+            &mut offset,
+        )
+    };
+    if code.is_null() {
+        Err((error, offset))
+    } else {
+        Ok(Code(code))
+    }
+}
+fn compile_error(err: i32, offset: usize, run: bool) -> O {
+    let mut bytes = [0u8; 120];
+    // SAFETY: `bytes` is writable for its full length.
+    let len = unsafe { ar_re_error_message(err, bytes.as_mut_ptr(), bytes.len()) };
+    let message = if len < 0 {
+        format!("Unknown error ({err})").into_bytes()
+    } else {
+        bytes[..len as usize].to_vec()
+    };
+    let detail = pair(
+        O::list(message.into_iter().map(|b| O::Int(i64::from(b))).collect()),
+        O::Int(offset as i64),
+    );
+    if run {
+        error(pair(atom("compile"), detail))
+    } else {
+        error(detail)
+    }
+}
+fn compiled_tuple(code: &Code, unicode: bool) -> Result<O, BifError> {
+    let newline = code.info(INFO_NEWLINE);
+    Ok(O::Tuple(vec![
+        atom("re_pattern"),
+        O::Int(i64::from(code.info(INFO_CAPTURES))),
+        O::Int(i64::from(unicode)),
+        O::Int(i64::from(matches!(newline, 3..=5))),
+        O::Binary(code.serialize()?),
+    ]))
+}
+fn compile_owned(args: &[O]) -> Result<O, BifError> {
+    let opts = options(args.get(1).unwrap_or(&O::Nil))?;
+    if opts.unique_exec {
+        return Err(BifError::BADARG);
+    }
+    let pattern = iodata(&args[0], opts.unicode)?;
+    let code = match compile_code(&pattern, &opts) {
+        Ok(c) => c,
+        Err((e, p)) => return Ok(compile_error(e, p, false)),
+    };
+    if opts.export {
+        let bytes = code.serialize()?;
+        let checksum = crc32(&bytes);
+        let mut header = b"re-PCRE2".to_vec();
+        header.extend(checksum.to_be_bytes());
+        header.extend([1, u8::from(opts.unicode)]);
+        return Ok(success(O::Tuple(vec![
+            atom("re_exported_pattern"),
+            O::Binary(header),
+            O::Binary(pattern),
+            args.get(1).cloned().unwrap_or(O::Nil),
+            O::Binary(bytes),
+        ])));
+    }
+    Ok(success(compiled_tuple(&code, opts.unicode)?))
+}
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for b in bytes {
+        crc ^= u32::from(*b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+fn decode(value: &O) -> Result<(Code, bool), BifError> {
+    let O::Tuple(fields) = value else {
+        return Err(BifError::BADARG);
+    };
+    if fields.len() != 5 || atom_name(&fields[0]) != Some("re_pattern") {
+        return Err(BifError::BADARG);
+    }
+    let count = number(&fields[1]).ok_or(BifError::BADARG)?;
+    let unicode = number(&fields[2]).ok_or(BifError::BADARG)? != 0;
+    number(&fields[3]).ok_or(BifError::BADARG)?;
+    let O::Binary(bytes) = &fields[4] else {
+        return Err(BifError::BADARG);
+    };
+    if bytes.len() < 32 {
+        return Err(BifError::BADARG);
+    }
+    let mut code = ptr::null_mut();
+    // SAFETY: serialized data was produced by the vendored PCRE2 encoder.
+    let rc = unsafe { ar_re_deserialize(bytes.as_ptr(), bytes.len(), &mut code) };
+    if rc != 1 || code.is_null() {
+        return Err(BifError::BADARG);
+    }
+    let code = Code(code);
+    if count != i64::from(code.info(INFO_CAPTURES)) {
+        return Err(BifError::BADARG);
+    }
+    Ok((code, unicode))
+}
+fn version(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, |_| {
+        let mut bytes = [0; 32];
+        // SAFETY: PCRE2 writes a version string shorter than this buffer.
+        let size = unsafe { ar_re_version(bytes.as_mut_ptr()) };
+        Ok(O::Binary(bytes[..(size - 1) as usize].to_vec()))
+    })
+}
+fn compile_1(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, compile_owned)
+}
+fn compile_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, compile_owned)
+}
+fn run_2(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, |a| run_owned(a, true))
+}
+fn run_3(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, |a| run_owned(a, true))
+}
+fn internal_run_4(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, |a| match atom_name(&a[3]) {
+        Some("true") => run_owned(a, true),
+        Some("false") => run_owned(a, false),
+        _ => Err(BifError::BADARG),
+    })
+}
+fn inspect(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, |a| {
+        if atom_name(&a[1]) != Some("namelist") {
+            return Err(BifError::BADARG);
+        }
+        let (code, _) = decode(&a[0])?;
+        let mut names = code
+            .names()
+            .into_iter()
+            .map(|(name, _)| O::Binary(name))
+            .collect::<Vec<_>>();
+        names.dedup();
+        Ok(pair(atom("namelist"), O::list(names)))
+    })
+}
+fn import(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    call(ctx, args, |a| {
+        let O::Tuple(fields) = &a[0] else {
+            return Err(BifError::BADARG);
+        };
+        if fields.len() != 5 || atom_name(&fields[0]) != Some("re_exported_pattern") {
+            return Err(BifError::BADARG);
+        }
+        let O::Binary(header) = &fields[1] else {
+            return Err(BifError::BADARG);
+        };
+        if header.len() < 14 || &header[..8] != b"re-PCRE2" {
+            return Err(BifError::BADARG);
+        }
+        if header[12] == 1 {
+            let O::Binary(bytes) = &fields[4] else {
+                return Err(BifError::BADARG);
+            };
+            if bytes.len() < 32
+                || crc32(bytes) != u32::from_be_bytes(header[8..12].try_into().unwrap())
+            {
+                return Err(BifError::BADARG);
+            }
+            let mut code = ptr::null_mut();
+            // SAFETY: CRC and header identify a serialized PCRE2 pattern.
+            let rc = unsafe { ar_re_deserialize(bytes.as_ptr(), bytes.len(), &mut code) };
+            if rc == 1 && !code.is_null() {
+                return compiled_tuple(&Code(code), header[13] != 0);
+            }
+            if rc != -32 && rc != -31 {
+                return Err(BifError::BADARG);
+            }
+        }
+        let O::Binary(pattern) = &fields[2] else {
+            return Err(BifError::BADARG);
+        };
+        let opts = options(&fields[3])?;
+        let code = compile_code(pattern, &opts).map_err(|_| BifError::BADARG)?;
+        compiled_tuple(&code, opts.unicode)
+    })
+}
+
+/// Dispatch an OTP `re` BIF while representing compiled patterns with an
+/// opaque magic reference, as ERTS does. The serialized PCRE2 code is retained
+/// by the reference so copied BEAM terms remain valid for their heap lifetime.
+pub fn invoke(ctx: &mut Ctx<'_>, name: &str, args: &[Term]) -> Result<Term, BifError> {
+    let mut adapted = args.to_vec();
+    if matches!(
+        (name, args.len()),
+        ("run", 2 | 3) | ("internal_run", 4) | ("inspect", 2)
+    ) {
+        let pattern_index = if name == "inspect" { 0 } else { 1 };
+        if let Some(pattern) = args.get(pattern_index)
+            && let Some(owned) = magic_pattern(*pattern)?
+        {
+            adapted[pattern_index] =
+                from_owned(&owned, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)?;
+        }
+    }
+    let bif = lookup("re", name, args.len() as u8).ok_or(BifError::BADARG)?;
+    let result = bif(ctx, &adapted)?;
+    if name == "compile" || name == "import" {
+        return magic_compile_result(ctx, result);
+    }
+    Ok(result)
+}
+
+fn magic_pattern(term: Term) -> Result<Option<O>, BifError> {
+    // SAFETY: arguments remain rooted in their process heap for this call.
+    let Some(fields) = (unsafe { term.tuple_ref() }) else {
+        return Ok(None);
+    };
+    if fields.len() != 5
+        || atom_name(&to_owned(fields.get(0).unwrap()).map_err(|_| BifError::BADARG)?)
+            != Some("re_pattern")
+    {
+        return Ok(None);
+    }
+    let reference = fields.get(4).unwrap();
+    // SAFETY: the magic reference owner is retained by the argument heap.
+    let Some(handle) =
+        (unsafe { reference.magic_ref() }).and_then(|owner| owner.downcast_ref::<RegexHandle>())
+    else {
+        return Ok(None);
+    };
+    let mut owned = Vec::with_capacity(5);
+    for index in 0..4 {
+        owned.push(to_owned(fields.get(index).unwrap()).map_err(|_| BifError::BADARG)?);
+    }
+    owned.push(O::Binary(handle.0.clone()));
+    Ok(Some(O::Tuple(owned)))
+}
+
+struct RegexHandle(Vec<u8>);
+
+fn magic_compile_result(ctx: &mut Ctx<'_>, result: Term) -> Result<Term, BifError> {
+    let owned = to_owned(result).map_err(|_| BifError::SystemLimit)?;
+    let O::Tuple(outer) = &owned else {
+        return Ok(result);
+    };
+    let (wrapper, pattern_term) = if outer.len() == 2 && atom_name(&outer[0]) == Some("ok") {
+        (Some(&outer[0]), &outer[1])
+    } else if outer.len() == 5 && atom_name(&outer[0]) == Some("re_pattern") {
+        (None, &owned)
+    } else {
+        return Ok(result);
+    };
+    let O::Tuple(pattern) = pattern_term else {
+        return Ok(result);
+    };
+    if pattern.len() != 5 || atom_name(&pattern[0]) != Some("re_pattern") {
+        return Ok(result);
+    }
+    let O::Binary(serialized) = &pattern[4] else {
+        return Err(BifError::BADARG);
+    };
+    let serialized = serialized.clone();
+    let mut heap = Heap(ctx.heap);
+    let mut terms = pattern[..4]
+        .iter()
+        .map(|item| from_owned(item, &mut heap).map_err(|_| BifError::SystemLimit))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reference = TermBuilder::new(&mut heap)
+        .magic_ref(MagicRef::new(RegexHandle(serialized)))
+        .map_err(|_| BifError::SystemLimit)?;
+    terms.push(reference);
+    let compiled = TermBuilder::new(&mut heap)
+        .tuple(&terms)
+        .map_err(|_| BifError::SystemLimit)?;
+    if let Some(ok) = wrapper {
+        let ok = from_owned(ok, &mut heap).map_err(|_| BifError::SystemLimit)?;
+        TermBuilder::new(&mut heap)
+            .tuple(&[ok, compiled])
+            .map_err(|_| BifError::SystemLimit)
+    } else {
+        Ok(compiled)
+    }
+}
+
+#[derive(Clone)]
+enum Selection {
+    All,
+    AllButFirst,
+    None,
+    Specific(Vec<CaptureKey>),
+}
+#[derive(Clone)]
+enum CaptureKey {
+    Number(i32),
+    Name(Vec<u8>),
+}
+fn selection(
+    code: &Code,
+    spec: Option<&(O, CaptureType)>,
+) -> Result<(Selection, CaptureType), BifError> {
+    let Some((value, kind)) = spec else {
+        return Ok((Selection::All, CaptureType::Index));
+    };
+    let chosen = match atom_name(value) {
+        Some("all") => Selection::All,
+        Some("all_but_first") => Selection::AllButFirst,
+        Some("first") => Selection::Specific(vec![CaptureKey::Number(0)]),
+        Some("none") => Selection::None,
+        Some("all_names") => {
+            let mut names = code.names().into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+            names.dedup();
+            if names.is_empty() {
+                Selection::None
+            } else {
+                Selection::Specific(names.into_iter().map(CaptureKey::Name).collect())
+            }
+        }
+        Some(_) => return Err(BifError::BADARG),
+        None => {
+            let mut keys = Vec::new();
+            for item in list(value)? {
+                if let Some(n) = number(item) {
+                    keys.push(CaptureKey::Number(
+                        i32::try_from(n).map_err(|_| BifError::BADARG)?,
+                    ));
+                } else if let Some(name) = atom_name(item) {
+                    keys.push(CaptureKey::Name(name.as_bytes().to_vec()));
+                } else {
+                    keys.push(CaptureKey::Name(iodata(item, false)?));
+                }
+            }
+            if keys.is_empty() {
+                Selection::None
+            } else {
+                Selection::Specific(keys)
+            }
+        }
+    };
+    Ok((chosen, *kind))
+}
+fn selected_indices(
+    code: &Code,
+    selection: &Selection,
+    rc: i32,
+    ovector: &[usize],
+) -> Vec<Option<usize>> {
+    match selection {
+        Selection::None => Vec::new(),
+        Selection::All => (0..rc as usize).map(Some).collect(),
+        Selection::AllButFirst => (1..rc as usize).map(Some).collect(),
+        Selection::Specific(keys) => keys
+            .iter()
+            .map(|key| match key {
+                CaptureKey::Number(n) => usize::try_from(*n).ok(),
+                CaptureKey::Name(name) => {
+                    let mut zname = name.clone();
+                    zname.push(0);
+                    // SAFETY: `zname` is NUL-terminated and `code` is live.
+                    let idx = unsafe { ar_re_capture_name(code.0, zname.as_ptr()) };
+                    if idx >= 0 {
+                        return Some(idx as usize);
+                    }
+                    let mut first = ptr::null();
+                    let mut last = ptr::null();
+                    // SAFETY: PCRE2 writes valid name table pointers for this code.
+                    let size = unsafe {
+                        ar_re_capture_name_range(code.0, zname.as_ptr(), &mut first, &mut last)
+                    };
+                    if size <= 0 || first.is_null() {
+                        return None;
+                    }
+                    let count = (last as usize - first as usize) / size as usize + 1;
+                    for i in 0..count {
+                        // SAFETY: name-table scan returned this inclusive range and stride.
+                        let entry =
+                            unsafe { std::slice::from_raw_parts(first.add(i * size as usize), 2) };
+                        let index = (usize::from(entry[0]) << 8) | usize::from(entry[1]);
+                        if index < rc as usize && ovector[index * 2] != UNSET {
+                            return Some(index);
+                        }
+                    }
+                    None
+                }
+            })
+            .collect(),
+    }
+}
+fn capture_values(
+    code: &Code,
+    selection: &Selection,
+    kind: CaptureType,
+    rc: i32,
+    ovector: &[usize],
+    subject: &[u8],
+    unicode: bool,
+) -> O {
+    // Port of erts/emulator/beam/erl_bif_re.c:1030-1262 (build_exec_return), OTP-29.1.1.
+    let indexes = selected_indices(code, selection, rc, ovector);
+    O::list(
+        indexes
+            .into_iter()
+            .map(|index| {
+                let (start, end) = index
+                    .filter(|i| *i < rc as usize && ovector[*i * 2] != UNSET)
+                    .map(|i| (ovector[2 * i], ovector[2 * i + 1]))
+                    .unwrap_or((UNSET, UNSET));
+                match kind {
+                    CaptureType::Index => {
+                        if start == UNSET {
+                            pair(O::Int(-1), O::Int(0))
+                        } else {
+                            pair(O::Int(start as i64), O::Int((end - start) as i64))
+                        }
+                    }
+                    CaptureType::Binary => O::Binary(if start == UNSET {
+                        Vec::new()
+                    } else {
+                        subject[start..end].to_vec()
+                    }),
+                    CaptureType::List => {
+                        let bytes = if start == UNSET {
+                            &[][..]
+                        } else {
+                            &subject[start..end]
+                        };
+                        if unicode {
+                            match std::str::from_utf8(bytes) {
+                                Ok(s) => O::charlist(s),
+                                Err(err) => {
+                                    let valid = std::str::from_utf8(&bytes[..err.valid_up_to()])
+                                        .expect("validated prefix");
+                                    O::Tuple(vec![
+                                        atom(if err.error_len().is_some() {
+                                            "error"
+                                        } else {
+                                            "incomplete"
+                                        }),
+                                        O::charlist(valid),
+                                        O::Binary(bytes[err.valid_up_to()..].to_vec()),
+                                    ])
+                                }
+                            }
+                        } else {
+                            O::list(bytes.iter().map(|b| O::Int(i64::from(*b))).collect())
+                        }
+                    }
+                }
+            })
+            .collect(),
+    )
+}
+enum MatchFailure {
+    Badarg,
+    Limit(&'static str),
+}
+fn match_once(
+    code: &Code,
+    subject: &[u8],
+    offset: usize,
+    flags: u32,
+    opts: &Options,
+) -> Result<Option<(i32, Vec<usize>)>, MatchFailure> {
+    let count = code.info(INFO_CAPTURES) as usize + 1;
+    let mut ovector = vec![UNSET; count * 2];
+    // SAFETY: the pointers cover live byte and ovector buffers; `code` is live.
+    let result = unsafe {
+        ar_re_match(
+            code.0,
+            subject.as_ptr(),
+            subject.len(),
+            offset,
+            flags,
+            opts.match_limit,
+            opts.depth_limit,
+            ovector.as_mut_ptr(),
+            count as u32,
+            LOOP_BUDGET.with(Cell::get),
+        )
+    };
+    LAST_LOOP_COUNT.with(|count| count.set(result.loops_consumed));
+    match result.rc {
+        rc if rc > 0 => Ok(Some((rc, ovector))),
+        -1 | -52 | -63 => Ok(None),
+        -47 if opts.report_errors => Err(MatchFailure::Limit("match_limit")),
+        -53 if opts.report_errors => Err(MatchFailure::Limit("match_limit_recursion")),
+        -47 | -53 => Ok(None),
+        _ => Err(MatchFailure::Badarg),
+    }
+}
+fn match_result(
+    code: &Code,
+    subject: &[u8],
+    opts: &Options,
+    unicode: bool,
+    first: bool,
+) -> Result<O, BifError> {
+    // Port of lib/stdlib/src/re.erl:1823-1906 (do_grun/loopexec), OTP-29.1.1.
+    let (selection, kind) = selection(code, opts.capture.as_ref())?;
+    let mut flags = opts.match_flags;
+    if !first {
+        flags |= NO_UTF_CHECK;
+    }
+    let mut offset = opts.offset;
+    let mut matches = Vec::new();
+    loop {
+        if offset > subject.len() {
+            break;
+        }
+        let found = match_once(code, subject, offset, flags, opts);
+        let (rc, ov) = match found {
+            Ok(Some(value)) => value,
+            Ok(None) => break,
+            Err(MatchFailure::Limit(reason)) => return Ok(error(atom(reason))),
+            Err(MatchFailure::Badarg) => return Err(BifError::BADARG),
+        };
+        let start = ov[0];
+        let end = ov[1];
+        if !matches!(selection, Selection::None) {
+            matches.push(capture_values(
+                code, &selection, kind, rc, &ov, subject, unicode,
+            ));
+        } else {
+            matches.push(O::Nil);
+        }
+        if !opts.global {
+            break;
+        }
+        if end > start {
+            offset = end;
+        } else {
+            let retry = match match_once(code, subject, offset, flags | ANCHORED | 8, opts) {
+                Ok(value) => value,
+                Err(MatchFailure::Limit(reason)) => return Ok(error(atom(reason))),
+                Err(MatchFailure::Badarg) => return Err(BifError::BADARG),
+            };
+            if let Some((retry_rc, retry_ov)) = retry
+                && retry_ov[1] > retry_ov[0]
+            {
+                matches.push(capture_values(
+                    code, &selection, kind, retry_rc, &retry_ov, subject, unicode,
+                ));
+                offset = retry_ov[1];
+                flags |= NO_UTF_CHECK;
+                continue;
+            }
+            if start >= subject.len() {
+                break;
+            }
+            offset = start
+                + if unicode {
+                    let b = subject[start];
+                    if b & 0xe0 == 0xc0 {
+                        2
+                    } else if b & 0xf0 == 0xe0 {
+                        3
+                    } else if b & 0xf8 == 0xf0 {
+                        4
+                    } else {
+                        1
+                    }
+                } else if matches!(code.info(INFO_NEWLINE), 3..=5)
+                    && subject.get(start..start + 2) == Some(b"\r\n")
+                {
+                    2
+                } else {
+                    1
+                };
+        }
+        flags |= NO_UTF_CHECK;
+    }
+    if matches.is_empty() {
+        return Ok(atom("nomatch"));
+    }
+    if opts.global {
+        if matches!(selection, Selection::None) {
+            Ok(atom("match"))
+        } else {
+            Ok(pair(atom("match"), O::list(matches)))
+        }
+    } else if matches!(selection, Selection::None) {
+        Ok(atom("match"))
+    } else {
+        Ok(pair(atom("match"), matches.remove(0)))
+    }
+}
+fn run_owned(args: &[O], first: bool) -> Result<O, BifError> {
+    let opts = options(args.get(2).unwrap_or(&O::Nil))?;
+    if opts.export {
+        return Err(BifError::BADARG);
+    }
+    let compiled = matches!(&args[1], O::Tuple(fields) if fields.len() == 5);
+    let (code, unicode) = if compiled {
+        if opts.unique_compile {
+            return Err(BifError::BADARG);
+        }
+        let (code, unicode) = decode(&args[1])?;
+        if opts.newline != 0 && opts.newline != code.info(INFO_NEWLINE) {
+            return Err(BifError::BADARG);
+        }
+        if opts.bsr != 0 && opts.bsr != code.info(INFO_BSR) {
+            return Err(BifError::BADARG);
+        }
+        (code, unicode)
+    } else {
+        let pattern = iodata(&args[1], opts.unicode)?;
+        match compile_code(&pattern, &opts) {
+            Ok(code) => (code, opts.unicode),
+            Err((err, pos)) if opts.report_errors => return Ok(compile_error(err, pos, true)),
+            Err(_) => return Err(BifError::BADARG),
+        }
+    };
+    let subject = iodata(&args[0], unicode)?;
+    if opts.offset > subject.len() && !opts.global {
+        return Err(BifError::BADARG);
+    }
+    match_result(&code, &subject, &opts, unicode, first)
+}

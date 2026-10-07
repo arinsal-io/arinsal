@@ -1,0 +1,14 @@
+  2175  <arinsal_vm::Vm>::run_slice_inner
+   602  arinsal_vm::interp::exec_hot
+    66  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+    27  __munmap
+    16  _platform_memmove
+    10  __mmap
+     9  <arinsal_term::heap::ProcessHeap>::collect
+     9  mach_absolute_time
+     8  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>
+     7  <arinsal_vm::process::Executor>::run
+     6  <hashbrown::map::HashMap<usize, (), std::hash::random::RandomState>>::insert
+     6  <arinsal_vm::proc_create::Process>::refresh_code_refs
+     6  arinsal_term::native_code::is_native_code_pointer
+     5  arinsal_sched::run_one::<arinsal_vm::proc_create::Process>

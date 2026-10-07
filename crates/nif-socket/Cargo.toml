@@ -1,0 +1,18 @@
+[package]
+name = "arinsal-nif-socket"
+description = "OTP 29.1.1 prim_socket and prim_net native operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arinsal-bifs.workspace = true
+arinsal-etf.workspace = true
+arinsal-nif-file.workspace = true
+arinsal-term.workspace = true
+libc = "0.2.175"
+socket2 = { version = "0.6.0", features = ["all"] }
