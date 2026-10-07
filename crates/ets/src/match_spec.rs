@@ -11,8 +11,12 @@ use num_traits::{Signed, ToPrimitive, Zero};
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+mod dmc;
+mod pam;
+
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+/// One clause of the specification as written, kept for the key analysis.
 struct Clause {
     head: Term,
     guards: Vec<Term>,
@@ -24,6 +28,10 @@ pub struct MatchProgram {
     // Clauses point into this stable, private heap.
     heap: VecHeap,
     clauses: Vec<Clause>,
+    /// The flat match program (`MatchProg::text`) and its binding count.
+    text: Vec<dmc::Op>,
+    num_bindings: usize,
+    stack_need: usize,
     id: u64,
     trace: bool,
 }
@@ -160,10 +168,7 @@ pub fn match_spec_test<H: HeapAlloc, C: MatchContext>(
     {
         return Err(EtsError::BadArg);
     }
-    let compiled = match dialect {
-        MatchDialect::Table => MatchProgram::compile(specification),
-        MatchDialect::Trace => MatchProgram::compile_trace(specification),
-    };
+    let compiled = MatchProgram::compile_test(specification, dialect == MatchDialect::Trace);
     let program = match compiled {
         Ok(program) => program,
         Err(_) => {
@@ -468,7 +473,7 @@ fn tuple(term: Term) -> Result<Vec<Term>, EtsError> {
 
 fn variable(term: Term) -> Option<usize> {
     // Port of erts/emulator/beam/erl_db_util.c:3896-3914, OTP-29.1.1 (db_is_variable).
-    let text = atom_name(term)?;
+    let text = global_atoms().text(term.as_atom()?)?;
     let digits = text.strip_prefix('$')?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -804,72 +809,73 @@ impl MatchProgram {
                 .intern(if whole_object { "$_" } else { "$$" })
                 .map_err(|_| EtsError::BadArg)?,
         );
+        // One heap for pattern and specification: the program keeps the pattern terms.
+        let pattern = copy_term(pattern, &mut heap)?;
         let mut builder = TermBuilder::new(&mut heap);
         let body = builder.list_from_iter([marker])?;
         let clause = builder.tuple(&[pattern, Term::NIL, body])?;
         let spec = builder.list_from_iter([clause])?;
-        Self::compile(spec)
+        Self::compile_in(heap, spec, dmc::DCOMP_TABLE)
     }
 
     /// Compile a match specification term, rejecting invalid or unsupported syntax.
     pub fn compile(specification: Term) -> Result<Self, EtsError> {
-        Self::compile_with_mode(specification, false)
+        Self::compile_with_flags(specification, dmc::DCOMP_TABLE)
     }
 
     /// Compile a tracing match specification, including effectful trace forms.
     pub fn compile_trace(specification: Term) -> Result<Self, EtsError> {
-        Self::compile_with_mode(specification, true)
+        Self::compile_with_flags(
+            specification,
+            dmc::DCOMP_TRACE | dmc::DCOMP_CALL_TRACE | dmc::DCOMP_ALLOW_TRACE_OPS,
+        )
     }
 
     /// Compile a `send` or `receive` event match specification.
     ///
     /// `send` patterns drop the call-only forms; `receive` patterns also drop the
     /// effectful trace forms.
-    // Port of erts/emulator/beam/erl_db_util.c:1187-1192 (erts_match_set_compile_trace flags)
-    // and 5009-5437 (check_trace), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_db_util.c:1187-1192 (erts_match_set_compile_trace flags),
+    // OTP-29.1.1; `check_trace` in the compiler enforces them.
     pub fn compile_trace_event(specification: Term, receive: bool) -> Result<Self, EtsError> {
-        fn forbidden(term: Term, receive: bool) -> bool {
-            match term.classify() {
-                TermKind::List => proper_list(term)
-                    .map(|items| items.into_iter().any(|item| forbidden(item, receive)))
-                    .unwrap_or(false),
-                TermKind::Tuple => {
-                    let Ok(parts) = tuple(term) else {
-                        return false;
-                    };
-                    let name = parts.first().and_then(|&head| atom_name(head));
-                    match name.as_deref() {
-                        Some("const") => false,
-                        Some("caller" | "caller_line" | "current_stacktrace") => true,
-                        Some(
-                            "is_seq_trace" | "set_seq_token" | "get_seq_token" | "process_dump"
-                            | "enable_trace" | "disable_trace" | "trace" | "silent",
-                        ) if receive => true,
-                        _ => parts.iter().skip(1).any(|&part| forbidden(part, receive)),
-                    }
-                }
-                _ => false,
-            }
-        }
-        let program = Self::compile_trace(specification)?;
-        let blocked = program.clauses.iter().any(|clause| {
-            clause
-                .guards
-                .iter()
-                .chain(&clause.body)
-                .any(|&expr| forbidden(expr, receive))
-        });
-        if blocked {
-            return Err(EtsError::BadArg);
-        }
-        Ok(program)
+        Self::compile_with_flags(
+            specification,
+            if receive {
+                dmc::DCOMP_TRACE
+            } else {
+                dmc::DCOMP_TRACE | dmc::DCOMP_ALLOW_TRACE_OPS
+            },
+        )
     }
 
-    // Port of erts/emulator/beam/erl_db_util.c:1717, OTP-29.1.1 (db_match_compile).
-    fn compile_with_mode(specification: Term, trace: bool) -> Result<Self, EtsError> {
+    /// Compile for `erlang:match_spec_test/3`: no process state may change.
+    fn compile_test(specification: Term, trace: bool) -> Result<Self, EtsError> {
+        Self::compile_with_flags(
+            specification,
+            dmc::DCOMP_FAKE_DESTRUCTIVE
+                | if trace {
+                    dmc::DCOMP_TRACE | dmc::DCOMP_CALL_TRACE | dmc::DCOMP_ALLOW_TRACE_OPS
+                } else {
+                    dmc::DCOMP_TABLE
+                },
+        )
+    }
+
+    fn compile_with_flags(specification: Term, cflags: u32) -> Result<Self, EtsError> {
         let mut heap = VecHeap::new();
         let specification = copy_term(specification, &mut heap)?;
+        Self::compile_in(heap, specification, cflags)
+    }
+
+    /// Compile a specification that already lives in `heap`, which the program then owns.
+    // Port of erts/emulator/beam/erl_db_util.c:1211 (db_match_set_compile), OTP-29.1.1.
+    fn compile_in(mut heap: VecHeap, specification: Term, cflags: u32) -> Result<Self, EtsError> {
+        let trace = cflags & dmc::DCOMP_TRACE != 0;
         let mut clauses = Vec::new();
+        let mut matches = Vec::new();
+        let mut guard_exprs = Vec::new();
+        let mut body_exprs = Vec::new();
+        let mut is_prefix = Vec::new();
         for clause in proper_list(specification)? {
             let triple = tuple(clause)?;
             if triple.len() != 3 {
@@ -888,6 +894,29 @@ impl MatchProgram {
             for &expr in &body {
                 validate_expr(expr, false, &bound, trace, 0)?;
             }
+            // When tracing, a list head is converted to a tuple and matched against the
+            // argument array; a '_' tail makes it a prefix match.
+            let mut prefix = false;
+            let head = if trace && matches!(triple[0].classify(), TermKind::List | TermKind::Nil) {
+                let mut elements = Vec::new();
+                let mut rest = triple[0];
+                while let Some((head, tail)) = cons(rest) {
+                    elements.push(head);
+                    rest = tail;
+                }
+                if atom_name(rest).as_deref() == Some("_") {
+                    prefix = true;
+                } else if rest != Term::NIL {
+                    return Err(EtsError::BadArg);
+                }
+                TermBuilder::new(&mut heap).tuple(&elements)?
+            } else {
+                triple[0]
+            };
+            matches.push(head);
+            guard_exprs.push(triple[1]);
+            body_exprs.push(triple[2]);
+            is_prefix.push(prefix);
             clauses.push(Clause {
                 head: triple[0],
                 guards,
@@ -897,9 +926,20 @@ impl MatchProgram {
         if clauses.is_empty() {
             return Err(EtsError::BadArg);
         }
+        let compiled = dmc::db_match_compile(
+            &mut heap,
+            &matches,
+            &guard_exprs,
+            &body_exprs,
+            cflags,
+            &is_prefix,
+        )?;
         Ok(Self {
             heap,
             clauses,
+            text: compiled.text,
+            num_bindings: compiled.num_bindings,
+            stack_need: compiled.stack_need,
             id: NEXT_PROGRAM_ID.fetch_add(1, AtomicOrdering::Relaxed),
             trace,
         })
@@ -965,48 +1005,46 @@ impl MatchProgram {
         dst: &mut H,
         context: &C,
     ) -> Result<Option<Term>, EtsError> {
-        let _keep_live = &self.heap;
-        for clause in &self.clauses {
-            let mut bindings = Vec::new();
-            let mut scratch = VecHeap::new();
-            let head_object = if self.trace && clause.head.classify() == TermKind::Tuple {
-                TermBuilder::new(&mut scratch).tuple(&proper_list(object)?)?
-            } else {
-                object
-            };
-            if !match_head(clause.head, head_object, &mut bindings, &mut scratch)? {
-                continue;
-            }
-            let mut pass = true;
-            for &guard in &clause.guards {
-                match eval(guard, object, &bindings, &mut scratch, context) {
-                    Ok(value) if boolean(value) == Some(true) => {}
-                    _ => {
-                        pass = false;
-                        break;
-                    }
-                }
-            }
-            if !pass {
-                continue;
-            }
-            let mut value = if self.trace { truth(true) } else { Term::NIL };
-            for &expr in &clause.body {
-                let evaluated = eval(expr, object, &bindings, &mut scratch, context)
-                    .unwrap_or_else(|_| Term::atom(global_atoms().intern("EXIT").unwrap()));
-                if !self.trace
-                    || tuple(expr)
-                        .ok()
-                        .and_then(|parts| parts.first().and_then(|&head| atom_name(head)))
-                        .as_deref()
-                        == Some("message")
-                {
-                    value = evaluated;
-                }
-            }
-            return Ok(Some(copy_term(value, dst)?));
+        // The match pseudo process (heap, stack, variables) is cached per thread like erts's
+        // `match_pseudo_process`; creating one per object dominated select over big tables.
+        thread_local! {
+            static STATE: Cell<Option<Box<pam::PamState>>> = const { Cell::new(None) };
         }
-        Ok(None)
+        let mut state = STATE
+            .take()
+            .unwrap_or_else(|| Box::new(pam::PamState::new()));
+        let result = self.run_program(object, dst, context, &mut state);
+        if state.heap.used_words() != 0 {
+            state.heap = VecHeap::new();
+        }
+        STATE.set(Some(state));
+        result
+    }
+
+    fn run_program<H: HeapAlloc, C: MatchContext>(
+        &self,
+        object: Term,
+        dst: &mut H,
+        context: &C,
+        state: &mut pam::PamState,
+    ) -> Result<Option<Term>, EtsError> {
+        let _keep_live = &self.heap;
+        let outcome = if self.trace {
+            // The trace argument list is the array the program matches.
+            let array = proper_list(object)?;
+            pam::db_prog_match(self, state, Term::NIL, &array, context)?
+        } else {
+            pam::db_prog_match(self, state, object, &[], context)?
+        };
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        if self.trace && outcome.returned {
+            // erts_call_trace reads the program's return value; the VM's context takes it as
+            // the `{message, Term}` payload.
+            let _ = context.trace_operation("message", &[outcome.value]);
+        }
+        Ok(Some(copy_term(outcome.value, dst)?))
     }
 
     /// Infer a key interval only when one clause has direct key comparisons.
@@ -1027,6 +1065,18 @@ impl MatchProgram {
             || bounds.least.is_some()
             || bounds.most.is_some())
         .then_some(bounds)
+    }
+
+    /// Return the key pattern when the sole clause binds it completely.
+    // Port of erts/emulator/beam/erl_db_hash.c:3177 (analyze_pattern) and
+    // erl_db_util.c:3962 (db_is_fully_bound), OTP-29.1.1.
+    pub fn exact_key_pattern(&self, keypos: usize) -> Option<Term> {
+        let [clause] = self.clauses.as_slice() else {
+            return None;
+        };
+        let items = tuple_view(clause.head)?;
+        let key = items.get(keypos.checked_sub(1)?)?;
+        is_fully_bound(key).then_some(key)
     }
 
     /// Least and most key pattern over all clause heads when the keys are bound or
@@ -1262,82 +1312,35 @@ fn uncons(term: &OwnedTerm) -> Option<(&OwnedTerm, OwnedTerm)> {
     Some((head, rest))
 }
 
-// Port of erts/emulator/beam/erl_db_util.c:2172, OTP-29.1.1 (db_prog_match).
-fn match_head(
-    pattern: Term,
-    object: Term,
-    bindings: &mut Vec<Option<Term>>,
-    scratch: &mut VecHeap,
-) -> Result<bool, EtsError> {
-    if atom_name(pattern).as_deref() == Some("_") {
-        return Ok(true);
-    }
-    if let Some(index) = variable(pattern) {
-        if bindings.len() <= index {
-            bindings.resize(index + 1, None);
-        }
-        return Ok(match bindings[index] {
-            Some(bound) => exact_eq(bound, object),
-            None => {
-                bindings[index] = Some(object);
-                true
-            }
-        });
-    }
-    match pattern.classify() {
-        TermKind::Tuple if object.classify() == TermKind::Tuple => {
-            let patterns = tuple(pattern)?;
-            let objects = tuple(object)?;
-            if patterns.len() != objects.len() {
-                return Ok(false);
-            }
-            for (a, b) in patterns.into_iter().zip(objects) {
-                if !match_head(a, b, bindings, scratch)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        TermKind::List if object.classify() == TermKind::List => {
-            // SAFETY: both cons cells remain owned by live heaps.
-            let (ph, pt) = unsafe { pattern.cons_ref().unwrap() };
-            // SAFETY: both cons cells remain owned by live heaps.
-            let (oh, ot) = unsafe { object.cons_ref().unwrap() };
-            Ok(match_head(ph, oh, bindings, scratch)? && match_head(pt, ot, bindings, scratch)?)
-        }
-        TermKind::Map if object.classify() == TermKind::Map => {
-            let owned = to_owned(pattern)?;
-            let OwnedTerm::Map(pairs) = &owned else {
-                return Err(EtsError::BadArg);
-            };
-            for (key, value) in pairs {
-                let key = from_owned(key, scratch)?;
-                let pattern_value = from_owned(value, scratch)?;
-                let Some(object_value) = map_get(key, object, scratch)? else {
-                    return Ok(false);
-                };
-                if !match_head(pattern_value, object_value, bindings, scratch)? {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        _ => Ok(exact_eq(pattern, object)),
-    }
+fn bool_atoms() -> (Atom, Atom) {
+    static ATOMS: std::sync::OnceLock<(Atom, Atom)> = std::sync::OnceLock::new();
+    *ATOMS.get_or_init(|| {
+        let atoms = global_atoms();
+        (
+            atoms.intern("true").unwrap(),
+            atoms.intern("false").unwrap(),
+        )
+    })
+}
+
+fn bool_term(value: bool) -> Term {
+    truth(value)
 }
 
 fn truth(value: bool) -> Term {
-    let atom = global_atoms()
-        .intern(if value { "true" } else { "false" })
-        .unwrap();
-    Term::atom(atom)
+    let (true_atom, false_atom) = bool_atoms();
+    Term::atom(if value { true_atom } else { false_atom })
 }
 
 fn boolean(value: Term) -> Option<bool> {
-    match atom_name(value).as_deref() {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
+    let atom = value.as_atom()?;
+    let (true_atom, false_atom) = bool_atoms();
+    if atom == true_atom {
+        Some(true)
+    } else if atom == false_atom {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -1403,124 +1406,11 @@ fn map_get(key: Term, map: Term, _scratch: &mut VecHeap) -> Result<Option<Term>,
 }
 
 // Port of erts/emulator/beam/erl_db_util.c:5592, OTP-29.1.1 (dmc_expr).
-fn eval<C: MatchContext>(
-    term: Term,
-    object: Term,
-    bindings: &[Option<Term>],
-    scratch: &mut VecHeap,
-    context: &C,
-) -> Result<Term, EtsError> {
-    if let Some(index) = variable(term) {
-        return bindings.get(index).and_then(|v| *v).ok_or(EtsError::BadArg);
-    }
-    match atom_name(term).as_deref() {
-        Some("$_") => return Ok(object),
-        // Port of erts/emulator/beam/erl_db_util.c:2638, OTP-29.1.1 (matchPushExpr).
-        Some("$$") => {
-            let values = bindings.iter().filter_map(|v| *v).collect::<Vec<_>>();
-            return Ok(TermBuilder::new(scratch).list_from_iter(values)?);
-        }
-        _ => {}
-    }
-    if term.classify() != TermKind::Tuple {
-        // Port of erts/emulator/beam/erl_db_util.c:4411, OTP-29.1.1 (dmc_map).
-        if term.classify() == TermKind::Map {
-            let owned = to_owned(term)?;
-            let OwnedTerm::Map(pairs) = &owned else {
-                return Err(EtsError::BadArg);
-            };
-            let mut evaluated = Vec::with_capacity(pairs.len());
-            for (key, value) in pairs {
-                let key = from_owned(key, scratch)?;
-                let key = eval(key, object, bindings, scratch, context)?;
-                let value = from_owned(value, scratch)?;
-                let value = eval(value, object, bindings, scratch, context)?;
-                evaluated.push((key, value));
-            }
-            return Ok(TermBuilder::new(scratch).flatmap_from_pairs(&evaluated)?);
-        }
-        // Port of erts/emulator/beam/erl_db_util.c:2461, OTP-29.1.1 (matchConsA).
-        if term.classify() == TermKind::List {
-            // SAFETY: the source or scratch heap retains the cons cell.
-            let (head, tail) = unsafe { term.cons_ref() }.ok_or(EtsError::BadArg)?;
-            let head = eval(head, object, bindings, scratch, context)?;
-            let tail = eval(tail, object, bindings, scratch, context)?;
-            return Ok(TermBuilder::new(scratch).cons(head, tail)?);
-        }
-        return Ok(term);
-    }
-    let elements = tuple(term)?;
-    if elements.len() == 1 && elements[0].classify() == TermKind::Tuple {
-        // Port of erts/emulator/beam/erl_db_util.c:2473, OTP-29.1.1 (matchMkTuple).
-        return eval_construct(elements[0], object, bindings, scratch, context);
-    }
-    let name = atom_name(elements[0]).ok_or(EtsError::BadArg)?;
-    if name == "const" {
-        // Port of erts/emulator/beam/erl_db_util.c:2452, OTP-29.1.1 (matchPushC).
-        return Ok(elements[1]);
-    }
-    if name == "self" {
-        return context
-            .self_pid()
-            .ok_or(EtsError::Unsupported("self context"));
-    }
-    if name == "node" && elements.len() == 1 {
-        return context
-            .node_name()
-            .ok_or(EtsError::Unsupported("node context"));
-    }
-    if name == "get_tcw" {
-        return context
-            .trace_control_word()
-            .ok_or(EtsError::Unsupported("trace control word"));
-    }
-    // Port of erts/emulator/beam/erl_db_util.c:2679, OTP-29.1.1 (matchOr short-circuit logic).
-    if name == "andalso" || name == "andthen" || name == "orelse" {
-        // Port of erts/emulator/beam/erl_db_util.c:4760 (dmc_andalso), OTP-29.1.1.
-        let conjunction = name != "orelse";
-        for (index, &argument) in elements[1..].iter().enumerate() {
-            let value = eval(argument, object, bindings, scratch, context)?;
-            if index == elements.len() - 2 {
-                return Ok(value);
-            }
-            let boolean = boolean(value).ok_or(EtsError::BadArg)?;
-            if boolean != conjunction {
-                return Ok(truth(boolean));
-            }
-        }
-        return Err(EtsError::BadArg);
-    }
-    // Port of erts/emulator/beam/erl_db_util.c:2569, OTP-29.1.1 (matchCall0..3).
-    let args = elements[1..]
-        .iter()
-        .map(|&arg| eval(arg, object, bindings, scratch, context))
-        .collect::<Result<Vec<_>, _>>()?;
-    if matches!(
-        name.as_str(),
-        "message"
-            | "return_trace"
-            | "exception_trace"
-            | "process_dump"
-            | "enable_trace"
-            | "disable_trace"
-            | "trace"
-            | "display"
-            | "caller"
-            | "caller_line"
-            | "current_stacktrace"
-            | "set_seq_token"
-            | "get_seq_token"
-            | "silent"
-            | "is_seq_trace"
-            | "set_tcw"
-    ) {
-        return context.trace_operation(&name, &args);
-    }
-    if name == "node" {
-        return context.node_of(args[0]).ok_or(EtsError::BadArg);
-    }
+/// Evaluate an already-argument-evaluated guard BIF.
+// Port of erts/emulator/beam/erl_db_util.c:572 (guard_tab), OTP-29.1.1.
+fn builtin(name: &str, args: &[Term], scratch: &mut VecHeap) -> Result<Term, EtsError> {
     let a = args[0];
-    let result = match name.as_str() {
+    let result = match name {
         // Port of erts/emulator/beam/erl_db_util.c:2390, OTP-29.1.1 (matchCmp).
         "==" => truth(cmp(a, args[1]) == Ordering::Equal),
         "/=" => truth(cmp(a, args[1]) != Ordering::Equal),
@@ -1548,7 +1438,7 @@ fn eval<C: MatchContext>(
                 }
             } else if let (Some(lhs), Some(rhs)) = (integer(a), integer(args[1])) {
                 boxed_int(
-                    match name.as_str() {
+                    match name {
                         "+" => lhs + rhs,
                         "-" => lhs - rhs,
                         _ => lhs * rhs,
@@ -1559,7 +1449,7 @@ fn eval<C: MatchContext>(
                 let lhs = float(a).ok_or(EtsError::BadArg)?;
                 let rhs = float(args[1]).ok_or(EtsError::BadArg)?;
                 boxed_float(
-                    match name.as_str() {
+                    match name {
                         "+" => lhs + rhs,
                         "-" => lhs - rhs,
                         _ => lhs * rhs,
@@ -1576,7 +1466,7 @@ fn eval<C: MatchContext>(
         // Port of erts/emulator/beam/erl_db_util.c:4701, OTP-29.1.1 (dmc_and).
         "and" | "or" => {
             let mut result = name == "and";
-            for &argument in &args {
+            for &argument in args {
                 let value = boolean(argument).ok_or(EtsError::BadArg)?;
                 if name == "and" {
                     result &= value;
@@ -1712,7 +1602,7 @@ fn eval<C: MatchContext>(
             let lhs = integer(a).ok_or(EtsError::BadArg)?;
             let rhs = integer(args[1]).ok_or(EtsError::BadArg)?;
             boxed_int(
-                match name.as_str() {
+                match name {
                     "band" => lhs & rhs,
                     "bor" => lhs | rhs,
                     _ => lhs ^ rhs,
@@ -1752,7 +1642,7 @@ fn eval<C: MatchContext>(
                 boxed_int(value, scratch)?
             } else {
                 let value = float(a).ok_or(EtsError::BadArg)?;
-                let rounded = match name.as_str() {
+                let rounded = match name {
                     "round" => value.round(),
                     "trunc" => value.trunc(),
                     "ceil" => value.ceil(),
@@ -1799,21 +1689,12 @@ fn eval<C: MatchContext>(
     Ok(result)
 }
 
-fn eval_construct<C: MatchContext>(
-    term: Term,
-    object: Term,
-    bindings: &[Option<Term>],
-    scratch: &mut VecHeap,
-    context: &C,
-) -> Result<Term, EtsError> {
-    if term.classify() != TermKind::Tuple {
-        return eval(term, object, bindings, scratch, context);
-    }
-    let mut values = Vec::new();
-    // Port of erts/emulator/beam/erl_db_util.c:4308-4334 and :5592-5649,
-    // OTP-29.1.1: dmc_tuple compiles each child as a dmc_expr.
-    for part in tuple(term)? {
-        values.push(eval(part, object, bindings, scratch, context)?);
-    }
-    Ok(TermBuilder::new(scratch).tuple(&values)?)
+/// Whether `term` is a boxed float.
+fn is_float_term(term: Term) -> bool {
+    term.classify() == TermKind::Number && term.header().is_some_and(|h| h & 63 == 24)
+}
+
+/// The IEEE bits of a float term, as `matchEqFloat` compares them.
+fn float_bits(term: Term) -> Result<u64, EtsError> {
+    float(term).map(f64::to_bits).ok_or(EtsError::BadArg)
 }
