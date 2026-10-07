@@ -10,34 +10,24 @@ use arinsal_sched::Pid;
 use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
 use arinsal_spec::Opcode;
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-/// State of the code modification permission; one per node.
+/// The code modification permission of a node.
+/// Port of erts/emulator/beam/code_ix.c:52-79 (`struct code_permission`,
+/// `code_mod_permission`), OTP-29.1.1.
 #[derive(Default)]
 pub(crate) struct CodeModPermission {
+    seized: bool,
     owner: Option<Pid>,
-    handover: bool,
-    waiters: VecDeque<Pid>,
-    wake: VecDeque<Pid>,
-}
-
-/// Acquire or release the node-wide code modification permission.
-/// Port of erts/emulator/beam/code_ix.c:378 (`erts_try_seize_code_mod_permission`), OTP-29.1.1.
-/// The lock is held only for the bookkeeping, so it is taken blocking like `perm->lock`.
-pub(crate) fn try_code_mod_permission(runtime: &Runtime, pid: Pid, acquire: bool) -> bool {
-    let mut current = lock(runtime);
-    if acquire {
-        if current.owner.is_some_and(|owner| owner != pid) {
-            return false;
-        }
-        current.owner = Some(pid);
-        current.handover = false;
-    } else if current.owner == Some(pid) {
-        current.hand_over();
-    }
-    true
+    /// Suspended processes waiting for the permission, first in line first.
+    queue: VecDeque<Pid>,
+    /// `ERTS_PXSFLG_HANDOVER_CODE_MOD_PERM`: the waiter given the permission by a release
+    /// while it was suspended; its retried BIF call finds it already seized.
+    handover: Option<Pid>,
+    /// `ERTS_PXSFLG_GC`: processes that are garbage collecting, which a release passes over.
+    collecting: HashSet<Pid>,
 }
 
 fn lock(runtime: &Runtime) -> std::sync::MutexGuard<'_, CodeModPermission> {
@@ -47,83 +37,125 @@ fn lock(runtime: &Runtime) -> std::sync::MutexGuard<'_, CodeModPermission> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Seizes the code modification permission for `pid`. When another process holds it, `pid`
+/// is suspended and queued, and the caller must yield and retry its BIF call once resumed.
+// Port of erts/emulator/beam/code_ix.c:214-290 (try_seize_code_permission) and 378-386
+// (erts_try_seize_code_mod_permission), OTP-29.1.1.
+pub(crate) fn try_seize_code_mod_permission(runtime: &Runtime, pid: Pid) -> bool {
+    let mut perm = lock(runtime);
+    if perm.handover == Some(pid) {
+        // Given to us as a waiter.
+        debug_assert!(perm.seized && perm.owner == Some(pid));
+        perm.handover = None;
+        return true;
+    }
+    if !perm.seized {
+        perm.seized = true;
+        perm.owner = Some(pid);
+        return true;
+    }
+    debug_assert_ne!(perm.owner, Some(pid));
+    perm.queue.push_back(pid);
+    runtime.suspend_internal(pid);
+    false
+}
+
+/// Releases the code modification permission and hands it to the first eligible waiter.
+// Port of erts/emulator/beam/code_ix.c:292-357 (release_code_permission) and 388-391
+// (erts_release_code_mod_permission), OTP-29.1.1.
+pub(crate) fn release_code_mod_permission(runtime: &Runtime) {
+    let resume = lock(runtime).release();
+    resume_waiters(runtime, resume);
+}
+
 impl CodeModPermission {
-    /// Port of erts/emulator/beam/code_ix.c:279 (`release_code_permission`), OTP-29.1.1:
-    /// the permission goes to the first queued waiter, which is resumed to retry.
-    fn hand_over(&mut self) {
-        self.owner = self.waiters.pop_front();
-        self.handover = self.owner.is_some();
-        if let Some(waiter) = self.owner {
-            self.wake.push_back(waiter);
+    /// Returns the waiters to resume: the new owner and the ones passed over while they
+    /// garbage collect, which retry after the collection.
+    fn release(&mut self) -> Vec<Pid> {
+        self.seized = false;
+        self.owner = None;
+        let mut resume = Vec::new();
+        while !self.seized
+            && let Some(waiter) = self.queue.pop_front()
+        {
+            // Avoid processes doing a potentially long GC: resume them and let them retry
+            // after the GC. This only happens when the suspended waiter got a GC signal.
+            if !self.collecting.contains(&waiter) {
+                self.seized = true;
+                self.owner = Some(waiter);
+                self.handover = Some(waiter);
+            }
+            resume.push(waiter);
+        }
+        resume
+    }
+}
+
+fn resume_waiters(runtime: &Runtime, pids: Vec<Pid>) {
+    if pids.is_empty() {
+        return;
+    }
+    let Ok(scheduler) = runtime.scheduler() else {
+        return;
+    };
+    for pid in pids {
+        if runtime.resume_internal(pid) {
+            // erts_resume schedules the waiter; the signal only reschedules it.
+            let _ = scheduler.signal(pid, pid, Signal::UnlinkAck(u64::MAX));
         }
     }
 }
 
-/// Queue a blocked code loader and suspend it until permission is handed over.
-pub(crate) fn wait_for_code_mod_permission(process: &Process, pid: Pid) {
+/// Gives up a permission handed to `pid` that it has not taken yet, so it goes to the next
+/// waiter.
+// Port of erts/emulator/beam/code_ix.c:430-445 (erts_reject_code_permissions), OTP-29.1.1.
+fn reject_code_permissions(perm: &mut CodeModPermission, pid: Pid) -> Vec<Pid> {
+    if perm.handover == Some(pid) {
+        perm.handover = None;
+        perm.release()
+    } else {
+        Vec::new()
+    }
+}
+
+/// An exiting process leaves the wait queue and gives up a permission it was handed but has
+/// not taken yet. A permission it holds stays seized, like in erts.
+// Port of erts/emulator/beam/erl_process.c:14215-14218 (erts_continue_exit_process) and
+// code_ix.c:319 (release_code_permission skips an exiting waiter), OTP-29.1.1.
+pub(crate) fn code_mod_permission_process_exit(process: &Process, pid: Pid) {
+    let Some(runtime) = &process.runtime else {
+        return;
+    };
+    let resume = {
+        let mut perm = lock(runtime);
+        perm.queue.retain(|waiter| *waiter != pid);
+        perm.collecting.remove(&pid);
+        reject_code_permissions(&mut perm, pid)
+    };
+    resume_waiters(runtime, resume);
+}
+
+/// Marks `pid` as garbage collecting (`ERTS_PXSFLG_GC`) until [`code_mod_permission_after_gc`];
+/// a permission handed to it but not taken yet goes to the next waiter.
+// Port of erts/emulator/beam/erl_gc.c:725-742 (erts_garbage_collect_nobump: set
+// ERTS_PXSFLG_GC, erts_reject_code_permissions), OTP-29.1.1.
+pub(crate) fn code_mod_permission_before_gc(process: &Process, pid: Pid) {
+    let Some(runtime) = &process.runtime else {
+        return;
+    };
+    let resume = {
+        let mut perm = lock(runtime);
+        perm.collecting.insert(pid);
+        reject_code_permissions(&mut perm, pid)
+    };
+    resume_waiters(runtime, resume);
+}
+
+/// Clears the `ERTS_PXSFLG_GC` mark of [`code_mod_permission_before_gc`].
+pub(crate) fn code_mod_permission_after_gc(process: &Process, pid: Pid) {
     if let Some(runtime) = &process.runtime {
-        let mut state = lock(runtime);
-        if !state.waiters.contains(&pid) {
-            state.waiters.push_back(pid);
-            runtime.suspend_internal(pid);
-        }
+        lock(runtime).collecting.remove(&pid);
     }
-}
-
-/// Resume the process that received code modification permission.
-pub(crate) fn wake_code_mod_permission_waiter(
-    process: &Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
-) {
-    let Some(runtime) = &process.runtime else {
-        return;
-    };
-    let waiter = lock(runtime).wake.pop_front();
-    if let Some(waiter) = waiter
-        && runtime.resume_internal(waiter)
-    {
-        // A zero id does not wake a parked process; erts_resume schedules the waiter.
-        let _ = ctx.signal(waiter, Signal::UnlinkAck(u64::MAX));
-    }
-}
-
-/// Remove a process that exited while waiting or immediately after handover.
-/// Port of erts/emulator/beam/code_ix.c:430 (`erts_reject_code_permissions`), OTP-29.1.1.
-pub(crate) fn code_mod_permission_process_exit(
-    process: &Process,
-    pid: Pid,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
-) {
-    let Some(runtime) = &process.runtime else {
-        return;
-    };
-    {
-        let mut state = lock(runtime);
-        state.waiters.retain(|waiter| *waiter != pid);
-        if state.owner == Some(pid) {
-            state.hand_over();
-        }
-    }
-    wake_code_mod_permission_waiter(process, ctx);
-}
-
-/// A GC system task may arrive after permission was handed to a suspended waiter: the
-/// waiter gives the permission on and retries after the collection.
-/// Port of erts/emulator/beam/code_ix.c:430 (`erts_reject_code_permissions`), OTP-29.1.1.
-pub(crate) fn code_mod_permission_before_gc(
-    process: &Process,
-    ctx: &mut RunCtx<'_, crate::process::Message>,
-) {
-    let Some(runtime) = &process.runtime else {
-        return;
-    };
-    {
-        let mut state = lock(runtime);
-        if state.owner == Some(ctx.pid()) && state.handover {
-            state.hand_over();
-        }
-    }
-    wake_code_mod_permission_waiter(process, ctx);
 }
 
 /// Port of erts/emulator/beam/beam_bif_load.c:50-66 (`purge_state`), OTP-29.1.1.
@@ -465,15 +497,59 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
-fn finish(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
-    // The loader resumed after its code barrier: commit and return (ERTS_BIF_YIELD_RETURN).
+/// Seizes the code loading permission for the calling process; when another process holds
+/// it, the caller is suspended and queued and the returned yield retries the BIF call once
+/// the permission is handed over (ERTS_BIF_YIELD to the BIF's own trap export).
+// Port of erts/emulator/beam/code_ix.c:407-421 (erts_try_seize_code_load_permission),
+// OTP-29.1.1. Arinsal has only the code modification permission: no operation needs the
+// staging permission alone while another process holds the modification permission.
+fn seize_code_load_permission(process: &Process, pid: Option<Pid>) -> Result<(), VmError> {
+    match (&process.runtime, pid) {
+        (Some(runtime), Some(pid)) if !try_seize_code_mod_permission(runtime, pid) => {
+            Err(VmError::Yield)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Port of erts/emulator/beam/code_ix.c:423-427 (erts_release_code_load_permission),
+/// OTP-29.1.1.
+fn release_code_load_permission(process: &Process, pid: Option<Pid>) {
+    if let (Some(runtime), Some(_)) = (&process.runtime, pid) {
+        release_code_mod_permission(runtime);
+    }
+}
+
+// Port of erts/emulator/beam/beam_bif_load.c:340-372 (finish_loading_1), OTP-29.1.1.
+fn finish(
+    vm: &mut Vm,
+    process: &mut Process,
+    pid: Option<Pid>,
+    args: &[Term],
+) -> Result<Term, VmError> {
+    // The loader resumed after its code barrier: commit_code_ix commits, releases the
+    // permission, and the loader returns (ERTS_BIF_YIELD_RETURN).
     if let Some(staged) = process
         .cold
         .as_mut()
         .and_then(|cold| cold.finish_loading_commit.take())
     {
-        return finish_commit(vm, process, staged);
+        let result = finish_commit(vm, process, staged);
+        release_code_load_permission(process, pid);
+        return result;
     }
+    seize_code_load_permission(process, pid)?;
+    let result = finish_stage(vm, process, args);
+    // A staged load keeps the permission until its commit.
+    if !matches!(result, Err(VmError::Yield)) {
+        release_code_load_permission(process, pid);
+    }
+    result
+}
+
+/// The staging half of `finish_loading/1`; yields when the load is staged and waits for its
+/// commit.
+fn finish_stage(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let Some(codes) = args.first().and_then(|term| list(*term)) else {
         return Err(badarg());
     };
@@ -913,6 +989,13 @@ fn purge(
         "prepare" | "prepare_on_load" | "abort" | "complete" => {}
         _ => return Err(badarg()),
     }
+    // Port of erts/emulator/beam/beam_bif_load.c:2115-2118 and 2235-2238, OTP-29.1.1: the
+    // phases that change code wait for the code permission. Arinsal has no separate staging
+    // permission, so prepare holds the modification permission only for its own call.
+    let seizes = phase != "abort";
+    if seizes {
+        seize_code_load_permission(process, Some(ctx.pid()))?;
+    }
     let mut resume = Vec::new();
     // Purging changes the old code of the active code index in place (erts_rwlock_old_code).
     let result = match phase {
@@ -966,6 +1049,9 @@ fn purge(
             removed
         }
     };
+    if seizes {
+        release_code_load_permission(process, Some(ctx.pid()));
+    }
     resume_pending_lambda_callers(process, ctx, resume);
     Ok(Term::atom(if result { atoms::TRUE } else { atoms::FALSE }))
 }
@@ -1185,7 +1271,7 @@ fn call_values(
         ("erts_internal", "beamfile_module_md5", 1) => Some(beamfile_module_md5(process, args[0])),
         ("erts_internal", "prepare_loading", 2) => Some(prepare(vm, process, args)),
         ("erlang", "has_prepared_code_on_load", 1) => Some(has_prepared_code_on_load(args[0])),
-        ("erlang", "finish_loading", 1) => Some(finish(vm, process, args)),
+        ("erlang", "finish_loading", 1) => Some(finish(vm, process, Some(ctx.pid()), args)),
         ("erlang", "module_loaded", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
             Ok(Term::atom(if vm.code.loaded.contains_key(&name) {
@@ -1259,7 +1345,10 @@ fn call_values(
         })()),
         ("erlang", "delete_module", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
+            // Port of erts/emulator/beam/beam_bif_load.c:691-694, OTP-29.1.1.
+            seize_code_load_permission(process, Some(ctx.pid()))?;
             let result = delete(vm, &name);
+            release_code_load_permission(process, Some(ctx.pid()));
             if matches!(result, Ok(term) if term == atom("true")) {
                 crate::trace_bp::module_code_changed(vm.code_scope, &name);
             }
@@ -1369,7 +1458,11 @@ fn call_values(
             if keep != atoms::TRUE && keep != atoms::FALSE {
                 return Err(badarg());
             }
-            finish_on_load(vm, &name, keep == atoms::TRUE)
+            // Port of erts/emulator/beam/beam_bif_load.c:828-831, OTP-29.1.1.
+            seize_code_load_permission(process, Some(ctx.pid()))?;
+            let result = finish_on_load(vm, &name, keep == atoms::TRUE);
+            release_code_load_permission(process, Some(ctx.pid()));
+            result
         })()),
         _ => {
             debug_assert!(
@@ -1416,8 +1509,8 @@ mod tests {
     /// Runs `finish_loading/1` as the scheduler does: the loader yields at its code barrier
     /// and its rescheduled call commits.
     pub(super) fn finish_now(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Term {
-        match finish(vm, process, args) {
-            Err(VmError::Yield) => finish(vm, process, args).unwrap(),
+        match finish(vm, process, None, args) {
+            Err(VmError::Yield) => finish(vm, process, None, args).unwrap(),
             other => other.unwrap(),
         }
     }

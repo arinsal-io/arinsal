@@ -368,10 +368,16 @@ impl Store {
         let mut live = Vec::new();
         while let Some(account) = self.processes.pop() {
             if let Some(account) = account.upgrade() {
+                live.push(Arc::downgrade(&account));
+                // Port of erts/emulator/beam/erl_process.c (delete_process), OTP-29.1.1: an
+                // exited process has freed its heap and off-heap list even while its
+                // registration lingers.
+                if account.exited.load(Ordering::Acquire) {
+                    continue;
+                }
                 capacity += account.capacity.load(Ordering::Relaxed);
                 used += account.used.load(Ordering::Relaxed);
                 binary += account.binary.load(Ordering::Relaxed);
-                live.push(Arc::downgrade(&account));
             }
         }
         for account in live {

@@ -1403,8 +1403,10 @@ pub(crate) fn fulfill_request(
         crate::signals::RemoteOp::Collect { request_id, major } => {
             // The id lives in the signal envelope, not in a GC root. Collect
             // first, then install it on the heap the reply is built in.
-            crate::natives::code::code_mod_permission_before_gc(process, ctx);
-            collect_heap(process, major, &mut [])?;
+            crate::natives::code::code_mod_permission_before_gc(process, ctx.pid());
+            let collected = collect_heap(process, major, &mut []);
+            crate::natives::code::code_mod_permission_after_gc(process, ctx.pid());
+            collected?;
             let request_id = request_id.decode_into(process)?;
             gc_message(process, request_id, true)
         }

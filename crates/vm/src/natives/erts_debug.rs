@@ -2655,15 +2655,15 @@ fn internal_state_set(
                 Some("false") => false,
                 _ => return Err(badarg()),
             };
-            if !process.runtime.as_ref().is_some_and(|runtime| {
-                crate::natives::code::try_code_mod_permission(runtime, ctx.pid(), acquire)
-            }) {
+            // Port of erts/emulator/beam/erl_bif_info.c:5385-5400, OTP-29.1.1: a failed seize
+            // yields through the BIF continuation (bif_traps.rs), so only a release gets here.
+            if acquire {
                 return Err(VmError::Unsupported(
                     "code_mod_permission must resume through its BIF continuation".into(),
                 ));
             }
-            if !acquire {
-                crate::natives::code::wake_code_mod_permission_waiter(process, ctx);
+            if let Some(runtime) = &process.runtime {
+                crate::natives::code::release_code_mod_permission(runtime);
             }
             return Ok(atom("true"));
         }

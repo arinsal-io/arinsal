@@ -2941,7 +2941,37 @@ pub(crate) fn handle_request(
             .push(crate::proc_create::DelayedGc::Request(pending));
         return Ok(());
     }
+    // Port of erts/emulator/beam/erl_gc.c:688-715 (check_for_possibly_long_gc) as called for
+    // the ERTS_PSTT_GC system task (erl_process.c:11018-11040), OTP-29.1.1: a potentially
+    // long collection runs on a dirty CPU scheduler, so it cannot hold up the processes
+    // queued on this one.
+    if let RemoteOp::Collect { major, .. } = &pending.op
+        && !ctx.scheduler_type().is_dirty()
+        && process
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.sys_task_point)
+        && potentially_long_gc(process, *major)
+    {
+        let cold = process.cold_mut();
+        cold.delayed_gc
+            .push(crate::proc_create::DelayedGc::Request(pending));
+        cold.dirty_sys_gc = true;
+        return Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
+    }
     reply_request(process, ctx, pending)
+}
+
+/// Port of erts/emulator/beam/erl_gc.c:688-715 (check_for_possibly_long_gc), OTP-29.1.1.
+fn potentially_long_gc(process: &Process, major: bool) -> bool {
+    // erl_gc.h:26 (ERTS_POTENTIALLY_LONG_GC_HSIZE).
+    const POTENTIALLY_LONG_GC_HSIZE: usize = 128 * 1024;
+    let words = process.heap.gc_info_words();
+    let mut size = words.heap_size + words.mbuf_size + words.stack_size;
+    if major {
+        size += words.old_heap_size;
+    }
+    size >= POTENTIALLY_LONG_GC_HSIZE
 }
 
 /// Run a queued request and send its reply.
