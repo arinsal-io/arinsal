@@ -717,7 +717,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     scheduler_registers: *mut arinsal_beamasm::SchedulerRegisters,
     need_words: usize,
     live: usize,
-    _fcalls: i32,
+    fcalls: i32,
 ) -> i32 {
     if scheduler_registers.is_null() {
         return 0;
@@ -759,6 +759,12 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
         *destination = crate::native_hooks::raw(*term);
     }
     process.sync_native_header();
+    // Port of erts/emulator/beam/erl_gc.c:588-597 and 975-980 (a delayed collection
+    // returns the reductions left), OTP-29.1.1: FCALLS runs out and the process yields at
+    // its next reduction check.
+    if process.force_yield {
+        return fcalls.max(0);
+    }
     0
 }
 

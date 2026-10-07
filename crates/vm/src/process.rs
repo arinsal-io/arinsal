@@ -1227,10 +1227,13 @@ impl Executor {
                 // Port of erts/emulator/beam/erl_process.c:10363-10372 and 11018-11040
                 // (a dirty scheduler executes the dirty GC system task, then the process
                 // returns to a normal scheduler), OTP-29.1.1.
-                if ctx.scheduler_type().is_dirty()
-                    && process.cold.as_ref().is_some_and(|cold| cold.dirty_sys_gc)
-                {
+                if process.cold.as_ref().is_some_and(|cold| cold.dirty_sys_gc) {
+                    if !ctx.scheduler_type().is_dirty() {
+                        // ERTS_PSFLG_DIRTY_ACTIVE_SYS: the dirty work runs before Erlang code.
+                        break 'execution Err(VmError::Dirty(arinsal_sched::DirtyKind::Cpu));
+                    }
                     process.cold_mut().dirty_sys_gc = false;
+                    process.run_dirty_gc()?;
                     process.drain(ctx)?;
                     break 'execution Ok(RunState::Yield);
                 }
@@ -5187,6 +5190,9 @@ impl Process {
         min_free: usize,
         hibernate: bool,
     ) -> Result<arinsal_term::GcStats, VmError> {
+        if !hibernate && self.delay_for_dirty_gc(min_free) {
+            return Ok(arinsal_term::GcStats::default());
+        }
         // Port of erts/emulator/beam/erl_gc.c:3730 (`has_reached_max_heap_size`) call in
         // `garbage_collect`, OTP-29.1.1: the limit is judged on the pre-collection size.
         if self
@@ -5306,6 +5312,63 @@ impl Process {
         }
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
         Ok(stats)
+    }
+
+    /// Hand a potentially long collection to a dirty CPU scheduler: satisfy `need` without
+    /// collecting and make the process leave its scheduler at the next reduction check.
+    /// Returns whether the collection was delayed.
+    // Port of erts/emulator/beam/erl_gc.c:780-792 (garbage_collect), 688-715
+    // (check_for_possibly_long_gc) and 500-603 (delay_garbage_collection), OTP-29.1.1.
+    fn delay_for_dirty_gc(&mut self, need: usize) -> bool {
+        // Only a scheduled process can move to a dirty scheduler; a dirty scheduler collects.
+        if self.runtime.is_none() || arinsal_sched::current_scheduler_type().is_dirty() {
+            return false;
+        }
+        // erl_gc.h:26 (ERTS_POTENTIALLY_LONG_GC_HSIZE).
+        const POTENTIALLY_LONG_GC_HSIZE: usize = 128 * 1024;
+        // A minor collection that cannot tenure continues as a major one
+        // (erl_gc.c:840-848), so the size check uses the collection that will run.
+        let major = self.heap.collection_is_major() || self.heap.minor_falls_back_to_major();
+        let mut size = self
+            .heap
+            .young_gen_usage()
+            .saturating_add(self.heap.stack_words());
+        if major {
+            size = size.saturating_add(self.heap.old_used_words());
+        }
+        if size < POTENTIALLY_LONG_GC_HSIZE {
+            return false;
+        }
+        let cold = self.cold_mut();
+        cold.dirty_gc = Some(if major {
+            crate::proc_create::DirtyGc::Major
+        } else {
+            crate::proc_create::DirtyGc::Minor
+        });
+        // erts_schedule_dirty_sys_execution: the process moves to a dirty CPU scheduler
+        // when it leaves this one.
+        cold.dirty_sys_gc = true;
+        self.heap.delay_collection(need);
+        // erl_gc.c:588-597 (force_reschedule): the remaining reductions are spent.
+        self.force_yield = true;
+        true
+    }
+
+    /// Run the collection a normal scheduler delayed, on the dirty CPU scheduler.
+    // Port of erts/emulator/beam/erl_process.c:11196-11201 (erts_execute_dirty_system_task),
+    // OTP-29.1.1: the roots are the `arity` registers the process was scheduled out with.
+    fn run_dirty_gc(&mut self) -> Result<(), VmError> {
+        let Some(kind) = self.cold.as_mut().and_then(|cold| cold.dirty_gc.take()) else {
+            return Ok(());
+        };
+        if kind == crate::proc_create::DirtyGc::Major {
+            // F_NEED_FULLSWEEP.
+            self.heap.request_full_sweep();
+        }
+        let live = switched_out_live(self);
+        let stats = self.collect_heap_roots(live, &mut [], 0)?;
+        crate::natives::sys::after_collection(self, live, stats.collections, stats.words_reclaimed);
+        Ok(())
     }
 
     /// Collect after a BIF left heap fragments larger than the free area or pushed the
@@ -5962,7 +6025,27 @@ impl Process {
             .cold
             .as_mut()
             .is_some_and(|cold| std::mem::take(&mut cold.suspend_parked));
+        // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
+        // with GC disabled the dirty collection is dropped; the next collection does it.
+        if !ctx.scheduler_type().is_dirty()
+            && !self.gc_enabled
+            && let Some(cold) = self.cold.as_mut()
+            && cold.dirty_gc.take().is_some()
+            && cold.delayed_gc.is_empty()
+        {
+            cold.dirty_sys_gc = false;
+        }
         match result {
+            // Port of erts/emulator/beam/erl_process.c:6695-6840 (schedule_out_process),
+            // OTP-29.1.1: a process with ERTS_PSFLG_DIRTY_ACTIVE_SYS is enqueued on the dirty
+            // CPU run queue.
+            Ok(RunState::Yield)
+                if !ctx.scheduler_type().is_dirty()
+                    && self.cold.as_ref().is_some_and(|cold| cold.dirty_sys_gc) =>
+            {
+                runtime.note_status(ctx.pid(), "runnable");
+                RunOutcome::Dirty(arinsal_sched::DirtyKind::Cpu)
+            }
             Ok(RunState::Yield) => {
                 runtime.note_status(ctx.pid(), "runnable");
                 RunOutcome::Yield

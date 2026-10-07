@@ -29,6 +29,20 @@ unsafe impl Send for WordBlock {}
 /// A heap fragment: a BIF-allocated side buffer or an adopted message heap.
 pub(crate) enum Fragment {
     Block(WordBlock),
+    /// erts `p->abandoned_heap`: the young heap left behind by a delayed collection. Its
+    /// first `used` words hold objects, and those below `high_water` are mature. It is not
+    /// part of `mbuf_sz`.
+    Abandoned {
+        block: WordBlock,
+        used: usize,
+        high_water: usize,
+    },
+    /// A heap fragment that served as the young heap of a delayed collection and was
+    /// abandoned in turn; it joins the `mbuf` list with its `used` words.
+    Used {
+        block: WordBlock,
+        used: usize,
+    },
 }
 
 impl Fragment {
@@ -38,29 +52,44 @@ impl Fragment {
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u64 {
         self.as_block_mut().as_mut_ptr().cast()
     }
+    /// Words that hold objects.
     pub(crate) fn len(&self) -> usize {
-        self.as_block().len()
+        match self {
+            Self::Block(block) => block.len(),
+            Self::Abandoned { used, .. } | Self::Used { used, .. } => *used,
+        }
     }
 
     fn as_block(&self) -> &WordBlock {
-        let Self::Block(block) = self;
-        block
+        match self {
+            Self::Block(block) | Self::Abandoned { block, .. } | Self::Used { block, .. } => block,
+        }
     }
 
     fn as_block_mut(&mut self) -> &mut WordBlock {
-        let Self::Block(block) = self;
-        block
+        match self {
+            Self::Block(block) | Self::Abandoned { block, .. } | Self::Used { block, .. } => block,
+        }
     }
 }
 
 impl WordBlock {
-    fn new(words: usize, allocation_type: ErtsAlcType) -> Self {
+    pub(crate) fn new(words: usize, allocation_type: ErtsAlcType) -> Self {
         let mut memory =
             AllocBlock::new(allocation_type, words).expect("ERTS heap block allocation failed");
         memory.as_mut_slice().fill(0);
         Self {
             memory: Box::new(memory),
         }
+    }
+
+    /// The block's words, for a copy that holds the heap exclusively.
+    pub(crate) fn words(&self) -> &[u64] {
+        self.memory.as_slice()
+    }
+
+    pub(crate) fn words_mut(&mut self) -> &mut [u64] {
+        self.memory.as_mut_slice()
     }
 
     fn empty(allocation_type: ErtsAlcType) -> Self {
