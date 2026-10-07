@@ -4185,6 +4185,33 @@ mod tests {
     }
 
     #[test]
+    fn trace_pattern_refresh_updates_matching_function_entries_like_otp() {
+        trace_pattern_diff(
+            "trace_refresh_entries",
+            "-module(trace_refresh_entries). -export([run/0,f/0,g/0]). run() -> N=erlang:trace_pattern({trace_refresh_entries,'_','_'},true,[local]), F0=erlang:trace_info({trace_refresh_entries,f,0},traced), G0=erlang:trace_info({trace_refresh_entries,g,0},traced), 1=erlang:trace_pattern({trace_refresh_entries,f,0},false,[local]), F1=erlang:trace_info({trace_refresh_entries,f,0},traced), G1=erlang:trace_info({trace_refresh_entries,g,0},traced), {N,F0,G0,F1,G1}. f() -> ok. g() -> ok.",
+        );
+    }
+
+    #[test]
+    #[ignore = "manual benchmark for no-op trace refreshes"]
+    fn trace_refresh_noop_benchmark() {
+        let reference = RefErl::start().expect("OTP 29.1.1 is required for this benchmark");
+        let source = "-module(trace_refresh_bench). -export([run/0]). run() -> loop(1000). loop(0) -> ok; loop(N) -> erlang:trace_pattern({'_','_','_'},false,[local]), erlang:trace(all,false,[all]), loop(N-1).";
+        let beam = reference
+            .compile_named("trace_refresh_bench", source, &[])
+            .unwrap();
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let start = std::time::Instant::now();
+        vm.eval_scheduled("trace_refresh_bench", "run", &[], 1, None)
+            .unwrap();
+        eprintln!(
+            "trace refresh benchmark: 1000 rounds in {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
     fn send_event_pattern_false_matches_otp() {
         trace_pattern_diff(
             "trace_t3a_send_pattern",
@@ -4579,6 +4606,7 @@ mod tests {
                 module: "trace_test".into(),
                 function: "function".into(),
                 arity: 0,
+                entry: 0,
                 exported: true,
             }],
             None,
