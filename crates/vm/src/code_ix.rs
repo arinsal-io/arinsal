@@ -53,9 +53,8 @@ pub(crate) struct CodeIndexes {
     permission: Mutex<Permission>,
     released: Condvar,
     /// Bodies of loader-bound static NIFs and `load_nif` functions. `NativeBody` instructions
-    /// patched into code index them; the code they patch is shared by every code index, so
-    /// this table is too. It only grows.
-    native_fns: RwLock<Arc<Vec<arinsal_bifs::BifFn>>>,
+    /// patched into code index them; released slots are reused after code purge.
+    native_fns: RwLock<Arc<Vec<Option<arinsal_bifs::BifFn>>>>,
     /// `erts_coverage_mode`: applies to modules loaded after it is set.
     coverage_mode: Mutex<arinsal_loader::CoverageMode>,
     pub(crate) purge_state: Arc<crate::natives::code::PurgeState>,
@@ -272,10 +271,11 @@ impl CodeIndexes {
         for slot in &self.tables {
             slot.store(Arc::clone(&tables));
         }
+        crate::natives::nif::invalidate_tracer_callbacks(self.scope);
     }
 
     /// The NIF bodies `NativeBody` instructions index.
-    pub(crate) fn native_fns(&self) -> Arc<Vec<arinsal_bifs::BifFn>> {
+    pub(crate) fn native_fns(&self) -> Arc<Vec<Option<arinsal_bifs::BifFn>>> {
         Arc::clone(
             &self
                 .native_fns
@@ -284,15 +284,52 @@ impl CodeIndexes {
         )
     }
 
-    /// Appends a NIF body and returns its index.
+    /// Stores a NIF body in a free slot or appends one and returns its index.
+    // Port of erts/emulator/beam/erl_nif.c:5334-5360 (erts_unload_nif), OTP-29.1.1.
     pub(crate) fn push_native_fn(&self, function: arinsal_bifs::BifFn) -> Option<u32> {
         let mut table = self
             .native_fns
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        let index = u32::try_from(table.len()).ok()?;
-        Arc::make_mut(&mut table).push(function);
+        let functions = Arc::make_mut(&mut table);
+        if let Some(index) = functions.iter().position(Option::is_none) {
+            functions[index] = Some(function);
+            return u32::try_from(index).ok();
+        }
+        let index = u32::try_from(functions.len()).ok()?;
+        functions.push(Some(function));
         Some(index)
+    }
+
+    /// Releases bodies patched into a code instance that has completed purge.
+    // Port of erts/emulator/beam/erl_nif.c:5334-5360 (erts_unload_nif), OTP-29.1.1.
+    pub(crate) fn release_native_fns(&self, module: &arinsal_loader::Module) {
+        let mut table = self
+            .native_fns
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let functions = Arc::make_mut(&mut table);
+        for instruction in &module.code {
+            if let arinsal_loader::Instr::NativeBody { index } = instruction
+                && let Some(function) = functions.get_mut(*index as usize)
+            {
+                *function = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn release_native_fn(&self, index: usize) {
+        if let Some(function) = Arc::make_mut(
+            &mut *self
+                .native_fns
+                .write()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
+        .get_mut(index)
+        {
+            *function = None;
+        }
     }
 
     pub(crate) fn coverage_mode(&self) -> arinsal_loader::CoverageMode {
@@ -561,6 +598,21 @@ mod tests {
         let staging = code.start_staging();
         assert!(!staging.with(|tables| tables.loaded.contains_key("aborted_mod")));
         drop(staging);
+        crate::beamasm_integration::release_code_scope(scope);
+    }
+
+    #[test]
+    fn purged_native_body_slots_are_reused() {
+        let (scope, code) = node();
+        let native = arinsal_bifs::lookup("erlang", "length", 1).unwrap();
+        let first = code.push_native_fn(native).unwrap();
+        let second = code.push_native_fn(native).unwrap();
+        assert_eq!((first, second), (0, 1));
+        code.release_native_fn(first as usize);
+        assert_eq!(code.native_fns().len(), 2);
+        assert!(code.native_fns()[first as usize].is_none());
+        assert_eq!(code.push_native_fn(native), Some(first));
+        assert_eq!(code.native_fns().len(), 2);
         crate::beamasm_integration::release_code_scope(scope);
     }
 

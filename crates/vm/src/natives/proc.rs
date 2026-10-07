@@ -3274,24 +3274,14 @@ fn trace_session_create(
     make_tuple(process, &[reference, weak_ref])
 }
 
+// Port of erts/emulator/beam/erl_trace.c:3017-3060 (load_tracer_nif), OTP-29.1.1.
 fn module_tracer(vm: &Vm, module: Term, state: Term) -> Result<crate::trace::Tracer, VmError> {
     let module = atom_name(module).ok_or_else(badarg)?;
     if !crate::natives::nif::has_tracer_nifs(vm, &module) {
         return Err(badarg());
     }
     let state = arinsal_term::to_owned(state).map_err(|_| badarg())?;
-    let instance = vm
-        .code
-        .loaded
-        .get(&module)
-        .and_then(|&id| vm.code.modules.get(id))
-        .cloned()
-        .ok_or_else(badarg)?;
-    Ok(crate::trace::Tracer::Module {
-        module,
-        state,
-        instance,
-    })
+    Ok(crate::trace::Tracer::Module { module, state })
 }
 
 fn trace_flag_names() -> &'static [(&'static str, u64)] {
