@@ -910,7 +910,7 @@ fn invoke_dispatch_bif(
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif trace trampolines),
         // OTP-29.1.1: a traced BIF runs in the executor, which has the trace context.
         || (crate::trace_bp::any_pattern()
-            && crate::trace_bp::selects(&export.module, &export.function, export.arity))
+            && crate::trace_bp::selects(process, &export.module, &export.function, export.arity))
     {
         process.reductions = process.header.fcalls;
         if export_call {

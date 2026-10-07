@@ -910,10 +910,56 @@ struct SimState<T: Task> {
     rng: Box<dyn Rng>,
 }
 
+/// An operation that runs once every managed thread passed a thread progress point.
+type LaterOp = Box<dyn FnOnce() + Send>;
+
 #[derive(Default)]
 struct ProgressState {
     active: usize,
     blocked: bool,
+    /// The ticket the next managed thread gets when it becomes active.
+    next_ticket: u64,
+    /// Tickets of the active managed threads, each one that has not passed a progress point
+    /// since it became active.
+    running: std::collections::BTreeSet<u64>,
+    /// Operations waiting until no thread active before their ticket still is, oldest first.
+    later: VecDeque<(u64, LaterOp)>,
+}
+
+impl ProgressState {
+    fn activate(&mut self) -> u64 {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        self.running.insert(ticket);
+        self.active += 1;
+        ticket
+    }
+
+    fn deactivate(&mut self, ticket: Option<u64>) {
+        self.active -= 1;
+        if let Some(ticket) = ticket {
+            self.running.remove(&ticket);
+        }
+        self.collect_later();
+    }
+
+    /// Hands the operations whose threads all passed a progress point to this thread, which
+    /// runs them outside every scheduler lock (`run_later_ops`).
+    // Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op), OTP-29.1.1.
+    fn collect_later(&mut self) {
+        let oldest = self.running.first().copied().unwrap_or(u64::MAX);
+        let mut ready = Vec::new();
+        while self
+            .later
+            .front()
+            .is_some_and(|(ticket, _)| *ticket <= oldest)
+        {
+            ready.extend(self.later.pop_front().map(|(_, op)| op));
+        }
+        if !ready.is_empty() {
+            LATER_READY.with(|later| later.borrow_mut().extend(ready));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -928,8 +974,36 @@ struct ProgressGuard {
 }
 
 thread_local! {
-    /// Thread progress this thread currently holds active, for waits deep in the scheduler.
-    static ACTIVE_PROGRESS: RefCell<Option<Arc<ThreadProgress>>> = const { RefCell::new(None) };
+    /// Thread progress this thread currently holds active, with its ticket, for waits deep in
+    /// the scheduler.
+    static ACTIVE_PROGRESS: RefCell<Option<(Arc<ThreadProgress>, u64)>> = const { RefCell::new(None) };
+    /// Later operations whose thread progress this thread observed.
+    static LATER_READY: RefCell<Vec<LaterOp>> = const { RefCell::new(Vec::new()) };
+}
+
+fn active_ticket() -> Option<u64> {
+    ACTIVE_PROGRESS.with(|active| active.borrow().as_ref().map(|(_, ticket)| *ticket))
+}
+
+fn set_active_ticket(ticket: u64) {
+    ACTIVE_PROGRESS.with(|active| {
+        if let Some((_, current)) = active.borrow_mut().as_mut() {
+            *current = ticket;
+        }
+    });
+}
+
+/// Runs the later operations this thread collected; the caller holds no scheduler lock.
+fn run_later_ops() {
+    loop {
+        let ready = LATER_READY.with(|later| std::mem::take(&mut *later.borrow_mut()));
+        if ready.is_empty() {
+            return;
+        }
+        for op in ready {
+            op();
+        }
+    }
 }
 
 impl ThreadProgress {
@@ -938,13 +1012,23 @@ impl ThreadProgress {
         while state.blocked {
             state = progress.changed.wait(state).unwrap();
         }
-        state.active += 1;
+        let ticket = state.activate();
         drop(state);
-        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(Arc::clone(&progress)));
+        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some((Arc::clone(&progress), ticket)));
         ProgressGuard {
             progress,
             active: true,
         }
+    }
+
+    /// Schedules `op` to run once every managed thread active now passed a progress point.
+    // Port of erts/emulator/beam/erl_thr_progress.h:245 (erts_thr_progress_later) and
+    // erl_process.c:2351 (erts_schedule_thr_prgr_later_op), OTP-29.1.1.
+    fn later(&self, op: LaterOp) {
+        let mut state = self.state.lock().unwrap();
+        let ticket = state.next_ticket;
+        state.later.push_back((ticket, op));
+        state.collect_later();
     }
 }
 
@@ -956,23 +1040,23 @@ impl ThreadProgress {
 /// in turn waits for it. Without this, `block_for` on one scheduler and a cross-scheduler
 /// request from another (statistics, timer commands) deadlock with every scheduler parked.
 fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
-    let Some(progress) = ACTIVE_PROGRESS.with(|active| active.borrow_mut().take()) else {
+    let Some((progress, ticket)) = ACTIVE_PROGRESS.with(|active| active.borrow_mut().take()) else {
         return wait();
     };
     {
         let mut state = progress.state.lock().unwrap();
-        state.active -= 1;
+        state.deactivate(Some(ticket));
         progress.changed.notify_all();
     }
     let result = wait();
-    {
+    let ticket = {
         let mut state = progress.state.lock().unwrap();
         while state.blocked {
             state = progress.changed.wait(state).unwrap();
         }
-        state.active += 1;
-    }
-    ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some(progress));
+        state.activate()
+    };
+    ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some((progress, ticket)));
     result
 }
 
@@ -988,7 +1072,9 @@ pub fn thread_progress_wait<R>(wait: impl FnOnce() -> R) -> R {
 impl ProgressGuard {
     fn block_for(&mut self, duration: Duration) {
         let mut state = self.progress.state.lock().unwrap();
-        state.active -= usize::from(self.active);
+        if self.active {
+            state.deactivate(active_ticket());
+        }
         self.active = false;
         self.progress.changed.notify_all();
         while state.blocked {
@@ -1004,18 +1090,22 @@ impl ProgressGuard {
         }
         let mut state = self.progress.state.lock().unwrap();
         state.blocked = false;
-        state.active += 1;
+        let ticket = state.activate();
         self.active = true;
         self.progress.changed.notify_all();
+        drop(state);
+        set_active_ticket(ticket);
     }
 }
 
 impl Drop for ProgressGuard {
     fn drop(&mut self) {
-        ACTIVE_PROGRESS.with(|active| active.borrow_mut().take());
+        let ticket = ACTIVE_PROGRESS
+            .with(|active| active.borrow_mut().take())
+            .map(|(_, ticket)| ticket);
         if self.active {
             let mut state = self.progress.state.lock().unwrap();
-            state.active -= 1;
+            state.deactivate(ticket);
             self.progress.changed.notify_all();
         }
     }
@@ -3070,6 +3160,7 @@ trait ContextOps<M: Send + 'static> {
         remaining: u32,
     ) -> Result<bool, Error>;
     fn flush(&mut self, remaining: u32);
+    fn thread_progress_later(&self, op: LaterOp);
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe>;
     fn total_reductions(&self) -> u64;
     fn scheduler_stats(&self) -> SchedulerStats;
@@ -3486,6 +3577,14 @@ impl<M: Send + 'static> RunCtx<'_, M> {
         self.inner.flush(self.remaining);
         self.inner.start_timer_to(pid, ms, msg, wrapped)
     }
+    /// Runs `op` once every managed scheduler thread passed a thread progress point: every
+    /// slice running now, this one included, ended. Never blocks; `op` runs on a scheduler
+    /// thread outside every scheduler lock.
+    // Port of erts/emulator/beam/erl_process.c:2351 (erts_schedule_thr_prgr_later_op) as
+    // used by code_ix.c:556 (erts_schedule_code_barrier), OTP-29.1.1.
+    pub fn thread_progress_later(&mut self, op: impl FnOnce() + Send + 'static) {
+        self.inner.thread_progress_later(Box::new(op));
+    }
     /// Port of erts/emulator/beam/erl_bif_info.c:5079-5091, OTP-29.1.1.
     /// Pause other running tasks until the callback returns.
     pub fn block_thread_progress(&mut self, duration: Duration) {
@@ -3688,6 +3787,9 @@ impl<T: Task> Runner<'_, T> {
 }
 
 impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
+    fn thread_progress_later(&self, op: LaterOp) {
+        self.inner.progress.later(op);
+    }
     fn process_priority(&self, pid: Pid) -> Option<Priority> {
         let process = self.inner.table.lookup(pid)?;
         Some(Priority::from_index(
@@ -5221,6 +5323,18 @@ impl<T: Task> Drop for Scheduler<T> {
 }
 
 fn run_one<'a, T: Task>(
+    inner: &'a Inner<T>,
+    item: Scheduled<T>,
+    local: Option<&'a mut Local<T>>,
+    worker: Option<usize>,
+    dirty: Option<DirtyKind>,
+) {
+    run_slice(inner, item, local, worker, dirty);
+    // Later operations run after the slice released the process and its locks.
+    run_later_ops();
+}
+
+fn run_slice<'a, T: Task>(
     inner: &'a Inner<T>,
     item: Scheduled<T>,
     mut local: Option<&'a mut Local<T>>,

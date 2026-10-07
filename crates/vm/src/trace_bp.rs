@@ -375,24 +375,80 @@ impl Drop for BpWriteGuard<'_> {
     }
 }
 
-fn breakpoints() -> &'static BpTables {
-    static TABLE: OnceLock<BpTables> = OnceLock::new();
-    TABLE.get_or_init(|| BpTables {
-        current: RwLock::new(Arc::new(HashMap::default())),
-        writer: Mutex::new(()),
-    })
+/// The breakpoint data of one node (a runtime and its code scope): erts keeps the breakpoint
+/// tables and the active breakpoint index per node, and only the holder of that node's code
+/// modification permission changes them.
+// Port of erts/emulator/beam/beam_bp.c:73-80 (erts_active_bp_index, erts_staging_bp_index)
+// and beam_bp.h:230-238 (erts_active_bp_ix, erts_staging_bp_ix), OTP-29.1.1.
+pub(crate) struct BpNode {
+    code_scope: u64,
+    tables: BpTables,
+    /// Only changed with the table write lock held.
+    active_ix: AtomicUsize,
+    /// Whether some function of this node has a breakpoint (counted in `ACTIVE_NODES`).
+    active: AtomicBool,
 }
 
-/// Port of erts/emulator/beam/beam_bp.h:230-238 (erts_active_bp_ix, erts_staging_bp_ix),
-/// OTP-29.1.1. Only changed with the table write lock held.
-static ACTIVE_BP_IX: AtomicUsize = AtomicUsize::new(0);
+/// Nodes in this OS process that hold a function breakpoint.
+static ACTIVE_NODES: AtomicUsize = AtomicUsize::new(0);
 
-fn active_bp_ix() -> usize {
-    ACTIVE_BP_IX.load(Ordering::Acquire)
+impl BpNode {
+    pub(crate) fn new(code_scope: u64) -> Self {
+        BpNode {
+            code_scope,
+            tables: BpTables {
+                current: RwLock::new(Arc::new(HashMap::default())),
+                writer: Mutex::new(()),
+            },
+            active_ix: AtomicUsize::new(0),
+            active: AtomicBool::new(false),
+        }
+    }
+
+    fn active_bp_ix(&self) -> usize {
+        self.active_ix.load(Ordering::Acquire)
+    }
+
+    fn staging_bp_ix(&self) -> usize {
+        self.active_bp_ix() ^ 1
+    }
+
+    /// Recomputes whether this node holds a breakpoint; called with the table write lock.
+    fn update_active(&self, table: &BpTable) {
+        BP_EPOCH.fetch_add(1, Ordering::AcqRel);
+        let any = table
+            .values()
+            .flat_map(|functions| functions.values())
+            .flat_map(|arities| arities.values())
+            .any(|bps| !bps.is_empty());
+        match (self.active.swap(any, Ordering::AcqRel), any) {
+            (false, true) => {
+                ACTIVE_NODES.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                ACTIVE_NODES.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+    }
 }
 
-fn staging_bp_ix() -> usize {
-    active_bp_ix() ^ 1
+impl Drop for BpNode {
+    fn drop(&mut self) {
+        if *self.active.get_mut() {
+            ACTIVE_NODES.fetch_sub(1, Ordering::AcqRel);
+            BP_EPOCH.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The breakpoint node of `process`; a process without a runtime has a node of its own kind.
+fn bp_node(process: &Process) -> &BpNode {
+    static DETACHED: OnceLock<BpNode> = OnceLock::new();
+    match process.runtime.as_deref() {
+        Some(runtime) => &runtime.breakpoints,
+        None => DETACHED.get_or_init(|| BpNode::new(0)),
+    }
 }
 
 /// The breakpoints of one function in this VM, any session.
@@ -420,24 +476,13 @@ fn code_scope(process: &Process) -> u64 {
         .map_or(0, |runtime| runtime.code_scope)
 }
 
-fn update_active(table: &BpTable) {
-    BP_EPOCH.fetch_add(1, Ordering::AcqRel);
-    active().store(
-        table
-            .values()
-            .flat_map(|functions| functions.values())
-            .flat_map(|arities| arities.values())
-            .any(|bps| !bps.is_empty()),
-        Ordering::Relaxed,
-    );
-}
-
 /// Breakpoints belong to a code instance: breakpoints set before a module was loaded,
 /// upgraded or deleted never apply to the module's later code.
 // Port of erts/emulator/beam/beam_bp.c:854-900 (erts_clear_module_break), called from
 // erts/emulator/beam/beam_bif_load.c:470-480 and 714-720, OTP-29.1.1.
-pub(crate) fn module_code_changed(code: u64, module: &str) {
-    let mut table = breakpoints().write().unwrap();
+pub(crate) fn module_code_changed(process: &Process, code: u64, module: &str) {
+    let node = bp_node(process);
+    let mut table = node.tables.write().unwrap();
     if let Some(functions) = table.get_mut(module) {
         for bps in functions
             .values_mut()
@@ -453,12 +498,13 @@ pub(crate) fn module_code_changed(code: u64, module: &str) {
             table.remove(module);
         }
     }
-    update_active(&table);
+    node.update_active(&table);
 }
 
 /// Port of erts/emulator/beam/beam_bp.c:2145-2295 (set_function_break), OTP-29.1.1, for the
 /// staging copy of one session's breakpoint of one function.
 fn set_function_break(
+    ix: usize,
     bps: &mut Vec<GenericBp>,
     tag: (usize, u64, u64),
     match_spec: Option<&Arc<MatchSpec>>,
@@ -466,7 +512,6 @@ fn set_function_break(
     count_op: BreakOp,
     tracer: Option<&crate::trace::Tracer>,
 ) {
-    let ix = staging_bp_ix();
     let (runtime, code, session) = tag;
     let position = bps
         .iter()
@@ -546,8 +591,12 @@ fn set_function_break(
 }
 
 /// Port of erts/emulator/beam/beam_bp.c:2332-2362 (clear_function_break_session), OTP-29.1.1.
-fn clear_function_break(bps: &mut [GenericBp], tag: (usize, u64, u64), break_flags: u32) {
-    let ix = staging_bp_ix();
+fn clear_function_break(
+    ix: usize,
+    bps: &mut [GenericBp],
+    tag: (usize, u64, u64),
+    break_flags: u32,
+) {
     let (runtime, code, session) = tag;
     let Some(g) = bps
         .iter_mut()
@@ -586,8 +635,8 @@ fn clear_function_break(bps: &mut [GenericBp], tag: (usize, u64, u64), break_fla
 /// Copy the active data to the staging area and unlink disabled breakpoints after a commit.
 // Port of erts/emulator/beam/beam_bp.c:443-560 (consolidate_bp_data,
 // consolidate_bp_data_session), OTP-29.1.1.
-fn consolidate_bp_data(bps: &mut Vec<GenericBp>) {
-    let (active, staging) = (active_bp_ix(), staging_bp_ix());
+fn consolidate_bp_data(node: &BpNode, bps: &mut Vec<GenericBp>) {
+    let (active, staging) = (node.active_bp_ix(), node.staging_bp_ix());
     for g in bps.iter_mut() {
         g.data[staging] = g.data[active].clone();
     }
@@ -611,21 +660,24 @@ fn function_entry<'a>(
 
 /// Make the staged breakpoint data active.
 // Port of erts/emulator/beam/beam_bp.c:562-569 (erts_commit_staged_bp), OTP-29.1.1.
-pub(crate) fn commit_staged() {
-    let table = breakpoints().write().unwrap();
-    ACTIVE_BP_IX.store(staging_bp_ix(), Ordering::Release);
-    update_active(&table);
+pub(crate) fn commit_staged(process: &Process) {
+    let node = bp_node(process);
+    let table = node.tables.write().unwrap();
+    node.active_ix
+        .store(node.staging_bp_ix(), Ordering::Release);
+    node.update_active(&table);
 }
 
 /// Copy the active data of `functions` to the staging area and unlink disabled breakpoints.
 // Port of erts/emulator/beam/erl_bif_trace.c (erts_finish_breakpointing case 3,
 // erts_consolidate_all_bp_data), OTP-29.1.1.
-pub(crate) fn consolidate_staged(functions: &[BpFunction]) {
-    let mut table = breakpoints().write().unwrap();
-    consolidate_functions(&mut table, functions);
+pub(crate) fn consolidate_staged(process: &Process, functions: &[BpFunction]) {
+    let node = bp_node(process);
+    let mut table = node.tables.write().unwrap();
+    consolidate_functions(node, &mut table, functions);
 }
 
-fn consolidate_functions(table: &mut BpTable, functions: &[BpFunction]) {
+fn consolidate_functions(node: &BpNode, table: &mut BpTable, functions: &[BpFunction]) {
     for function in functions {
         let Some(arities) = table
             .get_mut(&function.module)
@@ -634,7 +686,7 @@ fn consolidate_functions(table: &mut BpTable, functions: &[BpFunction]) {
             continue;
         };
         if let Some(bps) = arities.get_mut(&function.arity) {
-            consolidate_bp_data(bps);
+            consolidate_bp_data(node, bps);
             if bps.is_empty() {
                 arities.remove(&function.arity);
             }
@@ -647,7 +699,7 @@ fn consolidate_functions(table: &mut BpTable, functions: &[BpFunction]) {
             }
         }
     }
-    update_active(table);
+    node.update_active(table);
 }
 
 thread_local! {
@@ -664,20 +716,57 @@ pub(crate) fn with_install_view<R>(patch: impl FnOnce() -> R) -> R {
     result
 }
 
-/// Serializes staged breakpoint changes like erts' code modification permission: a waiter
-/// keeps passing code barriers so the holder's barriers can complete.
-// Port of erts/emulator/beam/code_ix.c:378 (erts_try_seize_code_mod_permission), OTP-29.1.1.
-pub(crate) fn seize_staging(
-    ctx: &mut arinsal_sched::RunCtx<'_, crate::process::Message>,
-) -> std::sync::MutexGuard<'static, ()> {
-    static STAGING: Mutex<()> = Mutex::new(());
-    loop {
-        match STAGING.try_lock() {
-            Ok(guard) => return guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => return error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                ctx.block_thread_progress(std::time::Duration::ZERO)
-            }
+/// A stage of erts_finish_breakpointing; each one runs after a code barrier.
+// Port of erts/emulator/beam/erl_bif_trace.c:2842-2935 (erts_finish_breakpointing), OTP-29.1.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinishStage {
+    /// Stage 0: code for the new breakpoints, which are still disabled.
+    Install,
+    /// Stage 1: switch the active breakpoint data.
+    Commit,
+    /// Stage 2: remove the code of disabled breakpoints.
+    Uninstall,
+    /// Stage 3: make the staged data equal to the active one.
+    Consolidate,
+    /// A phase that only waits for the barrier (event patterns, trace_info_finisher).
+    Wait,
+}
+
+/// A breakpoint update that a trace BIF caller, suspended between code barriers, finishes
+/// stage by stage (erts `finish_bp` and `trace_info_state`).
+pub(crate) struct TraceFinish {
+    pub(crate) functions: Vec<BpFunction>,
+    pub(crate) stages: std::collections::VecDeque<FinishStage>,
+    /// The BIF result once every stage ran; `None` when the BIF builds it again
+    /// (bif_trace_info_finish_trap).
+    pub(crate) result: Option<i64>,
+}
+
+impl TraceFinish {
+    /// The stages of erts_finish_breakpointing for a staged trace pattern.
+    pub(crate) fn breakpoints(functions: Vec<BpFunction>, install: bool, result: i64) -> Self {
+        let mut stages = std::collections::VecDeque::new();
+        if install {
+            stages.push_back(FinishStage::Install);
+        }
+        stages.extend([
+            FinishStage::Commit,
+            FinishStage::Uninstall,
+            FinishStage::Consolidate,
+        ]);
+        TraceFinish {
+            functions,
+            stages,
+            result: Some(result),
+        }
+    }
+
+    /// Only waits for `barriers` code barriers.
+    pub(crate) fn wait(barriers: usize, result: Option<i64>) -> Self {
+        TraceFinish {
+            functions: Vec::new(),
+            stages: std::iter::repeat_n(FinishStage::Wait, barriers.saturating_sub(1)).collect(),
+            result,
         }
     }
 }
@@ -705,8 +794,8 @@ pub(crate) fn set_trace_pattern(
         flags,
         meta_tracer,
     );
-    commit_staged();
-    consolidate_staged(functions);
+    commit_staged(process);
+    consolidate_staged(process, functions);
 }
 
 /// Stage the breakpoints of one session in the matched functions; nothing is active until
@@ -725,7 +814,9 @@ pub(crate) fn stage_trace_pattern(
     let tag = (scope(process), code_scope(process), session);
     let match_spec = match_spec.map(|source| Arc::new(MatchSpec::new(source)));
     let meta_match_spec = meta_match_spec.map(|source| Arc::new(MatchSpec::new(source)));
-    let mut table = breakpoints().write().unwrap();
+    let node = bp_node(process);
+    let ix = node.staging_bp_ix();
+    let mut table = node.tables.write().unwrap();
     // First the code breakpoints ("local" tracing).
     for function in functions {
         let bps = function_entry(
@@ -736,10 +827,11 @@ pub(crate) fn stage_trace_pattern(
         );
         if on != BreakOp::Nop {
             if !flags.breakpoint {
-                clear_function_break(bps, tag, BPF_ALL & !BPF_GLOBAL_TRACE);
+                clear_function_break(ix, bps, tag, BPF_ALL & !BPF_GLOBAL_TRACE);
             } else {
                 if flags.local {
                     set_function_break(
+                        ix,
                         bps,
                         tag,
                         match_spec.as_ref(),
@@ -750,6 +842,7 @@ pub(crate) fn stage_trace_pattern(
                 }
                 if flags.meta {
                     set_function_break(
+                        ix,
                         bps,
                         tag,
                         meta_match_spec.as_ref(),
@@ -759,10 +852,11 @@ pub(crate) fn stage_trace_pattern(
                     );
                 }
                 if flags.call_count {
-                    set_function_break(bps, tag, None, BPF_COUNT | BPF_COUNT_ACTIVE, on, None);
+                    set_function_break(ix, bps, tag, None, BPF_COUNT | BPF_COUNT_ACTIVE, on, None);
                 }
                 if flags.call_time {
                     set_function_break(
+                        ix,
                         bps,
                         tag,
                         None,
@@ -773,6 +867,7 @@ pub(crate) fn stage_trace_pattern(
                 }
                 if flags.call_memory {
                     set_function_break(
+                        ix,
                         bps,
                         tag,
                         None,
@@ -784,19 +879,19 @@ pub(crate) fn stage_trace_pattern(
             }
         } else {
             if flags.local {
-                clear_function_break(bps, tag, BPF_LOCAL_TRACE);
+                clear_function_break(ix, bps, tag, BPF_LOCAL_TRACE);
             }
             if flags.meta {
-                clear_function_break(bps, tag, BPF_META_TRACE);
+                clear_function_break(ix, bps, tag, BPF_META_TRACE);
             }
             if flags.call_count {
-                clear_function_break(bps, tag, BPF_COUNT | BPF_COUNT_ACTIVE);
+                clear_function_break(ix, bps, tag, BPF_COUNT | BPF_COUNT_ACTIVE);
             }
             if flags.call_time {
-                clear_function_break(bps, tag, BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE);
+                clear_function_break(ix, bps, tag, BPF_TIME_TRACE | BPF_TIME_TRACE_ACTIVE);
             }
             if flags.call_memory {
-                clear_function_break(bps, tag, BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE);
+                clear_function_break(ix, bps, tag, BPF_MEM_TRACE | BPF_MEM_TRACE_ACTIVE);
             }
         }
     }
@@ -810,6 +905,7 @@ pub(crate) fn stage_trace_pattern(
         );
         if on != BreakOp::Nop && !flags.breakpoint {
             set_function_break(
+                ix,
                 bps,
                 tag,
                 match_spec.as_ref(),
@@ -821,7 +917,7 @@ pub(crate) fn stage_trace_pattern(
             // Turning off breakpoint tracing leaves global tracing alone.
         } else {
             // Turn off global tracing, explicitly or before turning on breakpoint tracing.
-            clear_function_break(bps, tag, BPF_GLOBAL_TRACE);
+            clear_function_break(ix, bps, tag, BPF_GLOBAL_TRACE);
         }
     }
 }
@@ -830,11 +926,13 @@ pub(crate) fn stage_trace_pattern(
 // Port of erts/emulator/beam/erl_bif_trace.c:2727-2760 (prepare_clear_all_trace_pattern) and
 // 1352-1375, OTP-29.1.1.
 pub(crate) fn clear_session(process: &Process, session: u64) {
-    clear_session_scope(scope(process), session);
+    clear_session_node(bp_node(process), session);
 }
 
-pub(crate) fn clear_session_scope(runtime: usize, session: u64) {
-    let mut table = breakpoints().write().unwrap();
+/// [`clear_session`] for the node that created the session.
+pub(crate) fn clear_session_node(node: &BpNode, session: u64) {
+    let runtime = node.code_scope as usize;
+    let mut table = node.tables.write().unwrap();
     table.retain(|_, functions| {
         functions.retain(|_, arities| {
             arities.retain(|_, bps| {
@@ -845,7 +943,7 @@ pub(crate) fn clear_session_scope(runtime: usize, session: u64) {
         });
         !functions.is_empty()
     });
-    update_active(&table);
+    node.update_active(&table);
     drop(table);
     on_load_patterns()
         .lock()
@@ -869,8 +967,8 @@ pub(crate) struct Hit {
 // Port of erts/emulator/beam/beam_bp.c:994-1015 (erts_generic_breakpoint, the GenericBp loop),
 // OTP-29.1.1.
 pub(crate) fn hits(process: &Process, module: &str, function: &str, arity: u8) -> Vec<Hit> {
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
     function_bps(
         &table,
         scope(process),
@@ -955,8 +1053,8 @@ fn site_breakpoints(process: &Process, site: usize) -> Option<Arc<SiteBreakpoint
     }) {
         return Some(found);
     }
-    let ix = active_bp_ix();
-    let table = breakpoints().current.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
+    let table = bp_node(process).tables.current.read().unwrap();
     let bps = crate::native_bridge::with_native_function_at(site, |function| {
         function_bps(
             &table,
@@ -1034,7 +1132,7 @@ pub(crate) fn native_breakpoint_noop(process: &Process, pid: Pid, site: usize) -
 /// The functions among `functions` that have a breakpoint of any session: clearing, pausing or
 /// restarting a breakpoint only concerns them.
 pub(crate) fn with_breakpoints(process: &Process, functions: Vec<BpFunction>) -> Vec<BpFunction> {
-    let table = breakpoints().read().unwrap();
+    let table = bp_node(process).tables.read().unwrap();
     let runtime = scope(process);
     let code = code_scope(process);
     functions
@@ -1056,14 +1154,14 @@ pub(crate) fn with_breakpoints(process: &Process, functions: Vec<BpFunction>) ->
 
 /// True while some runtime holds a function breakpoint; keeps untraced BIF calls on the fast path.
 pub(crate) fn any_pattern() -> bool {
-    active().load(Ordering::Relaxed)
+    ACTIVE_NODES.load(Ordering::Relaxed) != 0
 }
 
 /// Whether a breakpoint of any session or runtime is set on this function.
 // Port of erts/emulator/beam/beam_bp.c:321-330 (erts_export_is_bif_traced), OTP-29.1.1.
-pub(crate) fn selects(module: &str, function: &str, arity: u8) -> bool {
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
+pub(crate) fn selects(process: &Process, module: &str, function: &str, arity: u8) -> bool {
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
     table
         .get(module)
         .and_then(|functions| functions.get(function))
@@ -1079,8 +1177,8 @@ pub(crate) fn increment(process: &Process, module: &str, function: &str, arity: 
     if !local || !any_pattern() {
         return;
     }
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
     for g in function_bps(
         &table,
         scope(process),
@@ -1139,8 +1237,8 @@ pub(crate) fn function_info(
     arity: u8,
     want: u32,
 ) -> FunctionInfo {
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
     let bp = function_bps(
         &table,
         scope(process),
@@ -1192,8 +1290,8 @@ pub(crate) fn sessions_for_function(
     function: &str,
     arity: u8,
 ) -> Vec<u64> {
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
     let mut sessions = function_bps(
         &table,
         scope(process),
@@ -1222,8 +1320,8 @@ pub(crate) fn breakpoint_kinds(
     let mut local = crate::trace::return_to_enabled(process)
         || debug_breakpoint_enabled(process, module, function, arity);
     let mut global = false;
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
     for g in function_bps(
         &table,
         scope(process),
@@ -1234,17 +1332,12 @@ pub(crate) fn breakpoint_kinds(
     ) {
         let mut flags = g.data[ix].flags;
         if INSTALL_VIEW.with(std::cell::Cell::get) {
-            flags |= g.data[staging_bp_ix()].flags;
+            flags |= g.data[bp_node(process).staging_bp_ix()].flags;
         }
         local |= flags & !BPF_GLOBAL_TRACE != 0;
         global |= flags & BPF_GLOBAL_TRACE != 0;
     }
     (local, global)
-}
-
-fn active() -> &'static AtomicBool {
-    static ACTIVE: AtomicBool = AtomicBool::new(false);
-    &ACTIVE
 }
 
 fn scope(process: &Process) -> usize {
@@ -1264,20 +1357,6 @@ impl Drop for crate::process::Runtime {
 }
 
 fn clear_scope(runtime: usize) {
-    {
-        let mut table = breakpoints().write().unwrap();
-        table.retain(|_, functions| {
-            functions.retain(|_, arities| {
-                arities.retain(|_, bps| {
-                    bps.retain(|g| g.runtime != runtime);
-                    !bps.is_empty()
-                });
-                !arities.is_empty()
-            });
-            !functions.is_empty()
-        });
-        update_active(&table);
-    }
     on_load_patterns()
         .lock()
         .unwrap()
@@ -1639,8 +1718,8 @@ fn func_name(id: u32) -> Option<FuncName> {
 // check_break), OTP-29.1.1.
 fn timem_break(process: &Process, session: u64, id: u32, memory: bool) -> Option<Arc<TimemTrace>> {
     let (module, function, arity) = func_name(id)?;
-    let table = breakpoints().read().unwrap();
-    let ix = active_bp_ix();
+    let table = bp_node(process).tables.read().unwrap();
+    let ix = bp_node(process).active_bp_ix();
     let bp = function_bps(
         &table,
         scope(process),

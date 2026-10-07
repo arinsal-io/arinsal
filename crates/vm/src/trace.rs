@@ -551,6 +551,8 @@ struct TraceSession {
 struct TraceSessionHandle {
     owner: usize,
     session: u64,
+    /// The breakpoint node of the runtime that created the session.
+    breakpoints: std::sync::Weak<crate::trace_bp::BpNode>,
 }
 
 // Port of erts/emulator/beam/erl_bif_trace.c:1188-1213 (tracer_session_destructor), OTP-29.1.1.
@@ -561,7 +563,9 @@ impl Drop for TraceSessionHandle {
             .unwrap()
             .retain(|(owner, _), session| *owner != self.owner || *session != self.session);
         destroy_session_key(self.owner, self.session);
-        crate::trace_bp::clear_session_scope(self.owner, self.session);
+        if let Some(node) = self.breakpoints.upgrade() {
+            crate::trace_bp::clear_session_node(&node, self.session);
+        }
     }
 }
 
@@ -4053,7 +4057,17 @@ pub(crate) fn session_handle(
     session: u64,
 ) -> std::sync::Arc<arinsal_term::MagicRef> {
     let owner = scope(process);
-    let handle = arinsal_term::MagicRef::new(TraceSessionHandle { owner, session });
+    let breakpoints = process
+        .runtime
+        .as_ref()
+        .map_or_else(std::sync::Weak::new, |runtime| {
+            std::sync::Arc::downgrade(&runtime.breakpoints)
+        });
+    let handle = arinsal_term::MagicRef::new(TraceSessionHandle {
+        owner,
+        session,
+        breakpoints,
+    });
     let magic_id = handle.id();
     session_handle_ids()
         .lock()

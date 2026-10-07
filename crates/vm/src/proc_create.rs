@@ -204,6 +204,9 @@ pub(crate) struct ProcessCold {
     /// Modules a suspended `finish_loading/1` staged; they commit when it is rescheduled
     /// after its code barrier, or when the loader exits first.
     pub(crate) finish_loading_commit: Option<crate::load::StagedLoad>,
+    /// Breakpoint update a trace BIF caller finishes between code barriers while it holds
+    /// the code modification permission.
+    pub(crate) trace_finish: Option<crate::trace_bp::TraceFinish>,
     /// Storage of a table being released by a trapped `ets:delete/1` or
     /// `ets:internal_delete_all/2`.
     pub(crate) ets_free: Option<EtsFree>,
