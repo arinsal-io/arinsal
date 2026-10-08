@@ -829,10 +829,12 @@ fn ets_external_atoms(bytes: &[u8], compress: bool) -> Result<Vec<u8>, EtsError>
                 for _ in 0..free_count {
                     walk(bytes, pos, out, compress)?;
                 }
-                if *pos - start != size {
+                // Port of erts/emulator/beam/external.c:3974-3990, OTP-29.1.1.
+                // NEW_FUN_EXT's size includes its own four-byte size field.
+                if *pos - start + 4 != size {
                     return Err(EtsError::BadArg);
                 }
-                let new = (out.len() - size_pos - 4) as u32;
+                let new = (out.len() - size_pos) as u32;
                 out[size_pos..size_pos + 4].copy_from_slice(&new.to_be_bytes());
             }
             67 => {
