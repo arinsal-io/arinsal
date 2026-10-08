@@ -599,6 +599,7 @@ pub fn run_native(
     registers.f_reg_array[..float_count].copy_from_slice(&process.fr[..float_count]);
     if let Some(cold) = process.cold.as_mut() {
         cold.native_bif_error = None;
+        cold.native_trap = None;
     }
     let saved_ftrace = process.header.ftrace;
     process.header.ftrace = (registers as *mut SchedulerRegisters).cast();
@@ -713,6 +714,16 @@ pub fn run_native(
         let mut trap = exceptions::native_trap(1, process.header.fvalue)?;
         trap.top = Some(crate::stacktrace::TopFrame::CurrentArgs(args));
         return Err(VmError::Trap(trap));
+    } else if process.header.freason != 0
+        && let Some(raised) = process
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.native_trap.take())
+        && raised.freason == process.header.freason
+        && raised.fvalue == process.header.fvalue
+    {
+        process.header.freason = 0;
+        return Err(VmError::Trap(raised.trap));
     } else if process.header.freason != 0
         && let Some(failure) = process
             .cold

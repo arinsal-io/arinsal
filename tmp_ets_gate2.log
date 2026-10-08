@@ -1,0 +1,3 @@
+ets_SUITE: erl=160/162 rc=0; arinsal=159/162 rc=0
+GATE PASS (159 vs erl 160)
+done

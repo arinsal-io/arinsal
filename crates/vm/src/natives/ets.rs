@@ -90,6 +90,11 @@ fn atom(name: &'static str) -> Term {
         _ => ETS_ATOMS[name],
     })
 }
+/// A BIF that sends or traps was called without a scheduler context; the direct path never
+/// routes those, so this only guards the invariant.
+fn needs_context() -> VmError {
+    VmError::Unsupported("ETS BIF needs the scheduler context".into())
+}
 fn badarg() -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(Term::atom(
         arinsal_term::atoms::BADARG,
@@ -454,12 +459,86 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
     if module != "ets" {
         return None;
     }
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif), OTP-29.1.1:
+    // erts calls every ETS BIF as an ordinary BIF from the generated code. Only the ones that
+    // send messages or trap (give_away, request_all, delete/1, internal_delete_all) need the
+    // scheduler context and keep the scheduler path.
     match (function, arity) {
         ("lookup", 2) => Some(direct_lookup),
         ("member", 2) => Some(direct_member),
         ("insert", 2) => Some(direct_insert),
+        ("insert_new", 2) => Some(direct_insert_new),
         ("update_counter", 3 | 4) => Some(direct_update_counter),
+        ("new", 2) => Some(direct_bif::<{ EtsBif::New as u8 }>),
+        ("whereis", 1) => Some(direct_bif::<{ EtsBif::Whereis as u8 }>),
+        ("rename", 2) => Some(direct_bif::<{ EtsBif::Rename as u8 }>),
+        ("info", 1 | 2) => Some(direct_bif::<{ EtsBif::Info as u8 }>),
+        ("delete", 2) => Some(direct_bif::<{ EtsBif::Delete as u8 }>),
+        ("take", 2) => Some(direct_bif::<{ EtsBif::Take as u8 }>),
+        ("slot", 2) => Some(direct_bif::<{ EtsBif::Slot as u8 }>),
+        ("first", 1) => Some(direct_bif::<{ EtsBif::First as u8 }>),
+        ("first_lookup", 1) => Some(direct_bif::<{ EtsBif::FirstLookup as u8 }>),
+        ("last", 1) => Some(direct_bif::<{ EtsBif::Last as u8 }>),
+        ("last_lookup", 1) => Some(direct_bif::<{ EtsBif::LastLookup as u8 }>),
+        ("next", 2) => Some(direct_bif::<{ EtsBif::Next as u8 }>),
+        ("next_lookup", 2) => Some(direct_bif::<{ EtsBif::NextLookup as u8 }>),
+        ("prev", 2) => Some(direct_bif::<{ EtsBif::Prev as u8 }>),
+        ("prev_lookup", 2) => Some(direct_bif::<{ EtsBif::PrevLookup as u8 }>),
+        ("safe_fixtable", 2) => Some(direct_bif::<{ EtsBif::SafeFixtable as u8 }>),
+        ("delete_object", 2) => Some(direct_bif::<{ EtsBif::DeleteObject as u8 }>),
+        ("select", 1..=3) => Some(direct_bif::<{ EtsBif::Select as u8 }>),
+        ("select_reverse", 1..=3) => Some(direct_bif::<{ EtsBif::SelectReverse as u8 }>),
+        ("match", 1..=3) => Some(direct_bif::<{ EtsBif::Match as u8 }>),
+        ("match_object", 1..=3) => Some(direct_bif::<{ EtsBif::MatchObject as u8 }>),
+        ("match_spec_compile", 1) => Some(direct_bif::<{ EtsBif::MatchSpecCompile as u8 }>),
+        ("is_compiled_ms", 1) => Some(direct_bif::<{ EtsBif::IsCompiledMs as u8 }>),
+        ("match_spec_run_r", 3) => Some(direct_bif::<{ EtsBif::MatchSpecRunR as u8 }>),
+        ("select_count", 2) => Some(direct_bif::<{ EtsBif::SelectCount as u8 }>),
+        ("internal_select_delete", 2) => Some(direct_bif::<{ EtsBif::InternalSelectDelete as u8 }>),
+        ("select_replace", 2) => Some(direct_bif::<{ EtsBif::SelectReplace as u8 }>),
+        ("lookup_element", 3 | 4) => Some(direct_bif::<{ EtsBif::LookupElement as u8 }>),
+        ("update_element", 3 | 4) => Some(direct_bif::<{ EtsBif::UpdateElement as u8 }>),
         _ => None,
+    }
+}
+
+/// Run a table BIF from the caller pid alone, once. A failure is raised from here with the
+/// BIF frame, as erts' BIF returns THE_NON_VALUE with `freason` set and BeamAsm raises it.
+fn direct_bif<const BIF: u8>(process: &mut Process, args: &[Term]) -> Option<Term> {
+    let caller = process.self_pid?;
+    let function = EtsBif::from_u8(BIF);
+    let result = call_inner(process, None, caller, function, args);
+    finish_direct(process, function.name(), args, result)
+}
+
+/// Value of a finished direct call, or `Some` dummy with `freason` set after the failure has
+/// been parked for the native exit. Never declines: the call already ran.
+fn finish_direct(
+    process: &mut Process,
+    function: &'static str,
+    args: &[Term],
+    result: Result<Term, VmError>,
+) -> Option<Term> {
+    match bif_frame("ets", function, args, result) {
+        Ok(value) => Some(value),
+        Err(VmError::Trap(trap)) => {
+            let class = match trap.class {
+                arinsal_bifs::Class::Error => 1,
+                arinsal_bifs::Class::Exit => 2,
+                arinsal_bifs::Class::Throw => 3,
+            };
+            let fvalue = crate::native_hooks::raw(trap.reason);
+            process.header.freason = class;
+            process.header.fvalue = fvalue;
+            process.cold_mut().native_trap = Some(crate::proc_create::NativeTrap {
+                trap,
+                freason: class,
+                fvalue,
+            });
+            Some(Term::NIL)
+        }
+        // Not an Erlang exception (yield, unsupported): redo on the scheduler path.
+        Err(_) => None,
     }
 }
 
@@ -524,6 +603,33 @@ fn with_cached_table<R>(
 }
 
 fn direct_lookup(process: &mut Process, args: &[Term]) -> Option<Term> {
+    direct_lookup_cached(process, args)
+        .or_else(|| direct_plain(process, args, "lookup", lookup_args_member))
+}
+
+/// `lookup`/`member`/`insert`/`insert_new` through the registry, for named tables and
+/// anything the cached path declines.
+fn direct_plain(
+    process: &mut Process,
+    args: &[Term],
+    function: &'static str,
+    run: fn(&mut Process, Term, Term, Term) -> Result<Term, VmError>,
+) -> Option<Term> {
+    let caller = direct_caller(process)?;
+    let result = run(process, caller, args[0], args[1]);
+    finish_direct(process, function, args, result)
+}
+
+fn lookup_args_member(
+    process: &mut Process,
+    caller: Term,
+    target: Term,
+    key: Term,
+) -> Result<Term, VmError> {
+    lookup_args(process, caller, false, target, key)
+}
+
+fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let key = args[1];
     with_cached_table(process, args[0], |shared, _, process| {
@@ -552,6 +658,14 @@ fn direct_lookup(process: &mut Process, args: &[Term]) -> Option<Term> {
 }
 
 fn direct_member(process: &mut Process, args: &[Term]) -> Option<Term> {
+    direct_member_cached(process, args).or_else(|| {
+        direct_plain(process, args, "member", |process, caller, target, key| {
+            lookup_args(process, caller, true, target, key)
+        })
+    })
+}
+
+fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let key = args[1];
     with_cached_table(process, args[0], |shared, _, _| {
@@ -564,6 +678,26 @@ fn direct_member(process: &mut Process, args: &[Term]) -> Option<Term> {
 }
 
 fn direct_insert(process: &mut Process, args: &[Term]) -> Option<Term> {
+    direct_insert_cached(process, args).or_else(|| {
+        direct_plain(
+            process,
+            args,
+            "insert",
+            |process, caller, target, objects| insert_args(process, caller, false, target, objects),
+        )
+    })
+}
+
+fn direct_insert_new(process: &mut Process, args: &[Term]) -> Option<Term> {
+    direct_plain(
+        process,
+        args,
+        "insert_new",
+        |process, caller, target, objects| insert_args(process, caller, true, target, objects),
+    )
+}
+
+fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     // A failed list insert may have stored a prefix, which a redo through the scheduler
     // path would store again.
     // SAFETY: the object term lives in the caller's process heap for this call.
@@ -603,6 +737,11 @@ fn direct_insert(process: &mut Process, args: &[Term]) -> Option<Term> {
 // Port of erts/emulator/beam/erl_db.c:1494-1728 (do_update_counter, ets_update_counter_3/4),
 // OTP-29.1.1.
 fn direct_update_counter(process: &mut Process, args: &[Term]) -> Option<Term> {
+    direct_update_counter_cached(process, args)
+        .or_else(|| direct_bif::<{ EtsBif::UpdateCounter as u8 }>(process, args))
+}
+
+fn direct_update_counter_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let (key, operation, default) = (args[1], args[2], args.get(3).copied());
     with_cached_table(process, args[0], |shared, options, process| {
@@ -810,13 +949,17 @@ fn delete_or_clear(
         .map_err(|_| badarg())
 }
 
+/// Run one ETS BIF. `ctx` is only present on the scheduler path: erts sends messages
+/// (give_away, request_all) and traps (delete) through the process, so those need it; every
+/// other table operation runs from the caller pid alone, as erts runs them from BeamAsm.
 fn call_inner(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    mut ctx: Option<&mut RunCtx<'_, Message>>,
+    caller_pid: Pid,
     function: EtsBif,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    let caller = ctx.pid().to_term().ok_or_else(badarg)?;
+    let caller = caller_pid.to_term().ok_or_else(badarg)?;
     if function == EtsBif::MatchSpecTest {
         // Port of erts/emulator/beam/erl_db_util.c:6045-6121
         // (`match_spec_test_3`, `match_spec_test`), OTP-29.1.1.
@@ -828,7 +971,7 @@ fn call_inner(
             Some(value) if Some(value) == ETS_ATOMS.get("trace").copied() => MatchDialect::Trace,
             _ => return Err(badarg()),
         };
-        let seq_token = crate::seq_trace::get_token_term(process, ctx.pid())?;
+        let seq_token = crate::seq_trace::get_token_term(process, caller_pid)?;
         let trace_control_word =
             Term::small(crate::natives::sys::trace_control_word_value(process))
                 .ok_or_else(badarg)?;
@@ -861,6 +1004,7 @@ fn call_inner(
         (function, args.len()),
         (EtsBif::Delete, 1) | (EtsBif::InternalDeleteAll, 2)
     ) {
+        let ctx = ctx.as_deref_mut().ok_or_else(needs_context)?;
         return delete_or_clear(process, ctx, function, args, caller);
     }
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -1380,7 +1524,9 @@ fn call_inner(
                 .tuple(&[atom("ETS-TRANSFER"), tab, caller, *data])
                 .map_err(|_| badarg())?;
             registry.exclusive()?.give_away(tid, *new_owner).map_err(err)?;
-            ctx.send(pid, Message::copy_from(transfer)?)
+            ctx.as_deref_mut()
+                .ok_or_else(needs_context)?
+                .send(pid, Message::copy_from(transfer)?)
                 .map_err(|_| badarg())?;
             Ok(atom("true"))
         }
@@ -1556,7 +1702,8 @@ fn call_inner(
             let table_list = TermBuilder::new(&mut heap)
                 .list_from_iter(tables)
                 .map_err(|_| badarg())?;
-            let caller = ctx.pid();
+            let caller = caller_pid;
+            let ctx = ctx.ok_or_else(needs_context)?;
             for index in 0..scheduler_count() {
                 let payload = if index == 0 { table_list } else { Term::NIL };
                 let message = TermBuilder::new(&mut heap)
@@ -1810,6 +1957,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 enum EtsBif {
     MatchSpecTest,
     LookupBinaryInfo,
@@ -1852,6 +2000,100 @@ enum EtsBif {
     UpdateCounter,
 }
 
+impl EtsBif {
+    const ALL: [EtsBif; 39] = [
+        EtsBif::MatchSpecTest,
+        EtsBif::LookupBinaryInfo,
+        EtsBif::RawFirst,
+        EtsBif::RawNext,
+        EtsBif::SuperUser,
+        EtsBif::New,
+        EtsBif::Whereis,
+        EtsBif::Rename,
+        EtsBif::Info,
+        EtsBif::Delete,
+        EtsBif::InternalDeleteAll,
+        EtsBif::SetOpts,
+        EtsBif::Take,
+        EtsBif::Slot,
+        EtsBif::First,
+        EtsBif::FirstLookup,
+        EtsBif::Last,
+        EtsBif::LastLookup,
+        EtsBif::Next,
+        EtsBif::NextLookup,
+        EtsBif::Prev,
+        EtsBif::PrevLookup,
+        EtsBif::SafeFixtable,
+        EtsBif::DeleteObject,
+        EtsBif::GiveAway,
+        EtsBif::Select,
+        EtsBif::SelectReverse,
+        EtsBif::Match,
+        EtsBif::MatchObject,
+        EtsBif::MatchSpecCompile,
+        EtsBif::IsCompiledMs,
+        EtsBif::InternalRequestAll,
+        EtsBif::MatchSpecRunR,
+        EtsBif::SelectCount,
+        EtsBif::InternalSelectDelete,
+        EtsBif::SelectReplace,
+        EtsBif::LookupElement,
+        EtsBif::UpdateElement,
+        EtsBif::UpdateCounter,
+    ];
+
+    /// The `ets` export name of the BIF, for the frame of a failure.
+    fn name(self) -> &'static str {
+        match self {
+            EtsBif::MatchSpecTest => "match_spec_test",
+            EtsBif::LookupBinaryInfo => "lookup_binary_info",
+            EtsBif::RawFirst => "raw_first",
+            EtsBif::RawNext => "raw_next",
+            EtsBif::SuperUser => "super_user",
+            EtsBif::New => "new",
+            EtsBif::Whereis => "whereis",
+            EtsBif::Rename => "rename",
+            EtsBif::Info => "info",
+            EtsBif::Delete => "delete",
+            EtsBif::InternalDeleteAll => "internal_delete_all",
+            EtsBif::SetOpts => "set_opts",
+            EtsBif::Take => "take",
+            EtsBif::Slot => "slot",
+            EtsBif::First => "first",
+            EtsBif::FirstLookup => "first_lookup",
+            EtsBif::Last => "last",
+            EtsBif::LastLookup => "last_lookup",
+            EtsBif::Next => "next",
+            EtsBif::NextLookup => "next_lookup",
+            EtsBif::Prev => "prev",
+            EtsBif::PrevLookup => "prev_lookup",
+            EtsBif::SafeFixtable => "safe_fixtable",
+            EtsBif::DeleteObject => "delete_object",
+            EtsBif::GiveAway => "give_away",
+            EtsBif::Select => "select",
+            EtsBif::SelectReverse => "select_reverse",
+            EtsBif::Match => "match",
+            EtsBif::MatchObject => "match_object",
+            EtsBif::MatchSpecCompile => "match_spec_compile",
+            EtsBif::IsCompiledMs => "is_compiled_ms",
+            EtsBif::InternalRequestAll => "internal_request_all",
+            EtsBif::MatchSpecRunR => "match_spec_run_r",
+            EtsBif::SelectCount => "select_count",
+            EtsBif::InternalSelectDelete => "internal_select_delete",
+            EtsBif::SelectReplace => "select_replace",
+            EtsBif::LookupElement => "lookup_element",
+            EtsBif::UpdateElement => "update_element",
+            EtsBif::UpdateCounter => "update_counter",
+        }
+    }
+
+    /// The variant with discriminant `value` (const-generic direct entries carry it).
+    fn from_u8(value: u8) -> EtsBif {
+        Self::ALL[usize::from(value)]
+    }
+}
+
 macro_rules! ets_entry {
     ($entry:ident, $id:ident, $arity:literal, $module:literal, $function:literal) => {
         fn $entry(
@@ -1864,8 +2106,9 @@ macro_rules! ets_entry {
                 return Some(Err(badarg()));
             }
             let _ = vm;
+            let ctx_pid = ctx.pid();
             Some(args.with_values(process, |process, values| {
-                let result = call_inner(process, ctx, EtsBif::$id, values);
+                let result = call_inner(process, Some(ctx), ctx_pid, EtsBif::$id, values);
                 bif_frame($module, $function, values, result)
             }))
         }
