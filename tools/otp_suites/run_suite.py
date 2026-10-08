@@ -144,6 +144,13 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
             for helper in helper_suites:
                 if not (directory / f"{helper.stem}.beam").is_file():
                     raise RuntimeError(f"helper suite did not compile: {helper.name}")
+            # A source whose module does not match its file name (code_a_test.erl defines
+            # code_b_test) never compiles to <stem>.beam; drop it so ct's make step does not
+            # fail the whole suite, as OTP's own test makefiles only build listed modules.
+            suite_text = (directory / f"{name}_SUITE.erl").read_text(encoding="utf-8", errors="replace")
+            for src in directory.glob("*.erl"):
+                if not (directory / f"{src.stem}.beam").is_file() and src.stem not in suite_text:
+                    src.unlink()
         expr = (
             "R=ct:run_test([{dir,\"" + str(directory) + "\"},{suite," + name
             + "_SUITE},{logdir,\"" + str(logdir) + "\"}" + extra + "]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
