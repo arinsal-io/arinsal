@@ -251,6 +251,13 @@ pub(crate) fn note_caller_native(process: &Process) {
     note_caller_pid(process, *pid);
 }
 
+/// Number of processes recorded as tty select owners; lets tests check that
+/// non-tty BIFs leave the poller state alone.
+#[doc(hidden)]
+pub fn registered_callers() -> usize {
+    registry().lock().unwrap().len()
+}
+
 fn note_caller_pid(process: &Process, pid: Pid) {
     let Some(runtime) = process.runtime.as_ref() else {
         return;
@@ -442,12 +449,6 @@ fn call_values(
     function: &str,
     args: &[Term],
 ) -> Option<Result<Term, VmError>> {
-    if module == "erlang" && matches!(function, "atom_to_list" | "list_to_atom" | "++") {
-        // prim_tty's reader registers its name, then calls tty_select locally.
-        // Recording the owner here lets that local NIF deliver to this process.
-        note_caller(process, ctx);
-        return None;
-    }
     let arity = args.len() as u8;
     if !recognizes(module, function, arity) {
         return None;
