@@ -49,6 +49,8 @@ pub use native_hooks::{
     arinsal_beamasm_guard3, arinsal_beamasm_map_lookup,
 };
 pub use natives::implemented_natives;
+#[doc(hidden)]
+pub use natives::tty::registered_callers as tty_registered_callers;
 mod stacktrace;
 mod tuples;
 

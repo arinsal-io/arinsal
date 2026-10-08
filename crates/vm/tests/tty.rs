@@ -30,7 +30,14 @@ const SOURCE: &str = r#"
 -module(tty_diff).
 -export([pipes/0, window/0, init_modes/0, create/0, write_ok/1, write_big/1,
          select_read/0, chars/0, locale/0, termcap/0, bad/0, closed/0,
-         encoding/0]).
+         encoding/0, plain_bifs/0]).
+plain_bifs() ->
+    F = fun(M, Fun, Args) -> apply(M, Fun, Args) end,
+    [a, b] = F(erlang, '++', [[a], [b]]),
+    "abc" = F(erlang, atom_to_list, [abc]),
+    abc = F(erlang, list_to_atom, ["abc"]),
+    [a, b] = [a] ++ [b],
+    ok.
 pipes() ->
     ok = prim_tty:load(),
     {prim_tty:isatty(stdin), prim_tty:isatty(stdout), prim_tty:isatty(stderr)}.
@@ -273,6 +280,17 @@ fn read_available(fd: RawFd, exact: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+/// `++`, `atom_to_list/1` and `list_to_atom/1` are plain BIFs in erts; they must not
+/// register the caller with the tty poller.
+#[test]
+fn plain_bifs_do_not_touch_the_tty_poller() {
+    let _lock = stdio();
+    let before = arinsal_vm::tty_registered_callers();
+    let result = scheduled("plain_bifs");
+    assert_eq!(result, atom("ok"));
+    assert_eq!(arinsal_vm::tty_registered_callers(), before);
 }
 
 #[test]

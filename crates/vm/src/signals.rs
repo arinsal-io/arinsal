@@ -1711,32 +1711,6 @@ pub(crate) fn handler_atoms(
                 crate::natives::NativeEntry::Direct(native_send),
             );
         }
-        if let Some(module) = atom_id("erlang") {
-            for (function, arity, entry) in [
-                (
-                    "atom_to_list",
-                    1,
-                    crate::natives::dynamic_atom_to_list as crate::natives::ResolvedNative,
-                ),
-                (
-                    "list_to_atom",
-                    1,
-                    crate::natives::dynamic_list_to_atom as crate::natives::ResolvedNative,
-                ),
-                (
-                    "++",
-                    2,
-                    crate::natives::dynamic_append as crate::natives::ResolvedNative,
-                ),
-            ] {
-                if let Some(function) = atom_id(function) {
-                    handlers.insert(
-                        (module, function, arity),
-                        crate::natives::NativeEntry::Resolved(entry),
-                    );
-                }
-            }
-        }
         handlers
     });
     handlers.get(&(module, function, arity)).copied()

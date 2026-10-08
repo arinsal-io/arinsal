@@ -155,33 +155,6 @@ fn node_call(
     })
 }
 
-pub(crate) fn dynamic_atom_to_list(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    tty::call(vm, process, ctx, "erlang", "atom_to_list", args)
-}
-
-pub(crate) fn dynamic_list_to_atom(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    tty::call(vm, process, ctx, "erlang", "list_to_atom", args)
-}
-
-pub(crate) fn dynamic_append(
-    vm: &mut Vm,
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    args: NativeArgs<'_>,
-) -> Option<Result<Term, VmError>> {
-    tty::call(vm, process, ctx, "erlang", "++", args)
-}
-
 fn env_call(
     vm: &mut Vm,
     process: &mut Process,
@@ -469,7 +442,6 @@ fn is_dynamic(module: &str, function: &str, arity: u8) -> bool {
         || (module == "erlang"
             && function == "nif_error"
             && !nif::recognizes(module, function, arity))
-        || (module == "erlang" && matches!(function, "++" | "atom_to_list" | "list_to_atom"))
 }
 
 fn proc_claims(module: &str, function: &str) -> bool {
@@ -507,14 +479,6 @@ fn resolve(module: &str, function: &str, arity: u8) -> Option<NativeEntry> {
     }
     if listed(erts_debug::IMPLEMENTED, module, function, arity) {
         return Some(NativeEntry::DirectFamily(erts_debug::call));
-    }
-    if module == "erlang" {
-        match (function, arity) {
-            ("atom_to_list", 1) => return Some(NativeEntry::Resolved(dynamic_atom_to_list)),
-            ("list_to_atom", 1) => return Some(NativeEntry::Resolved(dynamic_list_to_atom)),
-            ("++", 2) => return Some(NativeEntry::Resolved(dynamic_append)),
-            _ => {}
-        }
     }
     if listed(records::IMPLEMENTED, module, function, arity) {
         return Some(NativeEntry::DirectFamily(records::call));
@@ -663,13 +627,11 @@ mod tests {
             assert_eq!(class, ImportClass::Native);
             assert!(matches!(unpack_native(bits), Some(NativeEntry::Direct(_))));
         }
+        // Plain BIFs with no I/O side effects stay on the pure path.
         for (function, arity) in [("++", 2), ("atom_to_list", 1), ("list_to_atom", 1)] {
             let (class, bits) = classify("erlang", function, arity, true);
-            assert_eq!(class, ImportClass::Native);
-            assert!(matches!(
-                unpack_native(bits),
-                Some(NativeEntry::Resolved(_))
-            ));
+            assert_eq!(class, ImportClass::Pure, "erlang:{function}/{arity}");
+            assert_eq!(bits, 0);
         }
     }
 
