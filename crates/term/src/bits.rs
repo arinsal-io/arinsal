@@ -2,13 +2,47 @@
 use crate::{BIN_REF, HeapAlloc, SUB_BITS, Term, TermBuilder, TermError};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// The context cursor or active writer may modify this `SUB_BITS` object.
 pub const SUB_BITS_MUTABLE: u64 = 1;
 /// The binary data may have moved, so readers must resolve the BinRef.
 pub const SUB_BITS_VOLATILE: u64 = 2;
 const EXTERNAL_OWNER: u64 = 0x100;
+static BINARY_MEMORY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Return the live payload bytes held by refcounted binaries.
+pub fn binary_memory_bytes() -> u64 {
+    BINARY_MEMORY_BYTES.load(Ordering::Relaxed)
+}
+
+/// A refcounted binary payload whose size contributes to `erlang:memory(binary)`.
+pub struct RefcBinary {
+    bytes: Vec<u8>,
+}
+
+impl RefcBinary {
+    // Port of erts/emulator/beam/erl_binary.h:287 (erts_bin_nrml_alloc_fnf), OTP-29.1.1.
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        BINARY_MEMORY_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        Self { bytes }
+    }
+}
+
+impl std::ops::Deref for RefcBinary {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl Drop for RefcBinary {
+    fn drop(&mut self) {
+        // Port of erts/emulator/beam/erl_binary.h:374 (erts_bin_free), OTP-29.1.1.
+        BINARY_MEMORY_BYTES.fetch_sub(self.bytes.len() as u64, Ordering::Relaxed);
+    }
+}
 
 /// Bytes borrowed from a native resource whose owner remains live with the term.
 pub struct ExternalBinary {
@@ -63,15 +97,18 @@ unsafe impl Send for WritableBinary {}
 unsafe impl Sync for WritableBinary {}
 
 impl WritableBinary {
+    // Port of erts/emulator/beam/erl_binary.h:287 (erts_bin_nrml_alloc_fnf), OTP-29.1.1.
     fn new(bytes: &[u8], capacity: usize) -> Self {
         let mut data = Vec::with_capacity(capacity.max(bytes.len()));
         data.extend_from_slice(bytes);
-        Self {
+        let binary = Self {
             bytes: UnsafeCell::new(data),
             byte_len: AtomicUsize::new(bytes.len()),
             writer: AtomicBool::new(true),
             active: AtomicBool::new(true),
-        }
+        };
+        BINARY_MEMORY_BYTES.fetch_add(binary.capacity() as u64, Ordering::Relaxed);
+        binary
     }
     /// Current logical length in bytes.
     pub fn len(&self) -> usize {
@@ -89,6 +126,13 @@ impl WritableBinary {
     /// Whether the unique writer may still grow this buffer.
     pub fn has_writer(&self) -> bool {
         self.writer.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for WritableBinary {
+    fn drop(&mut self) {
+        // Port of erts/emulator/beam/erl_binary.h:374 (erts_bin_free), OTP-29.1.1.
+        BINARY_MEMORY_BYTES.fetch_sub(self.bytes.get_mut().capacity() as u64, Ordering::Relaxed);
     }
 }
 
@@ -164,7 +208,12 @@ pub unsafe fn writable_gc_visit(term: Term) {
         if binary.writer.load(Ordering::Relaxed) && !binary.active.swap(false, Ordering::Relaxed) {
             let bytes = &mut *binary.bytes.get();
             if bytes.capacity().saturating_sub(bytes.len()) >= 8 {
+                let old_capacity = bytes.capacity();
                 bytes.shrink_to_fit();
+                BINARY_MEMORY_BYTES.fetch_sub(
+                    old_capacity.saturating_sub(bytes.capacity()) as u64,
+                    Ordering::Relaxed,
+                );
             }
         }
     }
@@ -278,7 +327,7 @@ pub(crate) unsafe fn clone_binary_owner(bin_ref: Term) -> (u64, u64) {
         } else if flags & 1 == 1 {
             Arc::increment_strong_count(ptr as *const WritableBinary);
         } else {
-            Arc::increment_strong_count(ptr as *const Vec<u8>);
+            Arc::increment_strong_count(ptr as *const RefcBinary);
         }
         (ptr, flags)
     }
@@ -300,7 +349,7 @@ pub(crate) unsafe fn retain_cloned_binary_owner<H: HeapAlloc + ?Sized>(
         } else if flags & 1 == 1 {
             heap.retain_writable_binary(Arc::from_raw(ptr as *const WritableBinary))
         } else {
-            heap.retain_binary(Arc::from_raw(ptr as *const Vec<u8>));
+            heap.retain_binary(Arc::from_raw(ptr as *const RefcBinary));
             Ok(())
         }
     }
@@ -335,7 +384,15 @@ pub fn writable_extend_private(term: Term, new_bits: usize) -> Result<bool, Term
     // SAFETY: the active writer has exclusive mutation rights and no view lives here.
     unsafe {
         let bytes = &mut *binary.bytes.get();
+        // Port of erts/emulator/beam/erl_binary.h:321 (erts_bin_realloc_fnf), OTP-29.1.1.
+        let old_capacity = bytes.capacity();
         bytes.resize(new_bits.div_ceil(8), 0);
+        let new_capacity = bytes.capacity();
+        if new_capacity >= old_capacity {
+            BINARY_MEMORY_BYTES.fetch_add((new_capacity - old_capacity) as u64, Ordering::Relaxed);
+        } else {
+            BINARY_MEMORY_BYTES.fetch_sub((old_capacity - new_capacity) as u64, Ordering::Relaxed);
+        }
         binary.byte_len.store(bytes.len(), Ordering::Relaxed);
         binary.active.store(true, Ordering::Relaxed);
         *term.raw_ptr().add(3).cast_mut() = (new_bits + adjustment * 8) as u64;

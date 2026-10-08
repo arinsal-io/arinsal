@@ -211,7 +211,7 @@ impl HeapAlloc for EnvHeap {
             unsafe { (&mut **h).alloc(n) },
         }
     }
-    fn retain_binary(&mut self, x: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, x: Arc<arinsal_term::RefcBinary>) {
         match self {
             Self::Owned(h) => h.retain_binary(x),
             Self::Bound(h) =>

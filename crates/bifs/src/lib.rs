@@ -149,7 +149,7 @@ impl HeapAlloc for FragmentingHeap<'_> {
             None => Some(self.0.heap_fragment(words)),
         }
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(binary)
     }
     fn retain_writable_binary(

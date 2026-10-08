@@ -1047,7 +1047,7 @@ impl HeapAlloc for DynHeap<'_> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(binary);
     }
     fn retain_writable_binary(

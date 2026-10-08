@@ -128,7 +128,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapProxy<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(binary)
     }
     fn retain_node(&mut self, node: Arc<arinsal_term::Node>) {

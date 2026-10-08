@@ -903,7 +903,7 @@ struct ObjectHeap {
 
 #[derive(Default)]
 struct OffHeap {
-    binaries: Vec<Arc<Vec<u8>>>,
+    binaries: Vec<Arc<arinsal_term::RefcBinary>>,
     // mix_loop1: Elixir AST binaries are writable proc bins. ETS must retain
     // them after `ets:insert` copies the object off the process heap.
     writable: Vec<Arc<WritableBinary>>,
@@ -955,7 +955,7 @@ impl HeapAlloc for ObjectHeap {
         Some(ptr)
     }
 
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         self.off_heap().binaries.push(binary);
     }
     // mix_loop1: `copy_term` refuses writable owners unless the destination

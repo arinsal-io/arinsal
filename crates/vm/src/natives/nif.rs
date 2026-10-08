@@ -1266,7 +1266,7 @@ impl HeapAlloc for DynHeap<'_> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
-    fn retain_binary(&mut self, binary: std::sync::Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: std::sync::Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(binary);
     }
     fn retain_node(&mut self, node: std::sync::Arc<arinsal_term::Node>) {

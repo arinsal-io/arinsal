@@ -1,5 +1,5 @@
 //! Stable word allocations. Every pointer remains valid until its heap is dropped.
-use crate::bits::{ExternalBinary, WritableBinary, binary_data, owner_adjustment};
+use crate::bits::{ExternalBinary, RefcBinary, WritableBinary, binary_data, owner_adjustment};
 use crate::identity::check_external_ref;
 use crate::record::RecordSnapshot;
 use crate::record_table::RecordLayout;
@@ -222,7 +222,7 @@ pub trait HeapAlloc {
     /// Reserve contiguous words, or return `None` so the caller can collect.
     fn alloc(&mut self, words: usize) -> Option<*mut u64>;
     /// Keep an off-heap binary alive until GC examines this heap's owners.
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>);
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>);
     /// Retain a growable off-heap binary until collection examines its BinRef.
     fn retain_writable_binary(&mut self, _binary: Arc<WritableBinary>) -> Result<(), TermError> {
         Err(TermError::Unsupported("writable binary heap owner"))
@@ -332,14 +332,14 @@ impl Default for VheapCold {
 #[derive(Default)]
 pub(crate) struct HeapOwners {
     pub(crate) vheap: VheapCold,
-    pub(crate) off_heap: Vec<Arc<Vec<u8>>>,
+    pub(crate) off_heap: Vec<Arc<RefcBinary>>,
     pub(crate) writable: Vec<Arc<WritableBinary>>,
     pub(crate) external: Vec<Arc<ExternalBinary>>,
     pub(crate) nodes: Vec<Arc<Node>>,
     pub(crate) funs: Vec<Arc<FunEntry>>,
     pub(crate) exports: Vec<Arc<ExportEntry>>,
     pub(crate) magic: Vec<Arc<crate::MagicRef>>,
-    pub(crate) old_off_heap: Vec<Arc<Vec<u8>>>,
+    pub(crate) old_off_heap: Vec<Arc<RefcBinary>>,
     pub(crate) old_writable: Vec<Arc<WritableBinary>>,
     pub(crate) old_external: Vec<Arc<ExternalBinary>>,
     pub(crate) old_nodes: Vec<Arc<Node>>,
@@ -717,7 +717,7 @@ impl HeapAlloc for ProcessHeap {
         self.htop += words;
         Some(ptr)
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         if self.detached
             && let Some(heap) = self.owners.detached.as_deref_mut()
         {
@@ -799,7 +799,7 @@ pub struct VecHeap {
     // Each chunk reserves its full capacity up front and never grows past it, so words
     // handed out stay put; only words actually allocated are initialized.
     chunks: Vec<Vec<UnsafeCell<u64>>>,
-    off_heap: Vec<Arc<Vec<u8>>>,
+    off_heap: Vec<Arc<RefcBinary>>,
     writable: Vec<Arc<WritableBinary>>,
     external: Vec<Arc<ExternalBinary>>,
     nodes: Vec<Arc<Node>>,
@@ -920,7 +920,7 @@ impl HeapAlloc for VecHeap {
         self.total_used += words;
         Some(ptr)
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         self.off_heap.push(binary);
     }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
@@ -1163,7 +1163,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         {
             *last &= 0xff << (8 - bit_len % 8);
         }
-        let binary = Arc::new(data);
+        let binary = Arc::new(RefcBinary::new(data));
         let adjustment = binary.as_ptr() as usize & 3;
         let ref_ptr = self.words(8)?;
         // SAFETY: the same allocation reserves three BinRef and five SubBits words.
