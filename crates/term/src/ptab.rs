@@ -215,6 +215,19 @@ impl PtabIdRing {
         }
     }
 
+    /// Number of live elements.
+    ///
+    /// Port of erts/emulator/beam/erl_ptab.h:273 (erts_ptab_count), OTP-29.1.1.
+    pub fn count(&self) -> usize {
+        let mut max = self.layout.max();
+        let mut res = self.count.load(Ordering::Relaxed);
+        if max == PTAB_MAX_SIZE {
+            max -= 1;
+            res = res.saturating_sub(1);
+        }
+        res.min(max) as usize
+    }
+
     /// Table geometry.
     pub fn layout(&self) -> PtabLayout {
         self.layout
