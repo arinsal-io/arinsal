@@ -4,8 +4,8 @@
 //! freezes every word; the ordinary term tags and readers then need no adapter.
 
 use crate::{
-    ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder, TermError,
-    copy_term,
+    ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, RefcBinary, Term,
+    TermBuilder, TermError, copy_term,
 };
 use arinsal_etf::OwnedTerm;
 use std::alloc::{Layout, alloc, dealloc};
@@ -73,7 +73,7 @@ impl Drop for Chunk {
 struct Storage {
     chunks: Vec<Chunk>,
     words: usize,
-    binaries: Vec<Arc<Vec<u8>>>,
+    binaries: Vec<Arc<RefcBinary>>,
     external: Vec<Arc<ExternalBinary>>,
     nodes: Vec<Arc<Node>>,
     funs: Vec<Arc<FunEntry>>,
@@ -114,7 +114,7 @@ impl HeapAlloc for Storage {
         self.words = self.words.checked_add(words)?;
         Some(ptr)
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         self.binaries.push(binary);
     }
     fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {

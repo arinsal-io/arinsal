@@ -80,7 +80,7 @@ impl HeapAlloc for TraceHeap<'_> {
         HeapAlloc::alloc(self.heap, words).or_else(|| Some(self.heap.gc_fragment(words)))
     }
 
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         HeapAlloc::retain_binary(self.heap, binary);
     }
 

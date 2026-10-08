@@ -2263,7 +2263,10 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
 
 pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64); 9] {
     let store = process._persistent_terms.store();
-    let (processes, processes_used, binary) = store.process_memory_totals();
+    let (processes, processes_used, _) = store.process_memory_totals();
+    // Port of erts/emulator/beam/erl_bif_info.c:4459 (erts_memory) and erl_alloc.c:2495,
+    // OTP-29.1.1: binary memory is global allocator usage, independent of process ownership.
+    let binary = arinsal_term::binary_memory_bytes();
     let (atom, atom_used) = atom_bytes();
     let code = code_bytes(vm);
     let ets = ets_bytes(process);

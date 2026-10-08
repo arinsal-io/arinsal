@@ -136,7 +136,7 @@ impl HeapAlloc for Heap<'_> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
-    fn retain_binary(&mut self, value: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, value: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(value)
     }
     fn retain_writable_binary(

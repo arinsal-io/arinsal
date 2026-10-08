@@ -177,7 +177,7 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for SizingHeap<'_, H> {
         self.requested_words = self.requested_words.saturating_add(words);
         self.inner.alloc(words)
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         self.inner.retain_binary(binary);
     }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {

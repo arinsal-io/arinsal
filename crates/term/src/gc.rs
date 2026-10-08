@@ -11,7 +11,7 @@ use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
     ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, ExternalBinary, FUN,
     FunEntry, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, MagicRef, Node, ProcessHeap, RECORD,
-    S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
+    RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
 };
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -59,7 +59,7 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         Some(self.0.gc_fragment(words))
     }
-    fn retain_binary(&mut self, binary: Arc<Vec<u8>>) {
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         HeapAlloc::retain_binary(self.0, binary);
     }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
