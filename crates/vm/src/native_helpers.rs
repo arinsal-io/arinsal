@@ -882,6 +882,13 @@ fn invoke_dispatch_bif(
             if export_call {
                 charge_bif_reductions(process, 1);
             }
+            // A direct BIF that failed has parked its exception (freason/fvalue set, as an erts
+            // BIF returns THE_NON_VALUE); the call is not redone.
+            if process.header.freason != 0 {
+                publish_dispatch_x(process, registers);
+                process.sync_native_header();
+                return Some(0);
+            }
             process.x[0] = value;
             let mut raw = crate::native_hooks::raw(value);
             if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {

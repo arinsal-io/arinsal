@@ -196,6 +196,9 @@ pub(crate) struct ProcessCold {
     /// The BIF failure behind the current native exception, so the scheduler can name the BIF
     /// and its arguments as the top frame (erts passes the MFA to `raise_exception`).
     pub(crate) native_bif_error: Option<NativeBifError>,
+    /// A table BIF failure raised from the direct path with its BIF frame already built, as
+    /// erts' BIF returns THE_NON_VALUE with `freason`/`fvalue` set; the call is not redone.
+    pub(crate) native_trap: Option<NativeTrap>,
     /// Stable snapshot and cursor for a trapped `persistent_term:get/0` call.
     pub(crate) persistent_get_all: Option<PersistentGetAll>,
     /// Result of a published `persistent_term` update, returned when the yielded
@@ -631,6 +634,14 @@ impl Default for Process {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A table BIF exception with its BIF frame built, kept until the native exit raises it.
+pub(crate) struct NativeTrap {
+    pub(crate) trap: crate::exceptions::Trap,
+    /// The `c_p->freason`/`fvalue` pair this error produced; any other exception ignores it.
+    pub(crate) freason: u64,
+    pub(crate) fvalue: u64,
 }
 
 /// A BIF failure raised from native code, kept until the native exit builds the exception.
