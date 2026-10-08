@@ -850,6 +850,15 @@ fn switch_out_live(module: &Module, instr: Instr) -> Option<usize> {
                 _ => None,
             }
         }
+        // A traced function entry holds exactly the function's arguments. erts tests for a
+        // yield at every function entry, right behind the breakpoint trampoline (i_test_yield,
+        // erts/emulator/beam/jit/arm/instr_common.cpp:3097, OTP-29.1.1), so a busy traced loop
+        // is still preempted; the breakpoint runs when the process resumes here.
+        Instr::Breakpoint { index } => local_arity(index),
+        Instr::ExportBreakpoint { index } => module
+            .exports
+            .get(index as usize)
+            .map(|export| usize::from(export.arity)),
         _ => None,
     }
 }
