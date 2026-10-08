@@ -3,8 +3,9 @@ use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(ets_vm_diff).
--export([basic/0, private_access/0, heir/0, owner_exit/0, giveaway/0, errors/0, fixed_locks/0, private_fixed_concurrency/0, compressed_fun/0, select_chunk_ends/0, match_zero_variable/0, fix_time/0, binary_info/0, compressed_binary_info/0]).
+-export([basic/0, private_access/0, heir/0, owner_exit/0, giveaway/0, errors/0, fixed_locks/0, private_fixed_concurrency/0, compressed_fun/0, fun_roundtrips/0, select_chunk_ends/0, match_zero_variable/0, fix_time/0, binary_info/0, compressed_binary_info/0]).
 id(X) -> X.
+local_fun(X) -> X + 1.
 basic() ->
   T=ets:new(vm_table,[named_table,set,public,{keypos,1}]),
   true=ets:insert(T,[{a,1},{b,2}]),
@@ -57,6 +58,21 @@ compressed_fun() ->
   F=fun(X) -> {T,1,X} end,
   true=ets:insert(T,{F,1}),
   {ets:info(T,size),ets:info(T,compressed)}.
+fun_roundtrips() ->
+  Local=fun local_fun/1,
+  External=fun erlang:length/1,
+  Captured=42,
+  Closure=fun(X) -> X + Captured end,
+  LocalCopy=binary_to_term(term_to_binary(Local)),
+  ExternalCopy=binary_to_term(term_to_binary(External)),
+  ClosureCopy=binary_to_term(term_to_binary(Closure)),
+  T=ets:new(fun_roundtrips,[compressed,set]),
+  true=ets:insert(T,[{local,Local},{external,External},{closure,Closure}]),
+  [{local,StoredLocal}]=ets:lookup(T,local),
+  [{external,StoredExternal}]=ets:lookup(T,external),
+  [{closure,StoredClosure}]=ets:lookup(T,closure),
+  {LocalCopy(1),ExternalCopy([a,b]),ClosureCopy(1),
+   StoredLocal(1),StoredExternal([a,b]),StoredClosure(1)}.
 select_chunk_ends() ->
   T=ets:new(select_chunk_ends,[set]),
   true=ets:insert(T,{a,1}),
@@ -110,6 +126,7 @@ fn ets_process_semantics_match_otp_29() {
         "fixed_locks",
         "private_fixed_concurrency",
         "compressed_fun",
+        "fun_roundtrips",
         "select_chunk_ends",
         "match_zero_variable",
         "fix_time",

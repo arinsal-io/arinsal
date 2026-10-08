@@ -122,7 +122,7 @@ fn distribution_atom_cache_resolves_atom_positions_in_identity_and_code_terms() 
 }
 
 #[test]
-fn new_fun_size_excludes_its_size_word_like_otp() {
+fn new_fun_size_includes_its_size_word_like_otp() {
     let term = OwnedTerm::Fun {
         arity: 1,
         uniq: [9; 16],
@@ -141,7 +141,7 @@ fn new_fun_size_excludes_its_size_word_like_otp() {
     let bytes = arinsal_etf::encode(&term, Default::default());
     assert_eq!(bytes[1], 112);
     let declared = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
-    assert_eq!(declared, bytes.len() - 6);
+    assert_eq!(declared, bytes.len() - 2);
     assert_eq!(arinsal_etf::decode(&bytes).unwrap(), term);
 }
 
