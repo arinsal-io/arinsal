@@ -90,10 +90,8 @@ impl NativeTargetCache {
             // One registry pass per module: a lookup per function would be quadratic. An old
             // instance of the module may still be registered (a reused module id can even
             // reuse the `Module` address), so only this instance's own code counts.
-            let mut natives = crate::native_bridge::native_functions_of(self.scope, &module.name);
-            if let Some((start, end)) = range {
-                natives.retain(|_, native| start <= native.start && native.start < end);
-            }
+            let mut natives =
+                crate::native_bridge::native_functions_of(self.scope, &module.name, range);
             let cache = self.targets.get_mut(module_id)?;
             cache.clear();
             cache.extend(

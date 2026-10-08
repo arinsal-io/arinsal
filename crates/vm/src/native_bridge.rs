@@ -459,23 +459,34 @@ fn native_arity_at(address: usize) -> Option<u8> {
         .map(|function| function.arity)
 }
 
-/// Every registered native function of `module`, keyed by name and arity.
+/// Every registered native function of `module`, keyed by name and arity, restricted to the
+/// module version whose native code spans `range` when one is given.
+// The registry holds every loaded version (current and old) ordered by address, so the
+// version must be selected before the entries collapse into one per name and arity: a newer
+// version placed below the old one in memory would otherwise lose its entries to the old ones.
 pub(crate) fn native_functions_of(
     scope: u64,
     module: &str,
+    range: Option<(usize, usize)>,
 ) -> std::collections::HashMap<(String, u8), NativeFunction> {
     let Ok(functions) = native_functions().read() else {
         return std::collections::HashMap::new();
     };
+    let in_version = |entry: &&NativeFunction| {
+        entry.module == module
+            && range.is_none_or(|(start, end)| start <= entry.start && entry.start < end)
+    };
     let mut scoped = functions
         .iter()
-        .filter(|entry| entry.scope == scope && entry.module == module)
+        .filter(|entry| entry.scope == scope)
+        .filter(in_version)
         .map(|entry| ((entry.function.clone(), entry.arity), entry.clone()))
         .collect::<std::collections::HashMap<_, _>>();
     if scope != 0 {
         for entry in functions
             .iter()
-            .filter(|entry| entry.scope == 0 && entry.module == module)
+            .filter(|entry| entry.scope == 0)
+            .filter(in_version)
         {
             scoped
                 .entry((entry.function.clone(), entry.arity))
@@ -895,4 +906,46 @@ pub(crate) fn exception_trace_enabled() -> bool {
 pub(crate) fn lifetime_trace_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     env_flag(&FLAG, "ARINSAL_BEAMASM_LIFETIME", |value| value == "1")
+}
+
+#[cfg(test)]
+mod version_selection_tests {
+    use super::*;
+
+    fn function(scope: u64, start: usize, module: &str) -> NativeFunction {
+        let atoms = arinsal_term::global_atoms();
+        NativeFunction {
+            scope,
+            start,
+            end: start + 16,
+            module: module.to_owned(),
+            module_atom: atoms.intern(module).expect("module atom"),
+            function: "spin".to_owned(),
+            function_atom: atoms.intern("spin").expect("function atom"),
+            arity: 0,
+            line: None,
+            file: None,
+            file_term: None,
+            line_table: Vec::new(),
+        }
+    }
+
+    // An old and a current version of one module are registered at once; the current one
+    // may be placed below the old one in memory. Each version must still find its own code.
+    #[test]
+    fn native_functions_of_selects_the_requested_version() {
+        let memory: &'static [u8] = Box::leak(vec![0_u8; 256].into_boxed_slice());
+        let base = memory.as_ptr() as usize;
+        let module = "native_bridge_version_selection";
+        let old = function(7, base + 128, module);
+        let current = function(7, base, module);
+        register_native_function(old.clone()).expect("register old version");
+        register_native_function(current.clone()).expect("register current version");
+        let key = ("spin".to_owned(), 0);
+        let selected = native_functions_of(7, module, Some((base, base + 64)));
+        assert_eq!(selected.get(&key), Some(&current));
+        let selected = native_functions_of(7, module, Some((base + 128, base + 192)));
+        assert_eq!(selected.get(&key), Some(&old));
+        unregister_native_functions(&[old, current]);
+    }
 }
