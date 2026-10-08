@@ -1347,7 +1347,7 @@ impl Executor {
                         }
                         continue;
                     }
-                    if let Some(code_ptr) = process.native_pc.take() {
+                    if let Some(code_ptr) = process.native_pc {
                         crate::beamasm_integration::count_native_call();
                         // Native receives look at the private queue only; fetch what arrived.
                         // Signals handled here (process_info) still see the process suspended at

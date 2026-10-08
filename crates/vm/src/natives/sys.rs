@@ -1200,18 +1200,13 @@ fn allocator_names(process: &mut Process) -> Result<Term, VmError> {
     )
 }
 
+// Port of erts/emulator/beam/erl_bif_info.c:2943 (system_info process_count), OTP-29.1.1.
 fn process_count(process: &Process) -> usize {
-    let Some(runtime) = process.runtime.as_ref() else {
-        return 1;
-    };
-    let Ok(scheduler) = runtime.scheduler() else {
-        return 1;
-    };
-    runtime
-        .processes
-        .lock()
-        .map(|pids| pids.iter().filter(|pid| scheduler.lookup(**pid)).count())
-        .unwrap_or(1)
+    process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok())
+        .map_or(1, |scheduler| scheduler.process_count())
 }
 
 fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Term, VmError> {

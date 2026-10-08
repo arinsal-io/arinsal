@@ -4638,6 +4638,10 @@ impl<T: Task> Scheduler<T> {
         let cell = process.cell.lock().unwrap();
         inspectable(process.state.load(Ordering::Acquire)).then(|| inspect(&cell.task))
     }
+    /// Number of live process table elements, O(1) like `erts_ptab_count`.
+    pub fn process_count(&self) -> usize {
+        self.inner.table.ids.count()
+    }
     /// Number of live tasks; this scan is for diagnostics.
     pub fn live_count(&self) -> usize {
         self.inner.table.live_count()

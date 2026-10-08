@@ -2743,6 +2743,20 @@ pub(crate) fn is_waiting(process: &Process, pid: Pid) -> bool {
         .is_some_and(|runtime| runtime.remote_status(pid) == "waiting")
 }
 
+/// Whether `process` is parked in `erlang:process_info/2` awaiting a target reply.
+// Port of erts/emulator/beam/erl_bif_info.c:2341 (`current_function`), OTP-29.1.1.
+pub(crate) fn is_waiting_for_process_info(process: &Process) -> bool {
+    let Some(pid) = process.self_pid else {
+        return false;
+    };
+    tables()
+        .lock()
+        .unwrap()
+        .waiters
+        .get(&(scope(process), pid))
+        .is_some_and(|waiter| matches!(waiter.kind, WaitKind::Info))
+}
+
 /// `Ok(None)` when this process has no outstanding request.
 /// `Ok(Some(term))` when the reply has arrived.
 /// `Err(await)` when the reply is still pending.

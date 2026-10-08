@@ -471,30 +471,38 @@ fn process_info(
             }
             "current_location" => {
                 let (module_name, function, arity) = resolve_mfa(vm, process)?;
-                let native = native_call_site(process).map(|(function, pc)| {
-                    function
-                        .line_at(pc)
-                        .map(|(file, line)| (file.to_owned(), u64::from(line)))
-                });
-                let source = native.flatten().or_else(|| {
-                    process.runtime.as_ref().and_then(|runtime| {
-                        runtime.with_modules(|modules| {
-                            let module = modules.get(process.module)?;
-                            module
-                                .lines
-                                .get(process.ip)
-                                .and_then(Option::as_ref)
-                                .or_else(|| {
-                                    process
-                                        .ip
-                                        .checked_sub(1)
-                                        .and_then(|ip| module.lines.get(ip))
-                                        .and_then(Option::as_ref)
-                                })
-                                .cloned()
+                let waiting_for_process_info = crate::signals::is_waiting_for_process_info(process);
+                let native = (!waiting_for_process_info)
+                    .then(|| native_call_site(process))
+                    .flatten()
+                    .map(|(function, pc)| {
+                        function
+                            .line_at(pc)
+                            .map(|(file, line)| (file.to_owned(), u64::from(line)))
+                    });
+                let source = if waiting_for_process_info {
+                    None
+                } else {
+                    native.flatten().or_else(|| {
+                        process.runtime.as_ref().and_then(|runtime| {
+                            runtime.with_modules(|modules| {
+                                let module = modules.get(process.module)?;
+                                module
+                                    .lines
+                                    .get(process.ip)
+                                    .and_then(Option::as_ref)
+                                    .or_else(|| {
+                                        process
+                                            .ip
+                                            .checked_sub(1)
+                                            .and_then(|ip| module.lines.get(ip))
+                                            .and_then(Option::as_ref)
+                                    })
+                                    .cloned()
+                            })
                         })
                     })
-                });
+                };
                 let location = if let Some((file, line)) = source {
                     let file = charlist(process, &file)?;
                     let file = make_tuple(process, &[atom("file"), file])?;
@@ -1060,6 +1068,7 @@ pub(crate) fn native_call_site(
     crate::native_function_at(pc).map(|function| (function, pc))
 }
 
+// Port of erts/emulator/beam/erl_bif_info.c:2341 (`current_function`), OTP-29.1.1.
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
     if let Some((module, function, arity)) =
         process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
@@ -1082,6 +1091,9 @@ fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8
         == Some(arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY)
     {
         return Ok(("erlang".to_owned(), "send".to_owned(), 2));
+    }
+    if crate::signals::is_waiting_for_process_info(process) {
+        return Ok(("erlang".to_owned(), "process_info".to_owned(), 2));
     }
     if let Some((function, _)) = native_call_site(process) {
         return Ok((function.module, function.function, function.arity));
@@ -4818,4 +4830,60 @@ pub(crate) fn process_dump(
         "Internal State: ACT_PRIO_{priority} | USR_PRIO_{priority} | PRQ_PRIO_{priority} | ACTIVE | RUNNING"
     );
     Ok(text.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arinsal_difftest::{CallResult, RefErl};
+
+    #[test]
+    fn process_info_other_reports_the_waiting_bif_location_like_otp() {
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping process_info current_location differential test");
+            return;
+        };
+        let source = r#"
+-module(process_info_location_diff).
+-export([run/0]).
+
+run() ->
+    Parent = self(),
+    Pid = spawn(fun() -> Parent ! child_ready, process_info_looper(Parent) end),
+    receive child_ready -> ok end,
+    Result = pio_current_location(Pid, 10000),
+    exit(Pid, kill),
+    Result.
+
+pio_current_location(_, 0) -> true;
+pio_current_location(Pid, N) ->
+    erlang:yield(),
+    {current_location, Where} = process_info(Pid, current_location),
+    case Where of
+        {erlang, process_info, 2, []} -> pio_current_location(Pid, N - 1);
+        {erts_internal, await_result, 1, Loc} when is_list(Loc) ->
+            pio_current_location(Pid, N - 1);
+        {process_info_location_diff, process_info_looper, 1, Loc} when is_list(Loc) ->
+            pio_current_location(Pid, N - 1);
+        {process_info_location_diff, '-run/0-fun-0-', 1, Loc} when is_list(Loc) ->
+            pio_current_location(Pid, N - 1);
+        _ -> false
+    end.
+
+process_info_looper(Parent) ->
+    process_info(Parent, current_location),
+    process_info_looper(Parent).
+"#;
+        let beam = reference
+            .compile_named("process_info_location_diff", source, &[])
+            .unwrap();
+        reference.load("process_info_location_diff", &beam).unwrap();
+        let expected = reference.call("process_info_location_diff", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("process_info_location_diff", "run", &[], 4, None)
+            .unwrap();
+        assert_eq!(expected, CallResult::Ok(actual.term));
+    }
 }
