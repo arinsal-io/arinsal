@@ -461,6 +461,17 @@ fn deliver_exit(
     true
 }
 
+/// `trace_port_receive(prt, from, am_close)` (io.c:2196).
+fn trace_close_receive(runtime: &crate::process::Runtime, id: u64, from: Pid) {
+    let Some(caller) = from.to_term() else {
+        return;
+    };
+    let mut heap = VecHeap::new();
+    if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller, atom("close")]) {
+        crate::trace::emit_port_event(runtime, id, crate::trace::RECEIVE, "receive", &[event]);
+    }
+}
+
 /// Port of erts/emulator/beam/io.c:2241 (erts_port_exit) for a loaded driver.
 /// `want_ref` is `port_close/1`: its result goes to the returned reference id when
 /// scheduled. `Err` is `badarg`.
@@ -477,8 +488,14 @@ pub(crate) fn exit(
 ) -> Result<Option<u64>, VmError> {
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let closed_to = bang.then_some(from);
+    // port_close/1 traces `receive {Caller, close}` when the signal executes
+    // (io.c:2196 call_deliver_port_exit).
+    let trace_close = want_ref;
     match drv.try_imm_call(0, !want_ref, "close", (CONTEXT_REDS / 10) as u32) {
         Ok(imm) => {
+            if trace_close {
+                trace_close_receive(&runtime, handle.id, from);
+            }
             let mut heap = ProcessHeap::with_words(64);
             let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
             let done = deliver_exit(&runtime, handle, bang, from, reason, closed_to);
@@ -497,6 +514,9 @@ pub(crate) fn exit(
     let task_handle = Arc::clone(handle);
     schedule(drv, caller, move |op| {
         // Port of erts/emulator/beam/io.c:2212 (port_sig_exit), OTP-29.1.1.
+        if trace_close && op == SigOp::Exec {
+            trace_close_receive(&runtime, task_handle.id, from);
+        }
         let mut heap = ProcessHeap::with_words(64);
         let reason = from_owned(&reason, &mut heap).unwrap_or_else(|_| atom("normal"));
         let ok = op == SigOp::Exec

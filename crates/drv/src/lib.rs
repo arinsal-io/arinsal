@@ -554,6 +554,12 @@ pub trait PortHost: Send + Sync {
     /// Port of erl_process.c:9413 (erts_resume_processes): resume the processes
     /// (process-table data) that were suspended on the busy port.
     fn resume_processes(&self, port: &DriverPort, pids: Vec<u64>);
+    /// Put the port, which has scheduled tasks now, on its run queue so a normal
+    /// scheduler executes it (erl_port_task.c:1576-1598, erts_port_task_schedule).
+    fn enqueue_port(&self, port: Arc<DriverPort>);
+    /// Run `ready` (an async job's `ready_async`) as auxiliary work of normal scheduler
+    /// `sched_id` (erl_async.c:227 async_reply, `ERTS_SSI_AUX_WORK_ASYNC_READY`).
+    fn schedule_async_ready(&self, sched_id: usize, ready: Box<dyn FnOnce() + Send>);
     /// `profile_runnable_port`: the port became runnable (`active`) or inactive.
     fn profile_runnable_port(&self, _port: &DriverPort, _active: bool) {}
     /// `trace_sched_ports`: the port is scheduled in or out.
@@ -617,6 +623,8 @@ pub struct DriverPort {
     async_open: std::sync::atomic::AtomicBool,
     /// `prt->sched`: the port's task queues and scheduling flags.
     sched: port_task::PortSched,
+    /// `prt->run_queue`; the VM sets it at creation ([`DriverPort::init_run_queue`]).
+    run_queue: arinsal_sched::PortRunQueue,
 }
 
 /// Set in `DriverPort::caller` while a callback has a caller (pid data 0 is a valid pid).
@@ -671,12 +679,19 @@ impl DriverPort {
             os_pid: AtomicI64::new(-1),
             async_open: std::sync::atomic::AtomicBool::new(false),
             sched: port_task::PortSched::default(),
+            run_queue: arinsal_sched::PortRunQueue::default(),
         });
         registry()
             .lock()
             .unwrap()
             .insert(port.handle() as usize, Arc::downgrade(&port));
         port
+    }
+
+    /// Port of erts/emulator/beam/erl_port.h:210 (erts_init_runq_port), OTP-29.1.1: the
+    /// run queue of the scheduler that creates the port (io.c:352 create_port).
+    pub fn init_run_queue(&self, ix: usize) {
+        self.run_queue.set(ix);
     }
 
     /// VM port id.

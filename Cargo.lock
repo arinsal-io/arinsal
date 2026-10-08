@@ -169,6 +169,7 @@ name = "arinsal-drv"
 version = "0.0.1"
 dependencies = [
  "arinsal-etf",
+ "arinsal-sched",
  "cc",
  "libc",
  "libloading",
