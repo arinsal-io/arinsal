@@ -11,10 +11,10 @@
 use std::collections::HashMap;
 use std::ffi::c_int;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 
-use crate::task::{self, Task, call2, event_of};
-use crate::{DriverPort, layout, poll};
+use crate::task::{call2, event_of};
+use crate::{DriverPort, REDS_INPUT, layout, poll};
 
 /// `ERL_DRV_READ`.
 pub(crate) const READ: c_int = layout::ERL_DRV_READ as c_int;
@@ -107,15 +107,20 @@ fn arm_dir(fd: i32, state: &mut FdState, dir: usize) -> bool {
     }
     let id = next_registration();
     slot.reg = Some(id);
+    // A driver selection becomes an I/O task of its port right on the poller thread
+    // (erl_check_io.c:2102 iready/oready); everything that needs the descriptor table
+    // goes through the notifier, since the poller must not take the table lock.
+    let owner = state.nif.is_none().then(|| slot.owner.clone()).flatten();
+    let ready: Box<dyn FnOnce() + Send> = match owner {
+        Some(owner) => Box::new(move || {
+            if !owner.schedule_io(fd, dir, id) {
+                notify(fd, dir, id);
+            }
+        }),
+        None => Box::new(move || notify(fd, dir, id)),
+    };
     let notified = match poll::backend() {
-        Some(backend) => backend
-            .register(
-                id,
-                fd,
-                dir == 1,
-                Box::new(move || task::schedule(Task::Ready { fd, dir, reg: id })),
-            )
-            .is_ok(),
+        Some(backend) => backend.register(id, fd, dir == 1, ready).is_ok(),
         None => false,
     };
     if !notified {
@@ -130,7 +135,13 @@ fn arm(fd: i32, state: &mut FdState, dir: usize) {
     if !arm_dir(fd, state, dir) {
         let id = next_registration();
         state.dirs[dir].reg = Some(id);
-        task::schedule(Task::Ready { fd, dir, reg: id });
+        let scheduled = state.dirs[dir]
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.schedule_io(fd, dir, id));
+        if !scheduled {
+            notify(fd, dir, id);
+        }
     }
 }
 
@@ -600,9 +611,28 @@ fn nif_mode_text(mode: c_int) -> String {
     )
 }
 
-/// A poll registration fired: run `ready_input`/`ready_output` of the owner, then
-/// re-arm the event if it is still selected (`erts_io_notify_port_task_executed`).
-pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
+/// Hand a fired registration that needs the descriptor table to the notifier thread.
+fn notify(fd: i32, dir: usize, reg: u64) {
+    static NOTIFIER: OnceLock<Mutex<mpsc::Sender<(i32, usize, u64)>>> = OnceLock::new();
+    let sender = NOTIFIER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(i32, usize, u64)>();
+        std::thread::Builder::new()
+            .name("arinsal-drv-select".into())
+            .spawn(move || {
+                for (fd, dir, reg) in rx {
+                    fired(fd, dir, reg);
+                }
+            })
+            .expect("start select notifier");
+        Mutex::new(tx)
+    });
+    let _ = sender.lock().unwrap().send((fd, dir, reg));
+}
+
+/// A poll registration fired (erl_check_io.c:2102, erts_check_io) and could not become a
+/// port task directly: a NIF selection sends its message; a driver selection becomes an
+/// input or output task of the owning port, or is reported stale.
+fn fired(fd: i32, dir: usize, reg: u64) {
     let owner = {
         let mut table = table();
         let Some(state) = table.get_mut(&fd) else {
@@ -611,10 +641,10 @@ pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
         if state.dirs[dir].reg != Some(reg) {
             return;
         }
-        state.dirs[dir].reg = None;
         if let Some(nif) = state.nif.as_mut() {
             // erl_check_io.c:2121 (`ERTS_EV_TYPE_NIF` in erts_check_io): the selection is
             // one-shot; the prepared message goes to its recipient.
+            state.dirs[dir].reg = None;
             state.events &= !DIRS[dir];
             let message = nif.messages[dir].take();
             drop(table);
@@ -624,18 +654,62 @@ pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
             return;
         }
         let Some(owner) = state.dirs[dir].owner.clone() else {
+            state.dirs[dir].reg = None;
             return;
         };
         if !owner.live() {
             // erl_check_io.c:1884 (stale_drv_select): the port died with the fd selected.
+            state.dirs[dir].reg = None;
             report_stale(&owner, DIRS[dir]);
             deselect(&mut table, fd, DIRS[dir]);
             return;
         }
+        owner
+    };
+    if !owner.schedule_io(fd, dir, reg) {
+        // The port is exiting and takes no more tasks (erl_port_task.c:1517 fail).
+        let mut table = table();
+        if let Some(state) = table.get_mut(&fd)
+            && state.dirs[dir].reg == Some(reg)
+        {
+            state.dirs[dir].reg = None;
+        }
+    }
+}
+
+/// Execute the input or output task of `port` for registration `reg`: run
+/// `ready_input`/`ready_output`, then re-arm the event if it is still selected
+/// (`erts_io_notify_port_task_executed`). Returns the task's reductions.
+///
+/// Port of erts/emulator/beam/erl_port_task.c:1776-1806 (ERTS_PORT_TASK_INPUT/OUTPUT),
+/// OTP-29.1.1.
+pub(crate) fn ready(port: &DriverPort, fd: i32, dir: usize, reg: u64) -> i32 {
+    let owner = {
+        let mut table = table();
+        let Some(state) = table.get_mut(&fd) else {
+            return 0;
+        };
+        if state.dirs[dir].reg != Some(reg) {
+            return 0;
+        }
+        state.dirs[dir].reg = None;
+        let Some(owner) = state.dirs[dir]
+            .owner
+            .clone()
+            .filter(|owner| owner.id == port.id)
+        else {
+            return 0;
+        };
+        if !port.live() {
+            // erl_check_io.c:1884 (stale_drv_select): the port died with the fd selected.
+            report_stale(port, DIRS[dir]);
+            deselect(&mut table, fd, DIRS[dir]);
+            return 0;
+        }
         state.dirs[dir].running = Some(reg);
         owner
     };
-    owner.run_io(dir, fd, reg);
+    let ran = owner.run_io(dir, fd, reg);
     let mut table = table();
     if let Some(state) = table.get_mut(&fd)
         && state.dirs[dir].running == Some(reg)
@@ -644,6 +718,8 @@ pub(crate) fn ready(fd: i32, dir: usize, reg: u64) {
         state.dirs[dir].executing = false;
         arm(fd, state, dir);
     }
+    // ERTS_PORT_REDS_INPUT and ERTS_PORT_REDS_OUTPUT are equal (erl_port.h:365-366).
+    if ran { REDS_INPUT } else { 0 }
 }
 
 /// Whether a scheduled ready task still owns the selected direction after taking the
@@ -672,12 +748,12 @@ fn io_task_matches(state: &FdState, dir: usize, reg: u64) -> bool {
 impl DriverPort {
     /// Port of erl_port_task.c:1776 (ERTS_PORT_TASK_INPUT/OUTPUT) with the default
     /// callbacks of io.c:7517 (no_ready_input_callback/no_ready_output_callback).
-    pub(crate) fn run_io(self: &Arc<Self>, dir: usize, fd: i32, reg: u64) {
+    /// `true` when a callback (or the missing-callback report) ran.
+    pub(crate) fn run_io(self: &Arc<Self>, dir: usize, fd: i32, reg: u64) -> bool {
         let _guard = self.guard();
         if !self.live() || !begin_io_task(self, fd, dir, reg) {
-            return;
+            return false;
         }
-        self.start_task();
         let callback = if dir == 0 {
             self.driver.callbacks.ready_input
         } else {
@@ -713,6 +789,7 @@ impl DriverPort {
                 driver_select(self, fd, bit | USE_NO_CALLBACK, false);
             }
         }
+        true
     }
 
     /// Call `stop_select(event, NULL)` of the driver (io.c:7541 when it has none).

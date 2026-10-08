@@ -3,7 +3,7 @@
 //! Port of erts/emulator/beam/erl_async.c (driver_async :541, driver_async_port_key
 //! :518, async_main, call_async_ready :318) and io.c:5368 (async_ready), OTP-29.1.1.
 //! A job runs `async_invoke` on the worker picked by its key, then `ready_async` runs
-//! on the task executor with the port locked. If the port is gone by then, or the driver
+//! as auxiliary work of the scheduler that issued the job, with the port locked. If the port is gone by then, or the driver
 //! has no `ready_async`, `async_free` releases the job data.
 
 use std::ffi::{c_long, c_uint, c_void};
@@ -12,7 +12,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use crate::task::{self, Task, call1, call2};
+use crate::task::{call1, call2};
 use crate::threads;
 use crate::{DriverPort, DrvFn1, REDS_INPUT};
 
@@ -36,6 +36,8 @@ pub(crate) struct Job {
     free: Option<DrvFn1>,
     /// The port data lock the job holds a reference on (`ErtsAsync.pdl`), zero when none.
     pdl: usize,
+    /// Zero-based scheduler that issued the job (`a->sched_id - 1`).
+    sched_id: usize,
 }
 
 struct Pool {
@@ -53,7 +55,11 @@ fn pool() -> &'static Pool {
                     .spawn(move || {
                         for job in rx {
                             call1(job.invoke, job.data as *mut c_void);
-                            task::schedule(Task::AsyncReady(job));
+                            // Port of erl_async.c:227 (async_reply): the issuing
+                            // scheduler runs ready_async as aux work.
+                            let port = Arc::clone(&job.port);
+                            port.host
+                                .schedule_async_ready(job.sched_id, Box::new(move || job.ready()));
                         }
                     })
                     .expect("start driver async thread");
@@ -117,6 +123,8 @@ pub(crate) fn driver_async(
         data: data as usize,
         free,
         pdl: 0,
+        // Port of erl_async.c:552-554, OTP-29.1.1: scheduler 1 when not on a scheduler.
+        sched_id: arinsal_sched::current_normal_scheduler().unwrap_or(0),
     };
     if threads == 0 {
         call1(invoke, data);

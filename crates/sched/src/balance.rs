@@ -5,16 +5,21 @@
 //! erl_process.c:4746-5530 (migration paths, check_balance, change_no_used_runqs) and
 //! erl_process.h:131-215,789-875 (run queue flags and length bookkeeping), OTP-29.1.1.
 //!
-//! Ports are not scheduled on run queues here, so the port priority level
-//! (`ERTS_PORT_PRIO_LEVEL`) has no statistics and no migration path.
+//! Ports with scheduled tasks are queued on the run queues at the port priority level
+//! (`ERTS_PORT_PRIO_LEVEL`), which has its own statistics and migration path.
 
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex};
 
+// Port of erts/emulator/beam/erl_process.h:128-132, OTP-29.1.1.
 /// Process priority levels (`ERTS_NO_PROC_PRIO_LEVELS`).
-pub(crate) const PRIO_LEVELS: usize = 4;
+pub(crate) const PROC_PRIO_LEVELS: usize = 4;
+/// The port level (`ERTS_PORT_PRIO_LEVEL`).
+pub(crate) const PORT_PRIO_LEVEL: usize = PROC_PRIO_LEVELS;
+/// Process levels plus the port level (`ERTS_NO_PRIO_LEVELS`).
+pub(crate) const PRIO_LEVELS: usize = PROC_PRIO_LEVELS + 1;
 pub(crate) const PRIORITY_NORMAL: usize = 2;
 pub(crate) const PRIORITY_LOW: usize = 3;
 
@@ -27,8 +32,7 @@ pub(crate) const RESCHEDULE_LOW: u8 = 8;
 const FULL_REDS_HISTORY_AVG_SHFT: u32 = 3;
 const FULL_REDS_HISTORY_SIZE: usize = (1 << FULL_REDS_HISTORY_AVG_SHFT) - 1;
 
-// Port of erts/emulator/beam/erl_process.h:136-187 (run queue flags), OTP-29.1.1, without
-// the port level.
+// Port of erts/emulator/beam/erl_process.h:136-187 (run queue flags), OTP-29.1.1.
 const QMASK: u32 = (1 << PRIO_LEVELS) - 1;
 const EMIGRATE_SHFT: u32 = 0;
 const IMMIGRATE_SHFT: u32 = EMIGRATE_SHFT + PRIO_LEVELS as u32;
@@ -641,8 +645,8 @@ fn plan(
                 }
             } else {
                 let mut xreds = 0_i64;
-                let procreds = treds;
-                for pix in 0..PRIO_LEVELS {
+                let procreds = treds - queue.prio[PORT_PRIO_LEVEL].reds;
+                for pix in 0..PROC_PRIO_LEVELS {
                     let av = if xreds == 0 {
                         100
                     } else if procreds == xreds {
@@ -655,6 +659,7 @@ fn plan(
                         xreds += queue.prio[pix].reds;
                     }
                 }
+                queue.prio[PORT_PRIO_LEVEL].avail = 100;
             }
             update_full_reds(queue, treds);
             full_scheds_reds += queue.full_reds;
@@ -924,8 +929,8 @@ mod tests {
     fn busy(normal_max_len: i64) -> Sample {
         Sample {
             flags: 0,
-            max_len: [0, 0, normal_max_len, 0],
-            reds: [0, 0, CHECK_BALANCE_REDS_PER_SCHED, 0],
+            max_len: [0, 0, normal_max_len, 0, 0],
+            reds: [0, 0, CHECK_BALANCE_REDS_PER_SCHED, 0, 0],
             total_max_len: normal_max_len,
         }
     }
@@ -947,6 +952,27 @@ mod tests {
     }
 
     #[test]
+    fn long_port_queue_emigrates_to_short_queue() {
+        let mut st = state(2);
+        let ports = |max_len: i64| Sample {
+            flags: 0,
+            max_len: [0, 0, 0, 0, max_len],
+            reds: [0, 0, 0, 0, CHECK_BALANCE_REDS_PER_SCHED],
+            total_max_len: max_len,
+        };
+        let (planned, _) = plan(&mut st, &[ports(40), ports(0)], 2, false, true);
+        let from = planned.paths[0];
+        let to = planned.paths[1];
+        assert_ne!(from.flags & flg_emigrate(PORT_PRIO_LEVEL), 0);
+        assert_ne!(to.flags & flg_immigrate(PORT_PRIO_LEVEL), 0);
+        assert_eq!(from.prio[PORT_PRIO_LEVEL].runq, Some(1));
+        assert_eq!(to.prio[PORT_PRIO_LEVEL].runq, Some(0));
+        // Ports are always fully available; process levels see no process reductions.
+        assert_eq!(from.prio[PORT_PRIO_LEVEL].limit_here, 20);
+        assert_eq!(from.flags & flg_emigrate(PRIORITY_NORMAL), 0);
+    }
+
+    #[test]
     fn balanced_queues_get_no_paths() {
         let mut st = state(2);
         let (planned, _) = plan(&mut st, &[busy(10), busy(10)], 2, false, true);
@@ -961,7 +987,7 @@ mod tests {
             ..Sample::default()
         };
         let little = Sample {
-            reds: [0, 0, 1000, 0],
+            reds: [0, 0, 1000, 0, 0],
             ..Sample::default()
         };
         let (planned, _) = plan(&mut st, &[little, idle, idle, idle], 4, false, true);

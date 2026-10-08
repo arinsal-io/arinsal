@@ -60,4 +60,9 @@ impl ReentrantLock {
         }
         Some(ReentrantGuard(self))
     }
+
+    /// The calling thread holds the lock (`erts_lc_is_port_locked`).
+    pub(crate) fn held_here(&self) -> bool {
+        self.state.lock().unwrap().0 == Some(thread::current().id())
+    }
 }

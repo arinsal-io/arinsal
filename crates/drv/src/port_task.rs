@@ -3,14 +3,14 @@
 //!
 //! Port of erts/emulator/beam/erl_port_task.c and erl_port_task.h, OTP-29.1.1. Process to
 //! port signals that cannot run immediately on the caller's thread are queued as tasks of
-//! the port; the port is put in a run queue and executor threads run its tasks with the
-//! port lock held. erts executes ports on its normal schedulers; here a pool of port
-//! executor threads takes their place (see the crate report for this deviation).
+//! the port; the port is put on its run queue and a normal scheduler runs its tasks with
+//! the port lock held (arinsal-sched executes [`RunPort`] entries between processes).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-use std::thread;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use arinsal_sched::{PortExecution, PortRunQueue, RunPort};
 
 use crate::{CALLBACK_VREDS, CONTEXT_REDS, DriverPort, REDS_EXECUTE};
 
@@ -101,6 +101,13 @@ pub struct ProcSig {
 
 enum TaskKind {
     Timeout(u64),
+    /// `ERTS_PORT_TASK_INPUT` (`dir` 0) or `ERTS_PORT_TASK_OUTPUT` (`dir` 1) for poll
+    /// registration `reg` of `fd`.
+    Io {
+        fd: i32,
+        dir: usize,
+        reg: u64,
+    },
     ProcSig {
         caller: u64,
         size: usize,
@@ -119,21 +126,21 @@ impl PortTask {
     fn caller(&self) -> u64 {
         match &self.kind {
             TaskKind::ProcSig { caller, .. } => *caller,
-            TaskKind::Timeout(_) => INVALID_CALLER,
+            TaskKind::Timeout(_) | TaskKind::Io { .. } => INVALID_CALLER,
         }
     }
 
     fn size(&self) -> usize {
         match &self.kind {
             TaskKind::ProcSig { size, .. } => *size,
-            TaskKind::Timeout(_) => 0,
+            TaskKind::Timeout(_) | TaskKind::Io { .. } => 0,
         }
     }
 
     fn take_callback(&self) -> Option<SigCallback> {
         match &self.kind {
             TaskKind::ProcSig { callback, .. } => callback.lock().unwrap().take(),
-            TaskKind::Timeout(_) => None,
+            TaskKind::Timeout(_) | TaskKind::Io { .. } => None,
         }
     }
 
@@ -253,51 +260,10 @@ impl PortSched {
     }
 }
 
-struct RunQueue {
-    ports: Mutex<VecDeque<Arc<DriverPort>>>,
-    ready: Condvar,
-}
-
-/// The port run queue and its executor threads (`runq->ports`).
-fn run_queue() -> &'static RunQueue {
-    static RUNQ: OnceLock<&'static RunQueue> = OnceLock::new();
-    RUNQ.get_or_init(|| {
-        let runq: &'static RunQueue = Box::leak(Box::new(RunQueue {
-            ports: Mutex::new(VecDeque::new()),
-            ready: Condvar::new(),
-        }));
-        let threads = thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(4)
-            .clamp(2, 8);
-        for n in 0..threads {
-            thread::Builder::new()
-                .name(format!("arinsal-port-sched-{n}"))
-                .spawn(move || {
-                    loop {
-                        let port = {
-                            let mut ports = runq.ports.lock().unwrap();
-                            loop {
-                                if let Some(port) = ports.pop_front() {
-                                    break port;
-                                }
-                                ports = runq.ready.wait(ports).unwrap();
-                            }
-                        };
-                        execute(&port);
-                    }
-                })
-                .expect("start port executor");
-        }
-        runq
-    })
-}
-
-// Port of erts/emulator/beam/erl_port_task.c:941 (enqueue_port), OTP-29.1.1.
-fn enqueue_port(port: Arc<DriverPort>) {
-    let runq = run_queue();
-    runq.ports.lock().unwrap().push_back(port);
-    runq.ready.notify_one();
+// Port of erts/emulator/beam/erl_port_task.c:1576-1598 (enqueue port on run-queue),
+// OTP-29.1.1.
+fn enqueue_port(port: &Arc<DriverPort>) {
+    port.host.enqueue_port(Arc::clone(port));
 }
 
 impl DriverPort {
@@ -502,6 +468,24 @@ impl DriverPort {
         }
     }
 
+    /// Queue an I/O task for a fired poll registration (`ERTS_PORT_TASK_INPUT` or
+    /// `ERTS_PORT_TASK_OUTPUT`, erl_check_io.c:2102 iready/oready). `false` when the port
+    /// accepts no more tasks.
+    pub(crate) fn schedule_io(self: &Arc<Self>, fd: i32, dir: usize, reg: u64) -> bool {
+        let task = Arc::new(PortTask {
+            state: AtomicU32::new(STATE_SCHEDULED),
+            flags: 0,
+            kind: TaskKind::Io { fd, dir, reg },
+        });
+        match self.enqueue_task(&task, false) {
+            Ok(act) => {
+                self.activate(act);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     // erl_port_task.c:1561-1609: mark the port as having tasks and put it in the run
     // queue unless it is queued or executing already.
     fn activate(self: &Arc<Self>, mut act: u32) {
@@ -536,7 +520,7 @@ impl DriverPort {
         if act & PTS_FLG_EXEC_IMM == 0 {
             self.host.profile_runnable_port(self, true);
         }
-        enqueue_port(Arc::clone(self));
+        enqueue_port(self);
     }
 
     /// Port of erts/emulator/beam/erl_port_task.c:1310 (erts_port_task_abort): `true`
@@ -670,7 +654,7 @@ impl DriverPort {
     }
 
     /// Port of erts/emulator/beam/erl_port_task.c:1643 (erts_port_task_free_port): the
-    /// port terminated; abort its tasks unless an executor does that.
+    /// port terminated; abort its tasks unless a scheduler executing the port does that.
     pub(crate) fn sched_free(&self) {
         let flags = {
             let _inq = self.sched.inq();
@@ -922,9 +906,20 @@ fn select_task_for_exec(port: &DriverPort) -> Option<Arc<PortTask>> {
     }
 }
 
+impl RunPort for DriverPort {
+    fn run_queue(&self) -> &PortRunQueue {
+        &self.run_queue
+    }
+
+    fn execute(&self) -> PortExecution {
+        execute(self)
+    }
+}
+
 /// Port of erts/emulator/beam/erl_port_task.c:1677 (erts_port_task_execute): run the
-/// port's tasks until it runs out of tasks or reductions.
-fn execute(port: &Arc<DriverPort>) {
+/// port's tasks until it runs out of tasks or reductions. The scheduler re-enqueues the
+/// port when it is still active and accounts the returned reductions.
+fn execute(port: &DriverPort) -> PortExecution {
     prepare_exec(port);
     let guard = port.guard();
     port.host.trace_sched_port(port, true, None);
@@ -932,6 +927,7 @@ fn execute(port: &Arc<DriverPort>) {
     // `begin_handle_tasks` before the first task.
     port.reds
         .store(REDS_EXECUTE + CALLBACK_VREDS, Ordering::Release);
+    let mut vreds = CALLBACK_VREDS;
     let mut exited = port.sched.flags() & PTS_FLG_EXIT != 0;
     if exited {
         port.begin_port_cleanup();
@@ -945,29 +941,35 @@ fn execute(port: &Arc<DriverPort>) {
         }
         let started = std::time::Instant::now();
         let (reds, op) = match &task.kind {
-            TaskKind::Timeout(epoch) => (port.run_timeout_task(*epoch), "timeout"),
+            TaskKind::Timeout(epoch) => (port.run_timeout_task(*epoch), Some("timeout")),
+            // The I/O callback reports its own long schedule (select.rs run_io).
+            TaskKind::Io { fd, dir, reg } => (crate::select::ready(port, *fd, *dir, *reg), None),
             TaskKind::ProcSig { size, .. } => {
                 let reds = task
                     .take_callback()
                     .map_or(0, |callback| callback(SigOp::Exec));
                 port.dequeued_proc2port_data(*size);
-                (reds, "proc_sig")
+                (reds, Some("proc_sig"))
             }
         };
-        port.host
-            .task_done(port, op, started.elapsed().as_nanos() as u64);
+        if let Some(op) = op {
+            port.host
+                .task_done(port, op, started.elapsed().as_nanos() as u64);
+        }
         if port.sched.flags() & PTS_FLG_EXIT != 0 {
+            // erl_port_task.c:1845-1850: the freed port's task reductions are not added.
             port.begin_port_cleanup();
             exited = true;
+            continue;
         }
+        vreds += CALLBACK_VREDS;
         let used = reds + CALLBACK_VREDS;
         if port.reds.fetch_add(used, Ordering::AcqRel) + used >= CONTEXT_REDS {
             break;
         }
     }
     let active = finalize_exec(port);
+    let reds = port.reds.load(Ordering::Acquire) - vreds;
     drop(guard);
-    if active {
-        enqueue_port(Arc::clone(port));
-    }
+    PortExecution { active, reds }
 }

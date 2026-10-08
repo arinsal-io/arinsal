@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arinsal_etf::OwnedTerm;
 
 use crate::queue::IoQueue;
-use crate::termspec;
 use crate::{
     DriverPort, ExitReason, SFLG_BINARY_IO, SFLG_LINEBUF_IO, SFLG_STARTED, SFLG_TERMINATING,
     StartError, layout, threads,
 };
+use crate::{lock, termspec};
 
 /// `ErlDrvMonitor`: here the first word is the monitor id, the rest zero, so
 /// `driver_compare_monitors` is a plain byte comparison as in erts.
@@ -140,6 +140,18 @@ impl DriverPort {
         self.deliver(to, &term)
     }
 
+    /// Port of io.c:6044-6077 (deliver_term_check_port): a send is traced only from a
+    /// thread that runs a callback of the port with the port locked, never from a
+    /// driver thread.
+    fn trace_deliver(&self) -> bool {
+        self.caller_data().is_some()
+            && self
+                .lock
+                .as_ref()
+                .or(self.driver.lock.as_ref())
+                .is_some_and(lock::ReentrantLock::held_here)
+    }
+
     /// Hand a built term to the host: to `to` (a pid word) or the connected process.
     pub(crate) fn deliver(&self, to: Option<usize>, term: &OwnedTerm) -> c_int {
         let target = match to {
@@ -151,7 +163,7 @@ impl DriverPort {
         };
         c_int::from(
             self.host
-                .deliver_term(self, target, term, self.caller_data().is_some()),
+                .deliver_term(self, target, term, self.trace_deliver()),
         )
     }
 

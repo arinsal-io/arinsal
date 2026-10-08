@@ -4,7 +4,7 @@
 //! erts_cancel_port_timer, erts_read_port_timer) and :669 (get_timeout_pos,
 //! get_time_left), with the timeout task of erl_port_task.c:1760, OTP-29.1.1. Time
 //! is counted in 1 ms clock ticks like erts; one service thread expires timers and
-//! hands the `timeout` callback to the task executor.
+//! queues a timeout port task that a scheduler executes.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -165,7 +165,7 @@ impl DriverPort {
     }
 
     /// Port of erl_port_task.c:1760 (ERTS_PORT_TASK_TIMEOUT) with the default callback of
-    /// io.c:7535 (no_timeout_callback), run by the port executor with the port locked.
+    /// io.c:7535 (no_timeout_callback), run by the executing scheduler with the port locked.
     /// Returns the reductions of the task.
     pub(crate) fn run_timeout_task(&self, epoch: u64) -> i32 {
         {

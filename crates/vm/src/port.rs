@@ -1169,6 +1169,7 @@ fn start_dyn_driver(
         own: Arc::downgrade(&handle),
     };
     let drv_port = arinsal_drv::DriverPort::new(Arc::clone(&driver), port_id, Box::new(host));
+    drv_port.init_run_queue(scheduler.current_run_queue());
     let _ = handle.driver.set(Arc::clone(&drv_port));
     if let Some(handle_id) = handle_id {
         crate::ddll::port_opened(handle_id, &drv_port);
@@ -1585,6 +1586,23 @@ impl arinsal_drv::PortHost for DrvHost {
     }
 
     // Port of erts/emulator/beam/erl_process.c:9413 (erts_resume_processes), OTP-29.1.1.
+    fn schedule_async_ready(&self, sched_id: usize, ready: Box<dyn FnOnce() + Send>) {
+        match self.runtime.upgrade().map(|runtime| runtime.scheduler()) {
+            Some(Ok(scheduler)) => scheduler.request_aux_work(sched_id, ready),
+            // Without schedulers the job is completed here so its data is released.
+            _ => ready(),
+        }
+    }
+
+    fn enqueue_port(&self, port: Arc<arinsal_drv::DriverPort>) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        if let Ok(scheduler) = runtime.scheduler() {
+            scheduler.enqueue_port(port);
+        }
+    }
+
     fn resume_processes(&self, _port: &arinsal_drv::DriverPort, pids: Vec<u64>) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
@@ -1693,6 +1711,7 @@ impl arinsal_drv::PortHost for DrvHost {
                 own: Arc::downgrade(&handle),
             }),
         );
+        drv_port.init_run_queue(scheduler.current_run_queue());
         drv_port.adopt(drv_data);
         let _ = handle.driver.set(Arc::clone(&drv_port));
         crate::ddll::port_opened_for(&driver, &drv_port);
@@ -3451,20 +3470,8 @@ fn port_close(process: &mut Process, caller: Pid, port: Term) -> Result<Term, Vm
             .and_then(|runtime| runtime.ports.lock().unwrap().get(&id).cloned())
         && let Some(drv) = handle.driver.get().cloned()
     {
-        if let Some(caller_term) = caller.to_term()
-            && let Some(runtime) = process.runtime.as_ref()
-        {
-            let mut heap = VecHeap::new();
-            if let Ok(event) = TermBuilder::new(&mut heap).tuple(&[caller_term, atom("close")]) {
-                crate::trace::emit_port_event(
-                    runtime,
-                    id,
-                    crate::trace::RECEIVE,
-                    "receive",
-                    &[event],
-                );
-            }
-        }
+        // The `{Caller, close}` receive trace is emitted when the exit signal executes
+        // (drv_sig::exit, io.c:2196 call_deliver_port_exit).
         let normal = OwnedTerm::Atom("normal".into());
         return match drv_sig::exit(process, caller, &handle, &drv, false, caller, normal, true) {
             Ok(Some(reference)) => drv_sig::reference_term(process, reference),
