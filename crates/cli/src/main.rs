@@ -234,6 +234,9 @@ fn erl_launch(args: &[String]) -> ! {
             }),
         flags: launch.emulator.allocator_options.clone(),
     });
+    arinsal_args::configure_scheduler_options(arinsal_args::ActiveSchedulerOptions(
+        launch.emulator.scheduler.clone(),
+    ));
     // Port of erts/emulator/beam/erl_init.c:1874 (+P) and erl_process.c:765
     // (erts_ptab_init_table), OTP-29.1.1: the table rounds the limit up to a power of two.
     // `+P legacy` keeps the default size; the legacy id algorithm is not ported.

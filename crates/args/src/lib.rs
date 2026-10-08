@@ -225,6 +225,8 @@ pub struct EmulatorFlags {
     pub time_warp: Option<TimeWarp>,
     /// `+c`.
     pub time_correction: Option<bool>,
+    /// Scheduler emulator options controlled by the `+s*` flags.
+    pub scheduler: SchedulerOptions,
     /// Arinsal's `+Zsim` seed.
     pub simulation_seed: Option<u64>,
     /// Arinsal's `+Spool` assignments.
@@ -233,6 +235,48 @@ pub struct EmulatorFlags {
     pub ignored: Vec<IgnoredFlag>,
     /// Validated OTP allocator switches, retained in command-line order.
     pub allocator_options: Vec<IgnoredFlag>,
+}
+
+/// Scheduler startup options parsed from OTP's scheduler emulator flags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchedulerOptions {
+    /// `+scl` compact run-queue load balancing.
+    pub compact_load: Option<bool>,
+    /// `+sub` utilization balancing.
+    pub utilization_balancing: Option<bool>,
+    /// `+sbwt`, `+sbwtdcpu`, and `+sbwtdio` busy-wait thresholds.
+    pub busy_wait: [Option<String>; 3],
+    /// `+swt`, `+swtdcpu`, and `+swtdio` wakeup thresholds.
+    pub wakeup: [Option<String>; 3],
+    /// `+sfwi` forced wakeup interval.
+    pub forced_wakeup_interval: Option<u64>,
+    /// `+spp` port parallelism hint.
+    pub port_parallelism: Option<bool>,
+    /// `+sbt` scheduler bind type.
+    pub bind_type: Option<String>,
+}
+
+/// Scheduler options visible to the runtime after CLI startup parsing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActiveSchedulerOptions(pub SchedulerOptions);
+
+static ACTIVE_SCHEDULER_OPTIONS: OnceLock<Mutex<ActiveSchedulerOptions>> = OnceLock::new();
+
+/// Set scheduler startup options before the VM starts.
+pub fn configure_scheduler_options(options: ActiveSchedulerOptions) {
+    *ACTIVE_SCHEDULER_OPTIONS
+        .get_or_init(|| Mutex::new(ActiveSchedulerOptions::default()))
+        .lock()
+        .expect("scheduler options lock poisoned") = options;
+}
+
+/// Return the active scheduler startup options.
+pub fn active_scheduler_options() -> ActiveSchedulerOptions {
+    ACTIVE_SCHEDULER_OPTIONS
+        .get_or_init(|| Mutex::new(ActiveSchedulerOptions::default()))
+        .lock()
+        .expect("scheduler options lock poisoned")
+        .clone()
 }
 
 impl EmulatorFlags {
@@ -1085,6 +1129,106 @@ fn parse_emulator_flag(
         }
     };
     match name {
+        // Port of erts/emulator/beam/erl_init.c:1935-2038 (scheduler option parsing), OTP-29.1.1.
+        "+scl" | "+sub" | "+spp" => {
+            let v = value(true, &mut consumed)?.unwrap();
+            let parsed = match v.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    let message = match name {
+                        "+scl" => format!("bad scheduler compact load value '{v}'"),
+                        "+sub" => format!("bad scheduler utilization balancing  value '{v}'"),
+                        _ => format!("bad port parallelism scheduling hint {v}"),
+                    };
+                    return Err(scheduler_diagnostic(message));
+                }
+            };
+            match name {
+                "+scl" => {
+                    out.scheduler.compact_load = Some(parsed);
+                    if parsed {
+                        out.scheduler.utilization_balancing = Some(false);
+                    }
+                }
+                "+sub" => out.scheduler.utilization_balancing = Some(parsed),
+                _ => out.scheduler.port_parallelism = Some(parsed),
+            }
+        }
+        // Port of erts/emulator/beam/erl_init.c:1925-1978 and erl_process.c:5814-5899,
+        // OTP-29.1.1.
+        "+sbwt" | "+sbwtdcpu" | "+sbwtdio" => {
+            let v = value(true, &mut consumed)?.unwrap();
+            if !matches!(
+                v.as_str(),
+                "none" | "very_short" | "short" | "medium" | "long" | "very_long"
+            ) {
+                let scheduler = match name {
+                    "+sbwt" => "scheduler",
+                    "+sbwtdcpu" => "dirty CPU scheduler",
+                    _ => "dirty IO scheduler",
+                };
+                return Err(scheduler_diagnostic(format!(
+                    "bad {scheduler} busy wait threshold: {v}"
+                )));
+            }
+            let index = match name {
+                "+sbwt" => 0,
+                "+sbwtdcpu" => 1,
+                _ => 2,
+            };
+            out.scheduler.busy_wait[index] = Some(v);
+        }
+        // Port of erts/emulator/beam/erl_init.c:2095-2124 and erl_process.c:5814-5837,
+        // OTP-29.1.1.
+        "+swt" | "+swtdcpu" | "+swtdio" => {
+            let v = value(true, &mut consumed)?.unwrap();
+            if !matches!(
+                v.as_str(),
+                "very_low" | "low" | "medium" | "high" | "very_high"
+            ) {
+                let scheduler = match name {
+                    "+swt" => "scheduler",
+                    "+swtdcpu" => "dirty CPU scheduler",
+                    _ => "dirty IO scheduler",
+                };
+                return Err(scheduler_diagnostic(format!(
+                    "{scheduler} wakeup threshold: {v}"
+                )));
+            }
+            let index = match name {
+                "+swt" => 0,
+                "+swtdcpu" => 1,
+                _ => 2,
+            };
+            out.scheduler.wakeup[index] = Some(v);
+        }
+        // Port of erts/emulator/beam/erl_init.c:2087-2094 and erl_process.c:5892-5904,
+        // OTP-29.1.1.
+        "+sfwi" => {
+            let v = value(true, &mut consumed)?.unwrap();
+            let parsed = v
+                .parse::<i64>()
+                .ok()
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| {
+                    scheduler_diagnostic(format!("bad scheduler forced wakeup interval {v}"))
+                })? as u64;
+            out.scheduler.forced_wakeup_interval = Some(parsed);
+        }
+        // Port of erts/emulator/beam/erl_init.c:1914-1944, OTP-29.1.1.
+        "+sbt" => {
+            let v = value(true, &mut consumed)?.unwrap();
+            if !matches!(
+                v.as_str(),
+                "u" | "db" | "s" | "ps" | "ts" | "tnnps" | "nnps" | "nnts" | "ns"
+            ) {
+                return Err(scheduler_diagnostic(format!(
+                    "setting scheduler bind type '{v}' failed: invalid type"
+                )));
+            }
+            out.scheduler.bind_type = Some(v);
+        }
         // Port of erts/emulator/beam/erl_init.c:1648-1667, OTP-29.1.1.
         "+D" => {
             if let Some(value) = inline {
@@ -1315,6 +1459,24 @@ fn parse_emulator_flag(
 }
 
 fn split_emulator_flag(token: &str) -> (&str, Option<&str>) {
+    const SCHEDULER_FLAGS: &[&str] = &[
+        "+sbwtdcpu",
+        "+sbwtdio",
+        "+swtdcpu",
+        "+swtdio",
+        "+scl",
+        "+sub",
+        "+sbwt",
+        "+swt",
+        "+sfwi",
+        "+spp",
+        "+sbt",
+    ];
+    for prefix in SCHEDULER_FLAGS {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            return (*prefix, (!rest.is_empty()).then_some(rest));
+        }
+    }
     const PREFIXES: &[&str] = &[
         "+SDPcpu", "+SDcpu", "+SDio", "+Spool", "+Zsim", "+zdbbl", "+hmbs", "+hms", "+Dibpl", "+D",
         "+s", "+h", "+M", "+JP", "+fn", "+pc", "+pa", "+SP", "+S", "+P", "+Q", "+t", "+C", "+c",
@@ -1665,4 +1827,8 @@ fn invalid(flag: &str, value: &str) -> ArgsError {
         flag: flag.into(),
         value: value.into(),
     }
+}
+
+fn scheduler_diagnostic(message: String) -> ArgsError {
+    ArgsError::ErlDiagnostic(format!("{message}\r\n{OTP_29_USAGE}"))
 }
