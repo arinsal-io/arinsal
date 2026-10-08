@@ -1136,10 +1136,40 @@ fn system_info(
             Some(cons_list(process, &terms))
         }
         Some("cpu_topology") => Some(cpu_topology_info(process)),
-        Some("scheduler_bind_type") => Some(Ok(atom("unbound"))),
+        // Port of erts/emulator/beam/erl_bif_info.c:3251 and
+        // erts/emulator/beam/erl_cpu_topology.c:662-692, OTP-29.1.1.
+        Some("scheduler_bind_type") => {
+            let bind_type = arinsal_args::active_scheduler_options()
+                .0
+                .bind_type
+                .unwrap_or_else(|| "u".to_owned());
+            let atom_name = match bind_type.as_str() {
+                "s" => "spread",
+                "ps" => "processor_spread",
+                "ts" => "thread_spread",
+                "tnnps" => "thread_no_node_processor_spread",
+                "nnps" => "no_node_processor_spread",
+                "nnts" => "no_node_thread_spread",
+                "ns" => "no_spread",
+                _ => "unbound",
+            };
+            Some(Ok(atom(atom_name)))
+        }
         Some("scheduler_bindings") => Some(read_flags(process, |process, flags| {
             tuple(process, &vec![atom("unbound"); flags.schedulers_total])
         })),
+        // Port of erts/emulator/beam/erl_bif_info.c:3352-3353, OTP-29.1.1.
+        Some("port_parallelism") => Some(Ok(atom(
+            if arinsal_args::active_scheduler_options()
+                .0
+                .port_parallelism
+                .unwrap_or(false)
+            {
+                "true"
+            } else {
+                "false"
+            },
+        ))),
         Some("sequential_tracer") => Some(crate::seq_trace::system_tracer_info(process)),
         Some("allocated_areas") => Some(memory_areas(vm, process)),
         _ if selector.classify() == TermKind::Tuple => Some(Err(badarg())),
@@ -4570,6 +4600,33 @@ mod tests {
     /// Tests that change or read the process-global scheduler flags run one
     /// at a time; the flags are shared by every test in this binary.
     static SCHEDULER_FLAGS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn scheduler_startup_system_info_matches_otp_on_scheduler_path() {
+        let _flags = SCHEDULER_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        arinsal_args::configure_scheduler_options(arinsal_args::ActiveSchedulerOptions::default());
+        let Ok(reference) = RefErl::start() else {
+            eprintln!("erl unavailable; skipping scheduler startup system_info differential test");
+            return;
+        };
+        let beam = reference
+            .compile_named(
+                "scheduler_startup_info_probe",
+                "-module(scheduler_startup_info_probe). -export([run/0]). run() -> {erlang:system_info(scheduler_bind_type), erlang:system_info(port_parallelism)}.",
+                &[],
+            )
+            .unwrap();
+        reference
+            .load("scheduler_startup_info_probe", &beam)
+            .unwrap();
+        let expected = reference.call("scheduler_startup_info_probe", "run", &[]);
+        let mut vm = Vm::new([]);
+        vm.load_bytes(&beam).unwrap();
+        let actual = vm
+            .eval_scheduled("scheduler_startup_info_probe", "run", &[], 1, None)
+            .unwrap_or_else(|error| panic!("scheduler startup system_info VM error: {error:?}"));
+        assert_eq!(expected, CallResult::Ok(actual.term));
+    }
 
     #[test]
     fn beam_jump_table_system_info_matches_otp() {

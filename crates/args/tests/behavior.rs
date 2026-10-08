@@ -150,9 +150,9 @@ fn accepted_ignored_flags_are_reported() {
         &environment(),
     )
     .unwrap();
-    assert_eq!(launch.emulator.ignored.len(), 10);
-    assert_eq!(launch.emulator.ignored[7].value.as_deref(), Some("i"));
-    assert_eq!(launch.emulator.warnings().len(), 8);
+    assert_eq!(launch.emulator.ignored.len(), 9);
+    assert_eq!(launch.emulator.ignored[6].value.as_deref(), Some("i"));
+    assert_eq!(launch.emulator.warnings().len(), 7);
     assert!(
         launch
             .emulator
@@ -168,6 +168,61 @@ fn accepted_ignored_flags_are_reported() {
             .name,
         "+SP"
     );
+}
+
+#[test]
+fn scheduler_flags_are_parsed_into_runtime_options() {
+    let launch = parse(
+        &[
+            "erl",
+            "+scl",
+            "false",
+            "+sub",
+            "true",
+            "+sbwt",
+            "none",
+            "+sbwtdcpu",
+            "short",
+            "+sbwtdio",
+            "long",
+            "+swt",
+            "medium",
+            "+swtdcpu",
+            "high",
+            "+swtdio",
+            "low",
+            "+sfwi",
+            "0",
+            "+spp",
+            "true",
+            "+sbt",
+            "u",
+        ],
+        &environment(),
+    )
+    .unwrap();
+    let options = launch.emulator.scheduler;
+    assert_eq!(options.compact_load, Some(false));
+    assert_eq!(options.utilization_balancing, Some(true));
+    assert_eq!(
+        options.busy_wait,
+        [
+            Some("none".into()),
+            Some("short".into()),
+            Some("long".into())
+        ]
+    );
+    assert_eq!(
+        options.wakeup,
+        [
+            Some("medium".into()),
+            Some("high".into()),
+            Some("low".into())
+        ]
+    );
+    assert_eq!(options.forced_wakeup_interval, Some(0));
+    assert_eq!(options.port_parallelism, Some(true));
+    assert_eq!(options.bind_type.as_deref(), Some("u"));
 }
 
 #[test]
@@ -289,6 +344,10 @@ fn emulator_acceptance_matches_otp_for_representative_flags() {
         &["+hms", "233"],
         &["+hmbs", "464"],
         &["+zdbbl", "1024"],
+        &["+scl", "false", "+sub", "true"],
+        &["+sbwt", "none", "+sbwtdcpu", "short", "+sbwtdio", "long"],
+        &["+swt", "medium", "+swtdcpu", "high", "+swtdio", "low"],
+        &["+sfwi", "0", "+spp", "true", "+sbt", "u"],
         &["+S", "4:4"],
         &["+Q", "100000"],
         &["+#", "1"],

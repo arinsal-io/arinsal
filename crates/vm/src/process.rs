@@ -6276,11 +6276,19 @@ impl Vm {
         });
         let (dirty_cpu_schedulers, dirty_cpu_online, dirty_io_schedulers) =
             crate::natives::sys::dirty_scheduler_defaults(&runtime);
+        let scheduler_options = arinsal_args::active_scheduler_options().0;
         let config = Config {
             workers,
             reductions: reductions.max(1),
             dirty_cpu_schedulers,
             dirty_io_schedulers,
+            compact_load: scheduler_options.compact_load.unwrap_or(true),
+            utilization_balancing: scheduler_options.utilization_balancing.unwrap_or(false),
+            busy_wait_thresholds: scheduler_options.busy_wait,
+            wakeup_thresholds: scheduler_options.wakeup,
+            forced_wakeup_interval: scheduler_options.forced_wakeup_interval,
+            port_parallelism: scheduler_options.port_parallelism,
+            scheduler_bind_type: scheduler_options.bind_type,
             max_processes: arinsal_term::ptab::process_table_layout().max(),
             ..Config::default()
         };

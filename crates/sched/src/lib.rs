@@ -438,6 +438,18 @@ pub struct Config {
     pub dirty_io_schedulers: usize,
     /// Compact load on as few run queues as possible (`+scl`); erts defaults to true.
     pub compact_load: bool,
+    /// Utilization-driven run-queue balancing requested by `+sub`.
+    pub utilization_balancing: bool,
+    /// Busy-wait thresholds for normal, dirty CPU, and dirty I/O schedulers.
+    pub busy_wait_thresholds: [Option<String>; 3],
+    /// Wakeup thresholds for normal, dirty CPU, and dirty I/O schedulers.
+    pub wakeup_thresholds: [Option<String>; 3],
+    /// `+sfwi` forced wakeup interval.
+    pub forced_wakeup_interval: Option<u64>,
+    /// `+spp` port-parallelism scheduling hint.
+    pub port_parallelism: Option<bool>,
+    /// `+sbt` scheduler binding strategy.
+    pub scheduler_bind_type: Option<String>,
 }
 
 impl Default for Config {
@@ -452,6 +464,12 @@ impl Default for Config {
             dirty_io_schedulers: 10,
             // Port of erts/emulator/beam/erl_init.c:803 (erts_sched_compact_load), OTP-29.1.1.
             compact_load: true,
+            utilization_balancing: false,
+            busy_wait_thresholds: [None, None, None],
+            wakeup_thresholds: [None, None, None],
+            forced_wakeup_interval: None,
+            port_parallelism: None,
+            scheduler_bind_type: None,
         }
     }
 }
