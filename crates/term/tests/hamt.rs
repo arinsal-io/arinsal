@@ -396,11 +396,11 @@ fn yielding_builder_matches_straight_line_builder() {
                     (key(k + case, &mut builder), Term::small(i as i64).unwrap())
                 })
                 .collect();
+            let mut expected_heap = VecHeap::new();
             let expected = {
-                let mut heap = VecHeap::new();
                 let keys: Vec<Term> = entries.iter().map(|e| e.0).collect();
                 let values: Vec<Term> = entries.iter().map(|e| e.1).collect();
-                arinsal_term::hashmap_from_ks_and_vs(&keys, &values, &mut heap).unwrap()
+                arinsal_term::hashmap_from_ks_and_vs(&keys, &values, &mut expected_heap).unwrap()
             };
             let hashed: Vec<(u64, Term, Term)> = entries
                 .iter()
