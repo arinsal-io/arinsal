@@ -46,8 +46,40 @@ const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
 const MAPS_MERGE_CONTINUATION: &str = "maps:merge_trap/1";
+const MAPS_KEYS_CONTINUATION: &str = "maps:keys/1";
+const MAPS_VALUES_CONTINUATION: &str = "maps:values/1";
+const MAPS_FROM_LIST_CONTINUATION: &str = "maps:from_list/1";
+const MAPS_FROM_KEYS_CONTINUATION: &str = "maps:from_keys/2";
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "maps",
+        function: "from_list",
+        arity: 1,
+        continuation: MAPS_FROM_LIST_CONTINUATION,
+        handler: maps_from_list,
+    },
+    Entry {
+        module: "maps",
+        function: "from_keys",
+        arity: 2,
+        continuation: MAPS_FROM_KEYS_CONTINUATION,
+        handler: maps_from_keys,
+    },
+    Entry {
+        module: "maps",
+        function: "keys",
+        arity: 1,
+        continuation: MAPS_KEYS_CONTINUATION,
+        handler: maps_keys,
+    },
+    Entry {
+        module: "maps",
+        function: "values",
+        arity: 1,
+        continuation: MAPS_VALUES_CONTINUATION,
+        handler: maps_values,
+    },
     Entry {
         module: "maps",
         function: "merge",
@@ -297,6 +329,164 @@ fn binary_search(
 }
 
 type MapsMergeState = Mutex<Option<arinsal_maps::HashmapMergeContext>>;
+type MapsProjectionState = Mutex<Option<arinsal_bifs::MapsProjectionWalk>>;
+type MapsBuildState = Mutex<Option<arinsal_bifs::MapsBuildWalk>>;
+
+fn maps_from_list(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    pid: Option<arinsal_sched::Pid>,
+    restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    maps_build(process, args, state, pid, restore_gc, false)
+}
+
+fn maps_from_keys(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    pid: Option<arinsal_sched::Pid>,
+    restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    maps_build(process, args, state, pid, restore_gc, true)
+}
+
+/// Reductions a YCF-yielded BIF charges: `BUMP_REDS(p, (init_reds - nr_of_reductions) /
+/// iterations_per_red)` (erts_ycf_trap_driver, utils.c:3736-3790). The counter may end up
+/// negative, so the charge can exceed what was available.
+fn ycf_reductions(initial: i64, left: i64, iterations_per_red: i64) -> u32 {
+    ((initial - left) / iterations_per_red).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+// Port of erts/emulator/beam/erl_map.c:278-366 (from_keys/from_list helpers), :482-591,
+// :622-642 (maps_from_list_1, maps_from_keys_2: 40 iterations per reduction) and
+// utils.c:3730-3810 (erts_ycf_trap_driver), OTP-29.1.1.
+fn maps_build(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+    from_keys: bool,
+) -> Result<TrapResult, BifError> {
+    const ITERATIONS_PER_RED: i64 = 40;
+    let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
+    let mut reds = initial;
+    let state = if let Some(state) = state {
+        Arc::clone(state)
+    } else if from_keys {
+        MagicRef::new(Mutex::new(Some(arinsal_bifs::MapsBuildWalk::from_keys(
+            args[0], args[1],
+        ))))
+    } else {
+        MagicRef::new(Mutex::new(Some(arinsal_bifs::MapsBuildWalk::from_list(
+            args[0],
+        ))))
+    };
+    let mut guard = state
+        .downcast_ref::<MapsBuildState>()
+        .ok_or(BifError::BADARG)?
+        .lock()
+        .map_err(|_| BifError::SystemLimit)?;
+    let walk = guard.as_mut().ok_or(BifError::BADARG)?;
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+    let Some(value) = walk.step(&mut ctx, &mut reds)? else {
+        drop(guard);
+        return Ok(TrapResult::Yield {
+            continuation: if from_keys {
+                MAPS_FROM_KEYS_CONTINUATION
+            } else {
+                MAPS_FROM_LIST_CONTINUATION
+            },
+            state,
+            reductions: ycf_reductions(initial, reds, ITERATIONS_PER_RED),
+        });
+    };
+    *guard = None;
+    drop(guard);
+    Ok(TrapResult::Done {
+        value,
+        reductions: ycf_reductions(initial, reds, ITERATIONS_PER_RED),
+    })
+}
+
+// Port of erts/emulator/beam/erl_map.c:1206-1252 (maps_keys_1_helper) and
+// erts/emulator/beam/erl_map.c:2261-2309 (maps_values_1_helper), OTP-29.1.1.
+fn maps_keys(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    pid: Option<arinsal_sched::Pid>,
+    restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    maps_projection(process, args, state, pid, restore_gc, true)
+}
+
+fn maps_values(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    pid: Option<arinsal_sched::Pid>,
+    restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    maps_projection(process, args, state, pid, restore_gc, false)
+}
+
+fn maps_projection(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _restore_gc: bool,
+    keys: bool,
+) -> Result<TrapResult, BifError> {
+    const ITERATIONS_PER_RED: i64 = 15;
+    let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
+    let mut reds = initial;
+    let state = if let Some(state) = state {
+        Arc::clone(state)
+    } else {
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        match arinsal_bifs::MapsProjectionWalk::start(&mut ctx, args[0], keys)? {
+            arinsal_bifs::ProjectionStart::Done(value) => {
+                return Ok(TrapResult::Done {
+                    value,
+                    reductions: 0,
+                });
+            }
+            arinsal_bifs::ProjectionStart::Walk(walk) => MagicRef::new(Mutex::new(Some(walk))),
+        }
+    };
+    let mut guard = state
+        .downcast_ref::<MapsProjectionState>()
+        .ok_or(BifError::BADARG)?
+        .lock()
+        .map_err(|_| BifError::SystemLimit)?;
+    let walk = guard.as_mut().ok_or(BifError::BADARG)?;
+    let done = walk.step(&mut reds);
+    let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);
+    if !done {
+        drop(guard);
+        return Ok(TrapResult::Yield {
+            continuation: if keys {
+                MAPS_KEYS_CONTINUATION
+            } else {
+                MAPS_VALUES_CONTINUATION
+            },
+            state,
+            reductions,
+        });
+    }
+    let walk = guard.take().ok_or(BifError::BADARG)?;
+    drop(guard);
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+    let value = walk.finish(&mut ctx);
+    Ok(TrapResult::Done { value, reductions })
+}
 
 // Port of erts/emulator/beam/erl_map.c:1257 (maps_merge_2), 1498 (maps_merge_trap_1) and
 // 1558-1861 (hashmap_merge: MAP_MERGE_LOOP_FACTOR budget, BUMP_REDS, trap), OTP-29.1.1.

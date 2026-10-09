@@ -378,3 +378,47 @@ fn flatmap_and_hamt_with_identical_entries_compare_equal() {
     assert_eq!(to_owned(hamt).unwrap(), to_owned(copied).unwrap());
     assert_eq!(size_object(hamt), copied_heap.used_words());
 }
+
+/// The yielding constructor, run with a tiny budget so it yields inside every loop and sort,
+/// builds the same trie as the straight-line one (hash ties are resolved by key, so the sort
+/// order cannot leak into the result).
+#[test]
+#[cfg(not(miri))]
+fn yielding_builder_matches_straight_line_builder() {
+    use arinsal_term::{HashmapBuild, hashmap_key_hash, hashmap_leaves_hashed};
+    for (case, n) in [33, 34, 100, 129, 700, 3_000].into_iter().enumerate() {
+        for duplicates in [false, true] {
+            let mut heap = VecHeap::new();
+            let mut builder = TermBuilder::new(&mut heap);
+            let entries: Vec<(Term, Term)> = (0..n)
+                .map(|i| {
+                    let k = if duplicates { i % (n / 2 + 1) } else { i };
+                    (key(k + case, &mut builder), Term::small(i as i64).unwrap())
+                })
+                .collect();
+            let expected = {
+                let mut heap = VecHeap::new();
+                let keys: Vec<Term> = entries.iter().map(|e| e.0).collect();
+                let values: Vec<Term> = entries.iter().map(|e| e.1).collect();
+                arinsal_term::hashmap_from_ks_and_vs(&keys, &values, &mut heap).unwrap()
+            };
+            let hashed: Vec<(u64, Term, Term)> = entries
+                .iter()
+                .map(|&(k, v)| (hashmap_key_hash(k), k, v))
+                .collect();
+            let mut heap = VecHeap::new();
+            let mut build = HashmapBuild::new(hashmap_leaves_hashed(&hashed, &mut heap).unwrap());
+            let mut yields = 0;
+            let actual = loop {
+                let mut reds = 7;
+                if let Some(map) = build.step(&mut reds, &mut heap).unwrap() {
+                    break map;
+                }
+                yields += 1;
+            };
+            assert!(yields > n / 20, "n={n} yielded {yields} times");
+            assert_eq!(node_shapes(expected), node_shapes(actual), "n={n}");
+            assert!(exact_eq(expected, actual), "n={n} duplicates={duplicates}");
+        }
+    }
+}

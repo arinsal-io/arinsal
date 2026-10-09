@@ -1088,8 +1088,14 @@ impl Executor {
         process.self_pid = Some(ctx.pid());
         process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
         let schedule_started = std::time::Instant::now();
+        // A process runs with the code index active when it is scheduled in. The `in` trace
+        // event resolves the current function against it, so this replica must be current
+        // first (erts_find_function_from_pc reads the active code index).
+        // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247, OTP-29.1.1.
+        self.vm.refresh_code();
+        self.vm.sync_module(process.module);
         let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
-        let running_fields = running.as_slice();
+        let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
         crate::trace::emit(
             Some(&mut self.vm),
             process,
@@ -1097,16 +1103,12 @@ impl Executor {
             ctx.pid(),
             crate::trace::RUNNING,
             "in",
-            running_fields,
+            &running_fields,
         );
         // Port of erts/emulator/beam/erl_process.c:10541-10543 (trace_schedule_in), OTP-29.1.1.
         if crate::trace::flags(process, ctx.pid()) & crate::trace::CALL != 0 {
             crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
         }
-        // A process runs with the code index active when it is scheduled in.
-        // Port of erts/emulator/beam/jit/arm/process_main.cpp:235-247, OTP-29.1.1.
-        self.vm.refresh_code();
-        self.vm.sync_module(process.module);
         if process.native_pc.is_some() && process.reductions <= 0 {
             process.reductions = budget.min(i32::MAX as u32) as i32;
         }
@@ -2814,7 +2816,8 @@ impl Executor {
             process.fr = Box::new([]);
         }
         let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
-        let running_fields = running.as_slice();
+        // erl_trace.c:752-760 (trace_sched_session): no current function is reported as 0.
+        let running_fields = [running.unwrap_or(Term::small(0).expect("small zero"))];
         // A waiting process is not collected when it switches out: erts only runs
         // `scheduler_gc_proc` for a process being scheduled in (a yielded process is still
         // active) or handling signals/sys tasks, so a sleeping receiver with on-heap message
@@ -2845,7 +2848,7 @@ impl Executor {
                 ctx.pid(),
                 crate::trace::RUNNING,
                 "out",
-                running_fields,
+                &running_fields,
             );
         }
         crate::natives::erts_debug::after_schedule(
