@@ -676,9 +676,14 @@ impl BeamModuleAssembler {
         self.code.adr(Gpr::x(9), done)?;
         self.code.emit(|e| {
             e.str_uoff(Gpr::x(9), SCHEDULER_REGS, TRAP_RETURN_SLOT)?;
-            e.mov_const(Gpr::x(13), identity as u64)
+            e.mov_const(Gpr::x(13), identity as u64)?;
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610 (emit_call_light_bif
+            // passes the export and its BIF function, both bound at load time), OTP-29.1.1:
+            // the export's descriptor word names the BIF without a lookup.
+            e.ldr_uoff(Gpr::x(14), Gpr::x(13), crate::bif::EXPORT_INFO_OFFSET)
         })?;
-        self.emit_runtime_fragment(fragment, &[Gpr::x(13)])?;
+        // x1 = export, x2 = call site (only read by breakpoint trampolines), x3 = descriptor.
+        self.emit_runtime_fragment(fragment, &[Gpr::x(13), Gpr::x(13), Gpr::x(14)])?;
         self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
         // A trapping BIF's target returns here with its result in XREG0.
         self.code.bind(done)?;

@@ -9,8 +9,9 @@ use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 /// BIF target supplied by the runtime.
 pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32) -> u64;
 
-/// Runtime hook calling the BIF named by an export identity. Arguments: process, identity, then
-/// up to three argument terms. Zero means an exception is pending in `freason`.
+/// Runtime hook calling the BIF of an export. Arguments: process, the export's `info` word (see
+/// [`ExportEntry::info`]), then up to three argument terms. Zero means an exception is pending in
+/// `freason`.
 pub type BifIdentityHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u64) -> u64;
 
 /// Apply resolver supplied by the runtime; zero means the target could not be resolved.
@@ -33,7 +34,16 @@ pub const ERTS_SAVE_CALLS_CODE_IX: usize = ERTS_ADDRESSV_SIZE - 1;
 pub struct ExportEntry {
     /// Native entry addresses indexed by code index; the last slot is the save_calls entry.
     pub addresses: [AtomicUsize; ERTS_ADDRESSV_SIZE],
+    /// The runtime's descriptor of this export (its MFA and BIF function), set once when the
+    /// export is created. Generated code and the shared fragments read it next to the
+    /// addresses and hand it to the runtime, so a BIF call never looks its export up.
+    // Port of erts/emulator/beam/export.h:38-58 (Export: dispatch, info.mfa and
+    // trampoline.bif.address follow the address vector), OTP-29.1.1.
+    pub info: AtomicUsize,
 }
+
+/// Byte offset of [`ExportEntry::info`] for generated loads.
+pub const EXPORT_INFO_OFFSET: u32 = core::mem::offset_of!(ExportEntry, info) as u32;
 
 // erts calls `i_bif*` with only `Update::eReductions` (instr_bif.cpp:47-64) because its guard
 // BIFs never allocate on the process heap. This port's BIFs may build terms on the heap, so the
@@ -58,7 +68,18 @@ impl ExportEntry {
                 AtomicUsize::new(address),
                 AtomicUsize::new(save_calls),
             ],
+            info: AtomicUsize::new(0),
         }
+    }
+
+    /// The runtime descriptor word published by [`ExportEntry::set_info`]; zero before it.
+    pub fn info(&self) -> usize {
+        self.info.load(Ordering::Acquire)
+    }
+
+    /// Publishes the runtime descriptor word of this export.
+    pub fn set_info(&self, info: usize) {
+        self.info.store(info, Ordering::Release);
     }
 
     /// The address entered in code index `ix`.
@@ -359,7 +380,10 @@ impl BeamModuleAssembler {
         emit_enter_runtime(&mut self.code, 6, update)?;
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-151 (i_bif*: the BIF is
+            // bound at load time), OTP-29.1.1: the helper gets the export's descriptor word.
             e.mov_const(Gpr::x(1), identity as u64)?;
+            e.ldr_uoff(Gpr::x(1), Gpr::x(1), EXPORT_INFO_OFFSET)?;
             for (index, reg) in regs.iter().copied().enumerate() {
                 if index < args.len() {
                     e.mov_reg(Gpr::x(index as u8 + 2), reg)?;

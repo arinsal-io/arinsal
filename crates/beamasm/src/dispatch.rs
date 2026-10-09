@@ -207,6 +207,9 @@ fn emit_export_fragment(
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
+        // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
+        // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
         Ok(())
@@ -252,6 +255,7 @@ fn emit_save_calls_export_fragment(
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
         encoder.mov_reg(Gpr::x(17), Gpr::x(0))
