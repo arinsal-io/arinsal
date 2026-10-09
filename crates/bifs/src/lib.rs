@@ -28,6 +28,7 @@ mod time;
 mod unicode;
 
 pub use etf::{DecodeWalk, EncodeWalk};
+pub use maps_bifs::maps_merge_start;
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, IolistSizeWalk, IolistWalk, binary_bytes,
     bitstring_bit_len, copy_binary_range, copy_bitstring_range, next_ref_id, next_unique_monotonic,

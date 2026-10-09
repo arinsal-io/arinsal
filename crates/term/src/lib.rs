@@ -35,7 +35,11 @@ pub use copy::{
 };
 pub use fun::{ExportEntry, FunEntry, FunRef};
 pub use gc::{FragmentAlloc, FragmentIndex, GcStats};
-pub use hamt::{boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_node_children};
+pub use hamt::{
+    HxNode, boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_from_ks_and_vs,
+    hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array, hashmap_leaves,
+    hashmap_node_children, swizzle_map_hash,
+};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
 pub use heap::{
     AdoptError, CP_WORDS, FrameLayout, HeapAlloc, LiteralArea, ProcessHeap, S_REDZONE, S_RESERVED,
@@ -278,6 +282,13 @@ impl Term {
         } else {
             None
         }
+    }
+    /// Whether this is an immediate (primary tag 3).
+    ///
+    /// Port of erts/emulator/beam/erl_term.h:179 (is_immed), OTP-29.1.1.
+    #[inline]
+    pub const fn is_immed(self) -> bool {
+        self.0 & 3 == 3
     }
     /// Whether this is a heap pointer, including a cons pointer.
     #[inline]
