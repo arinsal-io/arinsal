@@ -959,7 +959,9 @@ mod tests {
                 .unwrap();
             assert_eq!(result.term.as_small(), Some(7 * bytes as i64));
             assert_eq!(result.stats.gc.collections, 0);
-            let words = result._process.heap.used_words();
+            // The process owns a copy of its argument (erl_create_process); only the
+            // words the summing loop allocates must stay constant.
+            let words = result._process.heap.used_words() - arinsal_term::size_object(source);
             if let Some(previous) = allocated {
                 assert_eq!(words, previous, "byte count changed process heap usage");
             }

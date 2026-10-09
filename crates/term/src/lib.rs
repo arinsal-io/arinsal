@@ -89,6 +89,13 @@ pub const SHARED_SUBTAG: u64 = 0x04;
 
 pub(crate) const ARITY: u64 = 0x00;
 pub(crate) static EMPTY_TUPLE: u64 = 0;
+
+/// The global literal empty tuple (erts `ERTS_GLOBAL_LIT_EMPTY_TUPLE`). Collections treat
+/// it as a literal, so every empty tuple shared outside a heap must be this one.
+// Port of erts/emulator/beam/erl_global_literals.h (ERTS_GLOBAL_LIT_EMPTY_TUPLE), OTP-29.1.1.
+pub fn global_empty_tuple() -> Term {
+    Term::from_ptr(std::ptr::from_ref(&EMPTY_TUPLE).cast_mut(), 2)
+}
 pub(crate) const POS_BIG: u64 = 0x08;
 pub(crate) const NEG_BIG: u64 = 0x0c;
 pub(crate) const REF: u64 = 0x10;

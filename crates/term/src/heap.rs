@@ -28,7 +28,10 @@ unsafe impl Send for WordBlock {}
 
 /// A heap fragment: a BIF-allocated side buffer or an adopted message heap.
 pub(crate) enum Fragment {
-    Block(WordBlock),
+    /// erts `ErlHeapFragment` on the `p->mbuf` list: one `ERTS_ALC_T_HEAP_FRAG` block whose
+    /// first `used` words (`used_size`) hold objects; `memory.len()` is `alloc_size`.
+    // Port of erts/emulator/beam/erl_message.h:72-78 (ErlHeapFragment), OTP-29.1.1.
+    Block { memory: AllocBlock, used: usize },
     /// erts `p->abandoned_heap`: the young heap left behind by a delayed collection. Its
     /// first `used` words hold objects, and those below `high_water` are mature. It is not
     /// part of `mbuf_sz`.
@@ -37,50 +40,33 @@ pub(crate) enum Fragment {
         used: usize,
         high_water: usize,
     },
-    /// A heap fragment that served as the young heap of a delayed collection and was
-    /// abandoned in turn; it joins the `mbuf` list with its `used` words.
-    Used {
-        block: WordBlock,
-        used: usize,
-    },
 }
 
 impl Fragment {
     pub(crate) fn as_ptr(&self) -> *const u64 {
-        self.as_block().as_ptr().cast()
-    }
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut u64 {
-        self.as_block_mut().as_mut_ptr().cast()
+        match self {
+            Self::Block { memory, .. } => memory.as_ptr(),
+            Self::Abandoned { block, .. } => block.as_ptr().cast(),
+        }
     }
     /// Words that hold objects.
     pub(crate) fn len(&self) -> usize {
         match self {
-            Self::Block(block) => block.len(),
-            Self::Abandoned { used, .. } | Self::Used { used, .. } => *used,
-        }
-    }
-
-    fn as_block(&self) -> &WordBlock {
-        match self {
-            Self::Block(block) | Self::Abandoned { block, .. } | Self::Used { block, .. } => block,
-        }
-    }
-
-    fn as_block_mut(&mut self) -> &mut WordBlock {
-        match self {
-            Self::Block(block) | Self::Abandoned { block, .. } | Self::Used { block, .. } => block,
+            Self::Block { used, .. } | Self::Abandoned { used, .. } => *used,
         }
     }
 }
 
 impl WordBlock {
     pub(crate) fn new(words: usize, allocation_type: ErtsAlcType) -> Self {
-        let mut memory =
-            AllocBlock::new(allocation_type, words).expect("ERTS heap block allocation failed");
-        memory.as_mut_slice().fill(0);
         Self {
-            memory: Box::new(memory),
+            memory: Box::new(zeroed_block(words, allocation_type)),
         }
+    }
+
+    /// The typed block itself, for a heap block that joins the `mbuf` list.
+    pub(crate) fn into_alloc_block(self) -> AllocBlock {
+        *self.memory
     }
 
     /// The block's words, for a copy that holds the heap exclusively.
@@ -98,10 +84,6 @@ impl WordBlock {
 
     pub(crate) fn as_ptr(&self) -> *const UnsafeCell<u64> {
         self.memory.as_ptr().cast()
-    }
-
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut UnsafeCell<u64> {
-        self.memory.as_mut_ptr().cast()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -125,6 +107,14 @@ impl WordBlock {
         // SAFETY: The allocator supplies aligned word storage; UnsafeCell has u64's layout.
         Some(unsafe { &*std::ptr::from_ref(word).cast::<UnsafeCell<u64>>() })
     }
+}
+
+/// A zero-filled typed block: no stale word can pass for a term in a heap scan.
+fn zeroed_block(words: usize, allocation_type: ErtsAlcType) -> AllocBlock {
+    let mut memory =
+        AllocBlock::new(allocation_type, words).expect("ERTS heap block allocation failed");
+    memory.as_mut_slice().fill(0);
+    memory
 }
 
 impl Default for WordBlock {
@@ -280,6 +270,9 @@ pub struct ProcessHeap {
     pub(crate) native_allocation: bool,
     /// Allocations go to `owners.detached` (see [`ProcessHeap::begin_detached`]).
     pub(crate) detached: bool,
+    /// Whether `fragments` holds the abandoned heap (erts `p->abandoned_heap != NULL`),
+    /// so the frequent "is there one" question does not walk the fragment list.
+    pub(crate) abandoned: bool,
     pub(crate) fragments: Vec<Fragment>,
     /// Total word capacity in process heap fragments (`mbuf_sz` in erts).
     /// Words in heap fragments (u32 keeps the hot heap struct within 128 bytes).
@@ -412,6 +405,7 @@ impl ProcessHeap {
             heap_grow: false,
             native_allocation: false,
             detached: false,
+            abandoned: false,
             fragments: Vec::new(),
             fragment_words: 0,
             owners: LazyOwners::default(),
@@ -553,17 +547,26 @@ impl ProcessHeap {
         {
             return ptr;
         }
+        // Port of erts/emulator/beam/utils.c:135-189 (erts_heap_alloc), OTP-29.1.1: the
+        // newest fragment (`MBUF(p)`) takes the words while it has room; otherwise a new
+        // fragment of exactly `words` (HAlloc passes no extra) heads the list.
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(words).unwrap_or(u32::MAX));
-        self.fragments.push(Fragment::Block(WordBlock::new(
-            words,
-            ErtsAlcType::HEAP_FRAG,
-        )));
-        self.fragments
-            .last_mut()
-            .expect("fragment inserted")
-            .as_mut_ptr()
+        if let Some(Fragment::Block { memory, used }) = self.fragments.last_mut()
+            && words <= memory.len() - *used
+        {
+            let at = *used;
+            *used += words;
+            return memory.as_mut_slice()[at..].as_mut_ptr();
+        }
+        let mut memory = zeroed_block(words, ErtsAlcType::HEAP_FRAG);
+        let ptr = memory.as_mut_ptr();
+        self.fragments.push(Fragment::Block {
+            memory,
+            used: words,
+        });
+        ptr
     }
     /// Move a standalone message heap into this process without copying its terms.
     ///
@@ -585,9 +588,14 @@ impl ProcessHeap {
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(adopted_words).unwrap_or(u32::MAX));
-        self.fragments
-            .push(Fragment::Block(std::mem::take(&mut source.words)));
+        let block = std::mem::take(&mut source.words).into_alloc_block();
+        let used = block.len();
+        self.fragments.push(Fragment::Block {
+            memory: block,
+            used,
+        });
         self.fragments.append(&mut source.fragments);
+        self.abandoned |= source.abandoned;
         if let Some(mut owners) = source.owners.0.take() {
             let source_old_vheap = owners.vheap.old;
             self.off_heap_binary_bytes = self

@@ -354,7 +354,7 @@ impl ThreadSpecificAllocators {
     }
 
     /// Runs queued cross-thread frees and hands abandoned carriers to the pool.
-    #[inline]
+    #[inline(always)]
     fn drain_and_publish(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
         if !state.delayed.is_empty() {
             let drained = Self::drain_locked(state)?;
@@ -558,11 +558,20 @@ impl ThreadSpecificAllocators {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn publish_transfers(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
         if !state.allocator.has_pending_carriers() {
             return Ok(());
         }
+        self.publish_pending_transfers(instance, state)
+    }
+
+    #[cold]
+    fn publish_pending_transfers(
+        &self,
+        instance: usize,
+        state: &mut Instance,
+    ) -> Result<(), AllocError> {
         let transfers = state.allocator.take_pending_carriers();
         let mut pool = self
             .carrier_pool

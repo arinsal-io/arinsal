@@ -1,7 +1,7 @@
 //! Safe alloc_util core with OTP block headers and bestfit policies.
 
 use crate::mseg::{CacheConfig, CallCount, MsegAllocator, MsegOptions, Segment, SegmentFlags};
-use crate::raw::{MapError, RawRegion, page_size};
+use crate::raw::{MapError, RawRegion, WordView, page_size};
 use std::collections::{HashMap as StdHashMap, HashSet as StdHashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -317,6 +317,49 @@ struct Block {
     last: bool,
 }
 
+/// One indexed carrier's address range: the cached answer to "which carrier holds this
+/// address". Block keys are addresses, so a key's words are read straight from the range.
+#[derive(Clone, Copy)]
+struct CarrierSpan {
+    start: usize,
+    end: usize,
+    index: usize,
+    sbc: bool,
+}
+
+impl CarrierSpan {
+    const EMPTY: Self = Self {
+        start: 0,
+        end: 0,
+        index: usize::MAX,
+        sbc: false,
+    };
+
+    /// The carrier's words. A span exists only while its carrier is indexed, and a carrier
+    /// is unindexed (dropping the cached span) before its memory moves or is released.
+    #[inline(always)]
+    fn words(self) -> WordView {
+        WordView::new(self.start as *mut u64, (self.end - self.start) / WORD)
+    }
+
+    #[inline(always)]
+    fn read(self, key: usize, word: usize) -> Option<usize> {
+        self.words()
+            .as_slice()
+            .get((key - self.start) / WORD + word)
+            .map(|&value| value as usize)
+    }
+
+    #[inline(always)]
+    fn write(self, key: usize, word: usize, value: usize) -> Option<()> {
+        *self
+            .words()
+            .as_mut_slice()
+            .get_mut((key - self.start) / WORD + word)? = value as u64;
+        Some(())
+    }
+}
+
 struct Carrier {
     memory: CarrierMemory,
     sbc: bool,
@@ -394,30 +437,47 @@ enum CarrierMemory {
 }
 
 impl CarrierMemory {
+    #[inline(always)]
     fn len(&self) -> usize {
         match self {
             Self::Mapped(region) => region.len(),
             Self::Segmented(segment) => segment.len(),
         }
     }
+    #[inline(always)]
     fn as_ptr(&self) -> *mut u8 {
         match self {
             Self::Mapped(region) => region.as_ptr(),
             Self::Segmented(segment) => segment.as_ptr(),
         }
     }
-    #[inline]
-    fn read_word(&self, offset: usize) -> Option<usize> {
-        match self {
-            Self::Mapped(region) => region.read_word(offset),
-            Self::Segmented(segment) => segment.read_word(offset),
-        }
+    /// The carrier as words. Carriers are mapped read-write for their whole life (no
+    /// carrier is ever re-protected), so the word view needs no protection check.
+    #[inline(always)]
+    fn words(&self) -> WordView {
+        WordView::new(self.as_ptr().cast(), self.len() / WORD)
     }
-    #[inline]
+    #[inline(always)]
+    fn read_word(&self, offset: usize) -> Option<usize> {
+        if !offset.is_multiple_of(WORD) {
+            return None;
+        }
+        self.words()
+            .as_slice()
+            .get(offset / WORD)
+            .map(|&word| word as usize)
+    }
+    #[inline(always)]
     fn write_word(&mut self, offset: usize, value: usize) -> bool {
-        match self {
-            Self::Mapped(region) => region.write_word(offset, value),
-            Self::Segmented(segment) => segment.write_word(offset, value),
+        if !offset.is_multiple_of(WORD) {
+            return false;
+        }
+        match self.words().as_mut_slice().get_mut(offset / WORD) {
+            Some(word) => {
+                *word = value as u64;
+                true
+            }
+            None => false,
         }
     }
     fn bytes(&self) -> Option<&[u8]> {
@@ -465,7 +525,7 @@ pub struct AllocUtil {
     /// standing in for erts' carrier pointer arithmetic (erl_alloc_util.h:430 FBLK_TO_MBC/ABLK_TO_MBC).
     carrier_ranges: Vec<(usize, usize, usize)>,
     /// Last `carrier_ranges` hit; consecutive header accesses nearly always stay in one carrier.
-    last_carrier: std::cell::Cell<(usize, usize, usize)>,
+    last_carrier: std::cell::Cell<CarrierSpan>,
     free_root: usize,
     aoff_roots: Vec<usize>,
     aoff_carrier_root: usize,
@@ -524,7 +584,7 @@ impl AllocUtil {
             free_carrier_slots: Vec::new(),
             mbc_count: 0,
             carrier_ranges: Vec::new(),
-            last_carrier: std::cell::Cell::new((0, 0, 0)),
+            last_carrier: std::cell::Cell::new(CarrierSpan::EMPTY),
             free_root: 0,
             aoff_roots: Vec::new(),
             aoff_carrier_root: 0,
@@ -680,24 +740,37 @@ impl AllocUtil {
     }
 
     /// Carrier index containing the address `key`.
-    #[inline]
+    #[inline(always)]
     fn carrier_of(&self, key: usize) -> Option<usize> {
-        let (start, end, carrier) = self.last_carrier.get();
-        if key >= start && key < end {
-            return Some(carrier);
-        }
-        self.carrier_of_slow(key)
+        self.span_of(key).map(|span| span.index)
     }
 
-    fn carrier_of_slow(&self, key: usize) -> Option<usize> {
+    /// The indexed carrier holding address `key`, from the one-entry cache when it hits.
+    #[inline(always)]
+    fn span_of(&self, key: usize) -> Option<CarrierSpan> {
+        let span = self.last_carrier.get();
+        if key >= span.start && key < span.end {
+            return Some(span);
+        }
+        self.span_of_slow(key)
+    }
+
+    #[cold]
+    fn span_of_slow(&self, key: usize) -> Option<CarrierSpan> {
         let index = self
             .carrier_ranges
             .partition_point(|&(start, _, _)| start <= key)
             .checked_sub(1)?;
-        let range @ (start, end, carrier) = self.carrier_ranges[index];
+        let (start, end, carrier) = self.carrier_ranges[index];
         if key >= start && key < end {
-            self.last_carrier.set(range);
-            Some(carrier)
+            let span = CarrierSpan {
+                start,
+                end,
+                index: carrier,
+                sbc: self.carriers[carrier].as_ref()?.sbc,
+            };
+            self.last_carrier.set(span);
+            Some(span)
         } else {
             None
         }
@@ -721,53 +794,57 @@ impl AllocUtil {
     fn unindex_carrier(&mut self, index: usize) {
         self.carrier_ranges
             .retain(|&(_, _, carrier)| carrier != index);
-        if self.last_carrier.get().2 == index {
-            self.last_carrier.set((0, 0, 0));
+        if self.last_carrier.get().index == index {
+            self.last_carrier.set(CarrierSpan::EMPTY);
         }
     }
 
     /// Reads word `word` of the block or carrier node at address `key`.
-    #[inline]
+    #[inline(always)]
     fn word_at(&self, key: usize, word: usize) -> Result<usize, AllocError> {
-        let carrier = self
-            .carrier_of(key)
-            .and_then(|index| self.carriers[index].as_ref())
-            .ok_or(AllocError::Corrupt)?;
-        carrier
-            .memory
-            .read_word(key - carrier.key_base + word * WORD)
-            .ok_or(AllocError::Corrupt)
+        let span = self.span_of(key).ok_or(AllocError::Corrupt)?;
+        span.read(key, word).ok_or(AllocError::Corrupt)
     }
 
-    #[inline]
+    #[inline(always)]
     fn set_word_at(&mut self, key: usize, word: usize, value: usize) -> Result<(), AllocError> {
-        let index = self.carrier_of(key).ok_or(AllocError::Corrupt)?;
-        let carrier = self.carriers[index].as_mut().ok_or(AllocError::Corrupt)?;
-        let offset = key - carrier.key_base + word * WORD;
-        if carrier.memory.write_word(offset, value) {
-            Ok(())
-        } else {
-            Err(AllocError::Corrupt)
-        }
+        let span = self.span_of(key).ok_or(AllocError::Corrupt)?;
+        span.write(key, word, value).ok_or(AllocError::Corrupt)
     }
 
     /// Decodes the block header at `key`; SBC blocks carry all three flags like erts' SBC_BLK_HDR.
-    #[inline]
+    #[inline(always)]
     fn blk(&self, key: usize) -> Result<Block, AllocError> {
-        let index = self.carrier_of(key).ok_or(AllocError::Corrupt)?;
-        self.blk_in(index, key)
+        let span = self.span_of(key).ok_or(AllocError::Corrupt)?;
+        Self::decode_block(span, key)
     }
 
     /// Like `blk` for a block known to live in carrier `index` (a neighbour of a known block).
-    #[inline]
+    #[inline(always)]
     fn blk_in(&self, index: usize, key: usize) -> Result<Block, AllocError> {
+        if let Some(span) = self.span_of(key).filter(|span| span.index == index) {
+            return Self::decode_block(span, key);
+        }
+        // A carrier outside the address index (one being resized or imported).
         let carrier = self.carriers[index].as_ref().ok_or(AllocError::Corrupt)?;
-        let header = carrier
-            .memory
-            .read_word(key - carrier.key_base)
-            .ok_or(AllocError::Corrupt)?;
+        let span = CarrierSpan {
+            start: carrier.key_base,
+            end: carrier.key_base + carrier.memory.len(),
+            index,
+            sbc: carrier.sbc,
+        };
+        if key < span.start || key >= span.end {
+            return Err(AllocError::Corrupt);
+        }
+        Self::decode_block(span, key)
+    }
+
+    #[inline(always)]
+    fn decode_block(span: CarrierSpan, key: usize) -> Result<Block, AllocError> {
+        let index = span.index;
+        let header = span.read(key, 0).ok_or(AllocError::Corrupt)?;
         let size = header & !BLOCK_FLAGS;
-        if carrier.sbc {
+        if span.sbc {
             return Ok(Block {
                 carrier: index,
                 offset: key,
@@ -788,7 +865,7 @@ impl AllocUtil {
     }
 
     /// Validates a caller-supplied allocation address.
-    #[inline]
+    #[inline(always)]
     fn live_block(&self, key: usize) -> Result<Block, AllocError> {
         let index = self.carrier_of(key).ok_or(AllocError::InvalidAllocation)?;
         let carrier = self.carriers[index]
@@ -864,7 +941,7 @@ impl AllocUtil {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     fn check_abandon_carrier(&mut self, carrier_index: usize) -> Result<(), AllocError> {
         if self.options.acul == 0
             || self.options.acnl == 0
@@ -1010,7 +1087,7 @@ impl AllocUtil {
         Ok(())
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn has_pending_carriers(&self) -> bool {
         !self.pending_carriers.is_empty()
     }
@@ -1900,7 +1977,7 @@ impl AllocUtil {
     }
     /// Writes a block header, plus the carrier word and size footer of a free MBC block.
     /// Port of SET_MBC_FBLK_HDR/SET_BLK_SZ_FTR, erl_alloc_util.c:225-262, OTP-29.1.1.
-    #[inline]
+    #[inline(always)]
     fn write_block(&mut self, b: &Block) -> Result<(), AllocError> {
         let c = self.carriers[b.carrier]
             .as_mut()
@@ -1926,7 +2003,7 @@ impl AllocUtil {
     }
 
     /// Sets or clears PREV_FREE on the block following `b`.
-    #[inline]
+    #[inline(always)]
     /// Port of SET_PREV_BLK_FREE/SET_PREV_BLK_ALLOCED, erl_alloc_util.c:237-250, OTP-29.1.1:
     /// one read-modify-write of the next header in the same carrier.
     fn set_next_prev_free(&mut self, b: &Block, value: bool) -> Result<(), AllocError> {
@@ -2152,7 +2229,7 @@ impl AllocUtil {
         self.unlink_free_inner(node, size)
     }
 
-    #[inline]
+    #[inline(always)]
     fn list_head(&self, list: FreeListId) -> usize {
         match list {
             FreeListId::Bucket(index) => self.goodfit_heads[index],
@@ -2160,7 +2237,7 @@ impl AllocUtil {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn set_list_head(&mut self, list: FreeListId, node: usize) {
         match list {
             FreeListId::Bucket(index) => self.goodfit_heads[index] = node,
@@ -2169,7 +2246,7 @@ impl AllocUtil {
     }
 
     /// Port of link_free_block, erl_goodfit_alloc.c:440 and erl_afit_alloc.c:150, OTP-29.1.1.
-    #[inline]
+    #[inline(always)]
     fn list_push_front(&mut self, list: FreeListId, node: usize) -> Result<(), AllocError> {
         let head = self.list_head(list);
         self.set_word_at(node, LIST_PREV_WORD, 0)?;
@@ -2196,7 +2273,7 @@ impl AllocUtil {
     }
 
     /// Port of unlink_free_block, erl_goodfit_alloc.c:461 and erl_afit_alloc.c:166, OTP-29.1.1.
-    #[inline]
+    #[inline(always)]
     fn list_remove(&mut self, list: FreeListId, node: usize) -> Result<(), AllocError> {
         let prev = self.word_at(node, LIST_PREV_WORD)?;
         let next = self.word_at(node, LIST_NEXT_WORD)?;
@@ -2224,7 +2301,7 @@ impl AllocUtil {
         Ok(nodes)
     }
 
-    #[inline]
+    #[inline(always)]
     fn link_free_inner(&mut self, node: usize, size: usize) -> Result<(), AllocError> {
         if self.strategy == Strategy::GoodFit {
             let bucket = goodfit_bucket(size, self.goodfit_interval_d);
@@ -2424,7 +2501,7 @@ impl AllocUtil {
 
     /// Removes a free block from its intrusive tree node or BF size list.
     /// Port of `bf_unlink_free_block` and `tree_delete`, `erl_bestfit_alloc.c:399-433,780-806`, OTP-29.1.1.
-    #[inline]
+    #[inline(always)]
     fn unlink_free_inner(&mut self, node: usize, size: usize) -> Result<(), AllocError> {
         if self.strategy == Strategy::GoodFit {
             let index = goodfit_bucket(size, self.goodfit_interval_d);
@@ -2885,7 +2962,7 @@ impl AllocUtil {
     }
     /// Start of the free block preceding `offset`, from its size footer.
     /// Port of PREV_BLK_SZ, erl_alloc_util.c:223, OTP-29.1.1.
-    #[inline]
+    #[inline(always)]
     fn previous_block(&self, offset: usize) -> Result<usize, AllocError> {
         let size = self.word_at(offset - WORD, 0)?;
         let previous = offset.checked_sub(size).ok_or(AllocError::Corrupt)?;
@@ -2920,7 +2997,7 @@ impl AllocUtil {
         }
         Ok(())
     }
-    #[inline]
+    #[inline(always)]
     fn update_block_peak(&mut self) {
         // Maxima can only move when a current value passes them (erl_alloc_util.c:726 STAT_MBC_BLK_ALLOC).
         if self.stats.blocks <= self.stats.max_blocks
@@ -2981,7 +3058,7 @@ impl AllocUtil {
             series.max_ever = series.max_ever.max(series.max);
         }
     }
-    #[inline]
+    #[inline(always)]
     fn block_added(&mut self, sbc: bool, size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
         class.blocks.current += 1;
@@ -2989,7 +3066,7 @@ impl AllocUtil {
         Self::update_series(&mut class.blocks);
         Self::update_series(&mut class.blocks_size);
     }
-    #[inline]
+    #[inline(always)]
     fn block_removed(&mut self, sbc: bool, size: usize) {
         let class = &mut self.class_stats[usize::from(sbc)];
         class.blocks.current -= 1;
@@ -3107,7 +3184,7 @@ fn goodfit_interval_d(sbct: usize) -> usize {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn goodfit_bucket(size: usize, interval_d: usize) -> usize {
     let max_d = GF_MIN_D.saturating_add(GF_QUARTER.saturating_mul(interval_d) - 1);
     if size <= GF_MAX_A {

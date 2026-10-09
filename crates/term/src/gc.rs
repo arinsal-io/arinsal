@@ -97,6 +97,10 @@ struct Copier<'a> {
     major: bool,
     young_scan: usize,
     old_scan: usize,
+    /// Literal areas: the only memory outside the process that its terms may point to.
+    literals: crate::literal::LiteralAreas,
+    /// Sorted owned fragment ranges, kept only to check the erts rule in debug builds.
+    #[cfg(debug_assertions)]
     fragment_ranges: Vec<(usize, usize)>,
     /// Mature part of an abandoned young heap; a minor collection promotes it.
     abandoned_mature: (usize, usize),
@@ -118,16 +122,23 @@ impl Copier<'_> {
         let young_start = self.from.words.as_ptr() as usize;
         let young_end = young_start + self.from.htop * 8;
         let in_young = address >= young_start && address < young_end;
+        // Port of erts/emulator/beam/erl_gc.c:1695 (do_minor, ErtsInYoungGen) and
+        // erl_gc.c:2296 (sweep, major: `!erts_is_literal`), OTP-29.1.1: a minor collection
+        // leaves the old heap alone, and every other non-literal pointer is in the young
+        // generation (heap, heap fragments or abandoned heap) and moves.
         if !in_young {
-            let in_old = if self.major {
-                let start = self.from.old_words.as_ptr() as usize;
-                address >= start && address < start + self.from.old_htop * 8
-            } else {
-                false
-            };
-            if !in_old && !self.fragment_contains(address) {
+            if !self.major {
+                // A minor collection hands the old heap to `to` before copying.
+                let start = self.to.old_words.as_ptr() as usize;
+                if address >= start && address < start + self.from.old_htop * 8 {
+                    return term;
+                }
+            }
+            if self.is_literal(address) {
                 return term;
             }
+            #[cfg(debug_assertions)]
+            self.check_owned(address);
         }
 
         let promote = !self.major
@@ -201,14 +212,31 @@ impl Copier<'_> {
         }
     }
 
+    /// `erts_is_literal`: literal areas and the global empty tuple.
+    // Port of erts/emulator/beam/global.h:1568 (erts_is_literal), OTP-29.1.1.
     #[inline]
-    fn fragment_contains(&self, address: usize) -> bool {
+    fn is_literal(&self, address: usize) -> bool {
+        address == std::ptr::from_ref(&crate::EMPTY_TUPLE) as usize
+            || self.literals.is_literal(address as u64)
+    }
+
+    /// Debug check of the erts invariant behind the ownership rule: a moved pointer that is
+    /// outside the young heap lies in a heap fragment, the abandoned heap or the old heap.
+    #[cfg(debug_assertions)]
+    fn check_owned(&self, address: usize) {
         let index = self
             .fragment_ranges
             .partition_point(|&(_, end)| end <= address);
-        self.fragment_ranges
+        let in_fragment = self
+            .fragment_ranges
             .get(index)
-            .is_some_and(|&(start, end)| start <= address && address < end)
+            .is_some_and(|&(start, end)| start <= address && address < end);
+        let old_start = self.from.old_words.as_ptr() as usize;
+        let in_old = address >= old_start && address < old_start + self.from.old_htop * 8;
+        assert!(
+            in_fragment || (self.major && in_old),
+            "collection found a pointer {address:#x} outside the process heap and literals"
+        );
     }
 
     fn retain_owner(&mut self, header: u64, ptr: *mut u64, term: Term, promote: bool) {
@@ -705,6 +733,9 @@ impl ProcessHeap {
 
     /// The young heap a delayed collection abandoned, if any (erts `p->abandoned_heap`).
     pub(crate) fn abandoned_heap(&self) -> Option<AbandonedHeap> {
+        if !self.abandoned {
+            return None;
+        }
         self.fragments.iter().find_map(|fragment| match fragment {
             crate::heap::Fragment::Abandoned {
                 block,
@@ -784,11 +815,12 @@ impl ProcessHeap {
             self.fragment_words = self
                 .fragment_words
                 .saturating_add(u32::try_from(used).unwrap_or(u32::MAX));
-            self.fragments.push(crate::heap::Fragment::Used {
-                block: abandoned,
+            self.fragments.push(crate::heap::Fragment::Block {
+                memory: abandoned.into_alloc_block(),
                 used,
             });
         } else {
+            self.abandoned = true;
             self.fragments.push(crate::heap::Fragment::Abandoned {
                 block: abandoned,
                 used,
@@ -1007,15 +1039,19 @@ impl ProcessHeap {
         let mature_words = self.mature_words();
         let fragments = (self.fragment_words as usize)
             .saturating_add(abandoned.map_or(0, |abandoned| abandoned.used));
-        let mut fragment_ranges = self
-            .fragments
-            .iter()
-            .map(|fragment| {
-                let start = fragment.as_ptr() as usize;
-                (start, start + fragment.len() * 8)
-            })
-            .collect::<Vec<_>>();
-        fragment_ranges.sort_unstable_by_key(|&(start, _)| start);
+        #[cfg(debug_assertions)]
+        let fragment_ranges = {
+            let mut ranges = self
+                .fragments
+                .iter()
+                .map(|fragment| {
+                    let start = fragment.as_ptr() as usize;
+                    (start, start + fragment.len() * 8)
+                })
+                .collect::<Vec<_>>();
+            ranges.sort_unstable_by_key(|&(start, _)| start);
+            ranges
+        };
         // `MSO(p).overhead` before the sweep; erl_gc.c:3285 sizes the old virtual heap from it.
         let young_overhead = self.bin_vheap;
         let major = self.collection_is_major() || self.minor_falls_back_to_major();
@@ -1118,6 +1154,8 @@ impl ProcessHeap {
             major,
             young_scan: 0,
             old_scan,
+            literals: crate::literal::LiteralAreas::current(),
+            #[cfg(debug_assertions)]
             fragment_ranges,
             abandoned_mature,
             young_words: 0,
@@ -1200,6 +1238,7 @@ impl ProcessHeap {
         self.request_full_sweep();
         let stats = self.collect(roots, extra, 0)?;
         self.fragments.clear();
+        self.abandoned = false;
         self.fragment_words = 0;
         let exact = self
             .htop
