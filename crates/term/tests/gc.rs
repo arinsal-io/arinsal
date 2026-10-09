@@ -194,6 +194,45 @@ fn heap_fragment_is_merged() {
 }
 
 #[test]
+fn heap_alloc_fills_the_newest_fragment_before_adding_one() {
+    // erts_heap_alloc (utils.c:135): HAlloc fragments are exact-size, and a request goes
+    // to the newest fragment while it has room, as a delayed-GC heap joining mbuf does.
+    let mut heap = ProcessHeap::with_words(64);
+    heap.heap_fragment(3);
+    heap.heap_fragment(2);
+    assert_eq!(heap.fragment_count(), 2);
+    heap.delay_collection(8);
+    heap.delay_collection(8);
+    let fragments = heap.fragment_count();
+    heap.heap_fragment(1);
+    assert_eq!(heap.fragment_count(), fragments);
+    assert_eq!(heap.fragment_words(), 6);
+}
+
+#[test]
+fn collection_moves_fragment_terms_and_keeps_the_global_empty_tuple() {
+    let empty = arinsal_term::global_empty_tuple();
+    let mut heap = ProcessHeap::with_words(64);
+    let pointer = heap.heap_fragment(3);
+    // SAFETY: the fragment reserves the three words of a 2-tuple.
+    let tuple = unsafe {
+        *pointer = 2 << 6;
+        *pointer.add(1) = empty.raw_bits();
+        *pointer.add(2) = Term::small(7).unwrap().raw_bits();
+        std::mem::transmute::<u64, Term>((pointer as u64) | 2)
+    };
+    let mut roots = [tuple, empty];
+    heap.collect(&mut roots, &mut [], 0).unwrap();
+    assert_eq!(heap.fragment_count(), 0);
+    assert!(heap.owns_term(roots[0]));
+    assert_eq!(roots[1], empty);
+    // SAFETY: the tuple now lives in the collected heap.
+    let elements = unsafe { roots[0].tuple_ref() }.unwrap();
+    assert_eq!(elements.get(0), Some(empty));
+    assert_eq!(elements.get(1).unwrap().as_small(), Some(7));
+}
+
+#[test]
 fn sparse_heap_shrinks_after_full_collection() {
     let mut heap = ProcessHeap::with_words(10_000);
     let mut roots = [TermBuilder::new(&mut heap)

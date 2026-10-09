@@ -21,7 +21,6 @@ pub use merge::{
 
 const MAP: u64 = 0x2c;
 const LIMIT: usize = 32;
-static EMPTY_TUPLE: u64 = 0;
 
 /// Map operation error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +151,7 @@ fn empty_flatmap<H: HeapAlloc + ?Sized>(heap: &mut H) -> Result<Term, TermError>
     let (slice, ptr) = merge::produce(heap, 3)?;
     slice[0].write(MAP);
     slice[1].write(0);
-    slice[2].write(bits(boxed((&EMPTY_TUPLE as *const u64).cast_mut())));
+    slice[2].write(bits(arinsal_term::global_empty_tuple()));
     Ok(boxed(ptr))
 }
 

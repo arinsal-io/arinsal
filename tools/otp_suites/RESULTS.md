@@ -74,7 +74,7 @@
 | `port_bif_SUITE` | 9 | 9/9 | 4/9 | 5 | 0 | busy_options: failed {{badmatch,false}; connect: failed {badarg; control: failed {badarg; port_info1: failed {{badmatch,false}; port_info2: failed {badarg |
 | `port_trace_SUITE` | 21 | 21/21 | 21/21 | 0 | 0 | none |
 | `prim_eval_SUITE` | 1 | 1/1 | 0/1 | 1 | 1 | 'ERL-365': missing |
-| `process_SUITE` | 104 | 70/104 | 70/104 | 0 | 0 | none |
+| `process_SUITE` | 104 | 25/104 | 67/104 | 0 | -9 | first failure: failed: {not_alive, |
 | `process_max_heap_size_SUITE` | 1 | 1/1 | 0/1 | 1 | 0 | immediate_termination: failed {{badmatch, {{a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a, a,a,a,a,a,a,a,a,a,a,a,a… |
 | `pseudoknot_SUITE` | 1 | 1/1 | 1/1 | 0 | 0 | none |
 | `receive_SUITE` | 14 | 12/14 | 12/14 | 0 | 0 | none |

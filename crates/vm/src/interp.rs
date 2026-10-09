@@ -1617,7 +1617,15 @@ impl Vm {
             })?;
         process.module = module_id;
         process.ip = ip;
-        process.x[..args.len()].copy_from_slice(args);
+        // Port of erts/emulator/beam/erl_process.c (erl_create_process: copy_struct of the
+        // arguments), OTP-29.1.1: the process owns its arguments, so a collection never
+        // meets a term outside its heap and the literal areas.
+        let literals = arinsal_term::LiteralAreas::current();
+        for (register, &arg) in process.x.iter_mut().zip(args) {
+            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            *register = arinsal_term::copy_term_litopt(arg, &mut heap, &literals)
+                .map_err(|error| VmError::Unsupported(format!("eval argument copy: {error:?}")))?;
+        }
         // ---- vm_exc ----
         let result = loop {
             match self.run(&mut process) {

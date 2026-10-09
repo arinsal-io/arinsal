@@ -17,15 +17,6 @@ impl Vm {
                 "native arity {arity} exceeds register file"
             ))));
         }
-        let mut inline_arguments = [Term::NIL; 8];
-        let mut overflow_arguments =
-            (arity > inline_arguments.len()).then(|| p.x[..arity].to_vec());
-        let arguments = if let Some(arguments) = overflow_arguments.as_mut() {
-            arguments.as_mut_slice()
-        } else {
-            inline_arguments[..arity].copy_from_slice(&p.x[..arity]);
-            &mut inline_arguments[..arity]
-        };
         let mut result = self.dispatch_native_source(
             p,
             ctx,
@@ -35,6 +26,19 @@ impl Vm {
             natives::NativeArgs::Registers(arity),
         );
         if let Some(result) = result.as_mut() {
+            // Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf with
+            // `regs`), OTP-29.1.1: the argument registers are the BIF's arguments. A
+            // collection inside the BIF (live = arity) already moved them, so the epilogue
+            // roots the registers as they are now, not values saved before the call.
+            let mut inline_arguments = [Term::NIL; 8];
+            let mut overflow_arguments =
+                (arity > inline_arguments.len()).then(|| p.x[..arity].to_vec());
+            let arguments = if let Some(arguments) = overflow_arguments.as_mut() {
+                arguments.as_mut_slice()
+            } else {
+                inline_arguments[..arity].copy_from_slice(&p.x[..arity]);
+                &mut inline_arguments[..arity]
+            };
             if let Err(error) = calls::gc_after_native(p, arguments, result) {
                 return Some(Err(error));
             }
