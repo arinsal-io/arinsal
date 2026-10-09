@@ -108,6 +108,14 @@ impl FlatMapRef<'_> {
             .zip(self.values)
             .map(|(key, value)| (Term(*key), Term(*value)))
     }
+    /// Iterate entries in reverse stored key order.
+    pub fn iter_rev(&self) -> impl Iterator<Item = (Term, Term)> + '_ {
+        self.keys
+            .iter()
+            .rev()
+            .zip(self.values.iter().rev())
+            .map(|(key, value)| (Term(*key), Term(*value)))
+    }
 }
 impl Term {
     /// Whether this pointer belongs to a loaded module's immutable literal area.

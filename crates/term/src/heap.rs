@@ -251,6 +251,112 @@ pub trait HeapAlloc {
     fn release(&mut self, _end: *mut u64, _start: *mut u64) {}
 }
 
+/// Store one word into a block the caller owns (`HAlloc` memory, a reservation or a patched slot).
+///
+/// Private on purpose: every caller passes a pointer it obtained from the allocator for the
+/// block it is filling, which is the one invariant a raw store needs.
+#[inline]
+fn store(ptr: *mut u64, value: u64) {
+    // SAFETY: callers pass an in-bounds, initialized-or-reserved slot of a live heap block.
+    unsafe { *ptr = value }
+}
+
+/// Head and open tail slot of a chain built by [`TermBuilder::chain3_push`].
+pub struct Tuple3Chain {
+    head: Term,
+    last: Option<*mut u64>,
+}
+impl Tuple3Chain {
+    /// An empty chain.
+    pub const fn new() -> Self {
+        Self {
+            head: Term::NIL,
+            last: None,
+        }
+    }
+    /// Close the chain with `tail`; an empty chain is just `tail`.
+    pub fn finish(self, tail: Term) -> Term {
+        match self.last {
+            Some(last) => {
+                store(last.wrapping_add(3), tail.bits());
+                self.head
+            }
+            None => tail,
+        }
+    }
+}
+impl Default for Tuple3Chain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A block taken from a heap in one `HAlloc` whose unused tail is handed back on drop.
+///
+/// Port of the `HAlloc(worst case)` / `HRelease(hp_end, hp)` idiom used by BIFs such as
+/// erts/emulator/beam/erl_map.c:3636-4130 (erts_internal_map_next_3), OTP-29.1.1: one block
+/// (one heap fragment when the heap is full) instead of one allocation per term.
+pub struct HeapReservation<'a, H: HeapAlloc + ?Sized> {
+    heap: &'a mut H,
+    cur: *mut u64,
+    end: *mut u64,
+}
+impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
+    /// Reserve `words` words from `heap`.
+    pub fn new(heap: &'a mut H, words: usize) -> Result<Self, TermError> {
+        let cur = heap.alloc(words).ok_or(TermError::SystemLimit)?;
+        let end = cur.wrapping_add(words);
+        Ok(Self { heap, cur, end })
+    }
+    /// Give back the unused tail and reserve a fresh block of `words` words.
+    pub fn regrow(&mut self, words: usize) -> Result<(), TermError> {
+        self.release_tail();
+        let cur = self.heap.alloc(words).ok_or(TermError::SystemLimit)?;
+        self.end = cur.wrapping_add(words);
+        self.cur = cur;
+        Ok(())
+    }
+    /// Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease) with erl_term.h:1500
+    /// (erts_write_heap_filler), OTP-29.1.1.
+    fn release_tail(&mut self) {
+        let words = (self.end as usize - self.cur as usize) / 8;
+        if words > 0 {
+            store(self.cur, ((words as u64 - 1) << 6) | POS_BIG);
+            self.heap.release(self.end, self.cur);
+            self.cur = self.end;
+        }
+    }
+}
+impl<H: HeapAlloc + ?Sized> Drop for HeapReservation<'_, H> {
+    fn drop(&mut self) {
+        self.release_tail();
+    }
+}
+impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
+    #[inline]
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        if words <= (self.end as usize - self.cur as usize) / 8 {
+            let ptr = self.cur;
+            self.cur = ptr.wrapping_add(words);
+            Some(ptr)
+        } else {
+            self.heap.alloc(words)
+        }
+    }
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
+        self.heap.retain_binary(binary)
+    }
+    fn retain_node(&mut self, node: Arc<Node>) {
+        self.heap.retain_node(node)
+    }
+    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
+        self.heap.retain_fun(entry)
+    }
+    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
+        self.heap.retain_export(entry)
+    }
+}
+
 /// A process heap with an upward bump pointer and a downward stack pointer.
 pub struct ProcessHeap {
     pub(crate) words: WordBlock,
@@ -1083,15 +1189,40 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             return Ok(Term::from_ptr((&EMPTY_TUPLE as *const u64).cast_mut(), 2));
         }
         let p = self.words(len + 1)?;
-        // SAFETY: words() reserved exactly the header and elements.
-        unsafe {
-            *p = (len as u64) << 6 | ARITY;
-            for i in 0..len {
-                *p.add(i + 1) = value_at(i, self.heap).bits();
-            }
+        store(p, (len as u64) << 6 | ARITY);
+        for i in 0..len {
+            // words() reserved exactly the header and elements.
+            store(p.wrapping_add(i + 1), value_at(i, self.heap).bits());
         }
         Ok(Term::from_ptr(p, 2))
     }
+
+    /// Append `{first, second, _}` to a destructively patched 3-tuple chain.
+    ///
+    /// The previous tuple's tail slot is patched to point at the new one, like
+    /// `*patch_ptr = make_tuple(hp); patch_ptr = &hp[3];` in erl_map.c.
+    pub fn chain3_push(
+        &mut self,
+        chain: &mut Tuple3Chain,
+        first: Term,
+        second: Term,
+    ) -> Result<(), TermError> {
+        let tuple = self.tuple(&[first, second, Term::NIL])?;
+        match chain.last {
+            Some(last) => store(last.wrapping_add(3), tuple.bits()),
+            None => chain.head = tuple,
+        }
+        chain.last = Some((tuple.bits() & !7) as *mut u64);
+        Ok(())
+    }
+
+    /// Box a positive bignum from little-endian digits without normalising to a small.
+    pub fn pos_bignum_from_digits(&mut self, digits: &[u64]) -> Result<Term, TermError> {
+        let p = self.words(1 + digits.len())?;
+        self.write_bignum(p, digits.len(), Sign::Plus, |index| digits[index]);
+        Ok(Term::from_ptr(p, 2))
+    }
+
     /// Build a two-word cons cell.
     pub fn cons(&mut self, head: Term, tail: Term) -> Result<Term, TermError> {
         let p = self.words(2)?;
@@ -1144,6 +1275,15 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     pub fn int_from_i128(&mut self, value: i128) -> Result<Term, TermError> {
         self.int_from_bigint(&BigInt::from(value))
     }
+    /// Select immediate or positive bignum storage for an unsigned integer.
+    pub fn int_from_u64(&mut self, value: u64) -> Result<Term, TermError> {
+        if value <= MAX_SMALL as u64 {
+            return Ok(Term::small(value as i64).unwrap());
+        }
+        let p = self.words(2)?;
+        self.write_bignum(p, 1, Sign::Plus, |index| if index == 0 { value } else { 0 });
+        Ok(Term::from_ptr(p, 2))
+    }
     /// Box little-endian 64-bit magnitude digits when outside the small range.
     pub fn int_from_bigint(&mut self, value: &BigInt) -> Result<Term, TermError> {
         if let Some(n) = value.to_i64()
@@ -1157,7 +1297,24 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             return Err(TermError::SystemLimit);
         }
         let p = self.words(1 + digits)?;
-        // SAFETY: header and digit words were reserved.
+        self.write_bignum(p, digits, sign, |index| {
+            let start = index * 8;
+            let end = (start + 8).min(bytes.len());
+            let mut digit = [0; 8];
+            digit[..end - start].copy_from_slice(&bytes[start..end]);
+            u64::from_le_bytes(digit)
+        });
+        Ok(Term::from_ptr(p, 2))
+    }
+
+    fn write_bignum(
+        &mut self,
+        p: *mut u64,
+        digits: usize,
+        sign: Sign,
+        mut digit_at: impl FnMut(usize) -> u64,
+    ) {
+        // SAFETY: the allocation reserves one header word and `digits` digit words.
         unsafe {
             *p = ((digits as u64) << 6)
                 | if sign == Sign::Minus {
@@ -1165,13 +1322,10 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
                 } else {
                     POS_BIG
                 };
-            for (i, part) in bytes.chunks(8).enumerate() {
-                let mut digit = [0; 8];
-                digit[..part.len()].copy_from_slice(part);
-                *p.add(i + 1) = u64::from_le_bytes(digit);
+            for index in 0..digits {
+                *p.add(index + 1) = digit_at(index);
             }
         }
-        Ok(Term::from_ptr(p, 2))
     }
     /// Build a byte-aligned binary.
     pub fn binary(&mut self, bytes: &[u8]) -> Result<Term, TermError> {
