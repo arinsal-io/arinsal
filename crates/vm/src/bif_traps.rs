@@ -45,8 +45,16 @@ const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
 const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
+const MAPS_MERGE_CONTINUATION: &str = "maps:merge_trap/1";
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "maps",
+        function: "merge",
+        arity: 2,
+        continuation: MAPS_MERGE_CONTINUATION,
+        handler: maps_merge,
+    },
     Entry {
         module: "erlang",
         function: "processes",
@@ -286,6 +294,64 @@ fn binary_search(
     let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
     let value = search.finish(&mut ctx)?;
     Ok(TrapResult::Done { value, reductions })
+}
+
+type MapsMergeState = Mutex<Option<arinsal_maps::HashmapMergeContext>>;
+
+// Port of erts/emulator/beam/erl_map.c:1257 (maps_merge_2), 1498 (maps_merge_trap_1) and
+// 1558-1861 (hashmap_merge: MAP_MERGE_LOOP_FACTOR budget, BUMP_REDS, trap), OTP-29.1.1.
+fn maps_merge(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    use arinsal_maps::{MAP_MERGE_LOOP_FACTOR, MergeStart};
+    let initial_reds = (process.reductions.max(0) as isize).saturating_mul(MAP_MERGE_LOOP_FACTOR);
+    let mut reds = initial_reds;
+    let resumed = state.is_some();
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let state = if let Some(state) = state {
+        Arc::clone(state)
+    } else {
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        match arinsal_bifs::maps_merge_start(&mut ctx, args)? {
+            MergeStart::Done(value) => {
+                return Ok(TrapResult::Done {
+                    value,
+                    reductions: 0,
+                });
+            }
+            MergeStart::Hashmap(merge) => MagicRef::new(MapsMergeState::new(Some(merge))),
+        }
+    };
+    let mut guard = state
+        .downcast_ref::<MapsMergeState>()
+        .ok_or(BifError::BADARG)?
+        .lock()
+        .map_err(|_| BifError::SystemLimit)?;
+    let merge = guard.as_mut().ok_or(BifError::BADARG)?;
+    let merged = arinsal_maps::hashmap_merge(merge, &mut reds, &mut heap)
+        .map_err(|_| BifError::SystemLimit)?;
+    let Some(value) = merged else {
+        drop(guard);
+        // BUMP_ALL_REDS before trapping.
+        return Ok(TrapResult::Yield {
+            continuation: MAPS_MERGE_CONTINUATION,
+            state,
+            reductions: process.reductions.max(0) as u32,
+        });
+    };
+    *guard = None;
+    drop(guard);
+    if resumed {
+        process.set_gc_enabled(restore_gc);
+    }
+    Ok(TrapResult::Done {
+        value,
+        reductions: ((initial_reds - reds) / MAP_MERGE_LOOP_FACTOR) as u32,
+    })
 }
 
 /// Key of a trapped call made through `apply` when the caller does not import the BIF.

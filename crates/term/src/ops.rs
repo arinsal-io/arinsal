@@ -924,10 +924,14 @@ fn exact_map_eq(a: Term, b: Term) -> bool {
     true
 }
 /// Erlang `=:=` for implemented types. Signed zero compares by bit pattern.
+#[inline]
 pub fn exact_eq(a: Term, b: Term) -> bool {
-    if a == b {
-        return true;
-    }
+    // Port of erts/emulator/beam/erl_utils.h:113 (EQ), OTP-29.1.1.
+    a == b || (!Term(a.0 & b.0).is_immed() && eq(a, b))
+}
+/// Port of erts/emulator/beam/utils.c:1125 (eq), OTP-29.1.1.
+#[inline(never)]
+fn eq(a: Term, b: Term) -> bool {
     let mut pending: SmallVec<[(Term, Term); 32]> = SmallVec::new();
     pending.push((a, b));
     while let Some((mut a, mut b)) = pending.pop() {

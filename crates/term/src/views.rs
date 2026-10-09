@@ -91,10 +91,15 @@ impl FlatMapRef<'_> {
         self.keys.is_empty()
     }
     /// Find a value by exact Erlang key equality.
+    #[inline]
     pub fn get(&self, key: Term) -> Option<Term> {
-        self.iter()
-            .find(|(candidate, _)| exact_eq(*candidate, key))
-            .map(|(_, value)| value)
+        // Port of erts/emulator/beam/erl_map.c:186-218 (erts_maps_get), OTP-29.1.1.
+        let i = if key.is_immed() {
+            self.keys.iter().position(|&k| k == key.0)
+        } else {
+            self.keys.iter().position(|&k| exact_eq(Term(k), key))
+        }?;
+        Some(Term(self.values[i]))
     }
     /// Iterate entries in the stored key order.
     pub fn iter(&self) -> impl Iterator<Item = (Term, Term)> + '_ {

@@ -15,6 +15,12 @@ use arinsal_term::{
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+mod merge;
+pub use merge::{
+    HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MergeStart, from_keys, from_list, hashmap_merge,
+    merge, merge_start,
+};
+
 const MAP: u64 = 0x2c;
 const LIMIT: usize = 32;
 static EMPTY_TUPLE: u64 = 0;
@@ -132,40 +138,24 @@ fn unique(pairs: &[(Term, Term)]) -> Vec<(Term, Term)> {
     out
 }
 fn flat<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:379-457, OTP-29.1.1.
-    let n = pairs.len();
-    if n == 0 {
-        let need_words = 3;
-        let p = heap
-            .alloc(need_words)
-            .ok_or(MapError::HeapFull { need_words })?;
-        // SAFETY: the allocation has three words; the empty tuple is static.
-        unsafe {
-            *p = MAP;
-            *p.add(1) = 0;
-            *p.add(2) = bits(boxed((&EMPTY_TUPLE as *const u64).cast_mut()));
-        }
-        return Ok(boxed(p));
-    }
-    let need_words = 4 + 2 * n;
-    let p = heap
-        .alloc(need_words)
-        .ok_or(MapError::HeapFull { need_words })?;
-    // SAFETY: one allocation holds the key tuple, flatmap header, and values.
-    unsafe {
-        *p = (n as u64) << 6;
-        for (i, (key, _)) in pairs.iter().enumerate() {
-            *p.add(1 + i) = bits(*key);
-        }
-        let m = p.add(1 + n);
-        *m = MAP;
-        *m.add(1) = n as u64;
-        *m.add(2) = bits(boxed(p));
-        for (i, (_, value)) in pairs.iter().enumerate() {
-            *m.add(3 + i) = bits(*value);
-        }
-        Ok(boxed(m))
-    }
+    let ks: Vec<Term> = pairs.iter().map(|p| p.0).collect();
+    let vs: Vec<Term> = pairs.iter().map(|p| p.1).collect();
+    merge::flatmap_from_sorted(&ks, &vs, heap).map_err(|_| MapError::HeapFull {
+        need_words: if pairs.is_empty() {
+            3
+        } else {
+            4 + 2 * pairs.len()
+        },
+    })
+}
+/// The empty flatmap, sharing the static empty key tuple.
+fn empty_flatmap<H: HeapAlloc + ?Sized>(heap: &mut H) -> Result<Term, TermError> {
+    // Port of erts/emulator/beam/erl_map.c:379-383 (ERTS_GLOBAL_LIT_EMPTY_TUPLE keys), OTP-29.1.1.
+    let (slice, ptr) = merge::produce(heap, 3)?;
+    slice[0].write(MAP);
+    slice[1].write(0);
+    slice[2].write(bits(boxed((&EMPTY_TUPLE as *const u64).cast_mut())));
+    Ok(boxed(ptr))
 }
 
 struct SizingHeap<'a, H: HeapAlloc + ?Sized> {
@@ -198,18 +188,10 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for SizingHeap<'_, H> {
 }
 
 fn build_hamt<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:644-752, OTP-29.1.1.
-    let mut heap = SizingHeap {
-        inner: heap,
-        requested_words: 0,
-    };
-    match arinsal_term::build_hamt_from_unique(pairs, &mut heap) {
-        Ok(map) => Ok(map),
-        Err(TermError::HeapFull) => Err(MapError::HeapFull {
-            need_words: heap.requested_words,
-        }),
-        Err(_) => unreachable!("HAMT builder only reports heap allocation failure"),
-    }
+    // Port of erts/emulator/beam/erl_map.c:712-759 (erts_hashmap_from_ks_and_vs_extra), OTP-29.1.1.
+    merge::sized(heap, |heap| {
+        arinsal_term::build_hamt_from_unique(pairs, heap)
+    })
 }
 fn flat_replace<H: HeapAlloc + ?Sized>(
     map: Term,
@@ -780,18 +762,15 @@ fn collision_children(node: Term) -> Vec<Tree> {
 fn collect(node: Term, out: &mut Vec<(Term, Term)>) {
     // Port of erts/emulator/beam/erl_map.c:1930-1992, OTP-29.1.1.
     if bits(node) & 3 == 1 {
-        // SAFETY: a HAMT leaf is a live cons.
-        out.push(unsafe { node.cons_ref().unwrap() });
-    } else if node.header().is_some_and(|h| h & 63 == 0) {
-        // SAFETY: a collision tuple holds initialized leaf terms.
-        let tuple = unsafe { node.tuple_ref().unwrap() };
-        for i in 0..tuple.len() {
-            collect(tuple.get(i).unwrap(), out);
-        }
-    } else {
-        for (_, Tree::Old(child)) in children(node) {
-            collect(child, out);
-        }
+        out.push(merge::leaf(node));
+        return;
+    }
+    let words = match merge::node_view(node) {
+        merge::NodeView::Bitmap(children) => children,
+        merge::NodeView::Collision(leaves) => leaves,
+    };
+    for &child in words {
+        collect(term(child), out);
     }
 }
 
@@ -1037,21 +1016,6 @@ pub fn from_pairs<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -
 pub fn new<H: HeapAlloc + ?Sized>(heap: &mut H) -> MapResult<Term> {
     flat(&[], heap)
 }
-/// `maps:from_list/1` for decoded pairs.
-pub fn from_list<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
-    from_pairs(pairs, heap)
-}
-/// `maps:from_keys/2`.
-pub fn from_keys<H: HeapAlloc + ?Sized>(
-    keys: &[Term],
-    value: Term,
-    heap: &mut H,
-) -> MapResult<Term> {
-    from_pairs(
-        &keys.iter().map(|key| (*key, value)).collect::<Vec<_>>(),
-        heap,
-    )
-}
 /// Iterate entries in the order of `maps:to_list/1`.
 pub fn iter(map: Term) -> MapResult<MapIter> {
     // Port of erts/emulator/beam/erl_map.c:2320-2410, OTP-29.1.1.
@@ -1099,105 +1063,6 @@ pub fn keys(map: Term) -> MapResult<Vec<Term>> {
 /// `maps:values/1` in native iteration order.
 pub fn values(map: Term) -> MapResult<Vec<Term>> {
     Ok(iter(map)?.map(|(_, v)| v).collect())
-}
-/// `maps:merge/2`; right values win.
-pub fn merge<H: HeapAlloc + ?Sized>(left: Term, right: Term, heap: &mut H) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:1257-1423, OTP-29.1.1.
-    check(left)?;
-    check(right)?;
-    if left == right {
-        return Ok(left);
-    }
-    if size(left)? == 0 {
-        return Ok(right);
-    }
-    if size(right)? == 0 {
-        return Ok(left);
-    }
-    if !left.is_hashmap() && !right.is_hashmap() {
-        // Port of erts/emulator/beam/erl_map.c:1286-1423, OTP-29.1.1.
-        // Flatmap keys are already sorted, so merge them in one pass instead
-        // of probing each map for every key.
-        let left_pairs = to_list(left)?;
-        let right_pairs = to_list(right)?;
-        let mut entries = Vec::with_capacity(left_pairs.len() + right_pairs.len());
-        let (mut i, mut j) = (0, 0);
-        while i < left_pairs.len() && j < right_pairs.len() {
-            match key_cmp(left_pairs[i].0, right_pairs[j].0) {
-                Ordering::Less => {
-                    entries.push(left_pairs[i]);
-                    i += 1;
-                }
-                Ordering::Greater => {
-                    entries.push(right_pairs[j]);
-                    j += 1;
-                }
-                Ordering::Equal => {
-                    entries.push(right_pairs[j]);
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-        entries.extend_from_slice(&left_pairs[i..]);
-        entries.extend_from_slice(&right_pairs[j..]);
-
-        if entries.len() == right_pairs.len() {
-            if left_pairs.len() == right_pairs.len()
-                && let (Some(left_keys), Some(right_keys)) =
-                    (left.flatmap_keys_tuple(), right.flatmap_keys_tuple())
-                && left_keys.is_literal()
-                && !right_keys.is_literal()
-            {
-                right.flatmap_replace_keys(left_keys);
-            }
-            return Ok(right);
-        }
-        if entries.len() <= LIMIT {
-            let result = flat(&entries, heap)?;
-            if entries.len() == left_pairs.len()
-                && let Some(keys) = left.flatmap_keys_tuple()
-            {
-                result.flatmap_replace_keys(keys);
-            }
-            return Ok(result);
-        }
-        return build_hamt(&entries, heap);
-    }
-    let right_pairs = to_list(right)?;
-    let mut left_is_subset = true;
-    for (key, _) in iter(left)? {
-        if get(right, key)?.is_none() {
-            left_is_subset = false;
-            break;
-        }
-    }
-    let mut right_is_subset = true;
-    for (key, _) in &right_pairs {
-        if get(left, *key)?.is_none() {
-            right_is_subset = false;
-            break;
-        }
-    }
-    if left_is_subset && right_is_subset {
-        if let (Some(left_keys), Some(right_keys)) =
-            (left.flatmap_keys_tuple(), right.flatmap_keys_tuple())
-            && left_keys.is_literal()
-            && !right_keys.is_literal()
-        {
-            right.flatmap_replace_keys(left_keys);
-        }
-        return Ok(right);
-    }
-    if left_is_subset {
-        return Ok(right);
-    }
-    if right_is_subset {
-        return put_many(left, &right_pairs, false, heap);
-    }
-    let mut entries = to_list(left)?;
-    entries.extend(right_pairs);
-    from_pairs(&entries, heap)
 }
 /// Lookup several keys; absent keys return `None`.
 pub fn get_many(map: Term, keys: &[Term]) -> MapResult<Vec<Option<Term>>> {

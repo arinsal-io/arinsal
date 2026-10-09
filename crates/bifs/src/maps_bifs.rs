@@ -105,6 +105,17 @@ fn merge(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let result = arinsal_maps::merge(args[0], args[1], ctx.heap);
     mapped(ctx, result)
 }
+/// First, non-yielding part of `maps:merge/2`; a HAMT result continues with
+/// [`arinsal_maps::hashmap_merge`] under a reduction budget.
+///
+/// Port of erts/emulator/beam/erl_map.c:1257-1284 (maps_merge_2), OTP-29.1.1.
+pub fn maps_merge_start(
+    ctx: &mut Ctx<'_>,
+    args: &[Term],
+) -> Result<arinsal_maps::MergeStart, BifError> {
+    let result = arinsal_maps::merge_start(args[0], args[1], ctx.heap);
+    mapped(ctx, result)
+}
 fn put(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let result = arinsal_maps::put(args[2], args[0], args[1], ctx.heap);
     mapped(ctx, result)

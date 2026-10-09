@@ -248,6 +248,7 @@ dependencies = [
  "arinsal-etf",
  "arinsal-term",
  "proptest",
+ "smallvec",
 ]
 
 [[package]]

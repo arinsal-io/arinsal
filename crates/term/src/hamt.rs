@@ -1,6 +1,7 @@
 //! Read-only HAMT traversal and the shared term-level bulk constructor.
 use crate::{HeapAlloc, MAP, Term, TermError, TermKind, internal_hash};
 use smallvec::SmallVec;
+use std::mem::MaybeUninit;
 
 /// Number of words in a boxed object whose header is at `ptr`.
 ///
@@ -219,138 +220,391 @@ pub fn flatmap_keys(map: Term) -> Option<Vec<Term>> {
     Some(PairIter::new(map).map(|(key, _)| key).collect())
 }
 
-fn slot(key: Term, level: usize) -> usize {
-    ((internal_hash(key) >> (level * 4)) & 15) as usize
+// Port of erts/emulator/beam/erl_map.h:178-220 (HAMT headers, HAMT_MAX_LEVEL), OTP-29.1.1.
+const HAMT_MAX_LEVEL: usize = 16;
+const fn node_bitmap_header(bitmap: u64) -> u64 {
+    MAP | (1 << 6) | (bitmap << 16)
 }
+const fn head_bitmap_header(bitmap: u64) -> u64 {
+    MAP | (3 << 6) | (1 << 8) | (bitmap << 16)
+}
+const HEAD_ARRAY_HEADER: u64 = MAP | (2 << 6) | (1 << 8) | (0xffff << 16);
 
-enum Tree {
-    Leaf(Term, Term),
-    Branch {
-        root: bool,
-        size: usize,
-        children: Vec<(usize, Tree)>,
-    },
-    Collision(Vec<Tree>),
+/// Temporary hash/leaf record of the bulk HAMT constructors.
+///
+/// Port of erts/emulator/beam/erl_map.c:80 (hxnode_t), OTP-29.1.1.
+#[derive(Clone, Copy, Debug)]
+pub struct HxNode {
+    /// Swizzled hash (path slots from the most significant nibble).
+    pub hx: u64,
+    /// Number of array entries this node stands for (collision runs).
+    pub skip: usize,
+    /// Input position; the highest position wins among duplicate keys.
+    pub i: usize,
+    /// Leaf cons `[Key | Value]`, or a collision node after chunking.
+    pub val: Term,
 }
-impl Tree {
-    fn words(&self) -> usize {
-        match self {
-            Self::Leaf(_, _) => 2,
-            Self::Branch { root, children, .. } => {
-                1 + usize::from(*root)
-                    + children.len()
-                    + children
-                        .iter()
-                        .map(|(_, child)| child.words())
-                        .sum::<usize>()
-            }
-            Self::Collision(children) => {
-                1 + children.len() + children.iter().map(Self::words).sum::<usize>()
-            }
-        }
-    }
-    // Port of erts/emulator/beam/erl_map.c:857-1158, OTP-29.1.1.
-    unsafe fn emit(&self, next: &mut *mut u64) -> Term {
-        match self {
-            Self::Leaf(key, value) => {
-                let ptr = *next;
-                // SAFETY: words() reserves two words for this leaf.
-                unsafe {
-                    *ptr = key.bits();
-                    *ptr.add(1) = value.bits();
-                    *next = ptr.add(2);
-                }
-                Term::from_ptr(ptr, 1)
-            }
-            Self::Branch {
-                root,
-                size,
-                children,
-            } => {
-                let terms: Vec<_> = children
-                    .iter()
-                    .map(|(_, child)| {
-                        // SAFETY: the tree's total word count was reserved.
-                        unsafe { child.emit(next) }
-                    })
-                    .collect();
-                let ptr = *next;
-                let bitmap = children.iter().fold(0u16, |mask, (i, _)| mask | 1 << i);
-                let kind = if *root && bitmap == u16::MAX {
-                    2
-                } else if *root {
-                    3
-                } else {
-                    1
-                };
-                let offset = 1 + usize::from(*root);
-                // SAFETY: this branch's header and child slots were reserved.
-                unsafe {
-                    *ptr = MAP | (kind << 6) | (u64::from(*root) << 8) | ((bitmap as u64) << 16);
-                    if *root {
-                        *ptr.add(1) = *size as u64;
-                    }
-                    for (i, child) in terms.iter().enumerate() {
-                        *ptr.add(offset + i) = child.bits();
-                    }
-                    *next = ptr.add(offset + terms.len());
-                }
-                Term::from_ptr(ptr, 2)
-            }
-            Self::Collision(children) => {
-                let terms: Vec<_> = children
-                    .iter()
-                    .map(|child| {
-                        // SAFETY: the tree's total word count was reserved.
-                        unsafe { child.emit(next) }
-                    })
-                    .collect();
-                let ptr = *next;
-                // SAFETY: this collision tuple's words were reserved.
-                unsafe {
-                    *ptr = (terms.len() as u64) << 6;
-                    for (i, child) in terms.iter().enumerate() {
-                        *ptr.add(1 + i) = child.bits();
-                    }
-                    *next = ptr.add(1 + terms.len());
-                }
-                Term::from_ptr(ptr, 2)
-            }
+impl HxNode {
+    /// Record for the leaf `val` (a `[Key | Value]` cons) at input position `i`.
+    pub fn new(key: Term, val: Term, i: usize) -> Self {
+        Self {
+            hx: swizzle_map_hash(internal_hash(key)),
+            skip: 1,
+            i,
+            val,
         }
     }
 }
 
-fn build(entries: &[(Term, Term)], level: usize, root: bool) -> Tree {
-    // Port of erts/emulator/beam/erl_map.c:857-1158, OTP-29.1.1.
-    if level == 16 {
-        let mut sorted = entries.to_vec();
-        sorted.sort_by(|a, b| crate::heap::exact_flat_key_cmp(a.0, b.0, false));
-        return Tree::Collision(
-            sorted
-                .into_iter()
-                .map(|(key, value)| Tree::Leaf(key, value))
-                .collect(),
+/// Reverse the 4-bit path slots of `hash` so that sorting orders by HAMT path.
+///
+/// Port of erts/emulator/beam/erl_map.c:4170 (swizzle_map_hash), OTP-29.1.1.
+pub fn swizzle_map_hash(hash: u64) -> u64 {
+    const MASK: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    let result = hash.swap_bytes();
+    ((result & MASK) >> 4) | ((result & (MASK >> 4)) << 4)
+}
+
+// Port of erts/emulator/beam/erl_map.c:108-109 (cdepth, maskval), OTP-29.1.1.
+fn cdepth(v1: u64, v2: u64) -> usize {
+    ((v1 ^ v2).leading_zeros() >> 2) as usize
+}
+fn maskval(v: u64, level: usize) -> u64 {
+    (v >> (((HAMT_MAX_LEVEL - 1) - level) * 4)) & 0xF
+}
+
+/// Fresh, uninitialized heap words (`erts_produce_heap`).
+fn produce<'a, H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    words: usize,
+) -> Result<(&'a mut [MaybeUninit<u64>], *mut u64), TermError> {
+    let ptr = heap.alloc(words).ok_or(TermError::HeapFull)?;
+    // SAFETY: the allocator returned `words` writable words that nothing else
+    // references; MaybeUninit admits their uninitialized contents.
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u64>>(), words) };
+    Ok((slice, ptr))
+}
+
+/// Allocate one node holding exactly `words`.
+fn produce_words<H: HeapAlloc + ?Sized>(heap: &mut H, words: &[u64]) -> Result<Term, TermError> {
+    let (slice, ptr) = produce(heap, words.len())?;
+    for (slot, word) in slice.iter_mut().zip(words) {
+        slot.write(*word);
+    }
+    Ok(Term::from_ptr(ptr, 2))
+}
+
+/// Allocate the `[Key | Value]` leaf conses of `ks`/`vs` in one block and
+/// return their hash records, as the callers of `hashmap_from_unsorted_array` do.
+///
+/// Port of erts/emulator/beam/erl_map.c:720-747 (leaf setup of
+/// erts_hashmap_from_ks_and_vs_extra), OTP-29.1.1.
+pub fn hashmap_leaves<H: HeapAlloc + ?Sized>(
+    pairs: impl ExactSizeIterator<Item = (Term, Term)>,
+    heap: &mut H,
+) -> Result<Vec<HxNode>, TermError> {
+    let n = pairs.len();
+    let (slice, ptr) = produce(heap, 2 * n)?;
+    let mut hxns = Vec::with_capacity(n);
+    for (i, (key, value)) in pairs.enumerate() {
+        slice[2 * i].write(key.bits());
+        slice[2 * i + 1].write(value.bits());
+        hxns.push(HxNode::new(
+            key,
+            Term::from_ptr(ptr.wrapping_add(2 * i), 1),
+            i,
+        ));
+    }
+    Ok(hxns)
+}
+
+fn leaf_key(leaf: Term) -> Term {
+    // SAFETY: hash records hold live leaf conses until chunking replaces them.
+    unsafe { leaf.cons_ref() }.expect("HAMT leaf").0
+}
+
+/// Build a HAMT from unsorted leaf records. Returns `None` when
+/// `reject_dupkeys` is set and two leaves have equal keys; otherwise the leaf
+/// with the highest input position wins.
+///
+/// Port of erts/emulator/beam/erl_map.c:774-855 (hashmap_from_unsorted_array), OTP-29.1.1.
+pub fn hashmap_from_unsorted_array<H: HeapAlloc + ?Sized>(
+    hxns: &mut [HxNode],
+    reject_dupkeys: bool,
+    heap: &mut H,
+) -> Result<Option<Term>, TermError> {
+    let n = hxns.len();
+    assert!(n > 0);
+    // hxnodecmp sorts by descending swizzled hash.
+    hxns.sort_unstable_by_key(|node| std::cmp::Reverse(node.hx));
+    let mut ix = 0;
+    let mut cx = 0;
+    while ix < n - 1 {
+        if hxns[ix].hx == hxns[ix + 1].hx {
+            let mut jx = ix + 2;
+            while jx < n && hxns[ix].hx == hxns[jx].hx {
+                jx += 1;
+            }
+            // hxnodecmpkey: CMP_TERM order of the keys within the region.
+            hxns[ix..jx].sort_unstable_by(|a, b| {
+                crate::heap::exact_flat_key_cmp(leaf_key(a.val), leaf_key(b.val), false)
+            });
+            while ix < jx {
+                let mut lx = ix;
+                loop {
+                    ix += 1;
+                    if !(ix < jx && crate::exact_eq(leaf_key(hxns[ix].val), leaf_key(hxns[lx].val)))
+                    {
+                        break;
+                    }
+                    if reject_dupkeys {
+                        return Ok(None);
+                    }
+                    if hxns[ix].i > hxns[lx].i {
+                        lx = ix;
+                    }
+                }
+                hxns[cx].hx = hxns[lx].hx;
+                hxns[cx].val = hxns[lx].val;
+                cx += 1;
+            }
+            ix = jx;
+            continue;
+        }
+        if ix > cx {
+            hxns[cx].hx = hxns[ix].hx;
+            hxns[cx].val = hxns[ix].val;
+        }
+        cx += 1;
+        ix += 1;
+    }
+    if ix < n {
+        hxns[cx].hx = hxns[ix].hx;
+        hxns[cx].val = hxns[ix].val;
+        cx += 1;
+    }
+    if cx > 1 {
+        return hashmap_from_sorted_unique_array(&mut hxns[..cx], heap).map(Some);
+    }
+    // One item: the swizzled hash keeps the root slot in its top nibble.
+    let slot = hxns[0].hx >> ((HAMT_MAX_LEVEL - 1) * 4);
+    produce_words(
+        heap,
+        &[head_bitmap_header(1 << slot), 1, hxns[0].val.bits()],
+    )
+    .map(Some)
+}
+
+// Port of erts/emulator/beam/erl_map.c:857-911 (hashmap_from_sorted_unique_array), OTP-29.1.1.
+fn hashmap_from_sorted_unique_array<H: HeapAlloc + ?Sized>(
+    hxns: &mut [HxNode],
+    heap: &mut H,
+) -> Result<Term, TermError> {
+    let n = hxns.len();
+    let mut ix = 0;
+    let mut elems = 1;
+    while ix < n - 1 {
+        if hxns[ix].hx == hxns[ix + 1].hx {
+            let mut jx = ix + 2;
+            while jx < n && hxns[ix].hx == hxns[jx].hx {
+                jx += 1;
+            }
+            let n_colliders = jx - ix;
+            let mut words: SmallVec<[u64; 8]> = SmallVec::with_capacity(1 + n_colliders);
+            words.push((n_colliders as u64) << 6);
+            words.extend(hxns[ix..jx].iter().map(|node| node.val.bits()));
+            hxns[ix].val = produce_words(heap, &words)?;
+            hxns[ix].skip = n_colliders;
+            ix = jx;
+            if ix < n {
+                elems += 1;
+            }
+            continue;
+        }
+        hxns[ix].skip = 1;
+        elems += 1;
+        ix += 1;
+    }
+    hashmap_from_chunked_array(hxns, elems, n, heap)
+}
+
+/// Wrap `res` in single-child bitmap nodes from level `HAMT_MAX_LEVEL - 1` down to `stop + 1`.
+fn collision_chain<H: HeapAlloc + ?Sized>(
+    mut res: Term,
+    v: u64,
+    stop: usize,
+    heap: &mut H,
+) -> Result<Term, TermError> {
+    let mut dc = HAMT_MAX_LEVEL - 1;
+    while dc > stop {
+        res = produce_words(heap, &[node_bitmap_header(1 << maskval(v, dc)), res.bits()])?;
+        dc -= 1;
+    }
+    Ok(res)
+}
+
+/// Pop `sz - 1` siblings from `stack` behind `res` into a node with `header`.
+fn stack_node<H: HeapAlloc + ?Sized>(
+    header: &[u64],
+    res: Term,
+    sz: usize,
+    stack: &mut SmallVec<[u64; 16]>,
+    heap: &mut H,
+) -> Result<Term, TermError> {
+    let mut words: SmallVec<[u64; 18]> = SmallVec::new();
+    words.extend_from_slice(header);
+    words.push(res.bits());
+    for _ in 1..sz {
+        words.push(stack.pop().expect("HAMT build stack"));
+    }
+    produce_words(heap, &words)
+}
+
+// Port of erts/emulator/beam/erl_map.c:919-1158 (hashmap_from_chunked_array), OTP-29.1.1.
+fn hashmap_from_chunked_array<H: HeapAlloc + ?Sized>(
+    hxns: &[HxNode],
+    n: usize,
+    size: usize,
+    heap: &mut H,
+) -> Result<Term, TermError> {
+    let mut stack: SmallVec<[u64; 16]> = SmallVec::new();
+    if n == 1 {
+        // Every key shares all HAMT_MAX_LEVEL hash slots.
+        let v = hxns[0].hx;
+        let res = collision_chain(hxns[0].val, v, 0, heap)?;
+        let slot = maskval(v, 0);
+        return produce_words(
+            heap,
+            &[head_bitmap_header(1 << slot), size as u64, res.bits()],
         );
     }
-    let mut buckets: [Vec<(Term, Term)>; 16] = std::array::from_fn(|_| Vec::new());
-    for &entry in entries {
-        buckets[slot(entry.0, level)].push(entry);
+
+    let mut ix = 0;
+    let mut d = 0;
+    let mut vp = hxns[ix].hx;
+    let mut v = hxns[ix + hxns[ix].skip].hx;
+    debug_assert!(vp > v);
+    let mut slot = maskval(vp, d);
+    while slot == maskval(v, d) {
+        stack.push(1 << slot);
+        d += 1;
+        slot = maskval(vp, d);
     }
-    let children = buckets
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, bucket)| match bucket.len() {
-            0 => None,
-            1 => Some((i, Tree::Leaf(bucket[0].0, bucket[0].1))),
-            _ => Some((i, build(&bucket, level + 1, false))),
-        })
-        .collect();
-    Tree::Branch {
-        root,
-        size: entries.len(),
-        children,
+    let mut res = hxns[ix].val;
+    if hxns[ix].skip > 1 {
+        res = collision_chain(res, vp, d, heap)?;
+    }
+    stack.push(res.bits());
+    stack.push(1 << slot);
+
+    for _ in 0..n - 2 {
+        let mut hdr = stack.pop().expect("HAMT build stack");
+        ix += hxns[ix].skip;
+        let vn = hxns[ix + hxns[ix].skip].hx;
+        let dn = cdepth(v, vn);
+        debug_assert!(v > vn);
+        res = hxns[ix].val;
+        if hxns[ix].skip > 1 {
+            res = collision_chain(res, v, d.max(dn), heap)?;
+        }
+        if d < dn {
+            while d < dn {
+                stack.push(hdr | 1 << maskval(v, d));
+                d += 1;
+                hdr = 0;
+            }
+            stack.push(res.bits());
+            stack.push(1 << maskval(v, d));
+        } else if d == dn {
+            stack.push(res.bits());
+            stack.push(hdr | 1 << maskval(v, d));
+        } else {
+            while dn != d {
+                hdr |= 1 << maskval(v, d);
+                let sz = (hdr as u16).count_ones() as usize;
+                res = stack_node(&[node_bitmap_header(hdr)], res, sz, &mut stack, heap)?;
+                hdr = stack.pop().expect("HAMT build stack");
+                d -= 1;
+            }
+            stack.push(res.bits());
+            stack.push(hdr);
+        }
+        vp = v;
+        v = vn;
+        d = dn;
+    }
+
+    let mut dn = cdepth(vp, v);
+    ix += hxns[ix].skip;
+    res = hxns[ix].val;
+    if hxns[ix].skip > 1 {
+        res = collision_chain(res, v, dn, heap)?;
+    }
+    let mut hdr = stack.pop().expect("HAMT build stack");
+    while dn > 0 {
+        hdr |= 1 << maskval(v, dn);
+        let sz = (hdr as u16).count_ones() as usize;
+        res = stack_node(&[node_bitmap_header(hdr)], res, sz, &mut stack, heap)?;
+        hdr = stack.pop().expect("HAMT build stack");
+        dn -= 1;
+    }
+    hdr |= 1 << maskval(v, dn);
+    let sz = (hdr as u16).count_ones() as usize;
+    let header = if hdr == 0xffff {
+        HEAD_ARRAY_HEADER
+    } else {
+        head_bitmap_header(hdr)
+    };
+    let root = stack_node(&[header, size as u64], res, sz, &mut stack, heap)?;
+    debug_assert!(stack.is_empty());
+    Ok(root)
+}
+
+/// Build a HAMT from parallel key and value arrays (more than `MAP_SMALL_MAP_LIMIT`
+/// entries), plus an optional extra pair. Returns `None` if `reject_dupkeys` is set
+/// and a key repeats; otherwise later entries win.
+///
+/// Port of erts/emulator/beam/erl_map.c:712-759 (erts_hashmap_from_ks_and_vs_extra), OTP-29.1.1.
+pub fn hashmap_from_ks_and_vs_extra<H: HeapAlloc + ?Sized>(
+    ks: &[Term],
+    vs: &[Term],
+    extra: Option<(Term, Term)>,
+    reject_dupkeys: bool,
+    heap: &mut H,
+) -> Result<Option<Term>, TermError> {
+    debug_assert_eq!(ks.len(), vs.len());
+    let pairs = ks.iter().copied().zip(vs.iter().copied()).chain(extra);
+    let mut hxns = hashmap_leaves(
+        ExactPairs(pairs, ks.len() + usize::from(extra.is_some())),
+        heap,
+    )?;
+    hashmap_from_unsorted_array(&mut hxns, reject_dupkeys, heap)
+}
+
+/// `erts_hashmap_from_ks_and_vs`: later duplicates win.
+///
+/// Port of erts/emulator/beam/erl_map.h:122, OTP-29.1.1.
+pub fn hashmap_from_ks_and_vs<H: HeapAlloc + ?Sized>(
+    ks: &[Term],
+    vs: &[Term],
+    heap: &mut H,
+) -> Result<Term, TermError> {
+    Ok(hashmap_from_ks_and_vs_extra(ks, vs, None, false, heap)?.expect("duplicates accepted"))
+}
+
+struct ExactPairs<I>(I, usize);
+impl<I: Iterator<Item = (Term, Term)>> Iterator for ExactPairs<I> {
+    type Item = (Term, Term);
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.0.next()?;
+        self.1 -= 1;
+        Some(item)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.1, Some(self.1))
     }
 }
+impl<I: Iterator<Item = (Term, Term)>> ExactSizeIterator for ExactPairs<I> {}
 
 /// Construct an OTP-layout HAMT from distinct pairs; callers handle duplicate keys.
 /// This is the shared bulk-construction entry point for `arinsal-maps`.
@@ -358,9 +612,6 @@ pub fn build_hamt_from_unique<H: HeapAlloc + ?Sized>(
     entries: &[(Term, Term)],
     heap: &mut H,
 ) -> Result<Term, TermError> {
-    let tree = build(entries, 0, true);
-    let ptr = heap.alloc(tree.words()).ok_or(TermError::HeapFull)?;
-    let mut next = ptr;
-    // SAFETY: the allocation covers exactly tree.words() words.
-    Ok(unsafe { tree.emit(&mut next) })
+    let mut hxns = hashmap_leaves(entries.iter().copied(), heap)?;
+    Ok(hashmap_from_unsorted_array(&mut hxns, false, heap)?.expect("duplicates accepted"))
 }
