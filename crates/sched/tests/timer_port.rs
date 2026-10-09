@@ -267,3 +267,59 @@ fn foreign_thread_insert_is_visible_to_later_requests() {
     assert!(matches!(scheduler.cancel_timer(timer), Some(ms) if ms <= 30_000));
     assert_eq!(scheduler.cancel_timer(timer), None);
 }
+
+/// Starts a timer to itself, then on a message cancels the timers aimed at it and exits,
+/// like the VM's exit path.
+struct Victim {
+    own: mpsc::Sender<arinsal_sched::TimerRef>,
+    done: mpsc::Sender<()>,
+    started: bool,
+}
+
+impl Task for Victim {
+    type Message = u64;
+
+    fn run(&mut self, ctx: &mut RunCtx<u64>, _: u32) -> RunOutcome {
+        if !self.started {
+            self.started = true;
+            self.own.send(ctx.start_timer(60_000, 1).unwrap()).unwrap();
+        }
+        if ctx.receive().is_some() {
+            ctx.cancel_target_timers(ctx.pid());
+            self.done.send(()).unwrap();
+            return RunOutcome::Exit(0);
+        }
+        RunOutcome::Wait { timeout_ms: None }
+    }
+}
+
+// Port of erts/emulator/beam/erl_hl_timer.c:2455 (erts_cancel_bif_timers), OTP-29.1.1: exit
+// cancels the receiver's timers on its own wheel and on other schedulers' wheels.
+#[test]
+fn exit_cancels_target_timers_on_every_wheel() {
+    let scheduler = Scheduler::<Victim>::new(Config {
+        workers: 4,
+        max_processes: 16,
+        ..Config::default()
+    });
+    let (own_tx, own_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let pid = scheduler
+        .spawn(Victim {
+            own: own_tx,
+            done: done_tx,
+            started: false,
+        })
+        .unwrap();
+    let own = own_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let remote = scheduler.start_timer(pid, 60_000, 2).unwrap();
+    assert!(scheduler.read_timer(own).is_some());
+    assert!(scheduler.read_timer(remote).is_some());
+    scheduler.send(pid, pid, 0).unwrap();
+    done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while scheduler.read_timer(own).is_some() || scheduler.read_timer(remote).is_some() {
+        assert!(Instant::now() < deadline, "timers survived their receiver");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
