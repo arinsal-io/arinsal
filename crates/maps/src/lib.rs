@@ -29,7 +29,7 @@ pub enum MapError {
     Badmap(Term),
     /// `{badkey, Key}`.
     Badkey(Term),
-    /// Caller must collect garbage and retry with this many words.
+    /// Caller must collect garbage and retry; `0` means the operation has no whole-operation hint.
     HeapFull { need_words: usize },
     /// Invalid iterator term or path.
     Badarg(Term),
@@ -157,9 +157,7 @@ fn empty_flatmap<H: HeapAlloc + ?Sized>(heap: &mut H) -> Result<Term, TermError>
 
 fn build_hamt<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
     // Port of erts/emulator/beam/erl_map.c:712-759 (erts_hashmap_from_ks_and_vs_extra), OTP-29.1.1.
-    merge::sized(heap, |heap| {
-        arinsal_term::build_hamt_from_unique(pairs, heap)
-    })
+    merge::allocation_result(arinsal_term::build_hamt_from_unique(pairs, heap))
 }
 // Port of erts/emulator/beam/erl_map.h:178-205 (HAMT headers), OTP-29.1.1.
 fn header(kind: u64, bitmap: u16) -> u64 {
@@ -416,6 +414,13 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> 
     const NONE: u8 = 0;
     const LEAF: u8 = 1;
     const BOXED: u8 = 2;
+    if map.is_hashmap() && size(map)? == LIMIT + 1 && get(map, key)?.is_some() {
+        let mut pairs: Vec<_> = iter(map)?
+            .filter(|(candidate, _)| !exact_eq(*candidate, key))
+            .collect();
+        pairs.sort_by(|a, b| key_cmp(a.0, b.0));
+        return flat(&pairs, heap);
+    }
     let mut path = [(map, 0_u32, 0_u32); MAX_HAMT_DEPTH];
     let mut depth = 0;
     let mut node = map;
@@ -425,6 +430,52 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> 
     // SAFETY: the source map and every child remain live during traversal; the
     // exact output size is computed from this bounded path before allocation.
     unsafe {
+        if !map.is_hashmap() {
+            let (keys, values, _) = merge::flatmap_kv(map);
+            let n = keys.len();
+            if n == 0 {
+                return Ok(map);
+            }
+            let found_index = keys.iter().position(|&word| {
+                (is_immed(key) && word == bits(key))
+                    || (!is_immed(key) && exact_eq(term(word), key))
+            });
+            let Some(found_index) = found_index else {
+                return Ok(map);
+            };
+            let new_n = n - 1;
+            let tuple_words = if new_n == 0 { 0 } else { new_n + 1 };
+            let need_words = tuple_words + FLATMAP_HEADER_WORDS + new_n;
+            let Some((output, ptr)) = merge::produce(heap, need_words).ok() else {
+                return Err(MapError::HeapFull { need_words });
+            };
+            let map_start = tuple_words;
+            let keys_term = if new_n == 0 {
+                arinsal_term::TermBuilder::new(heap)
+                    .tuple(&[])
+                    .map_err(|_| MapError::HeapFull { need_words })?
+            } else {
+                output[0].write((new_n as u64) << 6);
+                boxed(ptr)
+            };
+            output[map_start].write(MAP);
+            output[map_start + 1].write(new_n as u64);
+            output[map_start + 2].write(bits(keys_term));
+
+            let mut out_index = 0;
+            for index in 0..n {
+                if index == found_index {
+                    continue;
+                }
+                if new_n != 0 {
+                    output[1 + out_index].write(keys[index]);
+                }
+                output[map_start + FLATMAP_HEADER_WORDS + out_index].write(values[index]);
+                out_index += 1;
+            }
+            return Ok(boxed(ptr.add(map_start)));
+        }
+
         loop {
             if bits(node) & 3 == 1 {
                 let leaf = node.raw_ptr();
@@ -785,26 +836,9 @@ pub fn is_key(map: Term, key: Term) -> MapResult<bool> {
 
 /// `maps:remove/2`.
 pub fn remove<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:2036-2235, OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_map.c:1910-2030 (erts_maps_take) and
+    // 2881-3184 (hashmap_delete), OTP-29.1.1.
     check(map)?;
-    if !map.is_hashmap() {
-        let mut pairs: Vec<_> = iter(map)?.collect();
-        let Some(found) = pairs.iter().position(|(k, _)| exact_eq(*k, key)) else {
-            return Ok(map);
-        };
-        pairs.remove(found);
-        return flat(&pairs, heap);
-    }
-    let n = size(map)?;
-    if n == LIMIT + 1 {
-        if get(map, key)?.is_none() {
-            return Ok(map);
-        }
-        // Port of erts/emulator/beam/erl_map.c:2975-3025 (hashmap_delete), OTP-29.1.1.
-        let mut pairs: Vec<_> = iter(map)?.filter(|(k, _)| !exact_eq(*k, key)).collect();
-        pairs.sort_by(|a, b| key_cmp(a.0, b.0));
-        return flat(&pairs, heap);
-    }
     hashmap_delete(map, key, heap)
 }
 
@@ -839,12 +873,10 @@ fn hashmap_from_ks_and_vs_extra<H: HeapAlloc + ?Sized>(
     extra: Option<(Term, Term)>,
     heap: &mut H,
 ) -> MapResult<Term> {
-    merge::sized(heap, |heap| {
-        Ok(
-            arinsal_term::hashmap_from_ks_and_vs_extra(ks, vs, extra, false, heap)?
-                .expect("duplicates accepted"),
-        )
-    })
+    merge::allocation_result(
+        arinsal_term::hashmap_from_ks_and_vs_extra(ks, vs, extra, false, heap)
+            .map(|map| map.expect("duplicates accepted")),
+    )
 }
 
 /// The keys and values of a live flatmap as slices.
