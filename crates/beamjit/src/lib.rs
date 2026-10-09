@@ -3645,6 +3645,7 @@ fn emit_op(
                             value(map_at)?,
                             value(dest_at)?,
                             runtime,
+                            env.map_runtime(),
                         )
                     } else {
                         assembler.emit_bif_is_map_key(

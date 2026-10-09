@@ -18,9 +18,15 @@ fn run(
 ) -> ExitReason {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    // Fragment calls clobber LR; keep the return address in scratch memory (a stack word
+    // would be scanned by the GC cases).
+    let cp_slot = std::mem::offset_of!(SchedulerRegisters, tmp_mem) as u32 + 7 * 8;
+    asm.emit_raw(|e| e.str_uoff(Gpr::x(30), Gpr::x(19), cp_slot))
+        .unwrap();
     emit(&mut asm);
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ldr_uoff(Gpr::x(30), Gpr::x(19), cp_slot)?;
         e.ret(Gpr::x(30))
     })
     .unwrap();
@@ -198,8 +204,52 @@ fn map_get_on_hashmap_via_hook() {
     registers.x_reg_array[1] = bits(map);
     run(&mut process, &mut registers, |asm| {
         let helper: GuardHelper = arinsal_beamasm_guard;
-        asm.emit_bif_map_get(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), helper)
-            .unwrap();
+        asm.emit_bif_map_get(
+            0,
+            ArgVal::X(0),
+            ArgVal::X(1),
+            ArgVal::X(0),
+            helper,
+            test_map_runtime(),
+        )
+        .unwrap();
     });
     assert_eq!(from_bits(registers.x_reg_array[0]).as_small(), Some(37));
+}
+
+extern "C" fn unused_map_get(
+    _p: *mut arinsal_beamasm::ProcessHeader,
+    _map: u64,
+    _key: u64,
+    _hash: u64,
+) -> u64 {
+    0
+}
+extern "C" fn unused_map_update(
+    _p: *mut arinsal_beamasm::ProcessHeader,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _d: u64,
+) -> u64 {
+    0
+}
+
+/// Map runtime with real lookup fragments; `map_get` of a present immediate key never calls
+/// the other helpers.
+fn test_map_runtime() -> arinsal_beamasm::map::MapRuntime {
+    let fragments = Box::leak(Box::new(
+        arinsal_beamasm::map::MapFragments::new(unused_map_get).unwrap(),
+    ));
+    arinsal_beamasm::map::MapRuntime {
+        get: unused_map_get,
+        get_elements: unused_map_update,
+        new_map: unused_map_update,
+        update_assoc: unused_map_update,
+        update_exact: unused_map_update,
+        put_single: unused_map_update,
+        update_single: unused_map_update,
+        get_element_shared: fragments.get_element_shared(),
+        get_element_hash_shared: fragments.get_element_hash_shared(),
+    }
 }

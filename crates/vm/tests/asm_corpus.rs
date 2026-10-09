@@ -172,6 +172,8 @@ impl ModuleEnv for CorpusEnv {
             update_exact: map_many,
             put_single: map_many,
             update_single: map_many,
+            get_element_shared: map_fragments(map_get).get_element_shared(),
+            get_element_hash_shared: map_fragments(map_get).get_element_hash_shared(),
         }
     }
 
@@ -464,4 +466,12 @@ fn extended_x_fixtures_compile_with_beamasm() {
             "{file}: no native functions"
         );
     }
+}
+
+fn map_fragments(
+    get: arinsal_beamasm::map::MapGetHelper,
+) -> &'static arinsal_beamasm::map::MapFragments {
+    Box::leak(Box::new(
+        arinsal_beamasm::map::MapFragments::new(get).unwrap(),
+    ))
 }

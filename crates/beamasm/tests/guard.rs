@@ -370,10 +370,13 @@ fn native_value(
 ) {
     let _fixture = terms();
     let finalized = module(|asm| {
+        // Like a compiled function: CP lives on the stack because fragment calls clobber LR.
+        asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::x(20), -8))?;
         emit(asm)?;
         asm.move_(ArgVal::X(0), ArgVal::X(1))?;
         asm.emit_raw(|e| {
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+            e.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
             e.ret(Gpr::x(30))
         })
     });
@@ -814,7 +817,16 @@ fn native_bif_is_map_key() {
 fn native_bif_map_get() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_map_get(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
+        |a| {
+            a.emit_bif_map_get(
+                0,
+                ArgVal::X(0),
+                ArgVal::X(1),
+                ArgVal::X(0),
+                guard_helper,
+                map_runtime(),
+            )
+        },
         f.alpha,
         f.map,
         bits(f.one),
@@ -899,4 +911,38 @@ fn native_bif_abs() {
         small(0),
         bits(small(9)),
     );
+}
+
+extern "C" fn unused_map_get(_p: *mut ProcessHeader, _map: u64, _key: u64, _hash: u64) -> u64 {
+    0
+}
+extern "C" fn unused_get_elements(
+    _p: *mut ProcessHeader,
+    _a: u64,
+    _b: u64,
+    _c: u64,
+    _d: u64,
+) -> u64 {
+    0
+}
+extern "C" fn unused_map_update(_p: *mut ProcessHeader, _a: u64, _b: u64, _c: u64, _d: u64) -> u64 {
+    0
+}
+
+/// Map runtime with real lookup fragments; the other helpers are unused by `map_get`.
+fn map_runtime() -> arinsal_beamasm::map::MapRuntime {
+    let fragments = Box::leak(Box::new(
+        arinsal_beamasm::map::MapFragments::new(unused_map_get).unwrap(),
+    ));
+    arinsal_beamasm::map::MapRuntime {
+        get: unused_map_get,
+        get_elements: unused_get_elements,
+        new_map: unused_map_update,
+        update_assoc: unused_map_update,
+        update_exact: unused_map_update,
+        put_single: unused_map_update,
+        update_single: unused_map_update,
+        get_element_shared: fragments.get_element_shared(),
+        get_element_hash_shared: fragments.get_element_hash_shared(),
+    }
 }

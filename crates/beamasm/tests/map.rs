@@ -34,14 +34,23 @@ extern "C" fn guard_helper(_p: *mut ProcessHeader, _op: u32, _a: u64, _b: u64) -
 }
 
 fn runtime() -> MapRuntime {
+    runtime_with(hashmap_get)
+}
+/// A runtime whose lookup fragments are built around `get`.
+fn runtime_with(get: arinsal_beamasm::map::MapGetHelper) -> MapRuntime {
+    let fragments = Box::leak(Box::new(
+        arinsal_beamasm::map::MapFragments::new(get).unwrap(),
+    ));
     MapRuntime {
-        get: hashmap_get,
+        get,
         get_elements,
         new_map: update,
         update_assoc: update,
         update_exact: update,
         put_single: update,
         update_single: update,
+        get_element_shared: fragments.get_element_shared(),
+        get_element_hash_shared: fragments.get_element_hash_shared(),
     }
 }
 fn bits(term: Term) -> u64 {
@@ -71,13 +80,20 @@ fn run(
 ) -> u64 {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();
+    // Like a compiled function: CP lives on the stack because fragment calls clobber LR.
+    asm.emit_raw(|e| e.str_pre(Gpr::x(30), Gpr::x(20), -8))
+        .unwrap();
     emit(&mut asm).unwrap();
     asm.move_(ArgVal::X(2), ArgVal::X(0)).unwrap();
     asm.emit_raw(|e| e.mov_reg(Gpr::x(0), Gpr::xzr())).unwrap();
+    asm.emit_raw(|e| e.ldr_post(Gpr::x(30), Gpr::x(20), 8))
+        .unwrap();
     asm.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
     asm.emit_i_func_label(90).unwrap();
     asm.emit_raw(|e| e.mov_const(Gpr::x(25), 0x3f0)).unwrap();
     asm.emit_raw(|e| e.mov_reg(Gpr::x(0), Gpr::xzr())).unwrap();
+    asm.emit_raw(|e| e.ldr_post(Gpr::x(30), Gpr::x(20), 8))
+        .unwrap();
     asm.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
     let module: FinalizedModule = asm.finalize().unwrap();
     let mut heap = [0_u64; 128];
@@ -110,10 +126,7 @@ fn flatmap() -> (ProcessHeap, Term, Term) {
 #[test]
 fn native_flatmap_get_inline() {
     let (_heap, map, key) = flatmap();
-    let runtime = MapRuntime {
-        get: panic_get,
-        ..runtime()
-    };
+    let runtime = runtime_with(panic_get);
     let result = run(
         |m| {
             m.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), runtime)?;
@@ -128,10 +141,7 @@ fn native_flatmap_get_inline() {
 #[test]
 fn native_flatmap_miss() {
     let (_heap, map, _) = flatmap();
-    let runtime = MapRuntime {
-        get: panic_get,
-        ..runtime()
-    };
+    let runtime = runtime_with(panic_get);
     let result = run(
         |m| {
             m.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), runtime)?;
