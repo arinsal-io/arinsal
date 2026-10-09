@@ -1008,10 +1008,13 @@ fn spawn_options(runtime: Option<&Runtime>, term: Term) -> Result<SpawnOpts, VmE
             {
                 // Accepted; async_dist is applied through process_flag.
             } else if tuple.len() == 2 && tuple.get(0) == Some(atom("scheduler")) {
+                let scheduler_count = runtime
+                    .and_then(|runtime| runtime.scheduler().ok())
+                    .map_or(0, |scheduler| scheduler.scheduler_count());
                 let scheduler = tuple
                     .get(1)
                     .and_then(Term::as_small)
-                    .filter(|&scheduler| scheduler >= 0)
+                    .filter(|&scheduler| scheduler >= 0 && scheduler as usize <= scheduler_count)
                     .ok_or_else(|| badarg("erlang:spawn_opt"))?;
                 // Port of erts/emulator/beam/erl_process.c:12361 (erts_parse_spawn_opts): 0 means unbound.
                 opts.scheduler = (scheduler != 0).then_some(scheduler as usize);
