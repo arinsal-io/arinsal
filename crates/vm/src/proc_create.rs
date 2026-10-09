@@ -379,6 +379,17 @@ impl Process {
         self.header.current = std::ptr::null();
     }
 
+    /// Publishes what a runtime call that did not collect can change: the heap and stack
+    /// cursors and FCALLS. The heap bounds move only when the process collects.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:540-601 (emit_leave_runtime with
+    // Update::eHeap | eStack | eReductions), OTP-29.1.1.
+    pub(crate) fn sync_native_cursors(&mut self) {
+        let (htop, stop) = self.heap.heap_cursor();
+        self.header.htop = htop;
+        self.header.stop = stop;
+        self.header.fcalls = self.reductions;
+    }
+
     pub(crate) fn sync_native_header(&mut self) {
         let (htop, stop) = self.heap.heap_cursor();
         let (heap, hend) = self.heap.heap_bounds();

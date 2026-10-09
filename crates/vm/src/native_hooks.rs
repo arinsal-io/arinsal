@@ -82,6 +82,27 @@ pub extern "C" fn arinsal_beamasm_bif_mfa(
 pub(crate) fn process_and_registers<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
+    let (process, registers) = enter_runtime(header)?;
+    for (destination, raw) in process
+        .x
+        .iter_mut()
+        .take(NATIVE_X)
+        .zip(&registers.x_reg_array)
+    {
+        // SAFETY: The native ABI register array contains tagged BEAM terms.
+        *destination = unsafe { Term::from_raw_bits(*raw) };
+    }
+    Some((process, registers))
+}
+
+/// The process and scheduler registers of a helper called from native code, with the heap
+/// and stack cursors committed but the X registers left in the register array, where the
+/// helper reads them.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:460-540 (emit_enter_runtime stores only
+// HTOP/STOP; the runtime gets `reg`, the scheduler's x_reg_array, not a copy), OTP-29.1.1.
+pub(crate) fn enter_runtime<'a>(
+    header: *mut ProcessHeader,
+) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
     if header.is_null() {
         return None;
     }
@@ -99,15 +120,6 @@ pub(crate) fn process_and_registers<'a>(
     // SAFETY: run_native keeps its scheduler register area exclusively borrowed
     // while native code and its synchronous hooks are executing.
     let registers = unsafe { &mut *registers };
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .take(NATIVE_X)
-        .zip(&registers.x_reg_array)
-    {
-        // SAFETY: The native ABI register array contains tagged BEAM terms.
-        *destination = unsafe { Term::from_raw_bits(*raw) };
-    }
     Some((process, registers))
 }
 
