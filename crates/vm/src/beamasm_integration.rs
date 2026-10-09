@@ -12,7 +12,7 @@ use arinsal_beamjit::{
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock, Weak};
 
 type Mfa = (String, String, u8);
@@ -155,10 +155,52 @@ struct DispatchRegistry {
 
 impl DispatchRegistry {
     fn intern_identity(&mut self, identity: usize, entry: &Arc<DispatchTarget>) {
-        self.by_identity
-            .entry(identity)
-            .or_insert_with(|| Box::leak(Box::new(DispatchTarget::clone(entry))));
+        self.by_identity.entry(identity).or_insert_with(|| {
+            let target: &'static DispatchTarget = Box::leak(Box::new(DispatchTarget::clone(entry)));
+            // The slot names its descriptor, so native calls reach it without a lookup.
+            if let Some(info) = publish_descriptor(target) {
+                target.slot.set_info(info);
+            }
+            target
+        });
     }
+}
+
+/// Descriptors of every export a native call site can name, indexed by the `info` word of its
+/// export slot. Append-only: an index stays valid for the life of the VM, like the export
+/// table entries erts never frees.
+// Port of erts/emulator/beam/export.c:48-70 (export_tables: an index table whose entries keep
+// their address), OTP-29.1.1.
+const DESCRIPTOR_CHUNK: usize = 4096;
+const DESCRIPTOR_CHUNKS: usize = 1024;
+
+type DescriptorChunk = Box<[OnceLock<&'static DispatchTarget>]>;
+
+static DESCRIPTORS: [OnceLock<DescriptorChunk>; DESCRIPTOR_CHUNKS] =
+    [const { OnceLock::new() }; DESCRIPTOR_CHUNKS];
+// Index zero stays unused: an export slot's `info` is zero until its descriptor is published.
+static NEXT_DESCRIPTOR: AtomicUsize = AtomicUsize::new(1);
+
+fn publish_descriptor(target: &'static DispatchTarget) -> Option<usize> {
+    let info = NEXT_DESCRIPTOR.fetch_add(1, Ordering::Relaxed);
+    let chunk = DESCRIPTORS.get(info / DESCRIPTOR_CHUNK)?.get_or_init(|| {
+        (0..DESCRIPTOR_CHUNK)
+            .map(|_| OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
+    chunk.get(info % DESCRIPTOR_CHUNK)?.set(target).ok()?;
+    Some(info)
+}
+
+/// The export descriptor an export slot's `info` word names.
+pub(crate) fn export_descriptor(info: usize) -> Option<ExportDispatch> {
+    DESCRIPTORS
+        .get(info / DESCRIPTOR_CHUNK)?
+        .get()?
+        .get(info % DESCRIPTOR_CHUNK)?
+        .get()
+        .copied()
 }
 
 fn dispatch_registry() -> &'static RwLock<DispatchRegistry> {
@@ -434,8 +476,8 @@ fn refresh_import_slots(exports: &ScopeExports, ix: usize) {
 /// with `identity`: the export's address in its node's active code index.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:141-147 (emit_dispatch_save_calls_export:
 // "Keep going with the actual code index"), OTP-29.1.1.
-pub(crate) fn save_calls_continuation(identity: usize) -> usize {
-    target_for_identity(identity).map_or_else(
+pub(crate) fn save_calls_continuation(export: Option<ExportDispatch>) -> usize {
+    export.map_or_else(
         || fragments().map_or(0, DispatchFragments::export_trampoline),
         |target| {
             let active = crate::code_ix::for_scope(target.scope).active();

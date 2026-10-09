@@ -607,9 +607,10 @@ fn trap_to_dirty_nif(
 pub extern "C" fn arinsal_beamasm_export_trampoline(
     header: *mut ProcessHeader,
     identity: u64,
+    info: u64,
 ) -> u64 {
     // THE_NON_VALUE raises, 1 hands the call to the interpreter, any term word is the result.
-    invoke_dispatch_bif(header, identity as usize, 0, true).unwrap_or(1)
+    invoke_dispatch_bif(header, identity as usize, 0, info as usize, true).unwrap_or(1)
 }
 
 /// Records the remote call of a process saving calls (the export entry is `identity`) and
@@ -618,10 +619,11 @@ pub extern "C" fn arinsal_beamasm_export_trampoline(
 // OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_save_calls_export(
     header: *mut ProcessHeader,
-    identity: u64,
+    _identity: u64,
+    info: u64,
 ) -> u64 {
-    let identity = identity as usize;
-    if let Some(export) = crate::beamasm_integration::export_dispatch(identity)
+    let export = crate::beamasm_integration::export_descriptor(info as usize);
+    if let Some(export) = export
         && let Some((process, _registers)) = crate::native_hooks::process_and_registers(header)
     {
         crate::trace::save_call(
@@ -629,7 +631,7 @@ pub extern "C" fn arinsal_beamasm_save_calls_export(
             crate::trace::SavedCall::Mfa(export.module_atom, export.function_atom, export.arity),
         );
     }
-    crate::beamasm_integration::save_calls_continuation(identity) as u64
+    crate::beamasm_integration::save_calls_continuation(export) as u64
 }
 
 /// Runs a light BIF through the shared BeamAsm fragment.
@@ -638,9 +640,17 @@ pub extern "C" fn arinsal_beamasm_call_light_bif_shared(
     header: *mut ProcessHeader,
     identity: u64,
     site: u64,
+    info: u64,
 ) -> u64 {
-    // `site` is only meaningful for the breakpoint trampoline; other callers leave x2 alone.
-    invoke_dispatch_bif(header, identity as usize, site as usize, false).unwrap_or(0)
+    // `site` is only meaningful for the breakpoint trampoline, `info` only for a BIF call.
+    invoke_dispatch_bif(
+        header,
+        identity as usize,
+        site as usize,
+        info as usize,
+        false,
+    )
+    .unwrap_or(0)
 }
 
 /// Reads the active process dictionary for native `i_get` instructions.
@@ -775,6 +785,7 @@ fn invoke_dispatch_bif(
     header: *mut ProcessHeader,
     identity: usize,
     site: usize,
+    info: usize,
     export_call: bool,
 ) -> Option<u64> {
     let (process, registers) = crate::native_hooks::process_and_registers(header)?;
@@ -855,7 +866,9 @@ fn invoke_dispatch_bif(
             }
         }
     }
-    let export = crate::beamasm_integration::export_dispatch(identity)?;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared gets the
+    // export and its BIF from the call site), OTP-29.1.1.
+    let export = crate::beamasm_integration::export_descriptor(info)?;
     if saving_calls {
         crate::trace::save_call(
             process,
@@ -1013,11 +1026,11 @@ fn charge_bif_reductions(process: &mut crate::Process, reductions: u32) {
         .saturating_sub(reductions.min(i32::MAX as u32) as i32);
 }
 
-/// Calls a plain BIF named by its export identity (`i_bif1/2/3`, `nofail_bif1/2`).
+/// Calls a plain BIF named by its export's descriptor word (`i_bif1/2/3`, `nofail_bif1/2`).
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-200, OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_bif_by_identity(
     header: *mut ProcessHeader,
-    identity: u64,
+    info: u64,
     first: u64,
     second: u64,
     third: u64,
@@ -1028,7 +1041,8 @@ pub extern "C" fn arinsal_beamasm_bif_by_identity(
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
-    let Some((bif, arity)) = crate::beamasm_integration::dispatch_bif(identity as usize) else {
+    let export = crate::beamasm_integration::export_descriptor(info as usize);
+    let Some((bif, arity)) = export.and_then(|export| Some((export.bif?, export.arity))) else {
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
@@ -1044,7 +1058,7 @@ pub extern "C" fn arinsal_beamasm_bif_by_identity(
         Err(error) => {
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (i_bif: the failing BIF and its
             // arguments are the top frame), OTP-29.1.1.
-            match crate::beamasm_integration::export_dispatch(identity as usize) {
+            match export {
                 Some(export) => {
                     set_native_bif_error(process, &export.module, &export.function, args, error)
                 }

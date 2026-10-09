@@ -1,7 +1,7 @@
 //! Map BIF adapters over flatmaps and HAMTs.
 
 use arinsal_maps::{self, MapError, MapResult};
-use arinsal_term::{Term, TermKind, global_atoms};
+use arinsal_term::{Term, TermKind, atoms};
 
 use crate::pure::{bool_term, integer, list, make_list, tuple_build};
 use crate::{BifError, BifFn, Ctx};
@@ -28,17 +28,17 @@ pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).expect("OTP atom"))
-}
-
 // `UnsupportedKey` is deprecated and never produced any more, but the match
 // must stay exhaustive.
 #[allow(deprecated)]
 fn map_error(ctx: &mut Ctx<'_>, error: MapError) -> BifError {
     match error {
-        MapError::Badmap(map) => BifError::Error(tuple_build(ctx, &[atom("badmap"), map])),
-        MapError::Badkey(key) => BifError::Error(tuple_build(ctx, &[atom("badkey"), key])),
+        MapError::Badmap(map) => {
+            BifError::Error(tuple_build(ctx, &[Term::atom(atoms::BADMAP), map]))
+        }
+        MapError::Badkey(key) => {
+            BifError::Error(tuple_build(ctx, &[Term::atom(atoms::BADKEY), key]))
+        }
         MapError::Badarg(_) => BifError::BADARG,
         MapError::UnsupportedKey(_) => BifError::Unsupported("HAMT nested map key"),
         MapError::HeapFull { .. } => panic!("infallible BIF heap returned HeapFull"),
@@ -71,8 +71,8 @@ fn is_key(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 fn find(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     match mapped(ctx, arinsal_maps::find(args[1], args[0]))? {
-        Some(value) => Ok(tuple_build(ctx, &[atom("ok"), value])),
-        None => Ok(atom("error")),
+        Some(value) => Ok(tuple_build(ctx, &[Term::atom(atoms::OK), value])),
+        None => Ok(Term::atom(atoms::ERROR)),
     }
 }
 fn from_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -343,6 +343,6 @@ fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             let map = mapped(ctx, result)?;
             Ok(tuple_build(ctx, &[value, map]))
         }
-        None => Ok(atom("error")),
+        None => Ok(Term::atom(atoms::ERROR)),
     }
 }
