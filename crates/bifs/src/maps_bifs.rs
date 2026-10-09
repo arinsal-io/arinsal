@@ -1,7 +1,7 @@
 //! Map BIF adapters over flatmaps and HAMTs.
 
 use arinsal_maps::{self, MapError, MapResult};
-use arinsal_term::{Term, global_atoms};
+use arinsal_term::{Term, TermKind, global_atoms};
 
 use crate::pure::{bool_term, integer, list, make_list, tuple_build};
 use crate::{BifError, BifFn, Ctx};
@@ -101,6 +101,213 @@ fn values(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let items = mapped(ctx, arinsal_maps::values(args[0]))?;
     Ok(make_list(ctx, items, Term::NIL))
 }
+
+/// Resumable `maps:keys/1` / `maps:values/1` over a hashmap.
+///
+/// Port of erts/emulator/beam/erl_map.c:2801-2880 (hashmap_keys, hashmap_values), OTP-29.1.1:
+/// the entries are walked backwards and consed on, one reduction per entry. The partial list
+/// cannot be written into heap space across yields in safe code, so the visited items wait in
+/// a vector and are consed when the walk ends.
+pub struct MapsProjectionWalk {
+    iter: arinsal_term::MapReverseIter,
+    keys: bool,
+    items: Vec<Term>,
+}
+
+/// Outcome of starting a projection.
+pub enum ProjectionStart {
+    /// A flatmap: erts builds its list without yielding.
+    Done(Term),
+    /// A hashmap to walk with [`MapsProjectionWalk::step`].
+    Walk(MapsProjectionWalk),
+}
+
+impl MapsProjectionWalk {
+    /// Validate the map argument and start (`maps_keys_1_helper`, `maps_values_1_helper`).
+    pub fn start(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<ProjectionStart, BifError> {
+        mapped(ctx, arinsal_maps::size(map))?;
+        let Some(iter) = arinsal_term::MapReverseIter::new(map) else {
+            let items = mapped(
+                ctx,
+                if keys {
+                    arinsal_maps::keys(map)
+                } else {
+                    arinsal_maps::values(map)
+                },
+            )?;
+            return Ok(ProjectionStart::Done(make_list(ctx, items, Term::NIL)));
+        };
+        Ok(ProjectionStart::Walk(Self {
+            iter,
+            keys,
+            items: Vec::new(),
+        }))
+    }
+
+    /// Walk entries while `reds` (the YCF reduction counter) stays positive. Returns whether
+    /// the walk is complete.
+    pub fn step(&mut self, reds: &mut i64) -> bool {
+        for (key, value) in self.iter.by_ref() {
+            self.items.push(if self.keys { key } else { value });
+            *reds -= 1;
+            if *reds <= 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Cons the visited items; the backwards walk leaves them in reverse list order.
+    pub fn finish(mut self, ctx: &mut Ctx<'_>) -> Term {
+        self.items.reverse();
+        make_list(ctx, self.items, Term::NIL)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BuildPhase {
+    /// First loop of `maps_from_list_1_helper` / `maps_from_keys_2_helper`: check the list.
+    Validate,
+    /// Second loop of `hashmap_from_validated_list`: hash every entry.
+    Leaves,
+    /// `hashmap_from_unsorted_array` and what it calls.
+    Build,
+}
+
+/// Port of erts/emulator/beam/erl_map.h (MAP_SMALL_MAP_LIMIT), OTP-29.1.1.
+const MAP_SMALL_MAP_LIMIT: usize = 32;
+
+/// Resumable `maps:from_list/1` and `maps:from_keys/2`.
+///
+/// Port of erts/emulator/beam/erl_map.c:278-366 (maps_from_keys_2_helper,
+/// maps_from_list_1_helper) and :482-591 (hashmap_from_validated_list), OTP-29.1.1. Both list
+/// loops cost one reduction per element; the construction below them is
+/// [`arinsal_term::HashmapBuild`]. The leaves are allocated together once every entry is hashed,
+/// where C allocates them before the loop and fills them in.
+pub struct MapsBuildWalk {
+    list: Term,
+    /// The shared value of `maps:from_keys/2`.
+    fill: Option<Term>,
+    phase: BuildPhase,
+    cursor: Term,
+    size: usize,
+    entries: Vec<(u64, Term, Term)>,
+    build: Option<arinsal_maps::HashmapFromPairs>,
+}
+
+impl MapsBuildWalk {
+    /// Start `maps:from_list/1` on `list`.
+    pub fn from_list(list: Term) -> Self {
+        Self::new(list, None)
+    }
+
+    /// Start `maps:from_keys/2` on `list` with the shared `value`.
+    pub fn from_keys(list: Term, value: Term) -> Self {
+        Self::new(list, Some(value))
+    }
+
+    fn new(list: Term, fill: Option<Term>) -> Self {
+        Self {
+            list,
+            fill,
+            phase: BuildPhase::Validate,
+            cursor: list,
+            size: 0,
+            entries: Vec::new(),
+            build: None,
+        }
+    }
+
+    /// The key and value of a list element (`from_list` elements must be 2-tuples).
+    fn element(&self, item: Term) -> Result<(Term, Term), BifError> {
+        if let Some(value) = self.fill {
+            return Ok((item, value));
+        }
+        // SAFETY: the input list stays live while the call is trapped (GC is disabled).
+        let tuple = unsafe { item.tuple_ref() }.ok_or(BifError::BADARG)?;
+        if tuple.len() != 2 {
+            return Err(BifError::BADARG);
+        }
+        Ok((
+            tuple.get(0).ok_or(BifError::BADARG)?,
+            tuple.get(1).ok_or(BifError::BADARG)?,
+        ))
+    }
+
+    /// One cell of the input list.
+    fn cell(cursor: Term) -> Result<(Term, Term), BifError> {
+        // SAFETY: the input list stays live while the call is trapped (GC is disabled).
+        unsafe { cursor.cons_ref() }.ok_or(BifError::BADARG)
+    }
+
+    /// Run with `reds` reductions of budget (the YCF counter); the finished map, or `None`
+    /// after a yield.
+    pub fn step(&mut self, ctx: &mut Ctx<'_>, reds: &mut i64) -> Result<Option<Term>, BifError> {
+        loop {
+            match self.phase {
+                BuildPhase::Validate => {
+                    while self.cursor.classify() == TermKind::List {
+                        *reds -= 1;
+                        let (head, tail) = Self::cell(self.cursor)?;
+                        self.element(head)?;
+                        self.size += 1;
+                        self.cursor = tail;
+                        if *reds <= 0 {
+                            return Ok(None);
+                        }
+                    }
+                    if self.cursor != Term::NIL {
+                        return Err(BifError::BADARG);
+                    }
+                    if self.size <= MAP_SMALL_MAP_LIMIT {
+                        // No yielding while constructing a flatmap: the list is short.
+                        let mut pairs = Vec::with_capacity(self.size);
+                        let mut cursor = self.list;
+                        while cursor.classify() == TermKind::List {
+                            let (head, tail) = Self::cell(cursor)?;
+                            pairs.push(self.element(head)?);
+                            cursor = tail;
+                        }
+                        let result = if let Some(value) = self.fill {
+                            let keys: Vec<Term> = pairs.iter().map(|pair| pair.0).collect();
+                            arinsal_maps::from_keys(&keys, value, ctx.heap)
+                        } else {
+                            arinsal_maps::from_list(&pairs, ctx.heap)
+                        };
+                        return mapped(ctx, result).map(Some);
+                    }
+                    self.cursor = self.list;
+                    self.entries.reserve(self.size);
+                    self.phase = BuildPhase::Leaves;
+                }
+                BuildPhase::Leaves => {
+                    while self.cursor.classify() == TermKind::List {
+                        *reds -= 1;
+                        let (head, tail) = Self::cell(self.cursor)?;
+                        let (key, value) = self.element(head)?;
+                        self.entries
+                            .push((arinsal_term::hashmap_key_hash(key), key, value));
+                        self.cursor = tail;
+                        if *reds <= 0 {
+                            return Ok(None);
+                        }
+                    }
+                    let built = arinsal_maps::HashmapFromPairs::new(&self.entries, ctx.heap);
+                    let build = mapped(ctx, built)?;
+                    self.entries = Vec::new();
+                    self.build = Some(build);
+                    self.phase = BuildPhase::Build;
+                }
+                BuildPhase::Build => {
+                    let build = self.build.as_mut().ok_or(BifError::BADARG)?;
+                    let result = build.step(reds, ctx.heap);
+                    return mapped(ctx, result);
+                }
+            }
+        }
+    }
+}
+
 fn merge(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let result = arinsal_maps::merge(args[0], args[1], ctx.heap);
     mapped(ctx, result)

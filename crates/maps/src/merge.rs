@@ -819,16 +819,61 @@ fn hashmap_from_validated_list<H: HeapAlloc + ?Sized>(
     heap: &mut H,
 ) -> Result<Term, TermError> {
     let res = hashmap_from_pairs(pairs, heap)?;
+    flatmap_if_small(res, heap)
+}
+
+/// Duplicates may have shrunk a built HAMT to a flatmap's size (erts_validate_and_sort_flatmap).
+///
+/// Port of erts/emulator/beam/erl_map.c:555-588 (tail of hashmap_from_validated_list),
+/// OTP-29.1.1.
+fn flatmap_if_small<H: HeapAlloc + ?Sized>(res: Term, heap: &mut H) -> Result<Term, TermError> {
     if hashmap_size(res) > LIMIT {
         return Ok(res);
     }
-    // Duplicates shrank it to a flatmap (erts_validate_and_sort_flatmap).
     let mut entries = Vec::with_capacity(hashmap_size(res));
     super::collect(res, &mut entries);
     entries.sort_by(|a, b| key_cmp(a.0, b.0));
     let ks: SmallVec<[Term; LIMIT]> = entries.iter().map(|p| p.0).collect();
     let vs: SmallVec<[Term; LIMIT]> = entries.iter().map(|p| p.1).collect();
     flatmap_from_sorted(&ks, &vs, heap)
+}
+
+/// Yielding `hashmap_from_validated_list` from the point where the input list has been walked
+/// into hashed entries.
+///
+/// Port of erts/emulator/beam/erl_map.c:482-591 as transformed by YCF, OTP-29.1.1.
+pub struct HashmapFromPairs {
+    build: arinsal_term::HashmapBuild,
+}
+
+impl HashmapFromPairs {
+    /// Allocate the `[Key | Value]` leaves of `entries` (swizzled hash, key, value).
+    pub fn new<H: HeapAlloc + ?Sized>(
+        entries: &[(u64, Term, Term)],
+        heap: &mut H,
+    ) -> MapResult<Self> {
+        let hxns =
+            arinsal_term::hashmap_leaves_hashed(entries, heap).map_err(|_| MapError::HeapFull {
+                need_words: 2 * entries.len(),
+            })?;
+        Ok(Self {
+            build: arinsal_term::HashmapBuild::new(hxns),
+        })
+    }
+
+    /// Continue with `reds` reductions left; the finished map, or `None` after a yield.
+    pub fn step<H: HeapAlloc + ?Sized>(
+        &mut self,
+        reds: &mut i64,
+        heap: &mut H,
+    ) -> MapResult<Option<Term>> {
+        // The process heap grows by fragments, so exhaustion is not expected here.
+        let heap_full = |_| MapError::HeapFull { need_words: 0 };
+        let Some(res) = self.build.step(reds, heap).map_err(heap_full)? else {
+            return Ok(None);
+        };
+        flatmap_if_small(res, heap).map(Some).map_err(heap_full)
+    }
 }
 
 /// `maps:from_list/1` over validated pairs; later duplicates win.

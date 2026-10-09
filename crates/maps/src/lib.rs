@@ -15,8 +15,8 @@ use std::cmp::Ordering;
 
 mod merge;
 pub use merge::{
-    HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MergeStart, from_keys, from_list, hashmap_merge,
-    merge, merge_start,
+    HashmapFromPairs, HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MergeStart, from_keys, from_list,
+    hashmap_merge, merge, merge_start,
 };
 
 const MAP: u64 = 0x2c;

@@ -221,14 +221,14 @@ pub fn flatmap_keys(map: Term) -> Option<Vec<Term>> {
 }
 
 // Port of erts/emulator/beam/erl_map.h:178-220 (HAMT headers, HAMT_MAX_LEVEL), OTP-29.1.1.
-const HAMT_MAX_LEVEL: usize = 16;
-const fn node_bitmap_header(bitmap: u64) -> u64 {
+pub(crate) const HAMT_MAX_LEVEL: usize = 16;
+pub(crate) const fn node_bitmap_header(bitmap: u64) -> u64 {
     MAP | (1 << 6) | (bitmap << 16)
 }
-const fn head_bitmap_header(bitmap: u64) -> u64 {
+pub(crate) const fn head_bitmap_header(bitmap: u64) -> u64 {
     MAP | (3 << 6) | (1 << 8) | (bitmap << 16)
 }
-const HEAD_ARRAY_HEADER: u64 = MAP | (2 << 6) | (1 << 8) | (0xffff << 16);
+pub(crate) const HEAD_ARRAY_HEADER: u64 = MAP | (2 << 6) | (1 << 8) | (0xffff << 16);
 
 /// Temporary hash/leaf record of the bulk HAMT constructors.
 ///
@@ -266,10 +266,10 @@ pub fn swizzle_map_hash(hash: u64) -> u64 {
 }
 
 // Port of erts/emulator/beam/erl_map.c:108-109 (cdepth, maskval), OTP-29.1.1.
-fn cdepth(v1: u64, v2: u64) -> usize {
+pub(crate) fn cdepth(v1: u64, v2: u64) -> usize {
     ((v1 ^ v2).leading_zeros() >> 2) as usize
 }
-fn maskval(v: u64, level: usize) -> u64 {
+pub(crate) fn maskval(v: u64, level: usize) -> u64 {
     (v >> (((HAMT_MAX_LEVEL - 1) - level) * 4)) & 0xF
 }
 
@@ -286,12 +286,23 @@ fn produce<'a, H: HeapAlloc + ?Sized>(
 }
 
 /// Allocate one node holding exactly `words`.
-fn produce_words<H: HeapAlloc + ?Sized>(heap: &mut H, words: &[u64]) -> Result<Term, TermError> {
+pub(crate) fn produce_words<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    words: &[u64],
+) -> Result<Term, TermError> {
     let (slice, ptr) = produce(heap, words.len())?;
     for (slot, word) in slice.iter_mut().zip(words) {
         slot.write(*word);
     }
     Ok(Term::from_ptr(ptr, 2))
+}
+
+/// Swizzled hash of a map key, as stored in [`HxNode::hx`].
+///
+/// Port of erts/emulator/beam/erl_map.c:731-732 (hashmap_make_hash, swizzle_map_hash),
+/// OTP-29.1.1.
+pub fn hashmap_key_hash(key: Term) -> u64 {
+    swizzle_map_hash(internal_hash(key))
 }
 
 /// Allocate the `[Key | Value]` leaf conses of `ks`/`vs` in one block and
@@ -303,22 +314,38 @@ pub fn hashmap_leaves<H: HeapAlloc + ?Sized>(
     pairs: impl ExactSizeIterator<Item = (Term, Term)>,
     heap: &mut H,
 ) -> Result<Vec<HxNode>, TermError> {
-    let n = pairs.len();
+    let entries: Vec<_> = pairs
+        .map(|(key, value)| (hashmap_key_hash(key), key, value))
+        .collect();
+    hashmap_leaves_hashed(&entries, heap)
+}
+
+/// [`hashmap_leaves`] for entries whose swizzled hash is already known (the yielding
+/// constructors hash while they walk the input list).
+///
+/// Port of erts/emulator/beam/erl_map.c:506-531 (leaf setup of hashmap_from_validated_list),
+/// OTP-29.1.1.
+pub fn hashmap_leaves_hashed<H: HeapAlloc + ?Sized>(
+    entries: &[(u64, Term, Term)],
+    heap: &mut H,
+) -> Result<Vec<HxNode>, TermError> {
+    let n = entries.len();
     let (slice, ptr) = produce(heap, 2 * n)?;
     let mut hxns = Vec::with_capacity(n);
-    for (i, (key, value)) in pairs.enumerate() {
+    for (i, &(hx, key, value)) in entries.iter().enumerate() {
         slice[2 * i].write(key.bits());
         slice[2 * i + 1].write(value.bits());
-        hxns.push(HxNode::new(
-            key,
-            Term::from_ptr(ptr.wrapping_add(2 * i), 1),
+        hxns.push(HxNode {
+            hx,
+            skip: 1,
             i,
-        ));
+            val: Term::from_ptr(ptr.wrapping_add(2 * i), 1),
+        });
     }
     Ok(hxns)
 }
 
-fn leaf_key(leaf: Term) -> Term {
+pub(crate) fn leaf_key(leaf: Term) -> Term {
     // SAFETY: hash records hold live leaf conses until chunking replaces them.
     unsafe { leaf.cons_ref() }.expect("HAMT leaf").0
 }
