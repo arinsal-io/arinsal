@@ -2,6 +2,7 @@ use std::{collections::HashMap, env, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=atom.names");
+    println!("cargo:rerun-if-changed=../../spec/otp-29.1.1/bif.tab");
     let mut code = String::from("/// Predefined OTP 29.1.1 atom indices.\n");
     let mut names = Vec::new();
     let mut indices = HashMap::new();
@@ -33,6 +34,27 @@ fn main() {
                 index
             });
             declarations.push((identifier, value.to_owned(), index, aliased));
+        }
+    }
+    // Port of erts/emulator/utils/make_tables:92-102, OTP-29.1.1: erl_atom_table.c
+    // continues with the module and function atoms of every BIF in bif.tab order.
+    for line in include_str!("../../spec/otp-29.1.1/bif.tab").lines() {
+        let mut fields = line.split_whitespace();
+        if !matches!(fields.next(), Some("bif" | "ubif" | "hbif")) {
+            continue;
+        }
+        let Some(mfa) = fields.next() else { continue };
+        let (module, rest) = mfa.split_once(':').expect("bif.tab entry has a module");
+        let (name, _arity) = rest.rsplit_once('/').expect("bif.tab entry has an arity");
+        for atom in [module, name] {
+            let atom = atom
+                .strip_prefix('\'')
+                .and_then(|atom| atom.strip_suffix('\''))
+                .unwrap_or(atom);
+            if !indices.contains_key(atom) {
+                indices.insert(atom.to_owned(), names.len());
+                names.push(atom.to_owned());
+            }
         }
     }
     let mut used: HashMap<String, String> = HashMap::new();

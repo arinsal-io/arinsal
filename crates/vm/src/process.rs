@@ -6215,7 +6215,12 @@ impl Vm {
         simulation_seed: Option<u64>,
         reductions: u32,
     ) -> Result<ScheduledResult, VmError> {
-        initialize_feature_defaults(arinsal_pterm::store_for(self.code_scope))?;
+        // A booted node gets these from erl_features:init_features/0 during the
+        // boot, exactly like erts; seeding them earlier would also give the
+        // feature atoms indices erts does not give them.
+        if module != "erl_init" {
+            initialize_feature_defaults(arinsal_pterm::store_for(self.code_scope))?;
+        }
         let module_id = self.load_named(module)?;
         let ip = self.code.modules[module_id]
             .export(function, args.len() as u8)

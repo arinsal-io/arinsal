@@ -861,9 +861,18 @@ pub fn load_with_instrumentations(
     let name_atom = global_atoms()
         .get(&file.module)
         .ok_or_else(|| LoadError::Atom(file.module.clone()))?;
-    let unknown_function_atom = global_atoms()
-        .intern("?")
-        .map_err(|_| LoadError::Atom("?".into()))?;
+    // Port of erts/emulator/beam/beam_file.c:1373 (parse_decompressed_literals),
+    // OTP-29.1.1: the literal chunk is decoded in index order right after the
+    // atom chunk, so atoms first seen in literals get erts' table indices.
+    let mut literals = VecHeap::new_literal();
+    let mut literal_terms = HashMap::new();
+    for index in 0..file.literals.len() {
+        let Ok(owned) = file.literal(index as u32) else {
+            continue;
+        };
+        let term = from_owned(&owned, &mut literals).map_err(|_| LoadError::Limit)?;
+        literal_terms.insert(index as u32, term);
+    }
     // Port of erts/emulator/beam/jit/asm_load.c:79-95, OTP-29.1.1.
     let coverage_mode = match (file.lines.as_ref(), requested_mode) {
         (Some(lines), _) if lines.flags & 2 != 0 => CoverageMode::LineCounters,
@@ -1136,8 +1145,6 @@ pub fn load_with_instrumentations(
     let mut lists = Vec::new();
     let mut types = Vec::new();
     let mut lines = Vec::new();
-    let mut literals = VecHeap::new_literal();
-    let mut literal_terms = HashMap::new();
     let mut current_line = None;
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
@@ -1294,7 +1301,12 @@ pub fn load_with_instrumentations(
             index
         };
         if instruction.op == Opcode::FuncInfo {
-            let function_atom = args[1].term().as_atom().unwrap_or(unknown_function_atom);
+            let function_atom = match args[1].term().as_atom() {
+                Some(atom) => atom,
+                None => global_atoms()
+                    .intern("?")
+                    .map_err(|_| LoadError::Atom("?".into()))?,
+            };
             let name = global_atoms()
                 .text(function_atom)
                 .map(|name| name.to_string())

@@ -16,7 +16,8 @@ pub enum AtomError {
     SystemLimit,
 }
 
-/// Generated constants for all entries in OTP's `atom.names`.
+/// Generated constants for all entries in OTP's `atom.names`; `PREDEFINED` is the
+/// whole generated `erl_atom_table.c` (`atom.names`, then the `bif.tab` atoms).
 pub mod atoms {
     include!(concat!(env!("OUT_DIR"), "/atoms.rs"));
 }

@@ -1232,6 +1232,56 @@ fn ioctl(args: &[O]) -> Result<O, BifError> {
     }
     Err(BifError::Unsupported("interface ioctl request"))
 }
+/// The protocol database rows as `getprotoent(3)` yields them: name, number, aliases.
+fn protocol_entries() -> Vec<(String, i64, Vec<String>)> {
+    let Ok(text) = std::fs::read_to_string("/etc/protocols") else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("");
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            let number = fields.next()?.parse().ok()?;
+            Some((name.to_owned(), number, fields.map(str::to_owned).collect()))
+        })
+        .collect()
+}
+
+// Port of erts/emulator/nifs/common/prim_socket_nif.c:5396 (esock_supports_protocols),
+// OTP-29.1.1. Atoms are created in the C order (each entry's aliases, then its
+// name) because their table indices are observable through map key order.
+fn supports_protocols() -> O {
+    let make_atom = |text: &str| {
+        let _ = arinsal_term::global_atoms().intern(text);
+        atom(text)
+    };
+    let mut protocols = Vec::new();
+    for (name, number, aliases) in protocol_entries() {
+        let mut names = Vec::new();
+        for alias in &aliases {
+            names.insert(0, make_atom(alias));
+        }
+        names.insert(0, make_atom(&name));
+        protocols.insert(0, pair(O::list(names), O::Int(number)));
+    }
+    // Defaults prepended so that maps:from_list/2 keeps getprotoent's entries.
+    let mut defaults = vec![
+        ("ip", i64::from(libc::IPPROTO_IP)),
+        ("ipv6", i64::from(libc::IPPROTO_IPV6)),
+        ("tcp", i64::from(libc::IPPROTO_TCP)),
+        ("udp", i64::from(libc::IPPROTO_UDP)),
+        ("igmp", i64::from(libc::IPPROTO_IGMP)),
+    ];
+    if cfg!(target_os = "linux") {
+        defaults.push(("mptcp", 262));
+    }
+    for (name, number) in defaults {
+        protocols.insert(0, pair(O::list(vec![atom(name)]), O::Int(number)));
+    }
+    O::list(protocols)
+}
+
 fn supports(key: Option<&O>) -> O {
     // Snapshot of OTP 29.1.1's macOS NIF tables, captured via prim_socket:p_get/1.
     // These tables describe the OS ABI compiled into the reference runtime.
@@ -1246,6 +1296,9 @@ fn supports(key: Option<&O>) -> O {
     let Some(tag) = key.and_then(name) else {
         return O::Nil;
     };
+    if tag == "protocols" {
+        return supports_protocols();
+    }
     let Some((_, O::Map(entries))) = list(&parts[1]).and_then(|rows| {
         rows.iter().find_map(|row| {
             if let O::Tuple(pair) = row
@@ -2231,7 +2284,32 @@ mod tests {
                     _ => rebuilt.push((parts[0].clone(), parts[1].clone())),
                 }
             }
-            let mut rebuilt: Vec<_> = rebuilt
+            // prim_socket.erl merge_values/1: the last duplicate key wins,
+            // except that two list values are appended.
+            let mut merged: Vec<(O, O)> = Vec::new();
+            for (key, value) in rebuilt.into_iter().rev() {
+                match merged.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, later)) => {
+                        if let (
+                            O::List { elems: first, .. },
+                            O::List {
+                                elems: second,
+                                tail,
+                            },
+                        ) = (&value, &*later)
+                        {
+                            let mut elems = first.clone();
+                            elems.extend(second.iter().cloned());
+                            *later = O::List {
+                                elems,
+                                tail: tail.clone(),
+                            };
+                        }
+                    }
+                    None => merged.push((key, value)),
+                }
+            }
+            let mut rebuilt: Vec<_> = merged
                 .into_iter()
                 .map(|(k, v)| format!("{k:?}={v:?}"))
                 .collect();

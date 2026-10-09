@@ -46,11 +46,12 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     }
                 }
                 OwnedTerm::List { elems, tail } => {
+                    // Heads before the tail: erts creates atoms in ETF stream order.
                     tasks.push(Task::List(elems.len()));
+                    tasks.push(Task::Visit(tail));
                     for item in elems.iter().rev() {
                         tasks.push(Task::Visit(item));
                     }
-                    tasks.push(Task::Visit(tail));
                 }
                 OwnedTerm::Map(pairs) => {
                     tasks.push(Task::Map(pairs.len()));
@@ -217,8 +218,8 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
             }
             Task::List(n) => {
                 let start = values.len() - n - 1;
-                let mut tail = values[start];
-                for i in (start + 1..values.len()).rev() {
+                let mut tail = values[values.len() - 1];
+                for i in (start..values.len() - 1).rev() {
                     tail = builder.cons(values[i], tail)?;
                 }
                 values.truncate(start);
