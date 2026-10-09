@@ -111,103 +111,14 @@ fn hashmap_subtree_size(node: Term) -> usize {
     }
 }
 
-/// Scratch heap that measures a construction. erts grows its heap factory
-/// with fragments and never fails; Arinsal's fallible-heap callers instead
-/// collect once and retry, so a failed construction reports its exact size.
-#[derive(Default)]
-struct CountingHeap {
-    words: usize,
-    chunks: Vec<Box<[u64]>>,
-}
-impl HeapAlloc for CountingHeap {
-    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        self.words += words;
-        let mut chunk = vec![0; words].into_boxed_slice();
-        let ptr = chunk.as_mut_ptr();
-        self.chunks.push(chunk);
-        Some(ptr)
-    }
-    fn retain_binary(&mut self, _binary: std::sync::Arc<arinsal_term::RefcBinary>) {}
-    fn retain_node(&mut self, _node: std::sync::Arc<arinsal_term::Node>) {}
-    fn retain_fun(&mut self, _entry: std::sync::Arc<arinsal_term::FunEntry>) {}
-    fn retain_export(&mut self, _entry: std::sync::Arc<arinsal_term::ExportEntry>) {}
-}
-
-/// Run a construction. On heap exhaustion, measure the complete run and try
-/// once more inside a single block of exactly that size; if the heap cannot
-/// provide it either, report the size so the caller can collect and retry.
-pub(crate) fn sized<T, H: HeapAlloc + ?Sized>(
-    heap: &mut H,
-    f: impl Fn(&mut dyn HeapAlloc) -> Result<T, TermError>,
-) -> MapResult<T> {
-    match f(&mut HeapRef(heap)) {
+/// Map a fallible heap construction to the public map error type. Runtime BIFs
+/// use `FragmentingHeap`, so heap exhaustion is only possible for callers that
+/// deliberately supply a finite standalone heap.
+pub(crate) fn allocation_result<T>(result: Result<T, TermError>) -> MapResult<T> {
+    match result {
         Ok(value) => Ok(value),
-        Err(TermError::HeapFull) => {
-            let mut counting = CountingHeap::default();
-            f(&mut counting).map_err(|error| unreachable!("measuring run failed: {error:?}"))?;
-            let need_words = counting.words;
-            drop(counting);
-            let Some(block) = heap.alloc(need_words) else {
-                return Err(MapError::HeapFull { need_words });
-            };
-            let mut bump = BlockHeap {
-                inner: HeapRef(heap),
-                next: block,
-                left: need_words,
-            };
-            Ok(f(&mut bump).map_err(|error| unreachable!("exact block exhausted: {error:?}"))?)
-        }
-        Err(other) => unreachable!("map construction only fails on heap exhaustion: {other:?}"),
-    }
-}
-
-/// Bump allocator over one heap block measured by [`CountingHeap`].
-struct BlockHeap<'a, H: HeapAlloc + ?Sized> {
-    inner: HeapRef<'a, H>,
-    next: *mut u64,
-    left: usize,
-}
-impl<H: HeapAlloc + ?Sized> HeapAlloc for BlockHeap<'_, H> {
-    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        if words > self.left {
-            return None;
-        }
-        let ptr = self.next;
-        self.next = ptr.wrapping_add(words);
-        self.left -= words;
-        Some(ptr)
-    }
-    fn retain_binary(&mut self, binary: std::sync::Arc<arinsal_term::RefcBinary>) {
-        self.inner.retain_binary(binary);
-    }
-    fn retain_node(&mut self, node: std::sync::Arc<arinsal_term::Node>) {
-        self.inner.retain_node(node);
-    }
-    fn retain_fun(&mut self, entry: std::sync::Arc<arinsal_term::FunEntry>) {
-        self.inner.retain_fun(entry);
-    }
-    fn retain_export(&mut self, entry: std::sync::Arc<arinsal_term::ExportEntry>) {
-        self.inner.retain_export(entry);
-    }
-}
-
-/// `&mut H` as a `dyn HeapAlloc` for unsized `H`.
-struct HeapRef<'a, H: HeapAlloc + ?Sized>(&'a mut H);
-impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapRef<'_, H> {
-    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        self.0.alloc(words)
-    }
-    fn retain_binary(&mut self, binary: std::sync::Arc<arinsal_term::RefcBinary>) {
-        self.0.retain_binary(binary);
-    }
-    fn retain_node(&mut self, node: std::sync::Arc<arinsal_term::Node>) {
-        self.0.retain_node(node);
-    }
-    fn retain_fun(&mut self, entry: std::sync::Arc<arinsal_term::FunEntry>) {
-        self.0.retain_fun(entry);
-    }
-    fn retain_export(&mut self, entry: std::sync::Arc<arinsal_term::ExportEntry>) {
-        self.0.retain_export(entry);
+        Err(TermError::HeapFull) => Err(MapError::HeapFull { need_words: 0 }),
+        Err(error) => unreachable!("map construction failed: {error:?}"),
     }
 }
 
@@ -732,7 +643,7 @@ pub fn merge_start<H: HeapAlloc + ?Sized>(
     }
     check(left)?;
     check(right)?;
-    sized(heap, |heap| merge_start_checked(left, right, heap))
+    allocation_result(merge_start_checked(left, right, heap))
 }
 
 fn merge_start_checked<H: HeapAlloc + ?Sized>(
@@ -775,13 +686,13 @@ pub fn merge<H: HeapAlloc + ?Sized>(left: Term, right: Term, heap: &mut H) -> Ma
     }
     check(left)?;
     check(right)?;
-    sized(heap, |heap| match merge_start_checked(left, right, heap)? {
+    allocation_result((|| match merge_start_checked(left, right, heap)? {
         MergeStart::Done(map) => Ok(map),
         MergeStart::Hashmap(mut ctx) => {
             let mut reds = isize::MAX;
             Ok(hashmap_merge_loop(&mut ctx, &mut reds, heap)?.expect("unbounded merge completes"))
         }
-    })
+    })())
 }
 
 // Port of erts/emulator/beam/erl_map.c:368-468 (flatmap_from_validated_list), OTP-29.1.1.
@@ -880,12 +791,10 @@ impl HashmapFromPairs {
 ///
 /// Port of erts/emulator/beam/erl_map.c:317-366 (maps_from_list_1_helper), OTP-29.1.1.
 pub fn from_list<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
-    sized(heap, |heap| {
-        if pairs.len() > LIMIT {
-            hashmap_from_validated_list(pairs.iter().copied(), heap)
-        } else {
-            flatmap_from_validated_list(pairs.iter().copied(), heap)
-        }
+    allocation_result(if pairs.len() > LIMIT {
+        hashmap_from_validated_list(pairs.iter().copied(), heap)
+    } else {
+        flatmap_from_validated_list(pairs.iter().copied(), heap)
     })
 }
 
@@ -897,7 +806,7 @@ pub fn from_keys<H: HeapAlloc + ?Sized>(
     value: Term,
     heap: &mut H,
 ) -> MapResult<Term> {
-    sized(heap, |heap| {
+    allocation_result({
         let pairs = keys.iter().map(|&key| (key, value));
         if keys.len() > LIMIT {
             hashmap_from_validated_list(pairs, heap)

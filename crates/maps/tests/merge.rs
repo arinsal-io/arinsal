@@ -181,7 +181,7 @@ fn yielding_merge_matches_unbounded_merge() {
 type Attempt<'a> = dyn Fn(&mut ProcessHeap) -> Result<Term, MapError> + 'a;
 
 #[test]
-fn heap_full_reports_the_whole_construction() {
+fn finite_heap_returns_heap_full_without_replaying_construction() {
     let mut heap = VecHeap::new();
     let left = int_map(&mut heap, 1..=200, 0);
     let right = int_map(&mut heap, 150..=400, 3);
@@ -196,14 +196,7 @@ fn heap_full_reports_the_whole_construction() {
     ];
     for attempt in attempts {
         let mut tiny = ProcessHeap::with_words(16);
-        let Err(MapError::HeapFull { need_words }) = attempt(&mut tiny) else {
-            panic!("tiny heap must overflow");
-        };
-        let mut exact = ProcessHeap::with_words(need_words);
-        let map = attempt(&mut exact).unwrap();
-        assert_eq!(exact.used_words(), need_words);
-        let mut roomy = ProcessHeap::with_words(1 << 16);
-        assert_eq!(keys_line(map), keys_line(attempt(&mut roomy).unwrap()));
+        assert!(matches!(attempt(&mut tiny), Err(MapError::HeapFull { .. })));
     }
 }
 

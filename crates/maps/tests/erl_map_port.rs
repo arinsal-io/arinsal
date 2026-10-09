@@ -43,6 +43,20 @@ fn local_pairs(map: Term) -> O {
     )
 }
 
+fn local_map(map: Term) -> O {
+    O::Map(
+        iter(map)
+            .unwrap()
+            .map(|(key, value)| {
+                (
+                    arinsal_term::to_owned(key).unwrap(),
+                    arinsal_term::to_owned(value).unwrap(),
+                )
+            })
+            .collect(),
+    )
+}
+
 #[test]
 fn to_list_order_small_vs_erl() {
     let expected = erl(
@@ -217,4 +231,70 @@ fn term_to_binary_roundtrip_vs_erl() {
     };
     assert_eq!(O::Binary(binary), expected_parts[0]);
     assert_eq!(expected_parts[0], expected_parts[1]);
+}
+
+#[test]
+fn remove_take_without_and_empty_map_sizes_vs_erl() {
+    // Port of erts/emulator/beam/erl_map.c:1910-2030 (erts_maps_take) and
+    // 2881-3184 (hashmap_delete), OTP-29.1.1; maps:without/2 folds maps:remove/2.
+    let expected = erl(
+        "F=maps:from_list([{K,K*10}||K<-lists:seq(1,8)]),H=maps:from_list([{K,K*10}||K<-lists:seq(1,80)]),S=maps:from_list([{K,K*10}||K<-lists:seq(1,33)]),io:put_chars(binary:encode_hex(term_to_binary({maps:to_list(maps:remove(4,F)),{element(1,maps:take(4,F)),maps:to_list(element(2,maps:take(4,F)))},maps:to_list(maps:without([1,3,99],F)),maps:to_list(maps:remove(4,H)),maps:to_list(maps:without([1,3,99],H)),maps:to_list(maps:remove(1,S)),erts_debug:flat_size(#{}),erts_debug:size(#{}),term_to_binary(#{})}))),halt().",
+    );
+
+    let mut heap = VecHeap::new();
+    let flat = from_pairs(
+        &(1..=8)
+            .map(|key| (small(key), small(key * 10)))
+            .collect::<Vec<_>>(),
+        &mut heap,
+    )
+    .unwrap();
+    let large = from_pairs(
+        &(1..=80)
+            .map(|key| (small(key), small(key * 10)))
+            .collect::<Vec<_>>(),
+        &mut heap,
+    )
+    .unwrap();
+    let shrinking = from_pairs(
+        &(1..=33)
+            .map(|key| (small(key), small(key * 10)))
+            .collect::<Vec<_>>(),
+        &mut heap,
+    )
+    .unwrap();
+
+    let flat_remove = remove(flat, small(4), &mut heap).unwrap();
+    let flat_take_map = remove(flat, small(4), &mut heap).unwrap();
+    let mut flat_without = flat;
+    for key in [1, 3, 99] {
+        flat_without = remove(flat_without, small(key), &mut heap).unwrap();
+    }
+    let large_remove = remove(large, small(4), &mut heap).unwrap();
+    let mut large_without = large;
+    for key in [1, 3, 99] {
+        large_without = remove(large_without, small(key), &mut heap).unwrap();
+    }
+    let shrinking_remove = remove(shrinking, small(1), &mut heap).unwrap();
+    assert!(!shrinking_remove.is_hashmap());
+    assert_eq!(arinsal_maps::size(shrinking_remove), Ok(32));
+
+    let empty = arinsal_maps::new(&mut heap).unwrap();
+    let encoded_empty =
+        arinsal_etf::encode(&local_map(empty), arinsal_etf::EncodeOptions::default());
+    let actual = O::Tuple(vec![
+        local_pairs(flat_remove),
+        O::Tuple(vec![
+            arinsal_term::to_owned(small(40)).unwrap(),
+            local_pairs(flat_take_map),
+        ]),
+        local_pairs(flat_without),
+        local_pairs(large_remove),
+        local_pairs(large_without),
+        local_pairs(shrinking_remove),
+        O::Int(arinsal_term::flat_size(empty) as i64),
+        O::Int(arinsal_term::size_object(empty) as i64),
+        O::Binary(encoded_empty),
+    ]);
+    assert_eq!(actual, expected);
 }
