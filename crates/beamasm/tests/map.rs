@@ -40,6 +40,8 @@ fn runtime() -> MapRuntime {
         new_map: update,
         update_assoc: update,
         update_exact: update,
+        put_single: update,
+        update_single: update,
     }
 }
 fn bits(term: Term) -> u64 {

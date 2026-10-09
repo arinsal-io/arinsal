@@ -253,6 +253,12 @@ pub trait HeapAlloc {
     fn supports_magic(&self) -> bool {
         false
     }
+    /// Give back the unused words `[start, end)` at the end of the latest allocation.
+    ///
+    /// The caller has already covered the hole with a heap filler
+    /// (`erts_write_heap_filler`), so allocators that cannot lower their top keep it.
+    // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1.
+    fn release(&mut self, _end: *mut u64, _start: *mut u64) {}
 }
 
 /// A process heap with an upward bump pointer and a downward stack pointer.
@@ -430,6 +436,17 @@ impl ProcessHeap {
         // SAFETY: The index is within the allocated young heap, owned exclusively here.
         unsafe { cell.get().write(word) };
         true
+    }
+    /// erts `HeapWordsLeft`: words the young heap can still hand out before the limit
+    /// that [`HeapAlloc::alloc`] enforces.
+    // Port of erts/emulator/beam/erl_vm.h:175 (HeapWordsLeft), OTP-29.1.1.
+    pub fn words_left(&self) -> usize {
+        let limit = if self.native_allocation {
+            self.heap_limit_words()
+        } else {
+            self.stop
+        };
+        limit.saturating_sub(self.htop)
     }
     /// Number of words between the heap and stack pointers.
     pub fn free_words(&self) -> usize {
@@ -698,6 +715,22 @@ impl Default for ProcessHeap {
     }
 }
 impl HeapAlloc for ProcessHeap {
+    // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1: only the young
+    // heap top moves back; a heap fragment keeps the caller's filler.
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        if self.detached {
+            if let Some(heap) = self.owners.detached.as_deref_mut() {
+                heap.release(end, start);
+            }
+            return;
+        }
+        let base = self.words.as_ptr() as usize;
+        let top = base + self.htop * 8;
+        let address = start as usize;
+        if address >= base && address < top && end as usize == top {
+            self.htop = (address - base) / 8;
+        }
+    }
     #[inline]
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         if self.detached {

@@ -538,6 +538,39 @@ fn list_length(mut list: Term) -> Option<usize> {
     }
 }
 
+/// Collects with the first `live` scheduler X registers as roots and writes the moved
+/// roots back, like `erts_garbage_collect(p, need, reg, live)` on the register array.
+pub(crate) fn collect_native(
+    process: &mut Process,
+    registers: &mut SchedulerRegisters,
+    need_words: usize,
+    live: usize,
+) -> Result<(), VmError> {
+    // Exactly the live X registers are GC roots, including those past the six register-backed
+    // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
+    let roots = live.min(registers.x_reg_array.len());
+    if process.x.len() < roots {
+        let mut grown = process.x.to_vec();
+        grown.resize(roots, Term::NIL);
+        process.x = grown.into_boxed_slice();
+    }
+    for (destination, raw) in process.x.iter_mut().take(roots).zip(&registers.x_reg_array) {
+        // SAFETY: The register area contains tagged BEAM terms.
+        *destination = unsafe { Term::from_raw_bits(*raw) };
+    }
+    let result = ensure_native_frame(process, registers, need_words, live);
+    for (destination, term) in registers
+        .x_reg_array
+        .iter_mut()
+        .zip(process.x.iter())
+        .take(roots)
+    {
+        // SAFETY: X registers contain tagged BEAM terms.
+        *destination = unsafe { term.raw_bits() };
+    }
+    result
+}
+
 /// Heap slow path used by `test_heap` and heap allocation emitters.
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 and beam_asm_global.cpp:102-140, OTP-29.1.1.
 ///
@@ -558,29 +591,8 @@ pub unsafe extern "C" fn arinsal_beamasm_gc(
     let process = unsafe { &mut *header.cast::<Process>() };
     // SAFETY: The scheduler register pointer is live for the current native call.
     let registers = unsafe { &mut *registers };
-    // Exactly the live X registers are GC roots, including those past the six register-backed
-    // ones; dead registers may hold stale words (erts_garbage_collect_nobump, OTP-29.1.1).
-    let roots = live.min(registers.x_reg_array.len());
-    if process.x.len() < roots {
-        let mut grown = process.x.to_vec();
-        grown.resize(roots, Term::NIL);
-        process.x = grown.into_boxed_slice();
-    }
-    for (destination, raw) in process.x.iter_mut().take(roots).zip(&registers.x_reg_array) {
-        // SAFETY: The register area contains tagged BEAM terms.
-        *destination = unsafe { Term::from_raw_bits(*raw) };
-    }
-    if ensure_native_frame(process, registers, need_words, live).is_err() {
+    if collect_native(process, registers, need_words, live).is_err() {
         set_error(process, "system_limit");
-    }
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(roots)
-    {
-        // SAFETY: X registers contain tagged BEAM terms.
-        *destination = unsafe { term.raw_bits() };
     }
     process.sync_native_header();
     0

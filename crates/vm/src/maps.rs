@@ -6,6 +6,10 @@ use arinsal_maps::{self, MapError};
 use arinsal_spec::Opcode;
 use arinsal_term::{Term, TermBuilder, global_atoms};
 
+fn has_label(label: Arg) -> bool {
+    label.kind() == Arg::LABEL && label.value() != u32::MAX as u64
+}
+
 #[inline]
 fn failure(p: &mut Process, label: Arg) -> Result<(), VmError> {
     if label.kind() != Arg::LABEL || label.value() == u32::MAX as u64 {
@@ -58,46 +62,65 @@ pub(super) fn execute(
     let [fail, source, destination] = op.args;
     match op.opcode() {
         Opcode::PutMapAssoc | Opcode::PutMapExact => {
+            // Port of erts/emulator/beam/emu/map_instrs.tab:124-170 (update_map_assoc,
+            // update_map_exact) and beam_common.c:1863-2344, OTP-29.1.1.
+            let exact = op.opcode() == Opcode::PutMapExact;
             let live = module.arg(op, 3).value() as usize;
-            let pair_arg = module.arg(op, 4);
-            let args = &module.lists[pair_arg.value() as usize];
-            let mut attempt = 0;
-            loop {
-                let map = p.read(source)?;
-                let result = if let [key_arg, value_arg] = args.as_ref() {
-                    let key = p.read(*key_arg)?;
-                    let value = p.read(*value_arg)?;
-                    if op.opcode() == Opcode::PutMapExact {
-                        arinsal_maps::update(map, key, value, &mut p.heap)
-                    } else {
-                        arinsal_maps::put(map, key, value, &mut p.heap)
-                    }
-                } else {
-                    let pairs = args
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .map(|pair| Ok((p.read(pair[0])?, p.read(pair[1])?)))
-                        .collect::<Result<Vec<(Term, Term)>, VmError>>()?;
-                    arinsal_maps::put_many(
-                        map,
-                        &pairs,
-                        op.opcode() == Opcode::PutMapExact,
-                        &mut p.heap,
-                    )
-                };
-                match result {
-                    Ok(value) => {
-                        p.write(destination, value)?;
-                        p.ip += 1;
-                        return Ok(());
-                    }
-                    Err(MapError::HeapFull { need_words }) if attempt == 0 => {
-                        p.ensure(need_words, live)?;
-                        attempt += 1;
-                    }
-                    Err(error) => return Err(exception(p, error)),
+            let args = &module.lists[module.arg(op, 4).value() as usize];
+            let n = args.len();
+            let mut map = p.read(source)?;
+            let need = if exact {
+                arinsal_maps::update_map_exact_need(map)
+            } else {
+                arinsal_maps::update_map_assoc_need(map, n)
+            };
+            // reg[live] = map: the collection keeps it as the extra root.
+            if p.heap.words_left() < need {
+                if live >= p.x.len() {
+                    return Err(VmError::Unsupported("live X register count".into()));
                 }
+                p.x[live] = map;
+                p.ensure(need, live + 1)?;
+                map = p.x[live];
+            }
+            let result = if let [key_arg, value_arg] = args.as_ref() {
+                let (key, value) = (p.read(*key_arg)?, p.read(*value_arg)?);
+                let arg = |i: usize| if i == 0 { key } else { value };
+                let mut heap = crate::FragmentingHeap(&mut p.heap);
+                if exact {
+                    arinsal_maps::gc_update_map_exact(map, n, arg, &mut heap)
+                } else {
+                    arinsal_maps::gc_update_map_assoc(map, n, arg, &mut heap)
+                }
+            } else {
+                // The emulator's loader sorts the vector (`map_key_sort`); the generic
+                // instruction is sorted here instead.
+                let mut pairs = args
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| Ok((p.read(pair[0])?, p.read(pair[1])?)))
+                    .collect::<Result<Vec<(Term, Term)>, VmError>>()?;
+                pairs.sort_by(|a, b| arinsal_maps::flatmap_key_cmp(a.0, b.0));
+                let arg = |i: usize| {
+                    let (key, value) = pairs[i / 2];
+                    if i.is_multiple_of(2) { key } else { value }
+                };
+                let mut heap = crate::FragmentingHeap(&mut p.heap);
+                if exact {
+                    arinsal_maps::gc_update_map_exact(map, n, arg, &mut heap)
+                } else {
+                    arinsal_maps::gc_update_map_assoc(map, n, arg, &mut heap)
+                }
+            };
+            match result {
+                Ok(value) => {
+                    p.write(destination, value)?;
+                    p.ip += 1;
+                    Ok(())
+                }
+                Err(MapError::Badkey(_)) if exact && has_label(fail) => failure(p, fail),
+                Err(error) => Err(exception(p, error)),
             }
         }
         Opcode::GetMapElements => {

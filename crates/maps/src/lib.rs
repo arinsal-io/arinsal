@@ -9,11 +9,9 @@
 //! from 0 to 15 at each depth, independently of insertion order.
 
 use arinsal_term::{
-    ExportEntry, FunEntry, HeapAlloc, Node, Term, TermBuilder, TermError, TermKind, WritableBinary,
-    cmp, exact_eq, global_atoms, internal_hash,
+    HeapAlloc, Term, TermError, TermKind, cmp, exact_eq, global_atoms, internal_hash,
 };
 use std::cmp::Ordering;
-use std::sync::Arc;
 
 mod merge;
 pub use merge::{
@@ -158,63 +156,12 @@ fn empty_flatmap<H: HeapAlloc + ?Sized>(heap: &mut H) -> Result<Term, TermError>
     Ok(boxed(ptr))
 }
 
-struct SizingHeap<'a, H: HeapAlloc + ?Sized> {
-    inner: &'a mut H,
-    requested_words: usize,
-}
-impl<H: HeapAlloc + ?Sized> HeapAlloc for SizingHeap<'_, H> {
-    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        self.requested_words = self.requested_words.saturating_add(words);
-        self.inner.alloc(words)
-    }
-    fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
-        self.inner.retain_binary(binary);
-    }
-    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
-        self.inner.retain_writable_binary(binary)
-    }
-    fn supports_writable_binary(&self) -> bool {
-        self.inner.supports_writable_binary()
-    }
-    fn retain_node(&mut self, node: Arc<Node>) {
-        self.inner.retain_node(node);
-    }
-    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
-        self.inner.retain_fun(entry);
-    }
-    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
-        self.inner.retain_export(entry);
-    }
-}
-
 fn build_hamt<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
     // Port of erts/emulator/beam/erl_map.c:712-759 (erts_hashmap_from_ks_and_vs_extra), OTP-29.1.1.
     merge::sized(heap, |heap| {
         arinsal_term::build_hamt_from_unique(pairs, heap)
     })
 }
-fn flat_replace<H: HeapAlloc + ?Sized>(
-    map: Term,
-    at: usize,
-    value: Term,
-    heap: &mut H,
-) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:2070-2096, OTP-29.1.1.
-    // SAFETY: check() established a live flatmap and the source heap remains live.
-    let view = unsafe { map.flatmap_ref().unwrap() };
-    let n = view.len();
-    let need_words = 3 + n;
-    let p = heap
-        .alloc(need_words)
-        .ok_or(MapError::HeapFull { need_words })?;
-    // SAFETY: the source key tuple is reused; allocation holds n values.
-    unsafe {
-        std::ptr::copy_nonoverlapping(map.raw_ptr(), p, need_words);
-        *p.add(3 + at) = bits(value);
-    }
-    Ok(boxed(p))
-}
-
 // Port of erts/emulator/beam/erl_map.h:178-205 (HAMT headers), OTP-29.1.1.
 fn header(kind: u64, bitmap: u16) -> u64 {
     MAP | kind << 6 | u64::from(kind == 2 || kind == 3) << 8 | (bitmap as u64) << 16
@@ -791,16 +738,16 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
     }
     let mut node = map;
     let hash = internal_hash(key);
-    for level in 0..=17 {
-        if bits(node) & 3 == 1 {
-            // SAFETY: a HAMT leaf is a live cons.
-            let (candidate, value) = unsafe { node.cons_ref().unwrap() };
-            return Ok(exact_eq(candidate, key).then_some(value));
-        }
-        let h = node.header().unwrap();
-        if h & 63 == 0 {
-            // SAFETY: a collision tuple contains tagged leaf terms.
-            unsafe {
+    // SAFETY: every node reached from the live root is a live HAMT node, collision
+    // tuple or leaf cons; the bitmap selects an initialized child.
+    unsafe {
+        for level in 0..=17 {
+            if bits(node) & 3 == 1 {
+                let (candidate, value) = node.cons_ref().unwrap();
+                return Ok(exact_eq(candidate, key).then_some(value));
+            }
+            let h = node.header().unwrap();
+            if h & 63 == 0 {
                 let p = node.raw_ptr();
                 for i in 0..(h >> 6) as usize {
                     let leaf = term(*p.add(1 + i));
@@ -809,21 +756,20 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
                         return Ok(Some(value));
                     }
                 }
+                return Ok(None);
             }
-            return Ok(None);
+            if level == 17 {
+                return Ok(None);
+            }
+            let bitmap = ((h >> 16) & 0xffff) as u16;
+            let bit = 1u16 << slot(hash, level);
+            if bitmap & bit == 0 {
+                return Ok(None);
+            }
+            let index = (bitmap & (bit - 1)).count_ones() as usize;
+            let offset = if (h >> 6) & 3 >= 2 { 2 } else { 1 };
+            node = term(*node.raw_ptr().add(offset + index));
         }
-        if level == 17 {
-            return Ok(None);
-        }
-        let bitmap = ((h >> 16) & 0xffff) as u16;
-        let bit = 1u16 << slot(hash, level);
-        if bitmap & bit == 0 {
-            return Ok(None);
-        }
-        let index = (bitmap & (bit - 1)).count_ones() as usize;
-        let offset = if (h >> 6) & 3 >= 2 { 2 } else { 1 };
-        // SAFETY: the bitmap selects an initialized child of the live node.
-        node = unsafe { term(*node.raw_ptr().add(offset + index)) };
     }
     Ok(None)
 }
@@ -838,49 +784,17 @@ pub fn is_key(map: Term, key: Term) -> MapResult<bool> {
     Ok(get(map, key)?.is_some())
 }
 
-fn change<H: HeapAlloc + ?Sized>(
-    map: Term,
-    key: Term,
-    value: Option<Term>,
-    exact: bool,
-    heap: &mut H,
-) -> MapResult<Term> {
+/// `maps:remove/2`.
+pub fn remove<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> MapResult<Term> {
     // Port of erts/emulator/beam/erl_map.c:2036-2235, OTP-29.1.1.
     check(map)?;
     if !map.is_hashmap() {
-        // SAFETY: the map heap remains live during this operation.
-        let view = unsafe { map.flatmap_ref().unwrap() };
-        let found = view.iter().position(|(k, _)| exact_eq(k, key));
-        if exact && found.is_none() {
-            return Err(MapError::Badkey(key));
-        }
-        if let (Some(i), Some(v)) = (found, value) {
-            return if view.iter().nth(i).unwrap().1 == v {
-                Ok(map)
-            } else {
-                flat_replace(map, i, v, heap)
-            };
-        }
-        let mut pairs: Vec<_> = view.iter().collect();
-        match (found, value) {
-            (Some(i), None) => {
-                pairs.remove(i);
-            }
-            (None, Some(v)) => {
-                pairs.push((key, v));
-            }
-            (None, None) => return Ok(map),
-            (Some(_), Some(_)) => unreachable!(),
-        }
-        if pairs.len() <= LIMIT {
-            pairs.sort_by(|a, b| key_cmp(a.0, b.0));
-            return flat(&pairs, heap);
-        }
-        let entries = unique(&pairs);
-        return build_hamt(&entries, heap);
-    }
-    if let Some(value) = value {
-        return hashmap_insert(map, key, value, exact, heap);
+        let mut pairs: Vec<_> = iter(map)?.collect();
+        let Some(found) = pairs.iter().position(|(k, _)| exact_eq(*k, key)) else {
+            return Ok(map);
+        };
+        pairs.remove(found);
+        return flat(&pairs, heap);
     }
     let n = size(map)?;
     if n == LIMIT + 1 {
@@ -894,114 +808,506 @@ fn change<H: HeapAlloc + ?Sized>(
     }
     hashmap_delete(map, key, heap)
 }
+
+// erts MAP_HEADER_FLATMAP_SZ: header, size, key tuple.
+const FLATMAP_HEADER_WORDS: usize = 3;
+const POS_BIG_SUBTAG: u64 = 0x08;
+
+fn is_immed(t: Term) -> bool {
+    bits(t) & 3 == 3
+}
+
+/// Covers `[start, end)` with a heap filler and gives it back to the allocator; used
+/// inside the callers' unsafe blocks.
+// Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease) and erl_term.h:1500-1504
+// (erts_write_heap_filler), OTP-29.1.1.
+macro_rules! release {
+    ($heap:expr, $end:expr, $start:expr) => {{
+        let (end, start): (*mut u64, *mut u64) = ($end, $start);
+        let words = (end as usize).saturating_sub(start as usize) / 8;
+        if words > 0 {
+            start.write(((words as u64 - 1) << 6) | POS_BIG_SUBTAG);
+            HeapAlloc::release($heap, end, start);
+        }
+    }};
+}
+
+/// Builds the HAMT for a flatmap that outgrew `MAP_SMALL_MAP_LIMIT`, plus an extra pair.
+// Port of erts/emulator/beam/erl_map.c:712-759 (erts_hashmap_from_ks_and_vs_extra), OTP-29.1.1.
+fn hashmap_from_ks_and_vs_extra<H: HeapAlloc + ?Sized>(
+    ks: &[Term],
+    vs: &[Term],
+    extra: Option<(Term, Term)>,
+    heap: &mut H,
+) -> MapResult<Term> {
+    merge::sized(heap, |heap| {
+        Ok(
+            arinsal_term::hashmap_from_ks_and_vs_extra(ks, vs, extra, false, heap)?
+                .expect("duplicates accepted"),
+        )
+    })
+}
+
+/// The keys and values of a live flatmap as slices.
+// Port of erts/emulator/beam/erl_map.h:92-102 (flatmap_get_keys, flatmap_get_values),
+// OTP-29.1.1; used inside the callers' unsafe blocks.
+macro_rules! flatmap_slices {
+    ($ks:expr, $vs:expr, $n:expr) => {{
+        let (ks, vs, n): (*const u64, *const u64, usize) = ($ks, $vs, $n);
+        (
+            std::slice::from_raw_parts(ks.cast::<Term>(), n),
+            std::slice::from_raw_parts(vs.cast::<Term>(), n),
+        )
+    }};
+}
+
 /// `Map#{Key => Value}` / `maps:put/3`.
+// Port of erts/emulator/beam/erl_map.c:2105-2232 (erts_maps_put), OTP-29.1.1.
 pub fn put<H: HeapAlloc + ?Sized>(
     map: Term,
     key: Term,
     value: Term,
     heap: &mut H,
 ) -> MapResult<Term> {
-    change(map, key, Some(value), false, heap)
+    check(map)?;
+    if map.is_hashmap() {
+        return hashmap_insert(map, key, value, false, heap);
+    }
+    // SAFETY: check() established a live flatmap; every write stays inside the
+    // allocations made here, whose sizes are computed from the flatmap size.
+    unsafe {
+        let mp = map.raw_ptr();
+        let n = *mp.add(1) as usize;
+        if n == 0 {
+            let need_words = FLATMAP_HEADER_WORDS + 1 + 2;
+            let hp = heap
+                .alloc(need_words)
+                .ok_or(MapError::HeapFull { need_words })?;
+            *hp = 1 << 6;
+            *hp.add(1) = bits(key);
+            let m = hp.add(2);
+            *m = MAP;
+            *m.add(1) = 1;
+            *m.add(2) = bits(boxed(hp));
+            *m.add(3) = bits(value);
+            return Ok(boxed(m));
+        }
+        let ks = term(*mp.add(2)).raw_ptr().add(1);
+        let vs = mp.add(FLATMAP_HEADER_WORDS);
+
+        // Only allocate for values, assuming the key tuple stays intact.
+        let first = FLATMAP_HEADER_WORDS + n;
+        let shp = heap.alloc(first).ok_or(MapError::HeapFull {
+            need_words: first + FLATMAP_HEADER_WORDS + n + 1,
+        })?;
+        *shp = MAP;
+        *shp.add(1) = n as u64;
+        *shp.add(2) = *mp.add(2);
+        let hp = shp.add(FLATMAP_HEADER_WORDS);
+        let raw_key = bits(key);
+        let immed = is_immed(key);
+        let mut i = 0;
+        while i < n {
+            let candidate = *ks.add(i);
+            if candidate == raw_key || (!immed && exact_eq(term(candidate), key)) {
+                if *vs.add(i) == bits(value) {
+                    release!(heap, shp.add(first), shp);
+                    return Ok(map);
+                }
+                *hp.add(i) = bits(value);
+                std::ptr::copy_nonoverlapping(vs.add(i + 1), hp.add(i + 1), n - i - 1);
+                return Ok(boxed(shp));
+            }
+            *hp.add(i) = *vs.add(i);
+            i += 1;
+        }
+
+        // The map grows.
+        if n >= LIMIT {
+            release!(heap, shp.add(first), shp);
+            let (ks, vs) = flatmap_slices!(ks, vs, n);
+            return hashmap_from_ks_and_vs_extra(ks, vs, Some((key, value)), heap);
+        }
+        // Still a small map: the new key tuple reuses the first allocation.
+        let second = FLATMAP_HEADER_WORDS + n + 1;
+        let Some(hp) = heap.alloc(second) else {
+            release!(heap, shp.add(first), shp);
+            return Err(MapError::HeapFull {
+                need_words: first + second,
+            });
+        };
+        *shp = ((n + 1) as u64) << 6;
+        *hp = MAP;
+        *hp.add(1) = (n + 1) as u64;
+        *hp.add(2) = bits(boxed(shp));
+        let mut kp = shp.add(1);
+        let mut vp = hp.add(FLATMAP_HEADER_WORDS);
+        let mut i = 0;
+        while i < n && key_cmp(term(*ks.add(i)), key) == Ordering::Less {
+            *kp = *ks.add(i);
+            *vp = *vs.add(i);
+            kp = kp.add(1);
+            vp = vp.add(1);
+            i += 1;
+        }
+        *kp = raw_key;
+        *vp = bits(value);
+        kp = kp.add(1);
+        vp = vp.add(1);
+        std::ptr::copy_nonoverlapping(ks.add(i), kp, n - i);
+        std::ptr::copy_nonoverlapping(vs.add(i), vp, n - i);
+        // One word of the first allocation remains.
+        *kp.add(n - i) = POS_BIG_SUBTAG;
+        Ok(boxed(hp))
+    }
 }
-/// `Map#{Key := Value}` / `maps:update/3`.
+
+/// `Map#{Key := Value}` / `maps:update/3`; `Badkey` when the key is absent.
+// Port of erts/emulator/beam/erl_map.c:2036-2103 (erts_maps_update), OTP-29.1.1.
 pub fn update<H: HeapAlloc + ?Sized>(
     map: Term,
     key: Term,
     value: Term,
     heap: &mut H,
 ) -> MapResult<Term> {
-    change(map, key, Some(value), true, heap)
+    check(map)?;
+    if map.is_hashmap() {
+        return hashmap_insert(map, key, value, true, heap);
+    }
+    // SAFETY: check() established a live flatmap; writes stay inside the one
+    // allocation of header plus n values.
+    unsafe {
+        let mp = map.raw_ptr();
+        let n = *mp.add(1) as usize;
+        if n == 0 {
+            return Err(MapError::Badkey(key));
+        }
+        let ks = term(*mp.add(2)).raw_ptr().add(1);
+        let vs = mp.add(FLATMAP_HEADER_WORDS);
+        let need_words = FLATMAP_HEADER_WORDS + n;
+        let shp = heap
+            .alloc(need_words)
+            .ok_or(MapError::HeapFull { need_words })?;
+        *shp = MAP;
+        *shp.add(1) = n as u64;
+        *shp.add(2) = *mp.add(2);
+        let hp = shp.add(FLATMAP_HEADER_WORDS);
+        let raw_key = bits(key);
+        let immed = is_immed(key);
+        for i in 0..n {
+            let candidate = *ks.add(i);
+            if candidate == raw_key || (!immed && exact_eq(term(candidate), key)) {
+                if *vs.add(i) == bits(value) {
+                    release!(heap, shp.add(need_words), shp);
+                    return Ok(map);
+                }
+                *hp.add(i) = bits(value);
+                std::ptr::copy_nonoverlapping(vs.add(i + 1), hp.add(i + 1), n - i - 1);
+                return Ok(boxed(shp));
+            }
+            *hp.add(i) = *vs.add(i);
+        }
+        release!(heap, shp.add(need_words), shp);
+        Err(MapError::Badkey(key))
+    }
 }
-/// `maps:remove/2`.
-pub fn remove<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> MapResult<Term> {
-    change(map, key, None, false, heap)
+
+/// Heap words `erts_gc_new_map` requires before building from `n` vector entries.
+pub fn new_map_need(n: usize) -> usize {
+    if n > 2 * LIMIT { n } else { n + 4 }
 }
+
+/// Builds a map from a sorted key/value vector of `n` entries; `arg(i)` reads entry `i`.
+// Port of erts/emulator/beam/beam_common.c:1863-1925 (erts_gc_new_map), OTP-29.1.1. The
+// caller collects first when fewer than `new_map_need(n)` words are left.
+pub fn gc_new_map<H: HeapAlloc + ?Sized>(
+    n: usize,
+    arg: impl Fn(usize) -> Term,
+    heap: &mut H,
+) -> MapResult<Term> {
+    let pairs = n / 2;
+    if n > 2 * LIMIT {
+        // erts_hashmap_from_array with reject_dupkeys = 0: the last duplicate wins.
+        let entries: Vec<_> = (0..pairs).map(|i| (arg(2 * i), arg(2 * i + 1))).collect();
+        return from_pairs(&entries, heap);
+    }
+    if n == 0 {
+        return flat(&[], heap);
+    }
+    let need_words = n + 4;
+    let thp = heap
+        .alloc(need_words)
+        .ok_or(MapError::HeapFull { need_words })?;
+    // SAFETY: the allocation holds the key tuple, the flatmap header and the values.
+    unsafe {
+        *thp = (pairs as u64) << 6;
+        let mp = thp.add(1 + pairs);
+        *mp = MAP;
+        *mp.add(1) = pairs as u64;
+        *mp.add(2) = bits(boxed(thp));
+        for i in 0..pairs {
+            *thp.add(1 + i) = bits(arg(2 * i));
+            *mp.add(FLATMAP_HEADER_WORDS + i) = bits(arg(2 * i + 1));
+        }
+        Ok(boxed(mp))
+    }
+}
+
+/// Heap words `erts_gc_update_map_assoc` requires before updating `map` with `n` entries.
+pub fn update_map_assoc_need(map: Term, n: usize) -> usize {
+    if map.classify() != TermKind::Map || map.is_hashmap() {
+        return 0;
+    }
+    let num_old = size(map).unwrap_or(0);
+    if num_old == 0 {
+        new_map_need(n)
+    } else {
+        2 * (num_old + n / 2) + 1 + FLATMAP_HEADER_WORDS
+    }
+}
+
+/// Associative update of `map` with a key-sorted vector of `n` entries.
+// Port of erts/emulator/beam/beam_common.c:1959-2193 (erts_gc_update_map_assoc),
+// OTP-29.1.1. The caller collects first when fewer than `update_map_assoc_need` words are
+// left; the hashmap path allocates like `HAlloc`.
+pub fn gc_update_map_assoc<H: HeapAlloc + ?Sized>(
+    map: Term,
+    n: usize,
+    arg: impl Fn(usize) -> Term,
+    heap: &mut H,
+) -> MapResult<Term> {
+    check(map)?;
+    let num_updates = n / 2;
+    if map.is_hashmap() {
+        let mut res = map;
+        for i in 0..num_updates {
+            res = hashmap_insert(res, arg(2 * i), arg(2 * i + 1), false, heap)?;
+        }
+        return Ok(res);
+    }
+    // SAFETY: check() established a live flatmap. The allocation covers the worst case
+    // (every update key is new): header, num_old + num_updates values, key tuple.
+    unsafe {
+        let old_mp = map.raw_ptr();
+        let num_old = *old_mp.add(1) as usize;
+        if num_old == 0 {
+            return gc_new_map(n, arg, heap);
+        }
+        let need_words = 2 * (num_old + num_updates) + 1 + FLATMAP_HEADER_WORDS;
+        let mp = heap
+            .alloc(need_words)
+            .ok_or(MapError::HeapFull { need_words })?;
+        let end = mp.add(need_words);
+        *mp = MAP;
+        let mut hp = mp.add(FLATMAP_HEADER_WORDS);
+        let tuple = hp.add(num_old + num_updates);
+        *mp.add(2) = bits(boxed(tuple));
+        let mut kp = tuple.add(1);
+        let mut old_vals: *const u64 = old_mp.add(FLATMAP_HEADER_WORDS);
+        let mut old_keys: *const u64 = term(*old_mp.add(2)).raw_ptr().add(1);
+        let mut old_left = num_old;
+        let mut next = 0;
+        let mut new_key = arg(0);
+        let mut left = num_updates;
+        let mut changed_keys = false;
+        let mut changed_values = false;
+        loop {
+            let key = *old_keys;
+            let c = if key == bits(new_key) {
+                Ordering::Equal
+            } else {
+                key_cmp(term(key), new_key)
+            };
+            if c == Ordering::Less {
+                *kp = key;
+                *hp = *old_vals;
+                kp = kp.add(1);
+                hp = hp.add(1);
+                old_keys = old_keys.add(1);
+                old_vals = old_vals.add(1);
+                old_left -= 1;
+            } else {
+                *hp = bits(arg(next + 1));
+                if c == Ordering::Greater {
+                    *kp = bits(new_key);
+                    changed_keys = true;
+                } else {
+                    if *old_vals != *hp {
+                        changed_values = true;
+                    }
+                    *kp = key;
+                    old_keys = old_keys.add(1);
+                    old_vals = old_vals.add(1);
+                    old_left -= 1;
+                }
+                kp = kp.add(1);
+                hp = hp.add(1);
+                left -= 1;
+                if left == 0 {
+                    break;
+                }
+                next += 2;
+                new_key = arg(next);
+            }
+            if old_left == 0 {
+                break;
+            }
+        }
+        if left > 0 {
+            while left > 0 {
+                *kp = bits(arg(next));
+                *hp = bits(arg(next + 1));
+                kp = kp.add(1);
+                hp = hp.add(1);
+                next += 2;
+                left -= 1;
+            }
+        } else if !changed_keys && !changed_values {
+            release!(heap, end, mp);
+            return Ok(map);
+        } else if !changed_keys {
+            // Only values changed: keep the old key tuple.
+            *mp.add(1) = *old_mp.add(1);
+            *mp.add(2) = *old_mp.add(2);
+            std::ptr::copy_nonoverlapping(old_vals, hp, old_left);
+            hp = hp.add(old_left);
+            release!(heap, end, hp);
+            return Ok(boxed(mp));
+        } else {
+            std::ptr::copy_nonoverlapping(old_keys, kp, old_left);
+            std::ptr::copy_nonoverlapping(old_vals, hp, old_left);
+            kp = kp.add(old_left);
+            hp = hp.add(old_left);
+        }
+        // Unused value slots before the key tuple become a filler.
+        let gap = (tuple as usize - hp as usize) / 8;
+        if gap > 0 {
+            *hp = ((gap as u64 - 1) << 6) | POS_BIG_SUBTAG;
+        }
+        let size = (hp as usize - mp as usize) / 8 - FLATMAP_HEADER_WORDS;
+        *mp.add(1) = size as u64;
+        *tuple = (size as u64) << 6;
+        release!(heap, end, kp);
+        if size > LIMIT {
+            // erts_hashmap_from_ks_and_vs.
+            let (ks, vs) = flatmap_slices!(tuple.add(1), mp.add(FLATMAP_HEADER_WORDS), size);
+            return hashmap_from_ks_and_vs_extra(ks, vs, None, heap);
+        }
+        Ok(boxed(mp))
+    }
+}
+
+/// Heap words `erts_gc_update_map_exact` requires before updating `map`.
+pub fn update_map_exact_need(map: Term) -> usize {
+    if map.classify() != TermKind::Map || map.is_hashmap() {
+        return 0;
+    }
+    let num_old = size(map).unwrap_or(0);
+    if num_old == 0 {
+        0
+    } else {
+        num_old + FLATMAP_HEADER_WORDS
+    }
+}
+
+/// Exact update of existing keys of `map` with a key-sorted vector of `n` entries.
+// Port of erts/emulator/beam/beam_common.c:2199-2344 (erts_gc_update_map_exact),
+// OTP-29.1.1. The caller collects first when fewer than `update_map_exact_need` words are
+// left; the hashmap path allocates like `HAlloc`.
+pub fn gc_update_map_exact<H: HeapAlloc + ?Sized>(
+    map: Term,
+    n: usize,
+    arg: impl Fn(usize) -> Term,
+    heap: &mut H,
+) -> MapResult<Term> {
+    check(map)?;
+    let mut left = n / 2;
+    if map.is_hashmap() {
+        let mut res = map;
+        for i in 0..left {
+            res = hashmap_insert(res, arg(2 * i), arg(2 * i + 1), true, heap)?;
+        }
+        return Ok(res);
+    }
+    // SAFETY: check() established a live flatmap; the allocation holds the header and
+    // exactly num_old values, and the old key tuple is reused.
+    unsafe {
+        let old_mp = map.raw_ptr();
+        let num_old = *old_mp.add(1) as usize;
+        if num_old == 0 {
+            return Err(MapError::Badkey(arg(0)));
+        }
+        let need_words = num_old + FLATMAP_HEADER_WORDS;
+        let mp = heap
+            .alloc(need_words)
+            .ok_or(MapError::HeapFull { need_words })?;
+        let end = mp.add(need_words);
+        *mp = MAP;
+        *mp.add(1) = num_old as u64;
+        *mp.add(2) = *old_mp.add(2);
+        let mut hp = mp.add(FLATMAP_HEADER_WORDS);
+        let old_vals = old_mp.add(FLATMAP_HEADER_WORDS);
+        let old_keys = term(*old_mp.add(2)).raw_ptr().add(1);
+        let mut next = 0;
+        let mut new_key = arg(0);
+        let mut changed = false;
+        for i in 0..num_old {
+            if !exact_eq(term(*old_keys.add(i)), new_key) {
+                *hp = *old_vals.add(i);
+            } else {
+                *hp = bits(arg(next + 1));
+                if *hp != *old_vals.add(i) {
+                    changed = true;
+                }
+                left -= 1;
+                if left == 0 {
+                    if !changed {
+                        release!(heap, end, mp);
+                        return Ok(map);
+                    }
+                    std::ptr::copy_nonoverlapping(old_vals.add(i + 1), hp.add(1), num_old - i - 1);
+                    return Ok(boxed(mp));
+                }
+                next += 2;
+                new_key = arg(next);
+            }
+            hp = hp.add(1);
+        }
+        // Updates left: at least one key of the update list does not exist.
+        release!(heap, end, mp);
+        Err(MapError::Badkey(new_key))
+    }
+}
+
 /// Apply instruction key-value updates; exact mode rejects missing keys.
+///
+/// Sorts the pairs like the loader's `map_key_sort` and runs the instruction bodies; a
+/// `HeapFull` result asks the caller to collect and retry.
 pub fn put_many<H: HeapAlloc + ?Sized>(
     map: Term,
     pairs: &[(Term, Term)],
     exact: bool,
     heap: &mut H,
 ) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:261-365, OTP-29.1.1.
-    let mut sizing = SizingHeap {
-        inner: heap,
-        requested_words: 0,
-    };
-    let result = put_many_sized(map, pairs, exact, &mut sizing);
-    result.map_err(|error| match error {
-        MapError::HeapFull { .. } => MapError::HeapFull {
-            need_words: sizing.requested_words,
-        },
-        error => error,
-    })
-}
-
-fn put_many_sized<H: HeapAlloc + ?Sized>(
-    map: Term,
-    pairs: &[(Term, Term)],
-    exact: bool,
-    heap: &mut H,
-) -> MapResult<Term> {
-    // Port of erts/emulator/beam/beam_common.c:1960-2328, OTP-29.1.1.
+    // Port of erts/emulator/beam/beam_transform_helpers.c:54-110 (beam_load_map_key_sort),
+    // OTP-29.1.1.
     check(map)?;
-    // Port of erts/emulator/beam/emu/ops.tab:1378 (`map_key_sort` for
-    // `put_map_exact`), OTP-29.1.1. This order defines the reported missing key.
-    let mut sorted = pairs.to_vec();
-    sorted.sort_by(|a, b| key_cmp(a.0, b.0));
-    if exact {
-        for &(key, _) in &sorted {
-            if get(map, key)?.is_none() {
-                return Err(MapError::Badkey(key));
-            }
-        }
-    }
-    // Map instruction updates commonly retain every key and replace only
-    // values. Preserve the key tuple and the original map when possible;
-    // rebuilding all values through `from_pairs` loses OTP's sharing.
-    let unchanged = sorted.iter().enumerate().all(|(index, &(key, value))| {
-        if sorted[index + 1..]
-            .iter()
-            .any(|&(later_key, _)| exact_eq(key, later_key))
-        {
-            return true;
-        }
-        get(map, key).ok().flatten() == Some(value)
-    });
-    if unchanged {
+    if pairs.is_empty() {
         return Ok(map);
     }
-    if !map.is_hashmap()
-        && sorted
-            .iter()
-            .all(|(key, _)| get(map, *key).ok().flatten().is_some())
-    {
-        // Port of erts/emulator/beam/jit/arm/instr_map.cpp:600-636 and
-        // erts/emulator/beam/beam_common.c:2203-2328 (erts_gc_update_map_exact), OTP-29.1.1.
-        let mut entries: Vec<_> = iter(map)?.collect();
-        for (key, value) in sorted {
-            let index = entries
-                .binary_search_by(|(candidate, _)| key_cmp(*candidate, key))
-                .expect("exact map update key was checked above");
-            entries[index].1 = value;
-        }
-        let keys = map.flatmap_keys_tuple().ok_or(MapError::Badmap(map))?;
-        let values: Vec<_> = entries.iter().map(|(_, value)| *value).collect();
-        return TermBuilder::new(heap)
-            .flatmap_with_key_tuple(keys, &values)
-            .map_err(|error| match error {
-                TermError::HeapFull => MapError::HeapFull {
-                    need_words: 3 + values.len(),
-                },
-                _ => MapError::Badmap(map),
-            });
+    let mut sorted = pairs.to_vec();
+    sorted.sort_by(|a, b| key_cmp(a.0, b.0));
+    let arg = |i: usize| {
+        let (key, value) = sorted[i / 2];
+        if i.is_multiple_of(2) { key } else { value }
+    };
+    if exact {
+        gc_update_map_exact(map, 2 * sorted.len(), arg, heap)
+    } else {
+        gc_update_map_assoc(map, 2 * sorted.len(), arg, heap)
     }
-    let mut result = map;
-    let mut entries = to_list(result)?;
-    entries.extend_from_slice(&sorted);
-    result = from_pairs(&entries, heap)?;
-    Ok(result)
 }
+
 /// Build a map from pairs; the last value for a key wins.
 pub fn from_pairs<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResult<Term> {
     // Port of erts/emulator/beam/erl_map.c:644-827, OTP-29.1.1.
