@@ -1238,7 +1238,7 @@ impl BeamModuleAssembler {
         self.emit_guard_value_helper_fail(fail, true, 30, key, map, destination, helper)
     }
 
-    /// Emits `map_get/2`: inline lookup for immediate keys, the runtime hook otherwise.
+    /// Emits `map_get/2`: shared-fragment lookup, the runtime hook for a miss or non-map.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-936, OTP-29.1.1
     pub fn emit_bif_map_get(
         &mut self,
@@ -1247,10 +1247,11 @@ impl BeamModuleAssembler {
         map: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
+        map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
         let slow = self.code.new_label();
         let done = self.code.new_label();
-        self.emit_map_get_fast(map, key, destination, slow)?;
+        self.emit_map_get_fast(map, key, destination, slow, map_runtime)?;
         self.code.b(done)?;
         self.code.bind(slow)?;
         self.emit_guard_value_helper_fail(fail, false, 31, key, map, destination, helper)?;

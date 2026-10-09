@@ -204,6 +204,16 @@ fn fragments() -> Option<&'static DispatchFragments> {
         .as_ref()
 }
 
+fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
+    static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
+    FRAGMENTS
+        .get_or_init(|| {
+            arinsal_beamasm::map::MapFragments::new(crate::native_helpers::arinsal_beamasm_map_get)
+                .ok()
+        })
+        .as_ref()
+}
+
 fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usize>> {
     let trampoline = fragments()?.export_trampoline();
     let save_calls = fragments()?.save_calls_export();
@@ -1163,6 +1173,12 @@ impl ModuleEnv for VmModuleEnv<'_> {
             update_exact: crate::native_helpers::arinsal_beamasm_map_exact,
             put_single: crate::native_helpers::arinsal_beamasm_map_put_single,
             update_single: crate::native_helpers::arinsal_beamasm_map_update_single,
+            get_element_shared: map_fragments()
+                .map_or(0, arinsal_beamasm::map::MapFragments::get_element_shared),
+            get_element_hash_shared: map_fragments().map_or(
+                0,
+                arinsal_beamasm::map::MapFragments::get_element_hash_shared,
+            ),
         }
     }
     fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {

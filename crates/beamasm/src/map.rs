@@ -1,8 +1,9 @@
 //! Map construction, lookup, update, and boolean emitters.
 
 use arinsal_a64::{
-    buf::Label,
-    enc::{Cond, Gpr},
+    buf::{BufferError, CodeBuffer, Label},
+    enc::{Cond, Gpr, Shift, Shifted, VecReg},
+    exec::{CodeMemory, ExecError},
 };
 
 use crate::{
@@ -55,6 +56,10 @@ pub struct MapRuntime {
     pub put_single: MapUpdateHelper,
     /// Single-pair exact update without a failure label (`erts_maps_update`): key, value, map.
     pub update_single: MapUpdateHelper,
+    /// `i_get_map_element_shared` fragment ([`MapFragments::get_element_shared`]).
+    pub get_element_shared: usize,
+    /// `i_get_map_element_hash_shared` fragment ([`MapFragments::get_element_hash_shared`]).
+    pub get_element_hash_shared: usize,
 }
 
 /// The `hashmap_make_hash` the loader passes to `i_get_map_element_hash` for an
@@ -70,6 +75,275 @@ pub fn literal_key_hash(key: ArgVal) -> u64 {
     }
 }
 
+/// Process-wide map lookup fragments shared by every compiled module.
+pub struct MapFragments {
+    memory: CodeMemory,
+    get_element_offset: usize,
+    get_element_hash_offset: usize,
+}
+
+impl MapFragments {
+    /// Emits `i_get_map_element_shared` and `i_get_map_element_hash_shared`; `get` is the
+    /// runtime lookup the first one falls back to for a non-immediate key.
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:316-361 and 493-509, OTP-29.1.1.
+    pub fn new(get: MapGetHelper) -> Result<Self, ExecError> {
+        let mut code = CodeBuffer::new();
+        let get_element = code.new_label();
+        let get_element_hash = code.new_label();
+        let fail = |_: BufferError| ExecError::InvalidSize("map fragment");
+        code.bind(get_element).map_err(fail)?;
+        emit_i_get_map_element_shared(&mut code, get).map_err(fail)?;
+        code.bind(get_element_hash).map_err(fail)?;
+        emit_i_get_map_element_hash_shared(&mut code).map_err(fail)?;
+        let (words, labels) = code.finish_with_labels().map_err(fail)?;
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut memory = CodeMemory::new(bytes.len().max(4))?;
+        let offset = memory.alloc(bytes.len().max(4))?;
+        memory.write_bytes(offset, &bytes)?;
+        memory.flush_all()?;
+        Ok(Self {
+            memory,
+            get_element_offset: labels[&get_element],
+            get_element_hash_offset: labels[&get_element_hash],
+        })
+    }
+
+    /// Entry of `i_get_map_element_shared`: map in X0, key in X1; ZF set and the value in X0
+    /// on success.
+    pub fn get_element_shared(&self) -> usize {
+        self.memory.ptr_at(self.get_element_offset) as usize
+    }
+
+    /// Entry of `i_get_map_element_hash_shared`: map in X0, immediate key in X1, its internal
+    /// hash in X2; ZF set and the value in X0 on success.
+    pub fn get_element_hash_shared(&self) -> usize {
+        self.memory.ptr_at(self.get_element_hash_offset) as usize
+    }
+}
+
+// Registers of the lookup fragments, named after erts' ARG*/TMP* (arm/beam_asm.hpp).
+const ARG1: Gpr = Gpr::x(0);
+const ARG2: Gpr = Gpr::x(1);
+const ARG3: Gpr = Gpr::x(2);
+const ARG4: Gpr = Gpr::x(3);
+const ARG5: Gpr = Gpr::x(4);
+const TMP1: Gpr = Gpr::x(8);
+const TMP2: Gpr = Gpr::x(9);
+const TMP3: Gpr = Gpr::x(10);
+const TMP4: Gpr = Gpr::x(11);
+const TMP5: Gpr = Gpr::x(12);
+const TMP6: Gpr = Gpr::x(13);
+/// `_HEADER_MAP_SUBTAG_MASK` and `HAMT_SUBTAG_HEAD_FLATMAP`.
+const HEADER_MAP_SUBTAG_MASK: u64 = 0xfc;
+const HAMT_SUBTAG_HEAD_FLATMAP: u16 = 0x2c;
+const HAMT_MAX_LEVEL: u16 = 16;
+
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:316-361 (emit_i_get_map_element_shared),
+// OTP-29.1.1. ARG1 = map, ARG2 = key; the result is in ARG1 and ZF is set on success.
+fn emit_i_get_map_element_shared(
+    code: &mut CodeBuffer,
+    get: MapGetHelper,
+) -> Result<(), BufferError> {
+    let generic = code.new_label();
+    let hashmap = code.new_label();
+    code.emit(|e| {
+        e.and_imm(TMP1, ARG2, 3)?;
+        e.cmp_imm(TMP1, 3, false)
+    })?;
+    code.b_cond(Cond::Ne, generic)?;
+    code.emit(|e| {
+        e.and_imm(ARG1, ARG1, !7)?;
+        e.ldp(ARG4, ARG5, ARG1, 0)?;
+        e.and_imm(TMP1, ARG4, HEADER_MAP_SUBTAG_MASK)?;
+        e.cmp_imm(TMP1, HAMT_SUBTAG_HEAD_FLATMAP, false)
+    })?;
+    code.b_cond(Cond::Ne, hashmap)?;
+    emit_flatmap_get_element(code)?;
+
+    code.bind(generic)?;
+    // erts' get_map_element cannot fail; the helper's error word is cleared so a map the
+    // compiler did not guard with is_map reads as a miss instead of a stale pending error.
+    code.emit(|e| {
+        e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+        e.mov_reg(Gpr::x(29), Gpr::sp())
+    })?;
+    emit_enter_runtime(code, 6, Update::NONE)?;
+    code.emit(|e| {
+        e.mov_reg(Gpr::x(2), ARG2)?;
+        e.mov_reg(Gpr::x(1), ARG1)?;
+        e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        e.mov_reg(Gpr::x(3), Gpr::xzr())?;
+        e.mov_const(Gpr::x(17), get as usize as u64)?;
+        e.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, Update::NONE)?;
+    code.emit(|e| {
+        e.str_uoff(Gpr::xzr(), Gpr::x(21), 40)?;
+        e.cmp_imm(ARG1, 0, false)?;
+        // Invert ZF: it must be set when the result is a value.
+        e.cset(TMP1, Cond::Eq)?;
+        e.tst_reg(TMP1, TMP1, Shift::Lsl, 0)?;
+        e.mov_reg(Gpr::sp(), Gpr::x(29))?;
+        e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+        e.ret(Gpr::x(30))
+    })?;
+
+    code.bind(hashmap)?;
+    emit_internal_hash_helper(code)?;
+    emit_hashmap_get_element(code)
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:493-509
+// (emit_i_get_map_element_hash_shared), OTP-29.1.1. ARG1 = map, ARG2 = key, ARG3 = hash.
+fn emit_i_get_map_element_hash_shared(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let hashmap = code.new_label();
+    code.emit(|e| {
+        e.and_imm(ARG1, ARG1, !7)?;
+        e.ldp(ARG4, ARG5, ARG1, 0)?;
+        e.and_imm(TMP1, ARG4, HEADER_MAP_SUBTAG_MASK)?;
+        e.cmp_imm(TMP1, HAMT_SUBTAG_HEAD_FLATMAP, false)
+    })?;
+    code.b_cond(Cond::Ne, hashmap)?;
+    emit_flatmap_get_element(code)?;
+    code.bind(hashmap)?;
+    emit_hashmap_get_element(code)
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:25-60 (emit_internal_hash_helper),
+// OTP-29.1.1. ARG2 = term; the result is in ARG3. Clobbers TMP1.
+fn emit_internal_hash_helper(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let (key, key_hash) = (ARG2, ARG3);
+    let lsr33 = |reg| Shifted {
+        reg,
+        shift: Shift::Lsr,
+        amount: 33,
+    };
+    code.emit(|e| {
+        e.eor_reg(key_hash, key, lsr33(key))?;
+        e.mov_const(TMP1, 0xff51_afd7_ed55_8ccd)?;
+        e.mul(key_hash, key_hash, TMP1)?;
+        e.eor_reg(key_hash, key_hash, lsr33(key_hash))?;
+        e.mov_const(TMP1, 0xc4ce_b9fe_1a85_ec53)?;
+        e.mul(key_hash, key_hash, TMP1)?;
+        e.eor_reg(key_hash, key_hash, lsr33(key_hash))
+    })
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:80-187 (emit_hashmap_get_element),
+// OTP-29.1.1. ARG1 = untagged root, ARG2 = key, ARG3 = key hash, ARG4 = node header.
+// The result is in ARG1 and ZF is set on success; every path returns.
+fn emit_hashmap_get_element(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let (node, key, key_hash, header) = (ARG1, ARG2, ARG3, ARG4);
+    let (depth, index) = (TMP5, TMP6);
+    let node_loop = code.new_label();
+    let done = code.new_label();
+    let leaf_node = code.new_label();
+    let skip_index_adjustment = code.new_label();
+    let collision_node = code.new_label();
+    // The root header is two words long; child headers are one word.
+    code.emit(|e| {
+        e.add_imm(node, node, 16, false)?;
+        e.mov_reg(depth, Gpr::xzr())
+    })?;
+    code.bind(node_loop)?;
+    code.emit(|e| {
+        e.and_imm(index, key_hash, 0xf)?;
+        e.lsr_imm(key_hash, key_hash, 4)?;
+        e.add_imm(depth, depth, 1, false)?;
+        // Fully populated nodes have the index as the entry offset.
+        e.asr_imm(Gpr::w(3), Gpr::w(3), 16)?;
+        e.cmn_imm(Gpr::w(3), 1, false)
+    })?;
+    code.b_cond(Cond::Eq, skip_index_adjustment)?;
+    code.emit(|e| e.lsr_reg(TMP1, header, index))?;
+    // ZF is clear here, so the return sequence reports a miss.
+    code.tbz(TMP1, 0, done)?;
+    // The entry offset is the number of bitmap bits set below our index.
+    code.emit(|e| {
+        e.lsl_reg(TMP2, TMP1, index)?;
+        e.eor_reg(
+            TMP1,
+            TMP2,
+            Shifted {
+                reg: header,
+                shift: Shift::Lsl,
+                amount: 0,
+            },
+        )?;
+        e.fmov_d_from_x(VecReg(0), TMP1)?;
+        e.cnt_8b(VecReg(0), VecReg(0))?;
+        e.addv_8b(VecReg(0), VecReg(0))?;
+        e.fmov_x_from_d(index, VecReg(0))
+    })?;
+    code.bind(skip_index_adjustment)?;
+    code.emit(|e| {
+        e.ldr_regoff(TMP1, node, index, 3)?;
+        e.and_imm(node, TMP1, !7)
+    })?;
+    // A leaf is a list cell, not a boxed node.
+    code.tbnz(TMP1, 0, leaf_node)?;
+    code.emit(|e| {
+        e.ldr_post(header, node, 8)?;
+        e.cmp_imm(depth, HAMT_MAX_LEVEL, false)
+    })?;
+    code.b_cond(Cond::Ne, node_loop)?;
+    code.b(collision_node)?;
+
+    code.bind(leaf_node)?;
+    code.emit(|e| {
+        e.ldp(TMP1, ARG1, node, 0)?;
+        e.cmp_reg(TMP1, key, Shift::Lsl, 0)
+    })?;
+    code.bind(done)?;
+    code.emit(|e| e.ret(Gpr::x(30)))?;
+
+    // A collision node is a tuple of leaves searched linearly.
+    code.bind(collision_node)?;
+    let linear_loop = code.new_label();
+    code.emit(|e| e.lsr_imm(TMP1, header, 6 - 3))?;
+    code.bind(linear_loop)?;
+    code.emit(|e| {
+        e.sub_imm(TMP1, TMP1, 8, false)?;
+        e.ldr_regoff(TMP2, node, TMP1, 0)?;
+        e.and_imm(TMP2, TMP2, !7)?;
+        e.ldp(TMP3, TMP4, TMP2, 0)?;
+        e.cmp_reg(key, TMP3, Shift::Lsl, 0)?;
+        e.csel(ARG1, node, TMP4, Cond::Ne)
+    })?;
+    code.b_cond(Cond::Eq, done)?;
+    code.cbnz(TMP1, linear_loop)?;
+    code.emit(|e| e.ret(Gpr::x(30)))
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:196-221 (emit_flatmap_get_element),
+// OTP-29.1.1. ARG1 = untagged flat map, ARG2 = key, ARG5 = size.
+// The result is in ARG1 and ZF is set on success.
+fn emit_flatmap_get_element(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let fail = code.new_label();
+    let loop_label = code.new_label();
+    // Bump size by one to slide past the keys tuple header; the flags keep ZF clear when
+    // entering the loop.
+    code.emit(|e| {
+        e.adds_imm(ARG5, ARG5, 1, false)?;
+        e.ldr_pre(TMP1, ARG1, 16)?;
+        e.and_imm(TMP1, TMP1, !7)
+    })?;
+    code.bind(loop_label)?;
+    code.emit(|e| e.sub_imm(ARG5, ARG5, 1, false))?;
+    code.cbz(ARG5, fail)?;
+    code.emit(|e| {
+        e.ldr_regoff(TMP4, TMP1, ARG5, 3)?;
+        e.cmp_reg(ARG2, TMP4, Shift::Lsl, 0)
+    })?;
+    code.b_cond(Cond::Ne, loop_label)?;
+    code.emit(|e| e.ldr_regoff(ARG1, ARG1, ARG5, 3))?;
+    code.bind(fail)?;
+    code.emit(|e| e.ret(Gpr::x(30)))
+}
+
 impl BeamModuleAssembler {
     /// Emits one flatmap or HAMT lookup and branches to `fail` when absent.
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390, OTP-29.1.1.
@@ -82,12 +356,11 @@ impl BeamModuleAssembler {
         runtime: MapRuntime,
     ) -> Result<(), ModuleError> {
         let map = self.source_reg(src)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(0), map))?;
         let key = self.source_reg_into(key, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(2), key))?;
-        self.emit_small_internal_hash(Gpr::x(2))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(1), key))?;
         let fail = self.label(fail);
-        self.emit_map_get_inline(fail, dst, runtime.get)
+        self.emit_get_element_fragment_call(runtime.get_element_shared, fail, dst)
     }
 
     /// Emits lookup using a precomputed key hash, as generated map code does.
@@ -101,12 +374,47 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         runtime: MapRuntime,
     ) -> Result<(), ModuleError> {
+        let fail = self.label(fail);
+        // erts calls the shared fragment only for an immediate key (`Key.isImmed()`); any
+        // other constant goes straight to the runtime lookup.
+        if matches!(key, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3) {
+            for (arg, value) in [(Gpr::x(0), src), (Gpr::x(1), key), (Gpr::x(2), hash)] {
+                let reg = self.source_reg(value)?;
+                self.code.emit(|e| e.mov_reg(arg, reg))?;
+            }
+            return self.emit_get_element_fragment_call(runtime.get_element_hash_shared, fail, dst);
+        }
         for (arg, value) in [(Gpr::x(1), src), (Gpr::x(2), key), (Gpr::x(3), hash)] {
             let reg = self.source_reg(value)?;
             self.code.emit(|e| e.mov_reg(arg, reg))?;
         }
-        let fail = self.label(fail);
-        self.emit_map_get_inline(fail, dst, runtime.get)
+        emit_map_runtime(
+            self,
+            runtime.get as usize,
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3)],
+            6,
+            Update::NONE,
+        )?;
+        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
+        self.code.b_cond(Cond::Eq, fail)?;
+        self.store_map_result(dst, Gpr::x(0))
+    }
+
+    /// `fragment_call` of a shared lookup fragment (map in X0, key in X1): ZF set and the
+    /// value in X0 on success, otherwise branch to `fail`.
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:379-389 and 531-541, OTP-29.1.1.
+    fn emit_get_element_fragment_call(
+        &mut self,
+        fragment: usize,
+        fail: Label,
+        dst: ArgVal,
+    ) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(17), fragment as u64)?;
+            e.blr(Gpr::x(17))
+        })?;
+        self.code.b_cond(Cond::Ne, fail)?;
+        self.store_map_result(dst, Gpr::x(0))
     }
 
     /// Emits multi-key lookup; the operands are flattened `{key, dst, hash}` triplets.
@@ -506,245 +814,35 @@ impl BeamModuleAssembler {
         self.store_map_result(dst, Gpr::x(11))
     }
 
-    /// Inline part of `bif_map_get`: an immediate key found in a flatmap or HAMT is
-    /// stored in `dst`; anything else (not a map, other keys, a miss) branches to `slow`.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-930 (emit_bif_map_get) and
-    // instr_map.cpp:316-360 (emit_i_get_map_element_shared), OTP-29.1.1.
+    /// Inline part of `bif_map_get`: a key found in a map is stored in `dst`; anything else
+    /// (not a map, a miss) branches to `slow`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-930 (emit_bif_map_get),
+    // OTP-29.1.1.
     pub(crate) fn emit_map_get_fast(
         &mut self,
         map: ArgVal,
         key: ArgVal,
         dst: ArgVal,
         slow: Label,
+        runtime: MapRuntime,
     ) -> Result<(), ModuleError> {
         let map = self.source_reg(map)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(0), map))?;
         let key = self.source_reg_into(key, Gpr::x(17))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(1), key))?;
         self.code.emit(|e| {
-            e.mov_reg(Gpr::x(2), key)?;
-            e.and_imm(Gpr::x(9), Gpr::x(2), 3)?;
-            e.cmp_imm(Gpr::x(9), 3, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(9), Gpr::x(1), 3)?;
+            e.and_imm(Gpr::x(9), Gpr::x(0), 3)?;
             e.cmp_imm(Gpr::x(9), 2, false)
         })?;
         self.code.b_cond(Cond::Ne, slow)?;
         self.code.emit(|e| {
-            e.and_imm(Gpr::x(8), Gpr::x(1), !7)?;
+            e.and_imm(Gpr::x(8), Gpr::x(0), !7)?;
             e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0)?;
             e.and_imm(Gpr::x(10), Gpr::x(9), 0x3f)?;
             e.cmp_imm(Gpr::x(10), 0x2c, false)
         })?;
         self.code.b_cond(Cond::Ne, slow)?;
-        let hashmap = self.code.new_label();
-        let done = self.code.new_label();
-        self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(9), 0xc0))?;
-        self.code.cbnz(Gpr::x(10), hashmap)?;
-        self.emit_flatmap_lookup(slow)?;
-        self.code.b(done)?;
-        self.code.bind(hashmap)?;
-        self.emit_small_internal_hash(Gpr::x(2))?;
-        self.emit_hashmap_lookup(slow)?;
-        self.code.bind(done)?;
-        self.store_map_result(dst, Gpr::x(0))
-    }
-
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:316-390,511-542, OTP-29.1.1.
-    fn emit_map_get_inline(
-        &mut self,
-        fail: Label,
-        dst: ArgVal,
-        generic: MapGetHelper,
-    ) -> Result<(), ModuleError> {
-        let generic_label = self.code.new_label();
-        let done = self.code.new_label();
-        self.code.emit(|e| e.and_imm(Gpr::x(9), Gpr::x(2), 3))?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(9), 3, false))?;
-        self.code.b_cond(Cond::Ne, generic_label)?;
-        self.code.emit(|e| e.and_imm(Gpr::x(9), Gpr::x(1), 3))?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(9), 2, false))?;
-        self.code.b_cond(Cond::Ne, generic_label)?;
-        self.code.emit(|e| e.and_imm(Gpr::x(8), Gpr::x(1), !7))?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0))?;
-        self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(9), 0x3f))?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(10), 0x2c, false))?;
-        self.code.b_cond(Cond::Ne, generic_label)?;
-        self.code.emit(|e| e.and_imm(Gpr::x(9), Gpr::x(9), 0xc0))?;
-        let hashmap = self.code.new_label();
-        self.code.emit(|e| e.cmp_imm(Gpr::x(9), 0, false))?;
-        self.code.b_cond(Cond::Ne, hashmap)?;
-        self.emit_flatmap_lookup(fail)?;
-        self.code.b(done)?;
-        self.code.bind(hashmap)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0))?;
-        self.emit_hashmap_lookup(fail)?;
-        self.code.bind(done)?;
-        self.store_map_result(dst, Gpr::x(0))?;
-        let after_store = self.code.new_label();
-        self.code.b(after_store)?;
-        self.code.bind(generic_label)?;
-        emit_map_runtime(
-            self,
-            generic as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3)],
-            6,
-            Update::NONE,
-        )?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
-        self.code.b_cond(Cond::Eq, fail)?;
-        self.store_map_result(dst, Gpr::x(0))?;
-        self.code.bind(after_store)?;
-        Ok(())
-    }
-
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:267-293, OTP-29.1.1.
-    fn emit_flatmap_lookup(&mut self, fail: Label) -> Result<(), ModuleError> {
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(10), Gpr::x(8), 8))?;
-        self.code
-            .emit(|e| e.add_imm(Gpr::x(10), Gpr::x(10), 1, false))?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(11), Gpr::x(8), 16))?;
-        self.code.emit(|e| e.and_imm(Gpr::x(11), Gpr::x(11), !7))?;
-        let loop_label = self.code.new_label();
-        self.code.bind(loop_label)?;
-        self.code
-            .emit(|e| e.subs_imm(Gpr::x(10), Gpr::x(10), 1, false))?;
-        self.code.b_cond(Cond::Eq, fail)?;
-        self.code
-            .emit(|e| e.ldr_regoff(Gpr::x(12), Gpr::x(11), Gpr::x(10), 3))?;
-        self.code
-            .emit(|e| e.cmp_reg(Gpr::x(2), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.code.b_cond(Cond::Ne, loop_label)?;
-        self.code
-            .emit(|e| e.add_imm(Gpr::x(13), Gpr::x(8), 16, false))?;
-        self.code
-            .emit(|e| e.ldr_regoff(Gpr::x(0), Gpr::x(13), Gpr::x(10), 3))?;
-        Ok(())
-    }
-
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:25-60, OTP-29.1.1.
-    fn emit_small_internal_hash(&mut self, key: Gpr) -> Result<(), ModuleError> {
-        let shifted_key = arinsal_a64::enc::Shifted {
-            reg: key,
-            shift: arinsal_a64::enc::Shift::Lsr,
-            amount: 33,
-        };
-        self.code.emit(|e| e.eor_reg(Gpr::x(3), key, shifted_key))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(12), 0xff51_afd7_ed55_8ccd))?;
-        self.code
-            .emit(|e| e.mul(Gpr::x(3), Gpr::x(3), Gpr::x(12)))?;
-        let shifted = arinsal_a64::enc::Shifted {
-            reg: Gpr::x(3),
-            shift: arinsal_a64::enc::Shift::Lsr,
-            amount: 33,
-        };
-        self.code
-            .emit(|e| e.eor_reg(Gpr::x(3), Gpr::x(3), shifted))?;
-        self.code
-            .emit(|e| e.mov_const(Gpr::x(12), 0xc4ce_b9fe_1a85_ec53))?;
-        self.code
-            .emit(|e| e.mul(Gpr::x(3), Gpr::x(3), Gpr::x(12)))?;
-        let shifted = arinsal_a64::enc::Shifted {
-            reg: Gpr::x(3),
-            shift: arinsal_a64::enc::Shift::Lsr,
-            amount: 33,
-        };
-        self.code
-            .emit(|e| e.eor_reg(Gpr::x(3), Gpr::x(3), shifted))?;
-        Ok(())
-    }
-
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:80-187 (emit_hashmap_get_element),
-    // OTP-29.1.1. In: X8 = untagged root, X9 = root header, X2 = immediate key, X3 = hash.
-    // Out: the value in X0, or a branch to `fail` when the key is absent.
-    fn emit_hashmap_lookup(&mut self, fail: Label) -> Result<(), ModuleError> {
-        use arinsal_a64::enc::{Shift, VecReg};
-        let (node, key, key_hash, header) = (Gpr::x(8), Gpr::x(2), Gpr::x(3), Gpr::x(9));
-        let (depth, index) = (Gpr::x(13), Gpr::x(12));
-        let (tmp1, tmp2) = (Gpr::x(10), Gpr::x(11));
-        let node_loop = self.code.new_label();
-        let skip_index_adjustment = self.code.new_label();
-        let leaf_node = self.code.new_label();
-        let collision_node = self.code.new_label();
-        let linear_loop = self.code.new_label();
-        let done = self.code.new_label();
-        // The root header is two words long; child headers are one word.
-        self.code.emit(|e| {
-            e.add_imm(node, node, 16, false)?;
-            e.mov_reg(depth, Gpr::xzr())
-        })?;
-        self.code.bind(node_loop)?;
-        self.code.emit(|e| {
-            e.and_imm(index, key_hash, 0xf)?;
-            e.lsr_imm(key_hash, key_hash, 4)?;
-            e.add_imm(depth, depth, 1, false)?;
-            // Fully populated nodes have the index as the entry offset.
-            e.asr_imm(Gpr::w(9), Gpr::w(9), 16)?;
-            e.cmn_imm(Gpr::w(9), 1, false)
-        })?;
-        self.code.b_cond(Cond::Eq, skip_index_adjustment)?;
-        self.code.emit(|e| e.lsr_reg(tmp1, header, index))?;
-        // TBZ reaches only 32 KiB; the failure label may be farther away.
-        let present = self.code.new_label();
-        self.code.tbnz(tmp1, 0, present)?;
-        self.code.b(fail)?;
-        self.code.bind(present)?;
-        // The entry offset is the number of bits set below our index in the bitmap.
-        self.code.emit(|e| {
-            e.lsl_reg(tmp2, tmp1, index)?;
-            e.eor_reg(
-                tmp1,
-                tmp2,
-                arinsal_a64::enc::Shifted {
-                    reg: header,
-                    shift: Shift::Lsl,
-                    amount: 0,
-                },
-            )?;
-            e.fmov_d_from_x(VecReg(0), tmp1)?;
-            e.cnt_8b(VecReg(0), VecReg(0))?;
-            e.addv_8b(VecReg(0), VecReg(0))?;
-            e.fmov_x_from_d(index, VecReg(0))
-        })?;
-        self.code.bind(skip_index_adjustment)?;
-        self.code.emit(|e| {
-            e.ldr_regoff(tmp1, node, index, 3)?;
-            e.and_imm(node, tmp1, !7)?;
-            // A leaf is a list cell, not a boxed node.
-            e.tst_imm(tmp1, 1)
-        })?;
-        self.code.b_cond(Cond::Ne, leaf_node)?;
-        self.code.emit(|e| {
-            e.ldr_post(header, node, 8)?;
-            e.cmp_imm(depth, 16, false)
-        })?;
-        self.code.b_cond(Cond::Ne, node_loop)?;
-        self.code.b(collision_node)?;
-        self.code.bind(leaf_node)?;
-        self.code.emit(|e| {
-            e.ldp(tmp1, Gpr::x(0), node, 0)?;
-            e.cmp_reg(tmp1, key, Shift::Lsl, 0)
-        })?;
-        self.code.b_cond(Cond::Ne, fail)?;
-        self.code.b(done)?;
-        // A collision node is a tuple of leaves searched linearly.
-        self.code.bind(collision_node)?;
-        self.code.emit(|e| e.lsr_imm(tmp1, header, 6 - 3))?;
-        self.code.bind(linear_loop)?;
-        self.code.emit(|e| {
-            e.sub_imm(tmp1, tmp1, 8, false)?;
-            e.ldr_regoff(tmp2, node, tmp1, 0)?;
-            e.and_imm(tmp2, tmp2, !7)?;
-            e.ldp(Gpr::x(14), Gpr::x(0), tmp2, 0)?;
-            e.cmp_reg(key, Gpr::x(14), Shift::Lsl, 0)
-        })?;
-        self.code.b_cond(Cond::Eq, done)?;
-        self.code.cbnz(tmp1, linear_loop)?;
-        self.code.b(fail)?;
-        self.code.bind(done)?;
-        Ok(())
+        self.emit_get_element_fragment_call(runtime.get_element_shared, slow, dst)
     }
 
     fn destination_register_for(&self, dst: ArgVal) -> Result<Gpr, ModuleError> {

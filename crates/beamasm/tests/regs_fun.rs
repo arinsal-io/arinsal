@@ -124,7 +124,12 @@ extern "C" fn resolve_fun(process: *mut ProcessHeader, _: u64, _: u32) -> usize 
 }
 
 fn map_runtime() -> MapRuntime {
+    let fragments = Box::leak(Box::new(
+        arinsal_beamasm::map::MapFragments::new(map_get).unwrap(),
+    ));
     MapRuntime {
+        get_element_shared: fragments.get_element_shared(),
+        get_element_hash_shared: fragments.get_element_hash_shared(),
         get: map_get,
         get_elements: map_get_elements,
         new_map: map_update,
@@ -153,13 +158,24 @@ fn run(
 ) -> (Seen, [u64; 6], ProcessHeader) {
     *SEEN.lock().unwrap() = None;
     let mut asm = BeamModuleAssembler::new();
+    // Fragment calls clobber LR, so keep the return address in scratch memory (the stack
+    // pointer is asserted) unless the case builds its own frame.
+    let own_cp = target_frame == TargetFrame::None;
+    let cp_slot = std::mem::offset_of!(SchedulerRegisters, tmp_mem) as u32 + 7 * 8;
     asm.emit_i_func_label(1).unwrap();
+    if own_cp {
+        asm.emit_raw(|e| e.str_uoff(Gpr::x(30), Gpr::x(19), cp_slot))
+            .unwrap();
+    }
     emit(&mut asm).unwrap();
     let capture_and_return = |e: &mut arinsal_a64::enc::Emitter| {
         e.stp(Gpr::x(25), Gpr::x(26), Gpr::x(19), 0)?;
         e.stp(Gpr::x(27), Gpr::x(28), Gpr::x(19), 16)?;
         e.stp(Gpr::x(15), Gpr::x(16), Gpr::x(19), 32)?;
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        if own_cp {
+            e.ldr_uoff(Gpr::x(30), Gpr::x(19), cp_slot)?;
+        }
         e.ret(Gpr::x(30))
     };
     asm.emit_raw(capture_and_return).unwrap();
@@ -173,6 +189,9 @@ fn run(
     asm.emit_i_func_label(90).unwrap();
     asm.emit_raw(|e| {
         e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        if own_cp {
+            e.ldr_uoff(Gpr::x(30), Gpr::x(19), cp_slot)?;
+        }
         e.ret(Gpr::x(30))
     })
     .unwrap();
@@ -234,16 +253,22 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
     let initial = sentinels();
     let mut expected = initial;
 
+    // A non-immediate key makes the shared fragment call the runtime lookup; the fragment
+    // reads an immediate key's map directly, as erts does.
+    let mut generic_initial = initial;
+    generic_initial[1] = 0x208;
+    let mut generic_expected = generic_initial;
     let (seen, after, header) = run(
         |asm| {
             asm.emit_i_get_map_element(90, ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), map_runtime())
         },
-        initial,
+        generic_initial,
         TargetFrame::None,
     );
-    assert_seen(seen, initial, &header);
+    assert_seen(seen, generic_initial, &header);
+    generic_expected[2] = VALUE;
+    assert_xregs(after, generic_expected);
     expected[2] = VALUE;
-    assert_xregs(after, expected);
 
     let (seen, after, header) = run(
         |asm| {
