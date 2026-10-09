@@ -969,3 +969,133 @@ fn differential_term_to_binary_mixed_hamt() {
     let actual = arinsal_etf::encode(&owned, arinsal_etf::EncodeOptions::default());
     assert_eq!(actual, expected);
 }
+
+fn instruction_ops(seed: u64, rounds: usize) -> Vec<(bool, Vec<(i64, i64)>)> {
+    let mut state = seed;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    (0..rounds)
+        .map(|_| {
+            let exact = next() % 3 == 0;
+            let mut keys: Vec<i64> = (0..1 + next() % 4).map(|_| (next() % 60) as i64).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            let batch = keys
+                .into_iter()
+                .map(|key| (key, (next() % 5) as i64))
+                .collect();
+            (exact, batch)
+        })
+        .collect()
+}
+
+// Port check of erts/emulator/beam/beam_common.c:1863-2344 (erts_gc_new_map,
+// erts_gc_update_map_assoc, erts_gc_update_map_exact), OTP-29.1.1, against `erl`: the
+// sorted vector bodies must give the same maps and flat sizes as `M#{...}` in erl.
+#[test]
+fn differential_instruction_update_bodies() {
+    let ops = instruction_ops(0x9e37_79b9_7f4a_7c15, 300);
+    let source = ops
+        .iter()
+        .map(|(exact, batch)| {
+            let pairs = batch
+                .iter()
+                .map(|(k, v)| format!("{{{k},{v}}}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{exact},[{pairs}]}}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let eval = format!(
+        "Ops=[{source}],F=fun({{true,B}},A)->try lists:foldl(fun({{K,V}},X)->maps:update(K,V,X) end,A,B) catch error:{{badkey,_}}->A end;({{false,B}},A)->maps:merge(A,maps:from_list(B)) end,\
+         Ms=lists:foldl(fun(O,[A|_]=Acc)->[F(O,A)|Acc] end,[maps:from_list([{{100,0}}])],Ops),\
+         io:put_chars(binary:encode_hex(term_to_binary([{{maps:to_list(M),erts_debug:flat_size(M)}}||M<-lists:reverse(Ms)]))),halt()."
+    );
+    let Some(reference) = reference_terms(&eval) else {
+        return;
+    };
+    let arinsal_etf::OwnedTerm::List {
+        elems: expected, ..
+    } = &reference
+    else {
+        panic!("reference returned unexpected term");
+    };
+    let mut heap = VecHeap::new();
+    let mut map = arinsal_maps::gc_new_map(2, |i| small([100, 0][i]), &mut heap).unwrap();
+    let mut maps = vec![map];
+    for (exact, batch) in &ops {
+        let arg = |i: usize| {
+            let (key, value) = batch[i / 2];
+            small(if i.is_multiple_of(2) { key } else { value })
+        };
+        let n = 2 * batch.len();
+        map = if *exact {
+            match arinsal_maps::gc_update_map_exact(map, n, arg, &mut heap) {
+                Ok(updated) => updated,
+                Err(MapError::Badkey(key)) => {
+                    assert!(get(map, key).unwrap().is_none());
+                    map
+                }
+                Err(error) => panic!("exact update: {error:?}"),
+            }
+        } else {
+            arinsal_maps::gc_update_map_assoc(map, n, arg, &mut heap).unwrap()
+        };
+        maps.push(map);
+    }
+    assert_eq!(maps.len(), expected.len());
+    for (map, expected) in maps.into_iter().zip(expected) {
+        let actual = arinsal_etf::OwnedTerm::tuple(vec![
+            arinsal_etf::OwnedTerm::list(
+                iter(map)
+                    .unwrap()
+                    .map(|(k, v)| {
+                        arinsal_etf::OwnedTerm::tuple(vec![
+                            arinsal_etf::OwnedTerm::Int(k.as_small().unwrap()),
+                            arinsal_etf::OwnedTerm::Int(v.as_small().unwrap()),
+                        ])
+                    })
+                    .collect(),
+            ),
+            arinsal_etf::OwnedTerm::Int(map_words(map) as i64),
+        ]);
+        assert_eq!(&actual, expected);
+    }
+}
+
+// Port check of erts/emulator/beam/erl_map.c:2036-2232 (erts_maps_update, erts_maps_put)
+// heap use: unchanged maps release their optimistic copy (HRelease), a value change
+// reuses the key tuple, and a new key costs a key tuple plus a flatmap.
+#[test]
+fn put_and_update_release_unused_words() {
+    let mut heap = arinsal_term::ProcessHeap::with_words(4096);
+    let map = from_pairs(&pairs(4), &mut heap).unwrap();
+    let used = heap.used_words();
+    assert_eq!(put(map, small(2), small(2), &mut heap), Ok(map));
+    assert_eq!(update(map, small(2), small(2), &mut heap), Ok(map));
+    assert_eq!(
+        update(map, small(9), small(2), &mut heap),
+        Err(MapError::Badkey(small(9)))
+    );
+    assert_eq!(heap.used_words(), used);
+    let changed = update(map, small(2), small(7), &mut heap).unwrap();
+    assert_eq!(heap.used_words(), used + 3 + 4);
+    assert_eq!(changed.flatmap_keys_tuple(), map.flatmap_keys_tuple());
+    let used = heap.used_words();
+    let grown = put(map, small(0), small(0), &mut heap).unwrap();
+    assert_eq!(heap.used_words(), used + (3 + 4) + (3 + 5));
+    assert_eq!(
+        iter(grown).unwrap().map(|(k, _)| k).collect::<Vec<_>>(),
+        (0..=4).map(small).collect::<Vec<_>>()
+    );
+    let used = heap.used_words();
+    let same =
+        arinsal_maps::gc_update_map_assoc(grown, 4, |i| small([1, 1, 3, 3][i]), &mut heap).unwrap();
+    assert_eq!(same, grown);
+    assert_eq!(heap.used_words(), used);
+}

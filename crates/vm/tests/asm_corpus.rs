@@ -170,6 +170,8 @@ impl ModuleEnv for CorpusEnv {
             new_map: map_many,
             update_assoc: map_many,
             update_exact: map_many,
+            put_single: map_many,
+            update_single: map_many,
         }
     }
 

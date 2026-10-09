@@ -130,6 +130,8 @@ fn map_runtime() -> MapRuntime {
         new_map: map_update,
         update_assoc: map_update,
         update_exact: map_update,
+        put_single: map_update,
+        update_single: map_update,
     }
 }
 

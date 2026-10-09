@@ -1333,8 +1333,8 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
     fragment
 }
 
-/// Builds a map or applies staged key/value updates to one.
-// Port of erts/emulator/beam/jit/arm/instr_map.cpp:125-149,465-633, OTP-29.1.1.
+/// Builds a map from the staged key/value vector.
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:228-256 (emit_new_map_shared), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_map_new(
     header: *mut ProcessHeader,
     source: u64,
@@ -1342,10 +1342,12 @@ pub extern "C" fn arinsal_beamasm_map_new(
     live: u64,
     count: u64,
 ) -> u64 {
-    arinsal_beamasm_map_change(header, source, live, count, false, false)
+    arinsal_beamasm_map_change(header, source, live, count, MapChange::New)
 }
 
-/// Applies associative updates to a staged list of key/value pairs.
+/// Applies associative updates from the staged key/value vector.
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:543-559 (emit_update_map_assoc_shared),
+// OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_map_assoc(
     header: *mut ProcessHeader,
     source: u64,
@@ -1353,10 +1355,12 @@ pub extern "C" fn arinsal_beamasm_map_assoc(
     live: u64,
     count: u64,
 ) -> u64 {
-    arinsal_beamasm_map_change(header, source, live, count, false, true)
+    arinsal_beamasm_map_change(header, source, live, count, MapChange::Assoc)
 }
 
-/// Applies exact updates to a staged list of key/value pairs.
+/// Applies exact updates from the staged key/value vector.
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:604-648 (emit_update_map_exact_guard_shared
+// and emit_update_map_exact_body_shared), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_map_exact(
     header: *mut ProcessHeader,
     source: u64,
@@ -1364,98 +1368,122 @@ pub extern "C" fn arinsal_beamasm_map_exact(
     live: u64,
     count: u64,
 ) -> u64 {
-    arinsal_beamasm_map_change(header, source, live, count, true, true)
+    arinsal_beamasm_map_change(header, source, live, count, MapChange::Exact)
 }
 
+/// `Map#{Key => Value}` with a single pair: `erts_maps_put` without the register array.
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:561-577
+// (emit_update_map_single_assoc_shared), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_map_put_single(
+    header: *mut ProcessHeader,
+    key: u64,
+    value: u64,
+    map: u64,
+    _unused: u64,
+) -> u64 {
+    map_single(header, key, value, map, false)
+}
+
+/// `Map#{Key := Value}` with a single pair and no failure label: `erts_maps_update`.
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:650-683
+// (emit_update_map_single_exact_body_shared), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_map_update_single(
+    header: *mut ProcessHeader,
+    key: u64,
+    value: u64,
+    map: u64,
+    _unused: u64,
+) -> u64 {
+    map_single(header, key, value, map, true)
+}
+
+fn map_single(header: *mut ProcessHeader, key: u64, value: u64, map: u64, exact: bool) -> u64 {
+    let Some((process, _)) = crate::native_hooks::process_and_registers(header) else {
+        return 0;
+    };
+    let (key, value, map) = (
+        crate::native_hooks::from_raw(key),
+        crate::native_hooks::from_raw(value),
+        crate::native_hooks::from_raw(map),
+    );
+    // HAlloc: these helpers never collect, so the heap may spill into fragments.
+    let mut heap = crate::FragmentingHeap(&mut process.heap);
+    let result = if exact {
+        arinsal_maps::update(map, key, value, &mut heap)
+    } else {
+        arinsal_maps::put(map, key, value, &mut heap)
+    };
+    map_result(process, result, exact, false)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MapChange {
+    New,
+    Assoc,
+    Exact,
+}
+
+// Port of erts/emulator/beam/beam_common.c:1863-2344 (erts_gc_new_map,
+// erts_gc_update_map_assoc, erts_gc_update_map_exact), OTP-29.1.1. The emitter stages the
+// key/value vector at X{max(live, 6)}.. and the source map right after it; the vector is
+// read from the register array after any collection, like erts' GET_TERM.
 fn arinsal_beamasm_map_change(
     header: *mut ProcessHeader,
     source: u64,
     live: u64,
     count: u64,
-    exact: bool,
-    update: bool,
+    change: MapChange,
 ) -> u64 {
     let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
-    let Ok(count) = usize::try_from(count) else {
+    let Some(n) = usize::try_from(count).ok().and_then(|c| c.checked_mul(2)) else {
         return 0;
     };
     let has_fail_label = live >> 32 != 0;
     let Ok(live) = usize::try_from(live & 0xffff_ffff) else {
         return 0;
     };
-    // Stage source at X6-1 spill space is already used for pairs at X6+; keep source
-    // in the live X registers so GC during ensure relocates it. The emitter stages
-    // `{key,value}` pairs at X6.. and passes `live` covering X0..X{live-1} plus those.
     let base = live.max(6);
-    let source_slot = base + count * 2;
+    let source_slot = base + n;
     if source_slot >= registers.x_reg_array.len() {
         return 0;
     }
     registers.x_reg_array[source_slot] = source;
-    let root_live = live.max(source_slot + 1);
-    if process.x.len() < root_live {
-        let mut x = process.x.to_vec();
-        x.resize(root_live, arinsal_term::Term::NIL);
-        process.x = x.into_boxed_slice();
-    }
-    for (i, slot) in registers.x_reg_array[..root_live].iter().enumerate() {
-        // X registers between the live prefix and the staged pairs are dead and may hold
-        // stale words; they must not become GC roots.
-        process.x[i] = if (live..base).contains(&i) {
-            arinsal_term::Term::NIL
-        } else {
-            crate::native_hooks::from_raw(*slot)
-        };
-    }
-    // Like the interpreter's put_map_assoc/put_map_exact: build first, and collect only when
-    // the heap is short, keeping the live registers (erts/emulator/beam/erl_map.c, OTP-29.1.1).
-    let mut collected = false;
-    let result = loop {
-        let source_term = process.x[source_slot];
-        let pairs = (0..count)
-            .map(|index| (process.x[base + index * 2], process.x[base + 1 + index * 2]))
-            .collect::<Vec<_>>();
-        let attempt = match (update, pairs.as_slice()) {
-            (true, [(key, value)]) if exact => {
-                arinsal_maps::update(source_term, *key, *value, &mut process.heap)
-            }
-            (true, [(key, value)]) => {
-                arinsal_maps::put(source_term, *key, *value, &mut process.heap)
-            }
-            (true, _) => arinsal_maps::put_many(source_term, &pairs, exact, &mut process.heap),
-            (false, _) => arinsal_maps::from_pairs(&pairs, &mut process.heap),
-        };
-        match attempt {
-            Err(arinsal_maps::MapError::HeapFull { need_words }) if !collected => {
-                collected = true;
-                if process.ensure(need_words, root_live).is_err() {
-                    crate::native_hooks::set_error(process, "system_limit");
-                    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-                    return 0;
-                }
-                registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-            }
-            other => {
-                // Only the live registers moved; the dead ones between them and the staged
-                // pairs stay untouched, as in erts.
-                for (index, (slot, term)) in registers.x_reg_array[..root_live]
-                    .iter_mut()
-                    .zip(process.x.iter())
-                    .enumerate()
-                {
-                    if !(live..base).contains(&index) {
-                        *slot = crate::native_hooks::raw(*term);
-                    }
-                }
-                break other;
-            }
-        }
+    let map = crate::native_hooks::from_raw(source);
+    let need = match change {
+        MapChange::New => arinsal_maps::new_map_need(n),
+        MapChange::Assoc => arinsal_maps::update_map_assoc_need(map, n),
+        MapChange::Exact => arinsal_maps::update_map_exact_need(map),
     };
+    if process.heap.words_left() < need {
+        // X registers between the live prefix and the staged vector are dead and may hold
+        // stale words; they must not become GC roots.
+        registers.x_reg_array[live..base].fill(crate::native_hooks::raw(Term::NIL));
+        if crate::native_hooks::collect_native(process, registers, need, source_slot + 1).is_err() {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return 0;
+        }
+    }
+    let x = &registers.x_reg_array;
+    let arg = |i: usize| crate::native_hooks::from_raw(x[base + i]);
+    let map = crate::native_hooks::from_raw(x[source_slot]);
+    let mut heap = crate::FragmentingHeap(&mut process.heap);
+    let result = match change {
+        MapChange::New => arinsal_maps::gc_new_map(n, arg, &mut heap),
+        MapChange::Assoc => arinsal_maps::gc_update_map_assoc(map, n, arg, &mut heap),
+        MapChange::Exact => arinsal_maps::gc_update_map_exact(map, n, arg, &mut heap),
+    };
+    map_result(process, result, change == MapChange::Exact, has_fail_label)
+}
+
+fn map_result(
+    process: &mut crate::Process,
+    result: arinsal_maps::MapResult<Term>,
+    exact: bool,
+    has_fail_label: bool,
+) -> u64 {
     // The error tuples below allocate, so the native header is published after them.
     let raw = match result {
         Ok(term) => crate::native_hooks::raw(term),

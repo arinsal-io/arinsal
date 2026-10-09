@@ -51,6 +51,23 @@ pub struct MapRuntime {
     pub update_assoc: MapUpdateHelper,
     /// Runtime exact update; zero signals a missing key.
     pub update_exact: MapUpdateHelper,
+    /// Single-pair associative update (`erts_maps_put`): key, value, map.
+    pub put_single: MapUpdateHelper,
+    /// Single-pair exact update without a failure label (`erts_maps_update`): key, value, map.
+    pub update_single: MapUpdateHelper,
+}
+
+/// The `hashmap_make_hash` the loader passes to `i_get_map_element_hash` for an
+/// immediate key; other literal keys are hashed by the runtime lookup.
+// Port of erts/emulator/beam/generators.tab (gen.get_map_element) and erl_map.h:216
+// (hashmap_make_hash), OTP-29.1.1.
+pub fn literal_key_hash(key: ArgVal) -> u64 {
+    match key {
+        ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3 => {
+            arinsal_term::immediate_internal_hash(word)
+        }
+        _ => 0,
+    }
 }
 
 impl BeamModuleAssembler {
@@ -292,6 +309,10 @@ impl BeamModuleAssembler {
                 "map update operands must be key/value pairs",
             ));
         }
+        if updates.len() == 2 {
+            self.emit_map_single(src, updates, runtime.put_single)?;
+            return self.store_map_result(dst, Gpr::x(0));
+        }
         self.stage_map_args(updates, live.max(6))?;
         let source = self.source_reg(src)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), source))?;
@@ -326,6 +347,10 @@ impl BeamModuleAssembler {
             return Err(ModuleError::InvalidOperand(
                 "map update operands must be key/value pairs",
             ));
+        }
+        if updates.len() == 2 && fail == 0 {
+            self.emit_map_single(src, updates, runtime.update_single)?;
+            return self.store_map_result(dst, Gpr::x(0));
         }
         self.stage_map_args(updates, live.max(6))?;
         let source = self.source_reg(src)?;
@@ -481,6 +506,51 @@ impl BeamModuleAssembler {
         self.store_map_result(dst, Gpr::x(11))
     }
 
+    /// Inline part of `bif_map_get`: an immediate key found in a flatmap or HAMT is
+    /// stored in `dst`; anything else (not a map, other keys, a miss) branches to `slow`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-930 (emit_bif_map_get) and
+    // instr_map.cpp:316-360 (emit_i_get_map_element_shared), OTP-29.1.1.
+    pub(crate) fn emit_map_get_fast(
+        &mut self,
+        map: ArgVal,
+        key: ArgVal,
+        dst: ArgVal,
+        slow: Label,
+    ) -> Result<(), ModuleError> {
+        let map = self.source_reg(map)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(1), map))?;
+        let key = self.source_reg_into(key, Gpr::x(17))?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(2), key)?;
+            e.and_imm(Gpr::x(9), Gpr::x(2), 3)?;
+            e.cmp_imm(Gpr::x(9), 3, false)
+        })?;
+        self.code.b_cond(Cond::Ne, slow)?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(9), Gpr::x(1), 3)?;
+            e.cmp_imm(Gpr::x(9), 2, false)
+        })?;
+        self.code.b_cond(Cond::Ne, slow)?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(8), Gpr::x(1), !7)?;
+            e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0)?;
+            e.and_imm(Gpr::x(10), Gpr::x(9), 0x3f)?;
+            e.cmp_imm(Gpr::x(10), 0x2c, false)
+        })?;
+        self.code.b_cond(Cond::Ne, slow)?;
+        let hashmap = self.code.new_label();
+        let done = self.code.new_label();
+        self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(9), 0xc0))?;
+        self.code.cbnz(Gpr::x(10), hashmap)?;
+        self.emit_flatmap_lookup(slow)?;
+        self.code.b(done)?;
+        self.code.bind(hashmap)?;
+        self.emit_small_internal_hash(Gpr::x(2))?;
+        self.emit_hashmap_lookup(slow)?;
+        self.code.bind(done)?;
+        self.store_map_result(dst, Gpr::x(0))
+    }
+
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:316-390,511-542, OTP-29.1.1.
     fn emit_map_get_inline(
         &mut self,
@@ -509,19 +579,7 @@ impl BeamModuleAssembler {
         self.code.b(done)?;
         self.code.bind(hashmap)?;
         self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0))?;
-        let runtime_fallback = self.code.new_label();
-        self.emit_hashmap_lookup(runtime_fallback)?;
-        self.code.b(done)?;
-        self.code.bind(runtime_fallback)?;
-        emit_map_runtime(
-            self,
-            generic as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3)],
-            6,
-            Update::NONE,
-        )?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
-        self.code.b_cond(Cond::Eq, fail)?;
+        self.emit_hashmap_lookup(fail)?;
         self.code.bind(done)?;
         self.store_map_result(dst, Gpr::x(0))?;
         let after_store = self.code.new_label();
@@ -598,123 +656,94 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:64-264, OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:80-187 (emit_hashmap_get_element),
+    // OTP-29.1.1. In: X8 = untagged root, X9 = root header, X2 = immediate key, X3 = hash.
+    // Out: the value in X0, or a branch to `fail` when the key is absent.
     fn emit_hashmap_lookup(&mut self, fail: Label) -> Result<(), ModuleError> {
+        use arinsal_a64::enc::{Shift, VecReg};
+        let (node, key, key_hash, header) = (Gpr::x(8), Gpr::x(2), Gpr::x(3), Gpr::x(9));
+        let (depth, index) = (Gpr::x(13), Gpr::x(12));
+        let (tmp1, tmp2) = (Gpr::x(10), Gpr::x(11));
         let node_loop = self.code.new_label();
-        let direct = self.code.new_label();
-        let rank_loop = self.code.new_label();
-        let rank_done = self.code.new_label();
-        let nonroot = self.code.new_label();
-        let base_ready = self.code.new_label();
-        let leaf = self.code.new_label();
-        let child_ready = self.code.new_label();
-        let bitmap_miss = self.code.new_label();
-        let key_miss = self.code.new_label();
-        let level_miss = self.code.new_label();
-        let collision = self.code.new_label();
-        let collision_loop = self.code.new_label();
-        let success = self.code.new_label();
-        self.code.emit(|e| e.mov_reg(Gpr::x(11), Gpr::xzr()))?;
-        self.code.bind(node_loop)?;
-        self.code.emit(|e| e.and_imm(Gpr::x(12), Gpr::x(3), 15))?;
-        self.code.emit(|e| e.lsr_imm(Gpr::x(3), Gpr::x(3), 4))?;
-        self.code.emit(|e| e.and_imm(Gpr::x(13), Gpr::x(9), 0xc0))?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(13), 0x80, false))?;
-        self.code.b_cond(Cond::Eq, direct)?;
-        self.code.emit(|e| e.lsr_imm(Gpr::x(13), Gpr::x(9), 16))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(13)))?;
-        self.code
-            .emit(|e| e.lsr_reg(Gpr::x(14), Gpr::x(14), Gpr::x(12)))?;
-        self.code.tbz(Gpr::x(14), 0, bitmap_miss)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::xzr()))?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(10), Gpr::xzr()))?;
-        self.code.bind(rank_loop)?;
-        self.code
-            .emit(|e| e.cmp_reg(Gpr::x(14), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.code.b_cond(Cond::Cs, rank_done)?;
-        self.code.emit(|e| e.and_imm(Gpr::x(5), Gpr::x(13), 1))?;
+        let skip_index_adjustment = self.code.new_label();
+        let leaf_node = self.code.new_label();
+        let collision_node = self.code.new_label();
+        let linear_loop = self.code.new_label();
+        let done = self.code.new_label();
+        // The root header is two words long; child headers are one word.
         self.code.emit(|e| {
-            e.add_reg(
-                Gpr::x(10),
-                Gpr::x(10),
-                Gpr::x(5),
-                arinsal_a64::enc::Shift::Lsl,
-                0,
-            )
+            e.add_imm(node, node, 16, false)?;
+            e.mov_reg(depth, Gpr::xzr())
         })?;
-        self.code
-            .emit(|e| e.add_imm(Gpr::x(14), Gpr::x(14), 1, false))?;
-        self.code.emit(|e| e.lsr_imm(Gpr::x(13), Gpr::x(13), 1))?;
-        self.code.b(rank_loop)?;
-        self.code.bind(rank_done)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(10)))?;
-        let rank = self.code.new_label();
-        self.code.b(rank)?;
-        self.code.bind(direct)?;
-        self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(12)))?;
-        self.code.bind(rank)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(11), 0, false))?;
-        self.code.b_cond(Cond::Ne, nonroot)?;
-        self.code
-            .emit(|e| e.add_imm(Gpr::x(13), Gpr::x(8), 16, false))?;
-        self.code.b(base_ready)?;
-        self.code.bind(nonroot)?;
-        self.code
-            .emit(|e| e.add_imm(Gpr::x(13), Gpr::x(8), 8, false))?;
-        self.code.bind(base_ready)?;
-        self.code
-            .emit(|e| e.ldr_regoff(Gpr::x(8), Gpr::x(13), Gpr::x(14), 3))?;
-        self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(8), 3))?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(10), 1, false))?;
-        self.code.b_cond(Cond::Eq, leaf)?;
-        self.code.emit(|e| e.and_imm(Gpr::x(8), Gpr::x(8), !7))?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0))?;
-        self.code
-            .emit(|e| e.add_imm(Gpr::x(11), Gpr::x(11), 1, false))?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(11), 16, false))?;
-        self.code.b_cond(Cond::Eq, collision)?;
-        self.code.b_cond(Cond::Cs, level_miss)?;
-        self.code.b(node_loop)?;
-        self.code.bind(leaf)?;
-        self.code.emit(|e| e.and_imm(Gpr::x(8), Gpr::x(8), !7))?;
-        self.code
-            .emit(|e| e.ldp(Gpr::x(10), Gpr::x(0), Gpr::x(8), 0))?;
-        self.code
-            .emit(|e| e.cmp_reg(Gpr::x(10), Gpr::x(2), arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.code.b_cond(Cond::Ne, key_miss)?;
-        self.code.b(success)?;
-        self.code.bind(collision)?;
-        self.code.emit(|e| e.lsr_imm(Gpr::x(10), Gpr::x(9), 6))?;
-        self.code.bind(collision_loop)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(10), 0, false))?;
-        self.code.b_cond(Cond::Eq, key_miss)?;
-        self.code
-            .emit(|e| e.subs_imm(Gpr::x(10), Gpr::x(10), 1, false))?;
-        self.code
-            .emit(|e| e.add_imm(Gpr::x(13), Gpr::x(8), 8, false))?;
-        self.code
-            .emit(|e| e.ldr_regoff(Gpr::x(14), Gpr::x(13), Gpr::x(10), 3))?;
-        self.code.emit(|e| e.and_imm(Gpr::x(14), Gpr::x(14), !7))?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(12), Gpr::x(14), 0))?;
-        self.code
-            .emit(|e| e.cmp_reg(Gpr::x(12), Gpr::x(2), arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.code.b_cond(Cond::Eq, success)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(10), 0, false))?;
-        self.code.b_cond(Cond::Ne, collision_loop)?;
-        self.code.b(key_miss)?;
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(14), 8))?;
-        self.code.b(success)?;
-        self.code.bind(bitmap_miss)?;
-        self.code.emit(|e| e.mov_const(Gpr::x(3), 1))?;
+        self.code.bind(node_loop)?;
+        self.code.emit(|e| {
+            e.and_imm(index, key_hash, 0xf)?;
+            e.lsr_imm(key_hash, key_hash, 4)?;
+            e.add_imm(depth, depth, 1, false)?;
+            // Fully populated nodes have the index as the entry offset.
+            e.asr_imm(Gpr::w(9), Gpr::w(9), 16)?;
+            e.cmn_imm(Gpr::w(9), 1, false)
+        })?;
+        self.code.b_cond(Cond::Eq, skip_index_adjustment)?;
+        self.code.emit(|e| e.lsr_reg(tmp1, header, index))?;
+        // TBZ reaches only 32 KiB; the failure label may be farther away.
+        let present = self.code.new_label();
+        self.code.tbnz(tmp1, 0, present)?;
         self.code.b(fail)?;
-        self.code.bind(key_miss)?;
-        self.code.emit(|e| e.mov_const(Gpr::x(3), 2))?;
+        self.code.bind(present)?;
+        // The entry offset is the number of bits set below our index in the bitmap.
+        self.code.emit(|e| {
+            e.lsl_reg(tmp2, tmp1, index)?;
+            e.eor_reg(
+                tmp1,
+                tmp2,
+                arinsal_a64::enc::Shifted {
+                    reg: header,
+                    shift: Shift::Lsl,
+                    amount: 0,
+                },
+            )?;
+            e.fmov_d_from_x(VecReg(0), tmp1)?;
+            e.cnt_8b(VecReg(0), VecReg(0))?;
+            e.addv_8b(VecReg(0), VecReg(0))?;
+            e.fmov_x_from_d(index, VecReg(0))
+        })?;
+        self.code.bind(skip_index_adjustment)?;
+        self.code.emit(|e| {
+            e.ldr_regoff(tmp1, node, index, 3)?;
+            e.and_imm(node, tmp1, !7)?;
+            // A leaf is a list cell, not a boxed node.
+            e.tst_imm(tmp1, 1)
+        })?;
+        self.code.b_cond(Cond::Ne, leaf_node)?;
+        self.code.emit(|e| {
+            e.ldr_post(header, node, 8)?;
+            e.cmp_imm(depth, 16, false)
+        })?;
+        self.code.b_cond(Cond::Ne, node_loop)?;
+        self.code.b(collision_node)?;
+        self.code.bind(leaf_node)?;
+        self.code.emit(|e| {
+            e.ldp(tmp1, Gpr::x(0), node, 0)?;
+            e.cmp_reg(tmp1, key, Shift::Lsl, 0)
+        })?;
+        self.code.b_cond(Cond::Ne, fail)?;
+        self.code.b(done)?;
+        // A collision node is a tuple of leaves searched linearly.
+        self.code.bind(collision_node)?;
+        self.code.emit(|e| e.lsr_imm(tmp1, header, 6 - 3))?;
+        self.code.bind(linear_loop)?;
+        self.code.emit(|e| {
+            e.sub_imm(tmp1, tmp1, 8, false)?;
+            e.ldr_regoff(tmp2, node, tmp1, 0)?;
+            e.and_imm(tmp2, tmp2, !7)?;
+            e.ldp(Gpr::x(14), Gpr::x(0), tmp2, 0)?;
+            e.cmp_reg(key, Gpr::x(14), Shift::Lsl, 0)
+        })?;
+        self.code.b_cond(Cond::Eq, done)?;
+        self.code.cbnz(tmp1, linear_loop)?;
         self.code.b(fail)?;
-        self.code.bind(level_miss)?;
-        self.code.emit(|e| e.mov_const(Gpr::x(3), 3))?;
-        self.code.b(fail)?;
-        self.code.bind(success)?;
-        self.code.bind(child_ready)?;
+        self.code.bind(done)?;
         Ok(())
     }
 
@@ -727,6 +756,29 @@ impl BeamModuleAssembler {
                 "map destination must be an X register below 6 or a Y register",
             )),
         }
+    }
+
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694, OTP-29.1.1: a
+    // single pair goes to `erts_maps_put`/`erts_maps_update` in argument registers; those
+    // never collect, so only the heap and stack pointers are published.
+    fn emit_map_single(
+        &mut self,
+        src: ArgVal,
+        pair: &[ArgVal],
+        helper: MapUpdateHelper,
+    ) -> Result<(), ModuleError> {
+        for (target, value) in [(Gpr::x(1), pair[0]), (Gpr::x(2), pair[1]), (Gpr::x(3), src)] {
+            let reg = self.source_reg(value)?;
+            self.code.emit(|e| e.mov_reg(target, reg))?;
+        }
+        self.code.emit(|e| e.mov_reg(Gpr::x(4), Gpr::xzr()))?;
+        emit_map_runtime(
+            self,
+            helper as usize,
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
+            0,
+            Update::HEAP_ALLOC,
+        )
     }
 
     fn stage_map_args(&mut self, args: &[ArgVal], base: u32) -> Result<(), ModuleError> {

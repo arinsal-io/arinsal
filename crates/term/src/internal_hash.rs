@@ -43,7 +43,7 @@ impl State {
             .wrapping_add(0x3849_5ab5);
         self.ticks += 1;
     }
-    fn push(&mut self, term: Term, jobs: &mut Vec<Job>) {
+    fn push(&mut self, term: Term, jobs: &mut Jobs) {
         if term.bits() & 3 == 3 {
             self.alpha(1);
             self.beta(term.bits());
@@ -64,14 +64,56 @@ impl State {
         self.alpha ^ self.beta
     }
 }
+#[derive(Clone, Copy)]
 enum Job {
     Visit(Term),
     CdrMarker,
+}
+
+/// Work stack that starts in a local array and spills to the heap only when it grows.
+// Port of erts/emulator/beam/global.h (DECLARE_ESTACK, DEF_ESTACK_SIZE), OTP-29.1.1.
+struct Jobs {
+    local: [Job; 16],
+    len: usize,
+    overflow: Vec<Job>,
+}
+impl Jobs {
+    fn new(first: Job) -> Self {
+        Self {
+            local: [first; 16],
+            len: 1,
+            overflow: Vec::new(),
+        }
+    }
+    #[inline]
+    fn push(&mut self, job: Job) {
+        if self.overflow.is_empty() && self.len < self.local.len() {
+            self.local[self.len] = job;
+            self.len += 1;
+        } else {
+            self.overflow.push(job);
+        }
+    }
+    #[inline]
+    fn pop(&mut self) -> Option<Job> {
+        if let Some(job) = self.overflow.pop() {
+            return Some(job);
+        }
+        self.len = self.len.checked_sub(1)?;
+        Some(self.local[self.len])
+    }
 }
 /// OTP `erts_internal_hash` for terms on this VM's heap.
 /// Port of `erts/emulator/beam/erl_term_hashing.c:1770` (`make_internal_hash`), OTP-29.1.1.
 pub fn internal_hash(term: Term) -> u64 {
     internal_salted_hash(term, 0)
+}
+/// `erts_internal_hash` of an immediate term given by its word, as the loader computes
+/// for `i_get_map_element_hash` and the JIT's `emit_internal_hash_helper` does inline.
+// Port of erts/emulator/beam/erl_term_hashing.c:1770-1776 (make_internal_hash, immediate
+// fast path), OTP-29.1.1.
+pub fn immediate_internal_hash(word: u64) -> u64 {
+    mix64(word)
 }
 /// OTP internal hash with an explicit salt. OTP's ordinary internal hash uses zero.
 pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
@@ -83,7 +125,7 @@ pub fn internal_salted_hash(term: Term, salt: u64) -> u64 {
         beta: salt,
         ticks: 0,
     };
-    let mut jobs = vec![Job::Visit(term)];
+    let mut jobs = Jobs::new(Job::Visit(term));
     while let Some(job) = jobs.pop() {
         match job {
             Job::CdrMarker => state.beta(4),

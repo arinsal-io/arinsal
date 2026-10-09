@@ -87,6 +87,8 @@ impl ModuleEnv for TestEnv {
             new_map: map_update_helper,
             update_assoc: map_update_helper,
             update_exact: map_update_helper,
+            put_single: map_update_helper,
+            update_single: map_update_helper,
         }
     }
 
@@ -543,7 +545,9 @@ fn otp_logger_reply_return_returns_the_reply_map() {
         header.i
     );
     let result = registers.x_reg_array[0];
-    assert_eq!(MAP_LOOKUP_KEY.load(Ordering::SeqCst), atom("idle"));
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390, OTP-29.1.1: a flatmap
+    // lookup of an immediate key stays inline and never reaches the runtime hook.
+    assert_eq!(MAP_LOOKUP_KEY.load(Ordering::SeqCst), 0);
     assert_eq!(read_heap_word(result, 0), 3 << 6);
     assert_eq!(read_heap_word(result, 1), atom("reply"));
     assert_eq!(read_heap_word(result, 2), reply);

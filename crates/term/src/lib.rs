@@ -46,7 +46,7 @@ pub use heap::{
     StackWord, TermBuilder, VecHeap, flat_key_cmp,
 };
 pub use identity::{Identity, Node};
-pub use internal_hash::{internal_hash, internal_salted_hash};
+pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
 pub use literal::{LiteralAreas, set_literal_purge_area};
 pub use magic::MagicRef;
 pub use native_code::{

@@ -150,6 +150,9 @@ impl HeapAlloc for FragmentingHeap<'_> {
             None => Some(self.0.heap_fragment(words)),
         }
     }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        self.0.release(end, start)
+    }
     fn retain_binary(&mut self, binary: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(binary)
     }

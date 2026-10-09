@@ -1161,6 +1161,8 @@ impl ModuleEnv for VmModuleEnv<'_> {
             new_map: crate::native_helpers::arinsal_beamasm_map_new,
             update_assoc: crate::native_helpers::arinsal_beamasm_map_assoc,
             update_exact: crate::native_helpers::arinsal_beamasm_map_exact,
+            put_single: crate::native_helpers::arinsal_beamasm_map_put_single,
+            update_single: crate::native_helpers::arinsal_beamasm_map_update_single,
         }
     }
     fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {

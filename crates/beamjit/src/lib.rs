@@ -1986,59 +1986,28 @@ fn arg(
     }
 }
 
-struct MapLookupSpec {
-    map: ArgVal,
-    key: ArgVal,
-    hash: u32,
-    hashed: bool,
-    destination: ArgVal,
-    fail: u32,
-    helper: MapLookupHelper,
-}
-
-// Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-393 and 511-539, OTP-29.1.1.
-fn emit_map_lookup(
-    assembler: &mut BeamModuleAssembler,
-    spec: MapLookupSpec,
-) -> Result<(), EmitError> {
-    use arinsal_a64::enc::Gpr;
-
-    // x24 holds the process's code index (active_code_ix); the map goes in a scratch register.
-    assembler.mov_arg_to_reg(Gpr::x(10), spec.map)?;
-    assembler.mov_arg_to_reg(Gpr::x(11), spec.key)?;
-    assembler.emit_raw(|encoder| {
-        encoder.mov_const(Gpr::x(12), u64::from(spec.hash))?;
-        encoder.mov_const(Gpr::x(13), u64::from(spec.hashed))?;
-        encoder.str_uoff(Gpr::x(20), Gpr::x(21), 8)?;
-        encoder.str_uoff(Gpr::x(23), Gpr::x(21), 0)?;
-        encoder.str_uoff(Gpr::w(22), Gpr::x(21), 32)?;
-        for (index, reg) in [25, 26, 27, 28, 15, 16].into_iter().enumerate() {
-            encoder.str_uoff(Gpr::x(reg), Gpr::x(19), (index as u32) * 8)?;
-        }
-        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-        encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
-        encoder.mov_reg(Gpr::x(2), Gpr::x(10))?;
-        encoder.mov_reg(Gpr::x(3), Gpr::x(11))?;
-        encoder.mov_reg(Gpr::x(4), Gpr::x(12))?;
-        encoder.mov_reg(Gpr::x(5), Gpr::x(13))?;
-        encoder.mov_const(Gpr::x(17), spec.helper as usize as u64)?;
-        encoder.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-        encoder.blr(Gpr::x(17))?;
-        encoder.mov_reg(Gpr::x(14), Gpr::x(0))?;
-        encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)?;
-        encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
-        encoder.ldr_uoff(Gpr::w(22), Gpr::x(21), 32)?;
-        encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-        for (index, reg) in [25, 26, 27, 28, 15, 16].into_iter().enumerate() {
-            encoder.ldr_uoff(Gpr::x(reg), Gpr::x(19), (index as u32) * 8)?;
-        }
-        Ok(())
-    })?;
-    // Preserve XREG0: it can remain live as an input across this lookup.
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390, OTP-29.1.1.
-    assembler.branch_if_zero_register(Gpr::x(14), spec.fail)?;
-    assembler.mov_reg_to_arg(spec.destination, Gpr::x(14))?;
-    Ok(())
+/// Orders a map instruction's key/value vector by flatmap key order.
+// Port of erts/emulator/beam/beam_transform_helpers.c:54-110 (beam_load_map_key_sort),
+// OTP-29.1.1: a single pair is already sorted; several pairs need literal keys.
+fn map_key_sort(args: Vec<ArgVal>, env: &impl ModuleEnv) -> Result<Vec<ArgVal>, EmitError> {
+    if args.len() <= 2 {
+        return Ok(args);
+    }
+    let keys = args
+        .iter()
+        .step_by(2)
+        .map(|key| match key {
+            ArgVal::Immediate(word) | ArgVal::Literal(word) => Ok(*word),
+            _ => Err(EmitError::Operand(
+                "only a single variable key is allowed in a map instruction".to_owned(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let order = env.sort_map_keys(&keys).map_err(EmitError::Operand)?;
+    Ok(order
+        .into_iter()
+        .flat_map(|index| [args[2 * index], args[2 * index + 1]])
+        .collect())
 }
 
 /// `Live` of a bit-syntax match command: `nil` when the command cannot allocate.
@@ -2703,28 +2672,33 @@ fn emit_op(
             Ok(())
         }
         EmitterKind::MapLookup => {
-            // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-393 and 511-539,
-            // OTP-29.1.1. The VM hook performs the map representation-specific lookup.
-            let (key_at, hash_at, destination_at, hashed) = if op.name() == "i_get_map_element_hash"
-            {
+            // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390 and 511-542,
+            // OTP-29.1.1: immediate keys are looked up inline, others in the runtime.
+            let runtime = env.map_runtime();
+            if op.name() == "i_get_map_element_hash" {
                 count(5)?;
-                (2, Some(3), 4, true)
+                // Atom indices are only known at load time, so the key hash is computed here
+                // rather than by the BEAM operation lowering.
+                let key = value(2)?;
+                let hash = arinsal_beamasm::map::literal_key_hash(key);
+                assembler.emit_i_get_map_element_hash(
+                    n(0)?,
+                    value(1)?,
+                    key,
+                    ArgVal::Immediate(hash),
+                    value(4)?,
+                    runtime,
+                )?;
             } else {
                 count(4)?;
-                (2, None, 3, false)
-            };
-            emit_map_lookup(
-                assembler,
-                MapLookupSpec {
-                    map: value(1)?,
-                    key: value(key_at)?,
-                    hash: hash_at.map(&n).transpose()?.unwrap_or(0),
-                    hashed,
-                    destination: value(destination_at)?,
-                    fail: n(0)?,
-                    helper: env.map_lookup_helper(),
-                },
-            )?;
+                assembler.emit_i_get_map_element(
+                    n(0)?,
+                    value(1)?,
+                    value(2)?,
+                    value(3)?,
+                    runtime,
+                )?;
+            }
             Ok(())
         }
         EmitterKind::MapElements => unreachable!("map elements were emitted before dispatch"),
@@ -2741,6 +2715,7 @@ fn emit_op(
                     .iter()
                     .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                     .collect::<Result<Vec<_>, _>>()?;
+                let updates = map_key_sort(updates, env)?;
                 assembler.emit_update_map_assoc(value(0)?, value(1)?, n(2)?, &updates, runtime)
             } else {
                 count_at_least(args, 5, op.name())?;
@@ -2753,6 +2728,7 @@ fn emit_op(
                     .iter()
                     .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                     .collect::<Result<Vec<_>, _>>()?;
+                let updates = map_key_sort(updates, env)?;
                 assembler.emit_update_map_exact(
                     value(0)?,
                     n(1)?,
@@ -2775,6 +2751,7 @@ fn emit_op(
                 .iter()
                 .map(|item| arg(Some(item), beam, env).map_err(EmitError::Operand))
                 .collect::<Result<Vec<_>, _>>()?;
+            let pairs = map_key_sort(pairs, env)?;
             assembler.emit_new_map(value(0)?, n(1)?, &pairs, env.map_runtime())
         }
         EmitterKind::MapCreate => {

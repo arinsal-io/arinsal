@@ -62,6 +62,8 @@ fn reply_return(idle: bool) -> (u64, u64, u64) {
             new_map: unused_map_update,
             update_assoc: unused_map_update,
             update_exact: unused_map_update,
+            put_single: unused_map_update,
+            update_single: unused_map_update,
         },
     )
     .unwrap();
