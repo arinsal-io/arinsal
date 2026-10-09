@@ -17,6 +17,8 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Only atoms of the static erts table: interning others here would give them
+// indices erts does not (erts creates e.g. `safe_fixed` only when it is used).
 static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock::new(|| {
     [
         "badarg",
@@ -32,9 +34,6 @@ static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock
         "public",
         "compressed",
         "binary",
-        "fixed",
-        "safe_fixed",
-        "safe_fixed_monotonic_time",
         "keypos",
         "read_concurrency",
         "write_concurrency",
@@ -57,7 +56,6 @@ static ETS_ATOMS: LazyLock<HashMap<&'static str, arinsal_term::Atom>> = LazyLock
         "owner",
         "size",
         "memory",
-        "stats",
         "node",
         "named_table",
         "true",
@@ -204,7 +202,7 @@ fn info_item_name(term: Term) -> Option<&'static str> {
         "safe_fixed_monotonic_time",
     ]
     .into_iter()
-    .find(|name| ETS_ATOMS.get(name).copied() == Some(atom))
+    .find(|name| global_atoms().text(atom) == Some(*name))
 }
 fn end_of_table(term: Term) -> bool {
     term.as_atom() == ETS_ATOMS.get("$end_of_table").copied()

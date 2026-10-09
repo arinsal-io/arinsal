@@ -962,6 +962,18 @@ fn load_dynamic(
     Ok(atom("ok"))
 }
 
+/// Run the atom side of a static NIF library's `load` callback.
+// Port of erts/emulator/beam/erl_nif.c:4980-4982 (erts_load_nif calling the
+// library's load callback), OTP-29.1.1.
+fn intern_load_atoms(module: &str) -> Result<(), VmError> {
+    for name in super::nif_load_atoms::load_atoms(module) {
+        global_atoms()
+            .intern(name)
+            .map_err(|_| VmError::Unsupported("atom table full".into()))?;
+    }
+    Ok(())
+}
+
 fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let [path, info] = *args else {
         return Err(badarg());
@@ -1039,10 +1051,12 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
     }
     let loaded = match caller.as_str() {
         "prim_file" | "prim_buffer" | "zlib" | "prim_tty" | "prim_socket" | "prim_net" => {
+            intern_load_atoms(&caller)?;
             atom("ok")
         }
         "erl_tracer" => {
             bind_tracer(vm, caller_id)?;
+            intern_load_atoms(&caller)?;
             atom("ok")
         }
         _ => {

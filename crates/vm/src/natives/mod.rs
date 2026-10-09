@@ -39,6 +39,7 @@ pub(crate) use crate::dist;
 pub(crate) mod ets;
 mod maps;
 pub(crate) mod nif;
+mod nif_load_atoms;
 mod re;
 mod records;
 pub(crate) mod tty;
