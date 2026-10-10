@@ -114,7 +114,7 @@ fn execute(
     values: [u64; 3],
 ) -> (u64, u64, u64) {
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[..3].copy_from_slice(&values);
+    arinsal_beamasm::rt::set_fixture_words(&mut registers.x_reg_array[..3], &values);
     let mut stack = [0u64; 64];
     header.stop = stack.as_mut_ptr().wrapping_add(stack.len());
     if header.fcalls == 0 {
@@ -123,7 +123,7 @@ fn execute(
     let outcome = enter_native(&mut header, &mut registers, &module.entry(label).unwrap());
     assert_eq!(outcome, ExitReason::Returned);
     (
-        registers.x_reg_array[0],
+        registers.x_reg_array[0].tagged_word(),
         header.stop as usize as u64,
         header.freason,
     )
@@ -182,7 +182,7 @@ fn light_bif_reloads_moved_heap_and_stack_before_returning() {
         ..ProcessHeader::default()
     };
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = tagged(5);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged(5));
     assert_eq!(
         enter_native(&mut header, &mut registers, &module.entry(1).unwrap()),
         ExitReason::Returned
@@ -191,11 +191,11 @@ fn light_bif_reloads_moved_heap_and_stack_before_returning() {
     let heap = MOVED_HEAP.lock().unwrap();
     assert_eq!(
         registers.x_reg_array[0],
-        stack.as_ptr().wrapping_add(1) as u64
+        arinsal_beamasm::rt::fixture_term(stack.as_ptr().wrapping_add(1) as u64)
     );
     assert_eq!(
         registers.x_reg_array[1],
-        heap.as_ptr().wrapping_add(2) as u64
+        arinsal_beamasm::rt::fixture_term(heap.as_ptr().wrapping_add(2) as u64)
     );
 }
 

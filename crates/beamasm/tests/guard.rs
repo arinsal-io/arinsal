@@ -320,8 +320,8 @@ fn run(
     second: Term,
 ) -> [u64; 1024] {
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = bits(first);
-    regs.x_reg_array[1] = bits(second);
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(first));
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(second));
     let mut stack = [0u64; 128];
     let stack_end = stack.as_mut_ptr().wrapping_add(stack.len());
     let mut header = ProcessHeader {
@@ -332,7 +332,9 @@ fn run(
     };
     let exit = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
     assert_eq!(exit, ExitReason::Returned);
-    regs.x_reg_array
+    arinsal_beamasm::rt::fixture_words(&regs.x_reg_array)
+        .try_into()
+        .unwrap()
 }
 
 fn native_predicate(
@@ -519,9 +521,9 @@ fn native_is_tagged_tuple() {
     });
     for (_, value) in &fixture.values {
         let mut regs = SchedulerRegisters::default();
-        regs.x_reg_array[0] = bits(*value);
-        regs.x_reg_array[1] = bits(small(1));
-        regs.x_reg_array[2] = bits(tag);
+        regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(*value));
+        regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(small(1)));
+        regs.x_reg_array[2] = arinsal_beamasm::rt::fixture_term(bits(tag));
         let mut stack = [0u64; 128];
         let stop = stack.as_mut_ptr().wrapping_add(stack.len());
         let mut header = ProcessHeader {
@@ -532,7 +534,10 @@ fn native_is_tagged_tuple() {
         let exit = enter_native(&mut header, &mut regs, &finalized.entry(1).unwrap());
         assert_eq!(exit, ExitReason::Returned);
         // Fixture tuple has its atom tag; the other table terms do not match.
-        assert_eq!(regs.x_reg_array[1], u64::from(*value == fixture.tuple));
+        assert_eq!(
+            regs.x_reg_array[1],
+            arinsal_beamasm::rt::fixture_term(u64::from(*value == fixture.tuple))
+        );
     }
 }
 #[test]

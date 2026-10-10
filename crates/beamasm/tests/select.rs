@@ -46,13 +46,13 @@ fn run(
     };
     let mut regs = SchedulerRegisters::default();
     regs.x_reg_array[0] = if tuple_arity.is_some() {
-        heap.as_ptr() as u64 | 2
+        arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2)
     } else {
-        source
+        arinsal_beamasm::rt::fixture_term(source)
     };
     let reason = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
     assert_eq!(reason, ExitReason::Returned);
-    regs.x_reg_array[0]
+    regs.x_reg_array[0].tagged_word()
 }
 
 fn dest(label_index: usize) -> ArgVal {

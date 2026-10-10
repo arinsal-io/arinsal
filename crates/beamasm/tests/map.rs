@@ -106,11 +106,11 @@ fn run(
         ..ProcessHeader::default()
     };
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = regs0;
-    regs.x_reg_array[1] = regs1;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(regs0);
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(regs1);
     let reason = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
     assert_eq!(reason, ExitReason::Returned);
-    regs.x_reg_array[0]
+    regs.x_reg_array[0].tagged_word()
 }
 
 fn flatmap() -> (ProcessHeap, Term, Term) {

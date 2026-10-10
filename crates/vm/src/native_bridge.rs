@@ -603,8 +603,7 @@ pub fn run_native(
         .iter_mut()
         .zip(&process.x[..count])
     {
-        // SAFETY: X register values are 64-bit tagged terms.
-        *destination = unsafe { term.raw_bits() };
+        *destination = *term;
     }
     let float_count = process.fr.len().min(registers.f_reg_array.len());
     registers.f_reg_array[..float_count].copy_from_slice(&process.fr[..float_count]);
@@ -660,8 +659,7 @@ pub fn run_native(
         .take(count)
         .zip(&registers.x_reg_array[..count])
     {
-        // SAFETY: These words were loaded from the process's X register array.
-        *destination = unsafe { Term::from_raw_bits(*raw) };
+        *destination = *raw;
     }
     if crate::native_bridge::return_trace_enabled()
         && let Some(function) = native_function_at(code_address)

@@ -74,8 +74,10 @@ const _: () = assert!(std::mem::offset_of!(ProcessHeader, high_water) == 0x70);
 /// Register backing storage addressed by BeamAsm's x19.
 #[repr(C)]
 pub struct SchedulerRegisters {
-    /// X register array; x19 points to element zero.
-    pub x_reg_array: [u64; 1024],
+    /// X register array; x19 points to element zero. Typed like erts' `Eterm *reg`, so the
+    /// runtime hands BIFs `&reg[..arity]` as their arguments without a copy.
+    // Port of erts/emulator/beam/bif.h:33-40 (BIF_ARG_n is reg[n]), OTP-29.1.1.
+    pub x_reg_array: [arinsal_term::Term; 1024],
     /// Floating point register array.
     pub f_reg_array: [f64; 1024],
     /// Scratch words accessed by runtime fragments; word 6 records the pc of a native error.
@@ -116,7 +118,7 @@ const _: () = assert!(TRAP_RETURN_OFFSET == 16496);
 impl Default for SchedulerRegisters {
     fn default() -> Self {
         Self {
-            x_reg_array: [0; 1024],
+            x_reg_array: [arinsal_term::Term::NIL; 1024],
             f_reg_array: [0.0; 1024],
             tmp_mem: [0; 8],
             match_staging: [0; 4],

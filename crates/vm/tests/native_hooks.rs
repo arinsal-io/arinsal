@@ -68,8 +68,8 @@ fn arith_overflow_makes_bignum() {
     process.x[0] = lhs;
     process.x[1] = rhs;
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = bits(lhs);
-    registers.x_reg_array[1] = bits(rhs);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(lhs));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(rhs));
     assert_eq!(
         run(&mut process, &mut registers, |asm| {
             let helper: ArithHelper = arinsal_beamasm_arith;
@@ -78,7 +78,7 @@ fn arith_overflow_makes_bignum() {
         }),
         ExitReason::Returned
     );
-    let result = from_bits(registers.x_reg_array[1]);
+    let result = from_bits(registers.x_reg_array[1].tagged_word());
     assert_eq!(result.classify(), TermKind::Number);
     assert!(matches!(
         to_owned(result).unwrap(),
@@ -94,8 +94,8 @@ fn badarith_caught_by_interpreted_try() {
     process.x[0] = lhs;
     process.x[1] = rhs;
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = bits(lhs);
-    registers.x_reg_array[1] = bits(rhs);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(lhs));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(rhs));
     assert_eq!(
         run(&mut process, &mut registers, |asm| {
             let helper: ArithHelper = arinsal_beamasm_arith;
@@ -139,8 +139,8 @@ fn compare_bignum_float_and_mixed() {
     process.x[0] = integer;
     process.x[1] = float;
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = bits(integer);
-    registers.x_reg_array[1] = bits(float);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(integer));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(float));
     run(&mut process, &mut registers, |asm| {
         let helper: GuardHelper = arinsal_beamasm_guard;
         asm.emit_is_lt(ArgVal::X(0), ArgVal::X(1), 2, helper)
@@ -159,7 +159,10 @@ fn compare_bignum_float_and_mixed() {
         .unwrap();
         asm.emit_i_func_label(3).unwrap();
     });
-    assert_eq!(registers.x_reg_array[0], bits(Term::small(1).unwrap()));
+    assert_eq!(
+        registers.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(bits(Term::small(1).unwrap()))
+    );
 }
 
 #[test]
@@ -168,7 +171,7 @@ fn gc_hook_moves_terms_and_reloads_x() {
     let big = make_big(&mut process.heap, 1_i128 << 120);
     process.x[0] = big;
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = bits(big);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(big));
     let before = registers.x_reg_array[0];
     run(&mut process, &mut registers, |asm| {
         let hook: GcHook = arinsal_beamasm_gc;
@@ -177,7 +180,7 @@ fn gc_hook_moves_terms_and_reloads_x() {
     let after = registers.x_reg_array[0];
     assert_ne!(after, before);
     assert!(matches!(
-        to_owned(from_bits(after)).unwrap(),
+        to_owned(from_bits(after.tagged_word())).unwrap(),
         arinsal_etf::OwnedTerm::BigInt(_)
     ));
 }
@@ -200,8 +203,8 @@ fn map_get_on_hashmap_via_hook() {
     process.x[0] = key;
     process.x[1] = map;
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = bits(key);
-    registers.x_reg_array[1] = bits(map);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(bits(key));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(bits(map));
     run(&mut process, &mut registers, |asm| {
         let helper: GuardHelper = arinsal_beamasm_guard;
         asm.emit_bif_map_get(
@@ -214,7 +217,10 @@ fn map_get_on_hashmap_via_hook() {
         )
         .unwrap();
     });
-    assert_eq!(from_bits(registers.x_reg_array[0]).as_small(), Some(37));
+    assert_eq!(
+        from_bits(registers.x_reg_array[0].tagged_word()).as_small(),
+        Some(37)
+    );
 }
 
 extern "C" fn unused_map_get(

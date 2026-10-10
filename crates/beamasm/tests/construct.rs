@@ -46,13 +46,16 @@ extern "C" fn moving_gc(
             let old_start = old_heap as usize;
             let old_end = old_top as usize;
             for root in regs.x_reg_array.iter_mut().take(live.min(6)) {
-                let tag = *root & 7;
+                let word = root.tagged_word();
+                let tag = word & 7;
                 if tag == 1 || tag == 2 {
-                    let pointer = (*root & !7) as usize;
+                    let pointer = (word & !7) as usize;
                     if (old_start..old_end).contains(&pointer) {
-                        *root = ((*root & !7)
-                            .wrapping_add((new_heap as usize).wrapping_sub(old_start) as u64))
-                            | tag;
+                        *root = rt::fixture_term(
+                            ((word & !7)
+                                .wrapping_add((new_heap as usize).wrapping_sub(old_start) as u64))
+                                | tag,
+                        );
                     }
                 }
             }
@@ -89,7 +92,9 @@ extern "C" fn moving_gc_with_y_root(
             let new_heap = new_area.as_mut_ptr();
             rt::copy_words(old_heap, new_heap, used);
             for root in regs.x_reg_array.iter_mut().take(live.min(6)) {
-                relocate_test_root(root, old_start, old_end, new_heap);
+                let mut word = root.tagged_word();
+                relocate_test_root(&mut word, old_start, old_end, new_heap);
+                *root = rt::fixture_term(word);
             }
             let mut y_root = 0;
             rt::copy_words(header.stop, &mut y_root, 1);
@@ -152,7 +157,12 @@ fn run_native(
     setup(&mut area, &mut header, &mut regs);
     let result = enter_native(&mut header, &mut regs, &module.entry(1).unwrap());
     assert_eq!(result, ExitReason::Returned);
-    (header, regs.x_reg_array, area, base as usize)
+    (
+        header,
+        rt::fixture_words(&regs.x_reg_array).try_into().unwrap(),
+        area,
+        base as usize,
+    )
 }
 
 fn word_ptr(words: &mut [u64], index: usize) -> *mut u64 {
@@ -163,8 +173,8 @@ fn native_put_list() {
     let (_, regs, heap, base) = run_native(
         |m, _| m.emit_put_list(ArgVal::X(0), ArgVal::X(1), ArgVal::X(2)),
         |_, _, regs| {
-            regs.x_reg_array[0] = tagged_small(13);
-            regs.x_reg_array[1] = 0x3b;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(13));
+            regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(0x3b);
         },
     );
     assert_eq!(regs[2], base as u64 | 1);
@@ -175,7 +185,7 @@ fn native_put_tuple2() {
     let (_, regs, heap, base) = run_native(
         |m, _| m.emit_put_tuple2(ArgVal::X(3), &[ArgVal::X(0), ArgVal::Immediate(0x3b)]),
         |_, _, regs| {
-            regs.x_reg_array[0] = tagged_small(4);
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(4));
         },
     );
     assert_eq!(regs[3], base as u64 | 2);
@@ -187,7 +197,7 @@ fn native_get_list() {
         |m, _| m.emit_get_list(ArgVal::X(0), ArgVal::X(1), ArgVal::X(2)),
         |heap, _, regs| {
             heap[..2].copy_from_slice(&[tagged_small(8), 0x3b]);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 1;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 1);
         },
     );
     assert_eq!((regs[1], regs[2]), (tagged_small(8), 0x3b));
@@ -255,7 +265,7 @@ fn native_get_list_alias_survives_y_frame_return() {
             header.htop = word_ptr(heap, 7);
             header.stop = word_ptr(heap, 126);
             heap[126] = arinsal_beamasm::rt::arinsal_enter_native_return as *const () as u64;
-            regs.x_reg_array[0] = base as u64 | 2;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(base as u64 | 2);
         },
     );
 
@@ -304,9 +314,10 @@ fn native_list_tail_survives_tuple_field_loads() {
                 base as u64 | 2,
                 base.wrapping_add(6) as u64 | 1,
             ]);
-            regs.x_reg_array[0] = base.wrapping_add(3) as u64 | 1;
-            regs.x_reg_array[1] = tagged_small(2);
-            regs.x_reg_array[2] = tagged_small(0);
+            regs.x_reg_array[0] =
+                arinsal_beamasm::rt::fixture_term(base.wrapping_add(3) as u64 | 1);
+            regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(2));
+            regs.x_reg_array[2] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
         },
     );
     assert_eq!(regs[0], (base as u64 + 48) | 1);
@@ -319,7 +330,7 @@ fn native_get_hd() {
         |m, _| m.emit_get_hd(ArgVal::X(0), ArgVal::X(1)),
         |heap, _, regs| {
             heap[0] = tagged_small(21);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 1;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 1);
         },
     );
     assert_eq!(regs[1], tagged_small(21));
@@ -330,7 +341,7 @@ fn native_get_tl() {
         |m, _| m.emit_get_tl(ArgVal::X(0), ArgVal::X(1)),
         |heap, _, regs| {
             heap[1] = tagged_small(22);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 1;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 1);
         },
     );
     assert_eq!(regs[1], tagged_small(22));
@@ -341,7 +352,7 @@ fn native_get_tuple_element() {
         |m, _| m.emit_get_tuple_element(ArgVal::X(0), 16, ArgVal::X(1)),
         |heap, _, regs| {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(3), tagged_small(9)]);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
         },
     );
     assert_eq!(regs[1], tagged_small(9));
@@ -352,7 +363,7 @@ fn native_i_get_tuple_element2() {
         |m, _| m.emit_i_get_tuple_element2(ArgVal::X(0), 8, ArgVal::X(1)),
         |heap, _, regs| {
             heap[1] = tagged_small(31);
-            regs.x_reg_array[0] = heap.as_ptr() as u64;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64);
         },
     );
     assert_eq!(regs[1], tagged_small(31));
@@ -362,13 +373,14 @@ fn native_load_tuple_ptr() {
     let (_, regs, _, base) = run_native(
         |m, _| m.emit_load_tuple_ptr(ArgVal::X(0), ArgVal::X(1)),
         |heap, _, regs| {
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
         },
     );
     // OTP leaves the tagged source register alone and parks the untagged
     // pointer in ARG1 (x0), not in an X register.
     assert_eq!(regs[0], base as u64 | 2);
-    assert_eq!(regs[1], 0);
+    // X1 keeps its initial value.
+    assert_eq!(regs[1], arinsal_term::Term::NIL.tagged_word());
 }
 
 #[test]
@@ -386,7 +398,7 @@ fn tuple_pointer_operation_preserves_y_root_across_moving_gc() {
             header.htop = word_ptr(area, 3);
             header.hend = word_ptr(area, 4);
             header.stop = word_ptr(area, 8);
-            regs.x_reg_array[0] = area.as_ptr() as u64 | 2;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(area.as_ptr() as u64 | 2);
         },
     );
     assert_eq!(Y_ROOT_GC_CALLS.load(Ordering::SeqCst), 1);
@@ -399,8 +411,8 @@ fn native_set_tuple_element() {
         |m, _| m.emit_set_tuple_element(ArgVal::X(1), ArgVal::X(0), 16),
         |heap, _, regs| {
             heap[2] = tagged_small(1);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
-            regs.x_reg_array[1] = tagged_small(42);
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
+            regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(42));
         },
     );
     assert_eq!(heap[2], tagged_small(42));
@@ -419,7 +431,7 @@ fn native_update_record() {
         |heap, header, regs| {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(5), tagged_small(6)]);
             header.htop = word_ptr(heap, 3);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
         },
     );
     assert_eq!(regs[1], (base + 24) as u64 | 2);
@@ -433,8 +445,8 @@ fn native_update_record_in_place_reuses_young_tuple() {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(5), tagged_small(6)]);
             header.htop = word_ptr(heap, 3);
             header.high_water = word_ptr(heap, 0);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
-            regs.x_reg_array[2] = tagged_small(42);
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
+            regs.x_reg_array[2] = arinsal_beamasm::rt::fixture_term(tagged_small(42));
         },
     );
     assert_eq!(regs[1], base as u64 | 2);
@@ -452,8 +464,8 @@ fn native_update_record_in_place_copies_old_tuple() {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(5), tagged_small(6)]);
             header.htop = word_ptr(heap, 3);
             header.high_water = word_ptr(heap, 3);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
-            regs.x_reg_array[2] = tagged_small(42);
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
+            regs.x_reg_array[2] = arinsal_beamasm::rt::fixture_term(tagged_small(42));
         },
     );
     assert_eq!(regs[1], (base + 24) as u64 | 2);
@@ -477,7 +489,7 @@ fn native_test_heap() {
             header.htop = word_ptr(heap, 2);
             header.stop = word_ptr(heap, 2);
             header.hend = word_ptr(heap, 2);
-            regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
+            regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
         },
     );
     assert!(GC_CALLS.load(Ordering::SeqCst) > before);

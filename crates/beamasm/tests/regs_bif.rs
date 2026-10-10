@@ -60,7 +60,10 @@ fn record(process: *mut ProcessHeader) {
     let regs = SCHEDULER_REGS.load(Ordering::Relaxed) as *mut SchedulerRegisters;
     arinsal_beamasm::rt::scheduler_registers_mut(regs, |registers| {
         for (index, seen) in SEEN_XREGS.iter().enumerate() {
-            seen.store(registers.x_reg_array[index] as usize, Ordering::Relaxed);
+            seen.store(
+                registers.x_reg_array[index].tagged_word() as usize,
+                Ordering::Relaxed,
+            );
         }
     });
 }
@@ -86,7 +89,7 @@ fn execute(emit: impl FnOnce(&mut BeamModuleAssembler)) -> (ProcessHeader, Sched
     header.stop = stack.as_mut_ptr().wrapping_add(stack.len());
     header.fcalls = 77;
     for index in 0..6 {
-        registers.x_reg_array[index] = 0x1000 + index as u64;
+        registers.x_reg_array[index] = arinsal_beamasm::rt::fixture_term(0x1000 + index as u64);
     }
     SCHEDULER_REGS.store(registers.x_reg_array.as_ptr() as usize, Ordering::Relaxed);
     SEEN_HTOP.store(0, Ordering::Relaxed);
@@ -105,7 +108,10 @@ fn execute(emit: impl FnOnce(&mut BeamModuleAssembler)) -> (ProcessHeader, Sched
 fn assert_registers(registers: &SchedulerRegisters, written_xreg: Option<usize>) {
     for index in 0..6 {
         if Some(index) != written_xreg {
-            assert_eq!(registers.x_reg_array[index], 0x1000 + index as u64);
+            assert_eq!(
+                registers.x_reg_array[index],
+                arinsal_beamasm::rt::fixture_term(0x1000 + index as u64)
+            );
         }
     }
     for (index, seen) in SEEN_XREGS.iter().enumerate() {

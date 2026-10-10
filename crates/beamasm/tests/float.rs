@@ -47,8 +47,8 @@ fn execute(
     let mut heap = [0_u64; 16];
     let mut stack = [0_u64; 32];
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = terms[0];
-    registers.x_reg_array[1] = terms[1];
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(terms[0]);
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(terms[1]);
     registers.f_reg_array[..8].copy_from_slice(&float_regs);
     let mut header = ProcessHeader {
         htop: heap.as_mut_ptr(),
@@ -62,7 +62,9 @@ fn execute(
         enter_native(&mut header, &mut registers, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
-    let result_offset = registers.x_reg_array[1].wrapping_sub(heap.as_ptr() as u64) as usize;
+    let result_offset = registers.x_reg_array[1]
+        .tagged_word()
+        .wrapping_sub(heap.as_ptr() as u64) as usize;
     (header, registers, heap, result_offset)
 }
 

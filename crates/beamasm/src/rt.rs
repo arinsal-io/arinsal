@@ -5,8 +5,25 @@ use core::ffi::c_void;
 
 /// Returns the tagged word for a test-owned term whose heap remains live.
 pub fn term_bits(term: arinsal_term::Term) -> u64 {
-    // SAFETY: Callers use terms created by TermBuilder and retain their owning heap.
-    unsafe { term.raw_bits() }
+    term.tagged_word()
+}
+
+/// Rebuilds a term from a tagged word a test fixture built, for the typed X register array.
+pub fn fixture_term(bits: u64) -> arinsal_term::Term {
+    // SAFETY: Fixtures pass immediates or tagged pointers into heaps they retain for the call.
+    unsafe { arinsal_term::Term::from_raw_bits(bits) }
+}
+
+/// Tagged words of typed registers, for comparing them with fixture words.
+pub fn fixture_words(terms: &[arinsal_term::Term]) -> Vec<u64> {
+    terms.iter().map(|term| term.tagged_word()).collect()
+}
+
+/// Stores fixture words into typed registers.
+pub fn set_fixture_words(terms: &mut [arinsal_term::Term], words: &[u64]) {
+    for (term, &word) in terms.iter_mut().zip(words) {
+        *term = fixture_term(word);
+    }
 }
 
 /// Reads a tuple view for a test-owned term with a live owner heap.

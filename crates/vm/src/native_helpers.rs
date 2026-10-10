@@ -4,6 +4,8 @@ use arinsal_beamasm::ProcessHeader;
 use arinsal_bits::MatchOps;
 use arinsal_term::Term;
 
+use crate::beamasm_integration::ExportDispatch;
+
 struct StaticNif {
     module: String,
     function: String,
@@ -527,7 +529,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
         .zip(registers.x_reg_array.iter().copied())
         .take(usize::from(nif.arity))
     {
-        *destination = crate::native_hooks::from_raw(raw);
+        *destination = raw;
     }
     // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif / erts_call_dirty_nif),
     // OTP-29.1.1: a dirty NIF called on a normal scheduler first moves the process to a
@@ -604,25 +606,24 @@ fn trap_to_dirty_nif(
 
 /// Dispatches a BIF export from the shared export trampoline.
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_export_trampoline(
+pub(crate) extern "C" fn arinsal_beamasm_export_trampoline(
     header: *mut ProcessHeader,
     identity: u64,
-    info: u64,
+    export: Option<ExportDispatch>,
 ) -> u64 {
     // THE_NON_VALUE raises, 1 hands the call to the interpreter, any term word is the result.
-    invoke_dispatch_bif(header, identity as usize, 0, info as usize, true).unwrap_or(1)
+    invoke_dispatch_bif(header, identity as usize, 0, export, true).unwrap_or(1)
 }
 
 /// Records the remote call of a process saving calls (the export entry is `identity`) and
 /// returns the address the call continues with.
 // Port of erts/emulator/beam/jit/arm/instr_call.cpp:123-148 (emit_dispatch_save_calls_export),
 // OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_save_calls_export(
+pub(crate) extern "C" fn arinsal_beamasm_save_calls_export(
     header: *mut ProcessHeader,
     _identity: u64,
-    info: u64,
+    export: Option<ExportDispatch>,
 ) -> u64 {
-    let export = crate::beamasm_integration::export_descriptor(info as usize);
     if let Some(export) = export
         && let Some((process, _registers)) = crate::native_hooks::process_and_registers(header)
     {
@@ -636,21 +637,16 @@ pub extern "C" fn arinsal_beamasm_save_calls_export(
 
 /// Runs a light BIF through the shared BeamAsm fragment.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_call_light_bif_shared(
+// The call site passes the export's descriptor like erts passes the Export*; the send and
+// breakpoint identities pass none.
+pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
     header: *mut ProcessHeader,
     identity: u64,
     site: u64,
-    info: u64,
+    export: Option<ExportDispatch>,
 ) -> u64 {
-    // `site` is only meaningful for the breakpoint trampoline, `info` only for a BIF call.
-    invoke_dispatch_bif(
-        header,
-        identity as usize,
-        site as usize,
-        info as usize,
-        false,
-    )
-    .unwrap_or(0)
+    // `site` is only meaningful for the breakpoint trampoline.
+    invoke_dispatch_bif(header, identity as usize, site as usize, export, false).unwrap_or(0)
 }
 
 /// Reads the active process dictionary for native `i_get` instructions.
@@ -752,7 +748,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
         process.x = x.into_boxed_slice();
     }
     for index in 6..synced {
-        process.x[index] = crate::native_hooks::from_raw(registers.x_reg_array[index]);
+        process.x[index] = registers.x_reg_array[index];
     }
     let result = process.ensure(need_words, live);
     if result.is_err() {
@@ -766,7 +762,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
         .zip(process.x.iter())
         .take(live)
     {
-        *destination = crate::native_hooks::raw(*term);
+        *destination = *term;
     }
     process.sync_native_header();
     // Port of erts/emulator/beam/erl_gc.c:588-597 and 975-980 (a delayed collection
@@ -789,7 +785,7 @@ fn invoke_dispatch_bif(
     header: *mut ProcessHeader,
     identity: usize,
     site: usize,
-    info: usize,
+    export: Option<ExportDispatch>,
     export_call: bool,
 ) -> Option<u64> {
     // The BIF reads its arguments from the register array; only the paths that work on
@@ -797,30 +793,15 @@ fn invoke_dispatch_bif(
     // The frame pointer matters only to a collection, so the paths that may collect publish
     // it themselves; a plain BIF leaves E (x29) as it was, like erts.
     let (process, registers) = crate::native_hooks::enter_runtime(header)?;
-    if identity != arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
-        && identity != arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY
-        && arinsal_beamasm::dispatch::decode_line_breakpoint_identity(identity).is_none()
+    if let Some(export) = export
+        && let Some(bif) = export.light_bif
         && (export_call
             || registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64)
-        && let Some(export) = crate::beamasm_integration::export_descriptor(info)
-        && export.direct_ets.is_none()
-        && !runs_in_executor(export)
         && !crate::trace_bp::any_pattern()
-        && let Some(bif) = export.bif
     {
         return Some(call_plain_bif(process, registers, export, bif, export_call));
     }
-    invoke_dispatch_bif_slow(process, registers, identity, site, info, export_call)
-}
-
-/// Trapping BIFs keep continuation state that only the executor's call site handles.
-fn runs_in_executor(export: crate::beamasm_integration::ExportDispatch) -> bool {
-    matches!(
-        export.class,
-        arinsal_loader::ImportClass::Native
-            | arinsal_loader::ImportClass::Dynamic
-            | arinsal_loader::ImportClass::Fun
-    ) || export.trap_entry
+    invoke_dispatch_bif_slow(process, registers, identity, site, export, export_call)
 }
 
 #[cold]
@@ -830,7 +811,7 @@ fn invoke_dispatch_bif_slow(
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     identity: usize,
     site: usize,
-    info: usize,
+    export: Option<ExportDispatch>,
     export_call: bool,
 ) -> Option<u64> {
     process
@@ -913,7 +894,7 @@ fn invoke_dispatch_bif_slow(
     }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared gets the
     // export and its BIF from the call site), OTP-29.1.1.
-    let export = crate::beamasm_integration::export_descriptor(info)?;
+    let export = export?;
     if saving_calls {
         crate::trace::save_call(
             process,
@@ -934,8 +915,7 @@ fn invoke_dispatch_bif_slow(
             registers.x_reg_array[1],
             registers.x_reg_array[2],
             registers.x_reg_array[3],
-        ]
-        .map(crate::native_hooks::from_raw);
+        ];
         if let Some(value) = direct(process, &args[..arity]) {
             process.reductions = process.header.fcalls;
             if export_call {
@@ -966,7 +946,7 @@ fn invoke_dispatch_bif_slow(
         }
     }
 
-    if runs_in_executor(export)
+    if export.runs_in_executor()
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif trace trampolines),
         // OTP-29.1.1: a traced BIF runs in the executor, which has the trace context.
         || (crate::trace_bp::any_pattern()
@@ -991,7 +971,7 @@ fn invoke_dispatch_bif_slow(
 fn call_plain_bif(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: crate::beamasm_integration::ExportDispatch,
+    export: ExportDispatch,
     bif: arinsal_bifs::BifFn,
     export_call: bool,
 ) -> u64 {
@@ -1000,51 +980,49 @@ fn call_plain_bif(
         charge_bif_reductions(process, 1);
     }
     let arity = usize::from(export.arity);
-    if arity > process.x.len() {
-        crate::native_hooks::set_error(process, "system_limit");
-        return 0;
-    }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
-    // OTP-29.1.1: the BIF reads its arguments from the register array (BIF_ARG_n is reg[n]);
-    // no per-call allocation.
-    const INLINE_ARGS: usize = 8;
-    if arity > INLINE_ARGS {
-        return call_wide_plain_bif(process, registers, export, bif, arity);
+    // OTP-29.1.1: the BIF reads its arguments from the register array (BIF_ARG_n is reg[n]).
+    // A BIF leaves E alone, so only HTOP is read back after it.
+    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    // The result is matched where the BIF wrote it: moving it first would read it back with
+    // wider loads than the BIF's stores.
+    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
+    let reductions = ctx.reductions();
+    charge_bif_reductions(process, reductions);
+    let top = process.heap.heap_top_index();
+    // ERTS_IS_GC_DESIRED_INTERNAL: a value with no collection desired goes straight back to
+    // XREG0, and only the cursors the call changed are stored for the reload.
+    if let Ok(value) = &result
+        && stop - top >= process.heap.mbuf_size()
+        && !process.heap.bin_vheap_gc_due()
+    {
+        let value = *value;
+        registers.x_reg_array[0] = value;
+        if top != entry_top {
+            process.header.htop = process.heap.word_address(top);
+        }
+        if process.header.fcalls != process.reductions {
+            process.header.fcalls = process.reductions;
+        }
+        return crate::native_hooks::raw(value);
     }
-    let mut args: [Term; INLINE_ARGS] =
-        std::array::from_fn(|index| crate::native_hooks::from_raw(registers.x_reg_array[index]));
-    run_plain_bif(process, registers, export, bif, &mut args[..arity])
+    plain_bif_result(process, registers, export, arity, result)
 }
 
+/// An error, or a value after which a collection is desired.
 #[cold]
 #[inline(never)]
-fn call_wide_plain_bif(
+fn plain_bif_result(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: crate::beamasm_integration::ExportDispatch,
-    bif: arinsal_bifs::BifFn,
+    export: ExportDispatch,
     arity: usize,
+    mut result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
-    let mut args: Vec<Term> = registers.x_reg_array[..arity]
-        .iter()
-        .copied()
-        .map(crate::native_hooks::from_raw)
-        .collect();
-    run_plain_bif(process, registers, export, bif, &mut args)
-}
-
-#[inline(always)]
-fn run_plain_bif(
-    process: &mut crate::Process,
-    registers: &mut arinsal_beamasm::SchedulerRegisters,
-    export: crate::beamasm_integration::ExportDispatch,
-    bif: arinsal_bifs::BifFn,
-    args: &mut [Term],
-) -> u64 {
-    let (mut result, reductions) = crate::calls::call_bif_metered(&mut process.heap, bif, args);
-    charge_bif_reductions(process, reductions);
     let collected = process.gc_enabled && process.heap.gc_desired();
-    if collected && !gc_after_plain_bif(process, registers, args, &mut result) {
+    if collected && !gc_after_plain_bif(process, registers, arity, &mut result) {
         return 0;
     }
     match result {
@@ -1055,7 +1033,7 @@ fn run_plain_bif(
             if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
                 return collect_after_plain_bif(process, registers, value);
             }
-            registers.x_reg_array[0] = value;
+            registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
             if collected {
                 process.sync_native_header();
             } else {
@@ -1063,7 +1041,7 @@ fn run_plain_bif(
             }
             value
         }
-        Err(error) => plain_bif_error(process, export, args, error),
+        Err(error) => plain_bif_error(process, export, &registers.x_reg_array[..arity], error),
     }
 }
 
@@ -1076,18 +1054,18 @@ fn run_plain_bif(
 fn gc_after_plain_bif(
     process: &mut crate::Process,
     registers: &mut arinsal_beamasm::SchedulerRegisters,
-    args: &mut [Term],
+    arity: usize,
     result: &mut Result<Term, arinsal_bifs::BifError>,
 ) -> bool {
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
+    let args = &mut registers.x_reg_array[..arity];
     for (destination, term) in process.x.iter_mut().zip(args.iter()) {
         *destination = *term;
     }
     let collected = crate::calls::gc_after_bif(process, args, result);
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    store_dispatch_args(registers, args);
     if collected.is_err() {
         crate::native_hooks::set_error(process, "system_limit");
         process.sync_native_header();
@@ -1109,13 +1087,13 @@ fn collect_after_plain_bif(
     process.x[0] = value_term(value);
     if process.collect_bin_vheap_if_due(1).is_err() {
         crate::native_hooks::set_error(process, "system_limit");
-        registers.x_reg_array[0] = value;
+        registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
         process.sync_native_header();
         return 0;
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     let value = crate::native_hooks::raw(process.x[0]);
-    registers.x_reg_array[0] = value;
+    registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
     process.sync_native_header();
     value
 }
@@ -1124,7 +1102,7 @@ fn collect_after_plain_bif(
 #[inline(never)]
 fn plain_bif_error(
     process: &mut crate::Process,
-    export: crate::beamasm_integration::ExportDispatch,
+    export: ExportDispatch,
     args: &[Term],
     error: arinsal_bifs::BifError,
 ) -> u64 {
@@ -1143,20 +1121,18 @@ fn charge_bif_reductions(process: &mut crate::Process, reductions: u32) {
 
 /// Calls a plain BIF named by its export's descriptor word (`i_bif1/2/3`, `nofail_bif1/2`).
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:110-200, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_bif_by_identity(
+pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
     header: *mut ProcessHeader,
-    info: u64,
+    export: Option<ExportDispatch>,
     first: u64,
     second: u64,
     third: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+    // A guard BIF never collects (erts calls it with only Update::eReductions), so E (x29)
+    // and the frame pointer stay as they were.
+    let Some((process, _registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
-    let export = crate::beamasm_integration::export_descriptor(info as usize);
     let Some((bif, arity)) = export.and_then(|export| Some((export.bif?, export.arity))) else {
         crate::native_hooks::set_error(process, "undef");
         return 0;
@@ -1164,10 +1140,20 @@ pub extern "C" fn arinsal_beamasm_bif_by_identity(
     let all_args = [first, second, third].map(crate::native_hooks::from_raw);
     let args = &all_args[..usize::from(arity).min(all_args.len())];
     process.reductions = process.header.fcalls;
-    let (result, reductions) = crate::calls::call_bif_metered(&mut process.heap, bif, args);
+    let entry_top = process.heap.heap_top_index();
+    // Matched where the BIF wrote it, like the light BIF path.
+    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    let result = bif(&mut ctx, args);
+    let reductions = ctx.reductions();
     charge_bif_reductions(process, reductions);
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    process.sync_native_header();
+    let top = process.heap.heap_top_index();
+    if top != entry_top {
+        process.header.htop = process.heap.word_address(top);
+    }
+    if process.header.fcalls != process.reductions {
+        process.header.fcalls = process.reductions;
+    }
     match result {
         Ok(value) => crate::native_hooks::raw(value),
         Err(error) => {
@@ -1223,7 +1209,7 @@ fn set_call_fun_error(
         .zip(registers.x_reg_array.iter().copied())
         .take(arity)
     {
-        *destination = crate::native_hooks::from_raw(raw);
+        *destination = raw;
     }
     process.x[arity] = fun;
     match crate::funs::call_error_reason(process, fun, arity) {
@@ -1244,14 +1230,7 @@ fn load_dispatch_x(process: &mut crate::Process, registers: &arinsal_beamasm::Sc
         .zip(registers.x_reg_array.iter().copied())
         .take(6)
     {
-        *destination = crate::native_hooks::from_raw(raw);
-    }
-}
-
-/// Stores the argument registers a collection after a BIF moved.
-fn store_dispatch_args(registers: &mut arinsal_beamasm::SchedulerRegisters, args: &[Term]) {
-    for (destination, term) in registers.x_reg_array.iter_mut().zip(args) {
-        *destination = crate::native_hooks::raw(*term);
+        *destination = raw;
     }
 }
 
@@ -1265,7 +1244,7 @@ fn publish_dispatch_x(
         .zip(process.x.iter())
         .take(6)
     {
-        *destination = crate::native_hooks::raw(*term);
+        *destination = *term;
     }
 }
 
@@ -1439,8 +1418,8 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
         process.sync_native_header();
         return 0;
     }
-    let module = crate::native_hooks::from_raw(registers.x_reg_array[arity]);
-    let function = crate::native_hooks::from_raw(registers.x_reg_array[arity + 1]);
+    let module = registers.x_reg_array[arity];
+    let function = registers.x_reg_array[arity + 1];
     // Port of erts/emulator/beam/beam_common.c:1554-1557 (fixed_apply), OTP-29.1.1: an
     // apply of erlang:apply/3 is a plain apply/3 of its arguments.
     if arity == 3
@@ -1597,7 +1576,7 @@ fn arinsal_beamasm_map_change(
     if source_slot >= registers.x_reg_array.len() {
         return 0;
     }
-    registers.x_reg_array[source_slot] = source;
+    registers.x_reg_array[source_slot] = crate::native_hooks::from_raw(source);
     let map = crate::native_hooks::from_raw(source);
     let need = match change {
         MapChange::New => arinsal_maps::new_map_need(n),
@@ -1607,7 +1586,7 @@ fn arinsal_beamasm_map_change(
     if process.heap.words_left() < need {
         // X registers between the live prefix and the staged vector are dead and may hold
         // stale words; they must not become GC roots.
-        registers.x_reg_array[live..base].fill(crate::native_hooks::raw(Term::NIL));
+        registers.x_reg_array[live..base].fill(Term::NIL);
         if crate::native_hooks::collect_native(process, registers, need, source_slot + 1).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
             process.sync_native_header();
@@ -1615,8 +1594,8 @@ fn arinsal_beamasm_map_change(
         }
     }
     let x = &registers.x_reg_array;
-    let arg = |i: usize| crate::native_hooks::from_raw(x[base + i]);
-    let map = crate::native_hooks::from_raw(x[source_slot]);
+    let arg = |i: usize| x[base + i];
+    let map = x[source_slot];
     let mut heap = crate::FragmentingHeap(&mut process.heap);
     let result = match change {
         MapChange::New => arinsal_maps::gc_new_map(n, arg, &mut heap),
@@ -1677,7 +1656,7 @@ pub extern "C" fn arinsal_beamasm_map_get(
         .zip(process.x.iter())
         .take(6)
     {
-        *destination = crate::native_hooks::raw(*term);
+        *destination = *term;
     }
     process.sync_native_header();
     match result {
@@ -1709,12 +1688,12 @@ pub extern "C" fn arinsal_beamasm_map_get_elements(
         return 0;
     };
     for index in 0..count {
-        let key = crate::native_hooks::from_raw(registers.x_reg_array[base as usize + index * 3]);
+        let key = registers.x_reg_array[base as usize + index * 3];
         let result = arinsal_maps::get(crate::native_hooks::from_raw(map), key);
         let Ok(Some(value)) = result else {
             return 0;
         };
-        registers.x_reg_array[base as usize + 1 + index * 3] = crate::native_hooks::raw(value);
+        registers.x_reg_array[base as usize + 1 + index * 3] = value;
     }
     process.sync_native_header();
     1
@@ -1758,7 +1737,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         process.x[index] = if (live..base_slot).contains(&index) {
             Term::NIL
         } else {
-            crate::native_hooks::from_raw(*slot)
+            *slot
         };
     }
     let all = crate::signals::atom("all");
@@ -1844,7 +1823,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         .iter_mut()
         .zip(process.x.iter())
     {
-        *slot = crate::native_hooks::raw(*term);
+        *slot = *term;
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     process.sync_native_header();
@@ -1889,7 +1868,7 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
     // roots of a collection; the staged copies follow the registers in `process.x`.
     // Port of erts/emulator/beam/jit/arm/instr_bs.cpp (emit_gc_test_preserve), OTP-29.1.1.
     for (index, slot) in registers.x_reg_array[..base].iter().enumerate() {
-        process.x[index] = crate::native_hooks::from_raw(*slot);
+        process.x[index] = *slot;
     }
     for (index, slot) in registers.match_staging.iter().enumerate() {
         process.x[base + index] = crate::native_hooks::from_raw(*slot);
@@ -1977,7 +1956,7 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
         .iter_mut()
         .zip(process.x.iter())
     {
-        *slot = crate::native_hooks::raw(*term);
+        *slot = *term;
     }
     for (index, slot) in registers.match_staging.iter_mut().enumerate() {
         *slot = crate::native_hooks::raw(process.x[base + index]);
@@ -2137,7 +2116,7 @@ pub extern "C" fn arinsal_beamasm_bs_match(
         .zip(process.x.iter())
         .take(6)
     {
-        *destination = crate::native_hooks::raw(*term);
+        *destination = *term;
     }
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     process.sync_native_header();

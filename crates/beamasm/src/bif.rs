@@ -9,10 +9,11 @@ use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 /// BIF target supplied by the runtime.
 pub type BifTarget = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u32) -> u64;
 
-/// Runtime hook calling the BIF of an export. Arguments: process, the export's `info` word (see
-/// [`ExportEntry::info`]), then up to three argument terms. Zero means an exception is pending in
-/// `freason`.
-pub type BifIdentityHelper = extern "C" fn(*mut crate::ProcessHeader, u64, u64, u64, u64) -> u64;
+/// Address of the runtime hook calling the BIF of an export, an
+/// `extern "C" fn(process, descriptor, a1, a2, a3) -> u64` whose descriptor is the export's
+/// `info` word (see [`ExportEntry::info`]) typed by the runtime, then up to three argument
+/// terms. Zero means an exception is pending in `freason`.
+pub type BifIdentityHelper = usize;
 
 /// Apply resolver supplied by the runtime; zero means the target could not be resolved.
 pub type ApplyResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32) -> usize;
@@ -72,7 +73,8 @@ impl ExportEntry {
         }
     }
 
-    /// The runtime descriptor word published by [`ExportEntry::set_info`]; zero before it.
+    /// The runtime descriptor word published by [`ExportEntry::set_info`]: the address of the
+    /// runtime's export descriptor, zero before it.
     pub fn info(&self) -> usize {
         self.info.load(Ordering::Acquire)
     }
@@ -389,7 +391,7 @@ impl BeamModuleAssembler {
                     e.mov_reg(Gpr::x(index as u8 + 2), reg)?;
                 }
             }
-            e.mov_const(Gpr::x(17), helper as usize as u64)?;
+            e.mov_const(Gpr::x(17), helper as u64)?;
             e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
             e.blr(Gpr::x(17))
         })?;

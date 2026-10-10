@@ -12,7 +12,7 @@ use arinsal_beamjit::{
 use arinsal_term::{Term, TermBuilder, VecHeap, from_owned, global_atoms};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock, Weak};
 
 type Mfa = (String, String, u8);
@@ -127,6 +127,21 @@ pub(crate) struct DispatchTarget {
     pub trap_entry: bool,
     /// Runs the BIF inside native code, see `natives::ets::DirectEts`.
     pub direct_ets: Option<crate::natives::ets::DirectEts>,
+    /// The BIF a light BIF call runs straight away: set when it neither traps nor runs in
+    /// the executor nor on the table fast path, so the call checks one word.
+    pub light_bif: Option<arinsal_bifs::BifFn>,
+}
+
+impl DispatchTarget {
+    /// Trapping BIFs keep continuation state that only the executor's call site handles.
+    pub(crate) fn runs_in_executor(&self) -> bool {
+        matches!(
+            self.class,
+            arinsal_loader::ImportClass::Native
+                | arinsal_loader::ImportClass::Dynamic
+                | arinsal_loader::ImportClass::Fun
+        ) || self.trap_entry
+    }
 }
 
 /// One node's export state, like an erts code index: import slots, interpreted and native
@@ -156,51 +171,20 @@ struct DispatchRegistry {
 impl DispatchRegistry {
     fn intern_identity(&mut self, identity: usize, entry: &Arc<DispatchTarget>) {
         self.by_identity.entry(identity).or_insert_with(|| {
-            let target: &'static DispatchTarget = Box::leak(Box::new(DispatchTarget::clone(entry)));
-            // The slot names its descriptor, so native calls reach it without a lookup.
-            if let Some(info) = publish_descriptor(target) {
-                target.slot.set_info(info);
-            }
+            let mut leaked = DispatchTarget::clone(entry);
+            leaked.light_bif = leaked
+                .bif
+                .filter(|_| leaked.direct_ets.is_none() && !leaked.runs_in_executor());
+            let target: &'static DispatchTarget = Box::leak(Box::new(leaked));
+            // Port of erts/emulator/beam/export.h:38-58 (Export), OTP-29.1.1: the slot holds
+            // its descriptor's address, which generated code passes to the runtime helpers
+            // as a typed reference, like erts passes the Export* itself.
+            target
+                .slot
+                .set_info(std::ptr::from_ref::<DispatchTarget>(target) as usize);
             target
         });
     }
-}
-
-/// Descriptors of every export a native call site can name, indexed by the `info` word of its
-/// export slot. Append-only: an index stays valid for the life of the VM, like the export
-/// table entries erts never frees.
-// Port of erts/emulator/beam/export.c:48-70 (export_tables: an index table whose entries keep
-// their address), OTP-29.1.1.
-const DESCRIPTOR_CHUNK: usize = 4096;
-const DESCRIPTOR_CHUNKS: usize = 1024;
-
-type DescriptorChunk = Box<[OnceLock<&'static DispatchTarget>]>;
-
-static DESCRIPTORS: [OnceLock<DescriptorChunk>; DESCRIPTOR_CHUNKS] =
-    [const { OnceLock::new() }; DESCRIPTOR_CHUNKS];
-// Index zero stays unused: an export slot's `info` is zero until its descriptor is published.
-static NEXT_DESCRIPTOR: AtomicUsize = AtomicUsize::new(1);
-
-fn publish_descriptor(target: &'static DispatchTarget) -> Option<usize> {
-    let info = NEXT_DESCRIPTOR.fetch_add(1, Ordering::Relaxed);
-    let chunk = DESCRIPTORS.get(info / DESCRIPTOR_CHUNK)?.get_or_init(|| {
-        (0..DESCRIPTOR_CHUNK)
-            .map(|_| OnceLock::new())
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-    });
-    chunk.get(info % DESCRIPTOR_CHUNK)?.set(target).ok()?;
-    Some(info)
-}
-
-/// The export descriptor an export slot's `info` word names.
-pub(crate) fn export_descriptor(info: usize) -> Option<ExportDispatch> {
-    DESCRIPTORS
-        .get(info / DESCRIPTOR_CHUNK)?
-        .get()?
-        .get(info % DESCRIPTOR_CHUNK)?
-        .get()
-        .copied()
 }
 
 fn dispatch_registry() -> &'static RwLock<DispatchRegistry> {
@@ -301,6 +285,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 bif: import.bif_fn(),
                 class,
                 native_bits: bits,
+                light_bif: None,
             })
         }));
         let identity = Arc::as_ptr(&entry.slot) as usize;
@@ -336,6 +321,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             bif,
             class,
             native_bits: bits,
+            light_bif: None,
         })
     }));
     let identity = Arc::as_ptr(&entry.slot) as usize;
@@ -1224,7 +1210,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
         }
     }
     fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {
-        crate::native_helpers::arinsal_beamasm_bif_by_identity
+        crate::native_helpers::arinsal_beamasm_bif_by_identity as *const () as usize
     }
     fn plain_bif_identity(&self, _beam: &BeamFile, index: u32) -> Option<usize> {
         let identity = *self.export_entries.get(index as usize)?;
