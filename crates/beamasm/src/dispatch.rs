@@ -388,10 +388,11 @@ fn emit_unloaded_fun_fragment(
     helper: usize,
     raise_exception: arinsal_a64::buf::Label,
 ) -> Result<(), BufferError> {
+    let error = code.new_label();
     code.emit(|encoder| {
-        // As the export trampoline: the continuation is the exception pc on E, under a host
-        // frame the raise fragment pops.
-        encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
+        // emit_enter_runtime_frame: only a native frame. E stays the caller's, so the runtime
+        // sees the caller's stack like beam_jit_handle_unloaded_fun does in erts; the
+        // continuation (erts keeps ARG5 in TMP_MEM1q) is saved in the native frame.
         encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
         encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
         encoder.stp(Gpr::x(2), Gpr::x(4), Gpr::sp(), 16)
@@ -406,15 +407,21 @@ fn emit_unloaded_fun_fragment(
         encoder.mov_reg(Gpr::x(17), Gpr::x(0))
     })?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
-    code.emit(|encoder| encoder.cmp_imm(Gpr::x(17), 0, false))?;
-    code.b_cond(Cond::Eq, raise_exception)?;
+    code.cbz(Gpr::x(17), error)?;
     code.emit(|encoder| {
         encoder.ldp(Gpr::x(2), Gpr::x(4), Gpr::sp(), 16)?;
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
-        encoder.add_imm(Gpr::x(20), Gpr::x(20), 8, false)?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.br(Gpr::x(17))
-    })
+    })?;
+    code.bind(error)?;
+    // erts raises with ARG2 = the saved call site; the shared raise fragment here reads the
+    // exception pc from the top of E and pops the native frame itself.
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 8)?;
+        encoder.str_pre(Gpr::x(9), Gpr::x(20), -8)
+    })?;
+    code.b(raise_exception)
 }
 
 /// Continues a local fun call of a process saving calls with its node's active code index.
