@@ -645,10 +645,9 @@ impl ProcessHeap {
         let top = (htop as usize).wrapping_sub(base) >> 3;
         let stack = (stop as usize).wrapping_sub(base) >> 3;
         debug_assert_eq!((htop as usize | stop as usize).wrapping_sub(base) % 8, 0);
-        assert!(
-            top <= stack && stack <= self.words.len(),
-            "native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}"
-        );
+        if !(top <= stack && stack <= self.words.len()) {
+            native_cursors_outside_heap(htop, stop, base);
+        }
         self.htop = top;
         self.stop = stack;
     }
@@ -1841,4 +1840,11 @@ impl Term {
             None
         }
     }
+}
+
+/// Kept out of line so the light BIF path that syncs the cursors needs no formatting frame.
+#[cold]
+#[inline(never)]
+fn native_cursors_outside_heap(htop: *mut u64, stop: *mut u64, base: usize) -> ! {
+    panic!("native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}")
 }

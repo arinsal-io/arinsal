@@ -801,6 +801,20 @@ fn invoke_dispatch_bif(
     {
         return Some(call_plain_bif(process, registers, export, bif, export_call));
     }
+    if let Some(export) = export
+        && let Some(bif) = export.light_process_bif
+        && (export_call
+            || registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64)
+        && !crate::trace_bp::any_pattern()
+    {
+        return Some(call_process_bif(
+            process,
+            registers,
+            export,
+            bif,
+            export_call,
+        ));
+    }
     invoke_dispatch_bif_slow(process, registers, identity, site, export, export_call)
 }
 
@@ -1009,6 +1023,133 @@ fn call_plain_bif(
         return crate::native_hooks::raw(value);
     }
     plain_bif_result(process, registers, export, arity, result)
+}
+
+/// Calls a BIF that needs its process (`c_p`) straight from native code.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1:
+// the BIF gets `c_p` and reads its arguments from the register array; its result is handled
+// like any light BIF's.
+#[inline(always)]
+fn call_process_bif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    bif: crate::natives::ProcessBif,
+    export_call: bool,
+) -> u64 {
+    process.reductions = process.header.fcalls;
+    if export_call {
+        charge_bif_reductions(process, 1);
+    }
+    let arity = usize::from(export.arity);
+    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let result = bif(process, &registers.x_reg_array[..arity]);
+    let top = process.heap.heap_top_index();
+    if let Ok(value) = &result
+        && stop - top >= process.heap.mbuf_size()
+        && !process.heap.bin_vheap_gc_due()
+    {
+        let value = *value;
+        registers.x_reg_array[0] = value;
+        if top != entry_top {
+            process.header.htop = process.heap.word_address(top);
+        }
+        if process.header.fcalls != process.reductions {
+            process.header.fcalls = process.reductions;
+        }
+        return crate::native_hooks::raw(value);
+    }
+    process_bif_result(process, registers, export, arity, result)
+}
+
+/// A process BIF's exception, or a value after which a collection is desired.
+// Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1: the
+// argument registers stay live across the collection.
+#[cold]
+#[inline(never)]
+fn process_bif_result(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    arity: usize,
+    mut result: Result<Term, crate::exceptions::Trap>,
+) -> u64 {
+    let collected = process.gc_enabled && process.heap.gc_desired();
+    if collected {
+        process
+            .heap
+            .set_frame_pointer(registers.tmp_mem[2] as usize);
+        let args = &mut registers.x_reg_array[..arity];
+        for (destination, term) in process.x.iter_mut().zip(args.iter()) {
+            *destination = *term;
+        }
+        let (value, raised) = match &mut result {
+            Ok(value) => (Some(value), None),
+            Err(trap) => (None, Some(trap)),
+        };
+        let gc = crate::calls::gc_after_native_parts(process, args, value, raised);
+        registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+        if gc.is_err() {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return 0;
+        }
+    }
+    match result {
+        Ok(value) => {
+            let value = crate::native_hooks::raw(value);
+            if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
+                return collect_after_plain_bif(process, registers, value);
+            }
+            registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
+            if collected {
+                process.sync_native_header();
+            } else {
+                process.sync_native_cursors();
+            }
+            value
+        }
+        Err(trap) => process_bif_error(process, export, &registers.x_reg_array[..arity], trap),
+    }
+}
+
+/// Parks a process BIF's exception, with the BIF as its top frame, for the native exit.
+// Port of erts/emulator/beam/beam_common.c:880-930 (save_stacktrace), OTP-29.1.1: BIF_ERROR
+// reports the failing BIF and its arguments.
+fn process_bif_error(
+    process: &mut crate::Process,
+    export: ExportDispatch,
+    args: &[Term],
+    mut trap: crate::exceptions::Trap,
+) -> u64 {
+    if trap.class == arinsal_bifs::Class::Error && trap.top.is_none() && trap.trace.is_none() {
+        let Ok(args) = crate::stacktrace::BifArgs::from_terms(args) else {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return 0;
+        };
+        trap.top = Some(crate::stacktrace::TopFrame::Bif {
+            module: export.module_atom,
+            function: export.function_atom,
+            args,
+            info: crate::stacktrace::BifErrorInfo::Plain,
+        });
+    }
+    let freason = match trap.class {
+        arinsal_bifs::Class::Error => 1,
+        arinsal_bifs::Class::Exit => 2,
+        arinsal_bifs::Class::Throw => 3,
+    };
+    let fvalue = crate::native_hooks::raw(trap.reason);
+    process.header.freason = freason;
+    process.header.fvalue = fvalue;
+    process.cold_mut().native_trap = Some(crate::proc_create::NativeTrap {
+        trap,
+        freason,
+        fvalue,
+    });
+    process.sync_native_header();
+    0
 }
 
 /// An error, or a value after which a collection is desired.

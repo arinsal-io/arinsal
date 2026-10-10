@@ -1860,103 +1860,9 @@ fn call_values(
             }
             ("process_info", [pid]) => process_info_call(vm, process, ctx, *pid, None),
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),
-            ("put", [key, value]) => {
-                let cold = process.cold_mut();
-                let previous = cold
-                    .dictionary
-                    .iter()
-                    .find_map(|(stored, old)| term_equal(*stored, *key).then_some(*old))
-                    .unwrap_or_else(|| atom("undefined"));
-                // The dictionary lives on the process heap like erts' ProcDict, so
-                // GC roots it and releases off-heap owners (magic refs) once erased.
-                // Port of erts/emulator/beam/erl_process_dict.c (pd_hash_put), OTP-29.1.1.
-                let (key, value) = (*key, *value);
-                if let Some((stored, old)) = cold
-                    .dictionary
-                    .iter_mut()
-                    .find(|(stored, _)| term_equal(*stored, key))
-                {
-                    *stored = key;
-                    *old = value;
-                } else {
-                    cold.dictionary.push((key, value));
-                }
-                Ok(previous)
-            }
-            ("get", []) => {
-                let raw = process
-                    .cold
-                    .as_ref()
-                    .map(|c| {
-                        c.dictionary
-                            .iter()
-                            .map(|(k, v)| (*k, *v))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let entries = raw
-                    .into_iter()
-                    .map(|(k, v)| make_tuple(process, &[k, v]))
-                    .collect::<Result<Vec<_>, _>>()?;
-                make_list(process, entries)
-            }
-            ("get", [key]) => Ok(process
-                .cold
-                .as_ref()
-                .and_then(|c| {
-                    c.dictionary
-                        .iter()
-                        .find(|(k, _)| term_equal(*k, *key))
-                        .map(|(_, v)| *v)
-                })
-                .unwrap_or(atom("undefined"))),
-            ("get_keys", []) => make_list(
-                process,
-                process
-                    .cold
-                    .as_ref()
-                    .map(|c| c.dictionary.iter().map(|(k, _)| *k).collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            ),
-            ("get_keys", [value]) => make_list(
-                process,
-                process
-                    .cold
-                    .as_ref()
-                    .map(|c| {
-                        c.dictionary
-                            .iter()
-                            .filter_map(|(k, v)| term_equal(*v, *value).then_some(*k))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default(),
-            ),
-            ("erase", []) => {
-                let raw = process
-                    .cold
-                    .as_mut()
-                    .map(|c| {
-                        std::mem::take(&mut c.dictionary)
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let entries = raw
-                    .into_iter()
-                    .map(|(k, v)| make_tuple(process, &[k, v]))
-                    .collect::<Result<Vec<_>, _>>()?;
-                make_list(process, entries)
-            }
-            ("erase", [key]) => {
-                let Some(dictionary) = process.cold.as_mut().map(|cold| &mut cold.dictionary)
-                else {
-                    return Ok(atom("undefined"));
-                };
-                if let Some(index) = dictionary.iter().position(|(k, _)| term_equal(*k, *key)) {
-                    Ok(dictionary.remove(index).1)
-                } else {
-                    Ok(atom("undefined"))
-                }
+            ("put" | "get" | "get_keys" | "erase", _) => {
+                let bif = dictionary_bif(function, args.len() as u8).ok_or_else(badarg)?;
+                bif(process, args).map_err(VmError::Trap)
             }
             ("alias", [options]) => create_alias(process, ctx, &list(*options).ok_or_else(badarg)?),
             ("unalias", [reference]) => {
@@ -2074,6 +1980,148 @@ fn call_values(
         }
     })();
     Some(result)
+}
+
+/// The process dictionary BIFs, which need only their process.
+// Port of erts/emulator/beam/erl_process_dict.c (put_2, get_0, get_1, get_keys_0, get_keys_1,
+// erase_0, erase_1), OTP-29.1.1.
+pub(crate) fn dictionary_bif(function: &str, arity: u8) -> Option<super::ProcessBif> {
+    match (function, arity) {
+        ("put", 2) => Some(dictionary_put),
+        ("get", 0) => Some(dictionary_get0),
+        ("get", 1) => Some(dictionary_get1),
+        ("get_keys", 0) => Some(dictionary_get_keys0),
+        ("get_keys", 1) => Some(dictionary_get_keys1),
+        ("erase", 0) => Some(dictionary_erase0),
+        ("erase", 1) => Some(dictionary_erase1),
+        _ => None,
+    }
+}
+
+/// A list or tuple the dictionary BIFs build on the process heap (`HAlloc` never fails).
+fn dictionary_alloc(result: Result<Term, VmError>) -> Result<Term, crate::exceptions::Trap> {
+    result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit")))
+}
+
+fn dictionary_put(process: &mut Process, args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
+    let (key, value) = (args[0], args[1]);
+    let cold = process.cold_mut();
+    let previous = cold
+        .dictionary
+        .iter()
+        .find_map(|(stored, old)| term_equal(*stored, key).then_some(*old))
+        .unwrap_or_else(|| atom("undefined"));
+    // The dictionary lives on the process heap like erts' ProcDict, so
+    // GC roots it and releases off-heap owners (magic refs) once erased.
+    // Port of erts/emulator/beam/erl_process_dict.c (pd_hash_put), OTP-29.1.1.
+    if let Some((stored, old)) = cold
+        .dictionary
+        .iter_mut()
+        .find(|(stored, _)| term_equal(*stored, key))
+    {
+        *stored = key;
+        *old = value;
+    } else {
+        cold.dictionary.push((key, value));
+    }
+    Ok(previous)
+}
+
+fn dictionary_get0(process: &mut Process, _args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
+    let raw = process
+        .cold
+        .as_ref()
+        .map(|c| {
+            c.dictionary
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let entries = raw
+        .into_iter()
+        .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
+        .collect::<Result<Vec<_>, _>>()?;
+    dictionary_alloc(make_list(process, entries))
+}
+
+fn dictionary_get1(process: &mut Process, args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
+    let key = args[0];
+    Ok(process
+        .cold
+        .as_ref()
+        .and_then(|c| {
+            c.dictionary
+                .iter()
+                .find(|(k, _)| term_equal(*k, key))
+                .map(|(_, v)| *v)
+        })
+        .unwrap_or(atom("undefined")))
+}
+
+fn dictionary_get_keys0(
+    process: &mut Process,
+    _args: &[Term],
+) -> Result<Term, crate::exceptions::Trap> {
+    let keys = process
+        .cold
+        .as_ref()
+        .map(|c| c.dictionary.iter().map(|(k, _)| *k).collect::<Vec<_>>())
+        .unwrap_or_default();
+    dictionary_alloc(make_list(process, keys))
+}
+
+fn dictionary_get_keys1(
+    process: &mut Process,
+    args: &[Term],
+) -> Result<Term, crate::exceptions::Trap> {
+    let value = args[0];
+    let keys = process
+        .cold
+        .as_ref()
+        .map(|c| {
+            c.dictionary
+                .iter()
+                .filter_map(|(k, v)| term_equal(*v, value).then_some(*k))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    dictionary_alloc(make_list(process, keys))
+}
+
+fn dictionary_erase0(
+    process: &mut Process,
+    _args: &[Term],
+) -> Result<Term, crate::exceptions::Trap> {
+    let raw = process
+        .cold
+        .as_mut()
+        .map(|c| {
+            std::mem::take(&mut c.dictionary)
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let entries = raw
+        .into_iter()
+        .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
+        .collect::<Result<Vec<_>, _>>()?;
+    dictionary_alloc(make_list(process, entries))
+}
+
+fn dictionary_erase1(
+    process: &mut Process,
+    args: &[Term],
+) -> Result<Term, crate::exceptions::Trap> {
+    let key = args[0];
+    let Some(dictionary) = process.cold.as_mut().map(|cold| &mut cold.dictionary) else {
+        return Ok(atom("undefined"));
+    };
+    if let Some(index) = dictionary.iter().position(|(k, _)| term_equal(*k, key)) {
+        Ok(dictionary.remove(index).1)
+    } else {
+        Ok(atom("undefined"))
+    }
 }
 
 // Port of erts/emulator/beam/bif.c:1366 (`hibernate_3`) and
