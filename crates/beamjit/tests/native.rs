@@ -269,15 +269,18 @@ fn erlc_add_function_runs_through_native_bridge() {
         ..ProcessHeader::default()
     };
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = tagged_small(19);
-    registers.x_reg_array[1] = tagged_small(23);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(19));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(23));
     let target =
         module.native.entries[&function.label] as usize + arinsal_beamasm::module::FUNC_INFO_BYTES;
     let caller = caller_module(target, 0xffff_fffe);
     let caller_entry = caller.entry(0xffff_fffe).unwrap();
     let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &caller_entry);
     assert_eq!(result, ExitReason::Returned);
-    assert_eq!(registers.x_reg_array[0], tagged_small(42));
+    assert_eq!(
+        registers.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(tagged_small(42))
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -330,29 +333,35 @@ fn erlc_list_tuple_guards_run_natively() {
         ..ProcessHeader::default()
     };
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = tagged_small(0);
-    registers.x_reg_array[1] = heap.as_mut_ptr() as u64 + 1;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(heap.as_mut_ptr() as u64 + 1);
     let list_target = module.native.entries[&first_integer.label] as usize
         + arinsal_beamasm::module::FUNC_INFO_BYTES;
     let list_caller = caller_module(list_target, 0xffff_fffe);
     let list_entry = list_caller.entry(0xffff_fffe).unwrap();
     let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &list_entry);
     assert_eq!(result, ExitReason::Returned);
-    assert_eq!(registers.x_reg_array[0], tagged_small(77));
+    assert_eq!(
+        registers.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(tagged_small(77))
+    );
 
     heap[0] = 2 << 6;
     heap[1] = tagged_small(99);
     heap[2] = tagged_small(1);
     header.htop = heap.as_mut_ptr().wrapping_add(3);
-    registers.x_reg_array[0] = tagged_small(0);
-    registers.x_reg_array[1] = heap.as_mut_ptr() as u64 + 2;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(heap.as_mut_ptr() as u64 + 2);
     let tuple_target = module.native.entries[&tuple_list.label] as usize
         + arinsal_beamasm::module::FUNC_INFO_BYTES;
     let tuple_caller = caller_module(tuple_target, 0xffff_fffe);
     let tuple_entry = tuple_caller.entry(0xffff_fffe).unwrap();
     let result = arinsal_beamasm::enter_native(&mut header, &mut registers, &tuple_entry);
     assert_eq!(result, ExitReason::Returned);
-    assert_eq!(registers.x_reg_array[0], heap.as_mut_ptr() as u64 + 25);
+    assert_eq!(
+        registers.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(heap.as_mut_ptr() as u64 + 25)
+    );
     assert_eq!(heap[3], tagged_small(99));
     assert_eq!(heap[4], 0x3b);
     let _ = fs::remove_dir_all(root);
@@ -429,8 +438,8 @@ fn recursive_sum_and_fib_run_natively() {
         ..ProcessHeader::default()
     };
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = tagged_small(10_000_000);
-    registers.x_reg_array[1] = tagged_small(0);
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(10_000_000));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(tagged_small(0));
     let target =
         module.native.entries[&sum.label] as usize + arinsal_beamasm::module::FUNC_INFO_BYTES;
     let caller = caller_module(target, 0xffff_fffe);
@@ -450,11 +459,14 @@ fn recursive_sum_and_fib_run_natively() {
         }
     }
     let sum_elapsed = started.elapsed().as_nanos();
-    assert_eq!(registers.x_reg_array[0], tagged_small(values[0] as u64));
+    assert_eq!(
+        registers.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(tagged_small(values[0] as u64))
+    );
     println!("sum_10m_native_ok {}", sum_elapsed);
 
-    registers.x_reg_array[0] = tagged_small(25);
-    registers.x_reg_array[1] = 0;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged_small(25));
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(0);
     let target =
         module.native.entries[&fib.label] as usize + arinsal_beamasm::module::FUNC_INFO_BYTES;
     let caller = caller_module(target, 0xffff_fffd);
@@ -474,7 +486,10 @@ fn recursive_sum_and_fib_run_natively() {
         }
     }
     let fib_elapsed = started.elapsed().as_micros();
-    assert_eq!(registers.x_reg_array[0], tagged_small(values[1] as u64));
+    assert_eq!(
+        registers.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(tagged_small(values[1] as u64))
+    );
     println!("fib25_native_ok {fib_elapsed}us yields={yields}");
     let _ = fs::remove_dir_all(root);
 }
@@ -536,8 +551,8 @@ fn otp_logger_reply_return_returns_the_reply_map() {
     MAP_LOOKUP_RESULT.store(atom("true"), Ordering::SeqCst);
     MAP_LOOKUP_KEY.store(0, Ordering::SeqCst);
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = reply;
-    registers.x_reg_array[1] = state;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(reply);
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(state);
     let exit = arinsal_beamjit::enter_native(&module, function, &mut header, &mut registers);
     assert_eq!(
         exit,
@@ -550,10 +565,10 @@ fn otp_logger_reply_return_returns_the_reply_map() {
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:362-390, OTP-29.1.1: a flatmap
     // lookup of an immediate key stays inline and never reaches the runtime hook.
     assert_eq!(MAP_LOOKUP_KEY.load(Ordering::SeqCst), 0);
-    assert_eq!(read_heap_word(result, 0), 3 << 6);
-    assert_eq!(read_heap_word(result, 1), atom("reply"));
-    assert_eq!(read_heap_word(result, 2), reply);
-    assert_eq!(read_heap_word(result, 3), state);
+    assert_eq!(read_heap_word(result.tagged_word(), 0), 3 << 6);
+    assert_eq!(read_heap_word(result.tagged_word(), 1), atom("reply"));
+    assert_eq!(read_heap_word(result.tagged_word(), 2), reply);
+    assert_eq!(read_heap_word(result.tagged_word(), 3), state);
     MAP_LOOKUP_RESULT.store(0, Ordering::SeqCst);
 }
 

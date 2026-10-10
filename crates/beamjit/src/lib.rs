@@ -133,7 +133,7 @@ pub trait ModuleEnv {
     }
     /// Runtime hook calling a plain BIF by export identity.
     fn bif_identity_helper(&self) -> arinsal_beamasm::bif::BifIdentityHelper {
-        unused_bif_identity
+        unused_bif_identity as *const () as usize
     }
     /// Export identity of an import that is a plain (pure or heap-allocating) BIF, if it is one.
     fn plain_bif_identity(&self, _beam: &BeamFile, _index: u32) -> Option<usize> {

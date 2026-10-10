@@ -45,7 +45,7 @@ fn execute(asm: BeamModuleAssembler, values: &[u64]) -> (ProcessHeader, Schedule
     let mut heap = [0_u64; 128];
     let mut stack = [0_u64; 128];
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[..values.len()].copy_from_slice(values);
+    arinsal_beamasm::rt::set_fixture_words(&mut registers.x_reg_array[..values.len()], values);
     let mut header = ProcessHeader {
         htop: heap.as_mut_ptr(),
         heap: heap.as_mut_ptr(),
@@ -83,8 +83,8 @@ fn match_runtime_preserves_live_x_registers_and_arguments() {
     let (_, regs) = execute(asm, &[0x111, 0x222, 0x333, 0x444, 0x555, 0x666]);
     SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 0x111, 0x222, 0]));
     assert_eq!(
-        &regs.x_reg_array[..6],
-        &[0x111, 0x222, 0x333, 0x444, 0x555, 0x666]
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[..6]),
+        [0x111, 0x222, 0x333, 0x444, 0x555, 0x666]
     );
 }
 
@@ -99,8 +99,11 @@ fn writable_runtime_publishes_heap_and_stack_pointers() {
     let (header, regs) = execute(asm, &[0x1234, 2, 3, 4, 5, 6]);
     SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[0x1234]));
     assert_eq!(header.htop, header.heap);
-    assert_eq!(regs.x_reg_array[0], 1);
-    assert_eq!(&regs.x_reg_array[1..4], &[2, 3, 4]);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(1));
+    assert_eq!(
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[1..4]),
+        [2, 3, 4]
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -129,8 +132,14 @@ fn construction_runtime_keeps_non_destination_x_registers() {
     finish(&mut asm);
     let (_, regs) = execute(asm, &[0x123, 0x2f, 0xabc, 4, 5, 6]);
     SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 2, 3]));
-    assert_eq!(&regs.x_reg_array[..2], &[0x123, 0x2f]);
-    assert_eq!(&regs.x_reg_array[3..6], &[4, 5, 6]);
+    assert_eq!(
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[..2]),
+        [0x123, 0x2f]
+    );
+    assert_eq!(
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[3..6]),
+        [4, 5, 6]
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -147,8 +156,8 @@ fn float_runtime_preserves_register_backed_values() {
     let (_, regs) = execute(asm, &[term, 0x222, 0x333, 0x444, 0x555, 0x666]);
     SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[0xfeed]));
     assert_eq!(
-        &regs.x_reg_array[1..6],
-        &[0x222, 0x333, 0x444, 0x555, 0x666]
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[1..6]),
+        [0x222, 0x333, 0x444, 0x555, 0x666]
     );
 }
 
@@ -168,5 +177,8 @@ fn match_string_runtime_keeps_the_argument_registers() {
     finish(&mut asm);
     let (_, regs) = execute(asm, &[0x111, 0x222, 3, 4, 5, 6]);
     SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[9, 0x111, 0x222, 8]));
-    assert_eq!(&regs.x_reg_array[..6], &[0x111, 0x222, 3, 4, 5, 6]);
+    assert_eq!(
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[..6]),
+        [0x111, 0x222, 3, 4, 5, 6]
+    );
 }

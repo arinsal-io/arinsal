@@ -89,8 +89,7 @@ pub(crate) fn process_and_registers<'a>(
         .take(NATIVE_X)
         .zip(&registers.x_reg_array)
     {
-        // SAFETY: The native ABI register array contains tagged BEAM terms.
-        *destination = unsafe { Term::from_raw_bits(*raw) };
+        *destination = *raw;
     }
     Some((process, registers))
 }
@@ -111,8 +110,9 @@ pub(crate) fn enter_runtime<'a>(
     let process = unsafe { &mut *header.cast::<Process>() };
     // Rust helpers may allocate or publish the header again, so first commit the
     // native heap and stack cursors that generated code flushed at the call site.
-    process.heap.set_stack_pointer(process.header.stop);
-    process.heap.set_heap_top(process.header.htop);
+    process
+        .heap
+        .set_native_cursors(process.header.htop, process.header.stop);
     let registers = process.header.ftrace.cast::<SchedulerRegisters>();
     if registers.is_null() {
         return None;
@@ -130,8 +130,7 @@ fn publish_x(process: &Process, registers: &mut SchedulerRegisters) {
         .zip(process.x.iter())
         .take(NATIVE_X)
     {
-        // SAFETY: X registers contain tagged BEAM terms.
-        *destination = unsafe { term.raw_bits() };
+        *destination = *term;
     }
 }
 
@@ -567,8 +566,7 @@ pub(crate) fn collect_native(
         process.x = grown.into_boxed_slice();
     }
     for (destination, raw) in process.x.iter_mut().take(roots).zip(&registers.x_reg_array) {
-        // SAFETY: The register area contains tagged BEAM terms.
-        *destination = unsafe { Term::from_raw_bits(*raw) };
+        *destination = *raw;
     }
     let result = ensure_native_frame(process, registers, need_words, live);
     for (destination, term) in registers
@@ -577,8 +575,7 @@ pub(crate) fn collect_native(
         .zip(process.x.iter())
         .take(roots)
     {
-        // SAFETY: X registers contain tagged BEAM terms.
-        *destination = unsafe { term.raw_bits() };
+        *destination = *term;
     }
     result
 }

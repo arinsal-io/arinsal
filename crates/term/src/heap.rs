@@ -624,6 +624,43 @@ impl ProcessHeap {
         assert_eq!((address - base) % 8, 0);
         self.htop = (address - base) / 8;
     }
+    /// Commit both native cursors at once when native code enters the runtime.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-537 (emit_enter_runtime stores HTOP
+    // and E into c_p as they are), OTP-29.1.1: one bounds check keeps the indices valid.
+    #[inline]
+    pub fn set_native_cursors(&mut self, htop: *mut u64, stop: *mut u64) {
+        let base = self.words.as_ptr() as usize;
+        let top = (htop as usize).wrapping_sub(base) >> 3;
+        let stack = (stop as usize).wrapping_sub(base) >> 3;
+        debug_assert_eq!((htop as usize | stop as usize).wrapping_sub(base) % 8, 0);
+        assert!(
+            top <= stack && stack <= self.words.len(),
+            "native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}"
+        );
+        self.htop = top;
+        self.stop = stack;
+    }
+    /// Young heap top as a word index.
+    #[inline]
+    pub fn heap_top_index(&self) -> usize {
+        self.htop
+    }
+    /// Stack pointer as a word index.
+    #[inline]
+    pub fn stack_index(&self) -> usize {
+        self.stop
+    }
+    /// Capacity of the heap fragments in words (`mbuf_sz`), as [`ProcessHeap::gc_desired`]
+    /// compares it.
+    #[inline]
+    pub fn mbuf_size(&self) -> usize {
+        self.fragment_words as usize
+    }
+    /// Address of the word at `index` in the young heap block.
+    #[inline]
+    pub fn word_address(&self, index: usize) -> *mut u64 {
+        (self.words.as_ptr() as usize).wrapping_add(index.wrapping_mul(8)) as *mut u64
+    }
     /// Commit the native Erlang stack pointer before collection or interpretation.
     pub fn set_stack_pointer(&mut self, stop: *mut u64) {
         let base = self.words.as_ptr() as usize;

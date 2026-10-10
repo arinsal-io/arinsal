@@ -40,11 +40,14 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
     a.return_().unwrap();
     let (module_a, entry_a) = finish(a, 1);
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 0x1234;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(0x1234);
     let mut stack = [0u64; 128];
     let (_header, result) = run(&module_a, entry_a, &mut stack, 10, &mut regs);
     assert_eq!(result, ExitReason::Returned);
-    assert_eq!(regs.x_reg_array[1], 0x1234);
+    assert_eq!(
+        regs.x_reg_array[1],
+        arinsal_beamasm::rt::fixture_term(0x1234)
+    );
     drop(module_a);
 
     // (b) g calls h with a CP on the BEAM stack; h returns through its frame.
@@ -66,10 +69,13 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
     b.emit_leave_frame().unwrap();
     b.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
     let (module_b, entry_b) = finish(b, 10);
-    regs.x_reg_array[0] = 0x55aa;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(0x55aa);
     let (header_b, result_b) = run(&module_b, entry_b, &mut stack, 100, &mut regs);
     assert_eq!(result_b, ExitReason::Returned);
-    assert_eq!(regs.x_reg_array[1], 0x55aa);
+    assert_eq!(
+        regs.x_reg_array[1],
+        arinsal_beamasm::rt::fixture_term(0x55aa)
+    );
     let stack_end = stack.as_mut_ptr().wrapping_add(stack.len());
     assert_eq!(header_b.stop, stack_end);
     drop(module_b);
@@ -91,7 +97,7 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
     })
     .unwrap();
     let (module_c, entry_c) = finish(c, 20);
-    regs.x_reg_array[0] = 1_000_000;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(1_000_000);
     let mut left = 1_000_000i32;
     let mut stack_depth = stack.len();
     loop {
@@ -104,11 +110,11 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
         }
         stack_depth = stack.len();
         // The x-register countdown survives the scheduler boundary.
-        if regs.x_reg_array[0] == 0 {
+        if regs.x_reg_array[0] == arinsal_beamasm::rt::fixture_term(0) {
             break;
         }
     }
-    assert_eq!(regs.x_reg_array[0], 0);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(0));
     drop(module_c);
 
     // (d) Shuffle all supported source/destination classes across X and Y.
@@ -127,10 +133,10 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
     })
     .unwrap();
     let (module_d, entry_d) = finish(d, 30);
-    regs.x_reg_array[0] = 99;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(99);
     let (_, result_d) = run(&module_d, entry_d, &mut stack, 10, &mut regs);
     assert_eq!(result_d, ExitReason::Returned);
-    assert_eq!(regs.x_reg_array[2], 99);
+    assert_eq!(regs.x_reg_array[2], arinsal_beamasm::rt::fixture_term(99));
     drop(module_d);
 
     // (e) A forward local call more than 1 MiB away is fixed up after padding.

@@ -88,8 +88,8 @@ fn run(
         ..ProcessHeader::default()
     };
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = 0x1234;
-    registers.x_reg_array[1] = 0x5678;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(0x1234);
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(0x5678);
     let mut stack = Box::new([0u64; 64]);
     header.stop = stack.as_mut_ptr().wrapping_add(stack.len());
     let outcome = enter_native(&mut header, &mut registers, &module.entry(1).unwrap());
@@ -116,7 +116,10 @@ fn light_bif_trap_exits_to_target_with_saved_continuation_and_arguments() {
     assert_eq!(stack[63], resume_pc as u64);
     assert_eq!(header.freason, 0);
     assert_eq!(header.arity, 2);
-    assert_eq!(&registers.x_reg_array[..2], &[0x1234, 0x5678]);
+    assert_eq!(
+        arinsal_beamasm::rt::fixture_words(&registers.x_reg_array[..2]),
+        [0x1234, 0x5678]
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -163,7 +166,7 @@ fn scheduler_entry_restores_xreg0_into_native_x0() {
         ..ProcessHeader::default()
     };
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = expected;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(expected);
 
     assert_eq!(
         enter_native(&mut header, &mut registers, &entry),

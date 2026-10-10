@@ -39,7 +39,11 @@ static ASSERTION_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 
 fn observe(process: *mut ProcessHeader) {
     let regs = ACTIVE_REGS.load(Ordering::Relaxed);
-    let x = rt::scheduler_registers_mut(regs, |regs| regs.x_reg_array[..6].try_into().unwrap());
+    let x = rt::scheduler_registers_mut(regs, |regs| {
+        rt::fixture_words(&regs.x_reg_array[..6])
+            .try_into()
+            .unwrap()
+    });
     let seen = rt::process_header_mut(process, |header| Seen {
         x,
         htop: header.htop as usize,
@@ -65,7 +69,7 @@ extern "C" fn map_get_elements(
     // The lookup leaves each value in its staging slot (key, destination, hash triples start
     // at X`base`); the emitted code moves it to the destination register.
     rt::scheduler_registers_mut(registers as *mut SchedulerRegisters, |regs| {
-        regs.x_reg_array[base as usize + 1] = REG_OUTPUT;
+        regs.x_reg_array[base as usize + 1] = arinsal_beamasm::rt::fixture_term(REG_OUTPUT);
     });
     1
 }
@@ -101,7 +105,7 @@ extern "C" fn record_get_elements(
 ) -> u64 {
     observe(process);
     rt::scheduler_registers_mut(registers, |regs| {
-        regs.x_reg_array[base as usize] = REG_OUTPUT
+        regs.x_reg_array[base as usize] = arinsal_beamasm::rt::fixture_term(REG_OUTPUT)
     });
     1
 }
@@ -212,7 +216,7 @@ fn run(
         ..ProcessHeader::default()
     };
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[..6].copy_from_slice(&initial);
+    rt::set_fixture_words(&mut regs.x_reg_array[..6], &initial);
     ACTIVE_REGS.store(&mut regs, Ordering::Relaxed);
     assert_eq!(
         enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
@@ -220,7 +224,13 @@ fn run(
     );
     ACTIVE_REGS.store(std::ptr::null_mut(), Ordering::Relaxed);
     let seen = SEEN.lock().unwrap().unwrap();
-    (seen, regs.x_reg_array[..6].try_into().unwrap(), header)
+    (
+        seen,
+        rt::fixture_words(&regs.x_reg_array[..6])
+            .try_into()
+            .unwrap(),
+        header,
+    )
 }
 
 fn sentinels() -> [u64; 6] {

@@ -40,7 +40,7 @@ fn execute(
     values: [u64; 3],
 ) -> (ProcessHeader, SchedulerRegisters, ExitReason) {
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[..3].copy_from_slice(&values);
+    arinsal_beamasm::rt::set_fixture_words(&mut regs.x_reg_array[..3], &values);
     let mut stack = [0_u64; 64];
     header.stop = stack.as_mut_ptr().wrapping_add(stack.len());
     header.fcalls = 100;
@@ -89,7 +89,10 @@ fn native_apply() {
     };
     let (header, regs, outcome) = execute(&module, header, [0x44, 1, 0]);
     assert_eq!(outcome, ExitReason::Returned);
-    assert_eq!(regs.x_reg_array[0], 0xabc);
+    assert_eq!(
+        regs.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(0xabc)
+    );
     assert_eq!(header.fvalue, 1);
 }
 
@@ -109,7 +112,10 @@ fn native_apply_last() {
     };
     let (_, regs, outcome) = execute(&module, header, [0x55, 1, 0]);
     assert_eq!(outcome, ExitReason::Returned);
-    assert_eq!(regs.x_reg_array[0], 0xabc);
+    assert_eq!(
+        regs.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(0xabc)
+    );
 }
 
 #[cfg(target_arch = "aarch64")]

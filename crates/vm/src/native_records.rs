@@ -117,7 +117,7 @@ fn stage_roots(
         process.x[index] = if (live..base).contains(&index) {
             Term::NIL
         } else {
-            native_hooks::from_raw(*slot)
+            *slot
         };
     }
     Some(())
@@ -133,7 +133,7 @@ fn publish_roots(
 ) {
     for index in 0..top {
         if !(live..base).contains(&index) {
-            registers.x_reg_array[index] = native_hooks::raw(process.x[index]);
+            registers.x_reg_array[index] = process.x[index];
         }
     }
 }
@@ -336,7 +336,7 @@ fn update_record(
     if top > registers.x_reg_array.len() {
         return Err(Failure::SystemLimit);
     }
-    registers.x_reg_array[source_slot] = native_hooks::raw(source);
+    registers.x_reg_array[source_slot] = source;
     stage_roots(process, registers, live, base, top).ok_or(Failure::SystemLimit)?;
     process
         .ensure(2 + snapshot.fields.len(), top)
@@ -391,10 +391,8 @@ pub extern "C" fn arinsal_beamasm_get_record_elements(
     };
     let mut next = 0;
     for (key, value) in definition.keys.iter().zip(&snapshot.values) {
-        if next < count
-            && native_hooks::from_raw(registers.x_reg_array[base + next]) == Term::atom(*key)
-        {
-            registers.x_reg_array[base + next] = native_hooks::raw(*value);
+        if next < count && registers.x_reg_array[base + next] == Term::atom(*key) {
+            registers.x_reg_array[base + next] = *value;
             next += 1;
             if next == count {
                 return 1;

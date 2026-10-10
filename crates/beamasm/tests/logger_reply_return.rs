@@ -120,8 +120,8 @@ fn reply_return(idle: bool) -> (u64, u64, u64) {
     };
     let mut registers = SchedulerRegisters::default();
     let reply = Term::small(77).unwrap();
-    registers.x_reg_array[0] = reply.tagged_word();
-    registers.x_reg_array[1] = state.tagged_word();
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(reply.tagged_word());
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(state.tagged_word());
     assert_eq!(
         enter_native(&mut header, &mut registers, &module.entry(1).unwrap()),
         ExitReason::Returned
@@ -129,11 +129,11 @@ fn reply_return(idle: bool) -> (u64, u64, u64) {
 
     let tuple = registers.x_reg_array[0];
     let arity = if idle { 3 } else { 4 };
-    assert_eq!(read_heap_word(tuple, 0), (arity as u64) << 6);
-    assert_eq!(read_heap_word(tuple, 1), atom("reply"));
-    assert_eq!(read_heap_word(tuple, 2), reply.tagged_word());
-    assert_eq!(read_heap_word(tuple, 3), state.tagged_word());
-    (tuple, term_bits(state), term_bits(reply))
+    assert_eq!(read_heap_word(tuple.tagged_word(), 0), (arity as u64) << 6);
+    assert_eq!(read_heap_word(tuple.tagged_word(), 1), atom("reply"));
+    assert_eq!(read_heap_word(tuple.tagged_word(), 2), reply.tagged_word());
+    assert_eq!(read_heap_word(tuple.tagged_word(), 3), state.tagged_word());
+    (tuple.tagged_word(), term_bits(state), term_bits(reply))
 }
 
 #[test]

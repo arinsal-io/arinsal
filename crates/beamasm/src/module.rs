@@ -676,14 +676,24 @@ impl BeamModuleAssembler {
         self.code.adr(Gpr::x(9), done)?;
         self.code.emit(|e| {
             e.str_uoff(Gpr::x(9), SCHEDULER_REGS, TRAP_RETURN_SLOT)?;
-            e.mov_const(Gpr::x(13), identity as u64)?;
             // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610 (emit_call_light_bif
             // passes the export and its BIF function, both bound at load time), OTP-29.1.1:
             // the export's descriptor word names the BIF without a lookup.
-            e.ldr_uoff(Gpr::x(14), Gpr::x(13), crate::bif::EXPORT_INFO_OFFSET)
+            // x1 = export, x2 = call site (only read by breakpoint trampolines),
+            // x3 = descriptor.
+            e.mov_const(Gpr::x(1), identity as u64)?;
+            e.mov_reg(Gpr::x(2), Gpr::x(1))?;
+            e.ldr_uoff(Gpr::x(3), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
+            e.mov_reg(Gpr::x(0), C_P)?;
+            // Like erts' fragment_call, the shared fragment enters and leaves the runtime
+            // itself; the call site only keeps its return address.
+            e.mov_const(Gpr::x(17), fragment as u64)?;
+            e.str_uoff(Gpr::x(30), C_P, 72)?;
+            e.blr(Gpr::x(17))?;
+            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
+            e.ldr_uoff(Gpr::x(9), C_P, 40)
         })?;
-        // x1 = export, x2 = call site (only read by breakpoint trampolines), x3 = descriptor.
-        self.emit_runtime_fragment(fragment, &[Gpr::x(13), Gpr::x(13), Gpr::x(14)])?;
+        self.error_if_nonzero(Gpr::x(9))?;
         self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
         // A trapping BIF's target returns here with its result in XREG0.
         self.code.bind(done)?;
@@ -710,6 +720,8 @@ impl BeamModuleAssembler {
         self.code.emit(|e| {
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), Gpr::x(13))?;
+            // The send identity carries no export descriptor.
+            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
             e.mov_const(Gpr::x(17), fragment as u64)?;
             e.blr(Gpr::x(17))
         })?;
@@ -1189,6 +1201,10 @@ impl BeamModuleAssembler {
             for (index, arg) in args.iter().copied().enumerate() {
                 e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
             }
+            // Fragments reading a descriptor in x3 see none from a call that passes fewer.
+            for index in args.len()..3 {
+                e.mov_reg(Gpr::x(index as u8 + 1), Gpr::xzr())?;
+            }
             e.mov_const(Gpr::x(17), fragment as u64)?;
             e.str_uoff(Gpr::x(30), C_P, 72)?;
             e.blr(Gpr::x(17))
@@ -1538,8 +1554,8 @@ mod runtime_sync_tests {
             header.fcalls = 77;
         });
         crate::rt::scheduler_registers_mut(registers, |registers| {
-            registers.x_reg_array[4] = 0x4444;
-            registers.x_reg_array[5] = 0x5555;
+            registers.x_reg_array[4] = crate::rt::fixture_term(0x4444);
+            registers.x_reg_array[5] = crate::rt::fixture_term(0x5555);
         });
     }
 
@@ -1574,14 +1590,27 @@ mod runtime_sync_tests {
         let entry = module.entry(1).unwrap();
         let mut header = crate::ProcessHeader::default();
         let mut registers = crate::SchedulerRegisters::default();
-        registers.x_reg_array[..6].copy_from_slice(&[11, 22, 33, 44, 55, 66]);
+        registers.x_reg_array[..6].copy_from_slice(&[
+            crate::rt::fixture_term(11),
+            crate::rt::fixture_term(22),
+            crate::rt::fixture_term(33),
+            crate::rt::fixture_term(44),
+            crate::rt::fixture_term(55),
+            crate::rt::fixture_term(66),
+        ]);
 
         assert_eq!(
             crate::enter_native(&mut header, &mut registers, &entry),
             crate::ExitReason::Returned
         );
-        assert_eq!(registers.x_reg_array[..4], [11, 22, 33, 44]);
-        assert_eq!(registers.x_reg_array[4..6], [0x4444, 0x5555]);
+        assert_eq!(
+            crate::rt::fixture_words(&registers.x_reg_array[..4]),
+            [11, 22, 33, 44]
+        );
+        assert_eq!(
+            crate::rt::fixture_words(&registers.x_reg_array[4..6]),
+            [0x4444, 0x5555]
+        );
         assert_eq!(header.htop, 0x1234usize as *mut u64);
         assert_eq!(header.stop, 0x5678usize as *mut u64);
         assert_eq!(header.fcalls, 77);

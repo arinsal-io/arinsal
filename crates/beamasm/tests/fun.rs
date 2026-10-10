@@ -125,7 +125,7 @@ fn native_i_make_fun3() {
     let mut regs = SchedulerRegisters::default();
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[1] & !7, heap.as_ptr() as u64);
+    assert_eq!(regs.x_reg_array[1].tagged_word() & !7, heap.as_ptr() as u64);
     assert_eq!(&heap[..4], &[3 << 8 | 2 << 16 | 0x14, 0x1234, 79, 111]);
 }
 
@@ -176,7 +176,7 @@ fn native_i_make_fun3_entry_matches_interpreter_layout() {
     let mut regs = SchedulerRegisters::default();
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[1] & !7, heap.as_ptr() as u64);
+    assert_eq!(regs.x_reg_array[1].tagged_word() & !7, heap.as_ptr() as u64);
     assert_eq!(&heap[..4], &[1 << 8 | 2 << 16 | 0x14, entry_ptr, 79, 111]);
     std::mem::forget(entry);
 }
@@ -213,10 +213,10 @@ fn native_i_lambda_trampoline() {
         ..ProcessHeader::default()
     };
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 31;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(31);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], 191);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(191));
 }
 
 extern "C" fn unused_resolver(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
@@ -246,11 +246,11 @@ fn native_i_call_fun() {
     let mut dispatch = [0u64; 1];
     let fun = local_fun_words(&mut thing, &mut dispatch, module.entries[&2] as usize, 1);
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 31;
-    regs.x_reg_array[1] = fun;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(31);
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(fun);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], 31);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(31));
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -270,11 +270,11 @@ fn native_i_call_fun_last() {
     let mut dispatch = [0u64; 1];
     let fun = local_fun_words(&mut thing, &mut dispatch, module.entries[&2] as usize, 1);
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 31;
-    regs.x_reg_array[1] = fun;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(31);
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(fun);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], 31);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(31));
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -301,11 +301,11 @@ fn native_i_call_fun2() {
     let mut dispatch = [0u64; 1];
     let fun = local_fun_words(&mut thing, &mut dispatch, module.entries[&2] as usize, 1);
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 31;
-    regs.x_reg_array[1] = fun;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(31);
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(fun);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], 31);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(31));
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -344,11 +344,11 @@ fn native_i_call_fun2_exported_fun_m_f_1() {
         ..ProcessHeader::default()
     };
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 31;
-    regs.x_reg_array[1] = export_bits;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(31);
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(export_bits);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], 31);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(31));
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -369,11 +369,11 @@ fn native_i_call_fun2_last() {
     let mut dispatch = [0u64; 1];
     let fun = local_fun_words(&mut thing, &mut dispatch, module.entries[&2] as usize, 1);
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 31;
-    regs.x_reg_array[1] = fun;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(31);
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(fun);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], 31);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(31));
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -398,11 +398,11 @@ fn native_is_function2() {
     heap[0] = 1 << 8 | 0x14;
     let mut header = ProcessHeader::default();
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = heap.as_ptr() as u64 | 2;
-    regs.x_reg_array[1] = 31;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(31);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
-    assert_eq!(regs.x_reg_array[0], 1);
+    assert_eq!(regs.x_reg_array[0], arinsal_beamasm::rt::fixture_term(1));
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -414,7 +414,7 @@ fn native_call_fun_errors_badfun_and_badarity() {
     let module = asm.finalize().unwrap();
     let mut header = ProcessHeader::default();
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[1] = 15;
+    regs.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(15);
     let mut stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
     assert_eq!(header.freason, 1, "badfun");
@@ -430,7 +430,8 @@ fn native_call_fun_errors_badfun_and_badarity() {
     regs = SchedulerRegisters::default();
     let mut thing = [0u64; 2];
     let mut dispatch = [0u64; 1];
-    regs.x_reg_array[2] = local_fun_words(&mut thing, &mut dispatch, 0, 1);
+    regs.x_reg_array[2] =
+        arinsal_beamasm::rt::fixture_term(local_fun_words(&mut thing, &mut dispatch, 0, 1));
     stack = [0u64; 64];
     execute(&module, &mut header, &mut regs, &mut stack);
     assert_eq!(header.freason, 2, "badarity");

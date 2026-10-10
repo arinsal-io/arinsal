@@ -779,12 +779,19 @@ pub fn size(map: Term) -> MapResult<usize> {
     Ok(unsafe { *map.raw_ptr().add(1) as usize })
 }
 /// Lookup; `Ok(None)` when the key is absent.
+#[inline]
 pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
-    // Port of erts/emulator/beam/erl_map.c:2424-2474, OTP-29.1.1.
     check(map)?;
+    Ok(lookup(map, key))
+}
+
+/// Looks `key` up in a checked map.
+// Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_maps_get returns the value's address,
+// NULL when absent), OTP-29.1.1: the result comes back in registers.
+fn lookup(map: Term, key: Term) -> Option<Term> {
     if !map.is_hashmap() {
         // SAFETY: the source heap remains live during this operation.
-        return Ok(unsafe { map.flatmap_ref().unwrap() }.get(key));
+        return unsafe { map.flatmap_ref().unwrap() }.get(key);
     }
     let mut node = map;
     let hash = internal_hash(key);
@@ -794,7 +801,7 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
         for level in 0..=17 {
             if bits(node) & 3 == 1 {
                 let (candidate, value) = node.cons_ref().unwrap();
-                return Ok(exact_eq(candidate, key).then_some(value));
+                return exact_eq(candidate, key).then_some(value);
             }
             let h = node.header().unwrap();
             if h & 63 == 0 {
@@ -803,28 +810,29 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
                     let leaf = term(*p.add(1 + i));
                     let (candidate, value) = leaf.cons_ref().unwrap();
                     if exact_eq(candidate, key) {
-                        return Ok(Some(value));
+                        return Some(value);
                     }
                 }
-                return Ok(None);
+                return None;
             }
             if level == 17 {
-                return Ok(None);
+                return None;
             }
             let bitmap = ((h >> 16) & 0xffff) as u16;
             let bit = 1u16 << slot(hash, level);
             if bitmap & bit == 0 {
-                return Ok(None);
+                return None;
             }
             let index = (bitmap & (bit - 1)).count_ones() as usize;
             let offset = if (h >> 6) & 3 >= 2 { 2 } else { 1 };
             node = term(*node.raw_ptr().add(offset + index));
         }
     }
-    Ok(None)
+    None
 }
 
 /// `maps:find/2` value lookup.
+#[inline]
 pub fn find(map: Term, key: Term) -> MapResult<Option<Term>> {
     // Port of erts/emulator/beam/erl_map.c:2055-2101, OTP-29.1.1.
     get(map, key)

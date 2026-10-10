@@ -137,14 +137,14 @@ fn native_try_catches_throw_and_returns_catch_value() {
         ..ProcessHeader::default()
     };
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = 77;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(77);
     #[cfg(target_arch = "aarch64")]
     assert_eq!(
         enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
     // try_case leaves the reason in X1 (the harness routes to the handler directly).
-    assert_eq!(regs.x_reg_array[1], 77);
+    assert_eq!(regs.x_reg_array[1], arinsal_beamasm::rt::fixture_term(77));
     assert_eq!(header.catches, 0);
 }
 
@@ -233,13 +233,16 @@ fn native_catch_returns_exit_tuple_from_handler() {
         ..ProcessHeader::default()
     };
     let mut regs = SchedulerRegisters::default();
-    regs.x_reg_array[0] = result_bits;
+    regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(result_bits);
     #[cfg(target_arch = "aarch64")]
     assert_eq!(
         enter_native(&mut header, &mut regs, &module.entry(1).unwrap()),
         ExitReason::Returned
     );
-    assert_eq!(regs.x_reg_array[0], result_bits);
+    assert_eq!(
+        regs.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(result_bits)
+    );
 }
 
 #[test]
@@ -381,7 +384,10 @@ fn native_raw_raise_invalid_class_continues_with_badarg() {
     finish(&mut asm);
     let (_, header, regs, _) = execute(asm, 1);
     assert_eq!(header.freason, 0);
-    assert_eq!(regs.x_reg_array[0], atom_word("badarg"));
+    assert_eq!(
+        regs.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(atom_word("badarg"))
+    );
 }
 
 #[test]
@@ -395,7 +401,10 @@ fn native_build_stacktrace() {
     asm.emit_build_stacktrace(build).unwrap();
     finish(&mut asm);
     let (_, _, regs, _) = execute(asm, 1);
-    assert_eq!(regs.x_reg_array[0], 0x109);
+    assert_eq!(
+        regs.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(0x109)
+    );
 }
 
 #[test]

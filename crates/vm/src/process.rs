@@ -1179,8 +1179,7 @@ impl Executor {
             .iter_mut()
             .zip(&process.x[..native_x])
         {
-            // SAFETY: X registers store immediate or stable heap terms as raw 64-bit words.
-            *register = unsafe { term.raw_bits() };
+            *register = *term;
         }
         self.native_registers.f_reg_array[..self.fr.len().min(1024)]
             .copy_from_slice(&process.fr[..self.fr.len().min(1024)]);
@@ -1616,7 +1615,7 @@ impl Executor {
                                         .zip(self.native_registers.x_reg_array.iter().copied())
                                         .take(live)
                                     {
-                                        *destination = crate::native_hooks::from_raw(raw);
+                                        *destination = raw;
                                     }
                                     let handler =
                                         self.vm.load_named("erts_internal").is_ok_and(|id| {
@@ -1757,7 +1756,7 @@ impl Executor {
                                         .zip(self.native_registers.x_reg_array.iter().copied())
                                         .take(arity)
                                     {
-                                        *destination = crate::native_hooks::from_raw(raw);
+                                        *destination = raw;
                                     }
                                     let actions = crate::trace::executor_native_call_event(
                                         &mut self.vm,

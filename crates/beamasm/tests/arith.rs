@@ -101,8 +101,8 @@ fn run_binary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), lhs: u64
     .unwrap();
     let module: FinalizedModule = asm.finalize().unwrap();
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = lhs;
-    registers.x_reg_array[1] = rhs;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(lhs);
+    registers.x_reg_array[1] = arinsal_beamasm::rt::fixture_term(rhs);
     let mut stack = [0u64; 64];
     let stop = stack.as_mut_ptr().wrapping_add(stack.len());
     let mut header = ProcessHeader {
@@ -112,7 +112,7 @@ fn run_binary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), lhs: u64
     };
     let outcome = enter_native(&mut header, &mut registers, &module.entry(1).unwrap());
     assert_eq!(outcome, ExitReason::Returned);
-    registers.x_reg_array[1]
+    registers.x_reg_array[1].tagged_word()
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -127,7 +127,7 @@ fn run_unary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), input: u6
     .unwrap();
     let module = asm.finalize().unwrap();
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = input;
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(input);
     let mut stack = [0u64; 64];
     let stop = stack.as_mut_ptr().wrapping_add(stack.len());
     let mut header = ProcessHeader {
@@ -137,7 +137,7 @@ fn run_unary(emit: impl FnOnce(&mut BeamModuleAssembler, ArithHelper), input: u6
     };
     let outcome = enter_native(&mut header, &mut registers, &module.entry(1).unwrap());
     assert_eq!(outcome, ExitReason::Returned);
-    registers.x_reg_array[1]
+    registers.x_reg_array[1].tagged_word()
 }
 
 #[cfg(target_arch = "aarch64")]

@@ -87,8 +87,8 @@ fn run_native_offset(
     .unwrap();
     let module = asm.finalize().unwrap();
     let mut registers = SchedulerRegisters::default();
-    registers.x_reg_array[0] = rt::term_bits(context);
-    registers.x_reg_array[1] = rt::term_bits(Term::small(1).unwrap());
+    registers.x_reg_array[0] = context;
+    registers.x_reg_array[1] = Term::small(1).unwrap();
     let mut stack = [0_u64; 128];
     let mut header = ProcessHeader {
         stop: stack.as_mut_ptr().wrapping_add(stack.len()),
@@ -97,7 +97,7 @@ fn run_native_offset(
     };
     let result = enter_native(&mut header, &mut registers, &module.entry(1).unwrap());
     assert_eq!(result, ExitReason::Returned);
-    registers.x_reg_array[1]
+    registers.x_reg_array[1].tagged_word()
 }
 
 #[cfg(target_arch = "aarch64")]

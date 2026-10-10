@@ -694,22 +694,36 @@ fn member(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     }
     Ok(bool_term(false))
 }
+// Port of erts/emulator/beam/erl_bif_lists.c:1302-1380 (keyfind), OTP-29.1.1: an immediate
+// key compares words (a small key also equals a float of the same value); only a boxed key
+// needs the full comparison. Records are not tuples here, as in erts' is_tuple.
+#[inline]
 fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
     let index = args[1].as_small().ok_or(BADARG)?;
     if index < 1 {
         return Err(BADARG);
     }
+    let (key, slot) = (args[0], index as usize - 1);
+    let small_key = key.as_small().is_some();
+    let immediate_key = key.is_immed();
     let mut rest = args[2];
-    while rest.classify() == TermKind::List {
+    // SAFETY: The source heap remains live throughout this call.
+    while let Some((value, tail)) = unsafe { rest.cons_ref() } {
+        rest = tail;
         // SAFETY: The source heap remains live throughout this call.
-        let (value, tail) = unsafe { rest.cons_ref() }.ok_or(BADARG)?;
-        if let Ok(items) = tuple(value)
-            && let Some(&candidate) = items.get(index as usize - 1)
-            && loose_eq(args[0], candidate)
-        {
+        let Some(element) = unsafe { value.tuple_ref() }.and_then(|items| items.get(slot)) else {
+            continue;
+        };
+        let found = if element == key {
+            true
+        } else if immediate_key {
+            small_key && !element.is_immed() && loose_eq(key, element)
+        } else {
+            loose_eq(key, element)
+        };
+        if found {
             return Ok(Some(value));
         }
-        rest = tail;
     }
     if rest != Term::NIL {
         return Err(BADARG);
