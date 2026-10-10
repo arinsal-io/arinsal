@@ -38,16 +38,13 @@ fn run(
     function: &str,
     flags: [&str; 3],
 ) -> BTreeMap<String, String> {
-    let binary = if runtime == "erl" {
-        "erl"
-    } else {
-        env!("CARGO_BIN_EXE_arinsal")
-    };
     let mut command = if runtime == "erl" {
-        Command::new(binary)
+        arinsal_difftest::reference::erl().expect("reference OTP emulator")
     } else {
         let mut command = Command::new("timeout");
-        command.arg("30").arg(binary);
+        command
+            .arg("30")
+            .arg(env!("CARGO_BIN_EXE_arinsal"));
         command
     };
     let output = command
@@ -83,7 +80,7 @@ fn run(
 
 #[test]
 fn default_boot_values_match_otp() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if arinsal_difftest::reference::erl().is_none() {
         eprintln!("erl unavailable; skipping defaults differential");
         return;
     }
@@ -113,7 +110,7 @@ fn default_boot_values_match_otp() {
 
 #[test]
 fn system_flag_round_trips_match_otp() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if arinsal_difftest::reference::erl().is_none() {
         eprintln!("erl unavailable; skipping system_flag differential");
         return;
     }
@@ -128,7 +125,7 @@ fn system_flag_round_trips_match_otp() {
 #[test]
 #[ignore = "launch resource flags are not yet connected to system_info/1"]
 fn resource_flags_match_otp() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if arinsal_difftest::reference::erl().is_none() {
         eprintln!("erl unavailable; skipping resource flag differential");
         return;
     }
@@ -149,7 +146,7 @@ fn resource_flags_match_otp() {
 
 #[test]
 fn invalid_resource_flag_diagnostics_match_otp() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if arinsal_difftest::reference::erl().is_none() {
         eprintln!("erl unavailable; skipping invalid resource flag differential");
         return;
     }
@@ -163,7 +160,8 @@ fn invalid_resource_flag_diagnostics_match_otp() {
         ("+zdbbl", "0"),
         ("+zdbbl", "2097152"),
     ] {
-        let expected = Command::new("erl")
+        let expected = arinsal_difftest::reference::erl()
+            .expect("reference OTP emulator")
             .args([flag, value, "-noshell", "-eval", "halt()."])
             .output()
             .unwrap();

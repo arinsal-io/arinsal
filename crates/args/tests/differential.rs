@@ -8,8 +8,16 @@ use arinsal_etf::{OwnedTerm, decode};
 
 const PROBE: &str = "io:format(\"ARINSAL:~s~n\",[binary:encode_hex(term_to_binary({init:get_arguments(),init:get_plain_arguments()}))]),halt().";
 
+fn reference_erl() -> Command {
+    arinsal_difftest::reference::erl().expect("reference OTP emulator")
+}
+
+fn erl_available() -> bool {
+    arinsal_difftest::reference::erl().is_some()
+}
+
 fn erl_output(argv: &[String], env: &BTreeMap<String, String>) -> InitArgs {
-    let mut command = Command::new("erl");
+    let mut command = reference_erl();
     command.args(argv);
     command.env(
         "ERL_AFLAGS",
@@ -93,19 +101,10 @@ fn as_string(value: &OwnedTerm) -> String {
 }
 
 fn root_dir() -> String {
-    let output = Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\",[code:root_dir()]),halt().",
-        ])
-        .env("ERL_AFLAGS", "")
-        .env("ERL_FLAGS", "")
-        .env("ERL_ZFLAGS", "")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8(output.stdout).unwrap()
+    arinsal_difftest::reference::otp_root()
+        .expect("OTP root: set ARINSAL_OTP_ROOT or put erl on PATH")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn setup_env() -> BTreeMap<String, String> {
@@ -126,7 +125,7 @@ fn temp_dir(suffix: &str) -> PathBuf {
 
 #[test]
 fn differential_300_launches() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if !erl_available() {
         eprintln!("skipping differential_300_launches: erl is unavailable");
         return;
     }
@@ -214,7 +213,7 @@ fn differential_300_launches() {
 
 #[test]
 fn differential_edge_cases() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if !erl_available() {
         eprintln!("skipping differential_edge_cases: erl is unavailable");
         return;
     }

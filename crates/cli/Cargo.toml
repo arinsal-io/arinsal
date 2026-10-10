@@ -21,6 +21,9 @@ arinsal-vm.workspace = true
 arinsal-float.workspace = true
 arinsal-nif.workspace = true
 
+[dev-dependencies]
+arinsal-difftest.workspace = true
+
 [[bin]]
 name = "arinsal"
 path = "src/main.rs"

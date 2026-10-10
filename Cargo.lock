@@ -32,6 +32,7 @@ dependencies = [
 name = "arinsal-args"
 version = "0.0.1"
 dependencies = [
+ "arinsal-difftest",
  "arinsal-etf",
  "thiserror",
 ]
@@ -130,6 +131,7 @@ version = "0.0.1"
 dependencies = [
  "arinsal-args",
  "arinsal-beam",
+ "arinsal-difftest",
  "arinsal-etf",
  "arinsal-float",
  "arinsal-nif",
