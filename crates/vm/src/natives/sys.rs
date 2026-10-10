@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+#[path = "alloc_atoms.rs"]
+mod alloc_atoms;
 #[path = "alloc_info.rs"]
 mod alloc_info;
 
@@ -1179,6 +1181,8 @@ fn system_info(
 
 fn allocator_names(process: &mut Process) -> Result<Term, VmError> {
     use arinsal_etf::OwnedTerm as O;
+    // Port of erl_alloc.c:2805. Names are interned from the highest allocator down.
+    alloc_atoms::note_alloc_util_allocator_names();
     let names = [
         "temp_alloc",
         "sl_alloc",
@@ -1310,6 +1314,7 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
     use arinsal_etf::OwnedTerm as O;
     let configured = arinsal_args::active_allocator_options();
     if name == "sys_alloc" {
+        alloc_atoms::note_sys_alloc_options();
         return owned_system_info(
             process,
             O::List {
@@ -1335,6 +1340,7 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
         );
     }
     if name == "mseg_alloc" {
+        alloc_atoms::note_mseg();
         let schedulers = configured
             .schedulers
             .and_then(|count| usize::try_from(count).ok())
@@ -1396,8 +1402,10 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
     };
     apply_allocator_overrides(&mut spec, name, &configured.flags, schedulers);
     if !spec.enabled {
+        alloc_atoms::note_disabled_allocator(name);
         return owned_system_info(process, O::Atom("false".into()));
     }
+    alloc_atoms::note_one_allocator(name);
     let count = if spec.thread_specific {
         schedulers + dirty + 1
     } else {
@@ -1447,6 +1455,8 @@ fn allocator_system_info(process: &mut Process, name: &str) -> Result<Term, VmEr
 
 fn all_allocator_options(process: &mut Process) -> Result<Term, VmError> {
     use arinsal_etf::OwnedTerm as O;
+    // Port of erl_alloc.c:2902 (erts_allocator_options).
+    alloc_atoms::note_allocator_catalog();
     let active = arinsal_args::active_allocator_options();
     let (amcbf, rmcbf, mcs, mmap_scs, lock_memory, ycs, mmc, sac) =
         allocator_global_settings(&active.flags);
@@ -2230,6 +2240,7 @@ fn ethread_info(process: &mut Process) -> Result<Term, VmError> {
 
 fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_info.c:2773 (allocated_areas selector), OTP-29.1.1.
+    alloc_atoms::note_allocated_areas();
     snapshot_process(process, process.gc_live);
     let values = memory_values(vm, process);
     let value = |name: &str| {
