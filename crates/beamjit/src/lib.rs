@@ -2007,6 +2007,17 @@ fn arg(
     }
 }
 
+fn typed_arg(
+    value: Option<&SpecificOperand>,
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+) -> Result<arinsal_beamasm::types::TypedArg, String> {
+    Ok(arinsal_beamasm::types::TypedArg::new(
+        arg(value, beam, env)?,
+        operand_type(value, beam),
+    ))
+}
+
 /// The compiler type of an arithmetic operand: its `Type` chunk entry for a typed register, the
 /// type of the literal for a literal, otherwise `Any`.
 // Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry, getTypeUnion),
@@ -2193,6 +2204,10 @@ fn emit_op(
     beam: &BeamFile,
     env: &impl ModuleEnv,
 ) -> Result<(), EmitError> {
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452 (BeamModuleAssembler::emit),
+    // OTP-29.1.1: `tbz`/`tbnz` reach only ±32KB, so each instruction flushes a veneer before a
+    // forward short branch (such as `is_map`'s boxed test) falls out of range.
+    assembler.check_pending_stubs()?;
     let args = op.operands();
     let value = |index| arg(args.get(index), beam, env).map_err(EmitError::Operand);
     let count = |expected| {
@@ -2731,7 +2746,9 @@ fn emit_op(
                     "is_list" => assembler.emit_is_list(source, fail)?,
                     "is_nonempty_list" => assembler.emit_is_nonempty_list(source, fail)?,
                     "is_nil" => assembler.emit_is_nil(source, fail)?,
-                    "is_map" => assembler.emit_is_map(source, fail)?,
+                    "is_map" => {
+                        assembler.emit_is_map_typed(typed_arg(args.get(1), beam, env)?, fail)?
+                    }
                     "is_tuple" | "i_is_tuple" => assembler.emit_is_tuple(source, fail)?,
                     "i_is_tuple_of_arity" => {
                         assembler.emit_is_tuple_of_arity(source, value(2)?, fail, fail)?;
@@ -3742,9 +3759,12 @@ fn emit_op(
                         "bif_tuple_size" => {
                             assembler.emit_bif_tuple_size(n(0)?, source, destination, runtime)
                         }
-                        "bif_map_size" => {
-                            assembler.emit_bif_map_size(n(0)?, source, destination, runtime)
-                        }
+                        "bif_map_size" => assembler.emit_bif_map_size_typed(
+                            n(0)?,
+                            typed_arg(args.get(1), beam, env)?,
+                            destination,
+                            runtime,
+                        ),
                         "bif_length" => {
                             assembler.emit_bif_length(n(0)?, source, destination, runtime)
                         }
@@ -3769,12 +3789,13 @@ fn emit_op(
                             env.map_runtime(),
                         )
                     } else {
-                        assembler.emit_bif_is_map_key(
+                        assembler.emit_bif_is_map_key_typed(
                             n(1)?,
-                            value(key_at)?,
-                            value(map_at)?,
+                            typed_arg(args.get(key_at), beam, env)?,
+                            typed_arg(args.get(map_at), beam, env)?,
                             value(dest_at)?,
                             runtime,
+                            env.map_runtime(),
                         )
                     }
                 }

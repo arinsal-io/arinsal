@@ -165,6 +165,16 @@ impl TypedArg {
         union == union & types
     }
 
+    /// `maybe_one_of<Types...>`.
+    pub fn maybe_one_of(&self, types: u16) -> bool {
+        self.type_union() & types != 0
+    }
+
+    /// `masked_types<Types...>`.
+    pub fn masked_types(&self, types: u16) -> u16 {
+        self.type_union() & types
+    }
+
     /// `exact_type<Type>`.
     pub fn exact_type(&self, ty: u16) -> bool {
         let union = self.type_union();

@@ -51,6 +51,9 @@ pub enum SpecificOperand {
 /// Operations whose operands keep their `Type` chunk entry in the typed transform.
 // Port of erts/emulator/beam/jit/arm/instr_arith.cpp (getTypeEntry users), OTP-29.1.1.
 const TYPED_OPS: &[&str] = &[
+    "is_map",
+    "bif_is_map_key",
+    "bif_map_size",
     "i_plus",
     "i_minus",
     "i_band",
@@ -252,6 +255,20 @@ fn map_fields_to_elements(instruction: &Node) -> SpecificOp {
         return make_op(
             &instruction.name,
             instruction.args.iter().map(operand).collect(),
+        );
+    }
+    if keys.len() == 1 && matches!(keys[0], Operand::X(_) | Operand::Y(_)) {
+        // Port of erts/emulator/beam/jit/arm/ops.tab:1188-1190 and
+        // erts/emulator/beam/jit/arm/generators.tab:176-198 (one-key lookup),
+        // OTP-29.1.1. The ignored destination makes this the guard `is_map_key/2` path.
+        return make_op(
+            "i_get_map_element",
+            vec![
+                operand(fail),
+                operand(source),
+                operand(&keys[0]),
+                SpecificOperand::X(1023),
+            ],
         );
     }
     let mut args = Vec::with_capacity(3 + count * 2);
@@ -1115,6 +1132,25 @@ fn apply_rule(
                 let Operand::List(rest) = &args[3] else {
                     return None;
                 };
+                if matches!(args[2], Operand::U(2))
+                    && rest.len() == 2
+                    && matches!(rest[0], Operand::X(_) | Operand::Y(_))
+                {
+                    // Port of erts/emulator/beam/jit/arm/ops.tab:1188-1190 and
+                    // erts/emulator/beam/jit/arm/generators.tab:176-198 (one-key lookup),
+                    // OTP-29.1.1. Guard `is_map_key/2` uses a scratch destination.
+                    produced.push(Node {
+                        name: "i_get_map_element".into(),
+                        args: vec![
+                            args[0].clone(),
+                            args[1].clone(),
+                            rest[0].clone(),
+                            rest[1].clone(),
+                        ],
+                        offset: code[at].offset,
+                    });
+                    continue;
+                }
                 let mut specific_args = vec![
                     args[0].clone(),
                     args[1].clone(),
@@ -1838,6 +1874,32 @@ mod tests {
                 SpecificOperand::Atom(4),
                 SpecificOperand::X(1023),
                 SpecificOperand::Literal(7),
+                SpecificOperand::X(1023),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_key_map_guard_rewrites_to_shared_single_element_lookup() {
+        let input = [Instr {
+            op: Opcode::HasMapFields,
+            args: vec![
+                Operand::Label(9),
+                Operand::X(0),
+                Operand::U(1),
+                Operand::List(vec![Operand::X(1)]),
+            ],
+            offset: 0,
+        }];
+        let output = transform_function(&input);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].name(), "i_get_map_element");
+        assert_eq!(
+            output[0].operands(),
+            &[
+                SpecificOperand::Label(9),
+                SpecificOperand::X(0),
+                SpecificOperand::X(1),
                 SpecificOperand::X(1023),
             ]
         );

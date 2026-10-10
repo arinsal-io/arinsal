@@ -5,6 +5,7 @@ use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
     rt,
+    types::{ArgType, TypedArg, type_id},
 };
 use arinsal_term::{
     ExportEntry, FunEntry, ProcessHeap, Term, TermBuilder, TermKind, atoms, cmp, exact_eq,
@@ -612,6 +613,52 @@ fn native_is_map() {
         zero_term,
     );
 }
+
+#[test]
+fn native_is_map_with_map_type() {
+    let f = terms();
+    native_guard(
+        |a| {
+            a.emit_is_map_typed(
+                TypedArg::new(
+                    ArgVal::X(0),
+                    ArgType {
+                        union_bits: type_id::MAP,
+                        min: None,
+                        max: None,
+                    },
+                ),
+                2,
+            )
+        },
+        f.map,
+        small(0),
+        true,
+    );
+}
+
+#[test]
+fn native_is_map_with_integer_type() {
+    native_guard(
+        |a| {
+            a.emit_is_map_typed(
+                TypedArg::new(
+                    ArgVal::X(0),
+                    ArgType {
+                        union_bits: type_id::INTEGER,
+                        min: None,
+                        max: None,
+                    },
+                ),
+                2,
+            )
+        },
+        small(20_000),
+        small(0),
+        false,
+    );
+}
+
 #[test]
 fn native_is_function() {
     native_predicate(
@@ -808,11 +855,88 @@ fn native_bif_map_size() {
         bits(small(1)),
     );
 }
+
+#[test]
+fn native_bif_map_size_with_map_type() {
+    let f = terms();
+    native_value(
+        |a| {
+            a.emit_bif_map_size_typed(
+                0,
+                TypedArg::new(
+                    ArgVal::X(0),
+                    ArgType {
+                        union_bits: type_id::MAP,
+                        min: None,
+                        max: None,
+                    },
+                ),
+                ArgVal::X(0),
+                guard_helper,
+            )
+        },
+        f.map,
+        small(0),
+        bits(small(1)),
+    );
+}
+
+#[test]
+fn native_bif_map_size_with_integer_type() {
+    native_guard(
+        |a| {
+            a.emit_bif_map_size_typed(
+                2,
+                TypedArg::new(
+                    ArgVal::X(0),
+                    ArgType {
+                        union_bits: type_id::INTEGER,
+                        min: None,
+                        max: None,
+                    },
+                ),
+                ArgVal::X(0),
+                guard_helper,
+            )
+        },
+        small(20_000),
+        small(0),
+        false,
+    );
+}
+
 #[test]
 fn native_bif_is_map_key() {
     let f = terms();
     native_value(
         |a| a.emit_bif_is_map_key(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
+        f.alpha,
+        f.map,
+        bits(Term::atom(atoms::TRUE)),
+    );
+}
+
+#[test]
+fn native_bif_is_map_key_with_map_type() {
+    let f = terms();
+    native_value(
+        |a| {
+            a.emit_bif_is_map_key_typed(
+                0,
+                TypedArg::new(ArgVal::X(0), ArgType::ANY),
+                TypedArg::new(
+                    ArgVal::X(1),
+                    ArgType {
+                        union_bits: type_id::MAP,
+                        min: None,
+                        max: None,
+                    },
+                ),
+                ArgVal::X(0),
+                guard_helper,
+                map_runtime(),
+            )
+        },
         f.alpha,
         f.map,
         bits(Term::atom(atoms::TRUE)),
