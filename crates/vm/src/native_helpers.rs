@@ -1890,10 +1890,11 @@ pub extern "C" fn arinsal_beamasm_map_put_single(
     map: u64,
     _unused: u64,
 ) -> u64 {
-    map_single(header, key, value, map, false)
+    map_single(header, key, value, map, false, 0)
 }
 
-/// `Map#{Key := Value}` with a single pair and no failure label: `erts_maps_update`.
+/// `Map#{Key := Value}` with a single pair and no failure label: `erts_maps_update`; returns
+/// its status and writes the updated map through the scheduler's `TMP_MEM1` slot.
 // Port of erts/emulator/beam/jit/arm/instr_map.cpp:650-683
 // (emit_update_map_single_exact_body_shared), OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_map_update_single(
@@ -1901,14 +1902,33 @@ pub extern "C" fn arinsal_beamasm_map_update_single(
     key: u64,
     value: u64,
     map: u64,
-    _unused: u64,
+    result_pointer: u64,
 ) -> u64 {
-    map_single(header, key, value, map, true)
+    map_single(header, key, value, map, true, result_pointer)
 }
 
-fn map_single(header: *mut ProcessHeader, key: u64, value: u64, map: u64, exact: bool) -> u64 {
-    let Some((process, _)) = crate::native_hooks::process_and_registers(header) else {
-        return 0;
+fn map_single(
+    header: *mut ProcessHeader,
+    key: u64,
+    value: u64,
+    map: u64,
+    exact: bool,
+    result_pointer: u64,
+) -> u64 {
+    // erts_maps_put/erts_maps_update consume their operands from arguments and
+    // do not read the X register array.
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694,
+    // OTP-29.1.1.
+    let (process, registers) = if exact {
+        let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+            return 0;
+        };
+        (process, Some(registers))
+    } else {
+        let Some(process) = crate::native_hooks::enter_heap_runtime(header) else {
+            return 0;
+        };
+        (process, None)
     };
     let (key, value, map) = (
         crate::native_hooks::from_raw(key),
@@ -1922,7 +1942,29 @@ fn map_single(header: *mut ProcessHeader, key: u64, value: u64, map: u64, exact:
     } else {
         arinsal_maps::put(map, key, value, &mut heap)
     };
-    map_result(process, result, exact, false)
+    match result {
+        Ok(term) => {
+            // HAlloc advances HTOP; the map update leaves E unchanged.
+            process.header.htop = process.heap.heap_cursor().0;
+            if let Some(registers) = registers {
+                debug_assert_eq!(
+                    result_pointer,
+                    registers.tmp_mem.as_mut_ptr() as usize as u64
+                );
+                registers.tmp_mem[0] = crate::native_hooks::raw(term);
+                1
+            } else {
+                crate::native_hooks::raw(term)
+            }
+        }
+        Err(arinsal_maps::MapError::Badkey(_)) if exact => {
+            // `erts_maps_update` returns its zero status without setting exception fields; the
+            // exact-update fragment uses the saved TMP_MEM2 key to raise BADKEY.
+            process.header.htop = process.heap.heap_cursor().0;
+            0
+        }
+        Err(error) => map_result(process, Err(error), exact, false),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

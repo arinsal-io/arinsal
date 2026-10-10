@@ -39,7 +39,7 @@ fn runtime() -> MapRuntime {
 /// A runtime whose lookup fragments are built around `get`.
 fn runtime_with(get: arinsal_beamasm::map::MapGetHelper) -> MapRuntime {
     let fragments = Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(get).unwrap(),
+        arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
     ));
     MapRuntime {
         get,
@@ -48,7 +48,7 @@ fn runtime_with(get: arinsal_beamasm::map::MapGetHelper) -> MapRuntime {
         update_assoc: update,
         update_exact: update,
         put_single: update,
-        update_single: update,
+        update_single_exact_shared: fragments.update_single_exact_shared(),
         get_element_shared: fragments.get_element_shared(),
         get_element_hash_shared: fragments.get_element_hash_shared(),
     }

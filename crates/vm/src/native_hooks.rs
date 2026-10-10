@@ -102,17 +102,16 @@ pub(crate) fn process_and_registers<'a>(
 pub(crate) fn enter_runtime<'a>(
     header: *mut ProcessHeader,
 ) -> Option<(&'a mut Process, &'a mut SchedulerRegisters)> {
-    if header.is_null() {
-        return None;
-    }
-    // SAFETY: ProcessHeader is the first repr(C) field of Process; native entry
-    // publishes a live scheduler register pointer for the duration of the call.
-    let process = unsafe { &mut *header.cast::<Process>() };
+    let process = process_from_header(header)?;
     // Rust helpers may allocate or publish the header again, so first commit the
     // native heap and stack cursors that generated code flushed at the call site.
     process
         .heap
         .set_native_cursors(process.header.htop, process.header.stop);
+    scheduler_registers(process)
+}
+
+fn scheduler_registers(process: &mut Process) -> Option<(&mut Process, &mut SchedulerRegisters)> {
     let registers = process.header.ftrace.cast::<SchedulerRegisters>();
     if registers.is_null() {
         return None;
@@ -121,6 +120,26 @@ pub(crate) fn enter_runtime<'a>(
     // while native code and its synchronous hooks are executing.
     let registers = unsafe { &mut *registers };
     Some((process, registers))
+}
+
+/// Enters a non-collecting heap helper that receives all operands as arguments.
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-537 (emit_enter_runtime with
+// Update::eHeapAlloc publishes HTOP and E), OTP-29.1.1.
+pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
+    let process = process_from_header(header)?;
+    process
+        .heap
+        .set_native_cursors(process.header.htop, process.header.stop);
+    Some(process)
+}
+
+fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
+    if header.is_null() {
+        return None;
+    }
+    // SAFETY: ProcessHeader is the first repr(C) field of Process; native entry
+    // passes the active process header for the duration of the helper call.
+    Some(unsafe { &mut *header.cast::<Process>() })
 }
 
 fn publish_x(process: &Process, registers: &mut SchedulerRegisters) {

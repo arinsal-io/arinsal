@@ -131,7 +131,7 @@ extern "C" fn resolve_fun(process: *mut ProcessHeader, _: u64, _: u32) -> usize 
 
 fn map_runtime() -> MapRuntime {
     let fragments = Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(map_get).unwrap(),
+        arinsal_beamasm::map::MapFragments::new(map_get, map_update).unwrap(),
     ));
     MapRuntime {
         get_element_shared: fragments.get_element_shared(),
@@ -142,7 +142,7 @@ fn map_runtime() -> MapRuntime {
         update_assoc: map_update,
         update_exact: map_update,
         put_single: map_update,
-        update_single: map_update,
+        update_single_exact_shared: fragments.update_single_exact_shared(),
     }
 }
 

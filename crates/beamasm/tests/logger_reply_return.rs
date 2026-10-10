@@ -63,9 +63,12 @@ fn reply_return(idle: bool) -> (u64, u64, u64) {
             update_assoc: unused_map_update,
             update_exact: unused_map_update,
             put_single: unused_map_update,
-            update_single: unused_map_update,
-            get_element_shared: map_fragments(unused_map_get).get_element_shared(),
-            get_element_hash_shared: map_fragments(unused_map_get).get_element_hash_shared(),
+            update_single_exact_shared: map_fragments(unused_map_get, unused_map_update)
+                .update_single_exact_shared(),
+            get_element_shared: map_fragments(unused_map_get, unused_map_update)
+                .get_element_shared(),
+            get_element_hash_shared: map_fragments(unused_map_get, unused_map_update)
+                .get_element_hash_shared(),
         },
     )
     .unwrap();
@@ -146,8 +149,9 @@ fn reply_return_preserves_reply_and_state_for_both_idle_states() {
 
 fn map_fragments(
     get: arinsal_beamasm::map::MapGetHelper,
+    update: arinsal_beamasm::map::MapUpdateHelper,
 ) -> &'static arinsal_beamasm::map::MapFragments {
     Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(get).unwrap(),
+        arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
     ))
 }

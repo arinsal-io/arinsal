@@ -396,8 +396,11 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
     FRAGMENTS
         .get_or_init(|| {
-            arinsal_beamasm::map::MapFragments::new(crate::native_helpers::arinsal_beamasm_map_get)
-                .ok()
+            arinsal_beamasm::map::MapFragments::new(
+                crate::native_helpers::arinsal_beamasm_map_get,
+                crate::native_helpers::arinsal_beamasm_map_update_single,
+            )
+            .ok()
         })
         .as_ref()
 }
@@ -1495,7 +1498,10 @@ impl ModuleEnv for VmModuleEnv<'_> {
             update_assoc: crate::native_helpers::arinsal_beamasm_map_assoc,
             update_exact: crate::native_helpers::arinsal_beamasm_map_exact,
             put_single: crate::native_helpers::arinsal_beamasm_map_put_single,
-            update_single: crate::native_helpers::arinsal_beamasm_map_update_single,
+            update_single_exact_shared: map_fragments().map_or(
+                0,
+                arinsal_beamasm::map::MapFragments::update_single_exact_shared,
+            ),
             get_element_shared: map_fragments()
                 .map_or(0, arinsal_beamasm::map::MapFragments::get_element_shared),
             get_element_hash_shared: map_fragments().map_or(

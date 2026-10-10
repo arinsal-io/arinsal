@@ -39,6 +39,9 @@ pub const BADARG_MFAS: [(&str, &str, u8); 7] = [
 ];
 /// `freason` of an inline `map_size/1` failure: `{badmap, Value}` (erts `EXC_BADMAP`).
 pub const EXC_BADMAP: u64 = (18 << 10) | 0x50;
+/// `freason` of a missing key in exact map update: `{badkey, Key}` (erts `EXC_BADKEY`).
+// Port of erts/emulator/beam/error.h:168, OTP-29.1.1.
+pub const EXC_BADKEY: u64 = (19 << 10) | 0x50;
 const BADARG_MFA_SLOT: u32 = 16_440;
 
 /// Target mode accepted by the function arity guard adapter.
