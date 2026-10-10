@@ -51,7 +51,9 @@ pub(super) fn system_info(
         && allocator == "mseg_alloc"
     {
         // OTP returns `false` when this optional allocator is not present.
-        // Arinsal does not use the erts mseg allocator.
+        // Arinsal does not use the erts mseg allocator. The call still interns
+        // the mseg info atoms (erl_mseg.c:854) on builds where mseg exists.
+        super::alloc_atoms::note_mseg();
         return Some(Ok(atom("false")));
     }
     if parts.len() != 3 {
@@ -103,6 +105,10 @@ fn request_allocators(
     memory_internal: bool,
 ) -> Result<Term, VmError> {
     let names = validate_request(reference, allocators)?;
+    // Port of erl_alloc.c:3102 (reply_alloc_info) atom initialization. Done on
+    // the caller before aux workers build replies, so the intern order matches
+    // the aux-thread-then-requester order and does not race.
+    super::alloc_atoms::note_memory_internal(&names);
     snapshot_process(process, process.gc_live);
     let values = memory_values(vm, process);
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
