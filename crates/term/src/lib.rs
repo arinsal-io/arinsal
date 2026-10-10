@@ -41,9 +41,10 @@ pub use fun::{
 };
 pub use gc::{FragmentAlloc, FragmentIndex, GcStats};
 pub use hamt::{
-    HxNode, boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_from_ks_and_vs,
-    hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array, hashmap_key_hash, hashmap_leaves,
-    hashmap_leaves_hashed, hashmap_node_children, swizzle_map_hash,
+    HxNode, alloc_terms, boxed_object_words, build_hamt_from_unique, flatmap_keys,
+    hashmap_from_ks_and_vs, hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array,
+    hashmap_key_hash, hashmap_leaves, hashmap_leaves_hashed, hashmap_node_children,
+    swizzle_map_hash,
 };
 pub use hamt_yield::{HashmapBuild, MapReverseIter};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};

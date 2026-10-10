@@ -271,16 +271,43 @@ pub(crate) fn maskval(v: u64, level: usize) -> u64 {
     (v >> (((HAMT_MAX_LEVEL - 1) - level) * 4)) & 0xF
 }
 
+/// Fresh heap words (`erts_produce_heap` / `HAlloc`).
+///
+/// `T` is `MaybeUninit<u64>` or [`Term`] (`repr(transparent)` over one word).
+fn alloc_words<'a, T, H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    words: usize,
+) -> Result<(&'a mut [T], *mut u64), TermError> {
+    let ptr = heap.alloc(words).ok_or(TermError::HeapFull)?;
+    const {
+        assert!(std::mem::size_of::<T>() == 8);
+        assert!(std::mem::align_of::<T>() == 8);
+    }
+    // SAFETY: `HeapAlloc::alloc` returned `words` exclusive, aligned machine words
+    // (HAlloc, erl_map.c:376). This is the one slice view of that block. A `Term`
+    // slot is an Eterm: the caller stores it before loading it (erl_map.c:399-455).
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<T>(), words) };
+    Ok((slice, ptr))
+}
+
 /// Fresh, uninitialized heap words (`erts_produce_heap`).
 fn produce<'a, H: HeapAlloc + ?Sized>(
     heap: &mut H,
     words: usize,
 ) -> Result<(&'a mut [MaybeUninit<u64>], *mut u64), TermError> {
-    let ptr = heap.alloc(words).ok_or(TermError::HeapFull)?;
-    // SAFETY: the allocator returned `words` writable words that nothing else
-    // references; MaybeUninit admits their uninitialized contents.
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u64>>(), words) };
-    Ok((slice, ptr))
+    alloc_words(heap, words)
+}
+
+/// `HAlloc` `words` machine words and view them as `Eterm` slots.
+///
+/// Port of `Eterm *hp = HAlloc(p, words)` in erts/emulator/beam/erl_map.c:376,
+/// OTP-29.1.1. The slice is that block. Each slot is stored before it is loaded,
+/// as `flatmap_from_validated_list` does at erl_map.c:399-455.
+pub fn alloc_terms<'a, H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    words: usize,
+) -> Result<(&'a mut [Term], *mut u64), TermError> {
+    alloc_words(heap, words)
 }
 
 /// Allocate one node holding exactly `words`.

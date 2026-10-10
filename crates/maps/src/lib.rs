@@ -139,8 +139,16 @@ fn check(map: Term) -> MapResult<()> {
     }
 }
 
-// Port of erts/emulator/beam/erl_utils.h:267 (erts_cmp_flatmap_keys), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_utils.h:267-271 (erts_cmp_flatmap_keys), OTP-29.1.1:
+// two atoms compare by index; every other pair is `erts_cmp(..., exact=1)`, whose
+// small-integer path is a register compare.
 fn key_cmp(a: Term, b: Term) -> Ordering {
+    if let (Some(a), Some(b)) = (a.as_atom(), b.as_atom()) {
+        return a.0.cmp(&b.0);
+    }
+    if let (Some(a), Some(b)) = (a.as_small(), b.as_small()) {
+        return a.cmp(&b);
+    }
     exact_cmp(a, b, true)
 }
 
