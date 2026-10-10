@@ -37,6 +37,16 @@ run() ->
     B = [geib(A, T) || A <- [0, 1 bsl 70], T <- [{}, {1}]],
     {R, I, S, B}.
 "#;
+const LIST_FIELDS_SOURCE: &str = r#"-module(native_list_fields).
+-export([run/0]).
+
+head([H|_]) -> H.
+tail([_|T]) -> T.
+len([_|T], N) -> len(T, N + 1);
+len([], N) -> N.
+
+run() -> {head([first|last]), tail([first|last]), tail([first, second]), len([1, 2, 3], 0)}.
+"#;
 const BIF_FRAMES_MODULE: &str = "native_bif_frames";
 
 const BIF_FRAMES_SOURCE: &str = r#"-module(native_bif_frames).
@@ -441,6 +451,21 @@ fn native_lazy_debug_bif_frames_match_otp() {
         BIF_FRAMES_MODULE,
         BIF_FRAMES_SOURCE,
         BIF_FRAMES_MODULE,
+        &[],
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn native_list_field_loads_match_otp() {
+    if run_child_case() {
+        return;
+    }
+    assert_native_matches(
+        "native_list_field_loads_match_otp",
+        "native_list_fields",
+        LIST_FIELDS_SOURCE,
+        "native_list_fields",
         &[],
     );
 }
