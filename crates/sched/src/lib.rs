@@ -493,6 +493,15 @@ pub enum Error {
     WrongMode,
 }
 
+/// Outcome of attempting an erts-style sig-free task lock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignalFreeError {
+    /// The pid is no longer in the process table.
+    NoProcess,
+    /// The task is running or has signals waiting to be handled.
+    Busy,
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
@@ -4882,6 +4891,47 @@ impl<T: Task> Scheduler<T> {
         }
         let cell = process.cell.lock().unwrap();
         inspectable(process.state.load(Ordering::Acquire)).then(|| inspect(&cell.task))
+    }
+    /// Try the process main lock while its scheduler signal queues are empty.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:14836-14888
+    /// (`erts_try_lock_sig_free_proc`) and `erl_bif_info.c:1381-1417`, OTP-29.1.1:
+    /// a failed try-lock falls back to a process-info request signal.
+    pub fn inspect_signal_free<R>(
+        &self,
+        pid: Pid,
+        inspect: impl FnOnce(&T) -> R,
+    ) -> Result<R, SignalFreeError> {
+        let inspectable = |state| state == WAITING || state == QUEUED;
+        let has_pending_signals = |process: &Process<T>| {
+            process.publish_inflight.load(Ordering::Acquire) != 0 || process.input.has_pending()
+        };
+        let process = self
+            .inner
+            .table
+            .lookup(pid)
+            .ok_or(SignalFreeError::NoProcess)?;
+        let state = process.state.load(Ordering::Acquire);
+        if state == EXITED {
+            return Err(SignalFreeError::NoProcess);
+        }
+        if !inspectable(state) || has_pending_signals(&process) {
+            return Err(SignalFreeError::Busy);
+        }
+        // ERTS uses `erts_proc_trylock`; waiting for a running target here would
+        // turn a cheap process_info into a scheduler stall.
+        let cell = match process.cell.try_lock() {
+            Ok(cell) => cell,
+            Err(_) => return Err(SignalFreeError::Busy),
+        };
+        let state = process.state.load(Ordering::Acquire);
+        if state == EXITED {
+            return Err(SignalFreeError::NoProcess);
+        }
+        if !inspectable(state) || has_pending_signals(&process) || !cell.private.is_empty() {
+            return Err(SignalFreeError::Busy);
+        }
+        Ok(inspect(&cell.task))
     }
     /// Number of live process table elements, O(1) like `erts_ptab_count`.
     pub fn process_count(&self) -> usize {

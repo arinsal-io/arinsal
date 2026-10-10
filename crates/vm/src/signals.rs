@@ -1183,14 +1183,11 @@ fn access_timer_sync(
         },
         _ => return Err(badarg("timer reference")),
     };
-    tables().lock().unwrap().waiters.insert(
-        (scope(process), ctx.pid()),
-        Waiter {
-            id,
-            kind: WaitKind::Info,
-            save: process.inbox.len(),
-        },
-    );
+    process.pending_signal_waiter = Some(Waiter {
+        id,
+        kind: WaitKind::Info,
+        save: process.inbox.len(),
+    });
     *guard = TimerAccess::Parked {
         target: ctx.pid(),
         reply,
@@ -2377,7 +2374,7 @@ fn call_resolved(
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("cancel_timer/1"))?;
             if !options.asynchronous
-                && let Some(done) = poll(process, ctx.pid())?
+                && let Some(done) = poll(process)?
             {
                 return Ok(done);
             }
@@ -2458,7 +2455,7 @@ fn call_resolved(
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("read_timer/1"))?;
             if !options.asynchronous
-                && let Some(done) = poll(process, ctx.pid())?
+                && let Some(done) = poll(process)?
             {
                 return Ok(done);
             }
@@ -2592,15 +2589,16 @@ pub(crate) struct Pending {
     pub(crate) op: RemoteOp,
 }
 
-struct Waiter {
-    id: u64,
-    kind: WaitKind,
+#[derive(Clone, Copy)]
+pub(crate) struct Waiter {
+    pub(crate) id: u64,
+    pub(crate) kind: WaitKind,
     /// Mailbox length when the request was sent: the reply is queued after it.
     ///
     /// Port of erts/emulator/beam/erl_proc_sig_queue.c:3398 (erts_msgq_set_save_end),
     /// OTP-29.1.1: the wait skips the messages that predate the request instead of
     /// rescanning them on every retry.
-    save: usize,
+    pub(crate) save: usize,
 }
 
 /// Runtime address plus pid. Simulations reuse pid numbers, and tests run in parallel.
@@ -2667,7 +2665,6 @@ struct Tables {
     /// Per-target requests in submission order; wakeups usually arrive in that order,
     /// so lookups hit the front (system task blasts queue hundreds of thousands).
     requests: BTreeMap<Slot, Requests>,
-    waiters: BTreeMap<Slot, Waiter>,
     /// Processes that already answered their final requests but are still registered; a
     /// request sent to one now would never be served.
     exited: BTreeSet<Slot>,
@@ -2698,7 +2695,6 @@ fn tables() -> &'static Mutex<Tables> {
     TABLES.get_or_init(|| {
         Mutex::new(Tables {
             requests: BTreeMap::new(),
-            waiters: BTreeMap::new(),
             exited: BTreeSet::new(),
         })
     })
@@ -2723,30 +2719,19 @@ pub(crate) fn is_waiting(process: &Process, pid: Pid) -> bool {
 /// Whether `process` is parked in `erlang:process_info/2` awaiting a target reply.
 // Port of erts/emulator/beam/erl_bif_info.c:2341 (`current_function`), OTP-29.1.1.
 pub(crate) fn is_waiting_for_process_info(process: &Process) -> bool {
-    let Some(pid) = process.self_pid else {
-        return false;
-    };
-    tables()
-        .lock()
-        .unwrap()
-        .waiters
-        .get(&(scope(process), pid))
+    process
+        .pending_signal_waiter
         .is_some_and(|waiter| matches!(waiter.kind, WaitKind::Info))
 }
 
 /// `Ok(None)` when this process has no outstanding request.
 /// `Ok(Some(term))` when the reply has arrived.
 /// `Err(await)` when the reply is still pending.
-pub(crate) fn poll(process: &mut Process, caller: Pid) -> Result<Option<Term>, VmError> {
-    let slot = (scope(process), caller);
-    let waiter = {
-        let tables = tables().lock().unwrap();
-        let Some(waiter) = tables.waiters.get(&slot) else {
-            return Ok(None);
-        };
-        (waiter.id, waiter.kind, waiter.save)
+pub(crate) fn poll(process: &mut Process) -> Result<Option<Term>, VmError> {
+    let Some(waiter) = process.pending_signal_waiter else {
+        return Ok(None);
     };
-    let (id, kind, save) = waiter;
+    let (id, kind, save) = (waiter.id, waiter.kind, waiter.save);
     let Some(index) = process
         .inbox
         .position_from(save, |term| reply_inner(*term, id, kind).is_some())
@@ -2761,7 +2746,7 @@ pub(crate) fn poll(process: &mut Process, caller: Pid) -> Result<Option<Term>, V
     process.cold_mut().prio_len = new_prio_len;
     let term = removed.expect("reply index");
     process.message_removed(index);
-    tables().lock().unwrap().waiters.remove(&slot);
+    process.pending_signal_waiter = None;
     let inner = reply_inner(term, id, kind).ok_or_else(|| badarg("request reply"))?;
     interpret(kind, inner).map(Some)
 }
@@ -2795,7 +2780,7 @@ fn reply_inner(term: Term, id: u64, kind: WaitKind) -> Option<Term> {
 
 /// Enqueue `op` on `target` and, when `wait` is set, park the caller on the reply.
 pub(crate) fn submit(
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     target: Pid,
     op: RemoteOp,
@@ -2807,7 +2792,7 @@ pub(crate) fn submit(
 
 /// Like [`submit`], but the reply reference uses `id` (`0` allocates one).
 pub(crate) fn submit_id(
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     target: Pid,
     id: u64,
@@ -2821,7 +2806,7 @@ pub(crate) fn submit_id(
 ///
 /// Port of erts/emulator/beam/erl_process.c:7221 (schedule_process_sys_task), OTP-29.1.1.
 pub(crate) fn submit_sys_task(
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     requester: Pid,
     target: Pid,
@@ -2833,7 +2818,7 @@ pub(crate) fn submit_sys_task(
 
 #[allow(clippy::too_many_arguments)]
 fn submit_from(
-    process: &Process,
+    process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     from: Pid,
     target: Pid,
@@ -2866,14 +2851,11 @@ fn submit_from(
             None => queues.plain.push_back(pending),
         }
         if let Some(kind) = wait {
-            tables.waiters.insert(
-                (slot_of, ctx.pid()),
-                Waiter {
-                    id,
-                    kind,
-                    save: process.inbox.len(),
-                },
-            );
+            process.pending_signal_waiter = Some(Waiter {
+                id,
+                kind,
+                save: process.inbox.len(),
+            });
         }
     }
     let sent = match priority {
@@ -2899,7 +2881,12 @@ fn submit_from(
                     queue.retain(|pending| pending.id != id);
                 }
             }
-            tables.waiters.remove(&(slot_of, ctx.pid()));
+            if process
+                .pending_signal_waiter
+                .is_some_and(|waiter| waiter.id == id)
+            {
+                process.pending_signal_waiter = None;
+            }
             Ok(Submit::Dead)
         }
         Err(error) => Err(VmError::Unsupported(format!("request signal: {error}"))),
@@ -3160,6 +3147,7 @@ pub(crate) fn reply_request(
 /// Reply `false` / `undefined` / `badarg` for requests this process will never run.
 pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
     crate::natives::sys::release_multi_scheduling_blocks(process, ctx.pid());
+    process.pending_signal_waiter = None;
     // OTP destroys the trapped BIF state together with the exiting process.
     // Persistent get/0's snapshot retains a table generation and its literals.
     if let Some(cold) = process.cold.as_mut() {
@@ -3189,7 +3177,6 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
     });
     let pending = {
         let mut tables = tables().lock().unwrap();
-        tables.waiters.remove(&slot);
         for entry in &gone {
             tables.exited.remove(entry);
         }
@@ -3291,7 +3278,7 @@ fn is_process_alive(
     ctx: &mut RunCtx<'_, Message>,
     pid: Term,
 ) -> Result<Term, VmError> {
-    if let Some(done) = poll(process, ctx.pid())? {
+    if let Some(done) = poll(process)? {
         return Ok(done);
     }
     let pid = Pid::from_term(pid).ok_or_else(|| badarg("is_process_alive/1"))?;
