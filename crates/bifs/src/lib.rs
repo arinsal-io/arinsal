@@ -21,6 +21,7 @@ mod atomics;
 mod binary_mod;
 mod checksum;
 mod etf;
+mod lists;
 mod maps_bifs;
 mod pure;
 mod sys;
@@ -135,6 +136,7 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
         .or_else(|| sys::lookup(module, name, arity))
         .or_else(|| checksum::lookup(module, name, arity))
         .or_else(|| etf::lookup(module, name, arity))
+        .or_else(|| lists::lookup(module, name, arity))
         .or_else(|| pure::lookup(module, name, arity))
         .or_else(|| unicode::lookup(module, name, arity))
 }
@@ -144,6 +146,10 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
 pub struct FragmentingHeap<'a>(pub &'a mut ProcessHeap);
 
 impl HeapAlloc for FragmentingHeap<'_> {
+    #[inline]
+    fn words_left(&self) -> Option<usize> {
+        self.0.alloc_words_left()
+    }
     #[inline]
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         match HeapAlloc::alloc(self.0, words) {

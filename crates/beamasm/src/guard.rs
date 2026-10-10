@@ -1927,7 +1927,12 @@ impl BeamModuleAssembler {
     }
 
     /// Emits `length/1` through the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-335, OTP-29.1.1
+    ///
+    /// The `i_length` entry calls `erts_trapping_length_1`. This inlines that
+    /// walk for lists that stay under the reduction budget (the trap itself is
+    /// a later task): one `is_list` test, then `CDR` at tagged+7.
+    // Port of erts/emulator/beam/erl_bif_guard.c:293-296 (erts_trapping_length_1), OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:320-335 (emit_i_length), OTP-29.1.1.
     pub fn emit_bif_length(
         &mut self,
         fail: u32,
@@ -1938,6 +1943,7 @@ impl BeamModuleAssembler {
         let output = self.guard_destination(destination)?;
         let list_reg = self.source_reg(list)?;
         let loop_label = self.code.new_label();
+        let not_list = self.code.new_label();
         let slow = self.code.new_label();
         let done = self.code.new_label();
         self.code.emit(|e| {
@@ -1945,19 +1951,20 @@ impl BeamModuleAssembler {
             e.mov_const(Gpr::x(12), 0)
         })?;
         self.code.bind(loop_label)?;
-        self.code.emit(|e| e.cmp_imm(Gpr::x(11), 0x3b, false))?;
-        self.code.b_cond(Cond::Eq, done)?;
         self.code.emit(|e| {
             e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
             e.cmp_imm(Gpr::x(8), 1, false)
         })?;
-        self.code.b_cond(Cond::Ne, slow)?;
+        self.code.b_cond(Cond::Ne, not_list)?;
+        // CDR(list_val(list)): a list tag of 1 puts the tail word at tagged+7.
         self.code.emit(|e| {
-            e.and_imm(Gpr::x(10), Gpr::x(11), !7)?;
-            e.ldur(Gpr::x(11), Gpr::x(10), 8)?;
+            e.ldur(Gpr::x(11), Gpr::x(11), 7)?;
             e.add_imm(Gpr::x(12), Gpr::x(12), 1, false)
         })?;
         self.code.b(loop_label)?;
+        self.code.bind(not_list)?;
+        self.code.emit(|e| e.cmp_imm(Gpr::x(11), 0x3b, false))?;
+        self.code.b_cond(Cond::Ne, slow)?;
         self.code.bind(done)?;
         self.code.emit(|e| {
             e.lsl_imm(output, Gpr::x(12), 4)?;

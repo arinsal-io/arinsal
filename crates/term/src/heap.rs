@@ -235,6 +235,14 @@ pub(crate) fn exact_flat_key_cmp(a: Term, b: Term, flat_atom: bool) -> Ordering 
 pub trait HeapAlloc {
     /// Reserve contiguous words, or return `None` so the caller can collect.
     fn alloc(&mut self, words: usize) -> Option<*mut u64>;
+    /// Young-heap words [`alloc`](Self::alloc) can still return.
+    ///
+    /// `None` when this allocator does not expose a young-heap limit (a heap
+    /// fragment, or a process whose allocations are detached). Port of
+    /// erts/emulator/beam/erl_vm.h:175 (`HeapWordsLeft`), OTP-29.1.1.
+    fn words_left(&self) -> Option<usize> {
+        None
+    }
     /// Keep an off-heap binary alive until GC examines this heap's owners.
     fn retain_binary(&mut self, binary: Arc<RefcBinary>);
     /// Retain a growable off-heap binary until collection examines its BinRef.
@@ -331,6 +339,23 @@ impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
         let cur = heap.alloc(words).ok_or(TermError::SystemLimit)?;
         let end = cur.wrapping_add(words);
         Ok(Self { heap, cur, end })
+    }
+    /// Cursor (`HEAP_TOP` after the `HAlloc` of this block).
+    #[inline]
+    pub fn cursor(&self) -> *mut u64 {
+        self.cur
+    }
+    /// Exclusive end of the block.
+    #[inline]
+    pub fn limit(&self) -> *mut u64 {
+        self.end
+    }
+    /// Advance the cursor after a direct fill. `[cur, limit)` is released on drop.
+    ///
+    /// `cur` must be word-aligned and lie in `[cursor, limit]`.
+    #[inline]
+    pub fn set_cursor(&mut self, cur: *mut u64) {
+        self.cur = cur;
     }
     /// Give back the unused tail and reserve a fresh block of `words` words.
     pub fn regrow(&mut self, words: usize) -> Result<(), TermError> {
@@ -586,6 +611,15 @@ impl ProcessHeap {
         // SAFETY: The index is within the allocated young heap, owned exclusively here.
         unsafe { cell.get().write(word) };
         true
+    }
+    /// Young-heap words `alloc` will accept, or `None` when allocations are
+    /// redirected to a detached heap.
+    pub fn alloc_words_left(&self) -> Option<usize> {
+        if self.detached {
+            None
+        } else {
+            Some(self.words_left())
+        }
     }
     /// erts `HeapWordsLeft`: words the young heap can still hand out before the limit
     /// that [`HeapAlloc::alloc`] enforces.
@@ -915,6 +949,9 @@ impl Default for ProcessHeap {
     }
 }
 impl HeapAlloc for ProcessHeap {
+    fn words_left(&self) -> Option<usize> {
+        self.alloc_words_left()
+    }
     // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1: only the young
     // heap top moves back; a heap fragment keeps the caller's filler.
     fn release(&mut self, end: *mut u64, start: *mut u64) {
