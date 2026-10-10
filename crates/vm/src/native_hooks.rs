@@ -639,7 +639,7 @@ pub(crate) fn collect_native(
     if process.x.len() < roots {
         let mut grown = process.x.to_vec();
         grown.resize(roots, Term::NIL);
-        process.x = grown.into_boxed_slice();
+        process.x = grown.into();
     }
     for (destination, raw) in process.x.iter_mut().take(roots).zip(&registers.x_reg_array) {
         *destination = *raw;

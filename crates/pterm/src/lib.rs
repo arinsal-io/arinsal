@@ -264,6 +264,10 @@ pub struct Store {
     table: Atomic<Table>,
     writer: Mutex<Writer>,
     active_area: RwLock<Option<Arc<ActiveArea>>>,
+    /// Set before `active_area` becomes `Some`, cleared after it becomes `None`.
+    /// Exit skips the lock when no literal release is in progress
+    /// (erl_process.c:14374, `block_rla_ref` stays 0 for an immediate reason).
+    active_set: AtomicBool,
     last_trace: [AtomicU64; 4],
     processes: SegQueue<Weak<ProcessAccount>>,
     registration_generation: AtomicU64,
@@ -294,6 +298,7 @@ impl Store {
                 retired_order: VecDeque::new(),
             }),
             active_area: RwLock::new(None),
+            active_set: AtomicBool::new(false),
             last_trace: std::array::from_fn(|_| AtomicU64::new(0)),
             processes: SegQueue::new(),
             registration_generation: AtomicU64::new(0),
@@ -700,6 +705,7 @@ impl Store {
                 .is_some_and(|current| Arc::ptr_eq(current, &active))
             {
                 slot.take();
+                self.active_set.store(false, Ordering::Release);
                 arinsal_term::set_literal_purge_area(&active.pointer_ranges, false);
             }
             if literal_trace()
@@ -771,6 +777,9 @@ impl Store {
             // Port of erts/emulator/beam/beam_bif_load.c:1715 (rla_switch_area):
             // literal-aware copies now copy this area instead of sharing it.
             arinsal_term::set_literal_purge_area(&active.pointer_ranges, true);
+            // Publish the flag before the slot so an exiting process either sees the area
+            // or has already stored `exited`, which the scan below acknowledges.
+            self.active_set.store(true, Ordering::Release);
             *self
                 .active_area
                 .write()
@@ -922,6 +931,9 @@ impl Store {
             .expect("live process registration")
             .exited
             .store(true, Ordering::Release);
+        if !self.active_set.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(account) = process.account.as_ref()
             && let Some(active) = self
                 .active_area
@@ -1011,6 +1023,9 @@ impl Drop for ProcessRegistration<'_> {
         self.store.release_update_permission(self);
         if let Some(account) = self.account.take() {
             account.exited.store(true, Ordering::Release);
+            if !self.store.active_set.load(Ordering::Acquire) {
+                return;
+            }
             if let Some(active) = self
                 .store
                 .active_area

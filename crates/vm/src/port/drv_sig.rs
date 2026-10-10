@@ -562,6 +562,12 @@ pub(crate) fn connect(
         }
         handle.links.lock().unwrap().insert(pid);
         *handle.owner.lock().unwrap() = pid;
+        if !runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
+            handle.links.lock().unwrap().remove(&pid);
+            *handle.owner.lock().unwrap() = from;
+            signal_badsig(handle, handle.id);
+            return REDS_CONNECT;
+        }
         connected_message(
             &runtime,
             &scheduler,
@@ -598,7 +604,13 @@ pub(crate) fn link(
                 // Port of erts/emulator/beam/io.c:2669 (port_sig_link), OTP-29.1.1.
                 if live {
                     handle.links.lock().unwrap().insert(pid);
-                    trace_link(&task_runtime, handle.id, pid, "getting_linked");
+                    // erl_process.c:14084: the port link lives on the process, so exit
+                    // must visit the port table.
+                    if !task_runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
+                        handle.links.lock().unwrap().remove(&pid);
+                    } else {
+                        trace_link(&task_runtime, handle.id, pid, "getting_linked");
+                    }
                 } else if let (Some(port), Ok(reason)) =
                     (Term::port(handle.id), Message::copy_from(atom("noproc")))
                     && let Ok(port) = Message::copy_from(port)

@@ -205,7 +205,7 @@ pub(crate) fn next_catch(
             if process.x.len() < 4 {
                 let mut registers = process.x.to_vec();
                 registers.resize(4, Term::NIL);
-                process.x = registers.into_boxed_slice();
+                process.x = registers.into();
             }
             // Port of erts/emulator/beam/beam_common.c:541-544 (handle_error), OTP-29.1.1:
             // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.

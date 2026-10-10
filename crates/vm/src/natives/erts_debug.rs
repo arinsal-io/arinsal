@@ -3008,12 +3008,20 @@ fn system_monitor_set(
     if !matches_live_pid {
         return Err(badarg());
     }
+    let monitor_pid = match &receiver {
+        OwnedTerm::Pid { id, serial, .. } => Some(Pid::new(*id, *serial)),
+        _ => None,
+    };
     let state = SystemMonitorState {
         receiver,
         options,
         key,
     };
     store(Some(state));
+    // erl_process.c:14200 (erts_trace_check_exiting) only matters for the receiver.
+    if let Some(pid) = monitor_pid {
+        let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::SYS_MON);
+    }
     Ok(if key.is_some() { atom("ok") } else { old_term })
 }
 

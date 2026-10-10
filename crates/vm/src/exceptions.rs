@@ -800,7 +800,7 @@ pub(super) fn resume(
         if p.x.len() < 4 {
             let mut registers = p.x.to_vec();
             registers.resize(4, Term::NIL);
-            p.x = registers.into_boxed_slice();
+            p.x = registers.into();
         }
         p.x[0] = Term::catch(0);
         p.x[1] = trap.reason;

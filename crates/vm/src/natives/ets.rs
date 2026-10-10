@@ -1168,6 +1168,11 @@ fn call_inner(
                     EtsError::NameTaken => badarg_cause("already_exists"),
                     error => err(error),
                 })?;
+            // erl_db.c:2834: BIF_P->flags |= F_USING_DB so exit can find the table.
+            if !rt.publish_proc_flag(caller_pid, arinsal_sched::proc_flags::USING_DB) {
+                registry.exclusive()?.detach(tid).ok();
+                return Err(badarg());
+            }
             if registry.get(tid).map_err(err)?.options.named_table {
                 Ok(Term::atom(name.as_atom().unwrap()))
             } else {
@@ -1476,6 +1481,8 @@ fn call_inner(
                     .map_err(err)?;
                 drop(table);
                 registry.exclusive()?.note_fixation(caller, tid);
+                // erl_db.c:3048 and 5187: a fixation sets F_USING_DB on the fixing process.
+                let _ = rt.publish_proc_flag(caller_pid, arinsal_sched::proc_flags::USING_DB);
             } else {
                 table.safe_fixtable_for(caller, false).map_err(err)?;
             }
@@ -1522,6 +1529,10 @@ fn call_inner(
                 .tuple(&[atom("ETS-TRANSFER"), tab, caller, *data])
                 .map_err(|_| badarg())?;
             registry.exclusive()?.give_away(tid, *new_owner).map_err(err)?;
+            // erl_db.c:3128: the receiver's F_USING_DB is set so its exit deletes the table.
+            if !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::USING_DB) {
+                return Err(badarg());
+            }
             ctx.as_deref_mut()
                 .ok_or_else(needs_context)?
                 .send(pid, Message::copy_from(transfer)?)

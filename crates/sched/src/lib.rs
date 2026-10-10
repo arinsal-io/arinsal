@@ -606,6 +606,64 @@ struct TaskCell<T: Task> {
     task: T,
     private: Private<Event<T::Message>>,
 }
+
+/// Process-local words `erts_continue_exit_process` tests before taking a global table lock.
+///
+/// Low 16 bits are "this process has the resource" (`p->reg`, `F_USING_DB`, `p->bif_timers`,
+/// trace flags, …). High 16 bits are "exit has finished that resource", so a late registration
+/// can see the process is already gone and roll back. Port of erl_process.c:14301 (`bif_timers`),
+/// 14362 (`F_USING_DB`), 14424 (`p->common.u.alive.reg`), 14215 (code-permission xstate) and
+/// erl_process.c:13221 (`ERTS_P_ALL_TRACE_FLAGS`), OTP-29.1.1.
+pub mod proc_flags {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub const USING_DB: u32 = 1 << 0;
+    pub const BIF_TIMERS: u32 = 1 << 1;
+    pub const PORTS: u32 = 1 << 2;
+    pub const DDLL: u32 = 1 << 3;
+    pub const CODE_PERM: u32 = 1 << 4;
+    pub const SYS_MON: u32 = 1 << 5;
+    pub const NODE_MON: u32 = 1 << 6;
+    pub const REG: u32 = 1 << 7;
+    pub const TRACE: u32 = 1 << 8;
+    pub const TRACER: u32 = 1 << 9;
+    pub const PUBLISHED: u32 = 1 << 10;
+    pub const OWNED_TIMERS: u32 = 1 << 11;
+    /// A remote `process_info` / sys-task request is queued for this process
+    /// (`erl_proc_sig_queue.c` request tables). Exit takes that table only then.
+    pub const REQUESTS: u32 = 1 << 12;
+    pub const ALL: u32 = (1 << 13) - 1;
+    /// `ERTS_PSFLG_EXITING`, outside `ALL` so cleanup does not retire the bit.
+    /// Port of erl_nif.c:2323 (`enif_is_process_alive` sees the state flag), OTP-29.1.1.
+    pub const EXITING: u32 = 1 << 15;
+    const DONE_SHIFT: u32 = 16;
+
+    /// Bits whose global tables exit must still visit.
+    ///
+    /// Port of the NULL / flag tests in `erts_continue_exit_process` (erl_process.c:14290-14430):
+    /// a zero word skips the table. Unused bits are published as done so a registration that
+    /// arrives during exit rolls itself back instead of leaking into the table.
+    pub fn resources_to_clean(flags: &AtomicU32) -> u32 {
+        let current = flags.load(Ordering::Acquire) & ALL;
+        let unused = ALL & !current;
+        if unused != 0 {
+            flags.fetch_or(unused << DONE_SHIFT, Ordering::AcqRel);
+        }
+        flags.load(Ordering::Acquire) & ALL
+    }
+
+    /// Exit has already finished `bit` and will not look again.
+    pub fn finished(flags: &AtomicU32, bit: u32) -> bool {
+        flags.load(Ordering::Acquire) & (bit << DONE_SHIFT) != 0
+    }
+
+    /// Record that this process now has `bit`. False means exit already finished it.
+    pub fn publish(flags: &AtomicU32, bit: u32) -> bool {
+        let done = bit << DONE_SHIFT;
+        flags.fetch_or(bit, Ordering::AcqRel) & done == 0
+    }
+}
+
 struct Process<T: Task> {
     pid: Pid,
     /// Creation order of this incarnation, so a reused pid is distinguishable.
@@ -639,6 +697,8 @@ struct Process<T: Task> {
     /// the wheels that hold the receiver's timers, so a process without timers disturbs no
     /// other scheduler.
     bif_timer_wheels: AtomicU64,
+    /// See [`proc_flags`]. Read on exit without the process cell lock.
+    exit_flags: AtomicU32,
     wait_timer: AtomicU64,
     // Port of erts `Process.sig_inq`; shared with the task so receive can fetch in place.
     input: Arc<Incoming<Event<T::Message>>>,
@@ -753,6 +813,7 @@ impl<T: Task> ProcessTable<T> {
             wait_epoch: AtomicU64::new(0),
             timer_epoch_used: AtomicBool::new(false),
             bif_timer_wheels: AtomicU64::new(0),
+            exit_flags: AtomicU32::new(0),
             wait_timer: AtomicU64::new(0),
             input: Arc::default(),
             publish_inflight: AtomicUsize::new(0),
@@ -2351,6 +2412,7 @@ impl<T: Task> Inner<T> {
         // so every wheel may now hold timers aimed at it.
         if pause && let Some(process) = self.table.lookup(pid) {
             process.bif_timer_wheels.store(u64::MAX, Ordering::Release);
+            proc_flags::publish(&process.exit_flags, proc_flags::BIF_TIMERS);
         }
         for (worker, queue) in self.timer_commands.iter().enumerate() {
             queue.push(if pause {
@@ -2947,6 +3009,8 @@ impl<T: Task> Inner<T> {
                 receiver
                     .bif_timer_wheels
                     .fetch_or(timer_wheel_bit(worker), Ordering::AcqRel);
+                // p->bif_timers becomes non-NULL (erl_hl_timer.c:1832, erl_process.c:14301).
+                proc_flags::publish(&receiver.exit_flags, proc_flags::BIF_TIMERS);
             }
         }
         if ms == 0 {
@@ -3376,6 +3440,8 @@ pub struct RunCtx<'a, M: Send + 'static> {
     sched_type: SchedulerType,
     user_priority: &'a AtomicU8,
     active: &'a AtomicBool,
+    /// [`proc_flags`] of the running process. Exit tests this before any global table.
+    exit_flags: &'a AtomicU32,
     sys_task_run: bool,
     /// A dirty signal handler acts for a process whose dirty job is executing.
     dirty_running: bool,
@@ -3458,6 +3524,10 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Pid of the running task.
     pub fn pid(&self) -> Pid {
         self.pid
+    }
+    /// Process-local exit words (`p->flags`, `p->reg`, `p->bif_timers`, trace flags).
+    pub fn exit_flags(&self) -> &AtomicU32 {
+        self.exit_flags
     }
     /// Return the scheduler worker currently running this process.
     pub fn worker_id(&self) -> Option<usize> {
@@ -4092,6 +4162,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             sched_type: SchedulerType::Normal,
             user_priority: &process.user_priority,
             active: &process.active,
+            exit_flags: &process.exit_flags,
             sys_task_run: false,
             dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
         };
@@ -4706,6 +4777,14 @@ impl<T: Task> Scheduler<T> {
         }
     }
 
+    /// Run `f` on the process-local exit words of `pid`.
+    ///
+    /// The words live on the scheduler process, not behind the task cell, so a running
+    /// process and another process can publish them without taking each other's cell lock.
+    pub fn with_proc_flags<R>(&self, pid: Pid, f: impl FnOnce(&AtomicU32) -> R) -> Option<R> {
+        let process = self.inner.table.lookup(pid)?;
+        Some(f(&process.exit_flags))
+    }
     /// Spawn a normal-priority task.
     pub fn spawn(&self, task: T) -> Result<Pid, Error> {
         self.spawn_priority(task, Priority::Normal)
@@ -5337,6 +5416,7 @@ mod msgq_stage_microbench {
         let bound_worker = AtomicUsize::new(UNBOUND_WORKER);
         let user_priority = AtomicU8::new(Priority::Normal.index() as u8);
         let active = AtomicBool::new(true);
+        let exit_flags = AtomicU32::new(0);
         let mut context = RunCtx {
             inner: &mut receive_runner,
             pid: process,
@@ -5356,6 +5436,7 @@ mod msgq_stage_microbench {
             sched_type: SchedulerType::Normal,
             user_priority: &user_priority,
             active: &active,
+            exit_flags: &exit_flags,
             sys_task_run: false,
             dirty_running: false,
         };
@@ -5780,6 +5861,7 @@ fn run_slice<'a, T: Task>(
                 sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
                 user_priority: &process.user_priority,
                 active: &process.active,
+                exit_flags: &process.exit_flags,
                 sys_task_run,
                 dirty_running: false,
             };

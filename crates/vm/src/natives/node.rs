@@ -354,6 +354,15 @@ fn monitor_node(
         return Err(error("notalive"));
     }
     let immediate = tables.monitor(ctx.pid(), name.clone(), enabled);
+    if enabled {
+        // The process monitor tree is non-NULL; exit must walk the node table
+        // (dist.c monitor_node, cleared from erts_continue_exit_process).
+        if let Some(runtime) = process.runtime.as_ref()
+            && !runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::NODE_MON)
+        {
+            tables.monitor(ctx.pid(), name.clone(), false);
+        }
+    }
     drop(tables);
     if immediate {
         let mut heap = crate::FragmentingHeap(&mut process.heap);
