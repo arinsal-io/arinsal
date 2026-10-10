@@ -3,6 +3,7 @@
 use super::*;
 use arinsal_bifs::BifError;
 use arinsal_term::{MagicRef, global_atoms};
+use smallvec::SmallVec;
 use std::sync::{Arc, Mutex};
 
 pub(crate) enum TrapResult {
@@ -299,29 +300,44 @@ fn binary_search(
     // Port of erts/emulator/beam/erl_bif_binary.c:1433-1528 (do_binary_find), OTP-29.1.1.
     const SEARCH_LOOP_FACTOR: usize = 10;
     let budget = (process.reductions.max(0) as usize).saturating_mul(SEARCH_LOOP_FACTOR);
-    let resumed = state.is_some();
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
-        MagicRef::new(Mutex::new(arinsal_bifs::BinarySearchWalk::new(kind, args)?))
-    };
-    let search = state
-        .downcast_ref::<Mutex<arinsal_bifs::BinarySearchWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut search = search.lock().map_err(|_| BifError::SystemLimit)?;
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let search = state
+            .downcast_ref::<Mutex<arinsal_bifs::BinarySearchWalk>>()
+            .ok_or(BifError::BADARG)?;
+        let mut search = search.lock().map_err(|_| BifError::SystemLimit)?;
+        let (done, work) = search.step(budget);
+        let reductions = (work / SEARCH_LOOP_FACTOR) as u32;
+        if !done {
+            drop(search);
+            return Ok(TrapResult::Yield {
+                continuation: BINARY_SEARCH_CONTINUATION,
+                state,
+                reductions,
+            });
+        }
+        process.set_gc_enabled(restore_gc);
+        return finish_binary_search(process, &search, reductions);
+    }
+
+    let mut search = arinsal_bifs::BinarySearchWalk::new(kind, args)?;
     let (done, work) = search.step(budget);
     let reductions = (work / SEARCH_LOOP_FACTOR) as u32;
     if !done {
-        drop(search);
         return Ok(TrapResult::Yield {
             continuation: BINARY_SEARCH_CONTINUATION,
-            state,
+            state: MagicRef::new(Mutex::new(search)),
             reductions,
         });
     }
-    if resumed {
-        process.set_gc_enabled(restore_gc);
-    }
+    finish_binary_search(process, &search, reductions)
+}
+
+fn finish_binary_search(
+    process: &mut Process,
+    search: &arinsal_bifs::BinarySearchWalk,
+    reductions: u32,
+) -> Result<TrapResult, BifError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
     let value = search.finish(&mut ctx)?;
@@ -457,43 +473,65 @@ fn maps_projection(
     const ITERATIONS_PER_RED: i64 = 15;
     let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
     let mut reds = initial;
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let mut guard = state
+            .downcast_ref::<MapsProjectionState>()
+            .ok_or(BifError::BADARG)?
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?;
+        let walk = guard.as_mut().ok_or(BifError::BADARG)?;
+        let done = walk.step(&mut reds);
+        let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);
+        if !done {
+            drop(guard);
+            return Ok(TrapResult::Yield {
+                continuation: if keys {
+                    MAPS_KEYS_CONTINUATION
+                } else {
+                    MAPS_VALUES_CONTINUATION
+                },
+                state,
+                reductions,
+            });
+        }
+        let walk = guard.take().ok_or(BifError::BADARG)?;
+        drop(guard);
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
         let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-        match arinsal_bifs::MapsProjectionWalk::start(&mut ctx, args[0], keys)? {
-            arinsal_bifs::ProjectionStart::Done(value) => {
-                return Ok(TrapResult::Done {
-                    value,
-                    reductions: 0,
-                });
-            }
-            arinsal_bifs::ProjectionStart::Walk(walk) => MagicRef::new(Mutex::new(Some(walk))),
-        }
+        return Ok(TrapResult::Done {
+            value: walk.finish(&mut ctx),
+            reductions,
+        });
+    }
+
+    let start = {
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        arinsal_bifs::MapsProjectionWalk::start(&mut ctx, args[0], keys)?
     };
-    let mut guard = state
-        .downcast_ref::<MapsProjectionState>()
-        .ok_or(BifError::BADARG)?
-        .lock()
-        .map_err(|_| BifError::SystemLimit)?;
-    let walk = guard.as_mut().ok_or(BifError::BADARG)?;
+    let mut walk = match start {
+        arinsal_bifs::ProjectionStart::Done(value) => {
+            return Ok(TrapResult::Done {
+                value,
+                reductions: 0,
+            });
+        }
+        arinsal_bifs::ProjectionStart::Walk(walk) => walk,
+    };
     let done = walk.step(&mut reds);
     let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);
     if !done {
-        drop(guard);
         return Ok(TrapResult::Yield {
             continuation: if keys {
                 MAPS_KEYS_CONTINUATION
             } else {
                 MAPS_VALUES_CONTINUATION
             },
-            state,
+            state: MagicRef::new(Mutex::new(Some(walk))),
             reductions,
         });
     }
-    let walk = guard.take().ok_or(BifError::BADARG)?;
-    drop(guard);
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
     let value = walk.finish(&mut ctx);
@@ -512,11 +550,35 @@ fn maps_merge(
     use arinsal_maps::{MAP_MERGE_LOOP_FACTOR, MergeStart};
     let initial_reds = (process.reductions.max(0) as isize).saturating_mul(MAP_MERGE_LOOP_FACTOR);
     let mut reds = initial_reds;
-    let resumed = state.is_some();
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let mut guard = state
+            .downcast_ref::<MapsMergeState>()
+            .ok_or(BifError::BADARG)?
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?;
+        let merge = guard.as_mut().ok_or(BifError::BADARG)?;
+        let merged = arinsal_maps::hashmap_merge(merge, &mut reds, &mut heap)
+            .map_err(|_| BifError::SystemLimit)?;
+        let Some(value) = merged else {
+            drop(guard);
+            return Ok(TrapResult::Yield {
+                continuation: MAPS_MERGE_CONTINUATION,
+                state,
+                reductions: process.reductions.max(0) as u32,
+            });
+        };
+        *guard = None;
+        drop(guard);
+        process.set_gc_enabled(restore_gc);
+        return Ok(TrapResult::Done {
+            value,
+            reductions: ((initial_reds - reds) / MAP_MERGE_LOOP_FACTOR) as u32,
+        });
+    }
+
+    let mut merge = {
         let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
         match arinsal_bifs::maps_merge_start(&mut ctx, args)? {
             MergeStart::Done(value) => {
@@ -525,31 +587,19 @@ fn maps_merge(
                     reductions: 0,
                 });
             }
-            MergeStart::Hashmap(merge) => MagicRef::new(MapsMergeState::new(Some(merge))),
+            MergeStart::Hashmap(merge) => merge,
         }
     };
-    let mut guard = state
-        .downcast_ref::<MapsMergeState>()
-        .ok_or(BifError::BADARG)?
-        .lock()
-        .map_err(|_| BifError::SystemLimit)?;
-    let merge = guard.as_mut().ok_or(BifError::BADARG)?;
-    let merged = arinsal_maps::hashmap_merge(merge, &mut reds, &mut heap)
+    let merged = arinsal_maps::hashmap_merge(&mut merge, &mut reds, &mut heap)
         .map_err(|_| BifError::SystemLimit)?;
     let Some(value) = merged else {
-        drop(guard);
         // BUMP_ALL_REDS before trapping.
         return Ok(TrapResult::Yield {
             continuation: MAPS_MERGE_CONTINUATION,
-            state,
+            state: MagicRef::new(MapsMergeState::new(Some(merge))),
             reductions: process.reductions.max(0) as u32,
         });
     };
-    *guard = None;
-    drop(guard);
-    if resumed {
-        process.set_gc_enabled(restore_gc);
-    }
     Ok(TrapResult::Done {
         value,
         reductions: ((initial_reds - reds) / MAP_MERGE_LOOP_FACTOR) as u32,
@@ -939,16 +989,42 @@ fn iolist_size(
 ) -> Result<TrapResult, BifError> {
     const CHUNK: usize = 4096;
     let root = args[0];
-    let resumed = state.is_some();
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
-        MagicRef::new(Mutex::new(arinsal_bifs::IolistSizeWalk::new(root)))
-    };
-    let walker = state
-        .downcast_ref::<Mutex<arinsal_bifs::IolistSizeWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let walker = state
+            .downcast_ref::<Mutex<arinsal_bifs::IolistSizeWalk>>()
+            .ok_or(BifError::BADARG)?;
+        let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
+        let (done, reductions) = match walker.step(CHUNK) {
+            Ok(progress) => progress,
+            Err((error, reductions)) => {
+                return Ok(TrapResult::Failed {
+                    error,
+                    reductions: reductions as u32,
+                });
+            }
+        };
+        if !done {
+            drop(walker);
+            return Ok(TrapResult::Yield {
+                continuation: IOLIST_SIZE_CONTINUATION,
+                state,
+                reductions: reductions as u32,
+            });
+        }
+        let size = walker.take_size();
+        drop(walker);
+        process.set_gc_enabled(restore_gc);
+        let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .int_from_bigint(&size)
+            .map_err(|_| BifError::SystemLimit)?;
+        return Ok(TrapResult::Done {
+            value,
+            reductions: reductions as u32,
+        });
+    }
+
+    let mut walker = arinsal_bifs::IolistSizeWalk::new(root);
     let (done, reductions) = match walker.step(CHUNK) {
         Ok(progress) => progress,
         Err((error, reductions)) => {
@@ -959,18 +1035,13 @@ fn iolist_size(
         }
     };
     if !done {
-        drop(walker);
         return Ok(TrapResult::Yield {
             continuation: IOLIST_SIZE_CONTINUATION,
-            state,
+            state: MagicRef::new(Mutex::new(walker)),
             reductions: reductions as u32,
         });
     }
     let size = walker.take_size();
-    drop(walker);
-    if resumed {
-        process.set_gc_enabled(restore_gc);
-    }
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .int_from_bigint(&size)
         .map_err(|_| BifError::SystemLimit)?;
@@ -991,16 +1062,42 @@ fn iolist_conversion(
     if !matches!(root.classify(), TermKind::List | TermKind::Nil) {
         return Err(BifError::BADARG);
     }
-    let resumed = state.is_some();
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
-        MagicRef::new(Mutex::new(arinsal_bifs::IolistWalk::new(root, bitstring)))
-    };
-    let walker = state
-        .downcast_ref::<Mutex<arinsal_bifs::IolistWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let walker = state
+            .downcast_ref::<Mutex<arinsal_bifs::IolistWalk>>()
+            .ok_or(BifError::BADARG)?;
+        let mut walker = walker.lock().map_err(|_| BifError::SystemLimit)?;
+        let (done, reductions) = match walker.step(CHUNK) {
+            Ok(progress) => progress,
+            Err((error, reductions)) => {
+                return Ok(TrapResult::Failed {
+                    error,
+                    reductions: reductions as u32,
+                });
+            }
+        };
+        if !done {
+            drop(walker);
+            return Ok(TrapResult::Yield {
+                continuation: IOLIST_CONTINUATION,
+                state,
+                reductions: reductions as u32,
+            });
+        }
+        let (bytes, bits) = walker.take_parts();
+        drop(walker);
+        process.set_gc_enabled(restore_gc);
+        let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            .bitstring(&bytes, bits)
+            .map_err(|_| BifError::SystemLimit)?;
+        return Ok(TrapResult::Done {
+            value,
+            reductions: reductions as u32,
+        });
+    }
+
+    let mut walker = arinsal_bifs::IolistWalk::new(root, bitstring);
     let (done, reductions) = match walker.step(CHUNK) {
         Ok(progress) => progress,
         Err((error, reductions)) => {
@@ -1011,18 +1108,13 @@ fn iolist_conversion(
         }
     };
     if !done {
-        drop(walker);
         return Ok(TrapResult::Yield {
             continuation: IOLIST_CONTINUATION,
-            state,
+            state: MagicRef::new(Mutex::new(walker)),
             reductions: reductions as u32,
         });
     }
     let (bytes, bits) = walker.take_parts();
-    drop(walker);
-    if resumed {
-        process.set_gc_enabled(restore_gc);
-    }
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .bitstring(&bytes, bits)
         .map_err(|_| BifError::SystemLimit)?;
@@ -1041,27 +1133,46 @@ fn binary_to_term(
 ) -> Result<TrapResult, BifError> {
     const BYTES_PER_REDUCTION: usize = 128;
     let chunk_bytes = (process.reductions.max(0) as usize).saturating_mul(BYTES_PER_REDUCTION);
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
-        MagicRef::new(Mutex::new(arinsal_bifs::DecodeWalk::new(args)?))
-    };
-    let decoder = state
-        .downcast_ref::<Mutex<arinsal_bifs::DecodeWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut decoder = decoder.lock().map_err(|_| BifError::SystemLimit)?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-    let step = decoder.step_into(chunk_bytes, &mut ctx);
-    match step {
-        Ok((None, consumed)) => {
-            drop(decoder);
-            Ok(TrapResult::Yield {
-                continuation: BINARY_TO_TERM_CONTINUATION,
-                state,
-                reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
-            })
-        }
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let decoder = state
+            .downcast_ref::<Mutex<arinsal_bifs::DecodeWalk>>()
+            .ok_or(BifError::BADARG)?;
+        let mut decoder = decoder.lock().map_err(|_| BifError::SystemLimit)?;
+        let step = decode_step(process, &mut decoder, chunk_bytes);
+        return match step {
+            Ok((None, consumed)) => {
+                drop(decoder);
+                Ok(TrapResult::Yield {
+                    continuation: BINARY_TO_TERM_CONTINUATION,
+                    state,
+                    reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
+                })
+            }
+            Ok((Some(value), consumed)) => {
+                process.set_gc_enabled(restore_gc);
+                Ok(TrapResult::Done {
+                    value,
+                    reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
+                })
+            }
+            Err((error, consumed)) => {
+                process.set_gc_enabled(restore_gc);
+                Ok(TrapResult::Failed {
+                    error: decode_trap_error(error),
+                    reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
+                })
+            }
+        };
+    }
+
+    let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
+    match decode_step(process, &mut decoder, chunk_bytes) {
+        Ok((None, consumed)) => Ok(TrapResult::Yield {
+            continuation: BINARY_TO_TERM_CONTINUATION,
+            state: MagicRef::new(Mutex::new(decoder)),
+            reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
+        }),
         Ok((Some(value), consumed)) => {
             process.set_gc_enabled(restore_gc);
             Ok(TrapResult::Done {
@@ -1072,13 +1183,27 @@ fn binary_to_term(
         Err((error, consumed)) => {
             process.set_gc_enabled(restore_gc);
             Ok(TrapResult::Failed {
-                error: match error {
-                    BifError::Unsupported(_) => BifError::BADARG,
-                    other => other,
-                },
+                error: decode_trap_error(error),
                 reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
             })
         }
+    }
+}
+
+fn decode_step(
+    process: &mut Process,
+    decoder: &mut arinsal_bifs::DecodeWalk,
+    chunk_bytes: usize,
+) -> Result<(Option<Term>, usize), (BifError, usize)> {
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+    decoder.step_into(chunk_bytes, &mut ctx)
+}
+
+fn decode_trap_error(error: BifError) -> BifError {
+    match error {
+        BifError::Unsupported(_) => BifError::BADARG,
+        other => other,
     }
 }
 
@@ -1092,7 +1217,6 @@ fn binary_copy(
     // Port of erts/emulator/beam/erl_bif_binary.c:2380-2505, OTP-29.1.1.
     const COPY_BYTES_PER_REDUCTION: usize = 64;
     const CHUNK_BYTES: usize = 4000 * COPY_BYTES_PER_REDUCTION;
-    let resumed = state.is_some();
     let input = args[0];
     let count = if args.len() == 2 {
         args[1]
@@ -1120,21 +1244,65 @@ fn binary_copy(
             reductions: 1,
         });
     }
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| BifError::SystemLimit)?;
-        bytes.resize(len, 0);
-        MagicRef::new(Mutex::new(BinaryCopyState { bytes, copied: 0 }))
-    };
-    let copy = state
-        .downcast_ref::<Mutex<BinaryCopyState>>()
-        .ok_or(BifError::BADARG)?;
-    let mut copy = copy.lock().map_err(|_| BifError::SystemLimit)?;
-    let end = copy.copied.saturating_add(CHUNK_BYTES).min(len);
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let copy = state
+            .downcast_ref::<Mutex<BinaryCopyState>>()
+            .ok_or(BifError::BADARG)?;
+        let mut copy = copy.lock().map_err(|_| BifError::SystemLimit)?;
+        let (done, reductions) = copy_binary_chunk(
+            &mut copy,
+            input,
+            input_len,
+            len,
+            CHUNK_BYTES,
+            COPY_BYTES_PER_REDUCTION,
+        )?;
+        if !done {
+            drop(copy);
+            return Ok(TrapResult::Yield {
+                continuation: BINARY_COPY_CONTINUATION,
+                state,
+                reductions,
+            });
+        }
+        process.set_gc_enabled(restore_gc);
+        return finish_binary_copy(process, &copy.bytes, reductions);
+    }
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| BifError::SystemLimit)?;
+    bytes.resize(len, 0);
+    let mut copy = BinaryCopyState { bytes, copied: 0 };
+    let (done, reductions) = copy_binary_chunk(
+        &mut copy,
+        input,
+        input_len,
+        len,
+        CHUNK_BYTES,
+        COPY_BYTES_PER_REDUCTION,
+    )?;
+    if !done {
+        return Ok(TrapResult::Yield {
+            continuation: BINARY_COPY_CONTINUATION,
+            state: MagicRef::new(Mutex::new(copy)),
+            reductions,
+        });
+    }
+    finish_binary_copy(process, &copy.bytes, reductions)
+}
+
+fn copy_binary_chunk(
+    copy: &mut BinaryCopyState,
+    input: Term,
+    input_len: usize,
+    len: usize,
+    chunk_bytes: usize,
+    bytes_per_reduction: usize,
+) -> Result<(bool, u32), BifError> {
+    let end = copy.copied.saturating_add(chunk_bytes).min(len);
     let mut offset = copy.copied;
     while offset < end {
         let source_offset = offset % input_len;
@@ -1146,21 +1314,18 @@ fn binary_copy(
         )?;
         offset += amount;
     }
-    let reductions = ((end - copy.copied) / COPY_BYTES_PER_REDUCTION) as u32;
+    let reductions = ((end - copy.copied) / bytes_per_reduction) as u32;
     copy.copied = end;
-    if end < len {
-        drop(copy);
-        return Ok(TrapResult::Yield {
-            continuation: BINARY_COPY_CONTINUATION,
-            state,
-            reductions,
-        });
-    }
-    if resumed {
-        process.set_gc_enabled(restore_gc);
-    }
+    Ok((end == len, reductions))
+}
+
+fn finish_binary_copy(
+    process: &mut Process,
+    bytes: &[u8],
+    reductions: u32,
+) -> Result<TrapResult, BifError> {
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .binary(&copy.bytes)
+        .binary(bytes)
         .map_err(|_| BifError::SystemLimit)?;
     Ok(TrapResult::Done { value, reductions })
 }
@@ -1196,31 +1361,47 @@ fn term_encode(
     const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
     let chunk_work =
         (process.reductions.max(0) as usize).saturating_mul(TERM_TO_BINARY_LOOP_FACTOR);
-    let resumed = state.is_some();
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else {
-        MagicRef::new(Mutex::new(arinsal_bifs::EncodeWalk::new(args)?))
-    };
-    let encoder = state
-        .downcast_ref::<Mutex<arinsal_bifs::EncodeWalk>>()
-        .ok_or(BifError::BADARG)?;
-    let mut encoder_guard = encoder.lock().map_err(|_| BifError::SystemLimit)?;
-    let (done, work) = encoder_guard.step(chunk_work)?;
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let encoder = state
+            .downcast_ref::<Mutex<arinsal_bifs::EncodeWalk>>()
+            .ok_or(BifError::BADARG)?;
+        let mut encoder_guard = encoder.lock().map_err(|_| BifError::SystemLimit)?;
+        let (done, work) = encoder_guard.step(chunk_work)?;
+        let reductions = work.div_ceil(TERM_TO_BINARY_LOOP_FACTOR) as u32;
+        if !done {
+            drop(encoder_guard);
+            return Ok(TrapResult::Yield {
+                continuation: TERM_TO_BINARY_CONTINUATION,
+                state,
+                reductions,
+            });
+        }
+        process.set_gc_enabled(restore_gc);
+        let encoder = std::mem::replace(&mut *encoder_guard, arinsal_bifs::EncodeWalk::completed());
+        drop(encoder_guard);
+        return finish_term_encode(process, encoder, reductions, iovec);
+    }
+
+    let mut encoder = arinsal_bifs::EncodeWalk::new(args)?;
+    let (done, work) = encoder.step(chunk_work)?;
     let reductions = work.div_ceil(TERM_TO_BINARY_LOOP_FACTOR) as u32;
     if !done {
-        drop(encoder_guard);
         return Ok(TrapResult::Yield {
             continuation: TERM_TO_BINARY_CONTINUATION,
-            state,
+            state: MagicRef::new(Mutex::new(encoder)),
             reductions,
         });
     }
-    if resumed {
-        process.set_gc_enabled(restore_gc);
-    }
-    let encoder = std::mem::replace(&mut *encoder_guard, arinsal_bifs::EncodeWalk::completed());
-    drop(encoder_guard);
+    finish_term_encode(process, encoder, reductions, iovec)
+}
+
+fn finish_term_encode(
+    process: &mut Process,
+    encoder: arinsal_bifs::EncodeWalk,
+    reductions: u32,
+    iovec: bool,
+) -> Result<TrapResult, BifError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let value = if iovec {
@@ -1237,7 +1418,7 @@ fn term_encode(
                 .map_err(|_| BifError::SystemLimit)?
         }
     } else {
-        let bytes = encoder.finish_binary()?;
+        let bytes = encoder.finish_binary_buffer()?;
         builder.binary(&bytes).map_err(|_| BifError::SystemLimit)?
     };
     Ok(TrapResult::Done { value, reductions })
@@ -1246,7 +1427,7 @@ fn term_encode(
 /// Progress of one `erlang:processes/0` call.
 struct PtabListState {
     /// Consistent snapshot of the table taken when the BIF started.
-    pids: Vec<arinsal_sched::Pid>,
+    pids: SmallVec<[arinsal_sched::Pid; 16]>,
     /// Next table index to inspect.
     next_index: u32,
 }
@@ -1264,12 +1445,33 @@ fn processes(
     const INDICES_PER_RED: u32 = 25;
     const CHUNK_SIZE: u32 = 1000;
     const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
-    const CONSES_PER_RED: usize = 75;
     let table_max = arinsal_term::ptab::process_table_layout().max();
     let reds_left = process.reductions.max(0) as u32;
-    let (state, first) = if let Some(state) = state {
-        (Arc::clone(state), false)
-    } else {
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let list = state
+            .downcast_ref::<Mutex<PtabListState>>()
+            .ok_or(BifError::BADARG)?;
+        let mut list = list.lock().map_err(|_| BifError::SystemLimit)?;
+        let (done, spent) = scan_process_table(&mut list, table_max, reds_left);
+        if !done {
+            drop(list);
+            return Ok(TrapResult::Yield {
+                continuation: PTAB_LIST_CONTINUATION,
+                state,
+                reductions: spent,
+            });
+        }
+        let pid_terms = list
+            .pids
+            .iter()
+            .filter_map(|pid| pid.to_term())
+            .collect::<Vec<_>>();
+        drop(list);
+        return finish_processes(process, pid_terms, spent);
+    }
+
+    let mut list = {
         let runtime = process.runtime.as_ref().ok_or(BifError::BADARG)?;
         let scheduler = runtime.scheduler().map_err(|_| BifError::BADARG)?;
         let mut pids = runtime
@@ -1279,56 +1481,58 @@ fn processes(
             .iter()
             .copied()
             .filter(|pid| scheduler.lookup(*pid))
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[arinsal_sched::Pid; 16]>>();
         pids.sort_by_key(|pid| crate::process::pid_table_index(*pid));
-        (
-            MagicRef::new(Mutex::new(PtabListState {
-                pids,
-                next_index: 0,
-            })),
-            true,
-        )
+        PtabListState {
+            pids,
+            next_index: 0,
+        }
     };
-    let yield_now = |state: Arc<MagicRef>, reductions: u32| {
-        Ok(TrapResult::Yield {
+    if reds_left < MIN_START_REDS {
+        return Ok(TrapResult::Yield {
             continuation: PTAB_LIST_CONTINUATION,
-            state,
-            reductions,
-        })
-    };
-    if first && reds_left < MIN_START_REDS {
-        return yield_now(state, 1);
+            state: MagicRef::new(Mutex::new(list)),
+            reductions: 1,
+        });
     }
-    let mut spent = 0_u32;
-    let done = {
-        let mut list = state
-            .downcast_ref::<Mutex<PtabListState>>()
-            .ok_or(BifError::BADARG)?
-            .lock()
-            .map_err(|_| BifError::SystemLimit)?;
-        while list.next_index < table_max && spent < reds_left {
-            list.next_index = (list.next_index + CHUNK_SIZE).min(table_max);
-            spent += MIN_START_REDS;
-        }
-        if list.next_index >= table_max {
-            spent = spent.max(list.pids.len().div_ceil(CONSES_PER_RED) as u32);
-            true
-        } else {
-            false
-        }
-    };
+    let (done, spent) = scan_process_table(&mut list, table_max, reds_left);
     if !done {
-        return yield_now(state, spent);
+        return Ok(TrapResult::Yield {
+            continuation: PTAB_LIST_CONTINUATION,
+            state: MagicRef::new(Mutex::new(list)),
+            reductions: spent,
+        });
     }
-    let pid_terms = state
-        .downcast_ref::<Mutex<PtabListState>>()
-        .ok_or(BifError::BADARG)?
-        .lock()
-        .map_err(|_| BifError::SystemLimit)?
+    let pid_terms = list
         .pids
         .iter()
         .filter_map(|pid| pid.to_term())
         .collect::<Vec<_>>();
+    finish_processes(process, pid_terms, spent)
+}
+
+fn scan_process_table(list: &mut PtabListState, table_max: u32, reds_left: u32) -> (bool, u32) {
+    const CHUNK_SIZE: u32 = 1000;
+    const MIN_START_REDS: u32 = CHUNK_SIZE / 25;
+    const CONSES_PER_RED: usize = 75;
+    let mut spent = 0_u32;
+    while list.next_index < table_max && spent < reds_left {
+        list.next_index = (list.next_index + CHUNK_SIZE).min(table_max);
+        spent += MIN_START_REDS;
+    }
+    if list.next_index >= table_max {
+        spent = spent.max(list.pids.len().div_ceil(CONSES_PER_RED) as u32);
+        (true, spent)
+    } else {
+        (false, spent)
+    }
+}
+
+fn finish_processes(
+    process: &mut Process,
+    pid_terms: Vec<Term>,
+    spent: u32,
+) -> Result<TrapResult, BifError> {
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .list_from_iter(pid_terms)
         .map_err(|_| BifError::SystemLimit)?;

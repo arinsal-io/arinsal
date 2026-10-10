@@ -13,6 +13,7 @@ use arinsal_term::{
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{BifError, BifFn, Class, Ctx};
 
@@ -1094,7 +1095,7 @@ fn iolist_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> 
 fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_iolist.c:1116-1180 (iolist_to_iovec_engine), OTP-29.1.1.
     const COPY_THRESHOLD: usize = 64;
-    let mut work = vec![(args[0], false)];
+    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
     let mut copied = Vec::new();
     let mut segments = Vec::new();
     let mut total: usize = 0;
@@ -1150,7 +1151,7 @@ fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 pub(super) fn iolist_bytes(root: Term) -> Result<Vec<u8>, BifError> {
     let mut output = Vec::new();
-    let mut work = vec![(root, false)];
+    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(root, false)];
     while let Some((term, byte_allowed)) = work.pop() {
         match term.classify() {
             TermKind::Nil => {}
@@ -1196,8 +1197,8 @@ pub fn bitstring_bit_len(term: Term) -> Result<usize, BifError> {
 /// Stateful iolist conversion used by VM continuation exports.
 // Port of erts/emulator/beam/erl_iolist.c:842-935, OTP-29.1.1.
 pub struct IolistWalk {
-    work: Vec<(Term, bool)>,
-    bytes: Vec<u8>,
+    work: SmallVec<[(Term, bool); 8]>,
+    bytes: SmallVec<[u8; 64]>,
     bit_len: usize,
     bitstring: bool,
 }
@@ -1205,7 +1206,7 @@ pub struct IolistWalk {
 /// Stateful iolist size calculation used by the VM continuation export.
 // Port of erts/emulator/beam/erl_iolist.c:1013-1070, OTP-29.1.1.
 pub struct IolistSizeWalk {
-    work: Vec<(Term, bool)>,
+    work: SmallVec<[(Term, bool); 8]>,
     size: BigInt,
 }
 
@@ -1213,7 +1214,7 @@ impl IolistSizeWalk {
     /// Start traversing an iolist rooted in a stable process heap.
     pub fn new(root: Term) -> Self {
         Self {
-            work: vec![(root, false)],
+            work: smallvec![(root, false)],
             size: BigInt::from(0_u8),
         }
     }
@@ -1262,8 +1263,8 @@ impl IolistWalk {
     /// Start traversing an input already rooted in a stable heap.
     pub fn new(root: Term, bitstring: bool) -> Self {
         Self {
-            work: vec![(root, false)],
-            bytes: Vec::new(),
+            work: smallvec![(root, false)],
+            bytes: SmallVec::new(),
             bit_len: 0,
             bitstring,
         }
@@ -1291,8 +1292,7 @@ impl IolistWalk {
                         append_term_bitstring(&mut self.bytes, &mut self.bit_len, term)
                             .map_err(|error| (error, consumed))?;
                     } else {
-                        let bytes = binary_bytes(term).map_err(|error| (error, consumed))?;
-                        self.append_bytes(&bytes)
+                        self.append_binary(term)
                             .map_err(|error| (error, consumed))?;
                     }
                 }
@@ -1317,7 +1317,7 @@ impl IolistWalk {
     }
 
     /// Return accumulated data and significant bit count after completion.
-    pub fn take_parts(&mut self) -> (Vec<u8>, usize) {
+    pub fn take_parts(&mut self) -> (SmallVec<[u8; 64]>, usize) {
         (std::mem::take(&mut self.bytes), self.bit_len)
     }
 
@@ -1333,6 +1333,23 @@ impl IolistWalk {
         self.bit_len = len.checked_mul(8).ok_or(BifError::SystemLimit)?;
         Ok(())
     }
+
+    fn append_binary(&mut self, term: Term) -> Result<(), BifError> {
+        let bits = bitstring_bit_len(term)?;
+        if !bits.is_multiple_of(8) {
+            return Err(BADARG);
+        }
+        let additional = bits / 8;
+        let previous = self.bytes.len();
+        let len = previous
+            .checked_add(additional)
+            .filter(|length| *length <= (1 << 30))
+            .ok_or(BifError::SystemLimit)?;
+        self.bytes.resize(len, 0);
+        copy_binary_range(term, 0, &mut self.bytes[previous..len])?;
+        self.bit_len = len.checked_mul(8).ok_or(BifError::SystemLimit)?;
+        Ok(())
+    }
 }
 fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
     // SAFETY: The source heap remains live throughout the BIF call.
@@ -1343,7 +1360,7 @@ fn iolist_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Size queries count bitstrings directly; materializing an iolist can turn
     // a small shared term graph into a multi-gigabyte temporary buffer.
     let mut size = BigInt::from(0_u8);
-    let mut work = vec![(args[0], false)];
+    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
     while let Some((term, byte_allowed)) = work.pop() {
         match term.classify() {
             TermKind::Nil => {}
@@ -1405,8 +1422,8 @@ fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
     if !matches!(args[0].classify(), TermKind::List | TermKind::Nil) {
         return Err(BADARG);
     }
-    let mut work = vec![(args[0], false)];
-    let mut data = Vec::new();
+    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
+    let mut data = SmallVec::<[u8; 64]>::new();
     let mut bits = 0_usize;
     while let Some((term, byte_allowed)) = work.pop() {
         match term.classify() {
@@ -1433,24 +1450,53 @@ fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         .bitstring(&data, bits)
         .expect("infallible BIF heap"))
 }
-fn append_term_bitstring(
-    bytes: &mut Vec<u8>,
+trait BitBuffer {
+    fn push_byte(&mut self, byte: u8);
+    fn last_byte_mut(&mut self) -> Option<&mut u8>;
+}
+
+impl BitBuffer for Vec<u8> {
+    fn push_byte(&mut self, byte: u8) {
+        self.push(byte);
+    }
+
+    fn last_byte_mut(&mut self) -> Option<&mut u8> {
+        self.last_mut()
+    }
+}
+
+impl<A> BitBuffer for SmallVec<A>
+where
+    A: smallvec::Array<Item = u8>,
+{
+    fn push_byte(&mut self, byte: u8) {
+        self.push(byte);
+    }
+
+    fn last_byte_mut(&mut self) -> Option<&mut u8> {
+        self.last_mut()
+    }
+}
+
+fn append_term_bitstring<B: BitBuffer>(
+    bytes: &mut B,
     length: &mut usize,
     term: Term,
 ) -> Result<(), BifError> {
     let bit_len = bitstring_bit_len(term)?;
-    let mut data = vec![0; bit_len.div_ceil(8)];
+    let mut data = SmallVec::<[u8; 64]>::new();
+    data.resize(bit_len.div_ceil(8), 0);
     copy_bitstring_range(term, 0, &mut data, bit_len)?;
     for i in 0..bit_len {
         append_bit(bytes, length, (data[i / 8] >> (7 - i % 8)) & 1);
     }
     Ok(())
 }
-fn append_bit(bytes: &mut Vec<u8>, length: &mut usize, bit: u8) {
+fn append_bit(bytes: &mut impl BitBuffer, length: &mut usize, bit: u8) {
     if (*length).is_multiple_of(8) {
-        bytes.push(0);
+        bytes.push_byte(0);
     }
-    *bytes.last_mut().expect("byte") |= bit << (7 - *length % 8);
+    *bytes.last_byte_mut().expect("byte") |= bit << (7 - *length % 8);
     *length += 1;
 }
 fn range(bytes: &[u8], start: i64, length: i64) -> Result<&[u8], BifError> {

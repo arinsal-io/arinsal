@@ -12,6 +12,8 @@ use arinsal_term::{
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
+use smallvec::{SmallVec, smallvec};
+use std::ops::{Deref, DerefMut};
 
 use crate::pure::{Heap, integer, make_list, tuple_build};
 use crate::{BifError, BifFn, Ctx};
@@ -76,7 +78,35 @@ fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
     Ok(opts)
 }
 
-fn int_bytes(out: &mut Vec<u8>, n: &BigInt) {
+trait ByteOutput: Deref<Target = [u8]> + DerefMut<Target = [u8]> {
+    fn push(&mut self, byte: u8);
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+}
+
+impl ByteOutput for Vec<u8> {
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes);
+    }
+}
+
+impl<A> ByteOutput for SmallVec<A>
+where
+    A: smallvec::Array<Item = u8>,
+{
+    fn push(&mut self, byte: u8) {
+        SmallVec::push(self, byte);
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        SmallVec::extend_from_slice(self, bytes);
+    }
+}
+
+fn int_bytes(out: &mut impl ByteOutput, n: &BigInt) {
     if let Some(n) = n.to_i64() {
         if let Ok(byte) = u8::try_from(n) {
             out.extend_from_slice(&[97, byte]);
@@ -99,10 +129,10 @@ fn int_bytes(out: &mut Vec<u8>, n: &BigInt) {
     out.extend_from_slice(&digits);
 }
 
-fn atom_bytes(out: &mut Vec<u8>, name: &str, minor: u8) {
+fn atom_bytes(out: &mut impl ByteOutput, name: &str, minor: u8) {
     // Port of erts/emulator/beam/external.c (ATOM_EXT selection), OTP-29.1.1.
     if minor <= 1 && name.chars().all(|c| (c as u32) <= 255) {
-        let latin: Vec<u8> = name.chars().map(|c| c as u8).collect();
+        let latin: SmallVec<[u8; 32]> = name.chars().map(|c| c as u8).collect();
         out.push(100);
         out.extend_from_slice(&(latin.len() as u16).to_be_bytes());
         out.extend_from_slice(&latin);
@@ -118,15 +148,16 @@ fn atom_bytes(out: &mut Vec<u8>, name: &str, minor: u8) {
     }
 }
 
-fn atom_term(out: &mut Vec<u8>, term: Term, minor: u8) -> Result<(), BifError> {
+fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), BifError> {
     atom_bytes(out, &atom_name(term).ok_or(BifError::BADARG)?, minor);
     Ok(())
 }
 
-fn bit_bytes(term: Term) -> Result<(Vec<u8>, usize), BifError> {
+fn bit_bytes(term: Term) -> Result<(SmallVec<[u8; 64]>, usize), BifError> {
     // SAFETY: the process owns the binary; no writable append occurs in this BIF.
     let view = unsafe { term.binary_ref() }.ok_or(BifError::BADARG)?;
-    let mut bytes = vec![0; view.bit_len().div_ceil(8)];
+    let mut bytes = SmallVec::new();
+    bytes.resize(view.bit_len().div_ceil(8), 0);
     if view.start_bit().is_multiple_of(8) {
         let start = view.start_bit() / 8;
         let len = bytes.len();
@@ -156,16 +187,16 @@ enum Work {
     PatchFun(usize),
     ListGather {
         cursor: Term,
-        heads: Vec<Term>,
-        string_bytes: Vec<u8>,
+        heads: SmallVec<[Term; 8]>,
+        string_bytes: SmallVec<[u8; 32]>,
         is_string: bool,
     },
     ListElements {
-        heads: Arc<Vec<Term>>,
+        heads: SmallVec<[Term; 8]>,
         next: usize,
     },
     StringCopy {
-        bytes: Arc<Vec<u8>>,
+        bytes: SmallVec<[u8; 32]>,
         copied: usize,
     },
     BinaryCopy {
@@ -263,7 +294,7 @@ impl MapSort {
     }
 }
 
-fn push_map_terms(work: &mut Vec<Work>, pairs: Vec<(Term, Term)>) {
+fn push_map_terms(work: &mut SmallVec<[Work; 4]>, pairs: Vec<(Term, Term)>) {
     for (key, value) in pairs.into_iter().rev() {
         work.push(Work::Term(value));
         work.push(Work::Term(key));
@@ -275,9 +306,9 @@ type EncodedWithSplits = (Vec<u8>, Vec<(usize, usize)>);
 /// Incremental ETF encoder used by the VM's trapping `term_to_binary` path.
 pub struct EncodeWalk {
     opts: EncodeOpts,
-    out: Vec<u8>,
-    splits: Vec<(usize, usize)>,
-    work: Vec<Work>,
+    out: SmallVec<[u8; 64]>,
+    splits: SmallVec<[(usize, usize); 4]>,
+    work: SmallVec<[Work; 4]>,
 }
 
 impl EncodeWalk {
@@ -285,9 +316,9 @@ impl EncodeWalk {
     pub fn completed() -> Self {
         Self {
             opts: EncodeOpts::default(),
-            out: Vec::new(),
-            splits: Vec::new(),
-            work: Vec::new(),
+            out: SmallVec::new(),
+            splits: SmallVec::new(),
+            work: SmallVec::new(),
         }
     }
 
@@ -298,7 +329,7 @@ impl EncodeWalk {
     }
 
     fn start(term: Term, opts: EncodeOpts) -> Self {
-        let mut out = vec![131];
+        let mut out = smallvec![131];
         if opts.local {
             // Port of erts/emulator/beam/external.c:3305 (encode LOCAL_EXT), OTP-29.1.1.
             out.extend_from_slice(&[121, 0, 0, 0, 0]);
@@ -306,17 +337,17 @@ impl EncodeWalk {
         Self {
             opts,
             out,
-            splits: Vec::new(),
-            work: vec![Work::Term(term)],
+            splits: SmallVec::new(),
+            work: smallvec![Work::Term(term)],
         }
     }
 
     /// Encode at most `budget` pending terms and patch records.
     pub fn step(&mut self, budget: usize) -> Result<(bool, usize), BifError> {
         let opts = self.opts;
-        let mut out = std::mem::take(&mut self.out);
-        let mut splits = std::mem::take(&mut self.splits);
-        let mut work = std::mem::take(&mut self.work);
+        let out = &mut self.out;
+        let splits = &mut self.splits;
+        let work = &mut self.work;
         let mut consumed = 0;
         while consumed < budget {
             let Some(item) = work.pop() else {
@@ -365,7 +396,7 @@ impl EncodeWalk {
                         out.push(107);
                         out.extend_from_slice(&(heads.len() as u16).to_be_bytes());
                         work.push(Work::StringCopy {
-                            bytes: Arc::new(string_bytes),
+                            bytes: string_bytes,
                             copied: 0,
                         });
                     } else {
@@ -375,7 +406,6 @@ impl EncodeWalk {
                                 .map_err(|_| BifError::SystemLimit)?
                                 .to_be_bytes(),
                         );
-                        let heads = Arc::new(heads);
                         work.push(Work::Term(cursor));
                         work.push(Work::ListElements { heads, next: 0 });
                     }
@@ -384,11 +414,12 @@ impl EncodeWalk {
                 Work::ListElements { heads, next } => {
                     consumed += 1;
                     if next < heads.len() {
+                        let term = heads[next];
                         work.push(Work::ListElements {
-                            heads: Arc::clone(&heads),
+                            heads,
                             next: next + 1,
                         });
-                        work.push(Work::Term(heads[next]));
+                        work.push(Work::Term(term));
                     }
                     continue;
                 }
@@ -418,7 +449,8 @@ impl EncodeWalk {
                     let amount = len
                         .saturating_sub(copied)
                         .min(budget.saturating_sub(consumed).max(1));
-                    let mut bytes = vec![0; amount];
+                    let mut bytes = SmallVec::<[u8; 128]>::new();
+                    bytes.resize(amount, 0);
                     let bit_count = (amount * 8).min(bits.saturating_sub(copied * 8));
                     crate::pure::copy_bitstring_range(term, copied * 8, &mut bytes, bit_count)?;
                     out.extend_from_slice(&bytes);
@@ -451,7 +483,7 @@ impl EncodeWalk {
                     } else if opts.deterministic {
                         work.push(Work::MapSort(MapSort::new(pairs)));
                     } else {
-                        push_map_terms(&mut work, pairs);
+                        push_map_terms(work, pairs);
                     }
                     continue;
                 }
@@ -459,7 +491,7 @@ impl EncodeWalk {
                     let work_budget = budget.saturating_sub(consumed).max(1);
                     consumed += sorting.step(work_budget);
                     if sorting.is_done() {
-                        push_map_terms(&mut work, sorting.finish());
+                        push_map_terms(work, sorting.finish());
                     } else {
                         work.push(Work::MapSort(sorting));
                     }
@@ -469,7 +501,7 @@ impl EncodeWalk {
             match term.classify() {
                 TermKind::Number => {
                     if let Some(n) = term.as_small() {
-                        int_bytes(&mut out, &BigInt::from(n));
+                        int_bytes(out, &BigInt::from(n));
                     } else if let Some(header) = term.header() {
                         if header & 63 == 0x18 {
                             // SAFETY: a live boxed FLOAT has one initialized data word.
@@ -495,17 +527,17 @@ impl EncodeWalk {
                             let n = unsafe { term.big_ref() }
                                 .ok_or(BifError::BADARG)?
                                 .to_bigint();
-                            int_bytes(&mut out, &n);
+                            int_bytes(out, &n);
                         }
                     }
                 }
-                TermKind::Atom => atom_term(&mut out, term, opts.minor)?,
+                TermKind::Atom => atom_term(out, term, opts.minor)?,
                 TermKind::Nil => out.push(106),
                 TermKind::List => {
                     work.push(Work::ListGather {
                         cursor: term,
-                        heads: Vec::new(),
-                        string_bytes: Vec::new(),
+                        heads: SmallVec::new(),
+                        string_bytes: SmallVec::new(),
                         is_string: true,
                     });
                 }
@@ -518,8 +550,9 @@ impl EncodeWalk {
                         out.push(105);
                         out.extend_from_slice(&(view.len() as u32).to_be_bytes());
                     }
-                    let elements: Vec<_> = view.iter().collect();
-                    work.extend(elements.into_iter().rev().map(Work::Term));
+                    for index in (0..view.len()).rev() {
+                        work.push(Work::Term(view.get(index).ok_or(BifError::BADARG)?));
+                    }
                 }
                 TermKind::Map => {
                     out.push(116);
@@ -538,7 +571,7 @@ impl EncodeWalk {
                     } else {
                         let pairs = arinsal_maps::term_to_binary_pairs(term)
                             .map_err(|_| BifError::BADARG)?;
-                        push_map_terms(&mut work, pairs);
+                        push_map_terms(work, pairs);
                     }
                 }
                 TermKind::Bitstring => {
@@ -576,14 +609,14 @@ impl EncodeWalk {
                         } => {
                             out.push(88);
                             // Port of erts/emulator/beam/external.c:3651 (local pid node), OTP-29.1.1.
-                            write_node(&mut out, node, opts)?;
+                            write_node(out, node, opts)?;
                             out.extend_from_slice(&index.to_be_bytes());
                             out.extend_from_slice(&serial.to_be_bytes());
                             out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
                         }
                         Identity::Port { node, creation, id } => {
                             out.push(120);
-                            write_node(&mut out, node, opts)?;
+                            write_node(out, node, opts)?;
                             out.extend_from_slice(&id.to_be_bytes());
                             out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
                         }
@@ -594,7 +627,7 @@ impl EncodeWalk {
                         } => {
                             out.push(90);
                             out.extend_from_slice(&(ids.len() as u16).to_be_bytes());
-                            write_node(&mut out, node, opts)?;
+                            write_node(out, node, opts)?;
                             out.extend_from_slice(&local_creation(creation, opts).to_be_bytes());
                             for id in ids {
                                 out.extend_from_slice(&id.to_be_bytes());
@@ -607,9 +640,9 @@ impl EncodeWalk {
                     match unsafe { term.fun_ref() }.ok_or(BifError::BADARG)? {
                         FunRef::Export { entry } => {
                             out.push(113);
-                            atom_term(&mut out, Term::atom(entry.module), opts.minor)?;
-                            atom_term(&mut out, Term::atom(entry.function), opts.minor)?;
-                            int_bytes(&mut out, &BigInt::from(entry.arity));
+                            atom_term(out, Term::atom(entry.module), opts.minor)?;
+                            atom_term(out, Term::atom(entry.function), opts.minor)?;
+                            int_bytes(out, &BigInt::from(entry.arity));
                         }
                         FunRef::Local { entry, free_vars } => {
                             out.push(112);
@@ -619,9 +652,9 @@ impl EncodeWalk {
                             out.extend_from_slice(&entry.uniq);
                             out.extend_from_slice(&entry.index.to_be_bytes());
                             out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
-                            atom_term(&mut out, Term::atom(entry.module), opts.minor)?;
-                            int_bytes(&mut out, &BigInt::from(entry.old_index));
-                            int_bytes(&mut out, &BigInt::from(entry.old_uniq));
+                            atom_term(out, Term::atom(entry.module), opts.minor)?;
+                            int_bytes(out, &BigInt::from(entry.old_index));
+                            int_bytes(out, &BigInt::from(entry.old_uniq));
                             work.push(Work::PatchFun(at));
                             // SAFETY: the live source heap retains the fun entry and environment.
                             let view = unsafe { term.fun_ref() }.unwrap();
@@ -639,13 +672,13 @@ impl EncodeWalk {
                     out.push(67);
                     out.extend_from_slice(&(record.len() as u32).to_be_bytes());
                     out.push(u8::from(record.is_exported()));
-                    atom_term(&mut out, Term::atom(record.module()), opts.minor)?;
-                    atom_term(&mut out, Term::atom(record.name()), opts.minor)?;
+                    atom_term(out, Term::atom(record.module()), opts.minor)?;
+                    atom_term(out, Term::atom(record.name()), opts.minor)?;
                     let mut values = Vec::with_capacity(record.len());
                     for i in 0..record.len() {
                         let sorted = record.sorted_index(i).ok_or(BifError::BADARG)?;
                         atom_term(
-                            &mut out,
+                            out,
                             Term::atom(record.key(sorted).ok_or(BifError::BADARG)?),
                             opts.minor,
                         )?;
@@ -657,21 +690,26 @@ impl EncodeWalk {
             }
         }
         let done = work.is_empty();
-        self.out = out;
-        self.splits = splits;
-        self.work = work;
         Ok((done, consumed))
     }
 
     /// Finish compression and return the serialized byte vector.
     pub fn finish_binary(self) -> Result<Vec<u8>, BifError> {
-        encode_bytes(self.out, self.opts)
+        self.finish_binary_buffer().map(SmallVec::into_vec)
+    }
+
+    /// Finish as an inline buffer when the ETF output is small.
+    pub fn finish_binary_buffer(self) -> Result<SmallVec<[u8; 64]>, BifError> {
+        if self.opts.compressed.is_some_and(|level| level > 0) {
+            return encode_bytes(self.out.into_vec(), self.opts).map(SmallVec::from_vec);
+        }
+        Ok(self.out)
     }
 
     /// Finish as `term_to_iovec/1,2`, preserving large-binary split boundaries.
     pub fn finish_iovec(self) -> Result<(Vec<Vec<u8>>, bool), BifError> {
         if self.opts.compressed.is_some_and(|level| level > 0) {
-            return Ok((vec![encode_bytes(self.out, self.opts)?], true));
+            return Ok((vec![encode_bytes(self.out.into_vec(), self.opts)?], true));
         }
         let Self { out, splits, .. } = self;
         let mut at = 0;
@@ -693,12 +731,12 @@ impl EncodeWalk {
 fn encode_plain_with_splits(term: Term, opts: EncodeOpts) -> Result<EncodedWithSplits, BifError> {
     let mut walk = EncodeWalk::start(term, opts);
     walk.step(usize::MAX)?;
-    Ok((walk.out, walk.splits))
+    Ok((walk.out.into_vec(), walk.splits.into_vec()))
 }
 
 // Port of erts/emulator/beam/external.c:3651 (NIL_EXT node when encoding local), OTP-29.1.1.
 fn write_node(
-    out: &mut Vec<u8>,
+    out: &mut impl ByteOutput,
     node: arinsal_term::Atom,
     opts: EncodeOpts,
 ) -> Result<(), BifError> {
@@ -810,7 +848,7 @@ fn decode_options(term: Option<Term>) -> Result<DecodeOpts, BifError> {
 }
 
 struct Reader {
-    bytes: Vec<u8>,
+    bytes: SmallVec<[u8; 64]>,
     at: usize,
 }
 impl Reader {
@@ -897,8 +935,8 @@ enum FrameKind {
 struct Frame {
     kind: FrameKind,
     left: usize,
-    values: Vec<Term>,
-    shapes: Vec<Shape>,
+    values: SmallVec<[Term; 4]>,
+    shapes: SmallVec<[Shape; 4]>,
 }
 
 fn built(
@@ -932,7 +970,7 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
         }
         FrameKind::Map => {
             // Port of erts/emulator/beam/external.c:5428, OTP-29.1.1.
-            let pairs: Vec<_> = values
+            let pairs: SmallVec<[(Term, Term); 4]> = values
                 .as_chunks::<2>()
                 .0
                 .iter()
@@ -1018,7 +1056,7 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
                 }
             }
             let term = if ctx.is_some() {
-                let pairs: Vec<_> = (0..fields)
+                let pairs: SmallVec<[(arinsal_term::Atom, Term); 4]> = (0..fields)
                     .map(|i| (values[i + 2].as_atom().unwrap(), values[i + fields + 2]))
                     .collect();
                 built(ctx, |b| {
@@ -1051,7 +1089,7 @@ fn count_ok(count: usize, remaining: usize, input_complete: bool) -> Result<(), 
 
 fn parse_step(
     r: &mut Reader,
-    stack: &mut Vec<Frame>,
+    stack: &mut SmallVec<[Frame; 4]>,
     safe: bool,
     mut ctx: Option<&mut Ctx<'_>>,
     budget: usize,
@@ -1132,8 +1170,8 @@ fn parse_step(
                     stack.push(Frame {
                         kind: FrameKind::Tuple,
                         left: n,
-                        values: Vec::with_capacity(n.min(1024)),
-                        shapes: Vec::new(),
+                        values: SmallVec::with_capacity(n.min(1024)),
+                        shapes: SmallVec::with_capacity(n.min(1024)),
                     });
                     None
                 }
@@ -1174,8 +1212,8 @@ fn parse_step(
                             FrameKind::Map
                         },
                         left: count,
-                        values: Vec::with_capacity(count.min(1024)),
-                        shapes: Vec::new(),
+                        values: SmallVec::with_capacity(count.min(1024)),
+                        shapes: SmallVec::with_capacity(count.min(1024)),
                     });
                     None
                 }
@@ -1306,8 +1344,8 @@ fn parse_step(
                 stack.push(Frame {
                     kind: FrameKind::Export,
                     left: 3,
-                    values: Vec::new(),
-                    shapes: Vec::new(),
+                    values: SmallVec::new(),
+                    shapes: SmallVec::new(),
                 });
                 None
             }
@@ -1331,8 +1369,8 @@ fn parse_step(
                         free,
                     },
                     left: free + 4,
-                    values: Vec::new(),
-                    shapes: Vec::new(),
+                    values: SmallVec::new(),
+                    shapes: SmallVec::new(),
                 });
                 None
             }
@@ -1354,8 +1392,8 @@ fn parse_step(
                 stack.push(Frame {
                     kind: FrameKind::Record { exported, fields },
                     left: count,
-                    values: Vec::new(),
-                    shapes: Vec::new(),
+                    values: SmallVec::new(),
+                    shapes: SmallVec::new(),
                 });
                 None
             }
@@ -1381,10 +1419,10 @@ fn parse_step(
 
 fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, usize), BifError> {
     let mut reader = Reader {
-        bytes: bytes.to_vec(),
+        bytes: SmallVec::from_slice(bytes),
         at: 0,
     };
-    let mut stack = Vec::new();
+    let mut stack = SmallVec::new();
     match parse_step(&mut reader, &mut stack, safe, ctx, usize::MAX, true)? {
         Some(value) => Ok(value),
         None => Err(BifError::BADARG),
@@ -1394,13 +1432,13 @@ fn parse(bytes: &[u8], safe: bool, ctx: Option<&mut Ctx<'_>>) -> Result<(Term, u
 /// Incremental ETF validator retained by `binary_to_term_trap/1`.
 pub struct DecodeWalk {
     reader: Reader,
-    stack: Vec<Frame>,
+    stack: SmallVec<[Frame; 4]>,
     safe: bool,
     used: bool,
     compressed: bool,
     used_prefix: usize,
     input_size: usize,
-    compressed_input: Vec<u8>,
+    compressed_input: SmallVec<[u8; 64]>,
     input_offset: usize,
     expected_plain: usize,
     decompressor: Option<Decompress>,
@@ -1420,7 +1458,9 @@ impl DecodeWalk {
         }
         let bytes = if view.start_bit().is_multiple_of(8) {
             let start = view.start_bit() / 8;
-            view.bytes()[start..start + view.bit_len() / 8].to_vec()
+            let mut bytes = SmallVec::new();
+            bytes.extend_from_slice(&view.bytes()[start..start + view.bit_len() / 8]);
+            bytes
         } else {
             bit_bytes(args[0])?.0
         };
@@ -1434,22 +1474,29 @@ impl DecodeWalk {
                 }
                 let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
                 (
-                    Vec::new(),
+                    SmallVec::new(),
                     6,
                     true,
-                    bytes[6..].to_vec(),
+                    SmallVec::from_slice(&bytes[6..]),
                     size,
                     Some(Decompress::new(true)),
                 )
             } else {
-                (bytes[1..].to_vec(), 1, false, Vec::new(), 0, None)
+                (
+                    SmallVec::from_slice(&bytes[1..]),
+                    1,
+                    false,
+                    SmallVec::new(),
+                    0,
+                    None,
+                )
             };
         Ok(Self {
             reader: Reader {
                 bytes: plain,
                 at: 0,
             },
-            stack: Vec::new(),
+            stack: SmallVec::new(),
             safe: opts.safe,
             used: opts.used,
             compressed,
@@ -1471,7 +1518,8 @@ impl DecodeWalk {
         }
         let remaining = self.expected_plain.saturating_sub(self.reader.bytes.len());
         let capacity = output_budget.max(1).min(remaining.saturating_add(1));
-        let mut output = vec![0; capacity];
+        let mut output = SmallVec::<[u8; 128]>::new();
+        output.resize(capacity, 0);
         let input = &self.compressed_input[self.input_offset..];
         let flush = if input.is_empty() {
             FlushDecompress::Finish
