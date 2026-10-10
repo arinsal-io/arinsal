@@ -20,10 +20,7 @@ impl arinsal_difftest::Vm for Vm {
                 (function, args.len()),
                 ("apply", 2 | 3) | ("make_fun", 3) | ("fun_info", 1 | 2)
             );
-        let result = if direct_bif
-            || direct_vm_fun
-            || std::env::var_os("ARINSAL_DIFFTEST_UNSCHEDULED").is_some()
-        {
+        let result = if direct_bif || direct_vm_fun || crate::debug_env::difftest_unscheduled() {
             self.eval(module, function, &terms).and_then(|outcome| {
                 to_owned(outcome.term)
                     .map_err(|error| VmError::Unsupported(format!("result: {error:?}")))

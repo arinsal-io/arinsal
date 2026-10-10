@@ -1586,7 +1586,7 @@ pub(crate) fn compile(
     if !enabled() {
         return None;
     }
-    if let Ok(allowlist) = std::env::var("ARINSAL_BEAMASM_MODULES")
+    if let Some(allowlist) = crate::debug_env::beamasm_modules()
         && !allowlist
             .split(',')
             .map(str::trim)
@@ -1594,8 +1594,7 @@ pub(crate) fn compile(
     {
         return None;
     }
-    if std::env::var("ARINSAL_BEAMASM_SKIP")
-        .ok()
+    if crate::debug_env::beamasm_skip()
         .is_some_and(|skip| skip.split(',').any(|name| name == module.name))
     {
         return None;
@@ -1606,7 +1605,7 @@ pub(crate) fn compile(
             module.name, module
         );
     }
-    let function_allowlist = std::env::var("ARINSAL_BEAMASM_FUNCS").ok();
+    let function_allowlist = crate::debug_env::beamasm_funcs();
     let fragments = fragments()?;
     let export_entries = import_entries(scope, module)?;
     // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
@@ -1619,7 +1618,7 @@ pub(crate) fn compile(
     let compiled = match compile_parsed_module_with_options(
         beam,
         &env,
-        function_allowlist.as_deref(),
+        function_allowlist,
         line_breakpoints,
     ) {
         Ok(compiled) => compiled,
@@ -1636,8 +1635,8 @@ pub(crate) fn compile(
         .iter()
         .filter(|function| !is_loader_native_body(module, function))
         .collect::<Vec<_>>();
-    if let Some(directory) = std::env::var_os("ARINSAL_BEAMASM_DUMP")
-        && let Err(error) = arinsal_beamasm::write_global_note(std::path::Path::new(&directory))
+    if let Some(directory) = crate::debug_env::beamasm_dump()
+        && let Err(error) = arinsal_beamasm::write_global_note(std::path::Path::new(directory))
     {
         eprintln!("arinsal beamasm dump: could not write global.asm: {error}");
     }
@@ -1920,9 +1919,7 @@ pub(crate) fn count_call_unported() {
 }
 
 pub(crate) fn print_stats() {
-    if std::env::var_os("ARINSAL_BEAMASM_STATS").as_deref() != Some(std::ffi::OsStr::new("1"))
-        || PRINTED.swap(true, Ordering::Relaxed)
-    {
+    if !crate::debug_env::beamasm_stats() || PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
     eprintln!(

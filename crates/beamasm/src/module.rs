@@ -255,7 +255,7 @@ impl BeamModuleAssembler {
 
     /// Enables optional instruction-range capture for one module.
     pub fn enable_dump(&mut self, module: &str) {
-        if std::env::var_os("ARINSAL_BEAMASM_DUMP").is_some() {
+        if crate::dump_directory().is_some() {
             self.dump_module = Some(module.to_owned());
         }
     }
@@ -1663,9 +1663,9 @@ impl BeamModuleAssembler {
             .collect::<Vec<_>>();
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         if let Some(module) = &self.dump_module {
-            let directory = std::env::var_os("ARINSAL_BEAMASM_DUMP")
-                .expect("dump output directory was checked when enabled");
-            crate::dump::write_module(Path::new(&directory), module, &self.dump_functions, &bytes)
+            let directory =
+                crate::dump_directory().expect("dump output directory was checked when enabled");
+            crate::dump::write_module(Path::new(directory), module, &self.dump_functions, &bytes)
                 .map_err(ModuleError::Dump)?;
         }
         let mut memory = CodeMemory::new(bytes.len().max(4))?;

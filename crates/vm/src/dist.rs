@@ -123,7 +123,7 @@ fn get_dflags(process: &mut Process) -> Result<Term, VmError> {
 /// Port of erts/emulator/beam/dist.c:5571 (erts_internal_get_creation_0), OTP-29.1.1.
 fn get_creation() -> Result<Term, VmError> {
     let creation = node_tables::lock().local_creation;
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         eprintln!("DIST_GET_CREATION {creation}");
     }
     if creation == 0 {
@@ -200,7 +200,7 @@ fn create_channel(
     }
     let flags = as_u64(&options[0]).ok_or_else(badarg)?;
     let creation = as_u32(&options[1]).ok_or_else(badarg)?;
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         let tables = node_tables::lock();
         eprintln!(
             "DIST_HANDSHAKE local={} local_creation={} remote={} remote_creation={} flags={flags:#x}",
@@ -408,7 +408,7 @@ fn route_incoming(
     let Some(OwnedTerm::Int(op)) = parts.first() else {
         return Err(badarg());
     };
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         let tables = node_tables::lock();
         let destination = match *op {
             2 | 12 | 22 | 23 => parts.get(2),
@@ -749,7 +749,7 @@ pub(crate) fn queue_outgoing(
     control: OwnedTerm,
     message: Option<OwnedTerm>,
 ) -> Result<(), VmError> {
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some()
+    if crate::debug_env::trace_dist()
         && matches!(&control, OwnedTerm::Tuple(parts) if matches!(parts.first(), Some(OwnedTerm::Int(6))) && matches!(parts.get(3), Some(OwnedTerm::Atom(name)) if name == "global_name_server"))
     {
         eprintln!("DIST_TX_GLOBAL node={node} control={control:?} message={message:?}");
@@ -859,7 +859,7 @@ pub(crate) fn ingest_port_data(
     if bytes.is_empty() {
         return Ok(());
     }
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         eprintln!("DIST_FRAME port={port_id} bytes={}", bytes.len());
     }
     let local_name = node_tables::lock().local_name.clone();
@@ -879,7 +879,7 @@ pub(crate) fn ingest_port_data(
         state.read = state.read.saturating_add(1);
         let packet =
             arinsal_etf::decode_dist_packet(bytes, &mut state.incoming_cache).map_err(|error| {
-                if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+                if crate::debug_env::trace_dist() {
                     eprintln!("DIST_DECODE_HEADER_ERROR {error:?} bytes={}", bytes.len());
                 }
                 badarg()
@@ -888,7 +888,7 @@ pub(crate) fn ingest_port_data(
             return Ok(());
         };
         let decoded = arinsal_etf::decode_dist_payload(&packet).map_err(|error| {
-            if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+            if crate::debug_env::trace_dist() {
                 eprintln!(
                     "DIST_DECODE_PAYLOAD_ERROR {error:?} payload={}",
                     packet.payload.len()
@@ -1087,7 +1087,7 @@ fn route_incoming_port(
     let Some(OwnedTerm::Int(op)) = parts.first() else {
         return Err(badarg());
     };
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         let tables = node_tables::lock();
         let destination = match *op {
             2 | 12 | 22 | 23 => parts.get(2),
@@ -1674,7 +1674,7 @@ fn handle_spawn_request_port(
 ) -> Result<(), VmError> {
     let reference = parts[1].clone();
     let from = parts[2].clone();
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         let tables = node_tables::lock();
         eprintln!(
             "DIST_SPAWN_IDENT_PORT local={} creation={} from={from:?} ref={reference:?}",
@@ -1717,7 +1717,7 @@ fn handle_spawn_request_port(
     } else {
         Err(VmError::Unsupported("bad spawn options".into()))
     };
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         eprintln!(
             "DIST_SPAWN_REQUEST {mod_name}:{fun_name}/{arity} args={arg_list:?} options={options:?} result={spawn_result:?}"
         );
@@ -1735,18 +1735,18 @@ fn handle_spawn_request_port(
         child_to_schedule = Some(child);
         if monitor && let Some(ref_id) = remote_ref_id(&reference) {
             remember_remote_monitor_ref(handle, ref_id, &reference, true)?;
-            if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+            if crate::debug_env::trace_dist() {
                 eprintln!("DIST_SPAWN_MONITOR_REF {ref_id} {reference:?}");
             }
             let watcher = watcher.ok_or_else(badarg)?;
-            if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+            if crate::debug_env::trace_dist() {
                 eprintln!("DIST_SPAWN_MONITOR_WATCHER {watcher:?} child={child:?}");
             }
             runtime
                 .scheduler()?
                 .signal(watcher, child, Signal::Monitor(ref_id))
                 .map_err(|error| VmError::Unsupported(format!("spawn monitor arm: {error}")))?;
-            if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+            if crate::debug_env::trace_dist() {
                 eprintln!("DIST_SPAWN_MONITOR_ARMED");
             }
         }
@@ -1771,7 +1771,7 @@ fn emit_control_message_on_handle(
     control: OwnedTerm,
     message: Option<OwnedTerm>,
 ) -> Result<(), VmError> {
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some()
+    if crate::debug_env::trace_dist()
         && matches!(&control, OwnedTerm::Tuple(parts) if matches!(parts.first(), Some(OwnedTerm::Int(21 | 31))))
     {
         eprintln!("DIST_TX_CONTROL {control:?}");
@@ -1955,7 +1955,7 @@ pub(crate) fn forward_monitor_down_if_proxy(
             None,
         )
     };
-    if std::env::var_os("ARINSAL_TRACE_DIST").is_some() {
+    if crate::debug_env::trace_dist() {
         eprintln!("DIST_MONITOR_DOWN reference={reference} term={control:?}");
     }
     let _ = emit_control_message_on_handle(_runtime, handle, control, payload);

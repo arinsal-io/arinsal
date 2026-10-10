@@ -301,6 +301,29 @@ pub fn emit_leave_runtime(
     emit_validate_native_cursor(code)
 }
 
+fn validate_trace_instructions() -> &'static [u16] {
+    static TRACE: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    TRACE.get_or_init(|| {
+        std::env::var("ARINSAL_BEAMASM_VALIDATE_TRACE")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|item| item.trim().parse::<u16>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// `ARINSAL_BEAMASM_DUMP`, read once. Module emission consults it per load.
+pub(crate) fn dump_directory() -> Option<&'static std::ffi::OsStr> {
+    static DIRECTORY: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| std::env::var_os("ARINSAL_BEAMASM_DUMP"))
+        .as_deref()
+}
+
 /// Emits the JIT_HARD_DEBUG heap and stack cursor invariant check when requested.
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:160-177, OTP-29.1.1.
 pub fn emit_validate_native_cursor(code: &mut CodeBuffer) -> Result<(), BufferError> {
@@ -312,18 +335,7 @@ pub fn emit_validate_native_cursor(code: &mut CodeBuffer) -> Result<(), BufferEr
     let failed = code.new_label();
     let valid = code.new_label();
     let instruction = (code.offset() / 4) as u16;
-    let trace_instruction = std::env::var("ARINSAL_BEAMASM_VALIDATE_TRACE")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .filter_map(|item| item.trim().parse::<u16>().ok())
-                .collect::<Vec<_>>()
-        });
-    if trace_instruction
-        .as_ref()
-        .is_some_and(|instructions| instructions.contains(&instruction))
-    {
+    if validate_trace_instructions().contains(&instruction) {
         code.emit(|e| {
             e.stp_pre(Gpr::x(0), Gpr::x(1), Gpr::sp(), -80)?;
             e.stp(Gpr::x(2), Gpr::x(3), Gpr::sp(), 16)?;

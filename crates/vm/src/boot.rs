@@ -85,7 +85,7 @@ pub fn run_with_debugger_flags(
     // modules load in the generated preload.c order, each name interned first.
     for module in PRELOADED {
         let path = erts_ebin.join(format!("{module}.beam"));
-        if std::env::var_os("ARINSAL_TRACE_BOOT").is_some() {
+        if crate::calls::trace_boot_enabled() {
             eprintln!("arinsal boot: load {}", path.display());
         }
         global_atoms()

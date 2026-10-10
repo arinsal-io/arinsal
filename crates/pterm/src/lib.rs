@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, Weak};
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
 use arinsal_term::{
@@ -18,6 +18,11 @@ use crossbeam_epoch::{Atomic, Owned, pin};
 use crossbeam_queue::SegQueue;
 
 static GLOBAL: LazyLock<Store> = LazyLock::new(Store::new);
+
+fn literal_trace() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ARINSAL_LITERAL_TRACE").is_some())
+}
 
 /// The table used by BIF calls; the VM registers processes with this store.
 pub fn global_store() -> &'static Store {
@@ -697,7 +702,7 @@ impl Store {
                 slot.take();
                 arinsal_term::set_literal_purge_area(&active.pointer_ranges, false);
             }
-            if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some()
+            if literal_trace()
                 && let RetiredStorage::Persistent(stored) = &active.area
             {
                 eprintln!(
@@ -770,7 +775,7 @@ impl Store {
                 .active_area
                 .write()
                 .expect("active literal area poisoned") = Some(Arc::clone(&active));
-            if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+            if literal_trace() {
                 eprintln!("literal_switch area={} waiting={}", id, waiting.len());
             }
             for account in &waiting {
@@ -867,7 +872,7 @@ impl Store {
             return false;
         }
         let before = active.outstanding.fetch_sub(1, Ordering::AcqRel);
-        if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+        if literal_trace() {
             eprintln!(
                 "literal_ack area={} before={} copied={}",
                 active.id, before, copied_roots

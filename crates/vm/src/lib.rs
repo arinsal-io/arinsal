@@ -11,6 +11,7 @@ mod check_io;
 mod code_ix;
 mod compare;
 mod ddll;
+mod debug_env;
 #[cfg(feature = "difftest")]
 mod difftest;
 mod dirty;
