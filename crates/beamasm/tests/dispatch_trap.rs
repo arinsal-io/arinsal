@@ -67,19 +67,28 @@ fn run(
 ) {
     TARGET.store(target, Ordering::Release);
     let fragments = DispatchFragments::new(0, helper, 0, 0).unwrap();
+    let export = Box::leak(Box::new(arinsal_beamasm::bif::ExportEntry::with_addresses(
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::ERLANG,
+        0,
+        0,
+        0,
+    )));
+    let export_addr = std::ptr::from_ref(export) as u64;
     let mut assembler = BeamModuleAssembler::new();
     assembler.emit_i_func_label(1).unwrap();
     assembler
         .emit_raw(|encoder| {
-            encoder.mov_const(Gpr::x(13), 1)?;
-            encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
-            encoder.mov_reg(Gpr::x(1), Gpr::x(13))?;
-            encoder.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            // ARG4 = export, ARG3 = entry. The fragment calls `helper(c_p, ...)`.
+            encoder.mov_const(Gpr::x(4), export_addr)?;
+            encoder.mov_reg(Gpr::x(3), Gpr::xzr())?;
             encoder.mov_const(Gpr::x(17), fragments.call_light_bif() as u64)?;
             encoder.blr(Gpr::x(17))?;
-            encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-            encoder.mov_reg(Gpr::x(0), Gpr::xzr())?;
-            encoder.ret(Gpr::x(30))
+            // `bl`/`blr` leaves x30 at this instruction. A real function saved the
+            // scheduler bridge on E in the breakpoint trampoline; this caller did not,
+            // so the continuation returns through the bridge slot enter_native published.
+            encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
+            encoder.br(Gpr::x(30))
         })
         .unwrap();
     let module = assembler.finalize().unwrap();

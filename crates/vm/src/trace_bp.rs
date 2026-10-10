@@ -691,6 +691,17 @@ fn consolidate_functions(node: &BpNode, table: &mut BpTable, functions: &[BpFunc
                 arities.remove(&function.arity);
             }
         }
+        // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced), OTP-29.1.1.
+        let ix = node.active_bp_ix();
+        let traced = arities
+            .get(&function.arity)
+            .is_some_and(|bps| bps.iter().any(|bp| bp.data[ix].flags != 0));
+        crate::beamasm_integration::set_bif_traced(
+            &function.module,
+            &function.function,
+            function.arity,
+            traced,
+        );
         if arities.is_empty() {
             let functions = table.get_mut(&function.module).unwrap();
             functions.remove(&function.function);

@@ -105,9 +105,12 @@ pub(crate) fn enter_runtime<'a>(
     let process = process_from_header(header)?;
     // Rust helpers may allocate or publish the header again, so first commit the
     // native heap and stack cursors that generated code flushed at the call site.
-    process
-        .heap
-        .set_native_cursors(process.header.htop, process.header.stop);
+    // `c_p->heap` is the base; converting through the block pointer is the slow path.
+    process.heap.set_native_cursors_at(
+        process.header.heap,
+        process.header.htop,
+        process.header.stop,
+    );
     scheduler_registers(process)
 }
 

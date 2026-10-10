@@ -6,7 +6,10 @@ use arinsal_a64::{
     exec::{CodeMemory, ExecError},
 };
 
-use crate::{Update, emit_enter_runtime, emit_leave_runtime, rt::arinsal_enter_native_return};
+use crate::{
+    Update, emit_enter_runtime, emit_leave_runtime,
+    rt::{arinsal_enter_native_return, arinsal_enter_native_yield},
+};
 
 const RUNTIME_UPDATE: Update = Update::HEAP_ALLOC
     .union(Update::STACK)
@@ -20,6 +23,10 @@ pub struct DispatchFragments {
     memory: CodeMemory,
     export_offset: usize,
     light_bif_offset: usize,
+    /// Helper-ABI fragment for call and line breakpoints. `call_light_bif_shared` is not
+    /// their entry: erts calls `erts_generic_breakpoint` and the line-breakpoint helpers
+    /// from the trampolines themselves.
+    breakpoint_offset: usize,
     send_offset: usize,
     call_fun_unported_offset: usize,
     apply_fixed_offset: usize,
@@ -107,6 +114,7 @@ impl DispatchFragments {
         let mut code = CodeBuffer::new();
         let export = code.new_label();
         let light_bif = code.new_label();
+        let breakpoint = code.new_label();
         let send = code.new_label();
         let call_fun_unported = code.new_label();
         let raise_exception = code.new_label();
@@ -123,8 +131,16 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("export trampoline"))?;
         code.bind(light_bif)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_helper_fragment(&mut code, light_bif_helper, 6)
+        emit_call_light_bif_shared(&mut code, light_bif_helper)
             .map_err(|_| ExecError::InvalidSize("light BIF fragment"))?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-348
+        // (emit_i_breakpoint_trampoline / emit_i_line_breakpoint_trampoline), OTP-29.1.1:
+        // the trampoline passes (c_p, identity, site) and a trap return. That is the helper
+        // ABI, not ARG3/ARG4 of call_light_bif_shared.
+        code.bind(breakpoint)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_helper_fragment(&mut code, light_bif_helper, 6)
+            .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
         code.bind(send)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_helper_fragment(&mut code, light_bif_helper, 2)
@@ -178,6 +194,7 @@ impl DispatchFragments {
             memory,
             export_offset: labels[&export],
             light_bif_offset: labels[&light_bif],
+            breakpoint_offset: labels[&breakpoint],
             send_offset: labels[&send],
             call_fun_unported_offset: labels[&call_fun_unported],
             apply_fixed_offset: labels[&apply_fixed],
@@ -203,6 +220,15 @@ impl DispatchFragments {
     /// Shared light-BIF fragment address.
     pub fn call_light_bif(&self) -> usize {
         self.memory.ptr_at(self.light_bif_offset) as usize
+    }
+
+    /// Fragment the call and line breakpoint trampolines enter.
+    ///
+    /// The caller has already placed `c_p`, the breakpoint identity and the site in the
+    /// argument registers and, for a line breakpoint, the cleanup address in the trap-return
+    /// slot. `call_light_bif_shared` does not read those.
+    pub fn breakpoint(&self) -> usize {
+        self.memory.ptr_at(self.breakpoint_offset) as usize
     }
 
     /// Shared `send/2` fragment with only its two live X registers saved.
@@ -483,6 +509,132 @@ fn emit_raise_exception_fragment(
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
         encoder.br(Gpr::x(17))
     })
+}
+
+/// Shared body of every `call_light_bif`.
+///
+/// On entry ARG3 (`x3`) is the call's entry address and ARG4 (`x4`) is the export.
+/// The fragment charges one reduction, calls the BIF helper, and either returns with
+/// the result in XREG0 or leaves native code on a trap, an error or a yield.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-593 (emit_call_light_bif_shared),
+// OTP-29.1.1.
+fn emit_call_light_bif_shared(code: &mut CodeBuffer, helper: usize) -> Result<(), BufferError> {
+    let trace = code.new_label();
+    let yield_bif = code.new_label();
+    let success = code.new_label();
+    let trap = code.new_label();
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:384-387, OTP-29.1.1:
+    // spill the entry before the trace check. The trace path never returns here, and
+    // the scheduler names the caller from this slot (`native_error_pc` / `tmp_mem[6]`).
+    code.emit(|encoder| encoder.str_uoff(Gpr::x(3), Gpr::x(19), 16_432))?;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:388-397, OTP-29.1.1:
+    // a traced BIF, or a process saving calls, dispatches through the export entry.
+    code.emit(|encoder| {
+        encoder.ldr_uoff(
+            Gpr::w(9),
+            Gpr::x(4),
+            crate::bif::EXPORT_IS_BIF_TRACED_OFFSET,
+        )?;
+        encoder.cmp_imm(Gpr::w(9), 0, false)?;
+        encoder.ccmp_imm(
+            Gpr::x(24),
+            crate::bif::ERTS_SAVE_CALLS_CODE_IX as u8,
+            4,
+            Cond::Eq,
+        )
+    })?;
+    code.b_cond(Cond::Eq, trace)?;
+    code.emit(|encoder| encoder.subs_imm(Gpr::w(22), Gpr::w(22), 1, false))?;
+    code.b_cond(Cond::Le, yield_bif)?;
+    code.emit(|encoder| {
+        encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+        encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
+        Ok(())
+    })?;
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        // `emit_enter_runtime_frame` made x29 the host frame, and `emit_enter_runtime`
+        // stored that into `tmp_mem[2]`. The Erlang frame pointer is the x29 saved at
+        // `[sp]`; the light trap path reads `tmp_mem[2]` as that pointer.
+        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:437-440 (emit_enter_runtime_frame),
+        // OTP-29.1.1, with the same repair as `emit_helper_fragment`.
+        let frame_pointer_slot =
+            std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 2 * 8;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 0)?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(19), frame_pointer_slot)?;
+        // x0 = c_p, x1 = export, x2 = export (site; breakpoints use a real one),
+        // x3 = the export's descriptor word.
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(4))?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(4))?;
+        encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_const(Gpr::x(17), helper as u64)?;
+        encoder.blr(Gpr::x(17))?;
+        Ok(())
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
+    code.b_cond(Cond::Ne, success)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+        encoder.cmp_imm(Gpr::x(9), TRAP_REASON, false)
+    })?;
+    code.b_cond(Cond::Eq, trap)?;
+    // A non-value that is not a trap is an exception. The error pc was stored above.
+    // `emit_leave_runtime` reloaded x29 from `tmp_mem[2]` (the Erlang frame pointer).
+    // Pop the host frame without restoring that saved x29: it is the entry-time
+    // pointer, and a collection may have moved it.
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(30), Gpr::sp(), 8)?;
+        encoder.add_imm(Gpr::sp(), Gpr::sp(), 16, false)?;
+        encoder.ldr_uoff(Gpr::x(30), Gpr::x(19), 16_416)?;
+        encoder.br(Gpr::x(30))
+    })?;
+    code.bind(success)?;
+    code.emit(|encoder| {
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:518-523, OTP-29.1.1.
+        // x29 stays the Erlang frame pointer `emit_leave_runtime` reloaded.
+        encoder.mov_reg(Gpr::x(25), Gpr::x(0))?;
+        encoder.ldr_uoff(Gpr::x(30), Gpr::sp(), 8)?;
+        encoder.add_imm(Gpr::sp(), Gpr::sp(), 16, false)?;
+        encoder.ret(Gpr::x(30))
+    })?;
+    code.bind(trap)?;
+    code.emit(|encoder| {
+        // The bl that entered this fragment left the continuation in x30, saved in the
+        // frame. That is the address a trapping BIF returns to, with the result in XREG0.
+        encoder.ldr_uoff(Gpr::x(17), Gpr::sp(), 8)?;
+        encoder.str_pre(Gpr::x(17), Gpr::x(20), -8)?;
+        encoder.ldr_uoff(Gpr::x(1), Gpr::x(21), 72)?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(17))?;
+        encoder.mov_reg(Gpr::x(9), Gpr::xzr())?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+        encoder.mov_const(Gpr::x(0), 2)
+    })?;
+    emit_restore_and_exit(code)?;
+    code.bind(yield_bif)?;
+    code.emit(|encoder| {
+        // c_p->i = entry, c_p->arity = the export's arity, then the yield bridge.
+        encoder.str_uoff(Gpr::x(3), Gpr::x(21), 72)?;
+        encoder.ldrb_uoff(Gpr::w(8), Gpr::x(4), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
+        encoder.strb_uoff(Gpr::w(8), Gpr::x(21), 80)?;
+        Ok(())
+    })?;
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_const(Gpr::x(30), arinsal_enter_native_yield as *const () as u64)?;
+        encoder.ret(Gpr::x(30))
+    })?;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:578-581 and
+    // beam_asm.hpp:388-403 (emit_setup_dispatchable_call), OTP-29.1.1.
+    code.bind(trace)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(4))?;
+        encoder.ldr_regoff(Gpr::x(14), Gpr::x(4), Gpr::x(24), 3)?;
+        encoder.br(Gpr::x(14))
+    })?;
+    Ok(())
 }
 
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1.

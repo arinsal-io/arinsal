@@ -1,7 +1,7 @@
 //! OTP 29 two-word fun head and opaque code-table entries.
 use crate::{Atom, FUN, Term};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 /// Number of code indexes (`ERTS_NUM_CODE_IX`): active, staging and the one being retired.
 // Port of erts/emulator/beam/code_ix.h:72-78, OTP-29.1.1.
@@ -212,6 +212,9 @@ pub struct ExportEntry {
     /// The runtime's descriptor of this export (its BIF and call class), set once when the
     /// node creates the export. Generated code reads it next to the addresses.
     pub info: AtomicUsize,
+    /// Non-zero when this BIF export is traced. The light-BIF fragment loads it before the call.
+    // Port of erts/emulator/beam/export.h:58 (Export.is_bif_traced), OTP-29.1.1.
+    pub is_bif_traced: AtomicI32,
     /// Module.
     pub module: Atom,
     /// Function.
@@ -248,6 +251,7 @@ impl ExportEntry {
         Self {
             dispatch: ErtsDispatchable::new(address, save_calls),
             info: AtomicUsize::new(0),
+            is_bif_traced: AtomicI32::new(0),
             module,
             function,
             arity,
@@ -262,6 +266,13 @@ impl ExportEntry {
     /// Publishes the runtime descriptor word.
     pub fn set_info(&self, info: usize) {
         self.info.store(info, Ordering::Release);
+    }
+
+    /// Publishes `Export.is_bif_traced` for the light-BIF fragment's load.
+    // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced = ...), OTP-29.1.1.
+    pub fn set_bif_traced(&self, traced: bool) {
+        self.is_bif_traced
+            .store(i32::from(traced), Ordering::Release);
     }
 
     /// The address entered in code index `ix`.
