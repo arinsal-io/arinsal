@@ -1,7 +1,6 @@
 //! Node and external identity layouts.
 use crate::{
-    Atom, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, MAGIC_REF, REF, Term, TermError, atoms,
-    global_atoms,
+    Atom, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, REF, Term, TermError, atoms, global_atoms,
 };
 use std::sync::Arc;
 
@@ -70,15 +69,28 @@ pub enum Identity {
 impl Term {
     /// Numbers of a local ordinary reference without allocating, as `identity` reads them.
     pub fn local_ref_numbers(self) -> Option<[u32; 3]> {
-        if self.header()? & 63 != REF {
+        let header = self.header()?;
+        if header & 63 != REF {
             return None;
         }
-        // SAFETY: an ordinary reference has marker and three packed numbers.
+        // SAFETY: a REF thing has at least the header and two data words.
         let (one, two) = unsafe {
             let p = self.raw_ptr();
             (*p.add(1), *p.add(2))
         };
+        if crate::is_magic_ref_thing_with_hdr(header, one) {
+            return None;
+        }
         Some([(one >> 32) as u32, two as u32, (two >> 32) as u32])
+    }
+
+    /// Numbers of a local magic reference, read through its magic binary like
+    /// erts `internal_magic_ref_numbers` reads `mb->refn`.
+    // Port of erts/emulator/beam/erl_term.h:1083-1087 (internal_magic_thing_ref_numbers), OTP-29.1.1.
+    pub(crate) fn magic_ref_numbers(self) -> Option<[u32; 3]> {
+        // SAFETY: the magic binary is retained by the off-heap list of the term's heap.
+        let id = unsafe { self.magic_ref() }?.id();
+        Some([id as u32, (id >> 32) as u32, u32::MAX])
     }
 
     /// Read an identity as owned numeric fields.
@@ -102,19 +114,13 @@ impl Term {
         // SAFETY: a valid identity's header determines initialized payload fields.
         let p = unsafe { self.raw_ptr() };
         match header & 63 {
-            MAGIC_REF => {
-                // SAFETY: magic reference identity occupies word two.
-                let id = unsafe { *p.add(2) };
-                Some(Identity::Ref {
-                    node: atoms::NONAME,
-                    creation: 0,
-                    ids: vec![id as u32, (id >> 32) as u32, u32::MAX],
-                })
-            }
             REF => Some(Identity::Ref {
                 node: atoms::NONAME,
                 creation: 0,
-                ids: self.local_ref_numbers()?.to_vec(),
+                ids: self
+                    .local_ref_numbers()
+                    .or_else(|| self.magic_ref_numbers())?
+                    .to_vec(),
             }),
             EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
                 // SAFETY: external thing stores a retained Node pointer at word one.

@@ -1801,11 +1801,14 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             return Err(TermError::Unsupported("magic reference heap owner"));
         }
         let p = self.words(3)?;
-        // SAFETY: three reserved words hold the header, retained owner, and identity.
+        // Port of erts/emulator/beam/erl_term.h:883-890 (write_magic_ref_thing), OTP-29.1.1:
+        // an ErtsMRefThing is header, magic binary pointer and the off-heap `next` slot.
+        // The heap's off-heap owner list holds the reference count, so `next` stays null.
+        // SAFETY: three reserved words hold the ErtsMRefThing.
         unsafe {
-            *p = (2 << 6) | crate::MAGIC_REF;
+            *p = crate::REF_THING_HEADER;
             *p.add(1) = Arc::as_ptr(&owner) as u64;
-            *p.add(2) = owner.id();
+            *p.add(2) = 0;
         }
         self.heap.retain_magic(owner);
         Ok(Term::from_ptr(p, 2))

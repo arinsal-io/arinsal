@@ -11,8 +11,8 @@ use crate::bits::{binary_data, writable_gc_visit};
 use crate::hamt::{boxed_object_words, boxed_term_range};
 use crate::{
     ARITY, BIN_REF, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, ExternalBinary, FUN,
-    FunEntry, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, MagicRef, Node, ProcessHeap, RECORD,
-    RefcBinary, S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
+    FunEntry, HEAP_BITS, HeapAlloc, MAP, MagicRef, Node, ProcessHeap, RECORD, REF, RefcBinary,
+    S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
 };
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -227,8 +227,10 @@ impl Copier<'_> {
             *ptr = moved;
             if matches!(
                 val & 63,
-                BIN_REF | EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF | FUN | SUB_BITS | MAGIC_REF
-            ) {
+                BIN_REF | EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF | FUN | SUB_BITS
+            ) || (val == crate::REF_THING_HEADER
+                && crate::is_magic_ref_thing_with_hdr(val, *destination.add(1)))
+            {
                 self.retain_owner(val, destination, Term(moved), promote);
             }
             moved
@@ -479,7 +481,7 @@ impl Copier<'_> {
                 }
             }
             SUB_BITS => self.sub_bits.push(term),
-            MAGIC_REF => {
+            REF if crate::is_magic_ref_thing_with_hdr(header, key as u64) => {
                 let target = if promote {
                     &mut self.to.owners.old_magic
                 } else {

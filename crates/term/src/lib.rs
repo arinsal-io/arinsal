@@ -109,7 +109,19 @@ pub(crate) const MAP: u64 = 0x2c;
 pub(crate) const EXTERNAL_PID: u64 = 0x30;
 pub(crate) const EXTERNAL_PORT: u64 = 0x34;
 pub(crate) const EXTERNAL_REF: u64 = 0x38;
-pub(crate) const MAGIC_REF: u64 = 0x3c;
+/// `ERTS_REF_THING_HEADER`: ordinary and magic refs share this header on 64-bit little endian.
+// Port of erts/emulator/beam/erl_term.h:998 (ERTS_REF_THING_HEADER), OTP-29.1.1.
+pub(crate) const REF_THING_HEADER: u64 = (2 << 6) | REF;
+// Port of erts/emulator/beam/erl_term.h:794 (ERTS_ORDINARY_REF_MARKER), OTP-29.1.1.
+pub(crate) const ORDINARY_REF_MARKER: u32 = u32::MAX;
+
+/// Whether a REF thing is an `ErtsMRefThing`: the low half of word one is the ordinary
+/// marker or the low bits of the aligned magic binary pointer.
+// Port of erts/emulator/beam/erl_term.h:1017-1019 (is_magic_ref_thing_with_hdr), OTP-29.1.1.
+#[inline]
+pub(crate) const fn is_magic_ref_thing_with_hdr(header: u64, word1: u64) -> bool {
+    header == REF_THING_HEADER && word1 as u32 != ORDINARY_REF_MARKER
+}
 
 /// Coarse type tag, ordered according to Erlang term order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -322,7 +334,7 @@ impl Term {
             2 => match self.header().unwrap_or(0) & 63 {
                 ARITY => TermKind::Tuple,
                 POS_BIG | NEG_BIG | FLOAT => TermKind::Number,
-                REF | EXTERNAL_REF | MAGIC_REF => TermKind::Ref,
+                REF | EXTERNAL_REF => TermKind::Ref,
                 FUN => TermKind::Fun,
                 EXTERNAL_PORT => TermKind::Port,
                 EXTERNAL_PID => TermKind::Pid,
@@ -363,7 +375,11 @@ impl Term {
     /// Whether a boxed term is an internal magic reference.
     #[inline]
     pub fn is_magic_ref(self) -> bool {
-        self.header().is_some_and(|header| header & 63 == MAGIC_REF)
+        self.header() == Some(REF_THING_HEADER) && {
+            // SAFETY: a REF thing of arity two has an initialized word one.
+            let word1 = unsafe { *self.raw_ptr().add(1) };
+            is_magic_ref_thing_with_hdr(REF_THING_HEADER, word1)
+        }
     }
     /// Access a raw heap pointer. Caller must ensure its owner is live and
     /// prevent concurrent mutation or movement for the duration of access.

@@ -776,18 +776,13 @@ fn exact_ref_eq(a: Term, b: Term) -> bool {
         let mut ids = [0; 5];
         let (node, creation, len) = match header & 63 {
             crate::REF => {
-                // SAFETY: local reference numbers occupy words one and two.
-                unsafe {
-                    ids[0] = (*ptr.add(1) >> 32) as u32;
-                    ids[1] = *ptr.add(2) as u32;
-                    ids[2] = (*ptr.add(2) >> 32) as u32;
-                }
-                (crate::atoms::NONAME, 0, 3)
-            }
-            crate::MAGIC_REF => {
-                // SAFETY: the magic reference identity occupies word two.
-                let id = unsafe { *ptr.add(2) };
-                ids[..3].copy_from_slice(&[id as u32, (id >> 32) as u32, u32::MAX]);
+                // Ordinary and magic refs share the header; internal_ref_numbers picks the
+                // ErtsORefThing numbers or the magic binary's refn.
+                let numbers = term
+                    .local_ref_numbers()
+                    .or_else(|| term.magic_ref_numbers())
+                    .unwrap();
+                ids[..3].copy_from_slice(&numbers);
                 (crate::atoms::NONAME, 0, 3)
             }
             crate::EXTERNAL_REF => {

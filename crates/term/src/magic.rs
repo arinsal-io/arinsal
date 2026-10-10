@@ -91,10 +91,11 @@ impl crate::Term {
     /// # Safety
     /// The term's heap and its off-heap owners must stay live for the borrow.
     pub unsafe fn magic_ref<'a>(self) -> Option<&'a MagicRef> {
-        if self.header()? & 63 != crate::MAGIC_REF {
+        if !self.is_magic_ref() {
             return None;
         }
-        // SAFETY: MagicRef word one holds an Arc-owned pointer retained by the heap.
+        // SAFETY: ErtsMRefThing word one holds the Arc-owned magic binary pointer retained
+        // by the heap's off-heap list.
         Some(unsafe { &*(*self.raw_ptr().add(1) as *const MagicRef) })
     }
 }

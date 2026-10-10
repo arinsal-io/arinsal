@@ -467,9 +467,6 @@ impl BeamModuleAssembler {
                     self.code.emit(|e| e.and_imm(tmp1, tmp1, 63))?;
                     self.code.emit(|e| e.cmp_imm(tmp1, 0x38, false))?;
                     self.code.emit(|e| e.ccmp_imm(tmp1, 0x10, 4, Cond::Ne))?;
-                    // arinsal-term still tags magic refs with their own header (MAGIC_REF);
-                    // erts keeps them under _TAG_HEADER_REF (held: magic_ref_layout).
-                    self.code.emit(|e| e.ccmp_imm(tmp1, 0x3c, 4, Cond::Ne))?;
                     self.code.b_cond(Cond::Ne, fail)?;
                 }
             }
@@ -637,7 +634,8 @@ impl BeamModuleAssembler {
             }
             InlineType::Reference => {
                 self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 63))?;
-                for header in [0x10, 0x38, 0x3c] {
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1517-1521 (is_ref), OTP-29.1.1.
+                for header in [0x10, 0x38] {
                     self.code.emit(|e| e.cmp_imm(Gpr::x(10), header, false))?;
                     self.code.b_cond(Cond::Eq, yes)?;
                 }
