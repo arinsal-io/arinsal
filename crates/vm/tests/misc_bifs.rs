@@ -4,6 +4,8 @@ use arinsal_term::global_atoms;
 use arinsal_vm::Vm;
 use std::sync::Mutex;
 
+mod common;
+
 static PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn compare(source: &str, module: &str, function: &str) {
@@ -81,6 +83,11 @@ fn misc_bifs_ddll_demonitor_cancels_pending_driver_monitor_match_erts() {
 
 #[test]
 fn misc_bifs_ddll_missing_driver_fails_with_formattable_open_error() {
+    if !common::isolate_dyld_environment(
+        "misc_bifs_ddll_missing_driver_fails_with_formattable_open_error",
+    ) {
+        return;
+    }
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping missing-driver differential test");
         return;
