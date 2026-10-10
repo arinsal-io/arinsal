@@ -756,7 +756,8 @@ impl<T: Task> ProcessTable<T> {
         Ok(process)
     }
 
-    fn load_slot(&self, pix: u32) -> Option<Arc<Process<T>>> {
+    /// Run `f` on the process in slot `pix` while the epoch guard keeps it alive.
+    fn with_slot<R>(&self, pix: u32, f: impl FnOnce(&Arc<Process<T>>) -> R) -> Option<R> {
         let (page, offset) = self.page(pix)?;
         let slot = &page.slots[offset];
         let guard = &epoch::pin();
@@ -764,13 +765,27 @@ impl<T: Task> ProcessTable<T> {
         if ptr.is_null() {
             return None;
         }
-        // SAFETY: the epoch guard keeps the stored Arc alive during clone.
-        Some(unsafe { ptr.deref().clone() })
+        // SAFETY: the epoch guard keeps the stored Arc alive while `f` runs.
+        Some(f(unsafe { ptr.deref() }))
+    }
+
+    fn load_slot(&self, pix: u32) -> Option<Arc<Process<T>>> {
+        self.with_slot(pix, Arc::clone)
     }
 
     fn lookup(&self, pid: Pid) -> Option<Arc<Process<T>>> {
         self.load_slot(self.index(pid))
             .filter(|process| process.pid == pid)
+    }
+
+    /// Run `f` on a live process without touching its reference count.
+    // Port of erts/emulator/beam/erl_process.h (erts_proc_lookup_raw), OTP-29.1.1: thread
+    // progress (here the epoch guard) keeps the process struct alive during the lookup.
+    fn with_live<R>(&self, pid: Pid, f: impl FnOnce(&Arc<Process<T>>) -> R) -> Option<R> {
+        self.with_slot(self.index(pid), |process| {
+            (process.pid == pid).then(|| f(process))
+        })
+        .flatten()
     }
 
     fn remove(&self, pid: Pid) {
@@ -2404,7 +2419,21 @@ impl<T: Task> Inner<T> {
         local: Option<&mut Local<T>>,
         remaining: u32,
     ) -> Result<(), Error> {
-        let process = self.table.lookup(to).ok_or(Error::NoProcess)?;
+        self.table
+            .with_live(to, |process| {
+                self.deliver_live(process, from, payload, local, remaining)
+            })
+            .ok_or(Error::NoProcess)?
+    }
+
+    fn deliver_live(
+        &self,
+        process: &Arc<Process<T>>,
+        from: Pid,
+        payload: Payload<T::Message>,
+        local: Option<&mut Local<T>>,
+        remaining: u32,
+    ) -> Result<(), Error> {
         let state = process.state.load(Ordering::Acquire);
         let counted = state != WAITING && state != UNSCHEDULED;
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:1560-1563, OTP-29.1.1.
@@ -2413,9 +2442,9 @@ impl<T: Task> Inner<T> {
         if counted {
             process.backlog.fetch_add(1, Ordering::Relaxed);
         }
-        self.fanin_delivery(&process, 1);
+        self.fanin_delivery(process, 1);
         if let Err(error) = self.deliver_process(
-            process.clone(),
+            process,
             from,
             payload,
             local,
@@ -2434,7 +2463,7 @@ impl<T: Task> Inner<T> {
     #[allow(clippy::too_many_arguments)] // `force_enqueue` routes literal-copy signals like erts.
     fn deliver_process(
         &self,
-        process: Arc<Process<T>>,
+        process: &Arc<Process<T>>,
         from: Pid,
         payload: Payload<T::Message>,
         local: Option<&mut Local<T>>,
@@ -2453,7 +2482,7 @@ impl<T: Task> Inner<T> {
             .input
             .push_routed(signal_buffer_slot(from), Event { from, payload });
         if wake {
-            self.wake_after_publish(process.clone(), local, remaining, force_enqueue);
+            self.wake_after_publish(process, local, remaining, force_enqueue);
         }
         process.publish_inflight.fetch_sub(1, Ordering::Release);
         Ok(())
@@ -2480,7 +2509,7 @@ impl<T: Task> Inner<T> {
             .input
             .push_block_routed(events, |event| signal_buffer_slot(event.from));
         if wake {
-            self.wake_after_publish(process.clone(), local, remaining, force_enqueue);
+            self.wake_after_publish(&process, local, remaining, force_enqueue);
         }
         process.publish_inflight.fetch_sub(1, Ordering::Release);
         Ok(())
@@ -2503,7 +2532,7 @@ impl<T: Task> Inner<T> {
         process
             .input
             .push_routed(signal_buffer_slot(event.from), event);
-        self.wake_after_publish(process.clone(), local, remaining, false);
+        self.wake_after_publish(&process, local, remaining, false);
         process.publish_inflight.fetch_sub(1, Ordering::Release);
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:712 (signal enqueue), OTP-29.1.1.
         Ok(())
@@ -2511,7 +2540,7 @@ impl<T: Task> Inner<T> {
 
     fn wake_after_publish(
         &self,
-        process: Arc<Process<T>>,
+        process: &Arc<Process<T>>,
         local: Option<&mut Local<T>>,
         remaining: u32,
         force_enqueue: bool,
@@ -2524,15 +2553,15 @@ impl<T: Task> Inner<T> {
         {
             // Port of erts/emulator/beam/erl_proc_sig_queue.h:2072 (erts_proc_notify_new_sig),
             // OTP-29.1.1.
-            if Self::in_dirty_state(&process) {
-                self.notify_dirty_signal_handler(&process, None);
+            if Self::in_dirty_state(process) {
+                self.notify_dirty_signal_handler(process, None);
             }
         } else {
             if wait_timer != 0 {
                 process.wait_epoch.fetch_add(1, Ordering::AcqRel);
-                self.cancel_wait_timer(&process, wait_timer);
+                self.cancel_wait_timer(process, wait_timer);
             }
-            let item = Scheduled::new(process, Some(remaining));
+            let item = Scheduled::new(process.clone(), Some(remaining));
             if force_enqueue {
                 self.enqueue(item, false);
             } else {
@@ -3957,7 +3986,7 @@ impl<T: Task> Runner<'_, T> {
         if self
             .inner
             .deliver_process(
-                process,
+                &process,
                 from,
                 payload,
                 self.local.as_deref_mut(),
@@ -4243,7 +4272,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
                 }
             } else {
                 self.inner.deliver_process(
-                    process,
+                    &process,
                     from,
                     payload,
                     self.local.as_deref_mut(),
@@ -4807,7 +4836,7 @@ impl<T: Task> Scheduler<T> {
     }
     /// Whether a pid currently identifies a live task.
     pub fn lookup(&self, pid: Pid) -> bool {
-        self.inner.table.lookup(pid).is_some()
+        self.inner.table.with_live(pid, |_| ()).is_some()
     }
     /// Creation order of the live task with this pid; differs between incarnations
     /// of a reused pid. Port of erts/emulator/beam/erl_db.c:4908 (heir_started_interval), OTP-29.1.1.
@@ -5273,9 +5302,7 @@ mod msgq_stage_microbench {
         let started = Instant::now();
         for _ in 0..N {
             process.state.store(WAITING, Ordering::SeqCst);
-            scheduler
-                .inner
-                .wake_after_publish(process.clone(), None, 0, false);
+            scheduler.inner.wake_after_publish(&process, None, 0, false);
         }
         report("wake transition + schedule", N, started);
         scheduler

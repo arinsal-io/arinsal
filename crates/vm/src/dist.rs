@@ -2823,7 +2823,10 @@ fn send_to(
     target: Term,
     message: Term,
 ) -> Result<(), VmError> {
-    if try_remote_send(process, ctx, target, message)? {
+    // Port of erts/emulator/beam/bif.c:2469-2480,2511 (do_send), OTP-29.1.1: internal pids
+    // and atoms skip the remote-destination checks.
+    let local_destination = target.as_pid_data().is_some() || target.as_atom().is_some();
+    if !local_destination && try_remote_send(process, ctx, target, message)? {
         return Ok(());
     }
     process
