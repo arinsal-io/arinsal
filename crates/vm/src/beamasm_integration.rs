@@ -787,6 +787,25 @@ pub(crate) fn save_calls_continuation(export: Option<ExportDispatch>) -> usize {
     )
 }
 
+/// Publishes `Export.is_bif_traced` on every slot of `module:function/arity`.
+// Port of erts/emulator/beam/beam_bp.c:360-375 (consolidate_export_bp_data), OTP-29.1.1.
+pub(crate) fn set_bif_traced(module: &str, function: &str, arity: u8, traced: bool) {
+    let Some(mfa) = existing_mfa(module, function, arity) else {
+        return;
+    };
+    let Ok(registry) = dispatch_registry().read() else {
+        return;
+    };
+    for exports in registry.scopes.values() {
+        if let Some(target) = exports.dispatch.get(&mfa) {
+            target.slot.set_bif_traced(traced);
+        }
+    }
+    if let Some(target) = registry.bif_mfas.get(&mfa) {
+        target.slot.set_bif_traced(traced);
+    }
+}
+
 /// Routes native callers of an export through its interpreted entry, `target`, while a
 /// global call breakpoint is set on it.
 pub(crate) fn set_global_breakpoint(
@@ -824,6 +843,10 @@ pub(crate) fn set_global_breakpoint(
             exports.global_breakpoints.insert(mfa);
         } else {
             exports.global_breakpoints.remove(&mfa);
+        }
+        if let Some(target) = exports.dispatch.get(&mfa) {
+            // Port of erts/emulator/beam/beam_bp.c:374 (ep->is_bif_traced), OTP-29.1.1.
+            target.slot.set_bif_traced(enabled);
         }
         set_target(exports);
         vec![mfa]
@@ -1182,6 +1205,7 @@ struct VmModuleEnv<'a> {
     export_entries: Vec<usize>,
     export_trampoline: usize,
     light_bif_fragment: usize,
+    breakpoint_fragment: usize,
     send_fragment: usize,
     native_bodies: HashMap<(String, u8), (usize, usize)>,
     module_name: String,
@@ -1270,6 +1294,7 @@ impl<'a> VmModuleEnv<'a> {
             export_entries,
             export_trampoline: fragments.export_trampoline(),
             light_bif_fragment: fragments.call_light_bif(),
+            breakpoint_fragment: fragments.breakpoint(),
             send_fragment: fragments.send(),
             native_bodies,
             module_name: module.name.clone(),
@@ -1459,6 +1484,9 @@ impl ModuleEnv for VmModuleEnv<'_> {
 
     fn light_bif_fragment(&self) -> usize {
         self.light_bif_fragment
+    }
+    fn breakpoint_fragment(&self) -> usize {
+        self.breakpoint_fragment
     }
     fn send_fragment(&self) -> usize {
         self.send_fragment

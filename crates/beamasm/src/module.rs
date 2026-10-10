@@ -678,52 +678,29 @@ impl BeamModuleAssembler {
 
     /// Dispatches a light BIF without manufacturing an Erlang stack frame.
     ///
-    /// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1.
+    /// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610 (emit_call_light_bif), OTP-29.1.1.
+    /// The reduction check, the error pc and the trap continuation live in the shared
+    /// fragment, the same place as `call_light_bif_shared`.
     pub fn dispatch_light_bif(
         &mut self,
         fragment: usize,
         identity: usize,
         arity: u8,
     ) -> Result<(), ModuleError> {
-        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610, OTP-29.1.1.
-        let call = self.code.new_label();
-        self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
-        self.code.b_cond(Cond::Gt, call)?;
-        self.code.adr(Gpr::x(8), call)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
-        self.emit_yield_live(arity)?;
-        self.code.b(self.yield_label)?;
-        self.code.bind(call)?;
-        // A BIF that raises from the scheduler is attributed to this call site.
-        self.code.adr(Gpr::x(9), call)?;
+        // `arity` is `ExportEntry::arity`, published when the slot is created. The yield
+        // path in the fragment loads it; the call site does not.
+        let _ = arity;
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-609, OTP-29.1.1.
+        let entry = self.code.new_label();
+        self.code.bind(entry)?;
+        // ARG4 = export. `mov` rather than a literal: the constant pool is flushed at
+        // the end of the module, past the ±1MB literal reach on the largest OTP modules.
+        // ARG3 = this entry (the address a yield resumes at).
         self.code
-            .emit(|e| e.str_uoff(Gpr::x(9), SCHEDULER_REGS, NATIVE_ERROR_PC_SLOT))?;
-        let done = self.code.new_label();
-        self.code.adr(Gpr::x(9), done)?;
-        self.code.emit(|e| {
-            e.str_uoff(Gpr::x(9), SCHEDULER_REGS, TRAP_RETURN_SLOT)?;
-            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:595-610 (emit_call_light_bif
-            // passes the export and its BIF function, both bound at load time), OTP-29.1.1:
-            // the export's descriptor word names the BIF without a lookup.
-            // x1 = export, x2 = call site (only read by breakpoint trampolines),
-            // x3 = descriptor.
-            e.mov_const(Gpr::x(1), identity as u64)?;
-            e.mov_reg(Gpr::x(2), Gpr::x(1))?;
-            e.ldr_uoff(Gpr::x(3), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
-            e.mov_reg(Gpr::x(0), C_P)?;
-            // Like erts' fragment_call, the shared fragment enters and leaves the runtime
-            // itself; the call site only keeps its return address.
-            e.mov_const(Gpr::x(17), fragment as u64)?;
-            e.str_uoff(Gpr::x(30), C_P, 72)?;
-            e.blr(Gpr::x(17))?;
-            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
-            e.ldr_uoff(Gpr::x(9), C_P, 40)
-        })?;
-        self.error_if_nonzero(Gpr::x(9))?;
-        self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
-        // A trapping BIF's target returns here with its result in XREG0.
-        self.code.bind(done)?;
-        Ok(())
+            .emit(|e| e.mov_const(Gpr::x(4), identity as u64))?;
+        self.code.adr(Gpr::x(3), entry)?;
+        // One module-local veneer per fragment. `x30` is the next instruction.
+        self.fragment_call(fragment)
     }
 
     /// Calls `send/2` synchronously through its process-aware runtime helper.

@@ -90,6 +90,13 @@ pub trait ModuleEnv {
     fn light_bif_fragment(&self) -> usize {
         0
     }
+    /// Fragment for `i_breakpoint_trampoline` and `i_line_breakpoint_trampoline`.
+    ///
+    /// erts does not route those through `call_light_bif_shared`; they call
+    /// `erts_generic_breakpoint` and the line-breakpoint helpers with their own arguments.
+    fn breakpoint_fragment(&self) -> usize {
+        self.light_bif_fragment()
+    }
     /// Return the two-register shared fragment used by `send/2`.
     fn send_fragment(&self) -> usize {
         self.light_bif_fragment()
@@ -2356,7 +2363,7 @@ fn emit_op(
             "i_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:224-237, OTP-29.1.1.
                 assembler.emit_i_breakpoint_trampoline(
-                    env.light_bif_fragment(),
+                    env.breakpoint_fragment(),
                     arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY,
                 )
             }
@@ -2402,7 +2409,7 @@ fn emit_op(
             "i_line_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:337-348, OTP-29.1.1.
                 count(0)?;
-                assembler.emit_i_line_breakpoint_trampoline(env.light_bif_fragment())
+                assembler.emit_i_line_breakpoint_trampoline(env.breakpoint_fragment())
             }
             "i_test_yield" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.

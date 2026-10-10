@@ -844,12 +844,18 @@ pub fn get(map: Term, key: Term) -> MapResult<Option<Term>> {
 }
 
 /// Looks `key` up in a checked map.
-// Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_maps_get returns the value's address,
-// NULL when absent), OTP-29.1.1: the result comes back in registers.
+// Port of erts/emulator/beam/erl_map.c:185-223 (erts_maps_get), OTP-29.1.1.
 fn lookup(map: Term, key: Term) -> Option<Term> {
-    if !map.is_hashmap() {
-        // SAFETY: the source heap remains live during this operation.
-        return unsafe { map.flatmap_ref().unwrap() }.get(key);
+    let h = map.header()?;
+    lookup_header(map, key, h)
+}
+
+fn lookup_header(map: Term, key: Term, h: u64) -> Option<Term> {
+    if h & 63 != MAP {
+        return None;
+    }
+    if h & 0xc0 == 0 {
+        return flatmap_get(map, key);
     }
     let mut node = map;
     let hash = internal_hash(key);
@@ -889,11 +895,46 @@ fn lookup(map: Term, key: Term) -> Option<Term> {
     None
 }
 
+/// Flatmap half of `erts_maps_get`: word compare for an immediate key, `EQ` otherwise.
+// Port of erts/emulator/beam/erl_map.c:189-217 (erts_maps_get), OTP-29.1.1.
+fn flatmap_get(map: Term, key: Term) -> Option<Term> {
+    // SAFETY: `map` is a live flatmap. Word one is the size, word two the key tuple,
+    // and the values follow. The key tuple's elements start at its second word.
+    unsafe {
+        let mp = map.raw_ptr();
+        let n = *mp.add(1) as usize;
+        if n == 0 {
+            return None;
+        }
+        let ks = term(*mp.add(2)).raw_ptr().add(1);
+        let vs = mp.add(3);
+        if key.is_immed() {
+            let key = bits(key);
+            for i in 0..n {
+                if *ks.add(i) == key {
+                    return Some(term(*vs.add(i)));
+                }
+            }
+        } else {
+            for i in 0..n {
+                if exact_eq(term(*ks.add(i)), key) {
+                    return Some(term(*vs.add(i)));
+                }
+            }
+        }
+        None
+    }
+}
+
 /// `maps:find/2` value lookup.
 #[inline]
 pub fn find(map: Term, key: Term) -> MapResult<Option<Term>> {
-    // Port of erts/emulator/beam/erl_map.c:2055-2101, OTP-29.1.1.
-    get(map, key)
+    // Port of erts/emulator/beam/erl_map.c:225-242 (maps_find_2), OTP-29.1.1:
+    // is_map, then erts_maps_get. Absent is `error`; a non-map is `{badmap, Map}`.
+    match map.header() {
+        Some(h) if h & 63 == MAP => Ok(lookup_header(map, key, h)),
+        _ => Err(MapError::Badmap(map)),
+    }
 }
 /// `maps:is_key/2`.
 pub fn is_key(map: Term, key: Term) -> MapResult<bool> {

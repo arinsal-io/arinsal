@@ -776,16 +776,33 @@ impl ProcessHeap {
     }
     /// Commit both native cursors at once when native code enters the runtime.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-537 (emit_enter_runtime stores HTOP
-    // and E into c_p as they are), OTP-29.1.1: one bounds check keeps the indices valid.
-    #[inline]
+    // and E into c_p as they are), OTP-29.1.1. The young-heap base is `c_p->heap`; the
+    // indices are that base subtracted from the pointers, with no release-mode bounds check.
+    #[inline(always)]
     pub fn set_native_cursors(&mut self, htop: *mut u64, stop: *mut u64) {
-        let base = self.words.as_ptr() as usize;
+        self.commit_native_cursors(self.words.as_ptr() as usize, htop, stop);
+    }
+
+    /// Same as [`ProcessHeap::set_native_cursors`] using an already-known heap base
+    /// (`c_p->heap`). A null base falls back to the block pointer.
+    #[inline(always)]
+    pub fn set_native_cursors_at(&mut self, base: *mut u64, htop: *mut u64, stop: *mut u64) {
+        let base = if base.is_null() {
+            self.words.as_ptr() as usize
+        } else {
+            base as usize
+        };
+        self.commit_native_cursors(base, htop, stop);
+    }
+
+    #[inline(always)]
+    fn commit_native_cursors(&mut self, base: usize, htop: *mut u64, stop: *mut u64) {
         let top = (htop as usize).wrapping_sub(base) >> 3;
         let stack = (stop as usize).wrapping_sub(base) >> 3;
-        debug_assert_eq!((htop as usize | stop as usize).wrapping_sub(base) % 8, 0);
-        if !(top <= stack && stack <= self.words.len()) {
-            native_cursors_outside_heap(htop, stop, base);
-        }
+        debug_assert!(
+            top <= stack && stack <= self.words.len(),
+            "native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}"
+        );
         self.htop = top;
         self.stop = stack;
     }
@@ -2071,14 +2088,6 @@ impl Term {
         }
     }
 }
-
-/// Kept out of line so the light BIF path that syncs the cursors needs no formatting frame.
-#[cold]
-#[inline(never)]
-fn native_cursors_outside_heap(htop: *mut u64, stop: *mut u64, base: usize) -> ! {
-    panic!("native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}")
-}
-
 #[cfg(test)]
 mod heap_block_tests {
     use super::ProcessHeap;

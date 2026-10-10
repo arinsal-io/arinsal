@@ -816,10 +816,13 @@ fn invoke_dispatch_bif(
     // it themselves; a plain BIF leaves E (x29) as it was, like erts.
     let (process, registers) = crate::native_hooks::enter_runtime(header)?;
     if let Some(export) = export {
+        // The light-BIF fragment already loaded `Export.is_bif_traced` and compared
+        // `active_code_ix` (instr_bif.cpp:391-397). An export-entry call has not.
+        let export_checks = export_call
+            && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
+                || crate::trace_bp::any_pattern());
         if let Some(bif) = export.light_bif
-            && (export_call
-                || registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64)
-            && !crate::trace_bp::any_pattern()
+            && !export_checks
         {
             return Some(call_plain_bif(process, registers, export, bif, export_call));
         }
@@ -833,9 +836,9 @@ fn invoke_dispatch_bif(
     }
     if let Some(export) = export
         && let Some(bif) = export.light_process_bif
-        && (export_call
-            || registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64)
-        && !crate::trace_bp::any_pattern()
+        && !(export_call
+            && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
+                || crate::trace_bp::any_pattern()))
     {
         return Some(call_process_bif(
             process,
@@ -1182,7 +1185,7 @@ fn call_plain_bif(
         let value = *value;
         registers.x_reg_array[0] = value;
         if top != entry_top {
-            process.header.htop = process.heap.word_address(top);
+            process.header.htop = native_htop(process, top);
         }
         if process.header.fcalls != process.reductions {
             process.header.fcalls = process.reductions;
@@ -1190,6 +1193,17 @@ fn call_plain_bif(
         return crate::native_hooks::raw(value);
     }
     plain_bif_result(process, registers, export, arity, result)
+}
+
+/// `c_p->htop` after a BIF advanced the young heap by `index` words.
+#[inline(always)]
+fn native_htop(process: &crate::Process, index: usize) -> *mut u64 {
+    let base = process.header.heap;
+    if base.is_null() {
+        process.heap.word_address(index)
+    } else {
+        base.wrapping_add(index)
+    }
 }
 
 /// Calls a BIF that needs its process (`c_p`) straight from native code.
@@ -1219,7 +1233,7 @@ fn call_process_bif(
         let value = *value;
         registers.x_reg_array[0] = value;
         if top != entry_top {
-            process.header.htop = process.heap.word_address(top);
+            process.header.htop = native_htop(process, top);
         }
         if process.header.fcalls != process.reductions {
             process.header.fcalls = process.reductions;
