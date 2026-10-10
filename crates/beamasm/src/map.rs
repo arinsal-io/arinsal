@@ -54,8 +54,8 @@ pub struct MapRuntime {
     pub update_exact: MapUpdateHelper,
     /// Single-pair associative update (`erts_maps_put`): key, value, map.
     pub put_single: MapUpdateHelper,
-    /// Single-pair exact update without a failure label (`erts_maps_update`): key, value, map.
-    pub update_single: MapUpdateHelper,
+    /// Shared single-pair exact update fragment (`erts_maps_update`).
+    pub update_single_exact_shared: usize,
     /// `i_get_map_element_shared` fragment ([`MapFragments::get_element_shared`]).
     pub get_element_shared: usize,
     /// `i_get_map_element_hash_shared` fragment ([`MapFragments::get_element_hash_shared`]).
@@ -80,21 +80,26 @@ pub struct MapFragments {
     memory: CodeMemory,
     get_element_offset: usize,
     get_element_hash_offset: usize,
+    update_single_exact_offset: usize,
 }
 
 impl MapFragments {
-    /// Emits `i_get_map_element_shared` and `i_get_map_element_hash_shared`; `get` is the
-    /// runtime lookup the first one falls back to for a non-immediate key.
-    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:316-361 and 493-509, OTP-29.1.1.
-    pub fn new(get: MapGetHelper) -> Result<Self, ExecError> {
+    /// Emits the shared map lookup and single exact-update fragments; `get` handles generic
+    /// keys, while `update_single` implements `erts_maps_update`.
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:316-361, 493-509, and 650-683,
+    // OTP-29.1.1.
+    pub fn new(get: MapGetHelper, update_single: MapUpdateHelper) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
         let get_element = code.new_label();
         let get_element_hash = code.new_label();
+        let update_single_exact = code.new_label();
         let fail = |_: BufferError| ExecError::InvalidSize("map fragment");
         code.bind(get_element).map_err(fail)?;
         emit_i_get_map_element_shared(&mut code, get).map_err(fail)?;
         code.bind(get_element_hash).map_err(fail)?;
         emit_i_get_map_element_hash_shared(&mut code).map_err(fail)?;
+        code.bind(update_single_exact).map_err(fail)?;
+        emit_update_map_single_exact_body_shared(&mut code, update_single).map_err(fail)?;
         let (words, labels) = code.finish_with_labels().map_err(fail)?;
         let bytes = words
             .iter()
@@ -108,6 +113,7 @@ impl MapFragments {
             memory,
             get_element_offset: labels[&get_element],
             get_element_hash_offset: labels[&get_element_hash],
+            update_single_exact_offset: labels[&update_single_exact],
         })
     }
 
@@ -121,6 +127,12 @@ impl MapFragments {
     /// hash in X2; ZF set and the value in X0 on success.
     pub fn get_element_hash_shared(&self) -> usize {
         self.memory.ptr_at(self.get_element_hash_offset) as usize
+    }
+
+    /// Entry of the shared single-pair exact update fragment: key in X1, value in X2, map in
+    /// X3. Returns the updated map in X0; a missing key transfers to the native error exit.
+    pub fn update_single_exact_shared(&self) -> usize {
+        self.memory.ptr_at(self.update_single_exact_offset) as usize
     }
 }
 
@@ -378,9 +390,22 @@ impl BeamModuleAssembler {
         // erts calls the shared fragment only for an immediate key (`Key.isImmed()`); any
         // other constant goes straight to the runtime lookup.
         if matches!(key, ArgVal::Immediate(word) | ArgVal::Literal(word) if word & 3 == 3) {
-            for (arg, value) in [(Gpr::x(0), src), (Gpr::x(1), key), (Gpr::x(2), hash)] {
+            for (arg, value) in [(Gpr::x(0), src), (Gpr::x(1), key)] {
                 let reg = self.source_reg(value)?;
                 self.code.emit(|e| e.mov_reg(arg, reg))?;
+            }
+            match hash {
+                ArgVal::Immediate(value) | ArgVal::Literal(value) => {
+                    // ArgWord constants wider than 32 bits are embedded in OTP's module
+                    // literal area and loaded with LDR literal.
+                    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1528-1554,
+                    // OTP-29.1.1.
+                    self.code.ldr_literal(Gpr::x(2), value)?;
+                }
+                _ => {
+                    let reg = self.source_reg(hash)?;
+                    self.code.emit(|e| e.mov_reg(Gpr::x(2), reg))?;
+                }
             }
             return self.emit_get_element_fragment_call(runtime.get_element_hash_shared, fail, dst);
         }
@@ -687,7 +712,7 @@ impl BeamModuleAssembler {
             ));
         }
         if updates.len() == 2 {
-            self.emit_map_single(src, updates, runtime.put_single)?;
+            self.emit_map_single(src, updates, runtime.put_single, false)?;
             return self.store_map_result(dst, Gpr::x(0));
         }
         self.stage_map_args(updates, live.max(6))?;
@@ -726,7 +751,15 @@ impl BeamModuleAssembler {
             ));
         }
         if updates.len() == 2 && fail == 0 {
-            self.emit_map_single(src, updates, runtime.update_single)?;
+            for (target, value) in [
+                (Gpr::x(1), updates[0]),
+                (Gpr::x(2), updates[1]),
+                (Gpr::x(3), src),
+            ] {
+                let reg = self.source_reg(value)?;
+                self.code.emit(|e| e.mov_reg(target, reg))?;
+            }
+            self.fragment_call(runtime.update_single_exact_shared)?;
             return self.store_map_result(dst, Gpr::x(0));
         }
         self.stage_map_args(updates, live.max(6))?;
@@ -928,25 +961,40 @@ impl BeamModuleAssembler {
 
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694, OTP-29.1.1: a
     // single pair goes to `erts_maps_put`/`erts_maps_update` in argument registers; those
-    // never collect, so only the heap and stack pointers are published.
+    // never collect, and `erts_maps_update` writes its result through `TMP_MEM1`.
     fn emit_map_single(
         &mut self,
         src: ArgVal,
         pair: &[ArgVal],
         helper: MapUpdateHelper,
+        result_in_tmp_mem: bool,
     ) -> Result<(), ModuleError> {
         for (target, value) in [(Gpr::x(1), pair[0]), (Gpr::x(2), pair[1]), (Gpr::x(3), src)] {
             let reg = self.source_reg(value)?;
             self.code.emit(|e| e.mov_reg(target, reg))?;
         }
-        self.code.emit(|e| e.mov_reg(Gpr::x(4), Gpr::xzr()))?;
-        emit_map_runtime(
-            self,
-            helper as usize,
-            &[Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)],
-            0,
-            Update::HEAP_ALLOC,
-        )
+        if result_in_tmp_mem {
+            let tmp_mem = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32;
+            // The failure fragment reads TMP_MEM2 after the runtime call.
+            self.code
+                .emit(|e| e.str_uoff(Gpr::x(1), Gpr::x(19), tmp_mem + 8))?;
+            self.code
+                .emit(|e| e.add_imm(Gpr::x(4), Gpr::x(19), (tmp_mem >> 12) as u16, true))?;
+        } else {
+            self.code.emit(|e| e.mov_reg(Gpr::x(4), Gpr::xzr()))?;
+        }
+        let args = [Gpr::x(1), Gpr::x(2), Gpr::x(3), Gpr::x(4)];
+        if result_in_tmp_mem {
+            emit_map_runtime_status(self, helper as usize, &args, 0, Update::HEAP_ALLOC)?;
+        } else {
+            emit_map_runtime_framed(self, helper as usize, &args, 0, Update::HEAP_ALLOC)?;
+        }
+        if result_in_tmp_mem {
+            let tmp_mem = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32;
+            self.code
+                .emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(19), tmp_mem))?;
+        }
+        Ok(())
     }
 
     fn stage_map_args(&mut self, args: &[ArgVal], base: u32) -> Result<(), ModuleError> {
@@ -1012,26 +1060,155 @@ fn emit_map_runtime(
     live: usize,
     update: Update,
 ) -> Result<(), ModuleError> {
+    emit_map_runtime_inner(asm, helper, args, live, update, false, false)
+}
+
+fn emit_map_runtime_framed(
+    asm: &mut BeamModuleAssembler,
+    helper: usize,
+    args: &[Gpr],
+    live: usize,
+    update: Update,
+) -> Result<(), ModuleError> {
+    emit_map_runtime_inner(asm, helper, args, live, update, false, true)
+}
+
+fn emit_map_runtime_status(
+    asm: &mut BeamModuleAssembler,
+    helper: usize,
+    args: &[Gpr],
+    live: usize,
+    update: Update,
+) -> Result<(), ModuleError> {
+    emit_map_runtime_inner(asm, helper, args, live, update, true, true)
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_map.cpp:650-683
+// (emit_update_map_single_exact_body_shared), OTP-29.1.1. Arinsal transfers a failed update
+// through its module error-exit slots, preserving the raising pc from the fragment call.
+fn emit_update_map_single_exact_body_shared(
+    code: &mut CodeBuffer,
+    helper: MapUpdateHelper,
+) -> Result<(), BufferError> {
+    let error = code.new_label();
+    let tmp_mem1 = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32;
+    let tmp_mem2 = tmp_mem1 + 8;
+    let native_error_pc = tmp_mem1 + 6 * 8;
+    let native_return = tmp_mem1 + 4 * 8;
+    let freason = std::mem::offset_of!(crate::ProcessHeader, freason) as u32;
+
+    code.emit(|e| e.str_uoff(Gpr::x(1), Gpr::x(19), tmp_mem2))?;
+    code.emit(|e| {
+        e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+        e.mov_reg(Gpr::x(29), Gpr::sp())
+    })?;
+    emit_enter_runtime(code, 0, Update::HEAP_ALLOC)?;
+    code.emit(|e| {
+        e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        e.add_imm(Gpr::x(4), Gpr::x(19), (tmp_mem1 >> 12) as u16, true)?;
+        e.mov_const(Gpr::x(17), helper as usize as u64)?;
+        e.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 0, Update::HEAP_ALLOC)?;
+    code.emit(|e| e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16))?;
+    code.cbz(Gpr::w(0), error)?;
+    code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(19), tmp_mem1))?;
+    code.emit(|e| e.ret(Gpr::x(30)))?;
+
+    code.bind(error)?;
+    code.emit(|e| {
+        e.ldr_uoff(Gpr::x(9), Gpr::x(19), tmp_mem2)?;
+        e.mov_const(Gpr::x(8), crate::guard::EXC_BADKEY)?;
+        e.stp(Gpr::x(8), Gpr::x(9), Gpr::x(21), freason as i16)?;
+        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.str_uoff(Gpr::x(30), Gpr::x(19), native_error_pc)?;
+        e.ldr_uoff(Gpr::x(30), Gpr::x(19), native_return)?;
+        e.br(Gpr::x(30))
+    })
+}
+
+fn emit_map_runtime_inner(
+    asm: &mut BeamModuleAssembler,
+    helper: usize,
+    args: &[Gpr],
+    live: usize,
+    update: Update,
+    status_result: bool,
+    runtime_frame: bool,
+) -> Result<(), ModuleError> {
     if args.len() > 5 {
         return Err(ModuleError::InvalidOperand(
             "runtime hook has too many arguments",
         ));
     }
+    if runtime_frame {
+        asm.code.emit(|e| {
+            e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+            e.mov_reg(Gpr::x(29), Gpr::sp())
+        })?;
+    }
     emit_enter_runtime(&mut asm.code, live, update)?;
     asm.code.emit(|e| {
         e.mov_reg(Gpr::x(0), Gpr::x(21))?;
         for (index, arg) in args.iter().copied().enumerate() {
-            e.mov_reg(Gpr::x(index as u8 + 1), arg)?;
+            let target = Gpr::x(index as u8 + 1);
+            // BeamAsm's mov_var omits moves when source and destination already match.
+            // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1649-1664, OTP-29.1.1.
+            if target != arg {
+                e.mov_reg(target, arg)?;
+            }
         }
         e.mov_const(Gpr::x(17), helper as u64)?;
-        e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-        e.blr(Gpr::x(17))
+        if runtime_frame {
+            e.blr(Gpr::x(17))
+        } else {
+            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.blr(Gpr::x(17))
+        }
     })?;
     emit_leave_runtime(&mut asm.code, live, update)?;
     asm.code.emit(|e| {
-        e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
-        e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
+        if runtime_frame {
+            e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+        } else {
+            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+        }
+        if status_result {
+            Ok(())
+        } else {
+            e.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)
+        }
     })?;
-    asm.error_if_nonzero(Gpr::x(9))?;
+    if status_result {
+        emit_map_update_status_error(asm)?;
+    } else {
+        asm.error_if_nonzero(Gpr::x(9))?;
+    }
+    Ok(())
+}
+
+fn emit_map_update_status_error(asm: &mut BeamModuleAssembler) -> Result<(), ModuleError> {
+    // Port of erts/emulator/beam/jit/arm/instr_map.cpp:671-683,
+    // emit_update_map_single_exact_body_shared, OTP-29.1.1.
+    let success = asm.code.new_label();
+    let other_error = asm.code.new_label();
+    let tmp_mem2 = std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 8;
+    let freason = std::mem::offset_of!(crate::ProcessHeader, freason) as u32;
+
+    asm.code.cbnz(Gpr::w(0), success)?;
+    asm.code
+        .emit(|e| e.ldr_uoff(Gpr::x(9), Gpr::x(21), freason))?;
+    asm.code.cbnz(Gpr::x(9), other_error)?;
+    asm.code
+        .emit(|e| e.ldr_uoff(Gpr::x(10), Gpr::x(19), tmp_mem2))?;
+    asm.code
+        .emit(|e| e.mov_const(Gpr::x(11), crate::guard::EXC_BADKEY))?;
+    asm.code
+        .emit(|e| e.stp(Gpr::x(11), Gpr::x(10), Gpr::x(21), freason as i16))?;
+    asm.branch_error()?;
+
+    asm.code.bind(other_error)?;
+    asm.branch_error()?;
+    asm.code.bind(success)?;
     Ok(())
 }

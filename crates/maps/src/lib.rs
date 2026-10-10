@@ -1219,11 +1219,17 @@ pub fn update<H: HeapAlloc + ?Sized>(
     value: Term,
     heap: &mut H,
 ) -> MapResult<Term> {
-    check(map)?;
-    if map.is_hashmap() {
+    // `erts_maps_update` checks the boxed map subtype once, then branches on
+    // the flatmap header; avoid classifying the term and rereading that header.
+    // Port of is_flatmap/is_hashmap in erts/emulator/beam/erl_term.h:1307-1313,
+    // OTP-29.1.1.
+    let Some(header) = map.header().filter(|header| header & 63 == MAP) else {
+        return Err(MapError::Badmap(map));
+    };
+    if header & 0xc0 != 0 {
         return hashmap_insert(map, key, value, true, heap);
     }
-    // SAFETY: check() established a live flatmap; writes stay inside the one
+    // SAFETY: the header test above selected a flatmap; writes stay inside the
     // allocation of header plus n values.
     unsafe {
         let mp = map.raw_ptr();

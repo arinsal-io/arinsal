@@ -247,7 +247,7 @@ extern "C" fn unused_map_update(
 /// the other helpers.
 fn test_map_runtime() -> arinsal_beamasm::map::MapRuntime {
     let fragments = Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(unused_map_get).unwrap(),
+        arinsal_beamasm::map::MapFragments::new(unused_map_get, unused_map_update).unwrap(),
     ));
     arinsal_beamasm::map::MapRuntime {
         get: unused_map_get,
@@ -256,7 +256,7 @@ fn test_map_runtime() -> arinsal_beamasm::map::MapRuntime {
         update_assoc: unused_map_update,
         update_exact: unused_map_update,
         put_single: unused_map_update,
-        update_single: unused_map_update,
+        update_single_exact_shared: fragments.update_single_exact_shared(),
         get_element_shared: fragments.get_element_shared(),
         get_element_hash_shared: fragments.get_element_hash_shared(),
     }

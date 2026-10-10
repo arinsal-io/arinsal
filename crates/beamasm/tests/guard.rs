@@ -1116,7 +1116,7 @@ extern "C" fn unused_map_update(_p: *mut ProcessHeader, _a: u64, _b: u64, _c: u6
 /// Map runtime with real lookup fragments; the other helpers are unused by `map_get`.
 fn map_runtime() -> arinsal_beamasm::map::MapRuntime {
     let fragments = Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(unused_map_get).unwrap(),
+        arinsal_beamasm::map::MapFragments::new(unused_map_get, unused_map_update).unwrap(),
     ));
     arinsal_beamasm::map::MapRuntime {
         get: unused_map_get,
@@ -1125,7 +1125,7 @@ fn map_runtime() -> arinsal_beamasm::map::MapRuntime {
         update_assoc: unused_map_update,
         update_exact: unused_map_update,
         put_single: unused_map_update,
-        update_single: unused_map_update,
+        update_single_exact_shared: fragments.update_single_exact_shared(),
         get_element_shared: fragments.get_element_shared(),
         get_element_hash_shared: fragments.get_element_hash_shared(),
     }

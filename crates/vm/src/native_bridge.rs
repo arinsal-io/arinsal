@@ -810,6 +810,7 @@ pub fn run_native(
             7 => "case_clause",
             8 => "if_clause",
             16 => "try_clause",
+            19 => "badkey",
             20 => "badrecord",
             _ => {
                 return Err(VmError::Unsupported(format!(

@@ -92,9 +92,12 @@ impl ModuleEnv for TestEnv {
             update_assoc: map_update_helper,
             update_exact: map_update_helper,
             put_single: map_update_helper,
-            update_single: map_update_helper,
-            get_element_shared: map_fragments(map_get_helper).get_element_shared(),
-            get_element_hash_shared: map_fragments(map_get_helper).get_element_hash_shared(),
+            update_single_exact_shared: map_fragments(map_get_helper, map_update_helper)
+                .update_single_exact_shared(),
+            get_element_shared: map_fragments(map_get_helper, map_update_helper)
+                .get_element_shared(),
+            get_element_hash_shared: map_fragments(map_get_helper, map_update_helper)
+                .get_element_hash_shared(),
         }
     }
 
@@ -679,8 +682,9 @@ fn extended_x_fixtures_cover_op_families() {
 
 fn map_fragments(
     get: arinsal_beamasm::map::MapGetHelper,
+    update: arinsal_beamasm::map::MapUpdateHelper,
 ) -> &'static arinsal_beamasm::map::MapFragments {
     Box::leak(Box::new(
-        arinsal_beamasm::map::MapFragments::new(get).unwrap(),
+        arinsal_beamasm::map::MapFragments::new(get, update).unwrap(),
     ))
 }
