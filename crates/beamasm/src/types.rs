@@ -186,6 +186,18 @@ impl TypedArg {
     }
 }
 
+/// `is_product_small_if_args_are_small`.
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp:388-401, OTP-29.1.1.
+pub fn is_product_small_if_args_are_small(lhs: &TypedArg, rhs: &TypedArg) -> bool {
+    let (min1, max1) = lhs.clamped_range();
+    let (min2, max2) = rhs.clamped_range();
+    let mag1 = min1.abs().max(max1.abs());
+    let mag2 = min2.abs().max(max2.abs());
+    // mag1 * mag2 <= MAX_SMALL, i.e. mag1 <= MAX_SMALL / mag2 when mag2 != 0.
+    // MAX_SMALL < -MIN_SMALL, so a zero factor always fits.
+    mag2 == 0 || mag1 <= MAX_SMALL / mag2
+}
+
 /// `is_sum_small_if_args_are_small`.
 pub fn is_sum_small_if_args_are_small(lhs: &TypedArg, rhs: &TypedArg) -> bool {
     let (min1, max1) = lhs.clamped_range();

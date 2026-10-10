@@ -2502,31 +2502,30 @@ fn emit_op(
         }
         EmitterKind::Times => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_times_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::MulAdd => {
             count(6)?;
-            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-588, OTP-29.1.1.
-            let destination = value(5)?;
-            let fail = n(0)?;
-            assembler.emit_i_times_with_fail(value(1)?, value(2)?, destination, fail, helper)?;
-            // Adding a literal 0 is skipped: the product stays as computed (a -0.0 float
-            // product must not become 0.0), like erts' `is_increment_zero`.
-            let zero = ArgVal::Immediate(0xf);
-            let increment = if args.get(3) == args.get(5) {
-                value(4)?
-            } else if args.get(4) == args.get(5) {
-                value(3)?
-            } else {
-                return Err(EmitError::Assembler(
-                    "i_mul_add destination must alias one addend".to_owned(),
-                ));
-            };
-            if increment == zero {
-                Ok(())
-            } else {
-                assembler.emit_i_plus_with_fail(destination, increment, destination, fail, helper)
-            }
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731, OTP-29.1.1.
+            assembler.set_arith_types4([
+                operand_type(args.get(1), beam),
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+                operand_type(args.get(4), beam),
+            ]);
+            assembler.emit_i_mul_add_with_fail(
+                value(1)?,
+                value(2)?,
+                value(3)?,
+                value(4)?,
+                value(5)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::IntDiv if op.name() == "i_m_div" => {
             count(5)?;
@@ -2541,23 +2540,36 @@ fn emit_op(
             assembler.emit_i_int_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Rem if op.name() == "i_div_rem" => {
-            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1; the
-            // quotient register differs from both operands, so it can be written first.
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
             count(6)?;
-            if args.get(4) != args.get(5) {
-                assembler.emit_i_int_div(value(2)?, value(3)?, value(4)?, helper)?;
-            }
-            assembler.emit_i_rem(value(2)?, value(3)?, value(5)?, helper)
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
+            assembler.emit_i_div_rem_with_fail(
+                value(2)?,
+                value(3)?,
+                value(4)?,
+                value(5)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Rem if op.name() == "i_rem_div" => {
-            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1. The
-            // loader guarantees the remainder register differs from both operands, so the
-            // remainder and quotient are computed one after the other from the same sources.
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
             count(6)?;
-            if args.get(4) != args.get(5) {
-                assembler.emit_i_rem(value(2)?, value(3)?, value(4)?, helper)?;
-            }
-            assembler.emit_i_int_div(value(2)?, value(3)?, value(5)?, helper)
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
+            assembler.emit_i_rem_div_with_fail(
+                value(2)?,
+                value(3)?,
+                value(4)?,
+                value(5)?,
+                n(0)?,
+                helper,
+            )
         }
         EmitterKind::Rem => {
             count(5)?;

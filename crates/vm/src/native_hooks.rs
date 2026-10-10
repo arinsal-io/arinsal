@@ -196,6 +196,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     op: u32,
     lhs: u64,
     rhs: u64,
+    extra: u64,
 ) -> u64 {
     let Some((process, registers)) = process_and_registers(header) else {
         return 0;
@@ -203,6 +204,10 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
     // An operation with a failure label branches there instead of raising (QUIET_GUARD).
     let quiet = op & QUIET_GUARD != 0;
     let op = op & !QUIET_GUARD;
+    // The 128-bit product is a magnitude plus a sign, not two tagged terms.
+    if op == 15 {
+        return int128_to_big(process, registers, lhs, rhs, extra);
+    }
     let left = from_raw(lhs);
     let right = from_raw(rhs);
     let operation = match op {
@@ -218,6 +223,8 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
         9 => Some(("-", &[left][..])),
         10 => Some(("bsl", &[left, right][..])),
         11 => Some(("bsr", &[left, right][..])),
+        13 => Some(("*", &[left, right][..])),
+        14 => Some(("div", &[left, right][..])),
         _ => None,
     };
     // The call site published FCALLS (Update::REDUCTIONS) and reloads it afterwards.
@@ -262,7 +269,7 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
                 .map_err(|_| ArithError::HeapFull { need_words: 2 })
         })
         .map(raw),
-        0..=12 => with_fragment_alloc(process, left, right, |a, b, heap| match op {
+        0..=14 => with_fragment_alloc(process, left, right, |a, b, heap| match op {
             0 => arinsal_arith::add(a, b, heap),
             1 => arinsal_arith::sub(a, b, heap),
             2 => arinsal_arith::mul(a, b, heap),
@@ -276,6 +283,19 @@ pub unsafe extern "C" fn arinsal_beamasm_arith(
             10 => arinsal_arith::bsl(a, b, heap),
             // Port of erts/emulator/erl_arith.c (erts_mixed_div), OTP-29.1.1.
             12 => arinsal_arith::fdiv(a, b, heap),
+            // Port of erts/emulator/beam/erl_arith.c:919 (erts_mul_add), OTP-29.1.1.
+            13 => {
+                let product = arinsal_arith::mul(a, b, heap)?;
+                arinsal_arith::add(product, from_raw(extra), heap)
+            }
+            // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:802-854 (erts_int_div_rem
+            // body): quotient is the return value, remainder is published for the caller.
+            14 => {
+                let quotient = arinsal_arith::int_div(a, b, heap)?;
+                let remainder = arinsal_arith::rem(a, b, heap)?;
+                registers.tmp_mem[1] = raw(remainder);
+                Ok(quotient)
+            }
             _ => arinsal_arith::bsr(a, b, heap),
         })
         .map(raw),
@@ -327,8 +347,37 @@ fn arith_bif(op: u32) -> Option<(&'static str, usize)> {
         10 => ("bsl", 2),
         11 => ("bsr", 2),
         12 => ("/", 2),
+        13 => ("*", 2),
+        14 => ("div", 2),
         _ => return None,
     })
+}
+
+/// `beam_jit_int128_to_big`: a signed 128-bit magnitude becomes a small or a bignum.
+// Port of erts/emulator/beam/jit/beam_jit_common.cpp:1025-1040, OTP-29.1.1.
+fn int128_to_big(
+    process: &mut Process,
+    registers: &mut SchedulerRegisters,
+    low: u64,
+    high: u64,
+    sign: u64,
+) -> u64 {
+    let mut magnitude = num_bigint::BigInt::from((u128::from(high) << 64) | u128::from(low));
+    if sign != 0 {
+        magnitude = -magnitude;
+    }
+    let built = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        .int_from_bigint(&magnitude);
+    let answer = match built {
+        Ok(term) => raw(term),
+        Err(_) => {
+            set_error(process, "system_limit");
+            0
+        }
+    };
+    publish_x(process, registers);
+    process.sync_native_header();
+    answer
 }
 
 fn float_value(term: Term) -> Option<f64> {

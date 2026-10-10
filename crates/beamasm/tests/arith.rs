@@ -19,7 +19,23 @@ fn tagged(value: i64) -> Option<u64> {
         .then_some(((value as u64) << 4) | 15)
 }
 
-extern "C" fn runtime_arith(_process: *mut ProcessHeader, op: u32, lhs: u64, rhs: u64) -> u64 {
+extern "C" fn runtime_arith(
+    _process: *mut ProcessHeader,
+    op: u32,
+    lhs: u64,
+    rhs: u64,
+    extra: u64,
+) -> u64 {
+    if op == 15 {
+        return OVERFLOW;
+    }
+    if op == 13 {
+        let product = runtime_arith(_process, 2, lhs, rhs, 0);
+        if product == OVERFLOW || product == BADARITH {
+            return product;
+        }
+        return runtime_arith(_process, 0, product, extra, 0);
+    }
     if matches!(op, 16 | 17) {
         return lhs;
     }
@@ -253,7 +269,7 @@ fn integer_ops_use_small_fast_paths_and_runtime_fallbacks() {
     for (a, b) in cases {
         let ta = tagged(a).unwrap();
         let tb = tagged(b).unwrap();
-        let expected = |op: u32| runtime_arith(std::ptr::null_mut(), op, ta, tb);
+        let expected = |op: u32| runtime_arith(std::ptr::null_mut(), op, ta, tb, 0);
         assert_eq!(add(ta, tb), expected(0));
         assert_eq!(sub(ta, tb), expected(1));
         assert_eq!(mul(ta, tb), expected(2));
@@ -406,6 +422,125 @@ fn float_ops_preserve_ieee_results_and_reject_non_finite_values() {
         ),
         12.0f64.to_bits()
     );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn adjacent_y_registers_subtract_in_address_order() {
+    let sub = |left: u32, right: u32, a: i64, b: i64| {
+        let mut asm = BeamModuleAssembler::new();
+        asm.emit_i_func_label(1).unwrap();
+        asm.emit_i_minus(
+            ArgVal::Y(left),
+            ArgVal::Y(right),
+            ArgVal::X(0),
+            runtime_arith,
+        )
+        .unwrap();
+        asm.emit_raw(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+            e.ret(Gpr::x(30))
+        })
+        .unwrap();
+        let module = asm.finalize().unwrap();
+        let mut stack = [0u64; 8];
+        stack[2] = tagged(a).unwrap();
+        stack[3] = tagged(b).unwrap();
+        let mut registers = SchedulerRegisters::default();
+        let stop = stack.as_mut_ptr().wrapping_add(2);
+        let mut header = ProcessHeader {
+            stop,
+            fcalls: 100,
+            ..ProcessHeader::default()
+        };
+        let outcome = enter_native(&mut header, &mut registers, &module.entry(1).unwrap());
+        assert_eq!(outcome, ExitReason::Returned);
+        registers.x_reg_array[0].tagged_word()
+    };
+    assert_eq!(sub(0, 1, 10, 3), tagged(7).unwrap());
+    assert_eq!(sub(1, 0, 10, 3), tagged(-7).unwrap());
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
+    extern "C" fn slow_path(
+        _process: *mut ProcessHeader,
+        _op: u32,
+        _lhs: u64,
+        _rhs: u64,
+        _extra: u64,
+    ) -> u64 {
+        1
+    }
+    let integer = |min, max| arinsal_beamasm::types::ArgType {
+        union_bits: arinsal_beamasm::types::type_id::INTEGER,
+        min: Some(min),
+        max: Some(max),
+    };
+    let eight = tagged(8).unwrap();
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.set_arith_types(integer(0, 50), arinsal_beamasm::types::ArgType::ANY);
+    asm.emit_i_times(
+        ArgVal::X(0),
+        ArgVal::Immediate(eight),
+        ArgVal::X(1),
+        slow_path,
+    )
+    .unwrap();
+    asm.emit_raw(|e| {
+        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ret(Gpr::x(30))
+    })
+    .unwrap();
+    let module = asm.finalize().unwrap();
+    let mut registers = SchedulerRegisters::default();
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged(5).unwrap());
+    let mut stack = [0u64; 8];
+    let stop = stack.as_mut_ptr().wrapping_add(stack.len());
+    let mut header = ProcessHeader {
+        stop,
+        fcalls: 100,
+        ..ProcessHeader::default()
+    };
+    assert_eq!(
+        enter_native(&mut header, &mut registers, &module.entry(1).unwrap()),
+        ExitReason::Returned
+    );
+    assert_eq!(registers.x_reg_array[1].tagged_word(), tagged(40).unwrap());
+
+    let three = tagged(3).unwrap();
+    let five = tagged(5).unwrap();
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.set_arith_types4([
+        integer(0, 20),
+        arinsal_beamasm::types::ArgType::ANY,
+        integer(0, 100),
+        arinsal_beamasm::types::ArgType::ANY,
+    ]);
+    asm.emit_i_mul_add(
+        ArgVal::X(0),
+        ArgVal::Immediate(three),
+        ArgVal::X(0),
+        ArgVal::Immediate(five),
+        ArgVal::X(1),
+        slow_path,
+    )
+    .unwrap();
+    asm.emit_raw(|e| {
+        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ret(Gpr::x(30))
+    })
+    .unwrap();
+    let module = asm.finalize().unwrap();
+    registers.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(tagged(4).unwrap());
+    assert_eq!(
+        enter_native(&mut header, &mut registers, &module.entry(1).unwrap()),
+        ExitReason::Returned
+    );
+    assert_eq!(registers.x_reg_array[1].tagged_word(), tagged(17).unwrap());
 }
 
 #[cfg(not(target_arch = "aarch64"))]

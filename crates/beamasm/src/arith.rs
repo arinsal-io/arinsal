@@ -6,20 +6,60 @@ use arinsal_a64::enc::{Cond, Gpr, Shift, Shifted, is_logical_immediate};
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use crate::types::{
     ArgType, TypedArg, is_bsl_small, is_diff_small_if_args_are_small,
-    is_sum_small_if_args_are_small, type_id,
+    is_product_small_if_args_are_small, is_sum_small_if_args_are_small, type_id,
 };
 
 /// Runtime fallback for arithmetic that cannot return a small integer.
 ///
 /// The VM supplies this hook. Arguments and the result use OTP tagged-term words.
-pub type ArithHelper =
-    unsafe extern "C" fn(process: *mut crate::ProcessHeader, op: u32, lhs: u64, rhs: u64) -> u64;
+pub type ArithHelper = unsafe extern "C" fn(
+    process: *mut crate::ProcessHeader,
+    op: u32,
+    lhs: u64,
+    rhs: u64,
+    extra: u64,
+) -> u64;
 
 const ARG1: Gpr = Gpr::x(0);
 const ARG2: Gpr = Gpr::x(14);
 const ARG3: Gpr = Gpr::x(17);
 const TMP1: Gpr = Gpr::x(8);
 const TMP: Gpr = Gpr::x(9);
+
+/// erts register names used by `emit_i_mul_add` (ARG2/ARG3 here are x1/x2, not the helper ABI).
+const M_ARG2: Gpr = Gpr::x(1);
+const M_ARG3: Gpr = Gpr::x(2);
+const M_ARG4: Gpr = Gpr::x(3);
+const M_TMP2: Gpr = Gpr::x(9);
+const M_TMP3: Gpr = Gpr::x(10);
+const M_TMP4: Gpr = Gpr::x(11);
+
+/// Scheduler `tmp_mem[1]`, where the fused div/rem helper publishes the remainder.
+const TMP_MEM_REM: u32 = 16_392;
+
+/// Base and byte offset of an operand that lives in memory (not a cached X register).
+fn mem_operand(arg: ArgVal) -> Option<(Gpr, i64)> {
+    match arg {
+        ArgVal::XMemory(index) if index < 1024 => Some((Gpr::x(19), i64::from(index) * 8)),
+        ArgVal::Y(index) => index
+            .checked_mul(8)
+            .map(|offset| (Gpr::x(20), i64::from(offset))),
+        _ => None,
+    }
+}
+
+/// Untagged small factor and its shift (`ctz`) when it is a positive power of two.
+fn small_factor(src: &TypedArg) -> (i64, i32) {
+    if !src.is_small() {
+        return (0, -1);
+    }
+    let factor = src.small_value();
+    if factor > 0 && factor.count_ones() == 1 {
+        (factor, factor.trailing_zeros() as i32)
+    } else {
+        (factor, -1)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum BinaryOp {
@@ -100,7 +140,8 @@ impl BeamModuleAssembler {
     }
 
     /// Emits `i_times` with a 60-bit result check.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:472-590, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/ops.tab (`stimes` → `i_mul_add` with increment 0)
+    // and instr_arith.cpp:542-731 (emit_i_mul_add), OTP-29.1.1.
     pub fn emit_i_times(
         &mut self,
         lhs: ArgVal,
@@ -112,7 +153,7 @@ impl BeamModuleAssembler {
     }
 
     /// Emits `i_times` with the BEAM guard failure behavior.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:472-590, OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731 (emit_i_mul_add), OTP-29.1.1.
     pub fn emit_i_times_with_fail(
         &mut self,
         lhs: ArgVal,
@@ -121,7 +162,38 @@ impl BeamModuleAssembler {
         fail: u32,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_times(lhs, rhs, dst, helper, fail)
+        // `i_mul_add Fail S1 S2 Dst i Dst`: the addend is the small integer 0.
+        self.emit_i_mul_add_with_fail(lhs, rhs, dst, ArgVal::Immediate(0xf), dst, fail, helper)
+    }
+
+    /// Emits `i_mul_add`: `Dst = Src1 * Src2 + Src4`, with `Src3` used for the sum type check.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731, OTP-29.1.1.
+    pub fn emit_i_mul_add(
+        &mut self,
+        src1: ArgVal,
+        src2: ArgVal,
+        src3: ArgVal,
+        src4: ArgVal,
+        dst: ArgVal,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        self.emit_i_mul_add_with_fail(src1, src2, src3, src4, dst, 0, helper)
+    }
+
+    /// Emits `i_mul_add` with the BEAM guard failure behavior.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731, OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_i_mul_add_with_fail(
+        &mut self,
+        src1: ArgVal,
+        src2: ArgVal,
+        src3: ArgVal,
+        src4: ArgVal,
+        dst: ArgVal,
+        fail: u32,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        self.emit_mul_add(src1, src2, src3, src4, dst, helper, fail)
     }
 
     /// Emits `i_int_div`, including divide-by-zero and minimum-value overflow fallback.
@@ -146,7 +218,63 @@ impl BeamModuleAssembler {
         fail: u32,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_div_rem(true, lhs, rhs, dst, helper, fail)
+        self.emit_div_rem(lhs, rhs, dst, ArgVal::X(0), helper, fail, true, false)
+    }
+
+    /// Emits fused `i_div_rem`: quotient and remainder from one division.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
+    pub fn emit_i_div_rem(
+        &mut self,
+        lhs: ArgVal,
+        rhs: ArgVal,
+        quotient: ArgVal,
+        remainder: ArgVal,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        self.emit_i_div_rem_with_fail(lhs, rhs, quotient, remainder, 0, helper)
+    }
+
+    /// Emits fused `i_div_rem` with the BEAM guard failure behavior.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1055-1065, OTP-29.1.1.
+    pub fn emit_i_div_rem_with_fail(
+        &mut self,
+        lhs: ArgVal,
+        rhs: ArgVal,
+        quotient: ArgVal,
+        remainder: ArgVal,
+        fail: u32,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        let need_div = quotient != remainder;
+        self.emit_div_rem(lhs, rhs, quotient, remainder, helper, fail, need_div, true)
+    }
+
+    /// Emits fused `i_rem_div`: remainder and quotient from one division.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
+    pub fn emit_i_rem_div(
+        &mut self,
+        lhs: ArgVal,
+        rhs: ArgVal,
+        remainder: ArgVal,
+        quotient: ArgVal,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        self.emit_i_rem_div_with_fail(lhs, rhs, remainder, quotient, 0, helper)
+    }
+
+    /// Emits fused `i_rem_div` with the BEAM guard failure behavior.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:1043-1053, OTP-29.1.1.
+    pub fn emit_i_rem_div_with_fail(
+        &mut self,
+        lhs: ArgVal,
+        rhs: ArgVal,
+        remainder: ArgVal,
+        quotient: ArgVal,
+        fail: u32,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        let need_rem = quotient != remainder;
+        self.emit_div_rem(lhs, rhs, quotient, remainder, helper, fail, true, need_rem)
     }
 
     /// Emits `i_m_div` (`/`): always a runtime call, like erts.
@@ -183,7 +311,7 @@ impl BeamModuleAssembler {
         fail: u32,
         helper: ArithHelper,
     ) -> Result<(), ModuleError> {
-        self.emit_div_rem(false, lhs, rhs, dst, helper, fail)
+        self.emit_div_rem(lhs, rhs, ArgVal::X(0), dst, helper, fail, false, true)
     }
 
     /// Emits `i_band`.
@@ -484,16 +612,61 @@ impl BeamModuleAssembler {
 
     /// Takes the operand types supplied by [`Self::set_arith_types`]; untyped operands are `Any`.
     fn take_arith_args(&mut self, lhs: ArgVal, rhs: ArgVal) -> (TypedArg, TypedArg) {
-        let [lhs_type, rhs_type] = self.arith_types.take().unwrap_or([ArgType::ANY; 2]);
-        (TypedArg::new(lhs, lhs_type), TypedArg::new(rhs, rhs_type))
+        let types = self.arith_types.take().unwrap_or([ArgType::ANY; 4]);
+        (TypedArg::new(lhs, types[0]), TypedArg::new(rhs, types[1]))
     }
 
-    /// `load_sources(LHS, ARG2, RHS, ARG3)`.
+    /// `load_sources(LHS, ARG2, RHS, ARG3)`, pairing adjacent memory operands with `ldp`.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1586-1606, OTP-29.1.1.
     fn load_sources(&mut self, lhs: &TypedArg, rhs: &TypedArg) -> Result<(Gpr, Gpr), ModuleError> {
-        let left = self.source_reg_into(lhs.val, ARG2)?;
-        let right = self.source_reg_into(rhs.val, ARG3)?;
+        self.load_pair(lhs.val, ARG2, rhs.val, ARG3)
+    }
+
+    /// Loads two operands, using `ldp` when they occupy adjacent X-array or Y slots.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1586-1606 (load_sources) and
+    // :1862-1895 (safe_ldp), OTP-29.1.1.
+    fn load_pair(
+        &mut self,
+        src1: ArgVal,
+        tmp1: Gpr,
+        src2: ArgVal,
+        tmp2: Gpr,
+    ) -> Result<(Gpr, Gpr), ModuleError> {
+        if tmp1 != tmp2
+            && let (Some((base1, off1)), Some((base2, off2))) =
+                (mem_operand(src1), mem_operand(src2))
+            && base1 == base2
+        {
+            if off1 + 8 == off2 {
+                self.safe_ldp(tmp1, tmp2, base1, off1)?;
+                return Ok((tmp1, tmp2));
+            }
+            if off2 + 8 == off1 {
+                self.safe_ldp(tmp2, tmp1, base2, off2)?;
+                return Ok((tmp1, tmp2));
+            }
+        }
+        let left = self.source_reg_into(src1, tmp1)?;
+        let right = self.source_reg_into(src2, tmp2)?;
         Ok((left, right))
+    }
+
+    /// `safe_ldp`: one `ldp` inside the scaled immediate, otherwise two `ldr`s.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1872-1895, OTP-29.1.1.
+    fn safe_ldp(&mut self, gp1: Gpr, gp2: Gpr, base: Gpr, offset: i64) -> Result<(), ModuleError> {
+        if offset.unsigned_abs() <= 8 * 0x3f
+            && let Ok(byte_off) = i16::try_from(offset)
+        {
+            self.code.emit(|e| e.ldp(gp1, gp2, base, byte_off))?;
+        } else {
+            let byte_off = u32::try_from(offset)
+                .map_err(|_| ModuleError::InvalidOperand("paired load offset overflows"))?;
+            self.code.emit(|e| {
+                e.ldr_uoff(gp1, base, byte_off)?;
+                e.ldr_uoff(gp2, base, byte_off + 8)
+            })?;
+        }
+        Ok(())
     }
 
     /// `emit_is_boxed(next, reg)`: branches when bit 0 is set, i.e. the value is not boxed.
@@ -1073,45 +1246,77 @@ impl BeamModuleAssembler {
         self.store_result(dst, d)
     }
 
-    /// `i_int_div` (`need_div`) and `i_rem`.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:968-1041 (emit_div_rem), :1067-1087
-    // (emit_i_int_div, emit_i_rem) and the shared fragment :802-875, OTP-29.1.1
+    /// `i_int_div`, `i_rem`, `i_div_rem` and `i_rem_div`.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:968-1087 (emit_div_rem and the four
+    // callers), OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
     fn emit_div_rem(
         &mut self,
-        need_div: bool,
         lhs: ArgVal,
         rhs: ArgVal,
-        dst: ArgVal,
+        quotient_dst: ArgVal,
+        remainder_dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
+        need_div: bool,
+        need_rem: bool,
     ) -> Result<(), ModuleError> {
         let (l, r) = self.take_arith_args(lhs, rhs);
         let mut divisor = if r.is_small() { r.small_value() } else { 0 };
         if divisor == -1 {
             divisor = 0;
         }
-        // The unused output is a dummy register; ARG1 holds the quotient, ARG2 the remainder.
-        let result_reg = if need_div { ARG1 } else { ARG2 };
 
         if l.always_small() && divisor != 0 {
             let left = self.source_reg_into(l.val, ARG3)?;
-            let d = self.init_destination(dst, result_reg);
-            let (quotient, remainder) = if need_div { (d, ARG2) } else { (ARG1, d) };
-            self.emit_div_rem_literal(divisor, &l, left, quotient, remainder, None, need_div)?;
-            return self.store_result(dst, d);
+            let quotient = if need_div {
+                self.init_destination(quotient_dst, ARG1)
+            } else {
+                ARG1
+            };
+            let remainder = if need_rem {
+                self.init_destination(remainder_dst, ARG2)
+            } else {
+                ARG2
+            };
+            self.emit_div_rem_literal(
+                divisor, &l, left, quotient, remainder, None, need_div, need_rem,
+            )?;
+            if need_div {
+                self.store_result(quotient_dst, quotient)?;
+            }
+            if need_rem {
+                self.store_result(remainder_dst, remainder)?;
+            }
+            return Ok(());
         }
 
         let generic = self.code.new_label();
         let done = self.code.new_label();
         let (left, right) = self.load_sources(&l, &r)?;
         if divisor != 0 {
-            self.emit_div_rem_literal(divisor, &l, left, ARG1, ARG2, Some(generic), need_div)?;
+            self.emit_div_rem_literal(
+                divisor,
+                &l,
+                left,
+                ARG1,
+                ARG2,
+                Some(generic),
+                need_div,
+                need_rem,
+            )?;
             self.code.b(done)?;
         }
         self.code.bind(generic)?;
-        self.emit_int_div_rem_shared(need_div, left, right, helper, fail)?;
+        self.emit_int_div_rem_shared(need_div, need_rem, left, right, helper, fail)?;
         self.code.bind(done)?;
-        self.store_result(dst, result_reg)
+        if need_div {
+            self.store_result(quotient_dst, ARG1)?;
+        }
+        if need_rem {
+            self.store_result(remainder_dst, ARG2)?;
+        }
+        Ok(())
     }
 
     /// The shared `int_div_rem` fragment inlined: quotient in ARG1, remainder in ARG2.
@@ -1120,6 +1325,7 @@ impl BeamModuleAssembler {
     fn emit_int_div_rem_shared(
         &mut self,
         need_div: bool,
+        need_rem: bool,
         lhs: Gpr,
         rhs: Gpr,
         helper: ArithHelper,
@@ -1182,13 +1388,20 @@ impl BeamModuleAssembler {
         })?;
         self.code.b(done)?;
         self.code.bind(slow)?;
-        let op = if need_div {
-            BinaryOp::Div
+        if need_div && need_rem {
+            // Quotient comes back in x0; the helper stores the remainder in tmp_mem[1].
+            self.emit_arith_call(14, lhs, rhs, helper, fail)?;
+            self.code
+                .emit(|e| e.ldr_uoff(ARG2, Gpr::x(19), TMP_MEM_REM))?;
         } else {
-            BinaryOp::Rem
-        };
-        self.emit_arith_call(op.id(), lhs, rhs, helper, fail)?;
-        self.mov_if_needed(if need_div { ARG1 } else { ARG2 }, ARG1)?;
+            let op = if need_div {
+                BinaryOp::Div
+            } else {
+                BinaryOp::Rem
+            };
+            self.emit_arith_call(op.id(), lhs, rhs, helper, fail)?;
+            self.mov_if_needed(if need_div { ARG1 } else { ARG2 }, ARG1)?;
+        }
         self.code.bind(done)?;
         Ok(())
     }
@@ -1206,8 +1419,8 @@ impl BeamModuleAssembler {
         remainder: Gpr,
         generic: Option<Label>,
         need_div: bool,
+        need_rem: bool,
     ) -> Result<(), ModuleError> {
-        let need_rem = !need_div;
         let small_tag = Gpr::x(13);
         let small_dividend = generic.is_none();
 
@@ -1220,8 +1433,13 @@ impl BeamModuleAssembler {
         }
 
         if divisor > 0 && (divisor & (divisor - 1)) == 0 {
-            let original_dividend = dividend_reg;
+            let mut original_dividend = dividend_reg;
             let shift = divisor.trailing_zeros() as u8;
+            if need_div && need_rem && quotient == dividend_reg {
+                original_dividend = Gpr::x(12);
+                self.code
+                    .emit(|e| e.mov_reg(original_dividend, dividend_reg))?;
+            }
             if need_div && small_dividend {
                 self.code.emit(|e| e.mov_const(small_tag, 15))?;
             }
@@ -1247,7 +1465,7 @@ impl BeamModuleAssembler {
                 }
             } else {
                 // Negative dividend: bias by divisor - 1 before shifting.
-                let biased = Gpr::x(12);
+                let biased = Gpr::x(10);
                 if divisor == 2 {
                     self.code
                         .emit(|e| e.add_reg(biased, dividend_reg, dividend_reg, Shift::Lsr, 63))?;
@@ -1349,66 +1567,243 @@ impl BeamModuleAssembler {
         self.store_result(dst, d)
     }
 
-    /// `i_times`: both operands small and the 60-bit product check, else the runtime hook.
-    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-735 (emit_i_mul_add), OTP-29.1.1
-    fn emit_times(
+    /// `i_mul_add` / `i_times`: typed product, power-of-two shift, or `smulh` overflow check.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:542-731 (emit_i_mul_add), OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_mul_add(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        src1: ArgVal,
+        src2: ArgVal,
+        src3: ArgVal,
+        src4: ArgVal,
         dst: ArgVal,
         helper: ArithHelper,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        self.arith_types = None;
-        let left = self.source_reg(lhs)?;
+        let (src1, src2, src3, src4) = self.take_mul_args(src1, src2, src3, src4);
+        let is_product_small = is_product_small_if_args_are_small(&src1, &src2);
+        let is_sum_small = is_sum_small_if_args_are_small(&src3, &src4);
+        let sometimes_small = !(src2.is_literal() || src4.is_literal());
+        let is_increment_zero = src4.is_small() && src4.small_value() == 0;
+        let (factor, left_shift) = small_factor(&src2);
+
+        if src1.always_small()
+            && src2.is_small()
+            && src4.always_small()
+            && is_product_small
+            && is_sum_small
+        {
+            let destination = self.init_destination(dst, ARG1);
+            let (left, increment) = self.load_pair(src1.val, M_ARG2, src4.val, M_ARG3)?;
+            self.code.emit(|e| e.and_imm(TMP1, left, !15u64))?;
+            if left_shift > 0 {
+                self.code.emit(|e| {
+                    e.add_reg(destination, increment, TMP1, Shift::Lsl, left_shift as u8)
+                })?;
+            } else {
+                self.code.emit(|e| {
+                    e.mov_const(M_TMP2, factor as u64)?;
+                    e.madd(destination, TMP1, M_TMP2, increment, false)
+                })?;
+            }
+            return self.store_result(dst, destination);
+        }
+
+        let small = self.code.new_label();
+        let store_result = self.code.new_label();
+        let (left, right) = self.load_pair(src1.val, M_ARG2, src2.val, M_ARG3)?;
+        let increment = if is_increment_zero {
+            Gpr::xzr()
+        } else {
+            self.source_reg_into(src4.val, M_ARG4)?
+        };
+        let all_small = src1.always_small() && src2.always_small() && src4.always_small();
+        if !all_small {
+            if src4.always_small() {
+                self.emit_are_both_small(&src1, left, &src2, right, small)?;
+            } else if src2.always_small() {
+                self.emit_are_both_small(&src1, left, &src4, increment, small)?;
+            } else if sometimes_small {
+                self.code.emit(|e| {
+                    e.and_reg(
+                        TMP1,
+                        left,
+                        Shifted {
+                            reg: right,
+                            shift: Shift::Lsl,
+                            amount: 0,
+                        },
+                    )?;
+                    e.and_reg(
+                        TMP1,
+                        TMP1,
+                        Shifted {
+                            reg: increment,
+                            shift: Shift::Lsl,
+                            amount: 0,
+                        },
+                    )
+                })?;
+                let int_or_boxed = type_id::INTEGER | type_id::ALWAYS_BOXED;
+                if src1.always_one_of(int_or_boxed)
+                    && src2.always_one_of(int_or_boxed)
+                    && src4.always_one_of(int_or_boxed)
+                {
+                    self.branch_if_bit0(TMP1, small)?;
+                } else {
+                    self.code.emit(|e| {
+                        e.and_imm(TMP1, TMP1, 15)?;
+                        e.cmp_imm(TMP1, 15, false)
+                    })?;
+                    self.code.b_cond(Cond::Eq, small)?;
+                }
+            }
+            if !is_increment_zero {
+                self.mov_if_needed(M_ARG4, increment)?;
+            }
+            let op = if is_increment_zero {
+                BinaryOp::Mul.id()
+            } else {
+                13
+            };
+            self.emit_helper(op, left, right, helper, (fail != 0).then_some(fail))?;
+            if sometimes_small {
+                self.code.b(store_result)?;
+            }
+        }
+
+        self.code.bind(small)?;
+        if is_product_small && is_sum_small {
+            self.code.emit(|e| e.and_imm(M_TMP3, left, !15u64))?;
+            let increment_reg = if is_increment_zero {
+                self.code.emit(|e| e.mov_const(TMP1, 0xf))?;
+                TMP1
+            } else {
+                increment
+            };
+            if left_shift > 0 {
+                self.code.emit(|e| {
+                    e.add_reg(ARG1, increment_reg, M_TMP3, Shift::Lsl, left_shift as u8)
+                })?;
+            } else {
+                self.code.emit(|e| {
+                    e.asr_imm(M_TMP4, right, 4)?;
+                    e.madd(ARG1, M_TMP3, M_TMP4, increment_reg, false)
+                })?;
+            }
+        } else if sometimes_small {
+            self.emit_mul_overflow_check(
+                &src4,
+                left,
+                right,
+                increment,
+                left_shift,
+                is_increment_zero,
+                store_result,
+                helper,
+            )?;
+        }
+
+        self.code.bind(store_result)?;
+        self.store_result(dst, ARG1)
+    }
+
+    /// Small multiply whose product may not fit, then `int128_to_big` on overflow.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:680-725, OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_mul_overflow_check(
+        &mut self,
+        src4: &TypedArg,
+        left: Gpr,
+        right: Gpr,
+        increment: Gpr,
+        left_shift: i32,
+        is_increment_zero: bool,
+        store_result: Label,
+        helper: ArithHelper,
+    ) -> Result<(), ModuleError> {
+        let min_increment = src4.clamped_range().0;
+        self.code.emit(|e| e.and_imm(M_TMP3, left, !15u64))?;
+        if left_shift == 0 {
+            self.code.emit(|e| {
+                e.mov_reg(ARG1, M_TMP3)?;
+                e.asr_imm(M_TMP2, M_TMP3, 63)
+            })?;
+        } else if left_shift > 0 {
+            self.code.emit(|e| {
+                e.lsl_imm(ARG1, M_TMP3, left_shift as u8)?;
+                e.asr_imm(M_TMP2, M_TMP3, (64 - left_shift) as u8)
+            })?;
+        } else {
+            self.code.emit(|e| {
+                e.asr_imm(M_TMP4, right, 4)?;
+                e.mul(ARG1, M_TMP3, M_TMP4)?;
+                e.smulh(M_TMP2, M_TMP3, M_TMP4)
+            })?;
+        }
+        if is_increment_zero {
+            self.code.emit(|e| e.add_imm(ARG1, ARG1, 15, false))?;
+        } else if min_increment > 0 {
+            self.code.emit(|e| {
+                e.adds_reg(ARG1, ARG1, increment, Shift::Lsl, 0)?;
+                e.adc(M_TMP2, M_TMP2, Gpr::xzr())
+            })?;
+        } else {
+            self.code.emit(|e| {
+                e.asr_imm(M_TMP3, increment, 63)?;
+                e.adds_reg(ARG1, ARG1, increment, Shift::Lsl, 0)?;
+                e.adc(M_TMP2, M_TMP2, M_TMP3)
+            })?;
+        }
+        // The high half equals the sign extension of the low half when the tagged
+        // result fits in a small.
         self.code.emit(|e| {
-            e.mov_reg(Gpr::x(10), left)?;
-            e.mov_reg(Gpr::x(14), left)
+            e.asr_imm(M_TMP3, ARG1, 63)?;
+            e.cmp_reg(M_TMP2, M_TMP3, Shift::Lsl, 0)
         })?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
+        self.code.b_cond(Cond::Eq, store_result)?;
+        self.emit_int128_to_big(helper)
+    }
+
+    /// Converts the 128-bit tagged product in x0:x9 into a bignum.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:403-428 (emit_int128_to_big_shared),
+    // OTP-29.1.1.
+    fn emit_int128_to_big(&mut self, helper: ArithHelper) -> Result<(), ModuleError> {
         self.code.emit(|e| {
-            e.mov_reg(Gpr::x(11), right)?;
-            e.mov_reg(Gpr::x(17), right)
+            e.extr(Gpr::x(2), M_TMP2, ARG1, 4)?;
+            e.asr_imm(Gpr::x(3), M_TMP2, 4)?;
+            e.cmp_imm(Gpr::x(3), 0, false)?;
+            e.cset(Gpr::x(1), Cond::Mi)
         })?;
-        let slow = self.code.new_label();
-        let done = self.code.new_label();
+        let positive = self.code.new_label();
+        self.code.b_cond(Cond::Pl, positive)?;
         self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), Gpr::x(10), 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
+            e.negs(Gpr::x(2), Gpr::x(2))?;
+            e.ngc(Gpr::x(3), Gpr::x(3))
         })?;
-        self.code.b_cond(Cond::Ne, slow)?;
+        self.code.bind(positive)?;
         self.code.emit(|e| {
-            e.ands_imm(Gpr::x(8), Gpr::x(11), 15)?;
-            e.cmp_imm(Gpr::x(8), 15, false)
+            e.mov_reg(ARG2, Gpr::x(2))?;
+            e.mov_reg(ARG3, Gpr::x(3))?;
+            e.mov_reg(M_ARG4, Gpr::x(1))
         })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| {
-            e.asr_imm(Gpr::x(10), Gpr::x(10), 4)?;
-            e.asr_imm(Gpr::x(11), Gpr::x(11), 4)?;
-            e.mul(Gpr::x(12), Gpr::x(10), Gpr::x(11))?;
-            e.smulh(Gpr::x(13), Gpr::x(10), Gpr::x(11))?;
-            e.asr_imm(Gpr::x(9), Gpr::x(12), 63)?;
-            e.cmp_reg(Gpr::x(13), Gpr::x(9), Shift::Lsl, 0)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.emit_small_range_check(slow)?;
-        self.code.emit(|e| {
-            e.lsl_imm(Gpr::x(12), Gpr::x(12), 4)?;
-            e.orr_imm(Gpr::x(12), Gpr::x(12), 15)
-        })?;
-        self.store_result(dst, Gpr::x(12))?;
-        self.code.b(done)?;
-        self.code.bind(slow)?;
-        self.emit_helper(
-            BinaryOp::Mul.id(),
-            Gpr::x(14),
-            Gpr::x(17),
-            helper,
-            (fail != 0).then_some(fail),
-        )?;
-        self.store_result(dst, Gpr::x(0))?;
-        self.code.bind(done)?;
-        Ok(())
+        self.emit_helper(15, ARG2, ARG3, helper, None)
+    }
+
+    fn take_mul_args(
+        &mut self,
+        src1: ArgVal,
+        src2: ArgVal,
+        src3: ArgVal,
+        src4: ArgVal,
+    ) -> (TypedArg, TypedArg, TypedArg, TypedArg) {
+        let types = self.arith_types.take().unwrap_or([ArgType::ANY; 4]);
+        (
+            TypedArg::new(src1, types[0]),
+            TypedArg::new(src2, types[1]),
+            TypedArg::new(src3, types[2]),
+            TypedArg::new(src4, types[3]),
+        )
     }
     fn emit_small_range_check(&mut self, slow: arinsal_a64::buf::Label) -> Result<(), ModuleError> {
         self.code.emit(|e| {
