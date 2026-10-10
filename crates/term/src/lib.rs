@@ -394,6 +394,7 @@ impl Term {
     ///
     /// # Safety
     /// The heap must outlive the returned view and must not move.
+    #[inline]
     pub unsafe fn tuple_ref<'a>(self) -> Option<TupleRef<'a>> {
         let h = self.header()?;
         if h & 63 != ARITY {
@@ -408,6 +409,7 @@ impl Term {
     ///
     /// # Safety
     /// The heap must remain live and unmoved.
+    #[inline]
     pub unsafe fn cons_ref(self) -> Option<(Term, Term)> {
         if self.0 & 3 != 1 {
             return None;
@@ -436,10 +438,12 @@ impl TupleRef<'_> {
         self.elements.is_empty()
     }
     /// Read an element.
+    #[inline]
     pub fn get(&self, index: usize) -> Option<Term> {
         self.elements.get(index).copied().map(Term)
     }
     /// Read a tuple element without copying the tuple's element array.
+    #[inline]
     pub fn element(&self, index: usize) -> Option<Term> {
         self.get(index)
     }

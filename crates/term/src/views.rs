@@ -35,6 +35,7 @@ pub struct FloatRef<'a> {
 }
 impl FloatRef<'_> {
     /// Decode the exact IEEE 754 bit pattern.
+    #[inline]
     pub fn get(&self) -> f64 {
         f64::from_bits(*self.word)
     }
@@ -127,6 +128,7 @@ impl Term {
     ///
     /// # Safety
     /// The owning heap must remain live and unmoved while the view exists.
+    #[inline]
     pub unsafe fn float_ref<'a>(self) -> Option<FloatRef<'a>> {
         if self.header()? & 63 != FLOAT {
             return None;

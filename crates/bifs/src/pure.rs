@@ -151,7 +151,6 @@ impl HeapAlloc for ConsBlock<'_> {
 
 pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     let f: BifFn = match (module, name, arity) {
-        ("erlang", "length", 1) => length,
         ("erlang", "abs", 1) => abs,
         ("erlang", "float", 1) => to_float,
         ("erlang", "trunc", 1) => trunc,
@@ -194,13 +193,6 @@ pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
         ("erlang", "append_element", 2) => append_element,
         ("erlang", "delete_element", 2) => delete_element,
         ("erlang", "insert_element", 3) => insert_element,
-        ("erlang", "++" | "append", 2) => append,
-        ("erlang", "--" | "subtract", 2) => subtract,
-        ("lists", "reverse", 2) => reverse,
-        ("lists", "member", 2) => member,
-        ("lists", "keyfind", 3) => keyfind,
-        ("lists", "keymember", 3) => keymember,
-        ("lists", "keysearch", 3) => keysearch,
         ("erlang", "atom_to_list", 1) => atom_to_list,
         ("erlang", "list_to_atom", 1) => list_to_atom,
         ("erlang", "list_to_existing_atom", 1) => list_to_existing_atom,
@@ -387,9 +379,6 @@ pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
         .expect("infallible BIF heap")
 }
 
-fn length(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    integer(ctx, list(args[0])?.len())
-}
 fn hd(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // SAFETY: The input heap is live and stable.
     unsafe { args[0].cons_ref() }
@@ -707,113 +696,6 @@ mod tuple_limit_tests {
         assert!(check_tuple_arity(MAX_TUPLE_SIZE + 1).is_err());
     }
 }
-fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Erlang permits any right-hand tail, including an improper one.
-    Ok(make_list(ctx, list(args[0])?, args[1]))
-}
-fn subtract(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut left = list(args[0])?;
-    for removed in list(args[1])? {
-        if let Some(index) = left.iter().position(|&x| exact_eq(x, removed)) {
-            left.remove(index);
-        }
-    }
-    Ok(make_list(ctx, left, Term::NIL))
-}
-fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_bif_lists.c:1144 (lists_reverse_alloc), OTP-29.1.1.
-    // Count and validate before reserving the full output in one allocation.
-    if args[0] == Term::NIL {
-        return Ok(args[1]);
-    }
-    let mut source = args[0];
-    let mut count = 0usize;
-    while source.classify() == TermKind::List {
-        // SAFETY: the source list remains live for the BIF call.
-        source = unsafe { source.cons_ref() }.ok_or(BADARG)?.1;
-        count += 1;
-    }
-    if source != Term::NIL {
-        return Err(BADARG);
-    }
-    let mut heap = ConsBlock::new(ctx.heap, count);
-    let mut builder = TermBuilder::new(&mut heap);
-    let mut result = args[1];
-    source = args[0];
-    while source.classify() == TermKind::List {
-        // SAFETY: the source list remains live and the BIF heap never moves it.
-        let (head, next) = unsafe { source.cons_ref() }.ok_or(BADARG)?;
-        result = builder.cons(head, result).expect("infallible BIF heap");
-        source = next;
-    }
-    Ok(result)
-}
-fn member(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut rest = args[1];
-    while rest.classify() == TermKind::List {
-        // SAFETY: The source heap remains live throughout this call.
-        let (head, tail) = unsafe { rest.cons_ref() }.ok_or(BADARG)?;
-        if exact_eq(head, args[0]) {
-            return Ok(bool_term(true));
-        }
-        rest = tail;
-    }
-    if rest != Term::NIL {
-        return Err(BADARG);
-    }
-    Ok(bool_term(false))
-}
-// Port of erts/emulator/beam/erl_bif_lists.c:1302-1380 (keyfind), OTP-29.1.1: an immediate
-// key compares words (a small key also equals a float of the same value); only a boxed key
-// needs the full comparison. Records are not tuples here, as in erts' is_tuple.
-#[inline]
-fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
-    let index = args[1].as_small().ok_or(BADARG)?;
-    if index < 1 {
-        return Err(BADARG);
-    }
-    let (key, slot) = (args[0], index as usize - 1);
-    let small_key = key.as_small().is_some();
-    let immediate_key = key.is_immed();
-    let mut rest = args[2];
-    // SAFETY: The source heap remains live throughout this call.
-    while let Some((value, tail)) = unsafe { rest.cons_ref() } {
-        rest = tail;
-        let Some(element) = tuple_view(&value)
-            .ok()
-            .and_then(|items| items.element(slot))
-        else {
-            continue;
-        };
-        let found = if element == key {
-            true
-        } else if immediate_key {
-            small_key && !element.is_immed() && loose_eq(key, element)
-        } else {
-            loose_eq(key, element)
-        };
-        if found {
-            return Ok(Some(value));
-        }
-    }
-    if rest != Term::NIL {
-        return Err(BADARG);
-    }
-    Ok(None)
-}
-fn keyfind(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(key_search(args)?.unwrap_or(bool_term(false)))
-}
-fn keymember(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(key_search(args)?.is_some()))
-}
-fn keysearch(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(match key_search(args)? {
-        Some(value) => tuple_build(ctx, &[Term::atom(atoms::VALUE), value]),
-        None => bool_term(false),
-    })
-}
-
 pub(super) fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
