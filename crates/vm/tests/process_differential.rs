@@ -365,6 +365,69 @@ fn process_scenarios_match_otp_29() {
 }
 
 #[test]
+fn process_info_sig_free_items_match_otp_29() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping process_info fast-path differential test");
+        return;
+    };
+    let source = r#"
+-module(pinfo_qlen_diff).
+-export([run/0]).
+run() ->
+    Parent=self(), Name=pinfo_qlen_target,
+    Pid=spawn(fun() ->
+        true=register(Name,self()), Parent!{ready,self()}, receive stop -> ok end
+    end),
+    receive {ready,Pid} -> ok end,
+    await_waiting(Pid),
+    {message_queue_len,0}=process_info(Pid,message_queue_len),
+    {status,waiting}=process_info(Pid,status),
+    {registered_name,Name}=process_info(Pid,registered_name),
+    {heap_size,Heap}=process_info(Pid,heap_size),
+    true=is_integer(Heap),
+    [{message_queue_len,0},{status,waiting},{registered_name,Name},{heap_size,_}]=
+        process_info(Pid,[message_queue_len,status,registered_name,heap_size]),
+    Unnamed=spawn(fun() -> Parent!{unnamed,self()}, receive stop -> ok end end),
+    receive {unnamed,Unnamed} -> ok end,
+    await_waiting(Unnamed),
+    []=process_info(Unnamed,registered_name),
+    [{registered_name,[]}]=process_info(Unnamed,[registered_name]),
+    exit(Unnamed,kill),
+    Pid!queued,
+    {message_queue_len,1}=process_info(Pid,message_queue_len),
+    {memory,Memory}=process_info(Pid,memory),
+    true=is_integer(Memory) andalso Memory > 0,
+    exit(Pid,kill),
+    {message_queue_len,0}=process_info(self(),message_queue_len),
+    {status,running}=process_info(self(),status),
+    {heap_size,SelfHeap}=process_info(self(),heap_size),
+    true=is_integer(SelfHeap),
+    self()!self_queued,
+    {message_queue_len,1}=process_info(self(),message_queue_len),
+    receive self_queued -> ok end,
+    {message_queue_len,0}=process_info(self(),message_queue_len),
+    true.
+await_waiting(Pid) ->
+    case process_info(Pid,status) of
+        {status,waiting} -> ok;
+        _ -> timer:sleep(1), await_waiting(Pid)
+    end.
+"#;
+    let beam = reference
+        .compile_named("pinfo_qlen_diff", source, &[])
+        .unwrap();
+    reference.load("pinfo_qlen_diff", &beam).unwrap();
+    let expected = reference.call("pinfo_qlen_diff", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("pinfo_qlen_diff", "run", &[], 1, None)
+        .unwrap_or_else(|error| panic!("process_info direct-path scenario: {error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
+    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("true".into())));
+}
+
+#[test]
 fn otp_6237_owner_exit_100_cycles_match_otp_29() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping otp_6237 differential stress scenario");

@@ -1294,6 +1294,86 @@ pub(crate) fn live(process: &Process, pid: Pid) -> Result<bool, VmError> {
         .lookup(pid))
 }
 
+// Port of erts/emulator/beam/erl_bif_info.c:815-852 (`pi_args`), OTP-29.1.1.
+enum DirectInfoItems {
+    Singleton(Term),
+    List(Vec<Term>),
+}
+
+// Port of erts/emulator/beam/erl_bif_info.c:1381-1417 (`process_info_bif`), OTP-29.1.1:
+// these lock-readable items try the target's main lock; FORCE_SIG_SEND items use a request.
+fn process_info_direct_items(item: Term) -> Option<DirectInfoItems> {
+    let can_read = |item: Term| {
+        matches!(
+            item.as_atom(),
+            Some(arinsal_term::atoms::MESSAGE_QUEUE_LEN)
+                | Some(arinsal_term::atoms::STATUS)
+                | Some(arinsal_term::atoms::REGISTERED_NAME)
+                | Some(arinsal_term::atoms::HEAP_SIZE)
+        )
+    };
+    if item.as_atom().is_some() {
+        return can_read(item).then_some(DirectInfoItems::Singleton(item));
+    }
+    match list(item) {
+        Some(items) if items.iter().copied().all(can_read) => Some(DirectInfoItems::List(items)),
+        _ => None,
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_info.c:1624-1633, 1742-1755, and 1982-1991,
+// OTP-29.1.1: these values are immediate and are built on the requesting process heap.
+fn process_info_direct(
+    caller: &mut Process,
+    target: &Process,
+    target_pid: Pid,
+    items: DirectInfoItems,
+) -> Result<Term, VmError> {
+    let value = |key: Term| -> Result<Option<Term>, VmError> {
+        let value = match key.as_atom() {
+            Some(arinsal_term::atoms::MESSAGE_QUEUE_LEN) => {
+                Term::small(target.inbox.len() as i64).ok_or_else(badarg)?
+            }
+            Some(arinsal_term::atoms::HEAP_SIZE) => {
+                Term::small(target.heap.heap_size_words() as i64).ok_or_else(badarg)?
+            }
+            Some(arinsal_term::atoms::STATUS) => {
+                let runtime = target.runtime.as_ref().ok_or_else(badarg)?;
+                atom(runtime.remote_status(target_pid))
+            }
+            Some(arinsal_term::atoms::REGISTERED_NAME) => {
+                let runtime = target.runtime.as_ref().ok_or_else(badarg)?;
+                let name = runtime
+                    .names
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find_map(|(name, registered)| {
+                        (*registered == target_pid).then(|| name.clone())
+                    });
+                let Some(name) = name else { return Ok(None) };
+                atom(&name)
+            }
+            _ => return Err(badarg()),
+        };
+        Ok(Some(value))
+    };
+    match items {
+        DirectInfoItems::Singleton(key) => match value(key)? {
+            Some(value) => make_tuple(caller, &[key, value]),
+            None => Ok(Term::NIL),
+        },
+        DirectInfoItems::List(keys) => {
+            let mut pairs = Vec::with_capacity(keys.len());
+            for key in keys {
+                let value = value(key)?.unwrap_or(Term::NIL);
+                pairs.push(make_tuple(caller, &[key, value])?);
+            }
+            make_list(caller, pairs)
+        }
+    }
+}
+
 // Port of erts/emulator/beam/erl_bif_info.c:1555 (process_info_2), OTP-29.1.1.
 fn process_info_call(
     vm: &Vm,
@@ -1302,18 +1382,32 @@ fn process_info_call(
     target: Term,
     item: Option<Term>,
 ) -> Result<Term, VmError> {
-    if let Some(done) = crate::signals::poll(process, ctx.pid())? {
+    if let Some(done) = crate::signals::poll(process)? {
         return Ok(done);
     }
-    if let Some(item) = item {
+    let direct_items = item.and_then(process_info_direct_items);
+    if direct_items.is_none()
+        && let Some(item) = item
+    {
         validate_info_item(item)?;
     }
     let pid = Pid::from_term(target).ok_or_else(badarg)?;
     if pid == ctx.pid() {
         return process_info(Some(vm), process, ctx, item, atom("running"), true);
     }
-    if !live(process, pid)? {
-        return Ok(atom("undefined"));
+    // A running erts process publishes sends as they happen. Arinsal buffers them per
+    // scheduler turn, so publish earlier sends before trying the target's sig-free lock.
+    ctx.flush_pending();
+    if let Some(items) = direct_items {
+        let runtime = process.runtime.as_ref().cloned().ok_or_else(badarg)?;
+        let scheduler = runtime.scheduler()?;
+        match scheduler.inspect_signal_free(pid, |target| {
+            process_info_direct(process, target, pid, items)
+        }) {
+            Ok(result) => return result,
+            Err(arinsal_sched::SignalFreeError::NoProcess) => return Ok(atom("undefined")),
+            Err(arinsal_sched::SignalFreeError::Busy) => {}
+        }
     }
     let items = match item {
         Some(item) => Some(Message::copy_from(item)?),
@@ -1524,7 +1618,7 @@ fn group_leader_call(
     target: Term,
     signal_ref: Option<Term>,
 ) -> Result<Term, VmError> {
-    if let Some(done) = crate::signals::poll(process, ctx.pid())? {
+    if let Some(done) = crate::signals::poll(process)? {
         return Ok(done);
     }
     let internal = module == "erts_internal";
@@ -1601,7 +1695,7 @@ fn process_display_call(
     target: Term,
     display: Term,
 ) -> Result<Term, VmError> {
-    if let Some(done) = crate::signals::poll(process, ctx.pid())? {
+    if let Some(done) = crate::signals::poll(process)? {
         return Ok(done);
     }
     let internal = module == "erts_internal";

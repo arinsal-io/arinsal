@@ -78,6 +78,9 @@ pub struct Process {
     // ---- processes and messages ----
     pub(crate) runtime: Option<std::sync::Arc<process::Runtime>>,
     pub(crate) self_pid: Option<arinsal_sched::Pid>,
+    /// Saved continuation data for the process's pending `erts_await_result` BIF.
+    // Port of erts/emulator/beam/erl_bif_info.c:1480-1500, OTP-29.1.1.
+    pub(crate) pending_signal_waiter: Option<crate::signals::Waiter>,
     /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
     /// like erts' `c_p->scheduler_data`.
     pub(crate) scheduler_id: u32,
@@ -918,6 +921,7 @@ impl Process {
             final_exit_reason: None,
             runtime: None,
             self_pid: None,
+            pending_signal_waiter: None,
             scheduler_id: 0,
             hibernated: false,
             inbox: process::MessageQueue::default(),
