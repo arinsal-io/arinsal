@@ -1128,7 +1128,7 @@ fn term_type(value: Term) -> Term {
         },
         TermKind::Atom => "atom",
         TermKind::Ref => match value.header().map(|header| header & 63) {
-            Some(0x10 | 0x3c) => "reference",
+            Some(0x10) => "reference",
             _ => "external_reference",
         },
         TermKind::Fun => {

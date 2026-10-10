@@ -675,7 +675,7 @@ fn ref_to_list(term: Term) -> Result<String, VmError> {
     let Some(Identity::Ref { ids, .. }) = term.identity() else {
         return Err(badarg());
     };
-    let magic = term.header().is_some_and(|header| header & 63 == 0x3c);
+    let magic = term.is_magic_ref();
     let mut numbers: Vec<u32> = ids;
     if magic && numbers.last() == Some(&u32::MAX) {
         numbers.pop();

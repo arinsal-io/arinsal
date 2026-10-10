@@ -37,7 +37,6 @@ pub unsafe fn boxed_object_words(header: u64, ptr: *const u64) -> usize {
         | crate::POS_BIG
         | crate::NEG_BIG
         | crate::REF
-        | crate::MAGIC_REF
         | crate::FLOAT
         | crate::RECORD
         | crate::HEAP_BITS
@@ -67,7 +66,6 @@ pub(crate) unsafe fn boxed_term_range(header: u64, ptr: *const u64) -> std::ops:
         crate::POS_BIG
         | crate::NEG_BIG
         | crate::REF
-        | crate::MAGIC_REF
         | crate::FLOAT
         | crate::HEAP_BITS
         | crate::BIN_REF

@@ -1079,3 +1079,25 @@ fn differential_hashes_ten_thousand_identities_and_funs() {
         );
     }
 }
+
+#[test]
+fn magic_reference_uses_erts_ref_thing_header_and_marker() {
+    // erl_term.h: ErtsMRefThing shares ERTS_REF_THING_HEADER with ErtsORefThing on 64-bit
+    // little endian; the ordinary marker in word one tells them apart.
+    use arinsal_term::{MagicRef, TermBuilder};
+    let mut heap = VecHeap::new();
+    let magic = TermBuilder::new(&mut heap)
+        .magic_ref(MagicRef::new(()))
+        .unwrap();
+    let ordinary = TermBuilder::new(&mut heap).local_ref([1, 2, 3]).unwrap();
+    assert_eq!(magic.header(), Some((2 << 6) | 0x10));
+    assert_eq!(ordinary.header(), magic.header());
+    assert!(magic.is_magic_ref());
+    assert!(!ordinary.is_magic_ref());
+    assert_eq!(magic.local_ref_numbers(), None);
+    assert_eq!(ordinary.local_ref_numbers(), Some([1, 2, 3]));
+    // SAFETY: `heap` retains both references and the magic owner for the borrow.
+    assert!(unsafe { magic.magic_ref() }.is_some());
+    // SAFETY: as above; an ordinary reference has no owner to borrow.
+    assert!(unsafe { ordinary.magic_ref() }.is_none());
+}

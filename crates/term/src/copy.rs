@@ -4,8 +4,8 @@ use crate::literal::LiteralAreas;
 use crate::ops::{LiteralSkip, size_object_inner, size_object_with_prior};
 use crate::{
     ARITY, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry, FUN,
-    FunEntry, FunRef, HEAP_BITS, HeapAlloc, MAGIC_REF, MAP, Node, RECORD, SUB_BITS, Term,
-    TermError, TermKind, size_object,
+    FunEntry, FunRef, HEAP_BITS, HeapAlloc, MAP, Node, RECORD, REF, SUB_BITS, Term, TermError,
+    TermKind, size_object,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -377,7 +377,9 @@ fn copy_term_body<H: HeapAlloc + ?Sized>(
                             crate::bits::retain_cloned_binary_owner(dst, ptr, flags)?;
                         }
                     }
-                    MAGIC_REF => {
+                    // Port of erts/emulator/beam/copy.c:934-939 (copy_struct, magic ref), OTP-29.1.1.
+                    // SAFETY: a REF thing has an initialized word one.
+                    REF if crate::is_magic_ref_thing_with_hdr(header, unsafe { *to.add(1) }) => {
                         // SAFETY: source heap retains this Arc while the copy is in progress.
                         unsafe {
                             let ptr = *to.add(1) as *const crate::MagicRef;
