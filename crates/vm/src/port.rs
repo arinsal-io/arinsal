@@ -1053,6 +1053,7 @@ fn start(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     let owner = ctx.pid();
@@ -1114,6 +1115,7 @@ fn start_driver(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     // g_inet_udp
@@ -1190,6 +1192,7 @@ fn start_dyn_driver(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(&runtime, port_id);
     reservation.commit();
     let caller = packed_pid(ctx.pid());
@@ -1628,6 +1631,9 @@ impl arinsal_drv::PortHost for DrvHost {
             return false;
         }
         handle.drv_monitors.lock().unwrap().insert(monitor, target);
+        if let Some(runtime) = self.runtime.upgrade() {
+            let _ = runtime.publish_proc_flag(target, arinsal_sched::proc_flags::PORTS);
+        }
         true
     }
 
@@ -1716,6 +1722,9 @@ impl arinsal_drv::PortHost for DrvHost {
         let _ = handle.driver.set(Arc::clone(&drv_port));
         crate::ddll::port_opened_for(&driver, &drv_port);
         runtime.ports.lock().unwrap().insert(port_id, handle);
+        // The owner has a port in its link list (erl_process.c:14084). Exit scans the
+        // port table only when that list is non-NULL.
+        let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
         crate::trace::port_opened(&runtime, port_id);
         reservation.commit();
         Some(drv_port)
@@ -1944,6 +1953,7 @@ pub(crate) fn alloc_inet_port(
         .lock()
         .unwrap()
         .insert(port_id, Arc::clone(&handle));
+    let _ = runtime.publish_proc_flag(owner, arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, port_id);
     reservation.commit();
     Ok((port_id, handle))
@@ -2277,6 +2287,7 @@ fn start_fd(
         .lock()
         .unwrap()
         .insert(id, Arc::clone(&handle));
+    let _ = runtime.publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::PORTS);
     crate::trace::port_opened(runtime, id);
     reservation.commit();
     let owner = ctx.pid();
@@ -3550,6 +3561,7 @@ fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Res
     let old_owner = handle.owner_pid();
     handle.links.lock().unwrap().insert(pid);
     *handle.owner.lock().unwrap() = pid;
+    let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS);
     if notify.is_none()
         && old_owner != pid
         && let Some(pid_term) = pid.to_term()
@@ -3761,6 +3773,12 @@ pub(crate) fn link(process: &Process, port: Term, pid: Pid, linked: bool) -> Res
     }
     drop(links);
     drop(ports);
+    // A linked port is on the process link list. Exit scans ports only when that
+    // list is non-empty (erl_process.c:14084, `erts_proc_exit_handle_link`).
+    if linked && !runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS) {
+        handle.links.lock().unwrap().remove(&pid);
+        return Ok(false);
+    }
     if let Some(pid_term) = pid.to_term() {
         crate::trace::emit_port_event(
             runtime,
@@ -3828,6 +3846,9 @@ fn register_monitor(
     let mut monitors = handle.monitors.lock().unwrap();
     if monitored {
         monitors.insert(reference, PortMonitor { pid, object });
+        if let Some(runtime) = process.runtime.as_ref() {
+            let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::PORTS);
+        }
     } else {
         monitors.remove(&reference);
     }

@@ -516,6 +516,8 @@ pub(crate) fn try_load(
     ctx: &RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
+    // F_USING_DDLL (erl_process.c:14415): exit calls erts_ddll_proc_dead only when set.
+    arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DDLL);
     crate::port::install_hooks();
     let options = to_owned(args[2]).map_err(|_| badarg())?;
     let mut flags = 0;
@@ -765,6 +767,7 @@ pub(crate) fn try_unload(
     ctx: &RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
+    arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DDLL);
     let options = to_owned(args[1]).map_err(|_| badarg())?;
     let mut kill = 0;
     let mut monitor: i32 = 0;
@@ -994,6 +997,7 @@ pub(crate) fn monitor(
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
+    arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::DDLL);
     if args[0] != atom("driver") {
         return Err(badarg());
     }

@@ -354,7 +354,7 @@ impl Vm {
                 if need > p.x.len() {
                     let mut registers = p.x.to_vec();
                     registers.resize(need, Term::NIL);
-                    p.x = registers.into_boxed_slice();
+                    p.x = registers.into();
                 }
                 for (i, &word) in free_vars.iter().enumerate() {
                     // SAFETY: The fun header bounds the environment and every word is a term.
@@ -1036,7 +1036,7 @@ impl Vm {
         if args.len() <= 255 && args.len() >= p.x.len() {
             let mut registers = p.x.to_vec();
             registers.resize(args.len() + 1, Term::NIL);
-            p.x = registers.into_boxed_slice();
+            p.x = registers.into();
         }
         if args.len() >= p.x.len() {
             return Err(exceptions::bif_error(

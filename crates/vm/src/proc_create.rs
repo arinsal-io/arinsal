@@ -42,13 +42,88 @@ impl ProcessStats {
     }
 }
 
+/// X registers. The first six live in the process, like `def_arg_reg[6]`
+/// (erl_process.h:1079). A longer file is a separate block, like `arg_reg` when
+/// `max_arg_reg` exceeds `sizeof(def_arg_reg)`.
+pub struct ArgRegs {
+    inline: [Term; 6],
+    extra: Box<[Term]>,
+    len: usize,
+}
+
+impl ArgRegs {
+    /// `len` registers, all `NIL`. Lengths up to 6 do not allocate.
+    pub fn new(len: usize) -> Self {
+        if len <= 6 {
+            Self {
+                inline: [Term::NIL; 6],
+                extra: Box::from([]),
+                len,
+            }
+        } else {
+            Self {
+                inline: [Term::NIL; 6],
+                extra: vec![Term::NIL; len].into_boxed_slice(),
+                len,
+            }
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(0)
+    }
+}
+
+impl From<Vec<Term>> for ArgRegs {
+    fn from(values: Vec<Term>) -> Self {
+        let len = values.len();
+        if len <= 6 {
+            let mut inline = [Term::NIL; 6];
+            inline[..len].copy_from_slice(&values);
+            Self {
+                inline,
+                extra: Box::from([]),
+                len,
+            }
+        } else {
+            Self {
+                inline: [Term::NIL; 6],
+                extra: values.into_boxed_slice(),
+                len,
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for ArgRegs {
+    type Target = [Term];
+
+    fn deref(&self) -> &[Term] {
+        if self.len <= 6 {
+            &self.inline[..self.len]
+        } else {
+            &self.extra
+        }
+    }
+}
+
+impl std::ops::DerefMut for ArgRegs {
+    fn deref_mut(&mut self) -> &mut [Term] {
+        if self.len <= 6 {
+            &mut self.inline[..self.len]
+        } else {
+            &mut self.extra
+        }
+    }
+}
+
 /// One future schedulable process, with private registers and heap.
 #[repr(C)]
 pub struct Process {
     /// BeamAsm ABI prefix; interpreter fields remain authoritative outside native execution.
     pub(crate) header: ProcessHeader,
-    /// X registers, up to erts MAX_REG.
-    pub x: Box<[Term]>,
+    /// X registers. Inline for the erts default of six (`def_arg_reg`).
+    pub x: ArgRegs,
     /// Float registers.
     pub fr: Box<[f64]>,
     /// Contiguous process heap and Y stack.
@@ -957,7 +1032,7 @@ impl Process {
         );
         let mut process = Self {
             header: ProcessHeader::default(),
-            x: vec![Term::NIL; x_registers].into_boxed_slice(),
+            x: ArgRegs::new(x_registers),
             fr: vec![0.0; float_registers].into_boxed_slice(),
             heap,
             dictionary: None,

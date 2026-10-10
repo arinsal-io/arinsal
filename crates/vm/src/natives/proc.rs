@@ -1926,11 +1926,24 @@ fn call_values(
                         value if value == atom("false") => false,
                         _ => return Err(badarg()),
                     };
-                    let previous = crate::node_tables::lock().monitor_nodes(
+                    let mut nodes = crate::node_tables::lock();
+                    let previous = nodes.monitor_nodes(
                         ctx.pid(),
                         crate::node_tables::NodeMonitorOptions::default(),
                         enabled,
                     );
+                    if enabled
+                        && let Some(runtime) = process.runtime.as_ref()
+                        && !runtime
+                            .publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::NODE_MON)
+                    {
+                        nodes.monitor_nodes(
+                            ctx.pid(),
+                            crate::node_tables::NodeMonitorOptions::default(),
+                            false,
+                        );
+                    }
+                    drop(nodes);
                     let count = process.cold.as_ref().map_or(0, |cold| cold.monitor_nodes);
                     process.cold_mut().monitor_nodes = if enabled {
                         count.saturating_add(1)
@@ -1950,8 +1963,16 @@ fn call_values(
                     };
                     let options = crate::node_tables::parse_nodes_monitor_options(&parts[1])
                         .map_err(|_| badarg())?;
-                    let previous =
-                        crate::node_tables::lock().monitor_nodes(ctx.pid(), options, enabled);
+                    let mut nodes = crate::node_tables::lock();
+                    let previous = nodes.monitor_nodes(ctx.pid(), options, enabled);
+                    if enabled
+                        && let Some(runtime) = process.runtime.as_ref()
+                        && !runtime
+                            .publish_proc_flag(ctx.pid(), arinsal_sched::proc_flags::NODE_MON)
+                    {
+                        nodes.monitor_nodes(ctx.pid(), options, false);
+                    }
+                    drop(nodes);
                     let count = process.cold.as_ref().map_or(0, |cold| cold.monitor_nodes);
                     process.cold_mut().monitor_nodes = if enabled {
                         count.saturating_add(1)
@@ -2271,7 +2292,7 @@ fn hibernate(
     if process.x.len() < 3 {
         let mut registers = process.x.to_vec();
         registers.resize(3, Term::NIL);
-        process.x = registers.into_boxed_slice();
+        process.x = registers.into();
     }
     process.heap.release_stack(process.heap.stack_words());
     for register in process.x.iter_mut() {

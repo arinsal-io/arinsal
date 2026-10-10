@@ -535,7 +535,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     if process.x.len() < usize::from(nif.arity) {
         let mut x = process.x.to_vec();
         x.resize(usize::from(nif.arity), Term::NIL);
-        process.x = x.into_boxed_slice();
+        process.x = x.into();
     }
     for (destination, raw) in process
         .x
@@ -767,7 +767,7 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     if process.x.len() < synced {
         let mut x = process.x.to_vec();
         x.resize(synced, Term::NIL);
-        process.x = x.into_boxed_slice();
+        process.x = x.into();
     }
     for index in 6..synced {
         process.x[index] = registers.x_reg_array[index];
@@ -1512,7 +1512,7 @@ fn set_call_fun_error(
     if arity >= process.x.len() {
         let mut x = process.x.to_vec();
         x.resize(arity + 1, Term::NIL);
-        process.x = x.into_boxed_slice();
+        process.x = x.into();
     }
     process
         .heap
@@ -2154,7 +2154,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     if process.x.len() < root_live {
         let mut x = process.x.to_vec();
         x.resize(root_live, Term::NIL);
-        process.x = x.into_boxed_slice();
+        process.x = x.into();
     }
     for (index, slot) in registers.x_reg_array[..root_live].iter().enumerate() {
         // Dead X registers below the staged segments must not become GC roots.
@@ -2286,7 +2286,7 @@ pub extern "C" fn arinsal_beamasm_bs_match_command(
     if process.x.len() < root_live {
         let mut x = process.x.to_vec();
         x.resize(root_live, Term::NIL);
-        process.x = x.into_boxed_slice();
+        process.x = x.into();
     }
     // The X registers below `base` and the staged operands (the context among them) are the
     // roots of a collection; the staged copies follow the registers in `process.x`.

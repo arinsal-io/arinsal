@@ -6,6 +6,7 @@ use arinsal_beamasm::SchedulerRegisters;
 use arinsal_pterm::RetiredArea;
 use arinsal_sched::{
     Config, Event, Payload, Pid, ReceiveMarker, RunCtx, RunOutcome, Scheduler, Signal, Task,
+    proc_flags,
 };
 use arinsal_spec::Opcode;
 use arinsal_term::ptab::PtabIdRing;
@@ -1066,7 +1067,7 @@ thread_local! {
 struct Executor {
     owner: Weak<Runtime>,
     vm: Vm,
-    x: Box<[Term]>,
+    x: crate::proc_create::ArgRegs,
     fr: Box<[f64]>,
     /// Native register backing is scheduler-local, as required by x19.
     native_registers: SchedulerRegisters,
@@ -1182,7 +1183,7 @@ impl Executor {
         if self.x.len() < need_x {
             let mut registers = self.x.to_vec();
             registers.resize(need_x, Term::NIL);
-            self.x = registers.into_boxed_slice();
+            self.x = registers.into();
         }
         if self.fr.len() < need_fr {
             let mut registers = self.fr.to_vec();
@@ -1196,7 +1197,7 @@ impl Executor {
         if process.x.len() < self.x.len() {
             let mut registers = process.x.to_vec();
             registers.resize(self.x.len(), Term::NIL);
-            process.x = registers.into_boxed_slice();
+            process.x = registers.into();
         }
         process.x[..self.x.len()].copy_from_slice(&self.x);
         // The tail still holds the previous run's registers on this executor; those are
@@ -1654,7 +1655,7 @@ impl Executor {
                                     if process.x.len() < width {
                                         let mut x = process.x.to_vec();
                                         x.resize(width, Term::NIL);
-                                        process.x = x.into_boxed_slice();
+                                        process.x = x.into();
                                     }
                                     for (destination, raw) in process
                                         .x
@@ -1795,7 +1796,7 @@ impl Executor {
                                     if process.x.len() < arity {
                                         let mut x = process.x.to_vec();
                                         x.resize(arity, Term::NIL);
-                                        process.x = x.into_boxed_slice();
+                                        process.x = x.into();
                                     }
                                     for (destination, raw) in process
                                         .x
@@ -2879,14 +2880,14 @@ impl Executor {
             saved_x.resize(live_x, Term::NIL);
             let copy_x = self.x.len().min(live_x);
             saved_x[..copy_x].copy_from_slice(&self.x[..copy_x]);
-            process.x = saved_x.into_boxed_slice();
+            process.x = saved_x.into();
             let mut saved_fr = process.fr.to_vec();
             saved_fr.resize(live_fr, 0.0);
             let copy_fr = self.fr.len().min(live_fr);
             saved_fr[..copy_fr].copy_from_slice(&self.fr[..copy_fr]);
             process.fr = saved_fr.into_boxed_slice();
         } else {
-            process.x = Box::new([]);
+            process.x = crate::proc_create::ArgRegs::empty();
             process.fr = Box::new([]);
         }
         let running = crate::trace::running_mfa(process, &self.vm, ctx.pid())?;
@@ -3977,7 +3978,7 @@ impl Runtime {
             .is_ok_and(|scheduler| scheduler.lookup(pid))
     }
 
-    pub(crate) fn forget_process(&self, pid: Pid) {
+    pub(crate) fn forget_process(&self, pid: Pid, drop_published: bool) {
         if self.ever_suspended.load(Ordering::Acquire) {
             self.drop_suspend_waiters(pid);
         }
@@ -3990,7 +3991,11 @@ impl Runtime {
         if self.ever_max_heap.load(Ordering::Acquire) {
             self.max_heaps.lock().unwrap().remove(&pid);
         }
-        self.published.lock().unwrap().remove(&pid);
+        // `note_status` publishes PUBLISHED only when it inserts a slot. Exit skips the map
+        // when this process never had one (erl_process.c keeps status on the process struct).
+        if drop_published {
+            self.published.lock().unwrap().remove(&pid);
+        }
         if self.ever_suspended.load(Ordering::Acquire) {
             self.suspend_total.lock().unwrap().remove(&pid);
             self.suspend_counts
@@ -3998,6 +4003,20 @@ impl Runtime {
                 .unwrap()
                 .retain(|(by, target), _| *by != pid && *target != pid);
         }
+    }
+
+    /// Publish that `pid` now owns `bit`. False when that process has already finished
+    /// exit cleanup of `bit` (erl_process.c tests the word under the process lock; the
+    /// caller rolls the table update back).
+    pub(crate) fn publish_proc_flag(&self, pid: Pid, bit: u32) -> bool {
+        let Ok(scheduler) = self.scheduler() else {
+            return false;
+        };
+        scheduler
+            .with_proc_flags(pid, |flags| {
+                !proc_flags::finished(flags, bit) && proc_flags::publish(flags, bit)
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn note_status(&self, pid: Pid, status: &'static str) {
@@ -4017,6 +4036,9 @@ impl Runtime {
         } else {
             slot.status = status;
         }
+        if !self.publish_proc_flag(pid, proc_flags::PUBLISHED) {
+            published.remove(&pid);
+        }
     }
 
     pub(crate) fn mark_hibernating(&self, pid: Pid, on: bool) {
@@ -4032,6 +4054,9 @@ impl Runtime {
         slot.hibernating = on;
         if !suspended {
             slot.status = "waiting";
+        }
+        if !self.publish_proc_flag(pid, proc_flags::PUBLISHED) {
+            published.remove(&pid);
         }
     }
 
@@ -4097,6 +4122,9 @@ impl Runtime {
             slot.links.clear();
             slot.monitors.clear();
             slot.monitored_by.clear();
+        }
+        if !self.publish_proc_flag(pid, proc_flags::PUBLISHED) {
+            published.remove(&pid);
         }
     }
 
@@ -4277,9 +4305,16 @@ impl Process {
     }
 
     /// Process exit up to the release of owned ETS tables.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:14290-14430 (`erts_continue_exit_process`),
+    /// OTP-29.1.1: each global table is touched only when the process-local word says this
+    /// process has that resource.
     fn exit_stage1(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.final_exit_reason = Some(reason);
-        crate::natives::code::code_mod_permission_process_exit(self, ctx.pid());
+        let resources = proc_flags::resources_to_clean(ctx.exit_flags());
+        if resources & proc_flags::CODE_PERM != 0 {
+            crate::natives::code::code_mod_permission_process_exit(self, ctx.pid());
+        }
         // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1:
         // the code barrier of a loader commits and releases the code modification permission
         // even when the suspended loader exits.
@@ -4294,41 +4329,54 @@ impl Process {
             }
         }
         crate::natives::proc::trace_finish_process_exit(vm, self, ctx);
-        crate::trace::emit(
-            Some(vm),
-            self,
-            ctx,
-            ctx.pid(),
-            crate::trace::PROCS,
-            "exit",
-            &[reason],
-        );
-        // Port of erts/emulator/beam/erl_process.c:14421-14464, OTP-29.1.1: releasing the
-        // registered name is traced after the exit event.
-        let registered: Vec<String> = self.runtime.as_ref().map_or_else(Vec::new, |runtime| {
-            runtime
-                .names
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, pid)| **pid == ctx.pid())
-                .map(|(name, _)| name.clone())
-                .collect()
-        });
-        for name in registered {
+        // erl_process.c:14221: the exit trace is emitted only when F_TRACE_PROCS is set.
+        if resources & proc_flags::TRACE != 0 {
             crate::trace::emit(
                 Some(vm),
                 self,
                 ctx,
                 ctx.pid(),
                 crate::trace::PROCS,
-                "unregister",
-                &[crate::signals::atom(&name)],
+                "exit",
+                &[reason],
             );
         }
-        crate::natives::erts_debug::monitor_process_exited(self, ctx.pid());
-        crate::trace::retain_exiting(self, ctx.pid());
-        crate::trace::tracer_exited(self, ctx.pid());
+        // Port of erts/emulator/beam/erl_process.c:14421-14464, OTP-29.1.1: releasing the
+        // registered name is traced after the exit event, and only when p->reg != NULL.
+        if resources & proc_flags::REG != 0 {
+            let registered: Vec<String> = self.runtime.as_ref().map_or_else(Vec::new, |runtime| {
+                runtime
+                    .names
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, pid)| **pid == ctx.pid())
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            });
+            for name in registered {
+                crate::trace::emit(
+                    Some(vm),
+                    self,
+                    ctx,
+                    ctx.pid(),
+                    crate::trace::PROCS,
+                    "unregister",
+                    &[crate::signals::atom(&name)],
+                );
+            }
+        }
+        // erl_process.c:14200 (erts_trace_check_exiting) matches the system-monitor receiver.
+        if resources & proc_flags::SYS_MON != 0 {
+            crate::natives::erts_debug::monitor_process_exited(self, ctx.pid());
+        }
+        // delete_all_trace_refs walks p->common.tracee.first_ref, which is NULL when untraced.
+        if resources & proc_flags::TRACE != 0 {
+            crate::trace::retain_exiting(self, ctx.pid());
+        }
+        if resources & proc_flags::TRACER != 0 {
+            crate::trace::tracer_exited(self, ctx.pid());
+        }
         // Port of erts/emulator/beam/erl_process.c:11039 (cleanup_sys_tasks), OTP-29.1.1:
         // delayed literal-copy requests of an exiting process are answered with `ok`.
         if let Some(cold) = self.cold.as_mut() {
@@ -4344,23 +4392,36 @@ impl Process {
             }
         }
         // Port of erts/emulator/beam/erl_process.c:14300-14304, OTP-29.1.1.
-        // Timers aimed at this process are canceled before its other resources.
-        ctx.cancel_target_timers(ctx.pid());
+        // Timers aimed at this process are canceled only when p->bif_timers != NULL.
+        if resources & proc_flags::BIF_TIMERS != 0 {
+            ctx.cancel_target_timers(ctx.pid());
+        }
         // g_proc_sched: a terminating suspender releases every suspend it acquired.
         // g_port_fix: close owned ports synchronously on the termination path.
         if let Some(runtime) = self.runtime.clone() {
-            runtime.cancel_owned_timers(ctx.pid());
-            crate::node_tables::lock().forget_node_monitors(ctx.pid());
+            if resources & proc_flags::OWNED_TIMERS != 0 {
+                runtime.cancel_owned_timers(ctx.pid());
+            }
+            // Node monitors live in the process monitor tree; the global table is
+            // consulted only when this process registered one (dist.c:6732).
+            if resources & proc_flags::NODE_MON != 0 {
+                crate::node_tables::lock().forget_node_monitors(ctx.pid());
+            }
             let wake = runtime.release_suspender(ctx.pid());
             for pid in wake {
                 let _ = ctx.signal(pid, arinsal_sched::Signal::UnlinkAck(u64::MAX));
             }
             if let Ok(scheduler) = runtime.scheduler() {
-                crate::port::owner_exit(&runtime, &scheduler, ctx.pid(), reason);
-                // Port of erts/emulator/beam/erl_process.c:14416 (erts_ddll_proc_dead).
-                crate::ddll::proc_dead(&scheduler, ctx.pid());
+                // Ports are links on the process (erl_process.c:14084). No port list, no scan.
+                if resources & proc_flags::PORTS != 0 {
+                    crate::port::owner_exit(&runtime, &scheduler, ctx.pid(), reason);
+                }
+                // Port of erts/emulator/beam/erl_process.c:14415-14417 (F_USING_DDLL).
+                if resources & proc_flags::DDLL != 0 {
+                    crate::ddll::proc_dead(&scheduler, ctx.pid());
+                }
             }
-            runtime.forget_process(ctx.pid());
+            runtime.forget_process(ctx.pid(), resources & proc_flags::PUBLISHED != 0);
         }
     }
 
@@ -4369,6 +4430,10 @@ impl Process {
     ///
     /// Port of erts/emulator/beam/erl_db.c:5031 (erts_db_process_exiting), OTP-29.1.1.
     fn exit_ets(&mut self, ctx: &mut RunCtx<'_, Message>, reds: &mut isize) -> bool {
+        // erl_process.c:14362: erts_db_process_exiting runs only when F_USING_DB is set.
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::USING_DB == 0 {
+            return true;
+        }
         let (Some(runtime), Some(owner)) = (self.runtime.clone(), ctx.pid().to_term()) else {
             return true;
         };
@@ -4414,6 +4479,7 @@ impl Process {
                         scheduler.started_interval(pid) == Some(heir.started_interval)
                     });
                     if alive
+                        && runtime.publish_proc_flag(pid, proc_flags::USING_DB)
                         && runtime
                             .ets
                             .write()
@@ -4449,7 +4515,10 @@ impl Process {
                         && let Ok(message) = Message::copy_from(message_term)
                     {
                         let mut registry = runtime.ets.write().unwrap();
-                        if registry.give_away(tid, heir.pid).is_ok() {
+                        // erl_db.c:4914: the heir's F_USING_DB bit, so its exit releases the table.
+                        if runtime.publish_proc_flag(pid, proc_flags::USING_DB)
+                            && registry.give_away(tid, heir.pid).is_ok()
+                        {
                             drop(registry);
                             if ctx.send(pid, message).is_ok() {
                                 continue;
@@ -4479,15 +4548,21 @@ impl Process {
 
     /// Process exit after its tables are released: pending signals, names, links and monitors.
     fn exit_stage3(&mut self, ctx: &mut RunCtx<'_, Message>, reason: Term) {
-        crate::trace::clear(self, ctx.pid());
+        // delete_all_trace_refs (erl_trace.c:3774) is a no-op when first_ref is NULL.
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::TRACE != 0 {
+            crate::trace::clear(self, ctx.pid());
+        }
         crate::trace::clear_save_calls(self);
         // Further publishes fail with `NoProcess` and the watcher synthesizes
         // DOWN. Signals already queued are installed before we notify.
         ctx.begin_exit();
         self.absorb_exit_signals(ctx);
-        if let Some(runtime) = &self.runtime {
-            // Port of erts/emulator/beam/erl_process.c:14421-14464, OTP-29.1.1.
-            // The registered name is the last Erlang resource released, after owned ETS tables.
+        if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::REG != 0
+            && let Some(runtime) = &self.runtime
+        {
+            // Port of erts/emulator/beam/erl_process.c:14424-14426, OTP-29.1.1.
+            // The registered name is the last Erlang resource released, and only when
+            // p->common.u.alive.reg != NULL.
             runtime
                 .names
                 .lock()
@@ -5852,7 +5927,7 @@ fn with_executor<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Executor) -> R) 
                 Executor {
                     owner: Arc::downgrade(runtime),
                     vm: Vm::shared_replica(runtime.code_scope, &runtime.paths),
-                    x: Box::new([]),
+                    x: crate::proc_create::ArgRegs::empty(),
                     fr: Box::new([]),
                     native_registers: SchedulerRegisters::default(),
                 },

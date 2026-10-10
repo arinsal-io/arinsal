@@ -683,7 +683,8 @@ pub(crate) fn configure_session(
     } else {
         entry.flags &= !flags;
     }
-    if entry.flags == 0 {
+    let traced = entry.flags != 0;
+    if !traced {
         table.remove(&(scope(process), session, pid));
     }
     enabled().store(
@@ -691,6 +692,9 @@ pub(crate) fn configure_session(
         Ordering::Relaxed,
     );
     drop(table);
+    if traced {
+        note_trace_owner(process, pid, &tracer);
+    }
     refresh_running_procs_enabled();
     before
 }
@@ -1190,6 +1194,18 @@ fn module_tracer_alive(
     result == Some(crate::signals::atom("trace")) || result == Some(crate::signals::atom("discard"))
 }
 
+/// `ERTS_P_ALL_TRACE_FLAGS` / tracer identity (erl_process.c:13221). Exit walks trace tables
+/// only when one of these words is set.
+fn note_trace_owner(process: &Process, pid: Pid, tracer: &Tracer) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    let _ = runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::TRACE);
+    if let Tracer::Pid(tracer) = tracer {
+        let _ = runtime.publish_proc_flag(*tracer, arinsal_sched::proc_flags::TRACER);
+    }
+}
+
 // Port of erts/emulator/beam/erl_process.c:12692-12705, OTP-29.1.1.
 fn replace_session_flags(process: &Process, session: u64, pid: Pid, flags: u64, tracer: Tracer) {
     let key = (scope(process), session, pid);
@@ -1198,10 +1214,19 @@ fn replace_session_flags(process: &Process, session: u64, pid: Pid, flags: u64, 
     if flags == 0 {
         table.remove(&key);
     } else {
-        table.insert(key, Entry { flags, tracer });
+        table.insert(
+            key,
+            Entry {
+                flags,
+                tracer: tracer.clone(),
+            },
+        );
     }
     let processes_active = !table.is_empty();
     drop(table);
+    if flags != 0 {
+        note_trace_owner(process, pid, &tracer);
+    }
     enabled().store(
         processes_active || !port_table().lock().unwrap().is_empty(),
         Ordering::Relaxed,

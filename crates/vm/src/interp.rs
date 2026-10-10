@@ -919,7 +919,7 @@ fn ensure_register_file(need: (usize, usize), p: &mut Process) -> (*mut Term, *m
     if p.x.len() < need_x {
         let mut registers = p.x.to_vec();
         registers.resize(need_x, Term::NIL);
-        p.x = registers.into_boxed_slice();
+        p.x = registers.into();
     }
     if p.fr.len() < need_fr {
         let mut registers = p.fr.to_vec();
@@ -1777,7 +1777,7 @@ impl Vm {
         if p.x.len() < need_x {
             let mut registers = p.x.to_vec();
             registers.resize(need_x, Term::NIL);
-            p.x = registers.into_boxed_slice();
+            p.x = registers.into();
         }
         if p.fr.len() < need_fr {
             let mut registers = p.fr.to_vec();

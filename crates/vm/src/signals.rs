@@ -5,7 +5,7 @@ use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, Priority, RunCtx, Signal};
 use arinsal_term::{Atom, FunRef, Term, TermBuilder, TermKind, global_atoms, to_owned};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "pf-mem-counters")]
@@ -1823,6 +1823,11 @@ fn call_resolved(
                     {
                         return Err(badarg("register/2"));
                     }
+                    // p->common.u.alive.reg (erl_process.c:12649, register.c:237). Exit
+                    // unregisters only when this word is set (erl_process.c:14424).
+                    if !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG) {
+                        return Err(badarg("register/2"));
+                    }
                     names.insert(name.clone(), pid);
                 } else if let Some(id) = pid.as_port() {
                     if !crate::port::is_live(process, id) {
@@ -2325,7 +2330,11 @@ fn call_resolved(
             // bif-timer tree) and is cancelled when that process exits; name-addressed timers
             // have no owner.
             if let Some(pid) = pid {
-                rt.timer_owners.lock().unwrap().insert(id, pid);
+                // Owned BIF timers are p->bif_timers (erl_process.c:14301). Exit cancels
+                // them only when this word is set.
+                if rt.publish_proc_flag(pid, arinsal_sched::proc_flags::OWNED_TIMERS) {
+                    rt.timer_owners.lock().unwrap().insert(id, pid);
+                }
                 if !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid)) {
                     // The receiver exited meanwhile; its exit may already have swept its timers.
                     rt.cancel_owned_timers(pid);
@@ -2635,9 +2644,6 @@ struct Tables {
     /// Per-target requests in submission order; wakeups usually arrive in that order,
     /// so lookups hit the front (system task blasts queue hundreds of thousands).
     requests: BTreeMap<Slot, Requests>,
-    /// Processes that already answered their final requests but are still registered; a
-    /// request sent to one now would never be served.
-    exited: BTreeSet<Slot>,
 }
 
 fn scope(process: &Process) -> usize {
@@ -2653,11 +2659,37 @@ fn scope(process: &Process) -> usize {
 // OTP-29.1.1: erts removes an exiting process from the process table while its dirty NIF
 // still runs; this scheduler keeps the entry until the NIF returns, so exit start decides.
 pub(crate) fn has_begun_exit(runtime: &std::sync::Arc<crate::process::Runtime>, pid: Pid) -> bool {
-    tables()
-        .lock()
-        .unwrap()
-        .exited
-        .contains(&(std::sync::Arc::as_ptr(runtime) as usize, pid))
+    proc_is_exiting_runtime(runtime, pid)
+}
+
+fn proc_is_exiting_runtime(runtime: &crate::process::Runtime, pid: Pid) -> bool {
+    runtime
+        .scheduler()
+        .ok()
+        .and_then(|scheduler| {
+            scheduler.with_proc_flags(pid, |flags| {
+                flags.load(std::sync::atomic::Ordering::Acquire)
+                    & arinsal_sched::proc_flags::EXITING
+                    != 0
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn proc_is_exiting(process: &Process, pid: Pid) -> bool {
+    process
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| proc_is_exiting_runtime(runtime, pid))
+}
+
+/// Record that `pid` has a queued remote request. False when its exit already
+/// finished that table, so the caller must drop the queue entry.
+fn note_request(process: &Process, pid: Pid) -> bool {
+    process
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::REQUESTS))
 }
 
 fn tables() -> &'static Mutex<Tables> {
@@ -2665,7 +2697,6 @@ fn tables() -> &'static Mutex<Tables> {
     TABLES.get_or_init(|| {
         Mutex::new(Tables {
             requests: BTreeMap::new(),
-            exited: BTreeSet::new(),
         })
     })
 }
@@ -2811,7 +2842,9 @@ fn submit_from(
         let mut tables = tables().lock().unwrap();
         // Port of erts/emulator/beam/erl_proc_sig_queue.c (signals to an exiting process are
         // handled by its exit), OTP-29.1.1: the target already ran its exit handling.
-        if tables.exited.contains(&(slot_of, target)) {
+        // `ERTS_PSFLG_EXITING` is the process word; the request table is not a list of
+        // every pid that has ever exited.
+        if proc_is_exiting(process, target) {
             return Ok(Submit::Dead);
         }
         let queues = tables.requests.entry((slot_of, target)).or_default();
@@ -2826,6 +2859,23 @@ fn submit_from(
                 kind,
                 save: process.inbox.len(),
             });
+        }
+        if !note_request(process, target) || proc_is_exiting(process, target) {
+            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
+                match priority {
+                    Some(priority) => {
+                        queues.sys[sys_index(priority)].retain(|pending| pending.id != id)
+                    }
+                    None => queues.plain.retain(|pending| pending.id != id),
+                }
+            }
+            if process
+                .pending_signal_waiter
+                .is_some_and(|waiter| waiter.id == id)
+            {
+                process.pending_signal_waiter = None;
+            }
+            return Ok(Submit::Dead);
         }
     }
     let sent = match priority {
@@ -2883,7 +2933,7 @@ fn elevate_sig_handling_prio(
     let id = runtime(process)?.next_ref();
     {
         let mut tables = tables().lock().unwrap();
-        if tables.exited.contains(&(slot_of, target)) {
+        if proc_is_exiting(process, target) {
             return Ok(());
         }
         tables.requests.entry((slot_of, target)).or_default().sys[sys_index(min_prio)].push_back(
@@ -2893,6 +2943,12 @@ fn elevate_sig_handling_prio(
                 op: RemoteOp::PrioSig,
             },
         );
+        if !note_request(process, target) || proc_is_exiting(process, target) {
+            if let Some(queues) = tables.requests.get_mut(&(slot_of, target)) {
+                queues.sys[sys_index(min_prio)].retain(|pending| pending.id != id);
+            }
+            return Ok(());
+        }
     }
     match ctx.signal_sys_task(target, Signal::UnlinkAck(id), min_prio) {
         Ok(()) => Ok(()),
@@ -3125,32 +3181,17 @@ pub(crate) fn process_exiting(process: &mut Process, ctx: &mut RunCtx<'_, Messag
         cold.persistent_update_result = None;
     }
     let slot = (scope(process), ctx.pid());
-    let scheduler = process
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.scheduler().ok());
-    // Entries of processes the scheduler has since removed are no longer needed: a lookup
-    // already reports them dead. They are checked outside the table lock.
-    let candidates = tables()
-        .lock()
-        .unwrap()
-        .exited
-        .iter()
-        .filter(|(scope, _)| *scope == slot.0)
-        .copied()
-        .collect::<Vec<_>>();
-    let gone = scheduler.map_or_else(Vec::new, |scheduler| {
-        candidates
-            .into_iter()
-            .filter(|&(_, pid)| !scheduler.lookup(pid))
-            .collect::<Vec<_>>()
-    });
-    let pending = {
+    // Port of erl_nif.c:2323 (`ERTS_PSFLG_EXITING` on the process). The request table is
+    // taken only when this process was given a remote request (erl_proc_sig_queue.c).
+    let _ =
+        arinsal_sched::proc_flags::publish(ctx.exit_flags(), arinsal_sched::proc_flags::EXITING);
+    let pending = if ctx.exit_flags().load(std::sync::atomic::Ordering::Acquire)
+        & arinsal_sched::proc_flags::REQUESTS
+        == 0
+    {
+        VecDeque::new()
+    } else {
         let mut tables = tables().lock().unwrap();
-        for entry in &gone {
-            tables.exited.remove(entry);
-        }
-        tables.exited.insert(slot);
         let queues = tables.requests.remove(&slot).unwrap_or_default();
         let mut all = queues.plain;
         for queue in queues.sys {

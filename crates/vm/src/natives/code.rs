@@ -56,6 +56,13 @@ pub(crate) fn try_seize_code_mod_permission(runtime: &Runtime, pid: Pid) -> bool
     }
     debug_assert_ne!(perm.owner, Some(pid));
     perm.queue.push_back(pid);
+    // erl_process.c:14215 visits the code-permission lock only when the handover
+    // xstate bit is set. A queued waiter is the same kind of process-local mark:
+    // exit removes it from this queue and otherwise skips the lock.
+    if !runtime.publish_proc_flag(pid, arinsal_sched::proc_flags::CODE_PERM) {
+        perm.queue.retain(|waiter| *waiter != pid);
+        return false;
+    }
     runtime.suspend_internal(pid);
     false
 }
