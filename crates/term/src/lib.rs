@@ -48,8 +48,8 @@ pub use hamt::{
 pub use hamt_yield::{HashmapBuild, MapReverseIter};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
 pub use heap::{
-    AdoptError, CP_WORDS, FrameLayout, HeapAlloc, HeapReservation, LiteralArea, ProcessHeap,
-    S_REDZONE, S_RESERVED, StackWord, TermBuilder, Tuple3Chain, VecHeap, flat_key_cmp,
+    AdoptError, CP_WORDS, ConsHeapBuilder, FrameLayout, HeapAlloc, HeapReservation, LiteralArea,
+    ProcessHeap, S_REDZONE, S_RESERVED, StackWord, TermBuilder, Tuple3Chain, VecHeap, flat_key_cmp,
 };
 pub use identity::{Identity, Node};
 pub use internal_hash::{immediate_internal_hash, internal_hash, internal_salted_hash};
