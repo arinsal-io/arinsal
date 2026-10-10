@@ -9,6 +9,7 @@ use arinsal_beamasm::{
     fun::FunCallTag,
     guard::{GuardHelper, GuardHelper3},
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
+    types::ArgType,
 };
 use arinsal_beamops::{self as beamops, SpecificOp, SpecificOperand};
 use std::{
@@ -1483,7 +1484,7 @@ pub fn compile_parsed_module_with_options(
     function_allowlist: Option<&str>,
     line_breakpoints: bool,
 ) -> Result<CompiledModule, CompileError> {
-    let specialized = beamops::transform_module_with_line_breakpoints(beam, line_breakpoints);
+    let specialized = beamops::transform_module_typed(beam, line_breakpoints);
     let mut candidates = Vec::new();
     let mut unported = Vec::new();
 
@@ -1967,6 +1968,7 @@ fn arg(
     env: &impl ModuleEnv,
 ) -> Result<ArgVal, String> {
     match value.ok_or_else(|| "missing operand".to_owned())? {
+        SpecificOperand::Typed { reg, .. } => arg(Some(reg), beam, env),
         SpecificOperand::X(index) => x_register(*index),
         SpecificOperand::Y(index) => Ok(ArgVal::Y(*index)),
         SpecificOperand::Label(index) => Ok(ArgVal::Label(*index)),
@@ -1983,6 +1985,54 @@ fn arg(
         SpecificOperand::Nil => Ok(ArgVal::Immediate(0x3b)),
         SpecificOperand::BigInt(decimal) => env.bigint_literal(decimal).map(ArgVal::Literal),
         _ => Err("operand form is not accepted by the module assembler".to_owned()),
+    }
+}
+
+/// The compiler type of an arithmetic operand: its `Type` chunk entry for a typed register, the
+/// type of the literal for a literal, otherwise `Any`.
+// Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry, getTypeUnion),
+// OTP-29.1.1.
+fn operand_type(value: Option<&SpecificOperand>, beam: &BeamFile) -> ArgType {
+    match value {
+        Some(SpecificOperand::Typed { type_index, .. }) => beam
+            .types
+            .as_ref()
+            .and_then(|table| table.entries.get(*type_index as usize))
+            .map_or(ArgType::ANY, |entry| ArgType {
+                union_bits: entry.union_bits,
+                min: entry.lower_bound,
+                max: entry.upper_bound,
+            }),
+        Some(SpecificOperand::Literal(index)) => {
+            beam.literals
+                .get(*index as usize)
+                .map_or(ArgType::ANY, |literal| ArgType {
+                    union_bits: literal_type_union(&literal.0),
+                    min: None,
+                    max: None,
+                })
+        }
+        _ => ArgType::ANY,
+    }
+}
+
+/// The type union of an external-term-format literal, from its outermost tag.
+fn literal_type_union(etf: &[u8]) -> u16 {
+    use arinsal_beamasm::types::type_id;
+    match etf.get(1) {
+        Some(97 | 98 | 110 | 111) => type_id::INTEGER,
+        Some(70 | 99) => type_id::FLOAT,
+        Some(100 | 115 | 118 | 119) => type_id::ATOM,
+        Some(106) => type_id::NIL,
+        Some(104 | 105) => type_id::TUPLE,
+        Some(107 | 108) => type_id::CONS,
+        Some(109 | 77) => type_id::BITSTRING,
+        Some(116) => type_id::MAP,
+        Some(88 | 103) => type_id::PID,
+        Some(101 | 102 | 120) => type_id::PORT,
+        Some(90 | 114 | 82) => type_id::REFERENCE,
+        Some(112 | 113 | 117) => type_id::FUN,
+        _ => type_id::ANY,
     }
 }
 
@@ -2204,6 +2254,10 @@ fn emit_op(
     }
     let result = match ported(op.name()).expect("dispatch only follows capability validation") {
         EmitterKind::Metadata => match op.name() {
+            "i_flush_stubs" => {
+                count(0)?;
+                assembler.flush_yield_stubs()
+            }
             "i_func_label" | "label" => {
                 count(1)?;
                 assembler.emit_i_func_label(n(0)?)
@@ -2432,10 +2486,18 @@ fn emit_op(
         }
         EmitterKind::Plus => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_plus_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Minus => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_minus_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Times => {
@@ -2472,6 +2534,10 @@ fn emit_op(
         }
         EmitterKind::IntDiv => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_int_div_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Rem if op.name() == "i_div_rem" => {
@@ -2495,26 +2561,50 @@ fn emit_op(
         }
         EmitterKind::Rem => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_rem_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Band => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_band_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bor => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_bor_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bxor => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_bxor_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bsl => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_bsl_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bsr => {
             count(5)?;
+            assembler.set_arith_types(
+                operand_type(args.get(2), beam),
+                operand_type(args.get(3), beam),
+            );
             assembler.emit_i_bsr_with_fail(value(2)?, value(3)?, value(4)?, n(0)?, helper)
         }
         EmitterKind::Bnot => {

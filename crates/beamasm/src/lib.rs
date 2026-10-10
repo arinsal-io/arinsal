@@ -21,6 +21,7 @@ pub mod records;
 #[allow(unsafe_code)]
 pub mod rt;
 pub mod select;
+pub mod types;
 
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer},
