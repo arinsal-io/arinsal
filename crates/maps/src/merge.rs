@@ -798,6 +798,17 @@ pub fn from_list<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) ->
     })
 }
 
+/// The flatmap branch of `maps:from_list/1` and `maps:from_keys/2` over at most
+/// `MAP_SMALL_MAP_LIMIT` validated pairs; later duplicates win.
+///
+/// Port of erts/emulator/beam/erl_map.c:366-434 (flatmap_from_validated_list), OTP-29.1.1.
+pub fn from_small_pairs<H: HeapAlloc + ?Sized>(
+    pairs: impl Iterator<Item = (Term, Term)>,
+    heap: &mut H,
+) -> MapResult<Term> {
+    allocation_result(flatmap_from_validated_list(pairs, heap))
+}
+
 /// `maps:from_keys/2`.
 ///
 /// Port of erts/emulator/beam/erl_map.c:278-309 (maps_from_keys_2_helper), OTP-29.1.1.

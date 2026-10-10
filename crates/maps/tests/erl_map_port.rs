@@ -1,5 +1,7 @@
 use arinsal_etf::OwnedTerm as O;
-use arinsal_maps::{from_list, from_pairs, get, iter, merge, put, remove, update};
+use arinsal_maps::{
+    flatmap_next, from_list, from_pairs, get, iter, merge, put, remove, take, update,
+};
 use arinsal_term::{Term, VecHeap, internal_hash};
 use std::process::Command;
 
@@ -297,4 +299,80 @@ fn remove_take_without_and_empty_map_sizes_vs_erl() {
         O::Binary(encoded_empty),
     ]);
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn take_and_flatmap_next_vs_erl() {
+    // Port of erts/emulator/beam/erl_map.c:1943-2041 (erts_maps_take) and :3710-3735
+    // (erts_internal_map_next_3, flatmap branch), OTP-29.1.1.
+    let expected = erl(
+        "T=fun(K,M)->case maps:take(K,M) of {V,M2}->{V,maps:to_list(M2)};error->error end end,F=maps:from_list([{{K},K*10}||K<-lists:seq(1,8)]),H=maps:from_list([{K,K*10}||K<-lists:seq(1,80)]),S=maps:from_list([{K,K*10}||K<-lists:seq(1,33)]),O=#{{1}=>one},io:put_chars(binary:encode_hex(term_to_binary({T({4},F),T({9},F),T(4,H),T(99,H),T(1,S),T({1},O),T(x,#{}),erts_internal:map_next(0,F,iterator),erts_internal:map_next(0,F,[tail])}))),halt().",
+    );
+
+    let mut heap = VecHeap::new();
+    let tuple_key = |key: i64, heap: &mut VecHeap| {
+        arinsal_term::TermBuilder::new(heap)
+            .tuple(&[small(key)])
+            .unwrap()
+    };
+    let flat_pairs = (1..=8)
+        .map(|key| (tuple_key(key, &mut heap), small(key * 10)))
+        .collect::<Vec<_>>();
+    let flat = from_pairs(&flat_pairs, &mut heap).unwrap();
+    let large = from_pairs(
+        &(1..=80)
+            .map(|key| (small(key), small(key * 10)))
+            .collect::<Vec<_>>(),
+        &mut heap,
+    )
+    .unwrap();
+    let shrinking = from_pairs(
+        &(1..=33)
+            .map(|key| (small(key), small(key * 10)))
+            .collect::<Vec<_>>(),
+        &mut heap,
+    )
+    .unwrap();
+    let one_key = tuple_key(1, &mut heap);
+    let one_atom = Term::atom(arinsal_term::global_atoms().intern("one").unwrap());
+    let one = from_pairs(&[(one_key, one_atom)], &mut heap).unwrap();
+    let empty = arinsal_maps::new(&mut heap).unwrap();
+
+    let taken = |map: Term, key: Term, heap: &mut VecHeap| match take(map, key, heap).unwrap() {
+        Some((value, rest)) => {
+            assert!(remove(map, key, heap).is_ok_and(|removed| size_eq(removed, rest)));
+            O::Tuple(vec![
+                arinsal_term::to_owned(value).unwrap(),
+                local_pairs(rest),
+            ])
+        }
+        None => {
+            assert_eq!(remove(map, key, heap), Ok(map));
+            O::Atom("error".into())
+        }
+    };
+    let k4 = tuple_key(4, &mut heap);
+    let k9 = tuple_key(9, &mut heap);
+    let k1 = tuple_key(1, &mut heap);
+    let x = Term::atom(arinsal_term::global_atoms().intern("x").unwrap());
+    let tail = Term::atom(arinsal_term::global_atoms().intern("tail").unwrap());
+    let tail_list = arinsal_term::TermBuilder::new(&mut heap)
+        .cons(tail, Term::NIL)
+        .unwrap();
+    let actual = O::Tuple(vec![
+        taken(flat, k4, &mut heap),
+        taken(flat, k9, &mut heap),
+        taken(large, small(4), &mut heap),
+        taken(large, small(99), &mut heap),
+        taken(shrinking, small(1), &mut heap),
+        taken(one, k1, &mut heap),
+        taken(empty, x, &mut heap),
+        arinsal_term::to_owned(flatmap_next(flat, false, Term::NIL, &mut heap).unwrap()).unwrap(),
+        arinsal_term::to_owned(flatmap_next(flat, true, tail_list, &mut heap).unwrap()).unwrap(),
+    ]);
+    assert_eq!(actual, expected);
+}
+
+fn size_eq(a: Term, b: Term) -> bool {
+    arinsal_maps::size(a) == arinsal_maps::size(b)
 }

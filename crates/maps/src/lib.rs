@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 mod merge;
 pub use merge::{
     HashmapFromPairs, HashmapMergeContext, MAP_MERGE_LOOP_FACTOR, MergeStart, from_keys, from_list,
-    hashmap_merge, merge, merge_start,
+    from_small_pairs, hashmap_merge, merge, merge_start,
 };
 
 const MAP: u64 = 0x2c;
@@ -410,11 +410,20 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
 
 // Port of erts/emulator/beam/erl_map.c:2881-3184 (hashmap_delete), OTP-29.1.1.
 // Shape values model THE_NON_VALUE, a list leaf, and a boxed subtree.
-fn hashmap_delete<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> MapResult<Term> {
+fn hashmap_delete<H: HeapAlloc + ?Sized>(
+    map: Term,
+    key: Term,
+    heap: &mut H,
+    value: &mut Option<Term>,
+) -> MapResult<Term> {
     const NONE: u8 = 0;
     const LEAF: u8 = 1;
     const BOXED: u8 = 2;
-    if map.is_hashmap() && size(map)? == LIMIT + 1 && get(map, key)?.is_some() {
+    if map.is_hashmap()
+        && size(map)? == LIMIT + 1
+        && let Some(found) = get(map, key)?
+    {
+        *value = Some(found);
         let mut pairs: Vec<_> = iter(map)?
             .filter(|(candidate, _)| !exact_eq(*candidate, key))
             .collect();
@@ -430,58 +439,13 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> 
     // SAFETY: the source map and every child remain live during traversal; the
     // exact output size is computed from this bounded path before allocation.
     unsafe {
-        if !map.is_hashmap() {
-            let (keys, values, _) = merge::flatmap_kv(map);
-            let n = keys.len();
-            if n == 0 {
-                return Ok(map);
-            }
-            let found_index = keys.iter().position(|&word| {
-                (is_immed(key) && word == bits(key))
-                    || (!is_immed(key) && exact_eq(term(word), key))
-            });
-            let Some(found_index) = found_index else {
-                return Ok(map);
-            };
-            let new_n = n - 1;
-            let tuple_words = if new_n == 0 { 0 } else { new_n + 1 };
-            let need_words = tuple_words + FLATMAP_HEADER_WORDS + new_n;
-            let Some((output, ptr)) = merge::produce(heap, need_words).ok() else {
-                return Err(MapError::HeapFull { need_words });
-            };
-            let map_start = tuple_words;
-            let keys_term = if new_n == 0 {
-                arinsal_term::TermBuilder::new(heap)
-                    .tuple(&[])
-                    .map_err(|_| MapError::HeapFull { need_words })?
-            } else {
-                output[0].write((new_n as u64) << 6);
-                boxed(ptr)
-            };
-            output[map_start].write(MAP);
-            output[map_start + 1].write(new_n as u64);
-            output[map_start + 2].write(bits(keys_term));
-
-            let mut out_index = 0;
-            for index in 0..n {
-                if index == found_index {
-                    continue;
-                }
-                if new_n != 0 {
-                    output[1 + out_index].write(keys[index]);
-                }
-                output[map_start + FLATMAP_HEADER_WORDS + out_index].write(values[index]);
-                out_index += 1;
-            }
-            return Ok(boxed(ptr.add(map_start)));
-        }
-
         loop {
             if bits(node) & 3 == 1 {
                 let leaf = node.raw_ptr();
                 if !exact_eq(term(*leaf), key) {
                     return Ok(map);
                 }
+                *value = Some(term(*leaf.add(1)));
                 break;
             }
 
@@ -497,6 +461,7 @@ fn hashmap_delete<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> 
                 if index == arity {
                     return Ok(map);
                 }
+                *value = Some(term(*term(*source.add(1 + index)).raw_ptr().add(1)));
                 path[depth] = (node, index as u32, 0);
                 depth += 1;
                 break;
@@ -844,10 +809,144 @@ pub fn is_key(map: Term, key: Term) -> MapResult<bool> {
 
 /// `maps:remove/2`.
 pub fn remove<H: HeapAlloc + ?Sized>(map: Term, key: Term, heap: &mut H) -> MapResult<Term> {
-    // Port of erts/emulator/beam/erl_map.c:1910-2030 (erts_maps_take) and
-    // 2881-3184 (hashmap_delete), OTP-29.1.1.
+    Ok(maps_take(map, key, heap)?.map_or(map, |(_, map)| map))
+}
+
+/// `maps:take/2`: the value under `key` and the map without it, or `None` when absent.
+pub fn take<H: HeapAlloc + ?Sized>(
+    map: Term,
+    key: Term,
+    heap: &mut H,
+) -> MapResult<Option<(Term, Term)>> {
+    maps_take(map, key, heap)
+}
+
+// Port of erts/emulator/beam/erl_map.c:1943-2041 (erts_maps_take), OTP-29.1.1.
+fn maps_take<H: HeapAlloc + ?Sized>(
+    map: Term,
+    key: Term,
+    heap: &mut H,
+) -> MapResult<Option<(Term, Term)>> {
     check(map)?;
-    hashmap_delete(map, key, heap)
+    if !map.is_hashmap() {
+        return flatmap_take(map, key, heap);
+    }
+    let mut value = None;
+    let res = hashmap_delete(map, key, heap, &mut value)?;
+    Ok(value.map(|value| (value, res)))
+}
+
+/// The flatmap branch of `erts_maps_take`: one pass that assumes the key exists, copying the
+/// other keys and values as it searches, and releases the output when it does not.
+// Port of erts/emulator/beam/erl_map.c:1947-2033 (erts_maps_take), OTP-29.1.1.
+fn flatmap_take<H: HeapAlloc + ?Sized>(
+    map: Term,
+    key: Term,
+    heap: &mut H,
+) -> MapResult<Option<(Term, Term)>> {
+    let (ks, vs, _) = merge::flatmap_kv(map);
+    let n = ks.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    let tuple_words = if n == 1 { 0 } else { n };
+    let need_words = tuple_words + FLATMAP_HEADER_WORDS + n - 1;
+    let (output, start) =
+        merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
+    let (tuple, rest) = output.split_at_mut(tuple_words);
+    let (header, values) = rest.split_at_mut(FLATMAP_HEADER_WORDS);
+    let found = if is_immed(key) {
+        let key = bits(key);
+        ks.iter().position(|&k| k == key)
+    } else {
+        ks.iter().position(|&k| exact_eq(term(k), key))
+    };
+    let Some(found) = found else {
+        heap.release(start.wrapping_add(need_words), start);
+        return Ok(None);
+    };
+    let keys = if n == 1 {
+        arinsal_term::global_empty_tuple()
+    } else {
+        tuple[0].write(((n - 1) as u64) << 6);
+        copy_skipping(&mut tuple[1..], ks, found);
+        boxed(start)
+    };
+    copy_skipping(values, vs, found);
+    header[0].write(MAP);
+    header[1].write((n - 1) as u64);
+    header[2].write(bits(keys));
+    // The map header follows the key tuple inside the allocated block.
+    let res = boxed(start.wrapping_add(tuple_words));
+    Ok(Some((term(vs[found]), res)))
+}
+
+/// One `erts_internal:map_next/3` step over a whole flatmap: the `{K, V, Next}` chain ending
+/// in `none` (`list_mode == false`), or `[{K, V} | Acc]` for every association.
+// Port of erts/emulator/beam/erl_map.c:3710-3735 (erts_internal_map_next_3), OTP-29.1.1.
+pub fn flatmap_next<H: HeapAlloc + ?Sized>(
+    map: Term,
+    list_mode: bool,
+    acc: Term,
+    heap: &mut H,
+) -> MapResult<Term> {
+    let (ks, vs, _) = merge::flatmap_kv(map);
+    let n = ks.len();
+    let per_elem = if list_mode { 5 } else { 4 };
+    let need_words = per_elem * n;
+    let (output, start) =
+        merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
+    let mut res = if list_mode { acc } else { none_atom() };
+    for (index, words) in output.chunks_exact_mut(per_elem).enumerate() {
+        let from = n - 1 - index;
+        let at = start.wrapping_add(per_elem * index);
+        if list_mode {
+            words[0].write(2 << 6);
+            words[1].write(ks[from]);
+            words[2].write(vs[from]);
+            words[3].write(bits(boxed(at)));
+            words[4].write(bits(res));
+            res = cons(at.wrapping_add(3));
+        } else {
+            words[0].write(3 << 6);
+            words[1].write(ks[from]);
+            words[2].write(vs[from]);
+            words[3].write(bits(res));
+            res = boxed(at);
+        }
+    }
+    Ok(res)
+}
+
+/// `[{Key, Value} | Tail]`, the list-mode element of `erts_internal:map_next/3`: a 2-tuple
+/// followed by its cons cell in one 5-word block.
+// Port of erts/emulator/beam/erl_map.c:3733-3734 and :4002-4003 (TUPLE2 then CONS),
+// OTP-29.1.1.
+#[inline]
+pub fn cons_pair<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    key: Term,
+    value: Term,
+    tail: Term,
+) -> MapResult<Term> {
+    let (words, at) = merge::produce(heap, 5).map_err(|_| MapError::HeapFull { need_words: 5 })?;
+    words[0].write(2 << 6);
+    words[1].write(bits(key));
+    words[2].write(bits(value));
+    words[3].write(bits(boxed(at)));
+    words[4].write(bits(tail));
+    Ok(cons(at.wrapping_add(3)))
+}
+
+/// `source` without its element at `skip`, into `out` (one word shorter).
+fn copy_skipping(out: &mut [std::mem::MaybeUninit<u64>], source: &[u64], skip: usize) {
+    let (before, after) = out.split_at_mut(skip);
+    for (slot, &word) in before.iter_mut().zip(&source[..skip]) {
+        slot.write(word);
+    }
+    for (slot, &word) in after.iter_mut().zip(&source[skip + 1..]) {
+        slot.write(word);
+    }
 }
 
 // erts MAP_HEADER_FLATMAP_SZ: header, size, key tuple.
@@ -1416,11 +1515,14 @@ pub fn get_many(map: Term, keys: &[Term]) -> MapResult<Vec<Option<Term>>> {
 }
 
 fn none_atom() -> Term {
-    Term::atom(
-        global_atoms()
-            .intern("none")
-            .expect("OTP predefined atom fits"),
-    )
+    static NONE: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    *NONE.get_or_init(|| {
+        Term::atom(
+            global_atoms()
+                .intern("none")
+                .expect("OTP predefined atom fits"),
+        )
+    })
 }
 
 /// `maps:iterator/1` or `maps:iterator/2` with `ordered = true`.

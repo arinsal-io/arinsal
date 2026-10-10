@@ -373,33 +373,45 @@ fn maps_build(
     const ITERATIONS_PER_RED: i64 = 40;
     let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
     let mut reds = initial;
-    let state = if let Some(state) = state {
-        Arc::clone(state)
-    } else if from_keys {
-        MagicRef::new(Mutex::new(Some(arinsal_bifs::MapsBuildWalk::from_keys(
-            args[0], args[1],
-        ))))
+    let continuation = if from_keys {
+        MAPS_FROM_KEYS_CONTINUATION
     } else {
-        MagicRef::new(Mutex::new(Some(arinsal_bifs::MapsBuildWalk::from_list(
-            args[0],
-        ))))
+        MAPS_FROM_LIST_CONTINUATION
     };
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+    let Some(state) = state else {
+        // A new call runs on a walk of its own; the magic state is only created when it
+        // yields (erts_ycf_trap_driver allocates its state binary after the first yield).
+        let mut walk = if from_keys {
+            arinsal_bifs::MapsBuildWalk::from_keys(args[0], args[1])
+        } else {
+            arinsal_bifs::MapsBuildWalk::from_list(args[0])
+        };
+        let reductions = |reds| ycf_reductions(initial, reds, ITERATIONS_PER_RED);
+        return Ok(match walk.step(&mut ctx, &mut reds)? {
+            Some(value) => TrapResult::Done {
+                value,
+                reductions: reductions(reds),
+            },
+            None => TrapResult::Yield {
+                continuation,
+                state: MagicRef::new(Mutex::new(Some(walk))),
+                reductions: reductions(reds),
+            },
+        });
+    };
+    let state = Arc::clone(state);
     let mut guard = state
         .downcast_ref::<MapsBuildState>()
         .ok_or(BifError::BADARG)?
         .lock()
         .map_err(|_| BifError::SystemLimit)?;
     let walk = guard.as_mut().ok_or(BifError::BADARG)?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
     let Some(value) = walk.step(&mut ctx, &mut reds)? else {
         drop(guard);
         return Ok(TrapResult::Yield {
-            continuation: if from_keys {
-                MAPS_FROM_KEYS_CONTINUATION
-            } else {
-                MAPS_FROM_LIST_CONTINUATION
-            },
+            continuation,
             state,
             reductions: ycf_reductions(initial, reds, ITERATIONS_PER_RED),
         });

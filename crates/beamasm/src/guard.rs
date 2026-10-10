@@ -758,6 +758,58 @@ impl BeamModuleAssembler {
         self.emit_inline_type(InlineType::Arity, src, Some(arity), None, fail)
     }
 
+    /// Emits the fused `is_tuple` + `test_arity` test: one boxed check and one header load,
+    /// failing to `not_tuple` or, when the tuple has another arity, to `bad_arity`.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1611-1653 (emit_i_is_tuple_of_arity,
+    // emit_i_is_tuple_of_arity_ff), OTP-29.1.1. The arity operand is the loader's small
+    // integer; the header compare is against its `make_arityval`.
+    pub fn emit_is_tuple_of_arity(
+        &mut self,
+        src: ArgVal,
+        arity: ArgVal,
+        not_tuple: u32,
+        bad_arity: u32,
+    ) -> Result<(), ModuleError> {
+        const SMALL_TAG: u64 = 0xf;
+        let ArgVal::Immediate(small) = arity else {
+            self.emit_is_tuple(src, not_tuple)?;
+            return self.emit_test_arity(src, arity, bad_arity);
+        };
+        if small & SMALL_TAG != SMALL_TAG {
+            return Err(ModuleError::InvalidOperand("tuple arity must be a small"));
+        }
+        let header = (small >> 4) << 6;
+        let not_tuple = self.label(not_tuple);
+        let bad_arity = self.label(bad_arity);
+        let value = self.source_reg(src)?;
+        // emit_is_boxed: only the boxed primary tag has bit 0 clear in a register.
+        self.code.emit(|e| e.tst_imm(value, 1))?;
+        self.code.b_cond(Cond::Ne, not_tuple)?;
+        self.code.emit(|e| {
+            // emit_untag_ptr + ldr: the boxed tag is 2.
+            e.ldur(Gpr::x(10), value, -2)?;
+            if not_tuple != bad_arity {
+                e.tst_imm(Gpr::x(10), 63)?;
+            }
+            Ok(())
+        })?;
+        if not_tuple != bad_arity {
+            self.code.b_cond(Cond::Ne, not_tuple)?;
+        }
+        self.code.emit(|e| {
+            if let Ok(imm) = u16::try_from(header)
+                && imm < 4096
+            {
+                e.cmp_imm(Gpr::x(10), imm, false)
+            } else {
+                e.mov_const(Gpr::x(8), header)?;
+                e.cmp_reg(Gpr::x(10), Gpr::x(8), arinsal_a64::enc::Shift::Lsl, 0)
+            }
+        })?;
+        self.code.b_cond(Cond::Ne, bad_arity)?;
+        Ok(())
+    }
+
     /// Emits an exact tuple arity and tag test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1529-1551, OTP-29.1.1
     pub fn emit_is_tagged_tuple(

@@ -220,7 +220,11 @@ impl MapsBuildWalk {
 
     /// The key and value of a list element (`from_list` elements must be 2-tuples).
     fn element(&self, item: Term) -> Result<(Term, Term), BifError> {
-        if let Some(value) = self.fill {
+        Self::element_of(self.fill, item)
+    }
+
+    fn element_of(fill: Option<Term>, item: Term) -> Result<(Term, Term), BifError> {
+        if let Some(value) = fill {
             return Ok((item, value));
         }
         // SAFETY: the input list stays live while the call is trapped (GC is disabled).
@@ -260,20 +264,16 @@ impl MapsBuildWalk {
                         return Err(BifError::BADARG);
                     }
                     if self.size <= MAP_SMALL_MAP_LIMIT {
-                        // No yielding while constructing a flatmap: the list is short.
-                        let mut pairs = Vec::with_capacity(self.size);
+                        // No yielding while constructing a flatmap: the list is short. The
+                        // list was validated above, so every cell is a well-formed element.
+                        let fill = self.fill;
                         let mut cursor = self.list;
-                        while cursor.classify() == TermKind::List {
-                            let (head, tail) = Self::cell(cursor)?;
-                            pairs.push(self.element(head)?);
+                        let pairs = std::iter::from_fn(|| {
+                            let (head, tail) = Self::cell(cursor).ok()?;
                             cursor = tail;
-                        }
-                        let result = if let Some(value) = self.fill {
-                            let keys: Vec<Term> = pairs.iter().map(|pair| pair.0).collect();
-                            arinsal_maps::from_keys(&keys, value, ctx.heap)
-                        } else {
-                            arinsal_maps::from_list(&pairs, ctx.heap)
-                        };
+                            Self::element_of(fill, head).ok()
+                        });
+                        let result = arinsal_maps::from_small_pairs(pairs, ctx.heap);
                         return mapped(ctx, result).map(Some);
                     }
                     self.cursor = self.list;
@@ -336,13 +336,10 @@ fn update(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     mapped(ctx, result)
 }
 fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let value = mapped(ctx, arinsal_maps::get(args[1], args[0]))?;
-    match value {
-        Some(value) => {
-            let result = arinsal_maps::remove(args[1], args[0], ctx.heap);
-            let map = mapped(ctx, result)?;
-            Ok(tuple_build(ctx, &[value, map]))
-        }
+    // Port of erts/emulator/beam/erl_map.c:1910-1925 (maps_take_2), OTP-29.1.1.
+    let result = arinsal_maps::take(args[1], args[0], ctx.heap);
+    match mapped(ctx, result)? {
+        Some((value, map)) => Ok(tuple_build(ctx, &[value, map])),
         None => Ok(Term::atom(atoms::ERROR)),
     }
 }

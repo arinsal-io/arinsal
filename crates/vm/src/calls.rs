@@ -94,7 +94,8 @@ pub(super) fn gc_after_bif(
     if !process.gc_enabled || !process.heap.gc_desired() {
         return Ok(());
     }
-    let mut roots = arguments.to_vec();
+    // BIF arguments plus at most two result roots fit inline: no allocation per collection.
+    let mut roots: smallvec::SmallVec<[Term; 8]> = smallvec::SmallVec::from_slice(arguments);
     let result_index = if let Ok(value) = result {
         roots.push(*value);
         (Some(roots.len() - 1), None)

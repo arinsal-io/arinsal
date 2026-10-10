@@ -951,3 +951,53 @@ fn map_runtime() -> arinsal_beamasm::map::MapRuntime {
         get_element_hash_shared: fragments.get_element_hash_shared(),
     }
 }
+
+#[test]
+fn native_is_tuple_of_arity() {
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1611-1625 (emit_i_is_tuple_of_arity),
+    // OTP-29.1.1.
+    for arity in [1, 2] {
+        native_predicate(
+            |a| a.emit_is_tuple_of_arity(ArgVal::X(0), ArgVal::Immediate(bits(small(arity))), 2, 2),
+            |x, _| arity_matches(x, Some(small(arity))),
+            zero_term,
+        );
+    }
+}
+
+#[test]
+fn native_is_tuple_of_arity_ff() {
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1627-1653
+    // (emit_i_is_tuple_of_arity_ff), OTP-29.1.1: a non-tuple fails to the first label, a
+    // tuple of another arity to the second.
+    let fixture = terms();
+    for arity in [1, 2] {
+        let finalized = module(|a| {
+            a.emit_is_tuple_of_arity(ArgVal::X(0), ArgVal::Immediate(bits(small(arity))), 2, 3)?;
+            a.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
+            a.emit_raw(|e| {
+                e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ret(Gpr::x(30))
+            })?;
+            a.emit_i_func_label(2)?;
+            a.move_(ArgVal::Immediate(0), ArgVal::X(1))?;
+            a.emit_raw(|e| {
+                e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ret(Gpr::x(30))
+            })?;
+            a.emit_i_func_label(3)?;
+            a.move_(ArgVal::Immediate(2), ArgVal::X(1))
+        });
+        for (_, value) in &fixture.values {
+            let regs = run(&finalized, *value, zero_term(*value));
+            let expected = if value.classify() != TermKind::Tuple {
+                0
+            } else if arity_matches(*value, Some(small(arity))) {
+                1
+            } else {
+                2
+            };
+            assert_eq!(regs[1], expected, "term {value:?} arity {arity}");
+        }
+    }
+}
