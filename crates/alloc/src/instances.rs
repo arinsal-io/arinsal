@@ -5,8 +5,8 @@ use crate::alloc_util::{
     AllocError, AllocUtil, AllocUtilOptions, Allocation, AllocatorInfo, CarrierPoolStats,
     CarrierTransfer, Strategy,
 };
+use crossbeam_queue::SegQueue;
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, ThreadId};
@@ -23,7 +23,6 @@ thread_local! {
 
 struct Instance {
     allocator: AllocUtil,
-    delayed: VecDeque<(InstanceAllocation, Allocation)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -87,6 +86,9 @@ struct HomecomingCarrier {
 pub struct ThreadSpecificAllocators {
     // parking_lot: the uncontended lock is one CAS, on every alloc and free.
     instances: Vec<parking_lot::Mutex<Instance>>,
+    /// Cross-thread frees. Lock-free so a foreign free does not take the owner's mutex.
+    /// Port of erl_alloc_util.c:2225 (`enqueue_dealloc_other_instance` / `ddq_enqueue`), OTP-29.1.1.
+    delayed: Vec<SegQueue<(InstanceAllocation, Allocation)>>,
     thread_instances: Mutex<HashMap<ThreadId, usize>>,
     /// Owner of blocks whose carrier left the instance named in their handle, by block address.
     routes: Mutex<HashMap<u64, AllocationRoute>>,
@@ -139,10 +141,10 @@ impl ThreadSpecificAllocators {
                             instance,
                             true,
                         ),
-                        delayed: VecDeque::new(),
                     })
                 })
                 .collect(),
+            delayed: (0..count).map(|_| SegQueue::new()).collect(),
             thread_instances: Mutex::new(HashMap::default()),
             routes: Mutex::new(HashMap::default()),
             routed: AtomicUsize::new(0),
@@ -221,15 +223,18 @@ impl ThreadSpecificAllocators {
     pub fn free(&self, handle: InstanceAllocation) -> Result<(), AllocError> {
         let (instance, allocation) = self.route(handle)?;
         let current = self.current_instance();
-        let mut state = self.lock_instance(instance);
-        if current == instance {
-            self.drain_and_publish(instance, &mut state)?;
-            state.allocator.free(allocation)?;
-            self.publish_transfers(instance, &mut state)?;
-            self.forget_route(allocation.id());
-        } else {
-            state.delayed.push_back((handle, allocation));
+        if current != instance {
+            // Port of erl_alloc_util.c:6225-6230 (erts_alcu_free_thr_pref), OTP-29.1.1:
+            // a block freed by another scheduler is queued on the owning instance
+            // without taking that instance's mutex.
+            self.delayed[instance].push((handle, allocation));
+            return Ok(());
         }
+        let mut state = self.lock_instance(instance);
+        self.drain_and_publish(instance, &mut state)?;
+        state.allocator.free(allocation)?;
+        self.publish_transfers(instance, &mut state)?;
+        self.forget_route(allocation.id());
         Ok(())
     }
 
@@ -270,7 +275,7 @@ impl ThreadSpecificAllocators {
     /// Processes the delayed-free queue for one instance.
     pub fn drain_deallocations(&self, instance: usize) -> Result<usize, AllocError> {
         let mut state = self.lock_instance(instance);
-        let drained = Self::drain_locked(&mut state)?;
+        let drained = self.drain_locked(instance, &mut state)?;
         let count = drained.len();
         self.clear_routes(drained);
         self.publish_transfers(instance, &mut state)?;
@@ -279,7 +284,7 @@ impl ThreadSpecificAllocators {
 
     /// Returns the number of frees waiting for the instance.
     pub fn pending_deallocations(&self, instance: usize) -> usize {
-        self.lock_instance(instance).delayed.len()
+        self.delayed[instance].len()
     }
 
     #[cfg(test)]
@@ -367,8 +372,8 @@ impl ThreadSpecificAllocators {
     /// Runs queued cross-thread frees and hands abandoned carriers to the pool.
     #[inline(always)]
     fn drain_and_publish(&self, instance: usize, state: &mut Instance) -> Result<(), AllocError> {
-        if !state.delayed.is_empty() {
-            let drained = Self::drain_locked(state)?;
+        if !self.delayed[instance].is_empty() {
+            let drained = self.drain_locked(instance, state)?;
             self.clear_routes(drained);
         }
         self.publish_transfers(instance, state)
@@ -636,11 +641,16 @@ impl ThreadSpecificAllocators {
         Ok(())
     }
 
-    fn drain_locked(state: &mut Instance) -> Result<Vec<InstanceAllocation>, AllocError> {
+    fn drain_locked(
+        &self,
+        instance: usize,
+        state: &mut Instance,
+    ) -> Result<Vec<InstanceAllocation>, AllocError> {
         let mut drained = Vec::new();
-        while let Some((handle, allocation)) = state.delayed.pop_front() {
+        let queue = &self.delayed[instance];
+        while let Some((handle, allocation)) = queue.pop() {
             if let Err(error) = state.allocator.free(allocation) {
-                state.delayed.push_front((handle, allocation));
+                queue.push((handle, allocation));
                 return Err(error);
             }
             drained.push(handle);

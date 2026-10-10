@@ -1223,17 +1223,7 @@ fn system_info_dump(vm: &Vm, process: &mut Process, selector: &str) -> Result<Te
             let Some(runtime) = process.runtime.as_ref() else {
                 return owned_system_info(process, O::Binary(Vec::new()));
             };
-            let Ok(scheduler) = runtime.scheduler() else {
-                return owned_system_info(process, O::Binary(Vec::new()));
-            };
-            let pids = runtime
-                .processes
-                .lock()
-                .map_err(|_| badarg())?
-                .iter()
-                .copied()
-                .filter(|pid| scheduler.lookup(*pid))
-                .collect::<Vec<_>>();
+            let pids = runtime.process_pids();
             let mut dump = String::new();
             for pid in pids {
                 use std::fmt::Write as _;
@@ -3030,9 +3020,7 @@ fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>
     };
     let pid = ctx.pid().to_term().unwrap_or(Term::NIL);
     let group_leader = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.group_leader)
+        .group_leader
         .and_then(|leader| leader.to_term())
         .unwrap_or(Term::NIL);
     let timestamp = runtime_state(process)

@@ -2094,10 +2094,23 @@ fn module_call_enabled(
 
 /// Whether `module:function/arity` is the initial call of the process.
 fn is_initial_call(process: &Process, module: &str, function: &str, arity: u8) -> bool {
-    process.cold.as_ref().is_some_and(|cold| {
+    if process.cold.as_ref().is_some_and(|cold| {
         cold.initial_call
             .as_ref()
             .is_some_and(|(m, f, a)| m == module && f == function && *a == arity)
+    }) {
+        return true;
+    }
+    // Spawn records the entry as a module id and instruction (`p->u.initial`), not strings.
+    let Some((module_id, ip)) = process.initial_call else {
+        return false;
+    };
+    process.runtime.as_ref().is_some_and(|runtime| {
+        runtime.with_modules(|modules| {
+            modules.get(module_id).is_some_and(|loaded| {
+                loaded.name == module && loaded.function_at(ip) == Some((function, arity))
+            })
+        })
     })
 }
 
@@ -3899,7 +3912,7 @@ fn emit_module(
     let scheduler_id = ctx
         .as_ref()
         .and_then(|ctx| ctx.scheduler_id())
-        .or_else(|| process.cold.as_ref().map(|cold| cold.scheduler_id));
+        .or_else(|| (process.scheduler_id != 0).then_some(process.scheduler_id as usize));
     if let Some(ctx) = ctx {
         crate::natives::nif::refresh_hub(process, ctx);
     }

@@ -271,13 +271,9 @@ impl NifSelectReactor {
             return;
         }
         let pid = Pid::new(*id, *serial);
-        let Some(hub) = NIF_HUBS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap()
-            .get(&pid)
-            .cloned()
-        else {
+        // The node's scheduler is on this thread's hub (or the last NIF caller).
+        // erts finds it from the process table, not a side map of every pid.
+        let Some(hub) = current_hub() else {
             return;
         };
         let id = self
@@ -1337,9 +1333,14 @@ pub(crate) fn refresh_hub_native(process: &Process) {
         .runtime
         .as_ref()
         .map_or(0, |rt| Arc::as_ptr(rt) as usize);
-    if HUB_RUNTIME.get() == runtime
-        && HUB.with(|hub| hub.borrow().as_ref().is_some_and(|hub| hub.pid == *pid))
-    {
+    if HUB_RUNTIME.get() == runtime {
+        // The scheduler thread already has this node's hub. Only the current
+        // pid changes; erts does not republish a global process table for that.
+        HUB.with(|hub| {
+            if let Some(hub) = hub.borrow_mut().as_mut() {
+                hub.pid = *pid;
+            }
+        });
         return;
     }
     install_hub_for(process, *pid);
@@ -1403,16 +1404,10 @@ fn nif_thread_type() -> std::ffi::c_int {
 }
 
 fn nif_is_process_alive(caller: Term, target: Term) -> bool {
-    let (Some(caller), Some(target)) = (Pid::from_term(caller), Pid::from_term(target)) else {
+    let (Some(_caller), Some(target)) = (Pid::from_term(caller), Pid::from_term(target)) else {
         return false;
     };
-    let hub = NIF_HUBS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .get(&caller)
-        .cloned();
-    let Some(hub) = hub else {
+    let Some(hub) = current_hub() else {
         return false;
     };
     hub.scheduler

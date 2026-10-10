@@ -916,7 +916,6 @@ struct LocalInit<T: Task> {
     runnext: Option<Scheduled<T>>,
     streak: u8,
     message_slabs: Vec<Vec<Event<T::Message>>>,
-    pid_cache: Vec<Option<(Pid, Arc<Process<T>>)>>,
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
     profile_active: bool,
@@ -946,7 +945,6 @@ impl<T: Task> LocalInit<T> {
             streak: self.streak,
             pinned_turn: false,
             message_slabs: self.message_slabs,
-            pid_cache: self.pid_cache,
             pending_waits: self.pending_waits,
             check_time_reds: self.check_time_reds,
             profile_active: self.profile_active,
@@ -3107,7 +3105,6 @@ struct Local<T: Task> {
     /// The previous pick took a bound process ahead of equal-priority shared work.
     pinned_turn: bool,
     message_slabs: Vec<Vec<Event<T::Message>>>,
-    pid_cache: Vec<Option<(Pid, Arc<Process<T>>)>>,
     /// Receive timeouts not yet published to the wheel.
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
@@ -3248,20 +3245,10 @@ impl<T: Task> Local<T> {
     }
 
     fn lookup(&mut self, table: &ProcessTable<T>, pid: Pid) -> Option<Arc<Process<T>>> {
-        if self.pid_cache.is_empty() {
-            self.pid_cache = (0..1024).map(|_| None).collect();
-        }
-        let slot = pid.number() as usize % self.pid_cache.len();
-        let entry = &mut self.pid_cache[slot];
-        if let Some((cached_pid, process)) = entry
-            && *cached_pid == pid
-            && process.state.load(Ordering::Acquire) != EXITED
-        {
-            return Some(process.clone());
-        }
-        let process = table.lookup(pid)?;
-        *entry = Some((pid, process.clone()));
-        Some(process)
+        // Port of erts/emulator/beam/erl_ptab.c (erts_ptab_lookup / pix to slot).
+        // A side cache of Arcs kept exited processes alive until a later spawn
+        // reused the slot, so delete_process ran on the spawner.
+        table.lookup(pid)
     }
     /// Highest priority (lowest index) with runnable local work.
     fn best_priority(&self) -> Option<usize> {
@@ -4586,7 +4573,6 @@ impl<T: Task> Scheduler<T> {
                 runnext: None,
                 streak: 0,
                 message_slabs: Vec::new(),
-                pid_cache: Vec::new(),
                 pending_waits: Vec::new(),
                 check_time_reds: 0,
                 profile_active: false,

@@ -739,7 +739,6 @@ pub(crate) struct Runtime {
     code: Arc<crate::code_ix::CodeIndexes>,
     /// The node's code scope, which keys its native code registries.
     pub(crate) code_scope: u64,
-    pub(crate) processes: Mutex<std::collections::HashSet<Pid>>,
     pub(crate) system_processes: Mutex<std::collections::HashSet<Pid>>,
     otp_root: Option<std::path::PathBuf>,
     pub(crate) dirty_signal_handlers: Mutex<std::collections::HashSet<Pid>>,
@@ -3366,11 +3365,7 @@ fn report_max_heap(
     let Some(pid) = ctx.pid().to_term() else {
         return;
     };
-    let group_leader = process
-        .cold
-        .as_ref()
-        .and_then(|cold| cold.group_leader)
-        .and_then(Pid::to_term);
+    let group_leader = process.group_leader.and_then(Pid::to_term);
     let bool_atom = |on: bool| crate::signals::atom(if on { "true" } else { "false" });
     let built = (|| -> Result<Term, VmError> {
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
@@ -3932,6 +3927,34 @@ impl Runtime {
         Some(shift)
     }
 
+    /// Live pids in this runtime's process table.
+    ///
+    /// Port of erts/emulator/beam/erl_ptab.c:1515 (`erts_ptab_processes_next`), OTP-29.1.1.
+    /// The process table is the set; spawn and exit do not maintain a second one.
+    pub(crate) fn process_pids(&self) -> Vec<Pid> {
+        let Ok(scheduler) = self.scheduler() else {
+            return Vec::new();
+        };
+        let max = arinsal_term::ptab::process_table_layout().max();
+        let mut pids = Vec::new();
+        let mut index = 0u32;
+        loop {
+            let (batch, next) = scheduler.pids_in_table_range(index, max, 4096);
+            pids.extend(batch);
+            if next <= index || next >= max {
+                break;
+            }
+            index = next;
+        }
+        pids
+    }
+
+    /// Whether `pid` is in the process table (`erts_proc_lookup`).
+    pub(crate) fn process_alive(&self, pid: Pid) -> bool {
+        self.scheduler()
+            .is_ok_and(|scheduler| scheduler.lookup(pid))
+    }
+
     pub(crate) fn forget_process(&self, pid: Pid) {
         if self.ever_suspended.load(Ordering::Acquire) {
             self.drop_suspend_waiters(pid);
@@ -4134,7 +4157,6 @@ impl Runtime {
             scheduler.spawn_unscheduled(child)
         }
         .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        self.processes.lock().unwrap().insert(pid);
         Ok(pid)
     }
 
@@ -4208,7 +4230,7 @@ impl Process {
 
     fn notify_exit(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>, reason: Term) {
         self.exit_stage1(vm, ctx, reason);
-        self.cold_mut().exit_cont = Some(Box::new(crate::proc_create::ExitCont {
+        self.exit_cont = Some(Box::new(crate::proc_create::ExitCont {
             reason,
             garbage: None,
             entry_result: None,
@@ -4316,18 +4338,10 @@ impl Process {
             return true;
         };
         // FREE_OWNED_TABLE: finish the table whose release was interrupted.
-        if let Some(mut garbage) = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.exit_cont.as_mut())
-            .and_then(|cont| cont.garbage.take())
+        if let Some(mut garbage) = self.exit_cont.as_mut().and_then(|cont| cont.garbage.take())
             && !garbage.step(reds)
         {
-            self.cold_mut()
-                .exit_cont
-                .as_mut()
-                .expect("exit state")
-                .garbage = Some(garbage);
+            self.exit_cont.as_mut().expect("exit state").garbage = Some(garbage);
             return false;
         }
         // GET_OWNED_TABLE
@@ -4417,11 +4431,7 @@ impl Process {
             // FREE_OWNED_TABLE
             *reds -= fixations as isize;
             if !garbage.step(reds) {
-                self.cold_mut()
-                    .exit_cont
-                    .as_mut()
-                    .expect("exit state")
-                    .garbage = Some(garbage);
+                self.exit_cont.as_mut().expect("exit state").garbage = Some(garbage);
                 return false;
             }
         }
@@ -5101,9 +5111,6 @@ impl Process {
             // an exiting process is terminated while its dirty job keeps running.
             self.set_dirty_exited();
             crate::signals::process_exiting(self, ctx);
-            if let Some(runtime) = self.runtime.clone() {
-                runtime.processes.lock().unwrap().remove(&ctx.pid());
-            }
             let reason = exit_reason_from(self, &error);
             self.notify_exit(vm, ctx, reason);
             if self.entry
@@ -5361,6 +5368,8 @@ impl Process {
             }
         }
         let dict_end = roots.len();
+        let inline_len = usize::from(self.apply_inline_len);
+        roots.extend_from_slice(&self.apply_inline[..inline_len]);
         if let Some(cold) = self.cold.as_mut() {
             roots.extend_from_slice(&cold.apply_roots);
             if let Some(pending) = cold.nif_pending.as_mut() {
@@ -5434,10 +5443,13 @@ impl Process {
             });
             assert_eq!(index, extra_end + 2 * dict_len, "dictionary GC roots");
         }
+        let inline_len = usize::from(self.apply_inline_len);
+        self.apply_inline[..inline_len].copy_from_slice(&roots[dict_end..dict_end + inline_len]);
         if let Some(cold) = self.cold.as_mut() {
-            let apply_end = dict_end + cold.apply_roots.len();
+            let apply_start = dict_end + inline_len;
+            let apply_end = apply_start + cold.apply_roots.len();
             cold.apply_roots
-                .copy_from_slice(&roots[dict_end..apply_end]);
+                .copy_from_slice(&roots[apply_start..apply_end]);
             if let Some(pending) = cold.nif_pending.as_mut() {
                 pending.roots_mut().copy_from_slice(&roots[apply_end..]);
             }
@@ -5725,9 +5737,7 @@ fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, re
             ])
             .map_err(|error| VmError::Unsupported(format!("logger metadata: {error:?}")))?;
         let group_leader = process
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.group_leader)
+            .group_leader
             .and_then(Pid::to_term)
             .unwrap_or(Term::NIL);
         let time = std::time::SystemTime::now()
@@ -5849,9 +5859,10 @@ impl Task for Process {
             self._persistent_terms
                 .store()
                 .process_exited(&self._persistent_terms);
-            // Port of erts/emulator/beam/erl_process.c (erts_continue_exit_process): the exited
-            // process frees its heap and off-heap list, dropping its refc binary references.
-            self.heap = ProcessHeap::new();
+            // Port of erts/emulator/beam/erl_process.c (delete_process): free the heap and
+            // off-heap list. A fresh block would be allocated only to be dropped with the
+            // process.
+            self.heap = ProcessHeap::with_words(0);
         }
         if trace_scheduling {
             crate::trace::emit_process(
@@ -6004,7 +6015,7 @@ impl Process {
         with_executor(runtime, |executor| {
             self.exit_stage1(&mut executor.vm, ctx, reason)
         });
-        self.cold_mut().exit_cont = Some(Box::new(crate::proc_create::ExitCont {
+        self.exit_cont = Some(Box::new(crate::proc_create::ExitCont {
             reason,
             garbage: None,
             entry_result,
@@ -6054,11 +6065,7 @@ impl Process {
             });
             return RunOutcome::Yield;
         }
-        let cont = self
-            .cold
-            .as_mut()
-            .and_then(|cold| cold.exit_cont.take())
-            .expect("exit state");
+        let cont = self.exit_cont.take().expect("exit state");
         with_executor(runtime, |executor| {
             crate::trace::emit(
                 Some(&mut executor.vm),
@@ -6083,20 +6090,21 @@ impl Process {
         let Some(runtime) = self.runtime.clone() else {
             return RunOutcome::Exit(1);
         };
-        self.cold_mut().scheduler_id = ctx.scheduler_id().unwrap_or(0);
-        if !self.cold_mut().profile_active {
+        // erts stores the scheduler id on the process. Profiling allocates no side
+        // record unless runnable-proc profiling is actually on.
+        self.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
+        if !self.cold.as_ref().is_some_and(|cold| cold.profile_active) {
             crate::natives::misc::profile_process_event(self, ctx, true);
-            self.cold_mut().profile_active = true;
+            if crate::natives::misc::profile_runnable_procs() {
+                self.cold_mut().scheduler_id = self.scheduler_id as usize;
+                self.cold_mut().profile_active = true;
+            }
         }
         if self.dirty_exiting() {
             // Exited by a dirty signal handler while queued for a dirty scheduler.
             return RunOutcome::Exit(1);
         }
-        if self
-            .cold
-            .as_ref()
-            .is_some_and(|cold| cold.exit_cont.is_some())
-        {
+        if self.exit_cont.is_some() {
             // Port of erts/emulator/beam/erl_process.c:10528 (in_exiting), OTP-29.1.1: an
             // exiting process only continues its exit when scheduled in.
             return self.continue_exit(&runtime, ctx, true);
@@ -6142,14 +6150,13 @@ impl Process {
         result: Result<RunState, VmError>,
     ) -> RunOutcome {
         if matches!(&result, Ok(RunState::Wait { .. } | RunState::Done(_)))
-            && self.cold_mut().profile_active
+            && self.cold.as_ref().is_some_and(|cold| cold.profile_active)
         {
             crate::natives::misc::profile_process_event(self, ctx, false);
             self.cold_mut().profile_active = false;
         }
         // g_proc_sched. Port of erts/emulator/beam/erl_gc.c:1197 (max_heap_size kill), OTP-29.1.1.
         if result.is_ok() && heap_limit_kills(self, ctx) {
-            runtime.processes.lock().unwrap().remove(&ctx.pid());
             let entry_result = self
                 .entry
                 .then(|| Err(VmError::Unsupported("max_heap_size".into())));
@@ -6161,7 +6168,16 @@ impl Process {
                 1,
             );
         }
-        runtime.note_relations(ctx.pid(), self.cold.as_deref());
+        // erts keeps links and monitors on the process (NULL when unused) and does not
+        // publish them on every schedule-out. Copy only when this process has some,
+        // or a previous schedule published a set that must be cleared.
+        let has_relations = self.cold.as_ref().is_some_and(|cold| {
+            !cold.links.is_empty() || !cold.monitors.is_empty() || !cold.monitored_by.is_empty()
+        });
+        if has_relations || self.published_slot {
+            runtime.note_relations(ctx.pid(), self.cold.as_deref());
+            self.published_slot = has_relations;
+        }
         let parked = self
             .cold
             .as_mut()
@@ -6225,7 +6241,6 @@ impl Process {
                     );
                 }
                 crate::signals::process_exiting(self, ctx);
-                runtime.processes.lock().unwrap().remove(&ctx.pid());
                 let entry_result = self.entry.then(|| {
                     self.stats.heap_words = self.heap.capacity_words();
                     let owned = arinsal_term::to_owned(term).map_err(|error| {
@@ -6260,7 +6275,6 @@ impl Process {
                     report_process_error(self, ctx, reason);
                 }
                 crate::signals::process_exiting(self, ctx);
-                runtime.processes.lock().unwrap().remove(&ctx.pid());
                 if trace_boot_enabled() {
                     eprintln!("arinsal boot: process {:?} exited: {error}", ctx.pid());
                 }
@@ -6319,7 +6333,6 @@ impl Vm {
         let pid = scheduler
             .spawn_priority(process, priority)
             .map_err(|error| VmError::Unsupported(format!("system process {module}: {error}")))?;
-        runtime.processes.lock().unwrap().insert(pid);
         runtime.system_processes.lock().unwrap().insert(pid);
         Ok(pid)
     }
@@ -6375,7 +6388,6 @@ impl Vm {
             backtrace_depth: AtomicUsize::new(8),
             code: Arc::clone(&code),
             code_scope: self.code_scope,
-            processes: Mutex::new(std::collections::HashSet::new()),
             system_processes: Mutex::new(std::collections::HashSet::new()),
             otp_root: self.otp_root.clone(),
             dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
@@ -6470,7 +6482,6 @@ impl Vm {
         let entry_pid: Pid = scheduler
             .spawn_unscheduled(process)
             .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-        runtime.processes.lock().unwrap().insert(entry_pid);
         if module == "erl_init" && function == "start" {
             // Port of erts/emulator/beam/erl_init.c:2550 (erl_system_process_otp
             // "erts_code_purger"), OTP-29.1.1. code_server:finish_on_load sends
