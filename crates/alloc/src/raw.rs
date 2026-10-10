@@ -39,14 +39,24 @@ impl WordView {
     }
 
     pub(crate) fn as_slice(&self) -> &[u64] {
-        // SAFETY: typed-block ownership keeps the aligned payload allocated for this borrow.
-        unsafe { std::slice::from_raw_parts(self.ptr as *const u64, self.len) }
+        words_at(self.ptr as *const u64, self.len)
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u64] {
-        // SAFETY: &mut self gives exclusive access to the live typed-block payload.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u64, self.len) }
+        words_at_mut(self.ptr as *mut u64, self.len)
     }
+}
+
+/// Words of a live, aligned payload that outlives `'a`.
+pub(crate) fn words_at<'a>(ptr: *const u64, len: usize) -> &'a [u64] {
+    // SAFETY: callers pass a live, aligned payload of `len` words that outlives `'a`.
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+}
+
+/// Exclusive words of a live, aligned payload for `'a`.
+pub(crate) fn words_at_mut<'a>(ptr: *mut u64, len: usize) -> &'a mut [u64] {
+    // SAFETY: callers pass a live, aligned payload of `len` words and exclusive access for `'a`.
+    unsafe { std::slice::from_raw_parts_mut(ptr, len) }
 }
 
 /// A system page size in bytes on the current host.

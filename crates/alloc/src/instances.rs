@@ -38,6 +38,17 @@ impl InstanceAllocation {
     pub const fn instance(self) -> usize {
         self.instance
     }
+
+    pub(crate) fn from_parts(instance: usize, id: u64, size: usize) -> Self {
+        Self {
+            instance,
+            allocation: Allocation::from_parts(id, size),
+        }
+    }
+
+    pub(crate) fn allocation_id(self) -> u64 {
+        self.allocation.id()
+    }
 }
 
 #[derive(Clone, Copy)]

@@ -16,8 +16,13 @@ use std::cmp::Ordering;
 use std::ops::Index;
 use std::sync::Arc;
 
+/// One young or old heap block: the user pointer only.
+///
+/// The allocator handle sits in a prefix of the same allocation (`ERTS_HEAP_ALLOC`
+/// stores `Eterm *heap` in the process, not a side object). Null is an absent block,
+/// the way erts leaves `old_heap` NULL.
 pub(crate) struct WordBlock {
-    memory: Box<AllocBlock>,
+    ptr: *mut u64,
 }
 
 const LITERAL_HEAP_BIT: usize = MAPPED_WORDS;
@@ -63,61 +68,65 @@ impl WordBlock {
     // Port of erts/emulator/beam/erl_gc.c:1659 (do_minor `ERTS_HEAP_ALLOC`), OTP-29.1.1.
     pub(crate) fn new(words: usize, allocation_type: ErtsAlcType) -> Self {
         Self {
-            memory: Box::new({
-                #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-                let mut memory = AllocBlock::new(allocation_type, words)
-                    .expect("ERTS heap block allocation failed");
-                // Debug builds poison the block with a boxed pointer to unmapped memory, so
-                // a read of a word that was never written fails loudly.
-                #[cfg(debug_assertions)]
-                memory.as_mut_slice().fill(0x0000_dead_0000_0002);
-                memory
-            }),
+            ptr: AllocBlock::detach_heap(allocation_type, words)
+                .expect("ERTS heap block allocation failed"),
         }
+    }
+
+    /// Grow or shrink this block in place when the carrier allows it.
+    /// Port of erts/emulator/beam/erl_gc.c:2794 (`resize_new_heap` / `ERTS_HEAP_REALLOC`), OTP-29.1.1.
+    pub(crate) fn realloc(&mut self, words: usize) {
+        self.ptr = AllocBlock::realloc_detached_heap(self.ptr, words)
+            .expect("ERTS heap block reallocation failed");
     }
 
     /// The typed block itself, for a heap block that joins the `mbuf` list.
     pub(crate) fn into_alloc_block(self) -> AllocBlock {
-        *self.memory
+        let ptr = self.ptr;
+        // The reconstructed block frees the allocation; this value must not.
+        std::mem::forget(self);
+        AllocBlock::reattach_heap(ptr).expect("ERTS heap block reattach failed")
     }
 
     /// The block's words, for a copy that holds the heap exclusively.
     pub(crate) fn words(&self) -> &[u64] {
-        self.memory.as_slice()
+        AllocBlock::heap_user_slice(self.ptr)
     }
 
     pub(crate) fn words_mut(&mut self) -> &mut [u64] {
-        self.memory.as_mut_slice()
-    }
-
-    fn empty(allocation_type: ErtsAlcType) -> Self {
-        Self::new(0, allocation_type)
+        AllocBlock::heap_user_slice_mut(self.ptr)
     }
 
     pub(crate) fn as_ptr(&self) -> *const UnsafeCell<u64> {
-        self.memory.as_ptr().cast()
+        self.ptr.cast()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.memory.len()
+        AllocBlock::heap_user_len(self.ptr)
     }
 
     pub(crate) fn contains_initialized(&self, address: usize, words: usize) -> bool {
+        if self.ptr.is_null() {
+            return false;
+        }
         let start = self.as_ptr() as usize;
         address >= start && address < start.saturating_add(words.saturating_mul(8))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.ptr.is_null()
     }
 
     pub(crate) fn get(&self, index: usize) -> Option<&UnsafeCell<u64>> {
-        if index >= self.len() {
-            return None;
-        }
-        let word = self.memory.as_slice().get(index)?;
+        let word = self.words().get(index)?;
         // SAFETY: The allocator supplies aligned word storage; UnsafeCell has u64's layout.
         Some(unsafe { &*std::ptr::from_ref(word).cast::<UnsafeCell<u64>>() })
+    }
+}
+
+impl Drop for WordBlock {
+    fn drop(&mut self) {
+        AllocBlock::free_detached_heap(self.ptr);
     }
 }
 
@@ -131,7 +140,10 @@ fn zeroed_block(words: usize, allocation_type: ErtsAlcType) -> AllocBlock {
 
 impl Default for WordBlock {
     fn default() -> Self {
-        Self::empty(ErtsAlcType::OLD_HEAP)
+        // An absent old heap: erts leaves OLD_HEAP null and does not allocate.
+        Self {
+            ptr: std::ptr::null_mut(),
+        }
     }
 }
 
@@ -470,6 +482,32 @@ pub(crate) struct HeapOwners {
 
 #[derive(Default)]
 pub(crate) struct LazyOwners(Option<Box<HeapOwners>>);
+
+impl LazyOwners {
+    /// Whether the off-heap owner box has been created. A minor GC of a process
+    /// with no binaries must not allocate one.
+    pub(crate) fn is_allocated(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub(crate) fn vheap_min(&self) -> u64 {
+        self.0
+            .as_ref()
+            .map(|owners| owners.vheap.min)
+            .unwrap_or(46_422)
+    }
+
+    pub(crate) fn vheap_old(&self) -> u64 {
+        self.0.as_ref().map(|owners| owners.vheap.old).unwrap_or(0)
+    }
+
+    pub(crate) fn vheap_old_size(&self) -> u64 {
+        self.0
+            .as_ref()
+            .map(|owners| owners.vheap.old_size)
+            .unwrap_or(46_422)
+    }
+}
 
 impl std::ops::Deref for LazyOwners {
     type Target = HeapOwners;
@@ -1847,4 +1885,27 @@ impl Term {
 #[inline(never)]
 fn native_cursors_outside_heap(htop: *mut u64, stop: *mut u64, base: usize) -> ! {
     panic!("native cursors outside the heap: htop={htop:p} stop={stop:p} base={base:#x}")
+}
+
+#[cfg(test)]
+mod heap_block_tests {
+    use super::ProcessHeap;
+
+    #[test]
+    fn realloc_preserves_the_user_prefix_and_can_shrink() {
+        let mut heap = ProcessHeap::with_words(64);
+        assert!(heap.old_words.is_empty());
+        heap.words.words_mut()[0] = 0x1111;
+        heap.words.words_mut()[3] = 0x2222;
+        heap.words.words_mut()[60] = 0x3333;
+        heap.words.realloc(128);
+        assert_eq!(heap.words.len(), 128);
+        assert_eq!(heap.words.words()[0], 0x1111);
+        assert_eq!(heap.words.words()[3], 0x2222);
+        assert_eq!(heap.words.words()[60], 0x3333);
+        heap.words.realloc(32);
+        assert_eq!(heap.words.len(), 32);
+        assert_eq!(heap.words.words()[0], 0x1111);
+        assert_eq!(heap.words.words()[3], 0x2222);
+    }
 }

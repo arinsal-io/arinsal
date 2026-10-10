@@ -6342,7 +6342,6 @@ impl Vm {
         process.cold_mut().initial_call =
             Some((module.to_owned(), function.to_owned(), args.len() as u8));
         process.entry = true;
-        process.heap.set_min_heap_size(8192);
         // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
         // the first process gets the first pid; it runs once the system processes
         // exist, as erts starts its schedulers only after spawning them.
