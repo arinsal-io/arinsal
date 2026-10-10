@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Ordering, collections::HashMap, sync::Arc};
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap, process::Command, sync::Arc};
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
@@ -159,6 +159,12 @@ fn map_lookup(map: Term, key: Term) -> Option<Term> {
 extern "C" fn guard_helper(_process: *mut ProcessHeader, op: u32, first: u64, second: u64) -> u64 {
     if op == 34 {
         return SELF_TERM.with(|this| this.borrow().map(bits).unwrap_or(u64::MAX));
+    }
+    if op == 43 {
+        return u64::from(function_arity(
+            term(first).unwrap_or(Term::NIL),
+            term(second),
+        ));
     }
     let Some(a) = term(first) else {
         return u64::MAX;
@@ -497,7 +503,10 @@ fn native_is_tuple() {
 #[test]
 fn native_test_arity() {
     native_predicate(
-        |a| a.emit_test_arity(ArgVal::X(0), ArgVal::X(1), 2),
+        |a| {
+            a.emit_is_tuple(ArgVal::X(0), 2)?;
+            a.emit_test_arity(ArgVal::X(0), ArgVal::Immediate(bits(small(1))), 2)
+        },
         |x, y| type_matches(6, x, y),
         |_| small(1),
     );
@@ -507,7 +516,12 @@ fn native_is_tagged_tuple() {
     let fixture = terms();
     let tag = fixture.alpha;
     let finalized = module(|a| {
-        a.emit_is_tagged_tuple(ArgVal::X(0), ArgVal::X(1), ArgVal::X(2), 2)?;
+        a.emit_is_tagged_tuple(
+            ArgVal::X(0),
+            ArgVal::Immediate(bits(small(1))),
+            ArgVal::X(2),
+            2,
+        )?;
         a.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
         a.emit_raw(|e| {
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;
@@ -615,7 +629,7 @@ fn native_is_map_with_map_type() {
     let f = terms();
     native_guard(
         |a| {
-            a.emit_is_map_typed(
+            a.emit_is_map(
                 TypedArg::new(
                     ArgVal::X(0),
                     ArgType {
@@ -637,7 +651,7 @@ fn native_is_map_with_map_type() {
 fn native_is_map_with_integer_type() {
     native_guard(
         |a| {
-            a.emit_is_map_typed(
+            a.emit_is_map(
                 TypedArg::new(
                     ArgVal::X(0),
                     ArgType {
@@ -656,6 +670,38 @@ fn native_is_map_with_integer_type() {
 }
 
 #[test]
+fn native_is_reference_with_reference_type_matches_otp() {
+    let Some(expected) = erlang_type_matrix() else {
+        return;
+    };
+    let fixture = terms();
+    let index = fixture
+        .values
+        .iter()
+        .position(|(name, _)| *name == "reference")
+        .unwrap();
+    let value = fixture.values[index].1;
+    native_guard(
+        |a| {
+            a.emit_is_reference(
+                TypedArg::new(
+                    ArgVal::X(0),
+                    ArgType {
+                        union_bits: type_id::REFERENCE,
+                        min: None,
+                        max: None,
+                    },
+                ),
+                2,
+            )
+        },
+        value,
+        small(0),
+        expected[15][index],
+    );
+}
+
+#[test]
 fn native_is_function() {
     native_predicate(
         |a| a.emit_is_function(ArgVal::X(0), 2),
@@ -666,7 +712,7 @@ fn native_is_function() {
 #[test]
 fn native_is_function2() {
     native_predicate(
-        |a| a.emit_is_function2_guard(ArgVal::X(0), ArgVal::X(1), 2),
+        |a| a.emit_is_function2_guard(ArgVal::X(0), ArgVal::Immediate(bits(small(1))), 2),
         |x, y| type_matches(18, x, y),
         |_| small(1),
     );
@@ -1131,6 +1177,194 @@ fn native_is_tuple_of_arity_ff() {
                 2
             };
             assert_eq!(regs[1], expected, "term {value:?} arity {arity}");
+        }
+    }
+}
+
+fn erlang_type_matrix() -> Option<Vec<Vec<bool>>> {
+    let eval = r#"Port=open_port({spawn,"/usr/bin/true"},[]),Values=[1,1 bsl 80,1.0,guard_alpha,true,false,[],[1],{guard_alpha},{guard_beta,1},#{guard_alpha=>1},<<16#a5>>,<<5:3>>,self(),Port,make_ref(),fun(X)->X end,fun erlang:node/0],Ps=[fun erlang:is_integer/1,fun erlang:is_atom/1,fun erlang:is_list/1,fun(V)->is_list(V) andalso V=/=[] end,fun(V)->V=:=[] end,fun erlang:is_tuple/1,fun(V)->is_tuple(V) andalso tuple_size(V)=:=1 end,fun(V)->is_tuple(V) andalso tuple_size(V)=:=1 andalso element(1,V)=:=guard_alpha end,fun erlang:is_boolean/1,fun erlang:is_binary/1,fun erlang:is_bitstring/1,fun erlang:is_float/1,fun erlang:is_number/1,fun erlang:is_pid/1,fun erlang:is_port/1,fun erlang:is_reference/1,fun erlang:is_map/1,fun erlang:is_function/1,fun(V)->is_function(V,1) end],io:format("~w",[[[P(V)||V<-Values]||P<-Ps]]),halt()."#;
+    let output = match Command::new("timeout")
+        .args(["30", "erl", "-noshell", "-eval", eval])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("skipping OTP type differential: cannot run timeout: {error}");
+            return None;
+        }
+    };
+    if output.status.code() == Some(127) {
+        eprintln!("skipping OTP type differential: erl is not installed");
+        return None;
+    }
+    assert!(
+        output.status.success(),
+        "OTP type matrix failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let booleans = String::from_utf8_lossy(&output.stdout)
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .filter_map(|word| match word {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(booleans.len(), 19 * 18, "unexpected OTP type matrix");
+    Some(booleans.chunks(18).map(<[bool]>::to_vec).collect())
+}
+
+fn erlang_dynamic_function_matrix() -> Option<Vec<Vec<bool>>> {
+    let eval = r#"Values=[1,1 bsl 80,1.0,guard_alpha,true,false,[],[1],{guard_alpha},{guard_beta,1},#{guard_alpha=>1},<<16#a5>>,<<5:3>>,self(),open_port({spawn,"/usr/bin/true"},[]),make_ref(),fun(X)->X end,fun erlang:node/0],io:format("~w",[[[if is_function(F,A)->true; true->false end||A<-Values]||F<-Values]]),halt()."#;
+    let output = match Command::new("timeout")
+        .args(["30", "erl", "-noshell", "-eval", eval])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("skipping OTP dynamic function differential: cannot run timeout: {error}");
+            return None;
+        }
+    };
+    if output.status.code() == Some(127) {
+        eprintln!("skipping OTP dynamic function differential: erl is not installed");
+        return None;
+    }
+    assert!(
+        output.status.success(),
+        "OTP dynamic function matrix failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let booleans = String::from_utf8_lossy(&output.stdout)
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .filter_map(|word| match word {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        booleans.len(),
+        18 * 18,
+        "unexpected OTP dynamic function matrix"
+    );
+    Some(booleans.chunks(18).map(<[bool]>::to_vec).collect())
+}
+
+#[test]
+fn native_type_guards_match_otp_29() {
+    let Some(expected) = erlang_type_matrix() else {
+        return;
+    };
+    let Some(dynamic_expected) = erlang_dynamic_function_matrix() else {
+        return;
+    };
+    let fixture = terms();
+    assert_eq!(fixture.values.len(), 18);
+    let one = ArgVal::Immediate(bits(small(1)));
+    let tag = ArgVal::Immediate(bits(fixture.alpha));
+    type Emitter = Box<dyn Fn(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
+    let cases: Vec<(usize, Emitter)> = vec![
+        (0, Box::new(|asm| asm.emit_is_integer(ArgVal::X(0), 2))),
+        (1, Box::new(|asm| asm.emit_is_atom(ArgVal::X(0), 2))),
+        (2, Box::new(|asm| asm.emit_is_list(ArgVal::X(0), 2))),
+        (
+            3,
+            Box::new(|asm| asm.emit_is_nonempty_list(ArgVal::X(0), 2)),
+        ),
+        (4, Box::new(|asm| asm.emit_is_nil(ArgVal::X(0), 2))),
+        (5, Box::new(|asm| asm.emit_is_tuple(ArgVal::X(0), 2))),
+        (
+            6,
+            Box::new(move |asm| {
+                asm.emit_is_tuple(ArgVal::X(0), 2)?;
+                asm.emit_test_arity(ArgVal::X(0), one, 2)
+            }),
+        ),
+        (
+            6,
+            Box::new(move |asm| asm.emit_is_tuple_of_arity(ArgVal::X(0), one, 2, 2)),
+        ),
+        (
+            7,
+            Box::new(move |asm| asm.emit_is_tagged_tuple(ArgVal::X(0), one, tag, 2)),
+        ),
+        (
+            7,
+            Box::new(move |asm| asm.emit_is_tagged_tuple_ff(ArgVal::X(0), one, tag, 2, 2)),
+        ),
+        (8, Box::new(|asm| asm.emit_is_boolean(ArgVal::X(0), 2))),
+        (9, Box::new(|asm| asm.emit_is_binary(ArgVal::X(0), 2))),
+        (10, Box::new(|asm| asm.emit_is_bitstring(ArgVal::X(0), 2))),
+        (11, Box::new(|asm| asm.emit_is_float(ArgVal::X(0), 2))),
+        (12, Box::new(|asm| asm.emit_is_number(ArgVal::X(0), 2))),
+        (13, Box::new(|asm| asm.emit_is_pid(ArgVal::X(0), 2))),
+        (14, Box::new(|asm| asm.emit_is_port(ArgVal::X(0), 2))),
+        (15, Box::new(|asm| asm.emit_is_reference(ArgVal::X(0), 2))),
+        (16, Box::new(|asm| asm.emit_is_map(ArgVal::X(0), 2))),
+        (17, Box::new(|asm| asm.emit_is_function(ArgVal::X(0), 2))),
+        (
+            18,
+            Box::new(move |asm| asm.emit_is_function2_guard(ArgVal::X(0), one, 2)),
+        ),
+    ];
+    for (row, emit) in cases {
+        let finalized = module(|asm| {
+            emit(asm)?;
+            asm.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
+            asm.emit_raw(|e| {
+                e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+                e.ret(Gpr::x(30))
+            })?;
+            asm.emit_i_func_label(2)?;
+            asm.move_(ArgVal::Immediate(0), ArgVal::X(1))
+        });
+        for (index, (_, value)) in fixture.values.iter().enumerate() {
+            let regs = run(&finalized, *value, zero_term(*value));
+            assert_eq!(
+                regs[1],
+                u64::from(expected[row][index]),
+                "OTP type row {row}, term {}",
+                fixture.values[index].0
+            );
+        }
+    }
+
+    let finalized = module(|asm| {
+        asm.emit_is_function2(
+            ArgVal::X(0),
+            one,
+            arinsal_beamasm::guard::Function2TestTarget::LegacyBoolean(guard_helper),
+        )
+    });
+    for (index, (_, value)) in fixture.values.iter().enumerate() {
+        let regs = run(&finalized, *value, zero_term(*value));
+        assert_eq!(
+            regs[0],
+            u64::from(expected[18][index]),
+            "OTP function arity row, term {}",
+            fixture.values[index].0
+        );
+    }
+
+    let finalized = module(|asm| {
+        asm.emit_is_function2_guard_with_helper(ArgVal::X(0), ArgVal::X(1), 2, guard_helper)?;
+        asm.move_(ArgVal::Immediate(1), ArgVal::X(1))?;
+        asm.emit_raw(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+            e.ret(Gpr::x(30))
+        })?;
+        asm.emit_i_func_label(2)?;
+        asm.move_(ArgVal::Immediate(0), ArgVal::X(1))
+    });
+    for (function_index, (_, function)) in fixture.values.iter().enumerate() {
+        for (arity_index, (_, arity)) in fixture.values.iter().enumerate() {
+            let regs = run(&finalized, *function, *arity);
+            assert_eq!(
+                regs[1],
+                u64::from(dynamic_expected[function_index][arity_index]),
+                "dynamic function arity for {function:?} and {arity:?}"
+            );
         }
     }
 }

@@ -9,7 +9,7 @@ use arinsal_beamasm::{
     fun::FunCallTag,
     guard::{GuardHelper, GuardHelper3},
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
-    types::ArgType,
+    types::{ArgType, TypedArg},
 };
 use arinsal_beamops::{self as beamops, SpecificOp, SpecificOperand};
 use std::{
@@ -1656,6 +1656,12 @@ pub fn compile_parsed_module_with_options(
                 && may_load_nif
                 && (!has_nif_start || ops.iter().any(|op| op.name() == "nif_start"));
             for op in ops {
+                // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:452, OTP-29.1.1.
+                if let Err(error) = assembler.check_pending_stubs() {
+                    failure_index = Some(index);
+                    failure_reason = Some((op.name().to_owned(), format!("{error:?}")));
+                    break;
+                }
                 let start = if dump_enabled {
                     assembler.code_offset()
                 } else {
@@ -2685,6 +2691,8 @@ fn emit_op(
                 }
                 let source_index = usize::from(op.name().ends_with("_ff")) + 1;
                 let source = value(source_index)?;
+                let typed_source =
+                    TypedArg::new(source, operand_type(args.get(source_index), beam));
                 if op.name() == "is_int_in_range" {
                     count(4)?;
                     if fail == 0 {
@@ -2693,35 +2701,45 @@ fn emit_op(
                         ));
                     }
                     let helper = env.guard_helper();
-                    assembler.emit_is_integer(source, fail)?;
+                    assembler.emit_is_integer(typed_source, fail)?;
                     assembler.emit_is_ge(source, value(2)?, fail, helper)?;
                     assembler.emit_is_ge(value(3)?, source, fail, helper)?;
                     break 'body;
                 }
                 if op.name() == "i_is_tuple_of_arity_ff" {
                     count(4)?;
-                    assembler.emit_is_tuple_of_arity(source, value(3)?, fail, n(1)?)?;
+                    assembler.emit_is_tuple_of_arity(typed_source, value(3)?, fail, n(1)?)?;
                     break 'body;
                 }
                 if op.name() == "i_is_tagged_tuple_ff" {
                     count(5)?;
-                    assembler.emit_is_tuple(source, fail)?;
-                    assembler.emit_is_tagged_tuple(source, value(3)?, value(4)?, n(1)?)?;
+                    assembler.emit_is_tagged_tuple_ff(
+                        typed_source,
+                        value(3)?,
+                        value(4)?,
+                        fail,
+                        n(1)?,
+                    )?;
                     break 'body;
                 }
                 match op.name() {
-                    "is_integer" => assembler.emit_is_integer(source, fail)?,
-                    "is_atom" => assembler.emit_is_atom(source, fail)?,
-                    "is_float" => assembler.emit_is_float(source, fail)?,
-                    "is_boolean" => assembler.emit_is_boolean(source, fail)?,
-                    "is_binary" => assembler.emit_is_binary(source, fail)?,
-                    "is_bitstring" => assembler.emit_is_bitstring(source, fail)?,
-                    "is_number" => assembler.emit_is_number(source, fail)?,
-                    "is_pid" => assembler.emit_is_pid(source, fail)?,
-                    "is_port" => assembler.emit_is_port(source, fail)?,
-                    "is_reference" => assembler.emit_is_reference(source, fail)?,
-                    "is_function" => assembler.emit_is_function(source, fail)?,
-                    "is_function2" => assembler.emit_is_function2_guard(source, value(2)?, fail)?,
+                    "is_integer" => assembler.emit_is_integer(typed_source, fail)?,
+                    "is_atom" => assembler.emit_is_atom(typed_source, fail)?,
+                    "is_float" => assembler.emit_is_float(typed_source, fail)?,
+                    "is_boolean" => assembler.emit_is_boolean(typed_source, fail)?,
+                    "is_binary" => assembler.emit_is_binary(typed_source, fail)?,
+                    "is_bitstring" => assembler.emit_is_bitstring(typed_source, fail)?,
+                    "is_number" => assembler.emit_is_number(typed_source, fail)?,
+                    "is_pid" => assembler.emit_is_pid(typed_source, fail)?,
+                    "is_port" => assembler.emit_is_port(typed_source, fail)?,
+                    "is_reference" => assembler.emit_is_reference(typed_source, fail)?,
+                    "is_function" => assembler.emit_is_function(typed_source, fail)?,
+                    "is_function2" => assembler.emit_is_function2_guard_with_helper(
+                        typed_source,
+                        value(2)?,
+                        fail,
+                        env.guard_helper(),
+                    )?,
                     "is_any_native_record" => assembler.emit_is_any_native_record(fail, source)?,
                     "is_native_record" => {
                         // Port of erts/emulator/beam/jit/arm/instr_records.cpp:29-71, OTP-29.1.1.
@@ -2753,21 +2771,19 @@ fn emit_op(
                             ArgVal::Immediate(module),
                         )?;
                     }
-                    "is_list" => assembler.emit_is_list(source, fail)?,
-                    "is_nonempty_list" => assembler.emit_is_nonempty_list(source, fail)?,
-                    "is_nil" => assembler.emit_is_nil(source, fail)?,
-                    "is_map" => {
-                        assembler.emit_is_map_typed(typed_arg(args.get(1), beam, env)?, fail)?
-                    }
-                    "is_tuple" | "i_is_tuple" => assembler.emit_is_tuple(source, fail)?,
+                    "is_list" => assembler.emit_is_list(typed_source, fail)?,
+                    "is_nonempty_list" => assembler.emit_is_nonempty_list(typed_source, fail)?,
+                    "is_nil" => assembler.emit_is_nil(typed_source, fail)?,
+                    "is_map" => assembler.emit_is_map(typed_source, fail)?,
+                    "is_tuple" | "i_is_tuple" => assembler.emit_is_tuple(typed_source, fail)?,
                     "i_is_tuple_of_arity" => {
-                        assembler.emit_is_tuple_of_arity(source, value(2)?, fail, fail)?;
+                        assembler.emit_is_tuple_of_arity(typed_source, value(2)?, fail, fail)?;
                     }
                     "test_arity" | "i_test_arity" => {
-                        assembler.emit_test_arity(source, value(2)?, fail)?;
+                        assembler.emit_test_arity(typed_source, value(2)?, fail)?;
                     }
                     "is_tagged_tuple" | "i_is_tagged_tuple" => {
-                        assembler.emit_is_tagged_tuple(source, value(2)?, value(3)?, fail)?;
+                        assembler.emit_is_tagged_tuple(typed_source, value(2)?, value(3)?, fail)?;
                     }
                     "is_eq_exact" | "is_ne_exact" | "is_eq" | "is_ne" | "is_lt" | "is_ge"
                     | "is_int_ge" => {
@@ -2787,7 +2803,10 @@ fn emit_op(
                             // Port of erts/emulator/beam/jit/arm/instr_common.cpp (emit_is_int_ge),
                             // OTP-29.1.1: fails unless the source is an integer AND >= Min.
                             "is_int_ge" => {
-                                assembler.emit_is_integer(lhs, fail)?;
+                                assembler.emit_is_integer(
+                                    TypedArg::new(lhs, operand_type(args.get(1), beam)),
+                                    fail,
+                                )?;
                                 assembler.emit_is_ge(lhs, rhs, fail, env.guard_helper())?
                             }
                             _ => {

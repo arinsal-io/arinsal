@@ -46,7 +46,7 @@ pub enum Function2TestTarget {
     /// Branch to a BEAM failure label when the test does not match.
     FailLabel(u32),
     /// Preserve the older boolean result used by the fun module adapter.
-    LegacyBoolean,
+    LegacyBoolean(GuardHelper),
 }
 
 impl From<u32> for Function2TestTarget {
@@ -56,8 +56,8 @@ impl From<u32> for Function2TestTarget {
 }
 
 impl From<GuardHelper> for Function2TestTarget {
-    fn from(_: GuardHelper) -> Self {
-        Self::LegacyBoolean
+    fn from(helper: GuardHelper) -> Self {
+        Self::LegacyBoolean(helper)
     }
 }
 
@@ -81,6 +81,7 @@ enum InlineType {
     Reference,
     Function,
     Function2,
+    Map,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +92,21 @@ enum RelativeComparison {
 
 /// Guard helper op flag for an instruction with a failure label (see the VM guard hook).
 const QUIET_GUARD: u32 = 0x100;
+
+fn small_operand(value: ArgVal) -> Result<i64, ModuleError> {
+    let operand = TypedArg::new(value, ArgType::ANY);
+    if operand.is_small() {
+        Ok(operand.small_value())
+    } else {
+        Err(ModuleError::InvalidOperand(
+            "arity operand must be an immediate small",
+        ))
+    }
+}
+
+fn arity_word(arity: i64) -> u64 {
+    (arity as u64).wrapping_shl(6)
+}
 
 impl BeamModuleAssembler {
     fn emit_boolean_result(
@@ -106,18 +122,6 @@ impl BeamModuleAssembler {
         self.code.b(fail)?;
         self.code.bind(done)?;
         Ok(())
-    }
-
-    fn emit_inline_type(
-        &mut self,
-        op: InlineType,
-        src: ArgVal,
-        second: Option<ArgVal>,
-        third: Option<ArgVal>,
-        fail: u32,
-    ) -> Result<(), ModuleError> {
-        let fail = self.label(fail);
-        self.emit_inline_type_to_label(op, src, second, third, fail)
     }
 
     fn emit_inline_type_to_label(
@@ -173,6 +177,7 @@ impl BeamModuleAssembler {
             | InlineType::Binary
             | InlineType::Bitstring
             | InlineType::Float
+            | InlineType::Map
             | InlineType::Reference
             | InlineType::Function
             | InlineType::Function2 => {
@@ -233,6 +238,279 @@ impl BeamModuleAssembler {
             }
         }
         self.emit_boolean_result(yes, no, fail)
+    }
+
+    /// Emits erts' type tests directly to the failure label instead of materializing a Boolean.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1121-1403, 1529-1664, OTP-29.1.1.
+    fn emit_inline_type(
+        &mut self,
+        op: InlineType,
+        source: TypedArg,
+        second: Option<ArgVal>,
+        third: Option<ArgVal>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        let fail = self.label(fail);
+        let src = self.source_reg_into(source.val, Gpr::x(11))?;
+        let tmp1 = Gpr::x(8);
+        let tmp2 = Gpr::x(9);
+        let tmp3 = Gpr::x(10);
+
+        match op {
+            InlineType::Integer => {
+                if source.always_immediate() {
+                    self.code.emit(|e| e.and_imm(tmp2, src, 15))?;
+                    self.code.emit(|e| e.cmp_imm(tmp2, 15, false))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                } else {
+                    let next = self.code.new_label();
+                    if source.always_one_of(type_id::INTEGER | type_id::ALWAYS_BOXED) {
+                        if !source.always_boxed() {
+                            self.code.tbnz(src, 0, next)?;
+                        }
+                    } else {
+                        self.code.emit(|e| e.and_imm(tmp2, src, 15))?;
+                        self.code.emit(|e| e.cmp_imm(tmp2, 15, false))?;
+                        self.code.b_cond(Cond::Eq, next)?;
+                        self.emit_boxed_check(source, tmp2, fail)?;
+                    }
+                    if source.masked_types(type_id::MAYBE_BOXED) != type_id::INTEGER {
+                        self.code.emit(|e| e.ldur(tmp1, src, -2))?;
+                        self.code.emit(|e| e.and_imm(tmp1, tmp1, 0x38))?;
+                        self.code.emit(|e| e.cmp_imm(tmp1, 8, false))?;
+                        self.code.b_cond(Cond::Ne, fail)?;
+                    }
+                    self.code.bind(next)?;
+                }
+            }
+            InlineType::Atom => {
+                self.code.emit(|e| e.and_imm(tmp1, src, 63))?;
+                self.code.emit(|e| e.cmp_imm(tmp1, 11, false))?;
+                self.code.b_cond(Cond::Ne, fail)?;
+            }
+            InlineType::List => {
+                self.code.emit(|e| e.tst_imm(src, 2))?;
+                self.code.emit(|e| e.mov_const(Gpr::x(14), 0x3b))?;
+                self.code
+                    .emit(|e| e.ccmp_reg(src, Gpr::x(14), 4, Cond::Ne))?;
+                self.code.b_cond(Cond::Ne, fail)?;
+            }
+            InlineType::NonemptyList => self.code.tbnz(src, 1, fail)?,
+            InlineType::Nil => {
+                if source.always_one_of(type_id::CONS | type_id::NIL) {
+                    self.code.tbz(src, 1, fail)?;
+                } else {
+                    self.code.emit(|e| e.cmp_imm(src, 0x3b, false))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+            }
+            InlineType::Tuple => {
+                self.emit_boxed_check(source, src, fail)?;
+                self.code.emit(|e| e.and_imm(Gpr::x(0), src, !7))?;
+                if source.masked_types(type_id::MAYBE_BOXED) != type_id::TUPLE {
+                    self.code.emit(|e| e.ldr_uoff(tmp1, Gpr::x(0), 0))?;
+                    self.code.emit(|e| e.tst_imm(tmp1, 63))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+            }
+            InlineType::Arity => {
+                let arity = small_operand(second.ok_or(ModuleError::InvalidOperand(
+                    "arity operand must be an immediate small",
+                ))?)?;
+                let arity_word = arity_word(arity);
+                self.code.emit(|e| e.and_imm(Gpr::x(0), src, !7))?;
+                self.code.emit(|e| e.ldr_uoff(tmp1, Gpr::x(0), 0))?;
+                self.emit_cmp_constant(tmp1, arity_word, Gpr::x(14))?;
+                self.code.b_cond(Cond::Ne, fail)?;
+            }
+            InlineType::TaggedTuple => {
+                let arity = small_operand(second.ok_or(ModuleError::InvalidOperand(
+                    "arity operand must be an immediate small",
+                ))?)?;
+                let arity_word = arity_word(arity);
+                let tag = third.ok_or(ModuleError::InvalidOperand("tag operand required"))?;
+                self.emit_boxed_check(source, src, fail)?;
+                self.code.emit(|e| e.and_imm(Gpr::x(0), src, !7))?;
+                self.code.emit(|e| e.ldp(tmp1, tmp2, Gpr::x(0), 0))?;
+                let tag_reg = self.source_reg_into(tag, Gpr::x(14))?;
+                self.code
+                    .emit(|e| e.cmp_reg(tmp2, tag_reg, arinsal_a64::enc::Shift::Lsl, 0))?;
+                self.code.emit(|e| e.mov_const(tmp3, arity_word))?;
+                self.code.emit(|e| e.ccmp_reg(tmp1, tmp3, 0, Cond::Eq))?;
+                self.code.b_cond(Cond::Ne, fail)?;
+            }
+            InlineType::Boolean => {
+                self.code.emit(|e| e.and_imm(tmp1, src, !(1 << 6)))?;
+                self.code.emit(|e| e.cmp_imm(tmp1, 11, false))?;
+                self.code.b_cond(Cond::Ne, fail)?;
+            }
+            InlineType::Binary => {
+                self.emit_boxed_check(source, src, fail)?;
+                self.code.emit(|e| e.and_imm(Gpr::x(0), src, !7))?;
+                self.code.emit(|e| e.ldp(tmp1, tmp2, Gpr::x(0), 0))?;
+                let not_sub_bits = self.code.new_label();
+                self.code.emit(|e| e.cmp_imm(tmp1, 0x24, false))?;
+                self.code.b_cond(Cond::Ne, not_sub_bits)?;
+                self.code.emit(|e| e.ldp(tmp2, tmp3, Gpr::x(0), 16))?;
+                self.code
+                    .emit(|e| e.sub_reg(tmp2, tmp3, tmp2, arinsal_a64::enc::Shift::Lsl, 0))?;
+                self.code.bind(not_sub_bits)?;
+                if source.masked_types(type_id::MAYBE_BOXED) == type_id::BITSTRING {
+                    self.code.emit(|e| e.tst_imm(tmp2, 7))?;
+                } else {
+                    self.code.emit(|e| e.and_imm(tmp1, tmp1, 56))?;
+                    self.code.emit(|e| {
+                        e.orr_reg(
+                            tmp1,
+                            tmp1,
+                            arinsal_a64::enc::Shifted {
+                                reg: tmp2,
+                                shift: arinsal_a64::enc::Shift::Lsl,
+                                amount: 61,
+                            },
+                        )
+                    })?;
+                    self.code.emit(|e| e.cmp_imm(tmp1, 0x20, false))?;
+                }
+                self.code.b_cond(Cond::Ne, fail)?;
+            }
+            InlineType::Bitstring => {
+                self.emit_boxed_check(source, src, fail)?;
+                if source.masked_types(type_id::MAYBE_BOXED) != type_id::BITSTRING {
+                    self.code.emit(|e| e.ldur(tmp1, src, -2))?;
+                    self.code.emit(|e| e.and_imm(tmp1, tmp1, 56))?;
+                    self.code.emit(|e| e.cmp_imm(tmp1, 0x20, false))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+            }
+            InlineType::Float => {
+                self.emit_boxed_check(source, src, fail)?;
+                if source.masked_types(type_id::MAYBE_BOXED) != type_id::FLOAT {
+                    self.code.emit(|e| e.ldur(tmp1, src, -2))?;
+                    self.code.emit(|e| e.cmp_imm(tmp1, 0x58, false))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+            }
+            InlineType::Map => {
+                self.emit_boxed_check(source, src, fail)?;
+                if source.masked_types(type_id::MAYBE_BOXED) != type_id::MAP {
+                    self.code.emit(|e| e.ldur(tmp3, src, -2))?;
+                    self.code.emit(|e| e.and_imm(tmp3, tmp3, 63))?;
+                    self.code.emit(|e| e.cmp_imm(tmp3, 0x2c, false))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+            }
+            InlineType::Function => {
+                self.emit_boxed_check(source, src, fail)?;
+                if source.masked_types(type_id::MAYBE_BOXED) != type_id::FUN {
+                    self.code.emit(|e| e.ldurb(Gpr::w(8), src, -2))?;
+                    self.code.emit(|e| e.cmp_imm(tmp1, 0x14, false))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+            }
+            InlineType::Number => {
+                let next = self.code.new_label();
+                if source.always_one_of(type_id::INTEGER | type_id::ALWAYS_BOXED) {
+                    if !source.always_boxed() {
+                        self.code.tbnz(src, 0, next)?;
+                    }
+                } else {
+                    self.code.emit(|e| e.and_imm(tmp2, src, 15))?;
+                    self.code.emit(|e| e.cmp_imm(tmp2, 15, false))?;
+                    self.code.b_cond(Cond::Eq, next)?;
+                    self.emit_boxed_check(source, src, fail)?;
+                }
+                if source.masked_types(type_id::MAYBE_BOXED) != type_id::NUMBER {
+                    self.code.emit(|e| e.ldur(tmp1, src, -2))?;
+                    self.code.emit(|e| e.and_imm(tmp2, tmp1, 0x38))?;
+                    self.code.emit(|e| e.cmp_imm(tmp2, 8, false))?;
+                    self.code.emit(|e| e.mov_const(tmp3, 0x58))?;
+                    self.code.emit(|e| e.ccmp_reg(tmp1, tmp3, 4, Cond::Ne))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+                self.code.bind(next)?;
+            }
+            InlineType::Pid | InlineType::Port => {
+                let (immediate_tag, boxed_header) = if matches!(op, InlineType::Pid) {
+                    (3, 0x30)
+                } else {
+                    (7, 0x34)
+                };
+                let immediate_type = if matches!(op, InlineType::Pid) {
+                    type_id::PID
+                } else {
+                    type_id::PORT
+                };
+                let next = self.code.new_label();
+                if source.always_one_of(immediate_type | type_id::ALWAYS_BOXED) {
+                    if !source.always_boxed() {
+                        self.code.tbnz(src, 0, next)?;
+                    }
+                } else {
+                    self.code.emit(|e| e.and_imm(tmp2, src, 15))?;
+                    self.code.emit(|e| e.cmp_imm(tmp2, immediate_tag, false))?;
+                    self.code.b_cond(Cond::Eq, next)?;
+                    self.emit_boxed_check(source, tmp2, fail)?;
+                }
+                if source.masked_types(type_id::MAYBE_BOXED) != immediate_type {
+                    self.code.emit(|e| e.ldur(tmp2, src, -2))?;
+                    self.code.emit(|e| e.and_imm(tmp2, tmp2, 63))?;
+                    self.code.emit(|e| e.cmp_imm(tmp2, boxed_header, false))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+                self.code.bind(next)?;
+            }
+            InlineType::Reference => {
+                self.emit_boxed_check(source, src, fail)?;
+                if source.masked_types(type_id::MAYBE_BOXED) != type_id::REFERENCE {
+                    self.code.emit(|e| e.ldur(tmp1, src, -2))?;
+                    self.code.emit(|e| e.and_imm(tmp1, tmp1, 63))?;
+                    self.code.emit(|e| e.cmp_imm(tmp1, 0x38, false))?;
+                    self.code.emit(|e| e.ccmp_imm(tmp1, 0x10, 4, Cond::Ne))?;
+                    // arinsal-term still tags magic refs with their own header (MAGIC_REF);
+                    // erts keeps them under _TAG_HEADER_REF (held: magic_ref_layout).
+                    self.code.emit(|e| e.ccmp_imm(tmp1, 0x3c, 4, Cond::Ne))?;
+                    self.code.b_cond(Cond::Ne, fail)?;
+                }
+            }
+            InlineType::Function2 => {
+                let arity = small_operand(second.ok_or(ModuleError::InvalidOperand(
+                    "arity operand must be an immediate small",
+                ))?)?;
+                if !(0..=255).contains(&arity) {
+                    self.code.b(fail)?;
+                    return Ok(());
+                }
+                self.emit_boxed_check(source, src, fail)?;
+                self.code.emit(|e| e.ldurh(Gpr::w(9), src, -2))?;
+                self.emit_cmp_constant(Gpr::x(9), ((arity as u64) << 8) | 0x14, Gpr::x(14))?;
+                self.code.b_cond(Cond::Ne, fail)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_boxed_check(
+        &mut self,
+        source: TypedArg,
+        reg: Gpr,
+        fail: Label,
+    ) -> Result<(), ModuleError> {
+        if !source.always_boxed() {
+            self.code.tbnz(reg, 0, fail)?;
+        }
+        Ok(())
+    }
+
+    fn emit_cmp_constant(&mut self, reg: Gpr, value: u64, scratch: Gpr) -> Result<(), ModuleError> {
+        if value <= 4095 {
+            self.code.emit(|e| e.cmp_imm(reg, value as u16, false))?;
+        } else {
+            self.code.emit(|e| e.mov_const(scratch, value))?;
+            self.code
+                .emit(|e| e.cmp_reg(reg, scratch, arinsal_a64::enc::Shift::Lsl, 0))?;
+        }
+        Ok(())
     }
 
     fn load_boxed_header(&mut self, tagged: Gpr, out: Gpr) -> Result<(), ModuleError> {
@@ -325,6 +603,12 @@ impl BeamModuleAssembler {
                 };
                 self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 63))?;
                 self.code.emit(|e| e.cmp_imm(Gpr::x(10), expected, false))?;
+                self.code.b_cond(Cond::Eq, yes)?;
+                self.code.b(no)?;
+            }
+            InlineType::Map => {
+                self.code.emit(|e| e.and_imm(Gpr::x(10), Gpr::x(10), 63))?;
+                self.code.emit(|e| e.cmp_imm(Gpr::x(10), 0x2c, false))?;
                 self.code.b_cond(Cond::Eq, yes)?;
                 self.code.b(no)?;
             }
@@ -711,49 +995,61 @@ impl BeamModuleAssembler {
 
     /// Emits an integer type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1308-1357, OTP-29.1.1
-    pub fn emit_is_integer(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Integer, src, None, None, fail)
+    pub fn emit_is_integer(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Integer, src.into(), None, None, fail)
     }
 
     /// Emits an atom type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1132-1143, OTP-29.1.1
-    pub fn emit_is_atom(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Atom, src, None, None, fail)
+    pub fn emit_is_atom(&mut self, src: impl Into<TypedArg>, fail: u32) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Atom, src.into(), None, None, fail)
     }
 
     /// Emits a list-or-nil type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1359-1364, OTP-29.1.1
-    pub fn emit_is_list(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::List, src, None, None, fail)
+    pub fn emit_is_list(&mut self, src: impl Into<TypedArg>, fail: u32) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::List, src.into(), None, None, fail)
     }
 
     /// Emits a nonempty-list type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1121-1129, OTP-29.1.1
-    pub fn emit_is_nonempty_list(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::NonemptyList, src, None, None, fail)
+    pub fn emit_is_nonempty_list(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::NonemptyList, src.into(), None, None, fail)
     }
 
     /// Emits an empty-list test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1389-1401, OTP-29.1.1
-    pub fn emit_is_nil(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Nil, src, None, None, fail)
+    pub fn emit_is_nil(&mut self, src: impl Into<TypedArg>, fail: u32) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Nil, src.into(), None, None, fail)
     }
 
     /// Emits a tuple type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1590-1609, OTP-29.1.1
-    pub fn emit_is_tuple(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Tuple, src, None, None, fail)
+    pub fn emit_is_tuple(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Tuple, src.into(), None, None, fail)
     }
 
     /// Emits an exact tuple arity test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1655-1664, OTP-29.1.1
     pub fn emit_test_arity(
         &mut self,
-        src: ArgVal,
+        src: impl Into<TypedArg>,
         arity: ArgVal,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Arity, src, Some(arity), None, fail)
+        self.emit_inline_type(InlineType::Arity, src.into(), Some(arity), None, fail)
     }
 
     /// Emits the fused `is_tuple` + `test_arity` test: one boxed check and one header load,
@@ -763,47 +1059,25 @@ impl BeamModuleAssembler {
     // integer; the header compare is against its `make_arityval`.
     pub fn emit_is_tuple_of_arity(
         &mut self,
-        src: ArgVal,
+        src: impl Into<TypedArg>,
         arity: ArgVal,
         not_tuple: u32,
         bad_arity: u32,
     ) -> Result<(), ModuleError> {
-        const SMALL_TAG: u64 = 0xf;
-        let ArgVal::Immediate(small) = arity else {
-            self.emit_is_tuple(src, not_tuple)?;
-            return self.emit_test_arity(src, arity, bad_arity);
-        };
-        if small & SMALL_TAG != SMALL_TAG {
-            return Err(ModuleError::InvalidOperand("tuple arity must be a small"));
-        }
-        let header = (small >> 4) << 6;
+        let source = src.into();
+        let arity = small_operand(arity)?;
+        let header = arity_word(arity);
         let not_tuple = self.label(not_tuple);
         let bad_arity = self.label(bad_arity);
-        let value = self.source_reg(src)?;
-        // emit_is_boxed: only the boxed primary tag has bit 0 clear in a register.
-        self.code.emit(|e| e.tst_imm(value, 1))?;
-        self.code.b_cond(Cond::Ne, not_tuple)?;
-        self.code.emit(|e| {
-            // emit_untag_ptr + ldr: the boxed tag is 2.
-            e.ldur(Gpr::x(10), value, -2)?;
-            if not_tuple != bad_arity {
-                e.tst_imm(Gpr::x(10), 63)?;
-            }
-            Ok(())
-        })?;
-        if not_tuple != bad_arity {
+        let value = self.source_reg_into(source.val, Gpr::x(11))?;
+        self.emit_boxed_check(source, value, not_tuple)?;
+        self.code.emit(|e| e.and_imm(Gpr::x(0), value, !7))?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(8), Gpr::x(0), 0))?;
+        if not_tuple != bad_arity && source.masked_types(type_id::MAYBE_BOXED) != type_id::TUPLE {
+            self.code.emit(|e| e.tst_imm(Gpr::x(8), 63))?;
             self.code.b_cond(Cond::Ne, not_tuple)?;
         }
-        self.code.emit(|e| {
-            if let Ok(imm) = u16::try_from(header)
-                && imm < 4096
-            {
-                e.cmp_imm(Gpr::x(10), imm, false)
-            } else {
-                e.mov_const(Gpr::x(8), header)?;
-                e.cmp_reg(Gpr::x(10), Gpr::x(8), arinsal_a64::enc::Shift::Lsl, 0)
-            }
-        })?;
+        self.emit_cmp_constant(Gpr::x(8), header, Gpr::x(14))?;
         self.code.b_cond(Cond::Ne, bad_arity)?;
         Ok(())
     }
@@ -812,119 +1086,199 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1529-1551, OTP-29.1.1
     pub fn emit_is_tagged_tuple(
         &mut self,
-        src: ArgVal,
+        src: impl Into<TypedArg>,
         arity: ArgVal,
         tag: ArgVal,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::TaggedTuple, src, Some(arity), Some(tag), fail)
+        self.emit_inline_type(
+            InlineType::TaggedTuple,
+            src.into(),
+            Some(arity),
+            Some(tag),
+            fail,
+        )
+    }
+
+    /// Emits the tagged tuple test with separate non-tuple and record failures.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1554-1587, OTP-29.1.1.
+    pub fn emit_is_tagged_tuple_ff(
+        &mut self,
+        src: impl Into<TypedArg>,
+        arity: ArgVal,
+        tag: ArgVal,
+        not_tuple: u32,
+        not_record: u32,
+    ) -> Result<(), ModuleError> {
+        let source = src.into();
+        let src_reg = self.source_reg_into(source.val, Gpr::x(11))?;
+        let not_tuple = self.label(not_tuple);
+        let not_record = self.label(not_record);
+        let arity = small_operand(arity)?;
+        let arity_word = arity_word(arity);
+        self.emit_boxed_check(source, src_reg, not_tuple)?;
+        self.code.emit(|e| e.and_imm(Gpr::x(0), src_reg, !7))?;
+        self.code
+            .emit(|e| e.ldp(Gpr::x(8), Gpr::x(9), Gpr::x(0), 0))?;
+        let correct_arity = self.code.new_label();
+        self.emit_cmp_constant(Gpr::x(8), arity_word, Gpr::x(14))?;
+        self.code.b_cond(Cond::Eq, correct_arity)?;
+        self.code.emit(|e| e.tst_imm(Gpr::x(8), 63))?;
+        self.code.b_cond(Cond::Eq, not_record)?;
+        self.code.b(not_tuple)?;
+        self.code.bind(correct_arity)?;
+        let tag_reg = self.source_reg_into(tag, Gpr::x(14))?;
+        self.code
+            .emit(|e| e.cmp_reg(Gpr::x(9), tag_reg, arinsal_a64::enc::Shift::Lsl, 0))?;
+        self.code.b_cond(Cond::Ne, not_record)?;
+        Ok(())
     }
 
     /// Emits a boolean atom test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1145-1156, OTP-29.1.1
-    pub fn emit_is_boolean(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Boolean, src, None, None, fail)
+    pub fn emit_is_boolean(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Boolean, src.into(), None, None, fail)
     }
 
     /// Emits a byte-aligned bitstring test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1186-1227, OTP-29.1.1
-    pub fn emit_is_binary(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Binary, src, None, None, fail)
+    pub fn emit_is_binary(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Binary, src.into(), None, None, fail)
     }
 
     /// Emits a bitstring test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1158-1184, OTP-29.1.1
-    pub fn emit_is_bitstring(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Bitstring, src, None, None, fail)
+    pub fn emit_is_bitstring(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Bitstring, src.into(), None, None, fail)
     }
 
     /// Emits a float type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1229-1244, OTP-29.1.1
-    pub fn emit_is_float(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Float, src, None, None, fail)
+    pub fn emit_is_float(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Float, src.into(), None, None, fail)
     }
 
     /// Emits a number type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1403-1444, OTP-29.1.1
-    pub fn emit_is_number(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Number, src, None, None, fail)
+    pub fn emit_is_number(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Number, src.into(), None, None, fail)
     }
 
     /// Emits a process identifier type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1446-1474, OTP-29.1.1
-    pub fn emit_is_pid(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Pid, src, None, None, fail)
+    pub fn emit_is_pid(&mut self, src: impl Into<TypedArg>, fail: u32) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Pid, src.into(), None, None, fail)
     }
 
     /// Emits a port type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1476-1504, OTP-29.1.1
-    pub fn emit_is_port(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Port, src, None, None, fail)
+    pub fn emit_is_port(&mut self, src: impl Into<TypedArg>, fail: u32) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Port, src.into(), None, None, fail)
     }
 
     /// Emits a reference type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1506-1527, OTP-29.1.1
-    pub fn emit_is_reference(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Reference, src, None, None, fail)
+    pub fn emit_is_reference(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Reference, src.into(), None, None, fail)
     }
 
     /// Emits a map type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1366-1387, OTP-29.1.1
-    pub fn emit_is_map(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_is_map_typed(TypedArg::new(src, ArgType::ANY), fail)
-    }
-
-    /// Emits a map type test using the compiler's `Type` chunk information.
-    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1350-1387, OTP-29.1.1.
-    pub fn emit_is_map_typed(&mut self, src: TypedArg, fail: u32) -> Result<(), ModuleError> {
-        let value = self.source_reg(src.val)?;
-        let fail = self.label(fail);
-        if !src.always_one_of(type_id::ALWAYS_BOXED) {
-            self.code.tbnz(value, 0, fail)?;
-        }
-        if src.masked_types(type_id::MAYBE_BOXED) != type_id::MAP {
-            self.code.emit(|e| {
-                e.ldur(Gpr::x(11), value, -2)?;
-                e.and_imm(Gpr::x(11), Gpr::x(11), 0x3f)?;
-                e.cmp_imm(Gpr::x(11), 0x2c, false)
-            })?;
-            self.code.b_cond(Cond::Ne, fail)?;
-        }
-        Ok(())
+    pub fn emit_is_map(&mut self, src: impl Into<TypedArg>, fail: u32) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Map, src.into(), None, None, fail)
     }
 
     /// Emits a function type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1246-1261, OTP-29.1.1
-    pub fn emit_is_function(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Function, src, None, None, fail)
+    pub fn emit_is_function(
+        &mut self,
+        src: impl Into<TypedArg>,
+        fail: u32,
+    ) -> Result<(), ModuleError> {
+        self.emit_inline_type(InlineType::Function, src.into(), None, None, fail)
     }
 
     /// Emits a function type and arity test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1263-1306, OTP-29.1.1
     pub fn emit_is_function2_guard(
         &mut self,
-        src: ArgVal,
+        src: impl Into<TypedArg>,
         arity: ArgVal,
         fail: u32,
     ) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Function2, src, Some(arity), None, fail)
+        self.emit_inline_type(InlineType::Function2, src.into(), Some(arity), None, fail)
+    }
+
+    /// Emits the function arity guard, using OTP's runtime path for a non-small arity operand.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1263-1306, OTP-29.1.1.
+    pub fn emit_is_function2_guard_with_helper(
+        &mut self,
+        src: impl Into<TypedArg>,
+        arity: ArgVal,
+        fail: u32,
+        helper: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        if TypedArg::from(arity).is_small() {
+            self.emit_is_function2_guard(src, arity, fail)
+        } else {
+            self.emit_guard_helper(43, src.into().val, arity, fail, helper)
+        }
     }
 
     /// Emits a function arity guard or the older boolean form used by the fun adapter.
     pub fn emit_is_function2(
         &mut self,
-        src: ArgVal,
+        src: impl Into<TypedArg>,
         arity: ArgVal,
         fail: impl Into<Function2TestTarget>,
     ) -> Result<(), ModuleError> {
+        let src = src.into();
         match fail.into() {
             Function2TestTarget::FailLabel(label) => {
                 self.emit_is_function2_guard(src, arity, label)
             }
-            Function2TestTarget::LegacyBoolean => {
+            Function2TestTarget::LegacyBoolean(helper) => {
+                if !TypedArg::from(arity).is_small() {
+                    let source = self.source_reg(src.val)?;
+                    let arity = self.source_reg_into(arity, Gpr::x(17))?;
+                    self.code.emit(|e| e.mov_const(Gpr::x(8), 43))?;
+                    self.emit_guard_runtime_call(helper as usize, &[Gpr::x(8), source, arity])?;
+                    self.code.emit(|e| e.mov_reg(Gpr::x(25), Gpr::x(0)))?;
+                    return Ok(());
+                }
                 let no = self.code.new_label();
                 let done = self.code.new_label();
-                self.emit_inline_type_to_label(InlineType::Function2, src, Some(arity), None, no)?;
+                self.emit_inline_type_to_label(
+                    InlineType::Function2,
+                    src.val,
+                    Some(arity),
+                    None,
+                    no,
+                )?;
                 self.code.emit(|e| e.mov_const(Gpr::x(25), 1))?;
                 self.code.b(done)?;
                 self.code.bind(no)?;

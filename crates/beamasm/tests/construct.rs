@@ -289,6 +289,7 @@ fn native_list_tail_survives_tuple_field_loads() {
     let (_, regs, _, base) = run_native(
         |m, _| {
             m.emit_get_list(ArgVal::X(0), ArgVal::X(3), ArgVal::X(4))?;
+            m.emit_load_tuple_ptr(ArgVal::X(3), ArgVal::X(3))?;
             m.emit_get_tuple_element(ArgVal::X(3), 8, ArgVal::X(0))?;
             m.emit_i_plus(
                 ArgVal::X(1),
@@ -296,6 +297,7 @@ fn native_list_tail_survives_tuple_field_loads() {
                 ArgVal::X(0),
                 arithmetic_fallback,
             )?;
+            m.emit_load_tuple_ptr(ArgVal::X(3), ArgVal::X(3))?;
             m.emit_get_tuple_element(ArgVal::X(3), 16, ArgVal::X(1))?;
             m.emit_i_plus(
                 ArgVal::X(1),
@@ -350,7 +352,10 @@ fn native_get_tl() {
 
 fn native_get_tuple_element() {
     let (_, regs, _, _) = run_native(
-        |m, _| m.emit_get_tuple_element(ArgVal::X(0), 16, ArgVal::X(1)),
+        |m, _| {
+            m.emit_load_tuple_ptr(ArgVal::X(0), ArgVal::X(0))?;
+            m.emit_get_tuple_element(ArgVal::X(0), 16, ArgVal::X(1))
+        },
         |heap, _, regs| {
             heap[..3].copy_from_slice(&[(2 << 6) | 2, tagged_small(3), tagged_small(9)]);
             regs.x_reg_array[0] = arinsal_beamasm::rt::fixture_term(heap.as_ptr() as u64 | 2);

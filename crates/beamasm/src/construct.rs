@@ -157,13 +157,11 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:378-389, OTP-29.1.1
     pub fn emit_get_tuple_element(
         &mut self,
-        src: ArgVal,
+        _src: ArgVal,
         element: u32,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        let tuple = self.source_reg(src)?;
-        self.code.emit(|e| e.and_imm(SCRATCH[0], tuple, !7))?;
-        self.emit_tuple_element_load(SCRATCH[0], element, dst)
+        self.emit_tuple_element_load(Gpr::x(0), element, dst)
     }
 
     /// Loads a tuple word at its byte offset from an untagged tuple pointer.
@@ -175,8 +173,7 @@ impl BeamModuleAssembler {
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
         let ptr = self.source_reg(tuple_ptr)?;
-        self.code.emit(|e| e.and_imm(SCRATCH[0], ptr, !7))?;
-        self.emit_tuple_element_load(SCRATCH[0], element, dst)
+        self.emit_tuple_element_load(ptr, element, dst)
     }
 
     fn emit_tuple_element_load(

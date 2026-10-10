@@ -46,6 +46,8 @@ pub mod type_id {
     pub const MAYBE_IMMEDIATE: u16 = ATOM | INTEGER | NIL | PID | PORT;
     /// Types that are always boxed.
     pub const ALWAYS_BOXED: u16 = MAYBE_BOXED & !(CONS | MAYBE_IMMEDIATE);
+    /// Types that are always immediate.
+    pub const ALWAYS_IMMEDIATE: u16 = MAYBE_IMMEDIATE & !(CONS | MAYBE_BOXED);
 }
 
 /// Smallest and largest small integers (erts MIN_SMALL / MAX_SMALL, 60-bit smalls).
@@ -140,10 +142,18 @@ impl TypedArg {
                 _ if word & 15 == 15 => type_id::INTEGER,
                 0x0b => type_id::ATOM,
                 0x3b => type_id::NIL,
+                _ if word & 15 == 3 => type_id::PID,
+                _ if word & 15 == 7 => type_id::PORT,
+                _ if word & 7 == 1 => type_id::CONS,
                 _ => type_id::ANY,
             },
             _ => self.ty.union_bits,
         }
+    }
+
+    /// `masked_types<Type>`.
+    pub fn masked_types(&self, types: u16) -> u16 {
+        self.type_union() & types
     }
 
     /// `getClampedRange`.
@@ -170,9 +180,16 @@ impl TypedArg {
         self.type_union() & types != 0
     }
 
-    /// `masked_types<Types...>`.
-    pub fn masked_types(&self, types: u16) -> u16 {
-        self.type_union() & types
+    /// `always_immediate` for values whose type cannot be boxed.
+    // Port of erts/emulator/beam/jit/beam_jit_common.hpp:283-286, OTP-29.1.1.
+    pub fn always_immediate(&self) -> bool {
+        self.always_one_of(type_id::ALWAYS_IMMEDIATE) || self.always_small()
+    }
+
+    /// `always_one_of<AlwaysBoxed>`.
+    // Port of erts/emulator/beam/jit/beam_jit_common.hpp:316-329, OTP-29.1.1.
+    pub fn always_boxed(&self) -> bool {
+        self.always_one_of(type_id::ALWAYS_BOXED)
     }
 
     /// `exact_type<Type>`.
@@ -193,6 +210,12 @@ impl TypedArg {
             (Some(min), Some(max)) => is_ssmall(min) && is_ssmall(max),
             _ => false,
         }
+    }
+}
+
+impl From<ArgVal> for TypedArg {
+    fn from(val: ArgVal) -> Self {
+        Self::new(val, ArgType::ANY)
     }
 }
 
@@ -234,4 +257,53 @@ pub fn is_bsl_small(lhs: &TypedArg, rhs: &TypedArg) -> bool {
     }
     // _TAG_IMMED1_SIZE is 4.
     max2 < i64::from(max1.leading_zeros()) - 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArgType, MAX_SMALL, TypedArg, type_id};
+    use crate::module::ArgVal;
+
+    fn typed(union_bits: u16) -> TypedArg {
+        TypedArg::new(
+            ArgVal::X(0),
+            ArgType {
+                union_bits,
+                min: None,
+                max: None,
+            },
+        )
+    }
+
+    #[test]
+    fn immediate_and_boxed_elisions_match_beam_type_unions() {
+        assert_eq!(
+            TypedArg::from(ArgVal::Immediate(0x03)).type_union(),
+            type_id::PID
+        );
+        assert_eq!(
+            TypedArg::from(ArgVal::Immediate(0x07)).type_union(),
+            type_id::PORT
+        );
+        assert_eq!(
+            TypedArg::from(ArgVal::Immediate(0x101)).type_union(),
+            type_id::CONS
+        );
+        assert!(typed(type_id::ATOM).always_immediate());
+        assert!(typed(type_id::NIL).always_immediate());
+        assert!(!typed(type_id::CONS).always_immediate());
+        assert!(typed(type_id::TUPLE).always_boxed());
+        assert!(typed(type_id::MAP).always_boxed());
+        assert!(!typed(type_id::INTEGER).always_boxed());
+
+        let bounded_bigint = TypedArg::new(
+            ArgVal::X(0),
+            ArgType {
+                union_bits: type_id::INTEGER,
+                min: Some(MAX_SMALL + 1),
+                max: None,
+            },
+        );
+        assert!(!bounded_bigint.always_boxed());
+    }
 }

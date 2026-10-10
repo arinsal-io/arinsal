@@ -40,8 +40,8 @@ fn resolve(fun: u64, arity: u32, target: usize) -> usize {
     target
 }
 
-extern "C" fn guard_helper(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
-    0
+extern "C" fn guard_helper(_: *mut ProcessHeader, op: u32, _: u64, _: u64) -> u64 {
+    u64::from(op == 43)
 }
 
 fn target_code(asm: &mut BeamModuleAssembler, label: u32, pop_frame: bool, sum_captures: bool) {
