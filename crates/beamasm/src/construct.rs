@@ -150,25 +150,25 @@ impl BeamModuleAssembler {
     /// Loads the head word from a cons cell.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:299-307, OTP-29.1.1
     pub fn emit_get_hd(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
-        self.emit_list_field(src, dst, 0)
+        self.emit_list_field(src, dst, -1)
     }
 
     /// Loads the tail word from a cons cell.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:309-317, OTP-29.1.1
     pub fn emit_get_tl(&mut self, src: ArgVal, dst: ArgVal) -> Result<(), ModuleError> {
-        self.emit_list_field(src, dst, 8)
+        self.emit_list_field(src, dst, 7)
     }
 
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:299-317, OTP-29.1.1.
     fn emit_list_field(
         &mut self,
         src: ArgVal,
         dst: ArgVal,
-        offset: u32,
+        offset: i16,
     ) -> Result<(), ModuleError> {
         let list = self.source_reg(src)?;
-        self.code.emit(|e| e.and_imm(SCRATCH[0], list, !7))?;
         let out = self.destination_reg(dst)?;
-        self.code.emit(|e| e.ldr_uoff(out, SCRATCH[0], offset))?;
+        self.code.emit(|e| e.ldur(out, list, offset))?;
         self.store_arg(dst, out)
     }
 
