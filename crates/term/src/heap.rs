@@ -469,7 +469,6 @@ pub struct ProcessHeap {
     pub(crate) min_heap_size: u32,
     pub(crate) fullsweep_after: u16,
     pub(crate) minor_since_major: u16,
-    pub(crate) off_heap_binary_bytes: u64,
     pub(crate) bin_vheap: u64,
     pub(crate) bin_vheap_size: u64,
     pub(crate) heap_grow: bool,
@@ -583,6 +582,23 @@ impl LazyOwners {
             .map(|owners| owners.vheap.old_size)
             .unwrap_or(46_422)
     }
+
+    pub(crate) fn has_collection_state(&self) -> bool {
+        let Some(owners) = self.0.as_deref() else {
+            return false;
+        };
+        owners.vheap.min != 46_422
+            || owners.vheap.old != 0
+            || owners.vheap.old_size != 46_422
+            || !owners.old_off_heap.is_empty()
+            || !owners.old_writable.is_empty()
+            || !owners.old_external.is_empty()
+            || !owners.old_nodes.is_empty()
+            || !owners.old_funs.is_empty()
+            || !owners.old_exports.is_empty()
+            || !owners.old_magic.is_empty()
+            || !owners.old_writable_refs.is_empty()
+    }
 }
 
 impl std::ops::Deref for LazyOwners {
@@ -631,7 +647,6 @@ impl ProcessHeap {
             min_heap_size: 233,
             fullsweep_after: u16::MAX,
             minor_since_major: 0,
-            off_heap_binary_bytes: 0,
             bin_vheap: 0,
             bin_vheap_size: 46_422,
             heap_grow: false,
@@ -875,9 +890,6 @@ impl ProcessHeap {
         self.abandoned |= source.abandoned;
         if let Some(mut owners) = source.owners.0.take() {
             let source_old_vheap = owners.vheap.old;
-            self.off_heap_binary_bytes = self
-                .off_heap_binary_bytes
-                .saturating_add(source.off_heap_binary_bytes);
             self.bin_vheap = self.bin_vheap.saturating_add(source.bin_vheap);
             self.owners.vheap.old = self.owners.vheap.old.saturating_add(source_old_vheap);
             if let Some(target) = self.owners.0.as_mut() {
@@ -911,9 +923,21 @@ impl ProcessHeap {
             + self.owners.old_external.len()
     }
 
-    /// Number of bytes in live off-heap binaries after the last collection.
+    /// Number of bytes in the process's retained non-writable binaries.
     pub fn off_heap_binary_bytes(&self) -> u64 {
-        self.off_heap_binary_bytes
+        self.owners
+            .off_heap
+            .iter()
+            .chain(&self.owners.old_off_heap)
+            .map(|binary| binary.len() as u64)
+            .chain(
+                self.owners
+                    .external
+                    .iter()
+                    .chain(&self.owners.old_external)
+                    .map(|binary| binary.len() as u64),
+            )
+            .sum()
     }
 
     /// Return one `(identity, byte length, refcount)` per retained refc binary reference.
@@ -1046,9 +1070,6 @@ impl HeapAlloc for ProcessHeap {
         }
         // Port of erts/emulator/beam/erl_message.h:85 (OH_OVERHEAD), OTP-29.1.1.
         self.bin_vheap = self.bin_vheap.saturating_add((binary.len() / 8) as u64);
-        self.off_heap_binary_bytes = self
-            .off_heap_binary_bytes
-            .saturating_add(binary.len() as u64);
         self.owners.off_heap.push(binary);
     }
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
@@ -1115,11 +1136,50 @@ impl HeapAlloc for ProcessHeap {
     }
 }
 
+enum HeapChunk {
+    Ordinary(Vec<UnsafeCell<u64>>),
+    Literal(crate::literal::LiteralChunk),
+}
+
+impl HeapChunk {
+    fn new(words: usize, literal: bool) -> Option<Self> {
+        if literal {
+            crate::literal::allocate_chunk(words).map(Self::Literal)
+        } else {
+            Some(Self::Ordinary(Vec::with_capacity(words)))
+        }
+    }
+
+    fn as_ptr(&self) -> *const UnsafeCell<u64> {
+        match self {
+            Self::Ordinary(chunk) => chunk.as_ptr(),
+            Self::Literal(chunk) => chunk.as_ptr().cast(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Ordinary(chunk) => chunk.capacity(),
+            Self::Literal(chunk) => chunk.capacity(),
+        }
+    }
+
+    fn initialize_until(&mut self, start: usize, end: usize) -> bool {
+        match self {
+            Self::Ordinary(chunk) => {
+                chunk.resize_with(end, || UnsafeCell::new(0));
+                true
+            }
+            Self::Literal(chunk) => chunk.initialize_words(start, end),
+        }
+    }
+}
+
 /// Growable heap whose separately allocated chunks never move.
 pub struct VecHeap {
     // Each chunk reserves its full capacity up front and never grows past it, so words
     // handed out stay put; only words actually allocated are initialized.
-    chunks: Vec<Vec<UnsafeCell<u64>>>,
+    chunks: Vec<HeapChunk>,
     off_heap: Vec<Arc<RefcBinary>>,
     writable: Vec<Arc<WritableBinary>>,
     external: Vec<Arc<ExternalBinary>>,
@@ -1176,8 +1236,9 @@ impl VecHeap {
     /// Whether a pointer belongs to any allocation in this area.
     pub fn contains(&self, ptr: *const u64) -> bool {
         let address = ptr as usize;
-        self.chunks.iter().any(|c| {
-            address >= c.as_ptr() as usize && address < (c.as_ptr() as usize + c.capacity() * 8)
+        self.chunks.iter().any(|chunk| {
+            address >= chunk.as_ptr() as usize
+                && address < (chunk.as_ptr() as usize + chunk.capacity() * 8)
         })
     }
     /// Address ranges occupied by initialized or reserved heap chunks.
@@ -1215,7 +1276,8 @@ impl HeapAlloc for VecHeap {
             let size = self.next_chunk_words().max(words);
             // erts hands out heap words uninitialized (erl_alloc.c); reserving without
             // zeroing keeps a short-lived heap from touching its whole first chunk.
-            self.chunks.push(Vec::with_capacity(size));
+            self.chunks
+                .push(HeapChunk::new(size, self.is_literal_area())?);
             self.used = 0;
             let literal_bit = self.chunk_words & LITERAL_HEAP_BIT;
             self.chunk_words = self.next_chunk_words().saturating_mul(2) | literal_bit;
@@ -1234,7 +1296,9 @@ impl HeapAlloc for VecHeap {
         let chunk = self.chunks.last_mut()?;
         let end = self.used + words;
         // Within the reserved capacity: the buffer does not move.
-        chunk.resize_with(end, || UnsafeCell::new(0));
+        if !chunk.initialize_until(self.used, end) {
+            return None;
+        }
         // SAFETY: checked against chunk length above.
         let ptr = unsafe { chunk.as_ptr().add(self.used).cast::<u64>().cast_mut() };
         self.used += words;
