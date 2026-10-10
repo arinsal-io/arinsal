@@ -283,6 +283,11 @@ fn profile_target(profile: &Profile) -> Option<arinsal_sched::Pid> {
     Term::pid(*id, *serial).and_then(arinsal_sched::Pid::from_term)
 }
 
+/// Whether runnable-process profiling is enabled (`erlang:system_profile/2`).
+pub(crate) fn profile_runnable_procs() -> bool {
+    PROFILE_FLAGS.load(Ordering::Relaxed) & PROFILE_RUNNABLE_PROCS != 0
+}
+
 /// Emit the current process's runnable transition to a local profiler process.
 // Port of erts/emulator/beam/erl_trace.c:2357 (profile_runnable_proc), OTP-29.1.1.
 pub(crate) fn profile_process_event(

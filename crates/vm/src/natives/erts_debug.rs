@@ -186,17 +186,7 @@ fn after_collection_one(
     if flags == 0 {
         return;
     }
-    let Some(pid) = runtime
-        .processes
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .find(|pid| {
-            pid.to_term()
-                .is_some_and(|term| term.tagged_word() == process.header.self_pid)
-        })
-    else {
+    let Some(pid) = process.self_pid else {
         return;
     };
     let OwnedTerm::Pid {
@@ -336,17 +326,7 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
     if flags & MONITOR_LONG_SCHEDULE == 0 {
         return;
     }
-    let Some(pid) = runtime
-        .processes
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .find(|pid| {
-            pid.to_term()
-                .is_some_and(|term| term.tagged_word() == process.header.self_pid)
-        })
-    else {
+    let Some(pid) = process.self_pid else {
         return;
     };
     let Some(MonitorOption::Limit(limit)) = state.options.get("long_schedule") else {
@@ -480,17 +460,7 @@ fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorSt
     if flags & MONITOR_LONG_MESSAGE_QUEUE == 0 {
         return;
     }
-    let Some(pid) = runtime
-        .processes
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .find(|pid| {
-            pid.to_term()
-                .is_some_and(|term| term.tagged_word() == process.header.self_pid)
-        })
-    else {
+    let Some(pid) = process.self_pid else {
         return;
     };
     let Some(MonitorOption::Queue(off, on)) = state.options.get("long_message_queue") else {
@@ -1475,14 +1445,10 @@ fn internal_state_tuple_get(
                 .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).cloned())
                 .map(|published| atom(published.status))
                 .or_else(|| {
-                    process.runtime.as_ref().and_then(|runtime| {
-                        runtime
-                            .processes
-                            .lock()
-                            .unwrap()
-                            .contains(&pid)
-                            .then(|| atom("runnable"))
-                    })
+                    process
+                        .runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.process_alive(pid).then(|| atom("runnable")))
                 })
                 .unwrap_or_else(|| atom("undefined"));
             Ok(Some(status))
@@ -2083,7 +2049,7 @@ fn internal_state_get(
             let Some(runtime) = &process.runtime else {
                 return Ok(Term::NIL);
             };
-            let pids = runtime.processes.lock().unwrap().clone();
+            let pids = runtime.process_pids();
             let mut by_pid = pids
                 .into_iter()
                 .map(|pid| (pid, Vec::<Term>::new()))
@@ -2127,7 +2093,7 @@ fn internal_state_get(
                 .runtime
                 .as_ref()
                 .map(|runtime| {
-                    let mut pids = runtime.processes.lock().unwrap().clone();
+                    let mut pids = runtime.process_pids();
                     pids.extend(runtime.system_processes.lock().unwrap().iter().copied());
                     pids.iter()
                         .filter_map(|pid| pid.to_term())
@@ -2396,7 +2362,7 @@ fn internal_state_set(
             let found = process
                 .runtime
                 .as_ref()
-                .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
+                .is_some_and(|runtime| runtime.process_alive(pid));
             if !found {
                 return Ok(atom("false"));
             }
@@ -2730,7 +2696,7 @@ fn internal_state_set(
             let Some(runtime) = process.runtime.as_ref() else {
                 return Ok(atom("false"));
             };
-            if !runtime.processes.lock().unwrap().contains(&pid) {
+            if !runtime.process_alive(pid) {
                 return Ok(atom("false"));
             }
             return Ok(atom(
@@ -3010,10 +2976,8 @@ fn system_monitor_set(
     }
     let matches_live_pid = process.runtime.as_ref().is_some_and(|runtime| {
         runtime
-            .processes
-            .lock()
-            .unwrap()
-            .iter()
+            .process_pids()
+            .into_iter()
             .filter_map(|pid| pid.to_term())
             .filter_map(|pid| to_owned(pid).ok())
             .any(|pid| pid == receiver)

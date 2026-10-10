@@ -155,11 +155,14 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
                 _ => n,
             };
             let previous_min_bin_vheap = process.heap.min_bin_vheap_size();
+            let previous_min_heap = process.heap.min_heap_size_words();
             if name == "fullsweep_after" {
                 process.heap.set_fullsweep_after(normalized as u16);
             }
             if name == "min_heap_size" {
                 process.heap.set_min_heap_size(normalized as usize);
+                set_flag(process, name, Term::small(normalized).unwrap());
+                return Ok(Term::small(previous_min_heap as i64).unwrap());
             }
             if name == "min_bin_vheap_size" {
                 process.heap.set_min_bin_vheap_size(normalized as u64);
@@ -316,10 +319,7 @@ fn process_info(
                 }
             }
             "group_leader" => process
-                .cold
-                .as_ref()
-                .and_then(|cold| cold.group_leader)
-                .unwrap_or_else(|| ctx.pid())
+                .group_leader_pid(ctx.pid())
                 .to_term()
                 .unwrap_or(Term::NIL),
             "links" => {
@@ -440,11 +440,7 @@ fn process_info(
                 )?
             }
             "initial_call" => {
-                let (module_name, function, arity) = process
-                    .cold
-                    .as_ref()
-                    .and_then(|cold| cold.initial_call.clone())
-                    .map_or_else(|| resolve_mfa(vm, process), Ok)?;
+                let (module_name, function, arity) = initial_call_mfa(vm, process)?;
                 make_tuple(
                     process,
                     &[
@@ -626,7 +622,8 @@ fn process_info(
             "fullsweep_after" => flag_value(process, "fullsweep_after")
                 .unwrap_or_else(|| Term::small(65_535).unwrap()),
             "min_heap_size" => {
-                flag_value(process, "min_heap_size").unwrap_or_else(|| Term::small(233).unwrap())
+                // Port of erts/emulator/beam/erl_process.h (`p->min_heap_size`), OTP-29.1.1.
+                Term::small(process.heap.min_heap_size_words() as i64).ok_or_else(badarg)?
             }
             "min_bin_vheap_size" => {
                 Term::small(process.heap.min_bin_vheap_size() as i64).ok_or_else(badarg)?
@@ -1060,6 +1057,36 @@ pub(crate) fn native_call_site(
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:2341 (`current_function`), OTP-29.1.1.
+/// `process_info(Pid, initial_call)` from `p->u.initial` (the spawn entry), then the
+/// current MFA. Spawn stores the entry as a module id and instruction.
+fn initial_call_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
+    if let Some((module, function, arity)) = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.initial_call.clone())
+    {
+        return Ok((module, function, arity));
+    }
+    if let Some((module_id, ip)) = process.initial_call {
+        let resolve = |modules: &[std::sync::Arc<crate::Module>]| {
+            let module = modules.get(module_id)?;
+            let (function, arity) = module.function_at(ip).unwrap_or(("undefined", 0));
+            Some((module.name.clone(), function.to_owned(), arity))
+        };
+        if let Some(found) = vm.and_then(|vm| resolve(&vm.code.modules)) {
+            return Ok(found);
+        }
+        if let Some(found) = process
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.with_modules(resolve))
+        {
+            return Ok(found);
+        }
+    }
+    resolve_mfa(vm, process)
+}
+
 fn resolve_mfa(vm: Option<&Vm>, process: &Process) -> Result<(String, String, u8), VmError> {
     if let Some((module, function, arity)) =
         process.cold.as_ref().and_then(|cold| cold.dirty_bif_mfa)
@@ -1464,6 +1491,7 @@ fn gc_message(process: &mut Process, request_id: Term, ok: bool) -> Result<Term,
 fn set_group_leader(process: &mut Process, leader: Pid) -> Result<(), VmError> {
     let term = leader.to_term().ok_or_else(badarg)?;
     set_flag(process, "group_leader", term);
+    process.group_leader = Some(leader);
     process.cold_mut().group_leader = Some(leader);
     Ok(())
 }
@@ -1595,14 +1623,9 @@ pub(crate) fn failure_reply(
 fn processes(process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4097 (processes_0), OTP-29.1.1.
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let scheduler = runtime.scheduler()?;
     let pids = runtime
-        .processes
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .filter(|pid| scheduler.lookup(*pid))
+        .process_pids()
+        .into_iter()
         .filter_map(Pid::to_term)
         .collect::<Vec<_>>();
     make_list(process, pids)
@@ -1825,10 +1848,7 @@ fn call_values(
                 Err(VmError::Trap(crate::exceptions::Trap::exit(*reason)))
             }
             ("group_leader", []) => Ok(process
-                .cold
-                .as_ref()
-                .and_then(|cold| cold.group_leader)
-                .unwrap_or_else(|| ctx.pid())
+                .group_leader_pid(ctx.pid())
                 .to_term()
                 .unwrap_or(Term::NIL)),
             ("group_leader", [leader, pid]) if module == "erts_internal" => {
@@ -2839,13 +2859,8 @@ fn spawn_apply(
             Term::small(min_bin_vheap as i64).unwrap(),
         );
     }
-    child.cold_mut().group_leader = Some(
-        parent
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.group_leader)
-            .unwrap_or_else(|| ctx.pid()),
-    );
+    child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
+    child.cold_mut().group_leader = child.group_leader;
     // The child can exit before it drains the link/monitor signals. Record
     // them now so `notify_exit` still delivers EXIT and DOWN.
     if options.link {
@@ -2874,7 +2889,6 @@ fn spawn_apply(
     let pid = scheduler
         .spawn_priority(child, options.priority)
         .map_err(|error| VmError::Unsupported(format!("spawn_request: {error}")))?;
-    runtime.processes.lock().unwrap().insert(pid);
     if !is_default_max_heap(max_heap)
         || runtime
             .ever_max_heap
@@ -2884,9 +2898,6 @@ fn spawn_apply(
             .ever_max_heap
             .store(true, std::sync::atomic::Ordering::Release);
         runtime.max_heaps.lock().unwrap().insert(pid, max_heap);
-    }
-    if !scheduler.lookup(pid) {
-        runtime.processes.lock().unwrap().remove(&pid);
     }
     Ok(pid)
 }
@@ -4690,15 +4701,7 @@ pub(crate) fn bp_functions(
 
 fn live_pids(process: &Process) -> Result<Vec<Pid>, VmError> {
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let scheduler = runtime.scheduler()?;
-    let mut pids = runtime
-        .processes
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .filter(|pid| scheduler.lookup(*pid))
-        .collect::<Vec<_>>();
+    let mut pids = runtime.process_pids();
     pids.sort_by_key(|pid| crate::process::pid_table_index(*pid));
     Ok(pids)
 }
@@ -4725,12 +4728,7 @@ fn processes_next(
     }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
     let scheduler = runtime.scheduler()?;
-    let (mut pids, scan_end) = scheduler.pids_in_table_range(index, limit, max_pids as usize);
-    // List only processes registered with this runtime, as erlang:processes/0 does.
-    {
-        let processes = runtime.processes.lock().unwrap();
-        pids.retain(|pid| processes.contains(pid));
-    }
+    let (pids, scan_end) = scheduler.pids_in_table_range(index, limit, max_pids as usize);
     let pid_terms = pids
         .iter()
         .map(|pid| pid.to_term().ok_or_else(badarg))

@@ -1446,7 +1446,7 @@ fn call_values(
             let known = process
                 .runtime
                 .as_ref()
-                .is_some_and(|runtime| runtime.processes.lock().unwrap().contains(&pid));
+                .is_some_and(|runtime| runtime.process_alive(pid));
             if !known {
                 return Ok(Term::atom(atoms::FALSE));
             }

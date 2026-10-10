@@ -326,6 +326,17 @@ impl Store {
             copied_roots: self.last_trace[3].load(Ordering::Relaxed),
         }
     }
+    /// A handle that is not in the retirement barrier yet.
+    ///
+    /// `set_runtime` registers the process with its node's store. Registering
+    /// with the global store first would enqueue and then drop that account.
+    pub fn unregistered(&self) -> ProcessRegistration<'_> {
+        ProcessRegistration {
+            store: self,
+            account: None,
+        }
+    }
+
     /// Register a process for literal retirement before its first read.
     pub fn register_process(&self) -> ProcessRegistration<'_> {
         self.registrations_in_flight.fetch_add(1, Ordering::SeqCst);
@@ -982,6 +993,11 @@ impl<'a> ProcessRegistration<'a> {
     /// The node store this process is registered with.
     pub fn store(&self) -> &'a Store {
         self.store
+    }
+
+    /// Whether [`Store::register_process`] built this handle.
+    pub fn is_registered(&self) -> bool {
+        self.account.is_some()
     }
 }
 

@@ -496,10 +496,6 @@ fn spawn_mfa_with_priority(
         false,
     );
     child.heap.set_min_heap_size(min_heap);
-    child.cold_mut().flags.insert(
-        "min_heap_size".to_owned(),
-        Term::small(min_heap as i64).unwrap(),
-    );
     child.module = module_id;
     child.ip = ip;
     child.initial_call = Some((module_id, ip));
@@ -515,23 +511,9 @@ fn spawn_mfa_with_priority(
         }
     }
     child.set_runtime(parent.runtime.clone());
-    if let (Some(module_name), Some(function_name)) = (
-        arinsal_term::global_atoms().text(m),
-        arinsal_term::global_atoms().text(f),
-    ) {
-        child.cold_mut().initial_call = Some((
-            module_name.to_string(),
-            function_name.to_string(),
-            args.len() as u8,
-        ));
-    }
-    child.cold_mut().group_leader = Some(
-        parent
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.group_leader)
-            .unwrap_or_else(|| ctx.pid()),
-    );
+    // `p->u.initial` is the export the child starts at (`initial_call` module/ip).
+    // String copies and a cold record are not part of erl_create_process.
+    child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
     // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: the whole `args`
     // list is copied with size_object_litopt/copy_struct_litopt, its elements then move to the
     // X registers), OTP-29.1.1. The list cells stay on the child heap, where call_memory counts
@@ -567,7 +549,6 @@ fn spawn_mfa_with_priority(
         scheduler.spawn_unscheduled_with_priority(child, priority)
     }
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-    rt.processes.lock().unwrap().insert(pid);
     tuning.register(&rt, pid);
     if linked {
         parent.cold_mut().links.insert(pid);
@@ -734,22 +715,11 @@ fn spawn_fun_with_priority(
         false,
     );
     child.heap.set_min_heap_size(min_heap);
-    child.cold_mut().flags.insert(
-        "min_heap_size".to_owned(),
-        Term::small(min_heap as i64).unwrap(),
-    );
     child.module = apply_module;
     child.ip = apply_ip;
     child.initial_call = Some((apply_module, apply_ip));
     child.set_runtime(parent.runtime.clone());
-    child.cold_mut().initial_call = Some(("erlang".to_owned(), "apply".to_owned(), 2));
-    child.cold_mut().group_leader = Some(
-        parent
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.group_leader)
-            .unwrap_or_else(|| ctx.pid()),
-    );
+    child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
     {
         let copied = {
             let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
@@ -782,7 +752,6 @@ fn spawn_fun_with_priority(
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
     #[cfg(feature = "pf-mem-counters")]
     PF_SPAWN_FUN_SCHED_NS.fetch_add(phase.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    rt.processes.lock().unwrap().insert(pid);
     tuning.register(&rt, pid);
     if linked {
         parent.cold_mut().links.insert(pid);

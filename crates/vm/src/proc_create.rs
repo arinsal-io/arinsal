@@ -91,6 +91,17 @@ pub struct Process {
     pub(crate) receive_deadline: Option<std::time::Instant>,
     pub(crate) receive_deadline_ms: Option<u64>,
     pub(crate) cold: Option<Box<ProcessCold>>,
+    /// `p->group_leader`. Kept on the process so a spawn does not allocate `ProcessCold`.
+    pub(crate) group_leader: Option<arinsal_sched::Pid>,
+    /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
+    /// allocate on every exit.
+    pub(crate) exit_cont: Option<Box<ExitCont>>,
+    /// Outermost `apply` operands that must stay GC roots. Nested applies spill into
+    /// `ProcessCold.apply_roots`.
+    pub(crate) apply_inline: [Term; 3],
+    pub(crate) apply_inline_len: u8,
+    /// `note_relations` has published this process's links or monitors.
+    pub(crate) published_slot: bool,
     // Retired persistent-term areas are copied out and acknowledged in
     // `natives::sys::after_collection` on every collection.
     pub(crate) _persistent_terms: arinsal_pterm::ProcessRegistration<'static>,
@@ -658,8 +669,6 @@ pub(crate) struct ProcessCold {
     /// Module and instruction of a `call_ext_last` whose frame was already released when its
     /// BIF yielded, so the re-executed instruction does not release it twice.
     pub(crate) ext_last_released: Option<(usize, usize)>,
-    /// Exit work (owned ETS tables) that yielded; the process stays scheduled until it ends.
-    pub(crate) exit_cont: Option<Box<ExitCont>>,
     /// A process-local BIF trap waiting for its private continuation export.
     pub(crate) bif_trap: Option<BifTrapPending>,
     /// Operand registers of `apply` calls in progress. A callee may collect before it
@@ -789,11 +798,11 @@ impl Process {
             );
         }
         self.runtime = runtime;
-        if !std::ptr::eq(
-            self._persistent_terms.store(),
-            arinsal_pterm::store_for(scope),
-        ) {
-            self._persistent_terms = arinsal_pterm::store_for(scope).register_process();
+        let store = arinsal_pterm::store_for(scope);
+        if !self._persistent_terms.is_registered()
+            || !std::ptr::eq(self._persistent_terms.store(), store)
+        {
+            self._persistent_terms = store.register_process();
         }
     }
 
@@ -857,6 +866,13 @@ impl Process {
             .get_or_insert_with(|| Box::new(ProcessCold::default()))
     }
 
+    /// Group leader, or `fallback` when spawn did not record one (`p->group_leader`).
+    pub(crate) fn group_leader_pid(&self, fallback: arinsal_sched::Pid) -> arinsal_sched::Pid {
+        self.group_leader
+            .or_else(|| self.cold.as_ref().and_then(|cold| cold.group_leader))
+            .unwrap_or(fallback)
+    }
+
     /// Remember an explicit exit reason across the GC that builds its stacktrace.
     pub(crate) fn note_exit_reason(&mut self, reason: Term) -> Result<(), VmError> {
         let cold = self.cold_mut();
@@ -867,14 +883,15 @@ impl Process {
     }
     /// Construct a process with the erts minimum heap size.
     pub fn new() -> Self {
-        Self::with_registers_and_min_heap(1024, 1024, 233)
+        Self::with_registers_and_min_heap(1024, 1024, 233, true)
     }
     #[cfg(test)]
     pub(crate) fn with_registers(x_registers: usize, float_registers: usize) -> Self {
-        Self::with_registers_and_min_heap(x_registers, float_registers, 64)
+        Self::with_registers_and_min_heap(x_registers, float_registers, 64, true)
     }
     pub(crate) fn with_spawn_registers(x_registers: usize, float_registers: usize) -> Self {
-        let mut process = Self::with_registers_and_min_heap(x_registers, float_registers, 233);
+        let mut process =
+            Self::with_registers_and_min_heap(x_registers, float_registers, 233, false);
         // Port of erts/emulator/beam/erl_process.c (erl_create_process: c_p->arity = arg
         // count): a collection before the first run must keep the initial arguments alive.
         process.gc_live = x_registers;
@@ -884,6 +901,7 @@ impl Process {
         x_registers: usize,
         float_registers: usize,
         min_heap: usize,
+        register: bool,
     ) -> Self {
         #[cfg(feature = "pf-mem-counters")]
         let started = std::time::Instant::now();
@@ -929,7 +947,18 @@ impl Process {
             receive_deadline: None,
             receive_deadline_ms: None,
             cold: None,
-            _persistent_terms: arinsal_pterm::global_store().register_process(),
+            group_leader: None,
+            exit_cont: None,
+            apply_inline: [Term::NIL; 3],
+            apply_inline_len: 0,
+            published_slot: false,
+            _persistent_terms: if register {
+                arinsal_pterm::global_store().register_process()
+            } else {
+                // The node's store is attached in `set_runtime`. A provisional
+                // global registration would be created and dropped on every spawn.
+                arinsal_pterm::global_store().unregistered()
+            },
             trap_exit: false,
             exc_class: None,
             entry: false,

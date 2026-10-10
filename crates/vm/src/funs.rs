@@ -1073,7 +1073,18 @@ impl Vm {
             push_apply_error_continuation(p, return_ip, tail_dealloc)?;
         }
         // Re-executing this apply needs its own operands; keep them rooted while the callee runs.
-        let roots_base = {
+        // The outermost apply (spawn's erlang:apply/2) stays on the process. Nested applies
+        // spill into ProcessCold, which erts does not allocate for an empty fun.
+        let inline = arity <= 3
+            && p.apply_inline_len == 0
+            && p.cold
+                .as_ref()
+                .is_none_or(|cold| cold.apply_roots.is_empty());
+        let roots_base = if inline {
+            p.apply_inline[..arity].copy_from_slice(&original_operands[..arity]);
+            p.apply_inline_len = arity as u8;
+            0
+        } else {
             let cold = p.cold_mut();
             let base = cold.apply_roots.len();
             cold.apply_roots
@@ -1101,11 +1112,17 @@ impl Vm {
                 ctx,
             )
         };
-        let operands = {
+        let mut operand_buf = [Term::NIL; 3];
+        let operand_len = if inline {
+            operand_buf[..arity].copy_from_slice(&p.apply_inline[..arity]);
+            p.apply_inline_len = 0;
+            arity
+        } else {
             let cold = p.cold_mut();
-            let operands = cold.apply_roots[roots_base..].to_vec();
+            let len = cold.apply_roots.len() - roots_base;
+            operand_buf[..len].copy_from_slice(&cold.apply_roots[roots_base..]);
             cold.apply_roots.truncate(roots_base);
-            operands
+            len
         };
         let reexec_apply = matches!(&result, Ok(ImportOutcome::Yield)) && p.ip == original_ip;
         if matches!(
@@ -1116,7 +1133,7 @@ impl Vm {
         {
             // Only a yield that re-executes this apply may restore its argument registers; a yield after the
             // callee returned (reductions exhausted, ip advanced) must keep the result in x0.
-            p.x[..operands.len()].copy_from_slice(&operands);
+            p.x[..operand_len].copy_from_slice(&operand_buf[..operand_len]);
             p.gc_live = original_gc_live;
         } else if result.is_ok() {
             // The deferred collector runs before the next instruction. A completed callee
