@@ -1603,8 +1603,8 @@ pub fn compile_parsed_module_with_options(
 
         // Fun creators stay native even when a lambda body is still interpreted:
         // make_fun3_entry stores the shared FunEntry, and unpublished
-        // dispatch_target slots fall through to the call_fun resolver (same
-        // shape as OTP's unloaded/dispatchable path). Whole-module fallback is
+        // dispatch_target slots enter beam_unloaded_fun (OTP's unloaded/dispatchable
+        // path). Whole-module fallback is
         // reserved for hard assemble failures below, not for missing trampolines.
 
         assembler = BeamModuleAssembler::new();
@@ -1951,7 +1951,9 @@ fn fun_call_tag(value: Option<&SpecificOperand>, beam: &BeamFile) -> Result<FunC
             let name = beam
                 .atom(*index)
                 .ok_or_else(|| EmitError::Operand(format!("unknown call_fun2 atom {index}")))?;
-            if name == "safe" || name == "unsafe" {
+            if name == "safe" {
+                Ok(FunCallTag::DynamicSafe)
+            } else if name == "unsafe" {
                 Ok(FunCallTag::Dynamic)
             } else {
                 Err(EmitError::Operand(format!(

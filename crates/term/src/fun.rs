@@ -3,17 +3,94 @@ use crate::{Atom, FUN, Term};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+/// Number of code indexes (`ERTS_NUM_CODE_IX`): active, staging and the one being retired.
+// Port of erts/emulator/beam/code_ix.h:72-78, OTP-29.1.1.
+pub const ERTS_NUM_CODE_IX: usize = 3;
+/// Length of a dispatch address vector: one slot per code index plus the save_calls slot.
+// Port of erts/emulator/beam/code_ix.h:79-80 (ERTS_ADDRESSV_SIZE), OTP-29.1.1.
+pub const ERTS_ADDRESSV_SIZE: usize = ERTS_NUM_CODE_IX + 1;
+/// Code index of a process with `process_flag(save_calls, N > 0)`.
+// Port of erts/emulator/beam/code_ix.h:81 (ERTS_SAVE_CALLS_CODE_IX), OTP-29.1.1.
+pub const ERTS_SAVE_CALLS_CODE_IX: usize = ERTS_ADDRESSV_SIZE - 1;
+
+/// `beam_unloaded_fun`: the address every code index of a fun entry without loaded code enters.
+static BEAM_UNLOADED_FUN: AtomicUsize = AtomicUsize::new(0);
+/// `beam_save_calls_fun`: the address a process saving calls enters for every local fun.
+static BEAM_SAVE_CALLS_FUN: AtomicUsize = AtomicUsize::new(0);
+
+/// Publishes the native `unloaded_fun` and `dispatch_save_calls_fun` fragments that new fun
+/// entries dispatch to until their code is loaded.
+// Port of erts/emulator/beam/jit/beam_jit_main.cpp (beam_unloaded_fun, beam_save_calls_fun
+// set from the global fragments at JIT init), OTP-29.1.1.
+pub fn set_fun_dispatch_fragments(unloaded_fun: usize, save_calls_fun: usize) {
+    BEAM_UNLOADED_FUN.store(unloaded_fun, Ordering::Release);
+    BEAM_SAVE_CALLS_FUN.store(save_calls_fun, Ordering::Release);
+}
+
+/// The `beam_unloaded_fun` address, zero before the native fragments exist.
+pub fn beam_unloaded_fun() -> usize {
+    BEAM_UNLOADED_FUN.load(Ordering::Acquire)
+}
+
+/// Native entry addresses, one per code index (`ErtsDispatchable`). Fun and export entries
+/// both start with one, so `call_fun` loads `addresses[active_code_ix]` from either.
+// Port of erts/emulator/beam/code_ix.h:81-85 (ErtsDispatchable), OTP-29.1.1.
+#[derive(Debug)]
+#[repr(C)]
+pub struct ErtsDispatchable {
+    /// Native entry addresses indexed by code index; the last slot is the save_calls entry.
+    pub addresses: [AtomicUsize; ERTS_ADDRESSV_SIZE],
+}
+
+impl ErtsDispatchable {
+    /// A dispatchable entering `address` in every code index and `save_calls` in
+    /// `ERTS_SAVE_CALLS_CODE_IX`.
+    pub const fn new(address: usize, save_calls: usize) -> Self {
+        Self {
+            addresses: [
+                AtomicUsize::new(address),
+                AtomicUsize::new(address),
+                AtomicUsize::new(address),
+                AtomicUsize::new(save_calls),
+            ],
+        }
+    }
+
+    /// The address entered in code index `ix`.
+    pub fn address(&self, ix: usize) -> usize {
+        self.addresses[ix].load(Ordering::Acquire)
+    }
+
+    /// Sets the address entered in code index `ix`.
+    pub fn set_address(&self, ix: usize, address: usize) {
+        self.addresses[ix].store(address, Ordering::Release);
+    }
+}
+
+impl Default for ErtsDispatchable {
+    /// A fun entry's dispatchable before its code is loaded.
+    // Port of erts/emulator/beam/erl_fun.c:87-99 (fun_init), OTP-29.1.1.
+    fn default() -> Self {
+        Self::new(
+            BEAM_UNLOADED_FUN.load(Ordering::Acquire),
+            BEAM_SAVE_CALLS_FUN.load(Ordering::Acquire),
+        )
+    }
+}
+
 /// Immutable local fun entry, identified independently of a code address.
 ///
-/// Layout mirrors OTP `ErlFunEntry`: native dispatch addresses come first so
-/// BeamAsm can load `addresses[code_ix]` from offset zero like `ErtsDispatchable`.
+/// Layout mirrors OTP `ErlFunEntry`: the dispatchable comes first so BeamAsm loads
+/// `addresses[active_code_ix]` from offset zero, as for an export entry.
 #[derive(Debug)]
+#[repr(C)]
 pub struct FunEntry {
-    /// Native trampoline addresses for the two BEAM code generations.
+    /// Native entry addresses per code index (`ErlFunEntry.dispatch`).
     ///
-    /// Must remain the first field: `call_fun` loads `addresses[0]` from the
-    /// fun-entry pointer (Port of `ErlFunEntry.dispatch`, OTP-29.1.1).
-    pub dispatch_target: [AtomicUsize; 2],
+    /// Must remain the first field: `call_fun` loads `addresses[active_code_ix]` from the
+    /// fun-entry pointer.
+    // Port of erts/emulator/beam/erl_fun.h:31-35, OTP-29.1.1.
+    pub dispatch_target: ErtsDispatchable,
     /// Defining module.
     pub module: Atom,
     /// Function arity.
@@ -39,9 +116,11 @@ pub struct FunEntry {
 impl Clone for FunEntry {
     fn clone(&self) -> Self {
         Self {
-            dispatch_target: std::array::from_fn(|index| {
-                AtomicUsize::new(self.dispatch_target[index].load(Ordering::Acquire))
-            }),
+            dispatch_target: ErtsDispatchable {
+                addresses: std::array::from_fn(|ix| {
+                    AtomicUsize::new(self.dispatch_target.address(ix))
+                }),
+            },
             module: self.module,
             arity: self.arity,
             index: self.index,
@@ -63,20 +142,22 @@ impl Clone for FunEntry {
 }
 
 impl FunEntry {
-    /// Publish the native trampoline for one BEAM code generation.
-    pub fn set_dispatch_target(&self, code_index: usize, target: usize) {
-        if let Some(slot) = self.dispatch_target.get(code_index) {
-            slot.store(target, Ordering::Release);
-        }
+    /// Sets the code `address` entered in code index `ix`.
+    // Port of erts/emulator/beam/erl_fun.c:48-53 (erts_set_fun_code), OTP-29.1.1.
+    pub fn set_fun_code(&self, ix: usize, address: usize) {
+        self.dispatch_target.set_address(ix, address);
     }
 
-    /// Read the native trampoline for one BEAM code generation.
-    pub fn get_dispatch_target(&self, code_index: usize) -> Option<usize> {
-        let target = self
-            .dispatch_target
-            .get(code_index)?
-            .load(Ordering::Acquire);
-        (target != 0).then_some(target)
+    /// Whether code index `ix` enters loaded code rather than `beam_unloaded_fun`.
+    // Port of erts/emulator/beam/erl_fun.c:55-58 (erts_is_fun_loaded), OTP-29.1.1.
+    pub fn is_fun_loaded(&self, ix: usize) -> bool {
+        self.dispatch_target.address(ix) != BEAM_UNLOADED_FUN.load(Ordering::Acquire)
+    }
+
+    /// The loaded code address of code index `ix`, if any.
+    pub fn fun_code(&self, ix: usize) -> Option<usize> {
+        self.is_fun_loaded(ix)
+            .then(|| self.dispatch_target.address(ix))
     }
 
     /// Publish a resolved module and code target for one OTP code index.
@@ -119,12 +200,18 @@ impl FunEntry {
     }
 }
 
-/// Export fun entry for `fun M:F/A`, with a cached pointer to its node export slot.
+/// Export entry (`Export`): one per MFA and code scope, shared by external calls and by every
+/// `fun M:F/A` of that MFA, whose fun thing points at it.
+// Port of erts/emulator/beam/export.h:39-75 (Export: dispatch first, then the info word and
+// the MFA), OTP-29.1.1.
 #[derive(Debug)]
 #[repr(C)]
 pub struct ExportEntry {
-    /// Export slot cached after the first native call; zero means unresolved.
-    dispatch: AtomicUsize,
+    /// Native entry addresses indexed by code index (`Export.dispatch`); must stay first.
+    pub dispatch: ErtsDispatchable,
+    /// The runtime's descriptor of this export (its BIF and call class), set once when the
+    /// node creates the export. Generated code reads it next to the addresses.
+    pub info: AtomicUsize,
     /// Module.
     pub module: Atom,
     /// Function.
@@ -133,30 +220,86 @@ pub struct ExportEntry {
     pub arity: u8,
 }
 
-/// Byte offset of [`ExportEntry`]'s cached dispatch pointer for generated loads.
-pub const EXPORT_DISPATCH_OFFSET: u32 = core::mem::offset_of!(ExportEntry, dispatch) as u32;
+/// Byte offset of [`ExportEntry::info`] for generated loads.
+pub const EXPORT_INFO_OFFSET: u32 = core::mem::offset_of!(ExportEntry, info) as u32;
+const _: () = assert!(core::mem::offset_of!(ExportEntry, dispatch) == 0);
+const _: () = assert!(core::mem::offset_of!(FunEntry, dispatch_target) == 0);
 
 impl ExportEntry {
-    /// Creates an unresolved export fun entry.
-    pub const fn new(module: Atom, function: Atom, arity: u8) -> Self {
+    /// Creates an export entry for `module:function/arity` outside any node's export table.
+    /// Calls through it enter `beam_unloaded_fun`, whose resolver finds the caller's node
+    /// export; [`export_get_or_make_stub`] replaces it with the node's own entry whenever the
+    /// node is known.
+    pub fn new(module: Atom, function: Atom, arity: u8) -> Self {
+        let unloaded = BEAM_UNLOADED_FUN.load(Ordering::Acquire);
+        Self::with_addresses(module, function, arity, unloaded, unloaded)
+    }
+
+    /// Creates an export entry entering `address` in every code index and `save_calls` in
+    /// `ERTS_SAVE_CALLS_CODE_IX`.
+    // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
+    pub const fn with_addresses(
+        module: Atom,
+        function: Atom,
+        arity: u8,
+        address: usize,
+        save_calls: usize,
+    ) -> Self {
         Self {
-            dispatch: AtomicUsize::new(0),
+            dispatch: ErtsDispatchable::new(address, save_calls),
+            info: AtomicUsize::new(0),
             module,
             function,
             arity,
         }
     }
 
-    /// Caches the node's stable export table slot for generated export fun calls.
-    pub fn set_dispatch(&self, dispatch: usize) {
-        self.dispatch.store(dispatch, Ordering::Release);
+    /// The runtime descriptor word published by [`ExportEntry::set_info`], zero before it.
+    pub fn info(&self) -> usize {
+        self.info.load(Ordering::Acquire)
     }
 
-    /// Returns the cached export slot, if this fun has been resolved in its node.
-    pub fn dispatch(&self) -> Option<usize> {
-        let dispatch = self.dispatch.load(Ordering::Acquire);
-        (dispatch != 0).then_some(dispatch)
+    /// Publishes the runtime descriptor word.
+    pub fn set_info(&self, info: usize) {
+        self.info.store(info, Ordering::Release);
     }
+
+    /// The address entered in code index `ix`.
+    pub fn address(&self, ix: usize) -> usize {
+        self.dispatch.address(ix)
+    }
+
+    /// Sets the address entered in code index `ix`.
+    pub fn set_address(&self, ix: usize, address: usize) {
+        self.dispatch.set_address(ix, address);
+    }
+
+    /// Copies the address of code index `src` into `dst`.
+    // Port of erts/emulator/beam/export.c:100-106 (export_stage), OTP-29.1.1.
+    pub fn stage(&self, src: usize, dst: usize) {
+        self.set_address(dst, self.address(src));
+    }
+}
+
+/// Node hook resolving `module:function/arity` to its export entry
+/// (`erts_export_get_or_make_stub`).
+pub type ExportStubFn = fn(Atom, Atom, u8) -> Option<Arc<ExportEntry>>;
+
+static EXPORT_STUB: std::sync::OnceLock<ExportStubFn> = std::sync::OnceLock::new();
+
+/// Installs the runtime's export table lookup used by terms built outside a process
+/// (literals, `binary_to_term`).
+pub fn set_export_stub_hook(hook: ExportStubFn) {
+    let _ = EXPORT_STUB.set(hook);
+}
+
+/// The export entry of `module:function/arity`, creating a stub when it has none.
+// Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
+pub fn export_get_or_make_stub(module: Atom, function: Atom, arity: u8) -> Arc<ExportEntry> {
+    EXPORT_STUB
+        .get()
+        .and_then(|hook| hook(module, function, arity))
+        .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)))
 }
 
 /// Borrowed local or export fun.

@@ -180,7 +180,12 @@ struct PurgeInner {
     /// `sprocs`: processes suspended in `erts_code_purger:pending_purge_lambda/3`.
     sprocs: Vec<Pid>,
     /// `funs` with their `pend_purge_address` (the native dispatch target).
-    funs: Vec<(std::sync::Arc<arinsal_term::FunEntry>, usize)>,
+    /// Fun entries of the module being purged and their addresses before the purge
+    /// (`ErlFunEntry.pend_purge_address`).
+    funs: Vec<(
+        std::sync::Arc<arinsal_term::FunEntry>,
+        [usize; arinsal_term::ERTS_NUM_CODE_IX],
+    )>,
 }
 
 impl PurgeState {
@@ -216,12 +221,17 @@ impl PurgeState {
     fn prepare(&self, name: &str, old: usize, module: &arinsal_loader::Module) {
         let mut inner = self.inner.lock().unwrap();
         inner.module = Some(name.to_owned());
+        let unloaded = arinsal_term::beam_unloaded_fun();
         for slot in &module.funs {
-            if let Some(target) = slot.entry.get_dispatch_target(0) {
-                slot.entry.set_dispatch_target(0, 0);
+            let pending: [usize; arinsal_term::ERTS_NUM_CODE_IX] =
+                std::array::from_fn(|ix| slot.entry.dispatch_target.address(ix));
+            if pending.iter().any(|&address| address != unloaded) {
+                for ix in 0..arinsal_term::ERTS_NUM_CODE_IX {
+                    slot.entry.set_fun_code(ix, unloaded);
+                }
                 inner
                     .funs
-                    .push((std::sync::Arc::clone(&slot.entry), target));
+                    .push((std::sync::Arc::clone(&slot.entry), pending));
             }
         }
         self.old_id.store(old + 1, Ordering::Release);
@@ -234,8 +244,10 @@ impl PurgeState {
         let mut inner = self.inner.lock().unwrap();
         let funs = std::mem::take(&mut inner.funs);
         if aborted {
-            for (entry, target) in funs {
-                entry.set_dispatch_target(0, target);
+            for (entry, pending) in funs {
+                for (ix, address) in pending.into_iter().enumerate() {
+                    entry.set_fun_code(ix, address);
+                }
             }
         }
         self.old_id.store(0, Ordering::Release);

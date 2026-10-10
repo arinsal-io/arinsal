@@ -1494,7 +1494,9 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
                 process.sync_native_header();
                 return 0;
             }
-            if let Some(target) = entry.get_dispatch_target(0) {
+            let code_ix =
+                (registers.active_code_ix as usize).min(arinsal_term::ERTS_NUM_CODE_IX - 1);
+            if let Some(target) = entry.fun_code(code_ix) {
                 publish_dispatch_x(process, registers);
                 process.sync_native_header();
                 return target;
@@ -1535,9 +1537,6 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
             let export = process.runtime.as_ref().and_then(|runtime| {
                 runtime.export_entry((entry.module, entry.function, entry.arity), code_ix)
             });
-            if let Some(export) = export {
-                entry.set_dispatch(export as *const _ as usize);
-            }
             let target = export.map(|export| export.address(code_ix));
             if code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX
                 && let Some(target) = target

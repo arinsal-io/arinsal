@@ -435,6 +435,28 @@ impl Emitter {
     pub fn sub_ext(&mut self, rd: Gpr, rn: Gpr, op: Extended) -> Result<(), EncodeError> {
         self.add_sub_ext(rd, rn, op, 1, false)
     }
+    /// CMP extended register operand (`SUBS XZR, Rn, Rm{, extend}`).
+    pub fn cmp_ext(&mut self, rn: Gpr, op: Extended) -> Result<(), EncodeError> {
+        let width = rn.width;
+        if op.reg.width != Width::W32 && op.reg.width != Width::X64 {
+            return Err(EncodeError::WidthMismatch);
+        }
+        let n = Self::reg(rn, width, true, false)?;
+        let m = Self::reg(op.reg, op.reg.width, false, true)?;
+        if op.amount > 4 {
+            return Err(EncodeError::InvalidShift(op.amount));
+        }
+        let sf = if width == Width::X64 { 1 << 31 } else { 0 };
+        self.emit(
+            sf | 0x6b20_0000
+                | (m << 16)
+                | ((op.extend as u32) << 13)
+                | ((op.amount as u32) << 10)
+                | (n << 5)
+                | 31,
+        );
+        Ok(())
+    }
     fn add_sub_ext(
         &mut self,
         rd: Gpr,

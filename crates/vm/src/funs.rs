@@ -1143,8 +1143,15 @@ impl Vm {
             .filter(|n| (0..=255).contains(n))
             .ok_or_else(|| self.exception(p, "badarg"))? as u8;
         p.ensure(2, 3)?;
+        // Port of erts/emulator/beam/bif.c (erlang:make_fun/3: erts_export_get_or_make_stub,
+        // the fun is the export's lambda), OTP-29.1.1.
+        let entry = crate::beamasm_integration::export_get_or_make_stub(
+            self.code_scope,
+            (module, function, arity),
+        )
+        .unwrap_or_else(|| Arc::new(ExportEntry::new(module, function, arity)));
         TermBuilder::new(&mut p.heap)
-            .export_fun(Arc::new(ExportEntry::new(module, function, arity)))
+            .export_fun(entry)
             .map_err(|e| VmError::Unsupported(format!("export fun allocation {e:?}")))
     }
 

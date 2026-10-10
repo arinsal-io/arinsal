@@ -567,6 +567,7 @@ impl Vm {
         code_scope: u64,
         replica: bool,
     ) -> Self {
+        crate::fun_dispatch::set_thread_code_scope(code_scope);
         let code_ix = crate::code_ix::for_scope(code_scope);
         Self {
             paths,

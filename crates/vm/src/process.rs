@@ -5701,6 +5701,7 @@ pub(crate) fn with_replica_vm<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Vm)
 
 /// Run `f` on this worker's executor for `runtime`, creating it on first use.
 fn with_executor<R>(runtime: &Arc<Runtime>, f: impl FnOnce(&mut Executor) -> R) -> R {
+    crate::fun_dispatch::set_thread_code_scope(runtime.code_scope);
     EXECUTOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         let key = Arc::as_ptr(runtime) as usize;
