@@ -198,6 +198,7 @@ fn iex_shell_mix_project_starts_and_evaluates() {
     fn project(suffix: &str) -> PathBuf {
         let project =
             std::env::temp_dir().join(format!("iex-shell-mix-{}-{suffix}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&project);
         std::fs::create_dir_all(project.join("lib")).unwrap();
         std::fs::write(
             project.join("mix.exs"),
@@ -230,4 +231,6 @@ fn iex_shell_mix_project_starts_and_evaluates() {
     assert_eq!(arinsal.status.code(), reference.status.code());
     assert_eq!(normalized(&arinsal.stdout), normalized(&reference.stdout));
     assert!(String::from_utf8_lossy(&arinsal.stdout).contains("mix_ok"));
+    std::fs::remove_dir_all(reference_project).unwrap();
+    std::fs::remove_dir_all(arinsal_project).unwrap();
 }

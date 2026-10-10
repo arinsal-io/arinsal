@@ -9,6 +9,8 @@ use arinsal_difftest::{CallOptions, CallResult, RefErl, pretty};
 use arinsal_etf::OwnedTerm;
 use arinsal_vm::Vm;
 
+mod common;
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../drv/tests/fixtures")
 }
@@ -41,6 +43,9 @@ fn compile_driver(dir: &Path, name: &str, defines: &[&str]) {
 
 #[test]
 fn smoke_driver_matches_erl() {
+    if !common::isolate_dyld_environment("smoke_driver_matches_erl") {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("arinsal-drv-smoke-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
