@@ -263,11 +263,22 @@ fn resume_pending_lambda_callers(
 }
 
 struct Prepared {
-    beam: BeamFile,
-    bytes: Vec<u8>,
+    /// Parsed file, cleared once `finish_loading` has copied it. The magic ref stays
+    /// reachable until the caller's next fullsweep; keeping every boot module's parse
+    /// tree there made that sweep pay to drop them all.
+    beam: Mutex<Option<BeamFile>>,
+    bytes: Mutex<Vec<u8>>,
     has_on_load: bool,
     /// Loaded code from `prepare_loading`; taken by the first `finish_loading`.
     module: Mutex<Option<arinsal_loader::Module>>,
+}
+
+impl Prepared {
+    /// Drop the loader state `finish_loading` has already copied into the staged module.
+    fn release(&self) {
+        *self.beam.lock().unwrap() = None;
+        *self.bytes.lock().unwrap() = Vec::new();
+    }
 }
 
 // boot_loop1: preserve the on_load decision made by OTP's loader attributes.
@@ -489,8 +500,8 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     crate::funs::set_module_uniq(&mut module, bytes).map_err(|_| badarg())?;
     let prepared = Prepared {
         has_on_load: has_on_load_opcode(&beam),
-        beam,
-        bytes: bytes.clone(),
+        beam: Mutex::new(Some(beam)),
+        bytes: Mutex::new(bytes.clone()),
         module: Mutex::new(Some(module)),
     };
     // The code server heap is often full when Mix loads the next test beam.
@@ -559,12 +570,19 @@ fn finish_stage(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Ter
         return Err(badarg());
     };
     let mut prepared_modules = Vec::with_capacity(codes.len());
-    for code in codes {
-        // SAFETY: Each list member is a rooted term in the process heap.
+    let mut prepared_refs = Vec::with_capacity(codes.len());
+    for code in &codes {
+        // SAFETY: Each list member is a rooted term in the process heap. The
+        // reference stays live until this function returns, so a successful stage
+        // can drop the loader state without a second magic-ref borrow.
         let prepared = unsafe { code.magic_ref() }
             .and_then(|reference| reference.downcast_ref::<Prepared>())
             .ok_or_else(badarg)?;
-        let beam = &prepared.beam;
+        let beam_slot = prepared.beam.lock().unwrap();
+        let Some(beam) = beam_slot.as_ref() else {
+            return Err(badarg());
+        };
+        let bytes = prepared.bytes.lock().unwrap();
         let staged = prepared.module.lock().unwrap().take();
         let module = match staged {
             Some(module) => module,
@@ -577,12 +595,15 @@ fn finish_stage(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Ter
                     Ok(module) => module,
                     Err(_) => return make_tuple(process, &[atom("error"), atom("badfile")]),
                 };
-                crate::funs::set_module_uniq(&mut module, &prepared.bytes).map_err(|_| badarg())?;
+                crate::funs::set_module_uniq(&mut module, &bytes).map_err(|_| badarg())?;
                 module
             }
         };
         let registers = crate::process::register_requirements(beam);
-        let meta = CodeMeta::from_beam(beam, Some(&prepared.bytes));
+        let meta = CodeMeta::from_beam(beam, Some(&bytes));
+        drop(bytes);
+        drop(beam_slot);
+        prepared_refs.push(prepared);
         prepared_modules.push((module, registers, meta));
     }
     if prepared_modules.len() > 1
@@ -598,6 +619,9 @@ fn finish_stage(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Ter
         // a code barrier, so processes that were already runnable keep running the previous
         // code; commit_code_ix then commits and resumes the loader, which returns the result.
         Ok(staged) => {
+            for prepared in prepared_refs {
+                prepared.release();
+            }
             process.cold_mut().finish_loading_commit = Some(staged);
             Err(VmError::Yield)
         }

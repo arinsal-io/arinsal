@@ -176,6 +176,10 @@ struct ScopeExports {
     // Keyed by importing module, import index and the imported MFA: a reloaded module whose
     // import table differs must not reuse another function's slot.
     imports: HashMap<(String, u32, Mfa), Arc<DispatchTarget>>,
+    // Import slots that call an MFA, so publishing that export rewrites those slots only.
+    // erts keeps one `Export` per MFA and callers load its address; the per-site slot still
+    // has to be updated, but not every slot in the node.
+    importers: HashMap<Mfa, Vec<Arc<DispatchTarget>>, ExportHasher>,
     target_indices: HashMap<Mfa, usize, ExportHasher>,
     native_targets: HashMap<Mfa, usize, ExportHasher>,
     // Exports with a global call breakpoint: their callers go through the export
@@ -336,9 +340,10 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
         let key = (module.name.clone(), index as u32, mfa);
         let exports = registry.scopes.entry(scope).or_default();
         // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1:
-        // an export starts at the trampoline; the loader publishes its resolved
-        // address only in the staging code index before that index becomes active.
-        let address = trampoline;
+        // a new slot starts at the address the export has now (the trampoline until that
+        // MFA is published). A later publish of the MFA rewrites the slot through `importers`.
+        let address = import_slot_address(exports, &mfa, trampoline);
+        let is_new = !exports.imports.contains_key(&key);
         let entry = Arc::clone(exports.imports.entry(key).or_insert_with(|| {
             // A module can be compiled before the VM classified its imports.
             let (class, bits) = if import.class() == arinsal_loader::ImportClass::Fresh {
@@ -382,6 +387,13 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 light_process_bif: None,
             })
         }));
+        if is_new {
+            exports
+                .importers
+                .entry(mfa)
+                .or_default()
+                .push(Arc::clone(&entry));
+        }
         let identity = Arc::as_ptr(&entry.slot) as usize;
         registry.intern_identity(identity, &entry);
         identities.push(identity);
@@ -427,7 +439,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
 
 fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, usize)]) {
     staged(scope, |exports| {
-        publish_module_exports(exports, module, native);
+        publish_module_exports(exports, module, native)
     });
 }
 
@@ -435,25 +447,42 @@ fn publish_module_exports(
     exports: &mut ScopeExports,
     module: &arinsal_loader::Module,
     native: &[(Mfa, usize)],
-) {
+) -> Vec<Mfa> {
     let name = module.name_atom;
+    let mut affected = Vec::new();
     exports
         .target_indices
-        .retain(|(module, _, _), _| *module != name);
+        .retain(|(module, function, arity), _| {
+            if *module == name {
+                affected.push((*module, *function, *arity));
+                false
+            } else {
+                true
+            }
+        });
     exports
         .native_targets
-        .retain(|(module, _, _), _| *module != name);
+        .retain(|(module, function, arity), _| {
+            if *module == name {
+                affected.push((*module, *function, *arity));
+                false
+            } else {
+                true
+            }
+        });
     for export in &module.exports {
         let Ok(function) = global_atoms().intern(&export.function) else {
             continue;
         };
-        exports
-            .target_indices
-            .insert((name, function, export.arity), export.target());
+        let mfa = (name, function, export.arity);
+        exports.target_indices.insert(mfa, export.target());
+        affected.push(mfa);
     }
     for (mfa, address) in native {
         exports.native_targets.insert(*mfa, *address);
+        affected.push(*mfa);
     }
+    affected
 }
 
 /// Copies every export's active address of `scope` into the staging code index when the
@@ -475,15 +504,15 @@ pub(crate) fn stage_dispatch(scope: u64) {
 /// Applies `change` to the exports of `scope` in the staging code index. Outside a load's
 /// staging area the change is staged and committed on its own, like the code changes erts
 /// makes under the code modification permission (delete_module, trace patterns).
-fn staged(scope: u64, change: impl FnOnce(&mut ScopeExports)) {
+fn staged(scope: u64, change: impl FnOnce(&mut ScopeExports) -> Vec<Mfa>) {
     let code_ix = crate::code_ix::for_scope(scope);
     let staging = code_ix.start_staging();
     let Ok(mut registry) = dispatch_registry().write() else {
         return;
     };
     let exports = registry.scopes.entry(scope).or_default();
-    change(exports);
-    refresh_import_slots(exports, staging.ix());
+    let affected = change(exports);
+    refresh_import_slots(exports, staging.ix(), &affected);
     drop(registry);
     drop(staging);
 }
@@ -500,12 +529,28 @@ pub(crate) fn unpublish_module_exports(scope: u64, name: &str) {
         return;
     };
     staged(scope, |exports| {
+        let mut affected = Vec::new();
         exports
             .target_indices
-            .retain(|(module, _, _), _| *module != name);
+            .retain(|(module, function, arity), _| {
+                if *module == name {
+                    affected.push((*module, *function, *arity));
+                    false
+                } else {
+                    true
+                }
+            });
         exports
             .native_targets
-            .retain(|(module, _, _), _| *module != name);
+            .retain(|(module, function, arity), _| {
+                if *module == name {
+                    affected.push((*module, *function, *arity));
+                    false
+                } else {
+                    true
+                }
+            });
+        affected
     });
 }
 
@@ -522,11 +567,14 @@ fn unpublish_module(scope: u64, native: &[(Mfa, usize)]) {
         return;
     }
     staged(scope, |exports| {
+        let mut affected = Vec::new();
         for (mfa, address) in native {
             if exports.native_targets.get(mfa) == Some(address) {
                 exports.native_targets.remove(mfa);
+                affected.push(*mfa);
             }
         }
+        affected
     });
 }
 
@@ -549,14 +597,21 @@ fn import_slot_address(exports: &ScopeExports, mfa: &Mfa, trampoline: usize) -> 
         .unwrap_or(trampoline)
 }
 
-/// Writes every import slot's address in code index `ix` from the export tables.
-fn refresh_import_slots(exports: &ScopeExports, ix: usize) {
+/// Writes the address of import slots that call an MFA in `affected` into code index `ix`.
+///
+/// `stage_dispatch` has already copied every slot from the active index, so an export
+/// whose address did not change keeps that copy. erts updates the one `Export` callers
+/// share (`export.c`); each call site here has its own slot, and only those sites change.
+fn refresh_import_slots(exports: &ScopeExports, ix: usize, affected: &[Mfa]) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
-    for entry in exports.imports.values() {
-        let mfa = (entry.module_atom, entry.function_atom, entry.arity);
-        entry
-            .slot
-            .set_address(ix, import_slot_address(exports, &mfa, trampoline));
+    for mfa in affected {
+        let Some(slots) = exports.importers.get(mfa) else {
+            continue;
+        };
+        let address = import_slot_address(exports, mfa, trampoline);
+        for slot in slots {
+            slot.slot.set_address(ix, address);
+        }
     }
 }
 
@@ -613,6 +668,7 @@ pub(crate) fn set_global_breakpoint(
             exports.global_breakpoints.remove(&mfa);
         }
         set_target(exports);
+        vec![mfa]
     });
 }
 
