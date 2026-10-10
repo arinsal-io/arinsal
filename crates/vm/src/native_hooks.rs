@@ -530,6 +530,14 @@ pub unsafe extern "C" fn arinsal_beamasm_guard(
             Ok(node) => raw(node),
             Err(_) => fail(process, "node", &[a], BifError::BADARG),
         },
+        // OTP calls `erl_is_function` when the arity operand is not a small immediate.
+        43 => {
+            let requested = b.as_small().filter(|arity| (0..=255).contains(arity));
+            let actual = (a.classify() == TermKind::Fun)
+                .then(|| a.header().map(|header| ((header >> 8) & 255) as i64))
+                .flatten();
+            u64::from(requested.is_some() && requested == actual)
+        }
         40..=42 => {
             set_error(process, "badarg");
             0
