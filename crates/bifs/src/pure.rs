@@ -316,11 +316,17 @@ pub(super) fn integer(ctx: &mut Ctx<'_>, value: usize) -> Result<Term, BifError>
         .map_err(|_| BifError::SystemLimit)
 }
 
-pub(super) fn tuple(term: Term) -> Result<Vec<Term>, BifError> {
-    if !matches!(term.classify(), TermKind::Tuple | TermKind::Record) {
-        return Err(BADARG);
-    }
-    arinsal_term::term_sequence(term).ok_or(BADARG)
+fn tuple_view(term: &Term) -> Result<arinsal_term::TupleRef<'_>, BifError> {
+    // SAFETY: BIF arguments remain rooted in the live process heap for this call.
+    unsafe { term.tuple_ref() }.ok_or(BADARG)
+}
+
+pub(super) fn tuple_arity(term: Term) -> Result<usize, BifError> {
+    Ok(tuple_view(&term)?.len())
+}
+
+pub(super) fn tuple_element(term: Term, index: usize) -> Result<Term, BifError> {
+    tuple_view(&term)?.element(index).ok_or(BADARG)
 }
 
 pub(super) fn list(term: Term) -> Result<Vec<Term>, BifError> {
@@ -400,22 +406,39 @@ fn element(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if index < 1 {
         return Err(BADARG);
     }
-    tuple(args[1])?
-        .get(index as usize - 1)
-        .copied()
+    // Port of erts/emulator/beam/bif.c:2944-2963 (element_2), OTP-29.1.1.
+    tuple_view(&args[1])?
+        .element(index as usize - 1)
         .ok_or(BADARG)
 }
 fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1.
     let index = args[0].as_small().ok_or(BADARG)?;
-    let mut values = tuple(args[1])?;
-    if index < 1 || index as usize > values.len() {
+    if index < 1 {
         return Err(BADARG);
     }
-    values[index as usize - 1] = args[2];
-    Ok(tuple_build(ctx, &values))
+    let source = tuple_view(&args[1])?;
+    let arity = source.len();
+    if index as usize > arity {
+        return Err(BADARG);
+    }
+    let replacement = args[2];
+    TermBuilder::new(&mut Heap(ctx.heap))
+        .tuple_from_fn(arity, |slot, _| {
+            if slot + 1 == index as usize {
+                replacement
+            } else {
+                source
+                    .element(slot)
+                    .expect("tuple arity was read from source")
+            }
+        })
+        .map_err(|_| BifError::SystemLimit)
 }
 fn tuple_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    integer(ctx, tuple(args[0])?.len())
+    // Port of erts/emulator/beam/bif.c:2963-2973 (tuple_size_1), OTP-29.1.1.
+    let arity = tuple_view(&args[0])?.len();
+    integer(ctx, arity)
 }
 fn size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     match args[0].classify() {
@@ -572,7 +595,9 @@ fn time_unit(_: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
 }
 
 fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(make_list(ctx, tuple(args[0])?, Term::NIL))
+    // Port of erts/emulator/beam/bif.c:3762-3777 (tuple_to_list_1), OTP-29.1.1.
+    let values = tuple_view(&args[0])?;
+    Ok(make_list(ctx, values.iter(), Term::NIL))
 }
 fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3789 (list_to_tuple_1), OTP-29.1.1.
@@ -589,43 +614,86 @@ fn make_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let mut values = vec![args[1]; n as usize];
     if args.len() == 3 {
         for entry in list(args[2])? {
-            let pair = tuple(entry)?;
-            if pair.len() != 2 {
+            if tuple_arity(entry)? != 2 {
                 return Err(BADARG);
             }
-            let index = pair[0].as_small().ok_or(BADARG)?;
+            let index = tuple_element(entry, 0)?.as_small().ok_or(BADARG)?;
             if index < 1 || index > n {
                 return Err(BADARG);
             }
-            values[index as usize - 1] = pair[1];
+            values[index as usize - 1] = tuple_element(entry, 1)?;
         }
     }
     Ok(tuple_build(ctx, &values))
 }
 fn append_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3083 (append_element_2), OTP-29.1.1.
-    let mut values = tuple(args[0])?;
-    check_tuple_arity(values.len() + 1)?;
-    values.push(args[1]);
-    Ok(tuple_build(ctx, &values))
+    let source = tuple_view(&args[0])?;
+    let arity = source.len();
+    check_tuple_arity(arity + 1)?;
+    let appended = args[1];
+    TermBuilder::new(&mut Heap(ctx.heap))
+        .tuple_from_fn(arity + 1, |slot, _| {
+            if slot == arity {
+                appended
+            } else {
+                source
+                    .element(slot)
+                    .expect("tuple arity was read from source")
+            }
+        })
+        .map_err(|_| BifError::SystemLimit)
 }
 fn delete_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c:3144-3178 (delete_element_2), OTP-29.1.1.
     let index = args[0].as_small().ok_or(BADARG)?;
-    let mut values = tuple(args[1])?;
-    if index < 1 || index as usize > values.len() {
+    if index < 1 {
         return Err(BADARG);
     }
-    values.remove(index as usize - 1);
-    Ok(tuple_build(ctx, &values))
+    let source = tuple_view(&args[1])?;
+    let arity = source.len();
+    if index as usize > arity {
+        return Err(BADARG);
+    }
+    TermBuilder::new(&mut Heap(ctx.heap))
+        .tuple_from_fn(arity - 1, |slot, _| {
+            source
+                .element(if slot + 1 < index as usize {
+                    slot
+                } else {
+                    slot + 1
+                })
+                .expect("tuple index was validated")
+        })
+        .map_err(|_| BifError::SystemLimit)
 }
 fn insert_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/bif.c:3110-3141 (insert_element_3), OTP-29.1.1.
     let index = args[0].as_small().ok_or(BADARG)?;
-    let mut values = tuple(args[1])?;
-    if index < 1 || index as usize > values.len() + 1 {
+    if index < 1 {
         return Err(BADARG);
     }
-    values.insert(index as usize - 1, args[2]);
-    Ok(tuple_build(ctx, &values))
+    let source = tuple_view(&args[1])?;
+    let arity = source.len();
+    if index as usize > arity + 1 {
+        return Err(BADARG);
+    }
+    let inserted = args[2];
+    TermBuilder::new(&mut Heap(ctx.heap))
+        .tuple_from_fn(arity + 1, |slot, _| {
+            if slot + 1 == index as usize {
+                inserted
+            } else {
+                source
+                    .element(if slot + 1 < index as usize {
+                        slot
+                    } else {
+                        slot - 1
+                    })
+                    .expect("tuple index was validated")
+            }
+        })
+        .map_err(|_| BifError::SystemLimit)
 }
 
 #[cfg(test)]
@@ -710,8 +778,10 @@ fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
     // SAFETY: The source heap remains live throughout this call.
     while let Some((value, tail)) = unsafe { rest.cons_ref() } {
         rest = tail;
-        // SAFETY: The source heap remains live throughout this call.
-        let Some(element) = unsafe { value.tuple_ref() }.and_then(|items| items.get(slot)) else {
+        let Some(element) = tuple_view(&value)
+            .ok()
+            .and_then(|items| items.element(slot))
+        else {
             continue;
         };
         let found = if element == key {
@@ -888,15 +958,15 @@ fn float_opts(args: &[Term]) -> Result<arinsal_float::FloatFormatOpts, BifError>
                 _ => return Err(BADARG),
             }
         } else {
-            let pair = tuple(entry)?;
-            if pair.len() != 2 {
+            if tuple_arity(entry)? != 2 {
                 return Err(BADARG);
             }
-            let count = pair[1]
+            let option = tuple_element(entry, 1)?;
+            let count = option
                 .as_small()
                 .and_then(|n| u16::try_from(n).ok())
                 .ok_or(BADARG)?;
-            opts.notation = match atom_name(pair[0]) {
+            opts.notation = match atom_name(tuple_element(entry, 0)?) {
                 Some("decimals") => arinsal_float::FloatNotation::Decimals(count),
                 Some("scientific") => arinsal_float::FloatNotation::Scientific(count),
                 _ => return Err(BADARG),
@@ -1398,13 +1468,12 @@ fn range(bytes: &[u8], start: i64, length: i64) -> Result<&[u8], BifError> {
 fn binary_part(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let bytes = binary_bytes(args[0])?;
     let (start, len) = if args.len() == 2 {
-        let pair = tuple(args[1])?;
-        if pair.len() != 2 {
+        if tuple_arity(args[1])? != 2 {
             return Err(BADARG);
         }
         (
-            pair[0].as_small().ok_or(BADARG)?,
-            pair[1].as_small().ok_or(BADARG)?,
+            tuple_element(args[1], 0)?.as_small().ok_or(BADARG)?,
+            tuple_element(args[1], 1)?.as_small().ok_or(BADARG)?,
         )
     } else {
         (
@@ -1538,15 +1607,15 @@ fn longest_common_suffix(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
     integer(ctx, length)
 }
 fn patterns(term: Term) -> Result<Vec<Vec<u8>>, BifError> {
-    let source = if let Ok(compiled) = tuple(term) {
-        if compiled.len() != 2 {
+    let source = if let Ok(arity) = tuple_arity(term) {
+        if arity != 2 {
             return Err(BADARG);
         }
-        let tag = atom_name(compiled[0]).ok_or(BADARG)?;
+        let tag = atom_name(tuple_element(term, 0)?).ok_or(BADARG)?;
         if tag != "bm" && tag != "ac" {
             return Err(BADARG);
         }
-        compiled[1]
+        tuple_element(term, 1)?
     } else {
         term
     };
@@ -1586,16 +1655,15 @@ fn match_scope(len: usize, options: Term) -> Result<(usize, usize), BifError> {
     Ok(scope)
 }
 fn scope_option(len: usize, option: Term) -> Result<(usize, usize), BifError> {
-    let pair = tuple(option)?;
-    if pair.len() != 2 || atom_name(pair[0]) != Some("scope") {
+    if tuple_arity(option)? != 2 || atom_name(tuple_element(option, 0)?) != Some("scope") {
         return Err(BADARG);
     }
-    let range = tuple(pair[1])?;
-    if range.len() != 2 {
+    let range = tuple_element(option, 1)?;
+    if tuple_arity(range)? != 2 {
         return Err(BADARG);
     }
-    let start = range[0].as_small().ok_or(BADARG)?;
-    let length = range[1].as_small().ok_or(BADARG)?;
+    let start = tuple_element(range, 0)?.as_small().ok_or(BADARG)?;
+    let length = tuple_element(range, 1)?.as_small().ok_or(BADARG)?;
     let end = start.checked_add(length).ok_or(BADARG)?;
     let (lo, hi) = if length < 0 {
         (end, start)
@@ -1888,13 +1956,14 @@ fn is_record(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     } else {
         None
     };
-    let Ok(values) = tuple(args[0]) else {
+    let Ok(tuple_size) = tuple_arity(args[0]) else {
         return Ok(bool_term(false));
     };
+    if tuple_size == 0 || tuple_element(args[0], 0)? != args[1] {
+        return Ok(bool_term(false));
+    }
     Ok(bool_term(
-        !values.is_empty()
-            && values[0] == args[1]
-            && arity.is_none_or(|n| n == Some(values.len() as i64)),
+        arity.is_none_or(|n| n == Some(tuple_size as i64)),
     ))
 }
 fn cmp_term(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
