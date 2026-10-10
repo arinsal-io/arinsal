@@ -38,18 +38,40 @@ pub enum SpecificOperand {
     Allocations(Vec<(u8, u64)>),
     /// Operand forms without a specific BeamAsm representation yet.
     Other,
+    /// A register operand with the compiler's `Type` chunk entry (`{tr, Reg, Type}`); only
+    /// produced by the typed transform, for operations that use operand types.
+    Typed {
+        /// The register operand.
+        reg: Box<SpecificOperand>,
+        /// Index into the module's `Type` chunk.
+        type_index: u32,
+    },
 }
+
+/// Operations whose operands keep their `Type` chunk entry in the typed transform.
+// Port of erts/emulator/beam/jit/arm/instr_arith.cpp (getTypeEntry users), OTP-29.1.1.
+const TYPED_OPS: &[&str] = &[
+    "i_plus",
+    "i_minus",
+    "i_band",
+    "i_bor",
+    "i_bxor",
+    "i_bsl",
+    "i_bsr",
+    "i_rem",
+    "i_int_div",
+];
 
 include!(concat!(env!("OUT_DIR"), "/specific_ops.rs"));
 
 /// Rewrites one function's generic instruction slice into specific operations.
 pub fn transform_function(instructions: &[Instr]) -> Vec<SpecificOp> {
-    transform_with_options(instructions, None, false)
+    transform_with_options(instructions, None, false, false)
 }
 
 /// Rewrites one function with module metadata needed by OTP predicates.
 pub fn transform_function_in_module(instructions: &[Instr], beam: &BeamFile) -> Vec<SpecificOp> {
-    transform_with_options(instructions, Some(beam), false)
+    transform_with_options(instructions, Some(beam), false, false)
 }
 
 /// Splits a module at `func_info` boundaries and rewrites each function.
@@ -63,11 +85,29 @@ pub fn transform_module_with_line_breakpoints(
     beam: &BeamFile,
     instrument_line_breakpoints: bool,
 ) -> Vec<Vec<SpecificOp>> {
-    let transformed = transform_with_options(
+    split_functions(transform_with_options(
         &beam.code.instructions,
         Some(beam),
         instrument_line_breakpoints,
-    );
+        false,
+    ))
+}
+
+/// Like [`transform_module_with_line_breakpoints`], but arithmetic operations keep the
+/// `Type` chunk entry of their register operands as [`SpecificOperand::Typed`].
+pub fn transform_module_typed(
+    beam: &BeamFile,
+    instrument_line_breakpoints: bool,
+) -> Vec<Vec<SpecificOp>> {
+    split_functions(transform_with_options(
+        &beam.code.instructions,
+        Some(beam),
+        instrument_line_breakpoints,
+        true,
+    ))
+}
+
+fn split_functions(transformed: Vec<SpecificOp>) -> Vec<Vec<SpecificOp>> {
     let mut functions = Vec::new();
     let mut current = Vec::new();
     for op in transformed {
@@ -86,6 +126,7 @@ fn transform_with_options(
     instructions: &[Instr],
     beam: Option<&BeamFile>,
     instrument_line_breakpoints: bool,
+    typed: bool,
 ) -> Vec<SpecificOp> {
     let rules = rules();
     let raw = instructions
@@ -175,9 +216,14 @@ fn transform_with_options(
             if instruction.name == "has_map_fields" {
                 map_fields_to_elements(instruction)
             } else {
+                let convert = if typed && TYPED_OPS.contains(&instruction.name.as_str()) {
+                    typed_operand
+                } else {
+                    operand
+                };
                 make_op(
                     &instruction.name,
-                    instruction.args.iter().map(operand).collect(),
+                    instruction.args.iter().map(convert).collect(),
                 )
             }
         })
@@ -1672,6 +1718,16 @@ fn allocation_as_words(value: &Operand) -> Operand {
         })
     });
     Operand::U(words)
+}
+
+fn typed_operand(value: &Operand) -> SpecificOperand {
+    match value {
+        Operand::TypedReg { reg, type_index } if *type_index != 0 => SpecificOperand::Typed {
+            reg: Box::new(operand(reg)),
+            type_index: *type_index,
+        },
+        other => operand(other),
+    }
 }
 
 fn operand(value: &Operand) -> SpecificOperand {

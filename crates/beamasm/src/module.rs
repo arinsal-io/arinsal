@@ -139,6 +139,8 @@ pub struct BeamModuleAssembler {
     pub(super) code: CodeBuffer,
     /// Failure label of the arithmetic instruction being emitted (0: raise the error).
     pub(super) arith_fail: u32,
+    /// Compiler types of the next arithmetic instruction's operands, consumed by its emitter.
+    pub(super) arith_types: Option<[crate::types::ArgType; 2]>,
     labels: HashMap<u32, Label>,
     defined: HashMap<u32, ()>,
     lambda_labels: HashMap<u32, Label>,
@@ -151,6 +153,10 @@ pub struct BeamModuleAssembler {
     catch_patches: Vec<(usize, Label)>,
     /// Shared out-of-line `function_clause` raiser, bound in `finalize` when any function uses it.
     func_clause_stub: Option<Label>,
+    /// Shared arithmetic slow-path fragments keyed by hook address and operation code.
+    arith_fragments: Vec<((usize, u32), Label)>,
+    /// Out-of-line `i_test_yield` continuations (stub, continuation, live X registers).
+    yield_stubs: Vec<(Label, Label, u8)>,
     line_table: Vec<ModuleLine>,
     trace_breakpoints: HashMap<u32, (usize, Label)>,
     /// Line, live count and word offset recorded by `i_debug_line` until its trampoline.
@@ -212,8 +218,11 @@ impl BeamModuleAssembler {
             error_label,
             catch_patches: Vec::new(),
             func_clause_stub: None,
+            arith_fragments: Vec::new(),
+            yield_stubs: Vec::new(),
             line_table: Vec::new(),
             arith_fail: 0,
+            arith_types: None,
             trace_breakpoints: HashMap::new(),
             pending_debug_line: None,
             line_breakpoints: Vec::new(),
@@ -770,16 +779,31 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    /// Emits the out-of-line yield sequences of the function just ended, so that the
+    /// `i_test_yield` branches stay within conditional-branch range.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp (emit_i_flush_stubs), OTP-29.1.1.
+    pub fn flush_yield_stubs(&mut self) -> Result<(), ModuleError> {
+        for (stub, continuation, live) in std::mem::take(&mut self.yield_stubs) {
+            self.code.bind(stub)?;
+            self.code.adr(Gpr::x(8), continuation)?;
+            self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
+            self.emit_yield_live(live)?;
+            self.code.b(self.yield_label)?;
+        }
+        Ok(())
+    }
+
     /// Checks reductions and saves the native continuation before yielding.
     pub fn test_yield(&mut self) -> Result<(), ModuleError> {
+        // The yield sequence is out of line so the fall-through path has no taken branch,
+        // like erts' `b.le` to the shared context-switch fragment.
         let continuation = self.code.new_label();
+        let stub = self.code.new_label();
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
-        self.code.b_cond(Cond::Gt, continuation)?;
-        self.code.adr(Gpr::x(8), continuation)?;
-        self.code.emit(|e| e.str_uoff(Gpr::x(8), C_P, 72))?;
-        self.emit_yield_live(self.function_arity)?;
-        self.code.b(self.yield_label)?;
+        self.code.b_cond(Cond::Le, stub)?;
         self.code.bind(continuation)?;
+        self.yield_stubs
+            .push((stub, continuation, self.function_arity));
         Ok(())
     }
 
@@ -1135,6 +1159,40 @@ impl BeamModuleAssembler {
         self.arith_fail = fail;
     }
 
+    /// Supplies the compiler types of the next arithmetic instruction's source operands
+    /// (left, right); the next arithmetic emitter consumes them.
+    // Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry), OTP-29.1.1.
+    pub fn set_arith_types(&mut self, lhs: crate::types::ArgType, rhs: crate::types::ArgType) {
+        self.arith_types = Some([lhs, rhs]);
+    }
+
+    /// The label of the shared slow-path fragment calling `helper` with operation `op`
+    /// (ARG2 = left, ARG3 = right, result in ARG1, pending exception flag in x9), created on
+    /// first use and emitted by `finalize`.
+    // Port of erts/emulator/beam/jit/arm/instr_arith.cpp:114-143 (emit_plus_body_shared and
+    // the other *_body_shared fragments), OTP-29.1.1
+    pub(super) fn arith_fragment(&mut self, helper: usize, op: u32) -> Label {
+        if let Some((_, label)) = self
+            .arith_fragments
+            .iter()
+            .find(|(key, _)| *key == (helper, op))
+        {
+            return *label;
+        }
+        let label = self.code.new_label();
+        self.arith_fragments.push(((helper, op), label));
+        label
+    }
+
+    /// `init_destination`: the cached register of an X destination, otherwise `scratch`.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1479-1491, OTP-29.1.1.
+    pub(super) fn init_destination(&self, dst: ArgVal, scratch: Gpr) -> Gpr {
+        match dst {
+            ArgVal::X(i) if i < 6 => XREGS[i as usize],
+            _ => scratch,
+        }
+    }
+
     /// Branches to the shared error exit when `reg` is nonzero, recording this pc for the
     /// stacktrace.
     pub(super) fn error_if_nonzero(&mut self, reg: Gpr) -> Result<(), ModuleError> {
@@ -1425,6 +1483,30 @@ impl BeamModuleAssembler {
             })?;
             // x30 still holds the function entry from the `bl` in `emit_i_func_info`.
             self.code.b(self.error_label)?;
+        }
+        self.flush_yield_stubs()?;
+        let fragments = std::mem::take(&mut self.arith_fragments);
+        for ((helper, op), label) in fragments {
+            self.code.bind(label)?;
+            let update = crate::Update::HEAP_ALLOC.union(crate::Update::REDUCTIONS);
+            self.code
+                .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
+            crate::emit_enter_runtime(&mut self.code, 6, update)?;
+            self.code.emit(|e| {
+                e.mov_reg(Gpr::x(0), C_P)?;
+                e.mov_const(Gpr::x(1), u64::from(op))?;
+                e.mov_reg(Gpr::x(2), Gpr::x(14))?;
+                e.mov_reg(Gpr::x(3), Gpr::x(17))?;
+                e.mov_const(Gpr::x(17), helper as u64)?;
+                e.str_uoff(Gpr::x(30), C_P, 72)?;
+                e.blr(Gpr::x(17))
+            })?;
+            crate::emit_leave_runtime(&mut self.code, 6, update)?;
+            self.code.emit(|e| {
+                e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+                e.ldr_uoff(Gpr::x(9), C_P, 40)?;
+                e.ret(Gpr::x(30))
+            })?;
         }
         let entry_label = self.yield_label;
         self.code.bind(entry_label)?;
