@@ -323,6 +323,57 @@ impl Default for Tuple3Chain {
     }
 }
 
+/// Build a list in input order inside one pre-reserved heap block.
+pub struct ConsHeapBuilder<'a, H: HeapAlloc + ?Sized> {
+    reservation: HeapReservation<'a, H>,
+    head: Term,
+    last: Option<*mut u64>,
+}
+impl<'a, H: HeapAlloc + ?Sized> ConsHeapBuilder<'a, H> {
+    /// Reserve space for at most `max_cells` cons cells.
+    pub fn new(heap: &'a mut H, max_cells: usize) -> Result<Self, TermError> {
+        let words = max_cells.checked_mul(2).ok_or(TermError::SystemLimit)?;
+        Ok(Self {
+            reservation: HeapReservation::new(heap, words)?,
+            head: Term::NIL,
+            last: None,
+        })
+    }
+
+    /// Append a cell after the previous cell in input order.
+    pub fn push(&mut self, head: Term) -> Result<(), TermError> {
+        let cell = TermBuilder::new(&mut self.reservation).words(2)?;
+        let term = Term::from_ptr(cell, 1);
+        match self.last {
+            Some(last) => store(last.wrapping_add(1), term.bits()),
+            None => self.head = term,
+        }
+        self.last = Some(cell);
+        // Port of the `CAR(hp) = value` store in `erl_bif_lists.c:750-756` and
+        // `:896-899`; the open CDR is written by the next push or `finish`.
+        store(cell, head.bits());
+        Ok(())
+    }
+
+    /// Close the list with `tail` and release unused reserved heap words.
+    pub fn finish(mut self, tail: Term) -> Term {
+        match self.last.take() {
+            Some(last) => {
+                store(last.wrapping_add(1), tail.bits());
+                self.head
+            }
+            None => tail,
+        }
+    }
+}
+impl<H: HeapAlloc + ?Sized> Drop for ConsHeapBuilder<'_, H> {
+    fn drop(&mut self) {
+        if let Some(last) = self.last.take() {
+            store(last.wrapping_add(1), Term::NIL.bits());
+        }
+    }
+}
+
 /// A block taken from a heap in one `HAlloc` whose unused tail is handed back on drop.
 ///
 /// Port of the `HAlloc(worst case)` / `HRelease(hp_end, hp)` idiom used by BIFs such as
