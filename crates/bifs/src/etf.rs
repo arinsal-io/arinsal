@@ -38,8 +38,8 @@ struct EncodeOpts {
     local: bool,
 }
 
-fn atom_name(term: Term) -> Option<String> {
-    global_atoms().text(term.as_atom()?).map(|s| s.to_string())
+fn atom_text(term: Term) -> Option<&'static str> {
+    global_atoms().text(term.as_atom()?)
 }
 
 fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
@@ -54,7 +54,7 @@ fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
         // SAFETY: BIF arguments remain on stable live heaps throughout this call.
         let (head, next) = unsafe { tail.cons_ref() }.ok_or(BifError::BADARG)?;
         tail = next;
-        match atom_name(head).as_deref() {
+        match atom_text(head) {
             Some("compressed") => opts.compressed = Some(6),
             Some("deterministic") => opts.deterministic = true,
             // Port of erts/emulator/beam/external.c:3305 (LOCAL_EXT), OTP-29.1.1.
@@ -65,9 +65,9 @@ fn options(term: Option<Term>) -> Result<EncodeOpts, BifError> {
                 if tuple.len() != 2 {
                     return Err(BifError::BADARG);
                 }
-                let name = atom_name(tuple.get(0).unwrap()).ok_or(BifError::BADARG)?;
+                let name = atom_text(tuple.get(0).unwrap()).ok_or(BifError::BADARG)?;
                 let value = tuple.get(1).unwrap().as_small().ok_or(BifError::BADARG)?;
-                match (name.as_str(), value) {
+                match (name, value) {
                     ("compressed", 0..=9) => opts.compressed = Some(value as u8),
                     ("minor_version", 0..=2) => opts.minor = value as u8,
                     _ => return Err(BifError::BADARG),
@@ -129,28 +129,71 @@ fn int_bytes(out: &mut impl ByteOutput, n: &BigInt) {
     out.extend_from_slice(&digits);
 }
 
+// Port of erts/emulator/beam/external.c:2877 (enc_atom), OTP-29.1.1.
+// Atom text is copied from the atom table into the output. No intermediate name buffer.
 fn atom_bytes(out: &mut impl ByteOutput, name: &str, minor: u8) {
-    // Port of erts/emulator/beam/external.c (ATOM_EXT selection), OTP-29.1.1.
-    if minor <= 1 && name.chars().all(|c| (c as u32) <= 255) {
-        let latin: SmallVec<[u8; 32]> = name.chars().map(|c| c as u8).collect();
-        out.push(100);
-        out.extend_from_slice(&(latin.len() as u16).to_be_bytes());
-        out.extend_from_slice(&latin);
-    } else {
-        let bytes = name.as_bytes();
-        if bytes.len() <= 255 {
-            out.extend_from_slice(&[119, bytes.len() as u8]);
-        } else {
-            out.push(118);
-            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-        }
-        out.extend_from_slice(bytes);
+    if minor <= 1 && write_latin1_atom(out, name) {
+        return;
     }
+    let bytes = name.as_bytes();
+    if bytes.len() <= 255 {
+        out.push(119);
+        out.push(bytes.len() as u8);
+    } else {
+        out.push(118);
+        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    }
+    out.extend_from_slice(bytes);
+}
+
+fn write_latin1_atom(out: &mut impl ByteOutput, name: &str) -> bool {
+    if name.chars().any(|c| (c as u32) > 255) {
+        return false;
+    }
+    let len = name.chars().count();
+    out.push(100);
+    out.extend_from_slice(&(len as u16).to_be_bytes());
+    if name.is_ascii() {
+        out.extend_from_slice(name.as_bytes());
+    } else {
+        for c in name.chars() {
+            out.push(c as u8);
+        }
+    }
+    true
 }
 
 fn atom_term(out: &mut impl ByteOutput, term: Term, minor: u8) -> Result<(), BifError> {
-    atom_bytes(out, &atom_name(term).ok_or(BifError::BADARG)?, minor);
+    atom_bytes(out, atom_text(term).ok_or(BifError::BADARG)?, minor);
     Ok(())
+}
+
+// Port of erts/emulator/beam/external.c:3542 (SMALL_DEF), OTP-29.1.1.
+fn write_small(out: &mut impl ByteOutput, n: i64) {
+    if (0..256).contains(&n) {
+        out.push(97);
+        out.push(n as u8);
+    } else if let Ok(word) = i32::try_from(n) {
+        out.push(98);
+        out.extend_from_slice(&word.to_be_bytes());
+    } else {
+        int_bytes(out, &BigInt::from(n));
+    }
+}
+
+// Port of erts/emulator/beam/external.c:4253 (is_external_string), OTP-29.1.1.
+fn external_string_len(mut term: Term) -> Result<Option<usize>, BifError> {
+    let mut len = 0usize;
+    while term.classify() == TermKind::List {
+        // SAFETY: the list cell remains live for the duration of this BIF.
+        let (head, tail) = unsafe { term.cons_ref() }.ok_or(BifError::BADARG)?;
+        if head.as_small().filter(|n| (0..=255).contains(n)).is_none() || len == 0xffff {
+            return Ok(None);
+        }
+        len += 1;
+        term = tail;
+    }
+    Ok((term == Term::NIL).then_some(len))
 }
 
 fn bit_bytes(term: Term) -> Result<(SmallVec<[u8; 64]>, usize), BifError> {
@@ -185,19 +228,12 @@ fn exact_key_cmp(left: Term, right: Term) -> Ordering {
 enum Work {
     Term(Term),
     PatchFun(usize),
-    ListGather {
-        cursor: Term,
-        heads: SmallVec<[Term; 8]>,
-        string_bytes: SmallVec<[u8; 32]>,
-        is_string: bool,
-    },
-    ListElements {
-        heads: SmallVec<[Term; 8]>,
-        next: usize,
-    },
-    StringCopy {
-        bytes: SmallVec<[u8; 32]>,
-        copied: usize,
+    /// One cons of a `LIST_EXT`, length patched when the tail is not a list.
+    /// Port of erts/emulator/beam/external.c:3328 (ENC_ONE_CONS), OTP-29.1.1.
+    OneCons {
+        list: Term,
+        len_at: usize,
+        len: u32,
     },
     BinaryCopy {
         term: Term,
@@ -364,79 +400,22 @@ impl EncodeWalk {
                     consumed += 1;
                     term
                 }
-                Work::ListGather {
-                    cursor,
-                    mut heads,
-                    mut string_bytes,
-                    mut is_string,
-                } => {
+                Work::OneCons { list, len_at, len } => {
                     consumed += 1;
-                    if cursor.classify() == TermKind::List {
-                        // SAFETY: source list cells remain live while this BIF is suspended.
-                        let (head, tail) = unsafe { cursor.cons_ref() }.ok_or(BifError::BADARG)?;
-                        if heads.len() >= u32::MAX as usize {
-                            return Err(BifError::SystemLimit);
-                        }
-                        if is_string {
-                            if let Some(byte) = head.as_small().filter(|n| (0..=255).contains(n)) {
-                                string_bytes.push(byte as u8);
-                            } else {
-                                is_string = false;
-                                string_bytes.clear();
-                            }
-                        }
-                        heads.push(head);
-                        work.push(Work::ListGather {
-                            cursor: tail,
-                            heads,
-                            string_bytes,
-                            is_string,
-                        });
-                    } else if cursor == Term::NIL && is_string && heads.len() <= u16::MAX as usize {
-                        out.push(107);
-                        out.extend_from_slice(&(heads.len() as u16).to_be_bytes());
-                        work.push(Work::StringCopy {
-                            bytes: string_bytes,
-                            copied: 0,
+                    // SAFETY: the source cons stays live while this BIF is suspended.
+                    let (head, tail) = unsafe { list.cons_ref() }.ok_or(BifError::BADARG)?;
+                    let count = len.checked_add(1).ok_or(BifError::SystemLimit)?;
+                    if tail.classify() == TermKind::List {
+                        work.push(Work::OneCons {
+                            list: tail,
+                            len_at,
+                            len: count,
                         });
                     } else {
-                        out.push(108);
-                        out.extend_from_slice(
-                            &u32::try_from(heads.len())
-                                .map_err(|_| BifError::SystemLimit)?
-                                .to_be_bytes(),
-                        );
-                        work.push(Work::Term(cursor));
-                        work.push(Work::ListElements { heads, next: 0 });
+                        out[len_at..len_at + 4].copy_from_slice(&count.to_be_bytes());
+                        work.push(Work::Term(tail));
                     }
-                    continue;
-                }
-                Work::ListElements { heads, next } => {
-                    consumed += 1;
-                    if next < heads.len() {
-                        let term = heads[next];
-                        work.push(Work::ListElements {
-                            heads,
-                            next: next + 1,
-                        });
-                        work.push(Work::Term(term));
-                    }
-                    continue;
-                }
-                Work::StringCopy { bytes, copied } => {
-                    let amount = bytes
-                        .len()
-                        .saturating_sub(copied)
-                        .min(budget.saturating_sub(consumed).max(1));
-                    out.extend_from_slice(&bytes[copied..copied + amount]);
-                    consumed += amount;
-                    if copied + amount < bytes.len() {
-                        work.push(Work::StringCopy {
-                            bytes,
-                            copied: copied + amount,
-                        });
-                    }
-                    continue;
+                    head
                 }
                 Work::BinaryCopy {
                     term,
@@ -501,7 +480,7 @@ impl EncodeWalk {
             match term.classify() {
                 TermKind::Number => {
                     if let Some(n) = term.as_small() {
-                        int_bytes(out, &BigInt::from(n));
+                        write_small(out, n);
                     } else if let Some(header) = term.header() {
                         if header & 63 == 0x18 {
                             // SAFETY: a live boxed FLOAT has one initialized data word.
@@ -534,12 +513,29 @@ impl EncodeWalk {
                 TermKind::Atom => atom_term(out, term, opts.minor)?,
                 TermKind::Nil => out.push(106),
                 TermKind::List => {
-                    work.push(Work::ListGather {
-                        cursor: term,
-                        heads: SmallVec::new(),
-                        string_bytes: SmallVec::new(),
-                        is_string: true,
-                    });
+                    // Port of erts/emulator/beam/external.c:3703 (LIST_DEF), OTP-29.1.1.
+                    if let Some(len) = external_string_len(term)? {
+                        out.push(107);
+                        out.extend_from_slice(&(len as u16).to_be_bytes());
+                        let mut cursor = term;
+                        for _ in 0..len {
+                            // SAFETY: external_string_len already walked these cons cells.
+                            let (head, tail) =
+                                unsafe { cursor.cons_ref() }.ok_or(BifError::BADARG)?;
+                            out.push(head.as_small().ok_or(BifError::BADARG)? as u8);
+                            cursor = tail;
+                        }
+                        consumed += len;
+                    } else {
+                        out.push(108);
+                        let len_at = out.len();
+                        out.extend_from_slice(&0u32.to_be_bytes());
+                        work.push(Work::OneCons {
+                            list: term,
+                            len_at,
+                            len: 0,
+                        });
+                    }
                 }
                 TermKind::Tuple => {
                     // SAFETY: tuple remains live and stable during encoding.
@@ -642,7 +638,7 @@ impl EncodeWalk {
                             out.push(113);
                             atom_term(out, Term::atom(entry.module), opts.minor)?;
                             atom_term(out, Term::atom(entry.function), opts.minor)?;
-                            int_bytes(out, &BigInt::from(entry.arity));
+                            write_small(out, i64::from(entry.arity));
                         }
                         FunRef::Local { entry, free_vars } => {
                             out.push(112);
@@ -653,8 +649,8 @@ impl EncodeWalk {
                             out.extend_from_slice(&entry.index.to_be_bytes());
                             out.extend_from_slice(&(free_vars.len() as u32).to_be_bytes());
                             atom_term(out, Term::atom(entry.module), opts.minor)?;
-                            int_bytes(out, &BigInt::from(entry.old_index));
-                            int_bytes(out, &BigInt::from(entry.old_uniq));
+                            write_small(out, i64::from(entry.old_index));
+                            write_small(out, i64::from(entry.old_uniq));
                             work.push(Work::PatchFun(at));
                             // SAFETY: the live source heap retains the fun entry and environment.
                             let view = unsafe { term.fun_ref() }.unwrap();
@@ -838,7 +834,7 @@ fn decode_options(term: Option<Term>) -> Result<DecodeOpts, BifError> {
         // SAFETY: the option list remains live and stable during the BIF.
         let (head, next) = unsafe { tail.cons_ref() }.ok_or(BifError::BADARG)?;
         tail = next;
-        match atom_name(head).as_deref() {
+        match atom_text(head) {
             Some("safe") => opts.safe = true,
             Some("used") => opts.used = true,
             _ => return Err(BifError::BADARG),
@@ -877,7 +873,7 @@ impl Reader {
         &mut self,
         safe: bool,
         ctx: &mut Option<&mut Ctx<'_>>,
-    ) -> Result<(Term, String), BifError> {
+    ) -> Result<(Term, Option<String>), BifError> {
         let tag = self.u8()?;
         let (len, utf8) = match tag {
             100 => (self.u16()? as usize, false),
@@ -887,30 +883,34 @@ impl Reader {
             _ => return Err(BifError::BADARG),
         };
         let raw = self.take(len)?;
-        let name = if utf8 {
-            std::str::from_utf8(raw)
-                .map_err(|_| BifError::BADARG)?
-                .to_owned()
+        // UTF-8 and ASCII latin1 are decoded from the input bytes. A String is
+        // built only for non-ASCII latin1, which is not valid UTF-8 as-is.
+        let owned;
+        let name = if utf8 || raw.is_ascii() {
+            std::str::from_utf8(raw).map_err(|_| BifError::BADARG)?
         } else {
-            raw.iter().map(|b| char::from(*b)).collect::<String>()
+            owned = raw.iter().map(|b| char::from(*b)).collect::<String>();
+            owned.as_str()
         };
         if name.chars().count() > 255 {
             return Err(BifError::BADARG);
         }
         let atoms = global_atoms();
         let atom = if safe {
-            atoms.get(&name).ok_or(BifError::BADARG)?
+            atoms.get(name).ok_or(BifError::BADARG)?
         } else if ctx.is_some() {
-            atoms.intern(&name).map_err(|_| BifError::SystemLimit)?
+            atoms.intern(name).map_err(|_| BifError::SystemLimit)?
         } else {
-            atoms.get(&name).unwrap_or(arinsal_term::atoms::NONAME)
+            atoms.get(name).unwrap_or(arinsal_term::atoms::NONAME)
         };
-        Ok((Term::atom(atom), name))
+        let unknown = (atom == arinsal_term::atoms::NONAME).then(|| name.to_owned());
+        Ok((Term::atom(atom), unknown))
     }
 }
 
 enum Shape {
-    Atom(String),
+    /// `None` is an interned atom. `Some` keeps the text only when the index is `NONAME`.
+    Atom(Option<String>),
     Int(i64),
     Pid,
     Other,
@@ -1041,18 +1041,24 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
             Ok((term, Shape::Other))
         }
         FrameKind::Record { exported, fields } => {
-            if !frame.shapes[..fields + 2]
-                .iter()
-                .all(|shape| matches!(shape, Shape::Atom(_)))
-            {
-                return Err(BifError::BADARG);
-            }
-            let mut names = std::collections::HashSet::new();
-            for shape in &frame.shapes[2..fields + 2] {
-                if let Shape::Atom(name) = shape
-                    && !names.insert(name)
-                {
-                    return Err(BifError::BADARG);
+            let mut seen = std::collections::HashSet::new();
+            let mut unknown = std::collections::HashSet::new();
+            for (index, shape) in frame.shapes[..fields + 2].iter().enumerate() {
+                match shape {
+                    Shape::Atom(None) => {
+                        if index >= 2 {
+                            let atom = values[index].as_atom().ok_or(BifError::BADARG)?;
+                            if !seen.insert(atom) {
+                                return Err(BifError::BADARG);
+                            }
+                        }
+                    }
+                    Shape::Atom(Some(name)) => {
+                        if index >= 2 && !unknown.insert(name.as_str()) {
+                            return Err(BifError::BADARG);
+                        }
+                    }
+                    _ => return Err(BifError::BADARG),
                 }
             }
             let term = if ctx.is_some() {
@@ -1099,12 +1105,14 @@ fn parse_step(
         let tag = r.u8()?;
         let result: Option<(Term, Shape)> = match tag {
             97 | 98 => {
+                // Port of erts/emulator/beam/external.c:4452 (SMALL_INTEGER_EXT / INTEGER_EXT
+                // make_small), OTP-29.1.1. Both tags fit in an immediate small.
                 let n = if tag == 97 {
                     r.u8()? as i64
                 } else {
                     r.u32()? as i32 as i64
                 };
-                Some((built(&mut ctx, |b| b.int_from_i64(n))?, Shape::Int(n)))
+                Some((Term::small(n).ok_or(BifError::BADARG)?, Shape::Int(n)))
             }
             110 | 111 => {
                 let len = if tag == 110 {
@@ -1138,8 +1146,8 @@ fn parse_step(
             }
             100 | 115 | 118 | 119 => {
                 r.at -= 1;
-                let (term, name) = r.atom(safe, &mut ctx)?;
-                Some((term, Shape::Atom(name)))
+                let (term, unknown) = r.atom(safe, &mut ctx)?;
+                Some((term, Shape::Atom(unknown)))
             }
             73 | 75 => {
                 // Port of external.c:5177-5190 (internal atom references), OTP-29.1.1.
@@ -1153,8 +1161,7 @@ fn parse_step(
                 if global_atoms().text(atom).is_none() {
                     return Err(BifError::BADARG);
                 }
-                let name = global_atoms().text(atom).unwrap().to_string();
-                Some((Term::atom(atom), Shape::Atom(name)))
+                Some((Term::atom(atom), Shape::Atom(None)))
             }
             106 => Some((Term::NIL, Shape::Other)),
             104 | 105 => {
@@ -1177,15 +1184,19 @@ fn parse_step(
                 }
             }
             107 => {
+                // Port of erts/emulator/beam/external.c:4615 (STRING_EXT), OTP-29.1.1.
                 let n = r.u16()? as usize;
                 let raw = r.take(n)?;
-                let mut tail = Term::NIL;
-                if ctx.is_some() {
-                    for byte in raw.iter().rev() {
-                        let head = Term::small(*byte as i64).unwrap();
-                        tail = built(&mut ctx, |b| b.cons(head, tail))?;
-                    }
-                }
+                let tail = if let Some(ctx) = ctx.as_deref_mut() {
+                    TermBuilder::new(ctx.heap).byte_string_list(raw).map_err(
+                        |error| match error {
+                            arinsal_term::TermError::SystemLimit => BifError::SystemLimit,
+                            _ => BifError::BADARG,
+                        },
+                    )?
+                } else {
+                    Term::NIL
+                };
                 Some((tail, Shape::Other))
             }
             108 | 116 => {
@@ -1576,12 +1587,19 @@ impl DecodeWalk {
         }
         while consumed < byte_budget.max(1) {
             let before = self.reader.at;
+            // One dec_term loop when the plain text is complete. Compressed
+            // chunks stay at one tag so inflate can refill the buffer.
+            let tags = if self.compressed && !self.inflate_done {
+                1
+            } else {
+                byte_budget.saturating_sub(consumed).max(1)
+            };
             match parse_step(
                 &mut self.reader,
                 &mut self.stack,
                 self.safe,
                 None,
-                1,
+                tags,
                 !self.compressed || self.inflate_done,
             ) {
                 Ok(Some((_, checked))) => {
@@ -1649,12 +1667,17 @@ impl DecodeWalk {
         }
         while consumed < byte_budget.max(1) {
             let before = self.reader.at;
+            let tags = if self.compressed && !self.inflate_done {
+                1
+            } else {
+                byte_budget.saturating_sub(consumed).max(1)
+            };
             match parse_step(
                 &mut self.reader,
                 &mut self.stack,
                 self.safe,
                 Some(&mut parser_ctx),
-                1,
+                tags,
                 !self.compressed || self.inflate_done,
             ) {
                 Ok(Some((term, checked))) => {
