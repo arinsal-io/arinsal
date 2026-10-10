@@ -49,15 +49,28 @@ impl BeamModuleAssembler {
         tail: ArgVal,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        let h = self.source_reg(head)?;
-        self.code.emit(|e| e.mov_reg(SCRATCH[2], h))?;
-        let t = self.source_reg_into(tail, Gpr::x(17))?;
-        self.code.emit(|e| e.mov_reg(SCRATCH[3], t))?;
+        // Port of load_sources + stp into HTOP (instr_common.cpp:707-720): the source
+        // registers are stored directly. The tagged pointer is subtracted into the
+        // destination register.
+        let head_reg = self.source_reg(head)?;
+        let tail_scratch = if head_reg == Gpr::x(17) {
+            SCRATCH[5]
+        } else {
+            Gpr::x(17)
+        };
+        let tail_reg = self.source_reg_into(tail, tail_scratch)?;
+        let (dst_reg, store) = match dst {
+            ArgVal::X(index) if index < 6 => (XREGS[index as usize], false),
+            _ => (SCRATCH[4], true),
+        };
         self.code.emit(|e| {
-            e.stp_post(SCRATCH[2], SCRATCH[3], HTOP, 16)?;
-            e.sub_imm(SCRATCH[4], HTOP, 15, false)
+            e.stp_post(head_reg, tail_reg, HTOP, 16)?;
+            e.sub_imm(dst_reg, HTOP, 15, false)
         })?;
-        self.store_arg(dst, SCRATCH[4])
+        if store {
+            self.store_arg(dst, dst_reg)?;
+        }
+        Ok(())
     }
 
     /// Builds a tuple whose elements are supplied in source order.
@@ -65,27 +78,44 @@ impl BeamModuleAssembler {
     pub fn emit_put_tuple2(&mut self, dst: ArgVal, elements: &[ArgVal]) -> Result<(), ModuleError> {
         let arity = u64::try_from(elements.len())
             .map_err(|_| ModuleError::InvalidOperand("tuple arity overflow"))?;
-        // Tuple headers use the ARITY subtag; TAG_BOXED belongs on the term pointer.
-        self.code.emit(|e| e.mov_const(SCRATCH[4], arity << 6))?;
-        self.code.emit(|e| e.str_post(SCRATCH[4], HTOP, 8))?;
-        for pair in elements.chunks(2) {
-            let first = self.source_reg(pair[0])?;
-            self.code.emit(|e| e.mov_reg(SCRATCH[2], first))?;
-            if let Some(second_arg) = pair.get(1) {
-                let second = self.source_reg_into(*second_arg, Gpr::x(17))?;
-                self.code.emit(|e| e.mov_reg(SCRATCH[3], second))?;
-                self.code
-                    .emit(|e| e.stp_post(SCRATCH[2], SCRATCH[3], HTOP, 16))?;
+        // The arity header is the first word of the object and is paired with the
+        // following element, as erts does (instr_common.cpp:794-842).
+        let mut words = Vec::with_capacity(elements.len() + 1);
+        words.push(ArgVal::Immediate(arity << 6));
+        words.extend_from_slice(elements);
+        let mut index = 0;
+        while index + 1 < words.len() {
+            let first = self.source_reg(words[index])?;
+            let second_scratch = if first == Gpr::x(17) {
+                SCRATCH[3]
             } else {
-                self.code.emit(|e| e.str_post(SCRATCH[2], HTOP, 8))?;
-            }
+                Gpr::x(17)
+            };
+            let second = self.source_reg_into(words[index + 1], second_scratch)?;
+            self.code.emit(|e| e.stp_post(first, second, HTOP, 16))?;
+            index += 2;
         }
-        let bytes = (arity + 1)
+        if index < words.len() {
+            let last = self.source_reg(words[index])?;
+            self.code.emit(|e| e.str_post(last, HTOP, 8))?;
+        }
+        let bytes = words
+            .len()
             .checked_mul(8)
             .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
-        let tag_offset = bytes - TAG_BOXED;
-        self.emit_pointer_offset(SCRATCH[4], HTOP, tag_offset, true)?;
-        self.store_arg(dst, SCRATCH[4])
+        let tag_offset = u64::try_from(bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_sub(TAG_BOXED))
+            .ok_or(ModuleError::InvalidOperand("tuple allocation overflow"))?;
+        let (dst_reg, store) = match dst {
+            ArgVal::X(index) if index < 6 => (XREGS[index as usize], false),
+            _ => (SCRATCH[4], true),
+        };
+        self.emit_pointer_offset(dst_reg, HTOP, tag_offset, true)?;
+        if store {
+            self.store_arg(dst, dst_reg)?;
+        }
+        Ok(())
     }
 
     /// Loads a list head and tail, matching OTP's identical-destination rule.

@@ -1092,6 +1092,23 @@ impl BeamModuleAssembler {
         src2: ArgVal,
         dst2: ArgVal,
     ) -> Result<(), ModuleError> {
+        // Consecutive Y slots are one `stp`, the way flush_vars stores a register pair
+        // (instr_common.cpp:602-614).
+        if let (ArgVal::Y(first), ArgVal::Y(second)) = (dst1, dst2)
+            && second == first + 1
+            && let Ok(offset) = i16::try_from(first * 8)
+            && (-512..504).contains(&offset)
+        {
+            let left = self.source_reg(src1)?;
+            let right_scratch = if left == Gpr::x(10) {
+                Gpr::x(11)
+            } else {
+                Gpr::x(10)
+            };
+            let right = self.source_reg_into(src2, right_scratch)?;
+            self.code.emit(|e| e.stp(left, right, E, offset))?;
+            return Ok(());
+        }
         self.mov_arg_to_reg(TMP, src1)?;
         self.mov_arg_to_reg(Gpr::x(10), src2)?;
         self.store_operand(dst1, TMP)?;

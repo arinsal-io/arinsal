@@ -1,7 +1,7 @@
 //! Map BIF adapters over flatmaps and HAMTs.
 
 use arinsal_maps::{self, MapError, MapResult};
-use arinsal_term::{Term, TermKind, atoms};
+use arinsal_term::{Term, atoms};
 
 use crate::pure::{bool_term, integer, list, make_list, tuple_build};
 use crate::{BifError, BifFn, Ctx};
@@ -250,7 +250,9 @@ impl MapsBuildWalk {
         loop {
             match self.phase {
                 BuildPhase::Validate => {
-                    while self.cursor.classify() == TermKind::List {
+                    // `is_list` is the primary tag, not a full classification
+                    // (erl_map.c:331, erl_term.h is_list).
+                    while self.cursor.tagged_word() & 3 == 1 {
                         *reds -= 1;
                         let (head, tail) = Self::cell(self.cursor)?;
                         self.element(head)?;
@@ -273,7 +275,7 @@ impl MapsBuildWalk {
                             cursor = tail;
                             Self::element_of(fill, head).ok()
                         });
-                        let result = arinsal_maps::from_small_pairs(pairs, ctx.heap);
+                        let result = arinsal_maps::from_small_pairs(self.size, pairs, ctx.heap);
                         return mapped(ctx, result).map(Some);
                     }
                     self.cursor = self.list;
@@ -281,7 +283,7 @@ impl MapsBuildWalk {
                     self.phase = BuildPhase::Leaves;
                 }
                 BuildPhase::Leaves => {
-                    while self.cursor.classify() == TermKind::List {
+                    while self.cursor.tagged_word() & 3 == 1 {
                         *reds -= 1;
                         let (head, tail) = Self::cell(self.cursor)?;
                         let (key, value) = self.element(head)?;
