@@ -889,26 +889,7 @@ fn call_trap_bif(
     let mut args = [Term::NIL; 3];
     args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
     let callee = (export.module_atom, export.function_atom);
-    let trace_light_traps = std::env::var_os("ARINSAL_TRACE_LIGHT_TRAPS").is_some();
-    if trace_light_traps {
-        eprintln!(
-            "light BIF start {}:{}/{}",
-            export.module, export.function, export.arity
-        );
-    }
     let outcome = crate::bif_traps::call_light(process, entry, identity, callee, &args[..arity]);
-    if trace_light_traps {
-        eprintln!(
-            "light BIF result {}:{}/{}: {}",
-            export.module,
-            export.function,
-            export.arity,
-            match &outcome {
-                crate::bif_traps::LightTrap::Returned(_) => "returned",
-                crate::bif_traps::LightTrap::Trapped => "trapped",
-            }
-        );
-    }
     match outcome {
         crate::bif_traps::LightTrap::Returned(result) => {
             Some(plain_bif_result(process, registers, export, arity, result))
