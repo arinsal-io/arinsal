@@ -563,30 +563,33 @@ impl Clock for VirtualClock {
 /// alive; a probe of an exited process reports nothing pending.
 // Port of erts/emulator/beam/erl_process.h:1291 (ERTS_PSFLG_MSG_SIG_IN_Q), OTP-29.1.1.
 #[derive(Clone)]
-pub struct SignalProbe(std::sync::Weak<dyn PendingInput>);
+pub struct SignalProbe<M>(Arc<Incoming<Event<M>>>);
 
-impl SignalProbe {
+impl<M> SignalProbe<M> {
     /// Whether the outer signal queue holds unfetched signals.
     pub fn has_pending(&self) -> bool {
+        self.0.has_pending()
+    }
+
+    /// Fetch the oldest signal when it is a message that `accept` takes.
+    ///
+    /// Only valid while the receiver's private queue is empty; see
+    /// [`Incoming::fetch_first_if`].
+    pub fn fetch_message_if(&self, accept: impl FnOnce(&M) -> bool) -> Option<(Pid, M)> {
         self.0
-            .upgrade()
-            .is_some_and(|process| process.has_pending_input())
+            .fetch_first_if(
+                |event| matches!(&event.payload, Payload::Message(message) if accept(message)),
+            )
+            .map(|event| match event.payload {
+                Payload::Message(message) => (event.from, message),
+                _ => unreachable!("fetch_first_if accepted a message"),
+            })
     }
 }
 
-impl std::fmt::Debug for SignalProbe {
+impl<M> std::fmt::Debug for SignalProbe<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignalProbe").finish_non_exhaustive()
-    }
-}
-
-trait PendingInput: Send + Sync {
-    fn has_pending_input(&self) -> bool;
-}
-
-impl<T: Task> PendingInput for Process<T> {
-    fn has_pending_input(&self) -> bool {
-        self.input.has_pending()
     }
 }
 
@@ -625,8 +628,8 @@ struct Process<T: Task> {
     /// other scheduler.
     bif_timer_wheels: AtomicU64,
     wait_timer: AtomicU64,
-    input: Incoming<Event<T::Message>>,
-    backlog: AtomicUsize,
+    // Port of erts `Process.sig_inq`; shared with the task so receive can fetch in place.
+    input: Arc<Incoming<Event<T::Message>>>,
     /// Publishers between the EXITED check and the mailbox push.
     publish_inflight: AtomicUsize,
     /// Wheel that owns `wait_timer`, so cancel does not guess from the pid.
@@ -738,8 +741,7 @@ impl<T: Task> ProcessTable<T> {
             timer_epoch_used: AtomicBool::new(false),
             bif_timer_wheels: AtomicU64::new(0),
             wait_timer: AtomicU64::new(0),
-            input: Incoming::default(),
-            backlog: AtomicUsize::new(0),
+            input: Arc::default(),
             publish_inflight: AtomicUsize::new(0),
             wait_timer_worker: AtomicUsize::new(0),
             dirty: AtomicU8::new(0),
@@ -1627,7 +1629,7 @@ impl<T: Task> Inner<T> {
         if !self.fanin_stats {
             return;
         }
-        let backlog = process.backlog.load(Ordering::Relaxed);
+        let backlog = process.input.backlog.load(Ordering::Relaxed);
         self.fanin_peak_backlog
             .fetch_max(backlog, Ordering::Relaxed);
         let delivered = self
@@ -2440,7 +2442,7 @@ impl<T: Task> Inner<T> {
         // Literal-copy requests are non-message signals and enter a shared run queue.
         let force_enqueue = matches!(&payload, Payload::Signal(Signal::LiteralAreaCopy { .. }));
         if counted {
-            process.backlog.fetch_add(1, Ordering::Relaxed);
+            process.input.backlog.fetch_add(1, Ordering::Relaxed);
         }
         self.fanin_delivery(process, 1);
         if let Err(error) = self.deliver_process(
@@ -2453,7 +2455,7 @@ impl<T: Task> Inner<T> {
             force_enqueue,
         ) {
             if counted {
-                process.backlog.fetch_sub(1, Ordering::Relaxed);
+                process.input.backlog.fetch_sub(1, Ordering::Relaxed);
             }
             return Err(error);
         }
@@ -2503,7 +2505,10 @@ impl<T: Task> Inner<T> {
             process.publish_inflight.fetch_sub(1, Ordering::Release);
             return Err(Error::NoProcess);
         }
-        process.backlog.fetch_add(events.len(), Ordering::Relaxed);
+        process
+            .input
+            .backlog
+            .fetch_add(events.len(), Ordering::Relaxed);
         self.fanin_delivery(&process, events.len());
         process
             .input
@@ -2527,7 +2532,7 @@ impl<T: Task> Inner<T> {
             process.publish_inflight.fetch_sub(1, Ordering::Release);
             return Err(Error::NoProcess);
         }
-        process.backlog.fetch_add(1, Ordering::Relaxed);
+        process.input.backlog.fetch_add(1, Ordering::Relaxed);
         self.fanin_delivery(&process, 1);
         process
             .input
@@ -2546,10 +2551,14 @@ impl<T: Task> Inner<T> {
         force_enqueue: bool,
     ) {
         let wait_timer = process.wait_timer.load(Ordering::Acquire);
-        if process
-            .state
-            .compare_exchange(WAITING, QUEUED, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+        // Port of erts/emulator/beam/erl_proc_sig_queue.h:2080 (erts_proc_notify_new_message),
+        // OTP-29.1.1: read the state and schedule only a process that is not active. The
+        // SeqCst load orders after the SeqCst enqueue (see the wake protocol above).
+        if process.state.load(Ordering::SeqCst) != WAITING
+            || process
+                .state
+                .compare_exchange(WAITING, QUEUED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
         {
             // Port of erts/emulator/beam/erl_proc_sig_queue.h:2072 (erts_proc_notify_new_sig),
             // OTP-29.1.1.
@@ -3377,7 +3386,7 @@ trait ContextOps<M: Send + 'static> {
     ) -> Result<bool, Error>;
     fn flush(&mut self, remaining: u32);
     fn thread_progress_later(&self, op: LaterOp);
-    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe>;
+    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<M>>;
     fn total_reductions(&self) -> u64;
     fn scheduler_stats(&self) -> SchedulerStats;
     fn set_msacc_enabled(&mut self, enabled: bool);
@@ -3495,7 +3504,7 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     }
     /// A handle that tells, without this context, whether signals wait in this process's
     /// shared input queue.
-    pub fn signal_probe(&mut self) -> Option<SignalProbe> {
+    pub fn signal_probe(&mut self) -> Option<SignalProbe<M>> {
         self.inner.signal_probe(self.pid)
     }
     /// Configure the receiver's parallel sender buffers for off heap mailboxes.
@@ -3684,6 +3693,10 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Restart a selective receive scan after changing the pattern.
     pub fn reset_save(&mut self) {
         self.private.reset_save();
+    }
+    /// The private queue holds no events or markers (see [`Private::is_idle`]).
+    pub fn private_is_idle(&self) -> bool {
+        self.private.is_idle()
     }
     /// Reserve a receive marker after all currently published messages.
     pub fn recv_marker_reserve(&mut self) -> ReceiveMarker {
@@ -4053,7 +4066,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             pid,
             input: &process.input,
             private,
-            backlog: &process.backlog,
+            backlog: &process.input.backlog,
             bound_worker: &process.bound_worker,
             worker: None,
             worker_count: inner.config.workers,
@@ -4379,10 +4392,9 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             }
         }
     }
-    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe> {
+    fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<T::Message>> {
         let process = self.lookup(pid)?;
-        let process: Arc<dyn PendingInput> = process;
-        Some(SignalProbe(Arc::downgrade(&process)))
+        Some(SignalProbe(Arc::clone(&process.input)))
     }
     fn total_reductions(&self) -> u64 {
         if self.inner.sim.is_some() {
@@ -5320,7 +5332,7 @@ mod msgq_stage_microbench {
         let to = scheduler.spawn(Idle).unwrap();
         let process = scheduler.inner.table.lookup(to).unwrap();
         process.state.store(RUNNING, Ordering::Relaxed);
-        process.backlog.store(257, Ordering::Relaxed);
+        process.input.backlog.store(257, Ordering::Relaxed);
         let mut runner = Runner {
             inner: &scheduler.inner,
             local: None,
@@ -5689,7 +5701,7 @@ fn run_slice<'a, T: Task>(
                 pid: process.pid,
                 input: &process.input,
                 private,
-                backlog: &process.backlog,
+                backlog: &process.input.backlog,
                 bound_worker: &process.bound_worker,
                 worker,
                 worker_count: inner.config.workers,

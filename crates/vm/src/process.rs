@@ -1381,6 +1381,9 @@ impl Executor {
                         // Signals handled here (process_info) still see the process suspended at
                         // its native resume pc, as erts reads `c_p->i` while it waits.
                         process.drain(ctx)?;
+                        if let Some(cold) = process.cold.as_mut() {
+                            cold.native_inline_fetch = ctx.private_is_idle();
+                        }
                         process.native_pc = None;
                         process.header.self_pid =
                             ctx.pid().to_term().expect("valid pid").tagged_word();
@@ -5245,6 +5248,54 @@ impl Process {
     // OTP-29.1.1.
     /// Allocated words before a message is queued, only when call_memory tracing needs it:
     /// summing the heap fragments for every message made draining a long queue quadratic.
+    /// Fetch messages from the outer signal queue without the scheduler context.
+    ///
+    /// Native `loop_rec` calls this when its inner queue is exhausted, like erts'
+    /// `i_loop_rec` calling the receive helper. Messages at the head of the outer queue
+    /// move to the inner queue; the first non-message signal (or a message that needs
+    /// tracing or priority handling) stops the fetch and is left for the scheduler.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper)
+    // and the message case of erts_proc_sig_handle_incoming, OTP-29.1.1.
+    pub(crate) fn fetch_messages_in_place(&mut self) -> Result<usize, VmError> {
+        let Some(cold) = self.cold.as_mut() else {
+            return Ok(0);
+        };
+        if !cold.native_inline_fetch || !cold.delayed_gc.is_empty() || crate::trace::active() {
+            return Ok(0);
+        }
+        let Some(probe) = cold.signal_probe.take() else {
+            return Ok(0);
+        };
+        let fetched = self.fetch_messages_from(&probe);
+        self.cold_mut().signal_probe = Some(probe);
+        let fetched = fetched?;
+        if fetched != 0 {
+            crate::natives::erts_debug::after_message_queue_change(self);
+        }
+        Ok(fetched)
+    }
+
+    fn fetch_messages_from(
+        &mut self,
+        probe: &arinsal_sched::SignalProbe<Message>,
+    ) -> Result<usize, VmError> {
+        let data = self.message_queue_data();
+        let mut fetched = 0;
+        while let Some((_sender, message)) =
+            probe.fetch_message_if(|message| !message.is_priority())
+        {
+            let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+            let before = self.message_words_before();
+            let new_prio_len =
+                self.inbox
+                    .push_message(message, data, &mut self.heap, old_prio_len)?;
+            self.uncount_message_words(before);
+            self.cold_mut().prio_len = new_prio_len;
+            fetched += 1;
+        }
+        Ok(fetched)
+    }
+
     fn message_words_before(&self) -> Option<i64> {
         self.cold
             .as_ref()
