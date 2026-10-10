@@ -58,9 +58,21 @@ impl Fragment {
 }
 
 impl WordBlock {
+    /// A heap block whose words are not cleared: like `ERTS_HEAP_ALLOC`, only the words
+    /// below the heap top and above the stack pointer are ever read.
+    // Port of erts/emulator/beam/erl_gc.c:1659 (do_minor `ERTS_HEAP_ALLOC`), OTP-29.1.1.
     pub(crate) fn new(words: usize, allocation_type: ErtsAlcType) -> Self {
         Self {
-            memory: Box::new(zeroed_block(words, allocation_type)),
+            memory: Box::new({
+                #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+                let mut memory = AllocBlock::new(allocation_type, words)
+                    .expect("ERTS heap block allocation failed");
+                // Debug builds poison the block with a boxed pointer to unmapped memory, so
+                // a read of a word that was never written fails loudly.
+                #[cfg(debug_assertions)]
+                memory.as_mut_slice().fill(0x0000_dead_0000_0002);
+                memory
+            }),
         }
     }
 
@@ -1703,6 +1715,10 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             *p.add(1) = Arc::as_ptr(&node) as u64;
             *p.add(2) = 0;
             *p.add(3) = ids.len() as u64;
+            // Heap words are not cleared on allocation; the id words are OR-ed together.
+            for word in 4..words {
+                *p.add(word) = 0;
+            }
             for (i, id) in ids.iter().enumerate() {
                 let index = i + 1;
                 let slot = p.add(3 + index / 2);
