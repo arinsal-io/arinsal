@@ -4,6 +4,7 @@
 
 mod codec;
 pub mod gens;
+pub mod reference;
 pub mod suites;
 
 use arinsal_etf::OwnedTerm;

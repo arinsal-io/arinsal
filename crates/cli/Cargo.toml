@@ -22,6 +22,7 @@ arinsal-float.workspace = true
 arinsal-nif.workspace = true
 
 [dev-dependencies]
+arinsal-difftest.workspace = true
 similar-asserts = "1.7.0"
 
 [[bin]]

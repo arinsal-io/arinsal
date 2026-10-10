@@ -5,21 +5,19 @@ use std::process::Command;
 
 use arinsal_args::{ArgsError, parse};
 
+fn reference_erl() -> Command {
+    arinsal_difftest::reference::erl().expect("reference OTP emulator")
+}
+
+fn erl_available() -> bool {
+    arinsal_difftest::reference::erl().is_some()
+}
+
 fn setup_env() -> BTreeMap<String, String> {
-    let output = Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\",[code:root_dir()]),halt().",
-        ])
-        .env("ERL_AFLAGS", "")
-        .env("ERL_FLAGS", "")
-        .env("ERL_ZFLAGS", "")
-        .env_remove("ERL_EPMD_PORT")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let root = String::from_utf8(output.stdout).unwrap();
+    let root = arinsal_difftest::reference::otp_root()
+        .expect("OTP root: set ARINSAL_OTP_ROOT or put erl on PATH")
+        .to_string_lossy()
+        .into_owned();
     BTreeMap::from([
         ("ROOTDIR".into(), root.clone()),
         ("BINDIR".into(), format!("{root}/erts-17.1/bin")),
@@ -57,7 +55,7 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
 }
 
 fn erl_boot_vector(args: &[String], env: &BTreeMap<String, String>) -> Result<Vec<String>, String> {
-    let mut command = Command::new("erl");
+    let mut command = reference_erl();
     command.arg("-emu_args_exit");
     command.args(args);
     apply_env(&mut command, env);
@@ -76,7 +74,7 @@ fn erl_boot_vector(args: &[String], env: &BTreeMap<String, String>) -> Result<Ve
 }
 
 fn erl_failure(args: &[String], env: &BTreeMap<String, String>) -> (bool, String) {
-    let mut command = Command::new("erl");
+    let mut command = reference_erl();
     command.args(args);
     apply_env(&mut command, env);
     let output = command.output().unwrap();
@@ -95,7 +93,7 @@ fn assert_vector(label: &str, args: &[&str], env: &BTreeMap<String, String>) {
 
 #[test]
 fn flag_families_match_erl_boot_arguments() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if !erl_available() {
         eprintln!("skipping flag_families_match_erl_boot_arguments: erl is unavailable");
         return;
     }
@@ -227,7 +225,7 @@ fn flag_families_match_erl_boot_arguments() {
 
 #[test]
 fn flag_family_rejections_match_erl() {
-    if Command::new("erl").arg("-version").output().is_err() {
+    if !erl_available() {
         eprintln!("skipping flag_family_rejections_match_erl: erl is unavailable");
         return;
     }
