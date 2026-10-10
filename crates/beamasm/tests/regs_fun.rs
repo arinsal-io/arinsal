@@ -5,7 +5,9 @@ use std::sync::{
 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
-    ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
+    ExitReason, ProcessHeader, SchedulerRegisters,
+    dispatch::DispatchFragments,
+    enter_native,
     fun::{FunCallTag, FunResolver},
     map::MapRuntime,
     module::{ArgVal, BeamModuleAssembler, FinalizedModule, ModuleError},
@@ -231,6 +233,23 @@ fn run(
             .unwrap(),
         header,
     )
+}
+
+/// A local fun of arity 1 whose entry has no loaded code: every code index enters the
+/// unloaded_fun fragment, which asks the resolver (beam_jit_handle_unloaded_fun) where to
+/// continue.
+// Port of erts/emulator/beam/jit/arm/instr_fun.cpp:34-62 (emit_unloaded_fun), OTP-29.1.1: it
+// only pushes a native frame (emit_enter_runtime_frame), so the runtime sees E as the call
+// left it: with the caller's frame for `i_call_fun2`, without it for `i_call_fun2_last`,
+// which deallocates before `br` (instr_fun.cpp:425-455).
+fn unloaded_fun_term() -> u64 {
+    let fragments: &'static DispatchFragments = Box::leak(Box::new(
+        DispatchFragments::with_fun_helpers(0, 0, 0, 0, resolve_fun as *const () as usize, 0)
+            .unwrap(),
+    ));
+    let dispatch: &'static [u64; 4] = Box::leak(Box::new([fragments.unloaded_fun() as u64; 4]));
+    let thing: &'static [u64; 2] = Box::leak(Box::new([(1 << 8) | 0x14, dispatch.as_ptr() as u64]));
+    thing.as_ptr() as u64 | 2
 }
 
 fn sentinels() -> [u64; 6] {
@@ -463,6 +482,8 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
     assert_xregs(after, expected);
 
     let resolver: FunResolver = resolve_fun;
+    let mut initial = initial;
+    initial[1] = unloaded_fun_term();
     for call in 0..4 {
         let (seen, after, header) = run(
             |asm| match call {
@@ -492,7 +513,11 @@ fn runtime_calls_in_fun_map_and_records_keep_register_state() {
                 TargetFrame::Keep
             },
         );
-        assert_seen_with_frame(seen, initial, &header);
+        if call < 2 {
+            assert_seen_with_frame(seen, initial, &header);
+        } else {
+            assert_seen(seen, initial, &header);
+        }
         assert_xregs(after, initial);
     }
 }
@@ -565,7 +590,8 @@ fn record_creation_uses_live_prefix_and_keeps_unused_xregs() {
 #[test]
 fn dynamic_fun_resolver_restores_all_live_xregs() {
     let _guard = TEST_LOCK.lock().unwrap();
-    let initial = sentinels();
+    let mut initial = sentinels();
+    initial[1] = unloaded_fun_term();
     let resolver: FunResolver = resolve_fun;
     let (seen, after, header) = run(
         |asm| {
