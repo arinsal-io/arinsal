@@ -213,6 +213,8 @@ fn map_get_on_hashmap_via_hook() {
             ArgVal::X(1),
             ArgVal::X(0),
             helper,
+            true,
+            true,
             test_map_runtime(),
         )
         .unwrap();

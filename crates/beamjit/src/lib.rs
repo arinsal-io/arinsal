@@ -2018,8 +2018,8 @@ fn typed_arg(
     ))
 }
 
-/// The compiler type of an arithmetic operand: its `Type` chunk entry for a typed register, the
-/// type of the literal for a literal, otherwise `Any`.
+/// The compiler type of an operand: its `Type` chunk entry for a typed register, the type of a
+/// literal, otherwise `Any`.
 // Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry, getTypeUnion),
 // OTP-29.1.1.
 fn operand_type(value: Option<&SpecificOperand>, beam: &BeamFile) -> ArgType {
@@ -2044,6 +2044,16 @@ fn operand_type(value: Option<&SpecificOperand>, beam: &BeamFile) -> ArgType {
         }
         _ => ArgType::ANY,
     }
+}
+
+/// Whether OTP's Type chunk proves a BIF's map operand is exactly a map.
+fn operand_is_exact_map(value: Option<&SpecificOperand>, beam: &BeamFile) -> bool {
+    operand_type(value, beam).union_bits == arinsal_beamasm::types::type_id::MAP
+}
+
+/// Whether a typed BIF operand may be immediate, matching erts `maybe_one_of`.
+fn operand_maybe_one_of(value: Option<&SpecificOperand>, beam: &BeamFile, mask: u16) -> bool {
+    operand_type(value, beam).union_bits & mask != 0
 }
 
 /// The type union of an external-term-format literal, from its outermost tag.
@@ -3786,6 +3796,12 @@ fn emit_op(
                             value(map_at)?,
                             value(dest_at)?,
                             runtime,
+                            operand_is_exact_map(args.get(map_at), beam),
+                            operand_maybe_one_of(
+                                args.get(key_at),
+                                beam,
+                                arinsal_beamasm::types::type_id::MAYBE_IMMEDIATE,
+                            ),
                             env.map_runtime(),
                         )
                     } else {

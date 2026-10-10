@@ -909,7 +909,18 @@ fn native_bif_map_size_with_integer_type() {
 fn native_bif_is_map_key() {
     let f = terms();
     native_value(
-        |a| a.emit_bif_is_map_key(0, ArgVal::X(0), ArgVal::X(1), ArgVal::X(0), guard_helper),
+        |a| {
+            a.emit_bif_is_map_key(
+                0,
+                ArgVal::X(0),
+                ArgVal::X(1),
+                ArgVal::X(0),
+                guard_helper,
+                true,
+                true,
+                map_runtime(),
+            )
+        },
         f.alpha,
         f.map,
         bits(Term::atom(atoms::TRUE)),
@@ -953,6 +964,8 @@ fn native_bif_map_get() {
                 ArgVal::X(1),
                 ArgVal::X(0),
                 guard_helper,
+                true,
+                true,
                 map_runtime(),
             )
         },

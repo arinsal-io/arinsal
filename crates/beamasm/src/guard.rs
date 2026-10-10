@@ -1314,8 +1314,9 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
-    /// Emits `is_map_key/2` through the runtime hook.
+    /// Emits the body fast path of `is_map_key/2` through the shared map lookup fragment.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-830, OTP-29.1.1
+    #[allow(clippy::too_many_arguments)]
     pub fn emit_bif_is_map_key(
         &mut self,
         fail: u32,
@@ -1323,8 +1324,37 @@ impl BeamModuleAssembler {
         map: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
+        exact_map: bool,
+        key_maybe_immediate: bool,
+        map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
-        self.emit_guard_value_helper_fail(fail, true, 30, key, map, destination, helper)
+        if !exact_map {
+            let slow = self.code.new_label();
+            let done = self.code.new_label();
+            self.emit_map_is_key_fast(
+                map,
+                key,
+                destination,
+                false,
+                key_maybe_immediate,
+                Some(slow),
+                map_runtime,
+            )?;
+            self.code.b(done)?;
+            self.code.bind(slow)?;
+            self.emit_guard_value_helper_fail(fail, true, 30, key, map, destination, helper)?;
+            self.code.bind(done)?;
+            return Ok(());
+        }
+        self.emit_map_is_key_fast(
+            map,
+            key,
+            destination,
+            true,
+            key_maybe_immediate,
+            None,
+            map_runtime,
+        )
     }
 
     /// Emits `is_map_key/2`, using map and key types to select the shared lookup fragment.
@@ -1339,7 +1369,16 @@ impl BeamModuleAssembler {
         map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
         if !map.exact_type(type_id::MAP) {
-            return self.emit_bif_is_map_key(fail, key.val, map.val, destination, helper);
+            return self.emit_bif_is_map_key(
+                fail,
+                key.val,
+                map.val,
+                destination,
+                helper,
+                false,
+                key.maybe_one_of(type_id::MAYBE_IMMEDIATE),
+                map_runtime,
+            );
         }
 
         let output = self.guard_destination(destination)?;
@@ -1374,6 +1413,7 @@ impl BeamModuleAssembler {
 
     /// Emits `map_get/2`: shared-fragment lookup, the runtime hook for a miss or non-map.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-936, OTP-29.1.1
+    #[allow(clippy::too_many_arguments)]
     pub fn emit_bif_map_get(
         &mut self,
         fail: u32,
@@ -1381,11 +1421,21 @@ impl BeamModuleAssembler {
         map: ArgVal,
         destination: ArgVal,
         helper: GuardHelper,
+        exact_map: bool,
+        key_maybe_immediate: bool,
         map_runtime: crate::map::MapRuntime,
     ) -> Result<(), ModuleError> {
         let slow = self.code.new_label();
         let done = self.code.new_label();
-        self.emit_map_get_fast(map, key, destination, slow, map_runtime)?;
+        self.emit_map_get_fast(
+            map,
+            key,
+            destination,
+            slow,
+            exact_map,
+            key_maybe_immediate,
+            map_runtime,
+        )?;
         self.code.b(done)?;
         self.code.bind(slow)?;
         self.emit_guard_value_helper_fail(fail, false, 31, key, map, destination, helper)?;

@@ -135,6 +135,25 @@ hmf(#{a := _, b := _}) -> ab;
 hmf(#{[] := _, 42.0 := _}) -> boxed;
 hmf(#{#{k => v} := V}) -> {map_key, V};
 hmf(#{}) -> none.
+body_key_loop(0, _M, _K, Acc) -> Acc;
+body_key_loop(N, M, K, Acc) ->
+    Present = is_map_key(K, M),
+    Value = case Present of true -> 1; false -> 0 end,
+    body_key_loop(N - 1, M, K, Acc + Value).
+body_get_loop(0, _M, _K, Acc) -> Acc;
+body_get_loop(N, M, K, Acc) -> body_get_loop(N - 1, M, K, Acc + map_get(K, M)).
+body_map_bifs() ->
+    Flat = #{a => 1},
+    Hash = maps:from_list([{I, I + 1} || I <- lists:seq(0, 39)]),
+    Boxed = #{{k} => 41},
+    [is_map_key(a, Flat), is_map_key(c, Flat), map_get(a, Flat),
+     is_map_key(27, Hash), map_get(27, Hash),
+     is_map_key({k}, Boxed), map_get({k}, Boxed),
+     top(catch is_map_key(a, not_a_map)), top(catch map_get(a, not_a_map)),
+     top(catch map_get(c, Flat)),
+     body_key_loop(100, Flat, a, 0), body_key_loop(100, Flat, c, 0),
+     body_get_loop(100, Flat, a, 0),
+     body_key_loop(100, Hash, 27, 0), body_get_loop(100, Hash, 27, 0)].
 gar(A) when A + 1 > 2 -> big;
 gar(_) -> small.
 gl(L) when length(L) >= 0 -> ok;
@@ -206,6 +225,7 @@ run() ->
      [top(catch ar(1, 0)), top(catch ar(1, ok)), top(catch -id(a)), top(catch bnot id(1.0)),
       gar(5), nzm(id(-1.0), id(0.0)), nzm(id(0), id(-0.0)), nzm(id(-1), id(0.0)), nzn(id(0.0))],
      [hmf(M) || M <- [#{a => 1, b => 2}, #{[] => 1, 42.0 => 2}, #{#{k => v} => 3}, #{42.0 => 1}, #{}]],
+     body_map_bifs(),
      [top(catch length(id([1 | 2]))), top(catch abs(id(a))),
       top(catch map_get(a, id(#{}))), top(catch map_get(a, id(x))), top(catch is_map_key(a, id(x)))],
      [gl([1, 2]), gl([1 | 2]), gl(x), ga(-5), ga(x), ga(0), gn(self()), gn(x),
