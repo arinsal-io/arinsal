@@ -356,19 +356,25 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                 // OTP-29.1.1. The export index is walked from 0 and consed, which is
                 // reverse insertion order. Entries that only exist because something
                 // imported them (error-handler trampoline) are not in the export table.
-                let exported: std::collections::HashSet<(&str, u8)> = module
+                let exported: std::collections::HashSet<(arinsal_term::Atom, u8)> = module
                     .exports
                     .iter()
-                    .map(|export| (export.function.as_str(), export.arity))
+                    .map(|export| (export.function_atom, export.arity))
                     .collect();
+                let Some(name_atom) = args[0].as_atom() else {
+                    return Err(badarg());
+                };
                 let mut exports = Vec::new();
-                for (module_name, function, arity) in vm.code.exports.order.iter().rev() {
-                    if module_name != &name || !exported.contains(&(function.as_str(), *arity)) {
+                for &(module_atom, function_atom, arity) in vm.code.exports.order.iter().rev() {
+                    if module_atom != name_atom || !exported.contains(&(function_atom, arity)) {
                         continue;
                     }
                     exports.push(make_tuple(
                         process,
-                        &[atom(function), Term::small(i64::from(*arity)).unwrap()],
+                        &[
+                            Term::atom(function_atom),
+                            Term::small(i64::from(arity)).unwrap(),
+                        ],
                     )?);
                 }
                 info_list(process, exports)
@@ -460,10 +466,14 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     let Some(owned) = args.get(1).and_then(|term| to_owned(*term).ok()) else {
         return Err(badarg());
     };
-    let arinsal_etf::OwnedTerm::Binary(bytes) = &owned else {
+    // Move the file bytes out of the decoded term. `OwnedTerm` is `Drop`, so the
+    // binary is taken in place instead of cloned and then dropped.
+    let mut owned = owned;
+    let arinsal_etf::OwnedTerm::Binary(ref mut bytes_slot) = owned else {
         return Err(badarg());
     };
-    let Ok(beam) = arinsal_beam::parse(bytes) else {
+    let bytes = std::mem::take(bytes_slot);
+    let Ok(beam) = arinsal_beam::parse(&bytes) else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };
@@ -497,11 +507,11 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };
-    crate::funs::set_module_uniq(&mut module, bytes).map_err(|_| badarg())?;
+    crate::funs::set_module_uniq(&mut module, &bytes).map_err(|_| badarg())?;
     let prepared = Prepared {
         has_on_load: has_on_load_opcode(&beam),
         beam: Mutex::new(Some(beam)),
-        bytes: Mutex::new(bytes.clone()),
+        bytes: Mutex::new(bytes),
         module: Mutex::new(Some(module)),
     };
     // The code server heap is often full when Mix loads the next test beam.

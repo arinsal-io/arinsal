@@ -1488,7 +1488,7 @@ impl ModuleEnv for VmModuleEnv<'_> {
 
 /// Compile a module and retain both its executable mapping and embedded literals.
 pub(crate) fn compile(
-    bytes: &[u8],
+    beam: &arinsal_beam::BeamFile,
     module: &arinsal_loader::Module,
     scope: u64,
     line_breakpoints: bool,
@@ -1517,18 +1517,17 @@ pub(crate) fn compile(
         );
     }
     let function_allowlist = std::env::var("ARINSAL_BEAMASM_FUNCS").ok();
-    let beam = arinsal_beam::parse(bytes).ok()?;
     let fragments = fragments()?;
     let export_entries = import_entries(scope, module)?;
     // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
     let mut literal_heap = Box::new(VecHeap::new_literal());
-    let env = VmModuleEnv::new(&beam, module, &mut literal_heap, export_entries, fragments).ok()?;
+    let env = VmModuleEnv::new(beam, module, &mut literal_heap, export_entries, fragments).ok()?;
     let trace = crate::calls::trace_boot_enabled();
     if trace {
         eprintln!("arinsal boot: beamasm compiling {}", beam.module);
     }
     let compiled = match compile_parsed_module_with_options(
-        &beam,
+        beam,
         &env,
         function_allowlist.as_deref(),
         line_breakpoints,

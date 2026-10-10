@@ -123,7 +123,9 @@ pub(crate) struct CodeMeta {
     pub(crate) beam: BeamFile,
     pub(crate) md5: Option<[u8; 16]>,
     pub(crate) on_load: Option<(String, u8)>,
-    pub(crate) beam_bytes: Option<Arc<Vec<u8>>>,
+    /// The loader was given the original BEAM bytes, so this instance can be compiled.
+    /// The bytes themselves are not kept: erts discards the file after `beam_load`.
+    pub(crate) has_beam_bytes: bool,
     pub(crate) beamasm: Option<Arc<beamasm_integration::CompiledVersion>>,
 }
 /// Native code range of the module version in slot `id`, when it was compiled by BeamAsm.
@@ -165,7 +167,7 @@ impl CodeMeta {
             beam: beam.clone(),
             md5: bytes.and_then(|bytes| arinsal_loader::module_uniq(bytes).ok()),
             on_load,
-            beam_bytes: bytes.map(|bytes| Arc::new(bytes.to_vec())),
+            has_beam_bytes: bytes.is_some(),
             beamasm: None,
         }
     }
@@ -181,8 +183,10 @@ impl CodeMeta {
 // OTP-29.1.1.
 #[derive(Clone)]
 pub(crate) struct ExportIndex {
-    pub(crate) order: Vec<(String, String, u8)>,
-    seen: HashSet<(String, String, u8)>,
+    /// Insertion order of export entries. Atoms, as in erts' export table
+    /// (`export.c` / `index.c`), so staging copies the index without cloning MFA strings.
+    pub(crate) order: Vec<(Atom, Atom, u8)>,
+    seen: HashSet<(Atom, Atom, u8)>,
     /// Atom-keyed erts exports, including each JIT dispatch address vector.
     // Port of erts/emulator/beam/export.c:38-58, OTP-29.1.1.
     entries: HashMap<(Atom, Atom, u8), ExportIndexEntry, crate::beamasm_integration::ExportHasher>,
@@ -223,31 +227,32 @@ impl ExportIndex {
 
     // Port of erts/emulator/beam/export.c (erts_export_put) and
     // erts/emulator/beam/index.c (index_put_entry), OTP-29.1.1.
-    // An MFA already in the index keeps its original position.
+    // An MFA already in the index keeps its original position. Keys are atoms,
+    // the same layout as erts' export entries, not owned MFA strings.
     fn put(&mut self, module: &str, function: &str, arity: u8) {
-        if let (Ok(module_atom), Ok(function_atom)) = (
+        let (Ok(module_atom), Ok(function_atom)) = (
             global_atoms().intern(module),
             global_atoms().intern(function),
-        ) {
-            self.entries
-                .entry((module_atom, function_atom, arity))
-                .or_default();
-        }
-        let key = (module.to_owned(), function.to_owned(), arity);
-        if self.seen.insert(key.clone()) {
-            self.order.push(key);
+        ) else {
+            return;
+        };
+        self.put_atoms(module_atom, function_atom, arity);
+    }
+
+    fn put_atoms(&mut self, module: Atom, function: Atom, arity: u8) {
+        // Port of erts/emulator/beam/export.c (erts_export_put): one entry per MFA.
+        self.entries.entry((module, function, arity)).or_default();
+        if self.seen.insert((module, function, arity)) {
+            self.order.push((module, function, arity));
         }
     }
 
     fn note_module(&mut self, module: &Module) {
         for export in &module.exports {
-            self.put(&export.module, &export.function, export.arity);
-            self.entries
-                .entry((export.module_atom, export.function_atom, export.arity))
-                .or_default();
+            self.put_atoms(export.module_atom, export.function_atom, export.arity);
         }
         for import in &module.imports {
-            self.put(&import.module, &import.function, import.arity);
+            self.put_atoms(import.module_atom, import.function_atom, import.arity);
         }
     }
 
@@ -649,11 +654,12 @@ impl Vm {
     // Like `beam_load.c:417` and `asm_load.c:1177-1198` (OTP-29.1.1), compile after the module
     // body and its exported entries are resolved.
     fn compile_native(&self, module: &Module, meta: &mut CodeMeta) {
-        let Some(bytes) = meta.beam_bytes.as_deref() else {
+        if !meta.has_beam_bytes {
             return;
-        };
+        }
+        // The BEAM was parsed in prepare_loading. erts does not parse it again here.
         if let Some(native) = beamasm_integration::compile(
-            bytes,
+            &meta.beam,
             module,
             self.code_scope,
             crate::trace_bp::line_breakpoints_instrumented(),
