@@ -385,6 +385,21 @@ impl RawRegion {
         ))
     }
 
+    /// Joins two adjacent pieces of the same mapping without moving them.
+    pub fn merge_adjacent(self, next: Self) -> Result<Self, (Self, Self)> {
+        if self.ptr.checked_add(self.len) != Some(next.ptr) || self.protection != next.protection {
+            return Err((self, next));
+        }
+        let merged = Self {
+            ptr: self.ptr,
+            len: self.len + next.len,
+            protection: self.protection,
+        };
+        std::mem::forget(self);
+        std::mem::forget(next);
+        Ok(merged)
+    }
+
     fn base_ptr(&self) -> *mut u8 {
         self.ptr as *mut u8
     }

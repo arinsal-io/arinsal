@@ -270,13 +270,17 @@ impl Copier<'_> {
                     (2, 2 + ((gval >> 16) & 255) as usize)
                 } else if kind == MAP {
                     let range = boxed_term_range(gval, ptr);
+                    let object_words = range.end;
                     for offset in range {
                         let slot = ptr.add(offset);
                         *slot = self.evacuate::<INTO_OLD>(*slot);
                         #[cfg(debug_assertions)]
                         crate::validate::verify_copied_term_after_collection(self.to, Term(*slot));
                     }
-                    n_hp += boxed_object_words(gval, ptr) * 8;
+                    // The map child range ends at the copied object's word count. Reuse
+                    // that result, as `sweep` advances through the copied heap once.
+                    // Port of erts/emulator/beam/erl_gc.c:2281 (`sweep`), OTP-29.1.1.
+                    n_hp += object_words * 8;
                     continue;
                 } else if kind == SUB_BITS {
                     // The orig field; the byte pointer is rebased in finish_bits.
@@ -346,10 +350,6 @@ impl Copier<'_> {
                             .find(|arc| Arc::as_ptr(arc) as usize == key)
                             .cloned();
                         if let Some(owner) = owner {
-                            self.to.off_heap_binary_bytes = self
-                                .to
-                                .off_heap_binary_bytes
-                                .saturating_add(owner.len() as u64);
                             let vheap_words = (owner.len() / 8) as u64;
                             target.push(owner);
                             self.to.add_vheap(promote, vheap_words);
@@ -404,10 +404,6 @@ impl Copier<'_> {
                             .find(|arc| Arc::as_ptr(arc) as usize == key)
                             .cloned();
                         if let Some(owner) = owner {
-                            self.to.off_heap_binary_bytes = self
-                                .to
-                                .off_heap_binary_bytes
-                                .saturating_add(owner.len() as u64);
                             let vheap_words = (owner.len() / 8) as u64;
                             target.push(owner);
                             self.to.add_vheap(promote, vheap_words);
@@ -1081,25 +1077,12 @@ impl ProcessHeap {
         } else {
             self.minor_since_major.saturating_add(1)
         };
-        // A process with no off-heap owners keeps the lazy box empty. Forcing it
-        // here would malloc a HeapOwners on every minor GC.
-        if self.owners.is_allocated() {
+        // Match the embedded ERTS vheap state without materializing an empty owner
+        // box when a previous collection left only default values behind.
+        let copy_old_owner_state = self.owners.has_collection_state();
+        if copy_old_owner_state {
             next.owners.vheap.min = self.owners.vheap_min();
             next.owners.vheap.old_size = self.owners.vheap_old_size();
-            if !major {
-                next.off_heap_binary_bytes = self
-                    .owners
-                    .old_off_heap
-                    .iter()
-                    .map(|binary| binary.len() as u64)
-                    .chain(
-                        self.owners
-                            .old_external
-                            .iter()
-                            .map(|binary| binary.len() as u64),
-                    )
-                    .sum();
-            }
             next.owners.vheap.old = if major { 0 } else { self.owners.vheap_old() };
         }
         if !major {
@@ -1115,7 +1098,7 @@ impl ProcessHeap {
                 .words;
             }
             next.old_htop = self.old_htop;
-            if self.owners.is_allocated() {
+            if copy_old_owner_state {
                 next.owners.old_off_heap = std::mem::take(&mut self.owners.old_off_heap);
                 next.owners.old_writable = std::mem::take(&mut self.owners.old_writable);
                 next.owners.old_external = std::mem::take(&mut self.owners.old_external);
@@ -1256,7 +1239,7 @@ impl ProcessHeap {
             nanoseconds: start.elapsed().as_nanos() as u64,
         };
         // Port of erts/emulator/beam/erl_gc.c:3284-3289 (sweep_off_heap), OTP-29.1.1.
-        if major {
+        if major && self.owners.is_allocated() {
             self.owners.vheap.old = 0;
             self.owners.vheap.old_size = next_vheap_size(
                 young_overhead,
@@ -1744,6 +1727,18 @@ mod tests {
         message_heap.gc_fragment(7);
         heap.adopt_message_fragment(message_heap).unwrap();
         assert_eq!(heap.fragment_words, 168);
+    }
+
+    #[test]
+    fn minor_collection_does_not_reallocate_an_empty_owner_box() {
+        let mut heap = ProcessHeap::with_words(128);
+        heap.old_words = ProcessHeap::with_words(128).words;
+        heap.owners.vheap.old = 0;
+
+        heap.collect(&mut [], &mut [], 0).unwrap();
+
+        assert!(!heap.collection_is_major());
+        assert!(!heap.owners.is_allocated());
     }
 
     #[test]
