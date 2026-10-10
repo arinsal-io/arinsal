@@ -1439,16 +1439,14 @@ fn internal_state_tuple_get(
             if pid == ctx.pid() {
                 return Ok(Some(atom("running")));
             }
+            // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_status), OTP-29.1.1.
             let status = process
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).cloned())
-                .map(|published| atom(published.status))
-                .or_else(|| {
-                    process
-                        .runtime
-                        .as_ref()
-                        .and_then(|runtime| runtime.process_alive(pid).then(|| atom("runnable")))
+                .and_then(|runtime| {
+                    (runtime.published.lock().unwrap().contains_key(&pid)
+                        || runtime.process_alive(pid))
+                    .then(|| atom(runtime.remote_status(pid)))
                 })
                 .unwrap_or_else(|| atom("undefined"));
             Ok(Some(status))
@@ -1464,10 +1462,19 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                let published = process
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).cloned());
+                let published = process.runtime.as_ref().and_then(|runtime| {
+                    runtime
+                        .published
+                        .lock()
+                        .unwrap()
+                        .get(&pid)
+                        .cloned()
+                        .or_else(|| {
+                            runtime
+                                .process_alive(pid)
+                                .then(crate::process::Published::empty)
+                        })
+                });
                 return match published {
                     Some(published) => internal_link_list_from(process, &published.links).map(Some),
                     None => Ok(Some(atom("undefined"))),
@@ -1486,10 +1493,21 @@ fn internal_state_tuple_get(
         ) if node == "nonode@nohost" => {
             let pid = arinsal_sched::Pid::new(*id, *serial);
             if pid != ctx.pid() {
-                let published = process
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.published.lock().unwrap().get(&pid).cloned());
+                // A live process that never changed its relations has no published slot:
+                // its lists are empty (erts reads the target's own trees).
+                let published = process.runtime.as_ref().and_then(|runtime| {
+                    runtime
+                        .published
+                        .lock()
+                        .unwrap()
+                        .get(&pid)
+                        .cloned()
+                        .or_else(|| {
+                            runtime
+                                .process_alive(pid)
+                                .then(crate::process::Published::empty)
+                        })
+                });
                 return match published {
                     Some(published) => internal_monitor_list_from(
                         process,
