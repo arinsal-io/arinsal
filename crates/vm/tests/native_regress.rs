@@ -91,6 +91,9 @@ top(Other) -> Other.
 
 id(X) -> X.
 
+ib(B) when is_binary(B) -> yes;
+ib(_) -> no.
+
 ge(X) when is_integer(X), X >= 3 -> big;
 ge(_) -> small.
 
@@ -246,7 +249,12 @@ run() ->
       try erlang:fun_info(id(abc), module) catch C2:R2 -> {C2, R2} end],
      [max(id({1.0, b}), id({1, b})), min(id(1), id(1.0)), recs(),
       [ea(T) || T <- [apply, apply_last, double, fixed]]],
-     [bsi(), cl(), rd()]].
+     [bsi(), cl(), rd()],
+     begin
+         Off = list_to_binary(lists:duplicate(80, $a)),
+         Part = binary:part(Off, 1, 3),
+         [ib(Part), ib(Off), ib(<<"literal">>), ib(<<>>), ib(<<5:3>>), ib(id(<<"x">>)), ib(a)]
+     end].
 "#;
 
 /// Runs `module:run/0` in a child test process when this process is one; returns whether it was.

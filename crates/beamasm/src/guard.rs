@@ -349,7 +349,11 @@ impl BeamModuleAssembler {
                 self.code.emit(|e| e.and_imm(Gpr::x(0), src, !7))?;
                 self.code.emit(|e| e.ldp(tmp1, tmp2, Gpr::x(0), 0))?;
                 let not_sub_bits = self.code.new_label();
-                self.code.emit(|e| e.cmp_imm(tmp1, 0x24, false))?;
+                // HEADER_SUB_BITS = _make_header(ERL_SUB_BITS_SIZE-1, _TAG_HEADER_SUB_BITS).
+                // The bare subtag 0x24 never matches a live sub-binary (header 0x124), so the
+                // size would be taken from base_flags and a byte-aligned slice would fail.
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1196-1204, OTP-29.1.1.
+                self.code.emit(|e| e.cmp_imm(tmp1, 0x124, false))?;
                 self.code.b_cond(Cond::Ne, not_sub_bits)?;
                 self.code.emit(|e| e.ldp(tmp2, tmp3, Gpr::x(0), 16))?;
                 self.code
