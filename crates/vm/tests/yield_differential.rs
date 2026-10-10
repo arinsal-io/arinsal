@@ -66,3 +66,82 @@ collect(Pid, Acc) ->
         })
     );
 }
+
+#[test]
+fn large_trapping_bifs_still_yield_with_reductions_and_trace() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping large trap yield differential test");
+        return;
+    };
+    let source = r#"
+-module(trap_lazy_yield).
+-export([run/0]).
+run() ->
+    Values = lists:seq(1, 200000),
+    Encoded = term_to_binary(Values),
+    Pairs = [{N, N} || N <- lists:seq(1, 60000)],
+    Checks = [
+        observe(term_to_binary, fun() -> term_to_binary(Values) end),
+        observe(term_to_iovec, fun() -> term_to_iovec(Values) end),
+        observe(binary_to_term, fun() -> binary_to_term(Encoded) end),
+        observe(list_to_binary, fun() -> list_to_binary(lists:duplicate(200000, 97)) end),
+        observe(binary_copy, fun() -> binary:copy(<<7>>, 600000 + (length(Values) rem 2)) end),
+        observe(from_list, fun() -> maps:from_list(Pairs) end)
+    ],
+    [Name || {Name, Yielded, Reductions} <- Checks, Yielded andalso Reductions > 0].
+observe(Name, Fun) ->
+    Parent = self(),
+    Pid = spawn(fun() ->
+        receive start ->
+            {reductions, Before} = process_info(self(), reductions),
+            _ = Fun(),
+            {reductions, After} = process_info(self(), reductions),
+            Parent ! {done, self(), After - Before}
+        end
+    end),
+    1 = erlang:trace(Pid, true, [running, {tracer, Parent}]),
+    Pid ! start,
+    receive
+        {done, Pid, Delta} ->
+            Ref = erlang:trace_delivered(Pid),
+            {Name, count_out(Pid, Ref, 0) > 0, Delta}
+    after 30000 ->
+        exit(Pid, kill),
+        {Name, false, 0}
+    end.
+count_out(Pid, Ref, Count) ->
+    receive
+        {trace, Pid, out, _} -> count_out(Pid, Ref, Count + 1);
+        {trace_delivered, Pid, Ref} -> Count;
+        _ -> count_out(Pid, Ref, Count)
+    after 30000 ->
+        0
+    end.
+"#;
+    let beam = reference
+        .compile_named("trap_lazy_yield", source, &[])
+        .unwrap();
+    reference.load("trap_lazy_yield", &beam).unwrap();
+    let expected = reference.call("trap_lazy_yield", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("trap_lazy_yield", "run", &[], 2, Some(7))
+        .unwrap_or_else(|error| panic!("large trapping BIF yields: {error}"));
+
+    assert_eq!(expected, CallResult::Ok(actual.term.clone()));
+    assert_eq!(
+        actual.term,
+        OwnedTerm::List {
+            elems: vec![
+                OwnedTerm::atom("term_to_binary"),
+                OwnedTerm::atom("term_to_iovec"),
+                OwnedTerm::atom("binary_to_term"),
+                OwnedTerm::atom("list_to_binary"),
+                OwnedTerm::atom("binary_copy"),
+                OwnedTerm::atom("from_list"),
+            ],
+            tail: Box::new(OwnedTerm::Nil),
+        }
+    );
+}

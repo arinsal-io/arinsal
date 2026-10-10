@@ -125,6 +125,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "proptest",
+ "smallvec",
 ]
 
 [[package]]
