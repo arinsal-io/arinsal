@@ -4100,20 +4100,83 @@ fn emit_op(
                             "integer" | "binary" => {
                                 // {Name, Live, Flags, Size, Unit, Dst}
                                 let live = live_or_nil(args.get(at + 1))?;
-                                let flags = bs_flags(args.get(at + 2), beam)?;
-                                let size = small_or_arg(args.get(at + 3), beam, env)?;
-                                let unit = small_or_arg(args.get(at + 4), beam, env)?;
-                                let dst = value(at + 5)?;
-                                let kind = u32::from(name == "binary");
-                                assembler.emit_bs_match_command(
-                                    kind,
-                                    live,
-                                    &[ctx, ArgVal::Immediate(flags), size, unit],
-                                    fail,
-                                    Some(dst),
-                                    env.bs_match_cmd_helper(),
-                                )?;
-                                at += 6;
+                                // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:414-461, OTP-29.1.1:
+                                // consecutive unsigned big-endian fields share one read.
+                                let mut fused = Vec::new();
+                                let mut scan = at;
+                                let mut total = 0u16;
+                                if name == "integer" {
+                                    while scan + 5 < args.len() {
+                                        let Some(SpecificOperand::Atom(index)) = args.get(scan)
+                                        else {
+                                            break;
+                                        };
+                                        let Some(scan_name) = index
+                                            .checked_sub(1)
+                                            .and_then(|index| beam.atoms.get(index as usize))
+                                            .map(String::as_str)
+                                        else {
+                                            break;
+                                        };
+                                        if scan_name != "integer" {
+                                            break;
+                                        }
+                                        let flags = bs_flags(args.get(scan + 2), beam)?;
+                                        if flags != 0xf {
+                                            break;
+                                        }
+                                        let ArgVal::Immediate(unit) =
+                                            small_or_arg(args.get(scan + 4), beam, env)?
+                                        else {
+                                            break;
+                                        };
+                                        if unit != (1 << 4) | 0xf {
+                                            break;
+                                        }
+                                        let ArgVal::Immediate(size) =
+                                            small_or_arg(args.get(scan + 3), beam, env)?
+                                        else {
+                                            break;
+                                        };
+                                        if size & 0xf != 0xf {
+                                            break;
+                                        }
+                                        let bits = u16::try_from(size >> 4).unwrap_or(0);
+                                        if !matches!(bits, 8 | 16 | 32)
+                                            || total.checked_add(bits).is_none_or(|sum| sum > 32)
+                                        {
+                                            break;
+                                        }
+                                        total += bits;
+                                        fused.push((bits, value(scan + 5)?));
+                                        scan += 6;
+                                    }
+                                }
+                                if fused.len() >= 2 {
+                                    assembler.emit_bs_match_fused_integers(
+                                        ctx,
+                                        fail,
+                                        live,
+                                        &fused,
+                                        env.bs_match_cmd_helper(),
+                                    )?;
+                                    at = scan;
+                                } else {
+                                    let flags = bs_flags(args.get(at + 2), beam)?;
+                                    let size = small_or_arg(args.get(at + 3), beam, env)?;
+                                    let unit = small_or_arg(args.get(at + 4), beam, env)?;
+                                    let dst = value(at + 5)?;
+                                    let kind = u32::from(name == "binary");
+                                    assembler.emit_bs_match_command(
+                                        kind,
+                                        live,
+                                        &[ctx, ArgVal::Immediate(flags), size, unit],
+                                        fail,
+                                        Some(dst),
+                                        env.bs_match_cmd_helper(),
+                                    )?;
+                                    at += 6;
+                                }
                             }
                             "get_tail" => {
                                 // {Name, Live, Unit, Dst}

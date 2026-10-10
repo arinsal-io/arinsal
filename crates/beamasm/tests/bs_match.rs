@@ -53,18 +53,18 @@ fn run_native(
 fn run_native_configured(
     emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), arinsal_beamasm::module::ModuleError>,
 ) -> u64 {
-    run_native_offset(emit, 0)
+    run_native_offset(emit, 0, &[0x5a; 1000]).0
 }
 
 #[cfg(target_arch = "aarch64")]
 fn run_native_offset(
     emit: impl FnOnce(&mut BeamModuleAssembler) -> Result<(), arinsal_beamasm::module::ModuleError>,
     bit_offset: usize,
-) -> u64 {
+    bytes: &[u8],
+) -> (u64, u64) {
     let mut heap = ProcessHeap::with_words(4096);
-    let bytes = vec![0x5a; 1000];
     let mut builder = TermBuilder::new(&mut heap);
-    let binary = builder.binary(&bytes).unwrap();
+    let binary = builder.binary(bytes).unwrap();
     let sliced = builder
         .sub_binary(binary, bit_offset, bytes.len() * 8 - bit_offset)
         .unwrap();
@@ -90,14 +90,22 @@ fn run_native_offset(
     registers.x_reg_array[0] = context;
     registers.x_reg_array[1] = Term::small(1).unwrap();
     let mut stack = [0_u64; 128];
+    let (htop, hend) = heap.heap_cursor();
+    let (heap_start, _) = heap.heap_bounds();
     let mut header = ProcessHeader {
+        htop,
+        heap: heap_start,
+        hend,
         stop: stack.as_mut_ptr().wrapping_add(stack.len()),
         fcalls: 100,
         ..ProcessHeader::default()
     };
     let result = enter_native(&mut header, &mut registers, &module.entry(1).unwrap());
     assert_eq!(result, ExitReason::Returned);
-    registers.x_reg_array[1].tagged_word()
+    (
+        registers.x_reg_array[1].tagged_word(),
+        registers.x_reg_array[2].tagged_word(),
+    )
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -288,8 +296,9 @@ fn native_unaligned_match_context_and_fail_branch() {
             )
         },
         1,
+        &[0x5a; 1000],
     );
-    assert_eq!(result, 77);
+    assert_eq!(result.0, 77);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -305,11 +314,7 @@ fn native_byte_loop_over_thousand_byte_binary() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_sub_binary_extraction() {
-    let mut expected_heap = ProcessHeap::with_words(256);
-    let mut expected_builder = TermBuilder::new(&mut expected_heap);
-    let expected_binary = expected_builder.binary(&[0x12, 0x34]).unwrap();
-    let expected = rt::term_bits(expected_binary);
-    RETURN_VALUES.with(|values| *values.borrow_mut() = VecDeque::from([expected]));
+    // 16 bits of the 0x5a fixture are copied on-heap; the context then sits at bit 16.
     let actual = run_native_configured(|asm| {
         asm.emit_i_bs_get_binary2(
             ArgVal::X(0),
@@ -317,23 +322,128 @@ fn native_sub_binary_extraction() {
             1,
             ArgVal::Immediate(rt::term_bits(Term::small(16).unwrap())),
             1,
+            ArgVal::X(2),
+            match_helper,
+            gc_helper,
+        )?;
+        asm.emit_i_bs_get_position(ArgVal::X(0), ArgVal::X(1), match_helper)
+    });
+    assert_eq!(actual, rt::term_bits(Term::small(16).unwrap()));
+    // 80 bytes is past the 64-byte on-heap limit, so the slice is a shared sub-bits.
+    let wide = run_native_configured(|asm| {
+        asm.emit_i_bs_get_binary2(
+            ArgVal::X(0),
+            99,
+            1,
+            ArgVal::Immediate(rt::term_bits(Term::small(80).unwrap())),
+            8,
+            ArgVal::X(2),
+            match_helper,
+            gc_helper,
+        )?;
+        asm.emit_i_bs_get_position(ArgVal::X(0), ArgVal::X(1), match_helper)
+    });
+    assert_eq!(wide, rt::term_bits(Term::small(640).unwrap()));
+    // The extracted sub-bits is not a match context; start_match must build one.
+    let byte = run_native_configured(|asm| {
+        asm.emit_i_bs_get_binary2(
+            ArgVal::X(0),
+            99,
+            1,
+            ArgVal::Immediate(rt::term_bits(Term::small(80).unwrap())),
+            8,
             ArgVal::X(1),
             match_helper,
             gc_helper,
+        )?;
+        asm.emit_i_bs_start_match3(ArgVal::X(1), 1, 99, ArgVal::X(0), match_helper, gc_helper)?;
+        asm.emit_bs_match_command(
+            0,
+            1,
+            &[
+                ArgVal::X(0),
+                ArgVal::Immediate(0xf),
+                ArgVal::Immediate((8 << 4) | 0xf),
+                ArgVal::Immediate((1 << 4) | 0xf),
+            ],
+            99,
+            Some(ArgVal::X(1)),
+            match_command,
         )
     });
-    assert_eq!(actual, expected);
-    RETURN_VALUES.with(|values| assert!(values.borrow().is_empty()));
+    assert_eq!(byte, rt::term_bits(Term::small(0x5a).unwrap()));
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_inline_fixed_integers() {
+    let byte = run_native_configured(|asm| {
+        asm.emit_bs_match_command(
+            0,
+            1,
+            &[
+                ArgVal::X(0),
+                ArgVal::Immediate(0xf),
+                ArgVal::Immediate((8 << 4) | 0xf),
+                ArgVal::Immediate((1 << 4) | 0xf),
+            ],
+            99,
+            Some(ArgVal::X(1)),
+            match_command,
+        )
+    });
+    assert_eq!(byte, rt::term_bits(Term::small(0x5a).unwrap()));
+    let word = run_native_configured(|asm| {
+        asm.emit_bs_match_command(
+            0,
+            1,
+            &[
+                ArgVal::X(0),
+                ArgVal::Immediate(0xf),
+                ArgVal::Immediate((32 << 4) | 0xf),
+                ArgVal::Immediate((1 << 4) | 0xf),
+            ],
+            99,
+            Some(ArgVal::X(1)),
+            match_command,
+        )
+    });
+    assert_eq!(word, rt::term_bits(Term::small(0x5a5a_5a5a).unwrap()));
+}
+
+extern "C" fn match_command(_process: *mut ProcessHeader, _kind: u64, _live: u64) -> u64 {
+    0
 }
 
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_utf8_multibyte() {
+    // U+20AC EURO SIGN is the three-byte sequence E2 82 AC.
     let expected = rt::term_bits(Term::small(0x20ac).unwrap());
-    RETURN_VALUES.with(|values| *values.borrow_mut() = VecDeque::from([expected]));
-    let actual = run_native_configured(|asm| {
-        asm.emit_i_bs_get_utf8(ArgVal::X(0), 99, ArgVal::X(1), match_helper)
-    });
-    assert_eq!(actual, expected);
-    RETURN_VALUES.with(|values| assert!(values.borrow().is_empty()));
+    let actual = run_native_offset(
+        |asm| asm.emit_i_bs_get_utf8(ArgVal::X(0), 99, ArgVal::X(1), match_helper),
+        0,
+        &[0xe2, 0x82, 0xac, 0x41],
+    );
+    assert_eq!(actual.0, expected);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_fused_header_integers() {
+    let (len, tag) = run_native_offset(
+        |asm| {
+            asm.emit_bs_match_fused_integers(
+                ArgVal::X(0),
+                99,
+                1,
+                &[(8, ArgVal::X(2)), (16, ArgVal::X(1))],
+                match_command,
+            )
+        },
+        0,
+        &[0x01, 0x00, 0x0d, 0x07],
+    );
+    assert_eq!(tag, rt::term_bits(Term::small(1).unwrap()));
+    assert_eq!(len, rt::term_bits(Term::small(13).unwrap()));
 }
