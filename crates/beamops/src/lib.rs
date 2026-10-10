@@ -137,18 +137,12 @@ fn transform_with_options(
     let raw = instructions
         .iter()
         .map(|instruction| Node {
-            name: instruction.op.name().to_owned(),
+            name: instruction.op.name(),
             args: instruction.args.iter().map(allocation_as_words).collect(),
             offset: instruction.offset,
         })
         .collect::<Vec<_>>();
     let mut code = inject_function_starts(raw);
-    let max_pattern = rules
-        .values()
-        .flatten()
-        .map(|rule| rule.patterns.len())
-        .max()
-        .unwrap_or(1);
     // OTP rules are ordered, greedy peephole rewrites. Re-scan after a rewrite
     // because a later rule can expose an earlier multi-instruction pattern.
     // Like erts' loader (beam_load.c, transform_engine), generated instructions are put
@@ -164,7 +158,14 @@ fn transform_with_options(
             let (stream, at): (&[Node], usize) = if front.is_empty() {
                 (&code, index)
             } else {
-                let end = code.len().min(index + max_pattern);
+                // Only the current opcode's rules can match, so the window is that
+                // pattern width (erts transform_engine), not the longest rule in the module.
+                let need = front
+                    .front()
+                    .and_then(|node| rules.get(node.name))
+                    .and_then(|rules| rules.iter().map(|rule| rule.patterns.len()).max())
+                    .unwrap_or(1);
+                let end = code.len().min(index + need.saturating_sub(front.len()));
                 window = front
                     .iter()
                     .chain(&code[index..end])
@@ -173,7 +174,7 @@ fn transform_with_options(
                 (&window, 0)
             };
             let mut replacement = None;
-            for rule in rules.get(&stream[at].name).into_iter().flatten() {
+            for rule in rules.get(stream[at].name).into_iter().flatten() {
                 if let Some((consumed, produced)) =
                     apply_rule(rule, stream, at, beam, instrument_line_breakpoints)
                 {
@@ -221,13 +222,13 @@ fn transform_with_options(
             if instruction.name == "has_map_fields" {
                 map_fields_to_elements(instruction)
             } else {
-                let convert = if typed && TYPED_OPS.contains(&instruction.name.as_str()) {
+                let convert = if typed && TYPED_OPS.contains(&instruction.name) {
                     typed_operand
                 } else {
                     operand
                 };
                 make_op(
-                    &instruction.name,
+                    instruction.name,
                     instruction.args.iter().map(convert).collect(),
                 )
             }
@@ -239,7 +240,7 @@ fn transform_with_options(
 fn map_fields_to_elements(instruction: &Node) -> SpecificOp {
     let [fail, source, size, rest @ ..] = instruction.args.as_slice() else {
         return make_op(
-            &instruction.name,
+            instruction.name,
             instruction.args.iter().map(operand).collect(),
         );
     };
@@ -249,13 +250,13 @@ fn map_fields_to_elements(instruction: &Node) -> SpecificOp {
     };
     let Some(count) = operand_integer(size).and_then(|count| usize::try_from(count).ok()) else {
         return make_op(
-            &instruction.name,
+            instruction.name,
             instruction.args.iter().map(operand).collect(),
         );
     };
     if keys.len() != count {
         return make_op(
-            &instruction.name,
+            instruction.name,
             instruction.args.iter().map(operand).collect(),
         );
     }
@@ -286,7 +287,8 @@ fn map_fields_to_elements(instruction: &Node) -> SpecificOp {
 
 #[derive(Clone, Debug)]
 struct Node {
-    name: String,
+    /// Generic or specific opcode mnemonic. Static, as in the loader's opcode table.
+    name: &'static str,
     args: Vec<Operand>,
     offset: usize,
 }
@@ -295,7 +297,7 @@ impl Node {
     // A moved-out stream slot.
     fn empty() -> Self {
         Self {
-            name: String::new(),
+            name: "",
             args: Vec::new(),
             offset: 0,
         }
@@ -318,7 +320,7 @@ struct Rule {
 
 #[derive(Clone, Debug)]
 struct Pattern {
-    op: String,
+    op: &'static str,
     args: Vec<PatArg>,
 }
 #[derive(Clone, Debug)]
@@ -355,21 +357,18 @@ enum Predicate {
 }
 #[derive(Clone, Debug)]
 struct Output {
-    op: String,
+    op: &'static str,
     args: Vec<String>,
     function: bool,
 }
 
-fn rules() -> &'static HashMap<String, Vec<Rule>> {
-    static RULES: OnceLock<HashMap<String, Vec<Rule>>> = OnceLock::new();
+fn rules() -> &'static HashMap<&'static str, Vec<Rule>> {
+    static RULES: OnceLock<HashMap<&'static str, Vec<Rule>>> = OnceLock::new();
     RULES.get_or_init(|| {
         let parsed_rules = parse_rules();
-        let mut buckets: HashMap<String, Vec<Rule>> = HashMap::new();
+        let mut buckets: HashMap<&'static str, Vec<Rule>> = HashMap::new();
         for rule in parsed_rules {
-            buckets
-                .entry(rule.patterns[0].op.clone())
-                .or_default()
-                .push(rule);
+            buckets.entry(rule.patterns[0].op).or_default().push(rule);
         }
         buckets
     })
@@ -404,7 +403,7 @@ fn inject_function_starts(raw: Vec<Node>) -> Vec<Node> {
             }
             args.extend(raw[func_info_index].args.clone());
             code.push(Node {
-                name: "int_func_start".into(),
+                name: "int_func_start",
                 args,
                 offset: raw[index].offset,
             });
@@ -421,7 +420,7 @@ fn inject_function_starts(raw: Vec<Node>) -> Vec<Node> {
         if node.name == "int_func_start" {
             if let (Some(function), Some(entry)) = (current_function.take(), entry_label.take()) {
                 with_ends.push(Node {
-                    name: "int_func_end".into(),
+                    name: "int_func_end",
                     args: vec![function, entry],
                     offset: node.offset,
                 });
@@ -434,7 +433,7 @@ fn inject_function_starts(raw: Vec<Node>) -> Vec<Node> {
     }
     if let (Some(function), Some(entry)) = (current_function, entry_label) {
         with_ends.push(Node {
-            name: "int_func_end".into(),
+            name: "int_func_end",
             args: vec![function, entry],
             offset: with_ends.last().map_or(0, |node| node.offset),
         });
@@ -465,12 +464,14 @@ fn parse_rules() -> Vec<Rule> {
         if has_arrow {
             let rhs = pending.split_once("=>").map_or("", |(_, rhs)| rhs.trim());
             if !rhs.is_empty() && !rhs.ends_with('|') {
-                if let Some((lhs, rhs)) = pending.split_once("=>")
+                // Rule text is process-lifetime, like erts' generated op tables.
+                let owned = std::mem::take(&mut pending);
+                let static_rule: &'static str = Box::leak(owned.into_boxed_str());
+                if let Some((lhs, rhs)) = static_rule.split_once("=>")
                     && let Some(rule) = parse_rule(lhs.trim(), rhs.trim())
                 {
                     result.push(rule);
                 }
-                pending.clear();
                 has_arrow = false;
             }
         } else if !line.ends_with('|') {
@@ -483,7 +484,7 @@ fn parse_rules() -> Vec<Rule> {
     result
 }
 
-fn parse_rule(lhs: &str, rhs: &str) -> Option<Rule> {
+fn parse_rule(lhs: &'static str, rhs: &'static str) -> Option<Rule> {
     let mut patterns = Vec::new();
     let mut predicates = Vec::new();
     for segment in split_pipes(lhs) {
@@ -517,7 +518,7 @@ fn parse_rule(lhs: &str, rhs: &str) -> Option<Rule> {
             continue;
         }
         let mut words = segment.split_whitespace();
-        let op = words.next()?.to_owned();
+        let op = words.next()?;
         if !op.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return None;
         }
@@ -533,14 +534,14 @@ fn parse_rule(lhs: &str, rhs: &str) -> Option<Rule> {
         let (op, args, function) = if let Some((name, rest)) = segment.split_once('(') {
             let close = rest.strip_suffix(')')?;
             (
-                name.to_owned(),
+                name,
                 close.split(',').map(|arg| arg.trim().to_owned()).collect(),
                 true,
             )
         } else {
             let words = segment.split_whitespace().collect::<Vec<_>>();
             (
-                words[0].to_owned(),
+                words[0],
                 words[1..].iter().map(|s| (*s).to_owned()).collect(),
                 false,
             )
@@ -563,7 +564,7 @@ fn split_pipes(s: &str) -> Vec<&str> {
 fn parse_pat_arg(token: &str) -> Option<PatArg> {
     if token == "*" {
         return Some(PatArg {
-            name: Some("*".into()),
+            name: Some("*".to_owned()),
             ty: None,
             restriction: None,
             eq: None,
@@ -608,7 +609,7 @@ fn parse_pat_arg(token: &str) -> Option<PatArg> {
             return None;
         }
         return Some(PatArg {
-            name: name.or_else(|| Some("*".into())),
+            name: name.or_else(|| Some("*".to_owned())),
             ty: None,
             restriction: None,
             eq: None,
@@ -817,7 +818,7 @@ fn apply_rule(
                 .args
                 .last()
                 .and_then(|arg| arg.name.clone())
-                .unwrap_or_else(|| "*".into());
+                .unwrap_or_else(|| "*".to_owned());
             bindings.push((name, Operand::List(values)));
         }
     }
@@ -857,13 +858,13 @@ fn apply_rule(
         // Ports of OTP-29.1.1 loader generators: beam/generators.tab:87,128,176,202
         // and beam/jit/arm/generators.tab:375. These generate operations using
         // lambda metadata, map-key hashes, and normalized variable operands.
-        match output.op.as_str() {
+        match output.op {
             "get_utf16" => {
                 if args.len() != 4 {
                     return None;
                 }
                 produced.push(Node {
-                    name: "i_bs_get_utf16".into(),
+                    name: "i_bs_get_utf16",
                     args: vec![
                         args[1].clone(),
                         args[0].clone(),
@@ -878,7 +879,7 @@ fn apply_rule(
                     return None;
                 }
                 produced.push(Node {
-                    name: "i_bs_skip_utf16".into(),
+                    name: "i_bs_skip_utf16",
                     args: vec![args[1].clone(), args[0].clone(), args[2].clone()],
                     offset: code[at].offset,
                 });
@@ -892,7 +893,7 @@ fn apply_rule(
                 };
                 let value = rest.first()?;
                 produced.push(Node {
-                    name: "move".into(),
+                    name: "move",
                     args: vec![Operand::Nil, value.clone()],
                     offset: code[at].offset,
                 });
@@ -909,9 +910,9 @@ fn apply_rule(
                 specific_args.extend(rest.clone());
                 produced.push(Node {
                     name: if pairs <= 10 {
-                        "i_select_val_lins".into()
+                        "i_select_val_lins"
                     } else {
-                        "i_select_val_bins".into()
+                        "i_select_val_bins"
                     },
                     args: specific_args,
                     offset: code[at].offset,
@@ -927,7 +928,7 @@ fn apply_rule(
                 let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
                 specific_args.extend(rest.clone());
                 produced.push(Node {
-                    name: "i_select_tuple_arity".into(),
+                    name: "i_select_tuple_arity",
                     args: specific_args,
                     offset: code[at].offset,
                 });
@@ -958,7 +959,7 @@ fn apply_rule(
                     specific_args[4 + slot] = pair[1].clone();
                 }
                 produced.push(Node {
-                    name: "i_jump_on_val".into(),
+                    name: "i_jump_on_val",
                     args: specific_args,
                     offset: code[at].offset,
                 });
@@ -972,13 +973,13 @@ fn apply_rule(
                 };
                 for pair in rest.chunks_exact(2) {
                     produced.push(Node {
-                        name: "is_ne_exact".into(),
+                        name: "is_ne_exact",
                         args: vec![pair[1].clone(), args[0].clone(), pair[0].clone()],
                         offset: code[at].offset,
                     });
                 }
                 produced.push(Node {
-                    name: "jump".into(),
+                    name: "jump",
                     args: vec![args[1].clone()],
                     offset: code[at].offset,
                 });
@@ -993,7 +994,7 @@ fn apply_rule(
                 let mut specific_args = vec![args[0].clone(), args[1].clone()];
                 specific_args.extend(rest.clone());
                 produced.push(Node {
-                    name: "i_bs_match".into(),
+                    name: "i_bs_match",
                     args: specific_args,
                     offset: code[at].offset,
                 });
@@ -1008,7 +1009,7 @@ fn apply_rule(
                 let mut specific_args = vec![args[0].clone(), args[1].clone(), args[2].clone()];
                 specific_args.extend(rest.clone());
                 produced.push(Node {
-                    name: "i_new_small_map_lit".into(),
+                    name: "i_new_small_map_lit",
                     args: specific_args,
                     offset: code[at].offset,
                 });
@@ -1081,7 +1082,7 @@ fn apply_rule(
                     && operand_integer(&alloc).is_some_and(|words| words != 0)
                 {
                     produced.push(Node {
-                        name: "test_heap".into(),
+                        name: "test_heap",
                         args: vec![alloc.clone(), args[2].clone()],
                         offset: code[at].offset,
                     });
@@ -1089,7 +1090,7 @@ fn apply_rule(
                     specific_args[1] = alloc;
                 }
                 produced.push(Node {
-                    name: "i_bs_create_bin".into(),
+                    name: "i_bs_create_bin",
                     args: specific_args,
                     offset: code[at].offset,
                 });
@@ -1115,13 +1116,13 @@ fn apply_rule(
                         | Operand::Literal(_)
                 ) {
                     produced.push(Node {
-                        name: "i_get_map_element_hash".into(),
+                        name: "i_get_map_element_hash",
                         args: vec![args[0].clone(), args[1].clone(), key, Operand::U(0), dst],
                         offset: code[at].offset,
                     });
                 } else {
                     produced.push(Node {
-                        name: "i_get_map_element".into(),
+                        name: "i_get_map_element",
                         args: vec![args[0].clone(), args[1].clone(), key, dst],
                         offset: code[at].offset,
                     });
@@ -1142,7 +1143,7 @@ fn apply_rule(
                     // erts/emulator/beam/jit/arm/generators.tab:176-198 (one-key lookup),
                     // OTP-29.1.1. Guard `is_map_key/2` uses a scratch destination.
                     produced.push(Node {
-                        name: "i_get_map_element".into(),
+                        name: "i_get_map_element",
                         args: vec![
                             args[0].clone(),
                             args[1].clone(),
@@ -1165,7 +1166,7 @@ fn apply_rule(
                     specific_args.push(Operand::U(0));
                 }
                 produced.push(Node {
-                    name: "i_get_map_elements".into(),
+                    name: "i_get_map_elements",
                     args: specific_args,
                     offset: code[at].offset,
                 });
@@ -1183,7 +1184,7 @@ fn apply_rule(
                 let position = beam.records.iter().position(|record| record.name == name)?;
                 let literal = u32::try_from(beam.literals.len() + position).ok()?;
                 produced.push(Node {
-                    name: "create_local_native_record".into(),
+                    name: "create_local_native_record",
                     args: vec![
                         Operand::Literal(literal),
                         dst.clone(),
@@ -1207,7 +1208,7 @@ fn apply_rule(
                     .find(|lambda| u64::from(lambda.index) == *index)
                 else {
                     produced.push(Node {
-                        name: "i_lambda_error".into(),
+                        name: "i_lambda_error",
                         args: vec![Operand::U(0)],
                         offset: code[at].offset,
                     });
@@ -1215,7 +1216,7 @@ fn apply_rule(
                 };
                 if u64::from(lambda.num_free) != *num_free {
                     produced.push(Node {
-                        name: "i_lambda_error".into(),
+                        name: "i_lambda_error",
                         args: vec![Operand::U(0)],
                         offset: code[at].offset,
                     });
@@ -1223,7 +1224,7 @@ fn apply_rule(
                 }
                 if lambda.num_free == 0 {
                     produced.push(Node {
-                        name: "i_move".into(),
+                        name: "i_move",
                         // Keep zero-capture fun references distinct from BEAM literal 0.
                         // The high index range is reserved for this internal bridge.
                         args: vec![Operand::Literal(u32::MAX - lambda.index), args[1].clone()],
@@ -1239,7 +1240,7 @@ fn apply_rule(
                 specific_args.push(Operand::U(env.len() as u64));
                 specific_args.extend(env.clone());
                 produced.push(Node {
-                    name: "i_make_fun3".into(),
+                    name: "i_make_fun3",
                     args: specific_args,
                     offset: code[at].offset,
                 });
@@ -1256,7 +1257,7 @@ fn apply_rule(
                     .find(|lambda| lambda.label == entry_label && lambda.num_free > 0)
                 {
                     produced.push(Node {
-                        name: "i_lambda_trampoline".into(),
+                        name: "i_lambda_trampoline",
                         args: vec![
                             Operand::U(u64::from(lambda.index)),
                             Operand::U(u64::from(entry_label)),
@@ -1268,7 +1269,7 @@ fn apply_rule(
                 }
             }
             _ => produced.push(Node {
-                name: output.op.clone(),
+                name: output.op,
                 args,
                 offset: code[at].offset,
             }),
@@ -1813,12 +1814,12 @@ mod tests {
     fn function_start_without_line_injects_nil_location() {
         let output = inject_function_starts(vec![
             Node {
-                name: "label".into(),
+                name: "label",
                 args: vec![Operand::U(1)],
                 offset: 0,
             },
             Node {
-                name: "func_info".into(),
+                name: "func_info",
                 args: vec![Operand::Atom(1), Operand::Atom(2), Operand::U(0)],
                 offset: 2,
             },
