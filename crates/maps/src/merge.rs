@@ -21,6 +21,7 @@ fn heap_filler_header(words: usize) -> u64 {
 }
 
 /// Fresh, uninitialized heap words (`HAlloc`).
+#[inline(always)]
 pub(crate) fn produce<'a, H: HeapAlloc + ?Sized>(
     heap: &mut H,
     words: usize,
@@ -89,6 +90,7 @@ pub(crate) fn flatmap_kv<'a>(map: Term) -> (&'a [u64], &'a [u64], Term) {
 }
 
 /// Flatmap key and value words when the caller already has its checked size.
+#[inline(always)]
 pub(crate) fn flatmap_kv_with_size<'a>(map: Term, n: usize) -> (&'a [u64], &'a [u64], Term) {
     let words = boxed_words(map, 3 + n);
     let keys = term(words[2]);

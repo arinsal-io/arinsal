@@ -71,6 +71,7 @@ impl CheckedMap {
     }
 
     /// Number of key-value pairs.
+    #[inline(always)]
     pub fn size(self) -> usize {
         // SAFETY: `checked_map` validated the map tag and the live map header has its
         // size in word one, shared by flatmaps and HAMT heads.
@@ -84,6 +85,7 @@ impl CheckedMap {
     }
 
     /// Selects flatmap or HAMT storage after the map tag check.
+    #[inline(always)]
     pub fn kind(self) -> CheckedMapKind {
         if self.map.is_hashmap() {
             CheckedMapKind::Hashmap(CheckedHashMap(self))
@@ -132,7 +134,8 @@ fn cons(ptr: *mut u64) -> Term {
     term(ptr as u64 | 1)
 }
 fn check(map: Term) -> MapResult<()> {
-    if map.classify() == TermKind::Map {
+    // Port of erts/emulator/beam/erl_term.h:1317 (is_map), OTP-29.1.1.
+    if map.header().is_some_and(|header| header & 63 == MAP) {
         Ok(())
     } else {
         Err(MapError::Badmap(map))
@@ -822,6 +825,7 @@ fn collect(node: Term, out: &mut Vec<(Term, Term)>) {
 
 /// Validate a map once for one BIF operation.
 // Port of erts/emulator/beam/erl_map.c:3636-3710, OTP-29.1.1.
+#[inline(always)]
 pub fn checked_map(map: Term) -> MapResult<CheckedMap> {
     check(map)?;
     Ok(CheckedMap { map })
@@ -985,16 +989,19 @@ pub fn flatmap_next<H: HeapAlloc + ?Sized>(
 
 /// One flatmap iterator step with the already validated header from this call site.
 // Port of erts/emulator/beam/erl_map.c:3709-3738 (flatmap branch), OTP-29.1.1.
+#[inline(always)]
 pub fn flatmap_next_checked<H: HeapAlloc + ?Sized>(
     map: CheckedFlatMap,
+    size: usize,
     list_mode: bool,
     acc: Term,
     heap: &mut H,
 ) -> MapResult<Term> {
-    let (ks, vs, _) = merge::flatmap_kv_with_size(map.term(), map.size());
+    let (ks, vs, _) = merge::flatmap_kv_with_size(map.term(), size);
     flatmap_next_words(ks, vs, list_mode, acc, heap)
 }
 
+#[inline(always)]
 fn flatmap_next_words<H: HeapAlloc + ?Sized>(
     ks: &[u64],
     vs: &[u64],
@@ -1003,30 +1010,42 @@ fn flatmap_next_words<H: HeapAlloc + ?Sized>(
     heap: &mut H,
 ) -> MapResult<Term> {
     let n = ks.len();
-    let per_elem = if list_mode { 5 } else { 4 };
-    let need_words = per_elem * n;
-    let (output, start) =
-        merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
-    let mut res = if list_mode { acc } else { none_atom() };
-    for (index, words) in output.chunks_exact_mut(per_elem).enumerate() {
-        let from = n - 1 - index;
-        let at = start.wrapping_add(per_elem * index);
-        if list_mode {
+    if list_mode {
+        let need_words = 5 * n;
+        let (output, start) =
+            merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
+        let mut remaining = n;
+        let mut at = start;
+        let mut res = acc;
+        for words in output.as_chunks_mut::<5>().0 {
+            remaining -= 1;
             words[0].write(2 << 6);
-            words[1].write(ks[from]);
-            words[2].write(vs[from]);
+            words[1].write(ks[remaining]);
+            words[2].write(vs[remaining]);
             words[3].write(bits(boxed(at)));
             words[4].write(bits(res));
             res = cons(at.wrapping_add(3));
-        } else {
+            at = at.wrapping_add(5);
+        }
+        Ok(res)
+    } else {
+        let need_words = 4 * n;
+        let (output, start) =
+            merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
+        let mut remaining = n;
+        let mut at = start;
+        let mut res = none_atom();
+        for words in output.as_chunks_mut::<4>().0 {
+            remaining -= 1;
             words[0].write(3 << 6);
-            words[1].write(ks[from]);
-            words[2].write(vs[from]);
+            words[1].write(ks[remaining]);
+            words[2].write(vs[remaining]);
             words[3].write(bits(res));
             res = boxed(at);
+            at = at.wrapping_add(4);
         }
+        Ok(res)
     }
-    Ok(res)
 }
 
 /// `[{Key, Value} | Tail]`, the list-mode element of `erts_internal:map_next/3`: a 2-tuple

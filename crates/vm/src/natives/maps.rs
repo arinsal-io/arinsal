@@ -156,6 +156,7 @@ struct NodeCursor {
 }
 
 impl NodeCursor {
+    #[inline(always)]
     fn new(node: Term) -> Result<Self, Trap> {
         let header = node.header().ok_or_else(badarg)?;
         let subtype = (header >> 6) & 3;
@@ -221,6 +222,7 @@ impl PathDigits {
     }
 }
 
+#[inline(always)]
 fn path_digits(path: Term) -> Result<PathDigits, Trap> {
     if let Some(value) = path.as_small() {
         // unsigned_val(): a logical shift of the tagged word, so negatives keep their low bits.
@@ -249,6 +251,7 @@ fn path_digits(path: Term) -> Result<PathDigits, Trap> {
 
 /// Number of elements per call from the reductions left.
 /// Port of erts/emulator/beam/erl_map.c:3783-3801 (FCALLS_ELEMS), OTP-29.1.1.
+#[inline(always)]
 fn chunk_len(reductions: i32, map_size: usize) -> usize {
     let by_reds = ((reductions.max(0) as usize) / 4).max(1);
     by_reds.min(map_size)
@@ -487,7 +490,8 @@ fn flat_next(
         return Err(badarg());
     }
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    arinsal_maps::flatmap_next_checked(map, list_mode, acc, &mut heap).map_err(|_| system_limit())
+    arinsal_maps::flatmap_next_checked(map, n, list_mode, acc, &mut heap)
+        .map_err(|_| system_limit())
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3655-3706, OTP-29.1.1.
@@ -539,7 +543,7 @@ fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
     let map = arinsal_maps::checked_map(args[1]).map_err(|_| badarg())?;
     let mode = args[2];
     let iterator = mode == iterator_atom();
-    let list_mode = mode == Term::NIL || mode.classify() == TermKind::List;
+    let list_mode = !iterator && (mode == Term::NIL || mode.classify() == TermKind::List);
     if !iterator && !list_mode {
         return Err(badarg());
     }
