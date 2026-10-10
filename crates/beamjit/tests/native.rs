@@ -189,6 +189,7 @@ extern "C" fn arithmetic_helper(
     _op: u32,
     _lhs: u64,
     _rhs: u64,
+    _extra: u64,
 ) -> u64 {
     0
 }

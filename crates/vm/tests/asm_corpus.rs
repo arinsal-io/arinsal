@@ -197,7 +197,7 @@ impl ModuleEnv for CorpusEnv {
     }
 }
 
-extern "C" fn arith(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
+extern "C" fn arith(_: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) -> u64 {
     0
 }
 extern "C" fn guard(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {

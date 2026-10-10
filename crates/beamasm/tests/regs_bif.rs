@@ -41,7 +41,7 @@ extern "C" fn guard_helper(process: *mut ProcessHeader, _: u32, left: u64, right
     u64::from(left < right)
 }
 
-extern "C" fn arith_helper(process: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
+extern "C" fn arith_helper(process: *mut ProcessHeader, _: u32, _: u64, _: u64, _: u64) -> u64 {
     record(process);
     0xfeed
 }

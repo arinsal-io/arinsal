@@ -140,7 +140,7 @@ pub struct BeamModuleAssembler {
     /// Failure label of the arithmetic instruction being emitted (0: raise the error).
     pub(super) arith_fail: u32,
     /// Compiler types of the next arithmetic instruction's operands, consumed by its emitter.
-    pub(super) arith_types: Option<[crate::types::ArgType; 2]>,
+    pub(super) arith_types: Option<[crate::types::ArgType; 4]>,
     labels: HashMap<u32, Label>,
     defined: HashMap<u32, ()>,
     lambda_labels: HashMap<u32, Label>,
@@ -901,18 +901,21 @@ impl BeamModuleAssembler {
     }
 
     /// Emits the standard BEAM return and reduction accounting fragment.
-    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:45-68, OTP-29.1.1
+    // Port of erts/emulator/beam/jit/arm/instr_call.cpp:30-66 (emit_dispatch_return,
+    // emit_return), OTP-29.1.1.
     pub fn return_(&mut self) -> Result<(), ModuleError> {
         crate::emit_validate_native_cursor(&mut self.code)?;
         self.emit_leave_frame()?;
+        // The yield path is the forward `b.mi`, so a return with reductions left falls
+        // through to `ret`. erts keeps that sequence in the shared dispatch_return fragment.
         self.code.emit(|e| e.subs_imm(FCALLS, FCALLS, 1, false))?;
-        let returned = self.code.new_label();
-        self.code.b_cond(Cond::Pl, returned)?;
+        let stub = self.code.new_label();
+        self.code.b_cond(Cond::Mi, stub)?;
+        self.code.emit(|e| e.ret(Gpr::x(30)))?;
+        self.code.bind(stub)?;
         self.code.emit(|e| e.str_uoff(Gpr::x(30), C_P, 72))?;
         self.emit_yield_live(1)?;
         self.code.b(self.yield_label)?;
-        self.code.bind(returned)?;
-        self.code.emit(|e| e.ret(Gpr::x(30)))?;
         Ok(())
     }
 
@@ -1163,7 +1166,18 @@ impl BeamModuleAssembler {
     /// (left, right); the next arithmetic emitter consumes them.
     // Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry), OTP-29.1.1.
     pub fn set_arith_types(&mut self, lhs: crate::types::ArgType, rhs: crate::types::ArgType) {
-        self.arith_types = Some([lhs, rhs]);
+        self.set_arith_types4([
+            lhs,
+            rhs,
+            crate::types::ArgType::ANY,
+            crate::types::ArgType::ANY,
+        ]);
+    }
+
+    /// Supplies the compiler types of an `i_mul_add` (Src1, Src2, Src3, Src4).
+    // Port of erts/emulator/beam/jit/beam_jit_common.hpp:229-282 (getTypeEntry), OTP-29.1.1.
+    pub fn set_arith_types4(&mut self, types: [crate::types::ArgType; 4]) {
+        self.arith_types = Some(types);
     }
 
     /// The label of the shared slow-path fragment calling `helper` with operation `op`
@@ -1493,6 +1507,8 @@ impl BeamModuleAssembler {
                 .emit(|e| e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16))?;
             crate::emit_enter_runtime(&mut self.code, 6, update)?;
             self.code.emit(|e| {
+                // x3 is the third operand (mul-add increment, int128 sign); unused ops ignore it.
+                e.mov_reg(Gpr::x(4), Gpr::x(3))?;
                 e.mov_reg(Gpr::x(0), C_P)?;
                 e.mov_const(Gpr::x(1), u64::from(op))?;
                 e.mov_reg(Gpr::x(2), Gpr::x(14))?;
