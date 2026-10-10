@@ -1346,9 +1346,13 @@ pub(crate) fn collect_heap(
         process.heap.set_fullsweep_after(0);
     }
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (message queue GC scan), OTP-29.1.1.
-    let collected = process.collect_heap_roots(process.gc_live, keep, 0);
+    let live = process.gc_live;
+    let collected = process.collect_heap_roots(live, keep, 0);
     process.heap.set_fullsweep_after(fullsweep_after);
-    collected?;
+    let stats = collected?;
+    // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
+    // `esdp->gc_info`), OTP-29.1.1: a `garbage_collect` system task is a collection.
+    crate::natives::sys::after_collection(process, live, stats.collections, stats.words_reclaimed);
     Ok(())
 }
 

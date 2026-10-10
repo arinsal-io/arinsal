@@ -5104,7 +5104,17 @@ impl Process {
 
     pub(crate) fn service_deferred_gc(&mut self) -> Result<(), VmError> {
         if self.gc_enabled && std::mem::take(&mut self.gc_deferred) {
-            self.collect_heap_roots(self.gc_live, &mut [], 0)?;
+            let live = self.gc_live;
+            let stats = self.collect_heap_roots(live, &mut [], 0)?;
+            // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
+            // `esdp->gc_info`), OTP-29.1.1: a collection deferred while GC was disabled
+            // is counted when it actually runs.
+            crate::natives::sys::after_collection(
+                self,
+                live,
+                stats.collections,
+                stats.words_reclaimed,
+            );
         }
         Ok(())
     }
