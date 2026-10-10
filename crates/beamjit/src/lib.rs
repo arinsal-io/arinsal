@@ -1774,13 +1774,19 @@ fn function_allowlist_contains(list: &str, name: &str, arity: u8) -> bool {
     })
 }
 
+fn ported_index() -> &'static std::collections::HashMap<&'static str, EmitterKind> {
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, EmitterKind>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| PORTED_OPS.iter().map(|op| (op.name, op.emitter)).collect())
+}
+
 /// Report missing operations in order, without counting repeated uses twice.
 pub fn missing_ops(ops: &[SpecificOp]) -> Vec<String> {
-    let known = PORTED_OPS.iter().map(|op| op.name).collect::<BTreeSet<_>>();
+    let known = ported_index();
     let mut missing = BTreeSet::new();
     let mut ordered = Vec::new();
     for op in ops {
-        if !known.contains(op.name()) && missing.insert(op.name().to_owned()) {
+        if !known.contains_key(op.name()) && missing.insert(op.name().to_owned()) {
             ordered.push(op.name().to_owned());
         }
     }
@@ -4227,10 +4233,7 @@ fn emit_op(
 }
 
 fn ported(name: &str) -> Option<EmitterKind> {
-    PORTED_OPS
-        .iter()
-        .find(|op| op.name == name)
-        .map(|op| op.emitter)
+    ported_index().get(name).copied()
 }
 
 /// Error returned for invalid input files or module-wide emission failures.
