@@ -9,7 +9,7 @@ use libc::{localtime_r, mktime, time_t, tm};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 
-use crate::pure::{Heap, atom_name, bigint, tuple, tuple_build};
+use crate::pure::{Heap, atom_name, bigint, tuple_arity, tuple_build, tuple_element};
 use crate::{BifError, BifFn, Ctx};
 
 const NATIVE: i128 = 1_000_000_000;
@@ -239,24 +239,23 @@ fn component(term: Term) -> Result<i32, BifError> {
         .ok_or(BifError::BADARG)
 }
 fn parse_datetime(term: Term) -> Result<Calendar, BifError> {
-    let parts = tuple(term)?;
-    if parts.len() != 2 {
+    if tuple_arity(term)? != 2 {
         return Err(BifError::BADARG);
     }
-    let date = tuple(parts[0])?;
-    let time = tuple(parts[1])?;
-    if date.len() != 3 || time.len() != 3 {
+    let date = tuple_element(term, 0)?;
+    let time = tuple_element(term, 1)?;
+    if tuple_arity(date)? != 3 || tuple_arity(time)? != 3 {
         return Err(BifError::BADARG);
     }
-    let year = component(date[0])?;
+    let year = component(tuple_element(date, 0)?)?;
     if year < 1 {
         return Err(BifError::BADARG);
     }
-    let month = component(date[1])?;
-    let day = component(date[2])?;
-    let hour = component(time[0])?;
-    let minute = component(time[1])?;
-    let second = component(time[2])?;
+    let month = component(tuple_element(date, 1)?)?;
+    let day = component(tuple_element(date, 2)?)?;
+    let hour = component(tuple_element(time, 0)?)?;
+    let minute = component(tuple_element(time, 1)?)?;
+    let second = component(tuple_element(time, 2)?)?;
     if !(1..=12).contains(&month)
         || !(1..=days_in_month(year, month)).contains(&day)
         || !(0..=23).contains(&hour)

@@ -423,6 +423,10 @@ impl TupleRef<'_> {
     pub fn get(&self, index: usize) -> Option<Term> {
         self.elements.get(index).copied().map(Term)
     }
+    /// Read a tuple element without copying the tuple's element array.
+    pub fn element(&self, index: usize) -> Option<Term> {
+        self.get(index)
+    }
     /// Iterate elements in order.
     pub fn iter(&self) -> impl Iterator<Item = Term> + '_ {
         self.elements.iter().copied().map(Term)
