@@ -1,7 +1,8 @@
 //! Per-process copying collection with a young heap and an old heap.
 //!
 //! The high-water mark is the young heap top after collection. At the next
-//! minor collection, reachable objects below it move to the old heap. A full
+//! minor collection, reachable objects below it move to the old heap, together with the
+//! young objects only they reach (do_minor sweeps the tenured area last). A full
 //! sweep copies both heaps into a new young heap. Stack frame pointers into the
 //! current stack block are rebased; code pointers and CATCH words remain intact.
 
@@ -91,124 +92,208 @@ impl HeapAlloc for FragmentAlloc<'_> {
     }
 }
 
+/// A half-open byte-address range: erts `ErtsInArea(ptr, start, size)`.
+#[derive(Clone, Copy)]
+struct Area {
+    start: usize,
+    end: usize,
+}
+
+impl Area {
+    const EMPTY: Self = Self { start: 0, end: 0 };
+
+    #[inline(always)]
+    fn contains(self, address: usize) -> bool {
+        address.wrapping_sub(self.start) < self.end.wrapping_sub(self.start)
+    }
+}
+
+/// A destination heap top (`n_htop` or `old_htop` of do_minor) and its end, as addresses.
+#[derive(Clone, Copy)]
+struct HeapTop {
+    at: usize,
+    end: usize,
+}
+
 struct Copier<'a> {
     from: &'a mut ProcessHeap,
     to: &'a mut ProcessHeap,
     major: bool,
-    young_scan: usize,
-    old_scan: usize,
+    /// The young heap being evacuated: `HEAP_START(p)..HEAP_TOP(p)`.
+    young: Area,
+    /// do_minor's `mature`/`mature_size`: objects that a minor collection tenures.
+    mature: Area,
+    /// do_minor's `oh`/`oh_size`: the old heap a minor collection leaves in place.
+    old: Area,
+    n_htop: HeapTop,
+    old_htop: HeapTop,
     /// Literal areas: the only memory outside the process that its terms may point to.
     literals: crate::literal::LiteralAreas,
     /// Sorted owned fragment ranges, kept only to check the erts rule in debug builds.
     #[cfg(debug_assertions)]
     fragment_ranges: Vec<(usize, usize)>,
-    /// Mature part of an abandoned young heap; a minor collection promotes it.
-    abandoned_mature: (usize, usize),
-    young_words: usize,
-    promoted_words: usize,
     sub_bits: Vec<Term>,
     writable_refs: Vec<Term>,
     error: Option<TermError>,
 }
 
 impl Copier<'_> {
+    /// `ErtsInYoungGen` for a pointer outside the young heap block: heap fragments and
+    /// the abandoned heap are young; literals and, in a minor collection, the old heap are not.
+    // Port of erts/emulator/beam/erl_gc.h:97 (ErtsInYoungGen), OTP-29.1.1.
     #[inline]
-    fn copy(&mut self, term: Term) -> Term {
-        let tag = term.0 & 3;
-        if tag != 1 && tag != 2 {
-            return term;
+    fn in_young_gen(&self, address: usize) -> bool {
+        if self.young.contains(address) {
+            return true;
         }
-        let address = (term.0 & !7) as usize;
-        let young_start = self.from.words.as_ptr() as usize;
-        let young_end = young_start + self.from.htop * 8;
-        let in_young = address >= young_start && address < young_end;
-        // Port of erts/emulator/beam/erl_gc.c:1695 (do_minor, ErtsInYoungGen) and
-        // erl_gc.c:2296 (sweep, major: `!erts_is_literal`), OTP-29.1.1: a minor collection
-        // leaves the old heap alone, and every other non-literal pointer is in the young
-        // generation (heap, heap fragments or abandoned heap) and moves.
-        if !in_young {
-            if !self.major {
-                // A minor collection hands the old heap to `to` before copying.
-                let start = self.to.old_words.as_ptr() as usize;
-                if address >= start && address < start + self.from.old_htop * 8 {
-                    return term;
-                }
-            }
-            if self.is_literal(address) {
-                return term;
-            }
-            #[cfg(debug_assertions)]
-            self.check_owned(address);
+        if self.old.contains(address) || self.is_literal(address) {
+            return false;
         }
+        #[cfg(debug_assertions)]
+        self.check_owned(address);
+        true
+    }
 
-        let promote = !self.major
-            && if in_young {
-                address < young_start + self.from.high_water * 8
-            } else {
-                address >= self.abandoned_mature.0 && address < self.abandoned_mature.1
-            };
-        // SAFETY: The source is in an owned, live heap or fragment. Collection
-        // has exclusive process access, and source and destination do not overlap.
+    /// Evacuate the object `gval` points to, or follow its forwarding pointer. With
+    /// `INTO_OLD` every young object goes to the old heap: the second sweep of do_minor
+    /// over the tenured area.
+    // Port of erts/emulator/beam/erl_gc.c:1688-1717 (do_minor root loop) and
+    // erl_gc.h:42-94 (MOVE_CONS, MOVE_BOXED, move_cons, move_boxed), OTP-29.1.1.
+    #[inline(always)]
+    fn evacuate<const INTO_OLD: bool>(&mut self, gval: u64) -> u64 {
+        let tag = gval & 3;
+        if tag != 1 && tag != 2 {
+            return gval;
+        }
+        let address = (gval & !7) as usize;
+        // SAFETY: `gval` is a live list or boxed term of this process, so its first word
+        // is readable (literal and old heap objects are never forwarded). Objects that
+        // move are in owned, live from-space memory; the destination ranges were sized
+        // before the copy and do not overlap the sources. The collector has exclusive
+        // access to the process.
         unsafe {
-            let source = term.raw_ptr().cast_mut();
-            let first = *source;
+            let ptr = address as *mut u64;
+            let val = *ptr;
             if tag == 1 {
-                if first == 0 {
-                    return Term(*source.add(1));
+                // Port of erts/emulator/beam/erl_gc.h:42 (IS_MOVED_CONS): zero cannot be a
+                // cons head, so a zero head marks a moved cell and the tail holds the new term.
+                if val == 0 {
+                    return *ptr.add(1);
                 }
-            } else if first & 3 == 2 {
-                return Term(first);
+            } else if val & 3 == 2 {
+                // IS_MOVED_BOXED: a header never has the boxed tag.
+                return val;
             }
-            let words = if tag == 1 {
-                2
-            } else if first & 63 == ARITY || first & 63 == RECORD {
-                1 + (first >> 6) as usize
+            let promote = if self.mature.contains(address) {
+                true
+            } else if self.in_young_gen(address) {
+                INTO_OLD
             } else {
-                boxed_object_words(first, source)
+                return gval;
             };
-            let destination = if promote {
-                let top = self.to.old_htop;
-                if words > self.to.old_words.len().saturating_sub(top) {
-                    self.error = Some(TermError::HeapFull);
-                    return term;
-                }
-                self.to.old_htop += words;
-                self.promoted_words += words;
-                self.to.old_words.as_ptr().add(top).cast::<u64>().cast_mut()
+            let top = if promote {
+                &mut self.old_htop
             } else {
-                let top = self.to.htop;
-                if words > self.to.stop.saturating_sub(top) {
-                    self.error = Some(TermError::HeapFull);
-                    return term;
-                }
-                self.to.htop += words;
-                self.young_words += words;
-                self.to.words.as_ptr().add(top).cast::<u64>().cast_mut()
+                &mut self.n_htop
             };
-            std::ptr::copy_nonoverlapping(source, destination, words);
-            let moved = Term::from_ptr(destination, tag);
-            // Port of erts/emulator/beam/erl_gc.c:1639 (do_minor), OTP-29.1.1.
-            // A boxed header cannot have the boxed pointer tag. Zero cannot be
-            // a valid cons head, so its second word can hold the forwarding term.
             if tag == 1 {
-                *source = 0;
-                *source.add(1) = moved.0;
-            } else {
-                *source = moved.0;
-                if matches!(
-                    first & 63,
-                    BIN_REF
-                        | EXTERNAL_PID
-                        | EXTERNAL_PORT
-                        | EXTERNAL_REF
-                        | FUN
-                        | SUB_BITS
-                        | MAGIC_REF
-                ) {
-                    self.retain_owner(first, destination, moved, promote);
+                if top.end - top.at < 16 {
+                    self.error = Some(TermError::HeapFull);
+                    return gval;
                 }
+                let destination = top.at as *mut u64;
+                top.at += 16;
+                *destination = val;
+                *destination.add(1) = *ptr.add(1);
+                let moved = destination as u64 | 1;
+                *ptr = 0;
+                *ptr.add(1) = moved;
+                return moved;
+            }
+            let words = if val & 63 == ARITY || val & 63 == RECORD {
+                1 + (val >> 6) as usize
+            } else {
+                boxed_object_words(val, ptr)
+            };
+            if (top.end - top.at) / 8 < words {
+                self.error = Some(TermError::HeapFull);
+                return gval;
+            }
+            let destination = top.at as *mut u64;
+            top.at += words * 8;
+            *destination = val;
+            for i in 1..words {
+                *destination.add(i) = *ptr.add(i);
+            }
+            let moved = destination as u64 | 2;
+            *ptr = moved;
+            if matches!(
+                val & 63,
+                BIN_REF | EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF | FUN | SUB_BITS | MAGIC_REF
+            ) {
+                self.retain_owner(val, destination, Term(moved), promote);
             }
             moved
+        }
+    }
+
+    /// Sweep the objects copied to `n_htop` (or, with `INTO_OLD`, to `old_htop`) from
+    /// `n_hp` until the scan catches up with the top.
+    // Port of erts/emulator/beam/erl_gc.c:1728-1813 (do_minor sweep) and
+    // erl_gc.c:2281 (sweep), OTP-29.1.1.
+    fn sweep<const INTO_OLD: bool>(&mut self, mut n_hp: usize) {
+        loop {
+            let n_htop = if INTO_OLD {
+                self.old_htop.at
+            } else {
+                self.n_htop.at
+            };
+            if n_hp >= n_htop {
+                break;
+            }
+            let ptr = n_hp as *mut u64;
+            // SAFETY: `n_hp` is below the destination top, so it addresses an initialized
+            // word of a completely copied object; this collector alone writes to it.
+            unsafe {
+                let gval = *ptr;
+                if gval & 3 != 0 {
+                    *ptr = self.evacuate::<INTO_OLD>(gval);
+                    #[cfg(debug_assertions)]
+                    crate::validate::verify_copied_term_after_collection(self.to, Term(*ptr));
+                    n_hp += 8;
+                    continue;
+                }
+                let kind = gval & 63;
+                let (start, words) = if kind == ARITY || kind == RECORD {
+                    (1, 1 + (gval >> 6) as usize)
+                } else if kind == FUN {
+                    (2, 2 + ((gval >> 16) & 255) as usize)
+                } else if kind == MAP {
+                    let range = boxed_term_range(gval, ptr);
+                    for offset in range {
+                        let slot = ptr.add(offset);
+                        *slot = self.evacuate::<INTO_OLD>(*slot);
+                        #[cfg(debug_assertions)]
+                        crate::validate::verify_copied_term_after_collection(self.to, Term(*slot));
+                    }
+                    n_hp += boxed_object_words(gval, ptr) * 8;
+                    continue;
+                } else if kind == SUB_BITS {
+                    // The orig field; the byte pointer is rebased in finish_bits.
+                    (4, 5)
+                } else {
+                    // Things without term fields.
+                    n_hp += boxed_object_words(gval, ptr) * 8;
+                    continue;
+                };
+                for offset in start..words {
+                    let slot = ptr.add(offset);
+                    *slot = self.evacuate::<INTO_OLD>(*slot);
+                    #[cfg(debug_assertions)]
+                    crate::validate::verify_copied_term_after_collection(self.to, Term(*slot));
+                }
+                n_hp += words * 8;
+            }
         }
     }
 
@@ -423,87 +508,6 @@ impl Copier<'_> {
         }
     }
 
-    #[inline]
-    fn scan_slot(&mut self, slot: *mut u64) {
-        // SAFETY: `slot` is a term field in a copied object and this collector
-        // alone mutates the destination heap during the stop-the-world pass.
-        #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-        let copied = unsafe {
-            let copied = self.copy(Term(*slot));
-            *slot = copied.0;
-            copied
-        };
-        #[cfg(debug_assertions)]
-        crate::validate::verify_copied_term_after_collection(self.to, copied);
-    }
-
-    fn scan_space(&mut self, old: bool) {
-        let index = if old { self.old_scan } else { self.young_scan };
-        let base = if old {
-            self.to.old_words.as_ptr()
-        } else {
-            self.to.words.as_ptr()
-        };
-        // SAFETY: The index is below the initialized top of a fixed allocation.
-        let ptr = unsafe { base.add(index).cast::<u64>().cast_mut() };
-        // SAFETY: Copied objects have their complete initialized layout.
-        let first = unsafe { *ptr };
-        if first & 3 != 0 {
-            self.scan_slot(ptr);
-            if old {
-                self.old_scan += 1;
-            } else {
-                self.young_scan += 1;
-            }
-            return;
-        }
-        let header = first;
-        let kind = header & 63;
-        let (start, end, words) = if kind == ARITY || kind == RECORD {
-            let words = 1 + (header >> 6) as usize;
-            (1, words, words)
-        } else if kind == MAP {
-            // SAFETY: MAP headers and payloads use the shared HAMT layout.
-            let words = unsafe { boxed_object_words(header, ptr) };
-            // SAFETY: The copied MAP is complete and initialized.
-            let range = unsafe { boxed_term_range(header, ptr) };
-            (range.start, range.end, words)
-        } else if kind == FUN {
-            let words = 2 + ((header >> 16) & 255) as usize;
-            (2, words, words)
-        } else if kind == SUB_BITS {
-            (4, 5, 5)
-        } else {
-            // SAFETY: Other boxed kinds have no tagged payload fields.
-            (0, 0, unsafe { boxed_object_words(header, ptr) })
-        };
-        for offset in start..end {
-            if offset + 1 < end {
-                // The next child is commonly another heap object in tuple trees.
-                // SAFETY: The copied object has initialized fields through `end`.
-                prefetch_term(unsafe { Term(*ptr.add(offset + 1)) });
-            }
-            // SAFETY: The range selects initialized tagged fields of this object.
-            self.scan_slot(unsafe { ptr.add(offset) });
-        }
-        if old {
-            self.old_scan += words;
-        } else {
-            self.young_scan += words;
-        }
-    }
-
-    fn drain(&mut self) {
-        while self.young_scan < self.to.htop || self.old_scan < self.to.old_htop {
-            if self.old_scan < self.to.old_htop {
-                self.scan_space(true);
-            }
-            if self.young_scan < self.to.htop {
-                self.scan_space(false);
-            }
-        }
-    }
-
     fn finish_bits(&mut self) {
         // OTP visits writable owners even when their BinRefs are already old.
         // A volatile SUB_BITS resolves the current byte pointer through BinRef;
@@ -530,24 +534,6 @@ impl Copier<'_> {
             }
         }
     }
-}
-
-#[inline]
-fn prefetch_term(term: Term) {
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    if term.is_pointer() {
-        let address = (term.0 & !7) as *const u8;
-        // SAFETY: PRFM is a non-faulting read hint; no Rust reference is made.
-        unsafe {
-            std::arch::asm!(
-                "prfm pldl1keep, [{address}]",
-                address = in(reg) address,
-                options(readonly, nostack, preserves_flags)
-            );
-        }
-    }
-    #[cfg(any(not(target_arch = "aarch64"), miri))]
-    let _ = term;
 }
 
 impl ProcessHeap {
@@ -1147,36 +1133,84 @@ impl ProcessHeap {
         let code_ranges = code_ranges
             .as_deref()
             .map_or(&[][..], |ranges| ranges.as_slice());
-        let old_scan = self.old_htop;
+        let young_start = from.words.as_ptr() as usize;
+        let young = Area {
+            start: young_start,
+            end: young_start + from.htop * 8,
+        };
+        // Port of erts/emulator/beam/erl_gc.c:1402-1427 (minor_collection): the mature
+        // area is below the high-water mark of the abandoned heap if there is one, else
+        // of the young heap. A full sweep tenures nothing and moves the old heap too.
+        let (mature, old) = if major {
+            (Area::EMPTY, Area::EMPTY)
+        } else {
+            let mature = if abandoned.is_some() {
+                Area {
+                    start: abandoned_mature.0,
+                    end: abandoned_mature.1,
+                }
+            } else {
+                Area {
+                    start: young_start,
+                    end: young_start + from.high_water * 8,
+                }
+            };
+            let old_start = self.old_words.as_ptr() as usize;
+            (
+                mature,
+                Area {
+                    start: old_start,
+                    end: old_start + self.old_htop * 8,
+                },
+            )
+        };
+        let n_heap = self.words.as_ptr() as usize;
+        let old_heap = self.old_words.as_ptr() as usize;
+        let tenured_from = old_heap + self.old_htop * 8;
         let mut copier = Copier {
+            n_htop: HeapTop {
+                at: n_heap,
+                end: n_heap + self.stop * 8,
+            },
+            old_htop: HeapTop {
+                at: tenured_from,
+                end: old_heap + self.old_words.len() * 8,
+            },
             from: &mut from,
             to: self,
             major,
-            young_scan: 0,
-            old_scan,
+            young,
+            mature,
+            old,
             literals: crate::literal::LiteralAreas::current(),
             #[cfg(debug_assertions)]
             fragment_ranges,
-            abandoned_mature,
-            young_words: 0,
-            promoted_words: 0,
             sub_bits: Vec::new(),
             writable_refs: Vec::new(),
             error: None,
         };
         for root in roots.iter_mut().chain(extra.iter_mut()) {
-            *root = copier.copy(*root);
+            root.0 = copier.evacuate::<false>(root.0);
         }
+        // Port of erts/emulator/beam/erl_gc.c:1679-1720 (do_minor root loop over the stack)
+        // and erl_gc.c:520 (copy_erlang_stack), OTP-29.1.1: words with the header tag are
+        // continuation pointers or frame pointers; only frame pointers into the stack move.
+        let source = copier.from.words.as_ptr() as usize + copier.from.stop * 8;
+        let destination = copier.to.words.as_ptr() as usize + copier.to.stop * 8;
         for i in 0..stack {
-            // SAFETY: The live source and reserved destination stack slots are distinct.
+            // SAFETY: The live source and reserved destination stack slots are distinct
+            // words of two live heap blocks, `stack` words each.
             unsafe {
-                let raw = *copier.from.words[copier.from.stop + i].get();
-                *copier.to.words[copier.to.stop + i].get() =
-                    match classify_stack_word(raw, stack_move, code_ranges) {
-                        StackWord::Term(term) => copier.copy(term).0,
-                        StackWord::ReturnAddr(_) => raw,
-                        StackWord::FramePtr(address) => rebase_address(address, stack_move) as u64,
-                    };
+                let raw = *((source + i * 8) as *const u64);
+                *((destination + i * 8) as *mut u64) = if raw & 3 != 0 {
+                    copier.evacuate::<false>(raw)
+                } else if stack_move.old_start <= raw as usize
+                    && (raw as usize) < stack_move.old_end
+                {
+                    rebase_address(raw as usize, stack_move) as u64
+                } else {
+                    raw
+                };
             }
         }
         let new_frame_pointer = if old_frame_pointer == 0 {
@@ -1184,12 +1218,17 @@ impl ProcessHeap {
         } else {
             rebase_address(old_frame_pointer, stack_move)
         };
-        copier.drain();
+        // Port of erts/emulator/beam/erl_gc.c:1728-1823 (do_minor), OTP-29.1.1: sweep the
+        // new heap, then the tenured objects, whose young referents are tenured as well.
+        copier.sweep::<false>(n_heap);
+        copier.sweep::<true>(tenured_from);
+        copier.to.htop = (copier.n_htop.at - n_heap) / 8;
+        copier.to.old_htop = (copier.old_htop.at - old_heap) / 8;
         copier.finish_bits();
         copier.to.high_water = copier.to.htop;
         let error = copier.error.take();
-        let copied = copier.young_words as u64;
-        let promoted = copier.promoted_words as u64;
+        let copied = copier.to.htop as u64;
+        let promoted = ((copier.old_htop.at - tenured_from) / 8) as u64;
         drop(copier);
         drop(from);
         self.frame_pointer = new_frame_pointer;
@@ -1706,6 +1745,10 @@ mod tests {
         assert!(heap.stack_set(1, Term(code_pointer as u64)));
         assert!(heap.stack_set(2, Term(0)));
         assert!(heap.stack_set(3, Term(code_pointer as u64)));
+        // Like erts, the heap block is not cleared: every live stack slot is written.
+        for slot in 4..8 {
+            assert!(heap.stack_set(slot, Term::NIL));
+        }
         heap.set_frame_pointer(old_stack_start as usize);
 
         heap.collect(&mut [], &mut [], 0).unwrap();
