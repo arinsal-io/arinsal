@@ -2063,13 +2063,16 @@ fn dictionary_get_keys0(
     process: &mut Process,
     _args: &[Term],
 ) -> Result<Term, crate::exceptions::Trap> {
-    let keys = process.dictionary.as_ref().map_or_else(Vec::new, |dictionary| {
-        dictionary
-            .entries_reversed()
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect()
-    });
+    let keys = process
+        .dictionary
+        .as_ref()
+        .map_or_else(Vec::new, |dictionary| {
+            dictionary
+                .entries_reversed()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
+        });
     dictionary_alloc(make_list(process, keys))
 }
 
@@ -2078,13 +2081,16 @@ fn dictionary_get_keys1(
     args: &[Term],
 ) -> Result<Term, crate::exceptions::Trap> {
     let value = args[0];
-    let keys = process.dictionary.as_ref().map_or_else(Vec::new, |dictionary| {
-        dictionary
-            .entries_reversed()
-            .into_iter()
-            .filter_map(|(key, stored)| term_equal(stored, value).then_some(key))
-            .collect()
-    });
+    let keys = process
+        .dictionary
+        .as_ref()
+        .map_or_else(Vec::new, |dictionary| {
+            dictionary
+                .entries_reversed()
+                .into_iter()
+                .filter_map(|(key, stored)| term_equal(stored, value).then_some(key))
+                .collect()
+        });
     dictionary_alloc(make_list(process, keys))
 }
 

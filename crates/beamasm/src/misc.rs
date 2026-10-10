@@ -124,8 +124,7 @@ fn emit_apply_common(
         asm.emit_leave_frame()?;
         asm.code.emit(|e| e.br(Gpr::x(17)))?;
     } else {
-        asm.code.adr(Gpr::x(30), continuation)?;
-        asm.code.emit(|e| e.br(Gpr::x(17)))?;
+        asm.code.emit(|e| e.blr(Gpr::x(17)))?;
         asm.code.bind(continuation)?;
     }
     Ok(())
@@ -163,8 +162,7 @@ fn emit_apply_fun(
         asm.record_return_site(continuation)?;
         asm.code
             .emit(|e| e.mov_const(Gpr::x(17), runtime.apply2_fragment as u64))?;
-        asm.code.adr(Gpr::x(30), continuation)?;
-        asm.code.emit(|e| e.br(Gpr::x(17)))?;
+        asm.code.emit(|e| e.blr(Gpr::x(17)))?;
         asm.code.bind(continuation)?;
         asm.code.b(done)?;
     }

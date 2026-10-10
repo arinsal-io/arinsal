@@ -267,9 +267,8 @@ fn hamt_next(
                     break;
                 }
                 let (key, value) = leaf_pair(word);
-                let mut builder = TermBuilder::new(&mut region);
-                let tuple = builder.tuple(&[key, value]).map_err(|_| system_limit())?;
-                res = builder.cons(tuple, res).map_err(|_| system_limit())?;
+                res = arinsal_maps::cons_pair(&mut region, key, value, res)
+                    .map_err(|_| system_limit())?;
                 elems -= 1;
                 sidx -= 1;
             }
@@ -405,24 +404,8 @@ fn flat_next(
     if (n as i64) < index {
         return Err(badarg());
     }
-    // SAFETY: `map` is rooted by the caller and no allocation below collects.
-    let entries = unsafe { map.flatmap_ref() }.ok_or_else(badarg)?;
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut region = HeapReservation::new(&mut heap, n * if list_mode { 5 } else { 4 })
-        .map_err(|_| system_limit())?;
-    let mut builder = TermBuilder::new(&mut region);
-    let mut res = if list_mode { acc } else { none_atom() };
-    for (key, value) in entries.iter_rev() {
-        if list_mode {
-            let tuple = builder.tuple(&[key, value]).map_err(|_| system_limit())?;
-            res = builder.cons(tuple, res).map_err(|_| system_limit())?;
-        } else {
-            res = builder
-                .tuple(&[key, value, res])
-                .map_err(|_| system_limit())?;
-        }
-    }
-    Ok(res)
+    arinsal_maps::flatmap_next(map, list_mode, acc, &mut heap).map_err(|_| system_limit())
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3655-3706, OTP-29.1.1.

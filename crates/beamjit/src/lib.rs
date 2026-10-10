@@ -2669,8 +2669,7 @@ fn emit_op(
                 }
                 if op.name() == "i_is_tuple_of_arity_ff" {
                     count(4)?;
-                    assembler.emit_is_tuple(source, fail)?;
-                    assembler.emit_test_arity(source, value(3)?, n(1)?)?;
+                    assembler.emit_is_tuple_of_arity(source, value(3)?, fail, n(1)?)?;
                     break 'body;
                 }
                 if op.name() == "i_is_tagged_tuple_ff" {
@@ -2728,7 +2727,10 @@ fn emit_op(
                     "is_nil" => assembler.emit_is_nil(source, fail)?,
                     "is_map" => assembler.emit_is_map(source, fail)?,
                     "is_tuple" | "i_is_tuple" => assembler.emit_is_tuple(source, fail)?,
-                    "test_arity" | "i_test_arity" | "i_is_tuple_of_arity" => {
+                    "i_is_tuple_of_arity" => {
+                        assembler.emit_is_tuple_of_arity(source, value(2)?, fail, fail)?;
+                    }
+                    "test_arity" | "i_test_arity" => {
                         assembler.emit_test_arity(source, value(2)?, fail)?;
                     }
                     "is_tagged_tuple" | "i_is_tagged_tuple" => {

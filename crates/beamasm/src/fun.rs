@@ -302,11 +302,14 @@ impl BeamModuleAssembler {
                 if tail {
                     self.deallocate(deallocate)?;
                     self.emit_leave_frame()?;
+                    let trampoline = self.lambda_label(id);
+                    self.code.b(trampoline)?;
                 } else {
-                    self.code.adr(Gpr::x(30), continuation)?;
+                    // erlang_call (beam_asm.hpp:310-332): `bl` keeps the return-address
+                    // predictor paired with the callee's `ret`.
+                    let trampoline = self.lambda_label(id);
+                    self.code.bl(trampoline)?;
                 }
-                let trampoline = self.lambda_label(id);
-                self.code.b(trampoline)?;
             }
             FunCallTag::Dynamic => {
                 return self.emit_dynamic_fun_call(Some(arity), resolver, tail, deallocate);
@@ -377,8 +380,9 @@ impl BeamModuleAssembler {
             self.emit_leave_frame()?;
             self.code.emit(|e| e.br(Gpr::x(0)))?;
         } else {
-            self.code.adr(Gpr::x(30), continuation)?;
-            self.code.emit(|e| e.br(Gpr::x(0)))?;
+            // erlang_call (beam_asm.hpp:310-332): `blr` keeps the return-address
+            // predictor paired with the callee's `ret`.
+            self.code.emit(|e| e.blr(Gpr::x(0)))?;
             self.code.bind(continuation)?;
             crate::emit_validate_native_cursor(&mut self.code)?;
         }
