@@ -3202,10 +3202,10 @@ fn off_heap_binary_words(process: &Process) -> usize {
     {
         stack.push(term);
     }
-    if let Some(cold) = &process.cold {
-        for (key, value) in &cold.dictionary {
-            stack.push(*key);
-            stack.push(*value);
+    if let Some(dictionary) = &process.dictionary {
+        for (key, value) in dictionary.entries() {
+            stack.push(key);
+            stack.push(value);
         }
     }
     for index in 0..process.heap.stack_words() {
@@ -5222,11 +5222,14 @@ impl Process {
         let extra_end = roots.len();
         // The process dictionary is rooted on the process heap, like erts' ProcDict.
         // Port of erts/emulator/beam/erl_process_dict.c (erts_dicts_mem_size / GC roots), OTP-29.1.1.
-        let dict_len = self.cold.as_ref().map_or(0, |cold| cold.dictionary.len());
-        if let Some(cold) = self.cold.as_ref() {
-            for (key, value) in &cold.dictionary {
-                roots.push(*key);
-                roots.push(*value);
+        let dict_len = self
+            .dictionary
+            .as_ref()
+            .map_or(0, |dictionary| dictionary.len());
+        if let Some(dictionary) = self.dictionary.as_ref() {
+            for (key, value) in dictionary.entries() {
+                roots.push(key);
+                roots.push(value);
             }
         }
         let dict_end = roots.len();
@@ -5294,13 +5297,16 @@ impl Process {
         }
         let extra_start = mailbox_len + usize::from(continuation.is_some());
         extra.copy_from_slice(&roots[extra_start..extra_end]);
+        if let Some(dictionary) = self.dictionary.as_mut() {
+            let mut index = extra_end;
+            dictionary.for_each_mut(|key, value| {
+                *key = roots[index];
+                *value = roots[index + 1];
+                index += 2;
+            });
+            assert_eq!(index, extra_end + 2 * dict_len, "dictionary GC roots");
+        }
         if let Some(cold) = self.cold.as_mut() {
-            for (index, entry) in cold.dictionary.iter_mut().enumerate().take(dict_len) {
-                *entry = (
-                    roots[extra_end + 2 * index],
-                    roots[extra_end + 2 * index + 1],
-                );
-            }
             let apply_end = dict_end + cold.apply_roots.len();
             cold.apply_roots
                 .copy_from_slice(&roots[dict_end..apply_end]);

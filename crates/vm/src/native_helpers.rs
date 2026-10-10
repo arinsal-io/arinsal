@@ -639,37 +639,45 @@ pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
     invoke_dispatch_bif(header, identity as usize, site as usize, export, false).unwrap_or(0)
 }
 
-/// Reads the active process dictionary for native `i_get` instructions.
+/// Reads the active process dictionary for native `i_get` / `bif get` instructions.
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:319-329, OTP-29.1.1.
+// The lookup does not allocate, so the native heap cursors and X registers stay
+// where generated code left them. Copying the register file here showed up as
+// most of the gap against erts' `get/1`.
 pub extern "C" fn arinsal_beamasm_process_dictionary_get(
     header: *mut ProcessHeader,
     key: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+    if header.is_null() {
         return 0;
-    };
+    }
+    // SAFETY: ProcessHeader is the first repr(C) field of Process. Generated
+    // code calls this with the live process, and the key word is a caller-owned
+    // term that the lookup only reads.
+    let process = unsafe { &mut *header.cast::<crate::Process>() };
+    // Boxed keys are read through the heap. Commit the native cursors first;
+    // the lookup does not allocate, so they are not written back.
     process
         .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
+        .set_native_cursors(process.header.htop, process.header.stop);
     let key = crate::native_hooks::from_raw(key);
     let value = process
-        .cold
+        .dictionary
         .as_ref()
-        .and_then(|cold| {
-            cold.dictionary
-                .iter()
-                .find(|(stored, _)| arinsal_term::exact_eq(*stored, key))
-                .map(|(_, value)| *value)
-        })
-        .unwrap_or_else(|| {
-            Term::atom(
-                arinsal_term::global_atoms()
-                    .intern("undefined")
-                    .expect("built-in atom"),
-            )
-        });
-    process.sync_native_header();
+        .and_then(|dictionary| dictionary.get(key))
+        .unwrap_or_else(undefined_atom);
     crate::native_hooks::raw(value)
+}
+
+fn undefined_atom() -> Term {
+    static UNDEFINED: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    *UNDEFINED.get_or_init(|| {
+        Term::atom(
+            arinsal_term::global_atoms()
+                .intern("undefined")
+                .expect("built-in atom"),
+        )
+    })
 }
 
 /// Completes a traced native return and resumes its saved caller continuation.
@@ -783,13 +791,21 @@ fn invoke_dispatch_bif(
     // The frame pointer matters only to a collection, so the paths that may collect publish
     // it themselves; a plain BIF leaves E (x29) as it was, like erts.
     let (process, registers) = crate::native_hooks::enter_runtime(header)?;
-    if let Some(export) = export
-        && let Some(bif) = export.light_bif
-        && (export_call
-            || registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64)
-        && !crate::trace_bp::any_pattern()
-    {
-        return Some(call_plain_bif(process, registers, export, bif, export_call));
+    if let Some(export) = export {
+        if let Some(bif) = export.light_bif
+            && (export_call
+                || registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64)
+            && !crate::trace_bp::any_pattern()
+        {
+            return Some(call_plain_bif(process, registers, export, bif, export_call));
+        }
+        // ETS and the process dictionary run here so a `call_ext` does not trap back
+        // into the executor once per key.
+        if export.direct_ets.is_some()
+            && let Some(raw) = call_direct_bif(process, registers, export, export_call)
+        {
+            return Some(raw);
+        }
     }
     if let Some(export) = export
         && let Some(bif) = export.light_process_bif
@@ -908,48 +924,8 @@ fn invoke_dispatch_bif_slow(
 
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif), OTP-29.1.1:
     // the table BIFs run on the process heap straight from the generated code; anything the
-    // direct path declines is redone through the scheduler.
-    if let Some(direct) = export.direct_ets
-        && !crate::trace_bp::any_pattern()
-    {
-        load_dispatch_x(process, registers);
-        let arity = usize::from(export.arity).min(4);
-        let args = [
-            registers.x_reg_array[0],
-            registers.x_reg_array[1],
-            registers.x_reg_array[2],
-            registers.x_reg_array[3],
-        ];
-        if let Some(value) = direct(process, &args[..arity]) {
-            process.reductions = process.header.fcalls;
-            if export_call {
-                charge_bif_reductions(process, 1);
-            }
-            // A direct BIF that failed has parked its exception (freason/fvalue set, as an erts
-            // BIF returns THE_NON_VALUE); the call is not redone.
-            if process.header.freason != 0 {
-                publish_dispatch_x(process, registers);
-                process.sync_native_header();
-                return Some(0);
-            }
-            process.x[0] = value;
-            let mut raw = crate::native_hooks::raw(value);
-            if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
-                if process.collect_bin_vheap_if_due(1).is_err() {
-                    crate::native_hooks::set_error(process, "system_limit");
-                    publish_dispatch_x(process, registers);
-                    process.sync_native_header();
-                    return Some(0);
-                }
-                raw = crate::native_hooks::raw(process.x[0]);
-            }
-            registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-            publish_dispatch_x(process, registers);
-            process.sync_native_header();
-            return Some(raw);
-        }
-    }
-
+    // direct path declines is redone through the scheduler. The hot helper already ran a
+    // direct BIF that accepted the call.
     if export.runs_in_executor()
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp (bif trace trampolines),
         // OTP-29.1.1: a traced BIF runs in the executor, which has the trace context.
@@ -968,6 +944,57 @@ fn invoke_dispatch_bif_slow(
     }
     let bif = export.bif?;
     Some(call_plain_bif(process, registers, export, bif, export_call))
+}
+
+/// Runs an ETS or process-dictionary BIF from native code.
+///
+/// `None` means the direct body declined (or a trace pattern is active) and the
+/// scheduler path must run the call.
+fn call_direct_bif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    export_call: bool,
+) -> Option<u64> {
+    let direct = export.direct_ets?;
+    if crate::trace_bp::any_pattern() {
+        return None;
+    }
+    load_dispatch_x(process, registers);
+    let arity = usize::from(export.arity).min(4);
+    let args = [
+        registers.x_reg_array[0],
+        registers.x_reg_array[1],
+        registers.x_reg_array[2],
+        registers.x_reg_array[3],
+    ];
+    let value = direct(process, &args[..arity])?;
+    process.reductions = process.header.fcalls;
+    if export_call {
+        charge_bif_reductions(process, 1);
+    }
+    // A direct BIF that failed has parked its exception (freason/fvalue set, as an erts
+    // BIF returns THE_NON_VALUE); the call is not redone.
+    if process.header.freason != 0 {
+        publish_dispatch_x(process, registers);
+        process.sync_native_header();
+        return Some(0);
+    }
+    process.x[0] = value;
+    let mut raw = crate::native_hooks::raw(value);
+    if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
+        if process.collect_bin_vheap_if_due(1).is_err() {
+            crate::native_hooks::set_error(process, "system_limit");
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            return Some(0);
+        }
+        raw = crate::native_hooks::raw(process.x[0]);
+    }
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    publish_dispatch_x(process, registers);
+    process.sync_native_header();
+    Some(raw)
 }
 
 /// Calls a BIF that runs on the scheduler straight from native code.

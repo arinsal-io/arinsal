@@ -53,6 +53,8 @@ pub struct Process {
     pub fr: Box<[f64]>,
     /// Contiguous process heap and Y stack.
     pub heap: ProcessHeap,
+    /// The erts process dictionary pointer is part of the hot process structure.
+    pub(crate) dictionary: Option<ProcDict>,
     /// Per-process sequential trace token; `None` is the no-token fast path.
     pub(crate) seq_trace_token: Option<Box<crate::seq_trace::Token>>,
     pub(crate) module: usize,
@@ -102,6 +104,440 @@ pub struct Process {
 // The scheduler transfers exclusive ownership of each Process between workers.
 unsafe impl Send for Process {}
 const _: () = assert!(std::mem::offset_of!(Process, header) == 0);
+
+/// Empty chain / free-list terminator. A live slot holds a node index.
+const NIL_NODE: u32 = u32::MAX;
+
+/// One `{Key,Value}` on a bucket chain. `next == NIL_NODE` is erts' bare tuple;
+/// a longer chain is erts' list. Nodes live in one slab so grow/shrink rewire
+/// `next` instead of allocating a fresh vector per split or merge.
+struct DictNode {
+    key: Term,
+    value: Term,
+    next: u32,
+}
+
+/// Linear hash table used by the process dictionary.
+/// Port of erts/emulator/beam/erl_process_dict.h:27-40 (`ProcDict`), OTP-29.1.1.
+pub(crate) struct ProcDict {
+    nodes: Vec<DictNode>,
+    free: u32,
+    /// Bucket heads, indexed like `ProcDict.data`. Length is `array_size`.
+    heads: Vec<u32>,
+    size_mask: u32,
+    used_slots: u32,
+    array_size: u32,
+    split_position: u32,
+    num_elements: usize,
+}
+
+impl Default for ProcDict {
+    fn default() -> Self {
+        Self {
+            nodes: Vec::new(),
+            free: NIL_NODE,
+            heads: Vec::new(),
+            size_mask: 0,
+            used_slots: 0,
+            array_size: 0,
+            split_position: 0,
+            num_elements: 0,
+        }
+    }
+}
+
+/// Head-to-tail walk of buckets `0..used_slots`, matching `entries` before reversal.
+pub(crate) struct DictEntries<'a> {
+    nodes: &'a [DictNode],
+    heads: &'a [u32],
+    slot: usize,
+    used: usize,
+    cur: u32,
+}
+
+impl Iterator for DictEntries<'_> {
+    type Item = (Term, Term);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.cur == NIL_NODE {
+            if self.slot >= self.used {
+                return None;
+            }
+            self.cur = self.heads[self.slot];
+            self.slot += 1;
+        }
+        let node = &self.nodes[self.cur as usize];
+        self.cur = node.next;
+        Some((node.key, node.value))
+    }
+}
+
+impl ProcDict {
+    // Port of MAKE_HASH (erl_process_dict.c:58), OTP-29.1.1.
+    // `unsigned_val` is a logical shift of the tagged word, not a sign-extended cast.
+    #[inline]
+    fn hash(key: Term) -> u64 {
+        let word = key.tagged_word();
+        if word & 15 == 15 {
+            word >> 4
+        } else if let Some(atom) = key.as_atom() {
+            atom.0 as u64
+        } else {
+            arinsal_term::internal_hash(key)
+        }
+    }
+
+    // Port of pd_hash_value_to_ix (erl_process_dict.c:1008), OTP-29.1.1.
+    #[inline]
+    fn bucket_index(&self, key: Term) -> usize {
+        let hash = Self::hash(key);
+        let high = hash & self.size_mask as u64;
+        if high >= self.used_slots as u64 {
+            (hash & (self.size_mask >> 1) as u64) as usize
+        } else {
+            high as usize
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.num_elements
+    }
+
+    pub(crate) fn entries(&self) -> DictEntries<'_> {
+        DictEntries {
+            nodes: &self.nodes,
+            heads: &self.heads,
+            slot: 0,
+            used: self.used_slots as usize,
+            cur: NIL_NODE,
+        }
+    }
+
+    /// `get/0` order: erts conses each pair while scanning, which reverses this walk.
+    pub(crate) fn entries_reversed(&self) -> Vec<(Term, Term)> {
+        let mut entries: Vec<_> = self.entries().collect();
+        entries.reverse();
+        entries
+    }
+
+    /// Rewrite every live pair. Order matches [`Self::entries`].
+    pub(crate) fn for_each_mut(&mut self, mut visit: impl FnMut(&mut Term, &mut Term)) {
+        for slot in 0..self.used_slots as usize {
+            let mut cur = self.heads[slot];
+            while cur != NIL_NODE {
+                let next = self.nodes[cur as usize].next;
+                let node = &mut self.nodes[cur as usize];
+                visit(&mut node.key, &mut node.value);
+                cur = next;
+            }
+        }
+    }
+
+    pub(crate) fn assign_entries(&mut self, pairs: &[(Term, Term)]) {
+        let mut index = 0;
+        self.for_each_mut(|key, value| {
+            let (new_key, new_value) = pairs[index];
+            *key = new_key;
+            *value = new_value;
+            index += 1;
+        });
+        debug_assert_eq!(index, pairs.len());
+    }
+
+    fn alloc_node(&mut self, key: Term, value: Term, next: u32) -> u32 {
+        if self.free != NIL_NODE {
+            let id = self.free;
+            self.free = self.nodes[id as usize].next;
+            self.nodes[id as usize] = DictNode { key, value, next };
+            return id;
+        }
+        let id = u32::try_from(self.nodes.len()).expect("process dictionary node index");
+        self.nodes.push(DictNode { key, value, next });
+        id
+    }
+
+    fn free_node(&mut self, id: u32) {
+        let node = &mut self.nodes[id as usize];
+        // Drop the terms so a freed slot is not a GC root if a chain is walked twice.
+        node.key = Term::NIL;
+        node.value = Term::NIL;
+        node.next = self.free;
+        self.free = id;
+    }
+
+    fn prepend(&mut self, index: usize, key: Term, value: Term) {
+        let next = self.heads[index];
+        let id = self.alloc_node(key, value, next);
+        self.heads[index] = id;
+    }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        // Port of PD_SZ2BYTES (erl_process_dict.c:64), OTP-29.1.1.
+        // sizeof(ProcDict) is 32 on 64-bit: four unsigned ints, a Uint, and data[1].
+        if self.array_size == 0 {
+            return 0;
+        }
+        32 + (self.array_size as usize - 1) * std::mem::size_of::<Term>()
+    }
+
+    // Port of erts/emulator/beam/erl_process_dict.c:1023-1071 (next_array_size), OTP-29.1.1.
+    // Needs at or below the first table entry fall out of the search and return `need`
+    // itself, so the initial table is 8 words rather than 10.
+    fn next_array_size(need: u32) -> u32 {
+        const SIZES: [u32; 29] = [
+            10,
+            20,
+            40,
+            80,
+            160,
+            320,
+            640,
+            1280,
+            2560,
+            5120,
+            10240,
+            20480,
+            40960,
+            81920,
+            163840,
+            327680,
+            655360,
+            1310720,
+            2621440,
+            5242880,
+            10485760,
+            20971520,
+            41943040,
+            83886080,
+            167772160,
+            335544320,
+            671088640,
+            1342177280,
+            2_684_354_560,
+        ];
+        let mut hi = SIZES.len() as i32 - 1;
+        let mut lo = 1_i32;
+        let mut cur = 4_i32;
+        while hi >= lo {
+            let size = SIZES[cur as usize];
+            let previous = SIZES[(cur - 1) as usize];
+            if size >= need && previous < need {
+                return size;
+            }
+            if size > need {
+                hi = cur - 1;
+            } else {
+                lo = cur + 1;
+            }
+            cur = (hi + lo) / 2;
+        }
+        need
+    }
+
+    /// Look up a key using the active hash range.
+    // Port of erts/emulator/beam/erl_process_dict.c:463-501 (pd_hash_get), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn get(&self, key: Term) -> Option<Term> {
+        if self.used_slots == 0 {
+            return None;
+        }
+        let mut cur = self.heads[self.bucket_index(key)];
+        while cur != NIL_NODE {
+            let node = &self.nodes[cur as usize];
+            if arinsal_term::exact_eq(node.key, key) {
+                return Some(node.value);
+            }
+            cur = node.next;
+        }
+        None
+    }
+
+    /// Insert or replace an entry and return its previous value.
+    // Port of erts/emulator/beam/erl_process_dict.c:628-762 (pd_hash_put), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn put(&mut self, key: Term, value: Term) -> Option<Term> {
+        if self.used_slots == 0 {
+            // Port of erl_process_dict.c:644-650: ensure_array_size(INITIAL_SIZE),
+            // usedSlots = 8, sizeMask = 15, splitPosition = 0. INITIAL_SIZE is 8
+            // (erl_init.c), and next_array_size(8) is 8.
+            let size = Self::next_array_size(8);
+            self.array_size = size;
+            self.heads.resize(size as usize, NIL_NODE);
+            self.used_slots = 8;
+            self.size_mask = 15;
+            self.split_position = 0;
+        }
+        let index = self.bucket_index(key);
+        let mut prev = NIL_NODE;
+        let mut cur = self.heads[index];
+        while cur != NIL_NODE {
+            if arinsal_term::exact_eq(self.nodes[cur as usize].key, key) {
+                let previous = self.nodes[cur as usize].value;
+                // erts writes an immediate value into the existing tuple. A boxed value
+                // is a new tuple consed at the head (the old cell is unlinked first).
+                self.nodes[cur as usize].key = key;
+                self.nodes[cur as usize].value = value;
+                if !value.is_immed() && prev != NIL_NODE {
+                    let next = self.nodes[cur as usize].next;
+                    self.nodes[prev as usize].next = next;
+                    self.nodes[cur as usize].next = self.heads[index];
+                    self.heads[index] = cur;
+                }
+                return Some(previous);
+            }
+            prev = cur;
+            cur = self.nodes[cur as usize].next;
+        }
+        self.prepend(index, key, value);
+        self.num_elements += 1;
+        if self.used_slots as usize <= self.num_elements {
+            self.grow();
+        }
+        None
+    }
+
+    /// Erase a key, return its previous value, and shrink when erts would.
+    // Port of erts/emulator/beam/erl_process_dict.c:385-436 (pd_hash_erase), OTP-29.1.1.
+    #[inline]
+    pub(crate) fn erase(&mut self, key: Term) -> Option<Term> {
+        if self.used_slots == 0 {
+            return None;
+        }
+        let index = self.bucket_index(key);
+        let mut prev = NIL_NODE;
+        let mut cur = self.heads[index];
+        let mut result = None;
+        while cur != NIL_NODE {
+            let next = self.nodes[cur as usize].next;
+            if arinsal_term::exact_eq(self.nodes[cur as usize].key, key) {
+                if prev == NIL_NODE {
+                    self.heads[index] = next;
+                } else {
+                    self.nodes[prev as usize].next = next;
+                }
+                result = Some(self.nodes[cur as usize].value);
+                self.free_node(cur);
+                self.num_elements -= 1;
+                break;
+            }
+            prev = cur;
+            cur = next;
+        }
+        if self.used_slots > 8 && self.used_slots as usize / 2 > self.num_elements {
+            self.shrink();
+        }
+        result
+    }
+
+    fn grow(&mut self) {
+        // Port of erts/emulator/beam/erl_process_dict.c:852-954 (grow), OTP-29.1.1.
+        // Splitting a list prepends onto each side, which reverses that side. A
+        // one-element result stays a bare node (`next == NIL_NODE`), matching the
+        // tuple unwrap at lines 941-944.
+        const MAX_HASH: u32 = 1_342_177_280;
+        let steps = ((self.used_slots / 4) & 0xf).max(1);
+        if MAX_HASH - steps <= self.used_slots {
+            return;
+        }
+        let needed = self.used_slots + steps;
+        if needed > self.array_size {
+            let new_size = Self::next_array_size(needed);
+            self.heads.resize(new_size as usize, NIL_NODE);
+            self.array_size = new_size;
+        }
+        let mut home_size = self.used_slots - self.split_position;
+        for _ in 0..steps {
+            if self.split_position == home_size {
+                home_size *= 2;
+                self.size_mask = home_size * 2 - 1;
+                self.split_position = 0;
+            }
+            let position = self.split_position as usize;
+            self.split_position += 1;
+            self.used_slots += 1;
+            let from = position + home_size as usize;
+            let mut low = NIL_NODE;
+            let mut high = NIL_NODE;
+            let mut cur = self.heads[position];
+            while cur != NIL_NODE {
+                let next = self.nodes[cur as usize].next;
+                let key = self.nodes[cur as usize].key;
+                if self.bucket_index(key) == position {
+                    self.nodes[cur as usize].next = low;
+                    low = cur;
+                } else {
+                    self.nodes[cur as usize].next = high;
+                    high = cur;
+                }
+                cur = next;
+            }
+            self.heads[position] = low;
+            self.heads[from] = high;
+        }
+    }
+
+    fn shrink(&mut self) {
+        // Port of erts/emulator/beam/erl_process_dict.c:766-850 (shrink), OTP-29.1.1.
+        let range = self.used_slots;
+        let mut steps = range * 3 / 10;
+        if range - steps < 8 {
+            steps = range - 8;
+        }
+        for _ in 0..steps {
+            if self.split_position == 0 {
+                self.size_mask = self.used_slots - 1;
+                self.split_position = self.used_slots / 2;
+            }
+            self.split_position -= 1;
+            let high_index = (self.used_slots - 1) as usize;
+            let low_index = self.split_position as usize;
+            let hi = self.heads[high_index];
+            let lo = self.heads[low_index];
+            self.heads[low_index] = self.merge_shrink(lo, hi);
+            self.used_slots -= 1;
+            self.heads[self.used_slots as usize] = NIL_NODE;
+        }
+        // Port of erl_process_dict.c:847-849 and array_shrink (960-975): only shrink.
+        if self.used_slots <= self.array_size / 4 {
+            let siz = Self::next_array_size(self.used_slots * 3 / 2);
+            if siz < self.array_size {
+                self.array_size = siz;
+                self.heads.truncate(self.array_size as usize);
+            }
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_process_dict.c:793-840 (shrink bucket merge), OTP-29.1.1.
+    fn merge_shrink(&mut self, lo: u32, hi: u32) -> u32 {
+        if hi == NIL_NODE {
+            return lo;
+        }
+        if lo == NIL_NODE {
+            return hi;
+        }
+        let lo_tuple = self.nodes[lo as usize].next == NIL_NODE;
+        if lo_tuple {
+            // `{Lo,Hi}` or `[Lo|Hi]`: the low tuple is consed in front of hi.
+            self.nodes[lo as usize].next = hi;
+            return lo;
+        }
+        if self.nodes[hi as usize].next == NIL_NODE {
+            // `[Hi|Lo]`.
+            self.nodes[hi as usize].next = lo;
+            return hi;
+        }
+        // Both lists: walk hi head-to-tail, prepending onto lo (hi ends up reversed).
+        let mut hi_cur = hi;
+        let mut lo_head = lo;
+        while hi_cur != NIL_NODE {
+            let next = self.nodes[hi_cur as usize].next;
+            self.nodes[hi_cur as usize].next = lo_head;
+            lo_head = hi_cur;
+            hi_cur = next;
+        }
+        lo_head
+    }
+}
 /// The traced native functions a return left, innermost first with their trace actions, and the
 /// returned value.
 pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceAction>)>, Term);
@@ -250,7 +686,6 @@ pub(crate) struct ProcessCold {
     /// erts `F_HAVE_BLCKD_MSCHED | F_HAVE_BLCKD_NMSCHED`: this process holds a
     /// multi-scheduling block of its runtime.
     pub(crate) have_blocked_multi_scheduling: bool,
-    pub(crate) dictionary: Vec<(Term, Term)>,
     pub(crate) dictionary_heap: arinsal_term::VecHeap,
     pub(crate) flags: HashMap<String, Term>,
     pub(crate) monitor_nodes: usize,
@@ -459,6 +894,7 @@ impl Process {
             x: vec![Term::NIL; x_registers].into_boxed_slice(),
             fr: vec![0.0; float_registers].into_boxed_slice(),
             heap,
+            dictionary: None,
             seq_trace_token: None,
             module: 0,
             ip: 0,
@@ -709,4 +1145,59 @@ pub(crate) struct ExitCont {
     /// Result the entry process reports once exit completes, and its exit code.
     pub(crate) entry_result: Option<Result<crate::ScheduledResult, crate::VmError>>,
     pub(crate) code: u64,
+}
+
+#[cfg(test)]
+mod procdict_tests {
+    use super::ProcDict;
+
+    #[test]
+    fn array_size_matches_erts_search() {
+        for (need, expect) in [
+            (1, 1),
+            (8, 8),
+            (9, 9),
+            (10, 10),
+            (11, 20),
+            (20, 20),
+            (21, 40),
+            (5120, 5120),
+            (5121, 10240),
+        ] {
+            assert_eq!(ProcDict::next_array_size(need), expect, "need {need}");
+        }
+    }
+
+    #[test]
+    fn initial_table_is_eight_slots() {
+        let mut dict = ProcDict::default();
+        let key = arinsal_term::Term::small(1).unwrap();
+        assert_eq!(dict.put(key, key), None);
+        assert_eq!(dict.array_size, 8);
+        assert_eq!(dict.used_slots, 8);
+        assert_eq!(dict.size_mask, 15);
+        assert_eq!(dict.split_position, 0);
+        // PD_SZ2BYTES(8) = 32 + 7*8.
+        assert_eq!(dict.memory_bytes(), 88);
+    }
+
+    #[test]
+    fn integers_survive_grow_and_shrink() {
+        let mut dict = ProcDict::default();
+        for n in 1..=2000 {
+            let key = arinsal_term::Term::small(n).unwrap();
+            assert_eq!(dict.put(key, key), None);
+        }
+        assert_eq!(dict.len(), 2000);
+        for n in 1..=2000 {
+            let key = arinsal_term::Term::small(n).unwrap();
+            assert_eq!(dict.get(key), Some(key));
+        }
+        for n in 1..=2000 {
+            let key = arinsal_term::Term::small(n).unwrap();
+            assert_eq!(dict.erase(key), Some(key));
+        }
+        assert_eq!(dict.len(), 0);
+        assert!(dict.entries().next().is_none());
+    }
 }
