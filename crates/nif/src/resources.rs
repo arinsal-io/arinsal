@@ -115,9 +115,15 @@ pub fn resource_stop_data(data: usize, event: i32, direct: bool) -> bool {
 unsafe impl Send for Resource {}
 // SAFETY: the native resource contract requires consumers to synchronize access.
 unsafe impl Sync for Resource {}
+
+fn literal_trace() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ARINSAL_LITERAL_TRACE").is_some())
+}
+
 impl Drop for Resource {
     fn drop(&mut self) {
-        if std::env::var_os("ARINSAL_LITERAL_TRACE").is_some() {
+        if literal_trace() {
             eprintln!("resource_drop data={:p}", self.data);
         }
         // SAFETY: a registered type remains allocated, and data is live until this drop ends.

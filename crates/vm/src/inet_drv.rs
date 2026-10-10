@@ -3290,9 +3290,7 @@ fn pull(sock: &Arc<Sock>) -> bool {
         let _ = flush_send(&mut inner);
         (eof, bytes_read)
     };
-    if bytes_read > 0
-        && crate::node_tables::is_dist_port(sock.id)
-        && std::env::var_os("ARINSAL_TRACE_DIST").is_some()
+    if bytes_read > 0 && crate::node_tables::is_dist_port(sock.id) && crate::debug_env::trace_dist()
     {
         eprintln!("DIST_SOCKET_READ port={} bytes={bytes_read}", sock.id);
     }
