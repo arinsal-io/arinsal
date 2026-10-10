@@ -821,7 +821,152 @@ fn invoke_dispatch_bif(
             export_call,
         ));
     }
+    // The export trampoline has a separate interpreted-call sentinel. Only the light-BIF
+    // fragment turns THE_NON_VALUE with TRAP into `context_switch_simplified`.
+    if let Some(export) = export
+        && let Some(entry) = export.light_trap_bif
+        && !export_call
+        && registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
+        && !crate::trace_bp::any_pattern()
+        && process
+            .cold
+            .as_ref()
+            .is_none_or(|cold| cold.bif_trap.is_none())
+    {
+        return call_trap_bif(process, registers, identity, export, entry, export_call);
+    }
     invoke_dispatch_bif_slow(process, registers, identity, site, export, export_call)
+}
+
+/// Calls a trapping BIF straight from native code; `None` when it trapped.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared), OTP-29.1.1:
+// the BIF's value or error is handled like any light BIF's; THE_NON_VALUE with
+// `freason == TRAP` pushes the return address and context-switches to `c_p->i`, which the
+// scheduler resumes from the trap state.
+#[inline(never)]
+fn call_trap_bif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    identity: usize,
+    export: ExportDispatch,
+    entry: &'static crate::bif_traps::Entry,
+    export_call: bool,
+) -> Option<u64> {
+    process.reductions = process.header.fcalls;
+    if export_call {
+        charge_bif_reductions(process, 1);
+    }
+    let arity = usize::from(export.arity);
+    if entry.reserves_heap()
+        && let Ok(bits) = arinsal_bifs::bitstring_bit_len(registers.x_reg_array[0])
+        && bits.is_multiple_of(8)
+        && let Some(reserve) = (bits / 8).checked_mul(2).and_then(|n| n.checked_add(64))
+    {
+        // The decoder builds on the heap it reserved, with collection off until it is
+        // done; the arguments stay live across the reservation.
+        process
+            .heap
+            .set_frame_pointer(registers.tmp_mem[2] as usize);
+        load_dispatch_x(process, registers);
+        let ensured = process.ensure(reserve, arity);
+        registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+        for (destination, term) in registers
+            .x_reg_array
+            .iter_mut()
+            .zip(process.x.iter())
+            .take(arity)
+        {
+            *destination = *term;
+        }
+        // A collection moved the heap: publish every cursor, not just HTOP.
+        process.sync_native_header();
+        if ensured.is_err() {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return Some(0);
+        }
+    }
+    let mut args = [Term::NIL; 3];
+    args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
+    let callee = (export.module_atom, export.function_atom);
+    let trace_light_traps = std::env::var_os("ARINSAL_TRACE_LIGHT_TRAPS").is_some();
+    if trace_light_traps {
+        eprintln!(
+            "light BIF start {}:{}/{}",
+            export.module, export.function, export.arity
+        );
+    }
+    let outcome = crate::bif_traps::call_light(process, entry, identity, callee, &args[..arity]);
+    if trace_light_traps {
+        eprintln!(
+            "light BIF result {}:{}/{}: {}",
+            export.module,
+            export.function,
+            export.arity,
+            match &outcome {
+                crate::bif_traps::LightTrap::Returned(_) => "returned",
+                crate::bif_traps::LightTrap::Trapped => "trapped",
+            }
+        );
+    }
+    match outcome {
+        crate::bif_traps::LightTrap::Returned(result) => {
+            Some(plain_bif_result(process, registers, export, arity, result))
+        }
+        crate::bif_traps::LightTrap::Trapped => {
+            // The scheduler resumes the caller's frame chain from the process.
+            process
+                .heap
+                .set_frame_pointer(registers.tmp_mem[2] as usize);
+            debug_assert_native_heap(process);
+            debug_assert_eq!(
+                process.heap.frame_pointer(),
+                registers.tmp_mem[2] as usize,
+                "light trapping BIF frame pointer is outside its process heap: mfa={}:{}/{}, candidate={:#x}, heap={:#x}..{:#x}, live_stack={:#x}..{:#x}, module={}, ip={:#x}",
+                export.module,
+                export.function,
+                export.arity,
+                registers.tmp_mem[2],
+                process.heap.heap_bounds().0 as usize,
+                process.heap.heap_bounds().1 as usize,
+                process.heap.heap_cursor().1 as usize,
+                process.heap.heap_bounds().1 as usize,
+                process.module,
+                process.ip,
+            );
+            process.header.arity = export.arity;
+            process.header.i = identity as *const u8 as *const _;
+            process.header.freason = 1 << 10;
+            process.sync_native_header();
+            None
+        }
+    }
+}
+
+/// Checks heap cursors and the published native frame before a trap changes execution tiers.
+pub(crate) fn debug_assert_native_heap(_process: &crate::Process) {
+    #[cfg(debug_assertions)]
+    {
+        let (heap, end) = _process.heap.heap_bounds();
+        let (htop, stop) = _process.heap.heap_cursor();
+        let (heap, htop, stop, end) = (heap as usize, htop as usize, stop as usize, end as usize);
+        debug_assert!(heap <= htop && htop <= stop && stop <= end);
+        let frame_pointer = _process.heap.frame_pointer();
+        debug_assert!(
+            frame_pointer == 0 || (stop <= frame_pointer && frame_pointer < end),
+            "native frame pointer {frame_pointer:#x} is outside the live stack {stop:#x}..{end:#x}"
+        );
+        if let Some(pending) = _process
+            .cold
+            .as_deref()
+            .and_then(|cold| cold.bif_trap.as_ref())
+        {
+            debug_assert!(pending.arity <= pending.args.len());
+            for term in pending.args[..pending.arity].iter().copied() {
+                arinsal_term::validate::check_if_active(&_process.heap, term);
+            }
+        }
+    }
 }
 
 #[cold]

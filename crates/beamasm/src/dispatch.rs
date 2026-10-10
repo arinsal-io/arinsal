@@ -499,6 +499,12 @@ fn emit_helper_fragment(
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
     emit_enter_runtime(code, live, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
+        // Preserve the Erlang FP separately; x29 is the temporary host FP for this wrapper.
+        // Port of beam_asm.hpp:437-440 (emit_enter_runtime_frame), OTP-29.1.1.
+        let frame_pointer_slot =
+            std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 2 * 8;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 0)?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(19), frame_pointer_slot)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
         encoder.blr(Gpr::x(17))?;
         Ok(())
@@ -539,7 +545,8 @@ fn emit_helper_fragment(
     emit_restore_and_exit(code)?;
     code.bind(normal)?;
     code.emit(|encoder| {
-        encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+        encoder.ldr_uoff(Gpr::x(30), Gpr::sp(), 8)?;
+        encoder.add_imm(Gpr::sp(), Gpr::sp(), 16, false)?;
         encoder.ret(Gpr::x(30))
     })?;
     Ok(())
@@ -549,7 +556,8 @@ fn emit_helper_fragment(
 // OTP-29.1.1.
 fn emit_restore_and_exit(code: &mut CodeBuffer) -> Result<(), BufferError> {
     code.emit(|encoder| {
-        encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+        encoder.ldr_uoff(Gpr::x(30), Gpr::sp(), 8)?;
+        encoder.add_imm(Gpr::sp(), Gpr::sp(), 16, false)?;
         encoder.str_uoff(Gpr::x(0), Gpr::x(19), 16_408)?;
         encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
         encoder.br(Gpr::x(17))

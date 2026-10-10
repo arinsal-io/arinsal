@@ -1,7 +1,10 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+
+// Concurrent IEx startup can drop the OTP PTY prompt under test load.
+static IEX_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn shim_dir() -> &'static Path {
     static SHIM: OnceLock<PathBuf> = OnceLock::new();
@@ -89,6 +92,9 @@ fn assert_success(output: &Output, label: &str) {
 
 #[test]
 fn iex_shell_piped_expressions_multiline_and_raise_match_otp() {
+    let _guard = IEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let input = "x = Enum.sum(1..10)\nIO.puts(\"sum=#{x}\")\ncase [1, 2] do\n  [a, b] -> a + b\nend\nraise \"x\"\n";
     let reference = run(&[], input, env_path(false), None);
     let arinsal = run(&[], input, env_path(true), None);
@@ -100,6 +106,9 @@ fn iex_shell_piped_expressions_multiline_and_raise_match_otp() {
 
 #[test]
 fn iex_shell_help_without_tab_matches_otp() {
+    let _guard = IEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let input = "h Enum.map\nSystem.halt(0)\n";
     let reference = run(&[], input, env_path(false), None);
     let arinsal = run(&[], input, env_path(true), None);
@@ -111,6 +120,9 @@ fn iex_shell_help_without_tab_matches_otp() {
 
 #[test]
 fn iex_shell_eof_exit_status_matches_otp() {
+    let _guard = IEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let reference = run(&[], "", env_path(false), None);
     let arinsal = run(&[], "", env_path(true), None);
     assert_success(&reference, "OTP IEx EOF");
@@ -120,6 +132,9 @@ fn iex_shell_eof_exit_status_matches_otp() {
 
 #[test]
 fn iex_shell_pty_banner_and_prompts_match_otp() {
+    let _guard = IEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     fn pty(path: String) -> Output {
         let mut child = Command::new("/bin/sh")
             .arg("-c")
@@ -188,13 +203,22 @@ fn iex_shell_pty_banner_and_prompts_match_otp() {
         "pty_ok",
         "iex(2)> ",
     ] {
-        assert!(reference.contains(marker), "OTP PTY lacks {marker:?}");
-        assert!(arinsal.contains(marker), "Arinsal PTY lacks {marker:?}");
+        assert!(
+            reference.contains(marker),
+            "OTP PTY lacks {marker:?}: {reference:?}"
+        );
+        assert!(
+            arinsal.contains(marker),
+            "Arinsal PTY lacks {marker:?}: {arinsal:?}"
+        );
     }
 }
 
 #[test]
 fn iex_shell_mix_project_starts_and_evaluates() {
+    let _guard = IEX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     fn project(suffix: &str) -> PathBuf {
         let project =
             std::env::temp_dir().join(format!("iex-shell-mix-{}-{suffix}", std::process::id()));

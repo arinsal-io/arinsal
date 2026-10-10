@@ -41,6 +41,82 @@ pub enum MapError {
 /// Map operation result.
 pub type MapResult<T> = Result<T, MapError>;
 
+/// A map whose tag has been checked once for one map operation.
+/// This matches the checked map pointer used inside erts map BIFs.
+#[derive(Clone, Copy)]
+pub struct CheckedMap {
+    map: Term,
+}
+
+/// The flatmap or HAMT branch selected after checking a map's tag.
+pub enum CheckedMapKind {
+    /// The map uses flatmap storage.
+    Flatmap(CheckedFlatMap),
+    /// The map uses HAMT storage.
+    Hashmap(CheckedHashMap),
+}
+
+/// A checked flatmap pointer.
+#[derive(Clone, Copy)]
+pub struct CheckedFlatMap(CheckedMap);
+
+/// A checked HAMT pointer.
+#[derive(Clone, Copy)]
+pub struct CheckedHashMap(CheckedMap);
+
+impl CheckedMap {
+    /// The checked map term.
+    pub fn term(self) -> Term {
+        self.map
+    }
+
+    /// Number of key-value pairs.
+    pub fn size(self) -> usize {
+        // SAFETY: `checked_map` validated the map tag and the live map header has its
+        // size in word one, shared by flatmaps and HAMT heads.
+        unsafe { *self.map.raw_ptr().add(1) as usize }
+    }
+
+    /// Looks up a key without repeating the map tag check.
+    // Port of erts/emulator/beam/erl_map.c:2424-2474 (erts_maps_get), OTP-29.1.1.
+    pub fn get(self, key: Term) -> Option<Term> {
+        lookup(self.map, key)
+    }
+
+    /// Selects flatmap or HAMT storage after the map tag check.
+    pub fn kind(self) -> CheckedMapKind {
+        if self.map.is_hashmap() {
+            CheckedMapKind::Hashmap(CheckedHashMap(self))
+        } else {
+            CheckedMapKind::Flatmap(CheckedFlatMap(self))
+        }
+    }
+}
+
+impl CheckedFlatMap {
+    /// The checked map term.
+    pub fn term(self) -> Term {
+        self.0.term()
+    }
+
+    /// Number of key-value pairs.
+    pub fn size(self) -> usize {
+        self.0.size()
+    }
+}
+
+impl CheckedHashMap {
+    /// The checked map term.
+    pub fn term(self) -> Term {
+        self.0.term()
+    }
+
+    /// Number of key-value pairs.
+    pub fn size(self) -> usize {
+        self.0.size()
+    }
+}
+
 fn bits(t: Term) -> u64 {
     // SAFETY: pointer-bearing terms remain owned by their live heap.
     unsafe { t.raw_bits() }
@@ -736,12 +812,17 @@ fn collect(node: Term, out: &mut Vec<(Term, Term)>) {
     }
 }
 
+/// Validate a map once for one BIF operation.
+// Port of erts/emulator/beam/erl_map.c:3636-3710, OTP-29.1.1.
+pub fn checked_map(map: Term) -> MapResult<CheckedMap> {
+    check(map)?;
+    Ok(CheckedMap { map })
+}
+
 /// `map_size(Map)`.
 pub fn size(map: Term) -> MapResult<usize> {
     // Port of erts/emulator/beam/erl_map.c:1380-1399, OTP-29.1.1.
-    check(map)?;
-    // SAFETY: both flatmap and HAMT head have untagged size in word one.
-    Ok(unsafe { *map.raw_ptr().add(1) as usize })
+    checked_map(map).map(CheckedMap::size)
 }
 /// Lookup; `Ok(None)` when the key is absent.
 #[inline]
@@ -891,6 +972,28 @@ pub fn flatmap_next<H: HeapAlloc + ?Sized>(
     heap: &mut H,
 ) -> MapResult<Term> {
     let (ks, vs, _) = merge::flatmap_kv(map);
+    flatmap_next_words(ks, vs, list_mode, acc, heap)
+}
+
+/// One flatmap iterator step with the already validated header from this call site.
+// Port of erts/emulator/beam/erl_map.c:3709-3738 (flatmap branch), OTP-29.1.1.
+pub fn flatmap_next_checked<H: HeapAlloc + ?Sized>(
+    map: CheckedFlatMap,
+    list_mode: bool,
+    acc: Term,
+    heap: &mut H,
+) -> MapResult<Term> {
+    let (ks, vs, _) = merge::flatmap_kv_with_size(map.term(), map.size());
+    flatmap_next_words(ks, vs, list_mode, acc, heap)
+}
+
+fn flatmap_next_words<H: HeapAlloc + ?Sized>(
+    ks: &[u64],
+    vs: &[u64],
+    list_mode: bool,
+    acc: Term,
+    heap: &mut H,
+) -> MapResult<Term> {
     let n = ks.len();
     let per_elem = if list_mode { 5 } else { 4 };
     let need_words = per_elem * n;

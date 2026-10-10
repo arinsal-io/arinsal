@@ -156,6 +156,9 @@ pub(crate) struct DispatchTarget {
     /// The process BIF a light BIF call runs straight away, for a native that needs only its
     /// process (see `natives::ProcessBif`); the executor still runs it for interpreted code.
     pub light_process_bif: Option<crate::natives::ProcessBif>,
+    /// The trapping BIF a light BIF call runs straight away; it leaves native code only when
+    /// it traps (see `bif_traps::call_light`).
+    pub(crate) light_trap_bif: Option<&'static crate::bif_traps::Entry>,
 }
 
 impl DispatchTarget {
@@ -278,6 +281,18 @@ impl DispatchRegistry {
                 && leaked.direct_ets.is_none()
             {
                 crate::natives::process_bif(&leaked.module, &leaked.function, leaked.arity)
+            } else {
+                None
+            };
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared),
+            // OTP-29.1.1: a trapping BIF is a BIF like any other at its call site.
+            leaked.light_trap_bif = if leaked.trap_entry
+                && leaked.direct_ets.is_none()
+                && !matches!(
+                    leaked.class,
+                    arinsal_loader::ImportClass::Dynamic | arinsal_loader::ImportClass::Fun
+                ) {
+                crate::bif_traps::light_entry(&leaked.module, &leaked.function, leaked.arity)
             } else {
                 None
             };
@@ -426,6 +441,7 @@ pub(crate) fn export_get_or_make_stub(
             native_bits: bits,
             light_bif: None,
             light_process_bif: None,
+            light_trap_bif: None,
         })
     })?;
     crate::code_ix::for_scope(scope).update_active(|tables| {
@@ -479,6 +495,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 native_bits: bits,
                 light_bif: None,
                 light_process_bif: None,
+                light_trap_bif: None,
             })
         })?;
         crate::code_ix::for_scope(scope).update_active(|tables| {
@@ -516,6 +533,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             native_bits: bits,
             light_bif: None,
             light_process_bif: None,
+            light_trap_bif: None,
         })
     }));
     let identity = Arc::as_ptr(entry.slot) as usize;
@@ -564,6 +582,7 @@ fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, u
                 native_bits: bits,
                 light_bif: None,
                 light_process_bif: None,
+                light_trap_bif: None,
             })
         });
         if let Some(target) = target {

@@ -22,7 +22,7 @@ pub(crate) enum TrapResult {
     },
 }
 
-type Handler = fn(
+pub(crate) type Handler = fn(
     &mut Process,
     &[Term],
     Option<&Arc<MagicRef>>,
@@ -30,7 +30,8 @@ type Handler = fn(
     bool,
 ) -> Result<TrapResult, BifError>;
 
-struct Entry {
+/// A trapping BIF and the continuation export it traps to.
+pub(crate) struct Entry {
     module: &'static str,
     function: &'static str,
     arity: u8,
@@ -804,6 +805,7 @@ pub(crate) fn execute_named(
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.module,
                 caller_ip: process.ip,
+                schedule_out: false,
                 import,
                 continuation,
                 state,
@@ -837,6 +839,99 @@ pub(crate) fn execute_named(
             })
         }
     })
+}
+
+/// The trapping BIF a light BIF call runs straight from native code.
+///
+/// `erts_debug:set_internal_state/2` traps only for `code_mod_permission` and needs the
+/// scheduler's pid for it, so it keeps the executor path.
+pub(crate) fn light_entry(module: &str, function: &str, arity: u8) -> Option<&'static Entry> {
+    if module == "erts_debug" {
+        return None;
+    }
+    ENTRIES
+        .iter()
+        .find(|entry| entry.module == module && entry.function == function && entry.arity == arity)
+}
+
+/// Outcome of a trapping BIF run from a light BIF call.
+pub(crate) enum LightTrap {
+    /// The BIF finished: its value or its error, like any light BIF's result.
+    Returned(Result<Term, BifError>),
+    /// The BIF trapped to its continuation export (`THE_NON_VALUE` with `freason == TRAP`);
+    /// the call site context-switches and the scheduler resumes it through the trap state.
+    Trapped,
+}
+
+impl Entry {
+    /// Whether the BIF decodes onto the heap it reserved before the call.
+    pub(crate) fn reserves_heap(&self) -> bool {
+        self.continuation == BINARY_TO_TERM_CONTINUATION
+    }
+}
+
+/// Runs a trapping BIF from a light BIF call, with no trap pending for the process.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared), OTP-29.1.1:
+// a trapping BIF is called like any other BIF; one that finishes returns its value at once,
+// and one that traps (BIF_TRAP, bif.h) leaves through `context_switch_simplified` to resume
+// in its continuation export.
+pub(crate) fn call_light(
+    process: &mut Process,
+    entry: &'static Entry,
+    import: usize,
+    callee: (arinsal_term::Atom, arinsal_term::Atom),
+    args: &[Term],
+) -> LightTrap {
+    let gc_was_enabled = process.gc_enabled;
+    if entry.reserves_heap() {
+        process.set_gc_enabled(false);
+    }
+    let pid = process.self_pid;
+    let result = (entry.handler)(process, args, None, pid, gc_was_enabled);
+    let (result, reductions) = match result {
+        Err(error) => (Err(error), 0),
+        Ok(TrapResult::Done { value, reductions }) => (Ok(value), reductions),
+        Ok(TrapResult::Failed { error, reductions }) => (Err(error), reductions),
+        Ok(TrapResult::Yield {
+            continuation,
+            state,
+            reductions,
+        }) => {
+            if continuation != PTAB_LIST_CONTINUATION
+                && continuation != CODE_PERMISSION_CONTINUATION
+            {
+                process.set_gc_enabled(false);
+            }
+            let mut saved = [Term::NIL; 3];
+            saved[..args.len()].copy_from_slice(args);
+            // The scheduler binds the trap to its call site when it context-switches.
+            process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+                caller_module: process.module,
+                caller_ip: process.ip,
+                schedule_out: true,
+                import,
+                continuation,
+                state,
+                gc_was_enabled,
+                arity: args.len(),
+                callee,
+                args: saved,
+            });
+            charge_light(process, reductions);
+            return LightTrap::Trapped;
+        }
+    };
+    process.set_gc_enabled(gc_was_enabled);
+    charge_light(process, reductions);
+    LightTrap::Returned(result)
+}
+
+/// Charges a light trapping BIF's reductions against FCALLS (BUMP_REDS, bif.h); the call site
+/// has charged the call itself.
+fn charge_light(process: &mut Process, reductions: u32) {
+    process.reductions = process
+        .reductions
+        .saturating_sub(reductions.min(i32::MAX as u32) as i32);
 }
 
 /// The call's arguments as the X registers hold them now; a collection since the copies

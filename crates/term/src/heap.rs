@@ -1324,18 +1324,25 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     ///
     /// The previous tuple's tail slot is patched to point at the new one, like
     /// `*patch_ptr = make_tuple(hp); patch_ptr = &hp[3];` in erl_map.c.
+    // Port of erts/emulator/beam/erl_map.c:3920-3927 (iterator tuple chain), OTP-29.1.1.
+    #[inline(always)]
     pub fn chain3_push(
         &mut self,
         chain: &mut Tuple3Chain,
         first: Term,
         second: Term,
     ) -> Result<(), TermError> {
-        let tuple = self.tuple(&[first, second, Term::NIL])?;
+        let words = self.words(4)?;
+        store(words, (3u64 << 6) | ARITY);
+        store(words.wrapping_add(1), first.bits());
+        store(words.wrapping_add(2), second.bits());
+        store(words.wrapping_add(3), Term::NIL.bits());
+        let tuple = Term::from_ptr(words, 2);
         match chain.last {
             Some(last) => store(last.wrapping_add(3), tuple.bits()),
             None => chain.head = tuple,
         }
-        chain.last = Some((tuple.bits() & !7) as *mut u64);
+        chain.last = Some(words);
         Ok(())
     }
 
