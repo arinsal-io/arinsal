@@ -148,7 +148,9 @@ impl BeamModuleAssembler {
         // erts checks reductions before peeking and schedules out at the `loop_rec` itself.
         self.code.emit(|e| e.cmp_imm(FCALLS, 0, false))?;
         self.code.b_cond(Cond::Le, schedule_out)?;
-        self.emit_runtime_hook_with(hooks.loop_rec as usize, &[], 6, crate::Update::NONE)?;
+        // erts enters the runtime with eHeapAlloc for the receive helper, which may copy
+        // fetched messages onto the heap (instr_msg.cpp:139-153).
+        self.emit_runtime_hook_with(hooks.loop_rec as usize, &[], 6, crate::Update::HEAP_ALLOC)?;
         // Any word above the sentinel is a message.
         self.code
             .emit(|e| e.cmp_imm(Gpr::x(0), LOOP_REC_FETCH, false))?;

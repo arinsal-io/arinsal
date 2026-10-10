@@ -230,7 +230,7 @@ pub extern "C" fn arinsal_beamasm_recv_marker_use(header: *mut ProcessHeader, re
 // and erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper),
 // OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
-    let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
+    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
     if let Some(message) = process.inbox.get(process.receive_cursor) {
@@ -245,6 +245,30 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
         .and_then(|cold| cold.signal_probe.as_ref())
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if !pending {
+        return 0;
+    }
+    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:131-176 (erts_proc_sig_receive_helper
+    // call under eHeapAlloc), OTP-29.1.1: fetch messages in place and peek again.
+    process
+        .heap
+        .set_frame_pointer(registers.tmp_mem[2] as usize);
+    let fetched = process.fetch_messages_in_place();
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    process.sync_native_header();
+    if fetched.is_ok()
+        && let Some(message) = process.inbox.get(process.receive_cursor)
+    {
+        return crate::native_hooks::raw(*message);
+    }
+    // Everything fetched was scanned: wait. A non-message signal left at the head of the
+    // outer queue is handled by the scheduler.
+    if fetched.is_ok()
+        && process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.signal_probe.as_ref())
+            .is_some_and(|probe| !probe.has_pending())
+    {
         return 0;
     }
     process.cold_mut().native_signal_fetch = true;
