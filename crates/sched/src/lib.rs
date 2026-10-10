@@ -614,6 +614,9 @@ struct Process<T: Task> {
     /// User priority (`process_flag(priority, _)`).
     /// Port of erl_process.h (`ERTS_PSFLGS_USR_PRIO_MASK`), OTP-29.1.1.
     user_priority: AtomicU8,
+    /// erts `ERTS_PSFLG_ACTIVE` as seen by other processes: cleared when a slice ends
+    /// waiting in a receive, set when it ends runnable.
+    active: AtomicBool,
     /// Priority of the highest pending system task, [`NO_SYS_PRIORITY`] when none.
     /// The actual priority is the higher of the two.
     /// Port of erl_process.h (`ERTS_PSFLGS_ACT_PRIO_MASK`, `ERTS_PSFLG_SYS_TASKS`), OTP-29.1.1.
@@ -741,6 +744,7 @@ impl<T: Task> ProcessTable<T> {
             pid,
             started_interval: NEXT_STARTED_INTERVAL.fetch_add(1, Ordering::Relaxed),
             user_priority: AtomicU8::new(priority.index() as u8),
+            active: AtomicBool::new(true),
             sys_priority: AtomicU8::new(NO_SYS_PRIORITY),
             run_epoch: AtomicU64::new(0),
             bound_worker: AtomicUsize::new(bound_worker.unwrap_or(UNBOUND_WORKER)),
@@ -3371,6 +3375,7 @@ pub struct RunCtx<'a, M: Send + 'static> {
     gc_accounted_total: u64,
     sched_type: SchedulerType,
     user_priority: &'a AtomicU8,
+    active: &'a AtomicBool,
     sys_task_run: bool,
     /// A dirty signal handler acts for a process whose dirty job is executing.
     dirty_running: bool,
@@ -3692,6 +3697,12 @@ impl<M: Send + 'static> RunCtx<'_, M> {
         event
     }
     /// Restart a selective receive scan after changing the pattern.
+    /// Record whether this slice ends active (runnable) or waiting.
+    // Port of erts/emulator/beam/erl_process.c (ERTS_PSFLG_ACTIVE in the process state
+    // word, read by erts_process_state2status), OTP-29.1.1.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Release);
+    }
     pub fn reset_save(&mut self) {
         self.private.reset_save();
     }
@@ -4080,6 +4091,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             gc_accounted_total: 0,
             sched_type: SchedulerType::Normal,
             user_priority: &process.user_priority,
+            active: &process.active,
             sys_task_run: false,
             dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
         };
@@ -4858,6 +4870,12 @@ impl<T: Task> Scheduler<T> {
             .lookup(pid)
             .map(|process| process.started_interval)
     }
+    /// Whether a live task's last slice ended active (erts `ERTS_PSFLG_ACTIVE`).
+    pub fn is_active(&self, pid: Pid) -> Option<bool> {
+        self.inner
+            .table
+            .with_live(pid, |process| process.active.load(Ordering::Acquire))
+    }
     /// Whether a scheduler is executing the task right now.
     // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status: ERTS_PSFLG_RUNNING), OTP-29.1.1.
     pub fn is_running(&self, pid: Pid) -> bool {
@@ -5318,6 +5336,7 @@ mod msgq_stage_microbench {
         let backlog = AtomicUsize::new(N);
         let bound_worker = AtomicUsize::new(UNBOUND_WORKER);
         let user_priority = AtomicU8::new(Priority::Normal.index() as u8);
+        let active = AtomicBool::new(true);
         let mut context = RunCtx {
             inner: &mut receive_runner,
             pid: process,
@@ -5336,6 +5355,7 @@ mod msgq_stage_microbench {
             gc_accounted_total: 0,
             sched_type: SchedulerType::Normal,
             user_priority: &user_priority,
+            active: &active,
             sys_task_run: false,
             dirty_running: false,
         };
@@ -5759,6 +5779,7 @@ fn run_slice<'a, T: Task>(
                 },
                 sched_type: dirty.map_or(SchedulerType::Normal, SchedulerType::from),
                 user_priority: &process.user_priority,
+                active: &process.active,
                 sys_task_run,
                 dirty_running: false,
             };
@@ -6072,8 +6093,15 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         }
         // Port of erts/emulator/beam/erl_process.c:2683 (auxiliary work), OTP-29.1.1.
         local.set_msacc_state(MsaccState::Aux);
-        inner.poll_pending_waits(&mut local, false);
+        // Port of erts/emulator/beam/erl_process.c:9803 (check_time_reds) and
+        // erl_time_sup.c (erts_get_monotonic_time resets check_time_reds), OTP-29.1.1: a
+        // busy scheduler reads the clock once per ERTS_CHECK_TIME_REDS reductions.
+        let check_time = local.check_time_reds >= inner.config.reductions;
+        inner.poll_pending_waits(&mut local, check_time);
         inner.poll_timers(id, Some(&mut local), false);
+        if check_time {
+            local.check_time_reds = 0;
+        }
         local.set_msacc_state(MsaccState::Other);
         inner.flush_local_metrics(&mut local);
         // Port of erts/emulator/beam/erl_process.c:9812-9822 (check_activities_to_run:

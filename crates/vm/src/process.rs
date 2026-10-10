@@ -1010,6 +1010,19 @@ pub(crate) struct Published {
     pub monitored_by: Vec<(u64, Pid)>,
 }
 
+impl Published {
+    /// The slot of a process that has published nothing yet.
+    pub(crate) fn empty() -> Self {
+        Self {
+            status: "runnable",
+            hibernating: false,
+            links: Vec::new(),
+            monitors: Vec::new(),
+            monitored_by: Vec::new(),
+        }
+    }
+}
+
 /// Scheduling state of a hibernating process; `apply(M, F, A)` waits in X0..X2.
 ///
 /// g_proc_sched. Port of erts/emulator/beam/beam_common.c:1568 (`erts_hibernate`), OTP-29.1.1.
@@ -4022,22 +4035,35 @@ impl Runtime {
         }
     }
 
+    /// Status of another process, derived from its scheduling state when asked.
+    // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status), OTP-29.1.1:
+    // erts reads the state word instead of having each process publish its status.
     pub(crate) fn remote_status(&self, pid: Pid) -> &'static str {
         if self.suspend_active(pid) {
             return "suspended";
         }
-        self.published
+        let (exiting, hibernating) = self
+            .published
             .lock()
             .unwrap()
             .get(&pid)
-            .map(|slot| {
-                if slot.hibernating {
-                    "waiting"
-                } else {
-                    slot.status
-                }
-            })
-            .unwrap_or("runnable")
+            .map_or((false, false), |slot| {
+                (slot.status == "exiting", slot.hibernating)
+            });
+        if exiting {
+            return "exiting";
+        }
+        if hibernating {
+            return "waiting";
+        }
+        match self
+            .scheduler()
+            .ok()
+            .and_then(|scheduler| scheduler.is_active(pid))
+        {
+            Some(false) => "waiting",
+            Some(true) | None => "runnable",
+        }
     }
 
     fn note_relations(&self, pid: Pid, cold: Option<&crate::proc_create::ProcessCold>) {
@@ -6180,17 +6206,18 @@ impl Process {
         // erts keeps links and monitors on the process (NULL when unused) and does not
         // publish them on every schedule-out. Copy only when this process has some,
         // or a previous schedule published a set that must be cleared.
-        let has_relations = self.cold.as_ref().is_some_and(|cold| {
-            !cold.links.is_empty() || !cold.monitors.is_empty() || !cold.monitored_by.is_empty()
+        // Publish only when a relation changed during this slice (every mutation goes
+        // through `Tracked`), instead of copying them out on every schedule-out.
+        let changed = self.cold.as_mut().is_some_and(|cold| {
+            let links = cold.links.take_changed();
+            let monitors = cold.monitors.take_changed();
+            let monitored_by = cold.monitored_by.take_changed();
+            let tags = cold.monitor_tags.take_changed();
+            links | monitors | monitored_by | tags
         });
-        if has_relations || self.published_slot {
+        if changed {
             runtime.note_relations(ctx.pid(), self.cold.as_deref());
-            self.published_slot = has_relations;
         }
-        let parked = self
-            .cold
-            .as_mut()
-            .is_some_and(|cold| std::mem::take(&mut cold.suspend_parked));
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
         // with GC disabled the dirty collection is dropped; the next collection does it.
         if !ctx.scheduler_type().is_dirty()
@@ -6205,22 +6232,28 @@ impl Process {
             // Port of erts/emulator/beam/erl_process.c:6695-6840 (schedule_out_process),
             // OTP-29.1.1: a process with ERTS_PSFLG_DIRTY_ACTIVE_SYS is enqueued on the dirty
             // CPU run queue.
+            // The schedule-out sets the ACTIVE bit others read (remote_status) instead of
+            // publishing a status under the runtime lock.
             Ok(RunState::Yield)
                 if !ctx.scheduler_type().is_dirty()
                     && self.cold.as_ref().is_some_and(|cold| cold.dirty_sys_gc) =>
             {
-                runtime.note_status(ctx.pid(), "runnable");
+                ctx.set_active(true);
                 RunOutcome::Dirty(arinsal_sched::DirtyKind::Cpu)
             }
             Ok(RunState::Yield) => {
-                runtime.note_status(ctx.pid(), "runnable");
+                ctx.set_active(true);
                 RunOutcome::Yield
             }
             Ok(RunState::Wait { timeout_ms }) => {
                 // Port of erts/emulator/beam/erl_process.c:9304 (erts_process_state2status),
                 // OTP-29.1.1: suspension keeps ERTS_PSFLG_ACTIVE, so a process resumed while
                 // this slice ended is runnable, not waiting.
-                runtime.note_status(ctx.pid(), if parked { "runnable" } else { "waiting" });
+                let parked = self
+                    .cold
+                    .as_mut()
+                    .is_some_and(|cold| std::mem::take(&mut cold.suspend_parked));
+                ctx.set_active(parked);
                 RunOutcome::Wait { timeout_ms }
             }
             Ok(RunState::Done(term)) => {

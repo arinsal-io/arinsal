@@ -100,8 +100,6 @@ pub struct Process {
     /// `ProcessCold.apply_roots`.
     pub(crate) apply_inline: [Term; 3],
     pub(crate) apply_inline_len: u8,
-    /// `note_relations` has published this process's links or monitors.
-    pub(crate) published_slot: bool,
     // Retired persistent-term areas are copied out and acknowledged in
     // `natives::sys::after_collection` on every collection.
     pub(crate) _persistent_terms: arinsal_pterm::ProcessRegistration<'static>,
@@ -556,15 +554,49 @@ impl ProcDict {
 /// returned value.
 pub(crate) type NativeReturnEvents = (Vec<(usize, Vec<crate::trace::NativeTraceAction>)>, Term);
 
+/// A relation container that records whether it was mutated since the owner last
+/// published its relations (see `finish_run`).
+#[derive(Default)]
+pub(crate) struct Tracked<T> {
+    value: T,
+    changed: bool,
+}
+
+impl<T> Tracked<T> {
+    /// Whether the value was mutably borrowed since the last call; clears the mark.
+    pub(crate) fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+}
+
+impl<T> std::ops::Deref for Tracked<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: IntoIterator> IntoIterator for Tracked<T> {
+    type Item = T::Item;
+    type IntoIter = T::IntoIter;
+    fn into_iter(self) -> T::IntoIter {
+        self.value.into_iter()
+    }
+}
+
+impl<T> std::ops::DerefMut for Tracked<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.changed = true;
+        &mut self.value
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ProcessCold {
     /// `process_flag(save_calls, N)` buffer (erts `ERTS_PSD_SAVED_CALLS_BUF`).
     pub(crate) saved_calls: Option<crate::trace::SavedCalls>,
     /// Link halves retained until the matching unlink acknowledgement arrives.
     pub(crate) unlinking: std::collections::BTreeMap<u64, arinsal_sched::Pid>,
-    /// The last slice ended because the process is suspended, not because it waits in a
-    /// receive: it stays active (runnable once resumed).
-    pub(crate) suspend_parked: bool,
     /// The process already exited while its dirty job keeps running.
     /// Port of erl_process.c:10096 (`need_forced_exit`), OTP-29.1.1.
     pub(crate) dirty_exited: bool,
@@ -634,6 +666,9 @@ pub(crate) struct ProcessCold {
     /// The scheduler-side private queue was empty when native code was entered, so native
     /// `loop_rec` may fetch messages from the outer queue in place.
     pub(crate) native_inline_fetch: bool,
+    /// The last slice ended because the process is suspended, not because it waits in a
+    /// receive: it stays active (runnable once resumed).
+    pub(crate) suspend_parked: bool,
     /// Parked by hibernation until a message arrives (erts `F_HIBERNATE_SCHED`).
     pub(crate) hibernate_sched: bool,
     /// `message_queue_data` is `off_heap` (erts `FS_OFF_HEAP_MSGQ` in `sig_qs.flags`).
@@ -711,17 +746,17 @@ pub(crate) struct ProcessCold {
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
-    pub(crate) links: std::collections::BTreeSet<arinsal_sched::Pid>,
+    pub(crate) links: Tracked<std::collections::BTreeSet<arinsal_sched::Pid>>,
     /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
     pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
-    pub(crate) monitors: std::collections::BTreeMap<u64, arinsal_sched::Pid>,
+    pub(crate) monitors: Tracked<std::collections::BTreeMap<u64, arinsal_sched::Pid>>,
     /// Monitors created with the `priority` option — DOWN messages are priority.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
-    pub(crate) monitored_by: std::collections::BTreeMap<u64, arinsal_sched::Pid>,
+    pub(crate) monitored_by: Tracked<std::collections::BTreeMap<u64, arinsal_sched::Pid>>,
     pub(crate) aliases: std::collections::HashSet<u64>,
     /// Monitor message tag, owned off-heap. A tuple tag such as
     /// `{'ON_LOAD_DOWN', Mod}` must survive GC until the monitored process exits.
-    pub(crate) monitor_tags: std::collections::BTreeMap<u64, arinsal_etf::OwnedTerm>,
+    pub(crate) monitor_tags: Tracked<std::collections::BTreeMap<u64, arinsal_etf::OwnedTerm>>,
     /// Registered name of monitors created by name; their `DOWN` object is `{Name, Node}`.
     pub(crate) monitor_names: std::collections::BTreeMap<u64, String>,
 }
@@ -955,7 +990,6 @@ impl Process {
             exit_cont: None,
             apply_inline: [Term::NIL; 3],
             apply_inline_len: 0,
-            published_slot: false,
             _persistent_terms: if register {
                 arinsal_pterm::global_store().register_process()
             } else {
