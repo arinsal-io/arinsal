@@ -634,6 +634,10 @@ pub(crate) struct ProcessCold {
     /// The scheduler-side private queue was empty when native code was entered, so native
     /// `loop_rec` may fetch messages from the outer queue in place.
     pub(crate) native_inline_fetch: bool,
+    /// Parked by hibernation until a message arrives (erts `F_HIBERNATE_SCHED`).
+    pub(crate) hibernate_sched: bool,
+    /// `message_queue_data` is `off_heap` (erts `FS_OFF_HEAP_MSGQ` in `sig_qs.flags`).
+    pub(crate) off_heap_msgq: bool,
     /// Static NIF identity, native return point and target scheduler class of a NIF call
     /// (or `enif_schedule_nif` continuation) waiting for a scheduler of that class.
     pub(crate) native_dirty_nif: Option<(usize, usize, arinsal_bifs::SchedulerClass)>,

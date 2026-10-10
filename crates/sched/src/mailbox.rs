@@ -126,6 +126,12 @@ impl<T> Incoming<T> {
     /// Enable the per sender buffers, or flush and disable them.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10600-10694, OTP-29.1.1.
     pub fn set_buffers_enabled(&self, enabled: bool) {
+        // erts toggles the buffers only when the queue mode changes (process_flag or spawn).
+        if self.buffering_allowed.load(Ordering::Acquire) == enabled
+            && (enabled || !self.buffers_enabled.load(Ordering::Acquire))
+        {
+            return;
+        }
         if !enabled {
             let mut queue = self.msgq.lock().unwrap();
             self.uninstall_buffers_locked(&mut queue);

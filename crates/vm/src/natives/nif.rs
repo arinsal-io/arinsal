@@ -148,7 +148,9 @@ pub(crate) fn unload_instance(scope: u64, id: usize) {
 }
 
 static SLOTS: Mutex<Vec<Option<DynSlot>>> = Mutex::new(Vec::new());
-static NIF_HUBS: OnceLock<Mutex<HashMap<Pid, Hub>>> = OnceLock::new();
+/// Runtimes whose processes have called NIFs. erts has one runtime and one process
+/// table; a pid is resolved against the tables registered here (see [`hub_for_pid`]).
+static RUNTIME_HUBS: Mutex<Vec<Hub>> = Mutex::new(Vec::new());
 static SOCKET_REACTOR: OnceLock<Arc<NifSelectReactor>> = OnceLock::new();
 
 /// Port of erts/emulator/beam/erl_nif.c:5566-5649, OTP-29.1.1.
@@ -188,6 +190,29 @@ static GLOBAL_HUB: Mutex<Option<Hub>> = Mutex::new(None);
 fn current_hub() -> Option<Hub> {
     HUB.with(|hub| hub.borrow().clone())
         .or_else(|| GLOBAL_HUB.lock().unwrap().clone())
+}
+
+/// The runtime that owns `pid`: the calling thread's runtime when the pid lives there,
+/// else a registered runtime whose process table holds it, else the calling runtime.
+// Port of erts/emulator/beam/erl_process.h (erts_proc_lookup on the one process table),
+// OTP-29.1.1.
+fn hub_for_pid(pid: Pid) -> Option<Hub> {
+    let owns = |hub: &Hub| {
+        hub.scheduler
+            .upgrade()
+            .is_some_and(|scheduler| scheduler.lookup(pid))
+    };
+    let current = current_hub();
+    if let Some(hub) = current.as_ref().filter(|hub| owns(hub)) {
+        return Some(Hub { pid, ..hub.clone() });
+    }
+    let registered = RUNTIME_HUBS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|hub| owns(hub))
+        .cloned();
+    registered.or(current).map(|hub| Hub { pid, ..hub })
 }
 
 struct SelectRegistration {
@@ -271,9 +296,7 @@ impl NifSelectReactor {
             return;
         }
         let pid = Pid::new(*id, *serial);
-        // The node's scheduler is on this thread's hub (or the last NIF caller).
-        // erts finds it from the process table, not a side map of every pid.
-        let Some(hub) = current_hub() else {
+        let Some(hub) = hub_for_pid(pid) else {
             return;
         };
         let id = self
@@ -1353,27 +1376,32 @@ fn install_hub_for(process: &Process, pid: Pid) {
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
-    HUB.with(|hub| {
-        *hub.borrow_mut() = Some(Hub {
-            scheduler: Arc::downgrade(&scheduler),
-            pid,
-            runtime: Arc::downgrade(runtime),
-        });
-    });
-    *GLOBAL_HUB.lock().unwrap() = HUB.with(|hub| hub.borrow().clone());
-    HUB_RUNTIME.set(Arc::as_ptr(runtime) as usize);
-    NIF_HUBS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .insert(
-            pid,
-            Hub {
-                scheduler: Arc::downgrade(&scheduler),
-                pid,
-                runtime: Arc::downgrade(runtime),
-            },
-        );
+    // erts hands NIFs the calling process through the env; switching processes on a
+    // scheduler thread registers nothing globally. Only the thread's caller changes.
+    let runtime_id = Arc::as_ptr(runtime) as usize;
+    if HUB_RUNTIME.get() == runtime_id
+        && HUB.with(|hub| hub.borrow_mut().as_mut().map(|hub| hub.pid = pid).is_some())
+    {
+        return;
+    }
+    let hub = Hub {
+        scheduler: Arc::downgrade(&scheduler),
+        pid,
+        runtime: Arc::downgrade(runtime),
+    };
+    HUB.with(|current| *current.borrow_mut() = Some(hub.clone()));
+    HUB_RUNTIME.set(runtime_id);
+    *GLOBAL_HUB.lock().unwrap() = Some(hub.clone());
+    {
+        let mut runtimes = RUNTIME_HUBS.lock().unwrap();
+        runtimes.retain(|known| known.runtime.strong_count() != 0);
+        if !runtimes
+            .iter()
+            .any(|known| Weak::ptr_eq(&known.runtime, &hub.runtime))
+        {
+            runtimes.push(hub);
+        }
+    }
     let reactor = SOCKET_REACTOR.get_or_init(|| {
         let reactor = Arc::new(NifSelectReactor::default());
         arinsal_nif_socket::set_reactor(Some(reactor.clone()));
@@ -1404,10 +1432,10 @@ fn nif_thread_type() -> std::ffi::c_int {
 }
 
 fn nif_is_process_alive(caller: Term, target: Term) -> bool {
-    let (Some(_caller), Some(target)) = (Pid::from_term(caller), Pid::from_term(target)) else {
+    let (Some(caller), Some(target)) = (Pid::from_term(caller), Pid::from_term(target)) else {
         return false;
     };
-    let Some(hub) = current_hub() else {
+    let Some(hub) = hub_for_pid(caller) else {
         return false;
     };
     hub.scheduler
