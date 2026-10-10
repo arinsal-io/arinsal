@@ -183,8 +183,14 @@ impl CodeMeta {
 pub(crate) struct ExportIndex {
     pub(crate) order: Vec<(String, String, u8)>,
     seen: HashSet<(String, String, u8)>,
-    /// Atom-keyed export entries. `false` is an unresolved export stub.
-    entries: HashMap<(Atom, Atom, u8), bool>,
+    /// Atom-keyed erts exports, including each JIT dispatch address vector.
+    // Port of erts/emulator/beam/export.c:38-58, OTP-29.1.1.
+    entries: HashMap<(Atom, Atom, u8), ExportIndexEntry, crate::beamasm_integration::ExportHasher>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ExportIndexEntry {
+    dispatch: Option<&'static arinsal_beamasm::bif::ExportEntry>,
 }
 
 impl ExportIndex {
@@ -192,7 +198,7 @@ impl ExportIndex {
         let mut index = Self {
             order: Vec::new(),
             seen: HashSet::new(),
-            entries: HashMap::new(),
+            entries: HashMap::with_hasher(crate::beamasm_integration::ExportHasher),
         };
         for line in include_str!("../../../spec/otp-29.1.1/bif.tab").lines() {
             if let Some((module, function, arity)) = parse_bif_mfa(line) {
@@ -225,7 +231,7 @@ impl ExportIndex {
         ) {
             self.entries
                 .entry((module_atom, function_atom, arity))
-                .or_insert(false);
+                .or_default();
         }
         let key = (module.to_owned(), function.to_owned(), arity);
         if self.seen.insert(key.clone()) {
@@ -236,10 +242,9 @@ impl ExportIndex {
     fn note_module(&mut self, module: &Module) {
         for export in &module.exports {
             self.put(&export.module, &export.function, export.arity);
-            self.entries.insert(
-                (export.module_atom, export.function_atom, export.arity),
-                true,
-            );
+            self.entries
+                .entry((export.module_atom, export.function_atom, export.arity))
+                .or_default();
         }
         for import in &module.imports {
             self.put(&import.module, &import.function, import.arity);
@@ -262,6 +267,21 @@ impl ExportIndex {
             };
             self.put(module, function, import.arity as u8);
         }
+    }
+
+    pub(crate) fn bind_dispatch(
+        &mut self,
+        key: (Atom, Atom, u8),
+        dispatch: &'static arinsal_beamasm::bif::ExportEntry,
+    ) {
+        self.entries.entry(key).or_default().dispatch = Some(dispatch);
+    }
+
+    pub(crate) fn dispatch(
+        &self,
+        key: (Atom, Atom, u8),
+    ) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
+        self.entries.get(&key)?.dispatch
     }
 }
 
@@ -476,7 +496,7 @@ impl Vm {
         let key = (module_atom, function_atom, arity);
         if !self.code.exports.entries.contains_key(&key) {
             self.code_ix.update_active(|tables| {
-                tables.exports.entries.entry(key).or_insert(false);
+                tables.exports.entries.entry(key).or_default();
             });
         }
         let module_name = global_atoms()

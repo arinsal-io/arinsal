@@ -330,11 +330,11 @@ fn native_i_call_fun2_exported_fun_m_f_1() {
     let module_atom = global_atoms().intern("m").unwrap();
     let function_atom = global_atoms().intern("f").unwrap();
     let export_term = builder
-        .export_fun(std::sync::Arc::new(ExportEntry {
-            module: module_atom,
-            function: function_atom,
-            arity: 1,
-        }))
+        .export_fun(std::sync::Arc::new(ExportEntry::new(
+            module_atom,
+            function_atom,
+            1,
+        )))
         .unwrap();
     let export_bits = arinsal_beamasm::rt::term_bits(export_term);
 

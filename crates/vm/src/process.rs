@@ -884,6 +884,31 @@ impl MultiScheduling {
 }
 
 impl Runtime {
+    /// Address of an export in the requested active code index.
+    // Port of erts/emulator/beam/beam_common.c:1520-1530 (apply export dispatch), OTP-29.1.1.
+    pub(crate) fn export_address(
+        &self,
+        mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+        code_ix: usize,
+    ) -> Option<usize> {
+        self.export_entry(mfa, code_ix)
+            .map(|entry| entry.address(code_ix))
+    }
+
+    /// Export slot selected by the process-visible code index.
+    pub(crate) fn export_entry(
+        &self,
+        mfa: (arinsal_term::Atom, arinsal_term::Atom, u8),
+        code_ix: usize,
+    ) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
+        if code_ix >= arinsal_beamasm::bif::ERTS_ADDRESSV_SIZE {
+            return None;
+        }
+        self.code
+            .with_tables_for_code_ix(code_ix, |tables| tables.exports.dispatch(mfa))
+            .flatten()
+    }
+
     /// Keep the relation snapshot visible to process introspection in step with local signals.
     pub(crate) fn update_published_link(&self, owner: Pid, peer: Pid, linked: bool) {
         let mut published = self.published.lock().unwrap();

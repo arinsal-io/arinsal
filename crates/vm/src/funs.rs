@@ -1144,11 +1144,7 @@ impl Vm {
             .ok_or_else(|| self.exception(p, "badarg"))? as u8;
         p.ensure(2, 3)?;
         TermBuilder::new(&mut p.heap)
-            .export_fun(Arc::new(ExportEntry {
-                module,
-                function,
-                arity,
-            }))
+            .export_fun(Arc::new(ExportEntry::new(module, function, arity)))
             .map_err(|e| VmError::Unsupported(format!("export fun allocation {e:?}")))
     }
 
@@ -1351,11 +1347,7 @@ mod tests {
         let module = global_atoms().intern("erlang").unwrap();
         let function = global_atoms().intern("abs").unwrap();
         p.x[0] = TermBuilder::new(&mut p.heap)
-            .export_fun(Arc::new(ExportEntry {
-                module,
-                function,
-                arity: 1,
-            }))
+            .export_fun(Arc::new(ExportEntry::new(module, function, 1)))
             .unwrap();
         let fun = Arg::new(Arg::X, 0);
         assert!(is_function2(&p, fun, Arg::new(Arg::U, 1)).unwrap());

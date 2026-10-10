@@ -131,7 +131,7 @@ impl NativeTargetCache {
 
 #[derive(Clone)]
 pub(crate) struct DispatchTarget {
-    slot: Arc<arinsal_beamasm::bif::ExportEntry>,
+    slot: &'static arinsal_beamasm::bif::ExportEntry,
     /// Code scope whose code indexes select the slot's address; zero for scope-free slots.
     scope: u64,
     pub module: String,
@@ -158,6 +158,10 @@ pub(crate) struct DispatchTarget {
 }
 
 impl DispatchTarget {
+    pub(crate) fn export_entry(&self) -> &'static arinsal_beamasm::bif::ExportEntry {
+        self.slot
+    }
+
     /// Trapping BIFs keep continuation state that only the executor's call site handles.
     pub(crate) fn runs_in_executor(&self) -> bool {
         matches!(
@@ -169,17 +173,22 @@ impl DispatchTarget {
     }
 }
 
+// Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
+fn new_export_slot(
+    address: usize,
+    save_calls: usize,
+) -> &'static arinsal_beamasm::bif::ExportEntry {
+    Box::leak(Box::new(
+        arinsal_beamasm::bif::ExportEntry::with_save_calls(address, save_calls),
+    ))
+}
+
 /// One node's export state, like an erts code index: import slots, interpreted and native
 /// export targets and global call breakpoints.
 #[derive(Default)]
 struct ScopeExports {
-    // Keyed by importing module, import index and the imported MFA: a reloaded module whose
-    // import table differs must not reuse another function's slot.
-    imports: HashMap<(String, u32, Mfa), Arc<DispatchTarget>>,
-    // Import slots that call an MFA, so publishing that export rewrites those slots only.
-    // erts keeps one `Export` per MFA and callers load its address; the per-site slot still
-    // has to be updated, but not every slot in the node.
-    importers: HashMap<Mfa, Vec<Arc<DispatchTarget>>, ExportHasher>,
+    // One slot per MFA, shared by every import and export in this code scope.
+    dispatch: HashMap<Mfa, Arc<DispatchTarget>, ExportHasher>,
     target_indices: HashMap<Mfa, usize, ExportHasher>,
     native_targets: HashMap<Mfa, usize, ExportHasher>,
     // Exports with a global call breakpoint: their callers go through the export
@@ -189,7 +198,7 @@ struct ScopeExports {
 
 /// Hashes an export key like erts' export table.
 #[derive(Default, Clone, Copy)]
-struct ExportHasher;
+pub(crate) struct ExportHasher;
 
 impl std::hash::BuildHasher for ExportHasher {
     type Hasher = ExportHashState;
@@ -200,7 +209,7 @@ impl std::hash::BuildHasher for ExportHasher {
 
 /// Folds the module atom, function atom and arity of an [`Mfa`] in the order it hashes them.
 #[derive(Default)]
-struct ExportHashState {
+pub(crate) struct ExportHashState {
     words: [u64; 3],
     count: usize,
 }
@@ -248,7 +257,11 @@ struct DispatchRegistry {
 }
 
 impl DispatchRegistry {
-    fn intern_identity(&mut self, identity: usize, entry: &Arc<DispatchTarget>) {
+    fn intern_identity(
+        &mut self,
+        identity: usize,
+        entry: &Arc<DispatchTarget>,
+    ) -> &'static DispatchTarget {
         self.by_identity.entry(identity).or_insert_with(|| {
             let mut leaked = DispatchTarget::clone(entry);
             leaked.light_bif = leaked
@@ -273,13 +286,42 @@ impl DispatchRegistry {
                 .slot
                 .set_info(std::ptr::from_ref::<DispatchTarget>(target) as usize);
             target
-        });
+        })
     }
 }
 
 fn dispatch_registry() -> &'static RwLock<DispatchRegistry> {
     static REGISTRY: OnceLock<RwLock<DispatchRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(|| RwLock::new(DispatchRegistry::default()))
+}
+
+// Port of erts/emulator/beam/export.c:59-98 (MFA-keyed export lookup and initialization), OTP-29.1.1.
+fn dispatch_entry(
+    scope: u64,
+    key: Mfa,
+    create: impl FnOnce() -> Option<DispatchTarget>,
+) -> Option<&'static DispatchTarget> {
+    let mut registry = dispatch_registry().write().ok()?;
+    let existing = registry
+        .scopes
+        .get(&scope)
+        .and_then(|exports| exports.dispatch.get(&key))
+        .cloned();
+    let entry = match existing {
+        Some(entry) => entry,
+        None => {
+            let entry = Arc::new(create()?);
+            registry
+                .scopes
+                .entry(scope)
+                .or_default()
+                .dispatch
+                .insert(key, Arc::clone(&entry));
+            entry
+        }
+    };
+    let identity = entry.slot as *const _ as usize;
+    Some(registry.intern_identity(identity, &entry))
 }
 
 /// Allocates the code scope of a new node.
@@ -297,10 +339,10 @@ pub(crate) fn release_code_scope(scope: u64) {
         return;
     };
     if let Some(exports) = registry.scopes.remove(&scope) {
-        for entry in exports.imports.values() {
+        for entry in exports.dispatch.values() {
             registry
                 .by_identity
-                .remove(&(Arc::as_ptr(&entry.slot) as usize));
+                .remove(&(entry.slot as *const _ as usize));
         }
     }
 }
@@ -320,6 +362,12 @@ fn fragments() -> Option<&'static DispatchFragments> {
         .as_ref()
 }
 
+/// The unresolved or interpreted export entry used to distinguish an export table stub from
+/// a published native target.
+pub(crate) fn export_trampoline() -> usize {
+    fragments().map_or(0, DispatchFragments::export_trampoline)
+}
+
 fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
     static FRAGMENTS: OnceLock<Option<arinsal_beamasm::map::MapFragments>> = OnceLock::new();
     FRAGMENTS
@@ -333,18 +381,10 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
 fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usize>> {
     let trampoline = fragments()?.export_trampoline();
     let save_calls = fragments()?.save_calls_export();
-    let mut registry = dispatch_registry().write().ok()?;
     let mut identities = Vec::with_capacity(module.imports.len());
-    for (index, import) in module.imports.iter().enumerate() {
+    for import in &module.imports {
         let mfa = (import.module_atom, import.function_atom, import.arity);
-        let key = (module.name.clone(), index as u32, mfa);
-        let exports = registry.scopes.entry(scope).or_default();
-        // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1:
-        // a new slot starts at the address the export has now (the trampoline until that
-        // MFA is published). A later publish of the MFA rewrites the slot through `importers`.
-        let address = import_slot_address(exports, &mfa, trampoline);
-        let is_new = !exports.imports.contains_key(&key);
-        let entry = Arc::clone(exports.imports.entry(key).or_insert_with(|| {
+        let entry = dispatch_entry(scope, mfa, || {
             // A module can be compiled before the VM classified its imports.
             let (class, bits) = if import.class() == arinsal_loader::ImportClass::Fresh {
                 crate::natives::classify(
@@ -356,11 +396,9 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
             } else {
                 (import.class(), import.native_bits())
             };
-            Arc::new(DispatchTarget {
+            Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
-                slot: Arc::new(arinsal_beamasm::bif::ExportEntry::with_save_calls(
-                    address, save_calls,
-                )),
+                slot: new_export_slot(trampoline, save_calls),
                 scope,
                 trap_entry: crate::bif_traps::traps(&import.module, &import.function, import.arity),
                 direct_ets: crate::natives::ets::direct_entry(
@@ -386,17 +424,11 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 light_bif: None,
                 light_process_bif: None,
             })
-        }));
-        if is_new {
-            exports
-                .importers
-                .entry(mfa)
-                .or_default()
-                .push(Arc::clone(&entry));
-        }
-        let identity = Arc::as_ptr(&entry.slot) as usize;
-        registry.intern_identity(identity, &entry);
-        identities.push(identity);
+        })?;
+        crate::code_ix::for_scope(scope).update_active(|tables| {
+            tables.exports.bind_dispatch(mfa, entry.export_entry());
+        });
+        identities.push(entry.slot as *const _ as usize);
     }
     Some(identities)
 }
@@ -413,9 +445,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         let bif = arinsal_bifs::lookup(module, function, arity);
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
         Arc::new(DispatchTarget {
-            slot: Arc::new(arinsal_beamasm::bif::ExportEntry::with_save_calls(
-                trampoline, save_calls,
-            )),
+            slot: new_export_slot(trampoline, save_calls),
             scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
             direct_ets: crate::natives::ets::direct_entry(module, function, arity)
@@ -432,12 +462,63 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             light_process_bif: None,
         })
     }));
-    let identity = Arc::as_ptr(&entry.slot) as usize;
+    let identity = entry.slot as *const _ as usize;
     registry.intern_identity(identity, &entry);
     Some(identity)
 }
 
+// Port of erts/emulator/beam/export.c:154-180 (find an export) and erts_export_put, OTP-29.1.1.
 fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, usize)]) {
+    let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
+    let save_calls = fragments().map_or(0, DispatchFragments::save_calls_export);
+    let mut dispatch_entries = Vec::with_capacity(module.exports.len());
+    for export in &module.exports {
+        let Ok(function_atom) = global_atoms().intern(&export.function) else {
+            continue;
+        };
+        let mfa = (module.name_atom, function_atom, export.arity);
+        let bif = arinsal_bifs::lookup(&module.name, &export.function, export.arity);
+        let (class, bits) =
+            crate::natives::classify(&module.name, &export.function, export.arity, bif.is_some());
+        let target = dispatch_entry(scope, mfa, || {
+            Some(DispatchTarget {
+                // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
+                slot: new_export_slot(trampoline, save_calls),
+                scope,
+                trap_entry: crate::bif_traps::traps(&module.name, &export.function, export.arity),
+                direct_ets: crate::natives::ets::direct_entry(
+                    &module.name,
+                    &export.function,
+                    export.arity,
+                )
+                .or_else(|| {
+                    crate::natives::proc::direct_dictionary(
+                        &module.name,
+                        &export.function,
+                        export.arity,
+                    )
+                }),
+                module: module.name.clone(),
+                function: export.function.clone(),
+                module_atom: module.name_atom,
+                function_atom,
+                arity: export.arity,
+                bif,
+                class,
+                native_bits: bits,
+                light_bif: None,
+                light_process_bif: None,
+            })
+        });
+        if let Some(target) = target {
+            dispatch_entries.push((mfa, target));
+        }
+    }
+    crate::code_ix::for_scope(scope).update_active(|tables| {
+        for (mfa, target) in &dispatch_entries {
+            tables.exports.bind_dispatch(*mfa, target.export_entry());
+        }
+    });
     staged(scope, |exports| {
         publish_module_exports(exports, module, native)
     });
@@ -496,7 +577,7 @@ pub(crate) fn stage_dispatch(scope: u64) {
     let exports = registry.scopes.entry(scope).or_default();
     let code_ix = crate::code_ix::for_scope(scope);
     let (active, staging) = (code_ix.active(), code_ix.staging());
-    for entry in exports.imports.values() {
+    for entry in exports.dispatch.values() {
         entry.slot.stage(active, staging);
     }
 }
@@ -605,13 +686,12 @@ fn import_slot_address(exports: &ScopeExports, mfa: &Mfa, trampoline: usize) -> 
 fn refresh_import_slots(exports: &ScopeExports, ix: usize, affected: &[Mfa]) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
     for mfa in affected {
-        let Some(slots) = exports.importers.get(mfa) else {
+        let Some(entry) = exports.dispatch.get(mfa) else {
             continue;
         };
-        let address = import_slot_address(exports, mfa, trampoline);
-        for slot in slots {
-            slot.slot.set_address(ix, address);
-        }
+        entry
+            .slot
+            .set_address(ix, import_slot_address(exports, mfa, trampoline));
     }
 }
 
@@ -726,32 +806,9 @@ pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
     target_for_identity(identity)
 }
 
-/// Returns the published native entry for an MFA, if this module was BeamAsm-compiled.
-pub(crate) fn native_target_for_mfa(scope: u64, mfa: Mfa) -> Option<usize> {
-    let registry = dispatch_registry().read().ok()?;
-    registry
-        .scopes
-        .get(&scope)?
-        .native_targets
-        .get(&mfa)
-        .copied()
-}
-
 /// Shared fragment that exits native code so the scheduler can interpret a fun call.
 pub(crate) fn call_fun_unported_entry() -> usize {
     fragments().map_or(0, DispatchFragments::call_fun_unported)
-}
-
-/// Native entry for an exported MFA; local functions must stay unreachable through `apply`.
-// Port of erts/emulator/beam/export.c:154-180 (erts_find_export_entry), OTP-29.1.1.
-pub(crate) fn exported_native_target(scope: u64, key: Mfa) -> Option<usize> {
-    let registry = dispatch_registry().read().ok()?;
-    let exports = registry.scopes.get(&scope)?;
-    exports.target_indices.contains_key(&key).then_some(())?;
-    if exports.global_breakpoints.contains(&key) {
-        return None;
-    }
-    exports.native_targets.get(&key).copied()
 }
 
 /// Shared fragment that exits native code so the scheduler can interpret `apply Arity`.

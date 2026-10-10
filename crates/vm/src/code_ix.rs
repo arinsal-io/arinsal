@@ -83,6 +83,21 @@ impl CodeIndexes {
         self.tables[self.active()].load_full()
     }
 
+    /// Reads the tables visible to a process running `code_ix` without a reader lock.
+    // Port of erts/emulator/beam/code_ix.c:51-79 (code-indexed module and export tables), OTP-29.1.1.
+    pub(crate) fn with_tables_for_code_ix<R>(
+        &self,
+        code_ix: usize,
+        read: impl FnOnce(&CodeTables) -> R,
+    ) -> Option<R> {
+        let table_ix = if code_ix == ERTS_SAVE_CALLS_CODE_IX {
+            self.active()
+        } else {
+            code_ix
+        };
+        self.tables.get(table_ix).map(|tables| read(&tables.load()))
+    }
+
     /// Generation of the active tables.
     pub(crate) fn active_generation(&self) -> u64 {
         self.tables[self.active()].load().generation
