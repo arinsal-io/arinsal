@@ -1384,11 +1384,11 @@ impl BeamModuleAssembler {
         let output = self.guard_destination(destination)?;
         let map_reg = self.source_reg(map.val)?;
         let key_reg = self.source_reg_into(key.val, Gpr::x(17))?;
-        self.code.emit(|e| {
-            e.mov_reg(Gpr::x(0), map_reg)?;
-            e.mov_reg(Gpr::x(1), key_reg)
-        })?;
         if key.maybe_one_of(type_id::MAYBE_IMMEDIATE) {
+            self.code.emit(|e| {
+                e.mov_reg(Gpr::x(0), map_reg)?;
+                e.mov_reg(Gpr::x(1), key_reg)
+            })?;
             self.code
                 .emit(|e| e.mov_const(Gpr::x(17), map_runtime.get_element_shared as u64))?;
             self.code.emit(|e| e.blr(Gpr::x(17)))?;
@@ -1400,8 +1400,17 @@ impl BeamModuleAssembler {
             return self.store_guard_result(destination, output);
         }
 
-        self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::xzr()))?;
-        self.emit_guard_runtime_call(map_runtime.get as usize, &[Gpr::x(0), Gpr::x(1), Gpr::x(2)])?;
+        // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:811-819, OTP-29.1.1: the
+        // sources go to their own argument registers; x0 is rewritten with `c_p` first.
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(8), map_reg)?;
+            e.mov_reg(Gpr::x(9), key_reg)?;
+            e.mov_reg(Gpr::x(10), Gpr::xzr())
+        })?;
+        self.emit_guard_runtime_call(
+            map_runtime.get as usize,
+            &[Gpr::x(8), Gpr::x(9), Gpr::x(10)],
+        )?;
         self.code.emit(|e| {
             e.cmp_imm(Gpr::x(0), 0, false)?;
             e.mov_const(Gpr::x(10), 0x4b)?;

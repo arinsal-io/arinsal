@@ -149,11 +149,13 @@ body_map_bifs() ->
     [is_map_key(a, Flat), is_map_key(c, Flat), map_get(a, Flat),
      is_map_key(27, Hash), map_get(27, Hash),
      is_map_key({k}, Boxed), map_get({k}, Boxed),
+     tmk(Boxed), tmk(Flat), tmk(maps:put({k}, 0, Hash)), tmk(Hash),
      top(catch is_map_key(a, not_a_map)), top(catch map_get(a, not_a_map)),
      top(catch map_get(c, Flat)),
      body_key_loop(100, Flat, a, 0), body_key_loop(100, Flat, c, 0),
      body_get_loop(100, Flat, a, 0),
      body_key_loop(100, Hash, 27, 0), body_get_loop(100, Hash, 27, 0)].
+tmk(M) when is_map(M) -> is_map_key({k}, M).
 gar(A) when A + 1 > 2 -> big;
 gar(_) -> small.
 gl(L) when length(L) >= 0 -> ok;
