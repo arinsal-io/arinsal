@@ -1353,6 +1353,27 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         Ok(Term::from_ptr(p, 2))
     }
 
+    /// Write `STRING_EXT` bytes as one contiguous run of cons cells.
+    /// Port of erts/emulator/beam/external.c:4615 (STRING_EXT), OTP-29.1.1.
+    pub fn byte_string_list(&mut self, bytes: &[u8]) -> Result<Term, TermError> {
+        if bytes.is_empty() {
+            return Ok(Term::NIL);
+        }
+        let words = bytes.len().checked_mul(2).ok_or(TermError::SystemLimit)?;
+        let p = self.words(words)?;
+        for (i, byte) in bytes.iter().enumerate() {
+            let cell = p.wrapping_add(i * 2);
+            store(cell, Term::small(i64::from(*byte)).unwrap().bits());
+            let tail = if i + 1 == bytes.len() {
+                Term::NIL.bits()
+            } else {
+                Term::from_ptr(cell.wrapping_add(2), 1).bits()
+            };
+            store(cell.wrapping_add(1), tail);
+        }
+        Ok(Term::from_ptr(p, 1))
+    }
+
     /// Build a two-word cons cell.
     pub fn cons(&mut self, head: Term, tail: Term) -> Result<Term, TermError> {
         let p = self.words(2)?;
