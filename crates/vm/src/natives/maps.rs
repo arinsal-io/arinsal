@@ -1,7 +1,8 @@
 //! Map iterator primitives used by the OTP maps module.
 
+use crate::exceptions::Trap;
 use crate::process::Message;
-use crate::{Process, Vm, VmError, exceptions};
+use crate::{Process, Vm, VmError};
 use arinsal_sched::RunCtx;
 use arinsal_term::{HeapReservation, Term, TermBuilder, TermKind, Tuple3Chain, global_atoms};
 
@@ -31,12 +32,12 @@ fn none_atom() -> Term {
     *ATOM.get_or_init(|| atom("none"))
 }
 
-fn badarg() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("badarg")))
+fn badarg() -> Trap {
+    Trap::error(atom("badarg"))
 }
 
-fn system_limit() -> VmError {
-    VmError::Trap(exceptions::Trap::error(atom("system_limit")))
+fn system_limit() -> Trap {
+    Trap::error(atom("system_limit"))
 }
 
 /// Deepest HAMT path the stack can hold: two path digits of `PATH_ELEMS_PER_DIGIT` levels.
@@ -72,7 +73,7 @@ struct NodeCursor {
 }
 
 impl NodeCursor {
-    fn new(node: Term) -> Result<Self, VmError> {
+    fn new(node: Term) -> Result<Self, Trap> {
         let header = node.header().ok_or_else(badarg)?;
         let subtype = (header >> 6) & 3;
         let collision = header & 63 == 0;
@@ -132,7 +133,7 @@ impl PathDigits {
     }
 }
 
-fn path_digits(path: Term) -> Result<PathDigits, VmError> {
+fn path_digits(path: Term) -> Result<PathDigits, Trap> {
     if let Some(value) = path.as_small() {
         // unsigned_val(): a logical shift of the tagged word, so negatives keep their low bits.
         let digit = (value as u64) & (u64::MAX >> 4);
@@ -175,7 +176,7 @@ fn hamt_next(
     map: Term,
     list_mode: bool,
     acc: Term,
-) -> Result<Term, VmError> {
+) -> Result<Term, Trap> {
     let map_size = arinsal_maps::size(map).map_err(|_| badarg())?;
     let mut elems = chunk_len(process.reductions, map_size);
     let digits = path_digits(path)?;
@@ -395,7 +396,7 @@ fn flat_next(
     map: Term,
     list_mode: bool,
     acc: Term,
-) -> Result<Term, VmError> {
+) -> Result<Term, Trap> {
     let n = arinsal_maps::size(map).map_err(|_| badarg())?;
     // `n < unsigned_val(path)` is badarg; a negative small is a huge unsigned value.
     let Some(index) = path.as_small().filter(|value| *value >= 0) else {
@@ -425,7 +426,7 @@ fn flat_next(
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3655-3706, OTP-29.1.1.
-fn ordered_next(process: &mut Process, mut path: Term, map: Term) -> Result<Term, VmError> {
+fn ordered_next(process: &mut Process, mut path: Term, map: Term) -> Result<Term, Trap> {
     let orig_elems = (process.reductions / ORDERED_ITER_FACTOR).max(1) as usize;
     let mut elems = orig_elems;
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
@@ -463,7 +464,7 @@ fn ordered_next(process: &mut Process, mut path: Term, map: Term) -> Result<Term
 
 /// `erts_internal:map_next/3`.
 /// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
-fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
     if args.len() != 3 {
         return Err(badarg());
     }
@@ -507,13 +508,21 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
     }
 }
 
+/// The process BIF behind `module:function/arity`, which native code calls like any light BIF.
+pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<super::ProcessBif> {
+    match (module, function, arity) {
+        ("erts_internal", "map_next", 3) => Some(map_next),
+        _ => None,
+    }
+}
+
 fn call_map_next(
     _vm: &mut Vm,
     process: &mut Process,
     _ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    map_next(process, args)
+    map_next(process, args).map_err(VmError::Trap)
 }
 
 pub(crate) fn call(

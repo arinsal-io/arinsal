@@ -165,14 +165,28 @@ pub(super) fn gc_after_native(
     arguments: &mut [Term],
     result: &mut Result<Term, VmError>,
 ) -> Result<(), VmError> {
+    match result {
+        Ok(value) => gc_after_native_parts(process, arguments, Some(value), None),
+        Err(VmError::Trap(trap)) => gc_after_native_parts(process, arguments, None, Some(trap)),
+        Err(_) => gc_after_native_parts(process, arguments, None, None),
+    }
+}
+
+/// [`gc_after_native`] for a result already split into its value or raised exception.
+pub(crate) fn gc_after_native_parts(
+    process: &mut Process,
+    arguments: &mut [Term],
+    value: Option<&mut Term>,
+    raised: Option<&mut crate::exceptions::Trap>,
+) -> Result<(), VmError> {
     if !process.gc_enabled || !process.heap.gc_desired() {
         return Ok(());
     }
     let mut roots = arguments.to_vec();
-    let result_index = if let Ok(value) = result {
+    let result_index = if let Some(value) = value.as_deref() {
         roots.push(*value);
         (Some(roots.len() - 1), None)
-    } else if let Err(VmError::Trap(trap)) = result {
+    } else if let Some(trap) = raised.as_deref() {
         let reason = roots.len();
         roots.push(trap.reason);
         let trace = trap.trace.map(|value| {
@@ -200,11 +214,11 @@ pub(super) fn gc_after_native(
     process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
     arguments.copy_from_slice(&roots[..arguments.len()]);
     if let Some(index) = result_index.0 {
-        if let Ok(value) = result {
+        if let Some(value) = value {
             *value = roots[index];
         }
     } else if let Some(NativeErrorRoots::Trap { reason, trace, top }) = result_index.1
-        && let Err(VmError::Trap(trap)) = result
+        && let Some(trap) = raised
     {
         trap.reason = roots[reason];
         trap.trace = trace.map(|index| roots[index]);

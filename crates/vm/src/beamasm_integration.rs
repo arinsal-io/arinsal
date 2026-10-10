@@ -130,6 +130,9 @@ pub(crate) struct DispatchTarget {
     /// The BIF a light BIF call runs straight away: set when it neither traps nor runs in
     /// the executor nor on the table fast path, so the call checks one word.
     pub light_bif: Option<arinsal_bifs::BifFn>,
+    /// The process BIF a light BIF call runs straight away, for a native that needs only its
+    /// process (see `natives::ProcessBif`); the executor still runs it for interpreted code.
+    pub light_process_bif: Option<crate::natives::ProcessBif>,
 }
 
 impl DispatchTarget {
@@ -175,6 +178,17 @@ impl DispatchRegistry {
             leaked.light_bif = leaked
                 .bif
                 .filter(|_| leaked.direct_ets.is_none() && !leaked.runs_in_executor());
+            // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared),
+            // OTP-29.1.1: erts calls every BIF from the generated code with `c_p`, so a native
+            // that needs only its process is called the same way.
+            leaked.light_process_bif = if leaked.class == arinsal_loader::ImportClass::Native
+                && !leaked.trap_entry
+                && leaked.direct_ets.is_none()
+            {
+                crate::natives::process_bif(&leaked.module, &leaked.function, leaked.arity)
+            } else {
+                None
+            };
             let target: &'static DispatchTarget = Box::leak(Box::new(leaked));
             // Port of erts/emulator/beam/export.h:38-58 (Export), OTP-29.1.1: the slot holds
             // its descriptor's address, which generated code passes to the runtime helpers
@@ -286,6 +300,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 class,
                 native_bits: bits,
                 light_bif: None,
+                light_process_bif: None,
             })
         }));
         let identity = Arc::as_ptr(&entry.slot) as usize;
@@ -322,6 +337,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             class,
             native_bits: bits,
             light_bif: None,
+            light_process_bif: None,
         })
     }));
     let identity = Arc::as_ptr(&entry.slot) as usize;
