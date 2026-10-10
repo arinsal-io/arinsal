@@ -409,10 +409,7 @@ impl BeamModuleAssembler {
         fail: Label,
         dst: ArgVal,
     ) -> Result<(), ModuleError> {
-        self.code.emit(|e| {
-            e.mov_const(Gpr::x(17), fragment as u64)?;
-            e.blr(Gpr::x(17))
-        })?;
+        self.fragment_call(fragment)?;
         self.code.b_cond(Cond::Ne, fail)?;
         // Port of erts/emulator/beam/jit/arm/instr_map.cpp:384-389, OTP-29.1.1.
         // The scratch destination is used by `has_map_fields` only to test key presence.
@@ -421,6 +418,72 @@ impl BeamModuleAssembler {
         } else {
             self.store_map_result(dst, Gpr::x(0))
         }
+    }
+
+    /// Emits the body fast path of `is_map_key/2`.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-830, OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_map_is_key_fast(
+        &mut self,
+        map: ArgVal,
+        key: ArgVal,
+        destination: ArgVal,
+        exact_map: bool,
+        key_maybe_immediate: bool,
+        slow: Option<Label>,
+        runtime: MapRuntime,
+    ) -> Result<(), ModuleError> {
+        let map = self.source_reg(map)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(0), map))?;
+        let key = self.source_reg_into(key, Gpr::x(17))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(1), key))?;
+
+        if !exact_map {
+            let slow = slow.ok_or(ModuleError::InvalidOperand(
+                "unknown map type needs a BIF fallback label",
+            ))?;
+            emit_map_type_check(&mut self.code, Gpr::x(0), slow)?;
+        }
+        if key_maybe_immediate {
+            self.fragment_call(runtime.get_element_shared)?;
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(10), 0x0b)?;
+                e.mov_const(Gpr::x(11), 0x4b)?;
+                e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Eq)
+            })?;
+        } else {
+            self.emit_map_get_runtime(key, map, runtime)?;
+            self.code.emit(|e| {
+                e.cmp_imm(Gpr::x(0), 0, false)?;
+                e.mov_const(Gpr::x(10), 0x0b)?;
+                e.mov_const(Gpr::x(11), 0x4b)?;
+                e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Ne)
+            })?;
+        }
+        self.store_map_result(destination, Gpr::x(0))
+    }
+
+    /// Emits the generic runtime lookup for a boxed-only key.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:813-822,891-913,
+    // OTP-29.1.1 (`runtime_call<get_map_element>`).
+    fn emit_map_get_runtime(
+        &mut self,
+        key: Gpr,
+        map: Gpr,
+        runtime: MapRuntime,
+    ) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(2), key)?;
+            e.mov_reg(Gpr::x(1), map)?;
+            e.mov_reg(Gpr::x(3), Gpr::xzr())
+        })?;
+        emit_map_runtime(
+            self,
+            runtime.get as usize,
+            &[Gpr::x(1), Gpr::x(2), Gpr::x(3)],
+            6,
+            Update::NONE,
+        )
     }
 
     /// Emits multi-key lookup; the operands are flattened `{key, dst, hash}` triplets.
@@ -824,31 +887,32 @@ impl BeamModuleAssembler {
     /// (not a map, a miss) branches to `slow`.
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-930 (emit_bif_map_get),
     // OTP-29.1.1.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_map_get_fast(
         &mut self,
         map: ArgVal,
         key: ArgVal,
         dst: ArgVal,
         slow: Label,
+        exact_map: bool,
+        key_maybe_immediate: bool,
         runtime: MapRuntime,
     ) -> Result<(), ModuleError> {
         let map = self.source_reg(map)?;
         self.code.emit(|e| e.mov_reg(Gpr::x(0), map))?;
         let key = self.source_reg_into(key, Gpr::x(17))?;
         self.code.emit(|e| e.mov_reg(Gpr::x(1), key))?;
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(9), Gpr::x(0), 3)?;
-            e.cmp_imm(Gpr::x(9), 2, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(8), Gpr::x(0), !7)?;
-            e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0)?;
-            e.and_imm(Gpr::x(10), Gpr::x(9), 0x3f)?;
-            e.cmp_imm(Gpr::x(10), 0x2c, false)
-        })?;
-        self.code.b_cond(Cond::Ne, slow)?;
-        self.emit_get_element_fragment_call(runtime.get_element_shared, slow, dst)
+        if !exact_map {
+            emit_map_type_check(&mut self.code, Gpr::x(0), slow)?;
+        }
+        if key_maybe_immediate {
+            self.emit_get_element_fragment_call(runtime.get_element_shared, slow, dst)
+        } else {
+            self.emit_map_get_runtime(key, map, runtime)?;
+            self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
+            self.code.b_cond(Cond::Eq, slow)?;
+            self.store_map_result(dst, Gpr::x(0))
+        }
     }
 
     fn destination_register_for(&self, dst: ArgVal) -> Result<Gpr, ModuleError> {
@@ -914,6 +978,25 @@ impl BeamModuleAssembler {
         }
         Ok(())
     }
+}
+
+// `exact_type<Map>` lets erts omit these checks; otherwise the boxed tag and map header are
+// checked before the shared fragment dereferences the term.
+// Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-885, OTP-29.1.1.
+fn emit_map_type_check(code: &mut CodeBuffer, map: Gpr, not_map: Label) -> Result<(), ModuleError> {
+    code.emit(|e| {
+        e.and_imm(Gpr::x(9), map, 3)?;
+        e.cmp_imm(Gpr::x(9), 2, false)
+    })?;
+    code.b_cond(Cond::Ne, not_map)?;
+    code.emit(|e| {
+        e.and_imm(Gpr::x(8), map, !7)?;
+        e.ldr_uoff(Gpr::x(9), Gpr::x(8), 0)?;
+        e.and_imm(Gpr::x(10), Gpr::x(9), 0x3f)?;
+        e.cmp_imm(Gpr::x(10), 0x2c, false)
+    })?;
+    code.b_cond(Cond::Ne, not_map)?;
+    Ok(())
 }
 
 /// OTP's `SCRATCH_X_REG` (X1023): a destination whose value is not wanted.

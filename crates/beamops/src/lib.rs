@@ -49,7 +49,7 @@ pub enum SpecificOperand {
 }
 
 /// Operations whose operands keep their `Type` chunk entry in the typed transform.
-// Port of erts/emulator/beam/jit/arm/instr_arith.cpp (getTypeEntry users), OTP-29.1.1.
+// Port of erts/emulator/beam/jit/arm/instr_arith.cpp and instr_guard_bifs.cpp, OTP-29.1.1.
 const TYPED_OPS: &[&str] = &[
     "is_map",
     "bif_is_map_key",
@@ -63,6 +63,8 @@ const TYPED_OPS: &[&str] = &[
     "i_bsr",
     "i_rem",
     "i_int_div",
+    "bif_map_get",
+    "bif_is_map_key",
 ];
 
 include!(concat!(env!("OUT_DIR"), "/specific_ops.rs"));

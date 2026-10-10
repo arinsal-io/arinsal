@@ -155,6 +155,8 @@ pub struct BeamModuleAssembler {
     func_clause_stub: Option<Label>,
     /// Shared arithmetic slow-path fragments keyed by hook address and operation code.
     arith_fragments: Vec<((usize, u32), Label)>,
+    /// Module-local dispatch stubs for process-wide executable fragments.
+    dispatch_fragments: HashMap<usize, Label>,
     /// Out-of-line `i_test_yield` continuations (stub, continuation, live X registers).
     yield_stubs: Vec<(Label, Label, u8)>,
     line_table: Vec<ModuleLine>,
@@ -224,6 +226,7 @@ impl BeamModuleAssembler {
             catch_patches: Vec::new(),
             func_clause_stub: None,
             arith_fragments: Vec::new(),
+            dispatch_fragments: HashMap::new(),
             yield_stubs: Vec::new(),
             line_table: Vec::new(),
             arith_fail: 0,
@@ -1090,6 +1093,22 @@ impl BeamModuleAssembler {
         self.source_reg_into(src, TMP)
     }
 
+    /// Emits a direct call to a module-local stub for a process-wide executable fragment.
+    // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1440-1454 and
+    // beam_asm_module.cpp:596-603,724-732 (fragment_call / resolve_fragment), OTP-29.1.1.
+    pub(super) fn fragment_call(&mut self, target: usize) -> Result<(), ModuleError> {
+        let label = match self.dispatch_fragments.get(&target) {
+            Some(&label) => label,
+            None => {
+                let label = self.code.new_label();
+                self.dispatch_fragments.insert(target, label);
+                label
+            }
+        };
+        self.code.bl(label)?;
+        Ok(())
+    }
+
     /// Like [`Self::source_reg`], but materializes memory and immediate operands in `scratch`
     /// so that two operands can be live at once.
     pub(super) fn source_reg_into(
@@ -1549,6 +1568,14 @@ impl BeamModuleAssembler {
             e.ldr_uoff(Gpr::x(30), SCHEDULER_REGS, 16_416)?;
             e.br(Gpr::x(30))
         })?;
+        let dispatch_fragments = std::mem::take(&mut self.dispatch_fragments);
+        for (target, label) in dispatch_fragments {
+            self.code.bind(label)?;
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(17), target as u64)?;
+                e.br(Gpr::x(17))
+            })?;
+        }
         let (mut words, labels) = self.code.finish_with_labels()?;
         let trace_breakpoints = self
             .trace_breakpoints
