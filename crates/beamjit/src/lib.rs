@@ -3847,14 +3847,20 @@ fn emit_op(
                 "bif_is_eq_exact" | "bif_is_ne_exact" | "bif_is_ge" | "bif_is_lt" => {
                     count(3)?;
                     // Port of erts/emulator/beam/jit/arm/ops.tab:819-840 and
-                    // instr_guard_bifs.cpp:78-84, OTP-29.1.1.
+                    // instr_guard_bifs.cpp:157-262, OTP-29.1.1.
                     let operation = match op.name() {
                         "bif_is_eq_exact" => 19,
                         "bif_is_ne_exact" => 20,
                         "bif_is_lt" => 23,
                         _ => 24,
                     };
-                    assembler.emit_bif_compare(operation, value(0)?, value(1)?, value(2)?, runtime)
+                    assembler.emit_bif_compare(
+                        operation,
+                        typed_arg(args.first(), beam, env)?,
+                        typed_arg(args.get(1), beam, env)?,
+                        value(2)?,
+                        runtime,
+                    )
                 }
                 "bif_self" | "self" => {
                     count(1)?;

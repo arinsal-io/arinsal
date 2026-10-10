@@ -2,7 +2,7 @@
 
 use arinsal_a64::{
     buf::Label,
-    enc::{Cond, Gpr},
+    enc::{Cond, Gpr, Shifted},
 };
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
@@ -1423,19 +1423,141 @@ impl BeamModuleAssembler {
         self.emit_small_compare(lhs, rhs, Cond::Ge, 24, fail, helper)
     }
 
-    /// Emits a value-producing comparison BIF into its decoded destination.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1751-2355, OTP-29.1.1
+    /// Emits a value-producing comparison BIF (`bif_is_eq_exact`, `bif_is_ne_exact`,
+    /// `bif_is_lt`, `bif_is_ge`; `op` is the runtime helper's operation code 19, 20, 23 or 24)
+    /// into its decoded destination.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:157-262 (emit_bif_is_eq_exact,
+    // emit_bif_is_ne_exact, emit_bif_is_ge_lt, emit_bif_is_ge, emit_bif_is_lt), OTP-29.1.1.
     pub fn emit_bif_compare(
         &mut self,
         op: u32,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: TypedArg,
+        rhs: TypedArg,
         destination: ArgVal,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
-        // OTP's comparison BIFs produce tagged atoms even though this VM hook
-        // returns a native boolean condition for branch-oriented guard tests.
-        self.emit_guard_boolean_value_helper(op, lhs, rhs, destination, helper)
+        match op {
+            19 | 20 => {
+                let cc = if op == 19 { Cond::Eq } else { Cond::Ne };
+                if lhs.always_immediate() || rhs.always_immediate() {
+                    return self.emit_cmp_immed_to_bool(cc, lhs, rhs, destination);
+                }
+                // erts calls the shared `bif_is_eq_exact_shared`/`bif_is_ne_exact_shared`
+                // fragment here; global fragments are registered by the VM integration, so the
+                // generic comparison stays in the runtime helper.
+                self.emit_guard_boolean_value_helper(op, lhs.val, rhs.val, destination, helper)
+            }
+            24 => {
+                // Port of instr_guard_bifs.cpp:238-256 (emit_bif_is_ge).
+                if lhs.always_small() && rhs.is_small() {
+                    let left = self.source_reg_into(lhs.val, Gpr::x(11))?;
+                    self.emit_cmp_immediate_or_register(left, rhs.word())?;
+                    return self.emit_cond_to_bool(Cond::Ge, destination);
+                } else if lhs.is_small() && rhs.always_small() {
+                    let right = self.source_reg_into(rhs.val, Gpr::x(11))?;
+                    self.emit_cmp_immediate_or_register(right, lhs.word())?;
+                    return self.emit_cond_to_bool(Cond::Le, destination);
+                }
+                self.emit_bif_is_ge_lt(op, Cond::Ge, lhs, rhs, destination, helper)
+            }
+            23 => self.emit_bif_is_ge_lt(op, Cond::Lt, lhs, rhs, destination, helper),
+            _ => Err(ModuleError::InvalidOperand("unknown comparison BIF")),
+        }
+    }
+
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:135-142 (emit_cond_to_bool),
+    // OTP-29.1.1.
+    fn emit_cond_to_bool(&mut self, cc: Cond, destination: ArgVal) -> Result<(), ModuleError> {
+        let dst = self.guard_destination(destination)?;
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(10), 0x4b)?;
+            e.mov_const(Gpr::x(11), 0x0b)?;
+            e.csel(dst, Gpr::x(10), Gpr::x(11), cc)
+        })?;
+        self.store_guard_result(destination, dst)
+    }
+
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:144-155
+    // (emit_cmp_immed_to_bool), OTP-29.1.1.
+    fn emit_cmp_immed_to_bool(
+        &mut self,
+        cc: Cond,
+        lhs: TypedArg,
+        rhs: TypedArg,
+        destination: ArgVal,
+    ) -> Result<(), ModuleError> {
+        if rhs.is_immed() {
+            let left = self.source_reg_into(lhs.val, Gpr::x(11))?;
+            self.emit_cmp_immediate_or_register(left, rhs.word())?;
+        } else {
+            let left = self.source_reg_into(lhs.val, Gpr::x(11))?;
+            let right = self.source_reg_into(rhs.val, Gpr::x(12))?;
+            self.code
+                .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
+        }
+        self.emit_cond_to_bool(cc, destination)
+    }
+
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:196-236 (emit_bif_is_ge_lt),
+    // OTP-29.1.1. erts' generic path calls `arith_compare_shared` for the flags; here the
+    // runtime helper produces the boolean directly.
+    fn emit_bif_is_ge_lt(
+        &mut self,
+        op: u32,
+        cc: Cond,
+        lhs: TypedArg,
+        rhs: TypedArg,
+        destination: ArgVal,
+        helper: GuardHelper,
+    ) -> Result<(), ModuleError> {
+        let left = self.source_reg_into(lhs.val, Gpr::x(11))?;
+        let right = self.source_reg_into(rhs.val, Gpr::x(12))?;
+        let generic = self.code.new_label();
+        let next = self.code.new_label();
+        let done = self.code.new_label();
+        let int_or_boxed = type_id::INTEGER | type_id::ALWAYS_BOXED;
+        let both = Shifted {
+            reg: right,
+            shift: arinsal_a64::enc::Shift::Lsl,
+            amount: 0,
+        };
+        if lhs.always_one_of(int_or_boxed) && rhs.always_one_of(int_or_boxed) {
+            // The only possible immediate is a small, so testing for boxed tests for small.
+            if lhs.always_small() {
+                self.code.tbz(right, 0, generic)?;
+            } else if rhs.always_small() {
+                self.code.tbz(left, 0, generic)?;
+            } else {
+                self.code.emit(|e| e.and_reg(Gpr::x(8), left, both))?;
+                self.code.tbz(Gpr::x(8), 0, generic)?;
+            }
+        } else {
+            if rhs.always_small() {
+                self.code.emit(|e| e.and_imm(Gpr::x(8), left, 15))?;
+            } else if lhs.always_small() {
+                self.code.emit(|e| e.and_imm(Gpr::x(8), right, 15))?;
+            } else {
+                self.code.emit(|e| {
+                    e.and_reg(Gpr::x(8), left, both)?;
+                    e.and_imm(Gpr::x(8), Gpr::x(8), 15)
+                })?;
+            }
+            self.code.emit(|e| e.cmp_imm(Gpr::x(8), 15, false))?;
+            self.code.b_cond(Cond::Ne, generic)?;
+        }
+        self.code
+            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
+        self.code.b(next)?;
+        self.code.bind(generic)?;
+        self.code
+            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
+        self.code.b_cond(Cond::Eq, next)?;
+        self.emit_guard_boolean_value_helper(op, lhs.val, rhs.val, destination, helper)?;
+        self.code.b(done)?;
+        self.code.bind(next)?;
+        self.emit_cond_to_bool(cc, destination)?;
+        self.code.bind(done)?;
+        Ok(())
     }
 
     /// Emits the `element/2` guard BIF.

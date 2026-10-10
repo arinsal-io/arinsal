@@ -10,6 +10,33 @@ const CHILD_MODULE: &str = "ARINSAL_NATIVE_REGRESS_MODULE";
 const MODULE: &str = "native_regress_test";
 const GC_MODULE: &str = "native_regress_gc";
 const FRAMES_MODULE: &str = "native_regress_frames";
+// Value-producing comparison BIFs (`bif_is_eq_exact`, `bif_is_ne_exact`, `bif_is_lt`,
+// `bif_is_ge`): immediate, small-typed and generic operand paths.
+const COMPARE_MODULE: &str = "native_compare_bifs";
+const COMPARE_SOURCE: &str = r#"-module(native_compare_bifs).
+-export([run/0]).
+-compile(no_inline).
+eq0(X) -> X =:= 0.
+ne0(X) -> X =/= 0.
+eqa(X) -> X =:= ok.
+eqg(X, Y) -> X =:= Y.
+neg(X, Y) -> X =/= Y.
+lt(X, Y) -> X < Y.
+ge(X, Y) -> X >= Y.
+ge5(X) -> X >= 5.
+lt5(X) -> X < 5.
+gei(X) when is_integer(X) -> {X >= 5, 5 >= X, X < 5, 5 < X}.
+gesm(X, Y) when is_integer(X), X > -10, X < 10, is_integer(Y) -> {X >= Y, Y >= X, X < Y, Y < X}.
+geib(X, Y) when is_integer(X), is_tuple(Y) -> {X >= Y, X < Y, Y >= X, Y < X}.
+run() ->
+    Vs = [0, 1, -1, 5, 4, 6, 1 bsl 70, -(1 bsl 70), 0.0, 5.0, 4.9, ok, [], [1], {}, {1}, <<>>, self(), #{}, "a"],
+    R = [{eq0(A), ne0(A), eqa(A), ge5(A), lt5(A),
+          [{eqg(A,B), neg(A,B), lt(A,B), ge(A,B)} || B <- Vs]} || A <- Vs],
+    I = [gei(A) || A <- [0, 5, 4, 6, 1 bsl 70, -(1 bsl 70)]],
+    S = [gesm(A, B) || A <- [-9, 0, 5, 9], B <- [-9, 0, 5, 9, 1 bsl 70, -(1 bsl 70)]],
+    B = [geib(A, T) || A <- [0, 1 bsl 70], T <- [{}, {1}]],
+    {R, I, S, B}.
+"#;
 const BIF_FRAMES_MODULE: &str = "native_bif_frames";
 
 const BIF_FRAMES_SOURCE: &str = r#"-module(native_bif_frames).
@@ -353,6 +380,21 @@ fn native_regressions_match_interpreter_and_otp() {
         MODULE,
         SOURCE,
         &format!("{MODULE},io_lib_format,re"),
+        &[],
+    );
+}
+
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn native_comparison_bifs_match_otp() {
+    if run_child_case() {
+        return;
+    }
+    assert_native_matches(
+        "native_comparison_bifs_match_otp",
+        COMPARE_MODULE,
+        COMPARE_SOURCE,
+        COMPARE_MODULE,
         &[],
     );
 }
