@@ -237,14 +237,9 @@ fn process_info(
         if let Some((lookup_key, selector)) = dictionary_lookup(key) {
             // Port of erts/emulator/beam/erl_bif_info.c:852, OTP-29.1.1.
             let value = process
-                .cold
+                .dictionary
                 .as_ref()
-                .and_then(|cold| {
-                    cold.dictionary
-                        .iter()
-                        .find(|(candidate, _)| term_equal(*candidate, lookup_key))
-                        .map(|(_, value)| *value)
-                })
+                .and_then(|dictionary| dictionary.get(lookup_key))
                 .unwrap_or_else(|| atom("undefined"));
             // Port of erts/emulator/beam/erl_bif_info.c:2288 (ERTS_PI_IX_DICTIONARY_LOOKUP), OTP-29.1.1.
             let value = if process
@@ -281,15 +276,11 @@ fn process_info(
                     .self_pid
                     .is_some_and(|pid| crate::trace::is_sensitive(process, pid));
                 let raw = process
-                    .cold
+                    .dictionary
                     .as_ref()
                     .filter(|_| !sensitive)
-                    .map(|cold| {
-                        cold.dictionary
-                            .iter()
-                            .map(|(k, v)| (*k, *v))
-                            .collect::<Vec<_>>()
-                    })
+                    // erts_dictionary_copy conses entries while scanning ascending buckets.
+                    .map(|dictionary| dictionary.entries_reversed())
                     .unwrap_or_default();
                 let entries = raw
                     .into_iter()
@@ -303,7 +294,12 @@ fn process_info(
             "total_heap_size" => Term::small(total_heap_size as i64).ok_or_else(badarg)?,
             "stack_size" => Term::small(process.heap.stack_words() as i64).ok_or_else(badarg)?,
             "memory" => Term::small(
-                (std::mem::size_of::<Process>() + process.heap.total_heap_size_words() * 8) as i64,
+                (std::mem::size_of::<Process>()
+                    + process.heap.total_heap_size_words() * 8
+                    + process
+                        .dictionary
+                        .as_ref()
+                        .map_or(0, |dictionary| dictionary.memory_bytes())) as i64,
             )
             .ok_or_else(badarg)?,
             "reductions" => Term::small(process.reductions_used.min(i64::MAX as u64) as i64)
@@ -643,14 +639,9 @@ fn process_info(
             "label" => {
                 let label_key = atom("$process_label");
                 process
-                    .cold
+                    .dictionary
                     .as_ref()
-                    .and_then(|cold| {
-                        cold.dictionary
-                            .iter()
-                            .find(|(candidate, _)| term_equal(*candidate, label_key))
-                            .map(|(_, value)| *value)
-                    })
+                    .and_then(|dictionary| dictionary.get(label_key))
                     .unwrap_or_else(|| atom("undefined"))
             }
             "priority_messages" => {
@@ -1653,6 +1644,42 @@ fn process_display_call(
     }
 }
 
+/// `erlang:put/2` and `erlang:erase/1` from native code, without trapping to the executor.
+///
+/// erts compiles them as `call_ext` (they are heap BIFs). The generated call otherwise
+/// re-enters the scheduler on every key; these stay in the native helper, like the ETS
+/// direct BIFs. `None` is never returned: both BIFs always produce a term.
+pub(crate) fn direct_dictionary(
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Option<super::ets::DirectEts> {
+    if module != "erlang" {
+        return None;
+    }
+    match (function, arity) {
+        ("put", 2) => Some(|process, args| Some(dict_put(process, args[0], args[1]))),
+        ("erase", 1) => Some(|process, args| Some(dict_erase(process, args[0]))),
+        _ => None,
+    }
+}
+
+fn dict_put(process: &mut Process, key: Term, value: Term) -> Term {
+    process
+        .dictionary
+        .get_or_insert_with(crate::proc_create::ProcDict::default)
+        .put(key, value)
+        .unwrap_or_else(|| atom("undefined"))
+}
+
+fn dict_erase(process: &mut Process, key: Term) -> Term {
+    process
+        .dictionary
+        .as_mut()
+        .and_then(|dictionary| dictionary.erase(key))
+        .unwrap_or_else(|| atom("undefined"))
+}
+
 /// Dispatch process-local BIFs that use the scheduler context.
 pub(crate) fn call(
     vm: &mut Vm,
@@ -2004,40 +2031,15 @@ fn dictionary_alloc(result: Result<Term, VmError>) -> Result<Term, crate::except
 }
 
 fn dictionary_put(process: &mut Process, args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
-    let (key, value) = (args[0], args[1]);
-    let cold = process.cold_mut();
-    let previous = cold
-        .dictionary
-        .iter()
-        .find_map(|(stored, old)| term_equal(*stored, key).then_some(*old))
-        .unwrap_or_else(|| atom("undefined"));
-    // The dictionary lives on the process heap like erts' ProcDict, so
-    // GC roots it and releases off-heap owners (magic refs) once erased.
     // Port of erts/emulator/beam/erl_process_dict.c (pd_hash_put), OTP-29.1.1.
-    if let Some((stored, old)) = cold
-        .dictionary
-        .iter_mut()
-        .find(|(stored, _)| term_equal(*stored, key))
-    {
-        *stored = key;
-        *old = value;
-    } else {
-        cold.dictionary.push((key, value));
-    }
-    Ok(previous)
+    Ok(dict_put(process, args[0], args[1]))
 }
 
 fn dictionary_get0(process: &mut Process, _args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
     let raw = process
-        .cold
+        .dictionary
         .as_ref()
-        .map(|c| {
-            c.dictionary
-                .iter()
-                .map(|(k, v)| (*k, *v))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .map_or_else(Vec::new, |dictionary| dictionary.entries_reversed());
     let entries = raw
         .into_iter()
         .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
@@ -2046,16 +2048,10 @@ fn dictionary_get0(process: &mut Process, _args: &[Term]) -> Result<Term, crate:
 }
 
 fn dictionary_get1(process: &mut Process, args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
-    let key = args[0];
     Ok(process
-        .cold
+        .dictionary
         .as_ref()
-        .and_then(|c| {
-            c.dictionary
-                .iter()
-                .find(|(k, _)| term_equal(*k, key))
-                .map(|(_, v)| *v)
-        })
+        .and_then(|dictionary| dictionary.get(args[0]))
         .unwrap_or(atom("undefined")))
 }
 
@@ -2063,11 +2059,13 @@ fn dictionary_get_keys0(
     process: &mut Process,
     _args: &[Term],
 ) -> Result<Term, crate::exceptions::Trap> {
-    let keys = process
-        .cold
-        .as_ref()
-        .map(|c| c.dictionary.iter().map(|(k, _)| *k).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let keys = process.dictionary.as_ref().map_or_else(Vec::new, |dictionary| {
+        dictionary
+            .entries_reversed()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    });
     dictionary_alloc(make_list(process, keys))
 }
 
@@ -2076,16 +2074,13 @@ fn dictionary_get_keys1(
     args: &[Term],
 ) -> Result<Term, crate::exceptions::Trap> {
     let value = args[0];
-    let keys = process
-        .cold
-        .as_ref()
-        .map(|c| {
-            c.dictionary
-                .iter()
-                .filter_map(|(k, v)| term_equal(*v, value).then_some(*k))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let keys = process.dictionary.as_ref().map_or_else(Vec::new, |dictionary| {
+        dictionary
+            .entries_reversed()
+            .into_iter()
+            .filter_map(|(key, stored)| term_equal(stored, value).then_some(key))
+            .collect()
+    });
     dictionary_alloc(make_list(process, keys))
 }
 
@@ -2094,14 +2089,9 @@ fn dictionary_erase0(
     _args: &[Term],
 ) -> Result<Term, crate::exceptions::Trap> {
     let raw = process
-        .cold
-        .as_mut()
-        .map(|c| {
-            std::mem::take(&mut c.dictionary)
-                .into_iter()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        .dictionary
+        .take()
+        .map_or_else(Vec::new, |dictionary| dictionary.entries_reversed());
     let entries = raw
         .into_iter()
         .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
@@ -2113,15 +2103,7 @@ fn dictionary_erase1(
     process: &mut Process,
     args: &[Term],
 ) -> Result<Term, crate::exceptions::Trap> {
-    let key = args[0];
-    let Some(dictionary) = process.cold.as_mut().map(|cold| &mut cold.dictionary) else {
-        return Ok(atom("undefined"));
-    };
-    if let Some(index) = dictionary.iter().position(|(k, _)| term_equal(*k, key)) {
-        Ok(dictionary.remove(index).1)
-    } else {
-        Ok(atom("undefined"))
-    }
+    Ok(dict_erase(process, args[0]))
 }
 
 // Port of erts/emulator/beam/bif.c:1366 (`hibernate_3`) and
@@ -4859,7 +4841,12 @@ pub(crate) fn process_dump(
         BIN_VHEAP_SIZE.saturating_sub(bin_vheap)
     );
     let _ = writeln!(text, "OldBinVHeap unused: {BIN_VHEAP_SIZE}");
-    let memory = std::mem::size_of::<Process>() + process.heap.total_heap_size_words() * 8;
+    let memory = std::mem::size_of::<Process>()
+        + process.heap.total_heap_size_words() * 8
+        + process
+            .dictionary
+            .as_ref()
+            .map_or(0, |dictionary| dictionary.memory_bytes());
     let _ = writeln!(text, "Memory: {memory}");
     let _ = writeln!(text, "Stack dump:");
     let _ = writeln!(

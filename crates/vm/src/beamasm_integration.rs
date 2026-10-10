@@ -144,7 +144,10 @@ pub(crate) struct DispatchTarget {
     pub native_bits: usize,
     /// The BIF has a continuation entry in `bif_traps`; others skip that table on every call.
     pub trap_entry: bool,
-    /// Runs the BIF inside native code, see `natives::ets::DirectEts`.
+    /// Runs the BIF inside native code, without a trap back into the executor.
+    /// ETS uses this, and so do `erlang:put/2` and `erlang:erase/1`: those are
+    /// heap BIFs in erts (`call_ext`), and trapping once per key dominated the
+    /// dictionary benchmark.
     pub direct_ets: Option<crate::natives::ets::DirectEts>,
     /// The BIF a light BIF call runs straight away: set when it neither traps nor runs in
     /// the executor nor on the table fast path, so the call checks one word.
@@ -359,7 +362,14 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                     &import.module,
                     &import.function,
                     import.arity,
-                ),
+                )
+                .or_else(|| {
+                    crate::natives::proc::direct_dictionary(
+                        &import.module,
+                        &import.function,
+                        import.arity,
+                    )
+                }),
                 module: import.module.clone(),
                 function: import.function.clone(),
                 module_atom: import.module_atom,
@@ -396,7 +406,8 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             )),
             scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
-            direct_ets: crate::natives::ets::direct_entry(module, function, arity),
+            direct_ets: crate::natives::ets::direct_entry(module, function, arity)
+                .or_else(|| crate::natives::proc::direct_dictionary(module, function, arity)),
             module: module.to_owned(),
             function: function.to_owned(),
             module_atom,

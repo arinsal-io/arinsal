@@ -147,10 +147,10 @@ fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
     let x_and_stack =
         references_retired_from_roots(process, roots, std::slice::from_ref(area), &mut frag_index);
     let inbox = process.inbox.has_literal_area_reference(area);
-    let dictionary = process.cold.as_ref().is_some_and(|cold| {
-        cold.dictionary
-            .iter()
-            .any(|(key, value)| area.contains(*key) || area.contains(*value))
+    let dictionary = process.dictionary.as_ref().is_some_and(|dictionary| {
+        dictionary
+            .entries()
+            .any(|(key, value)| area.contains(key) || area.contains(value))
     });
     let continuation = process
         .cold
@@ -181,9 +181,9 @@ fn literal_scan_words(process: &Process) -> usize {
         ))
         .saturating_add(
             process
-                .cold
+                .dictionary
                 .as_ref()
-                .map_or(0, |cold| cold.dictionary.len().saturating_mul(2)),
+                .map_or(0, |dictionary| dictionary.len() * 2),
         )
 }
 
@@ -3938,15 +3938,19 @@ fn rewrite_roots(
         process.heap.stack_set(index, term);
         copied += u32::from(did);
     }
-    if let Some(cold) = process.cold.as_mut() {
-        let dictionary = std::mem::take(&mut cold.dictionary);
-        for (key, value) in dictionary {
+    if let Some(dictionary) = process.dictionary.as_ref() {
+        let entries = dictionary.entries().collect::<Vec<_>>();
+        let mut rewritten = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
             let (key, key_copied) =
                 rewrite_root(process, key, areas, &mut shared_copy, &mut frag_index)?;
             let (value, value_copied) =
                 rewrite_root(process, value, areas, &mut shared_copy, &mut frag_index)?;
-            process.cold_mut().dictionary.push((key, value));
+            rewritten.push((key, value));
             copied += u32::from(key_copied) + u32::from(value_copied);
+        }
+        if let Some(dictionary) = process.dictionary.as_mut() {
+            dictionary.assign_entries(&rewritten);
         }
     }
     if let Some(result) = process
