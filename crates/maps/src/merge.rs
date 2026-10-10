@@ -85,6 +85,11 @@ fn hashmap_size(map: Term) -> usize {
 /// Flatmap keys and values.
 pub(crate) fn flatmap_kv<'a>(map: Term) -> (&'a [u64], &'a [u64], Term) {
     let n = boxed_words(map, 2)[1] as usize;
+    flatmap_kv_with_size(map, n)
+}
+
+/// Flatmap key and value words when the caller already has its checked size.
+pub(crate) fn flatmap_kv_with_size<'a>(map: Term, n: usize) -> (&'a [u64], &'a [u64], Term) {
     let words = boxed_words(map, 3 + n);
     let keys = term(words[2]);
     (&boxed_words(keys, 1 + n)[1..], &words[3..], keys)

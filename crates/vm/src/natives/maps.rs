@@ -40,36 +40,119 @@ fn system_limit() -> Trap {
     Trap::error(atom("system_limit"))
 }
 
-/// Deepest HAMT path the stack can hold: two path digits of `PATH_ELEMS_PER_DIGIT` levels.
-/// Reaching it would need 128 equal hash bits; erts uses a growable WSTACK instead.
-const MAX_HAMT_DEPTH: usize = 2 * PATH_ELEMS_PER_DIGIT;
+/// `DECLARE_WSTACK` holds 16 words, or four `WSTACK_PUSH4` frames, before growing.
+/// Port of erts/emulator/beam/global.h:493-516, OTP-29.1.1.
+const WSTACK_INLINE_FRAMES: usize = 4;
 
-/// One WSTACK_PUSH4 entry: the node and its `idx`, `sz` and `ptr` (the node is only a debug aid
-/// in erts and is not kept; `collision` replaces re-reading its header).
+/// One `WSTACK_PUSH4` entry: node, index, size and child pointer.
+/// Port of erts/emulator/beam/erl_map.c:3844-3847, OTP-29.1.1.
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct Frame {
-    ptr: *const u64,
+    node: Term,
     idx: usize,
     sz: usize,
-    collision: bool,
+    ptr: *const u64,
 }
 
 impl Frame {
     const EMPTY: Self = Self {
-        ptr: std::ptr::null(),
+        node: Term::NIL,
         idx: 0,
         sz: 0,
-        collision: false,
+        ptr: std::ptr::null(),
     };
+}
+
+/// The inline and growing storage used by OTP's WSTACK macros.
+// Port of erts/emulator/beam/global.h:493-516, 623-655 and utils.c:238-262, OTP-29.1.1.
+struct WStack {
+    inline: [Frame; WSTACK_INLINE_FRAMES],
+    grown: Option<Box<[Frame]>>,
+    len: usize,
+}
+
+impl WStack {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            inline: [Frame::EMPTY; WSTACK_INLINE_FRAMES],
+            grown: None,
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn get(&self, index: usize) -> &Frame {
+        debug_assert!(index < self.len);
+        if let Some(grown) = self.grown.as_ref() {
+            &grown[index]
+        } else {
+            &self.inline[index]
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, frame: Frame) -> Result<(), ()> {
+        if self.len == WSTACK_INLINE_FRAMES && self.grown.is_none() {
+            self.grow(WSTACK_INLINE_FRAMES * 2)?;
+        } else if let Some(grown) = self.grown.as_ref()
+            && self.len == grown.len()
+        {
+            self.grow(grown.len() * 2)?;
+        }
+        if let Some(grown) = self.grown.as_mut() {
+            grown[self.len] = frame;
+        } else {
+            self.inline[self.len] = frame;
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn pop(&mut self) -> Option<Frame> {
+        if self.len == 0 {
+            return None;
+        }
+        let index = self.len - 1;
+        let frame = *self.get(index);
+        self.len = index;
+        Some(frame)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, size: usize) -> Result<(), ()> {
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(size).map_err(|_| ())?;
+        if let Some(grown) = &self.grown {
+            frames.extend_from_slice(grown);
+        } else {
+            frames.extend_from_slice(&self.inline);
+        }
+        frames.resize(size, Frame::EMPTY);
+        self.grown = Some(frames.into_boxed_slice());
+        Ok(())
+    }
 }
 
 /// A decoded HAMT node: `sz` children starting at `ptr`.
 /// Port of erts/emulator/beam/erl_map.c:2313-2335 (hashmap_node_size), OTP-29.1.1.
 #[derive(Clone, Copy)]
 struct NodeCursor {
+    node: Term,
     sz: usize,
     ptr: *const u64,
-    collision: bool,
 }
 
 impl NodeCursor {
@@ -89,13 +172,18 @@ impl NodeCursor {
         let offset = if collision || subtype == 1 { 1 } else { 2 };
         // SAFETY: the validated HAMT header describes the node allocation and child range.
         let ptr = unsafe { node.raw_ptr().add(offset) };
-        Ok(Self { sz, ptr, collision })
+        Ok(Self { node, sz, ptr })
+    }
+
+    #[inline(always)]
+    fn is_collision(self) -> bool {
+        self.node.header().is_some_and(|header| header & 63 == 0)
     }
 
     /// Read child word `idx` (`ptr[idx]`).
     #[inline(always)]
     fn word(self, idx: usize) -> u64 {
-        assert!(idx < self.sz);
+        debug_assert!(idx < self.sz);
         // SAFETY: `idx` is below the node's child count, all initialized words.
         unsafe { *self.ptr.add(idx) }
     }
@@ -174,10 +262,10 @@ fn hamt_next(
     process: &mut Process,
     path: Term,
     map: Term,
+    map_size: usize,
     list_mode: bool,
     acc: Term,
 ) -> Result<Term, Trap> {
-    let map_size = arinsal_maps::size(map).map_err(|_| badarg())?;
     let mut elems = chunk_len(process.reductions, map_size);
     let digits = path_digits(path)?;
     if digits.is_zero_small && elems > MAP_SMALL_MAP_LIMIT {
@@ -185,8 +273,7 @@ fn hamt_next(
     }
 
     // Look for the leaf to start at, pushing each node on the way.
-    let mut stack = [Frame::EMPTY; MAX_HAMT_DEPTH];
-    let mut top = 0usize;
+    let mut stack = WStack::new();
     let mut cur = NodeCursor::new(map)?;
     let mut curr_path = digits.get(0);
     let mut digit = 0usize;
@@ -206,20 +293,18 @@ fn hamt_next(
         if is_leaf_word(word) {
             break;
         }
-        if top == MAX_HAMT_DEPTH {
-            return Err(system_limit());
-        }
-        stack[top] = Frame {
-            ptr: cur.ptr,
-            idx: if list_mode {
-                idx.wrapping_sub(1)
-            } else {
-                idx + 1
-            },
-            sz: cur.sz,
-            collision: cur.collision,
-        };
-        top += 1;
+        stack
+            .push(Frame {
+                node: cur.node,
+                idx: if list_mode {
+                    idx.wrapping_sub(1)
+                } else {
+                    idx + 1
+                },
+                sz: cur.sz,
+                ptr: cur.ptr,
+            })
+            .map_err(|_| system_limit())?;
         // SAFETY: a non-leaf child word of a live HAMT node is a boxed node term.
         cur = NodeCursor::new(unsafe { Term::from_raw_bits(word) })?;
         curr_path >>= PATH_ELEM_SIZE;
@@ -253,7 +338,7 @@ fn hamt_next(
         } else {
             idx == 0
         };
-        if at_start && elems < cur.sz && cur.collision {
+        if at_start && elems < cur.sz && cur.is_collision() {
             elems = cur.sz;
             region
                 .regrow(words_per_elem * elems)
@@ -290,47 +375,46 @@ fn hamt_next(
         if elems == 0 {
             if idx < cur.sz {
                 // More elements in this node.
-                stack[top] = Frame {
-                    ptr: cur.ptr,
-                    idx: enc(idx),
-                    sz: cur.sz,
-                    collision: cur.collision,
-                };
-                top += 1;
+                stack
+                    .push(Frame {
+                        node: cur.node,
+                        idx: enc(idx),
+                        sz: cur.sz,
+                        ptr: cur.ptr,
+                    })
+                    .map_err(|_| system_limit())?;
             } else {
                 // Pop to find the next value.
-                while top > 0 {
-                    top -= 1;
-                    let f = stack[top];
+                while let Some(f) = stack.pop() {
                     if f.idx < f.sz {
-                        stack[top].idx = enc(f.idx);
-                        top += 1;
+                        stack
+                            .push(Frame {
+                                idx: enc(f.idx),
+                                ..f
+                            })
+                            .map_err(|_| system_limit())?;
                         break;
                     }
                 }
             }
             break;
         } else if idx < cur.sz {
-            if top == MAX_HAMT_DEPTH {
-                return Err(system_limit());
-            }
-            stack[top] = Frame {
-                ptr: cur.ptr,
-                idx: enc(idx),
-                sz: cur.sz,
-                collision: cur.collision,
-            };
-            top += 1;
+            stack
+                .push(Frame {
+                    node: cur.node,
+                    idx: enc(idx),
+                    sz: cur.sz,
+                    ptr: cur.ptr,
+                })
+                .map_err(|_| system_limit())?;
             // SAFETY: `idx < sz` and the word is not a leaf, so it is a boxed node term.
             cur = NodeCursor::new(unsafe { Term::from_raw_bits(cur.word(idx)) })?;
             idx = if list_mode { cur.sz - 1 } else { 0 };
-        } else if top > 0 {
-            top -= 1;
-            let f = stack[top];
+        } else if let Some(f) = stack.pop() {
             cur = NodeCursor {
+                node: f.node,
                 sz: f.sz,
                 ptr: f.ptr,
-                collision: f.collision,
             };
             idx = f.idx;
         } else {
@@ -340,17 +424,15 @@ fn hamt_next(
 
     drop(region);
     let mut builder = TermBuilder::new(&mut heap);
-    let result = if top > 0 {
+    let result = if !stack.is_empty() {
         // Pop the stack to create the complete path to the next leaf.
-        let mut depth = top + 1;
+        let mut depth = stack.len() + 1;
         let mut big = [0u64; 3];
         let big_len = (depth * PATH_ELEM_SIZE as usize).div_ceil(64);
         let use_big = depth >= PATH_ELEMS_PER_DIGIT;
         let mut slot = big_len;
         let mut path_word = 0u64;
-        while top > 0 {
-            top -= 1;
-            let f = stack[top];
+        while let Some(f) = stack.pop() {
             let path_elem = if list_mode {
                 f.sz - 1 - f.idx.wrapping_add(1)
             } else {
@@ -392,11 +474,11 @@ fn hamt_next(
 fn flat_next(
     process: &mut Process,
     path: Term,
-    map: Term,
+    map: arinsal_maps::CheckedFlatMap,
     list_mode: bool,
     acc: Term,
 ) -> Result<Term, Trap> {
-    let n = arinsal_maps::size(map).map_err(|_| badarg())?;
+    let n = map.size();
     // `n < unsigned_val(path)` is badarg; a negative small is a huge unsigned value.
     let Some(index) = path.as_small().filter(|value| *value >= 0) else {
         return Err(badarg());
@@ -405,11 +487,15 @@ fn flat_next(
         return Err(badarg());
     }
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    arinsal_maps::flatmap_next(map, list_mode, acc, &mut heap).map_err(|_| system_limit())
+    arinsal_maps::flatmap_next_checked(map, list_mode, acc, &mut heap).map_err(|_| system_limit())
 }
 
 /// Port of erts/emulator/beam/erl_map.c:3655-3706, OTP-29.1.1.
-fn ordered_next(process: &mut Process, mut path: Term, map: Term) -> Result<Term, Trap> {
+fn ordered_next(
+    process: &mut Process,
+    mut path: Term,
+    map: arinsal_maps::CheckedMap,
+) -> Result<Term, Trap> {
     let orig_elems = (process.reductions / ORDERED_ITER_FACTOR).max(1) as usize;
     let mut elems = orig_elems;
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
@@ -422,9 +508,7 @@ fn ordered_next(process: &mut Process, mut path: Term, map: Term) -> Result<Term
         }
         // SAFETY: the iterator path is a list on the live heap.
         let (key, tail) = unsafe { path.cons_ref() }.ok_or_else(badarg)?;
-        let value = arinsal_maps::get(map, key)
-            .map_err(|_| badarg())?
-            .ok_or_else(badarg)?;
+        let value = map.get(key).ok_or_else(badarg)?;
         builder
             .chain3_push(&mut chain, key, value)
             .map_err(|_| system_limit())?;
@@ -432,7 +516,7 @@ fn ordered_next(process: &mut Process, mut path: Term, map: Term) -> Result<Term
         elems -= 1;
     }
     if path.classify() == TermKind::List {
-        let next = builder.cons(path, map).map_err(|_| system_limit())?;
+        let next = builder.cons(path, map.term()).map_err(|_| system_limit())?;
         process.reductions = 0;
         Ok(chain.finish(next))
     } else if path == Term::NIL {
@@ -452,11 +536,8 @@ fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
         return Err(badarg());
     }
     let path = args[0];
-    let map = args[1];
+    let map = arinsal_maps::checked_map(args[1]).map_err(|_| badarg())?;
     let mode = args[2];
-    if map.classify() != TermKind::Map {
-        return Err(badarg());
-    }
     let iterator = mode == iterator_atom();
     let list_mode = mode == Term::NIL || mode.classify() == TermKind::List;
     if !iterator && !list_mode {
@@ -465,10 +546,13 @@ fn map_next(process: &mut Process, args: &[Term]) -> Result<Term, Trap> {
     if iterator && (path.classify() == TermKind::List || path == Term::NIL) {
         return ordered_next(process, path, map);
     }
-    if map.is_hashmap() {
-        hamt_next(process, path, map, list_mode, mode)
-    } else {
-        flat_next(process, path, map, list_mode, mode)
+    match map.kind() {
+        arinsal_maps::CheckedMapKind::Hashmap(map) => {
+            hamt_next(process, path, map.term(), map.size(), list_mode, mode)
+        }
+        arinsal_maps::CheckedMapKind::Flatmap(map) => {
+            flat_next(process, path, map, list_mode, mode)
+        }
     }
 }
 

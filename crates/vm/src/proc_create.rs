@@ -719,6 +719,9 @@ pub(crate) struct PersistentGetAll {
 pub(crate) struct BifTrapPending {
     pub(crate) caller_module: usize,
     pub(crate) caller_ip: usize,
+    /// Set by a light BIF call that trapped: the scheduler still has to context-switch
+    /// (erts `context_switch_simplified`) and bind the trap to its native call site.
+    pub(crate) schedule_out: bool,
     pub(crate) import: usize,
     pub(crate) continuation: &'static str,
     pub(crate) state: std::sync::Arc<arinsal_term::MagicRef>,

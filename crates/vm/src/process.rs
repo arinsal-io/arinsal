@@ -1406,6 +1406,16 @@ impl Executor {
                             .as_mut()
                             .and_then(|cold| cold.native_retry.take());
                         let outcome = if let Some(target_pc) = retry {
+                            if process
+                                .cold
+                                .as_ref()
+                                .and_then(|cold| cold.bif_trap.as_ref())
+                                .is_some_and(|pending| {
+                                    !pending.schedule_out && pending.import == target_pc
+                                })
+                            {
+                                crate::native_helpers::debug_assert_native_heap(process);
+                            }
                             // The redone call keeps its return address and call site, so a BIF
                             // that fails after trapping raises at the original call.
                             let (resume_pc, call_site_pc) = process
@@ -2184,6 +2194,28 @@ impl Executor {
                                                 .cold
                                                 .as_ref()
                                                 .is_some_and(|cold| cold.bif_trap.is_some());
+                                        // Port of erts/emulator/beam/jit/arm/process_main.cpp
+                                        // (context_switch_simplified), OTP-29.1.1: a light BIF
+                                        // call that trapped context-switches; the process
+                                        // resumes in the continuation when it next runs.
+                                        if let Some(pending) = process
+                                            .cold
+                                            .as_mut()
+                                            .and_then(|cold| cold.bif_trap.as_mut())
+                                            .filter(|pending| {
+                                                pending.schedule_out && pending.import == target_pc
+                                            })
+                                        {
+                                            pending.schedule_out = false;
+                                            pending.caller_module = process.module;
+                                            pending.caller_ip = process.ip;
+                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_pc = Some(code_ptr);
+                                            crate::native_helpers::debug_assert_native_heap(
+                                                process,
+                                            );
+                                            break Ok(RunState::Yield);
+                                        }
                                         // A traced trapping BIF reports its call once, when it is
                                         // first entered, and its return when it finishes.
                                         // Port of erts/emulator/beam/beam_bp.c:321-330
