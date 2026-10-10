@@ -6,6 +6,7 @@ use arinsal_a64::{
 };
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
+use crate::types::{ArgType, TypedArg, type_id};
 use crate::{Update, emit_enter_runtime, emit_leave_runtime};
 
 /// Runtime hook used for guards that need term-aware runtime behavior.
@@ -78,7 +79,6 @@ enum InlineType {
     Pid,
     Port,
     Reference,
-    Map,
     Function,
     Function2,
 }
@@ -174,7 +174,6 @@ impl BeamModuleAssembler {
             | InlineType::Bitstring
             | InlineType::Float
             | InlineType::Reference
-            | InlineType::Map
             | InlineType::Function
             | InlineType::Function2 => {
                 e.ands_imm(Gpr::x(8), Gpr::x(11), 3)?;
@@ -318,10 +317,9 @@ impl BeamModuleAssembler {
                     self.code.b(no)?;
                 }
             }
-            InlineType::Float | InlineType::Map | InlineType::Function => {
+            InlineType::Float | InlineType::Function => {
                 let expected = match op {
                     InlineType::Float => 0x18,
-                    InlineType::Map => 0x2c,
                     InlineType::Function => 0x14,
                     _ => unreachable!(),
                 };
@@ -873,7 +871,26 @@ impl BeamModuleAssembler {
     /// Emits a map type test.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1366-1387, OTP-29.1.1
     pub fn emit_is_map(&mut self, src: ArgVal, fail: u32) -> Result<(), ModuleError> {
-        self.emit_inline_type(InlineType::Map, src, None, None, fail)
+        self.emit_is_map_typed(TypedArg::new(src, ArgType::ANY), fail)
+    }
+
+    /// Emits a map type test using the compiler's `Type` chunk information.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:1350-1387, OTP-29.1.1.
+    pub fn emit_is_map_typed(&mut self, src: TypedArg, fail: u32) -> Result<(), ModuleError> {
+        let value = self.source_reg(src.val)?;
+        let fail = self.label(fail);
+        if !src.always_one_of(type_id::ALWAYS_BOXED) {
+            self.code.tbnz(value, 0, fail)?;
+        }
+        if src.masked_types(type_id::MAYBE_BOXED) != type_id::MAP {
+            self.code.emit(|e| {
+                e.ldur(Gpr::x(11), value, -2)?;
+                e.and_imm(Gpr::x(11), Gpr::x(11), 0x3f)?;
+                e.cmp_imm(Gpr::x(11), 0x2c, false)
+            })?;
+            self.code.b_cond(Cond::Ne, fail)?;
+        }
+        Ok(())
     }
 
     /// Emits a function type test.
@@ -1235,44 +1252,64 @@ impl BeamModuleAssembler {
         destination: ArgVal,
         _runtime: GuardHelper,
     ) -> Result<(), ModuleError> {
+        self.emit_bif_map_size_typed(
+            fail,
+            TypedArg::new(map, ArgType::ANY),
+            destination,
+            _runtime,
+        )
+    }
+
+    /// Emits `map_size/1`, eliding checks proven redundant by the `Type` chunk.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:947-997, OTP-29.1.1.
+    pub fn emit_bif_map_size_typed(
+        &mut self,
+        fail: u32,
+        map: TypedArg,
+        destination: ArgVal,
+        _runtime: GuardHelper,
+    ) -> Result<(), ModuleError> {
         let output = self.guard_destination(destination)?;
-        let map = self.source_reg(map)?;
-        let bad = self.code.new_label();
-        let ok = self.code.new_label();
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(12), map, 3)?;
-            e.cmp_imm(Gpr::x(12), 2, false)
-        })?;
-        self.code.b_cond(Cond::Ne, bad)?;
-        self.code.emit(|e| {
-            e.and_imm(Gpr::x(10), map, !7)?;
-            e.ldur(Gpr::x(12), Gpr::x(10), 0)?;
-            e.and_imm(Gpr::x(12), Gpr::x(12), 0x3f)?;
-            e.cmp_imm(Gpr::x(12), 0x2c, false)
-        })?;
-        self.code.b_cond(Cond::Ne, bad)?;
-        self.code.emit(|e| {
-            e.ldur(Gpr::x(12), Gpr::x(10), 8)?;
-            e.lsl_imm(output, Gpr::x(12), 4)?;
-            e.orr_imm(output, output, 15)
-        })?;
-        self.code.b(ok)?;
-        self.code.bind(bad)?;
-        if fail == 0 {
-            // Port of instr_guard_bifs.cpp (emit_handle_map_size_error): BADMAP with the map
-            // in `fvalue` and erlang:map_size/1 as the top frame.
-            self.code.emit(|e| {
-                e.mov_reg(Gpr::x(25), map)?;
-                e.mov_const(Gpr::x(9), EXC_BADMAP)?;
-                e.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
-                e.str_uoff(Gpr::x(25), Gpr::x(21), 48)
-            })?;
-            self.set_badarg_mfa(5)?;
-            self.branch_error()?;
-        } else {
-            self.emit_guard_fail(fail)?;
+        let map_reg = self.source_reg(map.val)?;
+        let needs_map_check = map.masked_types(type_id::MAYBE_BOXED) != type_id::MAP;
+        let needs_box_check = !map.always_one_of(type_id::ALWAYS_BOXED);
+        let bad = (needs_map_check || needs_box_check).then(|| self.code.new_label());
+        if needs_box_check {
+            self.code.tbnz(map_reg, 0, bad.expect("check label"))?;
         }
-        self.code.bind(ok)?;
+        if needs_map_check {
+            self.code.emit(|e| {
+                e.ldur(Gpr::x(12), map_reg, -2)?;
+                e.and_imm(Gpr::x(12), Gpr::x(12), 0x3f)?;
+                e.cmp_imm(Gpr::x(12), 0x2c, false)
+            })?;
+            self.code.b_cond(Cond::Ne, bad.expect("check label"))?;
+        }
+        self.code.emit(|e| {
+            e.ldur(Gpr::x(12), map_reg, 6)?;
+            e.mov_const(output, 15)?;
+            e.bfi(output, Gpr::x(12), 4, 60)
+        })?;
+        if let Some(bad) = bad {
+            let ok = self.code.new_label();
+            self.code.b(ok)?;
+            self.code.bind(bad)?;
+            if fail == 0 {
+                // Port of instr_guard_bifs.cpp:938-945 (emit_handle_map_size_error): BADMAP
+                // with the map in `fvalue` and erlang:map_size/1 as the top frame.
+                self.code.emit(|e| {
+                    e.mov_reg(Gpr::x(25), map_reg)?;
+                    e.mov_const(Gpr::x(9), EXC_BADMAP)?;
+                    e.str_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+                    e.str_uoff(Gpr::x(25), Gpr::x(21), 48)
+                })?;
+                self.set_badarg_mfa(5)?;
+                self.branch_error()?;
+            } else {
+                self.emit_guard_fail(fail)?;
+            }
+            self.code.bind(ok)?;
+        }
         self.store_guard_result(destination, output)?;
         Ok(())
     }
@@ -1288,6 +1325,51 @@ impl BeamModuleAssembler {
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
         self.emit_guard_value_helper_fail(fail, true, 30, key, map, destination, helper)
+    }
+
+    /// Emits `is_map_key/2`, using map and key types to select the shared lookup fragment.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:799-830, OTP-29.1.1.
+    pub fn emit_bif_is_map_key_typed(
+        &mut self,
+        fail: u32,
+        key: TypedArg,
+        map: TypedArg,
+        destination: ArgVal,
+        helper: GuardHelper,
+        map_runtime: crate::map::MapRuntime,
+    ) -> Result<(), ModuleError> {
+        if !map.exact_type(type_id::MAP) {
+            return self.emit_bif_is_map_key(fail, key.val, map.val, destination, helper);
+        }
+
+        let output = self.guard_destination(destination)?;
+        let map_reg = self.source_reg(map.val)?;
+        let key_reg = self.source_reg_into(key.val, Gpr::x(17))?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), map_reg)?;
+            e.mov_reg(Gpr::x(1), key_reg)
+        })?;
+        if key.maybe_one_of(type_id::MAYBE_IMMEDIATE) {
+            self.code
+                .emit(|e| e.mov_const(Gpr::x(17), map_runtime.get_element_shared as u64))?;
+            self.code.emit(|e| e.blr(Gpr::x(17)))?;
+            self.code.emit(|e| {
+                e.mov_const(Gpr::x(10), 0x4b)?;
+                e.mov_const(Gpr::x(11), 0x0b)?;
+                e.csel(output, Gpr::x(10), Gpr::x(11), Cond::Eq)
+            })?;
+            return self.store_guard_result(destination, output);
+        }
+
+        self.code.emit(|e| e.mov_reg(Gpr::x(2), Gpr::xzr()))?;
+        self.emit_guard_runtime_call(map_runtime.get as usize, &[Gpr::x(0), Gpr::x(1), Gpr::x(2)])?;
+        self.code.emit(|e| {
+            e.cmp_imm(Gpr::x(0), 0, false)?;
+            e.mov_const(Gpr::x(10), 0x4b)?;
+            e.mov_const(Gpr::x(11), 0x0b)?;
+            e.csel(output, Gpr::x(10), Gpr::x(11), Cond::Ne)
+        })?;
+        self.store_guard_result(destination, output)
     }
 
     /// Emits `map_get/2`: shared-fragment lookup, the runtime hook for a miss or non-map.

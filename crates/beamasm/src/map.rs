@@ -414,7 +414,13 @@ impl BeamModuleAssembler {
             e.blr(Gpr::x(17))
         })?;
         self.code.b_cond(Cond::Ne, fail)?;
-        self.store_map_result(dst, Gpr::x(0))
+        // Port of erts/emulator/beam/jit/arm/instr_map.cpp:384-389, OTP-29.1.1.
+        // The scratch destination is used by `has_map_fields` only to test key presence.
+        if is_scratch_x(dst) {
+            Ok(())
+        } else {
+            self.store_map_result(dst, Gpr::x(0))
+        }
     }
 
     /// Emits multi-key lookup; the operands are flattened `{key, dst, hash}` triplets.
