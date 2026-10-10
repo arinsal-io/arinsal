@@ -127,7 +127,7 @@ pub(super) fn gc_after_bif(
     } else {
         (None, None)
     };
-    process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
+    let stats = process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
     arguments.copy_from_slice(&roots[..arguments.len()]);
     if let Some(index) = result_index.0 {
         if let Ok(value) = result {
@@ -155,6 +155,14 @@ pub(super) fn gc_after_bif(
             _ => unreachable!("the error variant is stable across collection"),
         }
     }
+    // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
+    // `esdp->gc_info`), OTP-29.1.1: the BIF epilogue collection is counted.
+    crate::natives::sys::after_collection(
+        process,
+        arguments.len(),
+        stats.collections,
+        stats.words_reclaimed,
+    );
     Ok(())
 }
 
@@ -211,7 +219,7 @@ pub(crate) fn gc_after_native_parts(
     } else {
         (None, None)
     };
-    process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
+    let stats = process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
     arguments.copy_from_slice(&roots[..arguments.len()]);
     if let Some(index) = result_index.0 {
         if let Some(value) = value {
@@ -243,6 +251,14 @@ pub(crate) fn gc_after_native_parts(
             }
         }
     }
+    // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
+    // `esdp->gc_info`), OTP-29.1.1: the BIF epilogue collection is counted.
+    crate::natives::sys::after_collection(
+        process,
+        arguments.len(),
+        stats.collections,
+        stats.words_reclaimed,
+    );
     Ok(())
 }
 
