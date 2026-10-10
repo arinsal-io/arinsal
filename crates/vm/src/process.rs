@@ -746,7 +746,8 @@ pub(crate) struct Runtime {
     /// Pid of `erts_literal_area_collector` (an unregistered system process).
     pub(crate) literal_collector: Mutex<Option<Pid>>,
     paths: Vec<std::path::PathBuf>,
-    scheduler: Mutex<Weak<Scheduler<Process>>>,
+    // Set once when the scheduler starts; read without a lock like erts' scheduler data.
+    scheduler: OnceLock<Weak<Scheduler<Process>>>,
     pub(crate) names: Mutex<HashMap<String, Pid>>,
     pub(crate) port_names: Mutex<HashMap<String, u64>>,
     aliases: AliasTable,
@@ -1112,7 +1113,8 @@ impl Executor {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
         process.self_pid = Some(ctx.pid());
         process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
-        let schedule_started = std::time::Instant::now();
+        let schedule_started = crate::natives::erts_debug::long_schedule_monitored(process)
+            .then(std::time::Instant::now);
         // A process runs with the code index active when it is scheduled in. The `in` trace
         // event resolves the current function against it, so this replica must be current
         // first (erts_find_function_from_pc reads the active code index).
@@ -2907,10 +2909,12 @@ impl Executor {
                 &running_fields,
             );
         }
-        crate::natives::erts_debug::after_schedule(
-            process,
-            schedule_started.elapsed().as_nanos() as u64,
-        );
+        if let Some(schedule_started) = schedule_started {
+            crate::natives::erts_debug::after_schedule(
+                process,
+                schedule_started.elapsed().as_nanos() as u64,
+            );
+        }
         result
     }
 
@@ -3523,9 +3527,8 @@ impl Runtime {
 
     pub(crate) fn scheduler(&self) -> Result<Arc<Scheduler<Process>>, VmError> {
         self.scheduler
-            .lock()
-            .unwrap()
-            .upgrade()
+            .get()
+            .and_then(Weak::upgrade)
             .ok_or_else(|| VmError::Unsupported("scheduler has stopped".into()))
     }
 
@@ -4576,8 +4579,12 @@ impl Process {
             }
             return Ok(value);
         }
+        // Port of erts/emulator/beam/bif.c:2469-2480,2511 (do_send), OTP-29.1.1: internal pids
+        // and atoms are local destinations and never reach the distribution checks.
+        let local_destination = target.as_pid_data().is_some() || target.as_atom().is_some();
         // Port of erts/emulator/beam/erl_message.c (`erts_send` / remote_send), OTP-29.1.1.
         let remote = match ctx.as_deref_mut() {
+            _ if local_destination => false,
             Some(ctx) => crate::dist::try_remote_send(self, ctx, target, value)?,
             // Native code sends without a scheduler context; a remote send is redone by the
             // scheduler, which owns the distribution output path.
@@ -4597,42 +4604,17 @@ impl Process {
             );
             return Ok(value);
         }
-        let local_name = crate::dist::local_reg_name(target)?;
+        let local_name = if local_destination {
+            None
+        } else {
+            crate::dist::local_reg_name(target)?
+        };
         let local_name_tuple = local_name.is_some();
         let target = if let Some(name) = local_name {
             name
         } else {
             target
         };
-        if let Some(name) = target
-            .as_atom()
-            .and_then(|name| arinsal_term::global_atoms().text(name))
-            && let Some(id) = self
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.port_names.lock().unwrap().get(name).copied())
-            && crate::port::is_live(self, id)
-        {
-            let port = Term::port(id).ok_or_else(|| {
-                VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
-                    "badarg",
-                )))
-            })?;
-            if let Some(ctx) = ctx.as_deref_mut() {
-                crate::port::process_send_in(self, ctx, port, value)?;
-            } else {
-                crate::port::process_send(self, port, value)?;
-            }
-            crate::trace::emit_process(
-                vm.as_deref_mut(),
-                self,
-                sender,
-                crate::trace::SEND,
-                "send",
-                &[value, target],
-            );
-            return Ok(value);
-        }
         let mut via_prio_alias = false;
         let pid = if let Some(pid) = Pid::from_term(target) {
             Some(pid)
@@ -4673,6 +4655,34 @@ impl Process {
             };
             drop(names);
             if pid.is_none() {
+                // Port of erts/emulator/beam/bif.c:2511-2530 (do_send), OTP-29.1.1: a name
+                // that resolves to no live process is looked up as a port.
+                if let Some(id) = self
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.port_names.lock().unwrap().get(name).copied())
+                    && crate::port::is_live(self, id)
+                {
+                    let port = Term::port(id).ok_or_else(|| {
+                        VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
+                            "badarg",
+                        )))
+                    })?;
+                    if let Some(ctx) = ctx.as_deref_mut() {
+                        crate::port::process_send_in(self, ctx, port, value)?;
+                    } else {
+                        crate::port::process_send(self, port, value)?;
+                    }
+                    crate::trace::emit_process(
+                        vm.as_deref_mut(),
+                        self,
+                        sender,
+                        crate::trace::SEND,
+                        "send",
+                        &[value, target],
+                    );
+                    return Ok(value);
+                }
                 // Port of erts/emulator/beam/bif.c:2532-2536 (do_send), OTP-29.1.1: a send to
                 // an unregistered name is traced before it fails.
                 self.trace_send(
@@ -6320,7 +6330,7 @@ impl Vm {
             dirty_signal_handlers: Mutex::new(std::collections::HashSet::new()),
             literal_collector: Mutex::new(None),
             paths: self.paths.clone(),
-            scheduler: Mutex::new(Weak::new()),
+            scheduler: OnceLock::new(),
             names: Mutex::new(HashMap::new()),
             port_names: Mutex::new(HashMap::new()),
             aliases: AliasTable::new(),
@@ -6380,7 +6390,10 @@ impl Vm {
         let online = crate::natives::sys::scheduler_online_default(&runtime);
         let _ = scheduler.set_online_schedulers(online.min(workers.max(1)));
         let _ = scheduler.set_dirty_cpu_online(dirty_cpu_online);
-        *runtime.scheduler.lock().unwrap() = Arc::downgrade(&scheduler);
+        runtime
+            .scheduler
+            .set(Arc::downgrade(&scheduler))
+            .map_err(|_| VmError::Unsupported("runtime scheduler already set".into()))?;
         if module == "erl_init" && function == "start" && simulation_seed.is_none() {
             crate::natives::env::install_boot_signals(&runtime)?;
         }

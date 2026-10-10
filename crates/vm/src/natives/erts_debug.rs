@@ -311,6 +311,15 @@ fn send_system_monitor_event(
 
 /// Emit long-schedule events after a scheduler execution slice.
 // Port of erts/emulator/beam/erl_trace.c:1510-1595, OTP-29.1.1.
+/// Whether a long_schedule system monitor is active, so a schedule-in records its start time.
+// Port of erts/emulator/beam/jit/arm/process_main.cpp:84-85,173-180 (start_time only set when
+// erts_system_monitor_long_schedule != 0), OTP-29.1.1.
+pub(crate) fn long_schedule_monitored(process: &Process) -> bool {
+    process.runtime.as_ref().is_some_and(|runtime| {
+        runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_LONG_SCHEDULE != 0
+    })
+}
+
 pub(crate) fn after_schedule(process: &mut Process, elapsed_nanoseconds: u64) {
     if let Some(runtime) = process.runtime.clone() {
         for state in monitor_states(&runtime) {
@@ -449,6 +458,13 @@ pub(crate) fn after_port_task(
 /// Emit long-message-queue events when the mailbox crosses its configured limits.
 // Port of erts/emulator/beam/erl_trace.c:1863-1918, OTP-29.1.1.
 pub(crate) fn after_message_queue_change(process: &mut Process) {
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:1978-1994 (erts_chk_sys_mon_long_msgq_on/off),
+    // OTP-29.1.1: without a long_message_queue monitor the check is one flag test.
+    if process.runtime.as_ref().is_none_or(|runtime| {
+        runtime.system_monitor_flags.load(Ordering::Relaxed) & MONITOR_LONG_MESSAGE_QUEUE == 0
+    }) {
+        return;
+    }
     if let Some(runtime) = process.runtime.clone() {
         for state in monitor_states(&runtime) {
             after_message_queue_change_one(process, &state);
