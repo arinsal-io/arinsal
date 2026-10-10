@@ -25,7 +25,11 @@ impl ModuleEnv for TestEnv {
         1
     }
 
-    fn local_node_helper(&self) -> usize {
+    fn this_node_sysname(&self) -> usize {
+        1
+    }
+
+    fn sys_perf_counter(&self) -> usize {
         1
     }
 

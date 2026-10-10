@@ -572,3 +572,31 @@ fn native_heap_checks_collect_moving_live_roots() {
     native_allocate_heap_zero();
     native_test_heap_with_more_than_six_live_registers();
 }
+
+extern "C" fn small_counter() -> u64 {
+    123_456_789
+}
+
+extern "C" fn big_counter() -> u64 {
+    1 << 62
+}
+
+// `os:perf_counter/0` tags a small counter and boxes a larger one as a one-digit bignum.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_perf_counter() {
+    let (_, regs, _, _) = run_native(
+        |m, hook| m.emit_i_perf_counter(small_counter as *const () as usize, hook),
+        |_, _, _| {},
+    );
+    assert_eq!(regs[0], tagged_small(123_456_789));
+
+    let (header, regs, heap, base) = run_native(
+        |m, hook| m.emit_i_perf_counter(big_counter as *const () as usize, hook),
+        |_, _, _| {},
+    );
+    assert_eq!(regs[0], base as u64 | 2);
+    assert_eq!(heap[0], (1 << 6) | 0x08);
+    assert_eq!(heap[1], 1 << 62);
+    assert_eq!(header.htop as usize, base + 16);
+}

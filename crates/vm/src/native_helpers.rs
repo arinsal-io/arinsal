@@ -83,16 +83,6 @@ pub extern "C" fn arinsal_beamasm_raise_class(
     }
 }
 
-/// Returns the current local node atom for the native `node` instruction.
-// Port of erts/emulator/beam/jit/arm/instr_common.cpp:701-705, OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_local_node(_header: *mut ProcessHeader) -> u64 {
-    let name = crate::node_tables::lock().local_identity().0.to_owned();
-    arinsal_term::global_atoms()
-        .intern(&name)
-        .map(|atom| crate::native_hooks::raw(Term::atom(atom)))
-        .unwrap_or(0)
-}
-
 /// Materializes a process-owned raw trace on the process heap.
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3046-3055, OTP-29.1.1.
 pub extern "C" fn arinsal_beamasm_build_stacktrace(
@@ -1336,9 +1326,16 @@ fn set_call_fun_error(
     arity: u32,
 ) {
     let arity = arity as usize;
-    if arity >= process.x.len() {
+    if arity >= registers.x_reg_array.len() {
         crate::native_hooks::set_error(process, "system_limit");
         return;
+    }
+    // `apply/2` may pass more arguments than the module's register file holds (erts raises
+    // badarity with all of them, instr_fun.cpp:253-328).
+    if arity >= process.x.len() {
+        let mut x = process.x.to_vec();
+        x.resize(arity + 1, Term::NIL);
+        process.x = x.into_boxed_slice();
     }
     process
         .heap
@@ -1511,9 +1508,10 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
                 .runtime
                 .as_ref()
                 .map_or(0, |runtime| runtime.code_scope);
-            if let Some(target) =
-                crate::beamasm_integration::native_target_for(scope, module, function, entry.arity)
-            {
+            if let Some(target) = crate::beamasm_integration::native_target_for_mfa(
+                scope,
+                (entry.module, entry.function, entry.arity),
+            ) {
                 publish_dispatch_x(process, registers);
                 process.sync_native_header();
                 return target;
@@ -1564,14 +1562,8 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
     // Port of erts/emulator/beam/beam_common.c:1554-1557 (fixed_apply), OTP-29.1.1: an
     // apply of erlang:apply/3 is a plain apply/3 of its arguments.
     if arity == 3
-        && module
-            .as_atom()
-            .and_then(|atom| arinsal_term::global_atoms().text(atom))
-            == Some("erlang")
-        && function
-            .as_atom()
-            .and_then(|atom| arinsal_term::global_atoms().text(atom))
-            == Some("apply")
+        && module.as_atom() == Some(arinsal_term::atoms::ERLANG)
+        && function.as_atom() == Some(arinsal_term::atoms::APPLY)
     {
         let apply3 = crate::beamasm_integration::apply3_unported_entry();
         if apply3 != 0 {
@@ -1579,18 +1571,12 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
         }
     }
     if let (Some(module), Some(function)) = (module.as_atom(), function.as_atom())
-        && let (Some(module), Some(function)) = (
-            arinsal_term::global_atoms().text(module),
-            arinsal_term::global_atoms().text(function),
-        )
         && let Some(target) = crate::beamasm_integration::exported_native_target(
             process
                 .runtime
                 .as_ref()
                 .map_or(0, |runtime| runtime.code_scope),
-            module,
-            function,
-            arity as u8,
+            (module, function, arity as u8),
         )
     {
         return target;
@@ -1599,6 +1585,80 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
     process.header.arity = arity.min(u8::MAX as usize) as u8;
     process.sync_native_header();
     fragment
+}
+
+/// Resolves `apply/3` to a native entry with the arguments moved into the X registers, or to
+/// the fragment that lets the interpreter apply (and raise) with X0..X2 untouched.
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-244 (emit_variable_apply) and
+// erts/emulator/beam/beam_common.c:1434-1530 (apply), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_apply3_resolver(header: *mut ProcessHeader) -> usize {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let fallback = crate::beamasm_integration::apply3_unported_entry();
+    // A process saving calls records the call through the export, which the interpreter does.
+    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
+        return fallback;
+    }
+    let (mut module, mut function, mut args) = (
+        registers.x_reg_array[0],
+        registers.x_reg_array[1],
+        registers.x_reg_array[2],
+    );
+    // Port of erts/emulator/beam/beam_common.c:1462-1495 (nested apply loop), OTP-29.1.1.
+    while module.as_atom() == Some(arinsal_term::atoms::ERLANG)
+        && function.as_atom() == Some(arinsal_term::atoms::APPLY)
+    {
+        let Some((nested_module, rest)) = crate::lists::split(args) else {
+            break;
+        };
+        let Some((nested_function, rest)) = crate::lists::split(rest) else {
+            break;
+        };
+        let Some((nested_args, rest)) = crate::lists::split(rest) else {
+            break;
+        };
+        if rest != Term::NIL {
+            break;
+        }
+        (module, function, args) = (nested_module, nested_function, nested_args);
+    }
+    let (Some(module), Some(function)) = (module.as_atom(), function.as_atom()) else {
+        return fallback;
+    };
+    let mut arity = 0_usize;
+    let mut list = args;
+    while let Some((_, tail)) = crate::lists::split(list) {
+        arity += 1;
+        if arity >= registers.x_reg_array.len() - 1 {
+            return fallback;
+        }
+        list = tail;
+    }
+    if list != Term::NIL {
+        return fallback;
+    }
+    let scope = process
+        .runtime
+        .as_ref()
+        .map_or(0, |runtime| runtime.code_scope);
+    let Ok(arity) = u8::try_from(arity) else {
+        return fallback;
+    };
+    let Some(target) =
+        crate::beamasm_integration::exported_native_target(scope, (module, function, arity))
+    else {
+        return fallback;
+    };
+    let mut list = args;
+    for slot in registers.x_reg_array.iter_mut() {
+        let Some((head, tail)) = crate::lists::split(list) else {
+            break;
+        };
+        *slot = head;
+        list = tail;
+    }
+    target
 }
 
 /// Builds a map from the staged key/value vector.

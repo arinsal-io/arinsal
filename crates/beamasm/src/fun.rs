@@ -309,62 +309,78 @@ impl BeamModuleAssembler {
                 self.code.b(trampoline)?;
             }
             FunCallTag::Dynamic => {
-                self.code
-                    .emit(|e| e.mov_const(Gpr::x(2), u64::from(arity)))?;
-                let resolver_path = self.code.new_label();
-                let call_target = self.code.new_label();
-
-                // OTP first validates the boxed fun header and dispatches a local
-                // fun directly through its dispatchable entry. Export funs and
-                // every malformed or wrong-arity term go through the resolver.
-                self.code.emit(|e| {
-                    e.and_imm(Gpr::x(9), Gpr::x(4), 3)?;
-                    e.cmp_imm(Gpr::x(9), 2, false)
-                })?;
-                self.code.b_cond(Cond::Ne, resolver_path)?;
-                self.code.emit(|e| {
-                    e.and_imm(Gpr::x(10), Gpr::x(4), !7)?;
-                    e.ldp(Gpr::x(11), Gpr::x(12), Gpr::x(10), 0)
-                })?;
-                self.code.emit(|e| {
-                    e.and_imm(Gpr::x(13), Gpr::x(11), 0xffff)?;
-                    e.lsl_imm(Gpr::x(14), Gpr::x(2), 8)?;
-                    e.add_imm(Gpr::x(14), Gpr::x(14), FUN_SUBTAG as u16, false)?;
-                    e.cmp_reg(Gpr::x(13), Gpr::x(14), arinsal_a64::enc::Shift::Lsl, 0)
-                })?;
-                self.code.b_cond(Cond::Ne, resolver_path)?;
-                self.code.emit(|e| {
-                    e.and_imm(Gpr::x(13), Gpr::x(11), 1 << 24)?;
-                    e.cmp_imm(Gpr::x(13), 0, false)
-                })?;
-                self.code.b_cond(Cond::Ne, resolver_path)?;
-                // Port of erts/emulator/beam/jit/arm/instr_fun.cpp call_fun
-                // dispatchable load: `ErlFunEntry` begins with `ErtsDispatchable`.
-                // Unpublished entries keep address 0; fall through to the resolver
-                // (OTP jumps to `beam_unloaded_fun` instead).
-                self.code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(12), 0))?;
-                self.code.cbz(Gpr::x(0), resolver_path)?;
-                self.code.b(call_target)?;
-
-                self.code.bind(resolver_path)?;
-                emit_fun_resolver(self, resolver as usize)?;
-                self.code.bind(call_target)?;
-                crate::emit_validate_native_cursor(&mut self.code)?;
-                if tail {
-                    self.deallocate(deallocate)?;
-                    self.emit_leave_frame()?;
-                    self.code.emit(|e| e.br(Gpr::x(0)))?;
-                } else {
-                    self.code.adr(Gpr::x(30), continuation)?;
-                    self.code.emit(|e| e.br(Gpr::x(0)))?;
-                    self.code.bind(continuation)?;
-                    crate::emit_validate_native_cursor(&mut self.code)?;
-                }
-                return Ok(());
+                return self.emit_dynamic_fun_call(Some(arity), resolver, tail, deallocate);
             }
         }
         if !tail {
             self.code.bind(continuation)?;
+        }
+        Ok(())
+    }
+
+    /// Calls the fun in x4 with `arity` arguments, or with the arity already in x2 when it is
+    /// `None` (`apply/2`).
+    // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:342-400 (emit_call_fun), OTP-29.1.1.
+    pub(crate) fn emit_dynamic_fun_call(
+        &mut self,
+        arity: Option<u8>,
+        resolver: FunResolver,
+        tail: bool,
+        deallocate: u32,
+    ) -> Result<(), ModuleError> {
+        let continuation = self.code.new_label();
+        if let Some(arity) = arity {
+            self.code
+                .emit(|e| e.mov_const(Gpr::x(2), u64::from(arity)))?;
+        }
+        let resolver_path = self.code.new_label();
+        let call_target = self.code.new_label();
+
+        // OTP first validates the boxed fun header and dispatches a local
+        // fun directly through its dispatchable entry. Export funs and
+        // every malformed or wrong-arity term go through the resolver.
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(9), Gpr::x(4), 3)?;
+            e.cmp_imm(Gpr::x(9), 2, false)
+        })?;
+        self.code.b_cond(Cond::Ne, resolver_path)?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(10), Gpr::x(4), !7)?;
+            e.ldp(Gpr::x(11), Gpr::x(12), Gpr::x(10), 0)
+        })?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(13), Gpr::x(11), 0xffff)?;
+            e.lsl_imm(Gpr::x(14), Gpr::x(2), 8)?;
+            e.add_imm(Gpr::x(14), Gpr::x(14), FUN_SUBTAG as u16, false)?;
+            e.cmp_reg(Gpr::x(13), Gpr::x(14), arinsal_a64::enc::Shift::Lsl, 0)
+        })?;
+        self.code.b_cond(Cond::Ne, resolver_path)?;
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(13), Gpr::x(11), 1 << 24)?;
+            e.cmp_imm(Gpr::x(13), 0, false)
+        })?;
+        self.code.b_cond(Cond::Ne, resolver_path)?;
+        // Port of erts/emulator/beam/jit/arm/instr_fun.cpp call_fun
+        // dispatchable load: `ErlFunEntry` begins with `ErtsDispatchable`.
+        // Unpublished entries keep address 0; fall through to the resolver
+        // (OTP jumps to `beam_unloaded_fun` instead).
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(12), 0))?;
+        self.code.cbz(Gpr::x(0), resolver_path)?;
+        self.code.b(call_target)?;
+
+        self.code.bind(resolver_path)?;
+        emit_fun_resolver(self, resolver as usize)?;
+        self.code.bind(call_target)?;
+        crate::emit_validate_native_cursor(&mut self.code)?;
+        if tail {
+            self.deallocate(deallocate)?;
+            self.emit_leave_frame()?;
+            self.code.emit(|e| e.br(Gpr::x(0)))?;
+        } else {
+            self.code.adr(Gpr::x(30), continuation)?;
+            self.code.emit(|e| e.br(Gpr::x(0)))?;
+            self.code.bind(continuation)?;
+            crate::emit_validate_native_cursor(&mut self.code)?;
         }
         Ok(())
     }

@@ -126,8 +126,32 @@ impl ModuleEnv for CorpusEnv {
         1
     }
 
-    fn local_node_helper(&self) -> usize {
+    fn this_node_sysname(&self) -> usize {
         1
+    }
+
+    fn sys_perf_counter(&self) -> usize {
+        1
+    }
+
+    fn apply_runtime(&self) -> arinsal_beamasm::misc::ApplyRuntime {
+        extern "C" fn apply(_: *mut ProcessHeader, _: u32) -> usize {
+            0
+        }
+        extern "C" fn apply3(_: *mut ProcessHeader) -> usize {
+            0
+        }
+        extern "C" fn fun(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
+            0
+        }
+        arinsal_beamasm::misc::ApplyRuntime {
+            resolver: apply,
+            apply3_resolver: apply3,
+            apply_fun_shared: 1,
+            fun_resolver: fun,
+            apply2_fragment: 1,
+            apply3_fragment: 1,
+        }
     }
 
     fn build_stacktrace_helper(&self) -> Option<arinsal_beamasm::catch::BuildStacktraceHook> {
