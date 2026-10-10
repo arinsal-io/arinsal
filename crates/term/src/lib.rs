@@ -34,7 +34,7 @@ pub use copy::{
     SharedCopyCache, copy_shared, copy_term, copy_term_litopt, copy_term_preserving_sharing,
     copy_term_preserving_sharing_with_cache,
 };
-pub use fun::{ExportEntry, FunEntry, FunRef};
+pub use fun::{EXPORT_DISPATCH_OFFSET, ExportEntry, FunEntry, FunRef};
 pub use gc::{FragmentAlloc, FragmentIndex, GcStats};
 pub use hamt::{
     HxNode, boxed_object_words, build_hamt_from_unique, flatmap_keys, hashmap_from_ks_and_vs,

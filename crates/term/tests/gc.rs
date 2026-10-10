@@ -389,11 +389,7 @@ fn owner_arcs_are_released_when_unreachable() {
         dispatch_code: Default::default(),
         dispatch_epoch: Default::default(),
     });
-    let export = Arc::new(ExportEntry {
-        module,
-        function,
-        arity: 0,
-    });
+    let export = Arc::new(ExportEntry::new(module, function, 0));
     let _identity = TermBuilder::new(&mut heap)
         .external_pid(node.clone(), 1, 0)
         .unwrap();
@@ -511,11 +507,7 @@ fn mixed_boxed_graph_survives_one_hundred_collections() {
         .local_fun(fun_entry, &[record, hamt])
         .unwrap();
     let export = TermBuilder::new(&mut heap)
-        .export_fun(Arc::new(ExportEntry {
-            module,
-            function: name,
-            arity: 2,
-        }))
+        .export_fun(Arc::new(ExportEntry::new(module, name, 2)))
         .unwrap();
     let pid = TermBuilder::new(&mut heap)
         .external_pid(node.clone(), 10, 2)

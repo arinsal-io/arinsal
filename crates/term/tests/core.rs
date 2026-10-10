@@ -556,11 +556,7 @@ fn fun_layout_copy_and_conversion() {
     let mut heap = VecHeap::new();
     let mut builder = TermBuilder::new(&mut heap);
     let exported = builder
-        .export_fun(Arc::new(ExportEntry {
-            module,
-            function,
-            arity: 1,
-        }))
+        .export_fun(Arc::new(ExportEntry::new(module, function, 1)))
         .unwrap();
     assert_eq!(size_object(exported), 2);
     assert!(matches!(
@@ -1045,11 +1041,11 @@ fn differential_hashes_ten_thousand_identities_and_funs() {
     let mut heap = VecHeap::new();
     let mut builder = TermBuilder::new(&mut heap);
     let export = builder
-        .export_fun(Arc::new(arinsal_term::ExportEntry {
-            module: arinsal_term::atoms::ERLANG,
-            function: arinsal_term::global_atoms().intern("length").unwrap(),
-            arity: 1,
-        }))
+        .export_fun(Arc::new(arinsal_term::ExportEntry::new(
+            arinsal_term::atoms::ERLANG,
+            arinsal_term::global_atoms().intern("length").unwrap(),
+            1,
+        )))
         .unwrap();
     for n in 0..10_000 {
         let id = n % 1000;

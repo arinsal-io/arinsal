@@ -119,15 +119,44 @@ impl FunEntry {
     }
 }
 
-/// Immutable export table entry for `fun M:F/A`.
+/// Export fun entry for `fun M:F/A`, with a cached pointer to its node export slot.
 #[derive(Debug)]
+#[repr(C)]
 pub struct ExportEntry {
+    /// Export slot cached after the first native call; zero means unresolved.
+    dispatch: AtomicUsize,
     /// Module.
     pub module: Atom,
     /// Function.
     pub function: Atom,
     /// Arity.
     pub arity: u8,
+}
+
+/// Byte offset of [`ExportEntry`]'s cached dispatch pointer for generated loads.
+pub const EXPORT_DISPATCH_OFFSET: u32 = core::mem::offset_of!(ExportEntry, dispatch) as u32;
+
+impl ExportEntry {
+    /// Creates an unresolved export fun entry.
+    pub const fn new(module: Atom, function: Atom, arity: u8) -> Self {
+        Self {
+            dispatch: AtomicUsize::new(0),
+            module,
+            function,
+            arity,
+        }
+    }
+
+    /// Caches the node's stable export table slot for generated export fun calls.
+    pub fn set_dispatch(&self, dispatch: usize) {
+        self.dispatch.store(dispatch, Ordering::Release);
+    }
+
+    /// Returns the cached export slot, if this fun has been resolved in its node.
+    pub fn dispatch(&self) -> Option<usize> {
+        let dispatch = self.dispatch.load(Ordering::Acquire);
+        (dispatch != 0).then_some(dispatch)
+    }
 }
 
 /// Borrowed local or export fun.

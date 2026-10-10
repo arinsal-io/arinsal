@@ -1519,34 +1519,33 @@ pub extern "C" fn arinsal_beamasm_fun_resolver(
                 process.sync_native_header();
                 return 0;
             }
-            let Some(module) = arinsal_term::global_atoms().text(entry.module) else {
+            let Some(_module) = arinsal_term::global_atoms().text(entry.module) else {
                 set_call_fun_error(process, registers, fun, arity);
                 publish_dispatch_x(process, registers);
                 process.sync_native_header();
                 return 0;
             };
-            let Some(function) = arinsal_term::global_atoms().text(entry.function) else {
+            let Some(_function) = arinsal_term::global_atoms().text(entry.function) else {
                 set_call_fun_error(process, registers, fun, arity);
                 publish_dispatch_x(process, registers);
                 process.sync_native_header();
                 return 0;
             };
-            let scope = process
-                .runtime
-                .as_ref()
-                .map_or(0, |runtime| runtime.code_scope);
-            if let Some(target) = crate::beamasm_integration::native_target_for_mfa(
-                scope,
-                (entry.module, entry.function, entry.arity),
-            ) {
+            let code_ix = registers.active_code_ix as usize;
+            let export = process.runtime.as_ref().and_then(|runtime| {
+                runtime.export_entry((entry.module, entry.function, entry.arity), code_ix)
+            });
+            if let Some(export) = export {
+                entry.set_dispatch(export as *const _ as usize);
+            }
+            let target = export.map(|export| export.address(code_ix));
+            if code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX
+                && let Some(target) = target
+                && target != crate::beamasm_integration::export_trampoline()
+            {
                 publish_dispatch_x(process, registers);
                 process.sync_native_header();
                 return target;
-            }
-            if let Some(native) = crate::native_function_for(scope, module, function, entry.arity) {
-                publish_dispatch_x(process, registers);
-                process.sync_native_header();
-                return native.start;
             }
             process.header.arity = arity.min(u8::MAX as u32) as u8;
             if let Some(slot) = process.x.get_mut(arity as usize) {
@@ -1597,16 +1596,23 @@ pub extern "C" fn arinsal_beamasm_apply_resolver(header: *mut ProcessHeader, ari
             return apply3;
         }
     }
-    if let (Some(module), Some(function)) = (module.as_atom(), function.as_atom())
-        && let Some(target) = crate::beamasm_integration::exported_native_target(
-            process
-                .runtime
-                .as_ref()
-                .map_or(0, |runtime| runtime.code_scope),
-            (module, function, arity as u8),
-        )
-    {
-        return target;
+    if registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
+        process.header.arity = arity.min(u8::MAX as usize) as u8;
+        process.sync_native_header();
+        return fragment;
+    }
+    if let (Some(module), Some(function)) = (module.as_atom(), function.as_atom()) {
+        let target = process.runtime.as_ref().and_then(|runtime| {
+            runtime.export_address(
+                (module, function, arity as u8),
+                registers.active_code_ix as usize,
+            )
+        });
+        if let Some(target) =
+            target.filter(|target| *target != crate::beamasm_integration::export_trampoline())
+        {
+            return target;
+        }
     }
     // Not natively compiled (or invalid): the interpreter applies and raises errors.
     process.header.arity = arity.min(u8::MAX as usize) as u8;
@@ -1665,18 +1671,17 @@ pub extern "C" fn arinsal_beamasm_apply3_resolver(header: *mut ProcessHeader) ->
     if list != Term::NIL {
         return fallback;
     }
-    let scope = process
-        .runtime
-        .as_ref()
-        .map_or(0, |runtime| runtime.code_scope);
     let Ok(arity) = u8::try_from(arity) else {
         return fallback;
     };
-    let Some(target) =
-        crate::beamasm_integration::exported_native_target(scope, (module, function, arity))
-    else {
+    let Some(target) = process.runtime.as_ref().and_then(|runtime| {
+        runtime.export_address((module, function, arity), registers.active_code_ix as usize)
+    }) else {
         return fallback;
     };
+    if target == crate::beamasm_integration::export_trampoline() {
+        return fallback;
+    }
     let mut list = args;
     for slot in registers.x_reg_array.iter_mut() {
         let Some((head, tail)) = crate::lists::split(list) else {

@@ -14,6 +14,7 @@ const XREGS: [Gpr; 6] = [
     logical_xreg(16),
 ];
 const FUN_SUBTAG: u64 = 0x14;
+const ACTIVE_CODE_IX: Gpr = Gpr::x(24);
 
 // These entries map logical XREG4/5 to their caller-saved hardware registers.
 const fn logical_xreg(index: u8) -> Gpr {
@@ -337,11 +338,12 @@ impl BeamModuleAssembler {
                 .emit(|e| e.mov_const(Gpr::x(2), u64::from(arity)))?;
         }
         let resolver_path = self.code.new_label();
+        let external_fun = self.code.new_label();
         let call_target = self.code.new_label();
 
-        // OTP first validates the boxed fun header and dispatches a local
-        // fun directly through its dispatchable entry. Export funs and
-        // every malformed or wrong-arity term go through the resolver.
+        // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:342-400, OTP-29.1.1:
+        // local funs load their dispatchable entry, while export funs load the
+        // cached Export.addresses vector using the process code index.
         self.code.emit(|e| {
             e.and_imm(Gpr::x(9), Gpr::x(4), 3)?;
             e.cmp_imm(Gpr::x(9), 2, false)
@@ -362,27 +364,42 @@ impl BeamModuleAssembler {
             e.and_imm(Gpr::x(13), Gpr::x(11), 1 << 24)?;
             e.cmp_imm(Gpr::x(13), 0, false)
         })?;
-        self.code.b_cond(Cond::Ne, resolver_path)?;
+        self.code.b_cond(Cond::Ne, external_fun)?;
         // Port of erts/emulator/beam/jit/arm/instr_fun.cpp call_fun
         // dispatchable load: `ErlFunEntry` begins with `ErtsDispatchable`.
         // Unpublished entries keep address 0; fall through to the resolver
         // (OTP jumps to `beam_unloaded_fun` instead).
-        self.code.emit(|e| e.ldr_uoff(Gpr::x(0), Gpr::x(12), 0))?;
-        self.code.cbz(Gpr::x(0), resolver_path)?;
+        self.code.emit(|e| e.ldr_uoff(Gpr::x(14), Gpr::x(12), 0))?;
+        self.code.cbz(Gpr::x(14), resolver_path)?;
+        self.code.b(call_target)?;
+
+        self.code.bind(external_fun)?;
+        self.code
+            .emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), arinsal_term::EXPORT_DISPATCH_OFFSET))?;
+        self.code.cbz(Gpr::x(13), resolver_path)?;
+        self.code
+            .emit(|e| e.ldr_regoff(Gpr::x(14), Gpr::x(13), ACTIVE_CODE_IX, 3))?;
+        self.code.cbz(Gpr::x(14), resolver_path)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::x(21))?;
+            e.mov_reg(Gpr::x(1), Gpr::x(13))
+        })?;
         self.code.b(call_target)?;
 
         self.code.bind(resolver_path)?;
         emit_fun_resolver(self, resolver as usize)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(14), Gpr::x(0)))?;
         self.code.bind(call_target)?;
         crate::emit_validate_native_cursor(&mut self.code)?;
         if tail {
+            self.code.emit(|e| e.mov_reg(Gpr::x(17), Gpr::x(14)))?;
             self.deallocate(deallocate)?;
             self.emit_leave_frame()?;
-            self.code.emit(|e| e.br(Gpr::x(0)))?;
+            self.code.emit(|e| e.br(Gpr::x(17)))?;
         } else {
             // erlang_call (beam_asm.hpp:310-332): `blr` keeps the return-address
             // predictor paired with the callee's `ret`.
-            self.code.emit(|e| e.blr(Gpr::x(0)))?;
+            self.code.emit(|e| e.blr(Gpr::x(14)))?;
             self.code.bind(continuation)?;
             crate::emit_validate_native_cursor(&mut self.code)?;
         }

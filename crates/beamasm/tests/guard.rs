@@ -70,11 +70,7 @@ fn terms() -> Terms {
         )
         .unwrap();
     let export = b
-        .export_fun(Arc::new(ExportEntry {
-            module,
-            function: alpha_atom,
-            arity: 0,
-        }))
+        .export_fun(Arc::new(ExportEntry::new(module, alpha_atom, 0)))
         .unwrap();
     let values = vec![
         ("small", one),

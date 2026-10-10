@@ -996,11 +996,11 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
                 return Err(BifError::BADARG);
             }
             let term = if ctx.is_some() {
-                let entry = Arc::new(ExportEntry {
-                    module: values[0].as_atom().unwrap(),
-                    function: values[1].as_atom().unwrap(),
-                    arity: values[2].as_small().ok_or(BifError::BADARG)? as u8,
-                });
+                let entry = Arc::new(ExportEntry::new(
+                    values[0].as_atom().unwrap(),
+                    values[1].as_atom().unwrap(),
+                    values[2].as_small().ok_or(BifError::BADARG)? as u8,
+                ));
                 built(ctx, |b| b.export_fun(entry))?
             } else {
                 Term::NIL

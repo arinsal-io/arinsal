@@ -127,11 +127,9 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     let function = global_atoms()
                         .intern(function)
                         .map_err(|_| TermError::SystemLimit)?;
-                    values.push(builder.export_fun(Arc::new(ExportEntry {
-                        module,
-                        function,
-                        arity: *arity,
-                    }))?);
+                    values.push(
+                        builder.export_fun(Arc::new(ExportEntry::new(module, function, *arity)))?,
+                    );
                 }
                 OwnedTerm::Fun { pid, free_vars, .. } => {
                     tasks.push(Task::Fun(value));
