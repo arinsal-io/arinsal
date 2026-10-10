@@ -624,15 +624,10 @@ impl Process {
         self.priority_item_inserted(old_prio_len, term)
     }
 
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h (FS_OFF_HEAP_MSGQ in sig_qs.flags),
+    // OTP-29.1.1: the queue mode is a process flag bit.
     pub(crate) fn message_queue_data(&self) -> MessageQueueData {
-        let Some(value) = self
-            .cold
-            .as_ref()
-            .and_then(|cold| cold.flags.get("message_queue_data"))
-        else {
-            return MessageQueueData::OnHeap;
-        };
-        if *value == crate::signals::atom("off_heap") {
+        if self.cold.as_ref().is_some_and(|cold| cold.off_heap_msgq) {
             MessageQueueData::OffHeap
         } else {
             MessageQueueData::OnHeap
@@ -2068,6 +2063,8 @@ impl Executor {
                                                 hibernate_collect(process, ctx.pid())?;
                                                 if let Some(runtime) = process.runtime.clone() {
                                                     runtime.mark_hibernating(ctx.pid(), true);
+                                                    // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+                                                    process.cold_mut().hibernate_sched = true;
                                                 }
                                                 break Ok(RunState::Wait { timeout_ms: None });
                                             }
@@ -2540,6 +2537,8 @@ impl Executor {
                                                     hibernate_collect(process, ctx.pid())?;
                                                     if let Some(runtime) = process.runtime.clone() {
                                                         runtime.mark_hibernating(ctx.pid(), true);
+                                                        // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+                                                        process.cold_mut().hibernate_sched = true;
                                                     }
                                                     break Ok(RunState::Wait { timeout_ms: None });
                                                 }
@@ -2729,6 +2728,8 @@ impl Executor {
                             hibernate_collect(process, ctx.pid())?;
                             if let Some(runtime) = process.runtime.clone() {
                                 runtime.mark_hibernating(ctx.pid(), true);
+                                // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+                                process.cold_mut().hibernate_sched = true;
                             }
                             break Ok(RunState::Wait { timeout_ms: None });
                         }
@@ -2955,7 +2956,11 @@ impl Executor {
         {
             *deadline += shift;
         }
-        if runtime.is_hibernating(pid) {
+        if process
+            .cold
+            .as_ref()
+            .is_some_and(|cold| cold.hibernate_sched)
+        {
             process.drain(ctx)?;
             if process.inbox.is_empty() {
                 runtime.note_status(pid, "waiting");
@@ -2970,6 +2975,8 @@ impl Executor {
                 .is_some_and(|cont| cont.resume_in_place);
             if resume_in_place {
                 runtime.mark_hibernating(pid, false);
+                // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+                process.cold_mut().hibernate_sched = false;
             } else {
                 self.install_apply(process, ctx)?;
             }
@@ -2995,6 +3002,8 @@ impl Executor {
             .remove(&pid)
             .ok_or_else(|| VmError::Unsupported("hibernate continuation missing".into()))?;
         runtime.mark_hibernating(pid, false);
+        // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+        process.cold_mut().hibernate_sched = false;
         // hibernate/3 left `apply(M, F, A)` in X0..X2.
         if process.x.len() < 3 {
             return Err(VmError::Unsupported("hibernate registers".into()));

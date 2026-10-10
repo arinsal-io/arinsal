@@ -842,6 +842,7 @@ impl SpawnTuning {
             );
         }
         if let Some(off_heap) = self.off_heap_queue {
+            child.cold_mut().off_heap_msgq = off_heap;
             child.cold_mut().flags.insert(
                 "message_queue_data".to_owned(),
                 atom(if off_heap { "off_heap" } else { "on_heap" }),

@@ -115,6 +115,7 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
             // Port of erts/emulator/beam/erl_message.c:1054 (message queue data flag), OTP-29.1.1.
             let previous = flag_value(process, name).unwrap_or_else(|| atom("on_heap"));
             set_flag(process, name, value);
+            process.cold_mut().off_heap_msgq = value == atom("off_heap");
             previous
         }
         "sensitive" => {
@@ -2292,6 +2293,8 @@ fn hibernate(
         },
     );
     runtime.mark_hibernating(ctx.pid(), true);
+    // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+    process.cold_mut().hibernate_sched = true;
     Err(VmError::Unsupported("hibernate".into()))
 }
 
@@ -2322,6 +2325,8 @@ fn hibernate_zero(process: &mut Process, ctx: &RunCtx<'_, Message>) -> Result<Te
     );
     drop(parked);
     runtime.mark_hibernating(pid, true);
+    // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
+    process.cold_mut().hibernate_sched = true;
     Err(VmError::Unsupported("hibernate".into()))
 }
 

@@ -1608,7 +1608,7 @@ impl<T: Task> Inner<T> {
         // Port of erts/emulator/beam/erl_process.c:2719 (canceled timers before
         // debug-wait completion), OTP-29.1.1.
         self.poll_timers(worker, Some(local), false);
-        self.poll_pending_waits(local);
+        self.poll_pending_waits(local, true);
         self.handle_aux_work(worker);
     }
 
@@ -2634,8 +2634,13 @@ impl<T: Task> Inner<T> {
     /// Fire receive timeouts that were kept off the wheel while this worker
     /// stayed busy. A reply clears the epoch, so the common `gen_server:call`
     /// path never locks the timer wheel.
-    fn poll_pending_waits(&self, local: &mut Local<T>) {
+    fn poll_pending_waits(&self, local: &mut Local<T>, force: bool) {
         if local.pending_waits.is_empty() {
+            return;
+        }
+        // Port of erts/emulator/beam/erl_process.c:9803 (schedule: a busy scheduler reads the
+        // monotonic clock only once check_time_reds reaches ERTS_CHECK_TIME_REDS), OTP-29.1.1.
+        if !force && local.check_time_reds < self.config.reductions {
             return;
         }
         local.pending_waits.retain(|entry| {
@@ -6050,7 +6055,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
             // An offline or blocked scheduler hands its queued work and due timers to the
             // schedulers still running.
             inner.poll_timers(id, Some(&mut local), true);
-            inner.poll_pending_waits(&mut local);
+            inner.poll_pending_waits(&mut local, true);
             inner.evacuate_offline_local(&mut local);
             local.set_wall_enabled(false);
             local.set_msacc_state(MsaccState::Sleep);
@@ -6067,8 +6072,8 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         }
         // Port of erts/emulator/beam/erl_process.c:2683 (auxiliary work), OTP-29.1.1.
         local.set_msacc_state(MsaccState::Aux);
+        inner.poll_pending_waits(&mut local, false);
         inner.poll_timers(id, Some(&mut local), false);
-        inner.poll_pending_waits(&mut local);
         local.set_msacc_state(MsaccState::Other);
         inner.flush_local_metrics(&mut local);
         // Port of erts/emulator/beam/erl_process.c:9812-9822 (check_activities_to_run:
@@ -6197,7 +6202,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         local.wakeup_other_reds = 0;
         inner.parked[id].store(true, Ordering::SeqCst);
         local.set_msacc_state(MsaccState::Aux);
-        inner.poll_pending_waits(&mut local);
+        inner.poll_pending_waits(&mut local, true);
         inner.poll_timers(id, Some(&mut local), true);
         local.set_msacc_state(MsaccState::Other);
         if local.runnext.as_ref().is_some()
