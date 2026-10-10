@@ -190,14 +190,19 @@ impl Default for BeamModuleAssembler {
 }
 
 impl BeamModuleAssembler {
-    /// Loads the current local node name through the VM runtime hook.
+    /// Loads the local node name from the word at `sysname` (`erts_this_node->sysname`).
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:701-705, OTP-29.1.1.
-    pub fn emit_node(&mut self, dst: ArgVal, helper: usize) -> Result<(), ModuleError> {
-        if helper == 0 {
-            return Err(ModuleError::InvalidOperand("node helper is missing"));
+    pub fn emit_node(&mut self, dst: ArgVal, sysname: usize) -> Result<(), ModuleError> {
+        if sysname == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "local node name word is missing",
+            ));
         }
-        self.emit_runtime_fragment_with(helper, &[], 6, crate::Update::X_REGS)?;
-        self.store_register(dst, Gpr::x(0))
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(8), sysname as u64)?;
+            e.ldr_uoff(Gpr::x(8), Gpr::x(8), 0)
+        })?;
+        self.store_register(dst, Gpr::x(8))
     }
 
     /// Creates an empty module assembler.

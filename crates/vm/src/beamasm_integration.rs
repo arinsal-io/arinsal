@@ -15,7 +15,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock, Weak};
 
-type Mfa = (String, String, u8);
+// Port of erts/emulator/beam/export.c:59-72 (export_hash, export_cmp), OTP-29.1.1: exports
+// are keyed by their module and function atoms.
+type Mfa = (arinsal_term::Atom, arinsal_term::Atom, u8);
+
+/// The export key of `module:function/arity`; `None` when either name is not an atom yet,
+/// so no export can have it.
+fn existing_mfa(module: &str, function: &str, arity: u8) -> Option<Mfa> {
+    let atoms = global_atoms();
+    Some((atoms.get(module)?, atoms.get(function)?, arity))
+}
+
+/// The export key of `module:function/arity`, interning its names.
+fn interned_mfa(module: &str, function: &str, arity: u8) -> Option<Mfa> {
+    let atoms = global_atoms();
+    Some((
+        atoms.intern(module).ok()?,
+        atoms.intern(function).ok()?,
+        arity,
+    ))
+}
 
 /// Function-indexed BeamAsm target cache, invalidated when native code is published.
 pub(crate) struct NativeTargetCache {
@@ -154,16 +173,66 @@ struct ScopeExports {
     // Keyed by importing module, import index and the imported MFA: a reloaded module whose
     // import table differs must not reuse another function's slot.
     imports: HashMap<(String, u32, Mfa), Arc<DispatchTarget>>,
-    target_indices: HashMap<Mfa, usize>,
-    native_targets: HashMap<Mfa, usize>,
+    target_indices: HashMap<Mfa, usize, ExportHasher>,
+    native_targets: HashMap<Mfa, usize, ExportHasher>,
     // Exports with a global call breakpoint: their callers go through the export
     // trampoline, whose interpreted export entry is the breakpoint.
-    global_breakpoints: std::collections::HashSet<Mfa>,
+    global_breakpoints: std::collections::HashSet<Mfa, ExportHasher>,
+}
+
+/// Hashes an export key like erts' export table.
+#[derive(Default, Clone, Copy)]
+struct ExportHasher;
+
+impl std::hash::BuildHasher for ExportHasher {
+    type Hasher = ExportHashState;
+    fn build_hasher(&self) -> ExportHashState {
+        ExportHashState::default()
+    }
+}
+
+/// Folds the module atom, function atom and arity of an [`Mfa`] in the order it hashes them.
+#[derive(Default)]
+struct ExportHashState {
+    words: [u64; 3],
+    count: usize,
+}
+
+impl ExportHashState {
+    fn push(&mut self, value: u64) {
+        if let Some(word) = self.words.get_mut(self.count) {
+            *word = value;
+        } else {
+            self.words[2] = self.words[2].rotate_left(8) ^ value;
+        }
+        self.count += 1;
+    }
+}
+
+impl std::hash::Hasher for ExportHashState {
+    // Port of erts/emulator/beam/export.c:59-64 (export_hash), OTP-29.1.1:
+    // atom_val(module) * atom_val(function) ^ arity. The product is small, so it is spread
+    // over the high bits the hash table's control bytes are taken from.
+    fn finish(&self) -> u64 {
+        (self.words[0].wrapping_mul(self.words[1]) ^ self.words[2])
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.push(u64::from(byte));
+        }
+    }
+    fn write_u8(&mut self, value: u8) {
+        self.push(u64::from(value));
+    }
+    fn write_u32(&mut self, value: u32) {
+        self.push(u64::from(value));
+    }
 }
 
 #[derive(Default)]
 struct DispatchRegistry {
-    scopes: HashMap<u64, ScopeExports>,
+    scopes: HashMap<u64, ScopeExports, IdentityHasher>,
     // Leaked on first registration: native BIF calls read these on every call, and a shared
     // reference count would bounce between schedulers. Each is a few hundred bytes per import.
     by_identity: HashMap<usize, &'static DispatchTarget>,
@@ -260,8 +329,8 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
     let mut registry = dispatch_registry().write().ok()?;
     let mut identities = Vec::with_capacity(module.imports.len());
     for (index, import) in module.imports.iter().enumerate() {
-        let mfa = (import.module.clone(), import.function.clone(), import.arity);
-        let key = (module.name.clone(), index as u32, mfa.clone());
+        let mfa = (import.module_atom, import.function_atom, import.arity);
+        let key = (module.name.clone(), index as u32, mfa);
         let exports = registry.scopes.entry(scope).or_default();
         // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1:
         // an export starts at the trampoline; the loader publishes its resolved
@@ -315,9 +384,9 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
     let trampoline = fragments()?.export_trampoline();
     let save_calls = fragments()?.save_calls_export();
     let mut registry = dispatch_registry().write().ok()?;
-    let key = (module.to_owned(), function.to_owned(), arity);
     let module_atom = global_atoms().get(module)?;
     let function_atom = global_atoms().get(function)?;
+    let key = (module_atom, function_atom, arity);
     let entry = Arc::clone(registry.bif_mfas.entry(key).or_insert_with(|| {
         let bif = arinsal_bifs::lookup(module, function, arity);
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
@@ -356,20 +425,23 @@ fn publish_module_exports(
     module: &arinsal_loader::Module,
     native: &[(Mfa, usize)],
 ) {
+    let name = module.name_atom;
     exports
         .target_indices
-        .retain(|(name, _, _), _| name != &module.name);
+        .retain(|(module, _, _), _| *module != name);
     exports
         .native_targets
-        .retain(|(name, _, _), _| name != &module.name);
+        .retain(|(module, _, _), _| *module != name);
     for export in &module.exports {
-        exports.target_indices.insert(
-            (module.name.clone(), export.function.clone(), export.arity),
-            export.target(),
-        );
+        let Ok(function) = global_atoms().intern(&export.function) else {
+            continue;
+        };
+        exports
+            .target_indices
+            .insert((name, function, export.arity), export.target());
     }
     for (mfa, address) in native {
-        exports.native_targets.insert(mfa.clone(), *address);
+        exports.native_targets.insert(*mfa, *address);
     }
 }
 
@@ -413,13 +485,16 @@ pub(crate) fn unpublish_module_exports(scope: u64, name: &str) {
     if !has_scope(scope) {
         return;
     }
+    let Some(name) = global_atoms().get(name) else {
+        return;
+    };
     staged(scope, |exports| {
         exports
             .target_indices
-            .retain(|(module, _, _), _| module != name);
+            .retain(|(module, _, _), _| *module != name);
         exports
             .native_targets
-            .retain(|(module, _, _), _| module != name);
+            .retain(|(module, _, _), _| *module != name);
     });
 }
 
@@ -467,7 +542,7 @@ fn import_slot_address(exports: &ScopeExports, mfa: &Mfa, trampoline: usize) -> 
 fn refresh_import_slots(exports: &ScopeExports, ix: usize) {
     let trampoline = fragments().map_or(0, DispatchFragments::export_trampoline);
     for entry in exports.imports.values() {
-        let mfa = (entry.module.clone(), entry.function.clone(), entry.arity);
+        let mfa = (entry.module_atom, entry.function_atom, entry.arity);
         entry
             .slot
             .set_address(ix, import_slot_address(exports, &mfa, trampoline));
@@ -498,7 +573,9 @@ pub(crate) fn set_global_breakpoint(
     target: usize,
     enabled: bool,
 ) {
-    let mfa = (module.to_owned(), function.to_owned(), arity);
+    let Some(mfa) = interned_mfa(module, function, arity) else {
+        return;
+    };
     let set_target = |exports: &mut ScopeExports| {
         if let Some(index) = exports.target_indices.get_mut(&mfa) {
             *index = target;
@@ -520,7 +597,7 @@ pub(crate) fn set_global_breakpoint(
     // rerouting the export's callers is a staged code change.
     staged(scope, |exports| {
         if enabled {
-            exports.global_breakpoints.insert(mfa.clone());
+            exports.global_breakpoints.insert(mfa);
         } else {
             exports.global_breakpoints.remove(&mfa);
         }
@@ -583,18 +660,13 @@ pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
 }
 
 /// Returns the published native entry for an MFA, if this module was BeamAsm-compiled.
-pub(crate) fn native_target_for(
-    scope: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> Option<usize> {
+pub(crate) fn native_target_for_mfa(scope: u64, mfa: Mfa) -> Option<usize> {
     let registry = dispatch_registry().read().ok()?;
     registry
         .scopes
         .get(&scope)?
         .native_targets
-        .get(&(module.to_owned(), function.to_owned(), arity))
+        .get(&mfa)
         .copied()
 }
 
@@ -604,15 +676,10 @@ pub(crate) fn call_fun_unported_entry() -> usize {
 }
 
 /// Native entry for an exported MFA; local functions must stay unreachable through `apply`.
-pub(crate) fn exported_native_target(
-    scope: u64,
-    module: &str,
-    function: &str,
-    arity: u8,
-) -> Option<usize> {
+// Port of erts/emulator/beam/export.c:154-180 (erts_find_export_entry), OTP-29.1.1.
+pub(crate) fn exported_native_target(scope: u64, key: Mfa) -> Option<usize> {
     let registry = dispatch_registry().read().ok()?;
     let exports = registry.scopes.get(&scope)?;
-    let key = (module.to_owned(), function.to_owned(), arity);
     exports.target_indices.contains_key(&key).then_some(())?;
     if exports.global_breakpoints.contains(&key) {
         return None;
@@ -647,7 +714,7 @@ pub(crate) fn interpreted_target(
         .scopes
         .get(&scope)?
         .target_indices
-        .get(&(module.to_owned(), function.to_owned(), arity))
+        .get(&existing_mfa(module, function, arity)?)
         .copied()
 }
 
@@ -671,7 +738,7 @@ pub(crate) struct CompiledVersion {
     module: String,
     scope: u64,
     memory: std::sync::Mutex<arinsal_a64::exec::CodeMemory>,
-    trace_breakpoints: Vec<(Mfa, usize, u32)>,
+    trace_breakpoints: Vec<((String, String, u8), usize, u32)>,
     // Line breakpoint patch sites: source line, branch word offset, original branch.
     line_breakpoints: Vec<(u32, usize, u32)>,
     // Return addresses of enabled line-breakpoint hits, ascending.
@@ -1123,8 +1190,12 @@ impl ModuleEnv for VmModuleEnv<'_> {
         crate::native_helpers::arinsal_beamasm_raise_class as *const () as usize
     }
 
-    fn local_node_helper(&self) -> usize {
-        crate::native_helpers::arinsal_beamasm_local_node as *const () as usize
+    fn sys_perf_counter(&self) -> usize {
+        arinsal_bifs::sys_perf_counter as *const () as usize
+    }
+
+    fn this_node_sysname(&self) -> usize {
+        std::ptr::from_ref(crate::node_tables::this_node_sysname()) as usize
     }
 
     fn build_stacktrace_helper(&self) -> Option<arinsal_beamasm::catch::BuildStacktraceHook> {
@@ -1282,6 +1353,9 @@ impl ModuleEnv for VmModuleEnv<'_> {
         let fragments = fragments();
         arinsal_beamasm::misc::ApplyRuntime {
             resolver: crate::native_helpers::arinsal_beamasm_apply_resolver,
+            apply3_resolver: crate::native_helpers::arinsal_beamasm_apply3_resolver,
+            apply_fun_shared: fragments.map_or(0, DispatchFragments::apply_fun_shared),
+            fun_resolver: crate::native_helpers::arinsal_beamasm_fun_resolver,
             apply2_fragment: fragments.map_or(0, DispatchFragments::apply2_unported),
             apply3_fragment: fragments.map_or(0, DispatchFragments::apply3_unported),
         }
@@ -1447,12 +1521,12 @@ pub(crate) fn compile(
                 return None;
             }
             module.export_slot(&function.name, function.arity)?;
-            compiled.native.entries.get(&function.label).map(|entry| {
-                (
-                    (compiled.name.clone(), function.name.clone(), function.arity),
-                    *entry as usize + arinsal_beamasm::module::FUNC_INFO_BYTES,
-                )
-            })
+            let entry = compiled.native.entries.get(&function.label)?;
+            let name = global_atoms().intern(&function.name).ok()?;
+            Some((
+                (module.name_atom, name, function.arity),
+                *entry as usize + arinsal_beamasm::module::FUNC_INFO_BYTES,
+            ))
         })
         .collect::<Vec<_>>();
     let mut native_functions = Vec::with_capacity(compiled.functions.len());

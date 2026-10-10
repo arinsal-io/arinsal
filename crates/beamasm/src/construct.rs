@@ -332,6 +332,53 @@ impl BeamModuleAssembler {
         self.store_arg(dst, SCRATCH[4])
     }
 
+    /// `os:perf_counter/0` as an instruction: calls the performance counter `clock` directly
+    /// and tags its value, boxing it as a one-digit bignum when it is not a small.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3126-3164 (emit_i_perf_counter),
+    // OTP-29.1.1.
+    pub fn emit_i_perf_counter(&mut self, clock: usize, hook: GcHook) -> Result<(), ModuleError> {
+        if clock == 0 {
+            return Err(ModuleError::InvalidOperand("perf counter clock is missing"));
+        }
+        let next = self.code.new_label();
+        let small = self.code.new_label();
+        // No X register is live after a call, and the clock touches no process state.
+        crate::emit_enter_runtime(&mut self.code, 0, crate::Update::NONE)?;
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(17), clock as u64)?;
+            e.str_uoff(Gpr::x(30), C_P, 72)?;
+            e.blr(Gpr::x(17))
+        })?;
+        crate::emit_leave_runtime(&mut self.code, 0, crate::Update::NONE)?;
+        self.code.emit(|e| {
+            e.ldr_uoff(Gpr::x(30), C_P, 72)?;
+            // A small has SMALL_BITS (60) bits: the top five bits must all be equal.
+            e.asr_imm(SCRATCH[0], Gpr::x(0), 59)?;
+            e.add_imm(SCRATCH[0], SCRATCH[0], 1, false)?;
+            e.cmp_imm(SCRATCH[0], 1, false)
+        })?;
+        self.code.b_cond(Cond::Ls, small)?;
+        // XREG0 is callee-saved, so the raw counter survives the collection that keeps no
+        // X register live.
+        self.code.emit(|e| e.mov_reg(XREGS[0], Gpr::x(0)))?;
+        // ERTS_MAX_UINT64_HEAP_SIZE: a header and one digit.
+        self.emit_heap_check(0, 2, 0, hook)?;
+        self.code.emit(|e| {
+            // make_pos_bignum_header(1)
+            e.mov_const(SCRATCH[0], (1 << 6) | 0x08)?;
+            e.stp_post(SCRATCH[0], XREGS[0], HTOP, 16)?;
+            e.sub_imm(XREGS[0], HTOP, 16 - TAG_BOXED as u16, false)
+        })?;
+        self.code.b(next)?;
+        self.code.bind(small)?;
+        self.code.emit(|e| {
+            e.lsl_imm(Gpr::x(0), Gpr::x(0), 4)?;
+            e.orr_imm(XREGS[0], Gpr::x(0), 0xf)
+        })?;
+        self.code.bind(next)?;
+        Ok(())
+    }
+
     /// Checks available heap space and calls the GC hook on the slow path.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:90-122 and beam_asm_global.cpp:102-140, OTP-29.1.1
     pub fn emit_test_heap(

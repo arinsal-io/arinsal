@@ -2,7 +2,7 @@
 
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer},
-    enc::Gpr,
+    enc::{Cond, Gpr},
     exec::{CodeMemory, ExecError},
 };
 
@@ -26,6 +26,7 @@ pub struct DispatchFragments {
     apply2_offset: usize,
     apply3_offset: usize,
     save_calls_export_offset: usize,
+    apply_fun_offset: usize,
 }
 
 /// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
@@ -89,6 +90,7 @@ impl DispatchFragments {
         let apply2 = code.new_label();
         let apply3 = code.new_label();
         let save_calls_export = code.new_label();
+        let apply_fun = code.new_label();
         code.bind(export)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
         emit_export_fragment(&mut code, export_helper, raise_exception)
@@ -119,6 +121,10 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_save_calls_export_fragment(&mut code, save_calls_helper)
             .map_err(|_| ExecError::InvalidSize("save_calls export fragment"))?;
+        code.bind(apply_fun)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_apply_fun_fragment(&mut code)
+            .map_err(|_| ExecError::InvalidSize("apply/2 fragment"))?;
         code.bind(raise_exception)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_raise_exception_fragment(&mut code, exception_resolver)
@@ -144,6 +150,7 @@ impl DispatchFragments {
             apply2_offset: labels[&apply2],
             apply3_offset: labels[&apply3],
             save_calls_export_offset: labels[&save_calls_export],
+            apply_fun_offset: labels[&apply_fun],
         })
     }
 
@@ -182,10 +189,66 @@ impl DispatchFragments {
         self.memory.ptr_at(self.apply3_offset) as usize
     }
 
+    /// `apply_fun_shared`: unpacks the `apply/2` argument list in X1 into the X registers.
+    pub fn apply_fun_shared(&self) -> usize {
+        self.memory.ptr_at(self.apply_fun_offset) as usize
+    }
+
     /// Entry used when a fun has no native trampoline yet.
     pub fn call_fun_unported(&self) -> usize {
         self.memory.ptr_at(self.call_fun_unported_offset) as usize
     }
+}
+
+/// Highest number of `apply/2` arguments: erts bails at MAX_REG - 1, as the highest X
+/// register is reserved for the loader.
+const APPLY_MAX_ARGS: u16 = 1024 - 1;
+
+// Port of erts/emulator/beam/jit/arm/instr_fun.cpp:253-328 (emit_apply_fun_shared), OTP-29.1.1:
+// the fun (X0) goes to x4 and the arity to x2 for `call_fun`; x0 is zero once every argument is
+// in the X registers. A malformed list or one with too many elements returns nonzero with X0
+// and X1 untouched, and the caller hands the apply to the interpreter, which raises
+// badarg/system_limit for erlang:apply/2 like erts' error path.
+fn emit_apply_fun_fragment(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let unpack_next = code.new_label();
+    let malformed_list = code.new_label();
+    let finished = code.new_label();
+    code.emit(|e| {
+        e.mov_reg(Gpr::x(2), Gpr::xzr())?;
+        e.mov_reg(Gpr::x(4), Gpr::x(25))?;
+        e.mov_reg(Gpr::x(5), Gpr::x(26))
+    })?;
+    // No X register is live: the arguments are written straight to the X register array.
+    emit_enter_runtime(code, 0, Update::X_REGS)?;
+    code.emit(|e| {
+        e.mov_reg(Gpr::x(9), Gpr::x(5))?;
+        e.mov_reg(Gpr::x(10), Gpr::x(19))
+    })?;
+    code.bind(unpack_next)?;
+    code.emit(|e| e.cmp_imm(Gpr::x(9), 0x3b, false))?;
+    code.b_cond(Cond::Eq, finished)?;
+    // _TAG_PRIMARY_MASK - TAG_PRIMARY_LIST == 1 << 1: anything but a cons has bit 1 set.
+    code.tbnz(Gpr::x(9), 1, malformed_list)?;
+    code.emit(|e| {
+        e.sub_imm(Gpr::x(9), Gpr::x(9), 1, false)?;
+        e.ldp(Gpr::x(11), Gpr::x(9), Gpr::x(9), 0)?;
+        e.str_post(Gpr::x(11), Gpr::x(10), 8)?;
+        e.add_imm(Gpr::x(2), Gpr::x(2), 1, false)?;
+        e.cmp_imm(Gpr::x(2), APPLY_MAX_ARGS, false)
+    })?;
+    code.b_cond(Cond::Cc, unpack_next)?;
+    code.bind(malformed_list)?;
+    emit_leave_runtime(code, 0, Update::X_REGS)?;
+    code.emit(|e| {
+        e.mov_const(Gpr::x(0), 1)?;
+        e.ret(Gpr::x(30))
+    })?;
+    code.bind(finished)?;
+    emit_leave_runtime(code, 6, Update::X_REGS)?;
+    code.emit(|e| {
+        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ret(Gpr::x(30))
+    })
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:164-210, OTP-29.1.1.

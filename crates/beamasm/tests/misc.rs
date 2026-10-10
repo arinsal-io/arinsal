@@ -16,9 +16,20 @@ extern "C" fn apply_hook(process: *mut ProcessHeader, arity: u32) -> usize {
     arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
 }
 
+extern "C" fn apply3_hook(_: *mut ProcessHeader) -> usize {
+    0
+}
+
+extern "C" fn fun_hook(_: *mut ProcessHeader, _: u64, _: u32) -> usize {
+    0
+}
+
 fn runtime() -> ApplyRuntime {
     ApplyRuntime {
         resolver: apply_hook,
+        apply3_resolver: apply3_hook,
+        apply_fun_shared: 0,
+        fun_resolver: fun_hook,
         apply2_fragment: 0,
         apply3_fragment: 0,
     }
@@ -137,4 +148,92 @@ fn native_bs_set_position() {
     let (_, _, outcome) = execute(&module, ProcessHeader::default(), [ctx, tagged(7), 0]);
     assert_eq!(outcome, ExitReason::Returned);
     assert_eq!(context[2], 7);
+}
+
+extern "C" fn apply_fun_hook(process: *mut ProcessHeader, _fun: u64, arity: u32) -> usize {
+    arinsal_beamasm::rt::process_header_mut(process, |header| header.fvalue = u64::from(arity));
+    arinsal_beamasm::rt::process_header_mut(process, |header| header.self_pid as usize)
+}
+
+fn apply_fun_module(fragments: &DispatchFragments) -> FinalizedModule {
+    let runtime = ApplyRuntime {
+        apply_fun_shared: fragments.apply_fun_shared(),
+        fun_resolver: apply_fun_hook,
+        apply2_fragment: fragments.apply2_unported(),
+        ..runtime()
+    };
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
+    misc::emit_apply_call(&mut asm, ApplyKind::Apply2, runtime).unwrap();
+    asm.emit_leave_frame().unwrap();
+    asm.emit_raw(|e| {
+        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ret(Gpr::x(30))
+    })
+    .unwrap();
+    // The applied function returns its arguments untouched.
+    asm.emit_i_func_label(2).unwrap();
+    asm.emit_raw(|e| {
+        e.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        e.ret(Gpr::x(30))
+    })
+    .unwrap();
+    asm.finalize().unwrap()
+}
+
+// `apply/2` unpacks its argument list into X0.. and calls the fun with that arity.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_apply_fun_unpacks_arguments() {
+    let fragments = DispatchFragments::new(0, light_bif_hook as *const () as usize, 0, 0).unwrap();
+    let module = apply_fun_module(&fragments);
+    let header = ProcessHeader {
+        self_pid: module.entries[&2] as usize as u64,
+        ..ProcessHeader::default()
+    };
+    // [7, 8, 9] as three cons cells.
+    let mut cells = [0_u64; 6];
+    let base = cells.as_mut_ptr() as u64;
+    cells[0] = tagged(7);
+    cells[1] = (base + 16) | 1;
+    cells[2] = tagged(8);
+    cells[3] = (base + 32) | 1;
+    cells[4] = tagged(9);
+    cells[5] = 0x3b;
+    // Native code reads the cells through `base`.
+    std::hint::black_box(&cells);
+    let (header, regs, outcome) = execute(&module, header, [tagged(1), base | 1, 0]);
+    assert_eq!(outcome, ExitReason::Returned);
+    assert_eq!(header.fvalue, 3);
+    for (index, value) in [7, 8, 9].into_iter().enumerate() {
+        assert_eq!(
+            regs.x_reg_array[index],
+            arinsal_beamasm::rt::fixture_term(tagged(value))
+        );
+    }
+}
+
+// An improper argument list is applied by the interpreter, which raises, with X0/X1 intact.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn native_apply_fun_improper_list_goes_to_interpreter() {
+    let fragments = DispatchFragments::new(0, light_bif_hook as *const () as usize, 0, 0).unwrap();
+    let module = apply_fun_module(&fragments);
+    let cells = [tagged(7), tagged(8)];
+    let list = cells.as_ptr() as u64 | 1;
+    let (_, regs, outcome) = execute(&module, ProcessHeader::default(), [tagged(1), list, 0]);
+    assert!(matches!(
+        outcome,
+        ExitReason::CallUnported {
+            target_pc: arinsal_beamasm::dispatch::APPLY2_UNPORTED,
+            ..
+        }
+    ));
+    assert_eq!(
+        regs.x_reg_array[0],
+        arinsal_beamasm::rt::fixture_term(tagged(1))
+    );
+    assert_eq!(regs.x_reg_array[1], arinsal_beamasm::rt::fixture_term(list));
+    assert_eq!(cells, [tagged(7), tagged(8)]);
 }

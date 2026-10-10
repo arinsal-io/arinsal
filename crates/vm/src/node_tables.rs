@@ -415,6 +415,38 @@ static DIST_PORTS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
 pub(crate) static ANY_FRAGMENT_CONTINUATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// `erts_this_node->sysname`: the local node name atom, which native `node/0` loads
+/// without a runtime call; [`set_this_node`] updates it.
+static THIS_NODE_SYSNAME: AtomicU64 = AtomicU64::new(0);
+
+fn node_atom_word(name: &str) -> u64 {
+    arinsal_term::global_atoms()
+        .intern(name)
+        .map_or(0, |atom| arinsal_term::Term::atom(atom).tagged_word())
+}
+
+/// The word holding the local node name atom; generated code reads it by address.
+pub(crate) fn this_node_sysname() -> &'static AtomicU64 {
+    if THIS_NODE_SYSNAME.load(Ordering::Acquire) == 0 {
+        let word = node_atom_word(&lock().local_name);
+        let _ = THIS_NODE_SYSNAME.compare_exchange(0, word, Ordering::AcqRel, Ordering::Acquire);
+    }
+    &THIS_NODE_SYSNAME
+}
+
+/// Makes `name` the local node of the node table, as `setnode/2` does, and publishes it to
+/// native `node/0`.
+// Port of erts/emulator/beam/erl_node_tables.c:1042-1075 (erts_set_this_node), OTP-29.1.1.
+pub(crate) fn set_this_node(name: String, creation: u32) -> bool {
+    let mut tables = lock();
+    let word = node_atom_word(&name);
+    if !tables.set_local_node(name, creation) {
+        return false;
+    }
+    THIS_NODE_SYSNAME.store(word, Ordering::Release);
+    true
+}
+
 pub(crate) fn lock() -> MutexGuard<'static, NodeTables> {
     let mut tables = TABLES
         .get_or_init(|| Mutex::new(NodeTables::default()))

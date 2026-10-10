@@ -132,7 +132,7 @@ fn call_setnode2(
         }
         _ => return Err(badarg()),
     };
-    if !node_tables::lock().set_local_node(name.clone(), creation) {
+    if !node_tables::set_this_node(name.clone(), creation) {
         return Err(badarg());
     }
     Ok(atom("true"))

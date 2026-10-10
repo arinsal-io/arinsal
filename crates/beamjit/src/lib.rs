@@ -59,8 +59,14 @@ pub trait ModuleEnv {
     fn raise_class_helper(&self) -> usize {
         0
     }
-    /// Return the helper that reads the process-wide local node name.
-    fn local_node_helper(&self) -> usize {
+    /// Return the performance counter function native `os:perf_counter/0` calls
+    /// (`erts_sys_perf_counter`).
+    fn sys_perf_counter(&self) -> usize {
+        0
+    }
+    /// Return the address of the word holding the local node name atom
+    /// (`erts_this_node->sysname`).
+    fn this_node_sysname(&self) -> usize {
         0
     }
     /// Return the runtime hook that materializes an Erlang stacktrace.
@@ -190,6 +196,9 @@ pub trait ModuleEnv {
     fn apply_runtime(&self) -> arinsal_beamasm::misc::ApplyRuntime {
         arinsal_beamasm::misc::ApplyRuntime {
             resolver: unused_apply_resolver,
+            apply3_resolver: unused_apply3_resolver,
+            apply_fun_shared: 0,
+            fun_resolver: unused_fun_resolver,
             apply2_fragment: 0,
             apply3_fragment: 0,
         }
@@ -294,6 +303,10 @@ extern "C" fn unused_big_to_float(_process: *mut ProcessHeader, _term: u64) -> u
 }
 
 extern "C" fn unused_apply_resolver(_process: *mut ProcessHeader, _arity: u32) -> usize {
+    0
+}
+
+extern "C" fn unused_apply3_resolver(_process: *mut ProcessHeader) -> usize {
     0
 }
 
@@ -3286,7 +3299,7 @@ fn emit_op(
                 }
                 "node" => {
                     count(1)?;
-                    assembler.emit_node(value(0)?, env.local_node_helper())
+                    assembler.emit_node(value(0)?, env.this_node_sysname())
                 }
                 "build_stacktrace" => {
                     count(0)?;
@@ -3618,7 +3631,11 @@ fn emit_op(
                 count(0)?;
                 assembler.emit_i_yield()
             }
-            "i_hibernate" | "i_perf_counter" | "i_load_nif" | "i_call_on_load_function" => {
+            "i_perf_counter" => {
+                count(0)?;
+                assembler.emit_i_perf_counter(env.sys_perf_counter(), env.gc_hook())
+            }
+            "i_hibernate" | "i_load_nif" | "i_call_on_load_function" => {
                 // Port of erts/emulator/beam/jit/arm/ops.tab:660-680, 612-641, OTP-29.1.1: the
                 // loader turns these BIF calls into instructions. They keep their
                 // scheduler-visible behaviour by calling the BIF's export, whose import the
@@ -3626,11 +3643,10 @@ fn emit_op(
                 count(0)?;
                 let (module, function, arity) = match op.name() {
                     "i_hibernate" => ("erlang", "hibernate", 0),
-                    "i_perf_counter" => ("os", "perf_counter", 0),
                     "i_load_nif" => ("erlang", "load_nif", 2),
                     _ => ("erlang", "call_on_load_function", 1),
                 };
-                // The export of these BIFs names their own stub body in `erlang` (or `os`) once
+                // The export of these BIFs names their own stub body in `erlang` once
                 // that module is native, so enter the BIF itself like `call_bif_mfa` does.
                 let entry = match env.bif_mfa_entry(module, function, arity) {
                     Ok(entry) => entry,
@@ -3653,12 +3669,7 @@ fn emit_op(
                         env.export_entry(beam, import).map_err(EmitError::Operand)?
                     }
                 };
-                if op.name() == "i_perf_counter" {
-                    // A light BIF (instr_common.cpp:3126-3152 calls the clock function directly).
-                    assembler.dispatch_light_bif(env.light_bif_fragment(), entry, 0)
-                } else {
-                    assembler.dispatch_export(entry, false)
-                }
+                assembler.dispatch_export(entry, false)
             }
             "call_light_bif" => {
                 count(2)?;
