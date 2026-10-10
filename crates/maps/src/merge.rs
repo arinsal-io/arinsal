@@ -2,7 +2,7 @@
 //! them: single-pass flatmap merge, structural HAMT merge with node reuse and
 //! reduction-bounded yielding, and hash-sorted bulk HAMT construction.
 
-use super::{LIMIT, MAP, MapError, MapResult, bits, check, exact_cmp, key_cmp, term};
+use super::{LIMIT, MAP, MapError, MapResult, bits, boxed, check, exact_cmp, key_cmp, term};
 use arinsal_term::{HeapAlloc, Term, TermError, exact_eq};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -14,6 +14,12 @@ const HEAD_ARRAY: u64 = 2;
 const HEAD_BITMAP: u64 = 3;
 const NODE_BITMAP: u64 = 1;
 
+// Port of erts_write_heap_filler (erl_term.h:1500), OTP-29.1.1.
+fn heap_filler_header(words: usize) -> u64 {
+    debug_assert!(words > 0);
+    ((words as u64 - 1) << 6) | 0x08
+}
+
 /// Fresh, uninitialized heap words (`HAlloc`).
 pub(crate) fn produce<'a, H: HeapAlloc + ?Sized>(
     heap: &mut H,
@@ -24,15 +30,6 @@ pub(crate) fn produce<'a, H: HeapAlloc + ?Sized>(
     // references; MaybeUninit admits their uninitialized contents.
     let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u64>>(), words) };
     Ok((slice, ptr))
-}
-
-/// Allocate a boxed object holding exactly `words`.
-fn produce_boxed<H: HeapAlloc + ?Sized>(heap: &mut H, words: &[u64]) -> Result<Term, TermError> {
-    let (slice, ptr) = produce(heap, words.len())?;
-    for (slot, word) in slice.iter_mut().zip(words) {
-        slot.write(*word);
-    }
-    Ok(term(ptr as u64 | 2))
 }
 
 /// The words of a live boxed object: header plus `len - 1` payload words.
@@ -147,23 +144,6 @@ pub(crate) fn flatmap_from_sorted<H: HeapAlloc + ?Sized>(
     Ok(term(ptr.wrapping_add(1 + n) as u64 | 2))
 }
 
-/// Build a flatmap that shares `keys` (a key tuple of `vs.len()` keys).
-fn flatmap_with_keys<H: HeapAlloc + ?Sized>(
-    keys: Term,
-    vs: &[Term],
-    heap: &mut H,
-) -> Result<Term, TermError> {
-    let n = vs.len();
-    let (slice, ptr) = produce(heap, 3 + n)?;
-    slice[0].write(MAP);
-    slice[1].write(n as u64);
-    slice[2].write(bits(keys));
-    for (slot, value) in slice[3..].iter_mut().zip(vs) {
-        slot.write(bits(*value));
-    }
-    Ok(term(ptr as u64 | 2))
-}
-
 /// Hash-sorted HAMT from unique (or later-wins) key/value arrays.
 fn hashmap_from_pairs<H: HeapAlloc + ?Sized>(
     pairs: impl ExactSizeIterator<Item = (Term, Term)>,
@@ -177,9 +157,6 @@ fn hashmap_from_pairs<H: HeapAlloc + ?Sized>(
 }
 
 // Port of erts/emulator/beam/erl_map.c:1286-1423 (flatmap_merge), OTP-29.1.1.
-// erts writes into an oversized heap block and releases the tail; Arinsal has
-// no HRelease, so the merged arrays are staged (at most 2 * MAP_SMALL_MAP_LIMIT
-// entries) and the exact block is allocated afterwards.
 fn flatmap_merge<H: HeapAlloc + ?Sized>(
     map1: Term,
     map2: Term,
@@ -194,9 +171,18 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
     if n2 == 0 {
         return Ok(map1);
     }
-    let mut ks: SmallVec<[Term; 64]> = SmallVec::with_capacity(n1 + n2);
-    let mut vs: SmallVec<[Term; 64]> = SmallVec::with_capacity(n1 + n2);
+    let capacity = n1 + n2;
+    let words_needed = 4 + 2 * capacity;
+    let (output, output_ptr) = produce(heap, words_needed)?;
+    let values_start = 3;
+    let keys_tuple_start = values_start + capacity;
+    let keys_start = keys_tuple_start + 1;
+    output[0].write(MAP);
+    output[1].write(0);
+    output[2].write(bits(boxed(output_ptr.wrapping_add(keys_tuple_start))));
+    output[keys_tuple_start].write(0);
     let (mut i1, mut i2, mut unused_size) = (0, 0, 0);
+    let mut n = 0;
     while i1 < n1 && i2 < n2 {
         let c = if ks1[i1] == ks2[i2] {
             Ordering::Equal
@@ -205,44 +191,79 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
         };
         match c {
             Ordering::Equal => {
-                ks.push(term(ks2[i2]));
-                vs.push(term(vs2[i2]));
+                output[keys_start + n].write(ks2[i2]);
+                output[values_start + n].write(vs2[i2]);
                 i1 += 1;
                 i2 += 1;
                 unused_size += 1;
             }
             Ordering::Less => {
-                ks.push(term(ks1[i1]));
-                vs.push(term(vs1[i1]));
+                output[keys_start + n].write(ks1[i1]);
+                output[values_start + n].write(vs1[i1]);
                 i1 += 1;
             }
             Ordering::Greater => {
-                ks.push(term(ks2[i2]));
-                vs.push(term(vs2[i2]));
+                output[keys_start + n].write(ks2[i2]);
+                output[values_start + n].write(vs2[i2]);
                 i2 += 1;
             }
         }
+        n += 1;
     }
-    ks.extend(ks1[i1..].iter().map(|&k| term(k)));
-    vs.extend(vs1[i1..].iter().map(|&v| term(v)));
-    ks.extend(ks2[i2..].iter().map(|&k| term(k)));
-    vs.extend(vs2[i2..].iter().map(|&v| term(v)));
-    let n = ks.len();
+    while i1 < n1 {
+        output[keys_start + n].write(ks1[i1]);
+        output[values_start + n].write(vs1[i1]);
+        i1 += 1;
+        n += 1;
+    }
+    while i2 < n2 {
+        output[keys_start + n].write(ks2[i2]);
+        output[values_start + n].write(vs2[i2]);
+        i2 += 1;
+        n += 1;
+    }
+    output[1].write(n as u64);
+    output[keys_tuple_start].write((n as u64) << 6);
     if unused_size > 0 {
         if n == n2 {
             // Reuse all of map2; adopt map1's literal key tuple when map2's is not.
             if n == n1 && keys1.is_literal() && !keys2.is_literal() {
                 map2.flatmap_replace_keys(keys1);
             }
+            output[0].write(heap_filler_header(words_needed));
+            heap.release(output_ptr.wrapping_add(words_needed), output_ptr);
             return Ok(map2);
         } else if n == n1 {
-            return flatmap_with_keys(keys1, &vs, heap);
+            output[2].write(bits(keys1));
+            let release_from = values_start + n;
+            output[release_from].write(heap_filler_header(words_needed - release_from));
+            heap.release(
+                output_ptr.wrapping_add(words_needed),
+                output_ptr.wrapping_add(release_from),
+            );
+            return Ok(boxed(output_ptr));
+        } else {
+            output[values_start + n].write(heap_filler_header(unused_size));
+            let release_from = keys_start + n;
+            output[release_from].write(heap_filler_header(words_needed - release_from));
+            heap.release(
+                output_ptr.wrapping_add(words_needed),
+                output_ptr.wrapping_add(release_from),
+            );
         }
     }
+    let merged = boxed(output_ptr);
     if n > LIMIT {
-        return hashmap_from_pairs(ks.iter().copied().zip(vs.iter().copied()), heap);
+        let (ks, vs, _) = flatmap_kv(merged);
+        return hashmap_from_pairs(
+            ks.iter()
+                .copied()
+                .zip(vs.iter().copied())
+                .map(|(key, value)| (term(key), term(value))),
+            heap,
+        );
     }
-    flatmap_from_sorted(&ks, &vs, heap)
+    Ok(merged)
 }
 
 /// One level of the parallel HAMT walk (`struct HashmapMergePStackType`).
@@ -279,18 +300,29 @@ impl Src {
             Self::Slot(node, index) => term(boxed_words(node, index + 1)[index]),
         }
     }
+    // Port of `*srcA++` / `*srcB++` in erl_map.c:1758-1763, OTP-29.1.1.
+    fn next(&mut self) -> Term {
+        match self {
+            Self::Root(t) => *t,
+            Self::Slot(node, index) => {
+                let value = term(boxed_words(*node, *index + 1)[*index]);
+                *index += 1;
+                value
+            }
+        }
+    }
     fn advance(&mut self) {
         if let Self::Slot(_, index) = self {
             *index += 1;
         }
     }
-    /// `len` consecutive terms from this position.
-    fn run(self, len: usize) -> SmallVec<[u64; 16]> {
+    fn get_at(self, offset: usize) -> Term {
         match self {
-            Self::Root(t) => SmallVec::from_slice(&[bits(t)]),
-            Self::Slot(node, index) => {
-                SmallVec::from_slice(&boxed_words(node, index + len)[index..index + len])
+            Self::Root(t) => {
+                debug_assert_eq!(offset, 0);
+                t
             }
+            Self::Slot(node, index) => term(boxed_words(node, index + offset + 1)[index + offset]),
         }
     }
 }
@@ -303,7 +335,7 @@ impl Src {
 pub struct HashmapMergeContext {
     size: usize,
     lvl: usize,
-    stack: Vec<Frame>,
+    stack: SmallVec<[Frame; 4]>,
     started: bool,
 }
 impl std::fmt::Debug for HashmapMergeContext {
@@ -324,7 +356,7 @@ impl HashmapMergeContext {
         } else {
             (map_a, map_b)
         };
-        let mut stack = Vec::with_capacity(HAMT_MAX_LEVEL + 1);
+        let mut stack = SmallVec::new();
         stack.push(Frame {
             node_a: Term::NIL,
             node_b: Term::NIL,
@@ -356,21 +388,24 @@ fn merge_collision_node<H: HeapAlloc + ?Sized>(
     heap: &mut H,
 ) -> Result<Term, TermError> {
     debug_assert!(sz_a >= 1 && sz_b >= 1);
-    let a = src_a.run(sz_a);
-    let b = src_b.run(sz_b);
-    let mut words: SmallVec<[u64; 18]> = SmallVec::with_capacity(1 + sz_a + sz_b);
-    words.push(0);
+    let capacity = 1 + sz_a + sz_b;
+    let (words, ptr) = produce(heap, capacity)?;
+    let mut out = 1;
     let (mut ia, mut ib) = (0, 0);
-    while ia < a.len() && ib < b.len() {
-        let key_a = leaf(term(a[ia])).0;
-        let key_b = leaf(term(b[ib])).0;
+    while ia < sz_a && ib < sz_b {
+        let a = src_a.get_at(ia);
+        let b = src_b.get_at(ib);
+        let key_a = leaf(a).0;
+        let key_b = leaf(b).0;
         match exact_cmp(key_a, key_b, false) {
             Ordering::Less => {
-                words.push(a[ia]);
+                words[out].write(bits(a));
+                out += 1;
                 ia += 1;
             }
             order => {
-                words.push(b[ib]);
+                words[out].write(bits(b));
+                out += 1;
                 ib += 1;
                 if order == Ordering::Equal {
                     ia += 1;
@@ -379,12 +414,24 @@ fn merge_collision_node<H: HeapAlloc + ?Sized>(
             }
         }
     }
-    words.extend_from_slice(&a[ia..]);
-    words.extend_from_slice(&b[ib..]);
-    let arity = words.len() - 1;
+    while ia < sz_a {
+        words[out].write(bits(src_a.get_at(ia)));
+        out += 1;
+        ia += 1;
+    }
+    while ib < sz_b {
+        words[out].write(bits(src_b.get_at(ib)));
+        out += 1;
+        ib += 1;
+    }
+    let arity = out - 1;
     debug_assert!(arity >= 2);
-    words[0] = (arity as u64) << 6;
-    produce_boxed(heap, &words)
+    words[0].write((arity as u64) << 6);
+    if out < capacity {
+        words[out].write(heap_filler_header(capacity - out));
+        heap.release(ptr.wrapping_add(capacity), ptr.wrapping_add(out));
+    }
+    Ok(boxed(ptr))
 }
 
 /// Decode one side of a node pair for the walk: its bitmap at `lvl` (or its
@@ -557,15 +604,13 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                             clash = true;
                             break;
                         }
-                        sp.array[sp.ix] = sp.src_a.get();
+                        sp.array[sp.ix] = sp.src_a.next();
                         sp.ix += 1;
-                        sp.src_a.advance();
                         sp.mix |= 1;
                     } else {
                         debug_assert!(sp.bbm & bit != 0);
-                        sp.array[sp.ix] = sp.src_b.get();
+                        sp.array[sp.ix] = sp.src_b.next();
                         sp.ix += 1;
-                        sp.src_b.advance();
                         sp.mix |= 2;
                     }
                 }
@@ -597,19 +642,24 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     3 => {
                         debug_assert_eq!(sp.ix, (sp.abm | sp.bbm).count_ones() as usize);
                         let bitmap = u64::from(sp.abm | sp.bbm);
-                        let mut words: SmallVec<[u64; 18]> = SmallVec::new();
+                        let header_words = if lvl == 0 { 2 } else { 1 };
+                        let (words, ptr) = produce(heap, header_words + sp.ix)?;
                         if lvl == 0 {
-                            words.push(if sp.ix == 16 {
+                            words[0].write(if sp.ix == 16 {
                                 super::header(HEAD_ARRAY, 0xffff)
                             } else {
                                 super::header(HEAD_BITMAP, bitmap as u16)
                             });
-                            words.push(ctx.size as u64);
+                            words[1].write(ctx.size as u64);
                         } else {
-                            words.push(super::header(NODE_BITMAP, bitmap as u16));
+                            words[0].write(super::header(NODE_BITMAP, bitmap as u16));
                         }
-                        words.extend(sp.array[..sp.ix].iter().map(|t| bits(*t)));
-                        produce_boxed(heap, &words)?
+                        for (word, child) in
+                            words[header_words..].iter_mut().zip(&sp.array[..sp.ix])
+                        {
+                            word.write(bits(*child));
+                        }
+                        boxed(ptr)
                     }
                     mix => unreachable!("strange mix {mix}"),
                 });
@@ -620,6 +670,8 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
 }
 
 /// Outcome of the non-yielding part of `maps:merge/2`.
+// The inline stack is OTP's `PSTACK_DECLARE(s, 4)`; boxing it would allocate per merge.
+#[allow(clippy::large_enum_variant)]
 pub enum MergeStart {
     /// The merged map.
     Done(Term),
