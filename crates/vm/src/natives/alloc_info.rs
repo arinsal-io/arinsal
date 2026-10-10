@@ -109,8 +109,23 @@ fn request_allocators(
     // the caller before aux workers build replies, so the intern order matches
     // the aux-thread-then-requester order and does not race.
     super::alloc_atoms::note_memory_internal(&names);
+    // `allocated_areas` runs after this reply is built and interns its labels then.
+    // Intern them first so `atom_space` matches the bytes added to `std_alloc`.
+    if memory_internal {
+        super::alloc_atoms::note_allocated_areas();
+    }
     snapshot_process(process, process.gc_live);
     let values = memory_values(vm, process);
+    if memory_internal {
+        let value = |key: &str| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| *value)
+                .unwrap_or(0)
+        };
+        super::freeze_memory_sample(value("atom"), value("atom_used"), value("processes"));
+    }
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
     let target = ctx.pid();
     let names = names

@@ -127,8 +127,6 @@ struct Copier<'a> {
     old: Area,
     n_htop: HeapTop,
     old_htop: HeapTop,
-    /// Literal areas: the only memory outside the process that its terms may point to.
-    literals: crate::literal::LiteralAreas,
     /// Sorted owned fragment ranges, kept only to check the erts rule in debug builds.
     #[cfg(debug_assertions)]
     fragment_ranges: Vec<(usize, usize)>,
@@ -301,8 +299,7 @@ impl Copier<'_> {
     // Port of erts/emulator/beam/global.h:1568 (erts_is_literal), OTP-29.1.1.
     #[inline]
     fn is_literal(&self, address: usize) -> bool {
-        address == std::ptr::from_ref(&crate::EMPTY_TUPLE) as usize
-            || self.literals.is_literal(address as u64)
+        crate::literal::is_literal_address(address)
     }
 
     /// Debug check of the erts invariant behind the ownership rule: a moved pointer that is
@@ -900,7 +897,7 @@ impl ProcessHeap {
         !self.collection_is_major()
             && ((self.old_words.is_empty() && self.mature_words() == 0)
                 || (!self.old_words.is_empty()
-                    && self.owners.vheap.old_size <= self.owners.vheap.old))
+                    && self.owners.vheap_old_size() <= self.owners.vheap_old()))
     }
 
     /// Whether heap fragments exceed the free young-generation area.
@@ -1073,9 +1070,7 @@ impl ProcessHeap {
         next.stop = capacity - stack;
         next.frame_pointer = self.frame_pointer;
         next.min_heap_size = self.min_heap_size;
-        next.owners.vheap.min = self.owners.vheap.min;
         next.bin_vheap_size = self.bin_vheap_size;
-        next.owners.vheap.old_size = self.owners.vheap.old_size;
         next.fullsweep_after = self.fullsweep_after;
         next.heap_grow = self.heap_grow;
         next.native_allocation = self.native_allocation;
@@ -1084,22 +1079,27 @@ impl ProcessHeap {
         } else {
             self.minor_since_major.saturating_add(1)
         };
-        next.off_heap_binary_bytes = if major {
-            0
-        } else {
-            self.owners
-                .old_off_heap
-                .iter()
-                .map(|binary| binary.len() as u64)
-                .chain(
-                    self.owners
-                        .old_external
-                        .iter()
-                        .map(|binary| binary.len() as u64),
-                )
-                .sum()
-        };
-        next.owners.vheap.old = if major { 0 } else { self.owners.vheap.old };
+        // A process with no off-heap owners keeps the lazy box empty. Forcing it
+        // here would malloc a HeapOwners on every minor GC.
+        if self.owners.is_allocated() {
+            next.owners.vheap.min = self.owners.vheap_min();
+            next.owners.vheap.old_size = self.owners.vheap_old_size();
+            if !major {
+                next.off_heap_binary_bytes = self
+                    .owners
+                    .old_off_heap
+                    .iter()
+                    .map(|binary| binary.len() as u64)
+                    .chain(
+                        self.owners
+                            .old_external
+                            .iter()
+                            .map(|binary| binary.len() as u64),
+                    )
+                    .sum();
+            }
+            next.owners.vheap.old = if major { 0 } else { self.owners.vheap_old() };
+        }
         if !major {
             next.old_words = std::mem::take(&mut self.old_words);
             if next.old_words.is_empty() && mature_words > 0 {
@@ -1113,14 +1113,16 @@ impl ProcessHeap {
                 .words;
             }
             next.old_htop = self.old_htop;
-            next.owners.old_off_heap = std::mem::take(&mut self.owners.old_off_heap);
-            next.owners.old_writable = std::mem::take(&mut self.owners.old_writable);
-            next.owners.old_external = std::mem::take(&mut self.owners.old_external);
-            next.owners.old_nodes = std::mem::take(&mut self.owners.old_nodes);
-            next.owners.old_funs = std::mem::take(&mut self.owners.old_funs);
-            next.owners.old_exports = std::mem::take(&mut self.owners.old_exports);
-            next.owners.old_magic = std::mem::take(&mut self.owners.old_magic);
-            next.owners.old_writable_refs = std::mem::take(&mut self.owners.old_writable_refs);
+            if self.owners.is_allocated() {
+                next.owners.old_off_heap = std::mem::take(&mut self.owners.old_off_heap);
+                next.owners.old_writable = std::mem::take(&mut self.owners.old_writable);
+                next.owners.old_external = std::mem::take(&mut self.owners.old_external);
+                next.owners.old_nodes = std::mem::take(&mut self.owners.old_nodes);
+                next.owners.old_funs = std::mem::take(&mut self.owners.old_funs);
+                next.owners.old_exports = std::mem::take(&mut self.owners.old_exports);
+                next.owners.old_magic = std::mem::take(&mut self.owners.old_magic);
+                next.owners.old_writable_refs = std::mem::take(&mut self.owners.old_writable_refs);
+            }
         }
         let mut from = std::mem::replace(self, next);
         let old_frame_pointer = from.frame_pointer;
@@ -1129,10 +1131,6 @@ impl ProcessHeap {
             old_end: from.words.as_ptr() as usize + from.words.len() * 8,
             new_start: self.words.as_ptr() as usize + self.stop * 8,
         };
-        let code_ranges = crate::native_code::native_code_ranges();
-        let code_ranges = code_ranges
-            .as_deref()
-            .map_or(&[][..], |ranges| ranges.as_slice());
         let young_start = from.words.as_ptr() as usize;
         let young = Area {
             start: young_start,
@@ -1182,7 +1180,6 @@ impl ProcessHeap {
             young,
             mature,
             old,
-            literals: crate::literal::LiteralAreas::current(),
             #[cfg(debug_assertions)]
             fragment_ranges,
             sub_bits: Vec::new(),
@@ -1235,11 +1232,15 @@ impl ProcessHeap {
         if let Some(error) = error {
             return Err(error);
         }
-        // The code range guard stays held: a second read acquisition could block behind a
-        // queued writer (a module being registered) while this one is still held.
-        self.adjust_young_heap(major, min_free, roots, extra, code_ranges)?;
+        self.adjust_young_heap(major, min_free, roots, extra)?;
         #[cfg(debug_assertions)]
-        self.verify_frame_chain(code_ranges);
+        {
+            let code_ranges = crate::native_code::native_code_ranges();
+            let code_ranges = code_ranges
+                .as_deref()
+                .map_or(&[][..], |ranges| ranges.as_slice());
+            self.verify_frame_chain(code_ranges);
+        }
         // Verify all roots after collection so stale pointers fail where they enter.
         #[cfg(debug_assertions)]
         crate::validate::verify_roots_after_collection(self, roots, extra);
@@ -1257,12 +1258,12 @@ impl ProcessHeap {
             self.owners.vheap.old = 0;
             self.owners.vheap.old_size = next_vheap_size(
                 young_overhead,
-                self.owners.vheap.old_size,
-                self.owners.vheap.min,
+                self.owners.vheap_old_size(),
+                self.owners.vheap_min(),
             );
         }
         self.bin_vheap_size =
-            next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap.min);
+            next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
         Ok(stats)
     }
 
@@ -1284,11 +1285,7 @@ impl ProcessHeap {
             .saturating_add(S_RESERVED)
             .saturating_add(self.stack_words());
         if exact != self.words.len() {
-            let code_ranges = crate::native_code::native_code_ranges();
-            let code_ranges = code_ranges
-                .as_deref()
-                .map_or(&[][..], |ranges| ranges.as_slice());
-            self.relocate_young(exact, roots, extra, code_ranges);
+            self.relocate_young(exact, roots, extra);
         }
         self.heap_grow = false;
         Ok(stats)
@@ -1301,7 +1298,6 @@ impl ProcessHeap {
         min_free: usize,
         roots: &mut [Term],
         extra: &mut [Term],
-        code_ranges: &[(usize, usize)],
     ) -> Result<(), TermError> {
         let stack = self.stack_words();
         let need_after = self
@@ -1354,75 +1350,93 @@ impl ProcessHeap {
         if let Some(wanted) = wanted
             && wanted != capacity
         {
-            self.relocate_young(wanted, roots, extra, code_ranges);
+            self.relocate_young(wanted, roots, extra);
         }
         Ok(())
     }
 
-    /// Move the young heap to a block of `new_words`, keeping object addresses consistent.
-    fn relocate_young(
-        &mut self,
-        new_words: usize,
-        roots: &mut [Term],
-        extra: &mut [Term],
-        code_ranges: &[(usize, usize)],
-    ) {
+    /// Resize the young heap with `ERTS_HEAP_REALLOC`. When the block stays put, only
+    /// the stack (which moved within the block) is adjusted; a moved block rebases
+    /// every young pointer, the way `resize_new_heap` does.
+    // Port of erts/emulator/beam/erl_gc.c:2794 (`resize_new_heap`), OTP-29.1.1.
+    fn relocate_young(&mut self, new_words: usize, roots: &mut [Term], extra: &mut [Term]) {
         let stack = self.stack_words();
         debug_assert!(new_words >= self.htop.saturating_add(stack));
-        let old_start = self.words.as_ptr() as usize;
-        let old_end = old_start + self.htop * 8;
-        let old_stack_start = self.words.as_ptr() as usize + self.stop * 8;
-        let old_stack_end = self.words.as_ptr() as usize + self.words.len() * 8;
-        let mut fresh = ProcessHeap::with_words(new_words);
-        let block = std::mem::take(&mut fresh.words);
-        let new_start = block.as_ptr() as usize;
+        let prev_len = self.words.len();
+        if new_words == prev_len {
+            return;
+        }
+        let prev_heap = self.words.as_ptr() as usize;
+        let prev_stop = self.stop;
+        let prev_stack = prev_heap + prev_stop * 8;
+        let prev_stack_end = prev_heap + prev_len * 8;
+        let heap_end = prev_heap + self.htop * 8;
+        // Shrinking discards the tail, so the stack has to sit inside the kept prefix first.
+        if new_words < prev_len {
+            let new_stop = new_words - stack;
+            self.words
+                .words_mut()
+                .copy_within(prev_stop..prev_len, new_stop);
+        }
+        self.words.realloc(new_words);
+        let new_heap = self.words.as_ptr() as usize;
         let new_stop = new_words - stack;
+        if new_words > prev_len {
+            // Realloc leaves the stack at its old index (or copies it there). Slide it to the end.
+            let old_index = prev_len - stack;
+            self.words
+                .words_mut()
+                .copy_within(old_index..old_index + stack, new_stop);
+        }
+        self.stop = new_stop;
+        let new_stack = new_heap + new_stop * 8;
+        let heap_move = MoveRange {
+            old_start: prev_heap,
+            old_end: heap_end,
+            new_start: new_heap,
+        };
         let stack_move = MoveRange {
-            old_start: old_stack_start,
-            old_end: old_stack_end,
-            new_start: new_start + new_stop * 8,
+            old_start: prev_stack,
+            old_end: prev_stack_end,
+            new_start: new_stack,
         };
         if self.frame_pointer != 0 {
             self.frame_pointer = rebase_address(self.frame_pointer, stack_move);
         }
-        // SAFETY: `fresh` is exclusive, `htop` words were initialized by the copy,
-        // and the live stack occupies `stack` words at `stop`. The blocks do not overlap.
-        unsafe {
-            let src = self.words.as_ptr().cast::<u64>();
-            let dst = block.as_ptr().cast::<u64>().cast_mut();
-            if self.htop > 0 {
-                std::ptr::copy_nonoverlapping(src, dst, self.htop);
-            }
-            if stack > 0 {
-                std::ptr::copy_nonoverlapping(src.add(self.stop), dst.add(new_stop), stack);
-            }
-            offset_young_objects(dst, self.htop, old_start, old_end, new_start);
-            offset_stack_slots(
-                dst.add(new_stop),
-                stack,
-                MoveRange {
-                    old_start,
-                    old_end,
-                    new_start,
-                },
-                stack_move,
-                code_ranges,
+        if new_heap != prev_heap {
+            offset_young_objects(
+                self.words.as_ptr().cast::<u64>().cast_mut(),
+                self.htop,
+                prev_heap,
+                heap_end,
+                new_heap,
             );
+            for term in roots.iter_mut().chain(extra.iter_mut()) {
+                term.0 = offset_word(term.0, heap_move);
+            }
         }
-        for term in roots.iter_mut().chain(extra.iter_mut()) {
-            term.0 = offset_word(
-                term.0,
-                MoveRange {
-                    old_start,
-                    old_end,
-                    new_start,
-                },
-            );
-        }
-        self.words = block;
-        self.stop = new_stop;
+        // Untagged stack words inside the old stack are frame pointers. Return
+        // addresses fail that test and `offset_word` leaves them alone, so the
+        // code-range registry is not consulted. Port of erl_gc.c:3368 (`offset_stack`).
+        offset_stack_slots(
+            self.words
+                .as_ptr()
+                .cast::<u64>()
+                .cast_mut()
+                .wrapping_add(new_stop),
+            stack,
+            heap_move,
+            stack_move,
+            &[],
+        );
         #[cfg(debug_assertions)]
-        self.verify_frame_chain(code_ranges);
+        {
+            let code_ranges = crate::native_code::native_code_ranges();
+            let code_ranges = code_ranges
+                .as_deref()
+                .map_or(&[][..], |ranges| ranges.as_slice());
+            self.verify_frame_chain(code_ranges);
+        }
     }
 
     #[cfg(debug_assertions)]

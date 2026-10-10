@@ -154,6 +154,178 @@ impl AllocBlock {
     pub fn as_ptr(&self) -> *const u64 {
         self.memory.as_ptr()
     }
+
+    /// Allocates `user_words` and returns the user pointer.
+    ///
+    /// The handle lives in a prefix of the same allocation, so the caller stores one
+    /// pointer the way `ERTS_HEAP_ALLOC` stores `Eterm *heap` — no side descriptor.
+    /// Port of erts/emulator/beam/erl_process.h:88 (`ERTS_HEAP_ALLOC`), OTP-29.1.1.
+    pub fn detach_heap(
+        allocation_type: ErtsAlcType,
+        user_words: usize,
+    ) -> Result<*mut u64, AllocError> {
+        if user_words == 0 {
+            return Ok(std::ptr::null_mut());
+        }
+        let total = user_words
+            .checked_add(HEAP_PREFIX_WORDS)
+            .ok_or(AllocError::OutOfBounds)?;
+        let mut block = Self::new(allocation_type, total)?;
+        let handle = block
+            .handle
+            .expect("a non-empty heap block has an allocator handle");
+        let tag = heap_type_tag(allocation_type);
+        {
+            let slice = block.as_mut_slice();
+            slice[0] = handle.instance() as u64;
+            slice[1] = handle.allocation_id();
+            slice[2] = user_words as u64;
+            slice[3] = tag;
+        }
+        let user = block.as_ptr().wrapping_add(HEAP_PREFIX_WORDS) as *mut u64;
+        // The prefix now owns the handle; dropping `block` would free the heap.
+        std::mem::forget(block);
+        Ok(user)
+    }
+
+    /// Frees a block produced by [`AllocBlock::detach_heap`].
+    pub fn free_detached_heap(user: *mut u64) {
+        if user.is_null() {
+            return;
+        }
+        let Some(prefix) = heap_prefix(user) else {
+            return;
+        };
+        let allocation_type = heap_type_from_tag(prefix.tag);
+        let Ok(allocators) = allocator_for(allocation_type) else {
+            return;
+        };
+        let handle = InstanceAllocation::from_parts(prefix.instance, prefix.id, prefix.bytes);
+        let _ = allocators.free(handle);
+    }
+
+    /// `ERTS_HEAP_REALLOC`: resize, preserving the user prefix, and return the user pointer.
+    /// Port of erts/emulator/beam/erl_process.h:91 (`ERTS_HEAP_REALLOC`), OTP-29.1.1.
+    pub fn realloc_detached_heap(
+        user: *mut u64,
+        new_user_words: usize,
+    ) -> Result<*mut u64, AllocError> {
+        if user.is_null() {
+            return Self::detach_heap(ErtsAlcType::HEAP, new_user_words);
+        }
+        if new_user_words == 0 {
+            Self::free_detached_heap(user);
+            return Ok(std::ptr::null_mut());
+        }
+        let prefix = heap_prefix(user).ok_or(AllocError::Corrupt)?;
+        let allocation_type = heap_type_from_tag(prefix.tag);
+        let allocators = allocator_for(allocation_type)?;
+        let handle = InstanceAllocation::from_parts(prefix.instance, prefix.id, prefix.bytes);
+        let new_bytes = new_user_words
+            .checked_add(HEAP_PREFIX_WORDS)
+            .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+            .ok_or(AllocError::OutOfBounds)?;
+        let (handle, base) = allocators.realloc_with_ptr(handle, new_bytes)?;
+        let mut view = crate::raw::WordView::new(base, HEAP_PREFIX_WORDS);
+        let slice = view.as_mut_slice();
+        slice[0] = handle.instance() as u64;
+        slice[1] = handle.allocation_id();
+        slice[2] = new_user_words as u64;
+        slice[3] = prefix.tag;
+        Ok(base.wrapping_add(HEAP_PREFIX_WORDS))
+    }
+
+    /// Rebuilds an owned block for a detached user pointer. `as_ptr` is the user words;
+    /// dropping the block frees the whole allocation, prefix included.
+    pub fn reattach_heap(user: *mut u64) -> Result<Self, AllocError> {
+        if user.is_null() {
+            return Self::new(ErtsAlcType::OLD_HEAP, 0);
+        }
+        let prefix = heap_prefix(user).ok_or(AllocError::Corrupt)?;
+        let allocation_type = heap_type_from_tag(prefix.tag);
+        let allocators = allocator_for(allocation_type)?;
+        Ok(Self {
+            memory: crate::raw::WordView::new(user, prefix.user_words),
+            allocation_type,
+            handle: Some(InstanceAllocation::from_parts(
+                prefix.instance,
+                prefix.id,
+                prefix.bytes,
+            )),
+            allocators,
+        })
+    }
+
+    /// User words of a detached heap block. A null pointer is an empty block.
+    pub fn heap_user_slice<'a>(user: *const u64) -> &'a [u64] {
+        match heap_prefix(user) {
+            Some(prefix) => crate::raw::words_at(user, prefix.user_words),
+            None => &[],
+        }
+    }
+
+    /// Exclusive user words of a detached heap block. A null pointer is an empty block.
+    pub fn heap_user_slice_mut<'a>(user: *mut u64) -> &'a mut [u64] {
+        match heap_prefix(user) {
+            Some(prefix) => crate::raw::words_at_mut(user, prefix.user_words),
+            None => &mut [],
+        }
+    }
+
+    /// User-word count of a detached heap block.
+    pub fn heap_user_len(user: *const u64) -> usize {
+        heap_prefix(user).map_or(0, |prefix| prefix.user_words)
+    }
+}
+
+/// Words stored ahead of the user payload so a heap block is one pointer.
+const HEAP_PREFIX_WORDS: usize = 4;
+
+struct HeapPrefix {
+    instance: usize,
+    id: u64,
+    user_words: usize,
+    tag: u64,
+    bytes: usize,
+}
+
+fn heap_prefix(user: *const u64) -> Option<HeapPrefix> {
+    if user.is_null() {
+        return None;
+    }
+    let base = user.wrapping_sub(HEAP_PREFIX_WORDS);
+    let words = crate::raw::words_at(base, HEAP_PREFIX_WORDS);
+    let user_words = words[2] as usize;
+    let bytes = user_words
+        .checked_add(HEAP_PREFIX_WORDS)?
+        .checked_mul(std::mem::size_of::<u64>())?;
+    Some(HeapPrefix {
+        instance: words[0] as usize,
+        id: words[1],
+        user_words,
+        tag: words[3],
+        bytes,
+    })
+}
+
+fn heap_type_tag(allocation_type: ErtsAlcType) -> u64 {
+    if allocation_type == ErtsAlcType::HEAP {
+        1
+    } else if allocation_type == ErtsAlcType::OLD_HEAP {
+        2
+    } else if allocation_type == ErtsAlcType::HEAP_FRAG {
+        3
+    } else {
+        0
+    }
+}
+
+fn heap_type_from_tag(tag: u64) -> ErtsAlcType {
+    match tag {
+        2 => ErtsAlcType::OLD_HEAP,
+        3 => ErtsAlcType::HEAP_FRAG,
+        _ => ErtsAlcType::HEAP,
+    }
 }
 
 impl Drop for AllocBlock {

@@ -11,6 +11,7 @@ use arinsal_term::{
     FragmentIndex, SharedCopyCache, Term, TermBuilder, TermKind, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms,
 };
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2241,7 +2242,13 @@ fn ethread_info(process: &mut Process) -> Result<Term, VmError> {
 fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/erl_bif_info.c:2773 (allocated_areas selector), OTP-29.1.1.
     alloc_atoms::note_allocated_areas();
-    snapshot_process(process, process.gc_live);
+    // `erlang:memory/0` already sampled process and atom bytes into the allocator
+    // reply (`std_alloc`). A second sample sees the heap grow while those replies
+    // are built, and `system = total - processes` then drops below atom+code.
+    let sampled = take_memory_sample();
+    if sampled.is_none() {
+        snapshot_process(process, process.gc_live);
+    }
     let values = memory_values(vm, process);
     let value = |name: &str| {
         values
@@ -2254,10 +2261,12 @@ fn memory_areas(vm: &Vm, process: &mut Process) -> Result<Term, VmError> {
     let external_bytes = persistent as u64;
     let external_size = non_neg(process, external_bytes)?;
     let external = tuple(process, &[atom("external_alloc"), external_size])?;
-    let allocated_atoms = non_neg(process, value("atom"))?;
-    let used_atoms = non_neg(process, value("atom_used"))?;
+    let (atom_bytes, atom_used_bytes, process_bytes) =
+        sampled.unwrap_or((value("atom"), value("atom_used"), value("processes")));
+    let allocated_atoms = non_neg(process, atom_bytes)?;
+    let used_atoms = non_neg(process, atom_used_bytes)?;
     let atoms = tuple(process, &[atom("atom_space"), allocated_atoms, used_atoms])?;
-    let processes = non_neg(process, value("processes"))?;
+    let processes = non_neg(process, process_bytes)?;
     let processes = tuple(process, &[atom("process_table"), processes])?;
     let ets_size = non_neg(process, value("ets"))?;
     let ets = tuple(process, &[atom("ets_misc"), ets_size])?;
@@ -2294,6 +2303,21 @@ pub(crate) fn memory_values(vm: &Vm, process: &Process) -> [(&'static str, u64);
         ("code", code),
         ("ets", ets),
     ]
+}
+
+thread_local! {
+    /// `(atom, atom_used, processes)` from the `memory_internal` half of `erlang:memory/0`.
+    static MEMORY_SAMPLE: Cell<Option<(u64, u64, u64)>> = const { Cell::new(None) };
+}
+
+/// Keep the `memory_internal` sizes for the following `allocated_areas` call.
+pub(super) fn freeze_memory_sample(atom: u64, atom_used: u64, processes: u64) {
+    MEMORY_SAMPLE.set(Some((atom, atom_used, processes)));
+}
+
+/// Take the sample captured by [`freeze_memory_sample`], if this thread has one.
+pub(super) fn take_memory_sample() -> Option<(u64, u64, u64)> {
+    MEMORY_SAMPLE.replace(None)
 }
 
 pub(crate) fn snapshot_process(process: &mut Process, _live_x: usize) {

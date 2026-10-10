@@ -199,6 +199,10 @@ pub struct Allocation {
 }
 
 impl Allocation {
+    pub(crate) fn from_parts(id: u64, size: usize) -> Self {
+        Self { id, size }
+    }
+
     pub(crate) fn id(self) -> u64 {
         self.id
     }
