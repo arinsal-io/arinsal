@@ -131,7 +131,8 @@ impl NativeTargetCache {
 
 #[derive(Clone)]
 pub(crate) struct DispatchTarget {
-    slot: &'static arinsal_beamasm::bif::ExportEntry,
+    /// The node's export entry; export funs of this MFA hold it too (`Export.lambda`).
+    slot: &'static Arc<arinsal_beamasm::bif::ExportEntry>,
     /// Code scope whose code indexes select the slot's address; zero for scope-free slots.
     scope: u64,
     pub module: String,
@@ -174,13 +175,15 @@ impl DispatchTarget {
 }
 
 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
+// The entry is never freed: it lives as long as the export table, like erts' export entries.
 fn new_export_slot(
+    mfa: Mfa,
     address: usize,
     save_calls: usize,
-) -> &'static arinsal_beamasm::bif::ExportEntry {
-    Box::leak(Box::new(
-        arinsal_beamasm::bif::ExportEntry::with_save_calls(address, save_calls),
-    ))
+) -> &'static Arc<arinsal_beamasm::bif::ExportEntry> {
+    Box::leak(Box::new(Arc::new(
+        arinsal_beamasm::bif::ExportEntry::with_addresses(mfa.0, mfa.1, mfa.2, address, save_calls),
+    )))
 }
 
 /// One node's export state, like an erts code index: import slots, interpreted and native
@@ -320,12 +323,14 @@ fn dispatch_entry(
             entry
         }
     };
-    let identity = entry.slot as *const _ as usize;
+    let identity = Arc::as_ptr(entry.slot) as usize;
     Some(registry.intern_identity(identity, &entry))
 }
 
 /// Allocates the code scope of a new node.
 pub(crate) fn new_code_scope() -> u64 {
+    // The fun dispatch fragments must exist before the node creates fun entries.
+    let _ = fragments();
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -342,7 +347,7 @@ pub(crate) fn release_code_scope(scope: u64) {
         for entry in exports.dispatch.values() {
             registry
                 .by_identity
-                .remove(&(entry.slot as *const _ as usize));
+                .remove(&(Arc::as_ptr(entry.slot) as usize));
         }
     }
 }
@@ -351,13 +356,17 @@ fn fragments() -> Option<&'static DispatchFragments> {
     static FRAGMENTS: OnceLock<Option<DispatchFragments>> = OnceLock::new();
     FRAGMENTS
         .get_or_init(|| {
-            DispatchFragments::new(
+            let fragments = DispatchFragments::with_fun_helpers(
                 crate::native_helpers::arinsal_beamasm_export_trampoline as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_call_light_bif_shared as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_exception_resolver as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_save_calls_export as *const () as usize,
+                crate::native_helpers::arinsal_beamasm_fun_resolver as *const () as usize,
+                crate::fun_dispatch::arinsal_beamasm_save_calls_fun as *const () as usize,
             )
-            .ok()
+            .ok()?;
+            crate::fun_dispatch::init(fragments.unloaded_fun(), fragments.save_calls_fun());
+            Some(fragments)
         })
         .as_ref()
 }
@@ -376,6 +385,53 @@ fn map_fragments() -> Option<&'static arinsal_beamasm::map::MapFragments> {
                 .ok()
         })
         .as_ref()
+}
+
+/// The export entry of `mfa` in `scope`, creating a stub entry (entering the export
+/// trampoline) when the scope has none. Export funs point at it.
+// Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
+pub(crate) fn export_get_or_make_stub(
+    scope: u64,
+    mfa: Mfa,
+) -> Option<Arc<arinsal_beamasm::bif::ExportEntry>> {
+    if let Ok(registry) = dispatch_registry().read()
+        && let Some(entry) = registry
+            .scopes
+            .get(&scope)
+            .and_then(|exports| exports.dispatch.get(&mfa))
+    {
+        return Some(Arc::clone(entry.slot));
+    }
+    let trampoline = fragments()?.export_trampoline();
+    let save_calls = fragments()?.save_calls_export();
+    let module = global_atoms().text(mfa.0)?.to_string();
+    let function = global_atoms().text(mfa.1)?.to_string();
+    let entry = dispatch_entry(scope, mfa, || {
+        let bif = arinsal_bifs::lookup(&module, &function, mfa.2);
+        let (class, bits) = crate::natives::classify(&module, &function, mfa.2, bif.is_some());
+        Some(DispatchTarget {
+            // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
+            slot: new_export_slot(mfa, trampoline, save_calls),
+            scope,
+            trap_entry: crate::bif_traps::traps(&module, &function, mfa.2),
+            direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2)
+                .or_else(|| crate::natives::proc::direct_dictionary(&module, &function, mfa.2)),
+            module: module.clone(),
+            function: function.clone(),
+            module_atom: mfa.0,
+            function_atom: mfa.1,
+            arity: mfa.2,
+            bif,
+            class,
+            native_bits: bits,
+            light_bif: None,
+            light_process_bif: None,
+        })
+    })?;
+    crate::code_ix::for_scope(scope).update_active(|tables| {
+        tables.exports.bind_dispatch(mfa, entry.export_entry());
+    });
+    Some(Arc::clone(entry.slot))
 }
 
 fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usize>> {
@@ -398,7 +454,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
             };
             Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
-                slot: new_export_slot(trampoline, save_calls),
+                slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
                 trap_entry: crate::bif_traps::traps(&import.module, &import.function, import.arity),
                 direct_ets: crate::natives::ets::direct_entry(
@@ -428,7 +484,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
         crate::code_ix::for_scope(scope).update_active(|tables| {
             tables.exports.bind_dispatch(mfa, entry.export_entry());
         });
-        identities.push(entry.slot as *const _ as usize);
+        identities.push(Arc::as_ptr(entry.slot) as usize);
     }
     Some(identities)
 }
@@ -445,7 +501,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
         let bif = arinsal_bifs::lookup(module, function, arity);
         let (class, bits) = crate::natives::classify(module, function, arity, bif.is_some());
         Arc::new(DispatchTarget {
-            slot: new_export_slot(trampoline, save_calls),
+            slot: new_export_slot(key, trampoline, save_calls),
             scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
             direct_ets: crate::natives::ets::direct_entry(module, function, arity)
@@ -462,7 +518,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             light_process_bif: None,
         })
     }));
-    let identity = entry.slot as *const _ as usize;
+    let identity = Arc::as_ptr(entry.slot) as usize;
     registry.intern_identity(identity, &entry);
     Some(identity)
 }
@@ -483,7 +539,7 @@ fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, u
         let target = dispatch_entry(scope, mfa, || {
             Some(DispatchTarget {
                 // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
-                slot: new_export_slot(trampoline, save_calls),
+                slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
                 trap_entry: crate::bif_traps::traps(&module.name, &export.function, export.arity),
                 direct_ets: crate::natives::ets::direct_entry(
@@ -1030,12 +1086,15 @@ impl Drop for CompiledVersion {
         // Port of erts/emulator/beam/beam_bif_load.c (purge: fun entries of the purged code
         // dispatch to the unloaded-fun handler), OTP-29.1.1: a cleared slot sends the call
         // to the call_fun resolver, which raises through the error handler.
+        // Port of erts/emulator/beam/erl_fun.c:157-179 (fun_purge_foreach: entries of the
+        // purged code enter beam_unloaded_fun), OTP-29.1.1.
+        let unloaded = arinsal_term::beam_unloaded_fun();
         for entry in &self.lambda_entries {
-            if entry
-                .get_dispatch_target(0)
-                .is_some_and(|target| self.code_start <= target && target < self.code_end)
-            {
-                entry.set_dispatch_target(0, 0);
+            for ix in 0..arinsal_term::ERTS_NUM_CODE_IX {
+                let target = entry.dispatch_target.address(ix);
+                if self.code_start <= target && target < self.code_end {
+                    entry.set_fun_code(ix, unloaded);
+                }
             }
         }
         if let Some(heap) = self.literal_heap.take()
@@ -1362,7 +1421,13 @@ impl ModuleEnv for VmModuleEnv<'_> {
             .lambda_entries
             .get(&index)
             .ok_or_else(|| format!("lambda {index} has no loaded fun entry"))?;
-        entry.set_dispatch_target(0, target);
+        // Port of erts/emulator/beam/erl_fun.c:48-53 (erts_set_fun_code), OTP-29.1.1. Each
+        // load creates its own fun entries, which only code of this load reaches, so every
+        // code index gets the address at once (erts sets the staging index of a shared entry
+        // and `fun_stage` copies it into the others).
+        for ix in 0..arinsal_term::ERTS_NUM_CODE_IX {
+            entry.set_fun_code(ix, target);
+        }
         Ok(())
     }
 

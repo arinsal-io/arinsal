@@ -1,7 +1,6 @@
 //! BIF, export, and apply call emission for BeamAsm modules.
 
 use arinsal_a64::enc::Gpr;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use crate::{Update, emit_enter_runtime, emit_leave_runtime};
@@ -18,88 +17,17 @@ pub type BifIdentityHelper = usize;
 /// Apply resolver supplied by the runtime; zero means the target could not be resolved.
 pub type ApplyResolver = extern "C" fn(*mut crate::ProcessHeader, u64, u32, u32) -> usize;
 
-/// Number of code indexes (`ERTS_NUM_CODE_IX`): active, staging and the one being retired.
-// Port of erts/emulator/beam/code_ix.h:72-78, OTP-29.1.1.
-pub const ERTS_NUM_CODE_IX: usize = 3;
-/// Length of an export's address vector: one slot per code index plus the save_calls slot.
-pub const ERTS_ADDRESSV_SIZE: usize = ERTS_NUM_CODE_IX + 1;
-/// Code index of a process with `process_flag(save_calls, N > 0)`: every remote call lands in
-/// the save_calls dispatch fragment.
-pub const ERTS_SAVE_CALLS_CODE_IX: usize = ERTS_ADDRESSV_SIZE - 1;
-
-/// Mutable indirection used by external calls: one address per code index (`ErtsDispatchable`).
-/// Native code calls `addresses[active_code_ix]`.
-// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:394-401 and erts/emulator/beam/code_ix.h:91-95
-// (ErtsDispatchable), OTP-29.1.1.
-#[repr(C)]
-pub struct ExportEntry {
-    /// Native entry addresses indexed by code index; the last slot is the save_calls entry.
-    pub addresses: [AtomicUsize; ERTS_ADDRESSV_SIZE],
-    /// The runtime's descriptor of this export (its MFA and BIF function), set once when the
-    /// export is created. Generated code and the shared fragments read it next to the
-    /// addresses and hand it to the runtime, so a BIF call never looks its export up.
-    // Port of erts/emulator/beam/export.h:38-58 (Export: dispatch, info.mfa and
-    // trampoline.bif.address follow the address vector), OTP-29.1.1.
-    pub info: AtomicUsize,
-}
-
-/// Byte offset of [`ExportEntry::info`] for generated loads.
-pub const EXPORT_INFO_OFFSET: u32 = core::mem::offset_of!(ExportEntry, info) as u32;
+/// Code-index constants and the export entry (`Export`), shared with the term crate whose
+/// export funs point at the same entries.
+// Port of erts/emulator/beam/code_ix.h:72-95 and erts/emulator/beam/export.h:39-75, OTP-29.1.1.
+pub use arinsal_term::{
+    ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET, ExportEntry,
+};
 
 // erts calls `i_bif*` with only `Update::eReductions` (instr_bif.cpp:47-64) because its guard
 // BIFs never allocate on the process heap. This port's BIFs may build terms on the heap, so the
 // call also publishes and reloads HTOP and E.
 const PLAIN_BIF_UPDATE: Update = Update::HEAP_ALLOC.union(Update::REDUCTIONS);
-
-impl ExportEntry {
-    /// Creates an export entry whose every code index, the save_calls one included, enters
-    /// `address`.
-    pub const fn new(address: usize) -> Self {
-        Self::with_save_calls(address, address)
-    }
-
-    /// Creates an export entry entering `address` in every code index and `save_calls` in
-    /// `ERTS_SAVE_CALLS_CODE_IX`.
-    // Port of erts/emulator/beam/export.c:73-98 (export_init), OTP-29.1.1.
-    pub const fn with_save_calls(address: usize, save_calls: usize) -> Self {
-        Self {
-            addresses: [
-                AtomicUsize::new(address),
-                AtomicUsize::new(address),
-                AtomicUsize::new(address),
-                AtomicUsize::new(save_calls),
-            ],
-            info: AtomicUsize::new(0),
-        }
-    }
-
-    /// The runtime descriptor word published by [`ExportEntry::set_info`]: the address of the
-    /// runtime's export descriptor, zero before it.
-    pub fn info(&self) -> usize {
-        self.info.load(Ordering::Acquire)
-    }
-
-    /// Publishes the runtime descriptor word of this export.
-    pub fn set_info(&self, info: usize) {
-        self.info.store(info, Ordering::Release);
-    }
-
-    /// The address entered in code index `ix`.
-    pub fn address(&self, ix: usize) -> usize {
-        self.addresses[ix].load(Ordering::Acquire)
-    }
-
-    /// Sets the address entered in code index `ix`.
-    pub fn set_address(&self, ix: usize, address: usize) {
-        self.addresses[ix].store(address, Ordering::Release);
-    }
-
-    /// Copies the address of code index `src` into `dst` when a staging area opens.
-    // Port of erts/emulator/beam/export.c:100-106 (export_stage), OTP-29.1.1.
-    pub fn stage(&self, src: usize, dst: usize) {
-        self.set_address(dst, self.address(src));
-    }
-}
 
 const XREGS: [Gpr; 6] = [
     Gpr::x(25),

@@ -358,7 +358,13 @@ fn module_with_export(export: &'static ExportEntry, value: u64, tail_kind: u8) -
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_call_ext() {
-    let export = Box::leak(Box::new(ExportEntry::new(0)));
+    let export = Box::leak(Box::new(ExportEntry::with_addresses(
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::ERLANG,
+        0,
+        0,
+        0,
+    )));
     let module = module_with_export(export, tagged(31), 0);
     export.set_address(0, module.entries[&2] as usize);
     assert_eq!(
@@ -370,7 +376,13 @@ fn native_i_call_ext() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_call_ext_last() {
-    let export = Box::leak(Box::new(ExportEntry::new(0)));
+    let export = Box::leak(Box::new(ExportEntry::with_addresses(
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::ERLANG,
+        0,
+        0,
+        0,
+    )));
     let module = module_with_export(export, tagged(32), 2);
     export.set_address(0, module.entries[&2] as usize);
     execute(&module, 1, ProcessHeader::default(), [0; 3]);
@@ -379,7 +391,13 @@ fn native_i_call_ext_last() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_call_ext_only() {
-    let export = Box::leak(Box::new(ExportEntry::new(0)));
+    let export = Box::leak(Box::new(ExportEntry::with_addresses(
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::ERLANG,
+        0,
+        0,
+        0,
+    )));
     let module = module_with_export(export, tagged(33), 1);
     export.set_address(0, module.entries[&2] as usize);
     execute(&module, 1, ProcessHeader::default(), [0; 3]);
@@ -388,7 +406,13 @@ fn native_i_call_ext_only() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn export_entry_repoints_between_calls() {
-    let export = Box::leak(Box::new(ExportEntry::new(0)));
+    let export = Box::leak(Box::new(ExportEntry::with_addresses(
+        arinsal_term::atoms::ERLANG,
+        arinsal_term::atoms::ERLANG,
+        0,
+        0,
+        0,
+    )));
     let module = module_with_export(export, tagged(41), 0);
     export.set_address(0, module.entries[&2] as usize);
     assert_eq!(

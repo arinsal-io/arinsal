@@ -1737,6 +1737,15 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     }
     /// Construct an export fun with no environment.
     pub fn export_fun(&mut self, entry: Arc<ExportEntry>) -> Result<Term, TermError> {
+        // An export fun points at its node's export entry, never at a detached copy: entries
+        // built without a node (literals, `binary_to_term`) are looked up in the export table.
+        // Port of erts/emulator/beam/external.c (dec_term FUN_EXT/EXPORT_EXT:
+        // erts_export_get_or_make_stub), OTP-29.1.1.
+        let entry = if entry.info() == 0 {
+            crate::fun::export_get_or_make_stub(entry.module, entry.function, entry.arity)
+        } else {
+            entry
+        };
         let p = self.words(2)?;
         // SAFETY: the two-word fun head was reserved.
         unsafe {

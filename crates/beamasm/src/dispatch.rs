@@ -27,6 +27,8 @@ pub struct DispatchFragments {
     apply3_offset: usize,
     save_calls_export_offset: usize,
     apply_fun_offset: usize,
+    unloaded_fun_offset: usize,
+    save_calls_fun_offset: usize,
 }
 
 /// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
@@ -80,6 +82,28 @@ impl DispatchFragments {
         exception_resolver: usize,
         save_calls_helper: usize,
     ) -> Result<Self, ExecError> {
+        Self::with_fun_helpers(
+            export_helper,
+            light_bif_helper,
+            exception_resolver,
+            save_calls_helper,
+            0,
+            0,
+        )
+    }
+
+    /// As [`DispatchFragments::new`], plus the fun dispatch fragments: `unloaded_fun_helper`
+    /// is the `call_fun` resolver (`beam_jit_handle_unloaded_fun`) and
+    /// `save_calls_fun_helper(c_p, fun)` returns the fun's address in its node's active code
+    /// index.
+    pub fn with_fun_helpers(
+        export_helper: usize,
+        light_bif_helper: usize,
+        exception_resolver: usize,
+        save_calls_helper: usize,
+        unloaded_fun_helper: usize,
+        save_calls_fun_helper: usize,
+    ) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
         let export = code.new_label();
         let light_bif = code.new_label();
@@ -91,6 +115,8 @@ impl DispatchFragments {
         let apply3 = code.new_label();
         let save_calls_export = code.new_label();
         let apply_fun = code.new_label();
+        let unloaded_fun = code.new_label();
+        let save_calls_fun = code.new_label();
         code.bind(export)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
         emit_export_fragment(&mut code, export_helper, raise_exception)
@@ -125,6 +151,14 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_apply_fun_fragment(&mut code)
             .map_err(|_| ExecError::InvalidSize("apply/2 fragment"))?;
+        code.bind(unloaded_fun)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_unloaded_fun_fragment(&mut code, unloaded_fun_helper, raise_exception)
+            .map_err(|_| ExecError::InvalidSize("unloaded fun fragment"))?;
+        code.bind(save_calls_fun)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_save_calls_fun_fragment(&mut code, save_calls_fun_helper)
+            .map_err(|_| ExecError::InvalidSize("save_calls fun fragment"))?;
         code.bind(raise_exception)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_raise_exception_fragment(&mut code, exception_resolver)
@@ -151,6 +185,8 @@ impl DispatchFragments {
             apply3_offset: labels[&apply3],
             save_calls_export_offset: labels[&save_calls_export],
             apply_fun_offset: labels[&apply_fun],
+            unloaded_fun_offset: labels[&unloaded_fun],
+            save_calls_fun_offset: labels[&save_calls_fun],
         })
     }
 
@@ -197,6 +233,16 @@ impl DispatchFragments {
     /// Entry used when a fun has no native trampoline yet.
     pub fn call_fun_unported(&self) -> usize {
         self.memory.ptr_at(self.call_fun_unported_offset) as usize
+    }
+
+    /// Entry of every code index of a fun entry without loaded code (`beam_unloaded_fun`).
+    pub fn unloaded_fun(&self) -> usize {
+        self.memory.ptr_at(self.unloaded_fun_offset) as usize
+    }
+
+    /// Entry of every local fun in `ERTS_SAVE_CALLS_CODE_IX` (`beam_save_calls_fun`).
+    pub fn save_calls_fun(&self) -> usize {
+        self.memory.ptr_at(self.save_calls_fun_offset) as usize
     }
 }
 
@@ -326,6 +372,73 @@ fn emit_save_calls_export_fragment(
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         encoder.ldp_post(Gpr::x(30), Gpr::x(1), Gpr::sp(), 16)?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.br(Gpr::x(17))
+    })
+}
+
+/// Calls a fun whose entry has no code in the active code index. Entered from a `call_fun`
+/// site between caller and callee: x2 = expected fun header bits, x4 = fun, x30 = the caller's continuation.
+/// The helper either returns the address to continue with (the interpreter's fun call for an
+/// unloaded fun, which runs the error handler) or zero with the exception set, raised with the
+/// call site as the current pc.
+// Port of erts/emulator/beam/jit/arm/instr_fun.cpp:34-62 (emit_unloaded_fun), OTP-29.1.1.
+fn emit_unloaded_fun_fragment(
+    code: &mut CodeBuffer,
+    helper: usize,
+    raise_exception: arinsal_a64::buf::Label,
+) -> Result<(), BufferError> {
+    code.emit(|encoder| {
+        // As the export trampoline: the continuation is the exception pc on E, under a host
+        // frame the raise fragment pops.
+        encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
+        encoder.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -32)?;
+        encoder.mov_reg(Gpr::x(29), Gpr::sp())?;
+        encoder.stp(Gpr::x(2), Gpr::x(4), Gpr::sp(), 16)
+    })?;
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldp(Gpr::x(2), Gpr::x(1), Gpr::sp(), 16)?;
+        encoder.lsr_imm(Gpr::x(2), Gpr::x(2), 8)?;
+        encoder.mov_const(Gpr::x(17), helper as u64)?;
+        encoder.blr(Gpr::x(17))?;
+        encoder.mov_reg(Gpr::x(17), Gpr::x(0))
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| encoder.cmp_imm(Gpr::x(17), 0, false))?;
+    code.b_cond(Cond::Eq, raise_exception)?;
+    code.emit(|encoder| {
+        encoder.ldp(Gpr::x(2), Gpr::x(4), Gpr::sp(), 16)?;
+        encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
+        encoder.add_imm(Gpr::x(20), Gpr::x(20), 8, false)?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.br(Gpr::x(17))
+    })
+}
+
+/// Continues a local fun call of a process saving calls with its node's active code index.
+/// x4 = fun and x30 = return address are preserved: this runs between caller and callee.
+// Port of erts/emulator/beam/jit/arm/instr_fun.cpp:139-149 (emit_dispatch_save_calls_fun),
+// OTP-29.1.1. erts reads the one `the_active_code_index`; each node here has its own, which
+// the helper reads.
+fn emit_save_calls_fun_fragment(code: &mut CodeBuffer, helper: usize) -> Result<(), BufferError> {
+    code.emit(|encoder| {
+        encoder.stp_pre(Gpr::x(30), Gpr::x(4), Gpr::sp(), -32)?;
+        encoder.stp(Gpr::x(1), Gpr::x(2), Gpr::sp(), 16)
+    })?;
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldr_uoff(Gpr::x(1), Gpr::sp(), 8)?;
+        encoder.mov_const(Gpr::x(17), helper as u64)?;
+        encoder.blr(Gpr::x(17))?;
+        encoder.mov_reg(Gpr::x(17), Gpr::x(0))
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.ldp(Gpr::x(1), Gpr::x(2), Gpr::sp(), 16)?;
+        encoder.ldp_post(Gpr::x(30), Gpr::x(4), Gpr::sp(), 32)?;
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
         encoder.br(Gpr::x(17))
     })

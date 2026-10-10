@@ -167,7 +167,7 @@ fn emit_apply_fun(
         asm.code.b(done)?;
     }
     asm.code.bind(unpacked)?;
-    asm.emit_dynamic_fun_call(None, runtime.fun_resolver, tail, 0)?;
+    asm.emit_dynamic_fun_call(runtime.fun_resolver, tail, 0)?;
     asm.code.bind(done)?;
     Ok(())
 }

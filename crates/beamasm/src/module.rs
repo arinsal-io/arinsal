@@ -153,6 +153,8 @@ pub struct BeamModuleAssembler {
     catch_patches: Vec<(usize, Label)>,
     /// Shared out-of-line `function_clause` raiser, bound in `finalize` when any function uses it.
     func_clause_stub: Option<Label>,
+    /// Shared `call_fun` error handler and its resolver, bound in `finalize` when used.
+    call_fun_error_stub: Option<(Label, usize)>,
     /// Shared arithmetic slow-path fragments keyed by hook address and operation code.
     arith_fragments: Vec<((usize, u32), Label)>,
     /// Module-local dispatch stubs for process-wide executable fragments.
@@ -230,6 +232,7 @@ impl BeamModuleAssembler {
             error_label,
             catch_patches: Vec::new(),
             func_clause_stub: None,
+            call_fun_error_stub: None,
             arith_fragments: Vec::new(),
             dispatch_fragments: HashMap::new(),
             yield_stubs: Vec::new(),
@@ -1258,6 +1261,22 @@ impl BeamModuleAssembler {
         Ok(())
     }
 
+    /// Branches to the shared error exit with LR already holding the raising pc.
+    pub(super) fn branch_error_from_lr(&mut self) -> Result<(), ModuleError> {
+        self.code.b(self.error_label)?;
+        Ok(())
+    }
+
+    /// The module's shared `call_fun` error handler (`handle_call_fun_error`).
+    pub(super) fn call_fun_error_label(&mut self, helper: usize) -> Label {
+        if let Some((label, _)) = self.call_fun_error_stub {
+            return label;
+        }
+        let label = self.code.new_label();
+        self.call_fun_error_stub = Some((label, helper));
+        label
+    }
+
     pub(super) fn emit_runtime_hook_with(
         &mut self,
         helper: usize,
@@ -1529,6 +1548,10 @@ impl BeamModuleAssembler {
             self.code.b(self.error_label)?;
         }
         self.flush_yield_stubs()?;
+        if let Some((label, helper)) = self.call_fun_error_stub.take() {
+            self.code.bind(label)?;
+            crate::fun::emit_call_fun_error(&mut self, helper)?;
+        }
         let fragments = std::mem::take(&mut self.arith_fragments);
         for ((helper, op), label) in fragments {
             self.code.bind(label)?;

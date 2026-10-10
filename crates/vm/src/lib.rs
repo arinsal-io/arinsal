@@ -2,6 +2,7 @@
 mod arith;
 mod beamasm_integration;
 mod bif_traps;
+mod fun_dispatch;
 // c_boot: Launcher entry point for the preloaded OTP boot process.
 mod bif_dispatch;
 pub mod boot;

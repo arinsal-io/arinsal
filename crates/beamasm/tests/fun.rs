@@ -329,13 +329,18 @@ fn native_i_call_fun2_exported_fun_m_f_1() {
     let mut builder = TermBuilder::new(&mut term_heap);
     let module_atom = global_atoms().intern("m").unwrap();
     let function_atom = global_atoms().intern("f").unwrap();
-    let export_term = builder
-        .export_fun(std::sync::Arc::new(ExportEntry::new(
-            module_atom,
-            function_atom,
-            1,
-        )))
-        .unwrap();
+    // A node-owned export entry: its addresses enter the target in every code index, like
+    // erts' `Export.dispatch`, and a fun of it is called through them.
+    let target = module.entries[&2] as usize;
+    let entry = std::sync::Arc::new(ExportEntry::with_addresses(
+        module_atom,
+        function_atom,
+        1,
+        target,
+        target,
+    ));
+    entry.set_info(1);
+    let export_term = builder.export_fun(entry).unwrap();
     let export_bits = arinsal_beamasm::rt::term_bits(export_term);
 
     let mut header = ProcessHeader {
