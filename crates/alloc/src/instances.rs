@@ -272,6 +272,18 @@ impl ThreadSpecificAllocators {
             .allocation_ptr(allocation)
     }
 
+    /// Processes delayed frees for every instance.
+    ///
+    /// Used by `erts_debug:set_internal_state(wait, deallocations)`, which must
+    /// observe blocks a non-owner scheduler already queued.
+    pub fn drain_all_deallocations(&self) -> Result<usize, AllocError> {
+        let mut total = 0;
+        for instance in 0..self.instances.len() {
+            total += self.drain_deallocations(instance)?;
+        }
+        Ok(total)
+    }
+
     /// Processes the delayed-free queue for one instance.
     pub fn drain_deallocations(&self, instance: usize) -> Result<usize, AllocError> {
         let mut state = self.lock_instance(instance);

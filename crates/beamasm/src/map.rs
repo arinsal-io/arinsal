@@ -479,7 +479,9 @@ impl BeamModuleAssembler {
                 e.csel(Gpr::x(0), Gpr::x(11), Gpr::x(10), Cond::Eq)
             })?;
         } else {
-            self.emit_map_get_runtime(key, map, runtime)?;
+            // The header test writes TMP (x9). A map loaded from Y or memory lives in that
+            // register; x0 still holds it, as ARG1 does across erts' TMP1 header test.
+            self.emit_map_get_runtime(key, preserved_map(map), runtime)?;
             self.code.emit(|e| {
                 e.cmp_imm(Gpr::x(0), 0, false)?;
                 e.mov_const(Gpr::x(10), 0x0b)?;
@@ -945,7 +947,9 @@ impl BeamModuleAssembler {
         if key_maybe_immediate {
             self.emit_get_element_fragment_call(runtime.get_element_shared, slow, dst)
         } else {
-            self.emit_map_get_runtime(key, map, runtime)?;
+            // The header test writes TMP (x9). A map loaded from Y or memory lives in that
+            // register; x0 still holds it, as ARG1 does across erts' TMP1 header test.
+            self.emit_map_get_runtime(key, preserved_map(map), runtime)?;
             self.code.emit(|e| e.cmp_imm(Gpr::x(0), 0, false))?;
             self.code.b_cond(Cond::Eq, slow)?;
             self.store_map_result(dst, Gpr::x(0))
@@ -1035,6 +1039,16 @@ impl BeamModuleAssembler {
 // `exact_type<Map>` lets erts omit these checks; otherwise the boxed tag and map header are
 // checked before the shared fragment dereferences the term.
 // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:854-885, OTP-29.1.1.
+/// Map operand to pass to the boxed-key runtime after `emit_map_type_check`.
+///
+/// The check materializes the header in TMP (`x9`), which is also where
+/// `source_reg` puts a Y or memory operand. The copy in `x0` is the map.
+// Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:868-891, OTP-29.1.1
+// (the map stays in ARG1 while the header test uses TMP1).
+fn preserved_map(map: Gpr) -> Gpr {
+    if map == Gpr::x(9) { Gpr::x(0) } else { map }
+}
+
 fn emit_map_type_check(code: &mut CodeBuffer, map: Gpr, not_map: Label) -> Result<(), ModuleError> {
     code.emit(|e| {
         e.and_imm(Gpr::x(9), map, 3)?;

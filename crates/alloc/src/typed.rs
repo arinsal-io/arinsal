@@ -380,6 +380,39 @@ fn allocator_for(
         .ok_or(AllocError::InvalidAllocation)
 }
 
+/// Apply every queued cross-thread free.
+///
+/// Port of erts/emulator/beam/erl_process.c:2103 (`handle_delayed_dealloc`) and
+/// erl_alloc.c (`erts_alloc_handle_delayed_dealloc`), OTP-29.1.1. A literal area
+/// released on the collector thread queues its refc binaries on the allocating
+/// scheduler; `wait, deallocations` does not return until those frees land.
+pub fn drain_delayed_deallocations() -> usize {
+    let mut total = 0;
+    let mut seen = [false; 10];
+    for kind in [
+        ErtsAlcType::HEAP,
+        ErtsAlcType::BINARY,
+        ErtsAlcType::DB_TABLE,
+        ErtsAlcType::MSG_REF,
+        ErtsAlcType::DRV,
+        ErtsAlcType::MODULE,
+        ErtsAlcType::ATOM,
+        ErtsAlcType::FUN_ENTRY,
+        ErtsAlcType::DRV_BINARY,
+        ErtsAlcType::PORT,
+    ] {
+        let index = kind.allocator();
+        if seen[index] {
+            continue;
+        }
+        seen[index] = true;
+        if let Ok(allocators) = allocator_for(kind) {
+            total += allocators.drain_all_deallocations().unwrap_or(0);
+        }
+    }
+    total
+}
+
 /// Current allocated bytes belonging to the erts `BINARY` allocation type.
 // Port of erts/emulator/beam/erl_alloc.c:2124 (alcu_size), OTP-29.1.1.
 pub fn binary_allocation_bytes() -> u64 {
