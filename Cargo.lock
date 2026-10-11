@@ -400,6 +400,7 @@ dependencies = [
  "mio",
  "num-bigint",
  "num-traits",
+ "similar-asserts",
  "smallvec",
 ]
 
