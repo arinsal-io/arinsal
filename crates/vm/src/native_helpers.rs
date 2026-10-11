@@ -922,6 +922,94 @@ fn dispatch_native_send(
     }
 }
 
+/// Prepares the live X registers and handler arguments for a native line-breakpoint call.
+// Port of erts/emulator/beam/beam_bp.c:1821-1865
+// (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_line_breakpoint_prepare(
+    header: *mut ProcessHeader,
+    pc: u64,
+    live: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+        return 0;
+    };
+    let Ok(live) = usize::try_from(live) else {
+        return 0;
+    };
+    if live > registers.x_reg_array.len() {
+        return 0;
+    }
+    let Some(function) = crate::native_function_at(pc as usize) else {
+        return 0;
+    };
+    let Some((_, line)) = function.line_at(pc as usize) else {
+        return 0;
+    };
+    if (
+        function.module.as_str(),
+        function.function.as_str(),
+        function.arity,
+    ) == ("erts_internal", "breakpoint", 4)
+    {
+        return 0;
+    }
+    let Some(runtime) = process.runtime.as_ref() else {
+        return 0;
+    };
+    let Some(export) = crate::beamasm_integration::line_breakpoint_export(
+        runtime.code_scope,
+        registers.active_code_ix as usize,
+    ) else {
+        return 0;
+    };
+
+    for index in 0..live {
+        if !process.heap.stack_set(index, registers.x_reg_array[index]) {
+            crate::native_hooks::set_error(process, "system_limit");
+            process.sync_native_header();
+            return 0;
+        }
+    }
+    if process.x.len() < 4 {
+        let mut x = process.x.to_vec();
+        x.resize(4, Term::NIL);
+        process.x = x.into();
+    }
+    let args = [
+        Term::atom(function.module_atom),
+        Term::atom(function.function_atom),
+        Term::small(i64::from(function.arity)).expect("arity is a small integer"),
+        Term::small(i64::from(line)).expect("debug line is a small integer"),
+    ];
+    process.x[..4].copy_from_slice(&args);
+    registers.x_reg_array[..4].copy_from_slice(&args);
+    process.header.arity = 4;
+    process.sync_native_header();
+    export as *const arinsal_beamasm::bif::ExportEntry as usize as u64
+}
+
+/// Restores the live X register prefix from the stack below a returning breakpoint handler.
+// Port of erts/emulator/beam/beam_bp.c:1868-1882
+// (erts_line_breakpoint_hit__cleanup), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(header: *mut ProcessHeader) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let mut live = 0usize;
+    while let Some(value) = process.heap.stack_get(live) {
+        if crate::native_bridge::is_native_continuation(value.tagged_word() as usize) {
+            break;
+        }
+        let Some(destination) = registers.x_reg_array.get_mut(live) else {
+            break;
+        };
+        *destination = value;
+        live += 1;
+    }
+    process.sync_native_header();
+    live as u64
+}
+
 // `export_call`: reached through an export entry, whose BIF trampoline charges the call one
 // reduction (erts/emulator/beam/jit/arm/instr_bif.cpp:399, OTP-29.1.1); a light BIF call
 // site has already charged it.
@@ -1193,9 +1281,7 @@ fn invoke_dispatch_bif_slow(
         // native code with every register as it was.
         return Some(0);
     }
-    if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY
-        || arinsal_beamasm::dispatch::decode_line_breakpoint_identity(identity).is_some()
-    {
+    if identity == arinsal_beamasm::dispatch::BREAKPOINT_DISPATCH_IDENTITY {
         // The breakpoint traps like a BIF so the executor delivers its trace events.
         process.header.i = identity as *const u8 as *const _;
         process.header.freason = 1 << 10;
