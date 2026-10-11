@@ -2,7 +2,7 @@
 
 use arinsal_a64::{
     buf::{BufferError, CodeBuffer},
-    enc::{Cond, Gpr},
+    enc::{Cond, Gpr, Shift, Shifted, VecReg},
     exec::{CodeMemory, ExecError},
 };
 
@@ -36,6 +36,20 @@ pub struct DispatchFragments {
     apply_fun_offset: usize,
     unloaded_fun_offset: usize,
     save_calls_fun_offset: usize,
+    bif_is_eq_exact_offset: usize,
+    bif_is_ne_exact_offset: usize,
+    arith_compare_offset: usize,
+}
+
+/// C functions called by the comparison fragments (`eq`, `erts_cmp_atoms`, `erts_cmp_compound`).
+#[derive(Default)]
+pub struct CompareHelpers {
+    /// `eq(Eterm, Eterm) -> int`. Non-zero means equal.
+    pub eq: usize,
+    /// `erts_cmp_atoms(Eterm, Eterm) -> int`.
+    pub cmp_atoms: usize,
+    /// `erts_cmp_compound(Eterm, Eterm, int, int) -> Sint`.
+    pub cmp_compound: usize,
 }
 
 /// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
@@ -111,6 +125,29 @@ impl DispatchFragments {
         unloaded_fun_helper: usize,
         save_calls_fun_helper: usize,
     ) -> Result<Self, ExecError> {
+        Self::with_compare(
+            export_helper,
+            light_bif_helper,
+            exception_resolver,
+            save_calls_helper,
+            unloaded_fun_helper,
+            save_calls_fun_helper,
+            CompareHelpers::default(),
+        )
+    }
+
+    /// As [`DispatchFragments::with_fun_helpers`], plus the comparison fragments.
+    // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:67-131 and
+    // instr_common.cpp:2113-2176, OTP-29.1.1.
+    pub fn with_compare(
+        export_helper: usize,
+        light_bif_helper: usize,
+        exception_resolver: usize,
+        save_calls_helper: usize,
+        unloaded_fun_helper: usize,
+        save_calls_fun_helper: usize,
+        compare: CompareHelpers,
+    ) -> Result<Self, ExecError> {
         let mut code = CodeBuffer::new();
         let export = code.new_label();
         let light_bif = code.new_label();
@@ -125,6 +162,9 @@ impl DispatchFragments {
         let apply_fun = code.new_label();
         let unloaded_fun = code.new_label();
         let save_calls_fun = code.new_label();
+        let bif_is_eq_exact = code.new_label();
+        let bif_is_ne_exact = code.new_label();
+        let arith_compare = code.new_label();
         code.bind(export)
             .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
         emit_export_fragment(&mut code, export_helper, raise_exception)
@@ -179,6 +219,18 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_raise_exception_fragment(&mut code, exception_resolver)
             .map_err(|_| ExecError::InvalidSize("raise exception fragment"))?;
+        code.bind(bif_is_eq_exact)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_bif_is_eq_exact_shared(&mut code, compare.eq)
+            .map_err(|_| ExecError::InvalidSize("bif_is_eq_exact fragment"))?;
+        code.bind(bif_is_ne_exact)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_bif_is_ne_exact_shared(&mut code, compare.eq)
+            .map_err(|_| ExecError::InvalidSize("bif_is_ne_exact fragment"))?;
+        code.bind(arith_compare)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        emit_arith_compare_shared(&mut code, compare.cmp_atoms, compare.cmp_compound)
+            .map_err(|_| ExecError::InvalidSize("arith_compare fragment"))?;
         let (words, labels) = code
             .finish_with_labels()
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
@@ -204,6 +256,9 @@ impl DispatchFragments {
             apply_fun_offset: labels[&apply_fun],
             unloaded_fun_offset: labels[&unloaded_fun],
             save_calls_fun_offset: labels[&save_calls_fun],
+            bif_is_eq_exact_offset: labels[&bif_is_eq_exact],
+            bif_is_ne_exact_offset: labels[&bif_is_ne_exact],
+            arith_compare_offset: labels[&arith_compare],
         })
     }
 
@@ -270,11 +325,208 @@ impl DispatchFragments {
     pub fn save_calls_fun(&self) -> usize {
         self.memory.ptr_at(self.save_calls_fun_offset) as usize
     }
+
+    /// `bif_is_eq_exact_shared`: terms in x0 and x1, `true` or `false` in x0.
+    pub fn bif_is_eq_exact_shared(&self) -> usize {
+        self.memory.ptr_at(self.bif_is_eq_exact_offset) as usize
+    }
+
+    /// `bif_is_ne_exact_shared`: terms in x0 and x1, `true` or `false` in x0.
+    pub fn bif_is_ne_exact_shared(&self) -> usize {
+        self.memory.ptr_at(self.bif_is_ne_exact_offset) as usize
+    }
+
+    /// `arith_compare_shared`: terms in x0 and x1, the relation left in the flags.
+    pub fn arith_compare_shared(&self) -> usize {
+        self.memory.ptr_at(self.arith_compare_offset) as usize
+    }
 }
 
 /// Highest number of `apply/2` arguments: erts bails at MAX_REG - 1, as the highest X
 /// register is reserved for the loader.
 const APPLY_MAX_ARGS: u16 = 1024 - 1;
+
+// Registers of the comparison fragments, named after erts' ARG*/TMP* (arm/beam_asm.hpp).
+const ARG1: Gpr = Gpr::x(0);
+const ARG2: Gpr = Gpr::x(1);
+const TMP1: Gpr = Gpr::x(8);
+const TMP2: Gpr = Gpr::x(9);
+const TMP3: Gpr = Gpr::x(10);
+const TMP4: Gpr = Gpr::x(11);
+const TMP5: Gpr = Gpr::x(12);
+/// `TAG_PRIMARY_IMMED1` / `_TAG_PRIMARY_MASK`.
+const TAG_PRIMARY_IMMED1: u64 = 3;
+/// `_TAG_IMMED2_MASK` and `_TAG_IMMED2_ATOM`.
+const TAG_IMMED2_MASK: u64 = 0x3f;
+const TAG_IMMED2_ATOM: u16 = 0x0b;
+/// `HEADER_FLONUM` (`_make_header(1, _TAG_HEADER_FLOAT)`).
+const HEADER_FLONUM: u64 = (1 << 6) | 0x18;
+/// `am_false` / `am_true` (`make_atom(0)` / `make_atom(1)`).
+const AM_FALSE: u64 = 0x0b;
+const AM_TRUE: u64 = 0x4b;
+
+// Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:67-99 (emit_bif_is_eq_exact_shared),
+// OTP-29.1.1. ARG1 and ARG2 are the terms; the atom `true` or `false` is returned in ARG1.
+fn emit_bif_is_eq_exact_shared(code: &mut CodeBuffer, eq: usize) -> Result<(), BufferError> {
+    let succ = code.new_label();
+    let fail = code.new_label();
+    code.emit(|e| e.cmp_reg(ARG1, ARG2, Shift::Lsl, 0))?;
+    code.b_cond(Cond::Eq, succ)?;
+    emit_is_unequal_based_on_tags(code)?;
+    code.b_cond(Cond::Eq, fail)?;
+    emit_framed_call(code, eq, false)?;
+    code.cbz(Gpr::w(0), fail)?;
+    code.bind(succ)?;
+    code.emit(|e| {
+        e.mov_const(ARG1, AM_TRUE)?;
+        e.ret(Gpr::x(30))
+    })?;
+    code.bind(fail)?;
+    code.emit(|e| {
+        e.mov_const(ARG1, AM_FALSE)?;
+        e.ret(Gpr::x(30))
+    })
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:101-131 (emit_bif_is_ne_exact_shared),
+// OTP-29.1.1.
+fn emit_bif_is_ne_exact_shared(code: &mut CodeBuffer, eq: usize) -> Result<(), BufferError> {
+    let succ = code.new_label();
+    let fail = code.new_label();
+    code.emit(|e| e.cmp_reg(ARG1, ARG2, Shift::Lsl, 0))?;
+    code.b_cond(Cond::Eq, fail)?;
+    emit_is_unequal_based_on_tags(code)?;
+    code.b_cond(Cond::Eq, succ)?;
+    emit_framed_call(code, eq, false)?;
+    code.cbnz(Gpr::w(0), fail)?;
+    code.bind(succ)?;
+    code.emit(|e| {
+        e.mov_const(ARG1, AM_TRUE)?;
+        e.ret(Gpr::x(30))
+    })?;
+    code.bind(fail)?;
+    code.emit(|e| {
+        e.mov_const(ARG1, AM_FALSE)?;
+        e.ret(Gpr::x(30))
+    })
+}
+
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:698-711 (emit_is_unequal_based_on_tags),
+// OTP-29.1.1. Z is set when the tags alone prove the terms differ.
+fn emit_is_unequal_based_on_tags(code: &mut CodeBuffer) -> Result<(), BufferError> {
+    let super_tmp = Gpr::x(14);
+    code.emit(|e| {
+        e.orr_reg(
+            super_tmp,
+            ARG1,
+            Shifted {
+                reg: ARG2,
+                shift: Shift::Lsl,
+                amount: 0,
+            },
+        )?;
+        e.and_imm(super_tmp, super_tmp, TAG_PRIMARY_IMMED1)?;
+        e.cmp_imm(super_tmp, TAG_PRIMARY_IMMED1 as u16, false)
+    })
+}
+
+// Port of erts/emulator/beam/jit/arm/instr_common.cpp:2113-2176 (emit_arith_compare_shared),
+// OTP-29.1.1. The relation is returned in the flags (the same codes `cmp` / `fcmpe` set).
+fn emit_arith_compare_shared(
+    code: &mut CodeBuffer,
+    cmp_atoms: usize,
+    cmp_compound: usize,
+) -> Result<(), BufferError> {
+    let atom_compare = code.new_label();
+    let generic_compare = code.new_label();
+    code.emit(|e| {
+        e.orr_reg(
+            TMP1,
+            ARG1,
+            Shifted {
+                reg: ARG2,
+                shift: Shift::Lsl,
+                amount: 0,
+            },
+        )
+    })?;
+    // Not boxed: bit 0 of the primary tag is set (`emit_is_boxed`).
+    code.tbnz(TMP1, 0, atom_compare)?;
+    // `emit_ptr_val` is the identity when literals are not a distinct pointer tag, so the
+    // header is at the tagged pointer minus `TAG_PRIMARY_BOXED`.
+    code.emit(|e| {
+        e.ldur(TMP3, ARG1, -2)?;
+        e.ldur(TMP4, ARG2, -2)?;
+        e.mov_const(TMP5, HEADER_FLONUM)?;
+        e.cmp_reg(TMP3, TMP5, Shift::Lsl, 0)?;
+        e.ccmp_reg(TMP4, TMP5, 0, Cond::Eq)
+    })?;
+    code.b_cond(Cond::Ne, generic_compare)?;
+    code.emit(|e| {
+        e.ldur_d(VecReg(0), ARG1, 6)?;
+        e.ldur_d(VecReg(1), ARG2, 6)?;
+        e.fcmpe(VecReg(0), VecReg(1))?;
+        e.ret(Gpr::x(30))
+    })?;
+
+    code.bind(atom_compare)?;
+    code.emit(|e| {
+        e.and_imm(TMP1, ARG1, TAG_IMMED2_MASK)?;
+        e.and_imm(TMP2, ARG2, TAG_IMMED2_MASK)?;
+        e.sub_imm(TMP1, TMP1, TAG_IMMED2_ATOM, false)?;
+        e.sub_imm(TMP2, TMP2, TAG_IMMED2_ATOM, false)?;
+        e.orr_reg(
+            TMP1,
+            TMP1,
+            Shifted {
+                reg: TMP2,
+                shift: Shift::Lsl,
+                amount: 0,
+            },
+        )
+    })?;
+    code.cbnz(TMP1, generic_compare)?;
+    emit_framed_call(code, cmp_atoms, false)?;
+    code.emit(|e| {
+        e.tst_reg(Gpr::w(0), Gpr::w(0), Shift::Lsl, 0)?;
+        e.ret(Gpr::x(30))
+    })?;
+
+    code.bind(generic_compare)?;
+    emit_framed_call(code, cmp_compound, true)?;
+    code.emit(|e| {
+        e.tst_reg(ARG1, ARG1, Shift::Lsl, 0)?;
+        e.ret(Gpr::x(30))
+    })
+}
+
+// Port of erts/emulator/beam/jit/arm/beam_asm.hpp:437-445,459-536,539-601
+// (emit_enter_runtime_frame / emit_enter_runtime<0> / emit_leave_runtime / emit_leave_runtime_frame),
+// OTP-29.1.1. `zero_extra` loads the two trailing zeros of `erts_cmp_compound(X, Y, 0, 0)`.
+fn emit_framed_call(
+    code: &mut CodeBuffer,
+    target: usize,
+    zero_extra: bool,
+) -> Result<(), BufferError> {
+    code.emit(|e| {
+        e.stp_pre(Gpr::x(29), Gpr::x(30), Gpr::sp(), -16)?;
+        e.mov_reg(Gpr::x(29), Gpr::sp())
+    })?;
+    emit_enter_runtime(code, 6, Update::NONE)?;
+    code.emit(|e| {
+        if zero_extra {
+            e.mov_reg(Gpr::x(2), Gpr::xzr())?;
+            e.mov_reg(Gpr::x(3), Gpr::xzr())?;
+        }
+        e.mov_const(Gpr::x(17), target as u64)?;
+        e.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, Update::NONE)?;
+    code.emit(|e| {
+        e.mov_reg(Gpr::sp(), Gpr::x(29))?;
+        e.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)
+    })
+}
 
 // Port of erts/emulator/beam/jit/arm/instr_fun.cpp:253-328 (emit_apply_fun_shared), OTP-29.1.1:
 // the fun (X0) goes to x4 and the arity to x2 for `call_fun`; x0 is zero once every argument is

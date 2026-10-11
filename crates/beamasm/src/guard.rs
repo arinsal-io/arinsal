@@ -25,6 +25,17 @@ pub type GuardHelper3 = unsafe extern "C" fn(
     third: u64,
 ) -> u64;
 
+/// Addresses of the process-wide comparison fragments.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompareShared {
+    /// `bif_is_eq_exact_shared`: terms in x0/x1, `true` or `false` in x0.
+    pub eq_exact: usize,
+    /// `bif_is_ne_exact_shared`: terms in x0/x1, `true` or `false` in x0.
+    pub ne_exact: usize,
+    /// `arith_compare_shared`: terms in x0/x1, the relation in the flags.
+    pub arith: usize,
+}
+
 /// BIFs whose inline guard code raises `badarg` with the BIF itself as the top stack frame.
 /// `SchedulerRegisters::tmp_mem[7]` holds `index + 1` of the raising BIF; its arguments are in
 /// X0.. (erts passes the `ErtsCodeMFA` to `raise_exception` the same way).
@@ -1298,48 +1309,82 @@ impl BeamModuleAssembler {
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1751-1898, OTP-29.1.1
     pub fn emit_is_eq_exact(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: impl Into<TypedArg>,
+        rhs: impl Into<TypedArg>,
         fail: u32,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
+        let lhs = lhs.into();
+        let rhs = rhs.into();
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1844-1856, OTP-29.1.1.
-        if let Some((term, value)) = exact_immediate_operand(lhs, rhs) {
+        if lhs.always_immediate() || rhs.always_immediate() {
+            return self.emit_exact_immediate_guard(lhs, rhs, fail, false);
+        }
+        if let Some((term, value)) = exact_immediate_operand(lhs.val, rhs.val) {
             let left = self.source_reg(term)?;
             self.emit_cmp_immediate_or_register(left, value)?;
             let fail = self.label(fail);
             self.code.b_cond(Cond::Ne, fail)?;
             return Ok(());
         }
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
+        let left = self.source_reg(lhs.val)?;
+        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(19, true, lhs, rhs, fail, helper)
+        self.emit_comparison(19, true, lhs.val, rhs.val, fail, helper)
     }
 
     /// Emits an exact inequality guard.
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1900-2053, OTP-29.1.1
     pub fn emit_is_ne_exact(
         &mut self,
-        lhs: ArgVal,
-        rhs: ArgVal,
+        lhs: impl Into<TypedArg>,
+        rhs: impl Into<TypedArg>,
         fail: u32,
         helper: GuardHelper,
     ) -> Result<(), ModuleError> {
+        let lhs = lhs.into();
+        let rhs = rhs.into();
         // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2001-2013, OTP-29.1.1.
-        if let Some((term, value)) = exact_immediate_operand(lhs, rhs) {
+        if lhs.always_immediate() || rhs.always_immediate() {
+            return self.emit_exact_immediate_guard(lhs, rhs, fail, true);
+        }
+        if let Some((term, value)) = exact_immediate_operand(lhs.val, rhs.val) {
             let left = self.source_reg(term)?;
             self.emit_cmp_immediate_or_register(left, value)?;
             let fail = self.label(fail);
             self.code.b_cond(Cond::Eq, fail)?;
             return Ok(());
         }
-        let left = self.source_reg(lhs)?;
-        let right = self.source_reg_into(rhs, Gpr::x(17))?;
+        let left = self.source_reg(lhs.val)?;
+        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(20, false, lhs, rhs, fail, helper)
+        self.emit_comparison(20, false, lhs.val, rhs.val, fail, helper)
+    }
+
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1844-1856 and 2001-2013
+    // (always_immediate cmp_arg), OTP-29.1.1. `fail_on_equal` selects `=/=`.
+    fn emit_exact_immediate_guard(
+        &mut self,
+        lhs: TypedArg,
+        rhs: TypedArg,
+        fail: u32,
+        fail_on_equal: bool,
+    ) -> Result<(), ModuleError> {
+        if rhs.is_immed() {
+            let left = self.source_reg(lhs.val)?;
+            self.emit_cmp_immediate_or_register(left, rhs.word())?;
+        } else {
+            let left = self.source_reg(lhs.val)?;
+            let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
+            self.code
+                .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
+        }
+        let fail = self.label(fail);
+        self.code
+            .b_cond(if fail_on_equal { Cond::Eq } else { Cond::Ne }, fail)?;
+        Ok(())
     }
 
     /// Emits a loose equality guard.
@@ -1437,7 +1482,7 @@ impl BeamModuleAssembler {
         lhs: TypedArg,
         rhs: TypedArg,
         destination: ArgVal,
-        helper: GuardHelper,
+        shared: CompareShared,
     ) -> Result<(), ModuleError> {
         match op {
             19 | 20 => {
@@ -1445,10 +1490,22 @@ impl BeamModuleAssembler {
                 if lhs.always_immediate() || rhs.always_immediate() {
                     return self.emit_cmp_immed_to_bool(cc, lhs, rhs, destination);
                 }
-                // erts calls the shared `bif_is_eq_exact_shared`/`bif_is_ne_exact_shared`
-                // fragment here; global fragments are registered by the VM integration, so the
-                // generic comparison stays in the runtime helper.
-                self.emit_guard_boolean_value_helper(op, lhs.val, rhs.val, destination, helper)
+                // Port of instr_guard_bifs.cpp:165-174 and 185-194, OTP-29.1.1.
+                let fragment = if op == 19 {
+                    shared.eq_exact
+                } else {
+                    shared.ne_exact
+                };
+                let left = self.source_reg_into(lhs.val, Gpr::x(11))?;
+                let right = self.source_reg_into(rhs.val, Gpr::x(12))?;
+                self.code.emit(|e| {
+                    e.mov_reg(Gpr::x(0), left)?;
+                    e.mov_reg(Gpr::x(1), right)
+                })?;
+                self.fragment_call(fragment)?;
+                let dst = self.guard_destination(destination)?;
+                self.code.emit(|e| e.mov_reg(dst, Gpr::x(0)))?;
+                self.store_guard_result(destination, dst)
             }
             24 => {
                 // Port of instr_guard_bifs.cpp:238-256 (emit_bif_is_ge).
@@ -1461,9 +1518,9 @@ impl BeamModuleAssembler {
                     self.emit_cmp_immediate_or_register(right, lhs.word())?;
                     return self.emit_cond_to_bool(Cond::Le, destination);
                 }
-                self.emit_bif_is_ge_lt(op, Cond::Ge, lhs, rhs, destination, helper)
+                self.emit_bif_is_ge_lt(Cond::Ge, lhs, rhs, destination, shared.arith)
             }
-            23 => self.emit_bif_is_ge_lt(op, Cond::Lt, lhs, rhs, destination, helper),
+            23 => self.emit_bif_is_ge_lt(Cond::Lt, lhs, rhs, destination, shared.arith),
             _ => Err(ModuleError::InvalidOperand("unknown comparison BIF")),
         }
     }
@@ -1502,22 +1559,20 @@ impl BeamModuleAssembler {
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_guard_bifs.cpp:196-236 (emit_bif_is_ge_lt),
-    // OTP-29.1.1. erts' generic path calls `arith_compare_shared` for the flags; here the
-    // runtime helper produces the boolean directly.
+    // OTP-29.1.1. The generic path calls `arith_compare_shared`, which leaves the relation
+    // in the flags for `emit_cond_to_bool`.
     fn emit_bif_is_ge_lt(
         &mut self,
-        op: u32,
         cc: Cond,
         lhs: TypedArg,
         rhs: TypedArg,
         destination: ArgVal,
-        helper: GuardHelper,
+        arith_compare_shared: usize,
     ) -> Result<(), ModuleError> {
         let left = self.source_reg_into(lhs.val, Gpr::x(11))?;
         let right = self.source_reg_into(rhs.val, Gpr::x(12))?;
         let generic = self.code.new_label();
         let next = self.code.new_label();
-        let done = self.code.new_label();
         let int_or_boxed = type_id::INTEGER | type_id::ALWAYS_BOXED;
         let both = Shifted {
             reg: right,
@@ -1555,12 +1610,13 @@ impl BeamModuleAssembler {
         self.code
             .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
         self.code.b_cond(Cond::Eq, next)?;
-        self.emit_guard_boolean_value_helper(op, lhs.val, rhs.val, destination, helper)?;
-        self.code.b(done)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), left)?;
+            e.mov_reg(Gpr::x(1), right)
+        })?;
+        self.fragment_call(arith_compare_shared)?;
         self.code.bind(next)?;
-        self.emit_cond_to_bool(cc, destination)?;
-        self.code.bind(done)?;
-        Ok(())
+        self.emit_cond_to_bool(cc, destination)
     }
 
     /// Emits the `element/2` guard BIF.

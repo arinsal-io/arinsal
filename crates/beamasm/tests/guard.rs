@@ -730,6 +730,41 @@ fn native_is_eq_exact() {
 }
 
 #[test]
+fn typed_atom_exact_compare_does_not_call_the_runtime() {
+    let fixture = terms();
+    let atom = fixture
+        .values
+        .iter()
+        .find(|(name, _)| *name == "atom")
+        .unwrap()
+        .1;
+    let typed = TypedArg::new(
+        ArgVal::X(0),
+        ArgType {
+            union_bits: type_id::ATOM,
+            min: None,
+            max: None,
+        },
+    );
+    native_guard(
+        |a| a.emit_is_eq_exact(typed, ArgVal::X(1), 2, exploding_helper),
+        atom,
+        atom,
+        true,
+    );
+    native_guard(
+        |a| a.emit_is_ne_exact(typed, ArgVal::X(1), 2, exploding_helper),
+        atom,
+        fixture.tuple,
+        true,
+    );
+}
+
+extern "C" fn exploding_helper(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
+    panic!("always-immediate comparison must not call the runtime");
+}
+
+#[test]
 fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
     let fixture = terms();
     native_guard(

@@ -5,7 +5,7 @@ use arinsal_arith::{ArithError, ArithResult};
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bifs::BifError;
 use arinsal_maps::MapError;
-use arinsal_term::{Term, TermBuilder, TermKind, cmp, exact_eq, global_atoms, loose_eq};
+use arinsal_term::{Term, TermBuilder, TermKind, cmp, cmp_exact, exact_eq, global_atoms, loose_eq};
 use num_traits::ToPrimitive;
 use std::cmp::Ordering;
 
@@ -172,6 +172,39 @@ pub(crate) fn raw(term: Term) -> u64 {
 pub(crate) fn from_raw(raw: u64) -> Term {
     // SAFETY: The emitter passes tagged BEAM terms for term operands.
     unsafe { Term::from_raw_bits(raw) }
+}
+
+fn order_bits(order: Ordering) -> i32 {
+    match order {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
+/// Exact equality of two terms. Non-zero means equal.
+// Port of erts/emulator/beam/utils.c:1125 (eq), OTP-29.1.1.
+pub extern "C" fn arinsal_eq(a: u64, b: u64) -> i32 {
+    i32::from(exact_eq(from_raw(a), from_raw(b)))
+}
+
+/// Atom order. The shared fragment only calls this when both operands are atoms.
+// Port of erts/emulator/beam/erl_utils.h:193 (erts_cmp_atoms), OTP-29.1.1.
+pub extern "C" fn arinsal_cmp_atoms(a: u64, b: u64) -> i32 {
+    order_bits(cmp(from_raw(a), from_raw(b)))
+}
+
+/// Arithmetic term order (`exact == 0`) or exact term order. `eq_only` does not change the sign.
+// Port of erts/emulator/beam/utils.c:1658 (erts_cmp_compound), OTP-29.1.1.
+pub extern "C" fn arinsal_cmp_compound(a: u64, b: u64, exact: i32, _eq_only: i32) -> i64 {
+    let left = from_raw(a);
+    let right = from_raw(b);
+    let order = if exact == 0 {
+        cmp(left, right)
+    } else {
+        cmp_exact(left, right)
+    };
+    i64::from(order_bits(order))
 }
 
 /// Fun view for native ABI terms already recovered via [`from_raw`].

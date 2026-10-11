@@ -3,8 +3,9 @@ use arinsal_beam::BeamFile;
 use arinsal_beamasm::{
     arith::ArithHelper,
     construct::GcHook,
+    dispatch::CompareHelpers,
     dispatch::DispatchFragments,
-    guard::{GuardHelper, GuardHelper3},
+    guard::{CompareShared, GuardHelper, GuardHelper3},
 };
 use arinsal_beamjit::{
     BifMfaHelper, MapLookupHelper, ModuleEnv, compile_parsed_module_with_options,
@@ -371,13 +372,18 @@ fn fragments() -> Option<&'static DispatchFragments> {
     static FRAGMENTS: OnceLock<Option<DispatchFragments>> = OnceLock::new();
     FRAGMENTS
         .get_or_init(|| {
-            let fragments = DispatchFragments::with_fun_helpers(
+            let fragments = DispatchFragments::with_compare(
                 crate::native_helpers::arinsal_beamasm_export_trampoline as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_call_light_bif_shared as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_exception_resolver as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_save_calls_export as *const () as usize,
                 crate::native_helpers::arinsal_beamasm_fun_resolver as *const () as usize,
                 crate::fun_dispatch::arinsal_beamasm_save_calls_fun as *const () as usize,
+                CompareHelpers {
+                    eq: crate::native_hooks::arinsal_eq as *const () as usize,
+                    cmp_atoms: crate::native_hooks::arinsal_cmp_atoms as *const () as usize,
+                    cmp_compound: crate::native_hooks::arinsal_cmp_compound as *const () as usize,
+                },
             )
             .ok()?;
             crate::fun_dispatch::init(fragments.unloaded_fun(), fragments.save_calls_fun());
@@ -1497,6 +1503,13 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
     fn guard_helper(&self) -> GuardHelper {
         crate::arinsal_beamasm_guard
+    }
+    fn compare_shared(&self) -> CompareShared {
+        fragments().map_or(CompareShared::default(), |fragments| CompareShared {
+            eq_exact: fragments.bif_is_eq_exact_shared(),
+            ne_exact: fragments.bif_is_ne_exact_shared(),
+            arith: fragments.arith_compare_shared(),
+        })
     }
     fn guard_helper3(&self) -> GuardHelper3 {
         crate::arinsal_beamasm_guard3
