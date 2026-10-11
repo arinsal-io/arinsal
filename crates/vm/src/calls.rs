@@ -94,13 +94,21 @@ pub(super) fn gc_after_bif(
     if !process.gc_enabled || !process.heap.gc_desired() {
         return Ok(());
     }
-    // BIF arguments plus at most two result roots fit inline: no allocation per collection.
-    let mut roots: smallvec::SmallVec<[Term; 8]> = smallvec::SmallVec::from_slice(arguments);
-    let result_index = if let Ok(value) = result {
-        roots.push(*value);
-        (Some(roots.len() - 1), None)
-    } else if let Err(error) = result {
-        let error_roots = match error {
+    // Port of erl_gc.c:418-478 (`erts_gc_after_bif_call_lhf`), OTP-29.1.1:
+    // a successful BIF return roots only the result slot; argument registers are dead.
+    if let Ok(value) = result {
+        let mut roots = [*value];
+        let stats = process.collect_heap_roots(0, &mut roots, 0)?;
+        *value = roots[0];
+        // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
+        crate::natives::sys::after_collection(process, 0, stats.collections, stats.words_reclaimed);
+        return Ok(());
+    }
+
+    // The error path roots the BIF argument registers plus process-owned error terms.
+    let mut roots: smallvec::SmallVec<[Term; 8]> = smallvec::SmallVec::new();
+    let error_roots = if let Err(error) = result {
+        match error {
             arinsal_bifs::BifError::Badarg { cause: Some(cause) } => {
                 let index = roots.len();
                 roots.push(*cause);
@@ -123,18 +131,13 @@ pub(super) fn gc_after_bif(
                 Some(BifErrorRoots::Raise(reason_index, trace_index))
             }
             _ => None,
-        };
-        (None, error_roots)
+        }
     } else {
-        (None, None)
+        None
     };
     let stats = process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
-    arguments.copy_from_slice(&roots[..arguments.len()]);
-    if let Some(index) = result_index.0 {
-        if let Ok(value) = result {
-            *value = roots[index];
-        }
-    } else if let Some(error_roots) = result_index.1
+    arguments.copy_from_slice(&process.x[..arguments.len()]);
+    if let Some(error_roots) = error_roots
         && let Err(error) = result
     {
         match (error_roots, error) {
@@ -167,7 +170,7 @@ pub(super) fn gc_after_bif(
     Ok(())
 }
 
-/// Apply the native BIF epilogue with the process argument registers as roots.
+/// Apply the native BIF epilogue, preserving error arguments when needed.
 // Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1.
 pub(super) fn gc_after_native(
     process: &mut Process,
@@ -191,11 +194,16 @@ pub(crate) fn gc_after_native_parts(
     if !process.gc_enabled || !process.heap.gc_desired() {
         return Ok(());
     }
+    if let Some(value) = value {
+        let mut roots = [*value];
+        let stats = process.collect_heap_roots(0, &mut roots, 0)?;
+        *value = roots[0];
+        // Port of erl_gc.c:922-932 (`garbage_collect` records scheduler GC statistics), OTP-29.1.1.
+        crate::natives::sys::after_collection(process, 0, stats.collections, stats.words_reclaimed);
+        return Ok(());
+    }
     let mut roots = arguments.to_vec();
-    let result_index = if let Some(value) = value.as_deref() {
-        roots.push(*value);
-        (Some(roots.len() - 1), None)
-    } else if let Some(trap) = raised.as_deref() {
+    let error_roots = if let Some(trap) = raised.as_deref() {
         let reason = roots.len();
         roots.push(trap.reason);
         let trace = trap.trace.map(|value| {
@@ -216,17 +224,13 @@ pub(crate) fn gc_after_native_parts(
             }
             crate::stacktrace::TopFrame::CurrentArgsWithInfo(None, _) => None,
         });
-        (None, Some(NativeErrorRoots::Trap { reason, trace, top }))
+        Some(NativeErrorRoots::Trap { reason, trace, top })
     } else {
-        (None, None)
+        None
     };
     let stats = process.collect_heap_roots(arguments.len(), &mut roots, 0)?;
     arguments.copy_from_slice(&roots[..arguments.len()]);
-    if let Some(index) = result_index.0 {
-        if let Some(value) = value {
-            *value = roots[index];
-        }
-    } else if let Some(NativeErrorRoots::Trap { reason, trace, top }) = result_index.1
+    if let Some(NativeErrorRoots::Trap { reason, trace, top }) = error_roots
         && let Some(trap) = raised
     {
         trap.reason = roots[reason];
