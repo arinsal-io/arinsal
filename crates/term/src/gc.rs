@@ -919,20 +919,22 @@ impl ProcessHeap {
     /// Whether the next collection is a full sweep.
     /// Port of erts/emulator/beam/erl_gc.c:787 (minor/major choice in `erts_garbage_collect_nobump`), OTP-29.1.1.
     pub fn collection_is_major(&self) -> bool {
-        let promote_bound = self.old_htop.saturating_add(self.mature_words());
         self.minor_since_major >= self.fullsweep_after
-            || (!self.old_words.is_empty() && promote_bound > self.old_words.len())
     }
 
     /// Whether a collection that starts as minor cannot be one and continues as a full sweep.
     /// Port of erts/emulator/beam/erl_gc.c:1461-1488 and 1540 (`minor_collection` returning -1
-    /// when there is no old heap to tenure into or `bin_old_vheap` reached `bin_old_vheap_sz`),
-    /// OTP-29.1.1. erts traces the failed minor attempt before the major one.
+    /// when the old heap has no room for the mature region or `bin_old_vheap` reached
+    /// `bin_old_vheap_sz`), OTP-29.1.1. erts traces the failed minor attempt before the major one.
     pub fn minor_falls_back_to_major(&self) -> bool {
-        !self.collection_is_major()
-            && ((self.old_words.is_empty() && self.mature_words() == 0)
-                || (!self.old_words.is_empty()
-                    && self.owners.vheap_old_size() <= self.owners.vheap_old()))
+        if self.collection_is_major() {
+            return false;
+        }
+        let mature = self.mature_words();
+        (self.old_words.is_empty() && mature == 0)
+            || (!self.old_words.is_empty()
+                && (mature > self.old_words.len().saturating_sub(self.old_htop)
+                    || self.owners.vheap_old_size() <= self.owners.vheap_old()))
     }
 
     /// Whether heap fragments exceed the free young-generation area.
@@ -1872,6 +1874,24 @@ mod tests {
 
         assert!(!heap.collection_is_major());
         assert!(!heap.owners.is_allocated());
+    }
+
+    #[test]
+    fn old_heap_capacity_failure_stays_a_minor_attempt_until_minor_collection() {
+        let mut heap = ProcessHeap::with_words(512);
+        heap.old_words = ProcessHeap::with_words(100).words;
+        heap.old_htop = 25;
+        heap.high_water = 80;
+
+        assert!(!heap.collection_is_major());
+        assert!(heap.minor_falls_back_to_major());
+
+        heap.old_words = ProcessHeap::with_words(128).words;
+        assert!(!heap.minor_falls_back_to_major());
+
+        heap.request_full_sweep();
+        assert!(heap.collection_is_major());
+        assert!(!heap.minor_falls_back_to_major());
     }
 
     #[test]
