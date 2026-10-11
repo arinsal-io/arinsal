@@ -485,6 +485,25 @@ fn assert_encoding(reference: &RefErl, vm: &mut Vm, encoding: Encoding) {
 }
 
 #[test]
+fn build_utf8_multibyte_list_does_not_segfault() {
+    let reference = RefErl::start().expect("OTP 29.1.1 reference runtime");
+    let beam = reference
+        .compile_named(MODULE, SOURCE, &[])
+        .expect("compile UTF segment differential module");
+    reference
+        .load(MODULE, &beam)
+        .expect("load reference module");
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).expect("load VM module");
+    let values = list(
+        (0..200)
+            .map(|index| OwnedTerm::Int(i64::from(if index % 5 == 0 { 0x20acu32 } else { 0x80 })))
+            .collect(),
+    );
+    call(&reference, &mut vm, "build_utf8_cases", values);
+}
+
+#[test]
 fn utf_segments_match_otp_for_boundaries_invalid_data_offsets_subbinaries_and_builds() {
     let reference = RefErl::start().expect("OTP 29.1.1 reference runtime");
     assert!(reference.otp_version().starts_with("29.1.1"));

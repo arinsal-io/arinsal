@@ -26,9 +26,10 @@ mod native_code;
 pub use atom::{Atom, AtomError, AtomTable, atoms, global_atoms};
 pub use bits::{
     ExternalBinary, RefcBinary, SUB_BITS_MUTABLE, SUB_BITS_VOLATILE, WritableBinary,
-    binary_memory_bytes, binary_offset_adjustment, is_match_context, is_writable_binary,
-    match_position, set_match_position, sub_bits_flags, writable_bytes_mut, writable_capacity,
-    writable_extend_private, writable_finalize, writable_gc_visit,
+    binary_memory_bytes, binary_offset_adjustment, erts_bs_private_append_checked,
+    erts_bs_private_append_fast, install_private_append_overhead, is_match_context,
+    is_writable_binary, match_position, set_match_position, sub_bits_flags, writable_bytes_mut,
+    writable_capacity, writable_extend_private, writable_finalize, writable_gc_visit,
 };
 pub use copy::{
     SharedCopyCache, copy_shared, copy_term, copy_term_litopt, copy_term_preserving_sharing,

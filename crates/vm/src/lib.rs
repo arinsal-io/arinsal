@@ -16,6 +16,7 @@ mod debug_env;
 mod difftest;
 mod dirty;
 mod dist;
+mod erl_bits;
 mod exceptions;
 mod floats;
 mod interp;
