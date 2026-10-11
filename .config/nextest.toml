@@ -1,0 +1,32 @@
+[store]
+dir = "target/nextest"
+
+[profile.default]
+# The machine is shared with build jobs and other test runs.
+test-threads = 6
+slow-timeout = { period = "60s", terminate-after = 10 }
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "flaky"
+
+[profile.gate]
+retries = 1
+fail-fast = false
+
+# Tests that share an OS resource (PTYs, epmd, fixed ports, the terminal) run one at a time.
+[test-groups]
+pty = { max-threads = 1 }
+dist = { max-threads = 1 }
+inet = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary(iex_shell) | binary(tty)"
+test-group = "pty"
+
+[[profile.default.overrides]]
+filter = "binary(dist_mixed)"
+test-group = "dist"
+
+[[profile.default.overrides]]
+filter = "binary(inet_full)"
+test-group = "inet"
