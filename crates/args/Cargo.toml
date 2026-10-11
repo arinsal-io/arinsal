@@ -15,4 +15,4 @@ thiserror.workspace = true
 [dev-dependencies]
 arinsal-etf.workspace = true
 arinsal-difftest.workspace = true
-similar-asserts = "1.7.0"
+similar-asserts = "2"
