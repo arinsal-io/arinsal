@@ -1,5 +1,7 @@
 //! AArch64 emitters for BEAM bit syntax construction.
 
+pub use crate::bs_fast::{install_bs_append_binary, install_bs_gc};
+
 use crate::module::{ArgVal, BeamModuleAssembler, ModuleError};
 use arinsal_a64::enc::Gpr;
 
@@ -112,13 +114,31 @@ impl BeamModuleAssembler {
 
     /// Builds a binary from the segment list of `bs_create_bin`.
     ///
-    /// The segments are staged in the X register array so that the collector sees them as
-    /// roots; the hook allocates and fills the binary. A zero result with `fail` set
-    /// clears the pending exception and branches to `fail`, otherwise the exception
-    /// propagates.
-    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1442-1600 (emit_i_bs_create_bin), OTP-29.1.1.
+    /// Fixed on-heap integers, a private append of byte fields, a single UTF-8 segment, and an
+    /// append of one binary are emitted inline the way BeamAsm does. Every other shape falls
+    /// through to the runtime hook: the segments are staged in the X register array so that the
+    /// collector sees them as roots. A zero result with `fail` set clears the pending exception
+    /// and branches to `fail`, otherwise the exception propagates.
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:1442-2494 (emit_i_bs_create_bin), OTP-29.1.1.
     #[allow(clippy::too_many_arguments)]
     pub fn emit_i_bs_create_bin(
+        &mut self,
+        fail: u32,
+        alloc: u32,
+        live: u32,
+        dst: ArgVal,
+        segments: &[BsSegment],
+        helper: BsCreateBinHelper,
+    ) -> Result<(), ModuleError> {
+        if crate::bs_fast::emit_fast_bs_create_bin(self, fail, alloc, live, dst, segments, helper)?
+        {
+            return Ok(());
+        }
+        self.emit_generic_bs_create_bin(fail, alloc, live, dst, segments, helper)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_generic_bs_create_bin(
         &mut self,
         fail: u32,
         alloc: u32,

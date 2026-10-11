@@ -5,6 +5,7 @@
 pub mod arith;
 pub mod bif;
 pub mod bs_construct;
+mod bs_fast;
 pub mod bs_match;
 pub mod catch;
 pub mod construct;
@@ -102,6 +103,10 @@ pub struct SchedulerRegisters {
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:527-540, OTP-29.1.1: erts pushes the
     // call site's return address, behind which the BIF result is in XREG0.
     pub trap_return: u64,
+    /// Binary construction cursor (`erts_current_bin`, `erts_bin_offset`).
+    /// Appended after the frozen prefix so existing BeamAsm offsets stay put.
+    // Port of erts/emulator/beam/erl_bits.h:181 (struct erl_bits_state), OTP-29.1.1.
+    pub erl_bits_state: [u64; 2],
 }
 
 /// Offset of `SchedulerRegisters::active_code_ix`, read by the native entry trampoline.
@@ -126,6 +131,7 @@ impl Default for SchedulerRegisters {
             active_code_ix: 0,
             entry_return: 0,
             trap_return: 0,
+            erl_bits_state: [0, 0],
         }
     }
 }

@@ -1610,6 +1610,11 @@ impl ModuleEnv for VmModuleEnv<'_> {
         crate::native_helpers::arinsal_beamasm_bs_match_command
     }
     fn bs_create_bin_helper(&self) -> arinsal_beamasm::bs_construct::BsCreateBinHelper {
+        arinsal_beamasm::bs_construct::install_bs_append_binary(
+            crate::erl_bits::append_binary as *const () as usize,
+        );
+        arinsal_beamasm::bs_construct::install_bs_gc(self.gc_hook());
+        arinsal_term::install_private_append_overhead(crate::erl_bits::private_append_overhead);
         crate::native_helpers::arinsal_beamasm_bs_create_bin
     }
     fn binary_literal(&self, bytes: &[u8]) -> Result<u64, String> {

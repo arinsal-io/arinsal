@@ -182,3 +182,172 @@ fn match_string_runtime_keeps_the_argument_registers() {
         [0x111, 0x222, 3, 4, 5, 6]
     );
 }
+
+#[cfg(target_arch = "aarch64")]
+fn small(value: u64) -> u64 {
+    (value << 4) | 0xf
+}
+
+#[cfg(target_arch = "aarch64")]
+fn execute_inline(
+    asm: BeamModuleAssembler,
+    values: &[u64],
+) -> (Vec<u64>, ProcessHeader, SchedulerRegisters) {
+    let module = asm.finalize().unwrap();
+    let mut mem = vec![0_u64; 64];
+    let base = mem.as_mut_ptr();
+    let mut registers = SchedulerRegisters::default();
+    arinsal_beamasm::rt::set_fixture_words(&mut registers.x_reg_array[..values.len()], values);
+    let mut header = ProcessHeader {
+        htop: base,
+        heap: base,
+        hend: base.wrapping_add(mem.len()),
+        stop: base.wrapping_add(mem.len()),
+        fcalls: 100,
+        ..ProcessHeader::default()
+    };
+    assert_eq!(
+        enter_native(&mut header, &mut registers, &module.entry(1).unwrap()),
+        ExitReason::Returned
+    );
+    (mem, header, registers)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn fixed_integer_construction_is_inline() {
+    let segments = [
+        BsSegment {
+            kind: BsSegmentKind::Integer,
+            index: 1,
+            src: ArgVal::X(0),
+            size: ArgVal::Immediate(small(8)),
+            size_is_units: false,
+            unit: 1,
+            flags: 0,
+        },
+        BsSegment {
+            kind: BsSegmentKind::Integer,
+            index: 2,
+            src: ArgVal::X(1),
+            size: ArgVal::Immediate(small(16)),
+            size_is_units: false,
+            unit: 1,
+            flags: 0,
+        },
+        BsSegment {
+            kind: BsSegmentKind::Integer,
+            index: 3,
+            src: ArgVal::X(2),
+            size: ArgVal::Immediate(small(32)),
+            size_is_units: false,
+            unit: 1,
+            flags: 0,
+        },
+    ];
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.emit_i_bs_create_bin(
+        0,
+        0,
+        3,
+        ArgVal::X(0),
+        &segments,
+        segment_hook as BsCreateBinHelper,
+    )
+    .unwrap();
+    finish(&mut asm);
+    let (mem, _, _) = execute_inline(asm, &[small(0x11), small(0x2233), small(0x4455_6677)]);
+    SEEN.with(|seen| assert!(seen.borrow().is_empty()));
+    assert_eq!(mem[0], 0xa0);
+    assert_eq!(mem[1], 56);
+    assert_eq!(mem[2] & 0x00ff_ffff_ffff_ffff, 0x0077_6655_4433_2211);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn utf8_construction_is_inline() {
+    let segment = BsSegment {
+        kind: BsSegmentKind::Utf8,
+        index: 1,
+        src: ArgVal::X(0),
+        size: ArgVal::Immediate(0),
+        size_is_units: false,
+        unit: 1,
+        flags: 0,
+    };
+    let mut asm = BeamModuleAssembler::new();
+    // Callee: the fun body. A real function saves LR (`i_breakpoint_trampoline`).
+    // The UTF-8 path `bl`s the shared encoder the way BeamAsm does.
+    asm.emit_i_func_label(2).unwrap();
+    asm.emit_enter_frame().unwrap();
+    asm.emit_i_bs_create_bin(
+        0,
+        0,
+        1,
+        ArgVal::X(0),
+        &[segment],
+        segment_hook as BsCreateBinHelper,
+    )
+    .unwrap();
+    asm.emit_leave_frame().unwrap();
+    asm.emit_raw(|e| e.ret(Gpr::x(30))).unwrap();
+    // Caller: list-comprehension shape (`get_list` saves the tail in y0, then `call`).
+    asm.emit_i_func_label(1).unwrap();
+    asm.emit_enter_frame().unwrap();
+    asm.allocate(1, 1).unwrap();
+    asm.move_(ArgVal::Immediate(0x1111), ArgVal::Y(0)).unwrap();
+    asm.call(2).unwrap();
+    asm.move_(ArgVal::Y(0), ArgVal::X(1)).unwrap();
+    asm.deallocate(1).unwrap();
+    asm.emit_leave_frame().unwrap();
+    finish(&mut asm);
+    let (mem, header, regs) = execute_inline(asm, &[small(0x20ac)]);
+    SEEN.with(|seen| assert!(seen.borrow().is_empty()));
+    assert_eq!(mem[0], 0xa0);
+    assert_eq!(mem[1], 24);
+    assert_eq!(mem[2], 0x00ac_82e2);
+    assert_eq!(mem[3], 0, "construct wrote past the rounded heap bitstring");
+    let advanced = (header.htop as usize).wrapping_sub(header.heap as usize);
+    assert_eq!(
+        advanced, 24,
+        "HTOP advance {advanced:#x} is not the 3-word object"
+    );
+    assert_eq!(
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[1..2]),
+        [0x1111],
+        "caller y0 (list tail) was clobbered"
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn non_small_integer_construction_uses_the_helper() {
+    let segment = BsSegment {
+        kind: BsSegmentKind::Integer,
+        index: 1,
+        src: ArgVal::X(0),
+        size: ArgVal::Immediate(small(8)),
+        size_is_units: false,
+        unit: 1,
+        flags: 0,
+    };
+    let mut asm = BeamModuleAssembler::new();
+    asm.emit_i_func_label(1).unwrap();
+    asm.emit_i_bs_create_bin(
+        0,
+        0,
+        2,
+        ArgVal::X(2),
+        &[segment],
+        segment_hook as BsCreateBinHelper,
+    )
+    .unwrap();
+    finish(&mut asm);
+    let (_, regs) = execute(asm, &[0x2, 0x22, 0x33, 4, 5, 6]);
+    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 2, 0]));
+    assert_eq!(
+        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[..2]),
+        [0x2, 0x22]
+    );
+}

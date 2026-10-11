@@ -136,7 +136,7 @@ pub(crate) fn enter_heap_runtime<'a>(header: *mut ProcessHeader) -> Option<&'a m
     Some(process)
 }
 
-fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
+pub(crate) fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a mut Process> {
     if header.is_null() {
         return None;
     }

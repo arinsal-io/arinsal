@@ -4,6 +4,7 @@ use arinsal_alloc::typed::{AllocBlock, ErtsAlcType, binary_allocation_bytes};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The context cursor or active writer may modify this `SUB_BITS` object.
@@ -19,6 +20,30 @@ const BINARY_FLAG_ACTIVE_WRITER: u64 = 1 << 3;
 /// Return live allocated bytes for erts' `BINARY` allocation type.
 pub fn binary_memory_bytes() -> u64 {
     binary_allocation_bytes()
+}
+
+/// `erts_bs_private_append` notifies the process vheap through this hook.
+/// Arguments are the process, the bitstring, the old end, and the new end, in bits.
+pub type PrivateAppendOverhead = extern "C" fn(*mut core::ffi::c_void, u64, u64, u64);
+
+static PRIVATE_APPEND_OVERHEAD: OnceLock<PrivateAppendOverhead> = OnceLock::new();
+
+/// Install the process-vheap update used by private append. The VM owns the counter.
+pub fn install_private_append_overhead(hook: PrivateAppendOverhead) {
+    let _ = PRIVATE_APPEND_OVERHEAD.set(hook);
+}
+
+fn note_private_append_overhead(
+    process: *mut core::ffi::c_void,
+    bin: u64,
+    old_bits: u64,
+    new_bits: u64,
+) {
+    if !process.is_null()
+        && let Some(hook) = PRIVATE_APPEND_OVERHEAD.get()
+    {
+        hook(process, bin, old_bits, new_bits);
+    }
 }
 
 fn binary_words(size: usize) -> Result<usize, TermError> {
@@ -244,12 +269,14 @@ impl WritableBinary {
         self.byte_capacity.load(Ordering::Relaxed)
     }
     /// Whether the unique writer may still grow this buffer.
+    #[inline(always)]
     pub fn has_writer(&self) -> bool {
         self.writer.load(Ordering::Relaxed)
     }
 }
 
 /// Read the two low flag bits from a live `SUB_BITS` term.
+#[inline(always)]
 pub fn sub_bits_flags(term: Term) -> u64 {
     if term.header().is_some_and(|h| h & 63 == SUB_BITS) {
         // SAFETY: SUB_BITS has a base_flags word.
@@ -281,6 +308,7 @@ pub(crate) fn writable_bin_ref_address(term: Term) -> Option<usize> {
     owner(term).map(|(bin_ref, _)| bin_ref as usize)
 }
 
+#[inline(always)]
 fn owner(term: Term) -> Option<(*const u64, &'static WritableBinary)> {
     if term.header()? & 63 != SUB_BITS {
         return None;
@@ -501,22 +529,182 @@ pub unsafe fn writable_bytes_mut<'a>(term: Term) -> Option<&'a mut [u8]> {
 
 /// Extend an active private writer's bit length and reserve space geometrically.
 pub fn writable_extend_private(term: Term, new_bits: usize) -> Result<bool, TermError> {
-    if !is_writable_binary(term) {
-        return Ok(false);
+    match prepare_private_append(
+        term.tagged_word(),
+        new_bits,
+        true,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+    ) {
+        Ok(0) => Ok(false),
+        Ok(_) => Ok(true),
+        Err(error) => Err(error),
     }
-    let adjustment = owner_adjustment(term);
-    // SAFETY: word three is the current end, and this process is its only writer.
-    let current = unsafe { *term.raw_ptr().add(3) as usize } - adjustment * 8;
-    if new_bits < current || new_bits > isize::MAX as usize {
-        return Err(TermError::SystemLimit);
+}
+
+/// Grow a private writable binary by `extra_bits` and publish the pre-append cursor.
+///
+/// Returns the same bitstring word, or zero when `bin` is not an active private writer
+/// (the caller then uses the generic construction path). A system limit also returns zero
+/// after leaving the binary unchanged.
+// Port of erts/emulator/beam/erl_bits.c:1928 (erts_bs_private_append_checked), OTP-29.1.1.
+pub extern "C" fn erts_bs_private_append_checked(
+    ebs: *mut u64,
+    process: *mut core::ffi::c_void,
+    bin: u64,
+    extra_bits: u64,
+) -> u64 {
+    let word = erts_bs_private_append_fast(ebs, process, bin, extra_bits);
+    if word != u64::MAX {
+        return word;
     }
-    let (_, binary) = owner(term).unwrap();
-    // SAFETY: the active writer has exclusive mutation rights and no view lives here.
+    let Ok(extra) = usize::try_from(extra_bits) else {
+        return 0;
+    };
+    prepare_private_append(bin, extra, false, ebs, process).unwrap_or(0)
+}
+
+/// No-realloc private append.
+///
+/// Returns the bitstring, `0` when `bin` is not an active writer (generic path),
+/// or `u64::MAX` when the buffer must grow. A leaf: the realloc path is the
+/// caller. Port of the writable branch of erts/emulator/beam/erl_bits.c:1963-2016
+/// (`BEAMASM` drops the overflow and header asserts), OTP-29.1.1.
+#[inline(never)]
+pub extern "C" fn erts_bs_private_append_fast(
+    ebs: *mut u64,
+    process: *mut core::ffi::c_void,
+    bin: u64,
+    extra_bits: u64,
+) -> u64 {
+    if ebs.is_null() || extra_bits == 0 {
+        return u64::MAX;
+    }
+    // Boxed tag only. Release erts drops the HEADER_SUB_BITS / HEADER_BIN_REF
+    // asserts (instr path is BEAMASM); a non-box returns 0 so the generic
+    // builder runs.
+    if bin & 3 != 2 {
+        return 0;
+    }
+    // SAFETY: exclusive writer, same precondition as `prepare_private_append`.
     unsafe {
+        let sb = (bin & !7) as *mut u64;
+        if *sb.add(1) & 3 != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE {
+            return 0;
+        }
+        let orig = *sb.add(4);
+        if orig & 3 != 2 {
+            return 0;
+        }
+        let br = (orig & !7) as *const u64;
+        let binary = &*(*br.add(1) as *const WritableBinary);
+        if !binary.has_writer() {
+            return 0;
+        }
+        let adjustment = ((*br.add(2) >> 1) & 3) as usize;
+        let end_word = *sb.add(3) as usize;
+        if end_word < adjustment * 8 {
+            return 0;
+        }
+        let current = end_word - adjustment * 8;
+        if current & 7 != 0 {
+            return 0;
+        }
+        let Some(new_bits) = current.checked_add(extra_bits as usize) else {
+            return u64::MAX;
+        };
+        if new_bits > isize::MAX as usize {
+            return u64::MAX;
+        }
+        let new_len = new_bits.div_ceil(8);
+        let old_len = binary.len();
+        if new_len > binary.capacity() || new_len > old_len + 1 {
+            return u64::MAX;
+        }
+        let allocation = &mut *binary.bytes.get();
+        if new_len == old_len + 1 {
+            // One cleared byte. The inline segment store overwrites it; no realloc.
+            clear_binary_bytes(allocation, old_len, new_len);
+            binary.byte_len.store(new_len, Ordering::Relaxed);
+            allocation.as_mut_slice()[1] = new_len as u64;
+            binary.apparent_size.store(new_len, Ordering::Relaxed);
+        }
+        *sb.add(3) = (new_bits + adjustment * 8) as u64;
+        let ptr = allocation
+            .as_mut_ptr()
+            .wrapping_add(BINARY_HEADER_WORDS)
+            .cast::<u8>() as u64;
+        publish_ebs(ebs, ptr, current as u64);
+        // Port of erl_bits.c:1961 (`update_wb_overhead` before the size commit), OTP-29.1.1.
+        note_private_append_overhead(process, bin, current as u64, new_bits as u64);
+        bin
+    }
+}
+
+#[inline(always)]
+fn publish_ebs(ebs: *mut u64, ptr: u64, offset: u64) {
+    // SAFETY: `ebs` is the caller’s `ErlBitsState` (two u64s), non-null.
+    unsafe {
+        *ebs = ptr;
+        *ebs.add(1) = offset;
+    }
+}
+
+/// `absolute` selects a new total length; otherwise `bits` is the number of bits to add.
+/// On success the returned word is the bitstring. Zero means it is not a private writer.
+/// When `ebs` is non-null it receives `erts_current_bin` and the bit offset before the append.
+/// Growth goes through [`resize_writable_binary`], which applies `GROW_PROC_BIN_SIZE`.
+#[cold]
+#[inline(never)]
+fn prepare_private_append(
+    bin: u64,
+    bits: usize,
+    absolute: bool,
+    ebs: *mut u64,
+    process: *mut core::ffi::c_void,
+) -> Result<u64, TermError> {
+    // SAFETY: `bin` is a tagged term from a live register or `Term::tagged_word`. This process
+    // is the binary's only writer, which is the precondition of erts_bs_private_append_checked.
+    unsafe {
+        let term = Term::from_raw_bits(bin);
+        let Some((bin_ref, binary)) = owner(term) else {
+            return Ok(0);
+        };
+        if sub_bits_flags(term) != SUB_BITS_MUTABLE | SUB_BITS_VOLATILE || !binary.has_writer() {
+            return Ok(0);
+        }
+        let adjustment = ((*bin_ref.add(2) >> 1) & 3) as usize;
+        let current = *term.raw_ptr().add(3) as usize - adjustment * 8;
+        // The inline store writes whole bytes. A non-byte cursor stays on the generic path,
+        // which has not yet grown the binary.
+        if !absolute && !ebs.is_null() && !current.is_multiple_of(8) {
+            return Ok(0);
+        }
+        let new_bits = if absolute {
+            bits
+        } else {
+            current.checked_add(bits).ok_or(TermError::SystemLimit)?
+        };
+        if new_bits < current || new_bits > isize::MAX as usize {
+            return Err(TermError::SystemLimit);
+        }
+        // Port of erts/emulator/beam/erl_binary.h:321 (erts_bin_realloc_fnf) and
+        // erl_bits.c:72 (GROW_PROC_BIN_SIZE), OTP-29.1.1.
         resize_writable_binary(&mut *binary.bytes.get(), binary, new_bits.div_ceil(8))?;
         *term.raw_ptr().add(3).cast_mut() = (new_bits + adjustment * 8) as u64;
+        // Port of erl_bits.c:1961 (`update_wb_overhead` before realloc), OTP-29.1.1.
+        // Resize does not collect, so the counter moves with the committed size.
+        note_private_append_overhead(process, bin, current as u64, new_bits as u64);
+        if !ebs.is_null() {
+            let ptr = (*binary.bytes.get())
+                .as_ptr()
+                .wrapping_add(BINARY_HEADER_WORDS)
+                .cast::<u8>() as u64;
+            *ebs = ptr;
+            *ebs.add(1) = current as u64;
+        }
+        Ok(term.tagged_word())
     }
-    Ok(true)
 }
 
 impl<H: HeapAlloc> TermBuilder<'_, H> {
@@ -618,6 +806,25 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         self.writable_binary_with_allocation(bytes, bit_len, capacity, apparent_size_bits, true)
     }
 
+    /// Install a writable bitstring from bytes the caller already owns.
+    ///
+    /// The `Vec` is only the source of those bytes. Storage is an allocator block,
+    /// same as [`TermBuilder::writable_binary`].
+    pub fn writable_from_vec(
+        &mut self,
+        mut bytes: Vec<u8>,
+        bit_len: usize,
+    ) -> Result<Term, TermError> {
+        let count = bit_len.div_ceil(8);
+        if count > bytes.len() {
+            return Err(TermError::BadArg);
+        }
+        bytes.truncate(count);
+        let capacity = bytes.capacity().max(count);
+        let apparent = capacity.saturating_mul(8).max(bit_len);
+        self.writable_binary_with_allocation(&bytes, bit_len, capacity, apparent, false)
+    }
+
     fn writable_binary_with_allocation(
         &mut self,
         bytes: &[u8],
@@ -714,5 +921,46 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
             *p.add(3) = (new_bits + adjustment * 8) as u64;
         }
         Ok(Some(Term::from_ptr(p, 2)))
+    }
+}
+
+#[cfg(test)]
+mod private_append_checked {
+    use super::erts_bs_private_append_checked;
+    use crate::{TermBuilder, VecHeap};
+
+    #[test]
+    fn publishes_the_pre_append_cursor() {
+        let mut heap = VecHeap::new();
+        let bin = TermBuilder::new(&mut heap)
+            .writable_binary(b"ab", 16, 64)
+            .unwrap();
+        let mut ebs = [0_u64; 2];
+        let result = erts_bs_private_append_checked(
+            ebs.as_mut_ptr(),
+            core::ptr::null_mut(),
+            bin.tagged_word(),
+            8,
+        );
+        assert_eq!(result, bin.tagged_word());
+        assert_eq!(ebs[1], 16);
+        assert_ne!(ebs[0], 0);
+    }
+
+    #[test]
+    fn non_byte_cursor_is_left_for_the_generic_path() {
+        let mut heap = VecHeap::new();
+        let bin = TermBuilder::new(&mut heap)
+            .writable_binary(&[0xf0], 4, 64)
+            .unwrap();
+        let mut ebs = [7_u64; 2];
+        let result = erts_bs_private_append_checked(
+            ebs.as_mut_ptr(),
+            core::ptr::null_mut(),
+            bin.tagged_word(),
+            8,
+        );
+        assert_eq!(result, 0);
+        assert_eq!(ebs, [7, 7]);
     }
 }

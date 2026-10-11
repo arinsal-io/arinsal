@@ -49,8 +49,9 @@
 
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{
-    HeapAlloc, Term, TermBuilder, TermError, TermKind, is_match_context, match_position,
-    set_match_position, to_owned, writable_bytes_mut, writable_extend_private, writable_finalize,
+    HeapAlloc, Term, TermBuilder, TermError, TermKind, is_match_context, is_writable_binary,
+    match_position, set_match_position, to_owned, writable_bytes_mut, writable_extend_private,
+    writable_finalize,
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{ToPrimitive, Zero};
@@ -537,6 +538,45 @@ pub fn create_utf_segment<H: HeapAlloc>(
 
 /// Construct a bitstring after the caller has reserved `create_bin_size` words.
 /// An initial append segment grows a unique writer in place when possible.
+/// Two byte-aligned payloads in one buffer, sized with `GROW_PROC_BIN_SIZE`.
+///
+/// Port of erts/emulator/beam/erl_bits.c:72 and the append + `erts_bs_put_binary`
+/// copy in `erts_bs_append_checked`, OTP-29.1.1.
+pub fn concat_byte_buffers(prefix: Term, extra: Term) -> Option<Vec<u8>> {
+    let prefix_bits = bit_size(prefix)?;
+    let extra_bits = bit_size(extra)?;
+    if !prefix_bits.is_multiple_of(8) || !extra_bits.is_multiple_of(8) {
+        return None;
+    }
+    let total = prefix_bits / 8 + extra_bits / 8;
+    let cap = if total > (1 << 24) {
+        total + total / 5
+    } else {
+        total.saturating_mul(2)
+    };
+    let mut out = Vec::with_capacity(cap);
+    let copied = with_binary(prefix, |payload, start, bits| {
+        if !start.is_multiple_of(8) || bits != prefix_bits {
+            return false;
+        }
+        let begin = start / 8;
+        out.extend_from_slice(&payload[begin..begin + bits / 8]);
+        true
+    })?;
+    if !copied {
+        return None;
+    }
+    let copied = with_binary(extra, |payload, start, bits| {
+        if !start.is_multiple_of(8) || bits != extra_bits {
+            return false;
+        }
+        let begin = start / 8;
+        out.extend_from_slice(&payload[begin..begin + bits / 8]);
+        true
+    })?;
+    copied.then_some(out)
+}
+
 pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Result<Term, BitsError> {
     // Port of erts/emulator/beam/erl_bits.c:1523 (new binary construction), OTP-29.1.1.
     if let [segment] = segments
@@ -620,6 +660,37 @@ pub fn create_bin<H: HeapAlloc>(segments: &[Segment<'_>], heap: &mut H) -> Resul
                 .map_err(|e| term_error(e, first.index, 8))?;
         }
         let suffix_bits = size.bits - prefix_bits;
+        // A fresh (non-writable) prefix is copied once into the result buffer, then the
+        // remaining segments are written there. Writable sources keep append_inner, which
+        // extends the existing buffer and only copies the suffix.
+        // Port of erts/emulator/beam/erl_bits.c:1725 (erts_bs_append_checked), OTP-29.1.1.
+        if !is_writable_binary(prefix) {
+            // One buffer and two payload copies, matching erts_bs_append_checked
+            // plus erts_bs_put_binary for `<<Bin/binary, Bin2/binary>>`.
+            if let [suffix] = &segments[1..]
+                && suffix.ty == SegType::Binary
+                && matches!(suffix.size, SegSize::All)
+                && let Ok(extra) = source(suffix)
+                && let Some(built) = concat_byte_buffers(prefix, extra)
+            {
+                return TermBuilder::new(heap)
+                    .writable_from_vec(built, size.bits)
+                    .map_err(|e| term_error(e, first.index, 8));
+            }
+            let total_bytes = size.bits.div_ceil(8);
+            let mut bytes = Vec::with_capacity(total_bytes.max(256));
+            bytes.resize(total_bytes, 0);
+            with_binary(prefix, |payload, start, _| {
+                copy_bits(&mut bytes, 0, payload, start, prefix_bits);
+            })
+            .ok_or(BitsError::BadArg {
+                segment: first.index,
+            })?;
+            write_segments(&segments[1..], &mut bytes, prefix_bits)?;
+            return TermBuilder::new(heap)
+                .writable_from_vec(bytes, size.bits)
+                .map_err(|e| term_error(e, first.index, 8));
+        }
         let mut suffix = vec![0; suffix_bits.div_ceil(8)];
         write_segments(&segments[1..], &mut suffix, 0)?;
         return append_inner(

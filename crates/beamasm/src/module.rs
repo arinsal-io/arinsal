@@ -161,6 +161,9 @@ pub struct BeamModuleAssembler {
     dispatch_fragments: HashMap<usize, Label>,
     /// Out-of-line `i_test_yield` continuations (stub, continuation, live X registers).
     yield_stubs: Vec<(Label, Label, u8)>,
+    /// Failure and GC stubs for `bs_create_bin`, emitted with the yield stubs so the
+    /// fall-through path is straight-line (erts `b.ls` / `b.ne` over a fragment).
+    bs_cold: Vec<BsColdEmit>,
     line_table: Vec<ModuleLine>,
     trace_breakpoints: HashMap<u32, (usize, Label)>,
     /// Line, live count and word offset recorded by `i_debug_line` until its trampoline.
@@ -183,6 +186,8 @@ pub struct BeamModuleAssembler {
 /// Size of the `i_func_info` slot that precedes every function's call entry (erts places the
 /// `ErtsCodeInfo` before the entry the same way; beam_asm_module.cpp:499-540, OTP-29.1.1).
 pub const FUNC_INFO_BYTES: usize = 4;
+
+type BsColdEmit = Box<dyn FnOnce(&mut BeamModuleAssembler) -> Result<(), ModuleError>>;
 /// `tmp_mem[6]`: the native pc an exception is attributed to.
 const NATIVE_ERROR_PC_SLOT: u32 = 16_432;
 const TRAP_RETURN_SLOT: u32 = crate::TRAP_RETURN_OFFSET as u32;
@@ -236,6 +241,7 @@ impl BeamModuleAssembler {
             arith_fragments: Vec::new(),
             dispatch_fragments: HashMap::new(),
             yield_stubs: Vec::new(),
+            bs_cold: Vec::new(),
             line_table: Vec::new(),
             arith_fail: 0,
             arith_types: None,
@@ -784,7 +790,15 @@ impl BeamModuleAssembler {
             self.emit_yield_live(live)?;
             self.code.b(self.yield_label)?;
         }
+        for emit in std::mem::take(&mut self.bs_cold) {
+            emit(self)?;
+        }
         Ok(())
+    }
+
+    /// Queues code that must not sit on a `bs_create_bin` fall-through path.
+    pub(crate) fn push_bs_cold(&mut self, emit: BsColdEmit) {
+        self.bs_cold.push(emit);
     }
 
     /// Checks reductions and saves the native continuation before yielding.
