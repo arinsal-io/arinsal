@@ -381,7 +381,7 @@ fn ensure_signal_reader() -> Result<(), VmError> {
     let mut fds = [0; 2];
     // SAFETY: pipe writes two fresh descriptors; mark both close-on-exec before
     // publishing them so concurrently spawned port children cannot inherit them.
-    let rc = unsafe {
+    let rc = crate::port::cloexec_publish(|| unsafe {
         let rc = libc::pipe(fds.as_mut_ptr());
         if rc == 0
             && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
@@ -390,11 +390,18 @@ fn ensure_signal_reader() -> Result<(), VmError> {
             let error = std::io::Error::last_os_error();
             libc::close(fds[0]);
             libc::close(fds[1]);
+            Err(error)
+        } else {
+            Ok(rc)
+        }
+    });
+    let rc = match rc {
+        Err(error) => {
             return Err(VmError::Unsupported(format!(
                 "signal pipe close-on-exec: {error}"
             )));
         }
-        rc
+        Ok(rc) => rc,
     };
     if rc != 0 {
         return Err(badarg());

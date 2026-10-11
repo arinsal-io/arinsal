@@ -712,6 +712,14 @@ pub unsafe extern "C" fn arinsal_beamasm_gc(
     let process = unsafe { &mut *header.cast::<Process>() };
     // SAFETY: The scheduler register pointer is live for the current native call.
     let registers = unsafe { &mut *registers };
+    // emit_enter_runtime just stored the live HTOP and E into the header. The
+    // heap indices still describe the last runtime exit, so a collection that
+    // trusted them would treat the stack as empty and sync that cursor back.
+    process.heap.set_native_cursors_at(
+        process.header.heap,
+        process.header.htop,
+        process.header.stop,
+    );
     if collect_native(process, registers, need_words, live).is_err() {
         set_error(process, "system_limit");
     }

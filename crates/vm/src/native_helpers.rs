@@ -816,6 +816,14 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
+    // emit_enter_runtime just stored the live HTOP and E. The heap indices
+    // still describe the last runtime exit; collecting from them treats the
+    // native frames as empty and sync_native_header publishes that cursor.
+    process.heap.set_native_cursors_at(
+        process.header.heap,
+        process.header.htop,
+        process.header.stop,
+    );
     // The emitter passes the full checked free-space gap, including CP and
     // S_RESERVED. Process::ensure uses that gap to decide whether to collect.
     // X registers above the register cache live in the X register array. Those below `live`

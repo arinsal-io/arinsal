@@ -46,6 +46,7 @@ mod native_hooks;
 mod native_records;
 mod natives;
 pub use calls::call_bif;
+pub use native_bridge::install_crash_dump;
 pub use native_hooks::{
     arinsal_beamasm_arith, arinsal_beamasm_bif_mfa, arinsal_beamasm_gc, arinsal_beamasm_guard,
     arinsal_beamasm_guard3, arinsal_beamasm_map_lookup,

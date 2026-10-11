@@ -1227,7 +1227,13 @@ impl Executor {
         }
         let (mut need_x, need_fr) = self.vm.code.registers[process.module];
         if crate::beamasm_integration::enabled() {
-            need_x = need_x.max(8);
+            // A native continuation's live X count is `c_p->arity + 1`, independent
+            // of the interpreter module whose register count sized this file.
+            let native_live = process
+                .cold
+                .as_ref()
+                .map_or(0, |cold| usize::from(cold.native_resume_live));
+            need_x = need_x.max(8).max(native_live);
         }
         if self.x.len() < need_x {
             let mut registers = self.x.to_vec();

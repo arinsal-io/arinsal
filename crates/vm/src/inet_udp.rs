@@ -273,7 +273,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
         protocol = 0;
     }
     // SAFETY: socket returns a fresh descriptor; set close-on-exec before publishing it.
-    let (fd, cloexec_error) = unsafe {
+    let (fd, cloexec_error) = crate::port::cloexec_publish(|| unsafe {
         let fd = libc::socket(domain, libc::SOCK_DGRAM, protocol);
         if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
             let error = last_errno();
@@ -282,7 +282,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
         } else {
             (fd, None)
         }
-    };
+    });
     if let Some(error) = cloexec_error {
         return err_bytes(errno_name(error));
     }

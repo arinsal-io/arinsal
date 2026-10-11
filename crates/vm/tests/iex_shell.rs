@@ -1,3 +1,4 @@
+use similar_asserts::assert_eq;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -191,8 +192,16 @@ fn iex_shell_pty_banner_and_prompts_match_otp() {
     assert_success(&reference, "OTP IEx PTY");
     assert_success(&arinsal, "Arinsal IEx PTY");
     assert_eq!(arinsal.status.code(), reference.status.code());
-    let reference = normalized(&reference.stdout);
-    let arinsal = normalized(&arinsal.stdout);
+    // `normalized` drops a trailing `iex(N)> ` because erts races that prompt against
+    // System.halt. The second prompt is often only that trailing line (IEx may halt
+    // before echoing the command), so the marker check uses the raw PTY bytes.
+    // `read_until` already required both prompts before halt was sent.
+    let reference = String::from_utf8_lossy(&reference.stdout)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let arinsal = String::from_utf8_lossy(&arinsal.stdout)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
     assert!(reference.contains("Interactive Elixir"));
     assert!(arinsal.contains("Interactive Elixir"));
     assert!(arinsal.contains("iex(1)>"));
