@@ -526,14 +526,11 @@ pub fn run_native(
     code_address: usize,
 ) -> Result<ExitReason, VmError> {
     register_bridge_continuation().map_err(|error| VmError::Unsupported(error.into()))?;
-    let arity = native_arity_at(code_address).ok_or_else(|| {
-        VmError::Unsupported(format!("unregistered native entry: {code_address:#x}"))
-    })?;
     if crate::native_bridge::return_trace_enabled()
         && let Some(function) = native_function_at(code_address)
     {
         eprintln!(
-            "[native-before-ensure] {}:{}/{} arity={arity} x0={:#x} E={:#x}",
+            "[native-before-ensure] {}:{}/{} x0={:#x} E={:#x}",
             function.module,
             function.function,
             function.arity,
@@ -558,11 +555,17 @@ pub fn run_native(
         .cold
         .as_mut()
         .map_or(0, |cold| std::mem::take(&mut cold.native_resume_live));
-    let live = if resume_live == 0 {
-        arity as usize
+    // Port of erts/emulator/beam/erl_process.c:10550 and jit/arm/process_main.cpp (a process
+    // resumes with the `c_p->arity` live registers its yield site saved), OTP-29.1.1: only a
+    // call entry needs the function's arity from the code registry.
+    let arity = if resume_live == 0 {
+        native_arity_at(code_address).ok_or_else(|| {
+            VmError::Unsupported(format!("unregistered native entry: {code_address:#x}"))
+        })?
     } else {
-        resume_live as usize - 1
+        resume_live - 1
     };
+    let live = usize::from(arity);
     process.ensure(1 + arinsal_term::S_RESERVED, live)?;
     registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
     // Port of erts/emulator/beam/jit/arm/instr_call.cpp:256-261 (emit_i_apply_only),

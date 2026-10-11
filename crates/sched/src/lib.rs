@@ -1490,10 +1490,14 @@ impl<T: Task> Inner<T> {
     }
 
     fn handle_local_aux_work(&self, worker: usize, local: &mut Local<T>) {
+        // Port of erts/emulator/beam/erl_process.c:9803-9810 (schedule: a busy scheduler reads
+        // the monotonic clock only once check_time_reds reaches ERTS_CHECK_TIME_REDS and bumps
+        // its timers with that time), OTP-29.1.1. Receive timeouts are checked before the
+        // timer wheel resets check_time_reds.
+        self.poll_pending_waits(local, false);
         // Port of erts/emulator/beam/erl_process.c:2719 (canceled timers before
         // debug-wait completion), OTP-29.1.1.
         self.poll_timers(worker, Some(local), false);
-        self.poll_pending_waits(local, true);
         self.handle_aux_work(worker);
     }
 
@@ -6257,16 +6261,7 @@ fn wakeup_other_check<T: Task>(inner: &Inner<T>, local: &mut Local<T>) {
     if wo_reds == 0 {
         return;
     }
-    let len = local.queues.iter().map(Worker::len).sum::<usize>()
-        + usize::from(local.runnext.is_some())
-        + inner.pinned_injectors[local.worker_id]
-            .iter()
-            .map(SegQueue::len)
-            .sum::<usize>()
-        + inner.balance.rqs[local.worker_id]
-            .len(balance::PORT_PRIO_LEVEL)
-            .max(0) as usize;
-    let left_len = len as i64 - 1;
+    let left_len = i64::from(inner.balance.rqs[local.worker_id].total_len()) - 1;
     if left_len < 1 {
         local.wakeup_other = (local.wakeup_other - wo_reds).max(0);
     } else {
