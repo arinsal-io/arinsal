@@ -7,7 +7,7 @@ use arinsal_beamasm::{
     arith::ArithHelper,
     construct::GcHook,
     fun::FunCallTag,
-    guard::{GuardHelper, GuardHelper3},
+    guard::{CompareShared, GuardHelper, GuardHelper3},
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     types::{ArgType, TypedArg},
 };
@@ -117,6 +117,10 @@ pub trait ModuleEnv {
     fn arithmetic_helper(&self) -> ArithHelper;
     /// Guard slow path used for term comparisons and guard BIFs.
     fn guard_helper(&self) -> GuardHelper;
+    /// Process-wide comparison fragments. The default is unset; the VM installs the real ones.
+    fn compare_shared(&self) -> CompareShared {
+        CompareShared::default()
+    }
     /// Guard slow path for checks that compare a tuple tag as well as its arity.
     fn guard_helper3(&self) -> GuardHelper3;
     /// Heap slow path used by allocating native operations.
@@ -2799,12 +2803,18 @@ fn emit_op(
                         let lhs = value(1)?;
                         let rhs = value(2)?;
                         match op.name() {
-                            "is_eq_exact" => {
-                                assembler.emit_is_eq_exact(lhs, rhs, fail, env.guard_helper())?
-                            }
-                            "is_ne_exact" => {
-                                assembler.emit_is_ne_exact(lhs, rhs, fail, env.guard_helper())?
-                            }
+                            "is_eq_exact" => assembler.emit_is_eq_exact(
+                                typed_arg(args.get(1), beam, env)?,
+                                typed_arg(args.get(2), beam, env)?,
+                                fail,
+                                env.guard_helper(),
+                            )?,
+                            "is_ne_exact" => assembler.emit_is_ne_exact(
+                                typed_arg(args.get(1), beam, env)?,
+                                typed_arg(args.get(2), beam, env)?,
+                                fail,
+                                env.guard_helper(),
+                            )?,
                             "is_eq" => assembler.emit_is_eq(lhs, rhs, fail, env.guard_helper())?,
                             "is_ne" => assembler.emit_is_ne(lhs, rhs, fail, env.guard_helper())?,
                             "is_lt" => assembler.emit_is_lt(lhs, rhs, fail, env.guard_helper())?,
@@ -3866,7 +3876,7 @@ fn emit_op(
                         typed_arg(args.first(), beam, env)?,
                         typed_arg(args.get(1), beam, env)?,
                         value(2)?,
-                        runtime,
+                        env.compare_shared(),
                     )
                 }
                 "bif_self" | "self" => {

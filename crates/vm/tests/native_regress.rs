@@ -28,6 +28,19 @@ lt5(X) -> X < 5.
 gei(X) when is_integer(X) -> {X >= 5, 5 >= X, X < 5, 5 < X}.
 gesm(X, Y) when is_integer(X), X > -10, X < 10, is_integer(Y) -> {X >= Y, Y >= X, X < Y, Y < X}.
 geib(X, Y) when is_integer(X), is_tuple(Y) -> {X >= Y, X < Y, Y >= X, Y < X}.
+fresh_big(N) -> (1 bsl 80) + N.
+fresh_tup(A) -> {A, A + 1, [A]}.
+boxed() ->
+    B1 = fresh_big(0), B2 = fresh_big(0), B3 = fresh_big(1),
+    T1 = fresh_tup(7), T2 = fresh_tup(7), T3 = fresh_tup(8),
+    {B1 =:= B2, B1 =:= B3, B1 =/= B3, B1 < B3, B3 >= B1, B1 >= 1.0, 1.0 < B1,
+     T1 =:= T2, T1 =/= T3, T1 < T3, T3 >= T1,
+     1.0 =:= 1, 1.0 < 2, 1.0 >= 1, 2 >= 1.0, 1 < 1.0, 5.0 < 5, 5.0 >= 5}.
+atom_eq(X, Y) when is_atom(X) -> X =:= Y.
+atom_ne(X, Y) when is_atom(Y) -> X =/= Y.
+guard_atom(X, Y) when is_atom(X), X =:= Y -> eq;
+guard_atom(X, Y) when is_atom(X), X =/= Y -> ne;
+guard_atom(_, _) -> other.
 run() ->
     Vs = [0, 1, -1, 5, 4, 6, 1 bsl 70, -(1 bsl 70), 0.0, 5.0, 4.9, ok, [], [1], {}, {1}, <<>>, self(), #{}, "a"],
     R = [{eq0(A), ne0(A), eqa(A), ge5(A), lt5(A),
@@ -35,7 +48,10 @@ run() ->
     I = [gei(A) || A <- [0, 5, 4, 6, 1 bsl 70, -(1 bsl 70)]],
     S = [gesm(A, B) || A <- [-9, 0, 5, 9], B <- [-9, 0, 5, 9, 1 bsl 70, -(1 bsl 70)]],
     B = [geib(A, T) || A <- [0, 1 bsl 70], T <- [{}, {1}]],
-    {R, I, S, B}.
+    {R, I, S, B, boxed(),
+     atom_eq(ok, ok), atom_eq(ok, 1), atom_eq(ok, {1}),
+     atom_ne(1, ok), atom_ne(ok, ok),
+     guard_atom(ok, ok), guard_atom(ok, error), guard_atom(1, 1)}.
 "#;
 const LIST_FIELDS_SOURCE: &str = r#"-module(native_list_fields).
 -export([run/0]).
