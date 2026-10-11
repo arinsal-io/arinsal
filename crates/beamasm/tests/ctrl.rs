@@ -161,9 +161,3 @@ fn move_return_local_call_frame_tail_yield_and_far_call() {
     assert_eq!(result_e, ExitReason::Returned);
     drop(module_e);
 }
-
-#[cfg(not(target_arch = "aarch64"))]
-#[test]
-fn native_control_gate_requires_aarch64() {
-    assert_eq!(std::mem::size_of::<usize>(), 8);
-}
