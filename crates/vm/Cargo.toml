@@ -52,7 +52,6 @@ mio = { version = "1", features = ["os-poll", "os-ext"] }
 arc-swap = "1.9.2"
 
 [dev-dependencies]
-similar-asserts = "1.7.0"
 arinsal-beamjit = { path = "../beamjit" }
 arinsal-difftest.workspace = true
 arinsal-etf.workspace = true

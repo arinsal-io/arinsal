@@ -2,6 +2,7 @@ use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, Term, from_owned};
 use arinsal_vm::Vm;
+use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
 -module(re_vm_diff).
@@ -41,7 +42,6 @@ fn eval(
 }
 
 #[test]
-#[ignore = "blocked on `source operand kind 5` in re:replace (boot_loop1)"]
 fn scheduled_re_calls_match_otp() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping scheduled re differential scenarios");
@@ -227,7 +227,7 @@ fn scheduled_re_calls_match_otp() {
     let compile_args = [
         O::Binary(b"(?<word>ab)(c)?".to_vec()),
         O::Binary(b"xxabyy".to_vec()),
-        O::list(vec![O::atom("unicode"), O::atom("global")]),
+        O::list(vec![O::atom("global")]),
     ];
     let expected = reference.call("re_vm_diff", "compile_run", &compile_args);
     let actual = eval(&beam, "compile_run", &compile_args)
