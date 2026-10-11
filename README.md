@@ -66,6 +66,11 @@ cargo nextest run -p arinsal-args
 Set `ARINSAL_OTP_ROOT` to the directory reported by `code:root_dir()` to select
 an OTP installation explicitly.
 
+`erlang:system_info(check_io)` reports the `_SC_OPEN_MAX` value captured when
+the first VM starts in the process. Later changes to the process file-descriptor
+limit do not change `max_fds`. Like OTP, Arinsal uses `24576` if the system query
+reports an unlimited value.
+
 ## License
 
 Arinsal is licensed under Apache-2.0. See [LICENSE](LICENSE).

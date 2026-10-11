@@ -663,6 +663,9 @@ impl Vm {
         code_scope: u64,
         replica: bool,
     ) -> Self {
+        if !replica {
+            crate::natives::sys::poll_max_fds();
+        }
         crate::fun_dispatch::set_thread_code_scope(code_scope);
         let code_ix = crate::code_ix::for_scope(code_scope);
         Self {
