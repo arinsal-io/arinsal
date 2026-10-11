@@ -23,6 +23,7 @@ run(Case) ->
         closed_local -> closed_local();
         accept_timeout -> accept_timeout();
         refused -> refused();
+        connect_timeout -> connect_timeout();
         names -> names();
         udp -> udp();
         sctp -> sctp();
@@ -150,6 +151,11 @@ accept_timeout() ->
 refused() ->
     gen_tcp:connect({127,0,0,1}, 1, tcp([{active, false}]), 400).
 
+%% 192.0.2.1 is TEST-NET-1 (RFC 5737): the SYN is not answered, so the
+%% connect timer fires. erts closes the socket and returns `{error, timeout}`.
+connect_timeout() ->
+    gen_tcp:connect({192,0,2,1}, 1, tcp([{active, false}]), 200).
+
 names() ->
     {ok, L} = gen_tcp:listen(0, tcp([{ip, {127,0,0,1}}, {active, false}])),
     {ok, Port} = inet:port(L),
@@ -205,6 +211,7 @@ fn gen_tcp_matches_erts() {
         "closed_local",
         "accept_timeout",
         "refused",
+        "connect_timeout",
         "names",
         "inet6",
         "udp",
