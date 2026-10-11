@@ -214,12 +214,10 @@ internal_state_get_ported_tuples() ->
 
 internal_state_set_ported() ->
     erts_debug:set_internal_state(available_internal_state, true),
-    Parent = self(),
-    Probe = spawn(fun() -> Parent ! ready, receive stop -> ok end end),
-    receive ready -> ok end,
-    Gc = erts_debug:set_internal_state(force_gc, Probe),
-    Probe ! stop,
-    Gc.
+    {garbage_collection, Before} = process_info(self(), garbage_collection),
+    Gc = erts_debug:set_internal_state(force_gc, self()),
+    {garbage_collection, After} = process_info(self(), garbage_collection),
+    {Gc, proplists:get_value(minor_gcs, After) - proplists:get_value(minor_gcs, Before)}.
 
 internal_state_multizero_timer() ->
     erts_debug:set_internal_state(available_internal_state, true),
@@ -375,7 +373,7 @@ fn run(reference: &RefErl, function: &str) -> (CallResult, OwnedTerm) {
 }
 
 fn assert_reference(expected: CallResult, actual: OwnedTerm) {
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }
 
 fn run_vm(beam: &[u8], function: &str) -> OwnedTerm {
