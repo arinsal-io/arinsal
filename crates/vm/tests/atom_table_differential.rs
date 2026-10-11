@@ -19,6 +19,22 @@ fn run_at(program: &Path, args: &[&str], dir: Option<&Path>) -> (bool, String, S
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
+    // A temp dir has no .tool-versions: pin both runtimes to the reference OTP root, as the erl script's ERL_ROOTDIR does.
+    if let Some(root) = arinsal_difftest::reference::otp_root() {
+        if program == Path::new("erl") {
+            command = Command::new(root.join("bin/erl"));
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(dir) = dir {
+                command.current_dir(dir);
+            }
+        } else {
+            command.env("ERL_ROOTDIR", root);
+        }
+    }
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("spawn {}: {error}", program.display()));
