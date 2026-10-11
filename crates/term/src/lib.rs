@@ -37,8 +37,9 @@ pub use copy::{
 };
 pub use fun::{
     ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET,
-    ErtsDispatchable, ExportEntry, ExportStubFn, FunEntry, FunRef, beam_unloaded_fun,
-    export_get_or_make_stub, set_export_stub_hook, set_fun_dispatch_fragments,
+    ErtsDispatchable, ExportEntry, ExportStubFn, FunEntry, FunEntryStubFn, FunRef,
+    beam_unloaded_fun, export_get_or_make_stub, set_export_stub_hook, set_fun_dispatch_fragments,
+    set_fun_entry_stub_hook,
 };
 pub use gc::{
     FragmentAlloc, FragmentIndex, GcStats, set_gc_clock_for_long_gc, set_gc_clock_for_msacc,

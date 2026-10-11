@@ -6,6 +6,7 @@ use arinsal_term::{
 };
 #[cfg(not(miri))]
 use arinsal_term::{internal_hash, make_hash, phash, phash2_range};
+use similar_asserts::assert_eq;
 use std::cmp::Ordering;
 #[cfg(not(miri))]
 use std::process::Command;
@@ -565,6 +566,7 @@ fn fun_layout_copy_and_conversion() {
     ));
     let entry = Arc::new(FunEntry {
         dispatch_target: Default::default(),
+        pend_purge_address: Default::default(),
         module,
         arity: 1,
         index: 3,
@@ -921,6 +923,7 @@ fn differential_local_fun_hashes() {
         .local_fun(
             Arc::new(arinsal_term::FunEntry {
                 dispatch_target: Default::default(),
+                pend_purge_address: Default::default(),
                 module,
                 arity: 0,
                 index: fields[0] as u32,

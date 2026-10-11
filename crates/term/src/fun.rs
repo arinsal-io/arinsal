@@ -1,7 +1,8 @@
 //! OTP 29 two-word fun head and opaque code-table entries.
-use crate::{Atom, FUN, Term};
+use crate::{Atom, FUN, LiteralArea, Term, TermError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Number of code indexes (`ERTS_NUM_CODE_IX`): active, staging and the one being retired.
 // Port of erts/emulator/beam/code_ix.h:72-78, OTP-29.1.1.
@@ -91,6 +92,9 @@ pub struct FunEntry {
     /// fun-entry pointer.
     // Port of erts/emulator/beam/erl_fun.h:31-35, OTP-29.1.1.
     pub dispatch_target: ErtsDispatchable,
+    /// Address hidden while the active code index is being purged.
+    // Port of erts/emulator/beam/erl_fun.h:37, OTP-29.1.1.
+    pub pend_purge_address: AtomicUsize,
     /// Defining module.
     pub module: Atom,
     /// Function arity.
@@ -121,6 +125,7 @@ impl Clone for FunEntry {
                     AtomicUsize::new(self.dispatch_target.address(ix))
                 }),
             },
+            pend_purge_address: AtomicUsize::new(self.pend_purge_address.load(Ordering::Acquire)),
             module: self.module,
             arity: self.arity,
             index: self.index,
@@ -145,7 +150,62 @@ impl FunEntry {
     /// Sets the code `address` entered in code index `ix`.
     // Port of erts/emulator/beam/erl_fun.c:48-53 (erts_set_fun_code), OTP-29.1.1.
     pub fn set_fun_code(&self, ix: usize, address: usize) {
+        assert_eq!(self.pend_purge_address.load(Ordering::Acquire), 0);
         self.dispatch_target.set_address(ix, address);
+    }
+
+    /// Copies one code index's fun address into the staging index.
+    // Port of erts/emulator/beam/erl_fun.c:106-112 (fun_stage), OTP-29.1.1.
+    pub fn stage_fun_code(&self, src_ix: usize, dst_ix: usize) {
+        assert_eq!(self.pend_purge_address.load(Ordering::Acquire), 0);
+        self.dispatch_target
+            .set_address(dst_ix, self.dispatch_target.address(src_ix));
+    }
+
+    /// Hides this entry's active address when it belongs to the purged code area.
+    // Port of erts/emulator/beam/erl_fun.c:157-179 (fun_purge_foreach), OTP-29.1.1.
+    pub fn prepare_fun_purge(&self, code_ix: usize, code: std::ops::Range<usize>) -> bool {
+        let address = self.dispatch_target.address(code_ix);
+        if !code.contains(&address) {
+            return false;
+        }
+        assert_eq!(self.pend_purge_address.load(Ordering::Acquire), 0);
+        self.pend_purge_address.store(address, Ordering::Release);
+        self.dispatch_target
+            .set_address(code_ix, BEAM_UNLOADED_FUN.load(Ordering::Acquire));
+        true
+    }
+
+    /// Restores the active address in the first phase of an aborted purge.
+    // Port of erts/emulator/beam/erl_fun.c:190-203 (erts_fun_purge_abort_prepare), OTP-29.1.1.
+    pub fn abort_fun_purge_prepare(&self, code_ix: usize) {
+        assert_eq!(
+            self.dispatch_target.address(code_ix),
+            BEAM_UNLOADED_FUN.load(Ordering::Acquire)
+        );
+        let address = self.pend_purge_address.load(Ordering::Acquire);
+        assert_ne!(address, 0);
+        self.dispatch_target.set_address(code_ix, address);
+    }
+
+    /// Clears the purge marker after restoration and thread progress.
+    // Port of erts/emulator/beam/erl_fun.c:205-222 (erts_fun_purge_abort_finalize), OTP-29.1.1.
+    pub fn abort_fun_purge_finalize(&self, code_ix: usize) {
+        assert_ne!(
+            self.dispatch_target.address(code_ix),
+            BEAM_UNLOADED_FUN.load(Ordering::Acquire)
+        );
+        self.pend_purge_address.store(0, Ordering::Release);
+    }
+
+    /// Clears a completed purge marker while leaving the active address unloaded.
+    // Port of erts/emulator/beam/erl_fun.c:224-239 (erts_fun_purge_complete), OTP-29.1.1.
+    pub fn complete_fun_purge(&self, code_ix: usize) {
+        assert_eq!(
+            self.dispatch_target.address(code_ix),
+            BEAM_UNLOADED_FUN.load(Ordering::Acquire)
+        );
+        self.pend_purge_address.store(0, Ordering::Release);
     }
 
     /// Whether code index `ix` enters loaded code rather than `beam_unloaded_fun`.
@@ -221,6 +281,9 @@ pub struct ExportEntry {
     pub function: Atom,
     /// Arity.
     pub arity: u8,
+    /// Globally shared zero-environment fun literal for this export.
+    // Port of erts/emulator/beam/export.h:62 and export.c:44-56 (Export.lambda), OTP-29.1.1.
+    pub(crate) lambda: OnceLock<Term>,
 }
 
 /// Byte offset of [`ExportEntry::info`] for generated loads.
@@ -255,6 +318,7 @@ impl ExportEntry {
             module,
             function,
             arity,
+            lambda: OnceLock::new(),
         }
     }
 
@@ -285,10 +349,53 @@ impl ExportEntry {
         self.dispatch.set_address(ix, address);
     }
 
+    /// Cached `Export.lambda` literal, if one has been requested.
+    pub(crate) fn lambda(&self) -> Option<Term> {
+        self.lambda.get().copied()
+    }
+
     /// Copies the address of code index `src` into `dst`.
     // Port of erts/emulator/beam/export.c:100-106 (export_stage), OTP-29.1.1.
     pub fn stage(&self, src: usize, dst: usize) {
         self.set_address(dst, self.address(src));
+    }
+}
+
+/// Build and retain `Export.lambda` in the global literal area.
+// Port of erts/emulator/beam/export.c:44-56 (create_shared_lambda), OTP-29.1.1.
+pub(crate) fn export_lambda(entry: Arc<ExportEntry>) -> Result<Term, TermError> {
+    if let Some(lambda) = entry.lambda() {
+        return Ok(lambda);
+    }
+    static LITERALS: OnceLock<Mutex<LiteralArea>> = OnceLock::new();
+    let literals = LITERALS.get_or_init(|| Mutex::new(LiteralArea::new()));
+    let mut literals = literals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lambda) = entry.lambda() {
+        return Ok(lambda);
+    }
+    let lambda = literals.builder().export_fun_in_heap(Arc::clone(&entry))?;
+    let _ = entry.lambda.set(lambda);
+    Ok(entry.lambda().unwrap_or(lambda))
+}
+
+/// Node hook resolving an external fun identity to its global fun-table entry.
+pub type FunEntryStubFn = fn(Arc<FunEntry>) -> Arc<FunEntry>;
+
+static FUN_ENTRY_STUB: OnceLock<FunEntryStubFn> = OnceLock::new();
+
+/// Installs the runtime's local fun-table lookup used when decoding external terms.
+pub fn set_fun_entry_stub_hook(hook: FunEntryStubFn) {
+    let _ = FUN_ENTRY_STUB.set(hook);
+}
+
+/// Returns the global entry for a decoded local fun, inserting its stub when absent.
+// Port of erts/emulator/beam/erl_fun.c:299-309 (erts_fun_entry_get_or_make_stub), OTP-29.1.1.
+pub(crate) fn fun_entry_get_or_make_stub(candidate: Arc<FunEntry>) -> Arc<FunEntry> {
+    match FUN_ENTRY_STUB.get() {
+        Some(hook) => hook(candidate),
+        None => candidate,
     }
 }
 

@@ -1,7 +1,8 @@
 //! Module loading and code index management.
 
 use super::*;
-use arinsal_term::{Atom, global_atoms};
+use arinsal_term::{Atom, FunEntry, global_atoms};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 #[derive(Clone)]
 pub(crate) struct SharedTable<T: Clone>(Arc<T>);
@@ -25,6 +26,51 @@ impl<T: Clone> std::ops::DerefMut for SharedTable<T> {
         Arc::make_mut(&mut self.0)
     }
 }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct FunKey {
+    module: Atom,
+    index: u32,
+    arity: u8,
+    uniq: [u8; 16],
+}
+
+impl From<&FunEntry> for FunKey {
+    fn from(entry: &FunEntry) -> Self {
+        Self {
+            module: entry.module,
+            index: entry.index,
+            arity: entry.arity,
+            uniq: entry.uniq,
+        }
+    }
+}
+
+impl Hash for FunKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Port of erts/emulator/beam/erl_fun.c:60-74 (fun_hash), OTP-29.1.1.
+        let first = u64::from_ne_bytes(self.uniq[..8].try_into().expect("eight bytes"));
+        let second = u64::from_ne_bytes(self.uniq[8..].try_into().expect("eight bytes"));
+        state.write_u64(first ^ second ^ u64::from(self.index));
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FunTableHasher(u64);
+
+impl Hasher for FunTableHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if let Ok(bytes) = <[u8; 8]>::try_from(bytes) {
+            self.0 = u64::from_ne_bytes(bytes);
+        }
+    }
+}
+
+type FunEntries = HashMap<FunKey, Arc<FunEntry>, BuildHasherDefault<FunTableHasher>>;
 
 /// Key of `loaded_nifs`: NIF libraries are tracked per code instance, like erts' `Module.curr.nif`.
 pub(crate) fn nif_key(name: &str, id: usize) -> String {
@@ -50,6 +96,8 @@ pub(crate) struct CodeTables {
     pub(crate) loaded_nifs: SharedTable<std::collections::HashSet<String>>,
     // g_code_fix
     pub(crate) exports: SharedTable<ExportIndex>,
+    /// OTP's global local-fun table, staged with the node's code indexes.
+    funs: SharedTable<FunEntries>,
     pub(crate) free_ids: SharedTable<Vec<usize>>,
     pub(crate) module_live: SharedTable<Vec<bool>>,
     pub(crate) module_files: SharedTable<HashMap<String, arinsal_etf::OwnedTerm>>,
@@ -371,12 +419,39 @@ impl CodeTables {
             registers: SharedTable::new(Vec::new()),
             loaded_nifs: SharedTable::new(std::collections::HashSet::new()),
             exports: SharedTable::new(ExportIndex::new()),
+            funs: SharedTable::new(HashMap::with_hasher(BuildHasherDefault::default())),
             free_ids: SharedTable::new(Vec::new()),
             module_live: SharedTable::new(Vec::new()),
             module_files: SharedTable::new(HashMap::new()),
             condemned: SharedTable::new(Vec::new()),
             known_modules: SharedTable::new(HashSet::new()),
         }
+    }
+
+    /// Canonicalizes one lambda entry through the staged global fun table.
+    // Port of erts/emulator/beam/erl_fun.c:270-309 (init_fun_template/entry_put/get_or_make_stub), OTP-29.1.1.
+    pub(crate) fn intern_fun_entry(&mut self, candidate: Arc<FunEntry>) -> Arc<FunEntry> {
+        let key = FunKey::from(candidate.as_ref());
+        Arc::clone(self.funs.entry(key).or_insert(candidate))
+    }
+
+    /// Canonicalizes the module's lambda slots through the staged global fun table.
+    pub(crate) fn intern_fun_entries(&mut self, module: &mut Module) {
+        for slot in &mut module.funs {
+            slot.entry = self.intern_fun_entry(Arc::clone(&slot.entry));
+        }
+    }
+
+    /// Applies `fun_stage` to every active-table entry when code staging starts.
+    pub(crate) fn stage_fun_entries(&self, active: usize, staging: usize) {
+        for entry in self.funs.values() {
+            entry.stage_fun_code(active, staging);
+        }
+    }
+
+    /// Iterates the current global fun-table objects for purge preparation.
+    pub(crate) fn fun_entries(&self) -> impl Iterator<Item = &Arc<FunEntry>> {
+        self.funs.values()
     }
 
     /// Adds a module instance and returns its id.
@@ -677,7 +752,7 @@ impl Vm {
     /// every generation.
     pub fn load_next_version(&mut self, bytes: &[u8]) -> Result<(), VmError> {
         let beam = arinsal_beam::parse(bytes).map_err(|e| VmError::Load(e.to_string()))?;
-        let module = Arc::new(self.prepare_module(&beam, Some(bytes))?);
+        let mut module = self.prepare_module(&beam, Some(bytes))?;
         let name = module.name.clone();
         let registers = process::register_requirements(&beam);
         let mut meta = CodeMeta::from_beam(&beam, Some(bytes));
@@ -686,7 +761,9 @@ impl Vm {
             if let Some(old_id) = tables.old.remove(&name) {
                 tables.release(old_id);
             }
+            tables.intern_fun_entries(&mut module);
         });
+        let module = Arc::new(module);
         self.compile_native(&module, &mut meta);
         let id = staging.with(|tables| {
             let id = tables.alloc(module, registers, Some(meta));
@@ -742,7 +819,7 @@ impl Vm {
         if let Some(&id) = self.code.loaded.get(&beam.module) {
             return Ok(id);
         }
-        let module = Arc::new(self.prepare_module(beam, bytes)?);
+        let mut module = self.prepare_module(beam, bytes)?;
         let registers = process::register_requirements(beam);
         let mut meta = CodeMeta::from_beam(beam, bytes);
         let staging = self.code_ix.start_staging();
@@ -752,6 +829,8 @@ impl Vm {
             self.refresh_code();
             return Ok(id);
         }
+        staging.with(|tables| tables.intern_fun_entries(&mut module));
+        let module = Arc::new(module);
         if compile_native {
             self.compile_native(&module, &mut meta);
         }
@@ -812,9 +891,10 @@ impl Vm {
         }
         let mut on_load = Vec::new();
         let mut ids = Vec::new();
-        for (module, registers, mut meta) in prepared {
+        for (mut module, registers, mut meta) in prepared {
             let name = module.name.clone();
             let pending = meta.on_load.is_some();
+            staging.with(|tables| tables.intern_fun_entries(&mut module));
             self.compile_native(&module, &mut meta);
             let module = Arc::new(module);
             ids.push(staging.with(|tables| {

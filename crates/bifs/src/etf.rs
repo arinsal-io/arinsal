@@ -1023,6 +1023,7 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
             let term = if ctx.is_some() {
                 let entry = Arc::new(FunEntry {
                     dispatch_target: Default::default(),
+                    pend_purge_address: Default::default(),
                     module: values[0].as_atom().unwrap(),
                     arity,
                     index,
@@ -1034,7 +1035,8 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
                     dispatch_code: Default::default(),
                     dispatch_epoch: Default::default(),
                 });
-                built(ctx, |b| b.local_fun(entry, &values[4..4 + free]))?
+                // Port of erts/emulator/beam/external.c:5162-5168, OTP-29.1.1.
+                built(ctx, |b| b.local_fun_stub(entry, &values[4..4 + free]))?
             } else {
                 Term::NIL
             };

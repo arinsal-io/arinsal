@@ -6,6 +6,7 @@ use arinsal_beamasm::{
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
 };
 use arinsal_term::{ExportEntry, ProcessHeap, TermBuilder, global_atoms};
+use similar_asserts::assert_eq;
 
 extern "C" fn resolve_normal(process: *mut ProcessHeader, fun: u64, arity: u32) -> usize {
     let target =
@@ -138,6 +139,7 @@ fn native_i_make_fun3_entry_matches_interpreter_layout() {
 
     let entry = std::sync::Arc::new(arinsal_term::FunEntry {
         dispatch_target: Default::default(),
+        pend_purge_address: Default::default(),
         module: arinsal_term::Atom(1),
         arity: 1,
         index: 0,

@@ -130,6 +130,7 @@ pub(crate) fn load_funs(
         slots.push(FunSlot {
             entry: Arc::new(FunEntry {
                 dispatch_target: Default::default(),
+                pend_purge_address: Default::default(),
                 module,
                 arity,
                 index: lambda.index,
