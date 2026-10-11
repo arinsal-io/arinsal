@@ -29,6 +29,12 @@ pub fn run_with_debugger_flags(
     line_breakpoints: bool,
     distribution_buffer_busy_limit_kb: Option<u64>,
 ) -> Result<ScheduledResult, VmError> {
+    let async_threads = arinsal_args::active_emulator_flags()
+        .async_threads
+        .unwrap_or(1)
+        .max(1) as usize;
+    // Port of erts/emulator/beam/erl_init.c:925, 1162-1163 (+A), OTP-29.1.1.
+    arinsal_drv::set_async_threads(async_threads);
     erl_init_atoms()?;
     crate::trace_bp::configure_debugger(debugger_support, line_breakpoints);
     // g_erl_flags: -pa / -pz / -path and ERL_LIBS. boot_loop2 should keep this

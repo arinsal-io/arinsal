@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use arinsal_args::{ArgsError, Limit, SchedulerCount, TimeWarp, parse};
+use similar_asserts::assert_eq;
 
 fn environment() -> BTreeMap<String, String> {
     BTreeMap::from([
@@ -16,6 +17,8 @@ fn environment() -> BTreeMap<String, String> {
 fn typed_emulator_flags_and_launch_metadata() {
     let argv = [
         "erl",
+        "+A",
+        "4",
         "+S",
         "4:3",
         "+SDcpu",
@@ -54,6 +57,7 @@ fn typed_emulator_flags_and_launch_metadata() {
         "4321",
     ];
     let launch = parse(&argv, &environment()).unwrap();
+    assert_eq!(launch.emulator.async_threads, Some(4));
     assert_eq!(
         launch.emulator.schedulers,
         Some(SchedulerCount {
@@ -150,8 +154,8 @@ fn accepted_ignored_flags_are_reported() {
         &environment(),
     )
     .unwrap();
-    assert_eq!(launch.emulator.ignored.len(), 9);
-    assert_eq!(launch.emulator.ignored[6].value.as_deref(), Some("i"));
+    assert_eq!(launch.emulator.ignored.len(), 8);
+    assert_eq!(launch.emulator.ignored[5].value.as_deref(), Some("i"));
     assert_eq!(launch.emulator.warnings().len(), 7);
     assert!(
         launch

@@ -1,3 +1,4 @@
+use similar_asserts::assert_eq;
 use std::process::Command;
 
 fn root() -> String {
@@ -93,7 +94,6 @@ fn alloc_a4_bad_allocator_flags_match_otp_cli() {
 }
 
 #[test]
-#[ignore = "OTP boot does not yet reach init:start_em/1, so -s/-run are not executed; argument vectors are checked by arinsal-args flag-family tests"]
 fn s_and_run_execute_in_order() {
     let dir = std::env::temp_dir().join(format!("arinsal-s-run-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -127,7 +127,8 @@ fn s_and_run_execute_in_order() {
     ];
     let expected = quiet(Command::new("erl").args(args)).output().unwrap();
     let actual = quiet(
-        Command::new(env!("CARGO_BIN_EXE_arinsal"))
+        Command::new("timeout")
+            .args(["30", env!("CARGO_BIN_EXE_arinsal")])
             .args(args)
             .env("ERL_ROOTDIR", root()),
     )

@@ -1100,6 +1100,10 @@ fn system_info(
         Some("dirty_io_schedulers") => Some(read_flags(process, |process, flags| {
             non_neg(process, flags.dirty_io_total as u64)
         })),
+        // Port of erts/emulator/beam/erl_bif_info.c:3032-3037 (thread_pool_size), OTP-29.1.1.
+        Some("thread_pool_size") => Some(read_flags(process, |process, flags| {
+            non_neg(process, flags.thread_pool_size as u64)
+        })),
         Some("fullsweep_after") => Some(read_flags(process, |process, flags| {
             tagged(process, "fullsweep_after", u64::from(flags.fullsweep_after))
         })),
@@ -3263,6 +3267,7 @@ pub(crate) struct SystemFlags {
     fullsweep_after: u16,
     min_heap_size: i64,
     min_bin_vheap_size: i64,
+    thread_pool_size: usize,
     max_heap: crate::process::MaxHeap,
     schedulers_online: usize,
     schedulers_total: usize,
@@ -3364,21 +3369,28 @@ impl SystemFlags {
         static BOOT: OnceLock<SystemFlags> = OnceLock::new();
         BOOT.get_or_init(|| {
             let cpus = logical_processors();
+            let emulator = arinsal_args::active_emulator_flags();
             let (
                 schedulers_total,
                 schedulers_online,
                 dirty_cpu_total,
                 dirty_cpu_online,
                 dirty_io_total,
-            ) = boot_scheduler_counts(cpus);
+            ) = boot_scheduler_counts_from(cpus, &emulator);
             SystemFlags {
                 // Port of erl_init.c:1328-1332 (`ERL_FULLSWEEP_AFTER`), OTP-29.1.1.
                 fullsweep_after: std::env::var("ERL_FULLSWEEP_AFTER")
                     .ok()
                     .map(|value| value.trim().parse::<i64>().unwrap_or(0) as u16)
                     .unwrap_or(u16::MAX),
-                min_heap_size: 233,
+                // Port of erts/emulator/beam/erl_init.c:1556-1562 (+hms), OTP-29.1.1.
+                min_heap_size: emulator
+                    .min_heap_size
+                    .map(|words| next_heap_size(i64::try_from(words).unwrap_or(i64::MAX)))
+                    .unwrap_or(233),
                 min_bin_vheap_size: 46_422,
+                // Port of erts/emulator/beam/erl_init.c:1162-1163 (+A zero clamp), OTP-29.1.1.
+                thread_pool_size: emulator.async_threads.unwrap_or(1).max(1) as usize,
                 max_heap: crate::process::MaxHeap::default(),
                 schedulers_online,
                 schedulers_total,
@@ -3432,52 +3444,24 @@ pub(crate) fn scheduler_online_default(runtime: &crate::process::Runtime) -> usi
     with_runtime_flags(Some(runtime), |flags| flags.schedulers_online)
 }
 
+#[cfg(test)]
 fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
-    // Port of erts/emulator/beam/erl_init.c scheduler option defaults, OTP-29.1.1.
-    let args: Vec<String> = std::env::args().collect();
-    let mut schedulers = (cpus, cpus);
-    let mut dirty_cpu = (cpus, cpus);
+    boot_scheduler_counts_from(cpus, &arinsal_args::EmulatorFlags::default())
+}
+
+// Port of erts/emulator/beam/erl_init.c:851-867, 951-1140, 1193-1210, OTP-29.1.1.
+fn boot_scheduler_counts_from(
+    cpus: usize,
+    emulator: &arinsal_args::EmulatorFlags,
+) -> (usize, usize, usize, usize, usize) {
+    let schedulers =
+        arinsal_args::resolve_scheduler_count(emulator.schedulers, cpus).unwrap_or((cpus, cpus));
+    let dirty_cpu = arinsal_args::resolve_scheduler_count(emulator.dirty_cpu_schedulers, cpus)
+        .unwrap_or((cpus, cpus));
     // Port of erts/emulator/beam/erl_init.c:867 (dirty_io_scheds = 10), OTP-29.1.1.
-    let mut dirty_io = 10;
-    let mut index = 1;
-    while index < args.len() {
-        let flag = args[index].as_str();
-        let inline = args.get(index + 1).map(String::as_str);
-        let (name, value, consumed) = match flag {
-            "+S" => (Some("+S"), inline, 2),
-            "+SDcpu" => (Some("+SDcpu"), inline, 2),
-            "+SDio" => (Some("+SDio"), inline, 2),
-            _ if flag.starts_with("+SDcpu") && flag.len() > 6 => {
-                (Some("+SDcpu"), Some(&flag[6..]), 1)
-            }
-            _ => (None, None, 1),
-        };
-        if let (Some(name), Some(value)) = (name, value) {
-            match name {
-                "+S" => {
-                    if let Some(counts) = parse_scheduler_pair(value, cpus) {
-                        schedulers = counts;
-                    }
-                }
-                "+SDcpu" => {
-                    if let Some(counts) = parse_scheduler_pair(value, cpus) {
-                        dirty_cpu = counts;
-                    }
-                }
-                "+SDio" => {
-                    if let Ok(count) = value.parse::<usize>()
-                        && count > 0
-                    {
-                        dirty_io = count;
-                    }
-                }
-                _ => {}
-            }
-            index = index.saturating_add(consumed);
-        } else {
-            index += 1;
-        }
-    }
+    let dirty_io = emulator
+        .dirty_io_schedulers
+        .map_or(10, |count| count as usize);
     let schedulers = (
         schedulers.0.max(1),
         schedulers.1.clamp(1, schedulers.0.max(1)),
@@ -3498,24 +3482,18 @@ fn boot_scheduler_counts(cpus: usize) -> (usize, usize, usize, usize, usize) {
     )
 }
 
+#[cfg(test)]
 fn parse_scheduler_pair(value: &str, cpus: usize) -> Option<(usize, usize)> {
     let (total, online) = value
         .split_once(':')
         .map_or((value, None), |(a, b)| (a, Some(b)));
-    let resolve = |part: &str, default: usize| {
-        let value = part.parse::<i32>().ok()?;
-        let count = if value < 0 {
-            (cpus as i32).saturating_add(value)
-        } else if value == 0 {
-            default as i32
-        } else {
-            value
-        };
-        usize::try_from(count).ok().filter(|count| *count > 0)
-    };
-    let total = resolve(total, cpus)?;
-    let online = online.map_or(Some(total.min(cpus)), |value| resolve(value, total))?;
-    (online <= total).then_some((total, online))
+    arinsal_args::resolve_scheduler_count(
+        Some(arinsal_args::SchedulerCount {
+            total: total.parse().ok()?,
+            online: online.map(str::parse).transpose().ok()?,
+        }),
+        cpus,
+    )
 }
 
 // Port of erts/emulator/beam/erl_gc.c:265 (heap size table) and :311

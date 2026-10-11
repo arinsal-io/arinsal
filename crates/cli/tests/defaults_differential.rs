@@ -1,5 +1,6 @@
 //! Compare boot-visible defaults with the installed OTP 29.1.1 emulator.
 
+use similar_asserts::assert_eq;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -126,7 +127,6 @@ fn system_flag_round_trips_match_otp() {
 }
 
 #[test]
-#[ignore = "launch resource flags are not yet connected to system_info/1"]
 fn resource_flags_match_otp() {
     if Command::new("erl").arg("-version").output().is_err() {
         eprintln!("erl unavailable; skipping resource flag differential");

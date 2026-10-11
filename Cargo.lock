@@ -34,6 +34,7 @@ name = "arinsal-args"
 version = "0.0.1"
 dependencies = [
  "arinsal-etf",
+ "similar-asserts",
  "thiserror",
 ]
 
@@ -136,6 +137,7 @@ dependencies = [
  "arinsal-nif",
  "arinsal-term",
  "arinsal-vm",
+ "similar-asserts",
 ]
 
 [[package]]

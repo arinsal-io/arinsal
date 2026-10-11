@@ -14,3 +14,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 arinsal-etf.workspace = true
+similar-asserts = "1.7.0"
