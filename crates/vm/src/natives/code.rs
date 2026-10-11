@@ -179,6 +179,7 @@ pub(crate) struct PurgeState {
     /// every local fun call, so it lives outside the mutex.
     old_id: std::sync::atomic::AtomicUsize,
     inner: Mutex<PurgeInner>,
+    stage_released: std::sync::Condvar,
 }
 
 #[derive(Default)]
@@ -186,13 +187,10 @@ struct PurgeInner {
     module: Option<String>,
     /// `sprocs`: processes suspended in `erts_code_purger:pending_purge_lambda/3`.
     sprocs: Vec<Pid>,
-    /// `funs` with their `pend_purge_address` (the native dispatch target).
-    /// Fun entries of the module being purged and their addresses before the purge
-    /// (`ErlFunEntry.pend_purge_address`).
-    funs: Vec<(
-        std::sync::Arc<arinsal_term::FunEntry>,
-        [usize; arinsal_term::ERTS_NUM_CODE_IX],
-    )>,
+    /// Global fun-table entries whose active code address is in the old module.
+    funs: Vec<std::sync::Arc<arinsal_term::FunEntry>>,
+    /// `erts_fun_start_staging` stays seized while pending-purge markers exist.
+    holds_stage_permission: bool,
 }
 
 impl PurgeState {
@@ -223,43 +221,82 @@ impl PurgeState {
         self.inner.lock().unwrap().module.as_deref() == Some(name)
     }
 
-    // Port of erts/emulator/beam/erl_fun.c:157-189 (fun_purge_foreach,
-    // erts_fun_purge_prepare), OTP-29.1.1.
-    fn prepare(&self, name: &str, old: usize, module: &arinsal_loader::Module) {
+    /// Waits until purge markers no longer prohibit a new code staging area.
+    pub(crate) fn wait_for_stage_permission(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.module = Some(name.to_owned());
-        let unloaded = arinsal_term::beam_unloaded_fun();
-        for slot in &module.funs {
-            let pending: [usize; arinsal_term::ERTS_NUM_CODE_IX] =
-                std::array::from_fn(|ix| slot.entry.dispatch_target.address(ix));
-            if pending.iter().any(|&address| address != unloaded) {
-                for ix in 0..arinsal_term::ERTS_NUM_CODE_IX {
-                    slot.entry.set_fun_code(ix, unloaded);
-                }
-                inner
-                    .funs
-                    .push((std::sync::Arc::clone(&slot.entry), pending));
-            }
+        while inner.holds_stage_permission {
+            inner = self
+                .stage_released
+                .wait(inner)
+                .unwrap_or_else(|error| error.into_inner());
         }
-        self.old_id.store(old + 1, Ordering::Release);
     }
 
-    /// Port of erts/emulator/beam/erl_fun.c:191 (erts_fun_purge_abort_prepare) and
-    /// beam_bif_load.c:2010 (finalize_purge_operation), OTP-29.1.1. Returns the
-    /// processes to resume.
-    fn finish(&self, aborted: bool) -> Vec<Pid> {
+    /// Whether a prepared purge currently holds the code staging permission.
+    pub(crate) fn stage_permission_held(&self) -> bool {
+        self.inner.lock().unwrap().holds_stage_permission
+    }
+
+    // Port of erts/emulator/beam/erl_fun.c:157-189 (fun_purge_foreach,
+    // erts_fun_purge_prepare), OTP-29.1.1.
+    fn prepare<'a>(
+        &self,
+        name: &str,
+        old: usize,
+        code_ix: usize,
+        code: Option<std::ops::Range<usize>>,
+        entries: impl Iterator<Item = &'a std::sync::Arc<arinsal_term::FunEntry>>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.module = Some(name.to_owned());
+        self.old_id.store(old + 1, Ordering::Release);
+        if let Some(code) = code {
+            for entry in entries {
+                if entry.prepare_fun_purge(code_ix, code.clone()) {
+                    inner.funs.push(std::sync::Arc::clone(entry));
+                }
+            }
+        }
+        inner.holds_stage_permission = !inner.funs.is_empty();
+    }
+
+    /// Restores only the active addresses before the abort thread-progress barrier.
+    // Port of erts/emulator/beam/erl_fun.c:190-203 (erts_fun_purge_abort_prepare), OTP-29.1.1.
+    fn abort_prepare(&self, code_ix: usize) -> bool {
+        let inner = self.inner.lock().unwrap();
+        for entry in &inner.funs {
+            entry.abort_fun_purge_prepare(code_ix);
+        }
+        !inner.funs.is_empty()
+    }
+
+    /// Clears active purge markers before the old code allocation is released.
+    // Port of erts/emulator/beam/erl_fun.c:224-239 (erts_fun_purge_complete), OTP-29.1.1.
+    fn complete_fun_purge(&self, code_ix: usize) {
+        let inner = self.inner.lock().unwrap();
+        for entry in &inner.funs {
+            entry.complete_fun_purge(code_ix);
+        }
+    }
+
+    /// Finalizes an aborted or completed purge and returns its suspended processes.
+    // Port of erts/emulator/beam/erl_fun.c:205-239 (abort_finalize / purge_complete) and
+    // beam_bif_load.c:2010-2036 (finalize_purge_operation), OTP-29.1.1.
+    fn finish(&self, aborted: bool, code_ix: usize) -> Vec<Pid> {
         let mut inner = self.inner.lock().unwrap();
         let funs = std::mem::take(&mut inner.funs);
         if aborted {
-            for (entry, pending) in funs {
-                for (ix, address) in pending.into_iter().enumerate() {
-                    entry.set_fun_code(ix, address);
-                }
+            for entry in funs {
+                entry.abort_fun_purge_finalize(code_ix);
             }
         }
         self.old_id.store(0, Ordering::Release);
         inner.module = None;
-        std::mem::take(&mut inner.sprocs)
+        inner.holds_stage_permission = false;
+        let pids = std::mem::take(&mut inner.sprocs);
+        drop(inner);
+        self.stage_released.notify_all();
+        pids
     }
 }
 
@@ -1068,15 +1105,29 @@ fn purge(
             });
             vm.refresh_code();
             if let Some(id) = old {
-                state.prepare(name, id, &vm.code.modules[id]);
+                let code = vm.code.code_meta[id]
+                    .as_ref()
+                    .and_then(|meta| meta.beamasm.as_ref())
+                    .map(|native| {
+                        let (start, end) = native.code_range();
+                        start..end
+                    });
+                let tables = vm.code_ix.active_tables();
+                state.prepare(name, id, vm.code_ix.active(), code, tables.fun_entries());
             }
             old.is_some()
         }
         "abort" => {
-            resume = state.finish(true);
+            let code_ix = vm.code_ix.active();
+            if state.abort_prepare(code_ix) {
+                ctx.block_thread_progress(std::time::Duration::ZERO);
+            }
+            resume = state.finish(true, code_ix);
             false
         }
         _ => {
+            let code_ix = vm.code_ix.active();
+            state.complete_fun_purge(code_ix);
             // g_code_fix: drop the old version's slot once nothing references it.
             let removed = vm.code_ix.update_active(|tables| {
                 let pending = std::mem::take(&mut *tables.condemned);
@@ -1103,7 +1154,7 @@ fn purge(
                 removed.is_some()
             });
             vm.refresh_code();
-            resume = state.finish(false);
+            resume = state.finish(false, code_ix);
             removed
         }
     };

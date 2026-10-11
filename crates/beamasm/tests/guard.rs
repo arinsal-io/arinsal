@@ -11,6 +11,7 @@ use arinsal_term::{
     ExportEntry, FunEntry, ProcessHeap, Term, TermBuilder, TermKind, atoms, cmp, exact_eq,
     global_atoms, loose_eq,
 };
+use similar_asserts::assert_eq;
 
 thread_local! {
     static ROOTS: RefCell<HashMap<u64, Term>> = RefCell::new(HashMap::new());
@@ -55,6 +56,7 @@ fn terms() -> Terms {
         .local_fun(
             Arc::new(FunEntry {
                 dispatch_target: Default::default(),
+                pend_purge_address: Default::default(),
                 module,
                 arity: 1,
                 index: 1,

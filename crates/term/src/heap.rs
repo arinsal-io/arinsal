@@ -2132,6 +2132,15 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         self.heap.retain_fun(entry);
         Ok(Term::from_ptr(p, 2))
     }
+    /// Construct a decoded local fun, resolving its identity through the node fun table.
+    // Port of erts/emulator/beam/external.c:5162-5168, OTP-29.1.1.
+    pub fn local_fun_stub(
+        &mut self,
+        entry: Arc<FunEntry>,
+        free: &[Term],
+    ) -> Result<Term, TermError> {
+        self.local_fun(crate::fun::fun_entry_get_or_make_stub(entry), free)
+    }
     /// Construct an export fun with no environment.
     pub fn export_fun(&mut self, entry: Arc<ExportEntry>) -> Result<Term, TermError> {
         // An export fun points at its node's export entry, never at a detached copy: entries
@@ -2143,6 +2152,14 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         } else {
             entry
         };
+        crate::fun::export_lambda(entry)
+    }
+
+    /// Build the heap object retained by a global `Export.lambda` literal.
+    pub(crate) fn export_fun_in_heap(
+        &mut self,
+        entry: Arc<ExportEntry>,
+    ) -> Result<Term, TermError> {
         let p = self.words(2)?;
         // SAFETY: the two-word fun head was reserved.
         unsafe {

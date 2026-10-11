@@ -1263,6 +1263,7 @@ struct VmModuleEnv<'a> {
     send_fragment: usize,
     native_bodies: HashMap<(String, u8), (usize, usize)>,
     module_name: String,
+    code_index: usize,
     // Call-NIF bodies reserved for functions a later load_nif may replace.
     dynamic_nifs: std::cell::RefCell<HashMap<(String, u8), usize>>,
     _lifetime: std::marker::PhantomData<&'a BeamFile>,
@@ -1275,6 +1276,7 @@ impl<'a> VmModuleEnv<'a> {
         literal_heap: &'a mut VecHeap,
         export_entries: Vec<usize>,
         fragments: &DispatchFragments,
+        code_scope: u64,
     ) -> Result<Self, String> {
         let mut literals = Vec::with_capacity(beam.literals.len());
         for index in 0..beam.literals.len() {
@@ -1352,6 +1354,7 @@ impl<'a> VmModuleEnv<'a> {
             send_fragment: fragments.send(),
             native_bodies,
             module_name: module.name.clone(),
+            code_index: crate::code_ix::for_scope(code_scope).staging(),
             dynamic_nifs: std::cell::RefCell::new(HashMap::new()),
             _lifetime: std::marker::PhantomData,
         })
@@ -1522,13 +1525,8 @@ impl ModuleEnv for VmModuleEnv<'_> {
             .lambda_entries
             .get(&index)
             .ok_or_else(|| format!("lambda {index} has no loaded fun entry"))?;
-        // Port of erts/emulator/beam/erl_fun.c:48-53 (erts_set_fun_code), OTP-29.1.1. Each
-        // load creates its own fun entries, which only code of this load reaches, so every
-        // code index gets the address at once (erts sets the staging index of a shared entry
-        // and `fun_stage` copies it into the others).
-        for ix in 0..arinsal_term::ERTS_NUM_CODE_IX {
-            entry.set_fun_code(ix, target);
-        }
+        // Port of erts/emulator/beam/erl_fun.c:48-53 (erts_set_fun_code), OTP-29.1.1.
+        entry.set_fun_code(self.code_index, target);
         Ok(())
     }
 
@@ -1704,7 +1702,15 @@ pub(crate) fn compile(
     let export_entries = import_entries(scope, module)?;
     // Literals no loaded instruction uses; a literal heap so literal checks see them as such.
     let mut literal_heap = Box::new(VecHeap::new_literal());
-    let env = VmModuleEnv::new(beam, module, &mut literal_heap, export_entries, fragments).ok()?;
+    let env = VmModuleEnv::new(
+        beam,
+        module,
+        &mut literal_heap,
+        export_entries,
+        fragments,
+        scope,
+    )
+    .ok()?;
     let trace = crate::calls::trace_boot_enabled();
     if trace {
         eprintln!("arinsal boot: beamasm compiling {}", beam.module);

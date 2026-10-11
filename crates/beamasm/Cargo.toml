@@ -12,3 +12,6 @@ workspace = true
 [dependencies]
 arinsal-a64 = { path = "../a64" }
 arinsal-term = { path = "../term" }
+
+[dev-dependencies]
+similar-asserts = "2"

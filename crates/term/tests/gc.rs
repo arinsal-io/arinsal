@@ -4,6 +4,7 @@ use arinsal_term::{
     size_object, to_owned, writable_bytes_mut, writable_capacity, writable_extend_private,
 };
 use arinsal_term::{ExternalBinary, MagicRef};
+use similar_asserts::assert_eq;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -402,6 +403,7 @@ fn owner_arcs_are_released_when_unreachable() {
     let node = Node::new(module, 1);
     let fun = Arc::new(FunEntry {
         dispatch_target: Default::default(),
+        pend_purge_address: Default::default(),
         module,
         arity: 0,
         uniq: [1; 16],
@@ -516,6 +518,7 @@ fn mixed_boxed_graph_survives_one_hundred_collections() {
         .unwrap();
     let fun_entry = Arc::new(FunEntry {
         dispatch_target: Default::default(),
+        pend_purge_address: Default::default(),
         module,
         arity: 1,
         uniq: [7; 16],

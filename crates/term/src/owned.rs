@@ -165,6 +165,7 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     .map_err(|_| TermError::SystemLimit)?;
                 let entry = Arc::new(FunEntry {
                     dispatch_target: Default::default(),
+                    pend_purge_address: Default::default(),
                     module,
                     arity: *arity,
                     uniq: *uniq,
@@ -176,7 +177,8 @@ pub fn from_owned<H: HeapAlloc>(input: &OwnedTerm, heap: &mut H) -> Result<Term,
                     dispatch_code: Default::default(),
                     dispatch_epoch: Default::default(),
                 });
-                let fun = builder.local_fun(entry, &values[start + 1..])?;
+                // Port of erts/emulator/beam/external.c:5162-5168, OTP-29.1.1.
+                let fun = builder.local_fun_stub(entry, &values[start + 1..])?;
                 values.truncate(start);
                 values.push(fun);
             }

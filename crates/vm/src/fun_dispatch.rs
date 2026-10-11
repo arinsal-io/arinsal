@@ -1,7 +1,7 @@
 //! Fun dispatch glue: the node export lookup behind `erts_export_get_or_make_stub` for terms
 //! built outside a process, and the runtime half of the `dispatch_save_calls_fun` fragment.
 use arinsal_beamasm::ProcessHeader;
-use arinsal_term::{Atom, ExportEntry};
+use arinsal_term::{Atom, ExportEntry, FunEntry};
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -26,6 +26,17 @@ fn export_stub_hook(module: Atom, function: Atom, arity: u8) -> Option<Arc<Expor
     crate::beamasm_integration::export_get_or_make_stub(scope, (module, function, arity))
 }
 
+/// Local fun lookup for ETF terms decoded by a process on this node.
+// Port of erts/emulator/beam/erl_fun.c:299-309 (erts_fun_entry_get_or_make_stub), OTP-29.1.1.
+fn fun_entry_stub_hook(candidate: Arc<FunEntry>) -> Arc<FunEntry> {
+    let scope = CODE_SCOPE.with(Cell::get);
+    if scope == 0 {
+        candidate
+    } else {
+        crate::code_ix::for_scope(scope).intern_fun_entry(candidate)
+    }
+}
+
 /// Publishes the fun dispatch fragments as `beam_unloaded_fun` / `beam_save_calls_fun` and
 /// the export lookup, before any fun entry of the node is created.
 // Port of erts/emulator/beam/jit/beam_jit_main.cpp (beamasm_init: beam_unloaded_fun and
@@ -33,6 +44,7 @@ fn export_stub_hook(module: Atom, function: Atom, arity: u8) -> Option<Arc<Expor
 pub(crate) fn init(unloaded_fun: usize, save_calls_fun: usize) {
     arinsal_term::set_fun_dispatch_fragments(unloaded_fun, save_calls_fun);
     arinsal_term::set_export_stub_hook(export_stub_hook);
+    arinsal_term::set_fun_entry_stub_hook(fun_entry_stub_hook);
 }
 
 /// The address a local fun call of a process saving calls continues with: the fun entry's

@@ -17,6 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use arc_swap::ArcSwap;
 
 use crate::load::CodeTables;
+use arinsal_term::FunEntry;
 
 pub(crate) use arinsal_beamasm::bif::{ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX};
 
@@ -183,10 +184,19 @@ impl CodeIndexes {
     /// dropped. A thread that already stages joins its open staging area.
     // Port of erts/emulator/beam/code_ix.c:120-129 (erts_start_staging_code_ix), module.c
     // (module_start_staging) and export.c:277-280 (export_start_staging), OTP-29.1.1.
+    // Purge markers also hold erts' stage permission (beam_bif_load.c:2112-2118).
     pub(crate) fn start_staging(self: &Arc<Self>) -> Staging {
-        let nested = self.seize(false);
+        let nested = loop {
+            let nested = self.seize(false);
+            if nested || !self.purge_state.stage_permission_held() {
+                break nested;
+            }
+            self.release();
+            self.purge_state.wait_for_stage_permission();
+        };
         if !nested {
             let copy = CodeTables::clone(&self.active_tables());
+            copy.stage_fun_entries(self.active(), self.staging());
             self.lock_permission().work = Some(copy);
             crate::beamasm_integration::stage_dispatch(self.scope);
         }
@@ -263,6 +273,42 @@ impl CodeIndexes {
                 if let Some(mut work) = work {
                     change(&mut work);
                     self.lock_permission().work = Some(work);
+                }
+                result
+            }
+        };
+        self.release();
+        result
+    }
+
+    /// Inserts or finds a local fun stub in the active or in-flight staged fun table.
+    // Port of erts/emulator/beam/erl_fun.c:299-309 (erts_fun_entry_get_or_make_stub), OTP-29.1.1.
+    pub(crate) fn intern_fun_entry(&self, candidate: Arc<FunEntry>) -> Arc<FunEntry> {
+        let nested = self.seize(true);
+        let (work, ended) = {
+            let mut permission = self.lock_permission();
+            let ended = permission.ended.is_some();
+            (
+                (nested || ended).then(|| permission.work.take()).flatten(),
+                ended,
+            )
+        };
+        let result = match work {
+            Some(mut work) if !ended => {
+                let result = work.intern_fun_entry(candidate);
+                self.lock_permission().work = Some(work);
+                result
+            }
+            mut work => {
+                let candidate = work.as_mut().map_or(candidate.clone(), |staging| {
+                    staging.intern_fun_entry(candidate.clone())
+                });
+                let mut tables = CodeTables::clone(&self.tables[self.active()].load());
+                let result = tables.intern_fun_entry(candidate);
+                self.tables[self.active()].store(Arc::new(tables));
+                if let Some(mut staging) = work {
+                    staging.intern_fun_entry(Arc::clone(&result));
+                    self.lock_permission().work = Some(staging);
                 }
                 result
             }

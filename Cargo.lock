@@ -69,6 +69,7 @@ version = "0.0.1"
 dependencies = [
  "arinsal-a64",
  "arinsal-term",
+ "similar-asserts",
 ]
 
 [[package]]
