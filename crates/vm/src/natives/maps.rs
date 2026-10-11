@@ -425,6 +425,11 @@ fn hamt_next(
         }
     }
 
+    if !stack.is_empty() {
+        // Port of erts/emulator/beam/erl_map.c:4121-4124: HRelease is only called when
+        // the traversal stack is empty; otherwise the reservation remains consumed.
+        region.set_cursor(region.limit());
+    }
     drop(region);
     let mut builder = TermBuilder::new(&mut heap);
     let result = if !stack.is_empty() {

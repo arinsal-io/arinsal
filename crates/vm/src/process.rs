@@ -12,7 +12,7 @@ use arinsal_spec::Opcode;
 use arinsal_term::ptab::PtabIdRing;
 use arinsal_term::ptab::{PtabLayout, set_port_table_layout};
 use arinsal_term::{
-    ProcessHeap, SharedCopyCache, Term, TermBuilder, copy_term,
+    ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -5309,26 +5309,44 @@ impl Process {
     /// Emit a `garbage_collection` trace event with the GC info list and `{wordsize, Size}`.
     /// Port of erts/emulator/beam/erl_trace.c:1439 (`trace_gc`), OTP-29.1.1.
     fn trace_gc(&mut self, pid: arinsal_sched::Pid, tag: &str, size: usize) {
+        let gc_info = self.heap.gc_info_words();
         let entries = [
-            ("heap_block_size", self.heap.capacity_words()),
-            ("heap_size", self.heap.heap_size_words()),
-            ("old_heap_size", self.heap.old_used_words()),
-            ("stack_size", self.heap.stack_words()),
             ("wordsize", size),
+            ("old_heap_block_size", gc_info.old_heap_block_size),
+            ("heap_block_size", gc_info.heap_block_size),
+            ("mbuf_size", gc_info.mbuf_size),
+            ("recent_size", gc_info.recent_size),
+            ("stack_size", gc_info.stack_size),
+            ("old_heap_size", gc_info.old_heap_size),
+            ("heap_size", gc_info.heap_size),
+            ("bin_vheap_size", self.heap.bin_vheap_used() as usize),
+            (
+                "bin_vheap_block_size",
+                self.heap.bin_vheap_block_size() as usize,
+            ),
+            (
+                "bin_old_vheap_size",
+                self.heap.bin_old_vheap_used() as usize,
+            ),
+            (
+                "bin_old_vheap_block_size",
+                self.heap.bin_old_vheap_block_size() as usize,
+            ),
         ];
         let mut tuples = Vec::with_capacity(entries.len());
+        let mut scratch = VecHeap::new();
         for (name, value) in entries {
             let Some(value) = Term::small(value as i64) else {
                 return;
             };
             let Ok(tuple) =
-                TermBuilder::new(&mut self.heap).tuple(&[crate::signals::atom(name), value])
+                TermBuilder::new(&mut scratch).tuple(&[crate::signals::atom(name), value])
             else {
                 return;
             };
             tuples.push(tuple);
         }
-        let Ok(info) = TermBuilder::new(&mut self.heap).list_from_iter(tuples) else {
+        let Ok(info) = TermBuilder::new(&mut scratch).list_from_iter(tuples) else {
             return;
         };
         crate::trace::emit_process(None, self, pid, crate::trace::GC, tag, &[info]);

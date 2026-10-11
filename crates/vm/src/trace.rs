@@ -3596,22 +3596,21 @@ fn emit_filtered_without_ctx(
         if let Some(stamp) = timestamp_term(process, entry.flags) {
             values.push(stamp);
         }
-        // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253 (enif_make_tuple_from_array
-        // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
-        // the event, so the tuple may land in a heap fragment.
-        let Ok(event) =
-            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&values)
-        else {
-            continue;
-        };
-        let Ok(message) = Message::copy_from(event) else {
-            continue;
-        };
         match entry.tracer {
             Tracer::Default => continue,
             // A process never traces itself: the default tracer discards such events.
             Tracer::Pid(pid) if pid == subject => continue,
             Tracer::Pid(pid) => {
+                // Port of erts/emulator/beam/erl_trace.c:1439 and
+                // erts/emulator/nifs/common/erl_tracer_nif.c:237-253, OTP-29.1.1:
+                // build in temporary storage, then copy into the tracer's message.
+                let mut scratch = VecHeap::new();
+                let Ok(event) = TermBuilder::new(&mut scratch).tuple(&values) else {
+                    continue;
+                };
+                let Ok(message) = Message::copy_from(event) else {
+                    continue;
+                };
                 if let Some(runtime) = &process.runtime
                     && let Ok(scheduler) = runtime.scheduler()
                 {
@@ -3619,6 +3618,14 @@ fn emit_filtered_without_ctx(
                 }
             }
             Tracer::Port(id) => {
+                // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253,
+                // OTP-29.1.1: the port copies this term synchronously.
+                let Ok(event) =
+                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                        .tuple(&values)
+                else {
+                    continue;
+                };
                 if let Some(port) = Term::port(id) {
                     let _ = crate::port::trace_command(process, port, event);
                 }

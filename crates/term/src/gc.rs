@@ -66,6 +66,21 @@ impl HeapAlloc for FragmentAlloc<'_> {
     fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
         HeapAlloc::retain_writable_binary(self.0, binary)
     }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), TermError> {
+        HeapAlloc::retain_writable_binary_with_apparent_size(self.0, binary, apparent_size_bits)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        HeapAlloc::update_writable_binary_overhead(self.0, source, old_size_bits, new_size_bits)
+    }
     fn supports_writable_binary(&self) -> bool {
         true
     }

@@ -1,7 +1,7 @@
 use arinsal_term::{
-    ExportEntry, FunEntry, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term, TermBuilder, VecHeap,
-    copy_term, exact_eq, global_atoms, make_hash2, match_position, set_match_position, size_object,
-    to_owned, writable_bytes_mut, writable_capacity, writable_extend_private,
+    ExportEntry, FunEntry, HeapAlloc, Node, ProcessHeap, S_REDZONE, S_RESERVED, Term, TermBuilder,
+    VecHeap, copy_term, exact_eq, global_atoms, make_hash2, match_position, set_match_position,
+    size_object, to_owned, writable_bytes_mut, writable_capacity, writable_extend_private,
 };
 use arinsal_term::{ExternalBinary, MagicRef};
 use std::sync::Arc;
@@ -29,6 +29,30 @@ fn process_heap_allocator_leaves_the_native_stack_redzone() {
     assert_eq!(heap.allocation_reserve(), reserve);
     assert!(heap.alloc(words - reserve).is_some());
     assert!(heap.alloc(1).is_none());
+}
+
+#[test]
+fn halloc_reserves_the_stack_redzone_before_using_a_fragment() {
+    let words = S_REDZONE + 16;
+    let mut heap = ProcessHeap::with_words(words);
+    assert_eq!(heap.halloc_words_left(), Some(16));
+    assert!(heap.alloc_halloc(16).is_some());
+    assert_eq!(heap.halloc_words_left(), Some(0));
+    assert!(heap.alloc_halloc(1).is_none());
+}
+
+#[test]
+fn hrelease_shrinks_and_reuses_the_current_heap_fragment() {
+    let mut heap = ProcessHeap::with_words(16);
+    let block = heap.heap_fragment(16);
+    HeapAlloc::release(&mut heap, block.wrapping_add(16), block.wrapping_add(4));
+    assert_eq!(heap.mbuf_size(), 4);
+    assert_eq!(heap.fragment_count(), 1);
+
+    let reused = heap.heap_fragment(12);
+    assert_eq!(reused, block.wrapping_add(4));
+    assert_eq!(heap.mbuf_size(), 16);
+    assert_eq!(heap.fragment_count(), 1);
 }
 
 #[test]

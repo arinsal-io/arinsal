@@ -158,14 +158,20 @@ pub extern "C" fn arinsal_beamasm_big_to_float(header: *mut ProcessHeader, term_
 /// Creates the empty writable binary for a native `bs_init_writable`.
 // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:985-1000 and erl_bits.c:2002
 // (erts_bs_init_writable), OTP-29.1.1.
-pub extern "C" fn arinsal_beamasm_bs_init_writable(header: *mut ProcessHeader, _size: u64) -> u64 {
+pub extern "C" fn arinsal_beamasm_bs_init_writable(header: *mut ProcessHeader, size: u64) -> u64 {
     let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
+    let size = crate::native_hooks::from_raw(size).as_small();
     process
         .heap
         .set_frame_pointer(registers.tmp_mem[2] as usize);
-    let result = arinsal_bits::init_writable(&mut crate::FragmentingHeap(&mut process.heap));
+    if process.ensure(8, 0).is_err() {
+        crate::native_hooks::set_error(process, "system_limit");
+        process.sync_native_header();
+        return 0;
+    }
+    let result = arinsal_bits::init_writable_with_size(size, &mut process.heap);
     process.sync_native_header();
     match result {
         Ok(value) => crate::native_hooks::raw(value),
@@ -823,6 +829,7 @@ fn invoke_dispatch_bif(
                 || crate::trace_bp::any_pattern());
         if let Some(bif) = export.light_bif
             && !export_checks
+            && !export.trap_entry
         {
             return Some(call_plain_bif(process, registers, export, bif, export_call));
         }
@@ -839,6 +846,7 @@ fn invoke_dispatch_bif(
         && !(export_call
             && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
                 || crate::trace_bp::any_pattern()))
+        && !export.trap_entry
     {
         return Some(call_process_bif(
             process,
@@ -2227,7 +2235,11 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
         crate::native_hooks::set_error(process, "badarg");
         return 0;
     };
+    let fragment_only_append = initial.first().is_some_and(|segment| {
+        segment.ty == SegType::PrivateAppend && matches!(segment.size, SegSize::All)
+    });
     let mut request = match arinsal_bits::create_bin_size(&initial) {
+        Ok(_) if fragment_only_append => 0,
         Ok(size) => size.heap_words + alloc,
         Err(error) => {
             let (reason, info) = crate::bits::native_error(error);
@@ -2240,7 +2252,7 @@ pub extern "C" fn arinsal_beamasm_bs_create_bin(
     };
     drop(initial);
     let result = loop {
-        if process.ensure(request, root_live).is_err() {
+        if request != 0 && process.ensure(request, root_live).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
             registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
             return 0;

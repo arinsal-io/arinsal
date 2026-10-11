@@ -163,6 +163,11 @@ pub fn writable_capacity(term: Term) -> Option<usize> {
     owner(term).map(|(_, binary)| binary.capacity())
 }
 
+/// Return the writable binary's heap `BinRef` address for young/old accounting.
+pub(crate) fn writable_bin_ref_address(term: Term) -> Option<usize> {
+    owner(term).map(|(bin_ref, _)| bin_ref as usize)
+}
+
 fn owner(term: Term) -> Option<(*const u64, &'static WritableBinary)> {
     if term.header()? & 63 != SUB_BITS {
         return None;
@@ -466,7 +471,51 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         bit_len: usize,
         capacity: usize,
     ) -> Result<Term, TermError> {
+        self.writable_binary_with_allocation(
+            bytes,
+            bit_len,
+            capacity,
+            capacity.saturating_mul(8),
+            false,
+        )
+    }
+
+    /// Build a writable binary using its visible size for pre-GC overhead.
+    // Port of erl_bits.c:1675-1698 (`build_writable_bitstring`), OTP-29.1.1.
+    pub fn writable_binary_with_apparent_size(
+        &mut self,
+        bytes: &[u8],
+        bit_len: usize,
+        capacity: usize,
+        apparent_size_bits: usize,
+    ) -> Result<Term, TermError> {
+        self.writable_binary_with_allocation(bytes, bit_len, capacity, apparent_size_bits, false)
+    }
+
+    /// Build a writable binary whose `BinRef` and `SUB_BITS` live in a heap fragment.
+    // Port of erl_bits.c:1996 (`HeapFragOnlyAlloc` for private append), OTP-29.1.1.
+    pub fn writable_binary_in_fragment(
+        &mut self,
+        bytes: &[u8],
+        bit_len: usize,
+        capacity: usize,
+        apparent_size_bits: usize,
+    ) -> Result<Term, TermError> {
+        self.writable_binary_with_allocation(bytes, bit_len, capacity, apparent_size_bits, true)
+    }
+
+    fn writable_binary_with_allocation(
+        &mut self,
+        bytes: &[u8],
+        bit_len: usize,
+        capacity: usize,
+        apparent_size_bits: usize,
+        fragment_only: bool,
+    ) -> Result<Term, TermError> {
         if bit_len > bytes.len().saturating_mul(8) || bit_len > isize::MAX as usize {
+            return Err(TermError::BadArg);
+        }
+        if apparent_size_bits < bit_len || apparent_size_bits > isize::MAX as usize {
             return Err(TermError::BadArg);
         }
         if !self.heap.supports_writable_binary() {
@@ -480,7 +529,12 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         let binary = Arc::new(WritableBinary::new(&initial, capacity));
         // SAFETY: the Arc is retained below and its buffer is live.
         let adjustment = unsafe { (*binary.bytes.get()).as_ptr() as usize & 3 };
-        let p = self.words(8)?;
+        let p = if fragment_only {
+            self.heap.alloc_fragment_only(8)
+        } else {
+            self.heap.alloc(8)
+        }
+        .ok_or(TermError::HeapFull)?;
         // Port of erts/emulator/beam/erl_bits.c:1675 (build_writable_bitstring), OTP-29.1.1.
         // SAFETY: eight words hold a BinRef and SUB_BITS; heap retains the Arc.
         unsafe {
@@ -494,7 +548,8 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
             *sub.add(3) = (bit_len + adjustment * 8) as u64;
             *sub.add(4) = Term::from_ptr(p, 2).0;
         }
-        self.heap.retain_writable_binary(binary)?;
+        self.heap
+            .retain_writable_binary_with_apparent_size(binary, apparent_size_bits)?;
         // SAFETY: p was allocated for the SUB_BITS directly after the BinRef.
         Ok(Term::from_ptr(unsafe { p.add(3) }, 2))
     }
@@ -519,6 +574,8 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
             return Ok(Some(source));
         }
         let p = self.words(5)?;
+        self.heap
+            .update_writable_binary_overhead(source, end, new_bits);
         let (_, binary) = owner(source).unwrap();
         // SAFETY: this process owns the active writer and no bytes are borrowed.
         unsafe {

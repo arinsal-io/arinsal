@@ -7,7 +7,8 @@ use arinsal_vm::Vm;
 const MODULE: &str = "bin_vheap_differential";
 const SOURCE: &str = r#"
 -module(bin_vheap_differential).
--export([minimum/0, flag/0, gc_info/0, spawn_minimum/0, spawn_minimum_only/0, allocation_gc/0]).
+-export([minimum/0, flag/0, gc_info/0, spawn_minimum/0, spawn_minimum_only/0,
+         allocation_gc/0, private_append_info/0]).
 minimum() -> {erlang:system_info(min_bin_vheap_size), process_info(self(), min_bin_vheap_size)}.
 flag() -> Old=process_flag(min_bin_vheap_size, 80000), {Old,process_info(self(), min_bin_vheap_size)}.
 gc_info() ->
@@ -41,6 +42,24 @@ allocation_gc() ->
         Parent!{allocation_result,After>Before,lists:reverse(Rows),length(Bins),length(Seed)}
     end,[{min_heap_size,10000}]),
     receive {allocation_result,_,_,_,_}=Result -> Result end.
+private_append_info() ->
+    Parent=self(),
+    spawn_opt(fun() ->
+        {garbage_collection,G0}=process_info(self(),garbage_collection),
+        {garbage_collection_info,I0}=process_info(self(),garbage_collection_info),
+        Bin=append_loop(1000,<<>>),
+        {garbage_collection,G1}=process_info(self(),garbage_collection),
+        {garbage_collection_info,I}=process_info(self(),garbage_collection_info),
+        Keys=[mbuf_size,bin_vheap_size,bin_vheap_block_size],
+        Parent!{private_append_info,
+                {byte_size(Bin),
+                 proplists:get_value(minor_gcs,G1)-proplists:get_value(minor_gcs,G0),
+                 [{K,proplists:get_value(K,I0)} || K <- Keys],
+                 [{K,proplists:get_value(K,I)} || K <- Keys]}}
+    end,[{min_heap_size,233}]),
+    receive {private_append_info,Info} -> Info end.
+append_loop(0,Acc) -> Acc;
+append_loop(N,Acc) -> append_loop(N-1,<<Acc/binary,N:8>>).
 "#;
 
 fn calls(function: &str) -> (CallResult, CallResult) {
@@ -117,4 +136,13 @@ fn bin_vheap_large_binary_allocations_trigger_matching_gc() {
         panic!("expected allocation result tuple");
     };
     assert_eq!(fields[1], OwnedTerm::Atom("true".into()));
+}
+
+#[test]
+fn private_append_fragment_and_vheap_counters_match_otp() {
+    let value = assert_equal("private_append_info");
+    let OwnedTerm::Tuple(fields) = &value else {
+        panic!("expected binary append info tuple: {value:?}");
+    };
+    assert_eq!(fields.len(), 4);
 }
