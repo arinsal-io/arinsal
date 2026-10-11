@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::thread::JoinHandle;
 
 use crate::task::{call1, call2};
 use crate::threads;
@@ -21,6 +22,7 @@ const DEFAULT_ASYNC_THREADS: usize = 1;
 
 static CONFIGURED: AtomicUsize = AtomicUsize::new(DEFAULT_ASYNC_THREADS);
 static NEXT_ID: AtomicI64 = AtomicI64::new(0);
+static POOL: OnceLock<Pool> = OnceLock::new();
 
 /// Set the number of async threads (`erts_async_max_threads`, `+A`); zero runs jobs on
 /// the calling thread. It only takes effect before the first [`driver_async`] call.
@@ -41,33 +43,91 @@ pub(crate) struct Job {
 }
 
 struct Pool {
-    queues: Vec<Mutex<Sender<Job>>>,
+    queues: Vec<Mutex<Sender<AsyncMessage>>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    stopped: Mutex<bool>,
+}
+
+enum AsyncMessage {
+    Job(Job),
+    Exit,
 }
 
 fn pool() -> &'static Pool {
-    static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let queues = (0..CONFIGURED.load(Ordering::Relaxed))
-            .map(|index| {
-                let (tx, rx) = channel::<Job>();
-                thread::Builder::new()
-                    .name(format!("arinsal-drv-async-{}", index + 1))
-                    .spawn(move || {
-                        for job in rx {
-                            call1(job.invoke, job.data as *mut c_void);
-                            // Port of erl_async.c:227 (async_reply): the issuing
-                            // scheduler runs ready_async as aux work.
-                            let port = Arc::clone(&job.port);
-                            port.host
-                                .schedule_async_ready(job.sched_id, Box::new(move || job.ready()));
-                        }
-                    })
-                    .expect("start driver async thread");
-                Mutex::new(tx)
-            })
-            .collect();
-        Pool { queues }
+        let mut queues = Vec::new();
+        let mut threads = Vec::new();
+        for index in 0..CONFIGURED.load(Ordering::Relaxed) {
+            let (tx, rx) = channel::<AsyncMessage>();
+            let handle = thread::Builder::new()
+                .name(format!("arinsal-drv-async-{}", index + 1))
+                .spawn(move || {
+                    while let Ok(message) = rx.recv() {
+                        let AsyncMessage::Job(job) = message else {
+                            break;
+                        };
+                        call1(job.invoke, job.data as *mut c_void);
+                        // Port of erl_async.c:227 (async_reply): the issuing
+                        // scheduler runs ready_async as aux work.
+                        let port = Arc::clone(&job.port);
+                        port.host
+                            .schedule_async_ready(job.sched_id, Box::new(move || job.ready()));
+                    }
+                })
+                .expect("start driver async thread");
+            queues.push(Mutex::new(tx));
+            threads.push(handle);
+        }
+        Pool {
+            queues,
+            threads: Mutex::new(threads),
+            stopped: Mutex::new(false),
+        }
     })
+}
+
+impl Pool {
+    fn enqueue(&self, queue: usize, job: Job) -> Result<(), Job> {
+        let stopped = self.stopped.lock().unwrap();
+        if *stopped {
+            return Err(job);
+        }
+        match self.queues[queue]
+            .lock()
+            .unwrap()
+            .send(AsyncMessage::Job(job))
+        {
+            Ok(()) => Ok(()),
+            Err(error) => match error.0 {
+                AsyncMessage::Job(job) => Err(job),
+                AsyncMessage::Exit => unreachable!("an exit message is never enqueued here"),
+            },
+        }
+    }
+
+    /// Drain queued async invocations, send one exit marker per worker, and join every worker.
+    /// Port of erts/emulator/beam/erl_async.c:446-460 (`erts_exit_flush_async`), OTP-29.1.1.
+    fn flush_exit(&self) {
+        let mut stopped = self.stopped.lock().unwrap();
+        if *stopped {
+            return;
+        }
+        *stopped = true;
+        for queue in &self.queues {
+            let _ = queue.lock().unwrap().send(AsyncMessage::Exit);
+        }
+        drop(stopped);
+        for thread in self.threads.lock().unwrap().drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Flush queued async work during a runtime exit without starting an unused pool.
+pub(crate) fn flush_exit() {
+    if let Some(pool) = POOL.get() {
+        pool.flush_exit();
+    }
 }
 
 impl Job {
@@ -157,6 +217,10 @@ pub(crate) fn driver_async(
         job.pdl = pdl;
     }
     port.host.ddll_reference(&port);
-    let _ = pool.queues[queue].lock().unwrap().send(job);
+    if let Err(job) = pool.enqueue(queue, job) {
+        call1(job.invoke, job.data as *mut c_void);
+        job.ready();
+        return 0;
+    }
     id as c_long
 }

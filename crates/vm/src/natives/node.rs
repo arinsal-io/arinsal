@@ -51,10 +51,10 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
 fn call_halt2(
     _vm: &mut Vm,
     process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
+    ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    halt(process, args[0], args[1])
+    halt(process, ctx, args[0], args[1])
 }
 
 fn call_node0(
@@ -418,7 +418,12 @@ fn error(reason: &str) -> VmError {
     VmError::Trap(crate::exceptions::Trap::error(atom(reason)))
 }
 
-fn halt(process: &mut Process, code: Term, options: Term) -> Result<Term, VmError> {
+fn halt(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    code: Term,
+    options: Term,
+) -> Result<Term, VmError> {
     // Port of erts/emulator/beam/bif.c:4309 (halt/2), OTP-29.1.1.
     let (flush, flush_timeout) = halt_options(options)?;
     let code = owned(code)?;
@@ -428,9 +433,10 @@ fn halt(process: &mut Process, code: Term, options: Term) -> Result<Term, VmErro
         OwnedTerm::BigInt(value) if value.sign() != num_bigint::Sign::Minus => {
             mask_exit_code(value)
         }
-        OwnedTerm::Atom(name) if name == "abort" => {
-            flush_stdio();
-            std::process::abort();
+        OwnedTerm::Atom(name) if name == "abort" => std::process::abort(),
+        OwnedTerm::Nil => {
+            message = Some(String::new());
+            1
         }
         OwnedTerm::List { elems, tail } if **tail == OwnedTerm::Nil => {
             let mut text = String::new();
@@ -455,28 +461,43 @@ fn halt(process: &mut Process, code: Term, options: Term) -> Result<Term, VmErro
         _ => return Err(badarg()),
     };
 
-    arinsal_sched::begin_halt();
-    if flush && flush_timeout == Some(0) && message.is_none() {
-        super::nif::execute_on_halt();
-        std::process::exit(255);
-    }
-
-    // ERTS flushes ports before exiting; the OS streams are the only output
-    // channels exposed by this runtime, so flush them before the process exit.
-    let _ = process;
-    flush_stdio();
-    if flush {
-        super::nif::execute_on_halt();
-    }
     if let Some(text) = message {
+        let dump_path = write_halt_crash_dump(&text)
+            .unwrap_or_else(|_| std::path::PathBuf::from("erl_crash.dump"));
         let _ = write!(
             std::io::stderr().lock(),
-            "{text}\r\n\r\nCrash dump is being written to: erl_crash.dump...done\r\n"
+            "{text}\r\n\r\nCrash dump is being written to: {}...done\r\n",
+            dump_path.display()
         );
-        flush_stdio();
+        let _ = std::io::stderr().flush();
         std::process::exit(1);
     }
-    std::process::exit(status);
+    if !flush {
+        std::process::exit(status);
+    }
+
+    let runtime = process.runtime.as_ref().cloned().ok_or_else(badarg)?;
+    let timeout = combined_flush_timeout(flush_timeout);
+    let timeout = timeout.map(|ms| {
+        (
+            ms,
+            Box::new(halt_flush_timeout_callback) as arinsal_sched::TimerCallback<Message>,
+        )
+    });
+    let _ = ctx.begin_halt_with_start(
+        status,
+        timeout,
+        super::nif::notify_halt,
+        move |progress| crate::port::halt_reap_ports(&runtime, progress),
+        move |status| {
+            super::nif::execute_late_on_halt();
+            arinsal_drv::flush_async_exit();
+            super::nif::wait_for_halt_calls();
+            flush_stdio();
+            std::process::exit(status);
+        },
+    );
+    Err(VmError::Yield)
 }
 
 fn halt_options(options: Term) -> Result<(bool, Option<u32>), VmError> {
@@ -528,10 +549,37 @@ fn halt_options(options: Term) -> Result<(bool, Option<u32>), VmError> {
 }
 
 fn mask_exit_code(value: &BigInt) -> i32 {
-    let (_, bytes) = value.to_bytes_le();
-    let low = bytes.first().copied().unwrap_or(0) as u32;
-    let high = bytes.get(1).copied().unwrap_or(0) as u32;
-    ((low | (high << 8)) & i32::MAX as u32) as i32
+    (value.to_u32_digits().1.first().copied().unwrap_or(0) & i32::MAX as u32) as i32
+}
+
+fn combined_flush_timeout(option: Option<u32>) -> Option<u64> {
+    let command_line = arinsal_args::active_emulator_flags()
+        .ignored
+        .into_iter()
+        .find(|flag| flag.name == "+zhft")
+        .and_then(|flag| flag.value)
+        .and_then(|value| value.parse::<u64>().ok());
+    [command_line, option.map(u64::from)]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+fn halt_flush_timeout_callback(_ctx: &mut dyn arinsal_sched::TimerCallbackCtx<Message>) {
+    // Port of erts/emulator/beam/erl_init.c:2771 (flush-timeout exit), OTP-29.1.1.
+    std::process::exit(255);
+}
+
+fn write_halt_crash_dump(message: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::var_os("ERL_CRASH_DUMP")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("erl_crash.dump"));
+    let mut dump = std::fs::File::create(&path)?;
+    // Port of erts/emulator/beam/erl_crash_dump.c (dump header and slogan), OTP-29.1.1.
+    writeln!(dump, "=erl_crash_dump:0.5")?;
+    writeln!(dump, "Slogan: {message}")?;
+    Ok(path)
 }
 
 fn owned(term: Term) -> Result<OwnedTerm, VmError> {

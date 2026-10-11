@@ -80,6 +80,7 @@ pub(crate) use libloading::os::unix::Library;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[allow(non_upper_case_globals)]
@@ -624,6 +625,7 @@ pub struct NifLibrary {
     on_unload_thread: Option<extern "C" fn(*mut c_void)>,
     priv_data: *mut c_void,
     halt_calls: Arc<HaltCalls>,
+    on_halt_called: AtomicBool,
 }
 impl NifLibrary {
     /// Module name exported by this NIF library.
@@ -650,7 +652,9 @@ impl NifLibrary {
     }
     /// Run the callback registered with `ERL_NIF_OPT_ON_HALT`.
     pub fn execute_on_halt(&self) {
-        if let Some(callback) = self.on_halt {
+        if !self.on_halt_called.swap(true, Ordering::AcqRel)
+            && let Some(callback) = self.on_halt
+        {
             callback(self.priv_data);
         }
     }
@@ -742,6 +746,7 @@ impl NifImage {
             on_unload_thread: env.options.on_unload_thread,
             priv_data,
             halt_calls,
+            on_halt_called: AtomicBool::new(false),
         })
     }
 }
