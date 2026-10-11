@@ -9,7 +9,8 @@ struct Collector {
 }
 impl Task for Collector {
     type Message = u32;
-    fn run(&mut self, ctx: &mut RunCtx<u32>, _: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32) -> RunOutcome {
         while let Some(Event { from, payload }) = ctx.receive() {
             let entry = match payload {
                 Payload::Message(n) => (ctx.pid(), from, n, false),
@@ -94,7 +95,8 @@ fn seeded_ordering_across_messages_and_signals() {
 struct CountTask(Arc<AtomicUsize>);
 impl Task for CountTask {
     type Message = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
         while ctx.receive().is_some() {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
@@ -144,7 +146,8 @@ struct SchedulingProbe {
 }
 impl Task for SchedulingProbe {
     type Message = ();
-    fn run(&mut self, _ctx: &mut RunCtx<()>, _budget: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, _ctx: &mut RunCtx<()>, _: &mut (), _budget: u32) -> RunOutcome {
         let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
         self.peak.fetch_max(active, Ordering::AcqRel);
         while !self.release.load(Ordering::Acquire) {
@@ -162,7 +165,8 @@ struct PriorityCounter {
 }
 impl Task for PriorityCounter {
     type Message = ();
-    fn run(&mut self, _ctx: &mut RunCtx<()>, _budget: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, _ctx: &mut RunCtx<()>, _: &mut (), _budget: u32) -> RunOutcome {
         if self.stop.load(Ordering::Acquire) {
             return RunOutcome::Exit(0);
         }
@@ -270,7 +274,8 @@ fn hot_mailbox_repeated_waits_do_not_lose_wakes() {
     struct One(Arc<AtomicUsize>);
     impl Task for One {
         type Message = ();
-        fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
             if ctx.receive().is_some() {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
@@ -309,7 +314,8 @@ fn worker_blocks_preserve_sender_message_signal_order() {
     }
     impl Task for Work {
         type Message = u32;
-        fn run(&mut self, ctx: &mut RunCtx<u32>, _: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32) -> RunOutcome {
             match self {
                 Work::Producer(to) => {
                     for sequence in 0..1_000 {
@@ -362,7 +368,7 @@ fn worker_blocks_preserve_sender_message_signal_order() {
 }
 
 #[test]
-fn bounded_runnext_gives_external_work_a_turn() {
+fn ping_pong_gives_external_work_a_turn() {
     enum Work {
         Ping(Pid, Arc<AtomicUsize>),
         Observe(Arc<AtomicUsize>, Arc<AtomicUsize>),
@@ -370,7 +376,8 @@ fn bounded_runnext_gives_external_work_a_turn() {
     const LIMIT: usize = 1_000_000;
     impl Task for Work {
         type Message = ();
-        fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
             match self {
                 Work::Ping(to, count) => {
                     if ctx.receive().is_some() {
@@ -393,7 +400,6 @@ fn bounded_runnext_gives_external_work_a_turn() {
     let sched = Scheduler::new(Config {
         workers: 1,
         max_processes: 3,
-        runnext_limit: 3,
         ..Config::default()
     });
     let first = Pid::new(0, 0);
@@ -426,7 +432,8 @@ fn pid_generation_and_timer_firing() {
     struct Exit;
     impl Task for Exit {
         type Message = ();
-        fn run(&mut self, _: &mut RunCtx<()>, _: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, _: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
             RunOutcome::Exit(0)
         }
     }
@@ -472,7 +479,8 @@ fn timer_envelope_and_wait_timeout_cancellation() {
     }
     impl Task for Timed {
         type Message = ();
-        fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
             let n = self.runs.fetch_add(1, Ordering::Relaxed);
             while let Some(event) = ctx.receive() {
                 let kind = match event.payload {
@@ -576,7 +584,8 @@ fn simulation_seed_replays_dispatch_order() {
     struct Record(Arc<Mutex<Vec<u32>>>);
     impl Task for Record {
         type Message = ();
-        fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
             self.0.lock().unwrap().push(ctx.pid().number());
             RunOutcome::Exit(0)
         }
@@ -610,7 +619,8 @@ fn simulation_replays_batched_multi_recipient_delivery() {
     }
     impl Task for Work {
         type Message = u32;
-        fn run(&mut self, ctx: &mut RunCtx<u32>, _: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32) -> RunOutcome {
             match self {
                 Work::Sink(output) => {
                     while let Some(event) = ctx.receive() {
@@ -664,7 +674,8 @@ struct ProgressRacer {
 
 impl Task for ProgressRacer {
     type Message = u32;
-    fn run(&mut self, ctx: &mut RunCtx<u32>, _: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32) -> RunOutcome {
         if !self.bound {
             self.bound = true;
             ctx.bind_scheduler(if self.blocker { 1 } else { 2 });
@@ -732,7 +743,8 @@ struct LaterWaiter {
 
 impl Task for LaterWaiter {
     type Message = u32;
-    fn run(&mut self, ctx: &mut RunCtx<u32>, _: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, ctx: &mut RunCtx<u32>, _: &mut (), _: u32) -> RunOutcome {
         if !self.bound {
             self.bound = true;
             ctx.bind_scheduler(if self.spinner { 1 } else { 2 });

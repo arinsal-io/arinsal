@@ -14,7 +14,8 @@ struct Busy {
 
 impl Task for Busy {
     type Message = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
         if self.stop.load(Ordering::Relaxed) {
             return RunOutcome::Exit(0);
         }

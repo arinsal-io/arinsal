@@ -4983,7 +4983,8 @@ mod tests {
     struct CountedYield;
     impl Task for CountedYield {
         type Message = ();
-        fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _budget: u32) -> RunOutcome {
+        type SchedulerData = ();
+        fn run(&mut self, ctx: &mut RunCtx<'_, ()>, _: &mut (), _budget: u32) -> RunOutcome {
             assert!(ctx.consume(3));
             RunOutcome::Yield
         }

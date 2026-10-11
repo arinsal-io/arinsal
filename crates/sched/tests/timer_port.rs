@@ -7,8 +7,9 @@ struct Sink(Arc<Mutex<Vec<u64>>>);
 
 impl Task for Sink {
     type Message = u64;
+    type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: u32) -> RunOutcome {
+    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32) -> RunOutcome {
         while let Some(event) = ctx.receive() {
             match event.payload {
                 Payload::Timer { message, .. } => self.0.lock().unwrap().push(message),
@@ -138,8 +139,9 @@ struct ReentrantTimerTask {
 
 impl Task for ReentrantTimerTask {
     type Message = u64;
+    type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: u32) -> RunOutcome {
+    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32) -> RunOutcome {
         let Some(scheduler) = self.scheduler.get().and_then(Weak::upgrade) else {
             return RunOutcome::Exit(1);
         };
@@ -188,8 +190,9 @@ struct CrossCancelTask {
 
 impl Task for CrossCancelTask {
     type Message = u64;
+    type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: u32) -> RunOutcome {
+    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32) -> RunOutcome {
         let Some(scheduler) = self.scheduler.get().and_then(Weak::upgrade) else {
             return RunOutcome::Exit(1);
         };
@@ -278,8 +281,9 @@ struct Victim {
 
 impl Task for Victim {
     type Message = u64;
+    type SchedulerData = ();
 
-    fn run(&mut self, ctx: &mut RunCtx<u64>, _: u32) -> RunOutcome {
+    fn run(&mut self, ctx: &mut RunCtx<u64>, _: &mut (), _: u32) -> RunOutcome {
         if !self.started {
             self.started = true;
             self.own.send(ctx.start_timer(60_000, 1).unwrap()).unwrap();
