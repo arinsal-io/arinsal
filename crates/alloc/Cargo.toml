@@ -16,3 +16,4 @@ parking_lot = "0.12.5"
 
 [dev-dependencies]
 proptest.workspace = true
+similar-asserts = "1.7.0"

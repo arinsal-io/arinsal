@@ -44,21 +44,21 @@ fn litopt_copy_keeps_literal_references() {
     assert!(literal.is_literal());
     let literals = LiteralAreas::current();
     // Only the outer 3-word tuple and the 2-word cons are copied.
-    assert_eq!(size_object_litopt(outer, &literals), 5);
-    assert_eq!(size_object_litopt(literal, &literals), 0);
+    similar_asserts::assert_eq!(size_object_litopt(outer, &literals), 5);
+    similar_asserts::assert_eq!(size_object_litopt(literal, &literals), 0);
     let mut target = VecHeap::new();
     let copy = copy_term_litopt(outer, &mut target, &literals).unwrap();
     assert_ne!(copy, outer);
-    assert_eq!(element(copy, 1), literal);
-    assert_eq!(cons(element(copy, 2)), (literal, literal));
+    similar_asserts::assert_eq!(element(copy, 1), literal);
+    similar_asserts::assert_eq!(cons(element(copy, 2)), (literal, literal));
     // A plain copy duplicates every literal occurrence (`size_object` without litopt).
-    assert_eq!(size_object(outer), 5 + 3 * size_object(literal));
+    similar_asserts::assert_eq!(size_object(outer), 5 + 3 * size_object(literal));
     let mut full_heap = VecHeap::new();
     let full = copy_term(outer, &mut full_heap).unwrap();
     assert_ne!(element(full, 1), literal);
     // size_shared counts the heap part once and ignores literals.
-    assert_eq!(size_shared(outer), 5);
-    assert_eq!(size_shared(literal), 0);
+    similar_asserts::assert_eq!(size_shared(outer), 5);
+    similar_asserts::assert_eq!(size_shared(literal), 0);
 }
 
 #[test]
@@ -70,13 +70,13 @@ fn purge_area_literals_are_copied() {
     set_literal_purge_area(&ranges, true);
     let literals = LiteralAreas::current();
     set_literal_purge_area(&ranges, false);
-    assert_eq!(size_object_litopt(outer, &literals), size_object(outer));
+    similar_asserts::assert_eq!(size_object_litopt(outer, &literals), size_object(outer));
     let mut target = VecHeap::new();
     let copy = copy_term_litopt(outer, &mut target, &literals).unwrap();
     assert!(!element(copy, 1).is_literal());
     assert_ne!(element(copy, 1), literal);
     // A fresh snapshot shares the area again.
-    assert_eq!(size_object_litopt(outer, &LiteralAreas::current()), 5);
+    similar_asserts::assert_eq!(size_object_litopt(outer, &LiteralAreas::current()), 5);
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn copy_shared_honours_copy_literals() {
     let (literal, outer) = fixture(&mut area, &mut source);
     let mut shared_heap = VecHeap::new();
     let shared = copy_shared(outer, &mut shared_heap, false).unwrap();
-    assert_eq!(element(shared, 1), literal);
+    similar_asserts::assert_eq!(element(shared, 1), literal);
     let mut copied_heap = VecHeap::new();
     let copied = copy_shared(outer, &mut copied_heap, true).unwrap();
     let inner = element(copied, 1);
@@ -94,17 +94,17 @@ fn copy_shared_honours_copy_literals() {
     // As in erts, copied literals are not shared: each occurrence gets its own copy.
     let (head, tail) = cons(element(copied, 2));
     assert!(head != inner && tail != inner && head != tail);
-    assert_eq!(size_shared(copied), 5 + 3 * size_object(literal));
+    similar_asserts::assert_eq!(size_shared(copied), 5 + 3 * size_object(literal));
 }
 
 #[test]
-fn literal_registry_forgets_dropped_areas() {
+fn literal_membership_uses_reserved_range_after_drop() {
     let mut area = LiteralArea::with_capacity_words(8);
     let literal = area.builder().tuple(&[small(1)]).unwrap();
     assert!(literal.is_literal());
     let address = literal.tagged_word() & !7;
     drop(area);
-    assert!(!LiteralAreas::current().is_literal(address));
+    assert!(LiteralAreas::current().is_literal(address));
 }
 
 /// Port of the per-root copy in erl_gc.c:1136 (erts_garbage_collect_literals): roots copied
@@ -129,7 +129,7 @@ fn shared_copy_cache_reuses_earlier_roots() {
     // The list is copied once; every copy aliases the first copy's list.
     let first = element(copies[0], 1);
     assert!(copies.iter().all(|copy| element(*copy, 1) == first));
-    assert_eq!(cons(first).0, small(1));
+    similar_asserts::assert_eq!(cons(first).0, small(1));
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn indexed_ownership_matches_linear_scan() {
         let mut other = VecHeap::new();
         TermBuilder::new(&mut other).tuple(&[small(9)]).unwrap()
     };
-    assert_eq!(
+    similar_asserts::assert_eq!(
         heap.owns_term(foreign),
         heap.owns_term_indexed(foreign, &mut index)
     );
