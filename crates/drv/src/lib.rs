@@ -27,6 +27,10 @@ mod task;
 mod timer;
 
 pub use asyncq::set_async_threads;
+/// Drain queued async driver calls and join the async workers during runtime exit.
+pub fn flush_async_exit() {
+    asyncq::flush_exit();
+}
 pub use poll::{PollBackend, set_poll_backend};
 mod mem;
 mod queue;

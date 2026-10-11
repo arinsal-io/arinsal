@@ -153,25 +153,36 @@ static SLOTS: Mutex<Vec<Option<DynSlot>>> = Mutex::new(Vec::new());
 static RUNTIME_HUBS: Mutex<Vec<Hub>> = Mutex::new(Vec::new());
 static SOCKET_REACTOR: OnceLock<Arc<NifSelectReactor>> = OnceLock::new();
 
-/// Port of erts/emulator/beam/erl_nif.c:5566-5649, OTP-29.1.1.
-pub(crate) fn execute_on_halt() {
-    let libraries = {
-        let slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
-        let mut libraries: Vec<Arc<arinsal_nif::NifLibrary>> = Vec::new();
-        for slot in slots.iter().flatten() {
-            if !libraries
-                .iter()
-                .any(|library| Arc::ptr_eq(library, &slot.library))
-            {
-                libraries.push(Arc::clone(&slot.library));
-            }
+fn halt_libraries() -> Vec<Arc<arinsal_nif::NifLibrary>> {
+    let slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut libraries: Vec<Arc<arinsal_nif::NifLibrary>> = Vec::new();
+    for slot in slots.iter().flatten() {
+        if !libraries
+            .iter()
+            .any(|library| Arc::ptr_eq(library, &slot.library))
+        {
+            libraries.push(Arc::clone(&slot.library));
         }
-        libraries
-    };
-    for library in &libraries {
+    }
+    libraries
+}
+
+/// Port of erts/emulator/beam/erl_nif.c:5566-5595 (`erts_nif_notify_halt`), OTP-29.1.1.
+pub(crate) fn notify_halt() {
+    for library in halt_libraries() {
         library.execute_on_halt();
     }
-    for library in &libraries {
+}
+
+/// Execute callbacks registered after the initial halt notification.
+/// Port of erts/emulator/beam/erl_init.c:2683-2687, OTP-29.1.1.
+pub(crate) fn execute_late_on_halt() {
+    notify_halt();
+}
+
+/// Port of erts/emulator/beam/erl_nif.c:5626-5649 (`erts_nif_wait_calls`), OTP-29.1.1.
+pub(crate) fn wait_for_halt_calls() {
+    for library in halt_libraries() {
         library.wait_for_halt_calls();
     }
 }

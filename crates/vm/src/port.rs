@@ -2,7 +2,7 @@
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 use arinsal_etf::OwnedTerm;
-use arinsal_sched::{Pid, RunCtx, Scheduler};
+use arinsal_sched::{HaltProgress, Pid, RunCtx, Scheduler};
 use arinsal_term::{
     ProcessHeap, Term, TermBuilder, TermKind, VecHeap, copy_term, from_owned, global_atoms,
     to_owned,
@@ -244,6 +244,7 @@ pub(crate) struct PortHandle {
     reg_word: Arc<AtomicU32>,
     /// Set when the port is removed, before its name is erased.
     reg_closing: AtomicBool,
+    halt_progress: Mutex<Option<HaltProgress>>,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -380,6 +381,22 @@ impl PortHandle {
 
     pub(crate) fn exit_complete(&self) -> bool {
         self.state.lock().unwrap().exit_complete
+    }
+
+    fn track_halt(&self, progress: HaltProgress) {
+        progress.port_started();
+        let mut tracked = self.halt_progress.lock().unwrap();
+        if self.state.lock().unwrap().exit_complete {
+            progress.port_finished();
+        } else {
+            *tracked = Some(progress);
+        }
+    }
+
+    fn finish_halt(&self) {
+        if let Some(progress) = self.halt_progress.lock().unwrap().take() {
+            progress.port_finished();
+        }
     }
 }
 
@@ -2302,6 +2319,7 @@ fn make_handle_with(
         async_open: Mutex::new(None),
         reg_word: Arc::new(AtomicU32::new(crate::register::NO_REG_ATOM)),
         reg_closing: AtomicBool::new(false),
+        halt_progress: Mutex::new(None),
     });
     Ok(handle)
 }
@@ -2824,6 +2842,9 @@ fn worker(
     if let Some(mut child) = child.take() {
         if closed {
             handle.out.lock().unwrap().take();
+            // erts frees a killed port without waiting for the child; the forker
+            // reports its exit later (sys_drivers.c:1039 stop), so halt need not wait.
+            handle.finish_halt();
         }
         let status = child.wait().ok();
         if !closed && want_status {
@@ -2837,6 +2858,7 @@ fn worker(
         }
     }
     handle.state.lock().unwrap().exit_complete = true;
+    handle.finish_halt();
     if !closed && saw_eof && want_eof {
         event_message(&scheduler, owner, id, handle.trace_scope, atom("eof"));
     }
@@ -3462,10 +3484,17 @@ fn release_io(handle: &PortHandle) {
         st.broken = true;
         st.busy_port = false;
         st.busy_msgq = false;
+        // Driver and inet ports have no worker thread to finish the exit.
+        if handle.wake_w.is_none() || handle.inet {
+            st.exit_complete = true;
+        }
         std::mem::take(&mut st.suspended)
     };
     wake_suspended(&handle.scheduler, waiters);
     poke(handle);
+    if handle.wake_w.is_none() || handle.inet {
+        handle.finish_halt();
+    }
 }
 
 fn remove_and_notify(
@@ -3594,6 +3623,51 @@ pub(crate) fn exit_port(
     }
     release_io(&removed);
     Ok(())
+}
+
+/// Reap every live port during an orderly halt, leaving `heart_port` alive.
+///
+/// Port of erts/emulator/beam/erl_process.c:2537-2581 (`handle_reap_ports`), OTP-29.1.1.
+pub(crate) fn halt_reap_ports(runtime: &Arc<crate::process::Runtime>, progress: HaltProgress) {
+    let heart = global_atoms().intern("heart_port").ok();
+    let ports: Vec<_> = runtime.ports.lock().unwrap().values().cloned().collect();
+    for handle in ports {
+        if heart.is_some() && handle.registered_atom() == heart {
+            continue;
+        }
+        handle.track_halt(progress.clone());
+        if handle.driver.get().is_some() {
+            drv_sig::exit_for_halt(
+                Arc::clone(runtime),
+                Arc::clone(&handle),
+                handle.owner_pid(),
+                OwnedTerm::Atom("killed".into()),
+            );
+            continue;
+        }
+        crate::trace::emit_port_event(
+            runtime,
+            handle.id,
+            crate::trace::PORTS,
+            "closed",
+            &[atom("killed")],
+        );
+        let scheduler = Arc::clone(&handle.scheduler);
+        if let Some(removed) = remove_and_notify(
+            runtime,
+            handle.id,
+            &scheduler,
+            handle.owner_pid(),
+            atom("killed"),
+        ) {
+            crate::trace::port_closed(runtime, handle.id);
+            if removed.inet {
+                crate::inet_drv::detach(handle.id);
+                crate::inet_udp::detach(handle.id);
+            }
+            release_io(&removed);
+        }
+    }
 }
 
 fn connect(process: &Process, port: Term, pid: Term, notify: Option<Pid>) -> Result<Term, VmError> {

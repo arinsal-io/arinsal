@@ -77,7 +77,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
@@ -1106,6 +1108,9 @@ struct Inner<T: Task> {
     /// Scheduler data of the simulated scheduler, which runs on the stepping thread.
     sim_data: Mutex<T::SchedulerData>,
     stopped: AtomicBool,
+    halt_started: AtomicBool,
+    halt_requested: AtomicBool,
+    runq_halting: Arc<[AtomicBool]>,
     searching: AtomicU32,
     active_schedulers: AtomicUsize,
     worker_stats: Vec<WorkerCounters>,
@@ -1527,6 +1532,48 @@ impl<T: Task> Inner<T> {
         }
     }
 
+    fn begin_halt(
+        &self,
+        pid: Pid,
+        code: i32,
+        timeout: Option<(u64, TimerCallback<T::Message>)>,
+        actions: HaltActions,
+        local: Option<&mut Local<T>>,
+    ) -> bool {
+        if self
+            .halt_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let HaltActions {
+            start,
+            reap,
+            complete,
+        } = actions;
+        let state = HaltProgress(Arc::new(HaltState {
+            progress: AtomicI32::new(self.runq_halting.len() as i32),
+            code,
+            reap: Mutex::new(Some(reap)),
+            complete: Mutex::new(Some(complete)),
+        }));
+        if let Some((ms, callback)) = timeout {
+            let _ = self.start_timer(pid, ms, TimerPayload::Callback(pid, callback), local, None);
+        }
+        self.halt_requested.store(true, Ordering::Release);
+        start();
+        for pool in &self.dirty {
+            pool.ready.notify_all();
+        }
+        let halting = Arc::clone(&self.runq_halting);
+        self.request_aux_work_all(Arc::new(move |worker| {
+            halting[worker].store(true, Ordering::Release);
+            state.scheduler_reached_halt();
+        }));
+        true
+    }
+
     // Port of erts/emulator/beam/erl_process.c:2665 (handle_aux_work), OTP-29.1.1.
     fn handle_aux_work(&self, worker: usize) {
         while let Some(work) = self.aux_work[worker].pop() {
@@ -1539,10 +1586,16 @@ impl<T: Task> Inner<T> {
         // the monotonic clock only once check_time_reds reaches ERTS_CHECK_TIME_REDS and bumps
         // its timers with that time), OTP-29.1.1. Receive timeouts are checked before the
         // timer wheel resets check_time_reds.
-        self.poll_pending_waits(local, false);
+        if !self.halt_requested.load(Ordering::Acquire) {
+            self.poll_pending_waits(local, false);
+        }
         // Port of erts/emulator/beam/erl_process.c:2719 (canceled timers before
         // debug-wait completion), OTP-29.1.1.
-        self.poll_timers(worker, Some(local), false);
+        self.poll_timers(
+            worker,
+            Some(local),
+            self.halt_requested.load(Ordering::Acquire),
+        );
         if aux_work & AUX_WORK_FUNC != 0 {
             self.handle_aux_work(worker);
         }
@@ -3249,6 +3302,57 @@ fn pop_requeue<T: Task>(
 /// A runtime timer callback; it runs on a scheduler thread when the timer expires.
 pub type TimerCallback<M> = Box<dyn FnOnce(&mut dyn TimerCallbackCtx<M>) + Send>;
 
+type HaltReap = Arc<dyn Fn(HaltProgress) + Send + Sync + 'static>;
+type HaltStart = Box<dyn FnOnce() + Send + 'static>;
+type HaltComplete = Box<dyn FnOnce(i32) + Send + 'static>;
+
+struct HaltActions {
+    start: HaltStart,
+    reap: HaltReap,
+    complete: HaltComplete,
+}
+
+struct HaltState {
+    progress: AtomicI32,
+    code: i32,
+    reap: Mutex<Option<HaltReap>>,
+    complete: Mutex<Option<HaltComplete>>,
+}
+
+/// Shared progress for an orderly runtime halt.
+///
+/// Port of erts/emulator/beam/erl_process.c:15228-15279 (`erts_halt_progress`), OTP-29.1.1.
+#[derive(Clone)]
+pub struct HaltProgress(Arc<HaltState>);
+
+impl HaltProgress {
+    /// Account for a live port before sending its `killed` exit signal.
+    pub fn port_started(&self) {
+        self.0.progress.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Account for a port that completed its exit callback and driver stop.
+    pub fn port_finished(&self) {
+        if self.0.progress.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let complete = self.0.complete.lock().unwrap().take();
+            if let Some(complete) = complete {
+                complete(self.0.code);
+            }
+        }
+    }
+
+    fn scheduler_reached_halt(&self) {
+        if self.0.progress.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // The sentinel keeps the halt alive while the last scheduler enumerates ports.
+            self.0.progress.store(1, Ordering::Release);
+            if let Some(reap) = self.0.reap.lock().unwrap().take() {
+                reap(self.clone());
+            }
+            self.port_finished();
+        }
+    }
+}
+
 /// What a [`TimerCallback`] may do for the process that started it.
 pub trait TimerCallbackCtx<M> {
     /// Start another callback timer for the same process.
@@ -3358,6 +3462,13 @@ trait ContextOps<M: Send + 'static> {
     fn schedule_spawn(&mut self, pid: Pid) -> Result<(), Error>;
     fn cancel_pending_monitor(&mut self, to: Pid, reference: u64) -> bool;
     fn request_aux_work_all(&mut self, work: SchedulerAuxWork);
+    fn begin_halt(
+        &mut self,
+        pid: Pid,
+        code: i32,
+        timeout: Option<(u64, TimerCallback<M>)>,
+        actions: HaltActions,
+    ) -> bool;
     fn deliver_sys_task(
         &mut self,
         from: Pid,
@@ -3480,6 +3591,42 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Run one copy of `work` on every scheduler at its next scheduling point.
     pub fn request_aux_work_all(&mut self, work: impl Fn(usize) + Send + Sync + 'static) {
         self.inner.request_aux_work_all(Arc::new(work));
+    }
+
+    /// Stop scheduling processes, reap ports, and complete after every port has exited.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:15228-15279 (`erts_halt`), OTP-29.1.1.
+    pub fn begin_halt(
+        &mut self,
+        code: i32,
+        timeout: Option<(u64, TimerCallback<M>)>,
+        reap: impl Fn(HaltProgress) + Send + Sync + 'static,
+        complete: impl FnOnce(i32) + Send + 'static,
+    ) -> bool {
+        self.begin_halt_with_start(code, timeout, || {}, reap, complete)
+    }
+
+    /// Start halt and run `start` only when this call wins the halt race.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:15239-15253, OTP-29.1.1.
+    pub fn begin_halt_with_start(
+        &mut self,
+        code: i32,
+        timeout: Option<(u64, TimerCallback<M>)>,
+        start: impl FnOnce() + Send + 'static,
+        reap: impl Fn(HaltProgress) + Send + Sync + 'static,
+        complete: impl FnOnce(i32) + Send + 'static,
+    ) -> bool {
+        self.inner.begin_halt(
+            self.pid,
+            code,
+            timeout,
+            HaltActions {
+                start: Box::new(start),
+                reap: Arc::new(reap),
+                complete: Box::new(complete),
+            },
+        )
     }
 
     /// Schedule a message timer on the scheduler currently running this process.
@@ -4023,6 +4170,22 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         self.inner.request_aux_work_all(work);
     }
 
+    fn begin_halt(
+        &mut self,
+        pid: Pid,
+        code: i32,
+        timeout: Option<(u64, TimerCallback<T::Message>)>,
+        actions: HaltActions,
+    ) -> bool {
+        self.inner.begin_halt(
+            pid,
+            code,
+            timeout,
+            actions,
+            self.local.map(RefCell::borrow_mut).as_deref_mut(),
+        )
+    }
+
     fn cancel_target_timers(&mut self, pid: Pid) {
         if let Some(timers) = self.inner.sim_timers.as_ref() {
             for wheel in timers {
@@ -4441,6 +4604,12 @@ impl<T: Task> Scheduler<T> {
                 })
             }),
             stopped: AtomicBool::new(false),
+            halt_started: AtomicBool::new(false),
+            halt_requested: AtomicBool::new(false),
+            runq_halting: (0..workers)
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>()
+                .into(),
             searching: AtomicU32::new(0),
             active_schedulers: AtomicUsize::new(0),
             worker_stats: (0..workers)
@@ -6065,6 +6234,41 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         local.set_msacc_state(MsaccState::Aux);
         inner.handle_local_aux_work(id, &mut *local, aux_work);
         local.set_msacc_state(MsaccState::Other);
+        if inner.runq_halting[id].load(Ordering::Acquire) {
+            if inner.execute_port(local) {
+                continue;
+            }
+            let observed = inner.work_epoch.load(Ordering::SeqCst);
+            inner.parked[id].store(true, Ordering::SeqCst);
+            local.set_msacc_state(MsaccState::Aux);
+            inner.poll_timers(id, Some(&mut *local), true);
+            inner.handle_aux_work(id);
+            local.set_msacc_state(MsaccState::Other);
+            if !inner.port_queues[id].is_empty()
+                || !inner.aux_work[id].is_empty()
+                || inner.work_epoch.load(Ordering::SeqCst) != observed
+            {
+                inner.parked[id].store(false, Ordering::SeqCst);
+                continue;
+            }
+            let timer_ms = local
+                .timer_service
+                .borrow_mut()
+                .wheel
+                .next_timeout()
+                .map(|next| next.saturating_sub(inner.clock.now_ms()));
+            local.set_msacc_state(MsaccState::Sleep);
+            local.set_wall_enabled(false);
+            thr_progress::scheduler_prepare_wait();
+            if let Some(ms) = timer_ms {
+                thread::park_timeout(Duration::from_millis(ms.max(1)));
+            } else {
+                thread::park();
+            }
+            thr_progress::scheduler_finalize_wait();
+            inner.parked[id].store(false, Ordering::SeqCst);
+            continue;
+        }
         if id >= inner.online_schedulers.load(Ordering::Acquire)
             || (inner.scheduling_blocked.load(Ordering::Acquire)
                 && id != inner.scheduling_blocker.load(Ordering::Acquire))
@@ -6391,7 +6595,9 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
         let process = {
             let mut queue = pool.queue.lock().unwrap();
             loop {
-                if inner.stopped.load(Ordering::Acquire) || halting() {
+                if inner.stopped.load(Ordering::Acquire)
+                    || inner.halt_requested.load(Ordering::Acquire)
+                {
                     return;
                 }
                 if index < pool.online.load(Ordering::Acquire)
