@@ -87,12 +87,19 @@ pub struct RefErl {
     process: Mutex<Process>,
     next_id: AtomicU64,
     otp_version: String,
+    erl_args: Vec<String>,
 }
 
 impl RefErl {
     /// Compile and start the endpoint, checking the installed OTP release.
     pub fn start() -> Result<Self, Error> {
-        let output = Command::new("erl").args(["-noshell", "-eval",
+        Self::start_with_erl_args(&[])
+    }
+
+    /// Start the endpoint with emulator arguments such as `+D`.
+    pub fn start_with_erl_args(args: &[&str]) -> Result<Self, Error> {
+        let erl_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let output = Command::new("erl").args(&erl_args).args(["-noshell", "-eval",
             "io:format(\"~s|~s\", [erlang:system_info(otp_release), string:trim(element(2, file:read_file(filename:join([code:root_dir(), \"releases\", erlang:system_info(otp_release), \"OTP_VERSION\"]))))]), halt()."])
             .output()?;
         if !output.status.success() {
@@ -132,9 +139,10 @@ impl RefErl {
             }
         }
         Ok(Self {
-            process: Mutex::new(spawn(&ebin)?),
+            process: Mutex::new(spawn(&ebin, &erl_args)?),
             next_id: AtomicU64::new(1),
             otp_version: exact.to_owned(),
+            erl_args,
         })
     }
     /// Shared reference for tests. Calls themselves are pipelined internally.
@@ -164,7 +172,7 @@ impl RefErl {
         let mut process = self.process.lock().unwrap();
         if let Some(status) = process.child.try_wait()? {
             let _ = status;
-            *process = spawn(&server_ebin())?;
+            *process = spawn(&server_ebin(), &self.erl_args)?;
         }
         process.pending.lock().unwrap().insert(id, tx);
         let result = process
@@ -174,7 +182,7 @@ impl RefErl {
             .and_then(|()| process.stdin.flush());
         if result.is_err() {
             process.pending.lock().unwrap().remove(&id);
-            *process = spawn(&server_ebin())?;
+            *process = spawn(&server_ebin(), &self.erl_args)?;
             return Err(Error::Protocol("reference process died; restarted".into()));
         }
         Ok(rx)
@@ -186,7 +194,7 @@ impl RefErl {
                     Ok(Ok(term)) => return Ok(term),
                     Ok(Err(message)) if attempt == 0 => {
                         let mut p = self.process.lock().unwrap();
-                        *p = spawn(&server_ebin())?;
+                        *p = spawn(&server_ebin(), &self.erl_args)?;
                         let _ = message;
                     }
                     Ok(Err(message)) => return Err(Error::Protocol(message)),
@@ -321,8 +329,9 @@ fn server_source() -> std::path::PathBuf {
 fn server_ebin() -> std::path::PathBuf {
     server_source().parent().unwrap().join("ebin")
 }
-fn spawn(ebin: &std::path::Path) -> Result<Process, Error> {
+fn spawn(ebin: &std::path::Path, erl_args: &[String]) -> Result<Process, Error> {
     let mut child = Command::new("erl")
+        .args(erl_args)
         .args(["-noshell", "-pa"])
         .arg(ebin)
         .args([

@@ -136,6 +136,7 @@ fn toggle_instrumentations(_process: &mut Process, toggles: Term) -> Result<Term
     let O::Map(entries) = &owned else {
         return Err(badarg());
     };
+    let mut line_breakpoints = crate::trace_bp::line_breakpoints_instrumented();
     for (key, value) in entries {
         let (O::Atom(key), O::Atom(value)) = (key, value) else {
             return Err(badarg());
@@ -143,8 +144,9 @@ fn toggle_instrumentations(_process: &mut Process, toggles: Term) -> Result<Term
         if key != "line_breakpoint" || (value != "true" && value != "false") {
             return Err(badarg());
         }
-        crate::trace_bp::set_line_breakpoint_instrumentation(value == "true");
+        line_breakpoints = value == "true";
     }
+    crate::trace_bp::set_line_breakpoint_instrumentation(line_breakpoints);
     Ok(atom("ok"))
 }
 
@@ -155,10 +157,6 @@ fn register(
     term: Term,
 ) -> Result<Term, VmError> {
     let pid = Pid::from_term(term).ok_or_else(badarg)?;
-    let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    if !runtime.scheduler().map_err(|_| badarg())?.lookup(pid) {
-        return Err(badarg());
-    }
     match crate::trace_bp::register_debugger(process, pid) {
         Ok(session) => from_owned_term(
             process,
@@ -177,10 +175,7 @@ fn register(
 // Port of erts/emulator/beam/erl_debugger.c:163-188, OTP-29.1.1.
 fn unregister(process: &Process, term: Term, session: Term) -> Result<Term, VmError> {
     let pid = Pid::from_term(term).ok_or_else(badarg)?;
-    let session = session
-        .as_small()
-        .filter(|value| *value >= 0)
-        .ok_or_else(badarg)? as u64;
+    let session = session.as_small().ok_or_else(badarg)? as u64;
     crate::trace_bp::unregister_debugger(process, pid, session).map_err(|_| badarg())?;
     Ok(atom("ok"))
 }
@@ -202,12 +197,12 @@ fn breakpoint(
     enable: Term,
 ) -> Result<Term, VmError> {
     let module = atom_text(module).ok_or_else(badarg)?;
-    let line = u32::try_from(
-        line.as_small()
-            .filter(|value| *value > 0)
-            .ok_or_else(badarg)?,
-    )
-    .map_err(|_| badarg())?;
+    let line_term = line.as_small().ok_or_else(badarg)?;
+    let line = line_term as i32;
+    if line <= 0 {
+        return Err(badarg());
+    }
+    let line = line as u32;
     if enable != atom("true") && enable != atom("false") {
         return Err(badarg());
     }
@@ -250,7 +245,7 @@ fn breakpoint(
                     }
                     .into(),
                 ),
-                O::Int(i64::from(line)),
+                O::Int(line_term),
             ]),
         );
     }
@@ -272,6 +267,14 @@ fn breakpoints(
     function: Option<(Term, Term)>,
 ) -> Result<Term, VmError> {
     let module_name = atom_text(module_term).ok_or_else(badarg)?;
+    let function = function
+        .map(|(function, arity)| {
+            Ok((
+                atom_text(function).ok_or_else(badarg)?,
+                arity.as_small().ok_or_else(badarg)?,
+            ))
+        })
+        .transpose()?;
     let Some(&id) = vm.code.loaded.get(&module_name) else {
         return if function.is_some() {
             result_error(
@@ -284,8 +287,6 @@ fn breakpoints(
     };
     let code = vm.code.modules.get(id).ok_or_else(badarg)?;
     if let Some((function, arity)) = function {
-        let function = atom_text(function).ok_or_else(badarg)?;
-        let arity = arity.as_small().ok_or_else(badarg)?;
         let Some((start, _, _)) = code
             .functions
             .iter()
@@ -414,10 +415,10 @@ fn peek_stack_frame_slot(
 fn xregs_count(process: &Process, pid_term: Term) -> Result<Term, VmError> {
     let pid = inspect_pid(process, pid_term)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let Some(count) = runtime.inspect_suspended(pid, |target, _| target.gc_live) else {
+    let Some(count) = runtime.inspect_suspended(pid, |target, _| target.header.arity) else {
         return Ok(atom("running"));
     };
-    Term::small(count as i64).ok_or_else(badarg)
+    Term::small(i64::from(count)).ok_or_else(badarg)
 }
 
 // Port of erts/emulator/beam/erl_debugger.c:833-900, OTP-29.1.1.
@@ -432,7 +433,7 @@ fn peek_xreg(
     let max_size = nonnegative(max_size_term)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
     let Some(value) = runtime.inspect_suspended(pid, |target, _| {
-        (register < target.gc_live)
+        (register < usize::from(target.header.arity))
             .then(|| target.x.get(register).copied())
             .flatten()
             .map(|term| limit_term(term, max_size))
@@ -455,12 +456,8 @@ fn inspect_pid(process: &Process, term: Term) -> Result<Pid, VmError> {
 }
 
 fn nonnegative(term: Term) -> Result<usize, VmError> {
-    usize::try_from(
-        term.as_small()
-            .filter(|value| *value >= 0)
-            .ok_or_else(badarg)?,
-    )
-    .map_err(|_| badarg())
+    let value = term.as_small().ok_or_else(badarg)? as i32;
+    usize::try_from(value).map_err(|_| badarg())
 }
 
 /// Code position of the frame being assembled by [`inspect_frames`].
