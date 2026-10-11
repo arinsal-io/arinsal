@@ -2393,12 +2393,10 @@ fn internal_state_set(
             if !found {
                 return Ok(atom("false"));
             }
-            if pid == ctx.pid() {
-                process.force_gc()?;
-            } else {
-                ctx.signal(pid, arinsal_sched::Signal::GarbageCollect)
-                    .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-            }
+            // Port of erts/emulator/beam/erl_bif_info.c:5124-5133 and
+            // erts/emulator/beam/erl_gc.h:146-153, OTP-29.1.1. The target PID is only
+            // checked for existence; ERTS_FORCE_GC collects the calling process.
+            process.force_gc()?;
             return Ok(atom("true"));
         }
         Some("unique_monotonic_integer_state") => {
