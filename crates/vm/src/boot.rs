@@ -29,6 +29,11 @@ pub fn run_with_debugger_flags(
     line_breakpoints: bool,
     distribution_buffer_busy_limit_kb: Option<u64>,
 ) -> Result<ScheduledResult, VmError> {
+    // Port of erl_init.c:138 and :2223 (`+t` into `erts_atom_table_size`), OTP-29.1.1.
+    // Read before `erl_init_atoms`, which publishes the process-wide table.
+    if let Some(limit) = arinsal_args::active_emulator_flags().atom_limit {
+        arinsal_term::set_atom_table_limit(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
     let async_threads = arinsal_args::active_emulator_flags()
         .async_threads
         .unwrap_or(1)

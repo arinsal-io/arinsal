@@ -793,8 +793,7 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
         return x.cmp(&y);
     }
     if let (Some(x), Some(y)) = (a.as_atom(), b.as_atom()) {
-        let atoms = global_atoms();
-        return atoms.text(x).cmp(&atoms.text(y));
+        return global_atoms().cmp_atoms(x, y);
     }
     // Most comparisons inspect only one shallow object. Keep those pending
     // child pairs inline so the common tuple/list ordering path does not
@@ -813,12 +812,7 @@ fn cmp_impl(a: Term, b: Term, exact: bool) -> Ordering {
         }
         let c = match ak {
             TermKind::Number => number_cmp(a, b, exact),
-            TermKind::Atom => {
-                let atoms = global_atoms();
-                atoms
-                    .text(a.as_atom().unwrap())
-                    .cmp(&atoms.text(b.as_atom().unwrap()))
-            }
+            TermKind::Atom => global_atoms().cmp_atoms(a.as_atom().unwrap(), b.as_atom().unwrap()),
             TermKind::Nil => Ordering::Equal,
             TermKind::Pid | TermKind::Port | TermKind::Ref => {
                 identity_cmp(a.identity().unwrap(), b.identity().unwrap())

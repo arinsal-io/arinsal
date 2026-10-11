@@ -1002,6 +1002,8 @@ fn system_info(
         Some("process_count") => Some(non_neg(process, process_count(process) as u64)),
         // Port of erts/emulator/beam/erl_bif_info.c:3521, OTP-29.1.1.
         Some("atom_count") => Some(non_neg(process, global_atoms().len() as u64)),
+        // Port of erts/emulator/beam/erl_bif_info.c:3518 (atom_limit), OTP-29.1.1.
+        Some("atom_limit") => Some(non_neg(process, global_atoms().limit() as u64)),
         // Port of erts/emulator/beam/erl_bif_info.c:3524-3529, OTP-29.1.1.
         Some("tolerant_timeofday") => Some(Ok(atom("disabled"))),
         // Port of erts/emulator/beam/erl_bif_info.c:3515, OTP-29.1.1.

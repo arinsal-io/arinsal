@@ -7,9 +7,10 @@
 //! `registered` and send-to-name are one lookup.
 
 use arinsal_sched::Pid;
+use arinsal_term::FrequentReadRwLock;
 use arinsal_term::{Atom, global_atoms};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// `p->common.u.alive.reg == NULL`. Atom indices stay below the table limit.
 pub(crate) const NO_REG_ATOM: u32 = u32::MAX;
@@ -56,23 +57,23 @@ pub(crate) struct ProcessReg {
 
 /// `regtab_rwmtx`. Readers (`whereis`, `registered`, send) share the lock.
 pub(crate) struct RegisterTable {
-    inner: RwLock<ProcessReg>,
+    inner: FrequentReadRwLock<ProcessReg>,
 }
 
 impl RegisterTable {
     // Port of erts/emulator/beam/register.c:141 (init_register_table), OTP-29.1.1.
     pub(crate) fn new() -> Self {
         Self {
-            inner: RwLock::new(ProcessReg::new()),
+            inner: FrequentReadRwLock::new(ProcessReg::new()),
         }
     }
 
-    pub(crate) fn read(&self) -> RwLockReadGuard<'_, ProcessReg> {
-        self.inner.read().expect("register table")
+    pub(crate) fn read(&self) -> arinsal_term::FrequentReadGuard<'_, ProcessReg> {
+        self.inner.read()
     }
 
-    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, ProcessReg> {
-        self.inner.write().expect("register table")
+    pub(crate) fn write(&self) -> arinsal_term::FrequentWriteGuard<'_, ProcessReg> {
+        self.inner.write()
     }
 
     /// `erts_whereis_name_to_id`: one fetch, no liveness sweep.

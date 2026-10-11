@@ -17,7 +17,7 @@ const EXT_SEGMENT: usize = 2048;
 pub(super) fn ets_hash(term: Term) -> u64 {
     if let Some(atom) = term.as_atom() {
         // Port of erl_db_hash.c:280 (MAKE_HASH atom fast path), OTP-29.1.1.
-        return global_atoms().hash(atom).unwrap() as u64;
+        return global_atoms().hvalue(atom).unwrap();
     }
     if term.as_small().is_some() {
         // Port of crates/term/src/internal_hash.rs:74-75 fast path, OTP-29.1.1.
