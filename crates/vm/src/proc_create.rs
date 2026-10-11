@@ -972,7 +972,9 @@ impl Process {
         self.header.fcalls = self.reductions;
     }
 
-    pub(crate) fn sync_native_header(&mut self) {
+    /// Publish the heap bounds and cursors to the ABI prefix before entering native code,
+    /// as the executor does at every native entry.
+    pub fn sync_native_header(&mut self) {
         let (htop, stop) = self.heap.heap_cursor();
         let (heap, hend) = self.heap.heap_bounds();
         self.header.htop = htop;

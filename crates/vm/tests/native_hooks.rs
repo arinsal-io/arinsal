@@ -31,6 +31,7 @@ fn run(
     })
     .unwrap();
     let module = asm.finalize().unwrap();
+    process.sync_native_header();
     let saved_ftrace = process.native_header().ftrace;
     process.native_header().ftrace = (registers as *mut SchedulerRegisters).cast();
     // SAFETY: The code follows the BeamAsm ABI and the process plus register
