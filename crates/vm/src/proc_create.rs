@@ -146,6 +146,10 @@ pub struct Process {
     pub(crate) reductions_used: u64,
     pub(crate) gc_enabled: bool,
     pub(crate) gc_deferred: bool,
+    /// erts `F_DELAY_GC`: set from `loop_rec` until `remove_message` or the wait, while x0
+    /// may refer to a queued message whose data is still in its heap fragment.
+    // Port of erts/emulator/beam/erl_process.h:1643, 1728-1736 (F_DELAY_GC), OTP-29.1.1.
+    pub(crate) delay_gc: bool,
     pub(crate) uniq_counter: i64,
     pub(crate) stats: ProcessStats,
     /// Final reason remains on the task until the scheduler reaps late monitors.
@@ -1058,6 +1062,7 @@ impl Process {
             reductions: 4000,
             reductions_used: 0,
             gc_enabled: true,
+            delay_gc: false,
             gc_deferred: false,
             uniq_counter: 0,
             stats: ProcessStats::default(),

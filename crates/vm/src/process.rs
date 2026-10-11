@@ -163,9 +163,7 @@ impl MessageQueue {
     // Port of erts/emulator/beam/erl_message.c:698 (erts_send_message), OTP-29.1.1.
     pub(crate) fn push_message(
         &mut self,
-        mut message: Message,
-        data: MessageQueueData,
-        heap: &mut ProcessHeap,
+        message: Message,
         prio_len: usize,
     ) -> Result<usize, VmError> {
         let priority = message.priority;
@@ -188,44 +186,18 @@ impl MessageQueue {
             );
             return Ok(new_prio_len);
         }
-        match data {
-            MessageQueueData::OnHeap => {
-                // Port of erts/emulator/beam/erl_message.c:943 (copy_message), OTP-29.1.1.
-                let mut target = arinsal_bifs::FragmentingHeap(heap);
-                let mut fragment = message.fragment.take().expect("fragment was checked");
-                let term = if fragment.heap.is_some() {
-                    let literals = arinsal_term::LiteralAreas::current();
-                    arinsal_term::copy_term_litopt(message.term, &mut target, &literals).map_err(
-                        |error| VmError::Unsupported(format!("on-heap message copy: {error:?}")),
-                    )?
-                } else {
-                    message.term
-                };
-                fragment.heap = None;
-                push(
-                    self,
-                    QueuedMessage {
-                        term,
-                        fragment: fragment.seq_token.take().map(|seq_token| {
-                            Box::new(MessageFragment {
-                                heap: None,
-                                seq_token: Some(seq_token),
-                            })
-                        }),
-                    },
-                );
-            }
-            MessageQueueData::OffHeap => {
-                // Port of erts/emulator/beam/erl_message.c:1054 (off-heap message fragment), OTP-29.1.1.
-                push(
-                    self,
-                    QueuedMessage {
-                        term: message.term,
-                        fragment: message.fragment,
-                    },
-                );
-            }
-        }
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_fetch), OTP-29.1.1:
+        // fetching links the message into the private queue as is. Its data stays in the
+        // heap fragment in both queue modes; with an on-heap queue the next collection
+        // moves it onto the heap (move_msgs_to_heap), and receiving it first saves the
+        // fragment in the process (erts_save_message_in_proc).
+        push(
+            self,
+            QueuedMessage {
+                term: message.term,
+                fragment: message.fragment,
+            },
+        );
         Ok(new_prio_len)
     }
 
@@ -409,6 +381,43 @@ impl MessageQueue {
             copied += 1;
         }
         Ok(copied)
+    }
+
+    /// Take the heap fragments of queued messages for a collection that moves them onto
+    /// the heap (on-heap message queue).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8880 (move_msg_to_heap), OTP-29.1.1.
+    pub(crate) fn take_message_fragments(
+        &mut self,
+    ) -> (Vec<usize>, Vec<(Term, Option<ProcessHeap>)>) {
+        let mut indices = Vec::new();
+        let mut fragments = Vec::new();
+        for (index, entry) in self.entries.iter_mut().enumerate() {
+            if let Some(fragment) = entry.fragment.as_mut()
+                && let Some(heap) = fragment.heap.take()
+            {
+                indices.push(index);
+                fragments.push((entry.term, Some(heap)));
+            }
+        }
+        (indices, fragments)
+    }
+
+    /// Store the terms of messages moved onto the heap; their fragments are gone.
+    pub(crate) fn restore_moved_messages(
+        &mut self,
+        indices: &[usize],
+        moved: Vec<(Term, Option<ProcessHeap>)>,
+    ) {
+        for (&index, (term, heap)) in indices.iter().zip(moved) {
+            let entry = &mut self.entries[index];
+            entry.term = term;
+            if let Some(fragment) = entry.fragment.as_mut() {
+                fragment.heap = heap;
+                if fragment.heap.is_none() && fragment.seq_token.is_none() {
+                    entry.fragment = None;
+                }
+            }
+        }
     }
 
     pub(crate) fn update_gc_roots(&mut self, indices: &[usize], roots: &[Term]) {
@@ -4987,7 +4996,6 @@ impl Process {
                 }
             }
         }
-        let mut queue_data = None;
         loop {
             if marker.is_some_and(|marker| !ctx.recv_marker_has_saved_before(marker)) {
                 break;
@@ -4998,14 +5006,11 @@ impl Process {
             match payload {
                 Payload::Message(message) => {
                     let receive_traced = message.receive_traced;
-                    let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                     let sender = from;
                     let before = self.message_words_before();
-                    let new_prio_len =
-                        self.inbox
-                            .push_message(message, data, &mut self.heap, old_prio_len)?;
+                    let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
                     self.uncount_message_words(before);
                     let trace_index = if priority {
                         old_prio_len
@@ -5031,13 +5036,10 @@ impl Process {
                 }
                 Payload::TimerMessage { reference, message } => {
                     self.retire_timer_reference(reference);
-                    let data = *queue_data.get_or_insert_with(|| self.message_queue_data());
                     let priority = message.is_priority();
                     let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
                     let before = self.message_words_before();
-                    let new_prio_len =
-                        self.inbox
-                            .push_message(message, data, &mut self.heap, old_prio_len)?;
+                    let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
                     self.uncount_message_words(before);
                     self.cold_mut().prio_len = new_prio_len;
                     if priority {
@@ -5460,16 +5462,13 @@ impl Process {
         &mut self,
         probe: &arinsal_sched::SignalProbe<Message>,
     ) -> Result<usize, VmError> {
-        let data = self.message_queue_data();
         let mut fetched = 0;
         while let Some((_sender, message)) =
             probe.fetch_message_if(|message| !message.is_priority())
         {
             let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
             let before = self.message_words_before();
-            let new_prio_len =
-                self.inbox
-                    .push_message(message, data, &mut self.heap, old_prio_len)?;
+            let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
             self.uncount_message_words(before);
             self.cold_mut().prio_len = new_prio_len;
             fetched += 1;
@@ -5505,6 +5504,11 @@ impl Process {
         min_free: usize,
         hibernate: bool,
     ) -> Result<arinsal_term::GcStats, VmError> {
+        // Port of erts/emulator/beam/erl_gc.c:782-785 (garbage_collect: F_DELAY_GC), OTP-29.1.1.
+        if !hibernate && self.delay_gc {
+            self.heap.delay_collection(min_free);
+            return Ok(arinsal_term::GcStats::default());
+        }
         if !hibernate && self.delay_for_dirty_gc(min_free) {
             return Ok(arinsal_term::GcStats::default());
         }
@@ -5616,14 +5620,26 @@ impl Process {
             let allocated = self.allocated_words(0);
             crate::trace_bp::adjust_memory_break(self, allocated);
         }
+        // Port of erts/emulator/beam/erl_gc.c:1500-1501 and 1947-1948, OTP-29.1.1: with an
+        // on-heap message queue the collection moves queued message data onto the heap.
+        let (moved_indices, mut moved) =
+            if !hibernate && self.message_queue_data() == MessageQueueData::OnHeap {
+                self.inbox.take_message_fragments()
+            } else {
+                (Vec::new(), Vec::new())
+            };
         let stats = if hibernate {
             self.heap
                 .collect_hibernate(&mut self.x[..live_x], &mut roots)
         } else {
             self.heap
-                .collect(&mut self.x[..live_x], &mut roots, min_free)
+                .collect_with_messages(&mut self.x[..live_x], &mut roots, min_free, &mut moved)
+        };
+        if !moved_indices.is_empty() {
+            self.inbox.restore_moved_messages(&moved_indices, moved);
         }
-        .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
+        let stats =
+            stats.map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
         if let Some(pid) = traced {
             self.trace_gc(pid, end_tag, stats.words_reclaimed as usize);
         }
@@ -6854,7 +6870,7 @@ fn scheduler_class(kind: arinsal_sched::SchedulerType) -> arinsal_bifs::Schedule
 
 #[cfg(test)]
 mod layout_tests {
-    use super::{Message, MessageQueueData, Process, ProcessHeap, Term, TermBuilder};
+    use super::{Message, Process, ProcessHeap, Term, TermBuilder};
 
     fn envelope() -> Message {
         let mut source = ProcessHeap::with_words(8);
@@ -6867,17 +6883,10 @@ mod layout_tests {
     #[test]
     fn off_heap_message_fragment_stays_outside_gc_roots_until_removed() {
         let mut process = Process::new();
+        process.cold_mut().off_heap_msgq = true;
         let heap_words = process.heap.total_heap_size_words();
         let prio_len = 0;
-        process
-            .inbox
-            .push_message(
-                envelope(),
-                MessageQueueData::OffHeap,
-                &mut process.heap,
-                prio_len,
-            )
-            .unwrap();
+        process.inbox.push_message(envelope(), prio_len).unwrap();
 
         assert!(process.inbox.gc_root_snapshot().1.is_empty());
         assert_eq!(process.heap.total_heap_size_words(), heap_words);
@@ -6899,16 +6908,12 @@ mod layout_tests {
     fn on_heap_message_is_a_gc_root_in_the_process_heap() {
         let mut process = Process::new();
         let prio_len = 0;
-        process
-            .inbox
-            .push_message(
-                envelope(),
-                MessageQueueData::OnHeap,
-                &mut process.heap,
-                prio_len,
-            )
-            .unwrap();
+        process.inbox.push_message(envelope(), prio_len).unwrap();
 
+        // The fetched message keeps its fragment until a collection moves it onto the heap.
+        assert!(process.inbox.gc_root_snapshot().1.is_empty());
+        assert!(!process.inbox.is_on_heap(0));
+        process.collect_heap_roots(0, &mut [], 0).unwrap();
         assert_eq!(process.inbox.gc_root_snapshot().1.len(), 1);
         assert_eq!(process.inbox.entries.len(), 1);
         assert!(process.inbox.entries[0].fragment.is_none());

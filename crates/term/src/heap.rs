@@ -1069,6 +1069,28 @@ impl ProcessHeap {
         });
         self.fragments.append(&mut source.fragments);
         self.abandoned |= source.abandoned;
+        self.absorb_fragment_owners(&mut source);
+        Ok(())
+    }
+
+    /// Words of message data held by a standalone message heap: the used part of its block
+    /// and of each heap fragment.
+    // Port of erts/emulator/beam/erl_message.h (erts_msg_attached_data_size), OTP-29.1.1.
+    pub fn message_data_size(&self) -> usize {
+        self.fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                Fragment::Block { used, .. } => Some(*used),
+                Fragment::Abandoned { .. } => None,
+            })
+            .fold(self.htop, usize::saturating_add)
+    }
+
+    /// Link the off-heap objects of a message fragment into this process's off-heap list
+    /// and add its virtual binary heap overhead.
+    // Port of erts/emulator/beam/erl_message.c:980-990 (erts_save_message_in_proc) and
+    // erl_gc.c:2524 (OH_OVERHEAD in erts_copy_one_frag), OTP-29.1.1.
+    pub(crate) fn absorb_fragment_owners(&mut self, source: &mut ProcessHeap) {
         if let Some(mut owners) = source.owners.0.take() {
             let source_old_vheap = owners.vheap.old;
             self.bin_vheap = self.bin_vheap.saturating_add(source.bin_vheap);
@@ -1092,7 +1114,6 @@ impl ProcessHeap {
                 self.owners.0 = Some(owners);
             }
         }
-        Ok(())
     }
     /// Number of off-heap binary owners retained by this process.
     pub fn off_heap_count(&self) -> usize {
