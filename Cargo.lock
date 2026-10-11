@@ -26,7 +26,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "proptest",
- "similar-asserts",
+ "similar-asserts 2.0.0",
 ]
 
 [[package]]
@@ -35,7 +35,7 @@ version = "0.0.1"
 dependencies = [
  "arinsal-difftest",
  "arinsal-etf",
- "similar-asserts",
+ "similar-asserts 1.7.0",
  "thiserror",
 ]
 
@@ -139,7 +139,7 @@ dependencies = [
  "arinsal-nif",
  "arinsal-term",
  "arinsal-vm",
- "similar-asserts",
+ "similar-asserts 2.0.0",
 ]
 
 [[package]]
@@ -323,7 +323,7 @@ dependencies = [
  "arinsal-term",
  "crossbeam-epoch",
  "crossbeam-queue",
- "similar-asserts",
+ "similar-asserts 2.0.0",
 ]
 
 [[package]]
@@ -362,7 +362,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "proptest",
- "similar-asserts",
+ "similar-asserts 2.0.0",
  "smallvec",
 ]
 
@@ -403,7 +403,7 @@ dependencies = [
  "mio",
  "num-bigint",
  "num-traits",
- "similar-asserts",
+ "similar-asserts 2.0.0",
  "smallvec",
 ]
 
@@ -482,6 +482,17 @@ dependencies = [
  "libc",
  "once_cell",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "console"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e96a4956774c13c126a8b5af4daa79384f4d826534c95a02d76afb39e2ab64e3"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -991,13 +1002,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "similar"
+version = "3.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f66ca1f7aca2474dc10c942eb22feffc897735f54cd1db90138c2fddb490987"
+dependencies = [
+ "bstr",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "similar-asserts"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b441962c817e33508847a22bd82f03a30cff43642dc2fae8b050566121eb9a"
 dependencies = [
- "console",
- "similar",
+ "console 0.15.11",
+ "similar 2.7.0",
+]
+
+[[package]]
+name = "similar-asserts"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "997e6ca38e97437973fc9f7f50a50d1274cacd874341a4960fea90067291038c"
+dependencies = [
+ "console 0.16.6",
+ "similar 3.2.0",
 ]
 
 [[package]]
