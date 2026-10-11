@@ -235,6 +235,12 @@ pub(crate) fn exact_flat_key_cmp(a: Term, b: Term, flat_atom: bool) -> Ordering 
 pub trait HeapAlloc {
     /// Reserve contiguous words, or return `None` so the caller can collect.
     fn alloc(&mut self, words: usize) -> Option<*mut u64>;
+    /// Reserve words with spare capacity for later allocations from a heap fragment.
+    ///
+    /// Port of `HAllocX` in `erts/emulator/beam/erl_vm.h:154-159`, OTP-29.1.1.
+    fn alloc_with_extra(&mut self, words: usize, _extra: usize) -> Option<*mut u64> {
+        self.alloc(words)
+    }
     /// Young-heap words [`alloc`](Self::alloc) can still return.
     ///
     /// `None` when this allocator does not expose a young-heap limit (a heap
@@ -374,6 +380,85 @@ impl<H: HeapAlloc + ?Sized> Drop for ConsHeapBuilder<'_, H> {
     }
 }
 
+/// An append-only list whose open tail can survive a BIF reduction trap.
+///
+/// The caller must keep the heap stable while the chain is open. Trapping BIFs
+/// do this by disabling collection until the continuation completes.
+pub struct ConsHeapChain {
+    head: Term,
+    result_cdr: Option<usize>,
+}
+
+impl ConsHeapChain {
+    /// Start an empty chain.
+    /// Port of the initial result-cdr setup in `erl_bif_lists.c:697-705` and `:858-867`.
+    pub const fn new() -> Self {
+        Self {
+            head: Term::NIL,
+            result_cdr: None,
+        }
+    }
+
+    /// Append one input-order cell with the same heap-fragment slack as `HAllocX`.
+    ///
+    /// Port of `erl_bif_lists.c:740-756` and `:881-899`, OTP-29.1.1.
+    pub fn push<H: HeapAlloc + ?Sized>(
+        &mut self,
+        heap: &mut H,
+        value: Term,
+        remaining_cells: usize,
+    ) -> Result<(), TermError> {
+        let extra_words = remaining_cells
+            .checked_mul(2)
+            .ok_or(TermError::SystemLimit)?;
+        let cell = heap
+            .alloc_with_extra(2, extra_words)
+            .ok_or(TermError::SystemLimit)?;
+        let term = Term::from_ptr(cell, 1);
+        if let Some(result_cdr) = self.result_cdr {
+            store(result_cdr as *mut u64, term.bits());
+        } else {
+            self.head = term;
+        }
+        store(cell, value.bits());
+        self.result_cdr = Some(cell.wrapping_add(1) as usize);
+        Ok(())
+    }
+
+    /// Terminate the chain before yielding so the partial result remains valid.
+    /// Port of `*context->result_cdr = NIL` in `erl_bif_lists.c:786` and `:919`.
+    pub fn suspend(&self) {
+        if let Some(result_cdr) = self.result_cdr {
+            store(result_cdr as *mut u64, Term::NIL.bits());
+        }
+    }
+
+    /// Close the chain with `tail` and return its head.
+    /// Port of the result-cdr tail stores in `erl_bif_lists.c:767-771` and `:900-906`.
+    pub fn finish(mut self, tail: Term) -> Term {
+        if let Some(result_cdr) = self.result_cdr {
+            store(result_cdr as *mut u64, tail.bits());
+            self.result_cdr = None;
+            self.head
+        } else {
+            tail
+        }
+    }
+}
+
+impl Drop for ConsHeapChain {
+    // Port of the partial-result termination performed before trapping or BIF errors.
+    fn drop(&mut self) {
+        self.suspend();
+    }
+}
+
+impl Default for ConsHeapChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A block taken from a heap in one `HAlloc` whose unused tail is handed back on drop.
 ///
 /// Port of the `HAlloc(worst case)` / `HRelease(hp_end, hp)` idiom used by BIFs such as
@@ -441,6 +526,17 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
             Some(ptr)
         } else {
             self.heap.alloc(words)
+        }
+    }
+    #[inline]
+    fn alloc_with_extra(&mut self, words: usize, extra_words: usize) -> Option<*mut u64> {
+        // Port of `HAllocX`'s young-heap check and `erts_heap_alloc` fallback.
+        if words <= (self.end as usize - self.cur as usize) / 8 {
+            let ptr = self.cur;
+            self.cur = ptr.wrapping_add(words);
+            Some(ptr)
+        } else {
+            self.heap.alloc_with_extra(words, extra_words)
         }
     }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
@@ -847,18 +943,22 @@ impl ProcessHeap {
     }
     /// Allocate a side fragment when a BIF cannot collect at this point.
     pub fn heap_fragment(&mut self, words: usize) -> *mut u64 {
+        self.heap_fragment_with_extra(words, 0)
+    }
+    /// Allocate a side fragment with spare capacity for subsequent BIF allocations.
+    ///
+    /// Port of erts/emulator/beam/utils.c:135-189 (`erts_heap_alloc`), OTP-29.1.1.
+    pub fn heap_fragment_with_extra(&mut self, words: usize, extra: usize) -> *mut u64 {
         if self.detached
             && let Some(ptr) = self
                 .owners
                 .detached
                 .as_deref_mut()
-                .and_then(|heap| heap.alloc(words))
+                .and_then(|heap| heap.alloc_with_extra(words, extra))
         {
             return ptr;
         }
-        // Port of erts/emulator/beam/utils.c:135-189 (erts_heap_alloc), OTP-29.1.1: the
-        // newest fragment (`MBUF(p)`) takes the words while it has room; otherwise a new
-        // fragment of exactly `words` (HAlloc passes no extra) heads the list.
+        // ERTS reuses the newest fragment before allocating another one.
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(words).unwrap_or(u32::MAX));
@@ -869,7 +969,7 @@ impl ProcessHeap {
             *used += words;
             return memory.as_mut_slice()[at..].as_mut_ptr();
         }
-        let mut memory = zeroed_block(words, ErtsAlcType::HEAP_FRAG);
+        let mut memory = zeroed_block(words.saturating_add(extra), ErtsAlcType::HEAP_FRAG);
         let ptr = memory.as_mut_ptr();
         self.fragments.push(Fragment::Block {
             memory,
@@ -1044,8 +1144,7 @@ impl HeapAlloc for ProcessHeap {
     fn words_left(&self) -> Option<usize> {
         self.alloc_words_left()
     }
-    // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1: only the young
-    // heap top moves back; a heap fragment keeps the caller's filler.
+    // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1.
     fn release(&mut self, end: *mut u64, start: *mut u64) {
         if self.detached {
             if let Some(heap) = self.owners.detached.as_deref_mut() {
@@ -1058,6 +1157,19 @@ impl HeapAlloc for ProcessHeap {
         let address = start as usize;
         if address >= base && address < top && end as usize == top {
             self.htop = (address - base) / 8;
+            return;
+        }
+        if let Some(Fragment::Block { memory, used }) = self.fragments.last_mut() {
+            let fragment_base = memory.as_mut_ptr() as usize;
+            let fragment_end = fragment_base + *used * 8;
+            if end as usize == fragment_end && address >= fragment_base && address <= fragment_end {
+                let new_used = (address - fragment_base) / 8;
+                let released = *used - new_used;
+                *used = new_used;
+                self.fragment_words = self
+                    .fragment_words
+                    .saturating_sub(u32::try_from(released).unwrap_or(u32::MAX));
+            }
         }
     }
     #[inline]
@@ -2090,7 +2202,7 @@ impl Term {
 }
 #[cfg(test)]
 mod heap_block_tests {
-    use super::ProcessHeap;
+    use super::{HeapAlloc, ProcessHeap};
 
     #[test]
     fn realloc_preserves_the_user_prefix_and_can_shrink() {
@@ -2108,5 +2220,23 @@ mod heap_block_tests {
         assert_eq!(heap.words.len(), 32);
         assert_eq!(heap.words.words()[0], 0x1111);
         assert_eq!(heap.words.words()[3], 0x2222);
+    }
+
+    #[test]
+    fn heap_fragment_reuses_hallocx_extra_words() {
+        let mut heap = ProcessHeap::with_words(1);
+        let first = heap.heap_fragment_with_extra(2, 200);
+        let second = heap.heap_fragment_with_extra(3, 200);
+
+        assert_eq!(
+            second as usize,
+            first as usize + 2 * std::mem::size_of::<u64>()
+        );
+        assert_eq!(heap.mbuf_size(), 5);
+        let released_to = second as usize + std::mem::size_of::<u64>();
+        let end = (second as usize + 3 * std::mem::size_of::<u64>()) as *mut u64;
+        heap.release(end, released_to as *mut u64);
+        assert_eq!(heap.mbuf_size(), 3);
+        assert_eq!(heap.heap_fragment_with_extra(1, 200) as usize, released_to);
     }
 }

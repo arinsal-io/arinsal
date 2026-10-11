@@ -407,7 +407,8 @@ impl RbTree {
 /// Compare tagged terms using `erts_cmp`'s immediate fast paths before falling
 /// back to the full exact term order.
 ///
-/// Port of `erts/emulator/beam/erl_utils.h:238-257` (`erts_cmp`), OTP-29.1.1.
+/// Port of `erts/emulator/beam/utils.c:1723-1737` (`erts_cmp` immediate cases),
+/// reached through `erl_utils.h:122` (`CMP_TERM`), OTP-29.1.1.
 #[inline]
 fn subtract_term_cmp(a: Term, b: Term) -> Ordering {
     if a == b {

@@ -52,8 +52,17 @@ const MAPS_KEYS_CONTINUATION: &str = "maps:keys/1";
 const MAPS_VALUES_CONTINUATION: &str = "maps:values/1";
 const MAPS_FROM_LIST_CONTINUATION: &str = "maps:from_list/1";
 const MAPS_FROM_KEYS_CONTINUATION: &str = "maps:from_keys/2";
+const SUBTRACT_CONTINUATION: &str = "erlang:--/2";
+const CONTEXT_REDS: usize = 4000;
 
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "erlang",
+        function: "--",
+        arity: 2,
+        continuation: SUBTRACT_CONTINUATION,
+        handler: subtract,
+    },
     Entry {
         module: "maps",
         function: "from_list",
@@ -1014,6 +1023,60 @@ fn code_permission(
         state: MagicRef::new(acquire),
         reductions: 1,
     })
+}
+
+type SubtractState = Mutex<arinsal_bifs::SubtractWalk>;
+
+// Port of erts/emulator/beam/erl_bif_lists.c:390-1047 (ErtsSubtractContext,
+// subtract_continue, and BIF_TRAP2), OTP-29.1.1. Each continuation gets the
+// scheduler context budget from erl_vm.h:53 (`CONTEXT_REDS`).
+fn subtract(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<TrapResult, BifError> {
+    let reductions_left = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
+    if let Some(state) = state {
+        let state = Arc::clone(state);
+        let mut walk = state
+            .downcast_ref::<SubtractState>()
+            .ok_or(BifError::BADARG)?
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?;
+        let (result, reductions) = subtract_step(process, &mut walk, reductions_left)?;
+        return Ok(match result {
+            Some(value) => TrapResult::Done { value, reductions },
+            None => TrapResult::Yield {
+                continuation: SUBTRACT_CONTINUATION,
+                state: Arc::clone(&state),
+                reductions,
+            },
+        });
+    }
+
+    let mut walk = arinsal_bifs::SubtractWalk::new(args[0], args[1])?;
+    let (result, reductions) = subtract_step(process, &mut walk, reductions_left)?;
+    Ok(match result {
+        Some(value) => TrapResult::Done { value, reductions },
+        None => TrapResult::Yield {
+            continuation: SUBTRACT_CONTINUATION,
+            state: MagicRef::new(Mutex::new(walk)),
+            reductions,
+        },
+    })
+}
+
+fn subtract_step(
+    process: &mut Process,
+    walk: &mut arinsal_bifs::SubtractWalk,
+    reductions_left: usize,
+) -> Result<(Option<Term>, u32), BifError> {
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+    let result = walk.step(&mut ctx, reductions_left)?;
+    Ok((result, ctx.reductions()))
 }
 
 fn list_to_binary(

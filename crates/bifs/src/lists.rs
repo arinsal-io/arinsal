@@ -1,12 +1,10 @@
 //! List BIFs. The per-element loops follow `erl_bif_lists.c` and `erl_bif_guard.c`.
 //!
-//! Reduction traps (`BIF_TRAP` / `ERTS_BIF_PREP_TRAP` once the list exceeds the
-//! remaining reductions) are a later task. These implementations finish the
-//! whole list, using the same on-heap bump and single `HAlloc` as erts does
-//! when the list fits in the budget.
+//! Most loops finish in one call; `erlang:'--'/2` exposes its staged walk to the
+//! VM so the scheduler can resume it through the same continuation as erts.
 
 use arinsal_term::{
-    ConsHeapBuilder, HeapAlloc, HeapReservation, Term, TermBuilder, atoms, exact_eq, loose_eq,
+    ConsHeapChain, HeapAlloc, HeapReservation, Term, TermBuilder, atoms, exact_eq, loose_eq,
 };
 
 #[path = "rbtree.rs"]
@@ -178,8 +176,7 @@ fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 
 fn subtract(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_lists.c:367-1020 (subtract stages),
-    // OTP-29.1.1. The BIF interface cannot retain trap state, so each stage
-    // runs to completion in this call while preserving the erts algorithm.
+    // OTP-29.1.1. Runtime dispatch uses `SubtractWalk` to retain this state on trap.
     if !matches!(
         args[0].classify(),
         arinsal_term::TermKind::List | arinsal_term::TermKind::Nil
@@ -368,41 +365,368 @@ fn subtract(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     }
 }
 
-/// Reserve the remaining output area at the first retained LHS cell and fill
-/// it in input order. Port of `erl_bif_lists.c:748-770` and `:881-916`, where
-/// `HAllocX` and `result_cdr` build retained cells, OTP-29.1.1.
+/// Resumable state for `erlang:'--'/2`.
+///
+/// Port of `ErtsSubtractContext` and `subtract_continue` in
+/// `erts/emulator/beam/erl_bif_lists.c:390-1014`, OTP-29.1.1.
+pub struct SubtractWalk {
+    stage: SubtractStage,
+    lhs: Term,
+    rhs: Term,
+    lhs_remaining: usize,
+    rhs_remaining: usize,
+    iterator: Term,
+    result: Option<ConsHeapChain>,
+    scratch: SubtractScratch,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubtractStage {
+    Start,
+    LenLhs,
+    NaiveLhs,
+    LenRhs,
+    NaiveRhs,
+    SetBuild,
+    SetFinish,
+}
+
+enum SubtractScratch {
+    Empty,
+    Lhs([Term; 16]),
+    Rhs([Term; 16]),
+    Set(RbTree),
+}
+
+impl SubtractWalk {
+    /// Start after the argument-kind checks in OTP `subtract/2`.
+    /// Port of `subtract_start` and `subtract` at `erl_bif_lists.c:1017-1077`.
+    pub fn new(lhs: Term, rhs: Term) -> Result<Self, BifError> {
+        if !matches!(
+            lhs.classify(),
+            arinsal_term::TermKind::List | arinsal_term::TermKind::Nil
+        ) || !matches!(
+            rhs.classify(),
+            arinsal_term::TermKind::List | arinsal_term::TermKind::Nil
+        ) {
+            return Err(BADARG);
+        }
+        Ok(Self {
+            stage: SubtractStage::Start,
+            lhs,
+            rhs,
+            lhs_remaining: 0,
+            rhs_remaining: 0,
+            iterator: Term::NIL,
+            result: None,
+            scratch: SubtractScratch::Empty,
+        })
+    }
+
+    /// Run up to `reductions_left` BIF reductions; `None` means trap and resume.
+    /// Port of `subtract_continue` at `erl_bif_lists.c:931-1014`.
+    pub fn step(
+        &mut self,
+        ctx: &mut Ctx<'_>,
+        reductions_left: usize,
+    ) -> Result<Option<Term>, BifError> {
+        loop {
+            match self.stage {
+                SubtractStage::Start => {
+                    self.stage = SubtractStage::LenLhs;
+                    self.iterator = self.lhs;
+                }
+                SubtractStage::LenLhs => {
+                    let budget = subtract_budget(ctx, reductions_left, 32);
+                    if !subtract_get_length_chunk(
+                        ctx,
+                        &mut self.iterator,
+                        &mut self.lhs_remaining,
+                        budget,
+                    )? {
+                        return Ok(None);
+                    }
+                    if self.lhs_remaining > 0
+                        && self.lhs_remaining <= 16
+                        && self.rhs.classify() == arinsal_term::TermKind::List
+                    {
+                        let mut elements = [Term::NIL; 16];
+                        let mut iterator = self.lhs;
+                        for element in elements.iter_mut().take(self.lhs_remaining) {
+                            let (head, tail) = cons_cell(iterator).ok_or(BADARG)?;
+                            *element = head;
+                            iterator = tail;
+                        }
+                        self.iterator = self.rhs;
+                        self.scratch = SubtractScratch::Lhs(elements);
+                        self.stage = SubtractStage::NaiveLhs;
+                    } else {
+                        self.iterator = self.rhs;
+                        self.stage = SubtractStage::LenRhs;
+                    }
+                }
+                SubtractStage::NaiveLhs => {
+                    let budget = subtract_budget(ctx, reductions_left, 16);
+                    let SubtractScratch::Lhs(elements) = &mut self.scratch else {
+                        unreachable!("naive LHS stage owns its fixed array")
+                    };
+                    let mut checks = 0usize;
+                    while checks < budget {
+                        let Some((value, next)) = cons_cell(self.iterator) else {
+                            break;
+                        };
+                        let mut found_at = None;
+                        for (index, element) in elements.iter().take(self.lhs_remaining).enumerate()
+                        {
+                            if exact_eq(value, *element) {
+                                found_at = Some(index);
+                                break;
+                            }
+                        }
+                        if let Some(found_at) = found_at {
+                            let old_remaining = self.lhs_remaining;
+                            self.lhs_remaining -= 1;
+                            elements.copy_within(found_at + 1..old_remaining, found_at);
+                        }
+                        checks = checks.saturating_add(self.lhs_remaining.max(1));
+                        self.iterator = next;
+                    }
+                    ctx.charge_reductions(checks.min(budget) / 16);
+                    if self.iterator != Term::NIL {
+                        if self.iterator.classify() != arinsal_term::TermKind::List {
+                            return Err(BADARG);
+                        }
+                        return Ok(None);
+                    }
+                    return subtract_list_from_slice(
+                        ctx,
+                        &elements[..self.lhs_remaining],
+                        Term::NIL,
+                    )
+                    .map(Some);
+                }
+                SubtractStage::LenRhs => {
+                    let budget = subtract_budget(ctx, reductions_left, 32);
+                    if !subtract_get_length_chunk(
+                        ctx,
+                        &mut self.iterator,
+                        &mut self.rhs_remaining,
+                        budget,
+                    )? {
+                        return Ok(None);
+                    }
+                    if self.lhs_remaining == 0 {
+                        return Ok(Some(Term::NIL));
+                    }
+                    if self.rhs_remaining == 0 {
+                        return Ok(Some(self.lhs));
+                    }
+                    if self.rhs_remaining <= 16 {
+                        let mut elements = [Term::NIL; 16];
+                        let mut iterator = self.rhs;
+                        for element in elements.iter_mut().take(self.rhs_remaining) {
+                            let (head, tail) = cons_cell(iterator).ok_or(BADARG)?;
+                            *element = head;
+                            iterator = tail;
+                        }
+                        self.iterator = self.lhs;
+                        self.result = Some(ConsHeapChain::new());
+                        self.scratch = SubtractScratch::Rhs(elements);
+                        self.stage = SubtractStage::NaiveRhs;
+                    } else {
+                        self.iterator = self.rhs;
+                        self.scratch =
+                            SubtractScratch::Set(RbTree::with_capacity(self.rhs_remaining));
+                        self.stage = SubtractStage::SetBuild;
+                    }
+                }
+                SubtractStage::NaiveRhs => return self.step_naive_rhs(ctx, reductions_left),
+                SubtractStage::SetBuild => {
+                    if !self.step_set_build(ctx, reductions_left)? {
+                        return Ok(None);
+                    }
+                }
+                SubtractStage::SetFinish => return self.step_set_finish(ctx, reductions_left),
+            }
+        }
+    }
+
+    // Port of `subtract_naive_rhs` at `erl_bif_lists.c:723-795`, OTP-29.1.1.
+    fn step_naive_rhs(
+        &mut self,
+        ctx: &mut Ctx<'_>,
+        reductions_left: usize,
+    ) -> Result<Option<Term>, BifError> {
+        let budget = subtract_budget(ctx, reductions_left, 16);
+        let SubtractScratch::Rhs(elements) = &mut self.scratch else {
+            unreachable!("naive RHS stage owns its fixed array")
+        };
+        let mut checks = 0usize;
+        while checks < budget {
+            let Some((value, next)) = cons_cell(self.iterator) else {
+                break;
+            };
+            let found_at = (0..self.rhs_remaining)
+                .rev()
+                .find(|&i| exact_eq(value, elements[i]));
+            if let Some(found_at) = found_at {
+                if self.rhs_remaining == 1 {
+                    ctx.charge_reductions(checks.min(budget) / 16);
+                    return Ok(Some(
+                        self.result
+                            .take()
+                            .expect("naive RHS output chain")
+                            .finish(next),
+                    ));
+                }
+                self.rhs_remaining -= 1;
+                elements[found_at] = elements[self.rhs_remaining];
+            } else {
+                self.result
+                    .as_mut()
+                    .expect("naive RHS output chain")
+                    .push(ctx.heap, value, self.lhs_remaining)
+                    .map_err(|_| BifError::SystemLimit)?;
+            }
+            checks = checks.saturating_add(self.rhs_remaining);
+            self.iterator = next;
+            self.lhs_remaining -= 1;
+        }
+        if self.iterator != Term::NIL && self.iterator.classify() != arinsal_term::TermKind::List {
+            return Err(BADARG);
+        }
+        self.result
+            .as_ref()
+            .expect("naive RHS output chain")
+            .suspend();
+        ctx.charge_reductions(checks.min(budget) / 16);
+        if self.iterator == Term::NIL {
+            return Ok(Some(
+                self.result
+                    .take()
+                    .expect("naive RHS output chain")
+                    .finish(Term::NIL),
+            ));
+        }
+        Ok(None)
+    }
+
+    // Port of `subtract_set_build` at `erl_bif_lists.c:813-857`, OTP-29.1.1.
+    fn step_set_build(
+        &mut self,
+        ctx: &mut Ctx<'_>,
+        reductions_left: usize,
+    ) -> Result<bool, BifError> {
+        let budget = subtract_budget(ctx, reductions_left, 16);
+        let SubtractScratch::Set(tree) = &mut self.scratch else {
+            unreachable!("set build stage owns its red-black tree")
+        };
+        let mut insertions = 0usize;
+        while insertions < budget {
+            let Some((value, next)) = cons_cell(self.iterator) else {
+                break;
+            };
+            tree.insert(value);
+            insertions += 1;
+            self.iterator = next;
+        }
+        ctx.charge_reductions(insertions / 16);
+        if self.iterator != Term::NIL && self.iterator.classify() != arinsal_term::TermKind::List {
+            return Err(BADARG);
+        }
+        if self.iterator != Term::NIL {
+            return Ok(false);
+        }
+        self.stage = SubtractStage::SetFinish;
+        self.iterator = self.lhs;
+        self.result = Some(ConsHeapChain::new());
+        Ok(true)
+    }
+
+    // Port of `subtract_set_finish` at `erl_bif_lists.c:869-918`, OTP-29.1.1.
+    fn step_set_finish(
+        &mut self,
+        ctx: &mut Ctx<'_>,
+        reductions_left: usize,
+    ) -> Result<Option<Term>, BifError> {
+        let budget = subtract_budget(ctx, reductions_left, 8);
+        let SubtractScratch::Set(tree) = &mut self.scratch else {
+            unreachable!("set finish stage owns its red-black tree")
+        };
+        let mut checks = 0usize;
+        while checks < budget {
+            let Some((value, next)) = cons_cell(self.iterator) else {
+                break;
+            };
+            if let Some(node) = tree.lookup(value) {
+                debug_assert!(self.rhs_remaining > 0);
+                if self.rhs_remaining == 1 {
+                    ctx.charge_reductions(checks.min(budget) / 8);
+                    return Ok(Some(
+                        self.result.take().expect("set output chain").finish(next),
+                    ));
+                }
+                self.rhs_remaining -= 1;
+                tree.consume(node);
+            } else {
+                self.result
+                    .as_mut()
+                    .expect("set output chain")
+                    .push(ctx.heap, value, self.lhs_remaining)
+                    .map_err(|_| BifError::SystemLimit)?;
+            }
+            self.iterator = next;
+            self.lhs_remaining -= 1;
+            checks += 1;
+        }
+        if self.iterator != Term::NIL && self.iterator.classify() != arinsal_term::TermKind::List {
+            return Err(BADARG);
+        }
+        self.result.as_ref().expect("set output chain").suspend();
+        ctx.charge_reductions(checks.min(budget) / 8);
+        if self.iterator == Term::NIL {
+            debug_assert_eq!(self.lhs_remaining, 0);
+            return Ok(Some(
+                self.result
+                    .take()
+                    .expect("set output chain")
+                    .finish(Term::NIL),
+            ));
+        }
+        Ok(None)
+    }
+}
+
+// Port of the stage budgets and `BUMP_REDS` accounting in `erl_bif_lists.c:575-918`.
+fn subtract_budget(ctx: &Ctx<'_>, reductions_left: usize, units_per_red: usize) -> usize {
+    reductions_left
+        .saturating_sub(ctx.reductions() as usize)
+        .saturating_mul(units_per_red)
+}
+
+/// Append retained cells in input order with `HAllocX` fragment slack.
+/// Port of `erl_bif_lists.c:748-770` and `:881-916`, OTP-29.1.1.
 struct SubtractResultBuilder<'a> {
-    heap: Option<&'a mut (dyn HeapAlloc + 'a)>,
-    builder: Option<ConsHeapBuilder<'a, dyn HeapAlloc + 'a>>,
+    heap: &'a mut (dyn HeapAlloc + 'a),
+    chain: ConsHeapChain,
 }
 
 impl<'a> SubtractResultBuilder<'a> {
     fn new(heap: &'a mut (dyn HeapAlloc + 'a)) -> Self {
         Self {
-            heap: Some(heap),
-            builder: None,
+            heap,
+            chain: ConsHeapChain::new(),
         }
     }
 
     fn push(&mut self, value: Term, max_cells: usize) -> Result<(), BifError> {
-        if self.builder.is_none() {
-            let heap = self
-                .heap
-                .take()
-                .expect("first retained cell owns the heap borrow");
-            self.builder =
-                Some(ConsHeapBuilder::new(heap, max_cells).map_err(|_| BifError::SystemLimit)?);
-        }
-        self.builder
-            .as_mut()
-            .expect("a retained cell owns its heap reservation")
-            .push(value)
-            .expect("the result reservation covers all remaining LHS cells");
-        Ok(())
+        self.chain
+            .push(self.heap, value, max_cells)
+            .map_err(|_| BifError::SystemLimit)
     }
 
     fn finish(self, tail: Term) -> Term {
-        self.builder.map_or(tail, |builder| builder.finish(tail))
+        self.chain.finish(tail)
     }
 }
 
@@ -444,6 +768,31 @@ fn subtract_get_length(ctx: &mut Ctx<'_>, list: Term) -> Result<usize, BifError>
     }
     ctx.charge_reductions(count / 32);
     Ok(count)
+}
+
+/// Scan one reduction-sized portion of an input list.
+///
+/// Port of `subtract_get_length` at `erl_bif_lists.c:574-604`, OTP-29.1.1.
+fn subtract_get_length_chunk(
+    ctx: &mut Ctx<'_>,
+    iterator: &mut Term,
+    count: &mut usize,
+    budget: usize,
+) -> Result<bool, BifError> {
+    let mut scanned = 0usize;
+    while scanned < budget {
+        let Some((_, tail)) = cons_cell(*iterator) else {
+            break;
+        };
+        *iterator = tail;
+        *count += 1;
+        scanned += 1;
+    }
+    if *iterator != Term::NIL && iterator.classify() != arinsal_term::TermKind::List {
+        return Err(BADARG);
+    }
+    ctx.charge_reductions(scanned / 32);
+    Ok(*iterator == Term::NIL)
 }
 
 fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -726,6 +1075,37 @@ mod subtract_tests {
             .unwrap_or_else(|error| panic!("subtract mismatch for {args:?}: {error}"));
     }
 
+    fn local_walk_call(args: &[O], budget: usize) -> CallResult {
+        let mut heap = ProcessHeap::with_words(4096);
+        let mut allocator = FragmentingHeap(&mut heap);
+        let terms = args
+            .iter()
+            .map(|value| from_owned(value, &mut allocator).unwrap())
+            .collect::<Vec<_>>();
+        assert!(allocator.0.reserve_stack(3200));
+        let mut walk = SubtractWalk::new(terms[0], terms[1]).unwrap();
+        let result = loop {
+            let step = {
+                let mut ctx = Ctx::new(&mut allocator);
+                walk.step(&mut ctx, budget)
+            };
+            match step {
+                Ok(Some(term)) => break Ok(term),
+                Ok(None) => continue,
+                Err(error) => break Err(error),
+            }
+        };
+        match result {
+            Ok(term) => CallResult::Ok(to_owned(term).unwrap()),
+            Err(BifError::Badarg { .. }) => CallResult::Exception {
+                class: "error".to_owned(),
+                reason: O::atom("badarg"),
+                stack_top: None,
+            },
+            Err(error) => panic!("unexpected subtraction error: {error:?}"),
+        }
+    }
+
     #[test]
     fn subtract_matches_otp_across_stages_and_invalid_inputs() {
         let a = O::atom("a");
@@ -798,5 +1178,25 @@ mod subtract_tests {
         assert_matches_otp(improper_lhs, O::Nil);
         assert_matches_otp(O::list(vec![O::Int(1)]), improper_rhs);
         assert_matches_otp(O::Int(1), O::Nil);
+    }
+
+    #[test]
+    fn subtract_walk_resumes_each_stage_against_otp() {
+        for (lhs, rhs) in [
+            (
+                O::list((0..258).map(O::Int).collect()),
+                O::list((0..258).step_by(2).map(O::Int).collect()),
+            ),
+            (
+                O::list((0..9).map(O::Int).collect()),
+                O::list((1..302).step_by(2).map(O::Int).collect()),
+            ),
+        ] {
+            let args = [lhs, rhs];
+            let local = local_walk_call(&args, 1);
+            let expected = RefErl::shared().unwrap().call("erlang", "--", &args);
+            compare(&local, &expected, CompareMode::Exact)
+                .unwrap_or_else(|error| panic!("resumed subtract mismatch for {args:?}: {error}"));
+        }
     }
 }
