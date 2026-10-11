@@ -1180,7 +1180,21 @@ impl Executor {
                 .and_then(|meta| meta.as_ref())
                 .and_then(|meta| meta.beamasm.as_ref())
             {
-                Some(version) => version.native_function_start(function, arity),
+                // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process: I is the
+                // export's address), OTP-29.1.1: an exported entry starts at its export's
+                // native address when that address belongs to the spawned module instance.
+                Some(version) => module
+                    .function_atom_at(process.ip)
+                    .and_then(|(function, arity)| {
+                        crate::beamasm_integration::export_native_target(
+                            self.vm.code_scope,
+                            module.name_atom,
+                            function,
+                            arity,
+                        )
+                    })
+                    .filter(|&address| version.contains_code(address))
+                    .or_else(|| version.native_function_start(function, arity)),
                 None => {
                     crate::native_function_for(self.vm.code_scope, &module.name, function, arity)
                         .map(|native| native.start)

@@ -572,7 +572,8 @@ pub fn run_native(
     // erts' `beam_normal_exit`.
     registers.entry_return = 0;
     if !resuming_continuation
-        && native_function_at(code_address).is_some_and(|function| function.start == code_address)
+        && with_native_function_at(code_address, |function| function.start == code_address)
+            .unwrap_or(false)
         && let Some(word) = process.heap.stack_get(0)
     {
         let raw = word.tagged_word() as usize;
