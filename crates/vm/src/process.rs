@@ -11,7 +11,7 @@ use arinsal_sched::{
 use arinsal_spec::Opcode;
 use arinsal_term::ptab::PtabIdRing;
 use arinsal_term::{
-    Atom, ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_term,
+    Atom, ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_struct_litopt, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -450,13 +450,7 @@ impl Message {
     /// Copy the reachable object graph into an envelope owned by the receiver.
     pub fn copy_from(term: Term) -> Result<Self, VmError> {
         if !term.is_pointer() {
-            return Ok(Self {
-                term,
-                fragment: None,
-                priority: false,
-                timer_id: None,
-                receive_traced: false,
-            });
+            return Ok(Self::immediate(term));
         }
         // Port of erts/emulator/beam/erl_message.c:824 (erts_send_message),
         // OTP-29.1.1. Exact sizing keeps unused words out of long-lived
@@ -464,18 +458,23 @@ impl Message {
         // Literals outside the collector's purge area stay shared (copy_struct_litopt).
         let literals = arinsal_term::LiteralAreas::current();
         let words = arinsal_term::size_object_litopt(term, &literals);
+        Self::copy_counted(term, words, &literals)
+    }
+
+    /// `copy_from` when `words` is already `size_object_litopt(term, literals)`.
+    fn copy_counted(
+        term: Term,
+        words: usize,
+        literals: &arinsal_term::LiteralAreas,
+    ) -> Result<Self, VmError> {
         if words == 0 {
-            return Ok(Self {
-                term,
-                fragment: None,
-                priority: false,
-                timer_id: None,
-                receive_traced: false,
-            });
+            return Ok(Self::immediate(term));
         }
         let mut fragment =
             ProcessHeap::with_words_for_type(words, arinsal_alloc::typed::ErtsAlcType::HEAP_FRAG);
-        let term = arinsal_term::copy_term_litopt(term, &mut fragment, &literals)
+        // Size was computed by the caller; copy_struct must not walk the term again
+        // (erts_send_message: size_object then copy_struct).
+        let term = copy_struct_litopt(term, &mut fragment, words, literals)
             .map_err(|error| VmError::Unsupported(format!("message copy: {error:?}")))?;
         Ok(Self {
             term,
@@ -487,6 +486,16 @@ impl Message {
             timer_id: None,
             receive_traced: false,
         })
+    }
+
+    fn immediate(term: Term) -> Self {
+        Self {
+            term,
+            fragment: None,
+            priority: false,
+            timer_id: None,
+            receive_traced: false,
+        }
     }
 
     /// Build the signal envelope that the literal-copy handler will reuse as its reply.
@@ -574,7 +583,8 @@ impl Message {
 
     fn into_receiver(self, process: &mut Process) -> Result<Term, VmError> {
         if self.fragment.is_none() {
-            // Port of erts/emulator/beam/erl_message.c:734 (immediate message term), OTP-29.1.1.
+            // Immediate, literal, or already placed on this heap
+            // (erl_message.c:657, `attached == NULL`).
             return Ok(self.term);
         }
         if process.message_queue_data() == MessageQueueData::OnHeap || process.heap.is_detached() {
@@ -615,6 +625,66 @@ impl Message {
     pub(crate) fn decode_into(self, process: &mut Process) -> Result<Term, VmError> {
         self.into_receiver(process)
     }
+}
+
+/// A term already measured by `size_object_litopt` against `literals`.
+struct CountedSend<'a> {
+    value: Term,
+    words: usize,
+    literals: &'a arinsal_term::LiteralAreas,
+}
+
+/// Allocate `value` on `receiver`'s young heap when `erts_try_alloc_message_on_heap` would.
+///
+/// `Ok(None)` means the caller should build a heap fragment. The seq-trace token
+/// stays with the caller in that case.
+fn message_on_receiver_heap(
+    receiver: &mut Process,
+    counted: CountedSend<'_>,
+    priority: bool,
+    seq_token: &mut Option<Box<crate::seq_trace::Token>>,
+) -> Result<Option<Message>, VmError> {
+    let CountedSend {
+        value,
+        words,
+        literals,
+    } = counted;
+    if words == 0
+        || receiver.message_queue_data() != MessageQueueData::OnHeap
+        || !receiver.gc_enabled
+        || receiver.heap.is_detached()
+    {
+        return Ok(None);
+    }
+    // erl_message.c:640: `HEAP_LIMIT - HEAP_TOP <= sz` uses a fragment.
+    // One word stricter than `HAlloc`'s `HeapWordsLeft < sz`. Does not grow the heap.
+    let Some(left) = receiver.heap.halloc_words_left() else {
+        return Ok(None);
+    };
+    if left <= words {
+        return Ok(None);
+    }
+    let term = match copy_struct_litopt(value, &mut receiver.heap, words, literals) {
+        Ok(term) => term,
+        Err(arinsal_term::TermError::HeapFull) => return Ok(None),
+        Err(error) => {
+            return Err(VmError::Unsupported(format!("message copy: {error:?}")));
+        }
+    };
+    let mut envelope = Message {
+        term,
+        fragment: None,
+        priority: false,
+        timer_id: None,
+        receive_traced: false,
+    };
+    if priority {
+        envelope = envelope.with_priority();
+    }
+    if let Some(token) = seq_token.take() {
+        envelope.attach_seq_token(token);
+    }
+    Ok(Some(envelope))
 }
 
 /// Allocation policy for messages currently entering a process mailbox.
@@ -1348,6 +1418,11 @@ impl Executor {
                     process.cold_mut().sys_task_point = false;
                     executed?;
                 }
+                // erts collects a process that is being scheduled in once signals have
+                // been fetched (erl_process.c:10415). One check per slice: later
+                // iterations have already executed and their live X count is gc_live,
+                // not the switch-out arity.
+                let mut schedule_in_gc = true;
                 loop {
                     // A caught exception re-enters this loop without replenishing its process slice.
                     if ctx.remaining() == 0 {
@@ -1454,6 +1529,10 @@ impl Executor {
                         // Signals handled here (process_info) still see the process suspended at
                         // its native resume pc, as erts reads `c_p->i` while it waits.
                         process.drain(ctx)?;
+                        if schedule_in_gc {
+                            schedule_in_gc = false;
+                            collect_on_schedule_in(process)?;
+                        }
                         if let Some(cold) = process.cold.as_mut() {
                             cold.native_inline_fetch = ctx.private_is_idle();
                         }
@@ -2789,9 +2868,13 @@ impl Executor {
                         }
                     }
                     let remaining = ctx.remaining().min(budget);
-                    let result = process
-                        .drain(ctx)
-                        .and_then(|()| self.vm.run_slice(process, Some(ctx), remaining));
+                    let result = process.drain(ctx).and_then(|()| {
+                        if schedule_in_gc {
+                            schedule_in_gc = false;
+                            collect_on_schedule_in(process)?;
+                        }
+                        self.vm.run_slice(process, Some(ctx), remaining)
+                    });
                     // erts schedules out only when FCALLS runs out; an interpreted step that
                     // just hands control to native code continues the slice.
                     if matches!(&result, Ok(RunState::Yield))
@@ -3114,6 +3197,17 @@ impl Executor {
 /// Exact live X register count of a process that just switched out: a native
 /// continuation records `live + 1` in `native_resume_live` (the JIT's `c_p->arity`),
 /// interpreted code its switch-out point's count in `gc_live`.
+/// Collect when a slice starts and the heap wants it.
+///
+/// The caller has already drained the outer queue, so a message that woke this
+/// process is an inbox root. The new heap is sized from that message, the same
+/// way `scheduler_gc_proc` sizes from `mbuf` after `erts_proc_sig_handle_incoming`.
+// Port of erts/emulator/beam/erl_process.c:10415-10418 and 9558 (`scheduler_gc_proc`),
+// OTP-29.1.1.
+fn collect_on_schedule_in(process: &mut Process) -> Result<(), VmError> {
+    process.collect_bin_vheap_if_due(switched_out_live(process))
+}
+
 fn switched_out_live(process: &Process) -> usize {
     let native_live = if process.native_pc.is_some() {
         process
@@ -4689,6 +4783,62 @@ impl Process {
         }
     }
 
+    /// Place `value` on a waiting on-heap receiver and queue it before the main lock drops.
+    ///
+    /// Port of erts/emulator/beam/erl_message.c:621 (`erts_try_alloc_message_on_heap`)
+    /// and erl_process.h:2878 (`erts_alloc_message_heap_state`), OTP-29.1.1.
+    /// `Ok(false)` keeps the existing heap-fragment copy.
+    fn try_send_on_receiver_heap(
+        &self,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+        from: Pid,
+        to: Pid,
+        counted: CountedSend<'_>,
+        priority: bool,
+        seq_token: &mut Option<Box<crate::seq_trace::Token>>,
+    ) -> Result<bool, VmError> {
+        if counted.words == 0 {
+            return Ok(false);
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(false);
+        };
+        let Ok(scheduler) = runtime.scheduler() else {
+            return Ok(false);
+        };
+        if let Some(ctx) = ctx {
+            return match scheduler.try_with_task(to, |receiver| {
+                let Some(envelope) =
+                    message_on_receiver_heap(receiver, counted, priority, seq_token)?
+                else {
+                    return Ok(false);
+                };
+                let delivered = ctx.send(to, envelope);
+                // A queued target buffers on this worker. Publish before the lock drops
+                // so the term is in the signal queue while it still lives on that heap.
+                ctx.flush_pending();
+                match delivered {
+                    Ok(()) | Err(arinsal_sched::Error::NoProcess) => Ok(true),
+                    Err(error) => Err(VmError::Unsupported(format!("send: {error}"))),
+                }
+            }) {
+                Some(result) => result,
+                None => Ok(false),
+            };
+        }
+        match scheduler.try_send_on_heap(from, to, |receiver| {
+            message_on_receiver_heap(receiver, counted, priority, seq_token)
+        })? {
+            arinsal_sched::OnHeapSend::Unavailable | arinsal_sched::OnHeapSend::Declined => {
+                Ok(false)
+            }
+            arinsal_sched::OnHeapSend::Queued => Ok(true),
+            arinsal_sched::OnHeapSend::Failed(error) => {
+                Err(VmError::Unsupported(format!("send: {error}")))
+            }
+        }
+    }
+
     pub(crate) fn send_message(&mut self, target: Term, value: Term) -> Result<Term, VmError> {
         self.send_message_inner(None, target, value)
     }
@@ -4955,14 +5105,38 @@ impl Process {
             value,
             target,
         );
-        let mut envelope = Message::copy_from(value)?;
+        let mut seq_token = if crate::seq_trace::has_token(self) {
+            crate::seq_trace::on_send(vm, self, ctx.as_deref_mut(), sender, target, value)
+        } else {
+            None
+        };
+        // Size once. The on-heap attempt and the fragment fallback both consume it
+        // (erts_send_message: size_object_litopt, then alloc, then copy_struct_litopt).
+        let literals = arinsal_term::LiteralAreas::current();
+        let words = if value.is_pointer() {
+            arinsal_term::size_object_litopt(value, &literals)
+        } else {
+            0
+        };
+        if self.try_send_on_receiver_heap(
+            ctx.as_deref_mut(),
+            sender,
+            pid,
+            CountedSend {
+                value,
+                words,
+                literals: &literals,
+            },
+            via_prio_alias,
+            &mut seq_token,
+        )? {
+            return Ok(value);
+        }
+        let mut envelope = Message::copy_counted(value, words, &literals)?;
         if via_prio_alias {
             envelope = envelope.with_priority();
         }
-        if crate::seq_trace::has_token(self)
-            && let Some(token) =
-                crate::seq_trace::on_send(vm, self, ctx.as_deref_mut(), sender, target, value)
-        {
+        if let Some(token) = seq_token.take() {
             envelope.attach_seq_token(token);
         }
         let delivered = match ctx {
@@ -5533,7 +5707,7 @@ impl Process {
         let Some(probe) = cold.signal_probe.take() else {
             return Ok(0);
         };
-        let fetched = self.fetch_messages_from(&probe);
+        let fetched = self.fetch_outer_messages(&probe, false);
         self.cold_mut().signal_probe = Some(probe);
         let fetched = fetched?;
         if fetched != 0 {
@@ -5542,13 +5716,46 @@ impl Process {
         Ok(fetched)
     }
 
-    fn fetch_messages_from(
+    /// Move outer-queue messages into the inbox before an on-heap collection.
+    ///
+    /// Non-message signals stay in front of later messages, matching
+    /// `erts_proc_sig_fetch` order. Tracing and a delayed GC still belong to
+    /// the scheduler drain, which roots those signals itself.
+    // Port of erts/emulator/beam/erl_gc.c:987-990 (`erts_garbage_collect` fetches
+    // when `FS_ON_HEAP_MSGQ`) and erl_proc_sig_queue.h:1997 (`erts_proc_sig_fetch`),
+    // OTP-29.1.1.
+    fn fetch_outer_queue_for_gc(&mut self) -> Result<(), VmError> {
+        if self.message_queue_data() != MessageQueueData::OnHeap {
+            return Ok(());
+        }
+        if self
+            .cold
+            .as_ref()
+            .is_some_and(|cold| !cold.delayed_gc.is_empty())
+            || crate::trace::active()
+        {
+            return Ok(());
+        }
+        let Some(probe) = self.cold.as_mut().and_then(|cold| cold.signal_probe.take()) else {
+            return Ok(());
+        };
+        let fetched = self.fetch_outer_messages(&probe, true);
+        self.cold_mut().signal_probe = Some(probe);
+        let fetched = fetched?;
+        if fetched != 0 {
+            crate::natives::erts_debug::after_message_queue_change(self);
+        }
+        Ok(())
+    }
+
+    fn fetch_outer_messages(
         &mut self,
         probe: &arinsal_sched::SignalProbe<Message>,
+        include_priority: bool,
     ) -> Result<usize, VmError> {
         let mut fetched = 0;
         while let Some((_sender, message)) =
-            probe.fetch_message_if(|message| !message.is_priority())
+            probe.fetch_message_if(|message| include_priority || !message.is_priority())
         {
             let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
             let before = self.message_words_before();
@@ -5596,6 +5803,10 @@ impl Process {
         if !hibernate && self.delay_for_dirty_gc(min_free) {
             return Ok(arinsal_term::GcStats::default());
         }
+        // An on-heap message installed while this process was queued lives only in
+        // the outer signal queue until this fetch. Scanning without it would
+        // reclaim that term. Hibernate fetches too (erl_gc.c:1016).
+        self.fetch_outer_queue_for_gc()?;
         // Port of erl_gc.c:2616 (`setup_rootset` with `nobj == 0`, no dictionary and
         // an empty message queue): the stack is scanned in place. Building and
         // rewriting an auxiliary root vector is the on-heap message and dictionary case.

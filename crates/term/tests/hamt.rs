@@ -347,7 +347,8 @@ fn gc_boxed_word_counts_cover_all_subtags() {
     object[1] = 11;
     assert_eq!(object[1], 11);
     // SAFETY: the synthetic flatmap declares eleven in-bounds values.
-    assert_eq!(unsafe { boxed_object_words(0x2c, object.as_ptr()) }, 14);
+    // MAP_HEADER_FLATMAP is 0x12c (arity field 1); type 0 still reads the size word.
+    assert_eq!(unsafe { boxed_object_words(0x12c, object.as_ptr()) }, 14);
     let bitmap = 0b1010_0000_0000_0101_u64;
     for (kind, words) in [(1, 5), (2, 18), (3, 6)] {
         let header = 0x2c | (kind << 6) | (bitmap << 16);

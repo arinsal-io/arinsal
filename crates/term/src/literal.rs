@@ -233,10 +233,15 @@ impl LiteralAreas {
     }
 
     /// Whether a copy keeps `term` by reference: it is a literal outside the purge area.
-    // Port of erts/emulator/beam/copy.c:105 (`erts_is_literal(obj,ptr) &&
-    // !in_literal_purge_area(ptr)`), OTP-29.1.1.
+    // Port of erts/emulator/beam/copy.c:83-86 (`in_literal_purge_area`) and
+    // copy.c:105 (`erts_is_literal(obj,ptr) && !in_literal_purge_area(ptr)`), OTP-29.1.1.
+    // A null purge pointer makes the range test false, so only `erts_is_literal` runs.
+    #[inline]
     pub fn keeps(&self, address: u64) -> bool {
-        is_literal_address(address as usize) && find(&self.ranges, address as usize).is_none()
+        if !is_literal_address(address as usize) {
+            return false;
+        }
+        self.ranges.is_empty() || find(&self.ranges, address as usize).is_none()
     }
 
     /// Whether `term`'s object lies in any literal area, including the purge area.

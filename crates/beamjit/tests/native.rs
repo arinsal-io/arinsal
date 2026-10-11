@@ -539,7 +539,7 @@ fn otp_logger_reply_return_returns_the_reply_map() {
     let heap_start = heap.as_mut_ptr();
     heap[0] = 1 << 6;
     heap[1] = atom("idle");
-    heap[2] = 0x2c;
+    heap[2] = 0x12c;
     heap[3] = 1;
     heap[4] = heap_start as u64 | 2;
     heap[5] = atom("true");

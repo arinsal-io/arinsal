@@ -151,6 +151,8 @@ const TMP6: Gpr = Gpr::x(13);
 /// `_HEADER_MAP_SUBTAG_MASK` and `HAMT_SUBTAG_HEAD_FLATMAP`.
 const HEADER_MAP_SUBTAG_MASK: u64 = 0xfc;
 const HAMT_SUBTAG_HEAD_FLATMAP: u16 = 0x2c;
+/// `MAP_HEADER_FLATMAP` (erl_map.h:185): subtag 0x2c, arity field 1.
+const MAP_HEADER_FLATMAP: u64 = 0x12c;
 const HAMT_MAX_LEVEL: u16 = 16;
 
 // Port of erts/emulator/beam/jit/arm/instr_map.cpp:316-361 (emit_i_get_map_element_shared),
@@ -648,8 +650,10 @@ impl BeamModuleAssembler {
         let words = count
             .checked_add(3)
             .ok_or(ModuleError::InvalidOperand("map allocation overflow"))?;
-        // A flatmap header carries only the MAP subtag; bits 6-7 would mark a hashmap.
-        self.code.emit(|e| e.mov_const(Gpr::x(8), 0x2c))?;
+        // Arity field 1, type 0. The flatmap test masks with 0xfc, so this word
+        // still compares equal to HAMT_SUBTAG_HEAD_FLATMAP.
+        self.code
+            .emit(|e| e.mov_const(Gpr::x(8), MAP_HEADER_FLATMAP))?;
         self.code.emit(|e| e.str_post(Gpr::x(8), HTOP, 8))?;
         self.code.emit(|e| e.mov_const(Gpr::x(8), count))?;
         self.code.emit(|e| e.str_post(Gpr::x(8), HTOP, 8))?;

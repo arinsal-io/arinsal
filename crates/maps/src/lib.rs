@@ -20,6 +20,8 @@ pub use merge::{
 };
 
 const MAP: u64 = 0x2c;
+/// Port of erts/emulator/beam/erl_map.h:185 (MAP_HEADER_FLATMAP), OTP-29.1.1.
+const MAP_HEADER_FLATMAP: u64 = MAP | (1 << 8);
 const LIMIT: usize = 32;
 
 /// Map operation error.
@@ -236,7 +238,7 @@ fn flat<H: HeapAlloc + ?Sized>(pairs: &[(Term, Term)], heap: &mut H) -> MapResul
 fn empty_flatmap<H: HeapAlloc + ?Sized>(heap: &mut H) -> Result<Term, TermError> {
     // Port of erts/emulator/beam/erl_map.c:379-383 (ERTS_GLOBAL_LIT_EMPTY_TUPLE keys), OTP-29.1.1.
     let (slice, ptr) = merge::produce(heap, 3)?;
-    slice[0].write(MAP);
+    slice[0].write(MAP_HEADER_FLATMAP);
     slice[1].write(0);
     slice[2].write(bits(arinsal_term::global_empty_tuple()));
     Ok(boxed(ptr))
@@ -1007,7 +1009,7 @@ fn flatmap_take<H: HeapAlloc + ?Sized>(
         boxed(start)
     };
     copy_skipping(values, vs, found);
-    header[0].write(MAP);
+    header[0].write(MAP_HEADER_FLATMAP);
     header[1].write((n - 1) as u64);
     header[2].write(bits(keys));
     // The map header follows the key tuple inside the allocated block.
@@ -1195,7 +1197,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
             *hp = 1 << 6;
             *hp.add(1) = bits(key);
             let m = hp.add(2);
-            *m = MAP;
+            *m = MAP_HEADER_FLATMAP;
             *m.add(1) = 1;
             *m.add(2) = bits(boxed(hp));
             *m.add(3) = bits(value);
@@ -1209,7 +1211,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
         let shp = heap.alloc(first).ok_or(MapError::HeapFull {
             need_words: first + FLATMAP_HEADER_WORDS + n + 1,
         })?;
-        *shp = MAP;
+        *shp = MAP_HEADER_FLATMAP;
         *shp.add(1) = n as u64;
         *shp.add(2) = *mp.add(2);
         let hp = shp.add(FLATMAP_HEADER_WORDS);
@@ -1246,7 +1248,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
             });
         };
         *shp = ((n + 1) as u64) << 6;
-        *hp = MAP;
+        *hp = MAP_HEADER_FLATMAP;
         *hp.add(1) = (n + 1) as u64;
         *hp.add(2) = bits(boxed(shp));
         let mut kp = shp.add(1);
@@ -1303,7 +1305,7 @@ pub fn update<H: HeapAlloc + ?Sized>(
         let shp = heap
             .alloc(need_words)
             .ok_or(MapError::HeapFull { need_words })?;
-        *shp = MAP;
+        *shp = MAP_HEADER_FLATMAP;
         *shp.add(1) = n as u64;
         *shp.add(2) = *mp.add(2);
         let hp = shp.add(FLATMAP_HEADER_WORDS);
@@ -1357,7 +1359,7 @@ pub fn gc_new_map<H: HeapAlloc + ?Sized>(
     unsafe {
         *thp = (pairs as u64) << 6;
         let mp = thp.add(1 + pairs);
-        *mp = MAP;
+        *mp = MAP_HEADER_FLATMAP;
         *mp.add(1) = pairs as u64;
         *mp.add(2) = bits(boxed(thp));
         for i in 0..pairs {
@@ -1413,7 +1415,7 @@ pub fn gc_update_map_assoc<H: HeapAlloc + ?Sized>(
             .alloc(need_words)
             .ok_or(MapError::HeapFull { need_words })?;
         let end = mp.add(need_words);
-        *mp = MAP;
+        *mp = MAP_HEADER_FLATMAP;
         let mut hp = mp.add(FLATMAP_HEADER_WORDS);
         let tuple = hp.add(num_old + num_updates);
         *mp.add(2) = bits(boxed(tuple));
@@ -1557,7 +1559,7 @@ pub fn gc_update_map_exact<H: HeapAlloc + ?Sized>(
             .alloc(need_words)
             .ok_or(MapError::HeapFull { need_words })?;
         let end = mp.add(need_words);
-        *mp = MAP;
+        *mp = MAP_HEADER_FLATMAP;
         *mp.add(1) = num_old as u64;
         *mp.add(2) = *old_mp.add(2);
         let mut hp = mp.add(FLATMAP_HEADER_WORDS);

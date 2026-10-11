@@ -32,8 +32,8 @@ pub use bits::{
     writable_capacity, writable_extend_private, writable_finalize, writable_gc_visit,
 };
 pub use copy::{
-    SharedCopyCache, copy_shared, copy_term, copy_term_litopt, copy_term_preserving_sharing,
-    copy_term_preserving_sharing_with_cache,
+    SharedCopyCache, copy_shared, copy_struct_litopt, copy_term, copy_term_litopt,
+    copy_term_preserving_sharing, copy_term_preserving_sharing_with_cache,
 };
 pub use fun::{
     ERTS_ADDRESSV_SIZE, ERTS_NUM_CODE_IX, ERTS_SAVE_CALLS_CODE_IX, EXPORT_INFO_OFFSET,
@@ -116,6 +116,9 @@ pub(crate) const HEAP_BITS: u64 = 0x20;
 pub(crate) const SUB_BITS: u64 = 0x24;
 pub(crate) const BIN_REF: u64 = 0x28;
 pub(crate) const MAP: u64 = 0x2c;
+/// Flatmap header: map subtag, type 0, arity field 1 (`0x12c`).
+// Port of erts/emulator/beam/erl_map.h:185 (MAP_HEADER_FLATMAP), OTP-29.1.1.
+pub(crate) const MAP_HEADER_FLATMAP: u64 = MAP | (1 << 8);
 pub(crate) const EXTERNAL_PID: u64 = 0x30;
 pub(crate) const EXTERNAL_PORT: u64 = 0x34;
 pub(crate) const EXTERNAL_REF: u64 = 0x38;
