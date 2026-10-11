@@ -587,9 +587,17 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
 /// The process BIF behind `module:function/arity`, which native code calls like any light BIF.
 pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<super::ProcessBif> {
     match (module, function, arity) {
-        ("erts_internal", "map_next", 3) => Some(map_next),
+        ("erts_internal", "map_next", 3) => Some(map_next_process_bif),
         _ => None,
     }
+}
+
+// Port of erts/emulator/beam/erl_map.c:3636 (erts_internal_map_next_3), OTP-29.1.1.
+fn map_next_process_bif(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    Some(map_next(process, args))
 }
 
 fn call_map_next(

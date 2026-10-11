@@ -336,11 +336,12 @@ pub(crate) type DirectNative = fn(
     args: &[Term],
 ) -> Result<Term, VmError>;
 
-/// A BIF that needs only its process, like an erts BIF called with `c_p` and its arguments:
-/// native code calls it straight from the light BIF fragment. A failure is the Erlang
-/// exception it raises (`BIF_ERROR`); the call site gives it the BIF frame.
+/// A BIF that can run with only its process, like an erts BIF called with `c_p` and its
+/// arguments. `None` asks the caller to retry with scheduler context; a failure is the Erlang
+/// exception it raises (`BIF_ERROR`), and the call site gives it the BIF frame.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared), OTP-29.1.1.
-pub(crate) type ProcessBif = fn(&mut Process, &[Term]) -> Result<Term, crate::exceptions::Trap>;
+pub(crate) type ProcessBif =
+    fn(&mut Process, &[Term]) -> Option<Result<Term, crate::exceptions::Trap>>;
 
 /// The process BIF native code calls for `module:function/arity`, if it has one.
 pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<ProcessBif> {
@@ -348,6 +349,9 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     // through the export entry (`call_light_bif`), not an executor native.
     if module == "erts_internal" && function == "garbage_collect" && arity == 1 {
         return Some(sys::garbage_collect_bif);
+    }
+    if module == "erlang" && function == "process_flag" && arity == 2 {
+        return Some(proc::process_flag_save_calls_bif);
     }
     if module == "erlang"
         && let Some(bif) = proc::dictionary_bif(function, arity)

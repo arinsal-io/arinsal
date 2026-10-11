@@ -467,10 +467,9 @@ pub(crate) fn set_save_calls(process: &mut Process, len: usize) -> usize {
     let old = std::mem::replace(&mut cold.saved_calls, new);
     let was = old.as_ref().map_or(0, |scb| scb.len);
     if (was != 0) != (len != 0) {
-        // ERTS_VBUMP_ALL_REDS: reschedule at once so native code runs with the code index
-        // that matches the new setting (ERTS_SAVE_CALLS_CODE_IX or the active one).
+        // ERTS_VBUMP_ALL_REDS sets the remaining count to zero. Native code leaves at its next
+        // reduction check, preserving the current code index until that boundary.
         process.reductions = 0;
-        process.force_yield = true;
     }
     was
 }

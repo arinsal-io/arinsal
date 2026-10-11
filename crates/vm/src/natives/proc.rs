@@ -134,17 +134,9 @@ fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError>
             }
             set_flag(process, name, value).unwrap_or_else(|| atom("false"))
         }
-        "fullsweep_after" | "min_heap_size" | "min_bin_vheap_size" | "save_calls" => {
+        "save_calls" => return save_calls_flag(process, value).map_err(VmError::Trap),
+        "fullsweep_after" | "min_heap_size" | "min_bin_vheap_size" => {
             let n = value.as_small().filter(|n| *n >= 0).ok_or_else(badarg)?;
-            if name == "save_calls" && n > 10_000 {
-                return Err(badarg());
-            }
-            if name == "save_calls" {
-                // Port of erts/emulator/beam/bif.c:1907 (process_flag save_calls), OTP-29.1.1.
-                let old = crate::trace::set_save_calls(process, n as usize);
-                set_flag(process, name, Term::small(n).unwrap());
-                return Ok(Term::small(old as i64).unwrap());
-            }
             let normalized = match name {
                 "fullsweep_after" => n.min(u16::MAX as i64),
                 "min_heap_size" => n.max(233),
@@ -2029,7 +2021,9 @@ fn call_values(
             ("process_info", [pid, item]) => process_info_call(vm, process, ctx, *pid, Some(*item)),
             ("put" | "get" | "get_keys" | "erase", _) => {
                 let bif = dictionary_bif(function, args.len() as u8).ok_or_else(badarg)?;
-                bif(process, args).map_err(VmError::Trap)
+                bif(process, args)
+                    .ok_or_else(badarg)?
+                    .map_err(VmError::Trap)
             }
             ("alias", [options]) => create_alias(process, ctx, &list(*options).ok_or_else(badarg)?),
             ("unalias", [reference]) => {
@@ -2149,6 +2143,37 @@ fn call_values(
     Some(result)
 }
 
+/// Runs the `process_flag(save_calls, _)` BIF branch directly from native code.
+// Port of erts/emulator/beam/bif.c:1907-1950 (process_flag save_calls), OTP-29.1.1.
+pub(crate) fn process_flag_save_calls_bif(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [name, value] = args else {
+        return None;
+    };
+    if *name != atom("save_calls") {
+        return None;
+    }
+    Some(save_calls_flag(process, *value))
+}
+
+/// Replaces the saved-call buffer and returns the previous size.
+// Port of erts/emulator/beam/bif.c:1907-1950 (process_flag save_calls), OTP-29.1.1.
+fn save_calls_flag(process: &mut Process, value: Term) -> Result<Term, crate::exceptions::Trap> {
+    let n = value
+        .as_small()
+        .filter(|n| (0..=10_000).contains(n))
+        .ok_or_else(|| crate::exceptions::Trap::error(atom("badarg")))?;
+    let old = crate::trace::set_save_calls(process, n as usize);
+    set_flag(
+        process,
+        "save_calls",
+        Term::small(n).expect("bounded save_calls size"),
+    );
+    Ok(Term::small(old as i64).expect("bounded old save_calls size"))
+}
+
 /// The process dictionary BIFs, which need only their process.
 // Port of erts/emulator/beam/erl_process_dict.c (put_2, get_0, get_1, get_keys_0, get_keys_1,
 // erase_0, erase_1), OTP-29.1.1.
@@ -2170,12 +2195,18 @@ fn dictionary_alloc(result: Result<Term, VmError>) -> Result<Term, crate::except
     result.map_err(|_| crate::exceptions::Trap::error(atom("system_limit")))
 }
 
-fn dictionary_put(process: &mut Process, args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
+fn dictionary_put(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
     // Port of erts/emulator/beam/erl_process_dict.c (pd_hash_put), OTP-29.1.1.
-    Ok(dict_put(process, args[0], args[1]))
+    Some(Ok(dict_put(process, args[0], args[1])))
 }
 
-fn dictionary_get0(process: &mut Process, _args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
+fn dictionary_get0(
+    process: &mut Process,
+    _args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
     let raw = process
         .dictionary
         .as_ref()
@@ -2183,22 +2214,25 @@ fn dictionary_get0(process: &mut Process, _args: &[Term]) -> Result<Term, crate:
     let entries = raw
         .into_iter()
         .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
-        .collect::<Result<Vec<_>, _>>()?;
-    dictionary_alloc(make_list(process, entries))
+        .collect::<Result<Vec<_>, _>>();
+    Some(entries.and_then(|entries| dictionary_alloc(make_list(process, entries))))
 }
 
-fn dictionary_get1(process: &mut Process, args: &[Term]) -> Result<Term, crate::exceptions::Trap> {
-    Ok(process
+fn dictionary_get1(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    Some(Ok(process
         .dictionary
         .as_ref()
         .and_then(|dictionary| dictionary.get(args[0]))
-        .unwrap_or(atom("undefined")))
+        .unwrap_or(atom("undefined"))))
 }
 
 fn dictionary_get_keys0(
     process: &mut Process,
     _args: &[Term],
-) -> Result<Term, crate::exceptions::Trap> {
+) -> Option<Result<Term, crate::exceptions::Trap>> {
     let keys = process
         .dictionary
         .as_ref()
@@ -2209,13 +2243,13 @@ fn dictionary_get_keys0(
                 .map(|(key, _)| key)
                 .collect()
         });
-    dictionary_alloc(make_list(process, keys))
+    Some(dictionary_alloc(make_list(process, keys)))
 }
 
 fn dictionary_get_keys1(
     process: &mut Process,
     args: &[Term],
-) -> Result<Term, crate::exceptions::Trap> {
+) -> Option<Result<Term, crate::exceptions::Trap>> {
     let value = args[0];
     let keys = process
         .dictionary
@@ -2227,13 +2261,13 @@ fn dictionary_get_keys1(
                 .filter_map(|(key, stored)| term_equal(stored, value).then_some(key))
                 .collect()
         });
-    dictionary_alloc(make_list(process, keys))
+    Some(dictionary_alloc(make_list(process, keys)))
 }
 
 fn dictionary_erase0(
     process: &mut Process,
     _args: &[Term],
-) -> Result<Term, crate::exceptions::Trap> {
+) -> Option<Result<Term, crate::exceptions::Trap>> {
     let raw = process
         .dictionary
         .take()
@@ -2241,15 +2275,15 @@ fn dictionary_erase0(
     let entries = raw
         .into_iter()
         .map(|(k, v)| dictionary_alloc(make_tuple(process, &[k, v])))
-        .collect::<Result<Vec<_>, _>>()?;
-    dictionary_alloc(make_list(process, entries))
+        .collect::<Result<Vec<_>, _>>();
+    Some(entries.and_then(|entries| dictionary_alloc(make_list(process, entries))))
 }
 
 fn dictionary_erase1(
     process: &mut Process,
     args: &[Term],
-) -> Result<Term, crate::exceptions::Trap> {
-    Ok(dict_erase(process, args[0]))
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    Some(Ok(dict_erase(process, args[0])))
 }
 
 // Port of erts/emulator/beam/bif.c:1366 (`hibernate_3`) and

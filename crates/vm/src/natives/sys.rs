@@ -3902,17 +3902,17 @@ fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, Message>) {
 pub(crate) fn garbage_collect_bif(
     process: &mut Process,
     args: &[Term],
-) -> Result<Term, crate::exceptions::Trap> {
+) -> Option<Result<Term, crate::exceptions::Trap>> {
     if let Some(slot) = process.x.first_mut() {
         *slot = args[0];
     }
-    match garbage_collect(process, args[0]) {
+    Some(match garbage_collect(process, args[0]) {
         Ok(term) => Ok(term),
         Err(VmError::Trap(trap)) => Err(trap),
         Err(_) => Err(crate::exceptions::Trap::error(Term::atom(
             arinsal_term::atoms::SYSTEM_LIMIT,
         ))),
-    }
+    })
 }
 
 fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {

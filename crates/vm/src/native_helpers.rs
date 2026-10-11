@@ -905,14 +905,9 @@ fn invoke_dispatch_bif(
         && !((bif as usize)
             == (crate::natives::sys::garbage_collect_bif as *const () as usize)
             && process.gc_outer_queue_pending())
+        && let Some(raw) = call_process_bif(process, registers, export, bif, export_call)
     {
-        return Some(call_process_bif(
-            process,
-            registers,
-            export,
-            bif,
-            export_call,
-        ));
+        return Some(raw);
     }
     // The export trampoline has a separate interpreted-call sentinel. Only the light-BIF
     // fragment turns THE_NON_VALUE with TRAP into `context_switch_simplified`.
@@ -1486,7 +1481,7 @@ fn call_process_bif(
     export: ExportDispatch,
     bif: crate::natives::ProcessBif,
     export_call: bool,
-) -> u64 {
+) -> Option<u64> {
     process.reductions = process.header.fcalls;
     if export_call {
         charge_bif_reductions(process, 1);
@@ -1503,13 +1498,13 @@ fn call_process_bif(
             .set_frame_pointer(registers.tmp_mem[2] as usize);
     }
     let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
-    let result = bif(process, &registers.x_reg_array[..arity]);
+    let result = bif(process, &registers.x_reg_array[..arity])?;
     if collects {
         // The heap block moved. Heap indices from before the call belong to the
         // old block, so the post-BIF free-space check does not apply.
         registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
         process.sync_native_header();
-        return match result {
+        return Some(match result {
             Ok(value) => {
                 registers.x_reg_array[0] = value;
                 // A collection handed to a dirty scheduler must leave this one before
@@ -1523,7 +1518,7 @@ fn call_process_bif(
                 crate::native_hooks::raw(value)
             }
             Err(error) => process_bif_result(process, registers, export, arity, Err(error)),
-        };
+        });
     }
     let top = process.heap.heap_top_index();
     if let Ok(value) = &result
@@ -1538,9 +1533,11 @@ fn call_process_bif(
         if process.header.fcalls != process.reductions {
             process.header.fcalls = process.reductions;
         }
-        return crate::native_hooks::raw(value);
+        return Some(crate::native_hooks::raw(value));
     }
-    process_bif_result(process, registers, export, arity, result)
+    Some(process_bif_result(
+        process, registers, export, arity, result,
+    ))
 }
 
 /// A process BIF's exception, or a value after which a collection is desired.
