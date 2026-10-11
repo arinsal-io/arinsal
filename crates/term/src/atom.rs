@@ -96,8 +96,9 @@ struct AtomRec {
     ord0: i32,
     /// `Atom.u.bin`: the global-literal binary returned by `atom_to_binary`.
     bin: Term,
-    /// UTF-8 bytes inside `bin`. The literal heap never moves them.
-    name: &'static str,
+    /// UTF-8 name. Same bytes as `bin`. Owned here so lookup does not borrow
+    /// the literal heap: a `'static` slice of that chunk is not a safe view.
+    name: Box<str>,
 }
 
 struct Page {
@@ -251,7 +252,7 @@ impl AtomTable {
     /// Return immutable atom text for a valid index without taking the table lock.
     // Port of erts/emulator/beam/atom.c:107 (erts_atom_get_name), OTP-29.1.1.
     pub fn text(&self, atom: Atom) -> Option<&str> {
-        Some(self.record(atom)?.name)
+        self.record(atom).map(|rec| rec.name.as_ref())
     }
 
     /// The global-literal UTF-8 binary (`Atom.u.bin`).
@@ -531,7 +532,7 @@ fn push_new(inner: &mut Inner, bytes: &[u8], latin1_chars: i16) -> u32 {
     id
 }
 
-fn literal_atom(bytes: &[u8]) -> (Term, &'static str) {
+fn literal_atom(bytes: &[u8]) -> (Term, Box<str>) {
     // Port of atom.c:147 (erts_global_literal_allocate / erts_hfact_new_binary_from_data
     // / erts_global_literal_register), OTP-29.1.1. The heap is process-lifetime:
     // atom names are never freed (`atom_free` is empty).
@@ -541,19 +542,13 @@ fn literal_atom(bytes: &[u8]) -> (Term, &'static str) {
     let term = TermBuilder::new(&mut *heap)
         .binary(bytes)
         .expect("atom literal binary");
-    // SAFETY: `term` is a binary in the leaked literal heap. Chunks never move,
-    // and the heap is never dropped, so the byte slice is `'static`. Stored atom
-    // text is UTF-8 (ASCII bytes, Latin-1 expanded to UTF-8, or validated UTF-8).
-    let name = unsafe {
-        let view = term.binary_ref().expect("atom literal view");
-        let len = view.bit_len() / 8;
-        let start = view.start_bit() / 8;
-        let slice = view
-            .bytes()
-            .get(start..start + len)
-            .expect("atom literal bytes");
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(slice.as_ptr(), slice.len()))
-    };
+    // `bytes` is the UTF-8 just stored in that literal binary (ASCII, Latin-1
+    // expanded to UTF-8, or validated UTF-8). Lookup compares `name.as_bytes()`
+    // and does not re-read the heap. The chunk's words are not a safe `'static`
+    // `&[u8]` while later atoms still append to it.
+    let name = std::str::from_utf8(bytes)
+        .expect("atom text is utf-8")
+        .into();
     (term, name)
 }
 
