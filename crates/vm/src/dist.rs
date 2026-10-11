@@ -725,6 +725,9 @@ fn remote_ref_id(reference: &OwnedTerm) -> Option<u64> {
     let OwnedTerm::Ref { ids, .. } = reference else {
         return None;
     };
+    if ids.len() >= 3 {
+        return Some(arinsal_bifs::ordinary_ref_key([ids[0], ids[1], ids[2]]));
+    }
     let mut value = 0_u64;
     for (index, id) in ids.iter().take(2).enumerate() {
         value |= u64::from(*id) << (index * 32);
@@ -838,7 +841,7 @@ fn notify_auto_connect(
             OwnedTerm::Ref {
                 node: local_name,
                 creation: local_creation,
-                ids: vec![entry_ref as u32, (entry_ref >> 32) as u32, 0],
+                ids: arinsal_bifs::ordinary_ref_words(entry_ref).to_vec(),
             },
         ]),
     ]);
@@ -1917,7 +1920,7 @@ pub(crate) fn forward_monitor_down_if_proxy(
             .unwrap_or_else(|| OwnedTerm::Ref {
                 node: "nonode@nohost".into(),
                 creation: 0,
-                ids: vec![reference as u32, (reference >> 32) as u32, 0],
+                ids: arinsal_bifs::ordinary_ref_words(reference).to_vec(),
             });
         let deceased_term = OwnedTerm::Pid {
             node: local_name.clone(),
@@ -2020,10 +2023,17 @@ pub(crate) fn native_signal(
     // `monitor(Type, Item [, Opts])` — Item is args[1]; other BIFs take the
     // destination as args[0].
     let (remote, target_idx) = if function == "demonitor" {
-        (
-            crate::signals::ref_id(args[0]).and_then(monitor_node),
-            0usize,
-        )
+        // An internal ref that this process did not use for a remote monitor is
+        // not in any node table. erts looks up only `ERTS_P_MONITORS(c_p)`.
+        let remote = crate::signals::ref_id(args[0])
+            .filter(|id| {
+                process
+                    .cold
+                    .as_ref()
+                    .is_some_and(|cold| cold.dist_monitors.contains(id))
+            })
+            .and_then(monitor_node);
+        (remote, 0usize)
     } else if function == "monitor" {
         if args.len() < 2 || args[0] != atom("process") {
             let handler =
@@ -2120,6 +2130,7 @@ pub(crate) fn native_signal(
                 None,
             )?;
             remember_monitor(&node, id, target)?;
+            process.cold_mut().dist_monitors.insert(id);
             Ok(reference)
         }
         "demonitor" => {
@@ -2131,12 +2142,14 @@ pub(crate) fn native_signal(
                 return Err(badarg());
             }
             let Some((node, target)) = take_monitor(id) else {
+                process.cold_mut().dist_monitors.remove(&id);
                 return Ok(atom(if args.len() == 1 || !demonitor_info(args[1]) {
                     "true"
                 } else {
                     "false"
                 }));
             };
+            process.cold_mut().dist_monitors.remove(&id);
             let wire_target = match &target {
                 OwnedTerm::Tuple(parts)
                     if parts.len() == 2 && matches!(&parts[0], OwnedTerm::Atom(_)) =>

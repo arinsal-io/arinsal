@@ -20,6 +20,7 @@ const REDS_EXIT: i32 = CONTEXT_REDS / 100;
 const REDS_CONNECT: i32 = CONTEXT_REDS / 200;
 const REDS_LINK: i32 = CONTEXT_REDS / 200;
 const REDS_UNLINK: i32 = CONTEXT_REDS / 200;
+const REDS_DEMONITOR: i32 = CONTEXT_REDS / 200;
 const REDS_CONTROL: i32 = CONTEXT_REDS / 100;
 
 /// `ErtsPortOpResult`.
@@ -58,7 +59,7 @@ struct Reply {
 pub(crate) fn reference_term(process: &mut Process, reference: u64) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     TermBuilder::new(&mut heap)
-        .local_ref([reference as u32, (reference >> 32) as u32, 0])
+        .local_ref(arinsal_bifs::ordinary_ref_words(reference))
         .map_err(|_| badarg())
 }
 
@@ -82,7 +83,7 @@ impl Reply {
         };
         let reference = self.reference;
         let Ok(reference) =
-            TermBuilder::new(&mut heap).local_ref([reference as u32, (reference >> 32) as u32, 0])
+            TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
         else {
             return;
         };
@@ -633,6 +634,24 @@ pub(crate) fn link(
         },
     )
     .is_ok()
+}
+
+/// Port of erts/emulator/beam/io.c:2850 (`erts_port_demonitor`) and :2836
+/// (`port_sig_demonitor`), OTP-29.1.1. The origin monitor is already gone; this
+/// deletes the target half on the port, or drops it when the signal is aborted.
+pub(crate) fn demonitor(
+    handle: &Arc<PortHandle>,
+    drv: &Arc<DriverPort>,
+    caller: Pid,
+    reference: u64,
+) {
+    let task_handle = Arc::clone(handle);
+    let _ = imm_or_schedule(drv, caller, true, "demonitor", move |op| {
+        if op == SigOp::Exec {
+            task_handle.monitors.lock().unwrap().remove(&reference);
+        }
+        REDS_DEMONITOR
+    });
 }
 
 /// `trace_port(prt, am_getting_linked | am_getting_unlinked, Pid, F_TRACE_PORTS)`.

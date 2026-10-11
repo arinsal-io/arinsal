@@ -1235,7 +1235,7 @@ fn start_dyn_driver(
         drv_port.expect_init_ack();
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
         return TermBuilder::new(&mut heap)
-            .local_ref([reference as u32, (reference >> 32) as u32, 0])
+            .local_ref(arinsal_bifs::ordinary_ref_words(reference))
             .map_err(|_| badarg());
     }
     Ok(port)
@@ -1674,7 +1674,7 @@ impl arinsal_drv::PortHost for DrvHost {
         };
         let mut heap = ProcessHeap::with_words(16);
         let Ok(reference) =
-            TermBuilder::new(&mut heap).local_ref([reference as u32, (reference >> 32) as u32, 0])
+            TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
         else {
             return;
         };
@@ -2028,7 +2028,7 @@ fn notify_links_monitors(
     for (reference, monitor) in monitors {
         let mut heap = ProcessHeap::with_words(32);
         let Ok(reference_term) =
-            TermBuilder::new(&mut heap).local_ref([reference as u32, (reference >> 32) as u32, 0])
+            TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(reference))
         else {
             continue;
         };
@@ -3713,11 +3713,8 @@ pub(crate) fn owner_exit(
         let monitors = std::mem::take(&mut *handle.monitors.lock().unwrap());
         for (reference, monitor) in &monitors {
             let mut heap = ProcessHeap::with_words(32);
-            let reference_term = TermBuilder::new(&mut heap).local_ref([
-                *reference as u32,
-                (*reference >> 32) as u32,
-                0,
-            ]);
+            let reference_term =
+                TermBuilder::new(&mut heap).local_ref(arinsal_bifs::ordinary_ref_words(*reference));
             let Ok(reference_term) = reference_term else {
                 continue;
             };
@@ -3919,15 +3916,26 @@ pub(crate) fn monitors_by(process: &Process, pid: Pid) -> Vec<OwnedTerm> {
         .collect()
 }
 
-/// Remove a reference from any live port's monitor set.
-pub(crate) fn demonitor(process: &Process, reference: u64) -> bool {
-    let Some(runtime) = &process.runtime else {
-        return false;
+/// Demonitor one port. The caller already removed the origin from its monitor tree.
+///
+/// Port of erts/emulator/beam/bif.c:504-510 and io.c:2850 (`erts_port_demonitor`),
+/// OTP-29.1.1. A loaded driver gets a proc-to-port demonitor signal (immediate when
+/// the port is free). A spawn or fd port has no driver task queue; the target half
+/// is dropped under the port's monitor lock, which is that port's `try_imm` path.
+pub(crate) fn demonitor_port(process: &Process, caller: Pid, port_id: u64, reference: u64) {
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
     };
-    let ports = runtime.ports.lock().unwrap();
-    ports
-        .values()
-        .any(|handle| handle.monitors.lock().unwrap().remove(&reference).is_some())
+    let handle = runtime.ports.lock().unwrap().get(&port_id).cloned();
+    let Some(handle) = handle else {
+        // `erts_port_lookup` failed: `ERTS_PORT_OP_DROPPED`, origin already released.
+        return;
+    };
+    if let Some(drv) = handle.driver.get().cloned() {
+        drv_sig::demonitor(&handle, &drv, caller, reference);
+        return;
+    }
+    handle.monitors.lock().unwrap().remove(&reference);
 }
 
 /// Port of erts/emulator/beam/io.c:1715 (erts_port_output) for `{command, Data}`; also

@@ -374,7 +374,7 @@ pub extern "C" fn enif_make_monitor_term(e: *mut ErlNifEnv, m: *const [u8; 32]) 
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
     let env = unsafe { &mut *e };
     TermBuilder::new(&mut env.heap)
-        .local_ref([id as u32, (id >> 32) as u32, 0])
+        .local_ref(arinsal_bifs::ordinary_ref_words(id))
         .unwrap_or_else(|_| terms::enif_make_badarg(e))
 }
 

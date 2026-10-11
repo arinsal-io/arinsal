@@ -1,9 +1,8 @@
 //! Pure BIFs implemented against stable heap terms.
 
-use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
@@ -25,33 +24,9 @@ pub use binary_bifs::{
 };
 
 const BADARG: BifError = BifError::BADARG;
-static NEXT_REF: AtomicU64 = AtomicU64::new(1);
-static NEXT_UNIQUE: AtomicU64 = AtomicU64::new(1);
 
-// Port of erts/emulator/beam/erl_bif_unique.c (per-scheduler reference counters), OTP-29.1.1.
-// Thread-local counter block avoids atomic contention on every `make_ref/0`.
-const REF_BLOCK_SIZE: u64 = 4096;
-
-thread_local! {
-    static REF_BLOCK: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
-}
-
-/// Generate the next unique 64-bit reference ID from a thread-local block.
-/// Port of erts/emulator/beam/erl_bif_unique.c (per-scheduler reference counters), OTP-29.1.1.
-#[inline(always)]
-pub fn next_ref_id() -> u64 {
-    REF_BLOCK.with(|cell| {
-        let (current, limit) = cell.get();
-        if current < limit {
-            cell.set((current + 1, limit));
-            current
-        } else {
-            let start = NEXT_REF.fetch_add(REF_BLOCK_SIZE, AtomicOrdering::Relaxed);
-            cell.set((start + 1, start + REF_BLOCK_SIZE));
-            start
-        }
-    })
-}
+use crate::unique::next_ref_words;
+pub use crate::unique::{next_ref_id, next_unique_monotonic};
 
 pub(super) struct Heap<'a>(pub(super) &'a mut dyn HeapAlloc);
 impl HeapAlloc for Heap<'_> {
@@ -312,20 +287,31 @@ pub(super) fn list(term: Term) -> Result<Vec<Term>, BifError> {
 
 fn list_with_limit(term: Term, limit: usize) -> Result<Vec<Term>, BifError> {
     let mut out = Vec::new();
-    let mut tail = term;
-    while tail.classify() == TermKind::List {
+    for_each_cons(term, |head| {
         if out.len() == limit {
             return Err(BADARG);
         }
+        out.push(head);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Walk a proper list without allocating, as `unique_integer_1` walks `modlist`.
+fn for_each_cons(
+    mut tail: Term,
+    mut visit: impl FnMut(Term) -> Result<(), BifError>,
+) -> Result<(), BifError> {
+    while tail.classify() == TermKind::List {
         // SAFETY: The source heap remains live and stable for the call.
         let (head, next) = unsafe { tail.cons_ref() }.ok_or(BADARG)?;
-        out.push(head);
+        visit(head)?;
         tail = next;
     }
     if tail != Term::NIL {
         Err(BADARG)
     } else {
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -497,31 +483,70 @@ fn phash_bif(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let value = phash(args[0], range.try_into().map_err(|_| BADARG)?).ok_or(BADARG)?;
     integer(ctx, value as usize)
 }
-fn make_ref(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
-    let id = next_ref_id();
-    Term::local_ref(ctx.heap, [id as u32, (id >> 32) as u32, 0]).map_err(|_| BifError::SystemLimit)
+pub fn make_ref(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/erl_bif_unique.c:821-833 (make_ref_0), OTP-29.1.1.
+    // `erts_sched_make_ref_in_buffer` writes the three words straight into the
+    // heap buffer; the id is not packed and unpacked on the way.
+    Term::local_ref(ctx.heap, next_ref_words()).map_err(|_| BifError::SystemLimit)
 }
-/// The next strictly monotonic unique integer, as `erlang:unique_integer([monotonic])`.
-// Port of erts/emulator/beam/erl_bif_info.c (erts_raw_get_unique_monotonic_integer), OTP-29.1.1.
-pub fn next_unique_monotonic() -> i64 {
-    -(1_i64 << 59) + NEXT_UNIQUE.fetch_add(1, AtomicOrdering::Relaxed) as i64
-}
-fn unique_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+
+/// `erlang:unique_integer/0` and `/1` counter step, before the term is built.
+// Port of erts/emulator/beam/erl_bif_unique.c:835-871 (unique_integer_0/1), OTP-29.1.1.
+pub fn eval_unique_integer(args: &[Term]) -> Result<crate::unique::UniqueInt, BifError> {
     let mut positive = false;
+    let mut monotonic = false;
     if let Some(options) = args.first() {
-        for option in list(*options)? {
-            let name = atom_name(option).ok_or(BADARG)?;
-            if name != "positive" && name != "monotonic" {
-                return Err(BADARG);
+        let positive_atom = unique_flag_atom("positive");
+        let monotonic_atom = unique_flag_atom("monotonic");
+        // The option list is walked in place. Building a `Vec` for `[positive]`
+        // is not what `unique_integer_1` does.
+        for_each_cons(*options, |option| match option.as_atom() {
+            Some(atom) if atom == positive_atom => {
+                positive = true;
+                Ok(())
             }
-            positive |= name == "positive";
-        }
+            Some(atom) if atom == monotonic_atom => {
+                monotonic = true;
+                Ok(())
+            }
+            _ => Err(BADARG),
+        })?;
     }
-    let value = NEXT_UNIQUE.fetch_add(1, AtomicOrdering::Relaxed);
-    if positive {
-        integer(ctx, value as usize)
+    if monotonic {
+        return if positive {
+            let value = crate::unique::next_unique_monotonic_positive();
+            if let Ok(small) = i64::try_from(value) {
+                Ok(crate::unique::UniqueInt::Small(small))
+            } else {
+                Ok(crate::unique::UniqueInt::Big(BigInt::from(value)))
+            }
+        } else {
+            Ok(crate::unique::UniqueInt::Small(next_unique_monotonic()))
+        };
+    }
+    Ok(crate::unique::next_unique_integer(positive))
+}
+
+fn unique_flag_atom(name: &'static str) -> arinsal_term::Atom {
+    static POSITIVE: OnceLock<arinsal_term::Atom> = OnceLock::new();
+    static MONOTONIC: OnceLock<arinsal_term::Atom> = OnceLock::new();
+    let slot = if name == "positive" {
+        &POSITIVE
     } else {
-        Ok(Term::small(-(1_i64 << 59) + value as i64).expect("counter in small range"))
+        &MONOTONIC
+    };
+    *slot.get_or_init(|| global_atoms().intern(name).expect("unique_integer flag"))
+}
+
+pub fn unique_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/erl_bif_unique.c:835-871 (unique_integer_0/1), OTP-29.1.1.
+    match eval_unique_integer(args)? {
+        crate::unique::UniqueInt::Small(value) => {
+            Ok(Term::small(value).expect("unique integer small"))
+        }
+        crate::unique::UniqueInt::Big(value) => TermBuilder::new(&mut Heap(ctx.heap))
+            .int_from_bigint(&value)
+            .map_err(|_| BifError::SystemLimit),
     }
 }
 fn system_time(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

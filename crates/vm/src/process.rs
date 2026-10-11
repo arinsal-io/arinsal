@@ -1121,6 +1121,19 @@ impl Executor {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
         process.self_pid = Some(ctx.pid());
         process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
+        // Port of erts/emulator/beam/erl_process.h:2595 (erts_proc_sched_data): the process
+        // turn uses the scheduler thread's reference and unique-integer counters.
+        let thr = arinsal_bifs::scheduler_thr_id(
+            ctx.scheduler_id().map(|id| id as u32),
+            ctx.scheduler_count() as u32,
+        );
+        if process
+            .scheduler_ref_state
+            .as_ref()
+            .is_none_or(|state| state.thr_id() != thr)
+        {
+            process.scheduler_ref_state = Some(arinsal_bifs::bind_scheduler_ref_state(thr));
+        }
         let schedule_started = crate::natives::erts_debug::long_schedule_monitored(process)
             .then(std::time::Instant::now);
         // A process runs with the code index active when it is scheduled in. The `in` trace
@@ -4572,6 +4585,11 @@ impl Process {
         let Some(cold) = self.cold.take() else {
             return;
         };
+        // Port of erts/emulator/beam/erl_process.c:13918 (origin ERTS_MON_TYPE_PORT),
+        // OTP-29.1.1: exit demonitors each port the process was watching.
+        for (reference, port_id) in cold.port_monitors {
+            crate::port::demonitor_port(self, ctx.pid(), port_id, reference);
+        }
         for pid in cold.links {
             if cold.unlinking.values().any(|unlinking| *unlinking == pid) {
                 continue;
@@ -6581,6 +6599,11 @@ impl Vm {
             max_processes: arinsal_term::ptab::process_table_layout().max(),
             ..Config::default()
         };
+        arinsal_bifs::init_unique_scheduler_count(
+            config.workers as u32,
+            config.dirty_cpu_schedulers as u32,
+            config.dirty_io_schedulers as u32,
+        );
         let scheduler = Arc::new(match simulation_seed {
             Some(seed) => Scheduler::simulation(config, seed),
             None => Scheduler::new(config),

@@ -665,8 +665,52 @@ pub(crate) extern "C" fn arinsal_beamasm_call_light_bif_shared(
     site: u64,
     export: Option<ExportDispatch>,
 ) -> u64 {
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:421-447 (call_light_bif_shared's
+    // dynamic_runtime_call of the BIF pointer), OTP-29.1.1: make_ref/0 and
+    // unique_integer/0,1 are the BIF, not the dispatcher that selects them.
+    // A traced call or a process saving calls still goes through the export.
+    if let Some(export) = export
+        && export.scheduler_counter.is_some()
+        && !crate::trace_bp::any_pattern()
+    {
+        return scheduler_counter_entry(header, identity, site, export);
+    }
     // `site` is only meaningful for the breakpoint trampoline.
+    call_light_bif_body(header, identity, site, export)
+}
+
+/// The shared fragment's general path. Out of line so a counter BIF does not
+/// pay this function's prologue.
+#[inline(never)]
+fn call_light_bif_body(
+    header: *mut ProcessHeader,
+    identity: u64,
+    site: u64,
+    export: Option<ExportDispatch>,
+) -> u64 {
     invoke_dispatch_bif(header, identity as usize, site as usize, export, false).unwrap_or(0)
+}
+
+/// `make_ref/0` and `unique_integer/0,1` from the light-BIF fragment.
+///
+/// Port of erts/emulator/beam/erl_bif_unique.c:821-871, OTP-29.1.1. The fragment
+/// has already stored HTOP, E and FCALLS; this only runs the BIF.
+#[inline(never)]
+fn scheduler_counter_entry(
+    header: *mut ProcessHeader,
+    identity: u64,
+    site: u64,
+    export: ExportDispatch,
+) -> u64 {
+    {
+        let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+            return 0;
+        };
+        if registers.active_code_ix != crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64 {
+            return fast_scheduler_bif(process, registers, export, false).unwrap_or(0);
+        }
+    }
+    call_light_bif_body(header, identity, site, Some(export))
 }
 
 /// Reads the active process dictionary for native `i_get` / `bif get` instructions.
@@ -870,7 +914,65 @@ fn invoke_dispatch_bif(
     {
         return call_trap_bif(process, registers, identity, export, entry, export_call);
     }
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:447 (dynamic_runtime_call of
+    // monitor_2 / demonitor_1), OTP-29.1.1: those BIFs return in the caller. A
+    // Native-class export otherwise traps back into the executor.
+    let saving_calls =
+        !export_call && registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64;
+    if !saving_calls
+        && !crate::trace_bp::any_pattern()
+        && let Some(export) = export
+        && let Some(raw) = try_light_monitor(process, registers, export, export_call)
+    {
+        return Some(raw);
+    }
     invoke_dispatch_bif_slow(process, registers, identity, site, export, export_call)
+}
+
+/// `monitor/2` of the caller and `demonitor` of a ref that is not a monitor.
+///
+/// `None` means this call needs the executor (another process, a remote monitor,
+/// a port monitor, a traced call). Port of erts/emulator/beam/bif.c:782-784 and
+/// bif.c:437-454, OTP-29.1.1.
+fn try_light_monitor(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    export_call: bool,
+) -> Option<u64> {
+    if export.module_atom != arinsal_term::atoms::ERLANG {
+        return None;
+    }
+    let monitor = export.function_atom == arinsal_term::atoms::MONITOR;
+    if !monitor && export.function_atom != arinsal_term::atoms::DEMONITOR {
+        return None;
+    }
+    let arity = usize::from(export.arity);
+    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let result =
+        crate::signals::light_monitor_bif(process, monitor, &registers.x_reg_array[..arity])?;
+    process.reductions = process.header.fcalls;
+    if export_call {
+        charge_bif_reductions(process, 1);
+    }
+    let top = process.heap.heap_top_index();
+    if let Ok(value) = &result
+        && stop - top >= process.heap.mbuf_size()
+        && !process.heap.bin_vheap_gc_due()
+    {
+        let value = *value;
+        registers.x_reg_array[0] = value;
+        if top != entry_top {
+            process.header.htop = process.heap.word_address(top);
+        }
+        if process.header.fcalls != process.reductions {
+            process.header.fcalls = process.reductions;
+        }
+        return Some(crate::native_hooks::raw(value));
+    }
+    Some(process_bif_result(
+        process, registers, export, arity, result,
+    ))
 }
 
 /// Calls a trapping BIF straight from native code; `None` when it trapped.
@@ -1158,6 +1260,148 @@ fn call_direct_bif(
     Some(raw)
 }
 
+/// `make_ref/0` and `unique_integer/0,1` on the scheduler that is already running
+/// the process: bump that scheduler's counter and write the term.
+///
+/// Port of erts/emulator/beam/erl_bif_unique.c:821-871 (`make_ref_0`,
+/// `unique_integer_0`, `unique_integer_1`), OTP-29.1.1. Other BIFs return `None`
+/// and take the generic path.
+#[inline(always)]
+fn fast_scheduler_bif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    export_call: bool,
+) -> Option<u64> {
+    use crate::beamasm_integration::SchedulerCounterBif;
+    Some(match export.scheduler_counter? {
+        SchedulerCounterBif::MakeRef => make_ref_0(process, registers, export, export_call),
+        SchedulerCounterBif::Unique0 => {
+            unique_integer_n(process, registers, export, export_call, &[])
+        }
+        SchedulerCounterBif::Unique1 => {
+            let arg = registers.x_reg_array[0];
+            unique_integer_n(process, registers, export, export_call, &[arg])
+        }
+    })
+}
+
+/// Port of erts/emulator/beam/erl_bif_unique.c:821-833 (`make_ref_0`) and
+/// erl_bif_unique.h:190-198 (`erts_sched_make_ref_in_buffer`), OTP-29.1.1.
+///
+/// `HAlloc` of `ERTS_REF_THING_SIZE` words, then the scheduler counter is
+/// incremented and written into that buffer. No global atomic.
+#[inline(never)]
+fn make_ref_0(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    export_call: bool,
+) -> u64 {
+    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let words = arinsal_bifs::next_ref_words();
+    // Common path is the young-heap bump (`HAlloc` when `HeapWordsLeft` is enough).
+    // A full heap takes a fragment, as `HAlloc` calls `erts_heap_alloc`.
+    let result = match Term::local_ref(&mut process.heap, words) {
+        Ok(term) => Ok(term),
+        Err(_) => make_ref_in_fragment(process, words),
+    };
+    finish_counter_bif(
+        process,
+        registers,
+        export,
+        export_call,
+        entry_top,
+        stop,
+        result,
+    )
+}
+
+/// A full young heap: `HAlloc` falls through to `erts_heap_alloc`.
+#[cold]
+#[inline(never)]
+fn make_ref_in_fragment(
+    process: &mut crate::Process,
+    words: [u32; 3],
+) -> Result<Term, arinsal_bifs::BifError> {
+    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    Term::local_ref(&mut fragment, words).map_err(|_| arinsal_bifs::BifError::SystemLimit)
+}
+
+/// Port of erts/emulator/beam/erl_bif_unique.c:835-871 (`unique_integer_0` /
+/// `unique_integer_1`), OTP-29.1.1.
+#[inline(never)]
+fn unique_integer_n(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    export_call: bool,
+    args: &[Term],
+) -> u64 {
+    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let result = match arinsal_bifs::eval_unique_integer(args) {
+        Ok(arinsal_bifs::UniqueInt::Small(value)) => {
+            Ok(Term::small(value).expect("unique integer"))
+        }
+        Ok(arinsal_bifs::UniqueInt::Big(value)) => {
+            let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            arinsal_term::TermBuilder::new(&mut fragment)
+                .int_from_bigint(&value)
+                .map_err(|_| arinsal_bifs::BifError::SystemLimit)
+        }
+        Err(error) => Err(error),
+    };
+    finish_counter_bif(
+        process,
+        registers,
+        export,
+        export_call,
+        entry_top,
+        stop,
+        result,
+    )
+}
+
+#[inline(always)]
+fn finish_counter_bif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    export_call: bool,
+    entry_top: usize,
+    stop: usize,
+    result: Result<Term, arinsal_bifs::BifError>,
+) -> u64 {
+    process.reductions = process.header.fcalls;
+    if export_call {
+        charge_bif_reductions(process, 1);
+    }
+    let top = process.heap.heap_top_index();
+    // ERTS_IS_GC_DESIRED_INTERNAL: a value with no collection desired goes straight
+    // back to XREG0. The check is the one `call_light_bif_shared` does after the BIF.
+    if let Ok(value) = &result
+        && stop - top >= process.heap.mbuf_size()
+        && !process.heap.bin_vheap_gc_due()
+    {
+        let value = *value;
+        registers.x_reg_array[0] = value;
+        if top != entry_top {
+            process.header.htop = process.heap.word_address(top);
+        }
+        if process.header.fcalls != process.reductions {
+            process.header.fcalls = process.reductions;
+        }
+        return crate::native_hooks::raw(value);
+    }
+    plain_bif_result(
+        process,
+        registers,
+        export,
+        usize::from(export.arity),
+        result,
+    )
+}
+
 /// Calls a BIF that runs on the scheduler straight from native code.
 #[inline(always)]
 fn call_plain_bif(
@@ -1167,6 +1411,9 @@ fn call_plain_bif(
     bif: arinsal_bifs::BifFn,
     export_call: bool,
 ) -> u64 {
+    if let Some(raw) = fast_scheduler_bif(process, registers, export, export_call) {
+        return raw;
+    }
     process.reductions = process.header.fcalls;
     if export_call {
         charge_bif_reductions(process, 1);

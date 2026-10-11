@@ -215,8 +215,7 @@ fn contains_reference(term: &arinsal_etf::OwnedTerm, reference: u64) -> bool {
             ids,
         } if node == "nonode@nohost"
             && ids.len() == 3
-            && ids[2] == 0
-            && (ids[0] as u64 | ((ids[1] as u64) << 32)) == reference =>
+            && arinsal_bifs::ordinary_ref_key([ids[0], ids[1], ids[2]]) == reference =>
         {
             true
         }

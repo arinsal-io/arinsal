@@ -461,7 +461,7 @@ fn load_error(code: i32) -> O {
 
 fn notice_term(heap: &mut ProcessHeap, notice: &Notice) -> Option<Term> {
     let reference = TermBuilder::new(heap)
-        .local_ref([notice.reference as u32, (notice.reference >> 32) as u32, 0])
+        .local_ref(arinsal_bifs::ordinary_ref_words(notice.reference))
         .ok()?;
     let tag = match notice.error {
         None => atom(notice.tag),

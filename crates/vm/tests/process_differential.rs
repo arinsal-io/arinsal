@@ -1112,3 +1112,59 @@ fresh() ->
     assert_eq!(expected, CallResult::Ok(actual.unwrap()));
     drop(blocker);
 }
+
+/// `monitor(process, self())` creates only a ref (`bif.c` local_process). A live
+/// other process updates both monitor trees. A port monitor's target half is
+/// removed by the demonitor signal, and `port_close` still delivers `DOWN`.
+#[test]
+fn monitor_demonitor_trees_and_port_down_match_otp() {
+    let Ok(reference) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping monitor/demonitor differential test");
+        return;
+    };
+    let source = r#"
+-module(mon_trees).
+-export([run/0]).
+run() ->
+    Me = self(),
+    SelfRef = erlang:monitor(process, Me),
+    {monitors, []} = process_info(Me, monitors),
+    false = erlang:demonitor(SelfRef, [info, flush]),
+    Parent = Me,
+    Other = spawn(fun() ->
+        receive go -> ok end,
+        {monitored_by, Mb} = process_info(self(), monitored_by),
+        Parent ! {mb, Mb},
+        receive stop -> ok end
+    end),
+    Ref = erlang:monitor(process, Other),
+    {monitors, [{process, Other}]} = process_info(Me, monitors),
+    Other ! go,
+    Mb = receive {mb, Seen} -> Seen after 2000 -> timeout end,
+    [Me] = Mb,
+    true = erlang:demonitor(Ref, [info]),
+    {monitors, []} = process_info(Me, monitors),
+    Other ! stop,
+    Port = open_port({spawn, "sleep 30"}, []),
+    Pref = erlang:monitor(port, Port),
+    {monitored_by, [Me]} = erlang:port_info(Port, monitored_by),
+    {monitors, [{port, Port}]} = process_info(Me, monitors),
+    true = erlang:demonitor(Pref, [flush]),
+    {monitors, []} = process_info(Me, monitors),
+    {monitored_by, []} = erlang:port_info(Port, monitored_by),
+    Pref2 = erlang:monitor(port, Port),
+    true = port_close(Port),
+    receive {'DOWN', Pref2, port, Port, normal} -> ok after 2000 -> timeout end,
+    ok.
+"#;
+    let beam = reference.compile_named("mon_trees", source, &[]).unwrap();
+    reference.load("mon_trees", &beam).unwrap();
+    let expected = reference.call("mon_trees", "run", &[]);
+    let mut vm = Vm::new([]);
+    vm.load_bytes(&beam).unwrap();
+    let actual = vm
+        .eval_scheduled("mon_trees", "run", &[], 2, None)
+        .unwrap_or_else(|error| panic!("monitor trees: {error}"));
+    assert_eq!(expected, CallResult::Ok(actual.term));
+    assert_eq!(expected, CallResult::Ok(OwnedTerm::Atom("ok".into())));
+}

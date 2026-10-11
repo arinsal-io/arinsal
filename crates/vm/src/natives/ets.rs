@@ -1705,7 +1705,7 @@ fn call_inner(
             // one registry, so one reply carries them and the rest are empty.
             // `ets:all/0` waits for `erlang:system_info(schedulers)` replies.
             let id = rt.next_ref();
-            let reference = Term::local_ref(&mut heap, [id as u32, (id >> 32) as u32, 0])
+            let reference = Term::local_ref(&mut heap, arinsal_bifs::ordinary_ref_words(id))
                 .map_err(|_| badarg())?;
             let tables = live_table_terms(&registry, &mut heap)?;
             let table_list = TermBuilder::new(&mut heap)
