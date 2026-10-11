@@ -542,9 +542,3 @@ fn typed_power_of_two_multiply_and_mul_add_stay_on_the_fast_path() {
     );
     assert_eq!(registers.x_reg_array[1].tagged_word(), tagged(17).unwrap());
 }
-
-#[cfg(not(target_arch = "aarch64"))]
-#[test]
-fn arithmetic_execution_requires_aarch64() {
-    assert_eq!(std::mem::size_of::<usize>(), 8);
-}
