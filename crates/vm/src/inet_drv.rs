@@ -1236,6 +1236,7 @@ fn apply_opt(inner: &mut Inner, code: u8, val: i32, data: &[u8], i: &mut usize) 
         }
         // HAVE_SETNS is absent on macOS, so netns falls through to EINVAL.
         OPT_NETNS => return false,
+        #[cfg(have_so_bindtodevice)]
         OPT_BIND_TO_DEVICE => {
             // Port of inet_drv.c:7848 (SO_BINDTODEVICE), OTP-29.1.1.
             if val < 0 || val as usize > libc::IFNAMSIZ || *i + val as usize > data.len() {
@@ -1425,6 +1426,7 @@ fn push_opt(inner: &Inner, code: u8, data: &[u8], i: &mut usize, out: &mut Vec<u
             }
         }
         OPT_DEBUG => write_i32(out, i32::from(inner.debug)),
+        #[cfg(have_so_bindtodevice)]
         OPT_BIND_TO_DEVICE => {
             // Port of inet_drv.c:9599 (getsockopt SO_BINDTODEVICE), OTP-29.1.1.
             if let Some(name) = get_bind_device(inner) {
@@ -3284,17 +3286,22 @@ fn note_active(inner: &mut Inner, owner: Pid, outs: &mut Vec<Out>) {
     }
 }
 
+// Darwin's SO_BINDTODEVICE is 0x1134 (sys/socket.h); the libc crate does not name it there.
+#[cfg(all(have_so_bindtodevice, target_os = "macos"))]
+const SO_BINDTODEVICE: i32 = 0x1134;
+#[cfg(all(have_so_bindtodevice, not(target_os = "macos")))]
+const SO_BINDTODEVICE: i32 = libc::SO_BINDTODEVICE;
+
+#[cfg(have_so_bindtodevice)]
 fn set_bind_device(inner: &Inner, name: &[u8]) -> bool {
     let mut buf = [0u8; 16];
     let n = name.len().min(buf.len() - 1);
     buf[..n].copy_from_slice(&name[..n]);
-    // Darwin's SO_BINDTODEVICE is 4404 (sys/socket.h). The libc crate may not name it.
-    const SO_BINDTODEVICE: i32 = 4404;
     sock_set_raw(inner, libc::SOL_SOCKET, SO_BINDTODEVICE, &buf)
 }
 
+#[cfg(have_so_bindtodevice)]
 fn get_bind_device(inner: &Inner) -> Option<Vec<u8>> {
-    const SO_BINDTODEVICE: i32 = 4404;
     let bytes = sock_get_raw(inner, libc::SOL_SOCKET, SO_BINDTODEVICE, 16)?;
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     Some(bytes[..end].to_vec())
