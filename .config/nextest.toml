@@ -12,6 +12,8 @@ final-status-level = "flaky"
 [profile.gate]
 retries = 1
 fail-fast = false
+# A hung test is killed after 5 minutes in the landing gate.
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 # Tests that share an OS resource (PTYs, epmd, fixed ports, the terminal) run one at a time.
 [test-groups]
