@@ -1,5 +1,8 @@
 //! Stable word allocations. Every pointer remains valid until its heap is dropped.
-use crate::bits::{ExternalBinary, RefcBinary, WritableBinary, binary_data, owner_adjustment};
+use crate::bits::{
+    EXTERNAL_OWNER, ExternalBinary, RefcBinary, WRITABLE_OWNER, WritableBinary, binary_data,
+    owner_adjustment,
+};
 use crate::identity::check_external_ref;
 use crate::record::RecordSnapshot;
 use crate::record_table::RecordLayout;
@@ -1875,7 +1878,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         {
             *last &= 0xff << (8 - bit_len % 8);
         }
-        let binary = Arc::new(RefcBinary::new(data));
+        let binary = Arc::new(RefcBinary::new(data)?);
         let adjustment = binary.as_ptr() as usize & 3;
         let ref_ptr = self.words(8)?;
         // SAFETY: the same allocation reserves three BinRef and five SubBits words.
@@ -2261,6 +2264,7 @@ pub struct BinaryRef<'a> {
     bytes: &'a [u8],
     start: usize,
     bits: usize,
+    referenced_size: usize,
 }
 impl BinaryRef<'_> {
     /// Whole backing bytes; unused bits may be present at the ends.
@@ -2274,6 +2278,10 @@ impl BinaryRef<'_> {
     /// Starting bit within the backing data.
     pub fn start_bit(&self) -> usize {
         self.start
+    }
+    /// Size in bytes of the backing binary owner, or the heap bitstring itself.
+    pub fn referenced_size(&self) -> usize {
+        self.referenced_size
     }
 }
 impl Term {
@@ -2297,18 +2305,38 @@ impl Term {
                 bytes,
                 start: 0,
                 bits,
+                referenced_size: bits.div_ceil(8),
             })
         } else if header & 63 == SUB_BITS {
             // SAFETY: SUB_BITS stores start/end and a live original in word four.
             let (start, end, original) =
                 unsafe { (*p.add(2) as usize, *p.add(3) as usize, Term(*p.add(4))) };
             let adjustment = owner_adjustment(original) * 8;
-            let base = if original.header().is_some_and(|h| h & 63 == BIN_REF) {
+            let (base, referenced_size) = if original.header().is_some_and(|h| h & 63 == BIN_REF) {
+                // Port of erts/emulator/beam/erl_bif_binary.c:2520-2530, OTP-29.1.1.
                 // SAFETY: original is a retained BinRef and the caller prevents mutation.
-                unsafe { binary_data(original.raw_ptr()) }
+                unsafe {
+                    let bin_ref = original.raw_ptr();
+                    let owner = *bin_ref.add(1);
+                    let flags = *bin_ref.add(2);
+                    let size = if flags & EXTERNAL_OWNER != 0 {
+                        (&*(owner as *const ExternalBinary)).len()
+                    } else if flags & WRITABLE_OWNER != 0 {
+                        (&*(owner as *const WritableBinary)).capacity()
+                    } else {
+                        (&*(owner as *const RefcBinary)).len()
+                    };
+                    (binary_data(bin_ref), size)
+                }
             } else {
                 // SAFETY: a match context may refer directly to live HeapBits data.
-                unsafe { original.raw_ptr().add(2).cast::<u8>() }
+                unsafe {
+                    let original_ptr = original.raw_ptr();
+                    (
+                        original_ptr.add(2).cast::<u8>(),
+                        (*original_ptr.add(1) as usize).div_ceil(8),
+                    )
+                }
             };
             // SAFETY: The original allocation keeps this bit interval live.
             let bytes = unsafe { std::slice::from_raw_parts(base, (end - adjustment).div_ceil(8)) };
@@ -2316,6 +2344,7 @@ impl Term {
                 bytes,
                 start: start - adjustment,
                 bits: end - start,
+                referenced_size,
             })
         } else {
             None

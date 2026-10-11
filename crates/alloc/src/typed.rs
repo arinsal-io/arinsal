@@ -380,6 +380,14 @@ fn allocator_for(
         .ok_or(AllocError::InvalidAllocation)
 }
 
+/// Current allocated bytes belonging to the erts `BINARY` allocation type.
+// Port of erts/emulator/beam/erl_alloc.c:2124 (alcu_size), OTP-29.1.1.
+pub fn binary_allocation_bytes() -> u64 {
+    allocator_for(ErtsAlcType::BINARY)
+        .expect("the BINARY allocator is configured")
+        .current_blocks_size() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AllocBlock, ErtsAlcType};

@@ -18,6 +18,7 @@ fail-fast = false
 pty = { max-threads = 1 }
 dist = { max-threads = 1 }
 inet = { max-threads = 1 }
+binary-memory = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = "binary(iex_shell) | binary(tty)"
@@ -30,3 +31,7 @@ test-group = "dist"
 [[profile.default.overrides]]
 filter = "binary(inet_full)"
 test-group = "inet"
+
+[[profile.default.overrides]]
+filter = "binary(bin_accounting)"
+test-group = "binary-memory"

@@ -783,19 +783,7 @@ fn binary_copy(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 
 // Port of erts/emulator/beam/erl_bif_binary.c:2515-2555 (binary_referenced_byte_size_1), OTP-29.1.1.
 fn referenced_byte_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut bytes = with_binary_bytes(args[0], |view| view.bytes().len())?;
-    if args[0].header().is_some_and(|header| header & 63 == 0x24) {
-        // SAFETY: TermBuilder::sub_binary writes a live owner term in word four.
-        let owner = unsafe { *args[0].raw_ptr().add(4) };
-        let owner_ptr = (owner & !7) as *const u64;
-        // SAFETY: The tagged owner points to a retained BinRef allocation.
-        if unsafe { *owner_ptr } & 63 == 0x28 {
-            // SAFETY: BinRef word one points to the retained Arc<Vec<u8>> data.
-            let backing = unsafe { *owner_ptr.add(1) } as *const Vec<u8>;
-            // SAFETY: The process heap retains this Arc for the BIF call.
-            bytes = unsafe { &*backing }.len();
-        }
-    }
+    let bytes = with_binary_bytes(args[0], |view| view.referenced_size())?;
     integer(ctx, bytes)
 }
 

@@ -314,7 +314,7 @@ fn code_server_ops_async_check_and_onload_match_erts() {
     };
     assert!(status.success(), "arinsal code_server probe: {status}");
     let actual = arinsal_etf::decode(&std::fs::read(&output).unwrap()).unwrap();
-    assert_eq!(actual, expected);
+    similar_asserts::assert_eq!(actual, expected);
     std::fs::remove_dir_all(temp).unwrap();
 }
 
@@ -335,12 +335,16 @@ fn purged_module_versions_stay_bounded() {
         )
         .unwrap();
     reference.load("code_fix_probe", &probe).unwrap();
-    let expected = reference.call(
-        "code_fix_probe",
-        "reclaim",
-        &[OwnedTerm::Int(1000), OwnedTerm::Binary(reclaim.clone())],
-    );
-    assert_eq!(expected, CallResult::Ok(OwnedTerm::atom("ok")));
+    // RefErl applies a five-second timeout per call. Preserve all 1,000 code
+    // transitions while splitting the oracle work into bounded batches.
+    for _ in 0..10 {
+        let expected = reference.call(
+            "code_fix_probe",
+            "reclaim",
+            &[OwnedTerm::Int(100), OwnedTerm::Binary(reclaim.clone())],
+        );
+        similar_asserts::assert_eq!(expected, CallResult::Ok(OwnedTerm::atom("ok")));
+    }
     let mut vm = Vm::new([]);
     vm.load_bytes(&reclaim).unwrap();
     for _ in 0..1000 {
