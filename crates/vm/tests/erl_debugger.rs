@@ -1,7 +1,7 @@
-use arinsal_difftest::{CallResult, RefErl};
+use arinsal_difftest::{CallOptions, CallResult, RefErl};
 use arinsal_vm::Vm;
 use std::collections::HashMap;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -35,7 +35,7 @@ fn erl_debugger_supported_matches_otp_without_debug_flag() {
         .load_bytes(&beam)
         .and_then(|_| vm.eval_scheduled("erl_debugger_supported_fixture", "run", &[], 1, None))
         .unwrap_or_else(|error| panic!("erl_debugger:supported/0: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn erl_debugger_plus_d_enables_otp_support() {
         "erl failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
+    similar_asserts::assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "true|#{line_breakpoint => false}"
     );
@@ -67,7 +67,7 @@ fn erl_debugger_plus_d_enables_otp_support() {
     let args = ["erl", "+D", "+Dibpl", "false"];
     let launch = arinsal_args::parse(&args, &HashMap::new()).expect("parse debugger flags");
     assert!(launch.emulator.debugger_support);
-    assert_eq!(launch.emulator.debugger_line_breakpoints, Some(false));
+    similar_asserts::assert_eq!(launch.emulator.debugger_line_breakpoints, Some(false));
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn erl_debugger_internal_state_toggle_enables_support() {
         .load_bytes(&beam)
         .and_then(|_| vm.eval_scheduled("erl_debugger_internal_state_fixture", "run", &[], 1, None))
         .unwrap_or_else(|error| panic!("debugger internal-state toggle: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
     let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
 }
 
@@ -147,7 +147,7 @@ fn erl_debugger_line_metadata_loads_from_beam_debug_info() {
             None,
         )
         .expect("run VM fixture");
-    assert_eq!(expected, CallResult::Ok(actual.term));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
 #[test]
@@ -165,16 +165,192 @@ fn erl_debugger_default_instrumentation_toggle_accepts_empty_map_in_otp() {
         .output()
         .expect("run one-shot OTP debugger instrumentation probe");
     assert!(output.status.success());
-    assert_eq!(
+    similar_asserts::assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "#{line_breakpoint => true}"
     );
 }
 
 #[test]
+fn erl_debugger_bifs_match_otp_with_debugger_enabled() {
+    let _serial = serial_test();
+    let Ok(reference) = RefErl::start_with_erl_args(&["+D"]) else {
+        eprintln!("erl unavailable; skipping debugger BIF differential test");
+        return;
+    };
+    let module = "erl_debugger_bifs_fixture";
+    let source = r#"-module(erl_debugger_bifs_fixture).
+-export([run/0, target/1]).
+run() ->
+    Supported = erl_debugger:supported(),
+    Initial = erl_debugger:instrumentations(),
+    ok = erl_debugger:toggle_instrumentations(#{line_breakpoint => false}),
+    Disabled = erl_debugger:instrumentations(),
+    ok = erl_debugger:toggle_instrumentations(#{}),
+    EmptyToggle = erl_debugger:instrumentations(),
+    ok = erl_debugger:toggle_instrumentations(#{line_breakpoint => true}),
+    Enabled = erl_debugger:instrumentations(),
+    Where0 = erl_debugger:whereis(),
+    Dead = spawn(fun() -> ok end),
+    Monitor = erlang:monitor(process, Dead),
+    receive {'DOWN', Monitor, process, Dead, _} -> ok end,
+    {ok, DeadSession} = erl_debugger:register(Dead),
+    DeadRegistration = {is_integer(DeadSession), erl_debugger:whereis()},
+    {ok, Session} = erl_debugger:register(self()),
+    Registration = {is_integer(Session), erl_debugger:whereis() =:= self()},
+    Duplicate = erl_debugger:register(self()),
+    WrongSession = capture(fun() -> erl_debugger:unregister(self(), Session bxor 1) end),
+    Other = spawn(fun() -> receive stop -> ok end end),
+    DuplicateOther = erl_debugger:register(Other),
+    WrongPidNegativeSession = erl_debugger:unregister(Other, -1),
+    Running = {erl_debugger:stack_frames(Other, 10),
+               erl_debugger:peek_stack_frame_slot(Other, 0, 0, 10),
+               erl_debugger:xregs_count(Other),
+               erl_debugger:peek_xreg(Other, 0, 10)},
+    Other ! stop,
+    ok = erl_debugger:unregister(self(), Session),
+    Where1 = erl_debugger:whereis(),
+    {ok, AllBefore} = erl_debugger:breakpoints(erl_debugger_bifs_fixture),
+    {ok, TargetBefore} = erl_debugger:breakpoints(erl_debugger_bifs_fixture, target, 1),
+    [Line | _] = maps:keys(TargetBefore),
+    WideSetResult = erl_debugger:breakpoint(
+        erl_debugger_bifs_fixture, Line + 4294967296, true),
+    {ok, AllEnabled} = erl_debugger:breakpoints(erl_debugger_bifs_fixture),
+    {ok, TargetEnabled} = erl_debugger:breakpoints(erl_debugger_bifs_fixture, target, 1),
+    ClearResult = erl_debugger:breakpoint(erl_debugger_bifs_fixture, Line, false),
+    {ok, TargetCleared} = erl_debugger:breakpoints(erl_debugger_bifs_fixture, target, 1),
+    Badargs = [
+        capture(fun() -> erl_debugger:toggle_instrumentations([]) end),
+        capture(fun() -> erl_debugger:toggle_instrumentations(#{line_breakpoint => faux}) end),
+        capture(fun() -> erl_debugger:toggle_instrumentations(#{unknown => true}) end),
+        capture(fun() -> erl_debugger:toggle_instrumentations(#{line_breakpoint => false, unknown => true}) end),
+        capture(fun() -> erl_debugger:register(not_a_pid) end),
+        capture(fun() -> erl_debugger:unregister(not_a_pid, 0) end),
+        capture(fun() -> erl_debugger:unregister(self(), 1.0) end),
+        capture(fun() -> erl_debugger:unregister(self(), -1) end),
+        capture(fun() -> erl_debugger:breakpoint(not_an_atom, 1, true) end),
+        capture(fun() -> erl_debugger:breakpoint(erl_debugger_bifs_fixture, line, true) end),
+        capture(fun() -> erl_debugger:breakpoint(erl_debugger_bifs_fixture, 1, yes) end),
+        capture(fun() -> erl_debugger:breakpoint(erl_debugger_bifs_fixture, 2147483648, true) end),
+        capture(fun() -> erl_debugger:breakpoints(42) end),
+        capture(fun() -> erl_debugger:breakpoints(erl_debugger_bifs_fixture, 42, 1) end),
+        capture(fun() -> erl_debugger:breakpoints(erl_debugger_bifs_fixture, target, 1.0) end),
+        capture(fun() -> erl_debugger:breakpoints(erl_debugger_missing_fixture, 42, 1) end),
+        capture(fun() -> erl_debugger:breakpoints(erl_debugger_missing_fixture, target, 1.0) end),
+        capture(fun() -> erl_debugger:stack_frames(not_a_pid, 1) end),
+        capture(fun() -> erl_debugger:stack_frames(self(), 1) end),
+        capture(fun() -> erl_debugger:stack_frames(Other, -1) end),
+        capture(fun() -> erl_debugger:stack_frames(Other, 1.0) end),
+        capture(fun() -> erl_debugger:stack_frames(Other, 2147483648) end),
+        capture(fun() -> erl_debugger:peek_stack_frame_slot(not_a_pid, 0, 0, 10) end),
+        capture(fun() -> erl_debugger:peek_stack_frame_slot(self(), 0, 0, 10) end),
+        capture(fun() -> erl_debugger:peek_stack_frame_slot(Other, -1, 0, 10) end),
+        capture(fun() -> erl_debugger:peek_stack_frame_slot(Other, 2147483648, 0, 10) end),
+        capture(fun() -> erl_debugger:peek_stack_frame_slot(Other, 0, -1, 10) end),
+        capture(fun() -> erl_debugger:peek_stack_frame_slot(Other, 0, 0, -1) end),
+        capture(fun() -> erl_debugger:xregs_count(not_a_pid) end),
+        capture(fun() -> erl_debugger:xregs_count(self()) end),
+        capture(fun() -> erl_debugger:peek_xreg(not_a_pid, 0, 10) end),
+        capture(fun() -> erl_debugger:peek_xreg(self(), 0, 10) end),
+        capture(fun() -> erl_debugger:peek_xreg(Other, -1, 10) end),
+        capture(fun() -> erl_debugger:peek_xreg(Other, 2147483648, 10) end),
+        capture(fun() -> erl_debugger:peek_xreg(Other, 0, -1) end)
+    ],
+    #{supported => Supported, initial => Initial, disabled => Disabled,
+      empty_toggle => EmptyToggle, enabled => Enabled, where0 => Where0,
+      dead_registration => DeadRegistration, registration => Registration,
+      duplicate => Duplicate, wrong_session => WrongSession,
+      duplicate_other => DuplicateOther,
+      wrong_pid_negative_session => WrongPidNegativeSession, running => Running,
+      where1 => Where1, breakpoints_before => AllBefore,
+      target_before => TargetBefore, wide_set_result => WideSetResult,
+      breakpoints_enabled => AllEnabled, target_enabled => TargetEnabled,
+      clear_result => ClearResult, target_cleared => TargetCleared,
+      final_instrumentations => erl_debugger:instrumentations(),
+      missing_module => erl_debugger:breakpoints(erl_debugger_missing_fixture),
+      badargs => Badargs}.
+target(Value) -> Value + 1.
+capture(Fun) ->
+    try Fun() of Value -> {returned, Value}
+    catch error:badarg -> badarg
+    end.
+"#;
+    let beam = reference
+        .compile_named(
+            module,
+            source,
+            &[arinsal_etf::OwnedTerm::Atom("beam_debug_info".into())],
+        )
+        .expect("compile debugger BIF fixture");
+    reference.load(module, &beam).expect("load OTP fixture");
+    let mut expected = reference
+        .call_opts(
+            module,
+            "run",
+            &[],
+            &CallOptions {
+                timeout_ms: Some(30_000),
+                ..CallOptions::default()
+            },
+        )
+        .result;
+    assert!(
+        matches!(&expected, CallResult::Ok(_)),
+        "OTP fixture: {expected:?}"
+    );
+
+    let preloaded = reference
+        .eval("element(2, code:get_object_code(erts_internal))")
+        .expect("read OTP's preloaded breakpoint wrapper");
+    let arinsal_etf::OwnedTerm::Binary(preloaded) = &preloaded else {
+        panic!("OTP erts_internal object code was not a binary");
+    };
+    let mut vm = Vm::new_with_debugger_flags([], true, true);
+    vm.load_bytes(preloaded)
+        .expect("load OTP's preloaded breakpoint wrapper");
+    vm.load_bytes(&beam).expect("load debugger BIF fixture");
+    let actual = vm
+        .eval_scheduled(module, "run", &[], 8, None)
+        .unwrap_or_else(|error| panic!("run debugger BIF fixture: {error}"));
+    let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
+    let mut actual = CallResult::Ok(actual.term);
+    arinsal_difftest::compare(&expected, &actual, arinsal_difftest::CompareMode::Exact)
+        .unwrap_or_else(|mismatch| panic!("debugger BIF semantic mismatch: {mismatch}"));
+    canonicalize_call_result(&mut expected);
+    canonicalize_call_result(&mut actual);
+    similar_asserts::assert_eq!(expected, actual);
+}
+
+fn canonicalize_call_result(result: &mut CallResult) {
+    if let CallResult::Ok(term) = result {
+        canonicalize_maps(term);
+    }
+}
+
+// Erlang maps compare without regard to iteration order, while OwnedTerm preserves ETF order.
+fn canonicalize_maps(term: &mut arinsal_etf::OwnedTerm) {
+    use arinsal_etf::OwnedTerm;
+    match term {
+        OwnedTerm::Tuple(elements) => elements.iter_mut().for_each(canonicalize_maps),
+        OwnedTerm::List { elems, tail } => {
+            elems.iter_mut().for_each(canonicalize_maps);
+            canonicalize_maps(tail);
+        }
+        OwnedTerm::Map(entries) => {
+            for (key, value) in entries.iter_mut() {
+                canonicalize_maps(key);
+                canonicalize_maps(value);
+            }
+            entries.sort_by_key(|(key, _)| format!("{key:?}"));
+        }
+        _ => {}
+    }
+}
+
+#[test]
 fn erl_debugger_line_hit_inspection_and_resume_match_otp() {
     let _serial = serial_test();
-    let Ok(reference) = RefErl::start() else {
+    let Ok(reference) = RefErl::start_with_erl_args(&["+D"]) else {
         eprintln!("erl unavailable; skipping debugger hit differential test");
         return;
     };
@@ -183,20 +359,29 @@ fn erl_debugger_line_hit_inspection_and_resume_match_otp() {
 run() ->
     ok = erl_debugger:toggle_instrumentations(#{line_breakpoint => true}),
     {ok, Session} = erl_debugger:register(self()),
-    ok = erl_debugger:breakpoint(erl_debugger_active_fixture, 23, true),
+    {ok, HitBreakpoints} = erl_debugger:breakpoints(erl_debugger_active_fixture, hit, 2),
+    [Line | _] = maps:keys(HitBreakpoints),
+    ok = erl_debugger:breakpoint(erl_debugger_active_fixture, Line, true),
     Parent = self(),
     Worker = spawn(fun() -> hit(Parent, 42) end),
     receive
-        {debugger_event, Session, {breakpoint, Worker, {erl_debugger_active_fixture, hit, 2}, 23, Resume}} ->
+        {debugger_event, Session, {breakpoint, Worker, {erl_debugger_active_fixture, hit, 2}, Line, Resume}} ->
             true = erlang:suspend_process(Worker),
             Frames = erl_debugger:stack_frames(Worker, 10),
             XCount = erl_debugger:xregs_count(Worker),
             X0 = erl_debugger:peek_xreg(Worker, 0, 10),
+            X0Wide = erl_debugger:peek_xreg(Worker, 4294967296, 10),
+            X0WideMax = erl_debugger:peek_xreg(Worker, 0, 4294967296),
             {FrameNo, '<breakpoint>', _} = hd([F || F = {_, '<breakpoint>', _} <- Frames]),
             Slot = erl_debugger:peek_stack_frame_slot(Worker, FrameNo, 0, 10),
+            SlotWide = erl_debugger:peek_stack_frame_slot(
+                Worker, FrameNo + 4294967296, 4294967296, 10),
+            SlotWideMax = erl_debugger:peek_stack_frame_slot(
+                Worker, FrameNo, 0, 4294967296),
             Resume(),
             true = erlang:resume_process(Worker),
-            {XCount, compact(X0), compact(Slot), compact_frames(Frames)}
+            {XCount, compact(X0), compact(X0Wide), compact(X0WideMax),
+             compact(Slot), compact(SlotWide), compact(SlotWideMax), compact_frames(Frames)}
     after 5000 -> no_debugger_event
     end.
 hit(Parent, Value) ->
@@ -218,57 +403,24 @@ compact_fun(Fun) -> Fun.
             &[arinsal_etf::OwnedTerm::Atom("beam_debug_info".into())],
         )
         .expect("compile debugger hit fixture");
-    let reference_dir = std::env::temp_dir().join(format!(
-        "erl_debugger_{}_{}",
-        std::process::id(),
-        std::thread::current().name().unwrap_or("test")
-    ));
-    std::fs::create_dir_all(&reference_dir).expect("create temporary BEAM directory");
-    let beam_path = reference_dir.join("erl_debugger_active_fixture.beam");
-    std::fs::write(&beam_path, &beam).expect("write temporary BEAM file");
-    let result_path = reference_dir.join("result.etf");
-    let eval = format!(
-        "ok = file:write_file(\"{}\", term_to_binary(erl_debugger_active_fixture:run())), halt().",
-        result_path.display()
-    );
-    let child = Command::new("timeout")
-        .args([
-            "30",
-            "erl",
-            "+D",
-            "-noshell",
-            "-pa",
-            reference_dir.to_str().unwrap(),
-            "-eval",
-            &eval,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start one-shot OTP debugger fixture");
-    let output = child
-        .wait_with_output()
-        .expect("wait for OTP debugger fixture");
-    let expected_bytes = if output.status.success() {
-        std::fs::read(&result_path).expect("read OTP debugger result")
-    } else {
-        Vec::new()
+    reference
+        .load("erl_debugger_active_fixture", &beam)
+        .expect("load OTP debugger hit fixture");
+    let expected = reference
+        .call_opts(
+            "erl_debugger_active_fixture",
+            "run",
+            &[],
+            &CallOptions {
+                timeout_ms: Some(30_000),
+                ..CallOptions::default()
+            },
+        )
+        .result;
+    let CallResult::Ok(expected) = expected else {
+        panic!("OTP debugger fixture failed: {expected:?}");
     };
-    std::fs::remove_file(&beam_path).expect("remove temporary BEAM file");
-    if result_path.exists() {
-        std::fs::remove_file(&result_path).expect("remove temporary result file");
-    }
-    std::fs::remove_dir(&reference_dir).expect("remove temporary BEAM directory");
-    assert!(
-        output.status.success(),
-        "OTP debugger fixture failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let expected = arinsal_etf::decode(&expected_bytes).expect("decode OTP debugger result");
-    assert_ne!(
-        expected,
-        arinsal_etf::OwnedTerm::Atom("no_debugger_event".into())
-    );
+    assert!(expected != arinsal_etf::OwnedTerm::Atom("no_debugger_event".into()));
 
     let preloaded = reference
         .eval("element(2, code:get_object_code(erts_internal))")
@@ -284,17 +436,14 @@ compact_fun(Fun) -> Fun.
         .eval_scheduled("erl_debugger_active_fixture", "run", &[], 8, None)
         .unwrap_or_else(|error| panic!("run debugger hit fixture: {error}"));
     let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
-    assert_ne!(
-        actual.term,
-        arinsal_etf::OwnedTerm::Atom("no_debugger_event".into())
-    );
-    assert_eq!(expected, actual.term);
+    assert!(actual.term != arinsal_etf::OwnedTerm::Atom("no_debugger_event".into()));
+    similar_asserts::assert_eq!(expected, actual.term);
 }
 
 /// Runs `module:run/0` of `source` (compiled with `+beam_debug_info`) on OTP with `+D` and
 /// on Arinsal, and asserts both return the same term.
 fn assert_debugger_fixture_matches_otp(module: &str, source: &str) {
-    let Ok(reference) = RefErl::start() else {
+    let Ok(reference) = RefErl::start_with_erl_args(&["+D"]) else {
         eprintln!("erl unavailable; skipping debugger differential test");
         return;
     };
@@ -305,36 +454,23 @@ fn assert_debugger_fixture_matches_otp(module: &str, source: &str) {
             &[arinsal_etf::OwnedTerm::Atom("beam_debug_info".into())],
         )
         .expect("compile debugger fixture");
-    let dir = std::env::temp_dir().join(format!("erl_debugger_{}_{module}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temporary BEAM directory");
-    std::fs::write(dir.join(format!("{module}.beam")), &beam).expect("write BEAM file");
-    let result_path = dir.join("result.etf");
-    let eval = format!(
-        "ok = file:write_file(\"{}\", term_to_binary({module}:run())), halt().",
-        result_path.display()
-    );
-    let output = Command::new("timeout")
-        .args([
-            "30",
-            "erl",
-            "+D",
-            "-noshell",
-            "-pa",
-            dir.to_str().unwrap(),
-            "-eval",
-            &eval,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("run OTP debugger fixture");
-    let expected_bytes = std::fs::read(&result_path).unwrap_or_default();
-    std::fs::remove_dir_all(&dir).expect("remove temporary directory");
-    assert!(
-        output.status.success(),
-        "OTP debugger fixture failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let expected = arinsal_etf::decode(&expected_bytes).expect("decode OTP result");
+    reference
+        .load(module, &beam)
+        .expect("load OTP debugger fixture");
+    let expected = reference
+        .call_opts(
+            module,
+            "run",
+            &[],
+            &CallOptions {
+                timeout_ms: Some(30_000),
+                ..CallOptions::default()
+            },
+        )
+        .result;
+    let CallResult::Ok(expected) = expected else {
+        panic!("OTP debugger fixture failed: {expected:?}");
+    };
 
     let preloaded = reference
         .eval("element(2, code:get_object_code(erts_internal))")
@@ -349,7 +485,7 @@ fn assert_debugger_fixture_matches_otp(module: &str, source: &str) {
         .eval_scheduled(module, "run", &[], 8, None)
         .unwrap_or_else(|error| panic!("run debugger fixture: {error}"));
     let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
-    assert_eq!(expected, actual.term);
+    similar_asserts::assert_eq!(expected, actual.term);
 }
 
 /// Every line breakpoint of a function with more live X registers than the register cache
