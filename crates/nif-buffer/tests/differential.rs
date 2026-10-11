@@ -114,27 +114,6 @@ fn normalized(result: Result<O, BifError>) -> O {
     }
 }
 
-fn erlang_term(value: &O) -> String {
-    match value {
-        O::Int(n) => n.to_string(),
-        O::Binary(bytes) => format!(
-            "<<{}>>",
-            bytes
-                .iter()
-                .map(u8::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        O::Nil => "[]".into(),
-        O::List { elems, tail } if **tail == O::Nil => format!(
-            "[{}]",
-            elems.iter().map(erlang_term).collect::<Vec<_>>().join(",")
-        ),
-        O::Atom(value) => value.clone(),
-        other => panic!("unsupported generated test term: {other:?}"),
-    }
-}
-
 #[derive(Clone)]
 enum Action {
     Nif(&'static str, Vec<O>),
@@ -157,26 +136,15 @@ fn action_call(action: &Action, local_buffer: &O) -> Result<O, BifError> {
     }
 }
 
-fn action_expression(action: &Action, index: usize) -> String {
-    let call = match action {
-        Action::Nif(name, args) => {
-            let args = if args.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ",{}",
-                    args[1..]
-                        .iter()
-                        .map(erlang_term)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            };
-            format!("prim_buffer:{name}(B{args})")
-        }
-        Action::Read(name, size) => format!("prim_buffer:{name}(B,{size})"),
-    };
-    format!("(try {call} catch C{index}:R{index} -> {{exception,C{index},R{index}}} end)")
+fn reference_action(action: &Action) -> O {
+    match action {
+        Action::Nif(name, args) => O::Tuple(vec![
+            atom("nif"),
+            atom(name),
+            O::list(args.iter().skip(1).cloned().collect()),
+        ]),
+        Action::Read(name, size) => O::Tuple(vec![atom("read"), atom(name), O::Int(*size)]),
+    }
 }
 
 fn next(seed: &mut u64) -> u64 {
@@ -256,17 +224,34 @@ fn random_sequences_match_otp() {
         local_results.push(normalized(action_call(action, &local_buffer)));
     }
 
-    let expression = format!(
-        "B=prim_buffer:new(), [{}]",
-        actions
-            .iter()
-            .enumerate()
-            .map(|(index, action)| action_expression(action, index))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let remote_results = reference
-        .eval(&expression)
-        .expect("reference sequence eval");
-    assert_eq!(remote_results, O::list(local_results));
+    // Keep the generated workload in compiled Erlang code; one 3,000-form
+    // eval spends the reference worker's timeout scanning and parsing text.
+    let source = r#"
+-module(nif_buffer_sequence_probe).
+-export([run/1]).
+run(Actions) -> run(Actions, prim_buffer:new(), []).
+run([], _Buffer, Results) -> lists:reverse(Results);
+run([Action | Rest], Buffer, Results) ->
+    Result = try run_action(Action, Buffer)
+             catch Class:Reason -> {exception, Class, Reason}
+             end,
+    run(Rest, Buffer, [Result | Results]).
+run_action({nif, Name, Args}, Buffer) ->
+    apply(prim_buffer, Name, [Buffer | Args]);
+run_action({read, Name, Size}, Buffer) ->
+    apply(prim_buffer, Name, [Buffer, Size]).
+"#;
+    let beam = reference
+        .compile_named("nif_buffer_sequence_probe", source, &[])
+        .expect("compile reference sequence probe");
+    reference
+        .load("nif_buffer_sequence_probe", &beam)
+        .expect("load reference sequence probe");
+    let reference_actions = O::list(actions.iter().map(reference_action).collect());
+    let remote_results =
+        match reference.call("nif_buffer_sequence_probe", "run", &[reference_actions]) {
+            arinsal_difftest::CallResult::Ok(value) => value,
+            other => panic!("reference sequence call: {other:?}"),
+        };
+    similar_asserts::assert_eq!(remote_results, O::list(local_results));
 }

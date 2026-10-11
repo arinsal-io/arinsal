@@ -246,6 +246,7 @@ dependencies = [
  "arinsal-etf",
  "arinsal-term",
  "num-traits",
+ "similar-asserts",
 ]
 
 [[package]]

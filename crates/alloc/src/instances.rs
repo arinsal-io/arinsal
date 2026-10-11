@@ -333,6 +333,16 @@ impl ThreadSpecificAllocators {
         instance
     }
 
+    /// Current size of allocated blocks across this allocator's instances.
+    // Port of erts/emulator/beam/erl_alloc_util.c:5952 (erts_alcu_current_size), OTP-29.1.1.
+    pub(crate) fn current_blocks_size(&self) -> usize {
+        self.instances
+            .iter()
+            .enumerate()
+            .map(|(instance, _)| self.lock_instance(instance).allocator.stats().blocks_size)
+            .sum()
+    }
+
     /// Returns allocator information with the shared `{mbcs_pool, ...}` section.
     pub fn info(&self, instance: usize) -> AllocatorInfo {
         let mut info = self.lock_instance(instance).allocator.info();
