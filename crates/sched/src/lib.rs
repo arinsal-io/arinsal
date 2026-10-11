@@ -6017,6 +6017,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         .set(thread::current())
         .expect("worker registers once");
     NORMAL_SCHEDULER_ID.with(|current| current.set(Some(id)));
+    arinsal_term::set_reader_group(id);
     // Port of erts/emulator/beam/erl_process.c:8861 (sched_thread_func registers the
     // scheduler as a managed thread), OTP-29.1.1.
     let managed_thread = thr_progress::register_managed_thread(&inner.progress, id);

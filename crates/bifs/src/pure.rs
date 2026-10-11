@@ -6,9 +6,9 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
-    BinaryRef, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder,
-    TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size, global_atoms, loose_eq, phash,
-    phash2, phash2_range,
+    AtomEncoding, AtomError, BinaryRef, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef,
+    Node, Term, TermBuilder, TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size,
+    global_atoms, loose_eq, phash, phash2, phash2_range,
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -706,34 +706,101 @@ fn atom_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         Term::NIL,
     ))
 }
-fn charlist(term: Term) -> Result<String, BifError> {
-    let mut out = String::new();
-    for item in list(term)? {
-        let point = item
-            .as_small()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or(BADARG)?;
-        out.push(char::from_u32(point).ok_or(BADARG)?);
-    }
-    Ok(out)
-}
-fn intern(text: &str, existing: bool) -> Result<Term, BifError> {
-    let table = global_atoms();
-    let atom = if existing {
-        table.get(text).ok_or(BADARG)?
-    } else {
-        table.intern(text).map_err(|error| match error {
-            arinsal_term::AtomError::TooLong => BifError::SystemLimit,
-            arinsal_term::AtomError::SystemLimit => BifError::SystemLimit,
-        })?
-    };
+fn list_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of bif.c:3217 (list_to_atom_1) and utils.c:2862 (erts_unicode_list_to_buf),
+    // OTP-29.1.1. The bytes land in a fixed buffer, then erts_atom_put.
+    let mut buf = [0u8; MAX_ATOM_SZ_LIMIT];
+    let written = unicode_list_to_buf(args[0], &mut buf)?;
+    let atom = global_atoms()
+        .put(&buf[..written], AtomEncoding::Utf8, true)
+        .map_err(|error| match error {
+            AtomError::TooLong | AtomError::SystemLimit => BifError::SystemLimit,
+            AtomError::BadEncoding => BADARG,
+        })?;
     Ok(Term::atom(atom))
 }
-fn list_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    intern(&charlist(args[0])?, false)
-}
 fn list_to_existing_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    intern(&charlist(args[0])?, true)
+    // Port of bif.c:3239. Every conversion failure, including a too-long list, is badarg.
+    let mut buf = [0u8; MAX_ATOM_SZ_LIMIT];
+    let Ok(written) = unicode_list_to_buf(args[0], &mut buf) else {
+        return Err(BADARG);
+    };
+    let atom = global_atoms()
+        .existing(&buf[..written], AtomEncoding::Utf8)
+        .ok_or(BADARG)?;
+    Ok(Term::atom(atom))
+}
+
+const MAX_ATOM_CHARACTERS: usize = 255;
+const MAX_ATOM_SZ_LIMIT: usize = 4 * MAX_ATOM_CHARACTERS;
+
+/// Fill `buf` with the UTF-8 of a unicode list.
+///
+/// Port of utils.c:2862. `Ok` is 0, [`BifError::SystemLimit`] is -2, [`BADARG`] is -1.
+fn unicode_list_to_buf(list: Term, buf: &mut [u8]) -> Result<usize, BifError> {
+    let mut written = 0usize;
+    let mut chars = 0usize;
+    let mut too_long = false;
+    let walk = for_each_cons(list, |head| {
+        if chars >= MAX_ATOM_CHARACTERS {
+            too_long = true;
+            return Err(BADARG);
+        }
+        let Some(value) = head.as_small() else {
+            return Err(BADARG);
+        };
+        let Ok(val) = u32::try_from(value) else {
+            return Err(BADARG);
+        };
+        let width = if val < 0x80 {
+            1
+        } else if val < 0x800 {
+            2
+        } else if val < 0x1_0000 {
+            if (0xD800..=0xDFFF).contains(&val) {
+                return Err(BADARG);
+            }
+            3
+        } else if val < 0x11_0000 {
+            4
+        } else {
+            return Err(BADARG);
+        };
+        if written + width > buf.len() {
+            too_long = true;
+            return Err(BADARG);
+        }
+        encode_utf8(&mut buf[written..], val, width);
+        written += width;
+        chars += 1;
+        Ok(())
+    });
+    match walk {
+        Ok(()) => Ok(written),
+        Err(_) if too_long => Err(BifError::SystemLimit),
+        Err(error) => Err(error),
+    }
+}
+
+fn encode_utf8(buf: &mut [u8], val: u32, width: usize) {
+    match width {
+        1 => buf[0] = val as u8,
+        2 => {
+            buf[0] = 0xC0 | (val >> 6) as u8;
+            buf[1] = 0x80 | (val & 0x3F) as u8;
+        }
+        3 => {
+            buf[0] = 0xE0 | (val >> 12) as u8;
+            buf[1] = 0x80 | ((val >> 6) & 0x3F) as u8;
+            buf[2] = 0x80 | (val & 0x3F) as u8;
+        }
+        _ => {
+            buf[0] = 0xF0 | (val >> 18) as u8;
+            buf[1] = 0x80 | ((val >> 12) & 0x3F) as u8;
+            buf[2] = 0x80 | ((val >> 6) & 0x3F) as u8;
+            buf[3] = 0x80 | (val & 0x3F) as u8;
+        }
+    }
 }
 fn encoding(term: Term) -> Result<&'static str, BifError> {
     match atom_name(term) {
@@ -743,17 +810,24 @@ fn encoding(term: Term) -> Result<&'static str, BifError> {
     }
 }
 fn atom_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let text = atom_name(args[0]).ok_or(BADARG)?;
-    let bytes = match encoding(args[1])? {
-        "utf8" => text.as_bytes().to_vec(),
-        _ => text
-            .chars()
-            .map(|c| u8::try_from(c as u32).map_err(|_| BADARG))
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .binary(&bytes)
-        .expect("infallible BIF heap"))
+    let atom = args[0].as_atom().ok_or(BADARG)?;
+    let table = global_atoms();
+    match encoding(args[1])? {
+        // Port of erl_unicode.c:1954: utf8 returns Atom.u.bin, the literal.
+        "utf8" => table.utf8_literal(atom).ok_or(BADARG),
+        // Port of erl_unicode.c:1938. Latin-1 that is already the stored bytes
+        // returns the same literal; anything else is a fresh binary.
+        _ => match table.latin1_is_stored(atom) {
+            None => Err(BADARG),
+            Some(true) => table.utf8_literal(atom).ok_or(BADARG),
+            Some(false) => {
+                let bytes = table.latin1_bytes(atom).ok_or(BADARG)?;
+                Ok(TermBuilder::new(&mut Heap(ctx.heap))
+                    .binary(&bytes)
+                    .expect("infallible BIF heap"))
+            }
+        },
+    }
 }
 /// Copy a byte-aligned binary's significant bytes for a VM continuation.
 pub fn binary_bytes(term: Term) -> Result<Vec<u8>, BifError> {
@@ -819,24 +893,25 @@ pub fn with_binary_bytes<R>(term: Term, f: impl FnOnce(BinaryRef<'_>) -> R) -> R
     Ok(f(view))
 }
 fn binary_to_atom_inner(args: &[Term], existing: bool) -> Result<Term, BifError> {
-    let encoding = encoding(args[1])?;
+    let encoding = match encoding(args[1])? {
+        "utf8" => AtomEncoding::Utf8,
+        _ => AtomEncoding::Latin1,
+    };
     binary_bifs::with_binary_input(args[0], |bytes| {
-        let text = match encoding {
-            "utf8" => match std::str::from_utf8(bytes) {
-                Ok(text) => text.to_owned(),
-                Err(error) => {
-                    // erts_atom_put reports the character limit before a later malformed byte.
-                    if std::str::from_utf8(&bytes[..error.valid_up_to()])
-                        .is_ok_and(|prefix| prefix.chars().count() > 255)
-                    {
-                        return Err(BifError::SystemLimit);
-                    }
-                    return Err(BADARG);
-                }
-            },
-            _ => bytes.iter().copied().map(char::from).collect(),
+        // Port of erl_unicode.c:1963 (binary_to_atom), OTP-29.1.1.
+        let table = global_atoms();
+        let atom = if existing {
+            table.existing(bytes, encoding).ok_or(BADARG)?
+        } else {
+            table
+                .put(bytes, encoding, false)
+                .map_err(|error| match error {
+                    AtomError::TooLong => BifError::SystemLimit,
+                    AtomError::SystemLimit => BifError::SystemLimit,
+                    AtomError::BadEncoding => BADARG,
+                })?
         };
-        intern(&text, existing)
+        Ok(Term::atom(atom))
     })
 }
 fn binary_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {

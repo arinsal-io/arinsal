@@ -18,12 +18,16 @@ pub mod ptab;
 mod record;
 mod record_table;
 mod region;
+mod rwmutex;
 pub mod validate;
 mod views;
 
 mod native_code;
 
-pub use atom::{Atom, AtomError, AtomTable, atoms, global_atoms};
+pub use atom::{
+    Atom, AtomEncoding, AtomError, AtomTable, DEFAULT_ATOM_TABLE_LIMIT, HashInfo, IndexInfo, atoms,
+    global_atoms, set_atom_table_limit,
+};
 pub use bits::{
     ExternalBinary, RefcBinary, SUB_BITS_MUTABLE, SUB_BITS_VOLATILE, WritableBinary,
     binary_memory_bytes, binary_offset_adjustment, erts_bs_private_append_checked,
@@ -80,6 +84,7 @@ pub use region::{
     BuiltList, DEFAULT_REGION_LIST_CONS, GrowingList, RegionBuilder, RegionRoots,
     SEND_COPY_LIMIT_WORDS, SharedRoot, is_region_term, region_owner, seal_for_send,
 };
+pub use rwmutex::{FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, set_reader_group};
 pub use views::{BigRef, FlatMapRef, FloatRef, ListIter};
 
 use std::fmt;

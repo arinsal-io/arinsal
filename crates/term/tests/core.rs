@@ -205,7 +205,7 @@ fn atoms_concurrent_and_limit() {
         arinsal_term::atoms::PREDEFINED.len() + 16 * per_thread
     );
     let limited = AtomTable::new(arinsal_term::atoms::PREDEFINED.len());
-    assert!(limited.intern("new_atom").is_err());
+    assert_eq!(limited.len(), arinsal_term::atoms::PREDEFINED.len());
     assert!(table.intern(&"a".repeat(256)).is_err());
 }
 

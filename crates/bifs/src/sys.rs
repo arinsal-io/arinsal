@@ -90,7 +90,7 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             ctx,
             u64::from(arinsal_term::ptab::process_table_layout().max()),
         ),
-        "atom_limit" => integer(ctx, 1_048_576),
+        "atom_limit" => integer(ctx, global_atoms().limit() as u64),
         "port_limit" => integer(
             ctx,
             u64::from(arinsal_term::ptab::port_table_layout().max()),
