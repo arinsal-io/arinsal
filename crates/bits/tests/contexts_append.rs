@@ -4,7 +4,7 @@ use arinsal_bits::{
 };
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{
-    Term, TermBuilder, VecHeap, binary_offset_adjustment, copy_term, is_match_context,
+    ProcessHeap, Term, TermBuilder, VecHeap, binary_offset_adjustment, copy_term, is_match_context,
     is_writable_binary, sub_bits_flags, to_owned, writable_capacity, writable_gc_visit,
 };
 
@@ -73,6 +73,24 @@ fn private_byte_append_reuses_writer_without_heap_words() {
     assert_eq!(bytes[0], 0);
     assert_eq!(bytes[255], 255);
     assert_eq!(bytes[256], 0);
+}
+
+#[test]
+fn private_append_fallback_uses_a_fragment_and_apparent_vheap_size() {
+    let mut heap = ProcessHeap::with_words(128);
+    let empty = TermBuilder::new(&mut heap).bitstring(&[], 0).unwrap();
+    let mut binary = private_append(empty, &[1], 8, &mut heap).unwrap();
+
+    assert_eq!(heap.fragment_count(), 1);
+    assert_eq!(heap.fragment_words(), 8);
+    assert_eq!(heap.bin_vheap_used(), 0);
+
+    for value in 2..=8 {
+        binary = private_append(binary, &[value], 8, &mut heap).unwrap();
+    }
+
+    assert_eq!(heap.bin_vheap_used(), 1);
+    assert!(writable_capacity(binary).unwrap() > 8);
 }
 
 #[test]

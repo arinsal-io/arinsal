@@ -1111,9 +1111,16 @@ impl Process {
             return Err(VmError::Unsupported("live X register count".into()));
         }
         self.gc_live = live;
-        let words = words + self.heap.allocation_reserve();
+        let allocation_words = words
+            + if self.heap.native_active() {
+                arinsal_term::S_RESERVED
+            } else {
+                0
+            };
         // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
-        if self.heap.free_words() >= words && !self.heap.bin_vheap_gc_due() && !gc_stress_enabled()
+        if self.heap.free_words() >= allocation_words
+            && !self.heap.bin_vheap_gc_due()
+            && !gc_stress_enabled()
         {
             return Ok(());
         }
@@ -1122,7 +1129,14 @@ impl Process {
                 arinsal_term::atoms::SYSTEM_LIMIT,
             ))));
         }
+        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:94-99, OTP-29.1.1:
+        // the native heap check uses S_RESERVED, but GC receives the raw `need`.
         let gc = self.collect_heap_roots(live, &mut [], words)?;
+        // Port of erl_gc.c:501-513 (`delay_garbage_collection`): a zero-need
+        // delayed collection forces rescheduling without manufacturing heap space.
+        if words == 0 && gc.collections == 0 {
+            return Ok(());
+        }
         // Port of erts/emulator/beam/erl_gc.c:2639 (setup_rootset nobj), OTP-29.1.1.
         // The collector rewrites only the live prefix. Nilling the rest is an
         // extra guard for a later scan that roots a wider prefix than this one.
@@ -1130,7 +1144,7 @@ impl Process {
             self.x[live..].fill(Term::NIL);
         }
         natives::sys::after_collection(self, live, gc.collections, gc.words_reclaimed);
-        if self.heap.free_words() < words {
+        if self.heap.free_words() < allocation_words {
             return Err(VmError::Unsupported("heap exhausted after GC".into()));
         }
         Ok(())

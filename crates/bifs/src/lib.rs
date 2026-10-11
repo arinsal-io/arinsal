@@ -149,11 +149,12 @@ pub struct FragmentingHeap<'a>(pub &'a mut ProcessHeap);
 impl HeapAlloc for FragmentingHeap<'_> {
     #[inline]
     fn words_left(&self) -> Option<usize> {
-        self.0.alloc_words_left()
+        self.0.halloc_words_left()
     }
     #[inline]
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
-        match HeapAlloc::alloc(self.0, words) {
+        // Port of erts/emulator/beam/erl_vm.h:150-162 (HAllocX), OTP-29.1.1.
+        match self.0.alloc_halloc(words) {
             Some(ptr) => Some(ptr),
             None => Some(self.0.heap_fragment(words)),
         }
@@ -164,6 +165,9 @@ impl HeapAlloc for FragmentingHeap<'_> {
             Some(ptr) => Some(ptr),
             None => Some(self.0.heap_fragment_with_extra(words, extra)),
         }
+    }
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        HeapAlloc::alloc_fragment_only(self.0, words)
     }
     fn release(&mut self, end: *mut u64, start: *mut u64) {
         self.0.release(end, start)
@@ -176,6 +180,21 @@ impl HeapAlloc for FragmentingHeap<'_> {
         binary: Arc<arinsal_term::WritableBinary>,
     ) -> Result<(), arinsal_term::TermError> {
         self.0.retain_writable_binary(binary)
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<arinsal_term::WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), arinsal_term::TermError> {
+        HeapAlloc::retain_writable_binary_with_apparent_size(self.0, binary, apparent_size_bits)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: arinsal_term::Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        HeapAlloc::update_writable_binary_overhead(self.0, source, old_size_bits, new_size_bits)
     }
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()

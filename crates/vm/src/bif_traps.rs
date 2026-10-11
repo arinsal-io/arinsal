@@ -961,6 +961,7 @@ fn call_args(process: &Process, saved: &[Term; 3], arity: usize, resumed: bool) 
     }
 }
 
+// Port of erts/emulator/beam/bif.h:71-78 (BUMP_REDS), OTP-29.1.1.
 fn charge(
     process: &mut Process,
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
@@ -969,12 +970,10 @@ fn charge(
     let charge = reductions.max(1);
     process.reductions = process
         .reductions
-        .saturating_sub(charge.min(i32::MAX as u32) as i32);
+        .saturating_sub(charge.min(i32::MAX as u32) as i32)
+        .max(0);
     if let Some(run) = ctx {
         let _ = run.consume(charge);
-    }
-    if process.reductions <= 0 {
-        process.reductions = 4000;
     }
 }
 

@@ -241,6 +241,12 @@ pub trait HeapAlloc {
     fn alloc_with_extra(&mut self, words: usize, _extra: usize) -> Option<*mut u64> {
         self.alloc(words)
     }
+    /// Allocate words in a heap fragment without first trying the young heap.
+    ///
+    /// Port of `HeapFragOnlyAlloc` in erts/emulator/beam/erl_vm.h:219-224, OTP-29.1.1.
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        self.alloc(words)
+    }
     /// Young-heap words [`alloc`](Self::alloc) can still return.
     ///
     /// `None` when this allocator does not expose a young-heap limit (a heap
@@ -254,6 +260,22 @@ pub trait HeapAlloc {
     /// Retain a growable off-heap binary until collection examines its BinRef.
     fn retain_writable_binary(&mut self, _binary: Arc<WritableBinary>) -> Result<(), TermError> {
         Err(TermError::Unsupported("writable binary heap owner"))
+    }
+    /// Retain a writable binary using erts' apparent size, in bits, for pre-GC overhead.
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<WritableBinary>,
+        _apparent_size_bits: usize,
+    ) -> Result<(), TermError> {
+        self.retain_writable_binary(binary)
+    }
+    /// Add the overhead change performed by `update_wb_overhead` before a writable append.
+    fn update_writable_binary_overhead(
+        &mut self,
+        _source: Term,
+        _old_size_bits: usize,
+        _new_size_bits: usize,
+    ) {
     }
     /// Whether this heap can retain a writable owner without losing it at GC.
     fn supports_writable_binary(&self) -> bool {
@@ -539,8 +561,28 @@ impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapReservation<'_, H> {
             self.heap.alloc_with_extra(words, extra_words)
         }
     }
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        self.heap.alloc_fragment_only(words)
+    }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         self.heap.retain_binary(binary)
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), TermError> {
+        self.heap
+            .retain_writable_binary_with_apparent_size(binary, apparent_size_bits)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.heap
+            .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
     }
     fn retain_node(&mut self, node: Arc<Node>) {
         self.heap.retain_node(node)
@@ -783,8 +825,7 @@ impl ProcessHeap {
             Some(self.words_left())
         }
     }
-    /// erts `HeapWordsLeft`: words the young heap can still hand out before the limit
-    /// that [`HeapAlloc::alloc`] enforces.
+    /// erts `HeapWordsLeft`: words a normal heap allocation can hand out.
     // Port of erts/emulator/beam/erl_vm.h:175 (HeapWordsLeft), OTP-29.1.1.
     pub fn words_left(&self) -> usize {
         let limit = if self.native_allocation {
@@ -798,17 +839,39 @@ impl ProcessHeap {
     pub fn free_words(&self) -> usize {
         self.stop - self.htop
     }
-    /// Young heap allocation boundary, leaving the native stack redzone unused.
+    /// Runtime heap allocation boundary, leaving the stack redzone unused.
     // Port of erts/emulator/beam/erl_process.h:990-998, OTP-29.1.1.
     pub fn heap_limit_words(&self) -> usize {
         self.htop.max(self.stop.saturating_sub(crate::S_REDZONE))
+    }
+    /// Young-heap words available to `HAlloc` before it uses a fragment.
+    // Port of erts/emulator/beam/erl_vm.h:150-175 (HAllocX/HeapWordsLeft), OTP-29.1.1.
+    pub fn halloc_words_left(&self) -> Option<usize> {
+        (!self.detached).then(|| self.heap_limit_words().saturating_sub(self.htop))
+    }
+    /// Allocate on the young heap only when `HAlloc` stays below `HEAP_LIMIT`.
+    // Port of erts/emulator/beam/erl_vm.h:150-162 (HAllocX), OTP-29.1.1.
+    pub fn alloc_halloc(&mut self, words: usize) -> Option<*mut u64> {
+        if self.detached {
+            return self.owners.detached.as_deref_mut()?.alloc(words);
+        }
+        if words > self.heap_limit_words().saturating_sub(self.htop) {
+            return None;
+        }
+        let ptr = self
+            .words
+            .as_ptr()
+            .wrapping_add(self.htop)
+            .cast::<u64>()
+            .cast_mut();
+        self.htop += words;
+        Some(ptr)
     }
     /// Whether generated code is running on this heap (set by the native bridge).
     pub fn native_active(&self) -> bool {
         self.native_allocation
     }
-    /// Words an allocation must leave free below the stack: the native redzone while
-    /// generated code is active, none otherwise.
+    /// Words a normal allocation must leave free below the stack.
     pub fn allocation_reserve(&self) -> usize {
         if self.native_allocation {
             crate::S_REDZONE
@@ -816,7 +879,7 @@ impl ProcessHeap {
             0
         }
     }
-    /// Select the runtime heap limit while generated Erlang code is active.
+    /// Record whether generated Erlang code is active on this heap.
     pub fn set_native_allocation(&mut self, active: bool) {
         self.native_allocation = active;
     }
@@ -969,7 +1032,8 @@ impl ProcessHeap {
             *used += words;
             return memory.as_mut_slice()[at..].as_mut_ptr();
         }
-        let mut memory = zeroed_block(words.saturating_add(extra), ErtsAlcType::HEAP_FRAG);
+        let block_words = words.checked_add(extra).unwrap_or(words);
+        let mut memory = zeroed_block(block_words, ErtsAlcType::HEAP_FRAG);
         let ptr = memory.as_mut_ptr();
         self.fragments.push(Fragment::Block {
             memory,
@@ -1144,7 +1208,8 @@ impl HeapAlloc for ProcessHeap {
     fn words_left(&self) -> Option<usize> {
         self.alloc_words_left()
     }
-    // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease) and erl_process.h:1586-1598
+    // (erts_heap_frag_shrink), OTP-29.1.1.
     fn release(&mut self, end: *mut u64, start: *mut u64) {
         if self.detached {
             if let Some(heap) = self.owners.detached.as_deref_mut() {
@@ -1159,17 +1224,21 @@ impl HeapAlloc for ProcessHeap {
             self.htop = (address - base) / 8;
             return;
         }
-        if let Some(Fragment::Block { memory, used }) = self.fragments.last_mut() {
-            let fragment_base = memory.as_mut_ptr() as usize;
-            let fragment_end = fragment_base + *used * 8;
-            if end as usize == fragment_end && address >= fragment_base && address <= fragment_end {
-                let new_used = (address - fragment_base) / 8;
-                let released = *used - new_used;
-                *used = new_used;
-                self.fragment_words = self
-                    .fragment_words
-                    .saturating_sub(u32::try_from(released).unwrap_or(u32::MAX));
-            }
+        let Some(Fragment::Block { memory, used }) = self.fragments.last_mut() else {
+            return;
+        };
+        let fragment_start = memory.as_ptr() as usize;
+        let fragment_end = fragment_start.saturating_add(used.saturating_mul(8));
+        if address >= fragment_start
+            && address <= fragment_end
+            && end as usize == fragment_end
+            && (address - fragment_start).is_multiple_of(8)
+        {
+            let new_used = (address - fragment_start) / 8;
+            self.fragment_words = self
+                .fragment_words
+                .saturating_sub(u32::try_from(*used - new_used).unwrap_or(u32::MAX));
+            *used = new_used;
         }
     }
     #[inline]
@@ -1190,6 +1259,10 @@ impl HeapAlloc for ProcessHeap {
         let ptr = unsafe { self.words.as_ptr().add(self.htop).cast::<u64>().cast_mut() };
         self.htop += words;
         Some(ptr)
+    }
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        // HeapFragOnlyAlloc reserves 512 extra words outside Valgrind builds.
+        Some(self.heap_fragment_with_extra(words, 512))
     }
     fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
         if self.detached
@@ -1212,6 +1285,44 @@ impl HeapAlloc for ProcessHeap {
             .saturating_add((binary.capacity() / 8) as u64);
         self.owners.writable.push(binary);
         Ok(())
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), TermError> {
+        if self.detached
+            && let Some(heap) = self.owners.detached.as_deref_mut()
+        {
+            return heap.retain_writable_binary_with_apparent_size(binary, apparent_size_bits);
+        }
+        // Port of erl_bits.c:1691 (`build_writable_bitstring`), OTP-29.1.1.
+        self.bin_vheap = self
+            .bin_vheap
+            .saturating_add((apparent_size_bits.div_ceil(8) / 8) as u64);
+        self.owners.writable.push(binary);
+        Ok(())
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        if self.detached {
+            if let Some(heap) = self.owners.detached.as_deref_mut() {
+                heap.update_writable_binary_overhead(source, old_size_bits, new_size_bits);
+            }
+            return;
+        }
+        // Port of erl_bits.c:1660-1670 (`update_wb_overhead`), OTP-29.1.1.
+        let overhead = |bits: usize| (bits.div_ceil(8) / 8) as u64;
+        let increase = overhead(new_size_bits).saturating_sub(overhead(old_size_bits));
+        let old_start = self.old_words.as_ptr() as usize;
+        let old_end = old_start.saturating_add(self.old_htop.saturating_mul(8));
+        let old_generation = crate::bits::writable_bin_ref_address(source)
+            .is_some_and(|address| address >= old_start && address < old_end);
+        self.add_vheap(old_generation, increase);
     }
     fn supports_writable_binary(&self) -> bool {
         true

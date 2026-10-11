@@ -34,9 +34,8 @@ const RESERVED_WORDS: u32 = arinsal_term::S_RESERVED as u32;
 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:137-149 and erl_vm.h:120, OTP-29.1.1.
 const MAX_LIVE_X_REGS: u32 = 1027;
 
-/// GC callback used by emitted heap checks. It receives the minimum free-word
-/// gap checked by the emitter, including the stack/heap reserve, and the live
-/// X register count.
+/// GC callback used by emitted heap checks. It receives the raw allocation
+/// need and the live X register count; the reserve belongs to the heap check.
 pub type GcHook =
     unsafe extern "C" fn(*mut ProcessHeader, *mut SchedulerRegisters, usize, usize, i32) -> i32;
 
@@ -490,9 +489,9 @@ impl BeamModuleAssembler {
             e.str_uoff(Gpr::x(30), C_P, 72)?;
             e.mov_reg(Gpr::x(0), C_P)?;
             e.mov_reg(Gpr::x(1), SCHEDULER_REGS)?;
-            // The slow path must see the same minimum as the fast-path check;
-            // otherwise ensure() can skip collection while E is inside the reserve.
-            e.mov_const(Gpr::x(2), need as u64)?;
+            // `test_heap` checks with S_RESERVED but GC receives the raw need;
+            // `ensure()` reapplies the reserve only to its heap-space check.
+            e.mov_const(Gpr::x(2), requested_words as u64)?;
             e.mov_const(Gpr::x(3), live as u64)?;
             e.mov_reg(Gpr::w(4), FCALLS)?;
             e.mov_const(Gpr::x(17), hook as usize as u64)?;

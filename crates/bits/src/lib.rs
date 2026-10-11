@@ -643,6 +643,7 @@ fn fresh_append<H: HeapAlloc>(
     total_bits: usize,
     heap: &mut H,
     index: usize,
+    private: bool,
 ) -> Result<Term, BitsError> {
     // Port of erts/emulator/beam/erl_bits.c:1812 (copy-on-write append), OTP-29.1.1.
     writable_finalize(source);
@@ -651,9 +652,14 @@ fn fresh_append<H: HeapAlloc>(
         copy_bits(&mut bytes, 0, payload, start, prefix_bits);
     })
     .ok_or(BitsError::BadArg { segment: index })?;
-    TermBuilder::new(heap)
-        .writable_binary(&bytes, total_bits, total_bits.div_ceil(8).max(256))
-        .map_err(|e| term_error(e, index, 8))
+    let capacity = total_bits.div_ceil(8).max(256);
+    let mut builder = TermBuilder::new(heap);
+    let result = if private {
+        builder.writable_binary_in_fragment(&bytes, total_bits, capacity, total_bits)
+    } else {
+        builder.writable_binary_with_apparent_size(&bytes, total_bits, capacity, total_bits)
+    };
+    result.map_err(|e| term_error(e, index, 8))
 }
 
 fn write_segments(
@@ -736,9 +742,25 @@ fn write_segments(
 
 /// Build `bs_init_writable`'s empty binary with OTP's default capacity.
 pub fn init_writable<H: HeapAlloc>(heap: &mut H) -> Result<Term, BitsError> {
-    // Port of erts/emulator/beam/erl_bits.c:2002 (erts_bs_init_writable), OTP-29.1.1.
+    init_writable_with_size(None, heap)
+}
+
+/// Build `bs_init_writable`'s empty binary using its optional byte capacity.
+// Port of erts/emulator/beam/erl_bits.c:2021-2046 (`erts_bs_init_writable`), OTP-29.1.1.
+pub fn init_writable_with_size<H: HeapAlloc>(
+    size: Option<i64>,
+    heap: &mut H,
+) -> Result<Term, BitsError> {
+    let capacity = size
+        .filter(|size| *size >= 0)
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(1024);
+    let apparent_size_bits = capacity
+        .checked_mul(8)
+        .filter(|size| *size <= isize::MAX as usize)
+        .ok_or(BitsError::SystemLimit { segment: 0 })?;
     TermBuilder::new(heap)
-        .writable_binary(&[], 0, 1024)
+        .writable_binary_with_apparent_size(&[], 0, capacity, apparent_size_bits)
         .map_err(|e| term_error(e, 0, 8))
 }
 
@@ -795,6 +817,7 @@ fn append_inner<H: HeapAlloc>(
     }
     let output =
         if private && writable_extend_private(source, total).map_err(|e| term_error(e, 1, 8))? {
+            heap.update_writable_binary_overhead(source, prefix, total);
             source
         } else if !private {
             match TermBuilder::new(heap)
@@ -802,10 +825,10 @@ fn append_inner<H: HeapAlloc>(
                 .map_err(|e| term_error(e, 1, 5))?
             {
                 Some(next) => next,
-                None => fresh_append(source, prefix, total, heap, 1)?,
+                None => fresh_append(source, prefix, total, heap, 1, false)?,
             }
         } else {
-            fresh_append(source, prefix, total, heap, 1)?
+            fresh_append(source, prefix, total, heap, 1, true)?
         };
     // SAFETY: output is the active unique writer and no source view is live.
     let bytes = unsafe { writable_bytes_mut(output) }.ok_or(BitsError::BadArg { segment: 1 })?;

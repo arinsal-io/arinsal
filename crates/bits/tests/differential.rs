@@ -495,9 +495,21 @@ fn unsigned_widths_bignums_and_errors() {
                 value: SegmentValue::Term(Term::small(value).unwrap()),
                 size: SegSize::Units(0),
             };
+            // Port of erts/emulator/beam/emu/bs_instrs.tab:716-725 (BS_FAIL_INFO), OTP-29.1.1.
             assert_eq!(
                 create_bin_size(&[segment]),
-                Err(arinsal_bits::BitsError::BadArg { segment: 7 })
+                Err(arinsal_bits::BitsError::Detailed {
+                    segment: 7,
+                    reason: "badarg",
+                    ty: match ty {
+                        SegType::Utf8 => "utf8",
+                        SegType::Utf16 => "utf16",
+                        SegType::Utf32 => "utf32",
+                        _ => unreachable!(),
+                    },
+                    field: "type",
+                    value: Term::small(value).unwrap(),
+                })
             );
         }
     }
@@ -509,9 +521,16 @@ fn unsigned_widths_bignums_and_errors() {
         value: SegmentValue::Term(Term::small(1).unwrap()),
         size: SegSize::Term(Term::small(-1).unwrap()),
     };
+    // Port of erts/emulator/beam/emu/bs_instrs.tab:424-440 (BS_FAIL_INFO), OTP-29.1.1.
     assert_eq!(
         create_bin_size(&[bad_size]),
-        Err(arinsal_bits::BitsError::BadArg { segment: 9 })
+        Err(arinsal_bits::BitsError::Detailed {
+            segment: 9,
+            reason: "badarg",
+            ty: "integer",
+            field: "size",
+            value: Term::small(-1).unwrap(),
+        })
     );
     let large_size = Segment {
         size: SegSize::Term(big),
@@ -519,7 +538,13 @@ fn unsigned_widths_bignums_and_errors() {
     };
     assert_eq!(
         create_bin_size(&[large_size]),
-        Err(arinsal_bits::BitsError::SystemLimit { segment: 9 })
+        Err(arinsal_bits::BitsError::Detailed {
+            segment: 9,
+            reason: "system_limit",
+            ty: "integer",
+            field: "size",
+            value: big,
+        })
     );
 }
 
