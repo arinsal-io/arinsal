@@ -23,10 +23,11 @@ pub struct DispatchFragments {
     memory: CodeMemory,
     export_offset: usize,
     light_bif_offset: usize,
-    /// Helper-ABI fragment for call and line breakpoints. `call_light_bif_shared` is not
-    /// their entry: erts calls `erts_generic_breakpoint` and the line-breakpoint helpers
-    /// from the trampolines themselves.
+    /// Helper-ABI fragment for call breakpoints. `call_light_bif_shared` is not its entry:
+    /// erts calls `erts_generic_breakpoint` from the trampoline itself.
     breakpoint_offset: usize,
+    line_breakpoint_offset: usize,
+    line_breakpoint_cleanup_offset: usize,
     send_offset: usize,
     call_fun_unported_offset: usize,
     apply_fixed_offset: usize,
@@ -42,7 +43,7 @@ pub struct DispatchFragments {
 }
 
 /// C functions called by the comparison fragments (`eq`, `erts_cmp_atoms`, `erts_cmp_compound`).
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CompareHelpers {
     /// `eq(Eterm, Eterm) -> int`. Non-zero means equal.
     pub eq: usize,
@@ -50,6 +51,38 @@ pub struct CompareHelpers {
     pub cmp_atoms: usize,
     /// `erts_cmp_compound(Eterm, Eterm, int, int) -> Sint`.
     pub cmp_compound: usize,
+}
+
+/// Runtime helpers used by the shared native line-breakpoint fragment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LineBreakpointHelpers {
+    /// Performs the heap check used before spilling live X registers.
+    pub garbage_collect: usize,
+    /// Resolves the current source location and returns `erts_internal:breakpoint/4`.
+    pub prepare_call: usize,
+    /// Restores the live X register prefix from the Erlang stack.
+    pub cleanup: usize,
+}
+
+/// Runtime callbacks used by the shared export and instrumentation fragments.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DispatchRuntimeHelpers {
+    /// Shared export-entry trampoline helper.
+    pub export: usize,
+    /// Shared light-BIF helper.
+    pub light_bif: usize,
+    /// Shared exception resolver.
+    pub exception_resolver: usize,
+    /// Process-saving-calls export helper.
+    pub save_calls_export: usize,
+    /// Unloaded-fun resolver.
+    pub unloaded_fun: usize,
+    /// Process-saving-calls fun helper.
+    pub save_calls_fun: usize,
+    /// Comparison-BIF helpers.
+    pub compare: CompareHelpers,
+    /// Native line-breakpoint helpers.
+    pub line_breakpoint: LineBreakpointHelpers,
 }
 
 /// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
@@ -65,25 +98,24 @@ pub const SEND_DISPATCH_IDENTITY: usize = usize::MAX - 0xF1;
 /// Identity sent through the light-BIF fragment to hand a native entry breakpoint to the
 /// executor, which owns the VM and run context that tracer modules and meta tracing need.
 pub const BREAKPOINT_DISPATCH_IDENTITY: usize = usize::MAX - 0xF5;
+
 /// Top byte of the identity a native line-breakpoint site sends through the light-BIF
 /// fragment; bits 32..48 hold the live X register count and bits 0..32 the source line.
 const LINE_BREAKPOINT_TAG: usize = 0xF8 << 56;
 
 /// Identity of an enabled `i_line_breakpoint_trampoline` hit at `line` with `live` X registers.
-// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:257-350, OTP-29.1.1: erts passes
-// the live count in a register and recovers the line from the pc; here both ride in the
-// trap identity so the executor needs no per-site table.
 pub const fn line_breakpoint_identity(line: u32, live: u16) -> usize {
     LINE_BREAKPOINT_TAG | (live as usize) << 32 | line as usize
 }
 
-/// Decodes [`line_breakpoint_identity`] into `(line, live)`.
+/// Decodes a legacy executor line-breakpoint identity into `(line, live)`.
 pub const fn decode_line_breakpoint_identity(identity: usize) -> Option<(u32, u16)> {
     if identity >> 56 != 0xF8 {
         return None;
     }
     Some((identity as u32, (identity >> 32) as u16))
 }
+
 /// `target_pc` of the exit a traced native return takes so the executor can emit its
 /// `return_to` event; `resume_pc` is the caller continuation.
 pub const RETURN_TO_DISPATCH_IDENTITY: usize = usize::MAX - 0xF6;
@@ -148,10 +180,37 @@ impl DispatchFragments {
         save_calls_fun_helper: usize,
         compare: CompareHelpers,
     ) -> Result<Self, ExecError> {
+        Self::with_line_breakpoint_helpers(DispatchRuntimeHelpers {
+            export: export_helper,
+            light_bif: light_bif_helper,
+            exception_resolver,
+            save_calls_export: save_calls_helper,
+            unloaded_fun: unloaded_fun_helper,
+            save_calls_fun: save_calls_fun_helper,
+            compare,
+            line_breakpoint: LineBreakpointHelpers::default(),
+        })
+    }
+
+    /// As [`DispatchFragments::with_compare`], plus the line-breakpoint runtime helpers.
+    pub fn with_line_breakpoint_helpers(
+        helpers: DispatchRuntimeHelpers,
+    ) -> Result<Self, ExecError> {
+        let DispatchRuntimeHelpers {
+            export: export_helper,
+            light_bif: light_bif_helper,
+            exception_resolver,
+            save_calls_export: save_calls_helper,
+            unloaded_fun: unloaded_fun_helper,
+            save_calls_fun: save_calls_fun_helper,
+            compare,
+            line_breakpoint: line_breakpoint_helpers,
+        } = helpers;
         let mut code = CodeBuffer::new();
         let export = code.new_label();
         let light_bif = code.new_label();
         let breakpoint = code.new_label();
+        let line_breakpoint = code.new_label();
         let send = code.new_label();
         let call_fun_unported = code.new_label();
         let raise_exception = code.new_label();
@@ -173,14 +232,18 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_call_light_bif_shared(&mut code, light_bif_helper)
             .map_err(|_| ExecError::InvalidSize("light BIF fragment"))?;
-        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-348
-        // (emit_i_breakpoint_trampoline / emit_i_line_breakpoint_trampoline), OTP-29.1.1:
-        // the trampoline passes (c_p, identity, site) and a trap return. That is the helper
-        // ABI, not ARG3/ARG4 of call_light_bif_shared.
+        // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250
+        // (emit_i_breakpoint_trampoline), OTP-29.1.1: the trampoline passes (c_p, identity,
+        // site) and a trap return. That is the helper ABI, not ARG3/ARG4 of call_light_bif_shared.
         code.bind(breakpoint)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_helper_fragment(&mut code, light_bif_helper, 6)
             .map_err(|_| ExecError::InvalidSize("breakpoint fragment"))?;
+        code.bind(line_breakpoint)
+            .map_err(|_error| ExecError::InvalidSize("dispatch fragment"))?;
+        let line_breakpoint_cleanup =
+            emit_line_breakpoint_shared(&mut code, line_breakpoint_helpers)
+                .map_err(|_| ExecError::InvalidSize("line-breakpoint fragment"))?;
         code.bind(send)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
         emit_helper_fragment(&mut code, light_bif_helper, 2)
@@ -247,6 +310,8 @@ impl DispatchFragments {
             export_offset: labels[&export],
             light_bif_offset: labels[&light_bif],
             breakpoint_offset: labels[&breakpoint],
+            line_breakpoint_offset: labels[&line_breakpoint],
+            line_breakpoint_cleanup_offset: labels[&line_breakpoint_cleanup],
             send_offset: labels[&send],
             call_fun_unported_offset: labels[&call_fun_unported],
             apply_fixed_offset: labels[&apply_fixed],
@@ -277,13 +342,22 @@ impl DispatchFragments {
         self.memory.ptr_at(self.light_bif_offset) as usize
     }
 
-    /// Fragment the call and line breakpoint trampolines enter.
+    /// Fragment the native call-breakpoint trampoline enters.
     ///
     /// The caller has already placed `c_p`, the breakpoint identity and the site in the
-    /// argument registers and, for a line breakpoint, the cleanup address in the trap-return
-    /// slot. `call_light_bif_shared` does not read those.
+    /// argument registers. `call_light_bif_shared` does not read those.
     pub fn breakpoint(&self) -> usize {
         self.memory.ptr_at(self.breakpoint_offset) as usize
+    }
+
+    /// Fragment entered by the patchable `i_line_breakpoint_trampoline` call.
+    pub fn line_breakpoint(&self) -> usize {
+        self.memory.ptr_at(self.line_breakpoint_offset) as usize
+    }
+
+    /// Return address of the shared breakpoint-handler call's cleanup continuation.
+    pub fn line_breakpoint_cleanup(&self) -> usize {
+        self.memory.ptr_at(self.line_breakpoint_cleanup_offset) as usize
     }
 
     /// Shared `send/2` fragment with only its two live X registers saved.
@@ -954,6 +1028,125 @@ fn emit_helper_fragment(
         encoder.ret(Gpr::x(30))
     })?;
     Ok(())
+}
+
+// Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:257-334
+// (emit_i_line_breakpoint_trampoline_shared), OTP-29.1.1.
+fn emit_line_breakpoint_shared(
+    code: &mut CodeBuffer,
+    helpers: LineBreakpointHelpers,
+) -> Result<arinsal_a64::buf::Label, BufferError> {
+    let after_gc = code.new_label();
+    let no_handler = code.new_label();
+    let cleanup = code.new_label();
+    let error = code.new_label();
+    let exit = code.new_label();
+    let live_slot = tmp_mem_offset(0);
+    let pc_slot = tmp_mem_offset(1);
+    let stack_needed_slot = tmp_mem_offset(3);
+    let native_error_pc_slot = tmp_mem_offset(6);
+
+    code.emit(|encoder| {
+        // This Erlang frame keeps the call site's native continuation on E while the
+        // breakpoint handler runs or yields.
+        encoder.str_pre(Gpr::x(30), Gpr::x(20), -8)?;
+        encoder.str_uoff(Gpr::x(8), Gpr::x(19), live_slot)?;
+        encoder.sub_imm(Gpr::x(0), Gpr::x(30), 8, false)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::x(19), pc_slot)?;
+        encoder.str_uoff(Gpr::x(0), Gpr::x(19), native_error_pc_slot)?;
+        encoder.lsl_imm(Gpr::x(9), Gpr::x(8), 3)?;
+        encoder.str_uoff(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
+        encoder.add_imm(
+            Gpr::x(10),
+            Gpr::x(9),
+            (arinsal_term::S_RESERVED * 8) as u16,
+            false,
+        )?;
+        encoder.add_reg(Gpr::x(10), Gpr::x(10), Gpr::x(23), Shift::Lsl, 0)?;
+        encoder.cmp_reg(Gpr::x(10), Gpr::x(20), Shift::Lsl, 0)
+    })?;
+    code.b_cond(Cond::Ls, after_gc)?;
+
+    // The global assembler always emits this fragment (beam_asm_global.hpp.pl lists
+    // `i_line_breakpoint_trampoline_shared`). Helper addresses are immediates filled by
+    // the VM; unit tests that never enter the fragment pass zeros.
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), live_slot)?;
+        encoder.mov_reg(Gpr::x(3), Gpr::x(2))?;
+        encoder.mov_reg(Gpr::w(4), Gpr::w(22))?;
+        encoder.mov_const(Gpr::x(17), helpers.garbage_collect as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.sub_reg(Gpr::w(22), Gpr::w(22), Gpr::w(0), Shift::Lsl, 0)?;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+        encoder.cmp_imm(Gpr::x(9), 0, false)
+    })?;
+    code.b_cond(Cond::Ne, error)?;
+
+    code.bind(after_gc)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
+        encoder.sub_reg(Gpr::x(20), Gpr::x(20), Gpr::x(9), Shift::Lsl, 0)
+    })?;
+
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.ldr_uoff(Gpr::x(1), Gpr::x(19), pc_slot)?;
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), live_slot)?;
+        encoder.mov_const(Gpr::x(17), helpers.prepare_call as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.cbz(Gpr::x(0), no_handler)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(13), Gpr::x(0))?;
+        encoder.ldr_regoff(Gpr::x(14), Gpr::x(13), Gpr::x(24), 3)?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(13))?;
+        encoder.blr(Gpr::x(14))
+    })?;
+    code.bind(cleanup)?;
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_const(Gpr::x(17), helpers.cleanup as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.lsl_imm(Gpr::x(0), Gpr::x(0), 3)?;
+        encoder.add_reg(Gpr::x(20), Gpr::x(20), Gpr::x(0), Shift::Lsl, 0)
+    })?;
+    code.b(exit)?;
+
+    code.bind(no_handler)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(19), stack_needed_slot)?;
+        encoder.add_reg(Gpr::x(20), Gpr::x(20), Gpr::x(9), Shift::Lsl, 0)
+    })?;
+    code.bind(exit)?;
+    code.emit(|encoder| {
+        encoder.ldr_post(Gpr::x(30), Gpr::x(20), 8)?;
+        encoder.ret(Gpr::x(30))
+    })?;
+
+    code.bind(error)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::xzr())?;
+        encoder.mov_const(Gpr::x(17), arinsal_enter_native_return as *const () as u64)?;
+        encoder.br(Gpr::x(17))
+    })?;
+    Ok(cleanup)
+}
+
+fn tmp_mem_offset(index: u32) -> u32 {
+    std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + index * 8
 }
 
 // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:context_switch_simplified,

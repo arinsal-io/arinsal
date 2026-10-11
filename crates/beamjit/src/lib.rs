@@ -90,12 +90,16 @@ pub trait ModuleEnv {
     fn light_bif_fragment(&self) -> usize {
         0
     }
-    /// Fragment for `i_breakpoint_trampoline` and `i_line_breakpoint_trampoline`.
+    /// Fragment for `i_breakpoint_trampoline`.
     ///
-    /// erts does not route those through `call_light_bif_shared`; they call
-    /// `erts_generic_breakpoint` and the line-breakpoint helpers with their own arguments.
+    /// erts does not route it through `call_light_bif_shared`; the trampoline calls
+    /// `erts_generic_breakpoint` with its own arguments.
     fn breakpoint_fragment(&self) -> usize {
         self.light_bif_fragment()
+    }
+    /// Fragment called by `i_line_breakpoint_trampoline` when line instrumentation is enabled.
+    fn line_breakpoint_fragment(&self) -> usize {
+        0
     }
     /// Return the two-register shared fragment used by `send/2`.
     fn send_fragment(&self) -> usize {
@@ -2413,7 +2417,7 @@ fn emit_op(
             "i_line_breakpoint_trampoline" => {
                 // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:337-348, OTP-29.1.1.
                 count(0)?;
-                assembler.emit_i_line_breakpoint_trampoline(env.breakpoint_fragment())
+                assembler.emit_i_line_breakpoint_trampoline(env.line_breakpoint_fragment())
             }
             "i_test_yield" => {
                 // Port of erts/emulator/beam/jit/arm/instr_common.cpp:3097-3115, OTP-29.1.1.

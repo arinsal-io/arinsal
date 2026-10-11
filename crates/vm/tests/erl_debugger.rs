@@ -136,6 +136,7 @@ fn erl_debugger_line_metadata_loads_from_beam_debug_info() {
     );
     let mut vm = Vm::new([]);
     vm.load_bytes(&beam).expect("load VM fixture");
+    let interpreter_slices_before = arinsal_vm::interp_slices();
     let actual = vm
         .eval_scheduled(
             "erl_debugger_line_fixture",
@@ -147,6 +148,11 @@ fn erl_debugger_line_metadata_loads_from_beam_debug_info() {
             None,
         )
         .expect("run VM fixture");
+    similar_asserts::assert_eq!(
+        arinsal_vm::interp_slices(),
+        interpreter_slices_before,
+        "+beam_debug_info must not force this function into the interpreter"
+    );
     similar_asserts::assert_eq!(expected, CallResult::Ok(actual.term));
 }
 
@@ -432,9 +438,15 @@ compact_fun(Fun) -> Fun.
     vm.load_bytes(preloaded)
         .expect("load OTP's preloaded breakpoint wrapper");
     vm.load_bytes(&beam).expect("load debugger hit fixture");
+    let interpreter_slices_before = arinsal_vm::interp_slices();
     let actual = vm
         .eval_scheduled("erl_debugger_active_fixture", "run", &[], 8, None)
         .unwrap_or_else(|error| panic!("run debugger hit fixture: {error}"));
+    similar_asserts::assert_eq!(
+        arinsal_vm::interp_slices(),
+        interpreter_slices_before,
+        "debug-info breakpoint set/hit/continue must stay on the native path"
+    );
     let _reset = Vm::new_with_debugger_flags(Vec::<std::path::PathBuf>::new(), false, true);
     assert!(actual.term != arinsal_etf::OwnedTerm::Atom("no_debugger_event".into()));
     similar_asserts::assert_eq!(expected, actual.term);

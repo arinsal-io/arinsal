@@ -395,17 +395,34 @@ fn fragments() -> Option<&'static DispatchFragments> {
     static FRAGMENTS: OnceLock<Option<DispatchFragments>> = OnceLock::new();
     FRAGMENTS
         .get_or_init(|| {
-            let fragments = DispatchFragments::with_compare(
-                crate::native_helpers::arinsal_beamasm_export_trampoline as *const () as usize,
-                crate::native_helpers::arinsal_beamasm_call_light_bif_shared as *const () as usize,
-                crate::native_helpers::arinsal_beamasm_exception_resolver as *const () as usize,
-                crate::native_helpers::arinsal_beamasm_save_calls_export as *const () as usize,
-                crate::native_helpers::arinsal_beamasm_fun_resolver as *const () as usize,
-                crate::fun_dispatch::arinsal_beamasm_save_calls_fun as *const () as usize,
-                CompareHelpers {
-                    eq: crate::native_hooks::arinsal_eq as *const () as usize,
-                    cmp_atoms: crate::native_hooks::arinsal_cmp_atoms as *const () as usize,
-                    cmp_compound: crate::native_hooks::arinsal_cmp_compound as *const () as usize,
+            let fragments = DispatchFragments::with_line_breakpoint_helpers(
+                arinsal_beamasm::dispatch::DispatchRuntimeHelpers {
+                    export: crate::native_helpers::arinsal_beamasm_export_trampoline as *const ()
+                        as usize,
+                    light_bif: crate::native_helpers::arinsal_beamasm_call_light_bif_shared
+                        as *const () as usize,
+                    exception_resolver: crate::native_helpers::arinsal_beamasm_exception_resolver
+                        as *const () as usize,
+                    save_calls_export: crate::native_helpers::arinsal_beamasm_save_calls_export
+                        as *const () as usize,
+                    unloaded_fun: crate::native_helpers::arinsal_beamasm_fun_resolver as *const ()
+                        as usize,
+                    save_calls_fun: crate::fun_dispatch::arinsal_beamasm_save_calls_fun as *const ()
+                        as usize,
+                    compare: CompareHelpers {
+                        eq: crate::native_hooks::arinsal_eq as *const () as usize,
+                        cmp_atoms: crate::native_hooks::arinsal_cmp_atoms as *const () as usize,
+                        cmp_compound: crate::native_hooks::arinsal_cmp_compound as *const ()
+                            as usize,
+                    },
+                    line_breakpoint: arinsal_beamasm::dispatch::LineBreakpointHelpers {
+                        garbage_collect: crate::native_helpers::arinsal_beamasm_gc_sync as *const ()
+                            as usize,
+                        prepare_call: crate::native_helpers::arinsal_beamasm_line_breakpoint_prepare
+                            as *const () as usize,
+                        cleanup: crate::native_helpers::arinsal_beamasm_line_breakpoint_cleanup
+                            as *const () as usize,
+                    },
                 },
             )
             .ok()?;
@@ -481,6 +498,24 @@ pub(crate) fn export_get_or_make_stub(
         tables.exports.bind_dispatch(mfa, entry.export_entry());
     });
     Some(Arc::clone(entry.slot))
+}
+
+/// Export descriptor returned by the native line-breakpoint prepare helper.
+// Port of erts/emulator/beam/beam_bp.c:1828-1830
+// (erts_line_breakpoint_hit__prepare_call), OTP-29.1.1.
+pub(crate) fn line_breakpoint_export(
+    scope: u64,
+    code_ix: usize,
+) -> Option<&'static arinsal_beamasm::bif::ExportEntry> {
+    let atoms = arinsal_term::global_atoms();
+    let mfa = (
+        atoms.intern("erts_internal").ok()?,
+        atoms.intern("breakpoint").ok()?,
+        4,
+    );
+    crate::code_ix::for_scope(scope)
+        .with_tables_for_code_ix(code_ix, |tables| tables.exports.dispatch(mfa))
+        .flatten()
 }
 
 fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usize>> {
@@ -1086,10 +1121,11 @@ pub(crate) fn line_breakpoint_site(address: usize) -> Option<usize> {
         })
 }
 
-/// Whether `address` is the return address of a native line-breakpoint hit, the
-/// continuation that restores the registers spilled for `erts_internal:breakpoint/4`.
-pub(crate) fn is_line_breakpoint_return(address: usize) -> bool {
-    line_breakpoint_site(address).is_some()
+/// Whether `address` is OTP's shared line-breakpoint cleanup continuation.
+// Port of erts/emulator/beam/erl_process.c:14945-14946 and
+// erts/emulator/beam/jit/arm/beam_asm_module.cpp:312-322, OTP-29.1.1.
+pub(crate) fn is_line_breakpoint_cleanup(address: usize) -> bool {
+    fragments().is_some_and(|fragments| fragments.line_breakpoint_cleanup() == address)
 }
 
 /// Enable or disable the native line-breakpoint sites of `line` in `module`.
@@ -1260,6 +1296,7 @@ struct VmModuleEnv<'a> {
     export_trampoline: usize,
     light_bif_fragment: usize,
     breakpoint_fragment: usize,
+    line_breakpoint_fragment: usize,
     send_fragment: usize,
     native_bodies: HashMap<(String, u8), (usize, usize)>,
     module_name: String,
@@ -1351,6 +1388,7 @@ impl<'a> VmModuleEnv<'a> {
             export_trampoline: fragments.export_trampoline(),
             light_bif_fragment: fragments.call_light_bif(),
             breakpoint_fragment: fragments.breakpoint(),
+            line_breakpoint_fragment: fragments.line_breakpoint(),
             send_fragment: fragments.send(),
             native_bodies,
             module_name: module.name.clone(),
@@ -1539,6 +1577,9 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
     fn breakpoint_fragment(&self) -> usize {
         self.breakpoint_fragment
+    }
+    fn line_breakpoint_fragment(&self) -> usize {
+        self.line_breakpoint_fragment
     }
     fn send_fragment(&self) -> usize {
         self.send_fragment

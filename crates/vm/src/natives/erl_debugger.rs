@@ -547,7 +547,8 @@ fn inspect_frames(
         let raw = word.tagged_word() as usize;
         let normal_exit = raw == crate::native_bridge::bridge_return_address();
         reached_exit |= normal_exit;
-        if normal_exit || crate::native_bridge::is_native_function_at(raw) {
+        let breakpoint_cleanup = crate::beamasm_integration::is_line_breakpoint_cleanup(raw);
+        if normal_exit || breakpoint_cleanup || crate::native_bridge::is_native_function_at(raw) {
             push_frame(&mut frames, modules, current, &slots, current_is_return);
             slots.clear();
             current = FramePc::Native(raw);
@@ -621,8 +622,8 @@ fn function_info_native(address: usize, is_return_address: bool) -> O {
         // (erts_internal_fun_description_from_pc), OTP-29.1.1.
         return O::Atom("<terminate process normally>".into());
     }
-    if is_return_address && crate::beamasm_integration::is_line_breakpoint_return(address) {
-        // erts: the return address lies in the shared trampoline, which has no MFA.
+    if is_return_address && crate::beamasm_integration::is_line_breakpoint_cleanup(address) {
+        // Port of erts/emulator/beam/erl_process.c:14945-14946, OTP-29.1.1.
         return O::Atom("<breakpoint>".into());
     }
     let lookup = if is_return_address {
