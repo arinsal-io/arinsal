@@ -1389,11 +1389,8 @@ fn trace_action_target(process: &Process, current: Pid, value: Term) -> Option<P
     process
         .runtime
         .as_ref()?
-        .names
-        .lock()
-        .unwrap()
-        .get(name)
-        .copied()
+        .reg
+        .whereis_proc_str(name)
         .or_else(|| (name == "self").then_some(current))
 }
 

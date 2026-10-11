@@ -3012,11 +3012,10 @@ pub(crate) fn reader_groups_map(process: &mut Process, groups: i64) -> Result<Te
 // (`do_send_logger_message`), OTP-29.1.1.
 fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>, text: &str) {
     let logger = process.runtime.as_ref().and_then(|runtime| {
-        let names = runtime.names.lock().expect("registered process names");
-        names
-            .get("logger")
-            .or_else(|| names.get("error_logger"))
-            .copied()
+        runtime
+            .reg
+            .whereis_proc_str("logger")
+            .or_else(|| runtime.reg.whereis_proc_str("error_logger"))
     });
     let Some(logger) = logger else {
         eprintln!("{text}");

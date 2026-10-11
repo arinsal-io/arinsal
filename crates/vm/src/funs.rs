@@ -856,7 +856,7 @@ impl Vm {
         }
         p.runtime
             .as_ref()
-            .is_some_and(|runtime| runtime.names.lock().unwrap().contains_key("code_server"))
+            .is_some_and(|runtime| runtime.reg.whereis_proc_str("code_server").is_some())
     }
 
     /// Jump to `error_handler:undefined_function(Module, Function, Args)`.

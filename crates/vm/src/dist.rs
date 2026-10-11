@@ -306,7 +306,7 @@ fn notify_dist_ctrlr(
     node: Term,
 ) -> Result<(), VmError> {
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let net_kernel = runtime.names.lock().unwrap().get("net_kernel").copied();
+    let net_kernel = runtime.reg.whereis_proc_str("net_kernel");
     let Some(net_kernel) = net_kernel else {
         return Ok(());
     };
@@ -737,7 +737,7 @@ fn remote_ref_id(reference: &OwnedTerm) -> Option<u64> {
 
 fn registered_pid(process: &Process, name: &str) -> Option<Pid> {
     let runtime = process.runtime.as_ref()?;
-    runtime.names.lock().unwrap().get(name).copied()
+    runtime.reg.whereis_proc_str(name)
 }
 
 /// Queue one remote signal packet using the destination's negotiated atom cache.
@@ -825,7 +825,7 @@ fn notify_auto_connect(
     entry_ref: u64,
 ) -> Result<(), VmError> {
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
-    let Some(net_kernel) = runtime.names.lock().unwrap().get("net_kernel").copied() else {
+    let Some(net_kernel) = runtime.reg.whereis_proc_str("net_kernel") else {
         let _ = node_tables::lock().abort_pending(node, conn_id, entry_ref);
         return Err(badarg());
     };
@@ -1138,13 +1138,7 @@ fn route_incoming_port(
             let OwnedTerm::Atom(name) = &parts[3] else {
                 return Err(badarg());
             };
-            let target = runtime
-                .names
-                .lock()
-                .unwrap()
-                .get(name)
-                .copied()
-                .ok_or_else(badarg)?;
+            let target = runtime.reg.whereis_proc_str(name).ok_or_else(badarg)?;
             for term in terms {
                 let message = owned_to_message(&term)?;
                 sched
@@ -1179,7 +1173,7 @@ fn route_incoming_port(
         19 | 20 if parts.len() == 4 => {
             let watcher = remote_proxy(handle, &parts[1])?;
             let target = match &parts[2] {
-                OwnedTerm::Atom(name) => runtime.names.lock().unwrap().get(name).copied(),
+                OwnedTerm::Atom(name) => runtime.reg.whereis_proc_str(name),
                 other => local_pid(other, local),
             };
             let reference = remote_ref_id(&parts[3]).ok_or_else(badarg)?;
@@ -1259,13 +1253,7 @@ fn route_incoming_port(
                 let OwnedTerm::Atom(name) = &parts[3] else {
                     return Err(badarg());
                 };
-                let target = runtime
-                    .names
-                    .lock()
-                    .unwrap()
-                    .get(name)
-                    .copied()
-                    .ok_or_else(badarg)?;
+                let target = runtime.reg.whereis_proc_str(name).ok_or_else(badarg)?;
                 for term in terms {
                     let message = owned_to_message(&term)?;
                     sched.send(target, target, message).map_err(|error| {

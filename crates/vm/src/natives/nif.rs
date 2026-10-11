@@ -1561,15 +1561,13 @@ fn nif_select_hook(request: arinsal_nif::SelectRequest) -> i32 {
 // is registered for; `enif_get_local_pid`/`enif_get_local_port` check the type.
 fn nif_whereis_pid_hook(name: Term) -> Option<Term> {
     let runtime = current_hub()?.runtime.upgrade()?;
-    let name = atom_name(name)?;
-    let pid = *runtime.names.lock().unwrap().get(&name)?;
+    let pid = runtime.reg.whereis_proc(name.as_atom()?)?;
     pid.to_term()
 }
 
 fn nif_whereis_port_hook(name: Term) -> Option<Term> {
     let runtime = current_hub()?.runtime.upgrade()?;
-    let name = atom_name(name)?;
-    let id = *runtime.port_names.lock().unwrap().get(&name)?;
+    let id = runtime.reg.whereis_port(name.as_atom()?)?;
     Term::port(id)
 }
 

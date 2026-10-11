@@ -11,7 +11,7 @@ use arinsal_sched::{
 use arinsal_spec::Opcode;
 use arinsal_term::ptab::PtabIdRing;
 use arinsal_term::{
-    ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_term,
+    Atom, ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -765,8 +765,8 @@ pub(crate) struct Runtime {
     paths: Vec<std::path::PathBuf>,
     // Set once when the scheduler starts; read without a lock like erts' scheduler data.
     scheduler: OnceLock<Weak<Scheduler<Process>>>,
-    pub(crate) names: Mutex<HashMap<String, Pid>>,
-    pub(crate) port_names: Mutex<HashMap<String, u64>>,
+    /// `process_reg` (`regtab_rwmtx`). Names are atom indexes, not strings.
+    pub(crate) reg: crate::register::RegisterTable,
     aliases: AliasTable,
     pub(crate) timers: Mutex<HashMap<u64, arinsal_sched::TimerRef>>,
     pub(crate) timer_owners: Mutex<HashMap<u64, Pid>>,
@@ -3441,13 +3441,10 @@ fn report_max_heap(
     let Some(runtime) = process.runtime.clone() else {
         return;
     };
-    let logger = {
-        let names = runtime.names.lock().unwrap();
-        names
-            .get("logger")
-            .or_else(|| names.get("error_logger"))
-            .copied()
-    };
+    let logger = runtime
+        .reg
+        .whereis_proc_str("logger")
+        .or_else(|| runtime.reg.whereis_proc_str("error_logger"));
     let Some(logger) = logger else {
         return;
     };
@@ -4409,28 +4406,24 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_process.c:14421-14464, OTP-29.1.1: releasing the
         // registered name is traced after the exit event, and only when p->reg != NULL.
-        if resources & proc_flags::REG != 0 {
-            let registered: Vec<String> = self.runtime.as_ref().map_or_else(Vec::new, |runtime| {
-                runtime
-                    .names
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(_, pid)| **pid == ctx.pid())
-                    .map(|(name, _)| name.clone())
-                    .collect()
-            });
-            for name in registered {
-                crate::trace::emit(
-                    Some(vm),
-                    self,
-                    ctx,
-                    ctx.pid(),
-                    crate::trace::PROCS,
-                    "unregister",
-                    &[crate::signals::atom(&name)],
-                );
-            }
+        // The name lives on the process (`p->common.u.alive.reg`), so exit does not scan
+        // the table. The table entry itself is released in `exit_stage3`.
+        if resources & proc_flags::REG != 0
+            && let Some(index) = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.scheduler().ok())
+                .and_then(|scheduler| scheduler.registered_atom_index(ctx.pid()))
+        {
+            crate::trace::emit(
+                Some(vm),
+                self,
+                ctx,
+                ctx.pid(),
+                crate::trace::PROCS,
+                "unregister",
+                &[Term::atom(Atom(index))],
+            );
         }
         // erl_process.c:14200 (erts_trace_check_exiting) matches the system-monitor receiver.
         if resources & proc_flags::SYS_MON != 0 {
@@ -4625,15 +4618,20 @@ impl Process {
         self.absorb_exit_signals(ctx);
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::REG != 0
             && let Some(runtime) = &self.runtime
+            && let Ok(scheduler) = runtime.scheduler()
+            && let Some(index) = scheduler.registered_atom_index(ctx.pid())
         {
-            // Port of erts/emulator/beam/erl_process.c:14424-14426, OTP-29.1.1.
+            // Port of erts/emulator/beam/erl_process.c:14424-14426
+            // (`erts_unregister_name` with `THE_NON_VALUE`), OTP-29.1.1.
             // The registered name is the last Erlang resource released, and only when
             // p->common.u.alive.reg != NULL.
-            runtime
-                .names
-                .lock()
-                .unwrap()
-                .retain(|_, registered| *registered != ctx.pid());
+            let name = Atom(index);
+            let mut table = runtime.reg.write();
+            if matches!(table.fetch(name), Some(crate::register::RegId::Proc(pid)) if pid == ctx.pid())
+            {
+                table.erase(name);
+                scheduler.clear_registered_atom_index(ctx.pid(), index);
+            }
         }
         let Some(cold) = self.cold.take() else {
             return;
@@ -4748,11 +4746,33 @@ impl Process {
     // Port of erts/emulator/beam/erl_message.c / bif.c send with priority, OTP-29.1.1.
     pub(crate) fn send_message_prio(
         &mut self,
+        vm: Option<&mut Vm>,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+        target: Term,
+        value: Term,
+        want_priority: bool,
+    ) -> Result<Term, VmError> {
+        self.send_resolved(vm, ctx, target, value, want_priority, false)
+    }
+
+    /// `Name ! Msg` from native code. A registered port is redone by the scheduler,
+    /// which can suspend the sender; the name is resolved once either way.
+    pub(crate) fn send_message_native(
+        &mut self,
+        target: Term,
+        value: Term,
+    ) -> Result<Term, VmError> {
+        self.send_resolved(None, None, target, value, false, true)
+    }
+
+    fn send_resolved(
+        &mut self,
         mut vm: Option<&mut Vm>,
         mut ctx: Option<&mut RunCtx<'_, Message>>,
         target: Term,
         value: Term,
         want_priority: bool,
+        defer_port: bool,
     ) -> Result<Term, VmError> {
         let sender = self
             .self_pid
@@ -4829,34 +4849,31 @@ impl Process {
                     )));
                 }
             }
-        } else if let Some(atom) = target.as_atom() {
-            let name = arinsal_term::global_atoms()
-                .text(atom)
-                .ok_or_else(|| VmError::Unsupported("unbound destination atom".into()))?;
+        } else if let Some(name) = target.as_atom() {
             let runtime = self
                 .runtime
                 .as_ref()
                 .ok_or_else(|| VmError::Unsupported("send requires a scheduler".into()))?;
-            let mut names = runtime.names.lock().unwrap();
-            let pid = names.get(name).copied();
-            let pid = if let Some(pid) = pid
-                && !runtime.scheduler()?.lookup(pid)
-            {
-                names.remove(name);
-                None
-            } else {
-                pid
-            };
-            drop(names);
-            if pid.is_none() {
-                // Port of erts/emulator/beam/bif.c:2511-2530 (do_send), OTP-29.1.1: a name
-                // that resolves to no live process is looked up as a port.
-                if let Some(id) = self
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.port_names.lock().unwrap().get(name).copied())
-                    && crate::port::is_live(self, id)
+            // Port of erts/emulator/beam/bif.c (`ebif_bang_2` -> `erts_whereis_name`), OTP-29.1.1:
+            // one atom-index lookup yields the process or the port.
+            let pid = match runtime.reg.whereis(name) {
+                // Port of erts/emulator/beam/bif.c:2506-2519 (do_send): one
+                // whereis, then one raw process-table lookup. An exiting
+                // process is not a destination (erts_whereis_name's alive test).
+                Some(crate::register::RegId::Proc(pid))
+                    if runtime
+                        .scheduler()?
+                        .with_proc_flags(pid, |flags| {
+                            flags.load(Ordering::Acquire) & proc_flags::EXITING == 0
+                        })
+                        .unwrap_or(false) =>
                 {
+                    Some(pid)
+                }
+                Some(crate::register::RegId::Port(id)) if crate::port::is_live(self, id) => {
+                    if defer_port {
+                        return Err(VmError::Unsupported(REMOTE_SEND_NEEDS_CONTEXT.into()));
+                    }
                     let port = Term::port(id).ok_or_else(|| {
                         VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
                             "badarg",
@@ -4877,6 +4894,9 @@ impl Process {
                     );
                     return Ok(value);
                 }
+                _ => None,
+            };
+            if pid.is_none() {
                 // Port of erts/emulator/beam/bif.c:2532-2536 (do_send), OTP-29.1.1: a send to
                 // an unregistered name is traced before it fails.
                 self.trace_send(
@@ -5922,11 +5942,10 @@ fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, re
     } else if let Some(pid) = Pid::from_term(destination) {
         Some(pid)
     } else {
-        let names = runtime.names.lock().unwrap();
-        names
-            .get("logger")
-            .or_else(|| names.get("error_logger"))
-            .copied()
+        runtime
+            .reg
+            .whereis_proc_str("logger")
+            .or_else(|| runtime.reg.whereis_proc_str("error_logger"))
     };
     let Some(logger) = logger else {
         return;
@@ -6648,8 +6667,7 @@ impl Vm {
             literal_collector: Mutex::new(None),
             paths: self.paths.clone(),
             scheduler: OnceLock::new(),
-            names: Mutex::new(HashMap::new()),
-            port_names: Mutex::new(HashMap::new()),
+            reg: crate::register::RegisterTable::new(),
             aliases: AliasTable::new(),
             timers: Mutex::new(HashMap::new()),
             timer_owners: Mutex::new(HashMap::new()),

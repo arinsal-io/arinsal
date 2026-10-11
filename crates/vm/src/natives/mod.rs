@@ -358,6 +358,11 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     {
         return Some(bif);
     }
+    // Port of erts/emulator/beam/bif.c:2342 (whereis_1), OTP-29.1.1.
+    // `ops.tab` already emits `call_light_bif` for every plain `bif`; this is the body.
+    if module == "erlang" && function == "whereis" && arity == 1 {
+        return Some(crate::signals::whereis_bif);
+    }
     maps::process_bif(module, function, arity)
 }
 

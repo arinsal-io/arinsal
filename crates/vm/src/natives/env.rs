@@ -472,13 +472,7 @@ fn deliver_signal(target: SignalTarget, signal: i32) {
     let Some(runtime) = target.runtime.upgrade() else {
         return;
     };
-    let Some(pid) = runtime
-        .names
-        .lock()
-        .unwrap()
-        .get("erl_signal_server")
-        .copied()
-    else {
+    let Some(pid) = runtime.reg.whereis_proc_str("erl_signal_server") else {
         return;
     };
     let Ok(scheduler) = runtime.scheduler() else {
