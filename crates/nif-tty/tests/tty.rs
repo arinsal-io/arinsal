@@ -8,6 +8,7 @@ use std::time::Duration;
 use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
 use arinsal_etf::{OwnedTerm as O, decode};
 use arinsal_term::{ProcessHeap, from_owned, to_owned};
+use similar_asserts::assert_eq;
 
 static TERM_TEST_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_TMP: AtomicU64 = AtomicU64::new(1);
@@ -226,7 +227,37 @@ fn write_finishes_after_partial_nonblocking_writes() {
     arinsal_nif_tty::release(&tty).unwrap();
 }
 
-fn otp_file(term: Option<&str>, expr: &str) -> Option<O> {
+#[derive(Clone, Copy)]
+enum LocaleCase {
+    C,
+    Utf8,
+}
+
+impl LocaleCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::C => "C",
+            Self::Utf8 => "UTF8",
+        }
+    }
+
+    fn configure(self, command: &mut Command) {
+        match self {
+            Self::C => {
+                command.env("LANG", "");
+                command.env("LC_ALL", "C");
+                command.env("LC_CTYPE", "C");
+            }
+            Self::Utf8 => {
+                command.env_remove("LC_ALL");
+                command.env_remove("LC_CTYPE");
+                command.env("LANG", "en_US.UTF-8");
+            }
+        }
+    }
+}
+
+fn otp_file(term: Option<&str>, locale: Option<LocaleCase>, expr: &str) -> Option<O> {
     if Command::new("erl").arg("-version").output().is_err() {
         eprintln!("skipping OTP differential: erl is missing");
         return None;
@@ -245,6 +276,9 @@ fn otp_file(term: Option<&str>, expr: &str) -> Option<O> {
     if let Some(term) = term {
         command.env("TERM", term);
     }
+    if let Some(locale) = locale {
+        locale.configure(&mut command);
+    }
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -258,14 +292,77 @@ fn otp_file(term: Option<&str>, expr: &str) -> Option<O> {
 
 #[test]
 fn wide_character_large_sample_matches_erl() {
-    let Some(expected) = otp_file(
-        None,
-        "[prim_tty:wcswidth(<<N:32/native-signed>>) || N <- lists:seq(1, 16#10ffff, 11)]",
-    ) else {
+    const CASE_ENV: &str = "ARINSAL_NIF_TTY_LOCALE_CASE";
+    if let Some(case) = std::env::var_os(CASE_ENV) {
+        let locale = match case.to_str() {
+            Some("C") => LocaleCase::C,
+            Some("UTF8") => LocaleCase::Utf8,
+            _ => panic!("unknown locale case: {case:?}"),
+        };
+        wide_character_sample_for_locale(locale);
+        return;
+    }
+
+    let executable = std::env::current_exe().unwrap();
+    for locale in [LocaleCase::C, LocaleCase::Utf8] {
+        let mut command = Command::new(&executable);
+        command
+            .args([
+                "--exact",
+                "wide_character_large_sample_matches_erl",
+                "--nocapture",
+            ])
+            .env(CASE_ENV, locale.name());
+        locale.configure(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{} locale differential failed\nstdout: {}\nstderr: {}",
+            locale.name(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn wide_character_sample_for_locale(locale: LocaleCase) {
+    // OTP keeps setlocale/1 and isprint/1 private; init/1 and handle_request/2 expose their effects.
+    let expression = "begin true = register(tty_locale_test, self()), State = prim_tty:init(#{input => disabled}), InsertState = prim_tty:init_ssh(#{}, {80, 24}, latin1), Printable = [element(10, element(2, prim_tty:handle_request(InsertState, {insert, <<N>>}))) =:= [N] || N <- (lists:seq(0, 26) ++ lists:seq(28, 127))], {prim_tty:unicode(State), Printable, [prim_tty:wcswidth(<<N:32/native-signed>>) || N <- lists:seq(1, 16#10ffff, 11)]} end";
+    let Some(expected) = otp_file(None, Some(locale), expression) else {
         return;
     };
-    let O::List { elems, tail } = &expected else {
-        panic!("expected result list")
+    let O::Tuple(expected) = &expected else {
+        panic!("expected locale result tuple")
+    };
+    assert_eq!(expected.len(), 3);
+
+    let locale_result = call("setlocale", &[atom("ignored")]).unwrap();
+    assert_eq!(locale_result, expected[0], "setlocale/1");
+    assert_eq!(
+        call("tty_encoding", &[atom("ignored")]).unwrap(),
+        atom("utf8"),
+        "tty_encoding/1"
+    );
+
+    let O::List {
+        elems: printable,
+        tail: printable_tail,
+    } = &expected[1]
+    else {
+        panic!("expected isprint result list")
+    };
+    assert_eq!(**printable_tail, O::Nil);
+    assert_eq!(printable.len(), 127);
+    for (n, want) in (0..=127).filter(|n| *n != 27).zip(printable.iter()) {
+        assert_eq!(
+            call("isprint", &[O::Int(n)]).unwrap(),
+            *want,
+            "isprint byte {n}"
+        );
+    }
+
+    let O::List { elems, tail } = &expected[2] else {
+        panic!("expected width result list")
     };
     assert_eq!(**tail, O::Nil);
     assert_eq!(elems.len(), 101283);
@@ -276,7 +373,7 @@ fn wide_character_large_sample_matches_erl() {
             &[O::Binary((point as i32).to_ne_bytes().to_vec())],
         )
         .unwrap();
-        assert_eq!(&got, want, "U+{point:04X}");
+        assert_eq!(&got, want, "wcswidth U+{point:04X}");
         let wc = call("wcwidth", &[O::Int(point)]).unwrap();
         let mapped = match want {
             O::Tuple(v) if v.len() == 2 && v[0] == atom("ok") => v[1].clone(),
@@ -287,7 +384,7 @@ fn wide_character_large_sample_matches_erl() {
 }
 
 #[test]
-fn isprint_matches_erts_c_locale_rule() {
+fn isprint_matches_libc_for_current_locale() {
     let _ = call("setlocale", &[atom("ignored")]).unwrap();
     for n in 0..=255_i64 {
         // SAFETY: this uses the same libc call and signed-char cast as prim_tty_nif.c.
@@ -305,7 +402,7 @@ fn terminfo_matches_erl_for_xterm_and_dumb() {
     let _lock = TERM_TEST_LOCK.lock().unwrap();
     let expression = "[prim_tty:tigetnum(C) || C <- [\"co\",\"li\",\"it\",\"zz\"]] ++ [prim_tty:tigetflag(C) || C <- [\"am\",\"xn\",\"ms\",\"zz\"]] ++ [prim_tty:tigetstr(C) || C <- [\"clear\",\"cup\",\"sgr0\",\"el\",\"bold\"]]";
     for term in ["xterm-256color", "dumb"] {
-        let Some(expected) = otp_file(Some(term), expression) else {
+        let Some(expected) = otp_file(Some(term), None, expression) else {
             return;
         };
         // SAFETY: the test is the only test changing TERM; the environment value is valid UTF-8.
@@ -357,6 +454,7 @@ fn terminfo_matches_erl_for_xterm_and_dumb() {
         assert_eq!(O::list(got), expected, "TERM={term}");
         let Some(expected_puts) = otp_file(
             Some(term),
+            None,
             "[prim_tty:tputs(\"\\e[%i%p1%d;%p2%dH\", [3,7]), prim_tty:tputs(\"\\e[H\", [])]",
         ) else {
             return;
@@ -400,6 +498,7 @@ fn terminfo_metadata_is_available() {
     let _lock = TERM_TEST_LOCK.lock().unwrap();
     let Some(expected) = otp_file(
         Some("xterm-256color"),
+        None,
         "maps:map(fun(_, V) -> length(V) end, prim_tty:tinfo())",
     ) else {
         return;

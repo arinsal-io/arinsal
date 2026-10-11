@@ -15,3 +15,6 @@ arinsal-term.workspace = true
 arinsal-etf.workspace = true
 libc = "0.2.175"
 num-traits.workspace = true
+
+[dev-dependencies]
+similar-asserts = "2"

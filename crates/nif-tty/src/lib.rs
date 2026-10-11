@@ -569,6 +569,7 @@ fn tty_select_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     })
 }
 fn tty_encoding_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/nifs/common/prim_tty_nif.c:287 (tty_encoding_nif), OTP-29.1.1.
     call(ctx, a, |_| Ok(atom("utf8")))
 }
 fn tty_is_open_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
@@ -724,6 +725,7 @@ fn read_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     })
 }
 fn isprint_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/nifs/common/prim_tty_nif.c:300 (isprint_nif), OTP-29.1.1.
     call(ctx, a, |a| {
         let i =
             i32::try_from(number(&a[0]).ok_or(BifError::BADARG)?).map_err(|_| BifError::BADARG)?;
@@ -736,12 +738,13 @@ fn isprint_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     })
 }
 fn wcwidth_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/nifs/common/prim_tty_nif.c:309 (wcwidth_nif), OTP-29.1.1.
     call(ctx, a, |a| {
         let i =
             i32::try_from(number(&a[0]).ok_or(BifError::BADARG)?).map_err(|_| BifError::BADARG)?;
         // SAFETY: wchar_t on macOS is a signed 32-bit integer, matching OTP's cast.
         let width = unsafe { wcwidth(i as libc::wchar_t) };
-        Ok(if width < 0 {
+        Ok(if width == -1 {
             error("not_printable")
         } else {
             O::Int(i64::from(width))
@@ -749,6 +752,7 @@ fn wcwidth_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
     })
 }
 fn wcswidth_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/nifs/common/prim_tty_nif.c:327 (wcswidth_nif), OTP-29.1.1.
     call(ctx, a, |a| {
         let mut bytes = Vec::new();
         iolist(&a[0], &mut bytes)?;
@@ -760,7 +764,7 @@ fn wcswidth_nif(ctx: &mut Ctx<'_>, a: &[Term]) -> Result<Term, BifError> {
             .collect::<Vec<_>>();
         // SAFETY: chars is a valid contiguous wchar_t array for the supplied count.
         let width = unsafe { wcswidth(chars.as_ptr(), chars.len()) };
-        Ok(if width < 0 {
+        Ok(if width == -1 {
             error("not_printable")
         } else {
             ok(O::Int(i64::from(width)))
