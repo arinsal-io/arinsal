@@ -50,6 +50,9 @@ pub(crate) struct CodeIndexes {
     staging: AtomicU32,
     /// `module_tables[ERTS_NUM_CODE_IX]`, the export tables and the ranges of each code index.
     tables: [ArcSwap<CodeTables>; ERTS_NUM_CODE_IX],
+    /// Generation of each slot's tables, published after the tables: a scheduled-in process
+    /// compares its code index with one atomic read, like `erts_active_code_ix()`.
+    generations: [AtomicU64; ERTS_NUM_CODE_IX],
     permission: Mutex<Permission>,
     released: Condvar,
     /// Bodies of loader-bound static NIFs and `load_nif` functions. `NativeBody` instructions
@@ -69,6 +72,7 @@ impl CodeIndexes {
             scope,
             active: AtomicU32::new(0),
             staging: AtomicU32::new(0),
+            generations: std::array::from_fn(|_| AtomicU64::new(initial.generation)),
             tables: std::array::from_fn(|_| ArcSwap::new(Arc::clone(&initial))),
             permission: Mutex::default(),
             released: Condvar::new(),
@@ -99,8 +103,15 @@ impl CodeIndexes {
     }
 
     /// Generation of the active tables.
+    // Port of erts/emulator/beam/code_ix.h (erts_active_code_ix: one atomic read), OTP-29.1.1.
     pub(crate) fn active_generation(&self) -> u64 {
-        self.tables[self.active()].load().generation
+        self.generations[self.active()].load(Ordering::Acquire)
+    }
+
+    fn store_slot(&self, ix: usize, tables: Arc<CodeTables>) {
+        let generation = tables.generation;
+        self.tables[ix].store(tables);
+        self.generations[ix].store(generation, Ordering::Release);
     }
 
     /// Takes the staging tables for this thread, waiting while another thread holds them.
@@ -216,10 +227,10 @@ impl CodeIndexes {
     fn commit_tables(&self, mut tables: CodeTables) {
         tables.generation = next_generation();
         let tables = Arc::new(tables);
-        self.tables[self.staging()].store(Arc::clone(&tables));
+        self.store_slot(self.staging(), Arc::clone(&tables));
         self.commit();
         // The oldest code index is only read again once staging copies into it.
-        self.tables[self.staging()].store(tables);
+        self.store_slot(self.staging(), tables);
     }
 
     /// Changes the active tables in place under the code modification permission, the way
@@ -283,8 +294,8 @@ impl CodeIndexes {
     fn publish_everywhere(&self, mut tables: CodeTables) {
         tables.generation = next_generation();
         let tables = Arc::new(tables);
-        for slot in &self.tables {
-            slot.store(Arc::clone(&tables));
+        for ix in 0..ERTS_NUM_CODE_IX {
+            self.store_slot(ix, Arc::clone(&tables));
         }
         crate::natives::nif::invalidate_tracer_callbacks(self.scope);
     }

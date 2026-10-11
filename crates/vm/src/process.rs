@@ -2921,7 +2921,15 @@ impl Executor {
             };
             // A pending exception handler reads x0-x3 even when the module's own register
             // count is lower (`gc_live` is 4 from handler entry until it runs).
-            let live_x = live_x.max(native_live).max(process.gc_live);
+            // Port of erts/emulator/beam/erl_process.c:10550 and beam_common.c (the yield or
+            // wait site stores its live X register count in `c_p->arity`, and only those are
+            // saved in `c_p->arg_reg`), OTP-29.1.1: a native continuation records that count
+            // (plus one) in `native_resume_live`.
+            let live_x = if process.native_pc.is_some() && native_live != 0 {
+                (native_live - 1).max(process.gc_live)
+            } else {
+                live_x.max(native_live).max(process.gc_live)
+            };
             if crate::native_bridge::return_trace_enabled() && process.native_pc.is_some() {
                 eprintln!(
                     "[sched-save-native] live_x={live_x} x_len={} x0={:#x} module={} native_pc={:?}",
@@ -2931,16 +2939,19 @@ impl Executor {
                     process.native_pc
                 );
             }
-            let mut saved_x = process.x.to_vec();
-            saved_x.resize(live_x, Term::NIL);
+            // Port of erts/emulator/beam/erl_process.h (`def_arg_reg`): up to six saved X
+            // registers stay inline in the process, so switching out allocates nothing.
+            if process.x.len() != live_x {
+                process.x = crate::proc_create::ArgRegs::new(live_x);
+            }
             let copy_x = self.x.len().min(live_x);
-            saved_x[..copy_x].copy_from_slice(&self.x[..copy_x]);
-            process.x = saved_x.into();
-            let mut saved_fr = process.fr.to_vec();
-            saved_fr.resize(live_fr, 0.0);
+            process.x[..copy_x].copy_from_slice(&self.x[..copy_x]);
+            process.x[copy_x..].fill(Term::NIL);
+            if process.fr.len() != live_fr {
+                process.fr = vec![0.0; live_fr].into_boxed_slice();
+            }
             let copy_fr = self.fr.len().min(live_fr);
-            saved_fr[..copy_fr].copy_from_slice(&self.fr[..copy_fr]);
-            process.fr = saved_fr.into_boxed_slice();
+            process.fr[..copy_fr].copy_from_slice(&self.fr[..copy_fr]);
         } else {
             process.x = crate::proc_create::ArgRegs::empty();
             process.fr = Box::new([]);

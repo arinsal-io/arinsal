@@ -104,6 +104,13 @@ impl RunQueueBalance {
         self.len[prio].fetch_sub(n, Ordering::Relaxed);
     }
 
+    /// Processes and ports queued on this run queue (`rq->len`).
+    /// Port of erts/emulator/beam/erl_process.c:5616 (erts_atomic32_read_dirty(&rq->len)),
+    /// OTP-29.1.1.
+    pub(crate) fn total_len(&self) -> i32 {
+        self.total_len.load(Ordering::Relaxed)
+    }
+
     /// Port of erts/emulator/beam/erl_process.h:879 (RUNQ_READ_LEN), OTP-29.1.1.
     pub(crate) fn len(&self, prio: usize) -> i32 {
         self.len[prio].load(Ordering::Relaxed)
