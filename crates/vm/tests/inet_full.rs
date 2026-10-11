@@ -26,6 +26,8 @@ run(Case) ->
         local -> local();
         reset -> reset();
         send_timeout -> send_timeout();
+        connect_timeout -> connect_timeout();
+        refused -> refused();
         debug_on -> debug_on();
         sched -> sched();
         default_ifaces -> default_ifaces()
@@ -317,6 +319,12 @@ send_timeout() ->
     gen_tcp:close(L),
     {R1, R2}.
 
+connect_timeout() ->
+    gen_tcp:connect({192,0,2,1}, 1, [{tcp_module, inet_tcp}, {active, false}], 200).
+
+refused() ->
+    gen_tcp:connect({127,0,0,1}, 1, [{tcp_module, inet_tcp}, {active, false}], 400).
+
 sched() ->
     {ok, L} = listen([]),
     gen_tcp:close(L),
@@ -391,6 +399,8 @@ fn tcp_inet_matches_erts() {
         "local",
         "reset",
         "send_timeout",
+        "connect_timeout",
+        "refused",
     ] {
         run_case(&reference, &mut vm, case);
     }

@@ -746,63 +746,23 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
     let fd = inner.fd.as_ref().unwrap().as_raw_fd();
     let rc = dest.call(|ptr, len| {
         // SAFETY: ptr/len is the sockaddr this driver built; fd is its socket.
-        // Port of inet_drv.c connect completion (tcp_inet_output on writable):
-        // a nonblocking localhost handshake is often done before the caller
-        // yields. Observe it now so a peer that RSTs after establishment is
-        // reported by the following recv, not as a failed connect.
-        unsafe {
-            let rc = libc::connect(fd, ptr, len);
-            if rc == 0 {
-                return 0;
-            }
-            let err = *libc::__error();
-            if err != libc::EINPROGRESS && err != libc::EAGAIN && err != libc::EWOULDBLOCK {
-                return -1;
-            }
-            let mut pollfd = libc::pollfd {
-                fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            // Timeout 0 returns before the peer accept, so the later async
-            // completion observes the RST. A short wait here is still inside
-            // the driver, before this scheduler yields to the acceptor's
-            // close; erts runs the same SO_ERROR check from check_io in that
-            // window (inet_drv.c:14272).
-            let wait_ms = if timeout == 0 { 0 } else { 20 };
-            if libc::poll(&mut pollfd, 1, wait_ms) <= 0 {
-                return -1;
-            }
-            let mut so = 0i32;
-            let mut slen = std::mem::size_of::<i32>() as libc::socklen_t;
-            if libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                (&mut so as *mut i32).cast(),
-                &mut slen,
-            ) < 0
-            {
-                return -1;
-            }
-            if so == 0 {
-                return 0;
-            }
-            if so != libc::EINPROGRESS && so != libc::EAGAIN {
-                *libc::__error() = so;
-            }
-            -1
-        }
+        unsafe { libc::connect(fd, ptr, len) }
     });
     if rc == 0 {
         inner.phase = Phase::Connected;
         return ok_bytes(&[]);
     }
     let err = last_errno();
+    // Port of inet_drv.c:12098-12114 (EINPROGRESS → sock_select FD_CONNECT and
+    // driver_set_timer), OTP-29.1.1. Completion is tcp_inet_output when the
+    // poll set reports the socket writable, not a wait inside this call.
     if err == libc::EINPROGRESS || err == libc::EAGAIN || err == libc::EWOULDBLOCK {
         let aref = alloc_async(inner);
-        let deadline = deadline(timeout);
         if timeout == 0 {
+            // A zero timer is already due. erts closes the socket
+            // (tcp_inet_timeout) and replies `{error, timeout}`.
+            inner.fd.take();
+            inner.phase = Phase::Closed;
             emit(
                 sock,
                 Out::AsyncError {
@@ -816,12 +776,11 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
             inner.connect = Some(Waiter {
                 caller,
                 aref,
-                deadline,
+                deadline: deadline(timeout),
             });
             inner.pending.push((caller, aref));
-            // The inet thread may be blocked in a one-shot wait that does not
-            // include this fd yet. Wake it so tcp_inet_output runs when the
-            // handshake completes (inet_drv.c:14242), before the peer RSTs.
+            // The inet thread may be blocked in a wait that does not include
+            // this fd yet. Wake it so the next poll set selects FD_CONNECT.
             poke();
         }
         return ok_bytes(&aref.to_be_bytes());
@@ -3449,41 +3408,13 @@ fn on_eof(sock: &Arc<Sock>) {
     }
 }
 
-/// `true` when a connecting socket is writable or in error right now.
+/// Finish a non-blocking connect once the poll set reports the socket writable.
 ///
-/// The shared poller is one-shot and reports a single fd, so a connect
-/// completion can be cancelled by an unrelated wake. `poll(0)` sees the
-/// kernel state erts would see in `tcp_inet_output` on `FD_CONNECT`.
-fn connect_poll_ready(sock: &Sock) -> bool {
-    let fd = {
-        let inner = sock.inner.lock().unwrap();
-        if inner.phase != Phase::Connecting {
-            return false;
-        }
-        let Some(fd) = inner.fd.as_ref() else {
-            return false;
-        };
-        fd.as_raw_fd()
-    };
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    // SAFETY: fd is the connecting socket this driver owns. Timeout 0 does not block.
-    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
-    ready > 0 && (pollfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0
-}
-
-fn finish_writable_connects(socks: &[Arc<Sock>]) {
-    for sock in socks {
-        if connect_poll_ready(sock) {
-            try_io(sock, true);
-        }
-    }
-}
-
+/// Port of inet_drv.c:14242-14287 (`tcp_inet_output` while `INET_STATE_CONNECTING`),
+/// OTP-29.1.1: drop the write selection, cancel the connect timer by taking the
+/// waiter, and read `SO_ERROR`.
 fn poll_connect(inner: &mut Inner) -> Option<Out> {
+    inner.connect.as_ref()?;
     let fd = inner.fd.as_ref()?.as_raw_fd();
     let mut err = 0i32;
     let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -3497,52 +3428,20 @@ fn poll_connect(inner: &mut Inner) -> Option<Out> {
             &mut len,
         )
     };
-    inner.connect.as_ref()?;
-    if rc == 0 && err == 0 {
-        // Port of inet_drv.c:14242 (tcp_inet_output runs only once the socket
-        // is writable). SO_ERROR == 0 before that still means EINPROGRESS.
-        // The shared poller has delivered this fd's one-shot writable event.
-        err = 0;
-        len = std::mem::size_of::<i32>() as libc::socklen_t;
-        // SAFETY: fd is the connecting socket this driver owns.
-        let again = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                (&mut err as *mut i32).cast(),
-                &mut len,
-            )
-        };
-        if again == 0 && err == 0 {
-            let waiter = inner.connect.take().unwrap();
-            drop_pending(inner, waiter.caller, waiter.aref);
-            inner.phase = Phase::Connected;
-            return Some(Out::AsyncOk {
-                caller: waiter.caller,
-                aref: waiter.aref,
-            });
-        }
-        if again == 0 && (err == libc::EINPROGRESS || err == libc::EAGAIN) {
+    if rc == 0 && (err == 0 || err == libc::EINPROGRESS || err == libc::EAGAIN) {
+        if err != 0 {
+            // Writable interest fired early. Keep FD_CONNECT selected.
             return None;
         }
-        let reason = errno_name(if again == 0 { err } else { last_errno() });
         let waiter = inner.connect.take().unwrap();
         drop_pending(inner, waiter.caller, waiter.aref);
-        inner.phase = Phase::Open;
-        return Some(Out::AsyncError {
+        inner.phase = Phase::Connected;
+        return Some(Out::AsyncOk {
             caller: waiter.caller,
             aref: waiter.aref,
-            reason,
         });
     }
-    if rc == 0 && (err == libc::EINPROGRESS || err == 0) {
-        return None;
-    }
     let reason = errno_name(if rc == 0 { err } else { last_errno() });
-    if reason == "eagain" || reason == "einprogress" {
-        return None;
-    }
     let waiter = inner.connect.take().unwrap();
     drop_pending(inner, waiter.caller, waiter.aref);
     inner.phase = Phase::Open;
@@ -3568,11 +3467,6 @@ fn io_loop(wake_r: OwnedFd) {
         for sock in &socks {
             try_io(sock, false);
         }
-        // One-shot `wait_any_timeout` returns a single fd and cancels the rest
-        // (check_io.rs). A connect that became writable in that window must still
-        // run tcp_inet_output before the peer can RST. Port of inet_drv.c:14242
-        // (tcp_inet_output on FD_CONNECT), OTP-29.1.1.
-        finish_writable_connects(&socks);
         for sock in &socks {
             let inner = sock.inner.lock().unwrap();
             let Some(fd) = inner.fd.as_ref().map(AsRawFd::as_raw_fd) else {
@@ -3611,12 +3505,11 @@ fn io_loop(wake_r: OwnedFd) {
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => continue,
         }
-        // The one-shot wait drops every registration except the fd it returned.
-        // Complete connects that are already writable, then read the others before
-        // timers: an RST already pending on the socket is `econnreset` from recv,
-        // not the receive deadline (inet_drv.c tcp_inet_input runs from
-        // erts_check_io before timer expiry).
-        finish_writable_connects(&socks);
+        // Read before timers: an RST already pending on the socket is
+        // `econnreset` from recv, not the receive deadline (inet_drv.c
+        // tcp_inet_input runs from erts_check_io before timer expiry).
+        // A connect still in progress stays selected for write and finishes
+        // in `poll_connect` when this wait, or the next one, reports it.
         for sock in &socks {
             try_io(sock, false);
         }
@@ -3680,9 +3573,12 @@ fn fire_timeouts() {
             if let Some(waiter) = inner.connect.as_ref()
                 && waiter.deadline.is_some_and(|at| at <= now)
             {
+                // Port of inet_drv.c:12569-12573 (tcp_inet_timeout): a connect
+                // timer closes the socket, then replies `{error, timeout}`.
                 let waiter = inner.connect.take().unwrap();
                 drop_pending(&mut inner, waiter.caller, waiter.aref);
-                inner.phase = Phase::Open;
+                inner.fd.take();
+                inner.phase = Phase::Closed;
                 due.push((waiter.caller, waiter.aref));
             }
             let mut sends = Vec::new();
