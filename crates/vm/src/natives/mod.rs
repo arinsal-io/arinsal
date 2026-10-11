@@ -344,6 +344,11 @@ pub(crate) type ProcessBif = fn(&mut Process, &[Term]) -> Result<Term, crate::ex
 
 /// The process BIF native code calls for `module:function/arity`, if it has one.
 pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<ProcessBif> {
+    // Port of bif.tab `hbif erts_internal:garbage_collect/1`: a plain BIF called
+    // through the export entry (`call_light_bif`), not an executor native.
+    if module == "erts_internal" && function == "garbage_collect" && arity == 1 {
+        return Some(sys::garbage_collect_bif);
+    }
     if module == "erlang"
         && let Some(bif) = proc::dictionary_bif(function, arity)
     {

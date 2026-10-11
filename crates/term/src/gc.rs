@@ -14,9 +14,31 @@ use crate::{
     FunEntry, HEAP_BITS, HeapAlloc, MAP, MagicRef, Node, ProcessHeap, RECORD, REF, RefcBinary,
     S_RESERVED, SUB_BITS, StackWord, Term, TermError, WritableBinary,
 };
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+/// `erts_system_monitor_long_gc`: the collector reads the clock only while this is set.
+// Port of erts/emulator/beam/erl_gc.c:803, OTP-29.1.1.
+static GC_CLOCK_LONG: AtomicBool = AtomicBool::new(false);
+/// `erts_msacc_enabled`: microstate accounting times the collector the same way.
+// Port of erts/emulator/beam/erl_msacc.h:240 (`ERTS_MSACC_IS_ENABLED`), OTP-29.1.1.
+static GC_CLOCK_MSACC: AtomicBool = AtomicBool::new(false);
+
+/// Enable the monotonic clock around collections while `long_gc` monitoring is on.
+pub fn set_gc_clock_for_long_gc(enabled: bool) {
+    GC_CLOCK_LONG.store(enabled, Ordering::Relaxed);
+}
+
+/// Enable the monotonic clock around collections while microstate accounting is on.
+pub fn set_gc_clock_for_msacc(enabled: bool) {
+    GC_CLOCK_MSACC.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+fn gc_clock_active() -> bool {
+    GC_CLOCK_LONG.load(Ordering::Relaxed) || GC_CLOCK_MSACC.load(Ordering::Relaxed)
+}
 
 /// Location and sizes of an abandoned young heap.
 #[derive(Clone, Copy, Debug)]
@@ -1027,7 +1049,9 @@ impl ProcessHeap {
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<GcStats, TermError> {
-        let start = Instant::now();
+        // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
+        // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
+        let start = gc_clock_active().then(Instant::now);
         let abandoned = self.abandoned_heap();
         let abandoned_mature = abandoned.map_or((0, 0), |abandoned| {
             (abandoned.start, abandoned.start + abandoned.high_water * 8)
@@ -1251,7 +1275,7 @@ impl ProcessHeap {
             words_copied: copied,
             words_promoted: promoted,
             words_reclaimed: size_before.saturating_sub((copied + promoted) as usize) as u64,
-            nanoseconds: start.elapsed().as_nanos() as u64,
+            nanoseconds: start.map_or(0, |start| start.elapsed().as_nanos() as u64),
         };
         // Port of erts/emulator/beam/erl_gc.c:3284-3289 (sweep_off_heap), OTP-29.1.1.
         if major && self.owners.is_allocated() {
