@@ -1813,7 +1813,11 @@ impl arinsal_drv::SystemHooks for VmHooks {
     }
 
     fn async_threads(&self) -> usize {
-        1
+        // Port of erts/emulator/beam/erl_bif_info.c:3032-3037, OTP-29.1.1.
+        arinsal_args::active_emulator_flags()
+            .async_threads
+            .unwrap_or(1)
+            .max(1) as usize
     }
 
     fn scheduler_threads(&self) -> usize {

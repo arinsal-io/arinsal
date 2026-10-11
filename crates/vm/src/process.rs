@@ -10,7 +10,6 @@ use arinsal_sched::{
 };
 use arinsal_spec::Opcode;
 use arinsal_term::ptab::PtabIdRing;
-use arinsal_term::ptab::{PtabLayout, set_port_table_layout};
 use arinsal_term::{
     ProcessHeap, SharedCopyCache, Term, TermBuilder, VecHeap, copy_term,
     copy_term_preserving_sharing_with_cache, global_atoms, size_object,
@@ -6617,9 +6616,8 @@ impl Vm {
             })?;
         let (sender, receiver) = mpsc::channel();
         let code = Arc::clone(&self.code_ix);
-        let port_layout = PtabLayout::new(1 << 20);
-        set_port_table_layout(port_layout);
-        let port_ids = PtabIdRing::new(1 << 20);
+        let port_layout = arinsal_term::ptab::port_table_layout();
+        let port_ids = PtabIdRing::new(port_layout.max());
         // erts creates its forker port first and keeps port id zero occupied.
         assert_eq!(port_ids.reserve(), Some(0));
         let runtime = Arc::new(Runtime {

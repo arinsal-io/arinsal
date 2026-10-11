@@ -206,6 +206,7 @@ fn erl_launch(args: &[String]) -> ! {
             std::process::exit(status);
         }
     };
+    arinsal_args::configure_emulator_flags(launch.emulator.clone());
     let default_dirty_allocators = launch
         .emulator
         .dirty_cpu_schedulers
@@ -267,10 +268,9 @@ fn erl_launch(args: &[String]) -> ! {
     seeded.extend(launch.set_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     arinsal_vm::boot::seed_environment(&seeded);
     let root = PathBuf::from(&launch.root_dir);
-    let workers = launch.emulator.schedulers.map_or_else(
-        || std::thread::available_parallelism().map_or(1, |count| count.get()),
-        |count| usize::try_from(count.total).unwrap_or(1).max(1),
-    );
+    let cpus = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let workers = arinsal_args::resolve_scheduler_count(launch.emulator.schedulers, cpus)
+        .map_or(cpus, |(total, _)| total);
     match arinsal_vm::boot::run_with_debugger_flags(
         &root,
         &launch.boot_args,

@@ -128,6 +128,33 @@ pub struct SchedulerCount {
     pub online: Option<i32>,
 }
 
+/// Resolve a parsed `+S`/`+SDcpu` count against the machine CPU count.
+// Port of erts/emulator/beam/erl_init.c:1048-1070, 1120-1140, OTP-29.1.1.
+pub fn resolve_scheduler_count(
+    count: Option<SchedulerCount>,
+    cpus: usize,
+) -> Option<(usize, usize)> {
+    let Some(count) = count else {
+        return Some((cpus, cpus));
+    };
+    let resolve = |value: i32, default: usize| {
+        let cpus = i32::try_from(cpus).unwrap_or(i32::MAX);
+        let count = if value < 0 {
+            cpus.saturating_add(value)
+        } else if value == 0 {
+            i32::try_from(default).unwrap_or(i32::MAX)
+        } else {
+            value
+        };
+        usize::try_from(count).ok().filter(|count| *count > 0)
+    };
+    let total = resolve(count.total, cpus)?;
+    let online = count
+        .online
+        .map_or_else(|| Some(total.min(cpus)), |value| resolve(value, total))?;
+    (online <= total).then_some((total, online))
+}
+
 /// An OTP process or port limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
@@ -203,6 +230,8 @@ pub struct EmulatorFlags {
     pub debugger_support: bool,
     /// `+Dibpl` selects line breakpoint instrumentation for subsequently loaded modules.
     pub debugger_line_breakpoints: Option<bool>,
+    /// `+A` async thread count.
+    pub async_threads: Option<u32>,
     /// `+S`.
     pub schedulers: Option<SchedulerCount>,
     /// `+SDcpu`.
@@ -256,6 +285,25 @@ pub struct SchedulerOptions {
     pub bind_type: Option<String>,
 }
 
+static ACTIVE_EMULATOR_FLAGS: OnceLock<Mutex<EmulatorFlags>> = OnceLock::new();
+
+/// Set parsed emulator startup options before the VM starts.
+pub fn configure_emulator_flags(flags: EmulatorFlags) {
+    *ACTIVE_EMULATOR_FLAGS
+        .get_or_init(|| Mutex::new(EmulatorFlags::default()))
+        .lock()
+        .expect("emulator flags lock poisoned") = flags;
+}
+
+/// Return the active emulator startup options.
+pub fn active_emulator_flags() -> EmulatorFlags {
+    ACTIVE_EMULATOR_FLAGS
+        .get_or_init(|| Mutex::new(EmulatorFlags::default()))
+        .lock()
+        .expect("emulator flags lock poisoned")
+        .clone()
+}
+
 /// Scheduler options visible to the runtime after CLI startup parsing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActiveSchedulerOptions(pub SchedulerOptions);
@@ -282,7 +330,7 @@ pub fn active_scheduler_options() -> ActiveSchedulerOptions {
 impl EmulatorFlags {
     /// Messages the CLI can show for accepted options without VM support.
     ///
-    /// `+A`, `+sbwt`, and `+M*` are accepted and ignored with no diagnostic,
+    /// `+sbwt` and `+M*` are accepted and ignored with no diagnostic,
     /// matching an `erl` that starts successfully.
     pub fn warnings(&self) -> Vec<String> {
         self.ignored
@@ -1294,7 +1342,7 @@ fn parse_emulator_flag(
             let v = require_plus_value(args, i, token, &mut consumed)?;
             if name == "+hms" {
                 // Port of erts/emulator/beam/erl_init.c:1556 (erl_start -hms), OTP-29.1.1.
-                // Stored and not applied, so process heaps keep the VM default.
+                // The VM applies this through erts_next_heap_size at startup.
                 let words = c_atoi(&v);
                 if words <= 0 {
                     return Err(ArgsError::ErlDiagnostic(format!("bad heap size {v}")));
@@ -1394,6 +1442,7 @@ fn parse_emulator_flag(
                         "bad number of async threads {arg}"
                     )));
                 }
+                out.async_threads = Some(threads as u32);
             } else if name == "+sbwt" {
                 // Port of erts/emulator/beam/erl_process.c:5852
                 // (erts_sched_set_busy_wait_threshold), OTP-29.1.1.
@@ -1449,10 +1498,12 @@ fn parse_emulator_flag(
                     value: v.clone(),
                 });
             }
-            out.ignored.push(IgnoredFlag {
-                name: name.into(),
-                value: v,
-            });
+            if name != "+A" {
+                out.ignored.push(IgnoredFlag {
+                    name: name.into(),
+                    value: v,
+                });
+            }
         }
     }
     Ok(consumed)
