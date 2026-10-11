@@ -39,7 +39,9 @@ pub use fun::{
     ErtsDispatchable, ExportEntry, ExportStubFn, FunEntry, FunRef, beam_unloaded_fun,
     export_get_or_make_stub, set_export_stub_hook, set_fun_dispatch_fragments,
 };
-pub use gc::{FragmentAlloc, FragmentIndex, GcStats};
+pub use gc::{
+    FragmentAlloc, FragmentIndex, GcStats, set_gc_clock_for_long_gc, set_gc_clock_for_msacc,
+};
 pub use hamt::{
     HxNode, alloc_terms, boxed_object_words, build_hamt_from_unique, flatmap_keys,
     hashmap_from_ks_and_vs, hashmap_from_ks_and_vs_extra, hashmap_from_unsorted_array,

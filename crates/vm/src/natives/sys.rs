@@ -3918,23 +3918,47 @@ fn reset_microstate_baseline(process: &Process, ctx: &RunCtx<'_, Message>) {
         .expect("microstate baseline") = Some((Instant::now(), counters, poll_baseline));
 }
 
+/// `erts_internal:garbage_collect/1` from native code, on the light BIF path.
+// Port of erts/emulator/beam/bif.c:4077 (`erts_internal_garbage_collect_1`) and
+// jit/arm/instr_bif.cpp:378 (`call_light_bif_shared`), OTP-29.1.1.
+pub(crate) fn garbage_collect_bif(
+    process: &mut Process,
+    args: &[Term],
+) -> Result<Term, crate::exceptions::Trap> {
+    if let Some(slot) = process.x.first_mut() {
+        *slot = args[0];
+    }
+    match garbage_collect(process, args[0]) {
+        Ok(term) => Ok(term),
+        Err(VmError::Trap(trap)) => Err(trap),
+        Err(_) => Err(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        ))),
+    }
+}
+
 fn garbage_collect(process: &mut Process, arg: Term) -> Result<Term, VmError> {
-    let major = match atom_name(arg) {
-        Some("major") => true,
-        Some("minor") => false,
-        _ => return Err(badarg()),
+    // Port of erts/emulator/beam/bif.c:4079-4089, OTP-29.1.1: the argument is
+    // compared to the predefined atoms, and the result is `am_true`.
+    let major = if arg == Term::atom(arinsal_term::atoms::MAJOR) {
+        true
+    } else if arg == Term::atom(arinsal_term::atoms::MINOR) {
+        false
+    } else {
+        return Err(badarg());
     };
     let fullsweep_after = process.heap.fullsweep_after();
     if major {
         process.heap.set_fullsweep_after(0);
     }
-    let live = 1;
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8257 (on-heap mailbox roots), OTP-29.1.1.
+    // Port of bif.c:4084 (`erts_garbage_collect(BIF_P, 0, NULL, 0)`), OTP-29.1.1:
+    // the caller spilled live X registers, so this BIF passes no register roots.
+    let live = 0;
     let collected = process.collect_heap_roots(live, &mut [], 0);
     process.heap.set_fullsweep_after(fullsweep_after);
     let gc = collected.map_err(|error| VmError::Unsupported(format!("GC {error:?}")))?;
     after_collection(process, live, gc.collections, gc.words_reclaimed);
-    Ok(atom("true"))
+    Ok(Term::atom(arinsal_term::atoms::TRUE))
 }
 
 fn rewrite_roots(

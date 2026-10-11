@@ -634,6 +634,20 @@ impl Process {
             MessageQueueData::OnHeap
         }
     }
+
+    /// Whether `erts_garbage_collect` must fetch the outer signal queue first.
+    // Port of erts/emulator/beam/erl_gc.c:987-990, OTP-29.1.1: only an on-heap
+    // queue (or a queue changing onto the heap) is fetched, and only when the
+    // outer queue is non-empty (`sig_inq.first`).
+    pub(crate) fn gc_outer_queue_pending(&self) -> bool {
+        if self.message_queue_data() == MessageQueueData::OffHeap {
+            return false;
+        }
+        self.cold
+            .as_ref()
+            .and_then(|cold| cold.signal_probe.as_ref())
+            .is_some_and(arinsal_sched::SignalProbe::has_pending)
+    }
 }
 
 /// Reply for a suspend whose suspender waits on it (`{Tag, Res}`), with the variant sent
@@ -5494,6 +5508,38 @@ impl Process {
         if !hibernate && self.delay_for_dirty_gc(min_free) {
             return Ok(arinsal_term::GcStats::default());
         }
+        // Port of erl_gc.c:2616 (`setup_rootset` with `nobj == 0`, no dictionary and
+        // an empty message queue): the stack is scanned in place. Building and
+        // rewriting an auxiliary root vector is the on-heap message and dictionary case.
+        if !hibernate
+            && extra.is_empty()
+            && self.inbox.is_empty()
+            && self.dictionary.is_none()
+            && self.apply_inline_len == 0
+            && self.cold.as_ref().is_none_or(|cold| {
+                cold.persistent_get_all.is_none()
+                    && cold.apply_roots.is_empty()
+                    && cold.nif_pending.is_none()
+                    && cold.call_memory.is_empty()
+            })
+            && self.max_heap_peak == 0
+            && self
+                .runtime
+                .as_ref()
+                .is_none_or(|runtime| !runtime.ever_max_heap.load(Ordering::Acquire))
+            && self
+                .self_pid
+                .is_none_or(|pid| crate::trace::flags(self, pid) & crate::trace::GC == 0)
+        {
+            let stats = self
+                .heap
+                .collect(&mut self.x[..live_x], &mut [], min_free)
+                .map_err(|error| VmError::Unsupported(format!("process GC: {error:?}")))?;
+            self.stats.gc.collections += stats.collections;
+            self.stats.gc.nanoseconds += stats.nanoseconds;
+            crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
+            return Ok(stats);
+        }
         // Port of erts/emulator/beam/erl_gc.c:3730 (`has_reached_max_heap_size`) call in
         // `garbage_collect`, OTP-29.1.1: the limit is judged on the pre-collection size.
         if self
@@ -6008,6 +6054,16 @@ impl Task for Process {
             );
         }
         ctx.set_parallel_signal_buffers(self.message_queue_data() == MessageQueueData::OffHeap);
+        // The light BIF path has no scheduler context. A probe is the process-side
+        // `sig_inq` flag (`ERTS_PSFLG_MSG_SIG_IN_Q`) it checks before collecting.
+        if self
+            .cold
+            .as_ref()
+            .is_none_or(|cold| cold.signal_probe.is_none())
+            && let Some(probe) = ctx.signal_probe()
+        {
+            self.cold_mut().signal_probe = Some(probe);
+        }
         // Records built or decoded while this process runs use its node's canonical definitions.
         arinsal_term::set_record_scope(
             self.runtime

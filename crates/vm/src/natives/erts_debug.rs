@@ -162,15 +162,24 @@ fn refresh_system_monitor_flags(runtime: &crate::process::Runtime) {
         }
     }
     runtime.system_monitor_flags.store(flags, Ordering::Relaxed);
+    // Port of erl_gc.c:803 (`if (erts_system_monitor_long_gc)`), OTP-29.1.1.
+    arinsal_term::set_gc_clock_for_long_gc(flags & MONITOR_LONG_GC != 0);
 }
 
 /// Emit the monitor events that are observable from the VM's collection hook.
 // Port of erts/emulator/beam/erl_gc.c:904-920 and erl_trace.c:1604-1741, OTP-29.1.1.
 pub(crate) fn after_collection(process: &mut Process, elapsed_nanoseconds: u64) {
-    if let Some(runtime) = process.runtime.clone() {
-        for state in monitor_states(&runtime) {
-            after_collection_one(process, elapsed_nanoseconds, &state);
-        }
+    // Port of erl_gc.c:904-920: long_gc and large_heap are global flags tested
+    // before any monitor state is touched.
+    let Some(runtime) = process.runtime.as_ref() else {
+        return;
+    };
+    if runtime.system_monitor_flags.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let runtime = runtime.clone();
+    for state in monitor_states(&runtime) {
+        after_collection_one(process, elapsed_nanoseconds, &state);
     }
 }
 

@@ -4910,6 +4910,9 @@ impl<T: Task> Scheduler<T> {
                 .accounting_flags
                 .fetch_and(!ACCOUNTING_MSACC, Ordering::Relaxed);
         }
+        // Port of erl_msacc.h:240 (`ERTS_MSACC_IS_ENABLED`): the collector reads the
+        // clock only while accounting is on.
+        arinsal_term::set_gc_clock_for_msacc(enabled);
         self.wake_all_workers();
     }
 

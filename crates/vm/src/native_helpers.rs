@@ -891,6 +891,13 @@ fn invoke_dispatch_bif(
             && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
                 || crate::trace_bp::any_pattern()))
         && !export.trap_entry
+        // Port of erl_gc.c:987-990: an on-heap queue with signals still in the
+        // outer queue is fetched before the collection. That fetch needs the
+        // scheduler context, so this call leaves native code. An empty outer
+        // queue stays on the light path.
+        && !((bif as usize)
+            == (crate::natives::sys::garbage_collect_bif as *const () as usize)
+            && process.gc_outer_queue_pending())
     {
         return Some(call_process_bif(
             process,
@@ -1478,8 +1485,39 @@ fn call_process_bif(
         charge_bif_reductions(process, 1);
     }
     let arity = usize::from(export.arity);
+    // `garbage_collect` moves the heap and rebases the frame pointer. The light
+    // fragment stored the Erlang frame in `tmp_mem[2]` and reloads heap bounds
+    // from the process header on the way out (`RUNTIME_UPDATE`).
+    let collects =
+        (bif as usize) == (crate::natives::sys::garbage_collect_bif as *const () as usize);
+    if collects {
+        process
+            .heap
+            .set_frame_pointer(registers.tmp_mem[2] as usize);
+    }
     let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     let result = bif(process, &registers.x_reg_array[..arity]);
+    if collects {
+        // The heap block moved. Heap indices from before the call belong to the
+        // old block, so the post-BIF free-space check does not apply.
+        registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+        process.sync_native_header();
+        return match result {
+            Ok(value) => {
+                registers.x_reg_array[0] = value;
+                // A collection handed to a dirty scheduler must leave this one before
+                // the next call. `leave_runtime` reloads FCALLS, and the next
+                // `call_light_bif` yields when it is exhausted.
+                // Port of erl_gc.c:588-597 (`force_reschedule`), OTP-29.1.1.
+                if process.force_yield {
+                    process.reductions = 0;
+                    process.header.fcalls = 0;
+                }
+                crate::native_hooks::raw(value)
+            }
+            Err(error) => process_bif_result(process, registers, export, arity, Err(error)),
+        };
+    }
     let top = process.heap.heap_top_index();
     if let Ok(value) = &result
         && stop - top >= process.heap.mbuf_size()

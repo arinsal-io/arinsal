@@ -572,6 +572,7 @@ fn mixed_boxed_graph_survives_one_hundred_collections() {
 #[test]
 #[ignore = "release-mode throughput measurement"]
 fn gc_throughput() {
+    arinsal_term::set_gc_clock_for_long_gc(true);
     fn measure(label: &str, mut heap: ProcessHeap, root: Term) {
         heap.set_fullsweep_after(0);
         let mut roots = [root];
