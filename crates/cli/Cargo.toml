@@ -23,7 +23,7 @@ arinsal-nif.workspace = true
 
 [dev-dependencies]
 arinsal-difftest.workspace = true
-similar-asserts = "1.7.0"
+similar-asserts = "2"
 
 [[bin]]
 name = "arinsal"
