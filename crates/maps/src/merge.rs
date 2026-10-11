@@ -13,6 +13,8 @@ const HAMT_MAX_LEVEL: usize = 16;
 const HEAD_ARRAY: u64 = 2;
 const HEAD_BITMAP: u64 = 3;
 const NODE_BITMAP: u64 = 1;
+// Port of erts/emulator/beam/erl_map.c:112 (HALLOC_EXTRA), OTP-29.1.1.
+const HALLOC_EXTRA: usize = 200;
 
 // Port of erts_write_heap_filler (erl_term.h:1500), OTP-29.1.1.
 fn heap_filler_header(words: usize) -> u64 {
@@ -27,10 +29,25 @@ pub(crate) fn produce<'a, H: HeapAlloc + ?Sized>(
     words: usize,
 ) -> Result<(&'a mut [MaybeUninit<u64>], *mut u64), TermError> {
     let ptr = heap.alloc(words).ok_or(TermError::HeapFull)?;
+    Ok((uninitialized_words(ptr, words), ptr))
+}
+
+/// Fresh words allocated with ERTS's merge-node fragment reserve.
+fn produce_with_extra<'a, H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    words: usize,
+    extra: usize,
+) -> Result<(&'a mut [MaybeUninit<u64>], *mut u64), TermError> {
+    let ptr = heap
+        .alloc_with_extra(words, extra)
+        .ok_or(TermError::HeapFull)?;
+    Ok((uninitialized_words(ptr, words), ptr))
+}
+
+fn uninitialized_words<'a>(ptr: *mut u64, words: usize) -> &'a mut [MaybeUninit<u64>] {
     // SAFETY: the allocator returned `words` writable words that nothing else
     // references; MaybeUninit admits their uninitialized contents.
-    let slice = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u64>>(), words) };
-    Ok((slice, ptr))
+    unsafe { std::slice::from_raw_parts_mut(ptr.cast::<MaybeUninit<u64>>(), words) }
 }
 
 /// The words of a live boxed object: header plus `len - 1` payload words.
@@ -97,22 +114,28 @@ pub(crate) fn flatmap_kv_with_size<'a>(map: Term, n: usize) -> (&'a [u64], &'a [
     (&boxed_words(keys, 1 + n)[1..], &words[3..], keys)
 }
 
-// Port of erts/emulator/beam/erl_map.c:1863 (hashmap_subtree_size), OTP-29.1.1.
+// Port of erts/emulator/beam/erl_map.c:1858-1865 (hashmap_subtree_size), OTP-29.1.1.
 fn hashmap_subtree_size(node: Term) -> usize {
-    match node_view(node) {
-        NodeView::Collision(leaves) => leaves.len(),
-        NodeView::Bitmap(children) => children
-            .iter()
-            .map(|&child| {
-                let child = term(child);
-                if is_leaf(child) {
-                    1
-                } else {
-                    hashmap_subtree_size(child)
-                }
-            })
-            .sum(),
+    let mut stack: SmallVec<[(Term, usize); 8]> = SmallVec::new();
+    stack.push((node, 0));
+    let mut size = 0;
+    while let Some((parent, index)) = stack.last().copied() {
+        let children = match node_view(parent) {
+            NodeView::Bitmap(children) | NodeView::Collision(children) => children,
+        };
+        if index == children.len() {
+            stack.pop();
+            continue;
+        }
+        stack.last_mut().expect("subtree stack").1 += 1;
+        let child = term(children[index]);
+        if is_leaf(child) {
+            size += 1;
+        } else {
+            stack.push((child, 0));
+        }
     }
+    size
 }
 
 /// Map a fallible heap construction to the public map error type. Runtime BIFs
@@ -290,37 +313,39 @@ struct Frame {
     /// `&1`: unique A content in this node; `&2`: unique B content.
     mix: u8,
     ix: usize,
-    array: [Term; 16],
+    array: [u64; 16],
 }
 
 #[derive(Clone, Copy)]
 enum Src {
     /// The root map term.
     Root(Term),
-    /// Word `index` of the boxed node.
-    Slot(Term, usize),
+    /// Remaining child words, corresponding to ERTS's advancing `Eterm*`.
+    Slots(&'static [u64]),
 }
 impl Src {
     fn get(self) -> Term {
         match self {
             Self::Root(t) => t,
-            Self::Slot(node, index) => term(boxed_words(node, index + 1)[index]),
+            Self::Slots(words) => term(*words.first().expect("merge source slot")),
         }
     }
     // Port of `*srcA++` / `*srcB++` in erl_map.c:1758-1763, OTP-29.1.1.
     fn next(&mut self) -> Term {
         match self {
             Self::Root(t) => *t,
-            Self::Slot(node, index) => {
-                let value = term(boxed_words(*node, *index + 1)[*index]);
-                *index += 1;
-                value
+            Self::Slots(words) => {
+                let (word, remaining) = words.split_first().expect("merge source slot");
+                *words = remaining;
+                term(*word)
             }
         }
     }
     fn advance(&mut self) {
-        if let Self::Slot(_, index) = self {
-            *index += 1;
+        if let Self::Slots(words) = self
+            && let Some((_, remaining)) = words.split_first()
+        {
+            *words = remaining;
         }
     }
     fn get_at(self, offset: usize) -> Term {
@@ -329,7 +354,7 @@ impl Src {
                 debug_assert_eq!(offset, 0);
                 t
             }
-            Self::Slot(node, index) => term(boxed_words(node, index + offset + 1)[index + offset]),
+            Self::Slots(words) => term(words[offset]),
         }
     }
 }
@@ -374,7 +399,7 @@ impl HashmapMergeContext {
             rbm: 0,
             mix: 0,
             ix: 0,
-            array: [Term::NIL; 16],
+            array: [0; 16],
         });
         Self {
             size: hashmap_size(map_a) + hashmap_size(map_b),
@@ -460,22 +485,22 @@ fn open_node(node: Term, src: &mut Src, lvl: usize, bm: &mut u32, coll_sz: &mut 
         debug_assert!(lvl < HAMT_MAX_LEVEL);
         match (header >> 6) & 3 {
             HEAD_ARRAY => {
-                *src = Src::Slot(node, 2);
+                *src = Src::Slots(&boxed_words(node, 18)[2..]);
                 *bm = 0xffff;
             }
             HEAD_BITMAP => {
-                *src = Src::Slot(node, 2);
                 *bm = ((header >> 16) & 0xffff) as u32;
+                *src = Src::Slots(&boxed_words(node, 2 + bm.count_ones() as usize)[2..]);
             }
             _ => {
-                *src = Src::Slot(node, 1);
                 *bm = ((header >> 16) & 0xffff) as u32;
+                *src = Src::Slots(&boxed_words(node, 1 + bm.count_ones() as usize)[1..]);
             }
         }
     } else {
         debug_assert_eq!(lvl, HAMT_MAX_LEVEL);
-        *src = Src::Slot(node, 1);
         *coll_sz = (header >> 6) as usize;
+        *src = Src::Slots(&boxed_words(node, 1 + *coll_sz)[1..]);
         debug_assert!(*coll_sz >= 2);
     }
 }
@@ -484,13 +509,6 @@ fn open_node(node: Term, src: &mut Src, lvl: usize, bm: &mut u32, coll_sz: &mut 
 ///
 /// Port of erts/emulator/beam/erl_map.c:1508 (MAP_MERGE_LOOP_FACTOR), OTP-29.1.1.
 pub const MAP_MERGE_LOOP_FACTOR: isize = 8;
-
-#[derive(Clone, Copy)]
-enum Step {
-    Recurse,
-    MergeNodes,
-    Resume,
-}
 
 /// Continue a HAMT merge with `reds` loop iterations of budget. Returns the
 /// merged map, or `None` when the budget ran out and the call must trap.
@@ -514,64 +532,63 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
 ) -> Result<Option<Term>, TermError> {
     let mut res: Option<Term> = None;
     let (mut coll_sz_a, mut coll_sz_b) = (0, 0);
-    let mut step = if ctx.started {
-        Step::Resume
-    } else {
-        Step::Recurse
-    };
+    let mut resume_saved = ctx.started;
     ctx.started = true;
-    loop {
-        match step {
-            Step::Recurse => {
-                let lvl = ctx.lvl;
-                let sp = ctx.stack.last_mut().expect("merge stack");
-                sp.node_a = sp.src_a.get();
-                sp.node_b = sp.src_b.get();
-                step = Step::MergeNodes;
-                if sp.node_a == sp.node_b {
-                    res = Some(sp.node_a);
-                    ctx.size -= if is_leaf(sp.node_b) {
-                        1
-                    } else {
-                        hashmap_subtree_size(sp.node_b)
-                    };
-                    continue;
+    'traverse: loop {
+        if !resume_saved {
+            // Port of the `recurse` label in erl_map.c:1608-1679, OTP-29.1.1.
+            let lvl = ctx.lvl;
+            let sp = ctx.stack.last_mut().expect("merge stack");
+            sp.node_a = sp.src_a.get();
+            sp.node_b = sp.src_b.get();
+            if sp.node_a == sp.node_b {
+                res = Some(sp.node_a);
+                ctx.size -= if is_leaf(sp.node_b) {
+                    1
+                } else {
+                    hashmap_subtree_size(sp.node_b)
+                };
+            } else if is_leaf(sp.node_a) && is_leaf(sp.node_b) {
+                let key_a = leaf(sp.node_a).0;
+                let key_b = leaf(sp.node_b).0;
+                if exact_eq(key_a, key_b) {
+                    ctx.size -= 1;
+                    res = Some(sp.node_b);
+                    // Values are assumed to differ; comparing them could be costly.
+                    sp.mix = 2;
+                } else {
+                    let (node_a, node_b) = (sp.node_a, sp.node_b);
+                    open_node(node_a, &mut sp.src_a, lvl, &mut sp.abm, &mut coll_sz_a);
+                    open_node(node_b, &mut sp.src_b, lvl, &mut sp.bbm, &mut coll_sz_b);
                 }
-                if is_leaf(sp.node_a) && is_leaf(sp.node_b) {
-                    let key_a = leaf(sp.node_a).0;
-                    let key_b = leaf(sp.node_b).0;
-                    if exact_eq(key_a, key_b) {
-                        ctx.size -= 1;
-                        res = Some(sp.node_b);
-                        // Values are assumed to differ; comparing them could be costly.
-                        sp.mix = 2;
-                        continue;
-                    }
-                }
+            } else {
                 let (node_a, node_b) = (sp.node_a, sp.node_b);
                 open_node(node_a, &mut sp.src_a, lvl, &mut sp.abm, &mut coll_sz_a);
                 open_node(node_b, &mut sp.src_b, lvl, &mut sp.bbm, &mut coll_sz_b);
             }
-            Step::MergeNodes => {
-                if let Some(child) = res {
+        }
+
+        let mut skip_merge_nodes = resume_saved;
+        resume_saved = false;
+        loop {
+            if !skip_merge_nodes {
+                // Port of the `merge_nodes` label in erl_map.c:1682-1724.
+                if let Some(child) = res.take() {
                     if ctx.lvl == 0 {
                         debug_assert_eq!(hashmap_size(child), ctx.size);
                         return Ok(Some(child));
                     }
-                    // Pop and continue building the parent node.
                     ctx.lvl -= 1;
                     let child_mix = ctx.stack.pop().expect("merge stack").mix;
                     let sp = ctx.stack.last_mut().expect("merge stack");
-                    sp.array[sp.ix] = child;
+                    sp.array[sp.ix] = bits(child);
                     sp.ix += 1;
                     sp.mix |= child_mix;
-                    res = None;
                     if sp.rbm != 0 {
                         sp.src_a.advance();
                         sp.src_b.advance();
                     }
                 } else if ctx.lvl < HAMT_MAX_LEVEL {
-                    // Start building a node.
                     let sp = ctx.stack.last_mut().expect("merge stack");
                     sp.ix = 0;
                     sp.rbm = sp.abm | sp.bbm;
@@ -596,82 +613,77 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     debug_assert!(coll_sz_a == 0 && coll_sz_b == 0);
                     return Ok(None);
                 }
-                step = Step::Resume;
             }
-            Step::Resume => {
-                let lvl = ctx.lvl;
-                let sp = ctx.stack.last_mut().expect("merge stack");
-                let mut clash = false;
-                while sp.rbm != 0 {
-                    let next = sp.rbm & (sp.rbm - 1);
-                    let bit = sp.rbm ^ next;
-                    sp.rbm = next;
-                    if sp.abm & bit != 0 {
-                        if sp.bbm & bit != 0 {
-                            clash = true;
-                            break;
-                        }
-                        sp.array[sp.ix] = sp.src_a.next();
-                        sp.ix += 1;
-                        sp.mix |= 1;
-                    } else {
-                        debug_assert!(sp.bbm & bit != 0);
-                        sp.array[sp.ix] = sp.src_b.next();
-                        sp.ix += 1;
-                        sp.mix |= 2;
+            skip_merge_nodes = false;
+
+            // Port of the `resume_from_trap` label in erl_map.c:1727-1804.
+            let lvl = ctx.lvl;
+            let sp = ctx.stack.last_mut().expect("merge stack");
+            let mut clash = false;
+            while sp.rbm != 0 {
+                let next = sp.rbm & (sp.rbm - 1);
+                let bit = sp.rbm ^ next;
+                sp.rbm = next;
+                if sp.abm & bit != 0 {
+                    if sp.bbm & bit != 0 {
+                        clash = true;
+                        break;
                     }
+                    sp.array[sp.ix] = bits(sp.src_a.next());
+                    sp.ix += 1;
+                    sp.mix |= 1;
+                } else {
+                    debug_assert!(sp.bbm & bit != 0);
+                    sp.array[sp.ix] = bits(sp.src_b.next());
+                    sp.ix += 1;
+                    sp.mix |= 2;
                 }
-                if clash {
-                    // Bit clash: push and resolve by recursive merge.
-                    let (src_a, src_b) = (sp.src_a, sp.src_b);
-                    ctx.lvl += 1;
-                    ctx.stack.push(Frame {
-                        node_a: Term::NIL,
-                        node_b: Term::NIL,
-                        src_a,
-                        src_b,
-                        abm: 0,
-                        bbm: 0,
-                        rbm: 0,
-                        mix: 0,
-                        ix: 0,
-                        array: [Term::NIL; 16],
-                    });
-                    step = Step::Recurse;
-                    continue;
-                }
-                res = Some(match sp.mix {
-                    // Exactly the same subtrees, or only unique A content: reuse node A.
-                    0 | 1 => sp.node_a,
-                    // Only unique B content: reuse node B.
-                    2 => sp.node_b,
-                    // A mix: build a new node.
-                    3 => {
-                        debug_assert_eq!(sp.ix, (sp.abm | sp.bbm).count_ones() as usize);
-                        let bitmap = u64::from(sp.abm | sp.bbm);
-                        let header_words = if lvl == 0 { 2 } else { 1 };
-                        let (words, ptr) = produce(heap, header_words + sp.ix)?;
-                        if lvl == 0 {
-                            words[0].write(if sp.ix == 16 {
-                                super::header(HEAD_ARRAY, 0xffff)
-                            } else {
-                                super::header(HEAD_BITMAP, bitmap as u16)
-                            });
-                            words[1].write(ctx.size as u64);
-                        } else {
-                            words[0].write(super::header(NODE_BITMAP, bitmap as u16));
-                        }
-                        for (word, child) in
-                            words[header_words..].iter_mut().zip(&sp.array[..sp.ix])
-                        {
-                            word.write(bits(*child));
-                        }
-                        boxed(ptr)
-                    }
-                    mix => unreachable!("strange mix {mix}"),
+            }
+            if clash {
+                let (src_a, src_b) = (sp.src_a, sp.src_b);
+                ctx.lvl += 1;
+                ctx.stack.push(Frame {
+                    node_a: Term::NIL,
+                    node_b: Term::NIL,
+                    src_a,
+                    src_b,
+                    abm: 0,
+                    bbm: 0,
+                    rbm: 0,
+                    mix: 0,
+                    ix: 0,
+                    array: [0; 16],
                 });
-                step = Step::MergeNodes;
+                continue 'traverse;
             }
+            res = Some(match sp.mix {
+                0 | 1 => sp.node_a,
+                2 => sp.node_b,
+                3 => {
+                    debug_assert_eq!(sp.ix, (sp.abm | sp.bbm).count_ones() as usize);
+                    let bitmap = u64::from(sp.abm | sp.bbm);
+                    let header_words = if lvl == 0 { 2 } else { 1 };
+                    // Port of HAllocX(..., HALLOC_EXTRA) in erl_map.c:1783-1790.
+                    let (words, ptr) =
+                        produce_with_extra(heap, header_words + sp.ix, HALLOC_EXTRA)?;
+                    if lvl == 0 {
+                        words[0].write(if sp.ix == 16 {
+                            super::header(HEAD_ARRAY, 0xffff)
+                        } else {
+                            super::header(HEAD_BITMAP, bitmap as u16)
+                        });
+                        words[1].write(ctx.size as u64);
+                    } else {
+                        words[0].write(super::header(NODE_BITMAP, bitmap as u16));
+                    }
+                    // Port of sys_memcpy(hp, sp->array, sp->ix * sizeof(Eterm)),
+                    // erl_map.c:1793, OTP-29.1.1.
+                    words[header_words..header_words + sp.ix]
+                        .write_copy_of_slice(&sp.array[..sp.ix]);
+                    boxed(ptr)
+                }
+                mix => unreachable!("strange mix {mix}"),
+            });
         }
     }
 }

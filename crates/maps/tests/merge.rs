@@ -2,7 +2,9 @@
 //! against `erl`: iteration order, flat size and structural sharing
 //! (`erts_debug:size/1` of the inputs and the result together).
 
-use arinsal_maps::{MapError, MergeStart, from_keys, from_list, hashmap_merge, merge, merge_start};
+use arinsal_maps::{
+    MapError, MergeStart, from_keys, from_list, hashmap_merge, merge, merge_start, put,
+};
 use arinsal_term::{ProcessHeap, Term, VecHeap};
 use std::collections::HashSet;
 use std::process::Command;
@@ -179,6 +181,22 @@ fn yielding_merge_matches_unbounded_merge() {
     };
     assert!(yields > 10, "{yields}");
     assert_eq!(keys_line(merged), expected);
+}
+
+#[test]
+fn merge_reuses_shared_hamt_subtrees_like_erts() {
+    let expected = erl_lines(
+        "A=maps:from_list([{K,K}||K<-lists:seq(1,1000)]),B=maps:put(2000,2000,A),M=maps:merge(A,B),io:format(\"~p~n\",[erts_debug:same(M,B)]),halt().",
+    );
+    let Some(expected) = expected else {
+        return;
+    };
+    assert_eq!(expected, ["true"]);
+
+    let mut heap = VecHeap::new();
+    let left = int_map(&mut heap, 1..=1000, 0);
+    let right = put(left, small(2000), small(2000), &mut heap).unwrap();
+    assert_eq!(merge(left, right, &mut heap), Ok(right));
 }
 
 type Attempt<'a> = dyn Fn(&mut ProcessHeap) -> Result<Term, MapError> + 'a;

@@ -1,13 +1,12 @@
-//! maps:from_list/1, maps:from_keys/2, maps:keys/1 and maps:values/1 yield inside big inputs
-//! (YCF-transformed in erts) and must return exactly what erts returns, including the entry
-//! order of the projections, duplicate handling and maps that shrink back to flatmaps.
+//! Large map constructors and `maps:merge/2` yield inside big inputs and must match erts,
+//! including projection order, duplicate handling and the final merged map.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
 
 const SOURCE: &str = r#"
 -module(maps_yield_diff).
--export([build/0, trap_count/0]).
+-export([build/0, merge/0, trap_count/0]).
 %% Keys of several shapes so that many hash prefixes occur (atoms are left out: their
 %% internal hash differs from erts, which changes only the entry order).
 keys(N) ->
@@ -31,10 +30,17 @@ build() ->
       H(maps:keys(M2)), H(maps:values(M2)), H(maps:keys(Dups)), H(maps:values(Dups)),
       M1 =:= maps:from_list(maps:to_list(M1)), maps:keys(M1) =:= [K || {K, _} <- maps:to_list(M1)]}
    end || N <- [0, 1, 32, 33, 34, 100, 129, 1000, 5000, 20000]].
-%% Number of schedule-outs inside the four BIFs for a 60000 element input.
+merge() ->
+  A = maps:from_list([{K, K} || K <- lists:seq(1, 60000)]),
+  B = maps:from_list([{K, -K} || K <- lists:seq(30001, 90000)]),
+  M = maps:merge(A, B),
+  {map_size(M), erlang:phash2(M), maps:get(1, M), maps:get(30001, M), maps:get(90000, M)}.
+%% Number of schedule-outs inside the five BIFs for a 60000 element input.
 trap_count() ->
   Ks = lists:seq(1, 60000),
   Pairs = [{K, K} || K <- Ks],
+  A = maps:from_list(Pairs),
+  B = maps:from_list([{K, -K} || K <- lists:seq(30001, 90000)]),
   [begin
      Me = self(),
      Tr = spawn(fun() -> tracer(Me, 0) end),
@@ -50,10 +56,13 @@ trap_count() ->
    end || {Fn, F} <- [{from_list, fun() -> maps:from_list(Pairs) end},
                       {from_keys, fun() -> maps:from_keys(Ks, v) end},
                       {keys, fun() -> maps:keys(maps:from_keys(Ks, v)) end},
-                      {values, fun() -> maps:values(maps:from_list(Pairs)) end}]].
+                      {values, fun() -> maps:values(maps:from_list(Pairs)) end},
+                      {merge, fun() -> maps:merge(A, B) end}]].
 tracer(Me, N) ->
   receive
     {trace, _, out, {maps, F, _}} when F =:= from_list; F =:= from_keys; F =:= keys; F =:= values ->
+      tracer(Me, N + 1);
+    {trace, _, out, {maps, merge, _}} ->
       tracer(Me, N + 1);
     {trace, _, _, _} -> tracer(Me, N);
     {done, Fn} -> Me ! {Fn, N}
@@ -61,7 +70,7 @@ tracer(Me, N) ->
 "#;
 
 #[test]
-fn yielding_map_constructors_match_otp_29() {
+fn yielding_map_bifs_match_otp_29() {
     let Ok(reference) = RefErl::start() else {
         eprintln!("erl unavailable; skipping maps_yield differential scenarios");
         return;
@@ -70,7 +79,7 @@ fn yielding_map_constructors_match_otp_29() {
         .compile_named("maps_yield_diff", SOURCE, &[])
         .unwrap();
     reference.load("maps_yield_diff", &beam).unwrap();
-    for function in ["build", "trap_count"] {
+    for function in ["build", "merge", "trap_count"] {
         let expected = reference.call("maps_yield_diff", function, &[]);
         let mut vm = Vm::new([]);
         vm.load_bytes(&beam).unwrap();

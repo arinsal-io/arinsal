@@ -29,6 +29,7 @@ mod time;
 mod unicode;
 
 pub use etf::{DecodeWalk, EncodeWalk};
+pub use lists::SubtractWalk;
 pub use maps_bifs::maps_merge_start;
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use pure::{
@@ -155,6 +156,13 @@ impl HeapAlloc for FragmentingHeap<'_> {
         match HeapAlloc::alloc(self.0, words) {
             Some(ptr) => Some(ptr),
             None => Some(self.0.heap_fragment(words)),
+        }
+    }
+    #[inline]
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        match HeapAlloc::alloc(self.0, words) {
+            Some(ptr) => Some(ptr),
+            None => Some(self.0.heap_fragment_with_extra(words, extra)),
         }
     }
     fn release(&mut self, end: *mut u64, start: *mut u64) {
