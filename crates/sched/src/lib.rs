@@ -61,6 +61,7 @@
 mod balance;
 mod mailbox;
 mod ports;
+mod thr_progress;
 mod timer;
 
 pub use mailbox::{Incoming, Private, ReceiveMarker};
@@ -914,7 +915,7 @@ impl<T: Task> ProcessTable<T> {
     fn scheduler_shutdown(&self) {
         for pix in 0..self.ids.layout().max() {
             if let Some(process) = self.load_slot(pix) {
-                process.cell.lock().unwrap().task.scheduler_shutdown();
+                lock_cell(&process).task.scheduler_shutdown();
             }
         }
     }
@@ -1036,204 +1037,22 @@ struct SimState<T: Task> {
     rng: Box<dyn Rng>,
 }
 
-/// An operation that runs once every managed thread passed a thread progress point.
-type LaterOp = Box<dyn FnOnce() + Send>;
+use thr_progress::LaterOp;
+pub use thr_progress::thread_progress_wait;
 
-#[derive(Default)]
-struct ProgressState {
-    active: usize,
-    blocked: bool,
-    /// The ticket the next managed thread gets when it becomes active.
-    next_ticket: u64,
-    /// Tickets of the active managed threads, each one that has not passed a progress point
-    /// since it became active.
-    running: std::collections::BTreeSet<u64>,
-    /// Operations waiting until no thread active before their ticket still is, oldest first.
-    later: VecDeque<(u64, LaterOp)>,
-}
-
-impl ProgressState {
-    fn activate(&mut self) -> u64 {
-        let ticket = self.next_ticket;
-        self.next_ticket += 1;
-        self.running.insert(ticket);
-        self.active += 1;
-        ticket
-    }
-
-    fn deactivate(&mut self, ticket: Option<u64>) {
-        self.active -= 1;
-        if let Some(ticket) = ticket {
-            self.running.remove(&ticket);
-        }
-        self.collect_later();
-    }
-
-    /// Hands the operations whose threads all passed a progress point to this thread, which
-    /// runs them outside every scheduler lock (`run_later_ops`).
-    // Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op), OTP-29.1.1.
-    fn collect_later(&mut self) {
-        let oldest = self.running.first().copied().unwrap_or(u64::MAX);
-        let mut ready = Vec::new();
-        while self
-            .later
-            .front()
-            .is_some_and(|(ticket, _)| *ticket <= oldest)
-        {
-            ready.extend(self.later.pop_front().map(|(_, op)| op));
-        }
-        if !ready.is_empty() {
-            LATER_READY.with(|later| later.borrow_mut().extend(ready));
-        }
-    }
-}
-
-#[derive(Default)]
-struct ThreadProgress {
-    state: Mutex<ProgressState>,
-    changed: Condvar,
-}
-
-struct ProgressGuard {
-    progress: Arc<ThreadProgress>,
-    active: bool,
-}
-
-thread_local! {
-    /// Thread progress this thread currently holds active, with its ticket, for waits deep in
-    /// the scheduler.
-    static ACTIVE_PROGRESS: RefCell<Option<(Arc<ThreadProgress>, u64)>> = const { RefCell::new(None) };
-    /// Later operations whose thread progress this thread observed.
-    static LATER_READY: RefCell<Vec<LaterOp>> = const { RefCell::new(Vec::new()) };
-}
-
-fn active_ticket() -> Option<u64> {
-    ACTIVE_PROGRESS.with(|active| active.borrow().as_ref().map(|(_, ticket)| *ticket))
-}
-
-fn set_active_ticket(ticket: u64) {
-    ACTIVE_PROGRESS.with(|active| {
-        if let Some((_, current)) = active.borrow_mut().as_mut() {
-            *current = ticket;
-        }
-    });
-}
-
-/// Runs the later operations this thread collected; the caller holds no scheduler lock.
-fn run_later_ops() {
-    loop {
-        let ready = LATER_READY.with(|later| std::mem::take(&mut *later.borrow_mut()));
-        if ready.is_empty() {
-            return;
-        }
-        for op in ready {
-            op();
-        }
-    }
-}
-
-impl ThreadProgress {
-    fn enter(progress: Arc<Self>) -> ProgressGuard {
-        let mut state = progress.state.lock().unwrap();
-        while state.blocked {
-            state = progress.changed.wait(state).unwrap();
-        }
-        let ticket = state.activate();
-        drop(state);
-        ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some((Arc::clone(&progress), ticket)));
-        ProgressGuard {
-            progress,
-            active: true,
-        }
-    }
-
-    /// Schedules `op` to run once every managed thread active now passed a progress point.
-    // Port of erts/emulator/beam/erl_thr_progress.h:245 (erts_thr_progress_later) and
-    // erl_process.c:2351 (erts_schedule_thr_prgr_later_op), OTP-29.1.1.
-    fn later(&self, op: LaterOp) {
-        let mut state = self.state.lock().unwrap();
-        let ticket = state.next_ticket;
-        state.later.push_back((ticket, op));
-        state.collect_later();
-    }
-}
-
-/// Run a blocking wait on another thread without holding back thread progress.
-///
-/// Port of erts/emulator/beam/erl_thr_progress.c:884 (erts_thr_progress_prepare_wait) and
-/// :913 (erts_thr_progress_finalize_wait), OTP-29.1.1: a managed thread that waits stops
-/// counting as active, so a thread blocking thread progress never waits for a thread that
-/// in turn waits for it. Without this, `block_for` on one scheduler and a cross-scheduler
-/// request from another (statistics, timer commands) deadlock with every scheduler parked.
 fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
-    let Some((progress, ticket)) = ACTIVE_PROGRESS.with(|active| active.borrow_mut().take()) else {
-        return wait();
-    };
-    {
-        let mut state = progress.state.lock().unwrap();
-        state.deactivate(Some(ticket));
-        progress.changed.notify_all();
-    }
-    let result = wait();
-    let ticket = {
-        let mut state = progress.state.lock().unwrap();
-        while state.blocked {
-            state = progress.changed.wait(state).unwrap();
-        }
-        state.activate()
-    };
-    ACTIVE_PROGRESS.with(|active| *active.borrow_mut() = Some((progress, ticket)));
-    result
+    thr_progress::thread_progress_wait(wait)
 }
 
-/// Runs a blocking wait of a scheduler thread on another thread without holding back thread
-/// progress; the caller must not hold locks that a thread blocking progress needs.
-///
-/// Port of erts/emulator/beam/erl_thr_progress.c:884 (erts_thr_progress_prepare_wait) and
-/// :913 (erts_thr_progress_finalize_wait), OTP-29.1.1.
-pub fn thread_progress_wait<R>(wait: impl FnOnce() -> R) -> R {
-    progress_wait(wait)
-}
-
-impl ProgressGuard {
-    fn block_for(&mut self, duration: Duration) {
-        let mut state = self.progress.state.lock().unwrap();
-        if self.active {
-            state.deactivate(active_ticket());
-        }
-        self.active = false;
-        self.progress.changed.notify_all();
-        while state.blocked {
-            state = self.progress.changed.wait(state).unwrap();
-        }
-        state.blocked = true;
-        while state.active != 0 {
-            state = self.progress.changed.wait(state).unwrap();
-        }
-        drop(state);
-        if !duration.is_zero() {
-            thread::sleep(duration);
-        }
-        let mut state = self.progress.state.lock().unwrap();
-        state.blocked = false;
-        let ticket = state.activate();
-        self.active = true;
-        self.progress.changed.notify_all();
-        drop(state);
-        set_active_ticket(ticket);
-    }
-}
-
-impl Drop for ProgressGuard {
-    fn drop(&mut self) {
-        let ticket = ACTIVE_PROGRESS
-            .with(|active| active.borrow_mut().take())
-            .map(|(_, ticket)| ticket);
-        if self.active {
-            let mut state = self.progress.state.lock().unwrap();
-            state.deactivate(ticket);
-            self.progress.changed.notify_all();
-        }
+/// Lock a task cell; a contended lock is waited for as a thread progress wait, so a
+/// thread that blocks thread progress while its process holds the cell is not waiting on
+/// this scheduler (erl_thr_progress.c:884-913, erts_thr_progress_prepare_wait /
+/// finalize_wait around a blocking wait, OTP-29.1.1).
+fn lock_cell<T: Task>(process: &Process<T>) -> std::sync::MutexGuard<'_, TaskCell<T>> {
+    match process.cell.try_lock() {
+        Ok(cell) => cell,
+        Err(std::sync::TryLockError::WouldBlock) => progress_wait(|| process.cell.lock().unwrap()),
+        Err(std::sync::TryLockError::Poisoned(error)) => panic!("task cell poisoned: {error}"),
     }
 }
 
@@ -1267,14 +1086,15 @@ struct Inner<T: Task> {
     started_at: Instant,
     wall_start_requests: Mutex<Vec<Option<Instant>>>,
     work_epoch: AtomicU64,
-    parked: Vec<AtomicBool>,
+    parked: Arc<[AtomicBool]>,
     /// Port of erts/emulator/beam/erl_process.c:342 (`no_waiting_scheds`), OTP-29.1.1.
     waiting_schedulers: AtomicUsize,
-    sleepers: Vec<OnceLock<thread::Thread>>,
+    sleepers: Arc<[OnceLock<thread::Thread>]>,
     fanin_stats: bool,
     fanin_delivered: AtomicU64,
     fanin_peak_backlog: AtomicUsize,
-    progress: Arc<ThreadProgress>,
+    /// erts thread progress (erl_thr_progress.c) of the normal scheduler threads.
+    progress: Arc<thr_progress::ThrProgress>,
     /// Dirty CPU and dirty I/O pools, indexed by [`DirtyKind::index`].
     dirty: [DirtyPool<T>; 2],
     /// Scheduler type allowed to execute while multi-scheduling is blocked.
@@ -2385,7 +2205,7 @@ impl<T: Task> Inner<T> {
     }
 
     fn wake_all_workers(&self) {
-        for sleeper in &self.sleepers {
+        for sleeper in self.sleepers.iter() {
             if let Some(thread) = sleeper.get() {
                 thread.unpark();
             }
@@ -3433,7 +3253,6 @@ pub struct RunCtx<'a, M: Send + 'static> {
     remaining: u32,
     budget: u32,
     private_wake: bool,
-    progress: Option<ProgressGuard>,
     msacc_enabled: bool,
     wall_enabled: bool,
     gc_accounted_total: u64,
@@ -3458,6 +3277,7 @@ trait ContextOps<M: Send + 'static> {
     ) -> Result<bool, Error>;
     fn flush(&mut self, remaining: u32);
     fn thread_progress_later(&self, op: LaterOp);
+    fn block_thread_progress(&self, duration: Duration);
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<M>>;
     fn total_reductions(&self) -> u64;
     fn scheduler_stats(&self) -> SchedulerStats;
@@ -3900,11 +3720,7 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     /// Pause other running tasks until the callback returns.
     pub fn block_thread_progress(&mut self, duration: Duration) {
         self.inner.flush(self.remaining);
-        if let Some(progress) = &mut self.progress {
-            progress.block_for(duration);
-        } else if !duration.is_zero() {
-            thread::sleep(duration);
-        }
+        self.inner.block_thread_progress(duration);
     }
 }
 
@@ -4099,7 +3915,16 @@ impl<T: Task> Runner<'_, T> {
 
 impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     fn thread_progress_later(&self, op: LaterOp) {
-        self.inner.progress.later(op);
+        thr_progress::schedule_later_op(&self.inner.progress, op);
+    }
+    // Port of erts/emulator/beam/erl_bif_info.c:5079-5091 (block, wait, unblock),
+    // OTP-29.1.1: erts_thr_progress_block from a scheduler or an unmanaged thread.
+    fn block_thread_progress(&self, duration: Duration) {
+        thr_progress::block(&self.inner.progress);
+        if !duration.is_zero() {
+            thread::sleep(duration);
+        }
+        thr_progress::unblock(&self.inner.progress);
     }
     fn process_priority(&self, pid: Pid) -> Option<Priority> {
         let process = self.inner.table.lookup(pid)?;
@@ -4155,7 +3980,6 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             remaining,
             budget: remaining,
             private_wake: false,
-            progress: None,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
@@ -4640,6 +4464,15 @@ impl<T: Task> Scheduler<T> {
         let dirty_io = config.dirty_io_schedulers.max(1);
         let simulated = rng.is_some();
         let workers = if simulated { 1 } else { config.workers };
+        let parked: Arc<[AtomicBool]> = (0..workers).map(|_| AtomicBool::new(false)).collect();
+        let sleepers: Arc<[OnceLock<thread::Thread>]> =
+            (0..workers).map(|_| OnceLock::new()).collect();
+        // The simulated scheduler runs no scheduler threads, so it has no managed threads.
+        let progress = Arc::new(if simulated {
+            thr_progress::ThrProgress::new(Arc::from([]), Arc::from([]))
+        } else {
+            thr_progress::ThrProgress::new(Arc::clone(&parked), Arc::clone(&sleepers))
+        });
         let balance = Arc::new(balance::Balance::new(workers, workers, config.compact_load));
         let now = clock.now_ms();
         let timer_commands: Vec<_> = (0..workers).map(|_| Arc::new(SegQueue::new())).collect();
@@ -4725,13 +4558,13 @@ impl<T: Task> Scheduler<T> {
             started_at: Instant::now(),
             wall_start_requests: Mutex::new(vec![None; workers]),
             work_epoch: AtomicU64::new(0),
-            parked: (0..workers).map(|_| AtomicBool::new(false)).collect(),
+            parked: Arc::clone(&parked),
             waiting_schedulers: AtomicUsize::new(0),
-            sleepers: (0..workers).map(|_| OnceLock::new()).collect(),
+            sleepers: Arc::clone(&sleepers),
             fanin_stats: std::env::var_os("ARINSAL_FANIN_STATS").is_some(),
             fanin_delivered: AtomicU64::new(0),
             fanin_peak_backlog: AtomicUsize::new(0),
-            progress: Arc::new(ThreadProgress::default()),
+            progress,
             dirty: [
                 DirtyPool::new(dirty_cpu, 0),
                 DirtyPool::new(dirty_io, dirty_cpu),
@@ -4977,7 +4810,7 @@ impl<T: Task> Scheduler<T> {
         if !inspectable(process.state.load(Ordering::Acquire)) {
             return None;
         }
-        let cell = process.cell.lock().unwrap();
+        let cell = lock_cell(&process);
         inspectable(process.state.load(Ordering::Acquire)).then(|| inspect(&cell.task))
     }
     /// Try the process main lock while its scheduler signal queues are empty.
@@ -5429,7 +5262,6 @@ mod msgq_stage_microbench {
             remaining: 1_000,
             budget: 1_000,
             private_wake: false,
-            progress: None,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
@@ -5741,8 +5573,8 @@ fn run_one<'a, T: Task>(
     dirty: Option<DirtyKind>,
 ) {
     run_slice(inner, item, local, worker, dirty);
-    // Later operations run after the slice released the process and its locks.
-    run_later_ops();
+    // A runtime without managed threads runs later operations after the slice.
+    thr_progress::run_unmanaged_later_ops();
 }
 
 fn run_slice<'a, T: Task>(
@@ -5799,9 +5631,6 @@ fn run_slice<'a, T: Task>(
         .unwrap_or(inner.config.reductions);
     // Port of erts/emulator/beam/erl_thr_progress.c: dirty schedulers are unmanaged threads
     // and never delay thread progress, OTP-29.1.1.
-    let progress = dirty
-        .is_none()
-        .then(|| ThreadProgress::enter(Arc::clone(&inner.progress)));
     let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
     let msacc_enabled = accounting_flags & ACCOUNTING_MSACC != 0;
     if let Some(local) = local.as_deref_mut() {
@@ -5813,7 +5642,7 @@ fn run_slice<'a, T: Task>(
         local.set_wall_enabled_at(wall_enabled, started_at);
     }
     let accounting_started = (accounting_flags & ACCOUNTING_WALL != 0).then(Instant::now);
-    let mut cell = process.cell.lock().unwrap();
+    let mut cell = lock_cell(&process);
     if let Some(kind) = dirty
         && let Some(job) = cell.task.take_dirty_job(kind)
     {
@@ -5824,7 +5653,7 @@ fn run_slice<'a, T: Task>(
         let thread_type = SCHEDULER_TYPE.with(|current| current.replace(kind.into()));
         let result = job();
         SCHEDULER_TYPE.with(|current| current.set(thread_type));
-        cell = process.cell.lock().unwrap();
+        cell = lock_cell(&process);
         cell.task.finish_dirty_job(result);
     }
     let (outcome, remaining, private_pending, active_ns) = {
@@ -5850,7 +5679,6 @@ fn run_slice<'a, T: Task>(
                 remaining: budget,
                 budget,
                 private_wake: true,
-                progress,
                 msacc_enabled,
                 wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
                 gc_accounted_total: if msacc_enabled {
@@ -6125,6 +5953,9 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         .set(thread::current())
         .expect("worker registers once");
     NORMAL_SCHEDULER_ID.with(|current| current.set(Some(id)));
+    // Port of erts/emulator/beam/erl_process.c:8861 (sched_thread_func registers the
+    // scheduler as a managed thread), OTP-29.1.1.
+    thr_progress::register_managed_thread(&inner.progress, id);
     let inner_id = Arc::as_ptr(&inner) as usize;
     OWNER_TIMER_SERVICES.with(|services| {
         services
@@ -6132,9 +5963,14 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
             .insert(inner_id, (id, Box::new(local.timer_service.clone())));
     });
     while !inner.stopped.load(Ordering::Acquire) {
+        // Port of erts/emulator/beam/erl_process.c:9857-9866 (schedule: the progress point
+        // between two scheduled processes), OTP-29.1.1.
+        thr_progress::scheduler_progress();
         if halting() {
             // The halting scheduler terminates the OS process; the others stay idle.
+            thr_progress::scheduler_prepare_wait();
             thread::park();
+            thr_progress::scheduler_finalize_wait();
             continue;
         }
         let accounting_flags = inner.accounting_flags.load(Ordering::Relaxed);
@@ -6165,11 +6001,13 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
             inner.parked[id].store(true, Ordering::SeqCst);
             let has_local_timers =
                 !local.pending_waits.is_empty() || local.timer_service.borrow().wheel.has_timers();
+            thr_progress::scheduler_prepare_wait();
             if has_local_timers {
                 thread::park_timeout(Duration::from_millis(10));
             } else {
                 thread::park();
             }
+            thr_progress::scheduler_finalize_wait();
             inner.parked[id].store(false, Ordering::SeqCst);
             continue;
         }
@@ -6357,6 +6195,9 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         local.set_wall_enabled(false);
         inner.waiting_schedulers.fetch_add(1, Ordering::Relaxed);
         inner.balance.set_waiting(id, true);
+        // Port of erts/emulator/beam/erl_process.c:3576-3579 (erts_thr_progress_active(0),
+        // erts_thr_progress_prepare_wait before the spin), OTP-29.1.1.
+        thr_progress::scheduler_prepare_wait();
         // Port of erts/emulator/beam/erl_process.c:3065 (sched_spin_wait), OTP-29.1.1: spin
         // before sleeping so a wakeup that comes soon costs no system call.
         let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
@@ -6377,10 +6218,14 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, mut local: Local<T>) {
         } else {
             thread::park();
         }
+        thr_progress::scheduler_finalize_wait();
         inner.waiting_schedulers.fetch_sub(1, Ordering::Relaxed);
         inner.balance.set_waiting(id, false);
         inner.parked[id].store(false, Ordering::SeqCst);
     }
+    // A stopped scheduler waits forever: it must not hold back blockers.
+    thr_progress::scheduler_prepare_wait();
+    thr_progress::unregister_managed_thread();
     OWNER_TIMER_SERVICES.with(|services| {
         services.borrow_mut().remove(&inner_id);
     });
@@ -6509,7 +6354,7 @@ fn profile_scheduler_transition<T: Task>(
     {
         return;
     }
-    let Some((target, message)) = process.cell.lock().unwrap().task.scheduler_profile_event(
+    let Some((target, message)) = lock_cell(process).task.scheduler_profile_event(
         process.pid,
         scheduler_id as u32 + 1,
         active,
