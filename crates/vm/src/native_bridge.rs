@@ -865,6 +865,10 @@ pub fn run_native(
                 process.native_pc = None;
                 ExitReason::Returned
             } else {
+                // The live arguments are in the native array. The scheduler file may
+                // be shorter than `c_p->arity` when `process.module` is not the
+                // yielding function's module; copying them here is what the save keeps.
+                publish_yield_xregs(process, registers);
                 process.cold_mut().native_continuation_resume = true;
                 // The yield site stored its live X register count in `c_p->arity`.
                 process.cold_mut().native_resume_live = process.header.arity.saturating_add(1);
@@ -890,6 +894,34 @@ pub fn run_native(
     Ok(outcome)
 }
 
+/// Copies a yielding continuation's live X registers into the process register file.
+///
+/// `i_test_yield` runs at function entry and stores that function's arity in
+/// `c_p->arity`. Registers past the scheduler file (floored at eight, sized from
+/// the interpreter module) exist only in `x_reg_array`. Saving a shorter file
+/// nil-fills the rest, so a resumed call sees `[]` in those argument registers.
+// Port of erts/emulator/beam/jit/arm/instr_common.cpp:3086-3094 (`emit_i_test_yield_shared`
+// stores the MFA arity in `c_p->arity`) and erl_process.c:10415 (`scheduler_gc_proc`
+// roots `p->arity` X registers), OTP-29.1.1.
+fn publish_yield_xregs(process: &mut Process, registers: &SchedulerRegisters) {
+    let live = usize::from(process.header.arity)
+        .saturating_add(1)
+        .min(registers.x_reg_array.len());
+    if process.x.len() < live {
+        let mut extended = process.x.to_vec();
+        extended.resize(live, Term::NIL);
+        process.x = extended.into();
+    }
+    for (destination, raw) in process
+        .x
+        .iter_mut()
+        .take(live)
+        .zip(&registers.x_reg_array[..live])
+    {
+        *destination = *raw;
+    }
+}
+
 fn env_flag(cell: &'static OnceLock<bool>, name: &str, test: fn(&std::ffi::OsStr) -> bool) -> bool {
     *cell.get_or_init(|| std::env::var_os(name).is_some_and(|value| test(&value)))
 }
@@ -904,6 +936,241 @@ pub(crate) fn return_trace_enabled() -> bool {
 pub(crate) fn exception_trace_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     env_flag(&FLAG, "ARINSAL_BEAMASM_EXCEPTION_TRACE", |_| true)
+}
+
+/// Install a SIGSEGV dump when `ARINSAL_CRASH_DUMP=1`.
+///
+/// The dump records the faulting native function and whether the tuple in x25
+/// sits in the live young heap, the free gap, or the stack. It is off unless
+/// the variable is set, so ordinary runs do not install a handler.
+pub fn install_crash_dump() {
+    if std::env::var_os("ARINSAL_CRASH_DUMP").as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    // SAFETY: sigemptyset initializes the mask. sa_sigaction is the three-argument
+    // handler selected by SA_SIGINFO (0x40, Darwin <signal.h>). The handler only
+    // writes a file and reads the faulting thread's registers and the process header.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        if libc::sigemptyset(&mut action.sa_mask) != 0 {
+            return;
+        }
+        action.sa_flags = 0x40;
+        action.sa_sigaction = crash_dump_handler as *const () as libc::sighandler_t;
+        libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut());
+    }
+}
+
+extern "C" fn crash_dump_handler(
+    _sig: libc::c_int,
+    _info: *mut libc::c_void,
+    ctx: *mut libc::c_void,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DUMPING: AtomicBool = AtomicBool::new(false);
+    if DUMPING.swap(true, Ordering::Relaxed) || ctx.is_null() {
+        return;
+    }
+    // SAFETY: SA_SIGINFO passes a ucontext_t. uc_mcontext is at byte 48 and points
+    // at __darwin_mcontext64; the thread state x0 starts at byte 16 of that context
+    // (Darwin <sys/ucontext.h> and <mach/arm/_structs.h>).
+    let mcontext = unsafe { ctx.cast::<u8>().add(48).cast::<*const u8>().read() };
+    if mcontext.is_null() {
+        return;
+    }
+    let reg = |index: usize| {
+        // SAFETY: `mcontext` is the faulting thread's __darwin_mcontext64; GPR `index`
+        // is one u64 at byte 16 of that state.
+        unsafe { mcontext.add(16 + index * 8).cast::<u64>().read() }
+    };
+    let pc = reg(32);
+    let lr = reg(30);
+    let x0 = reg(0);
+    let x9 = reg(9);
+    let x13 = reg(13);
+    let x20 = reg(20);
+    let x21 = reg(21);
+    let x23 = reg(23);
+    let x25 = reg(25);
+    let mut path = *b"/tmp/arinsal-crash-00000000.txt\0";
+    // SAFETY: getpid reads the calling process id and has no preconditions.
+    let pid = unsafe { libc::getpid() } as u32;
+    for i in 0..8 {
+        let nibble = ((pid >> (28 - i * 4)) & 0xf) as usize;
+        path[19 + i] = b"0123456789abcdef"[nibble];
+    }
+    // SAFETY: `path` is a NUL-terminated stack buffer. open creates that file.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr().cast(),
+            libc::O_CREAT | libc::O_TRUNC | libc::O_WRONLY,
+            0o644,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    let mut line = [0u8; 192];
+    let mut write_line = |text: &str| {
+        let n = text.len().min(line.len() - 1);
+        line[..n].copy_from_slice(&text.as_bytes()[..n]);
+        line[n] = b'\n';
+        // SAFETY: `fd` is the dump file and `line` is a stack buffer of `n + 1` bytes.
+        unsafe {
+            libc::write(fd, line.as_ptr().cast(), n + 1);
+        }
+    };
+    let hex = |value: u64| {
+        let mut buf = [0u8; 18];
+        buf[0] = b'0';
+        buf[1] = b'x';
+        for i in 0..16 {
+            let nibble = ((value >> (60 - i * 4)) & 0xf) as u8;
+            buf[2 + i] = b"0123456789abcdef"[nibble as usize];
+        }
+        buf
+    };
+    let mut scratch = [0u8; 160];
+    let mut emit = |prefix: &str, value: u64| {
+        let h = hex(value);
+        let mut n = 0;
+        for byte in prefix.bytes() {
+            if n < scratch.len() {
+                scratch[n] = byte;
+                n += 1;
+            }
+        }
+        if n + 18 < scratch.len() {
+            scratch[n..n + 18].copy_from_slice(&h);
+            n += 18;
+        }
+        scratch[n] = b'\n';
+        // SAFETY: `fd` is the dump file and `scratch` is a stack buffer of `n + 1` bytes.
+        unsafe {
+            libc::write(fd, scratch.as_ptr().cast(), n + 1);
+        }
+    };
+    emit("pc ", pc);
+    emit("lr ", lr);
+    emit("x0 ", x0);
+    emit("x9 ", x9);
+    emit("x13 ", x13);
+    emit("x20 ", x20);
+    emit("x21 ", x21);
+    emit("x23 ", x23);
+    emit("x25 ", x25);
+    let word = |addr: u64| -> u64 {
+        if addr == 0 || !addr.is_multiple_of(8) {
+            return 0;
+        }
+        // SAFETY: `addr` is a non-null aligned word in the faulting process. The read is
+        // volatile so a second fault is not elided; the handler then exits.
+        unsafe { (addr as *const u64).read_volatile() }
+    };
+    let htop = word(x21);
+    let stop = word(x21.wrapping_add(8));
+    let heap = word(x21.wrapping_add(16));
+    let hend = word(x21.wrapping_add(24));
+    emit("htop ", htop);
+    emit("stop ", stop);
+    emit("heap ", heap);
+    emit("hend ", hend);
+    let tuple = x25 & !7;
+    emit("tuple ", tuple);
+    for index in 0..4 {
+        emit("tw ", word(tuple.wrapping_add(index * 8)));
+    }
+    let place = if heap != 0 && heap <= tuple && tuple < htop {
+        "place live-young"
+    } else if htop != 0 && htop <= tuple && tuple < stop {
+        "place free-gap"
+    } else if stop != 0 && stop <= tuple && tuple < hend {
+        "place stack"
+    } else {
+        "place outside"
+    };
+    write_line(place);
+    let _ = with_native_function_at(pc as usize, |function| {
+        let (file, line_no) = function.line_at(pc as usize).unwrap_or(("?", 0));
+        let mut text = [0u8; 240];
+        let mut n = 0;
+        for part in [
+            function.module.as_str(),
+            ":",
+            function.function.as_str(),
+            "/",
+        ] {
+            for byte in part.bytes() {
+                if n < text.len() {
+                    text[n] = byte;
+                    n += 1;
+                }
+            }
+        }
+        let mut value = u32::from(function.arity);
+        let mut digits = [0u8; 3];
+        let mut count = 0;
+        if value == 0 {
+            digits[0] = b'0';
+            count = 1;
+        }
+        while value > 0 {
+            digits[count] = b'0' + (value % 10) as u8;
+            value /= 10;
+            count += 1;
+        }
+        for i in (0..count).rev() {
+            if n < text.len() {
+                text[n] = digits[i];
+                n += 1;
+            }
+        }
+        for byte in b" " {
+            if n < text.len() {
+                text[n] = *byte;
+                n += 1;
+            }
+        }
+        for byte in file.bytes().take(80) {
+            if n < text.len() {
+                text[n] = byte;
+                n += 1;
+            }
+        }
+        if n < text.len() {
+            text[n] = b':';
+            n += 1;
+        }
+        let mut digits = [0u8; 8];
+        let mut value = line_no;
+        let mut count = 0;
+        if value == 0 {
+            digits[0] = b'0';
+            count = 1;
+        }
+        while value > 0 && count < digits.len() {
+            digits[count] = b'0' + (value % 10) as u8;
+            value /= 10;
+            count += 1;
+        }
+        for i in (0..count).rev() {
+            if n < text.len() {
+                text[n] = digits[i];
+                n += 1;
+            }
+        }
+        text[n] = b'\n';
+        // SAFETY: `fd` is the dump file and `text` is a stack buffer of `n + 1` bytes.
+        unsafe {
+            libc::write(fd, text.as_ptr().cast(), n + 1);
+        }
+    });
+    // SAFETY: `fd` is the dump file. _exit terminates this faulting process with the
+    // conventional SIGSEGV status and does not unwind.
+    unsafe {
+        libc::close(fd);
+        libc::_exit(139);
+    }
 }
 
 /// `ARINSAL_BEAMASM_LIFETIME=1`: log native code memory lifetimes.

@@ -7,6 +7,7 @@ mod disasm;
 mod eval;
 
 fn main() {
+    arinsal_vm::install_crash_dump();
     arinsal_nif::ensure_exports();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {

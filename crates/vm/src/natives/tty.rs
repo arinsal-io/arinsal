@@ -53,7 +53,7 @@ fn hub() -> &'static Hub {
         let mut pipe = [-1; 2];
         // SAFETY: pipe writes two new descriptors on success; mark both before
         // publishing either descriptor to the polling thread.
-        let status = unsafe {
+        let status = crate::port::cloexec_publish(|| unsafe {
             let status = libc::pipe(pipe.as_mut_ptr());
             if status != 0 {
                 Err(std::io::Error::last_os_error())
@@ -67,7 +67,7 @@ fn hub() -> &'static Hub {
             } else {
                 Ok(())
             }
-        };
+        });
         status.expect("tty select wake pipe");
         for fd in pipe {
             // SAFETY: both pipe ends are open descriptors from the successful pipe call.
@@ -135,7 +135,7 @@ fn install_break() {
     let mut pipe = [-1; 2];
     // SAFETY: pipe creates two fresh descriptors; mark them close-on-exec before
     // publishing the write descriptor to the signal handler.
-    let status = unsafe {
+    let status = crate::port::cloexec_publish(|| unsafe {
         let status = libc::pipe(pipe.as_mut_ptr());
         if status == 0
             && (libc::fcntl(pipe[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
@@ -143,10 +143,11 @@ fn install_break() {
         {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
-            return;
+            -1
+        } else {
+            status
         }
-        status
-    };
+    });
     if status != 0 {
         return;
     }

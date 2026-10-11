@@ -221,24 +221,27 @@ fn poke() {
 
 // g_inet_udp
 pub(crate) fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    // SAFETY: pipe writes two fresh descriptors; set close-on-exec before publishing either.
-    let rc = unsafe {
-        let rc = libc::pipe(fds.as_mut_ptr());
-        if rc == 0
-            && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
-        {
-            let error = std::io::Error::last_os_error();
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-            return Err(error);
+    let fds = crate::port::cloexec_publish(|| {
+        let mut fds = [0; 2];
+        // SAFETY: pipe writes two fresh descriptors; set close-on-exec before publishing either.
+        let rc = unsafe {
+            let rc = libc::pipe(fds.as_mut_ptr());
+            if rc == 0
+                && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                    || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
+            {
+                let error = std::io::Error::last_os_error();
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                return Err(error);
+            }
+            rc
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        rc
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+        Ok(fds)
+    })?;
     set_nonblock(fds[0]);
     set_nonblock(fds[1]);
     // SAFETY: both descriptors were just created and are not aliased.
@@ -644,7 +647,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
         return err_bytes("eprotonosupport");
     }
     // SAFETY: socket returns a fresh descriptor; set close-on-exec before publishing it.
-    let (fd, cloexec_error) = unsafe {
+    let (fd, cloexec_error) = crate::port::cloexec_publish(|| unsafe {
         let fd = libc::socket(domain, libc::SOCK_STREAM, 0);
         if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
             let error = last_errno();
@@ -653,7 +656,7 @@ fn open_socket(inner: &mut Inner, data: &[u8]) -> Vec<u8> {
         } else {
             (fd, None)
         }
-    };
+    });
     if let Some(error) = cloexec_error {
         return err_bytes(errno_name(error));
     }
@@ -743,7 +746,53 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
     let fd = inner.fd.as_ref().unwrap().as_raw_fd();
     let rc = dest.call(|ptr, len| {
         // SAFETY: ptr/len is the sockaddr this driver built; fd is its socket.
-        unsafe { libc::connect(fd, ptr, len) }
+        // Port of inet_drv.c connect completion (tcp_inet_output on writable):
+        // a nonblocking localhost handshake is often done before the caller
+        // yields. Observe it now so a peer that RSTs after establishment is
+        // reported by the following recv, not as a failed connect.
+        unsafe {
+            let rc = libc::connect(fd, ptr, len);
+            if rc == 0 {
+                return 0;
+            }
+            let err = *libc::__error();
+            if err != libc::EINPROGRESS && err != libc::EAGAIN && err != libc::EWOULDBLOCK {
+                return -1;
+            }
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // Timeout 0 returns before the peer accept, so the later async
+            // completion observes the RST. A short wait here is still inside
+            // the driver, before this scheduler yields to the acceptor's
+            // close; erts runs the same SO_ERROR check from check_io in that
+            // window (inet_drv.c:14272).
+            let wait_ms = if timeout == 0 { 0 } else { 20 };
+            if libc::poll(&mut pollfd, 1, wait_ms) <= 0 {
+                return -1;
+            }
+            let mut so = 0i32;
+            let mut slen = std::mem::size_of::<i32>() as libc::socklen_t;
+            if libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut so as *mut i32).cast(),
+                &mut slen,
+            ) < 0
+            {
+                return -1;
+            }
+            if so == 0 {
+                return 0;
+            }
+            if so != libc::EINPROGRESS && so != libc::EAGAIN {
+                *libc::__error() = so;
+            }
+            -1
+        }
     });
     if rc == 0 {
         inner.phase = Phase::Connected;
@@ -770,6 +819,10 @@ fn connect_socket(sock: &Arc<Sock>, inner: &mut Inner, caller: Pid, data: &[u8])
                 deadline,
             });
             inner.pending.push((caller, aref));
+            // The inet thread may be blocked in a one-shot wait that does not
+            // include this fd yet. Wake it so tcp_inet_output runs when the
+            // handshake completes (inet_drv.c:14242), before the peer RSTs.
+            poke();
         }
         return ok_bytes(&aref.to_be_bytes());
     }
@@ -822,7 +875,7 @@ fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
     let mut storage: libc::sockaddr_storage = zeroed();
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     // SAFETY: accept returns a fresh descriptor; set close-on-exec before publishing it.
-    let (got, cloexec_error) = unsafe {
+    let (got, cloexec_error) = crate::port::cloexec_publish(|| unsafe {
         let got = libc::accept(
             fd,
             (&mut storage as *mut libc::sockaddr_storage).cast(),
@@ -835,7 +888,7 @@ fn try_accept(inner: &Inner) -> Option<Result<OwnedFd, i32>> {
         } else {
             (got, None)
         }
-    };
+    });
     if let Some(error) = cloexec_error {
         return Some(Err(error));
     }
@@ -1497,7 +1550,7 @@ pub(crate) fn getiflist() -> Vec<u8> {
 fn ifconf_buf() -> Result<Vec<u8>, i32> {
     // SAFETY: a datagram socket is used only as an ioctl target; close-on-exec is
     // set before another scheduler can spawn a child while this descriptor is open.
-    let fd = unsafe {
+    let fd = crate::port::cloexec_publish(|| unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
             libc::close(fd);
@@ -1505,7 +1558,7 @@ fn ifconf_buf() -> Result<Vec<u8>, i32> {
         } else {
             fd
         }
-    };
+    });
     if fd == -2 {
         return Err(libc::EIO);
     }
@@ -1629,7 +1682,7 @@ fn ifreq_flags(name: &[u8]) -> Option<i32> {
 fn ifreq_ioctl(name: &[u8], req: u64, read: impl FnOnce(libc::ifreq)) -> Option<()> {
     // SAFETY: a datagram socket is used only as an ioctl target; close-on-exec is
     // set before another scheduler can spawn a child while this descriptor is open.
-    let fd = unsafe {
+    let fd = crate::port::cloexec_publish(|| unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd >= 0 && libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
             libc::close(fd);
@@ -1637,7 +1690,7 @@ fn ifreq_ioctl(name: &[u8], req: u64, read: impl FnOnce(libc::ifreq)) -> Option<
         } else {
             fd
         }
-    };
+    });
     if fd == -2 {
         return None;
     }
@@ -3389,6 +3442,40 @@ fn on_eof(sock: &Arc<Sock>) {
     }
 }
 
+/// `true` when a connecting socket is writable or in error right now.
+///
+/// The shared poller is one-shot and reports a single fd, so a connect
+/// completion can be cancelled by an unrelated wake. `poll(0)` sees the
+/// kernel state erts would see in `tcp_inet_output` on `FD_CONNECT`.
+fn connect_poll_ready(sock: &Sock) -> bool {
+    let fd = {
+        let inner = sock.inner.lock().unwrap();
+        if inner.phase != Phase::Connecting {
+            return false;
+        }
+        let Some(fd) = inner.fd.as_ref() else {
+            return false;
+        };
+        fd.as_raw_fd()
+    };
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: fd is the connecting socket this driver owns. Timeout 0 does not block.
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    ready > 0 && (pollfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0
+}
+
+fn finish_writable_connects(socks: &[Arc<Sock>]) {
+    for sock in socks {
+        if connect_poll_ready(sock) {
+            try_io(sock, true);
+        }
+    }
+}
+
 fn poll_connect(inner: &mut Inner) -> Option<Out> {
     let fd = inner.fd.as_ref()?.as_raw_fd();
     let mut err = 0i32;
@@ -3473,6 +3560,13 @@ fn io_loop(wake_r: OwnedFd) {
         )];
         for sock in &socks {
             try_io(sock, false);
+        }
+        // One-shot `wait_any_timeout` returns a single fd and cancels the rest
+        // (check_io.rs). A connect that became writable in that window must still
+        // run tcp_inet_output before the peer can RST. Port of inet_drv.c:14242
+        // (tcp_inet_output on FD_CONNECT), OTP-29.1.1.
+        finish_writable_connects(&socks);
+        for sock in &socks {
             let inner = sock.inner.lock().unwrap();
             let Some(fd) = inner.fd.as_ref().map(AsRawFd::as_raw_fd) else {
                 continue;
@@ -3509,6 +3603,15 @@ fn io_loop(wake_r: OwnedFd) {
             Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => continue,
+        }
+        // The one-shot wait drops every registration except the fd it returned.
+        // Complete connects that are already writable, then read the others before
+        // timers: an RST already pending on the socket is `econnreset` from recv,
+        // not the receive deadline (inet_drv.c tcp_inet_input runs from
+        // erts_check_io before timer expiry).
+        finish_writable_connects(&socks);
+        for sock in &socks {
+            try_io(sock, false);
         }
         fire_timeouts();
     }

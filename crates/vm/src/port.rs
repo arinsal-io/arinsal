@@ -969,14 +969,30 @@ fn start(
         } else {
             Stdio::null()
         });
-    if stderr_to_stdout {
-        // SAFETY: The child has a valid stdout pipe when this closure runs; dup2 only redirects fd 2.
+    // Hold the publish lock across the fd scan and spawn so a descriptor created on
+    // another thread cannot appear after the list is taken (erl_child_setup.c:313-318
+    // and closefrom at :466-470: only 0, 1, 2 and maybe 3, 4 survive exec).
+    let mut child = match cloexec_publish(|| {
+        let stray: Vec<i32> = std::fs::read_dir("/dev/fd")
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok()?.file_name().into_string().ok()?.parse().ok())
+                    .filter(|fd: &i32| *fd >= 3)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let keep_below = if use_stdio { 3 } else { 5 };
+        // SAFETY: pre_exec runs in the forked child after Command has dup2'd stdio.
+        // dup2 and close are async-signal-safe. Descriptors at or above `keep_below`
+        // are the ones erl_child_setup closes before exec.
         unsafe {
             command.pre_exec(move || {
                 unsafe extern "C" {
                     fn dup2(oldfd: i32, newfd: i32) -> i32;
+                    fn close(fd: i32) -> i32;
                 }
-                if dup2(1, 2) < 0 {
+                // dup2/close are async-signal-safe and run in the forked child.
+                if stderr_to_stdout && dup2(1, 2) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if !use_stdio {
@@ -987,27 +1003,16 @@ fn start(
                         return Err(std::io::Error::last_os_error());
                     }
                 }
-                Ok(())
-            });
-        }
-    } else if !use_stdio {
-        // SAFETY: The child stdio descriptors are prepared by Command before this closure runs.
-        unsafe {
-            command.pre_exec(move || {
-                unsafe extern "C" {
-                    fn dup2(oldfd: i32, newfd: i32) -> i32;
-                }
-                if rw & 2 != 0 && dup2(0, 3) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if rw & 1 != 0 && dup2(1, 4) < 0 {
-                    return Err(std::io::Error::last_os_error());
+                for fd in &stray {
+                    if *fd >= keep_below {
+                        close(*fd);
+                    }
                 }
                 Ok(())
             });
         }
-    }
-    let mut child = match command.spawn() {
+        command.spawn()
+    }) {
         Ok(child) => child,
         Err(error) => {
             if let Some(path) = config_path {
@@ -2072,26 +2077,40 @@ fn signal_badsig(handle: &PortHandle, id: u64) {
     signal_port_exit(handle, id, atom("badsig"));
 }
 
+/// Mutual exclusion between descriptor creation and `Command::spawn`.
+///
+/// `pipe`/`dup`/`socket`/`accept` then `FD_CLOEXEC` is not atomic. A port child
+/// spawned in that window inherits the descriptor. `erl_child_setup` never has
+/// this window: it closes every fd above 3 at start and sets CLOEXEC before any
+/// child exists (erl_child_setup.c:466-470, OTP-29.1.1).
+pub(crate) fn cloexec_publish<R>(body: impl FnOnce() -> R) -> R {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    body()
+}
+
 fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
-    unsafe extern "C" {
-        fn dup(fd: i32) -> i32;
-    }
-    // SAFETY: dup returns a fresh descriptor; setting CLOEXEC before it is published
-    // prevents a concurrently spawned port child from inheriting this duplicate.
-    let copy = unsafe {
-        let copy = dup(fd);
-        if copy >= 0 && libc::fcntl(copy, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
-            let error = std::io::Error::last_os_error();
-            libc::close(copy);
-            return Err(error);
+    cloexec_publish(|| {
+        unsafe extern "C" {
+            fn dup(fd: i32) -> i32;
         }
-        copy
-    };
-    if copy < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: copy is a fresh descriptor owned by this OwnedFd.
-    Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+        // SAFETY: dup returns a fresh descriptor; setting CLOEXEC before the lock is
+        // released prevents a concurrently spawned port child from inheriting it.
+        let copy = unsafe {
+            let copy = dup(fd);
+            if copy >= 0 && libc::fcntl(copy, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                let error = std::io::Error::last_os_error();
+                libc::close(copy);
+                return Err(error);
+            }
+            copy
+        };
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: copy is a fresh descriptor owned by this OwnedFd.
+        Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+    })
 }
 
 fn owned_stdio(file: impl IntoRawFd) -> OwnedFd {
@@ -2112,25 +2131,28 @@ fn set_nonblock(fd: RawFd) {
 }
 
 fn wake_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    // SAFETY: pipe initializes both slots with fresh descriptors on success; fcntl
-    // marks those owned descriptors close-on-exec before any child can inherit them.
-    let rc = unsafe {
-        let rc = libc::pipe(fds.as_mut_ptr());
-        if rc == 0
-            && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
-                || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
-        {
-            let error = std::io::Error::last_os_error();
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-            return Err(error);
+    let fds = cloexec_publish(|| {
+        let mut fds = [0; 2];
+        // SAFETY: pipe initializes both slots with fresh descriptors on success; fcntl
+        // marks those owned descriptors close-on-exec before the publish lock is released.
+        let rc = unsafe {
+            let rc = libc::pipe(fds.as_mut_ptr());
+            if rc == 0
+                && (libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                    || libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) < 0)
+            {
+                let error = std::io::Error::last_os_error();
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                return Err(error);
+            }
+            rc
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        rc
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+        Ok(fds)
+    })?;
     set_nonblock(fds[0]);
     set_nonblock(fds[1]);
     // SAFETY: both descriptors were just created by pipe and are not aliased.
