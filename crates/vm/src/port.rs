@@ -16,7 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 mod drv_sig;
@@ -172,18 +172,6 @@ fn process_send_inner(
     }
 }
 
-/// `true` when `target` names a local port (by id or registered name).
-pub(crate) fn is_port_target(process: &Process, target: Term) -> bool {
-    if target.as_port().is_some() {
-        return true;
-    }
-    target
-        .as_atom()
-        .and_then(|name| global_atoms().text(name))
-        .zip(process.runtime.as_ref())
-        .is_some_and(|(name, runtime)| runtime.port_names.lock().unwrap().contains_key(name))
-}
-
 /// True once, when the running BIF asked to suspend on a busy port.
 pub(crate) fn take_busy_suspend() -> bool {
     BUSY_SUSPEND.with(|flag| flag.replace(false))
@@ -252,6 +240,10 @@ pub(crate) struct PortHandle {
     drv_monitors: Mutex<HashMap<u64, Pid>>,
     /// The `open_port` waiting for `erl_drv_init_ack`: reference id and opener.
     async_open: Mutex<Option<(u64, Pid)>>,
+    /// `port->common.u.alive.reg->name`, shared with the register table entry.
+    reg_word: Arc<AtomicU32>,
+    /// Set when the port is removed, before its name is erased.
+    reg_closing: AtomicBool,
 }
 
 /// Inspect or move the next local port id for `erts_debug` table tests.
@@ -316,30 +308,28 @@ fn remove_port(runtime: &crate::process::Runtime, id: u64) -> Option<Arc<PortHan
     let handle = ports.remove(&id)?;
     runtime.port_ids.release(id);
     drop(ports);
-    unregister_port_names(runtime, id);
+    release_port_name(runtime, &handle);
     crate::trace::port_closed(runtime, id);
     Some(handle)
 }
 
-fn unregister_port_names(runtime: &crate::process::Runtime, id: u64) {
-    let names = {
-        let mut port_names = runtime.port_names.lock().unwrap();
-        let names = port_names
-            .iter()
-            .filter_map(|(name, port)| (*port == id).then_some(name.clone()))
-            .collect::<Vec<_>>();
-        for name in &names {
-            port_names.remove(name);
-        }
-        names
+fn release_port_name(runtime: &crate::process::Runtime, handle: &PortHandle) {
+    // Closing is published before the register lock so a concurrent register/2,
+    // which checks it under that lock, cannot insert a name for a dead port.
+    handle.mark_reg_closing();
+    let mut table = runtime.reg.write();
+    let Some(name) = handle.take_registered_atom() else {
+        return;
     };
-    for name in names {
+    if matches!(table.fetch(name), Some(crate::register::RegId::Port(id)) if id == handle.id()) {
+        table.erase(name);
+        drop(table);
         crate::trace::emit_port_event(
             runtime,
-            id,
+            handle.id(),
             crate::trace::PORTS,
             "unregister",
-            &[atom(&name)],
+            &[Term::atom(name)],
         );
     }
 }
@@ -353,6 +343,43 @@ impl PortHandle {
     }
     pub(crate) fn port_name(&self) -> String {
         self.name.clone()
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn reg_word(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.reg_word)
+    }
+
+    pub(crate) fn reg_closing(&self) -> bool {
+        self.reg_closing.load(Ordering::Acquire)
+    }
+
+    /// Port is gone: later `register/2` must fail even if it already cloned this handle.
+    pub(crate) fn mark_reg_closing(&self) {
+        self.reg_closing.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn registered_atom(&self) -> Option<arinsal_term::Atom> {
+        let index = self.reg_word.load(Ordering::Acquire);
+        (index != crate::register::NO_REG_ATOM).then_some(arinsal_term::Atom(index))
+    }
+
+    pub(crate) fn set_registered_atom(&self, atom: arinsal_term::Atom) {
+        self.reg_word.store(atom.0, Ordering::Release);
+    }
+
+    pub(crate) fn take_registered_atom(&self) -> Option<arinsal_term::Atom> {
+        let index = self
+            .reg_word
+            .swap(crate::register::NO_REG_ATOM, Ordering::AcqRel);
+        (index != crate::register::NO_REG_ATOM).then_some(arinsal_term::Atom(index))
+    }
+
+    pub(crate) fn exit_complete(&self) -> bool {
+        self.state.lock().unwrap().exit_complete
     }
 }
 
@@ -1399,13 +1426,10 @@ impl arinsal_drv::PortHost for DrvHost {
             eprint!("{text}");
             return;
         };
-        let logger = {
-            let names = runtime.names.lock().expect("registered process names");
-            names
-                .get("logger")
-                .or_else(|| names.get("error_logger"))
-                .copied()
-        };
+        let logger = runtime
+            .reg
+            .whereis_proc_str("logger")
+            .or_else(|| runtime.reg.whereis_proc_str("error_logger"));
         let Some(logger) = logger else {
             eprint!("{text}");
             return;
@@ -2276,6 +2300,8 @@ fn make_handle_with(
         driver: OnceLock::new(),
         drv_monitors: Mutex::new(HashMap::new()),
         async_open: Mutex::new(None),
+        reg_word: Arc::new(AtomicU32::new(crate::register::NO_REG_ATOM)),
+        reg_closing: AtomicBool::new(false),
     });
     Ok(handle)
 }
@@ -3453,7 +3479,7 @@ fn remove_and_notify(
     let handle = ports.remove(&id)?;
     runtime.port_ids.release(id);
     drop(ports);
-    unregister_port_names(runtime, id);
+    release_port_name(runtime, &handle);
     notify_links_monitors(&handle, id, scheduler, from, false, reason);
     Some(handle)
 }
@@ -3704,7 +3730,7 @@ pub(crate) fn owner_exit(
     };
     for (port_id, handle) in closed {
         crate::trace::emit_port_event(runtime, port_id, crate::trace::PORTS, "closed", &[reason]);
-        unregister_port_names(runtime, port_id);
+        release_port_name(runtime, &handle);
         crate::trace::port_closed(runtime, port_id);
         if handle.inet {
             crate::inet_drv::detach(port_id);

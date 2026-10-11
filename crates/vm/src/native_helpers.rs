@@ -861,6 +861,67 @@ pub extern "C" fn arinsal_beamasm_gc_sync(
     0
 }
 
+/// `send` from its own fragment. A traced send, a port id, or a registered port
+/// returns to the scheduler; a local pid or process name is delivered here.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:612-624 and bif.c:2458 (do_send), OTP-29.1.1.
+fn dispatch_native_send(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    saving_calls: bool,
+) -> Option<u64> {
+    load_dispatch_x(process, registers);
+    if saving_calls {
+        crate::trace::save_call_send_export(process);
+    }
+    process.reductions = process.header.fcalls;
+    // A port id may suspend the sender (bif.c:2581). A registered name is resolved
+    // once inside the send; a port name comes back here to be redone by the scheduler.
+    let target = registers.x_reg_array[0];
+    let message = registers.x_reg_array[1];
+    let result = if crate::trace::traces_sends(process) || target.as_port().is_some() {
+        Err(crate::VmError::Unsupported(
+            crate::process::REMOTE_SEND_NEEDS_CONTEXT.into(),
+        ))
+    } else if target.as_atom().is_some() {
+        process.send_message_native(target, message)
+    } else {
+        process.send_message(target, message)
+    };
+    match result {
+        Ok(value) => {
+            // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send: save_calls(p, &exp_send)),
+            // OTP-29.1.1.
+            if crate::trace::saves_calls(process) {
+                crate::trace::save_call(process, crate::trace::SavedCall::Send);
+            }
+            let raw = crate::native_hooks::raw(value);
+            process.x[0] = value;
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            Some(raw)
+        }
+        Err(crate::VmError::Unsupported(message))
+            if message == crate::process::REMOTE_SEND_NEEDS_CONTEXT =>
+        {
+            if crate::trace::saves_calls(process) {
+                crate::trace::save_call(process, crate::trace::SavedCall::Send);
+            }
+            process.header.arity = 2;
+            process.header.i =
+                arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY as *const u8 as *const _;
+            process.header.freason = 1 << 10;
+            process.sync_native_header();
+            None
+        }
+        Err(_) => {
+            crate::native_hooks::set_error(process, "badarg");
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            Some(0)
+        }
+    }
+}
+
 // `export_call`: reached through an export entry, whose BIF trampoline charges the call one
 // reduction (erts/emulator/beam/jit/arm/instr_bif.cpp:399, OTP-29.1.1); a light BIF call
 // site has already charged it.
@@ -880,6 +941,12 @@ fn invoke_dispatch_bif(
     // The frame pointer matters only to a collection, so the paths that may collect publish
     // it themselves; a plain BIF leaves E (x29) as it was, like erts.
     let (process, registers) = crate::native_hooks::enter_runtime(header)?;
+    // `send` is its own fragment (instr_bif.cpp:612), not a failed BIF dispatch.
+    if identity == arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY {
+        let saving_calls = !export_call
+            && registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64;
+        return dispatch_native_send(process, registers, saving_calls);
+    }
     if let Some(export) = export {
         // The light-BIF fragment already loaded `Export.is_bif_traced` and compared
         // `active_code_ix` (instr_bif.cpp:391-397). An export-entry call has not.
@@ -1139,59 +1206,6 @@ fn invoke_dispatch_bif_slow(
     // a process saving calls dispatches a light BIF through its export, which records it.
     let saving_calls =
         !export_call && registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64;
-    if identity == arinsal_beamasm::dispatch::SEND_DISPATCH_IDENTITY {
-        load_dispatch_x(process, registers);
-        if saving_calls {
-            crate::trace::save_call_send_export(process);
-        }
-        process.reductions = process.header.fcalls;
-        // Traced sends run in the scheduler, which evaluates send trace patterns.
-        // A port send may suspend the sender on a busy port (bif.c:2581): the scheduler
-        // runs it, as it can park and redo the send.
-        let result = if crate::trace::traces_sends(process)
-            || crate::port::is_port_target(process, process.x[0])
-        {
-            Err(crate::VmError::Unsupported(
-                crate::process::REMOTE_SEND_NEEDS_CONTEXT.into(),
-            ))
-        } else {
-            process.send_message(process.x[0], process.x[1])
-        };
-        match result {
-            Ok(value) => {
-                // Port of erts/emulator/beam/bif.c:2451-2452 (erl_send: save_calls(p, &exp_send)),
-                // OTP-29.1.1.
-                if crate::trace::saves_calls(process) {
-                    crate::trace::save_call(process, crate::trace::SavedCall::Send);
-                }
-                let raw = crate::native_hooks::raw(value);
-                process.x[0] = value;
-                publish_dispatch_x(process, registers);
-                process.sync_native_header();
-                return Some(raw);
-            }
-            // A remote destination is sent by the scheduler, which has the context the
-            // distribution output needs; the send resumes the native caller like a BIF trap.
-            Err(crate::VmError::Unsupported(message))
-                if message == crate::process::REMOTE_SEND_NEEDS_CONTEXT =>
-            {
-                if crate::trace::saves_calls(process) {
-                    crate::trace::save_call(process, crate::trace::SavedCall::Send);
-                }
-                process.header.arity = 2;
-                process.header.i = identity as *const u8 as *const _;
-                process.header.freason = 1 << 10;
-                process.sync_native_header();
-                return None;
-            }
-            Err(_) => {
-                crate::native_hooks::set_error(process, "badarg");
-                publish_dispatch_x(process, registers);
-                process.sync_native_header();
-                return Some(0);
-            }
-        }
-    }
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-471 (call_light_bif_shared gets the
     // export and its BIF from the call site), OTP-29.1.1.
     let export = export?;

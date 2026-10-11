@@ -1947,4 +1947,105 @@ mod tests {
                 }
         );
     }
+
+    /// Port of erts/emulator/beam/jit/arm/ops.tab:687-714, OTP-29.1.1.
+    /// A plain `bif` import becomes `call_light_bif`. An `hbif` stays `i_call_ext`.
+    /// An exit BIF's tail call is `call_light_bif` with no following return.
+    #[test]
+    fn plain_bif_call_ext_becomes_call_light_bif() {
+        let source = concat!(
+            "-module(light_bif_probe).\n",
+            "-export([plain/1, heavy/1, tail_plain/0, tail_exit/0, not_bif/0]).\n",
+            "plain(X) -> erlang:whereis(X), erlang:monotonic_time(), erlang:registered(), erlang:register(a, self()).\n",
+            "heavy(P) -> erlang:process_info(P).\n",
+            "tail_plain() -> erlang:whereis(a).\n",
+            "tail_exit() -> erlang:error(x).\n",
+            "not_bif() -> light_bif_probe_other:go().\n",
+        );
+        let dir = std::env::temp_dir().join(format!("light_bif_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let erl = dir.join("light_bif_probe.erl");
+        std::fs::write(&erl, source).unwrap();
+        let compiled = std::process::Command::new("erlc")
+            .arg("-o")
+            .arg(&dir)
+            .arg(&erl)
+            .output()
+            .expect("erlc");
+        assert!(
+            compiled.status.success(),
+            "erlc: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let bytes = std::fs::read(dir.join("light_bif_probe.beam")).unwrap();
+        let beam = arinsal_beam::parse(&bytes).unwrap();
+        let functions = transform_module(&beam);
+        let calls = |module: &str, function: &str, arity: u32| -> Vec<String> {
+            let index = beam
+                .imports
+                .iter()
+                .position(|import| {
+                    beam.atoms
+                        .get(import.module_atom as usize - 1)
+                        .is_some_and(|name| name == module)
+                        && beam
+                            .atoms
+                            .get(import.function_atom as usize - 1)
+                            .is_some_and(|name| name == function)
+                        && import.arity == arity
+                })
+                .unwrap_or_else(|| panic!("missing import {module}:{function}/{arity}"))
+                as u64;
+            functions
+                .iter()
+                .flatten()
+                .filter(|op| {
+                    op.operands().iter().any(|operand| {
+                        matches!(operand, SpecificOperand::SmallInt(value) if *value == index as i64)
+                            || matches!(operand, SpecificOperand::Unsigned(value) if *value == index)
+                            || matches!(operand, SpecificOperand::Export(value) if u64::from(*value) == index)
+                    })
+                })
+                .map(|op| op.name().to_owned())
+                .collect()
+        };
+        for (module, function, arity) in [
+            ("erlang", "whereis", 1),
+            ("erlang", "monotonic_time", 0),
+            ("erlang", "register", 2),
+        ] {
+            let names = calls(module, function, arity);
+            assert!(
+                names.iter().any(|name| name == "call_light_bif"),
+                "{module}:{function}/{arity} -> {names:?}"
+            );
+            assert!(
+                !names.iter().any(|name| name.starts_with("i_call_ext")),
+                "{module}:{function}/{arity} stayed on the export trampoline: {names:?}"
+            );
+        }
+        let heavy = calls("erlang", "process_info", 1);
+        assert!(
+            heavy.iter().any(|name| name.starts_with("i_call_ext")),
+            "hbif process_info/1 -> {heavy:?}"
+        );
+        assert!(
+            !heavy.iter().any(|name| name == "call_light_bif"),
+            "hbif process_info/1 became call_light_bif: {heavy:?}"
+        );
+        let exit = calls("erlang", "error", 1);
+        assert!(
+            exit.iter().any(|name| name == "call_light_bif"),
+            "exit bif error/1 -> {exit:?}"
+        );
+        let other = calls("light_bif_probe_other", "go", 0);
+        assert!(
+            other.iter().any(|name| name.starts_with("i_call_ext")),
+            "non-bif -> {other:?}"
+        );
+        assert!(
+            !other.iter().any(|name| name == "call_light_bif"),
+            "non-bif became call_light_bif: {other:?}"
+        );
+    }
 }

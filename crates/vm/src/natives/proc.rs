@@ -601,16 +601,15 @@ fn process_info(
             "suspending" => suspending_term(process, pid)?,
             "trace" => Term::small(trace_mask(process, pid) as i64).unwrap(),
             "registered_name" => {
-                let name = process
-                    .runtime
-                    .as_ref()
-                    .ok_or_else(badarg)?
-                    .names
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find_map(|(name, registered)| (*registered == pid).then(|| name.clone()));
-                name.map(|name| atom(&name)).unwrap_or(Term::NIL)
+                let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
+                match runtime
+                    .scheduler()
+                    .map_err(|_| badarg())?
+                    .registered_atom_index(pid)
+                {
+                    Some(index) => Term::atom(arinsal_term::Atom(index)),
+                    None => Term::NIL,
+                }
             }
             "fullsweep_after" => flag_value(process, "fullsweep_after")
                 .unwrap_or_else(|| Term::small(65_535).unwrap()),
@@ -1363,16 +1362,14 @@ fn process_info_direct(
             }
             Some(arinsal_term::atoms::REGISTERED_NAME) => {
                 let runtime = target.runtime.as_ref().ok_or_else(badarg)?;
-                let name = runtime
-                    .names
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find_map(|(name, registered)| {
-                        (*registered == target_pid).then(|| name.clone())
-                    });
-                let Some(name) = name else { return Ok(None) };
-                atom(&name)
+                let Some(index) = runtime
+                    .scheduler()
+                    .map_err(|_| badarg())?
+                    .registered_atom_index(target_pid)
+                else {
+                    return Ok(None);
+                };
+                Term::atom(arinsal_term::Atom(index))
             }
             _ => return Err(badarg()),
         };

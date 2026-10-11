@@ -27,6 +27,7 @@ mod proc_create;
 mod funs;
 mod lists;
 mod process;
+mod register;
 pub use beamasm_integration::{interp_native_starts, interp_slices};
 pub use process::ScheduledResult;
 mod inet_drv;

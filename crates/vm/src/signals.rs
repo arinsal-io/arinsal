@@ -80,6 +80,37 @@ fn runtime(process: &Process) -> Result<&Runtime, VmError> {
         .ok_or_else(|| VmError::Unsupported("process BIF requires a scheduler".into()))
 }
 
+/// `whereis/1` from native code. The light-BIF fragment calls this with `c_p`
+/// and the register arguments; it does not trap back into the executor.
+// Port of erts/emulator/beam/bif.c:2342 (whereis_1), OTP-29.1.1.
+pub(crate) fn whereis_bif(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    Some(match whereis_1(process, args[0]) {
+        Ok(term) => Ok(term),
+        Err(VmError::Trap(trap)) => Err(trap),
+        Err(_) => Err(crate::exceptions::Trap::error(atom("system_limit"))),
+    })
+}
+
+// Port of erts/emulator/beam/bif.c:2342 (whereis_1) and
+// register.c:276 (erts_whereis_name_to_id), OTP-29.1.1:
+// atom check, read lock, one hash fetch, unlock, the pid or port id.
+fn whereis_1(process: &Process, name: Term) -> Result<Term, VmError> {
+    let name = name.as_atom().ok_or_else(|| badarg("whereis/1"))?;
+    let rt = runtime(process)?;
+    Ok(match rt.reg.whereis(name) {
+        Some(crate::register::RegId::Proc(pid)) => {
+            pid.to_term().unwrap_or_else(|| atom("undefined"))
+        }
+        Some(crate::register::RegId::Port(id)) => {
+            Term::port(id).unwrap_or_else(|| atom("undefined"))
+        }
+        None => atom("undefined"),
+    })
+}
+
 #[cfg(test)]
 mod task_latency_tests {
     use arinsal_difftest::RefErl;
@@ -1323,10 +1354,15 @@ fn system_process(vm: &Vm, process: &Process, pid: Pid, names: &[&str]) -> bool 
         return true;
     }
     let registered = process.runtime.as_ref().is_some_and(|runtime| {
-        let table = runtime.names.lock().unwrap();
-        names
-            .iter()
-            .any(|name| table.get(*name).copied() == Some(pid))
+        runtime
+            .scheduler()
+            .ok()
+            .and_then(|scheduler| scheduler.registered_atom_index(pid))
+            .is_some_and(|index| {
+                names
+                    .iter()
+                    .any(|name| global_atoms().get(name).is_some_and(|atom| atom.0 == index))
+            })
     });
     if registered {
         return true;
@@ -1939,169 +1975,129 @@ fn call_resolved(
                 })
             })
         }
-        (SignalBif::Register2, [name, pid]) => {
-            let name = atom_name(*name).ok_or_else(|| badarg("register/2"));
-            name.and_then(|name| {
-                // Port of erts/emulator/beam/bif.c (register_2): `undefined` is not a valid name.
-                if name == "undefined" {
+        (SignalBif::Register2, [name, id]) => {
+            let name = name.as_atom().ok_or_else(|| badarg("register/2"))?;
+            // Port of erts/emulator/beam/register.c:184 (erts_register_name): `undefined` is not a name.
+            if name == arinsal_term::atoms::UNDEFINED {
+                return Err(badarg("register/2"));
+            }
+            let rt = std::sync::Arc::clone(
+                process
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| badarg("register/2"))?,
+            );
+            let scheduler = rt.scheduler()?;
+            if let Some(pid) = Pid::from_term(*id) {
+                let mut table = rt.reg.write();
+                if !scheduler.lookup(pid)
+                    || scheduler.registered_atom_index(pid).is_some()
+                    || table.contains(name)
+                    || !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
+                {
                     return Err(badarg("register/2"));
                 }
-                let rt = std::sync::Arc::clone(
-                    process
-                        .runtime
-                        .as_ref()
-                        .ok_or_else(|| badarg("register/2"))?,
-                );
-                if let Some(pid) = Pid::from_term(*pid) {
-                    if !rt.scheduler()?.lookup(pid) {
-                        return Err(badarg("register/2"));
-                    }
-                    let mut names = rt.names.lock().unwrap();
-                    if names.get(&name).is_some_and(|existing| {
-                        rt.scheduler()
-                            .is_ok_and(|scheduler| scheduler.lookup(*existing))
-                    }) || rt
-                        .port_names
-                        .lock()
-                        .unwrap()
-                        .get(&name)
-                        .is_some_and(|id| crate::port::is_live(process, *id))
-                    {
-                        return Err(badarg("register/2"));
-                    }
-                    // p->common.u.alive.reg (erl_process.c:12649, register.c:237). Exit
-                    // unregisters only when this word is set (erl_process.c:14424).
-                    if !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG) {
-                        return Err(badarg("register/2"));
-                    }
-                    names.insert(name.clone(), pid);
-                } else if let Some(id) = pid.as_port() {
-                    if !crate::port::is_live(process, id) {
-                        return Err(badarg("register/2"));
-                    }
-                    let mut names = rt.names.lock().unwrap();
-                    let mut port_names = rt.port_names.lock().unwrap();
-                    if names.get(&name).is_some_and(|existing| {
-                        rt.scheduler()
-                            .is_ok_and(|scheduler| scheduler.lookup(*existing))
-                    }) || port_names
-                        .get(&name)
-                        .is_some_and(|existing| crate::port::is_live(process, *existing))
-                    {
-                        return Err(badarg("register/2"));
-                    }
-                    names.remove(&name);
-                    port_names.insert(name.clone(), id);
-                } else {
-                    return Err(badarg("register/2"));
-                }
+                table.insert_proc(name, pid);
+                scheduler.set_registered_atom_index(pid, name.0);
+                drop(table);
                 // Port of erts/emulator/beam/register.c:237-240 (erts_register_name), OTP-29.1.1:
-                // the event belongs to the process that gets the name, not to the caller.
-                let subject = Pid::from_term(*pid).unwrap_or(ctx.pid());
+                // the event belongs to the process that gets the name.
                 crate::trace::emit(
                     Some(vm),
                     process,
                     ctx,
-                    subject,
+                    pid,
                     crate::trace::PROCS,
                     "register",
-                    &[atom(&name)],
+                    &[Term::atom(name)],
                 );
-                if let Some(id) = pid.as_port() {
-                    crate::trace::emit_port_event(
-                        &rt,
-                        id,
-                        crate::trace::PORTS,
-                        "register",
-                        &[atom(&name)],
-                    );
-                }
                 Ok(atom("true"))
-            })
+            } else if let Some(port_id) = id.as_port() {
+                let handle = {
+                    let ports = rt.ports.lock().unwrap();
+                    let handle = ports
+                        .get(&port_id)
+                        .cloned()
+                        .ok_or_else(|| badarg("register/2"))?;
+                    if handle.exit_complete() {
+                        return Err(badarg("register/2"));
+                    }
+                    handle
+                };
+                let mut table = rt.reg.write();
+                if handle.reg_closing()
+                    || handle.registered_atom().is_some()
+                    || table.contains(name)
+                {
+                    return Err(badarg("register/2"));
+                }
+                table.insert_port(name, port_id, handle.reg_word());
+                handle.set_registered_atom(name);
+                drop(table);
+                crate::trace::emit_port_event(
+                    &rt,
+                    port_id,
+                    crate::trace::PORTS,
+                    "register",
+                    &[Term::atom(name)],
+                );
+                Ok(atom("true"))
+            } else {
+                Err(badarg("register/2"))
+            }
         }
         (SignalBif::Unregister1, [name]) => {
-            let name = atom_name(*name).ok_or_else(|| badarg("unregister/1"));
-            name.and_then(|name| {
-                let rt = std::sync::Arc::clone(
-                    process
-                        .runtime
-                        .as_ref()
-                        .ok_or_else(|| badarg("unregister/1"))?,
-                );
-                let removed_pid = rt.names.lock().unwrap().remove(&name);
-                let removed_port = rt.port_names.lock().unwrap().remove(&name);
-                if removed_pid.is_none() && removed_port.is_none() {
-                    return Err(badarg("unregister/1"));
+            let name = name.as_atom().ok_or_else(|| badarg("unregister/1"))?;
+            let rt = std::sync::Arc::clone(
+                process
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| badarg("unregister/1"))?,
+            );
+            let mut table = rt.reg.write();
+            match table.erase(name) {
+                Some(crate::register::RegId::Proc(pid)) => {
+                    if let Ok(scheduler) = rt.scheduler() {
+                        scheduler.clear_registered_atom_index(pid, name.0);
+                    }
+                    drop(table);
+                    // Port of erts/emulator/beam/register.c:507-519 (erts_unregister_name), OTP-29.1.1.
+                    crate::trace::emit(
+                        Some(vm),
+                        process,
+                        ctx,
+                        pid,
+                        crate::trace::PROCS,
+                        "unregister",
+                        &[Term::atom(name)],
+                    );
+                    Ok(atom("true"))
                 }
-                // Port of erts/emulator/beam/register.c:297-307 (erts_unregister_name), OTP-29.1.1.
-                crate::trace::emit(
-                    Some(vm),
-                    process,
-                    ctx,
-                    removed_pid.unwrap_or(ctx.pid()),
-                    crate::trace::PROCS,
-                    "unregister",
-                    &[atom(&name)],
-                );
-                if let Some(id) = removed_port {
+                Some(crate::register::RegId::Port(port_id)) => {
+                    drop(table);
                     crate::trace::emit_port_event(
                         &rt,
-                        id,
+                        port_id,
                         crate::trace::PORTS,
                         "unregister",
-                        &[atom(&name)],
+                        &[Term::atom(name)],
                     );
+                    Ok(atom("true"))
                 }
-                Ok(atom("true"))
-            })
+                None => Err(badarg("unregister/1")),
+            }
         }
-        (SignalBif::Whereis1, [name]) => {
-            let name = atom_name(*name).ok_or_else(|| badarg("whereis/1"));
-            name.and_then(|name| {
-                let rt = runtime(process)?;
-                let mut names = rt.names.lock().unwrap();
-                let pid = names.get(&name).copied();
-                if let Some(pid) = pid
-                    && rt.scheduler()?.lookup(pid)
-                {
-                    Ok(pid.to_term().unwrap_or_else(|| atom("undefined")))
-                } else {
-                    names.remove(&name);
-                    drop(names);
-                    let mut port_names = rt.port_names.lock().unwrap();
-                    match port_names.get(&name).copied() {
-                        Some(id) if crate::port::is_live(process, id) => {
-                            Ok(Term::port(id).unwrap_or_else(|| atom("undefined")))
-                        }
-                        Some(_) => {
-                            port_names.remove(&name);
-                            Ok(atom("undefined"))
-                        }
-                        None => Ok(atom("undefined")),
-                    }
-                }
-            })
-        }
+        (SignalBif::Whereis1, [name]) => whereis_1(process, *name),
         (SignalBif::Registered0, []) => {
             let rt = runtime(process)?;
-            let names: Vec<_> = rt
-                .names
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, pid)| {
-                    rt.scheduler()
-                        .is_ok_and(|scheduler| scheduler.lookup(**pid))
-                })
-                .map(|(name, _)| atom(name))
-                .chain(
-                    rt.port_names
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(_, id)| crate::port::is_live(process, **id))
-                        .map(|(name, _)| atom(name)),
-                )
+            // Snapshot under the read lock, then build the list. Order is the
+            // reverse bucket walk from register.c:567.
+            let names: Vec<Term> = rt
+                .reg
+                .read()
+                .registered_atoms()
+                .into_iter()
+                .map(Term::atom)
                 .collect();
             let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
             TermBuilder::new(&mut heap)
@@ -2165,7 +2161,7 @@ fn call_resolved(
             let pid = if let Some(pid) = Pid::from_term(*target) {
                 Some(pid)
             } else if let Some(name) = name.as_ref() {
-                rt.names.lock().unwrap().get(name).copied()
+                rt.reg.whereis_proc_str(name)
             } else if matches!(to_owned(*target), Ok(arinsal_etf::OwnedTerm::Pid { .. })) {
                 // A pid of another incarnation of this node never matches a live process.
                 None
@@ -2260,7 +2256,7 @@ fn call_resolved(
                     .flatten()
                     .map(|(name, _node)| name)
             }) {
-                let id = runtime.port_names.lock().unwrap().get(&name).copied();
+                let id = runtime.reg.whereis_port_str(&name);
                 let node = crate::node_tables::lock().local_name.clone();
                 (
                     id,
@@ -2421,11 +2417,7 @@ fn call_resolved(
             };
             let pid = Pid::from_term(*target);
             let registered_name = if pid.is_none() {
-                Some(
-                    atom_name(*target)
-                        .ok_or_else(|| badarg("timer/3"))?
-                        .to_owned(),
-                )
+                Some(target.as_atom().ok_or_else(|| badarg("timer/3"))?)
             } else {
                 None
             };
@@ -2450,7 +2442,7 @@ fn call_resolved(
                     let runtime = rt.clone();
                     let name = registered_name.expect("resolved timer name");
                     ctx.schedule_resolved_timer(ms, message, false, move || {
-                        let target = runtime.names.lock().unwrap().get(&name).copied();
+                        let target = runtime.reg.whereis_proc(name);
                         if target.is_none() {
                             runtime.timers.lock().unwrap().remove(&id);
                             runtime.timer_messages.lock().unwrap().remove(&id);
@@ -2465,7 +2457,7 @@ fn call_resolved(
                     let runtime = rt.clone();
                     let name = registered_name.expect("resolved timer name");
                     ctx.schedule_resolved_timer(ms, message, true, move || {
-                        let target = runtime.names.lock().unwrap().get(&name).copied();
+                        let target = runtime.reg.whereis_proc(name);
                         if target.is_none() {
                             runtime.timers.lock().unwrap().remove(&id);
                             runtime.timer_messages.lock().unwrap().remove(&id);
@@ -3704,13 +3696,7 @@ fn trace_cleaner_send(
     to: Term,
 ) -> Result<Term, VmError> {
     let is_cleaner = process.runtime.as_ref().is_some_and(|runtime| {
-        runtime
-            .names
-            .lock()
-            .unwrap()
-            .get("erts_trace_cleaner")
-            .copied()
-            == Some(ctx.pid())
+        runtime.reg.whereis_proc_str("erts_trace_cleaner") == Some(ctx.pid())
     });
     if !is_cleaner {
         return Err(VmError::Trap(crate::exceptions::Trap::error(atom(

@@ -1413,14 +1413,11 @@ fn call_values(
             result
         })()),
         ("erts_internal", "purge_module", 2) => Some((|| {
-            let allowed = process.runtime.as_ref().and_then(|runtime| {
-                runtime
-                    .names
-                    .lock()
-                    .unwrap()
-                    .get("erts_code_purger")
-                    .copied()
-            }) == Some(ctx.pid());
+            let allowed = process
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.reg.whereis_proc_str("erts_code_purger"))
+                == Some(ctx.pid());
             if !allowed {
                 return Err(VmError::Trap(exceptions::Trap::error(atom("notsup"))));
             }

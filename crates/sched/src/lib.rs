@@ -490,7 +490,6 @@ impl Default for Config {
 pub enum Error {
     Capacity,
     NoProcess,
-    NameInUse,
     WrongMode,
 }
 
@@ -700,6 +699,9 @@ struct Process<T: Task> {
     bif_timer_wheels: AtomicU64,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
     exit_flags: AtomicU32,
+    /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
+    /// Port of erts/emulator/beam/erl_process.h (`common.u.alive.reg`), OTP-29.1.1.
+    reg_atom: AtomicU32,
     wait_timer: AtomicU64,
     // Port of erts `Process.sig_inq`; shared with the task so receive can fetch in place.
     input: Arc<Incoming<Event<T::Message>>>,
@@ -815,6 +817,7 @@ impl<T: Task> ProcessTable<T> {
             timer_epoch_used: AtomicBool::new(false),
             bif_timer_wheels: AtomicU64::new(0),
             exit_flags: AtomicU32::new(0),
+            reg_atom: AtomicU32::new(u32::MAX),
             wait_timer: AtomicU64::new(0),
             input: Arc::default(),
             publish_inflight: AtomicUsize::new(0),
@@ -1059,7 +1062,6 @@ fn lock_cell<T: Task>(process: &Process<T>) -> std::sync::MutexGuard<'_, TaskCel
 struct Inner<T: Task> {
     config: Config,
     table: ProcessTable<T>,
-    names: Mutex<HashMap<String, Pid>>,
     /// Per-scheduler run queues for unbound processes enqueued from elsewhere; the owner
     /// drains its queue into its local deques and idle schedulers steal from it.
     run_queues: Vec<[SegQueue<Scheduled<T>>; 4]>,
@@ -4519,7 +4521,6 @@ impl<T: Task> Scheduler<T> {
         let inner = Arc::new(Inner {
             table: ProcessTable::new(config.max_processes),
             config,
-            names: Mutex::new(HashMap::new()),
             run_queues: (0..workers)
                 .map(|_| std::array::from_fn(|_| SegQueue::new()))
                 .collect(),
@@ -4619,8 +4620,11 @@ impl<T: Task> Scheduler<T> {
     /// The words live on the scheduler process, not behind the task cell, so a running
     /// process and another process can publish them without taking each other's cell lock.
     pub fn with_proc_flags<R>(&self, pid: Pid, f: impl FnOnce(&AtomicU32) -> R) -> Option<R> {
-        let process = self.inner.table.lookup(pid)?;
-        Some(f(&process.exit_flags))
+        // Port of erts/emulator/beam/erl_process_lock.h:1135 (erts_proc_lookup_raw),
+        // OTP-29.1.1: the slot load does not increment the process refcount.
+        self.inner
+            .table
+            .with_live(pid, |process| f(&process.exit_flags))
     }
     /// Spawn a normal-priority task.
     pub fn spawn(&self, task: T) -> Result<Pid, Error> {
@@ -5020,36 +5024,31 @@ impl<T: Task> Scheduler<T> {
     pub fn process_table_size(&self) -> u32 {
         self.inner.table.ids.layout().max()
     }
-    /// Register a local name for a live pid.
-    pub fn register(&self, name: impl Into<String>, pid: Pid) -> Result<(), Error> {
-        if !self.lookup(pid) {
-            return Err(Error::NoProcess);
-        }
-        let mut names = self.inner.names.lock().unwrap();
-        let name = name.into();
-        if let Some(&existing) = names.get(&name)
-            && self.lookup(existing)
-        {
-            return Err(Error::NameInUse);
-        }
-        names.insert(name, pid);
-        Ok(())
+    /// Atom index stored in `p->common.u.alive.reg->name`, if this process has a name.
+    pub fn registered_atom_index(&self, pid: Pid) -> Option<u32> {
+        let process = self.inner.table.lookup(pid)?;
+        let index = process.reg_atom.load(Ordering::Acquire);
+        (index != u32::MAX).then_some(index)
     }
-    /// Remove a previously registered local name.
-    pub fn unregister(&self, name: &str) -> Option<Pid> {
-        self.inner.names.lock().unwrap().remove(name)
-    }
-    /// Resolve a registered local name, discarding names for exited tasks.
-    pub fn whereis(&self, name: &str) -> Option<Pid> {
-        let mut names = self.inner.names.lock().unwrap();
-        let pid = names.get(name).copied()?;
-        if self.lookup(pid) {
-            Some(pid)
-        } else {
-            names.remove(name);
-            None
+
+    /// Publish `p->common.u.alive.reg` for `pid`. The caller holds the register-table write lock.
+    pub fn set_registered_atom_index(&self, pid: Pid, index: u32) {
+        if let Some(process) = self.inner.table.lookup(pid) {
+            process.reg_atom.store(index, Ordering::Release);
         }
     }
+
+    /// Clear `p->common.u.alive.reg` when it still names `index`.
+    pub fn clear_registered_atom_index(&self, pid: Pid, index: u32) -> bool {
+        let Some(process) = self.inner.table.lookup(pid) else {
+            return false;
+        };
+        process
+            .reg_atom
+            .compare_exchange(index, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Schedule an opaque envelope for future delivery.
     pub fn start_timer(&self, pid: Pid, ms: u64, msg: T::Message) -> Result<TimerRef, Error> {
         self.inner
