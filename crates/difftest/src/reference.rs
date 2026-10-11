@@ -47,23 +47,16 @@ fn resolve_otp_root() -> Option<PathBuf> {
     (output.status.success() && root.is_dir()).then_some(root)
 }
 
+/// The emulator directory of the installed release.
+///
+/// `Install` records the ERTS version in `releases/start_erl.data`
+/// (erts/etc/unix/Install.src:119, OTP-29.1.1), and the `erl` script it writes
+/// hardcodes the same `erts-<vsn>`; a root may hold several `erts-*` trees.
 fn erts_bin_for(root: &Path) -> Option<PathBuf> {
-    let versions: Vec<PathBuf> = std::fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("erts-"))
-        })
-        .collect();
-    let mut versions = versions;
-    versions.sort();
-    versions.into_iter().rev().find_map(|erts| {
-        let bin = erts.join("bin");
-        bin.join(program("erlexec")).is_file().then_some(bin)
-    })
+    let data = std::fs::read_to_string(root.join("releases/start_erl.data")).ok()?;
+    let version = data.split_whitespace().next()?;
+    let bin = root.join(format!("erts-{version}")).join("bin");
+    bin.join(program("erlexec")).is_file().then_some(bin)
 }
 
 /// A reference emulator `Command`, launched the way the stock OTP `erl` script

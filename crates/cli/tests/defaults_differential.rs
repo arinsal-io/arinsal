@@ -43,9 +43,7 @@ fn run(
         arinsal_difftest::reference::erl().expect("reference OTP emulator")
     } else {
         let mut command = Command::new("timeout");
-        command
-            .arg("30")
-            .arg(env!("CARGO_BIN_EXE_arinsal"));
+        command.arg("30").arg(env!("CARGO_BIN_EXE_arinsal"));
         command
     };
     let output = command
