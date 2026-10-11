@@ -17,4 +17,4 @@ num-traits.workspace = true
 
 [dev-dependencies]
 arinsal-difftest.workspace = true
-similar-asserts = "1.7.0"
+similar-asserts = "2"
