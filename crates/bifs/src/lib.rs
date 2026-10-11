@@ -27,6 +27,7 @@ mod pure;
 mod sys;
 mod time;
 mod unicode;
+mod unique;
 
 pub use etf::{DecodeWalk, EncodeWalk};
 pub use lists::SubtractWalk;
@@ -35,10 +36,15 @@ pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use pure::{
     BinarySearchKind, BinarySearchWalk, IolistCopyWalk, IolistSizeWalk, IolistWalk,
     allocate_iolist_binary, binary_bytes, bitstring_bit_len, copy_binary_range,
-    copy_bitstring_range, finish_iolist_binary_output, next_ref_id, next_unique_monotonic,
-    singleton_bitstring, with_binary_bytes, with_iolist_binary_output,
+    copy_bitstring_range, eval_unique_integer, finish_iolist_binary_output, next_ref_id,
+    next_unique_monotonic, singleton_bitstring, with_binary_bytes, with_iolist_binary_output,
 };
 pub use time::{monotonic_time_milliseconds, monotonic_time_nanos};
+pub use unique::{
+    SchedulerRefState, UniqueInt, bind_scheduler_ref_state, init_unique_scheduler_count,
+    next_ref_words, next_unique_integer, next_unique_monotonic_positive, ordinary_ref_key,
+    ordinary_ref_words, scheduler_thr_id,
+};
 
 pub use sys::{set_emu_flavor_jit, sys_perf_counter};
 pub use time::initialize_time_origin;

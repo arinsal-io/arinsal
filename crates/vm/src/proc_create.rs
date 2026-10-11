@@ -159,6 +159,9 @@ pub struct Process {
     /// One-based id of the scheduler running this process (0 outside a run), refreshed each slice
     /// like erts' `c_p->scheduler_data`.
     pub(crate) scheduler_id: u32,
+    /// Reference and `unique_integer` counters of the scheduler running this process.
+    /// Port of `c_p->scheduler_data` (`ref` and `unique`), OTP-29.1.1.
+    pub(crate) scheduler_ref_state: Option<arinsal_bifs::SchedulerRefState>,
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
     pub(crate) inbox: process::MessageQueue,
@@ -825,6 +828,14 @@ pub(crate) struct ProcessCold {
     /// Links created with `link/2` `[priority]` — EXIT messages from these are priority.
     pub(crate) prio_links: std::collections::BTreeSet<arinsal_sched::Pid>,
     pub(crate) monitors: Tracked<std::collections::BTreeMap<u64, arinsal_sched::Pid>>,
+    /// Remote-process monitors. `demonitor` of any other ref does not take the
+    /// node-table lock: erts finds `ERTS_MON_TYPE_DIST_PROC` in this process's
+    /// own monitor tree (`bif.c` `demonitor`), not in a global scan.
+    pub(crate) dist_monitors: std::collections::HashSet<u64>,
+    /// Origin half of `monitor(port, _)`: reference to port id.
+    /// The target half lives on the port (`ERTS_P_LT_MONITORS`).
+    /// Port of `ERTS_MON_TYPE_PORT` in `ERTS_P_MONITORS` (`bif.c` `monitor`), OTP-29.1.1.
+    pub(crate) port_monitors: std::collections::BTreeMap<u64, u64>,
     /// Monitors created with the `priority` option — DOWN messages are priority.
     pub(crate) prio_monitors: std::collections::BTreeSet<u64>,
     pub(crate) monitored_by: Tracked<std::collections::BTreeMap<u64, arinsal_sched::Pid>>,
@@ -1055,6 +1066,7 @@ impl Process {
             self_pid: None,
             pending_signal_waiter: None,
             scheduler_id: 0,
+            scheduler_ref_state: None,
             hibernated: false,
             inbox: process::MessageQueue::default(),
             receive_cursor: 0,

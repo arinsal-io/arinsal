@@ -383,28 +383,153 @@ busy_wait(Until) ->
     }
 }
 
-fn list(term: Term) -> Option<Vec<Term>> {
-    let mut values = Vec::new();
+fn each_list_item(term: Term, mut visit: impl FnMut(Term)) -> Option<()> {
     let mut current = term;
     while current.classify() == TermKind::List {
         // SAFETY: The source heap remains live during this BIF call.
         let (head, tail) = unsafe { current.cons_ref()? };
-        values.push(head);
+        visit(head);
         current = tail;
     }
-    (current == Term::NIL).then_some(values)
+    (current == Term::NIL).then_some(())
+}
+
+fn list(term: Term) -> Option<Vec<Term>> {
+    let mut values = Vec::new();
+    each_list_item(term, |head| values.push(head))?;
+    Some(values)
+}
+
+/// `demonitor/2` options, walked in place like `bif.c` `demonitor_2`.
+/// `None` is a bad option list; the full BIF raises `badarg`.
+fn demonitor_flags(term: Term) -> Option<(bool, bool)> {
+    let flush_atom = atom("flush");
+    let info_atom = atom("info");
+    let mut flush = false;
+    let mut info = false;
+    let mut bad = false;
+    each_list_item(term, |option| {
+        if option == flush_atom {
+            flush = true;
+        } else if option == info_atom {
+            info = true;
+        } else {
+            bad = true;
+        }
+    })?;
+    (!bad).then_some((flush, info))
+}
+
+/// Local `monitor`/`demonitor` cases that erts returns from the BIF without a
+/// signal: monitoring oneself, and demonitoring a ref that is not a monitor.
+///
+/// `None` leaves the call to the executor path (another local process, a name,
+/// a remote or port monitor, a bad argument).
+// Port of erts/emulator/beam/bif.c:782-784 (`monitor`, no monitoring of self)
+// and bif.c:437-454 (`demonitor` tree miss), OTP-29.1.1.
+pub(crate) fn light_monitor_bif(
+    process: &mut Process,
+    monitor: bool,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    if monitor {
+        light_monitor_self(process, args)
+    } else {
+        light_demonitor_miss(process, args)
+    }
+}
+
+fn light_monitor_self(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    // monitor/3 options (alias, tag) stay on the full path. monitor/2 of self
+    // is `erts_make_ref` and nothing else.
+    if args.len() != 2 || args[0] != atom("process") {
+        return None;
+    }
+    let self_pid = process.header.self_pid;
+    if self_pid == 0 || args[1].tagged_word() != self_pid {
+        return None;
+    }
+    Some(light_ref(process))
+}
+
+fn light_ref(process: &mut Process) -> Result<Term, crate::exceptions::Trap> {
+    let words = arinsal_bifs::next_ref_words();
+    match Term::local_ref(&mut process.heap, words) {
+        Ok(term) => Ok(term),
+        Err(_) => {
+            let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            Term::local_ref(&mut fragment, words)
+                .map_err(|_| crate::exceptions::Trap::error(atom("system_limit")))
+        }
+    }
+}
+
+fn light_demonitor_miss(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let reference = *args.first()?;
+    let ids = reference.local_ref_numbers()?;
+    let id = arinsal_bifs::ordinary_ref_key(ids);
+    if let Some(cold) = process.cold.as_ref()
+        && (cold.monitors.contains_key(&id)
+            || cold.aliases.contains(&id)
+            || cold.dist_monitors.contains(&id)
+            || cold.port_monitors.contains_key(&id))
+    {
+        return None;
+    }
+    let (flush, info) = if args.len() < 2 {
+        (false, false)
+    } else {
+        demonitor_flags(args[1])?
+    };
+    if flush {
+        // The origin monitor is already gone, so a DOWN for this ref is in the
+        // inbox (or was never sent). An in-flight DOWN still sits with the
+        // monitor in the tree, which took the executor path above.
+        flush_monitor_inbox(process, id);
+    }
+    Some(Ok(atom(if info { "false" } else { "true" })))
+}
+
+/// Drop `{_, Ref, _, _, _}` messages already in the inbox.
+// Port of erts/preloaded/src/erts_internal.erl:523 (flush_monitor_messages), OTP-29.1.1.
+pub(crate) fn flush_monitor_inbox(process: &mut Process, id: u64) {
+    if process.inbox.is_empty() {
+        return;
+    }
+    let start = process.receive_marker_position(id).unwrap_or(0);
+    let old_prio_len = process.cold.as_ref().map_or(0, |cold| cold.prio_len);
+    let (new_prio_len, removed) = process.inbox.retain_from(start, old_prio_len, |message| {
+        // SAFETY: Mailbox terms remain in the receiver's live heap.
+        unsafe { message.tuple_ref() }
+            .is_none_or(|tuple| tuple.len() != 5 || tuple.get(1).and_then(ref_id) != Some(id))
+    });
+    if process.cold.is_some() || new_prio_len != old_prio_len {
+        process.cold_mut().prio_len = new_prio_len;
+    }
+    for (removed_count, original_index) in removed.into_iter().enumerate() {
+        process.message_removed(original_index - removed_count);
+    }
 }
 
 pub(crate) fn reference(process: &mut Process, id: u64) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    Term::local_ref(&mut heap, [id as u32, (id >> 32) as u32, 0])
+    Term::local_ref(&mut heap, arinsal_bifs::ordinary_ref_words(id))
         .map_err(|error| VmError::Unsupported(format!("reference allocation: {error:?}")))
 }
 
 pub(crate) fn ref_id(term: Term) -> Option<u64> {
+    if let Some(ids) = term.local_ref_numbers() {
+        return Some(arinsal_bifs::ordinary_ref_key(ids));
+    }
     match term.identity()? {
-        arinsal_term::Identity::Ref { ids, .. } if ids.len() == 3 && ids[2] == 0 => {
-            Some(ids[0] as u64 | ((ids[1] as u64) << 32))
+        arinsal_term::Identity::Ref { ids, .. } if ids.len() == 3 && ids[2] != u32::MAX => {
+            Some(arinsal_bifs::ordinary_ref_key([ids[0], ids[1], ids[2]]))
         }
         _ => None,
     }
@@ -1149,7 +1274,7 @@ fn access_timer_sync(
         }) => OwnedTerm::Ref {
             node: node.clone(),
             creation,
-            ids: vec![id as u32, (id >> 32) as u32, 0],
+            ids: arinsal_bifs::ordinary_ref_words(id).to_vec(),
         },
         _ => return Err(badarg("timer reference")),
     };
@@ -2028,6 +2153,11 @@ fn call_resolved(
             };
             let id = rt.next_ref();
             let ref_term = reference(process, id)?;
+            // Port of erts/emulator/beam/bif.c:782-784 (monitor), OTP-29.1.1.
+            // Monitoring oneself creates no monitor and sends no signal.
+            if name.is_none() && pid == Some(ctx.pid()) {
+                return Ok(ref_term);
+            }
             // The default `DOWN` tag is implied. Owning it allocates on every
             // `gen_server:call` monitor.
             if tag != atom("DOWN") {
@@ -2153,6 +2283,9 @@ fn call_resolved(
                             VmError::Unsupported(format!("port DOWN tuple: {error:?}"))
                         })?;
                     process.inbox.push_back(down);
+                } else {
+                    // Origin stays in this process; the target half is on the port.
+                    process.cold_mut().port_monitors.insert(reference_id, id);
                 }
                 Ok(reference_term)
             } else {
@@ -2202,24 +2335,23 @@ fn call_resolved(
             if alias_active && let Some(runtime) = &process.runtime {
                 runtime.alias_bind(id, None);
             }
-            was_active |= crate::port::demonitor(process, id);
-            if flush {
-                // Port of erts/emulator/beam/bif.c:647 (demonitor flush trap), OTP-29.1.1.
-                // erts_internal:flush_monitor_messages/3 scans from its compiler-bound marker.
+            // Port of erts/emulator/beam/bif.c:504-510 (demonitor, ERTS_MON_TYPE_PORT),
+            // OTP-29.1.1: the origin is in this process's monitor tree. The port id
+            // there selects the port; `erts_port_demonitor` sends the demonitor signal.
+            if let Some(port_id) = process
+                .cold
+                .as_mut()
+                .and_then(|cold| cold.port_monitors.remove(&id))
+            {
+                crate::port::demonitor_port(process, ctx.pid(), port_id, id);
+                was_active = true;
+            }
+            // Port of erts/emulator/beam/bif.c:640-654 (demonitor_2), OTP-29.1.1.
+            // Flush runs only when the monitor is already gone (`am_false`). An
+            // active process monitor just queues the demonitor signal.
+            if flush && !was_active {
                 process.drain(ctx)?;
-                let start = process.receive_marker_position(id).unwrap_or(0);
-                let old_prio_len = process.cold.as_ref().map_or(0, |cold| cold.prio_len);
-                let (new_prio_len, removed) =
-                    process.inbox.retain_from(start, old_prio_len, |message| {
-                        // SAFETY: Mailbox terms remain in the receiver's live heap.
-                        unsafe { message.tuple_ref() }.is_none_or(|tuple| {
-                            tuple.len() != 5 || tuple.get(1).and_then(ref_id) != Some(id)
-                        })
-                    });
-                process.cold_mut().prio_len = new_prio_len;
-                for (removed_count, original_index) in removed.into_iter().enumerate() {
-                    process.message_removed(original_index - removed_count);
-                }
+                flush_monitor_inbox(process, id);
             }
             Ok(atom(if options.contains(&atom("info")) && !was_active {
                 "false"

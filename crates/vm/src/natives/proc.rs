@@ -2404,7 +2404,7 @@ fn suspend_process(
             let id = arinsal_bifs::next_ref_id();
             let reference = Term::local_ref(
                 &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
-                [id as u32, (id >> 32) as u32, 0],
+                arinsal_bifs::ordinary_ref_words(id),
             )
             .map_err(|error| VmError::Unsupported(format!("suspend reference: {error:?}")))?;
             (reference, result, atom("exited"))
