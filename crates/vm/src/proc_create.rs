@@ -992,9 +992,18 @@ impl Process {
         adjustment + info.heap_size as i64 - info.recent_size as i64 + info.mbuf_size as i64
     }
 
+    #[inline]
     pub(crate) fn cold_mut(&mut self) -> &mut ProcessCold {
-        self.cold
-            .get_or_insert_with(|| Box::new(ProcessCold::default()))
+        if self.cold.is_none() {
+            self.allocate_cold();
+        }
+        self.cold.as_deref_mut().expect("cold part allocated")
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn allocate_cold(&mut self) {
+        self.cold = Some(Box::default());
     }
 
     /// Group leader, or `fallback` when spawn did not record one (`p->group_leader`).

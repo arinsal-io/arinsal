@@ -25,7 +25,8 @@ struct Dummy {
 
 impl Task for Dummy {
     type Message = ();
-    fn run(&mut self, ctx: &mut RunCtx<()>, _: u32) -> RunOutcome {
+    type SchedulerData = ();
+    fn run(&mut self, ctx: &mut RunCtx<()>, _: &mut (), _: u32) -> RunOutcome {
         match &mut self.mode {
             Mode::Forward(to) => {
                 while ctx.receive().is_some() {

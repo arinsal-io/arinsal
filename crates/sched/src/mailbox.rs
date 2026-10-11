@@ -10,6 +10,10 @@ const BUFFER_CONTENTION_INSTALL_LIMIT: usize = 50;
 const BUFFER_FLUSH_ROUNDS: usize = 8192;
 const BUFFER_ENQUEUES_TO_KEEP: usize = BUFFER_FLUSH_ROUNDS + BUFFER_FLUSH_ROUNDS / 2;
 
+/// The receiver exited and closed its in-queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueClosed;
+
 /// One parallel sender buffer (erts `ErtsSignalInQueueBuffer`).
 struct SignalBuffer<T> {
     /// Cleared when the buffers are uninstalled; a sender then enqueues directly.
@@ -41,6 +45,10 @@ pub struct Incoming<T> {
     /// enqueue and read without the lock. It is SeqCst so that it orders with the
     /// receiver's WAITING store (see the wake protocol in lib.rs).
     pending: AtomicUsize,
+    /// Set under the msgq lock once the receiver exited and took its last signals; later
+    /// enqueues fail. Port of erts/emulator/beam/erl_proc_sig_queue.c:712-800
+    /// (enqueue_signals checks the receiver's exiting state under the msgq lock), OTP-29.1.1.
+    closed: AtomicBool,
     /// Signals delivered but not yet consumed by the receiver (send pressure).
     pub(crate) backlog: AtomicUsize,
     buffering_allowed: AtomicBool,
@@ -57,6 +65,7 @@ impl<T> Default for Incoming<T> {
         Self {
             msgq: Mutex::new(VecDeque::new()),
             pending: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
             backlog: AtomicUsize::new(0),
             buffering_allowed: AtomicBool::new(false),
             buffers_enabled: AtomicBool::new(false),
@@ -93,23 +102,30 @@ impl<T> Incoming<T> {
 
     /// Publish a signal through its sender's parallel buffer when buffering is enabled.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10261 (erts_proc_sig_queue_try_enqueue_to_buffer)
-    // and :712 (enqueue_signals), OTP-29.1.1.
-    pub fn push_routed(&self, slot: usize, value: T) {
+    // and :712 (enqueue_signals), OTP-29.1.1. The sender's buffer slot is hashed only when
+    // buffers are installed (erl_proc_sig_queue.c:10271-10288).
+    /// Fails, giving the signal back, once the receiver closed its queue.
+    pub fn push_routed(&self, slot: impl FnOnce() -> usize, value: T) -> Result<(), T> {
         let value = match self.try_push_buffer(slot, value) {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(value) => value,
         };
         let (mut queue, contended) = self.lock_msgq();
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(value);
+        }
         queue.push_back(value);
         self.pending.fetch_add(1, Ordering::SeqCst);
         drop(queue);
         self.note_contention(contended);
+        Ok(())
     }
 
-    fn try_push_buffer(&self, slot: usize, value: T) -> Result<(), T> {
+    fn try_push_buffer(&self, slot: impl FnOnce() -> usize, value: T) -> Result<(), T> {
         if !self.buffers_enabled.load(Ordering::Acquire) {
             return Err(value);
         }
+        let slot = slot();
         let Some(buffers) = self.buffers.lock().unwrap().clone() else {
             return Err(value);
         };
@@ -165,6 +181,9 @@ impl<T> Incoming<T> {
 
     /// Install fresh buffers; the caller holds the msgq lock.
     fn install_buffers_locked(&self) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
         let mut buffers = self.buffers.lock().unwrap();
         if buffers.is_none() {
             *buffers = Some(Arc::new(std::array::from_fn(|_| {
@@ -249,27 +268,61 @@ impl<T> Incoming<T> {
 
     /// Publish a sender ordered block through the matching per sender buffers.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10261, OTP-29.1.1.
-    pub fn push_block_routed(&self, values: &mut Vec<T>, sender_slot: impl Fn(&T) -> usize) {
+    /// Fails once the receiver closed its queue; the signals not enqueued stay in `values`.
+    pub fn push_block_routed(
+        &self,
+        values: &mut Vec<T>,
+        sender_slot: impl Fn(&T) -> usize,
+    ) -> Result<(), QueueClosed> {
         if values.is_empty() {
-            return;
+            return Ok(());
         }
         if !self.buffers_enabled.load(Ordering::Acquire) {
             let (mut queue, contended) = self.lock_msgq();
+            if self.closed.load(Ordering::Relaxed) {
+                return Err(QueueClosed);
+            }
             let count = values.len();
             queue.extend(values.drain(..));
             self.pending.fetch_add(count, Ordering::SeqCst);
             drop(queue);
             self.note_contention(contended);
-            return;
+            return Ok(());
         }
-        for value in values.drain(..) {
+        let mut pending = std::mem::take(values).into_iter();
+        while let Some(value) = pending.next() {
             let slot = sender_slot(&value);
-            if let Err(value) = self.try_push_buffer(slot, value) {
+            if let Err(value) = self.try_push_buffer(|| slot, value) {
                 let (mut queue, _) = self.lock_msgq();
+                if self.closed.load(Ordering::Relaxed) {
+                    values.push(value);
+                    values.extend(pending);
+                    return Err(QueueClosed);
+                }
                 queue.push_back(value);
                 self.pending.fetch_add(1, Ordering::SeqCst);
             }
         }
+        Ok(())
+    }
+
+    /// Close the queue for an exited receiver and move every signal still queued, buffered
+    /// ones included, to `private`; enqueues after this fail.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_exit takes the
+    // remaining signals of an exiting process under the msgq lock), OTP-29.1.1.
+    pub fn close_into(&self, private: &mut Private<T>) -> usize {
+        let mut queue = self.msgq.lock().unwrap();
+        self.closed.store(true, Ordering::Relaxed);
+        self.uninstall_buffers_locked(&mut queue);
+        let count = queue.len();
+        if count != 0 {
+            private
+                .queue
+                .push_back(Chunk::Block(std::mem::take(&mut *queue)));
+            private.len += count;
+            self.pending.fetch_sub(count, Ordering::SeqCst);
+        }
+        count
     }
 
     /// Whether any signal waits in the in-queue or its buffers.
@@ -301,6 +354,25 @@ impl<T> Incoming<T> {
         count
     }
 
+    /// Take the whole in-queue, in order, for a receiver whose private queue is idle: the
+    /// receiver handles the signals and moves the messages into its own message queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
+    // queue is spliced onto the end of the inner queue under the msgq lock), OTP-29.1.1.
+    pub fn take_all(&self, into: &mut VecDeque<T>) {
+        if !self.has_pending() {
+            return;
+        }
+        let mut queue = self.msgq.lock().unwrap();
+        if self.buffers_enabled.load(Ordering::Acquire) {
+            self.flush_buffers_locked(&mut queue, true);
+        }
+        let count = queue.len();
+        // Both queues keep their storage: a fetch allocates nothing, like erts splicing
+        // the outer signal list onto the inner one.
+        into.extend(queue.drain(..));
+        self.pending.fetch_sub(count, Ordering::SeqCst);
+    }
+
     /// Fetch the oldest signal when `accept` takes it, for a receiver whose private queue
     /// is empty. The receiver handles it in place, like erts' receive helper fetching
     /// the outer queue before matching.
@@ -327,6 +399,8 @@ impl<T> Incoming<T> {
 /// Receiver-owned queue with a save position for selective receive.
 pub struct Private<T> {
     queue: VecDeque<Chunk<T>>,
+    /// Storage reused by [`Incoming::take_all`] fetches.
+    fetch_buffer: VecDeque<T>,
     len: usize,
     save: usize,
     markers: Vec<MarkerPosition>,
@@ -347,6 +421,7 @@ impl<T> Default for Private<T> {
     fn default() -> Self {
         Self {
             queue: VecDeque::new(),
+            fetch_buffer: VecDeque::new(),
             len: 0,
             save: 0,
             markers: Vec::new(),
@@ -374,6 +449,27 @@ impl<T> Private<T> {
     /// Whether an event remains at or after the selective receive save cursor.
     pub fn has_saved(&self) -> bool {
         self.save < self.len
+    }
+
+    /// The reusable fetch buffer, empty.
+    pub fn take_fetch_buffer(&mut self) -> VecDeque<T> {
+        std::mem::take(&mut self.fetch_buffer)
+    }
+
+    /// Put events taken with [`Incoming::take_all`] and not handled back in front of
+    /// everything else, in order; an empty buffer is kept for the next fetch.
+    pub fn restore_front(&mut self, values: VecDeque<T>) {
+        let count = values.len();
+        if count == 0 {
+            self.fetch_buffer = values;
+            return;
+        }
+        self.queue.push_front(Chunk::Block(values));
+        self.len += count;
+        self.save = 0;
+        for marker in &mut self.markers {
+            marker.position += count;
+        }
     }
 
     /// Pop the first event, preserving ordinary FIFO receive.
@@ -623,7 +719,7 @@ mod tests {
         let mut private = Private::default();
         input.force_buffers_enabled();
         for sequence in 0..128 {
-            input.push_routed(17, sequence);
+            input.push_routed(|| 17, sequence).unwrap();
         }
         assert!(input.has_pending());
         assert_eq!(input.drain_into(&mut private), 128);
@@ -632,9 +728,9 @@ mod tests {
             (0..128).collect::<Vec<_>>()
         );
 
-        input.push_routed(17, 128);
+        input.push_routed(|| 17, 128).unwrap();
         input.set_buffers_enabled(false);
-        input.push_routed(17, 129);
+        input.push_routed(|| 17, 129).unwrap();
         assert_eq!(input.drain_into(&mut private), 2);
         assert_eq!(private.pop(), Some(128));
         assert_eq!(private.pop(), Some(129));

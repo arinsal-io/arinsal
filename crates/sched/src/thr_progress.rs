@@ -128,7 +128,7 @@ struct ThrPrgrData {
 
 thread_local! {
     /// erts `erts_thr_prgr_data_key__`.
-    static TPD: RefCell<Option<ThrPrgrData>> = const { RefCell::new(None) };
+    static TPD: RefCell<Option<ManagedThread>> = const { RefCell::new(None) };
     /// Block nesting of an unmanaged thread (erts temporary `ErtsThrPrgrData`).
     static UNMANAGED_BLOCKING: Cell<u32> = const { Cell::new(0) };
     /// Later operations of a runtime without managed threads (the simulated scheduler):
@@ -506,30 +506,41 @@ fn thr_progress_unblock(progress: &ThrProgress, tpd: Option<&mut ThrPrgrData>) {
 }
 
 fn with_tpd<R>(body: impl FnOnce(Option<&mut ThrPrgrData>) -> R) -> R {
-    TPD.with(|tpd| body(tpd.borrow_mut().as_mut()))
+    let Some(tpd) = TPD.with(|tpd| tpd.borrow().clone()) else {
+        return body(None);
+    };
+    body(Some(&mut tpd.0.borrow_mut()))
 }
+
+/// The thread progress data of a managed thread, shared by its thread-specific key and the
+/// scheduler that owns it.
+///
+/// Port of erts/emulator/beam/erl_thr_progress.h:171-175 (erts_thr_prgr_data: a scheduler
+/// reads `esdp->thr_progress_data`, other code the thread-specific key), OTP-29.1.1.
+#[derive(Clone)]
+pub(crate) struct ManagedThread(std::rc::Rc<RefCell<ThrPrgrData>>);
 
 /// Register the calling thread as managed thread `id` of `progress`.
 // Port of erl_thr_progress.c:576 (erts_thr_progress_register_managed_thread), OTP-29.1.1.
-pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) {
+pub(crate) fn register_managed_thread(progress: &Arc<ThrProgress>, id: usize) -> ManagedThread {
     progress.lflgs.fetch_add(1, Ordering::Relaxed);
-    TPD.with(|tpd| {
-        *tpd.borrow_mut() = Some(ThrPrgrData {
-            progress: Arc::clone(progress),
-            id,
-            is_blocking: 0,
-            leader: false,
-            active: true,
-            confirmed: 0,
-            leader_current: VAL_WAITING,
-            leader_next: 0,
-            chk_next_ix: 0,
-            // erl_thr_progress.c:499 (init_wakeup_request_array): no slot matches its index.
-            wakeup_request: std::array::from_fn(|ix| (ix as u64).wrapping_sub(1)),
-            later_ops: VecDeque::new(),
-            latest_wakeup: VAL_WAITING,
-        });
-    });
+    let managed = ManagedThread(std::rc::Rc::new(RefCell::new(ThrPrgrData {
+        progress: Arc::clone(progress),
+        id,
+        is_blocking: 0,
+        leader: false,
+        active: true,
+        confirmed: 0,
+        leader_current: VAL_WAITING,
+        leader_next: 0,
+        chk_next_ix: 0,
+        // erl_thr_progress.c:499 (init_wakeup_request_array): no slot matches its index.
+        wakeup_request: std::array::from_fn(|ix| (ix as u64).wrapping_sub(1)),
+        later_ops: VecDeque::new(),
+        latest_wakeup: VAL_WAITING,
+    })));
+    TPD.with(|tpd| *tpd.borrow_mut() = Some(managed.clone()));
+    managed
 }
 
 /// Drop the calling thread's registration when its scheduler loop ends.
@@ -541,22 +552,26 @@ pub(crate) fn unregister_managed_thread() {
 /// later operations that became ready.
 // Port of erl_process.c:9857-9866 (schedule: erts_thr_progress_update and
 // erts_thr_progress_leader_update) and :2281 (handle_thr_prgr_later_op), OTP-29.1.1.
-pub(crate) fn scheduler_progress() {
-    let ready = with_tpd(|tpd| {
-        let tpd = tpd?;
+pub(crate) fn scheduler_progress(managed: &ManagedThread) {
+    let ready = {
+        let tpd = &mut *managed.0.borrow_mut();
         if update(tpd) {
             leader_update(tpd);
         }
-        Some(take_ready_later_ops(tpd))
-    });
-    if let Some(ready) = ready {
-        for op in ready {
-            op();
-        }
+        take_ready_later_ops(tpd)
+    };
+    for op in ready {
+        op();
     }
 }
 
 fn take_ready_later_ops(tpd: &mut ThrPrgrData) -> Vec<LaterOp> {
+    // Port of erts/emulator/beam/erl_process.c:2281 (handle_thr_prgr_later_op runs only
+    // when ERTS_SSI_AUX_WORK_THR_PRGR_LATER_OP is set, that is, later operations exist),
+    // OTP-29.1.1.
+    if tpd.later_ops.is_empty() && tpd.progress.unmanaged_later_len.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
     let progress = Arc::clone(&tpd.progress);
     let current = progress.current.load(Ordering::Acquire);
     let mut ready = Vec::new();
@@ -740,7 +755,7 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 progress.sleepers[0].set(std::thread::current()).unwrap();
-                register_managed_thread(&progress, 0);
+                let managed = register_managed_thread(&progress, 0);
                 let ran = Arc::new(AtomicBool::new(false));
                 let flag = Arc::clone(&ran);
                 schedule_later_op(
@@ -748,7 +763,7 @@ mod tests {
                     Box::new(move || flag.store(true, Ordering::SeqCst)),
                 );
                 for _ in 0..8 {
-                    scheduler_progress();
+                    scheduler_progress(&managed);
                 }
                 assert!(ran.load(Ordering::SeqCst));
                 assert!(reached(&progress, 2));
@@ -769,9 +784,9 @@ mod tests {
                 let passes = Arc::clone(&passes);
                 scope.spawn(move || {
                     progress.sleepers[id].set(std::thread::current()).unwrap();
-                    register_managed_thread(&progress, id);
+                    let managed = register_managed_thread(&progress, id);
                     while !stop.load(Ordering::SeqCst) {
-                        scheduler_progress();
+                        scheduler_progress(&managed);
                         passes.fetch_add(1, Ordering::SeqCst);
                     }
                     scheduler_prepare_wait();

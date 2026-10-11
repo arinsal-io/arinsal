@@ -525,10 +525,11 @@ pub fn run_native(
     registers: &mut SchedulerRegisters,
     code_address: usize,
 ) -> Result<ExitReason, VmError> {
+    // Debug knobs are environment switches: read once per entry, not at each use.
+    let return_trace = crate::native_bridge::return_trace_enabled();
+    let exception_trace = crate::native_bridge::exception_trace_enabled();
     register_bridge_continuation().map_err(|error| VmError::Unsupported(error.into()))?;
-    if crate::native_bridge::return_trace_enabled()
-        && let Some(function) = native_function_at(code_address)
-    {
+    if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
             "[native-before-ensure] {}:{}/{} x0={:#x} E={:#x}",
             function.module,
@@ -586,9 +587,7 @@ pub fn run_native(
         }
     }
     let code_ptr = code_address as *const std::ffi::c_void;
-    if crate::native_bridge::return_trace_enabled()
-        && let Some(function) = native_function_at(code_address)
-    {
+    if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
             "[native-enter] {}:{}/{} pc={code_address:#x} x0={:#x} E={:#x} freason={:#x}",
             function.module,
@@ -637,7 +636,7 @@ pub fn run_native(
     process.heap.set_native_allocation(false);
     let native_ftrace = process.header.ftrace as u64;
     process.header.ftrace = saved_ftrace;
-    if crate::native_bridge::exception_trace_enabled() {
+    if exception_trace {
         let (base, end) = process.heap.heap_bounds();
         let (_, current_stop) = process.heap.heap_cursor();
         let requested_stop = process.header.stop as usize;
@@ -665,9 +664,7 @@ pub fn run_native(
     {
         *destination = *raw;
     }
-    if crate::native_bridge::return_trace_enabled()
-        && let Some(function) = native_function_at(code_address)
-    {
+    if return_trace && let Some(function) = native_function_at(code_address) {
         eprintln!(
             "[native-exit] {}:{}/{} pc={code_address:#x} exit={exit:?} x0={:#x} E={:#x} i={:p} stop={:p}",
             function.module,
@@ -686,10 +683,7 @@ pub fn run_native(
     if process.header.freason != 0 || matches!(exit, ExitReason::CallUnported { .. }) {
         process.cold_mut().native_error_pc = registers.tmp_mem[6] as usize;
     }
-    if process.header.freason != 0
-        && process.header.freason != 1 << 10
-        && crate::native_bridge::exception_trace_enabled()
-    {
+    if process.header.freason != 0 && process.header.freason != 1 << 10 && exception_trace {
         eprintln!(
             "native exception freason={:#x} fvalue={:?} at {:?}",
             process.header.freason,
@@ -715,7 +709,7 @@ pub fn run_native(
         let arity = native_function_at(registers.tmp_mem[6] as usize)
             .map_or(0, |function| usize::from(function.arity));
         let args = process.x[..arity.min(process.x.len())].to_vec();
-        if crate::native_bridge::exception_trace_enabled() {
+        if exception_trace {
             eprintln!(
                 "native function_clause in {:?} args={:?}",
                 native_function_at(registers.tmp_mem[6] as usize)
@@ -925,17 +919,20 @@ fn publish_yield_xregs(process: &mut Process, registers: &SchedulerRegisters) {
     }
 }
 
+#[inline]
 fn env_flag(cell: &'static OnceLock<bool>, name: &str, test: fn(&std::ffi::OsStr) -> bool) -> bool {
     *cell.get_or_init(|| std::env::var_os(name).is_some_and(|value| test(&value)))
 }
 
 /// `ARINSAL_BEAMASM_RETURN_TRACE`: log native entries and exits.
+#[inline]
 pub(crate) fn return_trace_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     env_flag(&FLAG, "ARINSAL_BEAMASM_RETURN_TRACE", |_| true)
 }
 
 /// `ARINSAL_BEAMASM_EXCEPTION_TRACE`: log native exceptions.
+#[inline]
 pub(crate) fn exception_trace_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     env_flag(&FLAG, "ARINSAL_BEAMASM_EXCEPTION_TRACE", |_| true)
@@ -1177,6 +1174,7 @@ extern "C" fn crash_dump_handler(
 }
 
 /// `ARINSAL_BEAMASM_LIFETIME=1`: log native code memory lifetimes.
+#[inline]
 pub(crate) fn lifetime_trace_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     env_flag(&FLAG, "ARINSAL_BEAMASM_LIFETIME", |value| value == "1")
