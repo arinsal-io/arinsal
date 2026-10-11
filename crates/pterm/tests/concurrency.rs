@@ -7,6 +7,14 @@ use arinsal_etf::OwnedTerm;
 use arinsal_pterm::Store;
 use arinsal_term::{Term, TermBuilder, VecHeap, to_owned};
 
+struct DoneOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for DoneOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 fn tuple_pair(value: Term) -> (i64, i64) {
     let owned = to_owned(value).expect("persistent term");
     let OwnedTerm::Tuple(items) = &owned else {
@@ -41,11 +49,12 @@ fn eight_readers_and_one_hundred_thousand_updates() {
                 while !done.load(Ordering::Acquire) {
                     let value = store.get(key).unwrap();
                     let (a, b) = tuple_pair(value);
-                    assert_eq!(b, -a, "torn persistent-term read");
+                    similar_asserts::assert_eq!(b, -a, "torn persistent-term read");
                 }
                 assert!(store.retired_areas(&process).is_empty());
             });
         }
+        let _done_on_drop = DoneOnDrop(&done);
         start.wait();
         for i in 1..=100_000 {
             let value = TermBuilder::new(&mut source)
@@ -53,17 +62,16 @@ fn eight_readers_and_one_hundred_thousand_updates() {
                 .unwrap();
             store.put(key, value).unwrap();
         }
-        assert_eq!(
+        similar_asserts::assert_eq!(
             store.retired_count(),
             100_000,
             "retired areas stay queued until the collector selects them"
         );
-        done.store(true, Ordering::Release);
     });
     assert!(!store.collector_switch_area());
-    assert_eq!(store.retired_count(), 0);
+    similar_asserts::assert_eq!(store.retired_count(), 0);
     let value = store.get(key).unwrap();
-    assert_eq!(tuple_pair(value).0, 100_000);
+    similar_asserts::assert_eq!(tuple_pair(value).0, 100_000);
 }
 
 #[test]
@@ -91,7 +99,7 @@ fn get_latency_nanoseconds_per_operation() {
         "release"
     };
     eprintln!("persistent_term get/1: {ns} ns/op ({build} build), checksum={checksum}");
-    assert_eq!(checksum, iterations as i64 * 123);
+    similar_asserts::assert_eq!(checksum, iterations as i64 * 123);
     drop(process);
 }
 
@@ -108,7 +116,7 @@ fn vm_test_double_copies_then_acknowledges_each_area() {
     store.put(key, old).unwrap();
     let borrowed = store.get(key).unwrap();
     store.put(key, Term::small(99).unwrap()).unwrap();
-    assert_eq!(store.retired_count(), 1);
+    similar_asserts::assert_eq!(store.retired_count(), 1);
     assert!(store.collector_switch_area());
     let first_area = store.retired_areas(&first).pop().unwrap();
     let second_area = store.retired_areas(&second).pop().unwrap();
@@ -120,13 +128,13 @@ fn vm_test_double_copies_then_acknowledges_each_area() {
     let id = first_area.id();
     drop(first_area);
     assert!(store.acknowledge(&first, id));
-    assert_eq!(store.retired_count(), 1);
+    similar_asserts::assert_eq!(store.retired_count(), 1);
     let mut second_heap = VecHeap::new();
     second_area.copy_root(borrowed, &mut second_heap).unwrap();
     drop(second_area);
     assert!(store.acknowledge(&second, id));
-    assert_eq!(store.retired_count(), 1);
+    similar_asserts::assert_eq!(store.retired_count(), 1);
     assert!(!store.collector_switch_area());
-    assert_eq!(store.retired_count(), 0);
-    assert_eq!(tuple_pair(copied), (17, 23));
+    similar_asserts::assert_eq!(store.retired_count(), 0);
+    similar_asserts::assert_eq!(tuple_pair(copied), (17, 23));
 }

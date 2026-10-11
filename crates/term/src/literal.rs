@@ -1,15 +1,18 @@
-//! Shared literal virtual range and registry of module/persistent-term areas.
+//! Shared literal virtual range and the collector's literal purge area.
 //!
-//! erts allocates every literal inside one 1-GiB range and answers `erts_is_literal`
-//! with a single `ErtsInArea` check. The area registry here tracks purge state for
-//! literal-aware copies; collector membership uses the shared range directly.
+//! erts allocates literal blocks from `literal_alloc` carriers inside one 1-GiB
+//! range. `erts_is_literal` checks that range; the registry here tracks only the
+//! area currently being purged by literal-aware copies.
 // Port of erts/emulator/beam/global.h:1568 (erts_is_literal) and
 // erts/emulator/beam/global.h:1116 (INITIALIZE_LITERAL_PURGE_AREA), OTP-29.1.1.
+use arinsal_alloc::alloc_util::{AllocUtil, Allocation};
+use arinsal_alloc::raw::RawRegion;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const LITERAL_VIRTUAL_AREA_SIZE: usize = 1024 * 1024 * 1024;
+const LITERAL_AREA_HEADER_WORDS: usize = 2;
 
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -21,9 +24,6 @@ thread_local! {
 struct LiteralRange {
     start: usize,
     end: usize,
-    /// The range belongs to the area the literal collector is currently releasing
-    /// (`ERTS_COPY_LITERAL_AREA()`); copies must not keep references into it.
-    purge: bool,
 }
 
 fn registry() -> &'static RwLock<Arc<[LiteralRange]>> {
@@ -32,62 +32,38 @@ fn registry() -> &'static RwLock<Arc<[LiteralRange]>> {
 }
 
 struct LiteralArena {
-    free: Vec<(usize, arinsal_alloc::raw::RawRegion)>,
+    allocator: AllocUtil,
 }
 
 impl LiteralArena {
     fn new() -> Result<Self, arinsal_alloc::raw::MapError> {
         // Port of erts/emulator/sys/common/erl_mmap.h:99 and erl_mmap.c:2447-2449,
         // OTP-29.1.1: every literal allocation occupies this one 1-GiB virtual range.
-        let region = arinsal_alloc::raw::RawRegion::map(LITERAL_VIRTUAL_AREA_SIZE)?;
+        let region = RawRegion::map(LITERAL_VIRTUAL_AREA_SIZE)?;
         let start = region.as_ptr() as usize;
         let end = start + region.len();
         let _ = literal_bounds().set((start, end));
         Ok(Self {
-            free: vec![(start, region)],
+            allocator: AllocUtil::new_literal_alloc(region),
         })
     }
 
     fn allocate(&mut self, words: usize) -> Option<LiteralChunk> {
-        let bytes = words.checked_mul(std::mem::size_of::<u64>())?;
-        let page = arinsal_alloc::raw::page_size();
-        let mapped_bytes = bytes.checked_add(page - 1)? / page * page;
-        let index = self
-            .free
-            .iter()
-            .position(|(_, region)| region.len() >= mapped_bytes)?;
-        let (start, region) = self.free.swap_remove(index);
-        let allocated = if region.len() == mapped_bytes {
-            region
-        } else {
-            let (allocated, tail) = region.split_at(mapped_bytes).ok()?;
-            self.free.push((start + mapped_bytes, tail));
-            allocated
-        };
+        // Port of ERTS_LITERAL_AREA_ALLOC_SIZE, global.h:946-950, and the
+        // persistent_term allocation, erl_bif_persistent.c:754, OTP-29.1.1.
+        let payload_words = words.checked_add(LITERAL_AREA_HEADER_WORDS)?;
+        let bytes = payload_words.checked_mul(std::mem::size_of::<u64>())?;
+        let allocation = self.allocator.alloc(bytes).ok()?;
+        let base = self.allocator.allocation_ptr(allocation).ok()? as usize;
+        let end = base.checked_add(bytes)?;
+        let header = self.allocator.allocation_bytes_mut(allocation).ok()?;
+        header.get_mut(..8)?.fill(0);
+        header.get_mut(8..16)?.copy_from_slice(&end.to_ne_bytes());
         Some(LiteralChunk {
-            region: Some(allocated),
+            allocation,
+            base,
             words,
         })
-    }
-
-    fn release(&mut self, region: arinsal_alloc::raw::RawRegion) {
-        self.free.push((region.as_ptr() as usize, region));
-        self.free.sort_unstable_by_key(|(start, _)| *start);
-        let mut merged: Vec<(usize, arinsal_alloc::raw::RawRegion)> = Vec::new();
-        for (start, region) in std::mem::take(&mut self.free) {
-            if let Some((previous_start, previous)) = merged.pop() {
-                match previous.merge_adjacent(region) {
-                    Ok(joined) => merged.push((previous_start, joined)),
-                    Err((previous, region)) => {
-                        merged.push((previous_start, previous));
-                        merged.push((start, region));
-                    }
-                }
-            } else {
-                merged.push((start, region));
-            }
-        }
-        self.free = merged;
     }
 }
 
@@ -105,17 +81,14 @@ fn literal_bounds() -> &'static OnceLock<(usize, usize)> {
 
 /// One stable chunk allocated inside the shared literal virtual range.
 pub(crate) struct LiteralChunk {
-    region: Option<arinsal_alloc::raw::RawRegion>,
+    allocation: Allocation,
+    base: usize,
     words: usize,
 }
 
 impl LiteralChunk {
     pub(crate) fn as_ptr(&self) -> *mut u64 {
-        self.region
-            .as_ref()
-            .expect("live literal chunk")
-            .as_ptr()
-            .cast()
+        (self.base as *mut u64).wrapping_add(LITERAL_AREA_HEADER_WORDS)
     }
 
     pub(crate) fn capacity(&self) -> usize {
@@ -126,14 +99,29 @@ impl LiteralChunk {
         if start > end || end > self.words {
             return false;
         }
-        let Some(bytes) = self
-            .region
-            .as_mut()
-            .and_then(arinsal_alloc::raw::RawRegion::bytes_mut)
+        let Some(area_start) = LITERAL_AREA_HEADER_WORDS.checked_mul(8) else {
+            return false;
+        };
+        let Some(from) = start
+            .checked_mul(8)
+            .and_then(|offset| area_start.checked_add(offset))
         else {
             return false;
         };
-        let Some(range) = bytes.get_mut(start * 8..end * 8) else {
+        let Some(to) = end
+            .checked_mul(8)
+            .and_then(|offset| area_start.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(arena) = arena() else {
+            return false;
+        };
+        let mut arena = arena.lock().expect("literal arena poisoned");
+        let Ok(bytes) = arena.allocator.allocation_bytes_mut(self.allocation) else {
+            return false;
+        };
+        let Some(range) = bytes.get_mut(from..to) else {
             return false;
         };
         range.fill(0);
@@ -143,14 +131,13 @@ impl LiteralChunk {
 
 impl Drop for LiteralChunk {
     fn drop(&mut self) {
-        if let Some(region) = self.region.take()
-            && let Some(arena) = arena()
-        {
-            arena
-                .lock()
-                .expect("literal arena poisoned")
-                .release(region);
-        }
+        let Some(arena) = arena() else { return };
+        arena
+            .lock()
+            .expect("literal arena poisoned")
+            .allocator
+            .free(self.allocation)
+            .expect("live literal allocation");
     }
 }
 
@@ -188,24 +175,6 @@ fn precise(address: usize) -> bool {
         .is_some_and(|&(start, end)| address.wrapping_sub(start) < end - start)
 }
 
-pub(crate) fn register(start: usize, end: usize) {
-    update(|ranges| {
-        let at = ranges.partition_point(|range| range.start < start);
-        ranges.insert(
-            at,
-            LiteralRange {
-                start,
-                end,
-                purge: false,
-            },
-        );
-    });
-}
-
-pub(crate) fn unregister(start: usize, end: usize) {
-    update(|ranges| ranges.retain(|range| range.start != start || range.end != end));
-}
-
 /// Mark or unmark the chunk ranges of the literal area being released by the
 /// literal-area collector. Terms in a marked range are copied by
 /// literal-aware copies instead of being shared.
@@ -213,15 +182,24 @@ pub(crate) fn unregister(start: usize, end: usize) {
 // ERTS_COPY_LITERAL_AREA), OTP-29.1.1.
 pub fn set_literal_purge_area(area: &[(usize, usize)], purge: bool) {
     update(|ranges| {
-        for range in ranges.iter_mut() {
-            if area.contains(&(range.start, range.end)) {
-                range.purge = purge;
+        if purge {
+            for &(start, end) in area {
+                if ranges
+                    .iter()
+                    .any(|range| range.start == start && range.end == end)
+                {
+                    continue;
+                }
+                let at = ranges.partition_point(|range| range.start < start);
+                ranges.insert(at, LiteralRange { start, end });
             }
+        } else {
+            ranges.retain(|range| !area.contains(&(range.start, range.end)));
         }
     });
 }
 
-/// Whether `ptr` lies in any registered literal area.
+/// Whether `ptr` lies in the reserved literal range.
 pub(crate) fn is_literal_pointer(ptr: *const u64) -> bool {
     is_literal_address(ptr as usize)
 }
@@ -242,14 +220,14 @@ fn find(ranges: &[LiteralRange], address: usize) -> Option<&LiteralRange> {
     ranges[..at].last().filter(|range| address < range.end)
 }
 
-/// One consistent view of the literal ranges, the `erts_literal_area_t` of a copy.
+/// One consistent view of the collector's purge ranges during a copy.
 #[derive(Clone)]
 pub struct LiteralAreas {
     ranges: Arc<[LiteralRange]>,
 }
 
 impl LiteralAreas {
-    /// Snapshot the currently registered literal areas and the purge area.
+    /// Snapshot the current literal purge area.
     pub fn current() -> Self {
         Self { ranges: snapshot() }
     }
@@ -258,13 +236,13 @@ impl LiteralAreas {
     // Port of erts/emulator/beam/copy.c:105 (`erts_is_literal(obj,ptr) &&
     // !in_literal_purge_area(ptr)`), OTP-29.1.1.
     pub fn keeps(&self, address: u64) -> bool {
-        !self.ranges.is_empty()
-            && find(&self.ranges, address as usize).is_some_and(|range| !range.purge)
+        is_literal_address(address as usize) && find(&self.ranges, address as usize).is_none()
     }
 
     /// Whether `term`'s object lies in any literal area, including the purge area.
+    // Port of erts/emulator/beam/global.h:1568 (`erts_is_literal`), OTP-29.1.1.
     pub fn is_literal(&self, address: u64) -> bool {
-        !self.ranges.is_empty() && find(&self.ranges, address as usize).is_some()
+        is_literal_address(address as usize)
     }
 }
 
@@ -296,6 +274,6 @@ mod tests {
 
         drop(heap);
         assert!(is_literal_address(first));
-        assert!(!LiteralAreas::current().is_literal(first as u64));
+        assert!(LiteralAreas::current().is_literal(first as u64));
     }
 }

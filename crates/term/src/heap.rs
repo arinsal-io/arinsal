@@ -1500,10 +1500,6 @@ impl Default for VecHeap {
 impl Drop for VecHeap {
     fn drop(&mut self) {
         for chunk in &self.chunks {
-            if self.is_literal_area() {
-                let start = chunk.as_ptr() as usize;
-                crate::literal::unregister(start, start + chunk.capacity() * 8);
-            }
             #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             crate::validate::forget_stable_range(chunk.as_ptr() as usize);
         }
@@ -1521,12 +1517,6 @@ impl HeapAlloc for VecHeap {
             self.used = 0;
             let literal_bit = self.chunk_words & LITERAL_HEAP_BIT;
             self.chunk_words = self.next_chunk_words().saturating_mul(2) | literal_bit;
-            if self.is_literal_area()
-                && let Some(chunk) = self.chunks.last()
-            {
-                let start = chunk.as_ptr() as usize;
-                crate::literal::register(start, start + chunk.capacity() * 8);
-            }
             // g_asan: literal areas and other VecHeaps stay address-stable.
             #[cfg(any(feature = "validate-terms", debug_assertions, test))]
             if let Some(chunk) = self.chunks.last() {

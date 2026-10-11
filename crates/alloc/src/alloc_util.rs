@@ -437,6 +437,7 @@ pub struct AllocatorCallCounts {
 
 enum CarrierMemory {
     Mapped(RawRegion),
+    Arena(RawRegion),
     Segmented(Segment),
 }
 
@@ -445,6 +446,7 @@ impl CarrierMemory {
     fn len(&self) -> usize {
         match self {
             Self::Mapped(region) => region.len(),
+            Self::Arena(region) => region.len(),
             Self::Segmented(segment) => segment.len(),
         }
     }
@@ -452,6 +454,7 @@ impl CarrierMemory {
     fn as_ptr(&self) -> *mut u8 {
         match self {
             Self::Mapped(region) => region.as_ptr(),
+            Self::Arena(region) => region.as_ptr(),
             Self::Segmented(segment) => segment.as_ptr(),
         }
     }
@@ -487,20 +490,82 @@ impl CarrierMemory {
     fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Mapped(region) => region.bytes(),
+            Self::Arena(region) => region.bytes(),
             Self::Segmented(segment) => segment.bytes(),
         }
     }
     fn bytes_mut(&mut self) -> Option<&mut [u8]> {
         match self {
             Self::Mapped(region) => region.bytes_mut(),
+            Self::Arena(region) => region.bytes_mut(),
             Self::Segmented(segment) => segment.bytes_mut(),
         }
     }
     fn advise_range(&mut self, offset: usize, len: usize, advice: i32) -> Result<(), MapError> {
         match self {
             Self::Mapped(region) => region.advise_range(offset, len, advice),
+            Self::Arena(region) => region.advise_range(offset, len, advice),
             Self::Segmented(segment) => segment.advise_range(offset, len, advice),
         }
+    }
+}
+
+/// Free extents of the literal super-carrier, split into alloc_util carriers on demand.
+/// Port of `erts_alcu_mmapper_mseg_alloc` / `erts_alcu_mmapper_mseg_dealloc`,
+/// `erl_alloc_util.c:1049-1083`, OTP-29.1.1.
+struct CarrierArena {
+    free: Vec<RawRegion>,
+}
+
+impl CarrierArena {
+    fn new(region: RawRegion) -> Self {
+        Self { free: vec![region] }
+    }
+
+    fn allocate(&mut self, requested: usize) -> Result<RawRegion, AllocError> {
+        let page = page_size();
+        let size = requested
+            .checked_add(page - 1)
+            .ok_or(AllocError::Overflow)?
+            & !(page - 1);
+        let index = self
+            .free
+            .iter()
+            .position(|region| region.len() >= size)
+            .ok_or(AllocError::NoSpace)?;
+        let region = self.free.remove(index);
+        if region.len() == size {
+            return Ok(region);
+        }
+        let (allocated, tail) = region.split_at(size).map_err(|_| AllocError::Corrupt)?;
+        self.free.push(tail);
+        self.sort_and_coalesce();
+        Ok(allocated)
+    }
+
+    fn release(&mut self, region: RawRegion) {
+        self.free.push(region);
+        self.sort_and_coalesce();
+    }
+
+    fn sort_and_coalesce(&mut self) {
+        self.free
+            .sort_unstable_by_key(|region| region.as_ptr() as usize);
+        let mut merged: Vec<RawRegion> = Vec::with_capacity(self.free.len());
+        for region in std::mem::take(&mut self.free) {
+            if let Some(previous) = merged.pop() {
+                match previous.merge_adjacent(region) {
+                    Ok(joined) => merged.push(joined),
+                    Err((previous, region)) => {
+                        merged.push(previous);
+                        merged.push(region);
+                    }
+                }
+            } else {
+                merged.push(region);
+            }
+        }
+        self.free = merged;
     }
 }
 
@@ -545,6 +610,7 @@ pub struct AllocUtil {
     class_stats: [ClassStats; 2],
     mseg: MsegAllocator,
     pending_carriers: Vec<CarrierTransfer>,
+    carrier_arena: Option<CarrierArena>,
 }
 
 impl AllocUtil {
@@ -600,7 +666,25 @@ impl AllocUtil {
             class_stats: [ClassStats::default(); 2],
             mseg: MsegAllocator::new(0, CacheConfig::default()),
             pending_carriers: Vec::new(),
+            carrier_arena: None,
         }
+    }
+
+    /// Creates OTP's non-thread-specific literal allocator inside its reserved super-carrier.
+    ///
+    /// Port of `set_default_literal_alloc_opts`, `erl_alloc.c:287-310`, and the literal
+    /// mmapper binding, `erl_alloc.c:333`, OTP-29.1.1.
+    pub fn new_literal_alloc(region: RawRegion) -> Self {
+        let options = AllocUtilOptions {
+            sbct: usize::MAX,
+            mmsbc: 0,
+            mmbcs: 1024 * 1024,
+            ..AllocUtilOptions::default()
+        };
+        let mut allocator =
+            Self::new_for_type(Strategy::AddressOrderBestFit, options, "literal_alloc");
+        allocator.carrier_arena = Some(CarrierArena::new(region));
+        allocator
     }
 
     /// Allocates a payload of `size` bytes.
@@ -729,6 +813,32 @@ impl AllocUtil {
     pub fn allocation_ptr(&self, allocation: Allocation) -> Result<*mut u64, AllocError> {
         self.live_block(allocation.id as usize)?;
         self.payload_ptr(allocation)
+    }
+
+    /// Returns an exclusive byte view of the requested payload while this allocator is borrowed.
+    pub fn allocation_bytes_mut(
+        &mut self,
+        allocation: Allocation,
+    ) -> Result<&mut [u8], AllocError> {
+        let block = self.live_block(allocation.id as usize)?;
+        let carrier = self
+            .carriers
+            .get_mut(block.carrier)
+            .and_then(Option::as_mut)
+            .ok_or(AllocError::Corrupt)?;
+        let start = block
+            .offset
+            .checked_sub(carrier.key_base)
+            .and_then(|offset| offset.checked_add(BLOCK_HEADER))
+            .ok_or(AllocError::Corrupt)?;
+        let end = start
+            .checked_add(allocation.size)
+            .ok_or(AllocError::Overflow)?;
+        carrier
+            .memory
+            .bytes_mut()
+            .and_then(|bytes| bytes.get_mut(start..end))
+            .ok_or(AllocError::Corrupt)
     }
 
     /// Payload address of an allocation this instance just returned (no liveness check).
@@ -1955,6 +2065,12 @@ impl AllocUtil {
         may_use_mseg: bool,
         mseg_flags: SegmentFlags,
     ) -> Result<(CarrierMemory, bool), AllocError> {
+        if let Some(arena) = &mut self.carrier_arena {
+            self.stats.sys_alloc_calls += 1;
+            return arena
+                .allocate(size)
+                .map(|region| (CarrierMemory::Arena(region), false));
+        }
         if may_use_mseg {
             self.stats.mseg_alloc_calls += 1;
             if let Ok(segment) = self.mseg.alloc(size, mseg_flags) {
@@ -2996,7 +3112,13 @@ impl AllocUtil {
             } else {
                 self.stats.sys_alloc_carriers -= 1;
                 self.stats.sys_alloc_carriers_size -= c.size;
-                self.stats.sys_free_calls += 1
+                self.stats.sys_free_calls += 1;
+                if let CarrierMemory::Arena(region) = c.memory {
+                    self.carrier_arena
+                        .as_mut()
+                        .ok_or(AllocError::Corrupt)?
+                        .release(region);
+                }
             }
         }
         Ok(())
@@ -3416,6 +3538,31 @@ mod tests {
         assert_eq!(chosen_address, lower_address);
         address.free(separator).unwrap();
         address.validate().unwrap();
+    }
+
+    #[test]
+    fn literal_allocator_returns_empty_carriers_to_the_reserved_range() {
+        let region = RawRegion::map(4 * 1024 * 1024).unwrap();
+        let start = region.as_ptr() as usize;
+        let end = start + region.len();
+        let mut allocator = AllocUtil::new_literal_alloc(region);
+
+        let first = allocator.alloc(600 * 1024).unwrap();
+        let second = allocator.alloc(600 * 1024).unwrap();
+        let second_ptr = allocator.allocation_ptr(second).unwrap() as usize;
+        assert!(second_ptr >= start && second_ptr < end);
+        similar_asserts::assert_eq!(allocator.stats().carriers, 2);
+
+        allocator.free(second).unwrap();
+        similar_asserts::assert_eq!(allocator.stats().carriers, 1);
+        let reused = allocator.alloc(600 * 1024).unwrap();
+        similar_asserts::assert_eq!(
+            allocator.allocation_ptr(reused).unwrap() as usize,
+            second_ptr
+        );
+        allocator.free(reused).unwrap();
+        allocator.free(first).unwrap();
+        allocator.validate().unwrap();
     }
 
     #[test]
