@@ -1049,16 +1049,39 @@ impl ProcessHeap {
         extra: &mut [Term],
         min_free: usize,
     ) -> Result<GcStats, TermError> {
+        self.collect_with_messages(roots, extra, min_free, &mut [])
+    }
+
+    /// [`ProcessHeap::collect`] for a process with an on-heap message queue: `messages`
+    /// holds the queued messages whose data is still in their own heap fragment
+    /// (`ErtsMessage` with `data.attached`). Their size counts as young-generation usage,
+    /// and after copying they are moved onto the new heap; each moved entry's heap
+    /// becomes `None` and its term points into this heap.
+    // Port of erts/emulator/beam/erl_gc.c:606-644 (young_gen_usage, FS_ON_HEAP_MSGQ) and
+    // erl_gc.c:1500-1501, 1947-1948 (move_msgs_to_heap after do_minor/do_major), OTP-29.1.1.
+    pub fn collect_with_messages(
+        &mut self,
+        roots: &mut [Term],
+        extra: &mut [Term],
+        min_free: usize,
+        messages: &mut [(Term, Option<ProcessHeap>)],
+    ) -> Result<GcStats, TermError> {
         // Port of erl_gc.c:803-804: the clock is read only for long_gc monitoring.
         // Microstate accounting uses the same sample (`ERTS_MSACC_IS_ENABLED`).
         let start = gc_clock_active().then(Instant::now);
+        let message_words = messages
+            .iter()
+            .filter_map(|(_, heap)| heap.as_ref())
+            .map(ProcessHeap::message_data_size)
+            .fold(0usize, usize::saturating_add);
         let abandoned = self.abandoned_heap();
         let abandoned_mature = abandoned.map_or((0, 0), |abandoned| {
             (abandoned.start, abandoned.start + abandoned.high_water * 8)
         });
         let mature_words = self.mature_words();
         let fragments = (self.fragment_words as usize)
-            .saturating_add(abandoned.map_or(0, |abandoned| abandoned.used));
+            .saturating_add(abandoned.map_or(0, |abandoned| abandoned.used))
+            .saturating_add(message_words);
         #[cfg(debug_assertions)]
         let fragment_ranges = {
             let mut ranges = self
@@ -1248,7 +1271,6 @@ impl ProcessHeap {
         copier.finish_bits();
         copier.to.high_water = copier.to.htop;
         let error = copier.error.take();
-        let copied = copier.to.htop as u64;
         let promoted = ((copier.old_htop.at - tenured_from) / 8) as u64;
         drop(copier);
         drop(from);
@@ -1256,7 +1278,21 @@ impl ProcessHeap {
         if let Some(error) = error {
             return Err(error);
         }
-        self.adjust_young_heap(major, min_free, roots, extra)?;
+        if messages.is_empty() {
+            self.adjust_young_heap(major, min_free, roots, extra)?;
+        } else {
+            self.move_msgs_to_heap(messages)?;
+            // erts resize_new_heap offsets the on-heap queue with the rest of the root set.
+            let mut moved = extra.to_vec();
+            moved.extend(messages.iter().map(|(term, _)| *term));
+            self.adjust_young_heap(major, min_free, roots, &mut moved)?;
+            extra.copy_from_slice(&moved[..extra.len()]);
+            for ((term, _), &updated) in messages.iter_mut().zip(&moved[extra.len()..]) {
+                *term = updated;
+            }
+        }
+        // erl_gc.c:1506/1952: `size_after` includes the moved message data.
+        let copied = self.htop as u64;
         #[cfg(debug_assertions)]
         {
             let code_ranges = crate::native_code::native_code_ranges();
@@ -1375,6 +1411,64 @@ impl ProcessHeap {
             && wanted != capacity
         {
             self.relocate_young(wanted, roots, extra);
+        }
+        Ok(())
+    }
+
+    /// Move queued message fragments onto the heap top, rebasing their pointers, and free
+    /// the fragments. The collection sized the heap to hold them.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:8851-8889 (move_msg_to_heap,
+    // erts_proc_sig_move_msgs_to_heap), erl_gc.c:2514-2611 (erts_copy_one_frag) and
+    // copy.c:2049 (erts_move_multi_frags), OTP-29.1.1.
+    fn move_msgs_to_heap(
+        &mut self,
+        messages: &mut [(Term, Option<ProcessHeap>)],
+    ) -> Result<(), TermError> {
+        let pre_overhead = self.bin_vheap;
+        for (term, slot) in messages.iter_mut() {
+            let Some(mut fragment) = slot.take() else {
+                continue;
+            };
+            let mut blocks: Vec<&[u64]> = vec![&fragment.words.words()[..fragment.htop]];
+            for block in &fragment.fragments {
+                if let crate::heap::Fragment::Block { memory, used } = block {
+                    blocks.push(&memory.as_slice()[..*used]);
+                }
+            }
+            let words = blocks.iter().map(|block| block.len()).sum::<usize>();
+            if self.htop.saturating_add(words) > self.stop {
+                return Err(TermError::SystemLimit);
+            }
+            let start = self.htop;
+            let mut ranges = Vec::with_capacity(blocks.len());
+            for block in blocks {
+                let at = self.htop;
+                self.words.words_mut()[at..at + block.len()].copy_from_slice(block);
+                ranges.push(MoveRange {
+                    old_start: block.as_ptr() as usize,
+                    old_end: block.as_ptr() as usize + block.len() * 8,
+                    new_start: self.words.as_ptr() as usize + at * 8,
+                });
+                self.htop += block.len();
+            }
+            let base = self
+                .words
+                .as_ptr()
+                .cast::<u64>()
+                .cast_mut()
+                .wrapping_add(start);
+            // erts_copy_one_frag offsets every non-literal pointer by the fragment's distance;
+            // pointers of a multi-fragment message are rebased per source block.
+            for range in &ranges {
+                offset_young_objects(base, words, range.old_start, range.old_end, range.new_start);
+                term.0 = offset_word(term.0, *range);
+            }
+            self.absorb_fragment_owners(&mut fragment);
+        }
+        // Port of erts/emulator/beam/erl_gc.c:203-217 (move_msgs_to_heap), OTP-29.1.1.
+        if pre_overhead != self.bin_vheap {
+            self.bin_vheap_size =
+                next_vheap_size(self.bin_vheap, self.bin_vheap_size, self.owners.vheap_min());
         }
         Ok(())
     }

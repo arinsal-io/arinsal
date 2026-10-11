@@ -239,6 +239,9 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
+    // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:116-118, 179, 191 (F_DELAY_GC set on
+    // entry, cleared on the wait and schedule-out exits), OTP-29.1.1.
+    process.delay_gc = true;
     if let Some(message) = process.inbox.get(process.receive_cursor) {
         return crate::native_hooks::raw(*message);
     }
@@ -251,6 +254,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
         .and_then(|cold| cold.signal_probe.as_ref())
         .is_none_or(arinsal_sched::SignalProbe::has_pending);
     if !pending {
+        process.delay_gc = false;
         return 0;
     }
     // Port of erts/emulator/beam/jit/arm/instr_msg.cpp:131-176 (erts_proc_sig_receive_helper
@@ -266,6 +270,7 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     {
         return crate::native_hooks::raw(*message);
     }
+    process.delay_gc = false;
     // Everything fetched was scanned: wait. A non-message signal left at the head of the
     // outer queue is handled by the scheduler.
     if fetched.is_ok()
@@ -320,6 +325,8 @@ pub extern "C" fn arinsal_beamasm_set_save_next(header: *mut ProcessHeader) {
 /// Records that the process waits for a message; the scheduler puts it to sleep.
 pub extern "C" fn arinsal_beamasm_wait(header: *mut ProcessHeader, resume: usize) {
     if let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) {
+        // Port of erts/emulator/beam/emu/msg_instrs.tab:110 (wait clears F_DELAY_GC), OTP-29.1.1.
+        process.delay_gc = false;
         let cold = process.cold_mut();
         let timeout = cold.native_wait_timeout.take();
         cold.native_wait = Some(timeout);

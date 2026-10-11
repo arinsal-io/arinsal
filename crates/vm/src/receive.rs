@@ -409,10 +409,14 @@ impl Process {
     // Port of erts/emulator/beam/emu/msg_instrs.tab (receive instructions), OTP-29.1.1.
     pub(crate) fn loop_rec(&mut self, dst: Arg) -> Result<bool, VmError> {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:9605 (save pointer loop), OTP-29.1.1.
+        // Port of erts/emulator/beam/emu/msg_instrs.tab:59-67, 110 (F_DELAY_GC from loop_rec
+        // until remove_message or wait), OTP-29.1.1.
         if let Some(&message) = self.inbox.get(self.receive_cursor) {
+            self.delay_gc = true;
             self.write(dst, message)?;
             Ok(true)
         } else {
+            self.delay_gc = false;
             Ok(false)
         }
     }
@@ -504,6 +508,9 @@ impl Process {
         let (removed_message, new_prio_len) =
             self.inbox
                 .remove_to_heap_with_token(removed, &mut self.heap, old_prio_len)?;
+        // Port of erts/emulator/beam/jit/beam_jit_common.cpp:1168-1171 (beam_jit_remove_message:
+        // erts_save_message_in_proc, then F_DELAY_GC cleared), OTP-29.1.1.
+        self.delay_gc = false;
         if on_heap_words != 0 {
             crate::trace_bp::adjust_memory_break(self, on_heap_words as i64);
         }
@@ -538,6 +545,7 @@ impl Process {
     }
 
     pub(crate) fn timeout(&mut self) {
+        self.delay_gc = false;
         // `timeout` leaves the current receive and prepares the next one.
         // Port of erts/emulator/beam/emu/msg_instrs.tab (`timeout`) and
         // erl_proc_sig_queue.h:2331 (`erts_msgq_set_save_first`), OTP-29.1.1.
@@ -558,6 +566,8 @@ impl Process {
     }
 
     pub(crate) fn wait_timeout(&mut self, value: Term) -> Result<Option<u64>, VmError> {
+        // Port of erts/emulator/beam/emu/msg_instrs.tab:231 (F_DELAY_GC cleared), OTP-29.1.1.
+        self.delay_gc = false;
         // Port of erts/emulator/beam/emu/msg_instrs.tab:329-334 (wait.src), OTP-29.1.1:
         // once the timer is set (F_TIMO), a re-executed wait_timeout must not read
         // its operand again; no X register is live across the wait.

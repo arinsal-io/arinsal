@@ -394,6 +394,8 @@ pub(crate) enum LiteralSkip<'a> {
 }
 
 impl LiteralSkip<'_> {
+    // erts expands erts_is_literal inline (global.h:1572 macro), OTP-29.1.1.
+    #[inline]
     pub(crate) fn skips(self, address: u64) -> bool {
         match self {
             Self::None => false,
