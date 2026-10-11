@@ -252,6 +252,16 @@ struct BinaryCopyState {
     copied: usize,
 }
 
+enum IolistBinaryPhase {
+    Size(arinsal_bifs::IolistSizeWalk),
+    Copy {
+        output: Term,
+        byte_len: usize,
+        walk: arinsal_bifs::IolistCopyWalk,
+    },
+    Done,
+}
+
 fn binary_match(
     process: &mut Process,
     args: &[Term],
@@ -1095,7 +1105,7 @@ fn list_to_binary(
             reductions: 1,
         });
     }
-    iolist_conversion(process, root, state, false, gc_changed)
+    iolist_binary_conversion(process, root, state, gc_changed)
 }
 
 fn iolist_to_binary(
@@ -1115,7 +1125,7 @@ fn iolist_to_binary(
             reductions: 1,
         });
     }
-    iolist_conversion(process, root, state, false, gc_changed)
+    iolist_binary_conversion(process, root, state, gc_changed)
 }
 
 fn list_to_bitstring(
@@ -1173,7 +1183,7 @@ fn iolist_size(
         drop(walker);
         process.set_gc_enabled(restore_gc);
         let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-            .int_from_bigint(&size)
+            .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
             .map_err(|_| BifError::SystemLimit)?;
         return Ok(TrapResult::Done {
             value,
@@ -1200,7 +1210,7 @@ fn iolist_size(
     }
     let size = walker.take_size();
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .int_from_bigint(&size)
+        .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
         .map_err(|_| BifError::SystemLimit)?;
     Ok(TrapResult::Done {
         value,
@@ -1278,6 +1288,121 @@ fn iolist_conversion(
     Ok(TrapResult::Done {
         value,
         reductions: reductions as u32,
+    })
+}
+
+fn iolist_binary_conversion(
+    process: &mut Process,
+    root: Term,
+    state: Option<&Arc<MagicRef>>,
+    _restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    const SIZE_YIELDS_PER_RED: usize = 8;
+    let state = state.map(Arc::clone).unwrap_or_else(|| {
+        MagicRef::new(Mutex::new(IolistBinaryPhase::Size(
+            arinsal_bifs::IolistSizeWalk::new(root),
+        )))
+    });
+    let phase = state
+        .downcast_ref::<Mutex<IolistBinaryPhase>>()
+        .ok_or(BifError::BADARG)?;
+    let mut phase = phase.lock().map_err(|_| BifError::SystemLimit)?;
+    let mut available_reductions = process.reductions.max(0) as usize;
+    let mut size_reductions = 0_usize;
+
+    match &mut *phase {
+        IolistBinaryPhase::Size(walk) => {
+            let initial_yield_count =
+                (process.reductions.max(0) as usize).saturating_mul(SIZE_YIELDS_PER_RED);
+            let (done, work) = match walk.step(initial_yield_count) {
+                Ok(progress) => progress,
+                Err((error, work)) => {
+                    let reductions = work.div_ceil(SIZE_YIELDS_PER_RED) as u32;
+                    return Ok(TrapResult::Failed { error, reductions });
+                }
+            };
+            size_reductions = work.div_ceil(SIZE_YIELDS_PER_RED);
+            if !done {
+                drop(phase);
+                return Ok(TrapResult::Yield {
+                    continuation: IOLIST_CONTINUATION,
+                    state,
+                    reductions: size_reductions as u32,
+                });
+            }
+
+            let byte_len = walk.take_size();
+            let output = arinsal_bifs::allocate_iolist_binary(
+                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                byte_len,
+            )?;
+            if byte_len == 0 {
+                *phase = IolistBinaryPhase::Done;
+                return Ok(TrapResult::Done {
+                    value: output,
+                    reductions: size_reductions as u32,
+                });
+            }
+            *phase = IolistBinaryPhase::Copy {
+                output,
+                byte_len,
+                walk: arinsal_bifs::IolistCopyWalk::new(root),
+            };
+            available_reductions = available_reductions.saturating_sub(size_reductions);
+            if available_reductions == 0 {
+                drop(phase);
+                return Ok(TrapResult::Yield {
+                    continuation: IOLIST_CONTINUATION,
+                    state,
+                    reductions: size_reductions as u32,
+                });
+            }
+        }
+        IolistBinaryPhase::Copy { .. } => {}
+        IolistBinaryPhase::Done => return Err(BifError::BADARG),
+    }
+
+    let IolistBinaryPhase::Copy {
+        output,
+        byte_len,
+        walk,
+    } = &mut *phase
+    else {
+        unreachable!("the size phase transitions to copy or returns above")
+    };
+    let yield_count = available_reductions.saturating_mul(SIZE_YIELDS_PER_RED);
+    let (done, work) = match arinsal_bifs::with_iolist_binary_output(*output, |bytes| {
+        Ok(walk.step(bytes, yield_count))
+    })? {
+        Ok(progress) => progress,
+        Err((error, work)) => {
+            let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
+            arinsal_bifs::finish_iolist_binary_output(*output);
+            return Ok(TrapResult::Failed { error, reductions });
+        }
+    };
+    let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
+    if !done {
+        drop(phase);
+        return Ok(TrapResult::Yield {
+            continuation: IOLIST_CONTINUATION,
+            state,
+            reductions,
+        });
+    }
+    if walk.written() != *byte_len {
+        arinsal_bifs::finish_iolist_binary_output(*output);
+        return Ok(TrapResult::Failed {
+            error: BifError::SystemLimit,
+            reductions,
+        });
+    }
+    let result = *output;
+    arinsal_bifs::finish_iolist_binary_output(result);
+    *phase = IolistBinaryPhase::Done;
+    Ok(TrapResult::Done {
+        value: result,
+        reductions,
     })
 }
 
