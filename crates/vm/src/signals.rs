@@ -580,6 +580,30 @@ fn spawn_mfa(
     )
 }
 
+/// Whether `module:function/arity` is a BIF export.
+// Port of erts/emulator/beam/erl_init.c / export.c (BIF export entries carry `bif_number`,
+// set once from bif.tab when the emulator starts), OTP-29.1.1.
+fn is_bif_export(module: arinsal_term::Atom, function: arinsal_term::Atom, arity: u8) -> bool {
+    static BIF_EXPORTS: std::sync::OnceLock<
+        std::collections::HashSet<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
+    > = std::sync::OnceLock::new();
+    BIF_EXPORTS
+        .get_or_init(|| {
+            let atoms = arinsal_term::global_atoms();
+            arinsal_spec::BIFS
+                .iter()
+                .filter_map(|bif| {
+                    Some((
+                        atoms.intern(bif.module).ok()?,
+                        atoms.intern(bif.name).ok()?,
+                        bif.arity,
+                    ))
+                })
+                .collect()
+        })
+        .contains(&(module, function, arity))
+}
+
 #[allow(clippy::too_many_arguments)] // spawn_opt flags stay positional; packing them hides the monitor race.
 // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
 fn spawn_mfa_with_priority(
@@ -626,14 +650,11 @@ fn spawn_mfa_with_priority(
     child.initial_call = Some((module_id, ip));
     // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1:
     // a spawned MFA naming a BIF runs the BIF itself, not the erlang.erl stub.
-    if let Ok(arity) = u8::try_from(args.len()) {
-        let (m_name, f_name) = (atom_name(module), atom_name(function));
-        if let (Some(m_name), Some(f_name)) = (m_name, f_name)
-            && (arinsal_bifs::lookup(&m_name, &f_name, arity).is_some()
-                || arinsal_spec::bif_lookup(&m_name, &f_name, arity).is_some())
-        {
-            child.cold_mut().initial_bif = Some((m_name, f_name, arity));
-        }
+    if let Ok(arity) = u8::try_from(args.len())
+        && is_bif_export(m, f, arity)
+        && let (Some(m_name), Some(f_name)) = (atom_name(module), atom_name(function))
+    {
+        child.cold_mut().initial_bif = Some((m_name, f_name, arity));
     }
     child.set_runtime(parent.runtime.clone());
     // `p->u.initial` is the export the child starts at (`initial_call` module/ip).
