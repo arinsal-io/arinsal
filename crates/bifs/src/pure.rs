@@ -7,15 +7,22 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arinsal_term::{
-    ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder, TermError,
-    TermKind, atoms, cmp, copy_term, exact_eq, flat_size, global_atoms, loose_eq, phash, phash2,
-    phash2_range, writable_bytes_mut, writable_extend_private, writable_finalize,
+    BinaryRef, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, TermBuilder,
+    TermError, TermKind, atoms, cmp, copy_term, exact_eq, flat_size, global_atoms, loose_eq, phash,
+    phash2, phash2_range,
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, ToPrimitive};
 use smallvec::{SmallVec, smallvec};
 
 use crate::{BifError, BifFn, Class, Ctx};
+
+#[path = "binary_bifs.rs"]
+mod binary_bifs;
+pub use binary_bifs::{
+    BinarySearchKind, BinarySearchWalk, IolistCopyWalk, allocate_iolist_binary,
+    finish_iolist_binary_output, with_iolist_binary_output,
+};
 
 const BADARG: BifError = BifError::BADARG;
 static NEXT_REF: AtomicU64 = AtomicU64::new(1);
@@ -150,6 +157,9 @@ impl HeapAlloc for ConsBlock<'_> {
 }
 
 pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
+    if let Some(bif) = binary_bifs::lookup(module, name, arity) {
+        return Some(bif);
+    }
     let f: BifFn = match (module, name, arity) {
         ("erlang", "abs", 1) => abs,
         ("erlang", "float", 1) => to_float,
@@ -163,8 +173,6 @@ pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
         ("erlang", "setelement", 3) => setelement,
         ("erlang", "tuple_size", 1) => tuple_size,
         ("erlang", "size", 1) => size,
-        ("erlang", "byte_size", 1) => byte_size,
-        ("erlang", "bit_size", 1) => bit_size,
         ("erlang", "node", 0 | 1) => node,
         ("erlang", "self", 0) => self_bif,
         ("erlang", "min", 2) => min,
@@ -205,30 +213,6 @@ pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
         ("erlang", "binary_to_float", 1) => binary_to_float,
         ("erlang", "integer_to_list", 1 | 2) => integer_to_list,
         ("erlang", "integer_to_binary", 1 | 2) => integer_to_binary,
-        ("erlang", "binary_to_list", 1 | 3) => erlang_binary_to_list,
-        ("erlang", "list_to_binary", 1) => list_to_binary,
-        ("erlang", "iolist_to_binary", 1) => iolist_to_binary,
-        ("erlang", "iolist_to_iovec", 1) => iolist_to_iovec,
-        ("erlang", "iolist_size", 1) => iolist_size,
-        ("erlang", "bitstring_to_list", 1) => bitstring_to_list,
-        ("erlang", "list_to_bitstring", 1) => list_to_bitstring,
-        ("erlang", "split_binary", 2) => split_binary,
-        ("erlang", "binary_part", 2 | 3) => binary_part,
-        ("binary", "part", 2 | 3) => binary_part,
-        ("binary", "first", 1) => binary_first,
-        ("binary", "last", 1) => binary_last,
-        ("binary", "at", 2) => binary_at,
-        ("binary", "copy", 1 | 2) => binary_copy,
-        ("binary", "referenced_byte_size", 1) => referenced_byte_size,
-        ("binary", "longest_common_prefix", 1) => longest_common_prefix,
-        ("binary", "longest_common_suffix", 1) => longest_common_suffix,
-        ("binary", "compile_pattern", 1) => compile_pattern,
-        ("binary", "match", 2 | 3) => binary_match,
-        ("binary", "matches", 2 | 3) => binary_matches,
-        ("binary", "split", 2 | 3) => binary_split,
-        ("binary", "encode_unsigned", 1 | 2) => encode_unsigned,
-        ("binary", "decode_unsigned", 1 | 2) => decode_unsigned,
-        ("binary", "list_to_bin", 1) => list_to_binary,
         ("erlang", "is_atom", 1) => is_atom,
         ("erlang", "is_list", 1) => is_list,
         ("erlang", "is_tuple", 1) => is_tuple,
@@ -440,16 +424,6 @@ fn size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         }
         _ => Err(BADARG),
     }
-}
-fn bit_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // SAFETY: The input heap and off-heap binary owner are live.
-    let view = unsafe { args[0].binary_ref() }.ok_or(BADARG)?;
-    integer(ctx, view.bit_len())
-}
-fn byte_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // SAFETY: The input heap and off-heap binary owner are live.
-    let view = unsafe { args[0].binary_ref() }.ok_or(BADARG)?;
-    integer(ctx, view.bit_len().div_ceil(8))
 }
 fn node(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if args.is_empty() {
@@ -775,6 +749,7 @@ pub fn copy_binary_range(term: Term, start: usize, output: &mut [u8]) -> Result<
 }
 
 /// Copy significant bits into a most-significant-bit-first packed byte slice.
+// Port of erts/emulator/beam/erl_bits.c:2389-2515 (erts_copy_bits_fwd), OTP-29.1.1.
 pub fn copy_bitstring_range(
     term: Term,
     start: usize,
@@ -782,45 +757,62 @@ pub fn copy_bitstring_range(
     bit_count: usize,
 ) -> Result<(), BifError> {
     let output_bits = output.len().checked_mul(8).ok_or(BADARG)?;
-    let total_bits = bitstring_bit_len(term)?;
-    if bit_count > output_bits
-        || start
-            .checked_add(bit_count)
-            .is_none_or(|end| end > total_bits)
-    {
-        return Err(BADARG);
-    }
-    // SAFETY: The caller keeps the bitstring and owner live through this copy.
-    let view = unsafe { term.binary_ref() }.ok_or(BADARG)?;
-    output.fill(0);
-    for index in 0..bit_count {
-        let source = view.start_bit() + start + index;
-        let bit = (view.bytes()[source / 8] >> (7 - source % 8)) & 1;
-        output[index / 8] |= bit << (7 - index % 8);
-    }
-    Ok(())
+    with_binary_bytes(term, |view| {
+        if bit_count > output_bits
+            || start
+                .checked_add(bit_count)
+                .is_none_or(|end| end > view.bit_len())
+        {
+            return Err(BADARG);
+        }
+        let source_start = view.start_bit().checked_add(start).ok_or(BADARG)?;
+        if source_start.is_multiple_of(8) && bit_count.is_multiple_of(8) {
+            let source_start = source_start / 8;
+            let byte_count = bit_count / 8;
+            let source_end = source_start.checked_add(byte_count).ok_or(BADARG)?;
+            output[..byte_count]
+                .copy_from_slice(view.bytes().get(source_start..source_end).ok_or(BADARG)?);
+            output[byte_count..].fill(0);
+        } else {
+            output.fill(0);
+            for index in 0..bit_count {
+                let source = source_start + index;
+                let bit = (view.bytes()[source / 8] >> (7 - source % 8)) & 1;
+                output[index / 8] |= bit << (7 - index % 8);
+            }
+        }
+        Ok(())
+    })?
 }
-fn binary_input<'a>(term: Term) -> Result<std::borrow::Cow<'a, [u8]>, BifError> {
-    Ok(std::borrow::Cow::Owned(binary_bytes(term)?))
+
+/// Run a read-only operation while the term's backing bytes remain borrowed.
+///
+/// The callback cannot retain the view beyond the term's live interval.
+pub fn with_binary_bytes<R>(term: Term, f: impl FnOnce(BinaryRef<'_>) -> R) -> Result<R, BifError> {
+    // SAFETY: The view cannot escape `f`, and the caller keeps the term and its owner live.
+    let view = unsafe { term.binary_ref() }.ok_or(BADARG)?;
+    Ok(f(view))
 }
 fn binary_to_atom_inner(args: &[Term], existing: bool) -> Result<Term, BifError> {
-    let bytes = binary_bytes(args[0])?;
-    let text = match encoding(args[1])? {
-        "utf8" => match std::str::from_utf8(&bytes) {
-            Ok(text) => text.to_owned(),
-            Err(error) => {
-                // erts_atom_put reports the character limit before a later malformed byte.
-                if std::str::from_utf8(&bytes[..error.valid_up_to()])
-                    .is_ok_and(|prefix| prefix.chars().count() > 255)
-                {
-                    return Err(BifError::SystemLimit);
+    let encoding = encoding(args[1])?;
+    binary_bifs::with_binary_input(args[0], |bytes| {
+        let text = match encoding {
+            "utf8" => match std::str::from_utf8(bytes) {
+                Ok(text) => text.to_owned(),
+                Err(error) => {
+                    // erts_atom_put reports the character limit before a later malformed byte.
+                    if std::str::from_utf8(&bytes[..error.valid_up_to()])
+                        .is_ok_and(|prefix| prefix.chars().count() > 255)
+                    {
+                        return Err(BifError::SystemLimit);
+                    }
+                    return Err(BADARG);
                 }
-                return Err(BADARG);
-            }
-        },
-        _ => bytes.into_iter().map(char::from).collect(),
-    };
-    intern(&text, existing)
+            },
+            _ => bytes.iter().copied().map(char::from).collect(),
+        };
+        intern(&text, existing)
+    })
 }
 fn binary_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     binary_to_atom_inner(args, false)
@@ -892,10 +884,12 @@ fn list_to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         .expect("infallible BIF heap"))
 }
 fn binary_to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let value = arinsal_float::list_to_float(&binary_bytes(args[0])?).map_err(|_| BADARG)?;
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .float(value)
-        .expect("infallible BIF heap"))
+    binary_bifs::with_binary_input(args[0], |bytes| {
+        let value = arinsal_float::list_to_float(bytes).map_err(|_| BADARG)?;
+        Ok(TermBuilder::new(&mut Heap(ctx.heap))
+            .float(value)
+            .expect("infallible BIF heap"))
+    })
 }
 fn integer_text(args: &[Term]) -> Result<String, BifError> {
     let base = if args.len() == 2 {
@@ -922,136 +916,8 @@ fn integer_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         .binary(text.as_bytes())
         .expect("infallible BIF heap"))
 }
-fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = binary_input(args[0])?;
-    let selected = if args.len() == 3 {
-        let start = args[1].as_small().ok_or(BADARG)?;
-        let end = args[2].as_small().ok_or(BADARG)?;
-        if start < 1 || end < start || end as usize > bytes.len() {
-            return Err(BADARG);
-        }
-        &bytes[start as usize - 1..end as usize]
-    } else {
-        &bytes
-    };
-    byte_list(ctx, selected)
-}
-fn byte_list(ctx: &mut Ctx<'_>, selected: &[u8]) -> Result<Term, BifError> {
-    ctx.charge_reductions(selected.len());
-    if selected.is_empty() {
-        return Ok(Term::NIL);
-    }
-    let words = selected.len().checked_mul(2).ok_or(BifError::SystemLimit)?;
-    let cells = ctx.heap.alloc(words).ok_or(BifError::SystemLimit)?;
-    let mut result = Term::NIL;
-    for index in (0..selected.len()).rev() {
-        // SAFETY: one allocation reserved two words for each indexed cons cell.
-        let cell = unsafe { cells.add(index * 2) };
-        let head = Term::small(i64::from(selected[index])).unwrap();
-        // SAFETY: all terms are immediate or point to initialized cells in this heap.
-        unsafe {
-            *cell = head.raw_bits();
-            *cell.add(1) = result.raw_bits();
-            result = std::mem::transmute::<u64, Term>((cell as u64) | 1);
-        }
-    }
-    Ok(result)
-}
-fn list_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if !matches!(args[0].classify(), TermKind::List | TermKind::Nil) {
-        return Err(BADARG);
-    }
-    let bytes = iolist_bytes(args[0])?;
-    ctx.charge_reductions(bytes.len());
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .binary(&bytes)
-        .expect("infallible BIF heap"))
-}
-fn iolist_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = iolist_bytes(args[0])?;
-    ctx.charge_reductions(bytes.len());
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .binary(&bytes)
-        .expect("infallible BIF heap"))
-}
-fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_iolist.c:1116-1180 (iolist_to_iovec_engine), OTP-29.1.1.
-    const COPY_THRESHOLD: usize = 64;
-    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
-    let mut copied = Vec::new();
-    let mut segments = Vec::new();
-    let mut total: usize = 0;
-    while let Some((term, byte_allowed)) = work.pop() {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::List => {
-                let (head, tail) = iolist_cons(term)?;
-                work.push((tail, false));
-                work.push((head, true));
-            }
-            TermKind::Bitstring => {
-                let bytes = binary_bytes(term)?;
-                total = total
-                    .checked_add(bytes.len())
-                    .ok_or(BifError::SystemLimit)?;
-                if bytes.len() > COPY_THRESHOLD {
-                    if !copied.is_empty() {
-                        segments.push(
-                            TermBuilder::new(&mut Heap(ctx.heap))
-                                .binary(&copied)
-                                .expect("infallible BIF heap"),
-                        );
-                        copied.clear();
-                    }
-                    segments.push(term);
-                } else {
-                    copied.extend(bytes);
-                }
-            }
-            TermKind::Number if byte_allowed => {
-                let byte = term
-                    .as_small()
-                    .and_then(|n| u8::try_from(n).ok())
-                    .ok_or(BADARG)?;
-                copied.push(byte);
-                total = total.checked_add(1).ok_or(BifError::SystemLimit)?;
-            }
-            _ => return Err(BADARG),
-        }
-    }
-    ctx.charge_reductions(total);
-    if !copied.is_empty() {
-        segments.push(
-            TermBuilder::new(&mut Heap(ctx.heap))
-                .binary(&copied)
-                .expect("infallible BIF heap"),
-        );
-    }
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .list_from_iter(segments)
-        .expect("infallible BIF heap"))
-}
 pub(super) fn iolist_bytes(root: Term) -> Result<Vec<u8>, BifError> {
-    let mut output = Vec::new();
-    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(root, false)];
-    while let Some((term, byte_allowed)) = work.pop() {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::List => {
-                let (head, tail) = iolist_cons(term)?;
-                work.push((tail, false));
-                work.push((head, true));
-            }
-            TermKind::Bitstring => output.extend(binary_bytes(term)?),
-            TermKind::Number if byte_allowed => output.push(
-                term.as_small()
-                    .and_then(|n| u8::try_from(n).ok())
-                    .ok_or(BADARG)?,
-            ),
-            _ => return Err(BADARG),
-        }
-    }
-    Ok(output)
+    binary_bifs::iolist_bytes(root)
 }
 
 /// Return the sole bitstring in a singleton list when its length satisfies `unit`.
@@ -1070,10 +936,7 @@ pub fn singleton_bitstring(root: Term, unit: usize) -> Result<Option<Term>, BifE
 
 /// Return the significant bit count for a live bitstring term.
 pub fn bitstring_bit_len(term: Term) -> Result<usize, BifError> {
-    // SAFETY: The caller keeps the bitstring and owner live through this query.
-    unsafe { term.binary_ref() }
-        .map(|view| view.bit_len())
-        .ok_or(BADARG)
+    with_binary_bytes(term, |view| view.bit_len())
 }
 
 /// Stateful iolist conversion used by VM continuation exports.
@@ -1088,56 +951,83 @@ pub struct IolistWalk {
 /// Stateful iolist size calculation used by the VM continuation export.
 // Port of erts/emulator/beam/erl_iolist.c:1013-1070, OTP-29.1.1.
 pub struct IolistSizeWalk {
-    work: SmallVec<[(Term, bool); 8]>,
-    size: BigInt,
+    current: Term,
+    tails: SmallVec<[Term; 8]>,
+    size: usize,
 }
 
 impl IolistSizeWalk {
     /// Start traversing an iolist rooted in a stable process heap.
     pub fn new(root: Term) -> Self {
         Self {
-            work: smallvec![(root, false)],
-            size: BigInt::from(0_u8),
+            current: root,
+            tails: SmallVec::new(),
+            size: 0,
         }
     }
 
     /// Process at most `budget` list nodes and leaves.
     pub fn step(&mut self, budget: usize) -> Result<(bool, usize), (BifError, usize)> {
         let mut consumed = 0;
-        while consumed < budget {
-            let Some((term, byte_allowed)) = self.work.pop() else {
-                return Ok((true, consumed));
-            };
+        loop {
+            while self.current.classify() == TermKind::List {
+                if consumed == budget {
+                    return Ok((false, consumed));
+                }
+                consumed += 1;
+                let (head, tail) = iolist_cons(self.current).map_err(|error| (error, consumed))?;
+                if head.classify() == TermKind::List {
+                    self.tails.push(tail);
+                    self.current = head;
+                    continue;
+                }
+                self.add(head, true).map_err(|error| (error, consumed))?;
+                self.current = tail;
+            }
+
+            if consumed == budget {
+                return Ok((false, consumed));
+            }
             consumed += 1;
-            match term.classify() {
-                TermKind::Nil => {}
-                TermKind::List => {
-                    let (head, tail) = iolist_cons(term).map_err(|e| (e, consumed))?;
-                    self.work.push((tail, false));
-                    self.work.push((head, true));
-                }
-                TermKind::Bitstring => {
-                    let bits = bitstring_bit_len(term).map_err(|e| (e, consumed))?;
-                    if !bits.is_multiple_of(8) {
-                        return Err((BADARG, consumed));
-                    }
-                    self.size += BigInt::from(bits / 8);
-                }
-                TermKind::Number if byte_allowed => {
-                    if !term.as_small().is_some_and(|n| (0..=255).contains(&n)) {
-                        return Err((BADARG, consumed));
-                    }
-                    self.size += 1_u8;
-                }
-                _ => return Err((BADARG, consumed)),
+            self.add(self.current, false)
+                .map_err(|error| (error, consumed))?;
+            match self.tails.pop() {
+                Some(tail) => self.current = tail,
+                None => return Ok((true, consumed)),
             }
         }
-        Ok((self.work.is_empty(), consumed))
     }
 
-    /// Return the accumulated size after a complete traversal.
-    pub fn take_size(&mut self) -> BigInt {
-        std::mem::take(&mut self.size)
+    /// Return the accumulated byte count after a complete traversal.
+    pub fn take_size(&mut self) -> usize {
+        std::mem::take(&mut self.size) / 8
+    }
+
+    fn add(&mut self, term: Term, byte_allowed: bool) -> Result<(), BifError> {
+        match term.classify() {
+            TermKind::Nil => Ok(()),
+            TermKind::Bitstring => {
+                let bits = bitstring_bit_len(term)?;
+                if !bits.is_multiple_of(8) {
+                    return Err(BADARG);
+                }
+                // Port of erts/emulator/beam/erl_iolist.c:139-191
+                // (generic_iolist_size), OTP-29.1.1. ERTS keeps a Uint accumulator.
+                self.size = self.size.checked_add(bits).ok_or(BifError::SystemLimit)?;
+                Ok(())
+            }
+            TermKind::Number if byte_allowed => {
+                if !term
+                    .as_small()
+                    .is_some_and(|number| (0..=255).contains(&number))
+                {
+                    return Err(BADARG);
+                }
+                self.size = self.size.checked_add(8).ok_or(BifError::SystemLimit)?;
+                Ok(())
+            }
+            _ => Err(BADARG),
+        }
     }
 }
 
@@ -1237,101 +1127,6 @@ fn iolist_cons(term: Term) -> Result<(Term, Term), BifError> {
     // SAFETY: The source heap remains live throughout the BIF call.
     unsafe { term.cons_ref() }.ok_or(BADARG)
 }
-fn iolist_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_iolist.c:114 (generic_iolist_size), OTP-29.1.1.
-    // Size queries count bitstrings directly; materializing an iolist can turn
-    // a small shared term graph into a multi-gigabyte temporary buffer.
-    let mut size = BigInt::from(0_u8);
-    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
-    while let Some((term, byte_allowed)) = work.pop() {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::List => {
-                let (head, tail) = iolist_cons(term)?;
-                work.push((tail, false));
-                work.push((head, true));
-            }
-            TermKind::Bitstring => {
-                let bits = bitstring_bit_len(term)?;
-                if !bits.is_multiple_of(8) {
-                    return Err(BADARG);
-                }
-                size += BigInt::from(bits / 8);
-            }
-            TermKind::Number if byte_allowed => {
-                if !term.as_small().is_some_and(|n| (0..=255).contains(&n)) {
-                    return Err(BADARG);
-                }
-                size += 1_u8;
-            }
-            _ => return Err(BADARG),
-        }
-    }
-    ctx.charge_reductions(size.to_usize().unwrap_or(usize::MAX));
-    TermBuilder::new(&mut Heap(ctx.heap))
-        .int_from_bigint(&size)
-        .map_err(|_| BifError::SystemLimit)
-}
-fn bitstring_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // SAFETY: The source bitstring and owner remain live.
-    let view = unsafe { args[0].binary_ref() }.ok_or(BADARG)?;
-    let mut data = Vec::with_capacity(view.bit_len().div_ceil(8));
-    for i in 0..view.bit_len() {
-        let source = view.start_bit() + i;
-        if i % 8 == 0 {
-            data.push(0_u8);
-        }
-        let bit = (view.bytes()[source / 8] >> (7 - source % 8)) & 1;
-        let last = data.last_mut().expect("byte");
-        *last |= bit << (7 - i % 8);
-    }
-    let full = view.bit_len() / 8;
-    ctx.charge_reductions(full);
-    let mut values = data[..full]
-        .iter()
-        .map(|&b| Term::small(b as i64).unwrap())
-        .collect::<Vec<_>>();
-    if view.bit_len() % 8 != 0 {
-        values.push(
-            TermBuilder::new(&mut Heap(ctx.heap))
-                .bitstring(&data[full..], view.bit_len() % 8)
-                .expect("infallible BIF heap"),
-        );
-    }
-    Ok(make_list(ctx, values, Term::NIL))
-}
-fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    if !matches!(args[0].classify(), TermKind::List | TermKind::Nil) {
-        return Err(BADARG);
-    }
-    let mut work: SmallVec<[(Term, bool); 8]> = smallvec![(args[0], false)];
-    let mut data = SmallVec::<[u8; 64]>::new();
-    let mut bits = 0_usize;
-    while let Some((term, byte_allowed)) = work.pop() {
-        match term.classify() {
-            TermKind::Nil => {}
-            TermKind::List => {
-                let (head, tail) = iolist_cons(term)?;
-                work.push((tail, false));
-                work.push((head, true));
-            }
-            TermKind::Number if byte_allowed && term.as_small().is_some() => {
-                let byte = u8::try_from(term.as_small().expect("checked")).map_err(|_| BADARG)?;
-                for bit in 0..8 {
-                    append_bit(&mut data, &mut bits, (byte >> (7 - bit)) & 1);
-                }
-            }
-            TermKind::Bitstring => {
-                append_term_bitstring(&mut data, &mut bits, term)?;
-            }
-            _ => return Err(BADARG),
-        }
-    }
-    ctx.charge_reductions(data.len());
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .bitstring(&data, bits)
-        .expect("infallible BIF heap"))
-}
 trait BitBuffer {
     fn push_byte(&mut self, byte: u8);
     fn last_byte_mut(&mut self) -> Option<&mut u8>;
@@ -1381,390 +1176,6 @@ fn append_bit(bytes: &mut impl BitBuffer, length: &mut usize, bit: u8) {
     *bytes.last_byte_mut().expect("byte") |= bit << (7 - *length % 8);
     *length += 1;
 }
-fn range(bytes: &[u8], start: i64, length: i64) -> Result<&[u8], BifError> {
-    let end = start.checked_add(length).ok_or(BADARG)?;
-    let (lo, hi) = if length < 0 {
-        (end, start)
-    } else {
-        (start, end)
-    };
-    if lo < 0 || hi < 0 {
-        return Err(BADARG);
-    }
-    bytes.get(lo as usize..hi as usize).ok_or(BADARG)
-}
-fn binary_part(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = binary_bytes(args[0])?;
-    let (start, len) = if args.len() == 2 {
-        if tuple_arity(args[1])? != 2 {
-            return Err(BADARG);
-        }
-        (
-            tuple_element(args[1], 0)?.as_small().ok_or(BADARG)?,
-            tuple_element(args[1], 1)?.as_small().ok_or(BADARG)?,
-        )
-    } else {
-        (
-            args[1].as_small().ok_or(BADARG)?,
-            args[2].as_small().ok_or(BADARG)?,
-        )
-    };
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .binary(range(&bytes, start, len)?)
-        .expect("infallible BIF heap"))
-}
-fn split_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = binary_bytes(args[0])?;
-    let at = args[1].as_small().ok_or(BADARG)?;
-    if at < 0 || at as usize > bytes.len() {
-        return Err(BADARG);
-    }
-    let mut heap = Heap(ctx.heap);
-    let mut builder = TermBuilder::new(&mut heap);
-    let left = builder
-        .sub_binary(args[0], 0, at as usize * 8)
-        .expect("infallible BIF heap");
-    let right = builder
-        .sub_binary(args[0], at as usize * 8, (bytes.len() - at as usize) * 8)
-        .expect("infallible BIF heap");
-    Ok(builder.tuple(&[left, right]).expect("infallible BIF heap"))
-}
-fn binary_first(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    integer(ctx, *binary_bytes(args[0])?.first().ok_or(BADARG)? as usize)
-}
-fn binary_last(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    integer(ctx, *binary_bytes(args[0])?.last().ok_or(BADARG)? as usize)
-}
-fn binary_at(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = binary_bytes(args[0])?;
-    let index = args[1].as_small().ok_or(BADARG)?;
-    if index < 0 {
-        return Err(BADARG);
-    }
-    integer(ctx, *bytes.get(index as usize).ok_or(BADARG)? as usize)
-}
-fn binary_copy(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let bytes = binary_input(args[0])?;
-    let count = if args.len() == 2 {
-        args[1].as_small().ok_or(BADARG)?
-    } else {
-        1
-    };
-    if count < 0 {
-        return Err(BADARG);
-    }
-    let len = bytes
-        .len()
-        .checked_mul(count as usize)
-        .ok_or(BifError::SystemLimit)?;
-    if len > (1 << 30) {
-        return Err(BifError::SystemLimit);
-    }
-    if !ctx.heap.supports_writable_binary() {
-        let mut output = Vec::with_capacity(len);
-        for _ in 0..count {
-            output.extend_from_slice(&bytes);
-        }
-        return Ok(TermBuilder::new(&mut Heap(ctx.heap))
-            .binary(&output)
-            .expect("infallible BIF heap"));
-    }
-    // vm_binparse2: one exact-size owner serves every binary:copy/2 caller.
-    let result = TermBuilder::new(&mut Heap(ctx.heap))
-        .writable_binary(&[], 0, len)
-        .map_err(|_| BifError::SystemLimit)?;
-    writable_extend_private(result, len * 8).map_err(|_| BifError::SystemLimit)?;
-    // SAFETY: `result` is a fresh private writer; its source is a different term.
-    let output = unsafe { writable_bytes_mut(result) }.ok_or(BifError::SystemLimit)?;
-    if len > 0 && !bytes.is_empty() {
-        output[..bytes.len()].copy_from_slice(&bytes);
-        let mut filled = bytes.len();
-        while filled < len {
-            let copy = filled.min(len - filled);
-            output.copy_within(0..copy, filled);
-            filled += copy;
-        }
-    }
-    writable_finalize(result);
-    Ok(result)
-}
-fn referenced_byte_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // SAFETY: The source heap and binary owner remain live.
-    let view = unsafe { args[0].binary_ref() }.ok_or(BADARG)?;
-    let mut bytes = view.bytes().len();
-    if args[0].header().is_some_and(|header| header & 63 == 0x24) {
-        // A SubBits stores its retained BinRef owner at word four; BinaryRef's
-        // slice ends at the subbinary boundary and omits later backing bytes.
-        // SAFETY: TermBuilder::sub_binary writes a live owner term in word four.
-        let owner = unsafe { *args[0].raw_ptr().add(4) };
-        let owner_ptr = (owner & !7) as *const u64;
-        // SAFETY: The tagged owner points to a retained BinRef allocation.
-        if unsafe { *owner_ptr } & 63 == 0x28 {
-            // SAFETY: BinRef word one points to the retained Arc<Vec<u8>> data.
-            let backing = unsafe { *owner_ptr.add(1) } as *const Vec<u8>;
-            // SAFETY: The process heap retains this Arc for the BIF call.
-            bytes = unsafe { &*backing }.len();
-        }
-    }
-    integer(ctx, bytes)
-}
-fn longest_common_prefix(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let binaries = list(args[0])?
-        .into_iter()
-        .map(binary_bytes)
-        .collect::<Result<Vec<_>, _>>()?;
-    let first = binaries.first().ok_or(BADARG)?;
-    let length = (0..first.len())
-        .take_while(|&i| binaries.iter().all(|b| b.get(i) == first.get(i)))
-        .count();
-    integer(ctx, length)
-}
-fn longest_common_suffix(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let binaries = list(args[0])?
-        .into_iter()
-        .map(binary_bytes)
-        .collect::<Result<Vec<_>, _>>()?;
-    let first = binaries.first().ok_or(BADARG)?;
-    let length = (0..first.len())
-        .take_while(|&i| {
-            binaries
-                .iter()
-                .all(|b| b.iter().rev().nth(i) == first.iter().rev().nth(i))
-        })
-        .count();
-    integer(ctx, length)
-}
-fn patterns(term: Term) -> Result<Vec<Vec<u8>>, BifError> {
-    let source = if let Ok(arity) = tuple_arity(term) {
-        if arity != 2 {
-            return Err(BADARG);
-        }
-        let tag = atom_name(tuple_element(term, 0)?).ok_or(BADARG)?;
-        if tag != "bm" && tag != "ac" {
-            return Err(BADARG);
-        }
-        tuple_element(term, 1)?
-    } else {
-        term
-    };
-    let candidates = if source.classify() == TermKind::Bitstring {
-        vec![source]
-    } else {
-        list(source)?
-    };
-    if candidates.is_empty() {
-        return Err(BADARG);
-    }
-    let mut result = Vec::new();
-    for candidate in candidates {
-        let bytes = binary_bytes(candidate)?;
-        if bytes.is_empty() {
-            return Err(BADARG);
-        }
-        result.push(bytes);
-    }
-    Ok(result)
-}
-fn compile_pattern(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    patterns(args[0])?;
-    let tag = if args[0].classify() == TermKind::Bitstring {
-        "bm"
-    } else {
-        "ac"
-    };
-    let atom = Term::atom(global_atoms().intern(tag).expect("atom"));
-    Ok(tuple_build(ctx, &[atom, args[0]]))
-}
-fn match_scope(len: usize, options: Term) -> Result<(usize, usize), BifError> {
-    let mut scope = (0, len);
-    for option in list(options)? {
-        scope = scope_option(len, option)?;
-    }
-    Ok(scope)
-}
-fn scope_option(len: usize, option: Term) -> Result<(usize, usize), BifError> {
-    if tuple_arity(option)? != 2 || atom_name(tuple_element(option, 0)?) != Some("scope") {
-        return Err(BADARG);
-    }
-    let range = tuple_element(option, 1)?;
-    if tuple_arity(range)? != 2 {
-        return Err(BADARG);
-    }
-    let start = tuple_element(range, 0)?.as_small().ok_or(BADARG)?;
-    let length = tuple_element(range, 1)?.as_small().ok_or(BADARG)?;
-    let end = start.checked_add(length).ok_or(BADARG)?;
-    let (lo, hi) = if length < 0 {
-        (end, start)
-    } else {
-        (start, end)
-    };
-    if lo < 0 || hi < 0 || hi as usize > len {
-        return Err(BADARG);
-    }
-    Ok((lo as usize, hi as usize))
-}
-/// Search operation retained by the VM while a binary search BIF is trapped.
-#[derive(Clone, Copy)]
-pub enum BinarySearchKind {
-    Match,
-    Matches,
-    Split,
-}
-
-/// Resumable state for `binary:match/2,3`, `matches/2,3`, and `split/2,3`.
-pub struct BinarySearchWalk {
-    bytes: Vec<u8>,
-    walk: crate::binary_mod::SearchWalk,
-    kind: BinarySearchKind,
-    split_trim: bool,
-    split_trim_all: bool,
-}
-
-impl BinarySearchWalk {
-    /// Parse the BIF options and prepare the binary search state.
-    pub fn new(kind: BinarySearchKind, args: &[Term]) -> Result<Self, BifError> {
-        let subject = binary_input(args[0])?;
-        let bytes = subject.into_owned();
-        let patterns = patterns(args[1])?;
-        let (scope, first_only, split_trim, split_trim_all) = match kind {
-            BinarySearchKind::Match => (
-                if args.len() == 3 {
-                    match_scope(bytes.len(), args[2])?
-                } else {
-                    (0, bytes.len())
-                },
-                true,
-                false,
-                false,
-            ),
-            BinarySearchKind::Matches => (
-                if args.len() == 3 {
-                    match_scope(bytes.len(), args[2])?
-                } else {
-                    (0, bytes.len())
-                },
-                false,
-                false,
-                false,
-            ),
-            BinarySearchKind::Split => {
-                let (global, trim, trim_all, scope) = if args.len() == 3 {
-                    split_options(bytes.len(), args[2])?
-                } else {
-                    (false, false, false, (0, bytes.len()))
-                };
-                (scope, !global, trim, trim_all)
-            }
-        };
-        let walk = crate::binary_mod::SearchWalk::new(&bytes, &patterns, scope, first_only);
-        Ok(Self {
-            bytes,
-            walk,
-            kind,
-            split_trim,
-            split_trim_all,
-        })
-    }
-
-    /// Scan no more than `budget` search steps and return completion plus work.
-    pub fn step(&mut self, budget: usize) -> (bool, usize) {
-        self.walk.step(budget)
-    }
-
-    /// Build the result term after the search completes.
-    pub fn finish(&self, ctx: &mut Ctx<'_>) -> Result<Term, BifError> {
-        let found = self.walk.finish();
-        match self.kind {
-            BinarySearchKind::Match => match found.first() {
-                Some(&(position, length)) => match_result(ctx, position, length),
-                None => Ok(Term::atom(global_atoms().intern("nomatch").expect("atom"))),
-            },
-            BinarySearchKind::Matches => {
-                let values = found
-                    .into_iter()
-                    .map(|(position, length)| match_result(ctx, position, length))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(make_list(ctx, values, Term::NIL))
-            }
-            BinarySearchKind::Split => {
-                let mut parts = Vec::new();
-                let mut previous = 0;
-                for (position, length) in found {
-                    parts.push(&self.bytes[previous..position]);
-                    previous = position + length;
-                }
-                parts.push(&self.bytes[previous..]);
-                if self.split_trim_all {
-                    parts.retain(|part| !part.is_empty());
-                } else if self.split_trim {
-                    while parts.last().is_some_and(|part| part.is_empty()) {
-                        parts.pop();
-                    }
-                }
-                let values = parts
-                    .into_iter()
-                    .map(|part| {
-                        TermBuilder::new(&mut Heap(ctx.heap))
-                            .binary(part)
-                            .map_err(|_| BifError::SystemLimit)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(make_list(ctx, values, Term::NIL))
-            }
-        }
-    }
-}
-
-fn match_result(ctx: &mut Ctx<'_>, position: usize, length: usize) -> Result<Term, BifError> {
-    let pos = integer(ctx, position)?;
-    let len = integer(ctx, length)?;
-    Ok(tuple_build(ctx, &[pos, len]))
-}
-fn binary_match(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut walk = BinarySearchWalk::new(BinarySearchKind::Match, args)?;
-    while !walk.step(usize::MAX).0 {}
-    walk.finish(ctx)
-}
-fn binary_matches(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut walk = BinarySearchWalk::new(BinarySearchKind::Matches, args)?;
-    while !walk.step(usize::MAX).0 {}
-    walk.finish(ctx)
-}
-fn split_options(
-    len: usize,
-    options: Term,
-) -> Result<(bool, bool, bool, (usize, usize)), BifError> {
-    let mut global = false;
-    let mut trim = false;
-    let mut trim_all = false;
-    let mut scope = (0, len);
-    for option in list(options)? {
-        match atom_name(option) {
-            Some("global") => global = true,
-            Some("trim") => trim = true,
-            Some("trim_all") => trim_all = true,
-            _ => {
-                scope = scope_option(len, option)?;
-            }
-        }
-    }
-    Ok((global, trim, trim_all, scope))
-}
-fn binary_split(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut walk = BinarySearchWalk::new(BinarySearchKind::Split, args)?;
-    while !walk.step(usize::MAX).0 {}
-    walk.finish(ctx)
-}
-fn byte_order(args: &[Term]) -> Result<bool, BifError> {
-    if args.len() == 1 {
-        return Ok(false);
-    }
-    match atom_name(args[1]) {
-        Some("big") => Ok(false),
-        Some("little") => Ok(true),
-        _ => Err(BADARG),
-    }
-}
 pub(super) fn bigint(term: Term) -> Result<BigInt, BifError> {
     if let Some(n) = term.as_small() {
         return Ok(BigInt::from(n));
@@ -1774,33 +1185,6 @@ pub(super) fn bigint(term: Term) -> Result<BigInt, BifError> {
         .map(|view| view.to_bigint())
         .ok_or(BADARG)
 }
-fn encode_unsigned(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let value = bigint(args[0])?;
-    if value.sign() == Sign::Minus {
-        return Err(BADARG);
-    }
-    let mut bytes = value.to_bytes_be().1;
-    if bytes.is_empty() {
-        bytes.push(0);
-    }
-    if byte_order(args)? {
-        bytes.reverse();
-    }
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
-        .binary(&bytes)
-        .expect("infallible BIF heap"))
-}
-fn decode_unsigned(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut bytes = binary_bytes(args[0])?;
-    if byte_order(args)? {
-        bytes.reverse();
-    }
-    let value = BigInt::from_bytes_be(Sign::Plus, &bytes);
-    TermBuilder::new(&mut Heap(ctx.heap))
-        .int_from_bigint(&value)
-        .map_err(|_| BifError::SystemLimit)
-}
-
 macro_rules! predicate {
     ($name:ident, $body:expr) => {
         fn $name(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -1921,7 +1305,8 @@ fn debug_same(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 fn bin_is_7bit(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(bool_term(
-        binary_bytes(args[0]).is_ok_and(|bytes| bytes.iter().all(u8::is_ascii)),
+        binary_bifs::with_binary_input(args[0], |bytes| Ok(bytes.iter().all(u8::is_ascii)))
+            .is_ok_and(|is_ascii| is_ascii),
     ))
 }
 fn map_entries(ctx: &mut Ctx<'_>, term: Term) -> Result<Vec<(Term, Term)>, BifError> {

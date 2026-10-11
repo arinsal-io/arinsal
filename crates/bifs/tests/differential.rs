@@ -1,9 +1,9 @@
 mod support;
 
-use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{Ctx, FragmentingHeap, copy_bitstring_range, lookup};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
-use arinsal_term::{ProcessHeap, TermBuilder, to_owned};
+use arinsal_term::{ProcessHeap, TermBuilder, from_owned, to_owned};
 use num_traits::ToPrimitive;
 use std::collections::HashSet;
 use support::{call, equivalent};
@@ -353,12 +353,21 @@ fn compiled_patterns_match_plain_patterns() {
     for n in 0..1000 {
         let needle = O::Binary(vec![1, (n % 255) as u8]);
         let haystack = O::Binary(vec![0, 1, (n % 255) as u8, 1]);
-        let arinsal_difftest::CallResult::Ok(compiled) =
-            call("binary", "compile_pattern", std::slice::from_ref(&needle))
-        else {
-            panic!("compile_pattern failed");
+        let mut heap = ProcessHeap::with_words(1024);
+        let mut allocator = FragmentingHeap(&mut heap);
+        let needle_term = from_owned(&needle, &mut allocator).expect("needle term");
+        let haystack_term = from_owned(&haystack, &mut allocator).expect("haystack term");
+        let compile = lookup("binary", "compile_pattern", 1).expect("compile_pattern/1");
+        let compiled = {
+            let mut ctx = Ctx::new(&mut allocator);
+            compile(&mut ctx, &[needle_term]).expect("compile_pattern succeeds")
         };
-        let actual = call("binary", "match", &[haystack.clone(), compiled]);
+        let matching = lookup("binary", "match", 2).expect("match/2");
+        let mut ctx = Ctx::new(&mut allocator);
+        let actual_term = matching(&mut ctx, &[haystack_term, compiled])
+            .expect("compiled pattern must match in its owner heap");
+        let actual =
+            arinsal_difftest::CallResult::Ok(to_owned(actual_term).expect("owned match result"));
         let expected = reference.call("binary", "match", &[haystack, needle]);
         assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
     }
@@ -1032,6 +1041,54 @@ fn binary_match_accepts_unaligned_subbinary() {
         &[O::Binary(vec![0b1000_0001]), O::Binary(vec![0b1000_0001])],
     );
     assert!(equivalent(&actual, &expected), "{actual:?} != {expected:?}");
+}
+
+#[test]
+fn binary_reads_and_bit_copies_handle_unaligned_subbinary() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let mut heap = ProcessHeap::with_words(512);
+    let mut builder = TermBuilder::new(&mut heap);
+    let backing = builder
+        .binary(&[0b0100_0000, 0b1100_0000, 0b0100_0000])
+        .expect("backing");
+    let subject = builder.sub_binary(backing, 1, 16).expect("subbinary");
+    let needle = builder.binary(&[0b1000_0000]).expect("needle");
+
+    let mut unaligned_copy = [0];
+    copy_bitstring_range(subject, 4, &mut unaligned_copy, 8).expect("unaligned copy");
+    assert_eq!(unaligned_copy, [0b0001_1000]);
+    let mut aligned_copy = [0];
+    copy_bitstring_range(subject, 8, &mut aligned_copy, 8).expect("aligned copy");
+    assert_eq!(aligned_copy, [0b1000_0000]);
+
+    let mut allocator = FragmentingHeap(&mut heap);
+    let reference_subject = O::Binary(vec![0b1000_0001, 0b1000_0000]);
+    for (module, name, args) in [
+        ("erlang", "binary_to_list", vec![subject]),
+        (
+            "binary",
+            "at",
+            vec![subject, arinsal_term::Term::small(1).unwrap()],
+        ),
+        ("binary", "match", vec![subject, needle]),
+        ("binary", "split", vec![subject, needle]),
+    ] {
+        let bif = lookup(module, name, args.len() as u8).expect("BIF");
+        let mut ctx = Ctx::new(&mut allocator);
+        let actual = CallResult::Ok(to_owned(bif(&mut ctx, &args).expect("BIF succeeds")).unwrap());
+        let remote_args = if name == "at" {
+            vec![reference_subject.clone(), O::Int(1)]
+        } else if name == "binary_to_list" {
+            vec![reference_subject.clone()]
+        } else {
+            vec![reference_subject.clone(), O::Binary(vec![0b1000_0000])]
+        };
+        let expected = reference.call(module, name, &remote_args);
+        assert!(
+            equivalent(&actual, &expected),
+            "{module}:{name}: {actual:?} != {expected:?}"
+        );
+    }
 }
 
 #[test]
