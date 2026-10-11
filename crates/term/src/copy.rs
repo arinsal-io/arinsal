@@ -441,38 +441,38 @@ fn copy_sub_bits<H: HeapAlloc + ?Sized>(
         *to = (((words - 1) as u64) << 6) | HEAP_BITS;
         *to.add(1) = bits as u64;
         if words > 2 {
-            std::ptr::write_bytes(to.add(2).cast::<u8>(), 0, (words - 2) * 8);
+            let payload = (words - 2) * 8;
+            std::ptr::write_bytes(to.add(2).cast::<u8>(), 0, payload);
             let base = (*objp.add(1) & !3) as *const u8;
-            copy_binary_to_buffer(to.add(2).cast::<u8>(), base, start, bits);
+            let src_len = start.saturating_add(bits).div_ceil(8);
+            // The source window is the bitstring `size_object_x` measured, and
+            // `payload` is the zeroed heap-bitstring reserved for it.
+            let src = std::slice::from_raw_parts(base, src_len);
+            let dst = std::slice::from_raw_parts_mut(to.add(2).cast::<u8>(), payload);
+            copy_binary_to_buffer(dst, src, start, bits);
         }
         *argp = Term::from_ptr(to, 2).0;
     }
     Ok(())
 }
 
-fn copy_binary_to_buffer(dst: *mut u8, src: *const u8, src_offset: usize, size: usize) {
+fn copy_binary_to_buffer(dst: &mut [u8], src: &[u8], src_offset: usize, size: usize) {
     // Port of erts/emulator/beam/erl_bits.h:541 (`copy_binary_to_buffer`), OTP-29.1.1.
+    // `src` / `dst` are the live windows the caller already bounded.
     if size == 0 {
         return;
     }
     if src_offset.is_multiple_of(8) && size.is_multiple_of(8) {
-        // SAFETY: the caller reserved `size` bits of destination and the source
-        // window is inside the live bitstring.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.add(src_offset / 8), dst, size / 8);
-        }
+        let start = src_offset / 8;
+        let nbytes = size / 8;
+        dst[..nbytes].copy_from_slice(&src[start..start + nbytes]);
         return;
     }
     for i in 0..size {
         let src_bit = src_offset + i;
-        // SAFETY: `src_bit` lies in the window `size_object_x` measured.
-        let byte = unsafe { *src.add(src_bit / 8) };
+        let byte = src[src_bit / 8];
         let bit = (byte >> (7 - src_bit % 8)) & 1;
-        // SAFETY: `i` is inside the zeroed destination heap-bitstring payload.
-        unsafe {
-            let out = dst.add(i / 8);
-            *out |= bit << (7 - i % 8);
-        }
+        dst[i / 8] |= bit << (7 - i % 8);
     }
 }
 
