@@ -2,7 +2,10 @@
 //! them: single-pass flatmap merge, structural HAMT merge with node reuse and
 //! reduction-bounded yielding, and hash-sorted bulk HAMT construction.
 
-use super::{LIMIT, MAP, MapError, MapResult, bits, boxed, check, exact_cmp, key_cmp, term};
+use super::{
+    LIMIT, MAP, MAP_HEADER_FLATMAP, MapError, MapResult, bits, boxed, check, exact_cmp, key_cmp,
+    term,
+};
 use arinsal_term::{HeapAlloc, Term, TermError, exact_eq};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -165,7 +168,7 @@ pub(crate) fn flatmap_from_sorted<H: HeapAlloc + ?Sized>(
     for (slot, key) in slice[1..=n].iter_mut().zip(ks) {
         slot.write(bits(*key));
     }
-    slice[1 + n].write(MAP);
+    slice[1 + n].write(MAP_HEADER_FLATMAP);
     slice[2 + n].write(n as u64);
     slice[3 + n].write(ptr as u64 | 2);
     for (slot, value) in slice[4 + n..].iter_mut().zip(vs) {
@@ -207,7 +210,7 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
     let values_start = 3;
     let keys_tuple_start = values_start + capacity;
     let keys_start = keys_tuple_start + 1;
-    output[0].write(MAP);
+    output[0].write(MAP_HEADER_FLATMAP);
     output[1].write(0);
     output[2].write(bits(boxed(output_ptr.wrapping_add(keys_tuple_start))));
     output[keys_tuple_start].write(0);
@@ -785,7 +788,7 @@ fn flatmap_from_validated_list<H: HeapAlloc + ?Sized>(
     block[0] = term((allocated as u64) << 6);
     let map_at = 1 + allocated;
     let vs = map_at + 3;
-    block[map_at] = term(MAP);
+    block[map_at] = term(MAP_HEADER_FLATMAP);
     block[map_at + 1] = term(allocated as u64);
     block[map_at + 2] = term(ptr as u64 | 2);
 

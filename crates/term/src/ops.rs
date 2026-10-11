@@ -348,25 +348,201 @@ pub(crate) fn children(term: Term) -> Children {
 /// Number of words needed for a deep copy, counting shared objects each time.
 /// Port of `erts/emulator/beam/copy.c:88` (`size_object_x`), OTP-29.1.1.
 pub fn size_object(root: Term) -> usize {
-    size_object_inner(
-        root,
-        false,
-        std::collections::HashSet::new(),
-        LiteralSkip::None,
-        None,
-    )
+    size_object_x(root, None)
 }
 
 /// Words a literal-aware copy needs: literals outside the purge area are not copied.
 /// Port of erts/emulator/beam/copy.c:88 (size_object_x with a litopt), OTP-29.1.1.
 pub fn size_object_litopt(root: Term, literals: &crate::LiteralAreas) -> usize {
-    size_object_inner(
-        root,
-        false,
-        std::collections::HashSet::new(),
-        LiteralSkip::Kept(literals),
-        None,
-    )
+    size_object_x(root, Some(literals))
+}
+
+/// Flat size of `obj`. Sharing is not collapsed. Literals outside the purge area
+/// contribute nothing when `litopt` is set.
+/// Port of erts/emulator/beam/copy.c:88 (`size_object_x`), OTP-29.1.1.
+pub(crate) fn size_object_x(mut obj: Term, litopt: Option<&crate::LiteralAreas>) -> usize {
+    // `DECLARE_ESTACK` starts at DEF_ESTACK_SIZE (global.h:322).
+    let mut stack: SmallVec<[Term; 16]> = SmallVec::new();
+    let mut sum = 0usize;
+    // SAFETY: `obj` and every child pushed below are live terms owned by the caller.
+    // Each raw read is the word `size_object_x` reads for that primary tag or header.
+    unsafe {
+        loop {
+            match obj.0 & 3 {
+                1 => {
+                    let ptr = obj.raw_ptr();
+                    if lit_kept(litopt, ptr) {
+                        pop_size(&mut stack, &mut obj);
+                        if obj.0 == u64::MAX {
+                            return sum;
+                        }
+                        continue;
+                    }
+                    sum += 2;
+                    let head = Term(*ptr);
+                    if !head.is_immed() {
+                        stack.push(head);
+                    }
+                    obj = Term(*ptr.add(1));
+                }
+                2 => {
+                    let ptr = obj.raw_ptr();
+                    if lit_kept(litopt, ptr) {
+                        pop_size(&mut stack, &mut obj);
+                        if obj.0 == u64::MAX {
+                            return sum;
+                        }
+                        continue;
+                    }
+                    let hdr = *ptr;
+                    match hdr & 63 {
+                        crate::ARITY | crate::RECORD => {
+                            let arity = (hdr >> 6) as usize;
+                            // Empty tuple is the global literal and adds no words (copy.c:130).
+                            if arity == 0 {
+                                pop_size(&mut stack, &mut obj);
+                                if obj.0 == u64::MAX {
+                                    return sum;
+                                }
+                                continue;
+                            }
+                            sum += arity + 1;
+                            for i in 1..arity {
+                                let child = Term(*ptr.add(i));
+                                if !child.is_immed() {
+                                    stack.push(child);
+                                }
+                            }
+                            obj = Term(*ptr.add(arity));
+                        }
+                        crate::FUN => {
+                            // ERL_FUN_SIZE is 2 (thing word + entry); env is the flexible tail.
+                            let nfree = ((hdr >> 16) & 255) as usize;
+                            sum += 2 + nfree;
+                            if nfree == 0 {
+                                pop_size(&mut stack, &mut obj);
+                                if obj.0 == u64::MAX {
+                                    return sum;
+                                }
+                                continue;
+                            }
+                            for i in 1..nfree {
+                                let env = Term(*ptr.add(2 + i));
+                                if !env.is_immed() {
+                                    stack.push(env);
+                                }
+                            }
+                            obj = Term(*ptr.add(2));
+                        }
+                        crate::MAP => match (hdr >> 6) & 3 {
+                            0 => {
+                                let n = (*ptr.add(1) as usize) + 1;
+                                sum += n + 2;
+                                let mut child = ptr.add(2);
+                                for _ in 0..n {
+                                    let term = Term(*child);
+                                    child = child.add(1);
+                                    if !term.is_immed() {
+                                        stack.push(term);
+                                    }
+                                }
+                                pop_size(&mut stack, &mut obj);
+                                if obj.0 == u64::MAX {
+                                    return sum;
+                                }
+                            }
+                            1..=3 => {
+                                let sz = ((hdr >> 16) as u16).count_ones() as usize;
+                                let hdr_arity = if (hdr >> 6) & 3 == 1 {
+                                    0
+                                } else {
+                                    ((hdr >> 8) & 0xff) as usize
+                                };
+                                sum += 1 + sz + hdr_arity;
+                                if sz == 0 {
+                                    pop_size(&mut stack, &mut obj);
+                                    if obj.0 == u64::MAX {
+                                        return sum;
+                                    }
+                                    continue;
+                                }
+                                let head = ptr.add(1 + hdr_arity);
+                                let mut left = sz;
+                                while left > 1 {
+                                    left -= 1;
+                                    let term = Term(*head.add(left));
+                                    if !term.is_immed() {
+                                        stack.push(term);
+                                    }
+                                }
+                                obj = Term(*head);
+                            }
+                            _ => unreachable!(),
+                        },
+                        crate::SUB_BITS => {
+                            let orig = Term(*ptr.add(4));
+                            let underlying = *orig.raw_ptr();
+                            if underlying == (2 << 6) | crate::BIN_REF {
+                                // Sub-bits and its BinRef are one unit (copy.c:224-230).
+                                sum += 8;
+                            } else {
+                                // Match context over a heap bitstring: the copy is a
+                                // heap bitstring of the window, not the context (copy.c:233-238).
+                                let bits =
+                                    (*ptr.add(3) as usize).wrapping_sub(*ptr.add(2) as usize);
+                                sum += heap_bits_words(bits);
+                            }
+                            pop_size(&mut stack, &mut obj);
+                            if obj.0 == u64::MAX {
+                                return sum;
+                            }
+                        }
+                        _ => {
+                            sum += ((hdr >> 6) as usize) + 1;
+                            pop_size(&mut stack, &mut obj);
+                            if obj.0 == u64::MAX {
+                                return sum;
+                            }
+                        }
+                    }
+                }
+                3 => {
+                    pop_size(&mut stack, &mut obj);
+                    if obj.0 == u64::MAX {
+                        return sum;
+                    }
+                }
+                _ => {
+                    debug_assert!(false, "size_object: bad tag {:#x}", obj.0);
+                    pop_size(&mut stack, &mut obj);
+                    if obj.0 == u64::MAX {
+                        return sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn lit_kept(litopt: Option<&crate::LiteralAreas>, ptr: *const u64) -> bool {
+    // Port of copy.c:105 (`litopt && erts_is_literal && !in_literal_purge_area`).
+    litopt.is_some_and(|areas| areas.keeps(ptr as u64))
+}
+
+#[inline]
+fn pop_size(stack: &mut SmallVec<[Term; 16]>, obj: &mut Term) {
+    match stack.pop() {
+        Some(next) => *obj = next,
+        None => *obj = Term(u64::MAX),
+    }
+}
+
+#[inline]
+fn heap_bits_words(num_bits: usize) -> usize {
+    // Port of erl_bits.h:156-161 (`heap_bits_size`).
+    let nbytes = num_bits.div_ceil(8);
+    2 + nbytes.div_ceil(8)
 }
 
 /// `erts_debug:size_shared/1`: words with sharing preserved, ignoring every literal.
@@ -432,6 +608,17 @@ pub(crate) fn size_object_inner(
     skip: LiteralSkip<'_>,
     unshared_literals: Option<&crate::LiteralAreas>,
 ) -> usize {
+    // Sharing preservation is `copy_shared_calculate`. The default copier is
+    // `size_object_x` and does not build a visited set (copy.c:88).
+    if !preserve_sharing {
+        return match skip {
+            LiteralSkip::None => size_object_x(root, None),
+            LiteralSkip::Kept(areas) => size_object_x(root, Some(areas)),
+            LiteralSkip::All(_) => {
+                size_object_with_prior(root, false, &mut visited, None, skip, unshared_literals)
+            }
+        };
+    }
     size_object_with_prior(
         root,
         preserve_sharing,

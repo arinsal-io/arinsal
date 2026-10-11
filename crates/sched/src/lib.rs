@@ -502,6 +502,20 @@ pub enum Error {
     WrongMode,
 }
 
+/// Outcome of [`Scheduler::try_send_on_heap`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnHeapSend {
+    /// The main lock was not taken: the receiver is missing, not waiting, exiting,
+    /// executing on a dirty scheduler, or the lock was already held.
+    Unavailable,
+    /// The lock was held, and the caller left the message on a heap fragment.
+    Declined,
+    /// The message was queued, or the receiver exited before the queue push.
+    Queued,
+    /// The lock was held and the queue push failed.
+    Failed(Error),
+}
+
 /// Outcome of attempting an erts-style sig-free task lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignalFreeError {
@@ -1051,6 +1065,17 @@ fn progress_wait<R>(wait: impl FnOnce() -> R) -> R {
 /// thread that blocks thread progress while its process holds the cell is not waiting on
 /// this scheduler (erl_thr_progress.c:884-913, erts_thr_progress_prepare_wait /
 /// finalize_wait around a blocking wait, OTP-29.1.1).
+/// The receiver is not executing, so its heap stays put for the caller that holds
+/// the main lock. `RUNNING` owns the cell for the whole slice. `EXITED` is gone.
+/// A dirty job sets `dirty_runner`. `QUEUED` and `WAITING` are stable: collection
+/// fetches the outer queue before it scans (erl_gc.c:987).
+/// Port of erts/emulator/beam/erl_message.c:621 (`erts_try_alloc_message_on_heap`
+/// try-locks the main lock and rejects a volatile heap), OTP-29.1.1.
+fn receiver_heap_stable<T: Task>(process: &Process<T>) -> bool {
+    let state = process.state.load(Ordering::Acquire);
+    state != RUNNING && state != EXITED && process.dirty_runner.load(Ordering::Acquire) == 0
+}
+
 fn lock_cell<T: Task>(process: &Process<T>) -> std::sync::MutexGuard<'_, TaskCell<T>> {
     match process.cell.try_lock() {
         Ok(cell) => cell,
@@ -4735,6 +4760,63 @@ impl<T: Task> Scheduler<T> {
         }
         Ok(inspect(&cell.task))
     }
+    /// Run `body` while holding `pid`'s main lock, when the receiver is not executing.
+    ///
+    /// The task-cell mutex is the process main lock: `run_slice` sets `RUNNING`
+    /// and then holds the cell for the whole slice, and a dirty job does the
+    /// same after setting `dirty_runner`. `std::sync::Mutex` is not reentrant,
+    /// so a process that sends to itself fails the try-lock.
+    ///
+    /// Port of erts/emulator/beam/erl_message.c:661 (`erts_proc_trylock`) and
+    /// the volatile-heap check in `erts_try_alloc_message_on_heap`, OTP-29.1.1.
+    /// `None` means the caller should allocate a heap fragment instead.
+    pub fn try_with_task<R>(&self, pid: Pid, body: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let process = self.inner.table.lookup(pid)?;
+        if !receiver_heap_stable(&process) {
+            return None;
+        }
+        let mut cell = match process.cell.try_lock() {
+            Ok(cell) => cell,
+            Err(_) => return None,
+        };
+        if !receiver_heap_stable(&process) {
+            return None;
+        }
+        Some(body(&mut cell.task))
+    }
+    /// Copy helper for a sender that has no [`RunCtx`]: queue `prepare`'s message
+    /// before the main lock drops. A [`RunCtx`] send must use [`Self::try_with_task`]
+    /// and publish through that context, so the message stays on the sender's worker.
+    ///
+    /// Port of erts/emulator/beam/erl_message.c:874 (`erts_queue_proc_message` while
+    /// the main lock is held), OTP-29.1.1.
+    pub fn try_send_on_heap<E>(
+        &self,
+        from: Pid,
+        to: Pid,
+        prepare: impl FnOnce(&mut T) -> Result<Option<T::Message>, E>,
+    ) -> Result<OnHeapSend, E> {
+        let Some(process) = self.inner.table.lookup(to) else {
+            return Ok(OnHeapSend::Unavailable);
+        };
+        if !receiver_heap_stable(&process) {
+            return Ok(OnHeapSend::Unavailable);
+        }
+        let mut cell = match process.cell.try_lock() {
+            Ok(cell) => cell,
+            Err(_) => return Ok(OnHeapSend::Unavailable),
+        };
+        if !receiver_heap_stable(&process) {
+            return Ok(OnHeapSend::Unavailable);
+        }
+        let Some(message) = prepare(&mut cell.task)? else {
+            return Ok(OnHeapSend::Declined);
+        };
+        match self.send(from, to, message) {
+            Ok(()) | Err(Error::NoProcess) => Ok(OnHeapSend::Queued),
+            Err(error) => Ok(OnHeapSend::Failed(error)),
+        }
+    }
     /// Number of live process table elements, O(1) like `erts_ptab_count`.
     pub fn process_count(&self) -> usize {
         self.inner.table.ids.count()
@@ -5367,6 +5449,44 @@ mod dirty_state_tests {
 
         process.dirty_runner.store(1, Ordering::Release);
         assert!(scheduler.is_executing_dirty(pid));
+    }
+
+    #[test]
+    fn on_heap_send_requires_a_stable_receiver() {
+        let scheduler = Scheduler::<Idle>::simulation(Config::default(), 1);
+        let from = scheduler.spawn(Idle).unwrap();
+        let to = scheduler.spawn(Idle).unwrap();
+        let target = scheduler.inner.table.lookup(to).unwrap();
+        // A queued receiver is not executing. Collection fetches the outer queue
+        // before scanning, so the on-heap term is a root by then.
+        assert!(matches!(
+            scheduler
+                .try_send_on_heap(from, to, |_| Ok::<_, ()>(Some(())))
+                .unwrap(),
+            OnHeapSend::Queued
+        ));
+        target.state.store(WAITING, Ordering::Release);
+        assert!(matches!(
+            scheduler
+                .try_send_on_heap(from, to, |_| Ok::<_, ()>(Some(())))
+                .unwrap(),
+            OnHeapSend::Queued
+        ));
+        target.state.store(EXITED, Ordering::Release);
+        assert!(matches!(
+            scheduler
+                .try_send_on_heap(from, to, |_| Ok::<_, ()>(Some(())))
+                .unwrap(),
+            OnHeapSend::Unavailable
+        ));
+        target.state.store(RUNNING, Ordering::Release);
+        assert!(scheduler.try_with_task(to, |_| ()).is_none());
+        target.state.store(WAITING, Ordering::Release);
+        target.dirty_runner.store(1, Ordering::Release);
+        assert!(scheduler.try_with_task(to, |_| ()).is_none());
+        target.dirty_runner.store(0, Ordering::Release);
+        let _held = target.cell.lock().unwrap();
+        assert!(scheduler.try_with_task(to, |_| ()).is_none());
     }
 }
 

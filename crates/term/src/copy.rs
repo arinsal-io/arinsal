@@ -19,26 +19,45 @@ enum Job {
 /// Copy an Erlang term after sizing its entire reachable object graph.
 /// Sharing of ordinary heap objects is deliberately not retained, as in erts.
 pub fn copy_term<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Term, TermError> {
-    // Immediates and tuples of immediates (table rows, small messages) need no traversal.
-    if let Some(copied) = copy_flat(root, dst)? {
-        return Ok(copied);
+    // Port of erts/emulator/beam/copy.c:52 (`copy_object_x`): immediates are not sized.
+    if root.is_immed() {
+        return Ok(root);
     }
     validate_destination(root, dst)?;
-    copy_term_with_mode(root, dst, false, size_object(root), LiteralSkip::None)
+    let size = size_object(root);
+    copy_struct_x(root, size, dst, None)
 }
 
 /// Copy a term, keeping references to literals outside the collector's purge area.
 /// `literals` must be the snapshot used to size the destination.
-/// Port of erts/emulator/beam/copy.c:648 (copy_struct_x with a litopt), OTP-29.1.1.
+/// Port of erts/emulator/beam/copy.c:647 (copy_struct_x with a litopt), OTP-29.1.1.
 pub fn copy_term_litopt<H: HeapAlloc + ?Sized>(
     root: Term,
     dst: &mut H,
     literals: &LiteralAreas,
 ) -> Result<Term, TermError> {
+    if root.is_immed() {
+        return Ok(root);
+    }
     validate_destination(root, dst)?;
-    let skip = LiteralSkip::Kept(literals);
-    let size = size_object_inner(root, false, Default::default(), skip, None);
-    copy_term_with_mode(root, dst, false, size, skip)
+    let size = crate::size_object_litopt(root, literals);
+    copy_struct_x(root, size, dst, Some(literals))
+}
+
+/// `copy_struct` into `dst` using a size already returned by [`crate::size_object_litopt`]
+/// for the same `literals` snapshot. Does not walk the term to size it again.
+/// Port of erts/emulator/beam/copy.c:647 (`copy_struct_x`), OTP-29.1.1.
+pub fn copy_struct_litopt<H: HeapAlloc + ?Sized>(
+    root: Term,
+    dst: &mut H,
+    size: usize,
+    literals: &LiteralAreas,
+) -> Result<Term, TermError> {
+    if root.is_immed() || size == 0 {
+        return Ok(root);
+    }
+    validate_destination(root, dst)?;
+    copy_struct_x(root, size, dst, Some(literals))
 }
 
 /// `erts_debug:copy_shared/2`: preserve sharing and keep literal references
@@ -103,33 +122,397 @@ pub fn copy_term_preserving_sharing_with_cache<H: HeapAlloc + ?Sized>(
     copy_term_body(root, dst, true, size, cache, LiteralSkip::None, None)
 }
 
-/// Copy `root` when it is an immediate or a tuple whose elements are all immediates; `None`
-/// leaves the general traversal to the caller.
-/// Port of erts/emulator/beam/copy.c:648 (copy_struct_x, the tuple arm with no boxed
-/// elements), OTP-29.1.1.
-fn copy_flat<H: HeapAlloc + ?Sized>(root: Term, dst: &mut H) -> Result<Option<Term>, TermError> {
-    if !root.is_pointer() {
-        return Ok(Some(root));
+/// Cheney copy into one pre-sized heap block. Constant cons cells and leaf
+/// objects grow down from the end; objects with children grow up from the start.
+/// Port of erts/emulator/beam/copy.c:647 (`copy_struct_x`), OTP-29.1.1.
+fn copy_struct_x<H: HeapAlloc + ?Sized>(
+    root: Term,
+    size: usize,
+    dst: &mut H,
+    litopt: Option<&LiteralAreas>,
+) -> Result<Term, TermError> {
+    if root.is_immed() || size == 0 {
+        return Ok(root);
     }
-    let Some(header) = root.header() else {
-        return Ok(None);
+    let base = dst.alloc(size).ok_or(TermError::HeapFull)?;
+    copy_struct_into(root, base, size, dst, litopt)
+}
+
+enum CopyAt {
+    Scan,
+    List(*mut u64, Term),
+    Boxed(*mut u64, Term),
+}
+
+fn copy_struct_into<H: HeapAlloc + ?Sized>(
+    root: Term,
+    base: *mut u64,
+    size: usize,
+    dst: &mut H,
+    litopt: Option<&LiteralAreas>,
+) -> Result<Term, TermError> {
+    let hstart = base;
+    let hsize = size * 8;
+    let mut hp = base;
+    let mut htop = base;
+    // SAFETY: `base` addresses `size` reserved words; `hbot` is the end pointer.
+    let mut hbot = unsafe { base.add(size) };
+    let mut res = 0u64;
+    let mut const_tuple: *mut u64 = std::ptr::null_mut();
+    let mut at = match root.0 & 3 {
+        1 => CopyAt::List(&mut res, root),
+        2 => CopyAt::Boxed(&mut res, root),
+        _ => return Ok(root),
     };
-    if header & 63 != ARITY || root.bits() == ((&EMPTY_TUPLE as *const u64 as u64) | 2) {
-        return Ok(None);
-    }
-    let words = 1 + (header >> 6) as usize;
-    // SAFETY: a live tuple has its header and `words - 1` element words initialized.
-    let from = unsafe { root.raw_ptr() };
-    for index in 1..words {
-        // SAFETY: element words follow the header.
-        if Term(unsafe { *from.add(index) }).is_pointer() {
-            return Ok(None);
+    // SAFETY: `base` is `size` writable words that do not alias `root`. Every
+    // source pointer is a live cons or boxed object. Off-heap owners are
+    // retained on `dst` the way copy_struct links them into `off_heap`.
+    unsafe {
+        loop {
+            match at {
+                CopyAt::Scan => {
+                    if hp == htop {
+                        debug_assert_eq!(htop, hbot, "copy_struct htop/hbot");
+                        return Ok(Term(res));
+                    }
+                    let obj = Term(*hp);
+                    match obj.0 & 3 {
+                        3 => hp = hp.add(1),
+                        1 => {
+                            let objp = obj.raw_ptr();
+                            if in_copy_area(objp, hstart, hsize) {
+                                hp = hp.add(1);
+                            } else {
+                                let argp = hp;
+                                hp = hp.add(1);
+                                at = CopyAt::List(argp, obj);
+                            }
+                        }
+                        2 => {
+                            let objp = obj.raw_ptr();
+                            if in_copy_area(objp, hstart, hsize) {
+                                hp = hp.add(1);
+                            } else {
+                                let argp = hp;
+                                hp = hp.add(1);
+                                at = CopyAt::Boxed(argp, obj);
+                            }
+                        }
+                        0 => {
+                            let hdr = obj.0;
+                            if header_is_thing(hdr) || hp == const_tuple {
+                                hp = hp.add(copy_scan_skip(hdr));
+                            } else {
+                                hp = hp.add(1);
+                            }
+                        }
+                        _ => hp = hp.add(1),
+                    }
+                }
+                CopyAt::List(mut argp, mut obj) => {
+                    let mut objp = obj.raw_ptr();
+                    if lit_kept(litopt, objp) {
+                        *argp = obj.0;
+                        at = CopyAt::Scan;
+                        continue;
+                    }
+                    loop {
+                        let tp = argp;
+                        let elem = Term(*objp);
+                        let tailp = if elem.is_immed() {
+                            hbot = hbot.sub(2);
+                            *hbot = elem.0;
+                            hbot.add(1)
+                        } else {
+                            *htop = elem.0;
+                            let tailp = htop.add(1);
+                            htop = htop.add(2);
+                            tailp
+                        };
+                        *tp = Term::from_ptr(tailp.sub(1), 1).0;
+                        obj = Term(*objp.add(1));
+                        if obj.0 & 3 != 1 {
+                            argp = tailp;
+                            break;
+                        }
+                        objp = obj.raw_ptr();
+                        if lit_kept(litopt, objp) {
+                            *tailp = obj.0;
+                            at = CopyAt::Scan;
+                            break;
+                        }
+                        argp = tailp;
+                    }
+                    if matches!(at, CopyAt::Scan) {
+                        continue;
+                    }
+                    match obj.0 & 3 {
+                        3 => {
+                            *argp = obj.0;
+                            at = CopyAt::Scan;
+                        }
+                        2 => at = CopyAt::Boxed(argp, obj),
+                        _ => {
+                            debug_assert!(false, "copy_struct bad list tail {:#x}", obj.0);
+                            *argp = obj.0;
+                            at = CopyAt::Scan;
+                        }
+                    }
+                }
+                CopyAt::Boxed(argp, obj) => {
+                    let mut objp = obj.raw_ptr();
+                    if lit_kept(litopt, objp) {
+                        *argp = obj.0;
+                        at = CopyAt::Scan;
+                        continue;
+                    }
+                    let hdr = *objp;
+                    match hdr & 63 {
+                        ARITY => {
+                            let n = (hdr >> 6) as usize;
+                            if n == 0 {
+                                *argp = (std::ptr::from_ref(&EMPTY_TUPLE) as u64) | 2;
+                                at = CopyAt::Scan;
+                                continue;
+                            }
+                            *argp = Term::from_ptr(htop, 2).0;
+                            let tp = htop;
+                            *htop = *objp;
+                            htop = htop.add(1);
+                            objp = objp.add(1);
+                            let mut const_flag = true;
+                            for _ in 0..n {
+                                let elem = Term(*objp);
+                                objp = objp.add(1);
+                                if !elem.is_immed() {
+                                    const_flag = false;
+                                }
+                                *htop = elem.0;
+                                htop = htop.add(1);
+                            }
+                            if const_flag {
+                                const_tuple = tp;
+                            }
+                        }
+                        RECORD => {
+                            let n = (hdr >> 6) as usize;
+                            *argp = Term::from_ptr(htop, 2).0;
+                            let words = n + 1;
+                            std::ptr::copy_nonoverlapping(objp, htop, words);
+                            htop = htop.add(words);
+                        }
+                        SUB_BITS => {
+                            copy_sub_bits(obj, objp, argp, &mut hbot, dst)?;
+                        }
+                        FUN => {
+                            let nfree = ((hdr >> 16) & 255) as usize;
+                            let words = 2 + nfree;
+                            let dst_fun = htop;
+                            std::ptr::copy_nonoverlapping(objp, dst_fun, words);
+                            htop = htop.add(words);
+                            *argp = Term::from_ptr(dst_fun, 2).0;
+                            let entry = *dst_fun.add(1);
+                            if hdr & (1 << 24) != 0 {
+                                dst.retain_export(clone_export_entry(entry as *const ExportEntry));
+                            } else {
+                                dst.retain_fun(clone_fun_entry(entry as *const FunEntry));
+                            }
+                        }
+                        EXTERNAL_PID | EXTERNAL_PORT | EXTERNAL_REF => {
+                            copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, false)?;
+                        }
+                        MAP => {
+                            copy_map(objp, hdr, argp, &mut htop);
+                        }
+                        REF if crate::is_magic_ref_thing_with_hdr(hdr, *objp.add(1)) => {
+                            let ptr = *objp.add(1) as *const crate::MagicRef;
+                            Arc::increment_strong_count(ptr);
+                            dst.retain_magic(Arc::from_raw(ptr));
+                            copy_off_heap_thing(objp, hdr, argp, &mut htop, dst, true)?;
+                        }
+                        _ => {
+                            let words = ((hdr >> 6) as usize) + 1;
+                            hbot = hbot.sub(words);
+                            std::ptr::copy_nonoverlapping(objp, hbot, words);
+                            *argp = Term::from_ptr(hbot, 2).0;
+                        }
+                    }
+                    at = CopyAt::Scan;
+                }
+            }
         }
     }
-    let to = dst.alloc(words).ok_or(TermError::HeapFull)?;
-    // SAFETY: the allocation holds `words` writable words and cannot overlap the source.
-    unsafe { std::ptr::copy_nonoverlapping(from, to, words) };
-    Ok(Some(Term::from_ptr(to, 2)))
+}
+
+fn copy_map(objp: *const u64, hdr: u64, argp: *mut u64, htop: &mut *mut u64) {
+    // Port of copy.c:910-932. Flatmap words are header, size, keys, values.
+    // HAMT heads copy the header then fall through to the node payload.
+    let tp = *htop;
+    let map_type = (hdr >> 6) & 3;
+    // SAFETY: the source map is live and `size_object_x` reserved these words.
+    unsafe {
+        match map_type {
+            0 => {
+                let words = (*objp.add(1) as usize) + 3;
+                *argp = Term::from_ptr(tp, 2).0;
+                std::ptr::copy_nonoverlapping(objp, tp, words);
+                *htop = tp.add(words);
+            }
+            2 | 3 => {
+                *tp = *objp;
+                let n = 1 + ((hdr >> 16) as u16).count_ones() as usize;
+                std::ptr::copy_nonoverlapping(objp.add(1), tp.add(1), n);
+                *htop = tp.add(1 + n);
+                *argp = Term::from_ptr(tp, 2).0;
+            }
+            1 => {
+                let n = 1 + ((hdr >> 16) as u16).count_ones() as usize;
+                std::ptr::copy_nonoverlapping(objp, tp, n);
+                *htop = tp.add(n);
+                *argp = Term::from_ptr(tp, 2).0;
+            }
+            _ => debug_assert!(false, "copy_struct bad hashmap type {map_type}"),
+        }
+    }
+}
+
+fn copy_off_heap_thing<H: HeapAlloc + ?Sized>(
+    objp: *const u64,
+    hdr: u64,
+    argp: *mut u64,
+    htop: &mut *mut u64,
+    dst: &mut H,
+    magic_already_retained: bool,
+) -> Result<(), TermError> {
+    // Port of copy.c:882-908 (`L_off_heap_node_container_common`).
+    let words = ((hdr >> 6) as usize) + 1;
+    let tp = *htop;
+    // SAFETY: the external or magic thing is live and the destination has `words` free.
+    unsafe {
+        std::ptr::copy_nonoverlapping(objp, tp, words);
+        *argp = Term::from_ptr(tp, 2).0;
+        *htop = tp.add(words);
+        if !magic_already_retained {
+            let ptr = *tp.add(1) as *const Node;
+            Arc::increment_strong_count(ptr);
+            dst.retain_node(Arc::from_raw(ptr));
+        }
+    }
+    Ok(())
+}
+
+fn copy_sub_bits<H: HeapAlloc + ?Sized>(
+    obj: Term,
+    objp: *const u64,
+    argp: *mut u64,
+    hbot: &mut *mut u64,
+    dst: &mut H,
+) -> Result<(), TermError> {
+    // Port of copy.c:812-864. A BinRef is copied with its sub-bits; a match
+    // context over a heap bitstring becomes a heap bitstring of that window.
+    // SAFETY: `obj` is a live sub-bits. Word 4 is its original boxed term. The
+    // destination tail has the words `size_object_x` reserved for this object,
+    // and those words do not overlap the source.
+    unsafe {
+        let orig = Term(*objp.add(4));
+        let underlying = orig.raw_ptr();
+        let uhdr = *underlying;
+        if uhdr & 63 == BIN_REF {
+            crate::bits::writable_finalize(obj);
+            let to_br = (*hbot).sub(3);
+            *hbot = to_br;
+            let to_sb = (*hbot).sub(5);
+            *hbot = to_sb;
+            std::ptr::copy_nonoverlapping(underlying, to_br, 3);
+            std::ptr::copy_nonoverlapping(objp, to_sb, 5);
+            *to_sb.add(4) = Term::from_ptr(to_br, 2).0;
+            *argp = Term::from_ptr(to_sb, 2).0;
+            let (ptr, flags) =
+                crate::bits::clone_binary_owner(Term::from_ptr(underlying.cast_mut(), 2));
+            crate::bits::retain_cloned_binary_owner(dst, ptr, flags)?;
+            return Ok(());
+        }
+        let start = *objp.add(2) as usize;
+        let end = *objp.add(3) as usize;
+        let bits = end.wrapping_sub(start);
+        let words = heap_bits_words(bits);
+        let to = (*hbot).sub(words);
+        *hbot = to;
+        *to = (((words - 1) as u64) << 6) | HEAP_BITS;
+        *to.add(1) = bits as u64;
+        if words > 2 {
+            std::ptr::write_bytes(to.add(2).cast::<u8>(), 0, (words - 2) * 8);
+            let base = (*objp.add(1) & !3) as *const u8;
+            copy_binary_to_buffer(to.add(2).cast::<u8>(), base, start, bits);
+        }
+        *argp = Term::from_ptr(to, 2).0;
+    }
+    Ok(())
+}
+
+fn copy_binary_to_buffer(dst: *mut u8, src: *const u8, src_offset: usize, size: usize) {
+    // Port of erts/emulator/beam/erl_bits.h:541 (`copy_binary_to_buffer`), OTP-29.1.1.
+    if size == 0 {
+        return;
+    }
+    if src_offset.is_multiple_of(8) && size.is_multiple_of(8) {
+        // SAFETY: the caller reserved `size` bits of destination and the source
+        // window is inside the live bitstring.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.add(src_offset / 8), dst, size / 8);
+        }
+        return;
+    }
+    for i in 0..size {
+        let src_bit = src_offset + i;
+        // SAFETY: `src_bit` lies in the window `size_object_x` measured.
+        let byte = unsafe { *src.add(src_bit / 8) };
+        let bit = (byte >> (7 - src_bit % 8)) & 1;
+        // SAFETY: `i` is inside the zeroed destination heap-bitstring payload.
+        unsafe {
+            let out = dst.add(i / 8);
+            *out |= bit << (7 - i % 8);
+        }
+    }
+}
+
+#[inline]
+fn lit_kept(litopt: Option<&LiteralAreas>, ptr: *const u64) -> bool {
+    litopt.is_some_and(|areas| areas.keeps(ptr as u64))
+}
+
+#[inline]
+fn in_copy_area(ptr: *const u64, start: *mut u64, nbytes: usize) -> bool {
+    // Port of erl_alloc.h `ErtsInArea` as used by copy.c:712.
+    (ptr as usize).wrapping_sub(start as usize) < nbytes
+}
+
+#[inline]
+fn header_is_thing(hdr: u64) -> bool {
+    // Port of erl_term.h:170-175. Tuples and records are transparent.
+    !((hdr & 0x3b) == 0 || (hdr & 0x3f) == RECORD)
+}
+
+#[inline]
+fn copy_scan_skip(hdr: u64) -> usize {
+    // Port of erl_term.h:310 (`header_arity`) and copy.c:951-956, OTP-29.1.1.
+    // Flatmaps store MAP_HEADER_FLATMAP, so the arity field is 1 and this skip
+    // covers the header plus the raw size word. HAMT nodes store arity 0.
+    let sub = hdr & 63;
+    let arity = if sub == MAP {
+        ((hdr >> 8) & 0xff) as usize
+    } else if sub == FUN {
+        1
+    } else {
+        (hdr >> 6) as usize
+    };
+    arity + 1
+}
+
+#[inline]
+fn heap_bits_words(num_bits: usize) -> usize {
+    let nbytes = num_bits.div_ceil(8);
+    2 + nbytes.div_ceil(8)
 }
 
 fn validate_destination<H: HeapAlloc + ?Sized>(root: Term, dst: &H) -> Result<(), TermError> {
@@ -145,24 +528,6 @@ fn validate_destination<H: HeapAlloc + ?Sized>(root: Term, dst: &H) -> Result<()
         stack.extend(crate::ops::children(term).filter(|child| child.is_pointer()));
     }
     Ok(())
-}
-
-fn copy_term_with_mode<H: HeapAlloc + ?Sized>(
-    root: Term,
-    dst: &mut H,
-    preserve_sharing: bool,
-    size: usize,
-    skip: LiteralSkip<'_>,
-) -> Result<Term, TermError> {
-    copy_term_body(
-        root,
-        dst,
-        preserve_sharing,
-        size,
-        &mut SharedCopyCache::default(),
-        skip,
-        None,
-    )
 }
 
 fn copy_term_body<H: HeapAlloc + ?Sized>(

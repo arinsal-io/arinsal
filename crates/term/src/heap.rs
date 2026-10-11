@@ -8,8 +8,8 @@ use crate::record::RecordSnapshot;
 use crate::record_table::RecordLayout;
 use crate::{
     ARITY, Atom, BIN_REF, EMPTY_TUPLE, EXTERNAL_PID, EXTERNAL_PORT, EXTERNAL_REF, ExportEntry,
-    FLOAT, FunEntry, HEAP_BITS, MAP, MAX_SMALL, MIN_SMALL, NEG_BIG, Node, POS_BIG, RECORD, REF,
-    SUB_BITS, Term, TermError, TermKind, cmp, exact_eq,
+    FLOAT, FunEntry, HEAP_BITS, MAP_HEADER_FLATMAP, MAX_SMALL, MIN_SMALL, NEG_BIG, Node, POS_BIG,
+    RECORD, REF, SUB_BITS, Term, TermError, TermKind, cmp, exact_eq,
 };
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
 use num_bigint::{BigInt, Sign};
@@ -1994,7 +1994,7 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         let p = self.words(3 + values.len())?;
         // SAFETY: header, size, keys, values are reserved.
         unsafe {
-            *p = MAP;
+            *p = MAP_HEADER_FLATMAP;
             *p.add(1) = values.len() as u64;
             *p.add(2) = keys.bits();
             for (i, value) in values.iter().enumerate() {
