@@ -49,6 +49,23 @@ cargo run -p arinsal-cli -- --version
 See [`examples/arinsal_demo`](examples/arinsal_demo/README.md) for an Elixir
 application used to compare workloads on Arinsal and ERTS.
 
+## Tests
+
+The argument-parser differential tests use the installed OTP emulator as a
+reference. They resolve the OTP root from `ARINSAL_OTP_ROOT` or from `erl` on
+`PATH`. They launch `erlexec` directly and set `PROGNAME=erl`. This avoids
+changes in a package wrapper's script name from changing Erlang launch
+arguments.
+
+Run the argument-parser differential tests with:
+
+```sh
+cargo nextest run -p arinsal-args
+```
+
+Set `ARINSAL_OTP_ROOT` to the directory reported by `code:root_dir()` to select
+an OTP installation explicitly.
+
 ## License
 
 Arinsal is licensed under Apache-2.0. See [LICENSE](LICENSE).
