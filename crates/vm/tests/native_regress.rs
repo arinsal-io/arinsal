@@ -3,6 +3,7 @@
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
+use similar_asserts::assert_eq;
 use std::process::Command;
 
 const CHILD: &str = "ARINSAL_NATIVE_REGRESS_CHILD";
@@ -137,12 +138,21 @@ run() ->
 // Each case is evaluated separately so one mismatch names its case. Stack frames are cut to
 // {M,F,Arity-or-Args} because line information of the caller differs between runs.
 const SOURCE: &str = r#"-module(native_regress_test).
--export([run/0]).
+-export([run/0, yget/2, ykey/2]).
 
 top({'EXIT', {Reason, [{M, F, A, _} | _]}}) -> {Reason, M, F, A};
 top(Other) -> Other.
 
 id(X) -> X.
+% Exported so the map stays untyped. A tuple key plus a call spills both into Y,
+% which is the boxed-key map_get / is_map_key path that reads the map after the header test.
+yget(K, M) when is_tuple(K) ->
+    yid(),
+    map_get(K, M).
+ykey(K, M) when is_tuple(K) ->
+    yid(),
+    is_map_key(K, M).
+yid() -> ok.
 
 ib(B) when is_binary(B) -> yes;
 ib(_) -> no.
@@ -303,6 +313,11 @@ run() ->
      [max(id({1.0, b}), id({1, b})), min(id(1), id(1.0)), recs(),
       [ea(T) || T <- [apply, apply_last, double, fixed]]],
      [bsi(), cl(), rd()],
+     begin
+         K = {key, 1},
+         M = #{K => value, a => 1, b => 2, c => 3, d => 4, e => 5, f => 6, g => 7},
+         [yget(K, M), ykey(K, M), ykey({missing, 2}, M), top(catch yget({nope}, not_a_map))]
+     end,
      begin
          Off = list_to_binary(lists:duplicate(80, $a)),
          Part = binary:part(Off, 1, 3),

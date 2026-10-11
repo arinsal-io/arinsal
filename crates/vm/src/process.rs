@@ -6896,6 +6896,51 @@ impl Vm {
         Ok(pid)
     }
 
+    /// Run `module`'s `-on_load` before `user_ip` when this load did not go through `code_server`.
+    fn arm_entry_on_load(
+        &mut self,
+        process: &mut Process,
+        module_id: usize,
+        user_ip: usize,
+        arity: usize,
+    ) -> Result<(), VmError> {
+        let Some((function, on_arity)) = self
+            .code
+            .code_meta
+            .get(module_id)
+            .and_then(|meta| meta.as_ref())
+            .and_then(|meta| meta.on_load.clone())
+        else {
+            return Ok(());
+        };
+        let Some(on_ip) = Self::on_load_entry(&self.code.modules[module_id], &function, on_arity)
+        else {
+            return Ok(());
+        };
+        if on_ip == user_ip {
+            return Ok(());
+        }
+        let mut heap = arinsal_term::VecHeap::new();
+        let mut saved = Vec::with_capacity(arity);
+        for &arg in &process.x[..arity] {
+            saved.push(
+                arinsal_term::copy_term(arg, &mut heap)
+                    .map_err(|error| VmError::Load(format!("on_load arguments: {error:?}")))?,
+            );
+        }
+        crate::calls::push_continuation(process, module_id, user_ip, 0)?;
+        process.cold_mut().entry_args_after_on_load =
+            Some(crate::proc_create::EntryArgsAfterOnLoad {
+                _heap: heap,
+                args: saved,
+                module: module_id,
+                ip: user_ip,
+            });
+        process.ip = on_ip;
+        process.native_pc = None;
+        Ok(())
+    }
+
     /// Run an exported function with schedulable BEAM processes.
     pub fn eval_scheduled(
         &mut self,
@@ -7037,6 +7082,10 @@ impl Vm {
         process.cold_mut().initial_call =
             Some((module.to_owned(), function.to_owned(), args.len() as u8));
         process.entry = true;
+        // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1.
+        // A direct `eval_scheduled` has no `code_server` to run `-on_load` before the call.
+        // The entry process runs that function first and continues only when it returns `ok`.
+        self.arm_entry_on_load(&mut process, module_id, ip, args.len())?;
         // Port of erts/emulator/beam/erl_init.c:2540 (erl_first_process_otp), OTP-29.1.1:
         // the first process gets the first pid; it runs once the system processes
         // exist, as erts starts its schedulers only after spawning them.

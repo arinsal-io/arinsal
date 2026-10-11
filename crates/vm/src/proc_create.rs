@@ -849,6 +849,18 @@ pub(crate) struct ProcessCold {
     pub(crate) monitor_tags: Tracked<std::collections::BTreeMap<u64, arinsal_etf::OwnedTerm>>,
     /// Registered name of monitors created by name; their `DOWN` object is `{Name, Node}`.
     pub(crate) monitor_names: std::collections::BTreeMap<u64, String>,
+    /// Arguments of an `eval_scheduled` entry, restored when its `-on_load` prelude returns.
+    ///
+    /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.
+    pub(crate) entry_args_after_on_load: Option<EntryArgsAfterOnLoad>,
+}
+
+/// Entry arguments held aside while `-on_load` runs as that process's first function.
+pub(crate) struct EntryArgsAfterOnLoad {
+    pub(crate) _heap: arinsal_term::VecHeap,
+    pub(crate) args: Vec<Term>,
+    pub(crate) module: usize,
+    pub(crate) ip: usize,
 }
 
 pub(crate) struct PersistentGetAll {
@@ -880,6 +892,55 @@ pub(crate) struct BifTrapPending {
     pub(crate) callee: (arinsal_term::Atom, arinsal_term::Atom),
 }
 impl Process {
+    /// `true` when `-on_load` did not return `ok` and the entry call must not run.
+    ///
+    /// A matching continuation that returned `ok` has its saved arguments copied back
+    /// into X and stays armed only once.
+    pub(crate) fn finish_on_load_prelude(&mut self, module: usize, ip: usize) -> bool {
+        let matches = self
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.entry_args_after_on_load.as_ref())
+            .is_some_and(|saved| saved.module == module && saved.ip == ip);
+        if !matches {
+            return false;
+        }
+        let ok = self.x[0]
+            .as_atom()
+            .and_then(|atom| arinsal_term::global_atoms().text(atom))
+            == Some("ok");
+        if !ok {
+            if let Some(cold) = self.cold.as_mut() {
+                cold.entry_args_after_on_load = None;
+            }
+            return true;
+        }
+        let args = self
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.entry_args_after_on_load.as_ref())
+            .map(|saved| saved.args.clone())
+            .unwrap_or_default();
+        if self.x.len() < args.len() {
+            let mut registers = self.x.to_vec();
+            registers.resize(args.len(), Term::NIL);
+            self.x = registers.into();
+        }
+        for (index, arg) in args.iter().enumerate() {
+            self.x[index] = *arg;
+        }
+        self.gc_live = args.len();
+        if let Some(saved) = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.entry_args_after_on_load.as_mut())
+        {
+            // One return into the entry. A later call to the same ip is not the prelude.
+            saved.module = usize::MAX;
+        }
+        false
+    }
+
     /// Returns the BeamAsm ABI prefix for direct native entry and runtime hooks.
     pub fn native_header(&mut self) -> &mut ProcessHeader {
         &mut self.header

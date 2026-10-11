@@ -291,6 +291,12 @@ pub(super) fn return_to(p: &mut Process) -> Option<Term> {
     let Some((false, module, ip)) = crate::stacktrace::decode_tag(cp) else {
         return Some(p.x[0]);
     };
+    // `eval_scheduled` runs `-on_load` first and returns here into the requested
+    // function. A non-`ok` result is the load failure; the entry is not called.
+    if p.finish_on_load_prelude(module, ip) {
+        p.heap.release_stack(1);
+        return Some(p.x[0]);
+    }
     p.module = module;
     p.ip = ip;
     p.heap.release_stack(1);

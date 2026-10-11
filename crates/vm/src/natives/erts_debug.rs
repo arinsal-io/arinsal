@@ -2267,6 +2267,12 @@ fn internal_state_set(
         ) {
             return Err(badarg());
         }
+        // Port of erts/emulator/beam/erl_process.c:2103 (handle_delayed_dealloc), OTP-29.1.1.
+        // Refc binaries released with a literal area are queued on the allocating
+        // scheduler; this wait is what code_SUITE uses before erlang:memory(binary).
+        if kind == "deallocations" {
+            arinsal_alloc::typed::drain_delayed_deallocations();
+        }
         let runtime = process.runtime.as_ref().ok_or_else(badarg)?.clone();
         if let Some(completion) = process.cold_mut().debug_wait_completion.clone() {
             if completion.load(Ordering::Acquire) {

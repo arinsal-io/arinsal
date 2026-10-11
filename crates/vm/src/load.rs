@@ -1185,6 +1185,21 @@ impl Vm {
         Ok(id)
     }
 
+    /// Instruction index of a module's `-on_load` function, exported or local.
+    pub(crate) fn on_load_entry(
+        module: &arinsal_loader::Module,
+        function: &str,
+        arity: u8,
+    ) -> Option<usize> {
+        module.export(function, arity).or_else(|| {
+            module
+                .functions
+                .iter()
+                .find(|(_, name, found)| name == function && *found == arity)
+                .map(|(start, _, _)| start + 1)
+        })
+    }
+
     pub(crate) fn load_named(&mut self, name: &str) -> Result<usize, VmError> {
         self.refresh_code();
         if let Some(&id) = self.code.loaded.get(name) {
