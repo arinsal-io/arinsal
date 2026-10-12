@@ -1359,6 +1359,7 @@ pub(crate) fn live(process: &Process, pid: Pid) -> Result<bool, VmError> {
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:815-852 (`pi_args`), OTP-29.1.1.
+#[derive(Clone)]
 enum DirectInfoItems {
     Singleton(Term),
     List(Vec<Term>),
@@ -1387,6 +1388,64 @@ fn process_info_direct_items(item: Term) -> Option<DirectInfoItems> {
 
 // Port of erts/emulator/beam/erl_bif_info.c:1624-1633, 1742-1755, and 1982-1991,
 // OTP-29.1.1: these values are immediate and are built on the requesting process heap.
+/// Items a process reads of itself without the general item table: the message queue
+/// length, the heap size and the status, which are plain counters for the caller.
+fn self_direct_key(key: Term) -> bool {
+    matches!(
+        key.as_atom(),
+        Some(arinsal_term::atoms::MESSAGE_QUEUE_LEN)
+            | Some(arinsal_term::atoms::HEAP_SIZE)
+            | Some(arinsal_term::atoms::STATUS)
+    )
+}
+
+fn self_direct_items(items: &DirectInfoItems) -> bool {
+    match items {
+        DirectInfoItems::Singleton(key) => self_direct_key(*key),
+        DirectInfoItems::List(keys) => keys.iter().copied().all(self_direct_key),
+    }
+}
+
+/// `process_info(self(), Item)` for the counter items. The heap size is read before the
+/// drain, as `process_info` takes its snapshot first, and the drain fetches queued signals as
+/// erts does for the caller (erl_bif_info.c:1236-1250, 1742-1752), OTP-29.1.1.
+fn process_info_self_direct(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    items: DirectInfoItems,
+) -> Result<Term, VmError> {
+    let heap_size = process.heap.heap_size_words();
+    process.drain(ctx)?;
+    let queue_len = process.inbox.len();
+    let value = |key: Term| -> Result<Term, VmError> {
+        Ok(match key.as_atom() {
+            Some(arinsal_term::atoms::MESSAGE_QUEUE_LEN) => {
+                Term::small(queue_len as i64).ok_or_else(badarg)?
+            }
+            Some(arinsal_term::atoms::HEAP_SIZE) => {
+                Term::small(heap_size as i64).ok_or_else(badarg)?
+            }
+            _ => atom("running"),
+        })
+    };
+    match items {
+        DirectInfoItems::Singleton(key) => {
+            let value = value(key)?;
+            make_tuple(process, &[key, value])
+        }
+        DirectInfoItems::List(keys) => {
+            let pairs = keys
+                .into_iter()
+                .map(|key| {
+                    let value = value(key)?;
+                    make_tuple(process, &[key, value])
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            make_list(process, pairs)
+        }
+    }
+}
+
 fn process_info_direct(
     caller: &mut Process,
     target: &Process,
@@ -1455,6 +1514,12 @@ fn process_info_call(
     }
     let pid = Pid::from_term(target).ok_or_else(badarg)?;
     if pid == ctx.pid() {
+        if let Some(items) = direct_items
+            .as_ref()
+            .filter(|items| self_direct_items(items))
+        {
+            return process_info_self_direct(process, ctx, items.clone());
+        }
         return process_info(Some(vm), process, ctx, item, atom("running"), true);
     }
     // A running erts process publishes sends as they happen. Arinsal buffers them per
