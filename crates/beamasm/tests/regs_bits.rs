@@ -74,22 +74,6 @@ fn finish(asm: &mut BeamModuleAssembler) {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn match_runtime_preserves_live_x_registers_and_arguments() {
-    let mut asm = BeamModuleAssembler::new();
-    asm.emit_i_func_label(1).unwrap();
-    asm.emit_i_bs_match(ArgVal::X(0), 99, ArgVal::X(1), match_hook as BsMatchHelper)
-        .unwrap();
-    finish(&mut asm);
-    let (_, regs) = execute(asm, &[0x111, 0x222, 0x333, 0x444, 0x555, 0x666]);
-    SEEN.with(|seen| assert_eq!(&*seen.borrow(), &[1, 0x111, 0x222, 0]));
-    assert_eq!(
-        arinsal_beamasm::rt::fixture_words(&regs.x_reg_array[..6]),
-        [0x111, 0x222, 0x333, 0x444, 0x555, 0x666]
-    );
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
 fn writable_runtime_publishes_heap_and_stack_pointers() {
     let mut asm = BeamModuleAssembler::new();
     asm.emit_i_func_label(1).unwrap();

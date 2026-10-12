@@ -3861,12 +3861,14 @@ pub extern "C" fn arinsal_beamasm_bs_match(
     value: u64,
     _unit: u64,
 ) -> u64 {
-    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+    // Every operation here is a HeapOnlyAlloc runtime call: the operands arrive as
+    // arguments, the heap space was reserved by the preceding heap test, nothing collects and
+    // the X registers are not read.
+    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:170-182 (emit_enter_runtime with
+    // Update::eHeapOnlyAlloc), OTP-29.1.1.
+    let Some(process) = crate::native_hooks::enter_heap_runtime(header) else {
         return 0;
     };
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
     let context = crate::native_hooks::from_raw(context);
     let value = crate::native_hooks::from_raw(value);
     let result = match op {
@@ -3966,15 +3968,7 @@ pub extern "C" fn arinsal_beamasm_bs_match(
         }
         _ => None,
     };
-    for (destination, term) in registers
-        .x_reg_array
-        .iter_mut()
-        .zip(process.x.iter())
-        .take(6)
-    {
-        *destination = *term;
-    }
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    process.sync_native_header();
+    // HeapOnlyAlloc advances HTOP; the stack is untouched.
+    process.header.htop = process.heap.heap_cursor().0;
     result.map(crate::native_hooks::raw).unwrap_or(0)
 }

@@ -1,6 +1,8 @@
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
-    ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
+    ExitReason, ProcessHeader, SchedulerRegisters,
+    bs_segments::BsmCommand,
+    enter_native,
     module::{ArgVal, BeamModuleAssembler},
     rt,
 };
@@ -119,7 +121,18 @@ fn native_i_bs_start_match3() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_bs_match_test_heap() {
-    run_native(|a| a.emit_i_bs_match_test_heap(ArgVal::X(0), 0, 1, 99, match_helper));
+    run_native(|a| {
+        a.emit_i_bs_match_segments(
+            ArgVal::X(0),
+            99,
+            0,
+            1,
+            &[BsmCommand::EnsureAtLeast { size: 8, unit: 1 }],
+            match_helper,
+            match_command,
+            gc_helper,
+        )
+    });
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -281,7 +294,18 @@ fn native_i_bs_get_float2() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_i_bs_match() {
-    run_native(|a| a.emit_i_bs_match(ArgVal::X(0), 99, ArgVal::Immediate(0), match_helper));
+    run_native(|a| {
+        a.emit_i_bs_match_segments(
+            ArgVal::X(0),
+            99,
+            0,
+            0,
+            &[BsmCommand::EnsureExactly { size: 8000 }],
+            match_helper,
+            match_command,
+            gc_helper,
+        )
+    });
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -357,19 +381,7 @@ fn native_sub_binary_extraction() {
             gc_helper,
         )?;
         asm.emit_i_bs_start_match3(ArgVal::X(1), 1, 99, ArgVal::X(0), match_helper, gc_helper)?;
-        asm.emit_bs_match_command(
-            0,
-            1,
-            &[
-                ArgVal::X(0),
-                ArgVal::Immediate(0xf),
-                ArgVal::Immediate((8 << 4) | 0xf),
-                ArgVal::Immediate((1 << 4) | 0xf),
-            ],
-            99,
-            Some(ArgVal::X(1)),
-            match_command,
-        )
+        int_segments(asm, &[(8, ArgVal::X(1))])
     });
     assert_eq!(byte, rt::term_bits(Term::small(0x5a).unwrap()));
 }
@@ -377,38 +389,37 @@ fn native_sub_binary_extraction() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn native_inline_fixed_integers() {
-    let byte = run_native_configured(|asm| {
-        asm.emit_bs_match_command(
-            0,
-            1,
-            &[
-                ArgVal::X(0),
-                ArgVal::Immediate(0xf),
-                ArgVal::Immediate((8 << 4) | 0xf),
-                ArgVal::Immediate((1 << 4) | 0xf),
-            ],
-            99,
-            Some(ArgVal::X(1)),
-            match_command,
-        )
-    });
+    let byte = run_native_configured(|asm| int_segments(asm, &[(8, ArgVal::X(1))]));
     assert_eq!(byte, rt::term_bits(Term::small(0x5a).unwrap()));
-    let word = run_native_configured(|asm| {
-        asm.emit_bs_match_command(
-            0,
-            1,
-            &[
-                ArgVal::X(0),
-                ArgVal::Immediate(0xf),
-                ArgVal::Immediate((32 << 4) | 0xf),
-                ArgVal::Immediate((1 << 4) | 0xf),
-            ],
-            99,
-            Some(ArgVal::X(1)),
-            match_command,
-        )
-    });
+    let word = run_native_configured(|asm| int_segments(asm, &[(32, ArgVal::X(1))]));
     assert_eq!(word, rt::term_bits(Term::small(0x5a5a_5a5a).unwrap()));
+}
+
+#[cfg(target_arch = "aarch64")]
+fn int_segments(
+    asm: &mut BeamModuleAssembler,
+    fields: &[(u64, ArgVal)],
+) -> Result<(), arinsal_beamasm::module::ModuleError> {
+    let commands: Vec<_> = fields
+        .iter()
+        .map(|&(size, dst)| BsmCommand::Integer {
+            live: None,
+            flags: 0,
+            size,
+            unit: 1,
+            dst,
+        })
+        .collect();
+    asm.emit_i_bs_match_segments(
+        ArgVal::X(0),
+        99,
+        0,
+        1,
+        &commands,
+        match_helper,
+        match_command,
+        gc_helper,
+    )
 }
 
 extern "C" fn match_command(_process: *mut ProcessHeader, _kind: u64, _live: u64) -> u64 {
@@ -432,15 +443,7 @@ fn native_utf8_multibyte() {
 #[test]
 fn native_fused_header_integers() {
     let (len, tag) = run_native_offset(
-        |asm| {
-            asm.emit_bs_match_fused_integers(
-                ArgVal::X(0),
-                99,
-                1,
-                &[(8, ArgVal::X(2)), (16, ArgVal::X(1))],
-                match_command,
-            )
-        },
+        |asm| int_segments(asm, &[(8, ArgVal::X(2)), (16, ArgVal::X(1))]),
         0,
         &[0x01, 0x00, 0x0d, 0x07],
     );

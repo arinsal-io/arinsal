@@ -1,5 +1,5 @@
 //! Mutable sub-bitstring state and growable off-heap binary owners.
-use crate::{BIN_REF, HeapAlloc, SUB_BITS, Term, TermBuilder, TermError};
+use crate::{BIN_REF, HEAP_BITS, HeapAlloc, SUB_BITS, Term, TermBuilder, TermError};
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType, binary_allocation_bytes};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -744,9 +744,16 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         if source.classify() != crate::TermKind::Bitstring {
             return Err(TermError::BadArg);
         }
-        writable_finalize(source);
-        // SAFETY: the source heap stays live through construction.
-        let view = unsafe { source.binary_ref() }.ok_or(TermError::BadArg)?;
+        // A heap bitstring is its own original, has no owner to pin and starts at bit zero
+        // (erl_bits.h:433-439, ERTS_PIN_BITSTRING).
+        let heap_bits = source.header().is_some_and(|h| h & 63 == HEAP_BITS);
+        let view = if heap_bits {
+            None
+        } else {
+            writable_finalize(source);
+            // SAFETY: the source heap stays live through construction.
+            Some(unsafe { source.binary_ref() }.ok_or(TermError::BadArg)?)
+        };
         let mut original = source;
         while original.header().is_some_and(|h| h & 63 == SUB_BITS) {
             // SAFETY: SUB_BITS word four retains its original.
@@ -755,12 +762,20 @@ impl<H: HeapAlloc> TermBuilder<'_, H> {
         let p = self.words(5)?;
         let adjustment = owner_adjustment(original);
         // Port of erts/emulator/beam/erl_bits.c:79 (erts_bs_start_match_3), OTP-29.1.1.
-        // SAFETY: five words are reserved; the original term stays rooted by word four.
+        // SAFETY: five words are reserved; the original term stays rooted by word four. A
+        // heap bitstring keeps its size in word one and its data from word two.
         unsafe {
             *p = (4 << 6) | SUB_BITS;
-            *p.add(1) = (view.bytes().as_ptr() as u64 & !3) | SUB_BITS_MUTABLE;
-            *p.add(2) = (view.start_bit() + adjustment * 8) as u64;
-            *p.add(3) = (view.start_bit() + view.bit_len() + adjustment * 8) as u64;
+            if let Some(view) = &view {
+                *p.add(1) = (view.bytes().as_ptr() as u64 & !3) | SUB_BITS_MUTABLE;
+                *p.add(2) = (view.start_bit() + adjustment * 8) as u64;
+                *p.add(3) = (view.start_bit() + view.bit_len() + adjustment * 8) as u64;
+            } else {
+                let heap_bits = source.raw_ptr();
+                *p.add(1) = (heap_bits.add(2) as u64 & !3) | SUB_BITS_MUTABLE;
+                *p.add(2) = 0;
+                *p.add(3) = *heap_bits.add(1);
+            }
             *p.add(4) = original.0;
         }
         Ok(Term::from_ptr(p, 2))

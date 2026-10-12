@@ -7,6 +7,7 @@ pub mod bif;
 pub mod bs_construct;
 mod bs_fast;
 pub mod bs_match;
+pub mod bs_segments;
 pub mod catch;
 pub mod construct;
 pub mod dispatch;

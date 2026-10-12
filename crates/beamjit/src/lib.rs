@@ -2154,14 +2154,6 @@ fn map_key_sort(args: Vec<ArgVal>, env: &impl ModuleEnv) -> Result<Vec<ArgVal>, 
 }
 
 /// `Live` of a bit-syntax match command: `nil` when the command cannot allocate.
-fn live_or_nil(value: Option<&SpecificOperand>) -> Result<u32, String> {
-    if matches!(value, Some(SpecificOperand::Nil)) {
-        Ok(0)
-    } else {
-        number(value)
-    }
-}
-
 fn number(value: Option<&SpecificOperand>) -> Result<u32, String> {
     as_u32(value).ok_or_else(|| "expected nonnegative integer operand".to_owned())
 }
@@ -4124,28 +4116,48 @@ fn emit_op(
                     )
                 }
                 "i_bs_match" | "i_bs_match_test_heap" => {
+                    use arinsal_beamasm::bs_segments::BsmCommand;
                     count_at_least(args, 2, op.name())?;
                     let ctx = value(1)?;
                     let fail = n(0)?;
                     let mut at = 2;
-                    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2916-2940 (Need, Live) and
-                    // beam_jit_bs.cpp:366-528 (beam_jit_opt_bsm_segments), OTP-29.1.1: the heap
-                    // test of `i_bs_match_test_heap` is a plain `emit_gc_test` with `Live`, run
-                    // only once every command has matched. `Live` is the live count after the
-                    // match, so X registers at or above it may still be live at the fail label
-                    // and must not be touched before a command can fail. The commands that
-                    // allocate here reserve and collect in their own runtime call, so the test
-                    // covers only `Need` and stays trailing.
-                    let mut trailing_heap_test = None;
+                    // Port of erts/emulator/beam/jit/arm/instr_bs.cpp:2916-2940 (Need, Live):
+                    // the heap test of `i_bs_match_test_heap` is merged into the segment list.
+                    let (mut need, mut live) = (0u64, 0u32);
                     if op.name() == "i_bs_match_test_heap" {
                         count_at_least(args, 4, op.name())?;
-                        let need =
-                            count_or_allocation_words(args.get(2)).map_err(EmitError::Operand)?;
-                        if need != 0 {
-                            trailing_heap_test = Some((need, n(3)?));
-                        }
+                        need = u64::from(
+                            count_or_allocation_words(args.get(2)).map_err(EmitError::Operand)?,
+                        );
+                        live = n(3)?;
                         at = 4;
                     }
+                    let word = |index: usize| -> Result<u64, EmitError> {
+                        match args.get(index) {
+                            Some(SpecificOperand::Unsigned(word)) => Ok(*word),
+                            Some(SpecificOperand::SmallInt(word)) => Ok(*word as u64),
+                            _ => Err(EmitError::Operand(
+                                "bitstring match command expects an integer operand".to_owned(),
+                            )),
+                        }
+                    };
+                    let live_at = |index: usize| -> Result<Option<u32>, EmitError> {
+                        if matches!(args.get(index), Some(SpecificOperand::Nil)) {
+                            Ok(None)
+                        } else {
+                            n(index).map(Some)
+                        }
+                    };
+                    // `bs_get_flags`: native endianness is little on this target.
+                    let raw_flags = |index: usize| -> Result<u64, EmitError> {
+                        let flags = bs_flags(args.get(index), beam)? >> 4;
+                        Ok(if flags & 16 != 0 {
+                            (flags & !16) | 2
+                        } else {
+                            flags
+                        })
+                    };
+                    let mut commands = Vec::new();
                     while at < args.len() {
                         let Some(SpecificOperand::Atom(index)) = args.get(at) else {
                             return Err(EmitError::Operand(
@@ -4163,130 +4175,67 @@ fn emit_op(
                         };
                         match name {
                             "ensure_exactly" => {
-                                let bits = number(args.get(at + 1))?;
-                                assembler.emit_bs_match_ensure_exactly(ctx, bits, fail)?;
+                                commands.push(BsmCommand::EnsureExactly {
+                                    size: word(at + 1)?,
+                                });
                                 at += 2;
                             }
                             "ensure_at_least" => {
-                                let bits = number(args.get(at + 1))?;
-                                let unit = number(args.get(at + 2))?;
-                                assembler.emit_bs_match_ensure_at_least(ctx, bits, unit, fail)?;
+                                commands.push(BsmCommand::EnsureAtLeast {
+                                    size: word(at + 1)?,
+                                    unit: word(at + 2)?,
+                                });
                                 at += 3;
                             }
                             "skip" => {
-                                let bits = number(args.get(at + 1))?;
-                                assembler.emit_bs_match_skip(ctx, bits)?;
+                                commands.push(BsmCommand::Skip {
+                                    size: word(at + 1)?,
+                                });
                                 at += 2;
                             }
                             "integer" | "binary" => {
                                 // {Name, Live, Flags, Size, Unit, Dst}
-                                let live = live_or_nil(args.get(at + 1))?;
-                                // Port of erts/emulator/beam/jit/beam_jit_bs.cpp:414-461, OTP-29.1.1:
-                                // consecutive unsigned big-endian fields share one read.
-                                let mut fused = Vec::new();
-                                let mut scan = at;
-                                let mut total = 0u16;
-                                if name == "integer" {
-                                    while scan + 5 < args.len() {
-                                        let Some(SpecificOperand::Atom(index)) = args.get(scan)
-                                        else {
-                                            break;
-                                        };
-                                        let Some(scan_name) = index
-                                            .checked_sub(1)
-                                            .and_then(|index| beam.atoms.get(index as usize))
-                                            .map(String::as_str)
-                                        else {
-                                            break;
-                                        };
-                                        if scan_name != "integer" {
-                                            break;
-                                        }
-                                        let flags = bs_flags(args.get(scan + 2), beam)?;
-                                        if flags != 0xf {
-                                            break;
-                                        }
-                                        let ArgVal::Immediate(unit) =
-                                            small_or_arg(args.get(scan + 4), beam, env)?
-                                        else {
-                                            break;
-                                        };
-                                        if unit != (1 << 4) | 0xf {
-                                            break;
-                                        }
-                                        let ArgVal::Immediate(size) =
-                                            small_or_arg(args.get(scan + 3), beam, env)?
-                                        else {
-                                            break;
-                                        };
-                                        if size & 0xf != 0xf {
-                                            break;
-                                        }
-                                        let bits = u16::try_from(size >> 4).unwrap_or(0);
-                                        if !matches!(bits, 8 | 16 | 32)
-                                            || total.checked_add(bits).is_none_or(|sum| sum > 32)
-                                        {
-                                            break;
-                                        }
-                                        total += bits;
-                                        fused.push((bits, value(scan + 5)?));
-                                        scan += 6;
+                                let (live, flags, size, unit, dst) = (
+                                    live_at(at + 1)?,
+                                    raw_flags(at + 2)?,
+                                    word(at + 3)?,
+                                    word(at + 4)?,
+                                    value(at + 5)?,
+                                );
+                                commands.push(if name == "integer" {
+                                    BsmCommand::Integer {
+                                        live,
+                                        flags,
+                                        size,
+                                        unit,
+                                        dst,
                                     }
-                                }
-                                if fused.len() >= 2 {
-                                    assembler.emit_bs_match_fused_integers(
-                                        ctx,
-                                        fail,
-                                        live,
-                                        &fused,
-                                        env.bs_match_cmd_helper(),
-                                    )?;
-                                    at = scan;
                                 } else {
-                                    let flags = bs_flags(args.get(at + 2), beam)?;
-                                    let size = small_or_arg(args.get(at + 3), beam, env)?;
-                                    let unit = small_or_arg(args.get(at + 4), beam, env)?;
-                                    let dst = value(at + 5)?;
-                                    let kind = u32::from(name == "binary");
-                                    assembler.emit_bs_match_command(
-                                        kind,
+                                    BsmCommand::Binary {
                                         live,
-                                        &[ctx, ArgVal::Immediate(flags), size, unit],
-                                        fail,
-                                        Some(dst),
-                                        env.bs_match_cmd_helper(),
-                                    )?;
-                                    at += 6;
-                                }
+                                        flags,
+                                        size,
+                                        unit,
+                                        dst,
+                                    }
+                                });
+                                at += 6;
                             }
                             "get_tail" => {
                                 // {Name, Live, Unit, Dst}
-                                let live = live_or_nil(args.get(at + 1))?;
-                                let unit = small_or_arg(args.get(at + 2), beam, env)?;
-                                let dst = value(at + 3)?;
-                                assembler.emit_bs_match_command(
-                                    2,
-                                    live,
-                                    &[ctx, unit],
-                                    fail,
-                                    Some(dst),
-                                    env.bs_match_cmd_helper(),
-                                )?;
+                                commands.push(BsmCommand::GetTail {
+                                    live: live_at(at + 1)?,
+                                    dst: value(at + 3)?,
+                                });
                                 at += 4;
                             }
                             "=:=" => {
                                 // {Name, Live, Bits, Value}
-                                let live = live_or_nil(args.get(at + 1))?;
-                                let bits = small_or_arg(args.get(at + 2), beam, env)?;
-                                let expected = small_or_arg(args.get(at + 3), beam, env)?;
-                                assembler.emit_bs_match_command(
-                                    3,
-                                    live,
-                                    &[ctx, bits, expected],
-                                    fail,
-                                    None,
-                                    env.bs_match_cmd_helper(),
-                                )?;
+                                commands.push(BsmCommand::Eq {
+                                    live: live_at(at + 1)?,
+                                    size: word(at + 2)?,
+                                    value: word(at + 3)?,
+                                });
                                 at += 4;
                             }
                             other => {
@@ -4296,10 +4245,16 @@ fn emit_op(
                             }
                         }
                     }
-                    if let Some((need, live)) = trailing_heap_test {
-                        assembler.emit_test_heap(need, live, env.gc_hook())?;
-                    }
-                    Ok(())
+                    assembler.emit_i_bs_match_segments(
+                        ctx,
+                        fail,
+                        need,
+                        live,
+                        &commands,
+                        helper,
+                        env.bs_match_cmd_helper(),
+                        env.gc_hook(),
+                    )
                 }
                 "i_bs_get_position" => {
                     count(2)?;
