@@ -4,11 +4,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arinsal_term::{
-    HeapAlloc, Identity, MagicRef, TermBuilder, writable_bytes_mut, writable_extend_private,
-    writable_finalize,
+    ConsListBuilder, HeapAlloc, Identity, MagicRef, TermBuilder, writable_bytes_mut,
+    writable_extend_private, writable_finalize,
 };
 
 use crate::binary_mod::{SearchPattern, SearchWalk};
+use crate::lists::DeferredTrap;
 use crate::{BifError, Ctx};
 
 use super::*;
@@ -65,19 +66,164 @@ fn bit_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 
 // Port of erts/emulator/beam/binary.c:202-403 (binary_to_list_1/3), OTP-29.1.1.
 fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    with_binary_input(args[0], |bytes| {
-        let selected = if args.len() == 3 {
+    with_binary_bytes(args[0], |view| {
+        if !view.bit_len().is_multiple_of(8) {
+            return Err(BADARG);
+        }
+        let input = binary_input(&view)?;
+        let size = view.bit_len() / 8;
+        let (start, len) = if args.len() == 3 {
             let start = args[1].as_small().ok_or(BADARG)?;
             let end = args[2].as_small().ok_or(BADARG)?;
-            if start < 1 || end < start || end as usize > bytes.len() {
+            if start < 1 || end < start || end as usize > size {
                 return Err(BADARG);
             }
-            &bytes[start as usize - 1..end as usize]
+            (start as usize - 1, (end - start + 1) as usize)
         } else {
-            bytes
+            (0, size)
         };
-        byte_list(ctx, selected)
-    })
+        if len == 0 {
+            return Ok(Term::NIL);
+        }
+
+        let budget = ctx.reduction_budget();
+        let min_reds = 1_000;
+        let resched_reds = 100;
+        if budget != usize::MAX
+            && size >= budget.saturating_mul(B2L_BYTES_PER_REDUCTION)
+            && size < min_reds * B2L_BYTES_PER_REDUCTION
+            && budget <= resched_reds
+        {
+            let aligned = match input {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(bytes) => Some(bytes),
+            };
+            ctx.defer_trap(DeferredTrap::BinaryToList(BinaryToListWalk {
+                source: args[0],
+                start,
+                remaining: len,
+                total: len,
+                list: None,
+                aligned,
+            }));
+            return Ok(Term::NIL);
+        }
+        let one_chunk = budget == usize::MAX
+            || size < budget.saturating_mul(B2L_BYTES_PER_REDUCTION)
+            || (size < min_reds * B2L_BYTES_PER_REDUCTION && budget > resched_reds);
+        let reservation = {
+            let mut builder = TermBuilder::new(ctx.heap);
+            builder
+                .reserve_cons_list(len)
+                .map_err(|_| BifError::SystemLimit)?
+        };
+        if one_chunk {
+            let value = reservation
+                .prepend_exact_with_tail(
+                    input[start..start + len]
+                        .iter()
+                        .rev()
+                        .map(|byte| Term::small(i64::from(*byte)).expect("byte fits small")),
+                    Term::NIL,
+                )
+                .map_err(|_| BifError::SystemLimit)?;
+            ctx.charge_reductions(len.div_ceil(B2L_BYTES_PER_REDUCTION));
+            return Ok(value);
+        }
+        let mut walk = BinaryToListWalk {
+            source: args[0],
+            start,
+            remaining: len,
+            total: len,
+            list: Some(reservation),
+            aligned: None,
+        };
+        let chunk = len.min(
+            budget
+                .saturating_add(1)
+                .saturating_mul(B2L_BYTES_PER_REDUCTION),
+        );
+        let (result, used) = walk.step_bytes(input.as_ref(), chunk)?;
+        if let Some(result) = result {
+            ctx.charge_reductions(used.div_ceil(B2L_BYTES_PER_REDUCTION));
+            Ok(result)
+        } else {
+            if let Cow::Owned(bytes) = input {
+                walk.aligned = Some(bytes);
+            }
+            ctx.charge_reductions(used.div_ceil(B2L_BYTES_PER_REDUCTION));
+            ctx.defer_trap(DeferredTrap::BinaryToList(walk));
+            Ok(Term::NIL)
+        }
+    })?
+}
+
+const B2L_BYTES_PER_REDUCTION: usize = 256;
+
+/// Resumable fill of one HAlloc reservation, as in `ErtsB2LState`.
+// Port of erts/emulator/beam/binary.c:182-239, OTP-29.1.1.
+pub struct BinaryToListWalk {
+    source: Term,
+    start: usize,
+    remaining: usize,
+    total: usize,
+    list: Option<ConsListBuilder>,
+    aligned: Option<Vec<u8>>,
+}
+
+impl BinaryToListWalk {
+    /// Whether OTP would first reschedule before creating the list reservation.
+    pub fn needs_initial_allocation(&self) -> bool {
+        self.list.is_none()
+    }
+
+    /// Fill at most one scheduler chunk, visiting the source from its end.
+    pub fn step(
+        &mut self,
+        heap: &mut dyn HeapAlloc,
+        max_bytes: usize,
+    ) -> Result<(Option<Term>, usize), BifError> {
+        if self.list.is_none() {
+            let mut builder = TermBuilder::new(heap);
+            self.list = Some(
+                builder
+                    .reserve_cons_list(self.total)
+                    .map_err(|_| BifError::SystemLimit)?,
+            );
+        }
+        if let Some(bytes) = self.aligned.take() {
+            let result = self.step_bytes(&bytes, max_bytes);
+            self.aligned = Some(bytes);
+            return result;
+        }
+        with_binary_input(self.source, |bytes| self.step_bytes(bytes, max_bytes))
+    }
+
+    fn step_bytes(
+        &mut self,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Option<Term>, usize), BifError> {
+        let count = self.remaining.min(max_bytes);
+        let from = self.start + self.remaining - count;
+        let list = self.list.as_mut().ok_or(BifError::SystemLimit)?;
+        for byte in bytes[from..from + count].iter().rev() {
+            list.prepend(Term::small(i64::from(*byte)).expect("byte fits small integer"))
+                .map_err(|_| BifError::SystemLimit)?;
+        }
+        self.remaining -= count;
+        if self.remaining == 0 {
+            let value = self
+                .list
+                .take()
+                .ok_or(BifError::SystemLimit)?
+                .finish(Term::NIL)
+                .map_err(|_| BifError::SystemLimit)?;
+            Ok((Some(value), count))
+        } else {
+            Ok((None, count))
+        }
+    }
 }
 
 /// Use the original byte slice when aligned; OTP likewise allocates a
@@ -120,29 +266,6 @@ pub(super) fn with_binary_input<R>(
         let bytes = binary_input(&view)?;
         f(&bytes)
     })?
-}
-
-// Port of erts/emulator/beam/binary.c:259-288, 306-352 (binary_to_list), OTP-29.1.1.
-fn byte_list(ctx: &mut Ctx<'_>, selected: &[u8]) -> Result<Term, BifError> {
-    ctx.charge_reductions(selected.len());
-    if selected.is_empty() {
-        return Ok(Term::NIL);
-    }
-    let words = selected.len().checked_mul(2).ok_or(BifError::SystemLimit)?;
-    let cells = ctx.heap.alloc(words).ok_or(BifError::SystemLimit)?;
-    let mut result = Term::NIL;
-    for index in (0..selected.len()).rev() {
-        // SAFETY: one allocation reserved two words for each indexed cons cell.
-        let cell = unsafe { cells.add(index * 2) };
-        let head = Term::small(i64::from(selected[index])).unwrap();
-        // SAFETY: terms are immediate or point to initialized cells in this heap.
-        unsafe {
-            *cell = head.raw_bits();
-            *cell.add(1) = result.raw_bits();
-            result = std::mem::transmute::<u64, Term>((cell as u64) | 1);
-        }
-    }
-    Ok(result)
 }
 
 // Port of erts/emulator/beam/erl_iolist.c:857-935 (list_to_bitstring_bif), OTP-29.1.1.

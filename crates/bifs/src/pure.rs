@@ -19,7 +19,7 @@ use crate::{BifError, Class, Ctx};
 #[path = "binary_bifs.rs"]
 mod binary_bifs;
 pub use binary_bifs::{
-    BinarySearchKind, BinarySearchWalk, IolistCopyWalk, allocate_iolist_binary,
+    BinarySearchKind, BinarySearchWalk, BinaryToListWalk, IolistCopyWalk, allocate_iolist_binary,
     finish_iolist_binary_output, with_iolist_binary_output,
 };
 
