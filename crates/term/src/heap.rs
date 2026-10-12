@@ -1743,6 +1743,29 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
             first_cdr: None,
         })
     }
+    /// Reserve a boxed heap object and fill its header and terms in allocation order.
+    ///
+    /// Port of `erts_produce_heap(factory, words, extra)` in
+    /// erts/emulator/beam/erl_map.c:857-911, OTP-29.1.1. The reservation can live
+    /// across a reduction yield while the object is filled.
+    pub fn reserve_boxed_words(
+        &mut self,
+        words: usize,
+        extra: usize,
+    ) -> Result<HeapBlockBuilder, TermError> {
+        if words == 0 {
+            return Err(TermError::BadArg);
+        }
+        let start = self
+            .heap
+            .alloc_with_extra(words, extra)
+            .ok_or(TermError::HeapFull)?;
+        Ok(HeapBlockBuilder {
+            start: start as usize,
+            words,
+            written: 0,
+        })
+    }
     pub(crate) fn words(&mut self, words: usize) -> Result<*mut u64, TermError> {
         self.heap.alloc(words).ok_or(TermError::HeapFull)
     }
@@ -2423,6 +2446,53 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     #[inline]
     pub fn local_ref(&mut self, ids: [u32; 3]) -> Result<Term, TermError> {
         Term::local_ref(self.heap, ids)
+    }
+}
+
+/// A boxed heap object filled in order after one contiguous allocation.
+pub struct HeapBlockBuilder {
+    start: usize,
+    words: usize,
+    written: usize,
+}
+
+impl HeapBlockBuilder {
+    /// Append a non-term header word to the reserved object.
+    #[inline(always)]
+    pub fn write_header(&mut self, value: u64) -> Result<(), TermError> {
+        self.write_word(value)
+    }
+
+    /// Append an Erlang term to the reserved object.
+    #[inline(always)]
+    pub fn write_term(&mut self, value: Term) -> Result<(), TermError> {
+        self.write_word(value.bits())
+    }
+
+    /// Append a previously saved term word, such as one popped from a HAMT build stack.
+    #[inline(always)]
+    pub fn write_term_bits(&mut self, value: u64) -> Result<(), TermError> {
+        self.write_word(value)
+    }
+
+    #[inline(always)]
+    fn write_word(&mut self, value: u64) -> Result<(), TermError> {
+        if self.written == self.words {
+            return Err(TermError::BadArg);
+        }
+        let slot = (self.start as *mut u64).wrapping_add(self.written);
+        store(slot, value);
+        self.written += 1;
+        Ok(())
+    }
+
+    /// Finish after every reserved word has been initialized.
+    #[inline(always)]
+    pub fn finish(self) -> Result<Term, TermError> {
+        if self.written != self.words {
+            return Err(TermError::BadArg);
+        }
+        Ok(Term::from_ptr(self.start as *mut u64, 2))
     }
 }
 

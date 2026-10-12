@@ -215,7 +215,6 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
     output[2].write(bits(boxed(output_ptr.wrapping_add(keys_tuple_start))));
     output[keys_tuple_start].write(0);
     let (mut i1, mut i2, mut unused_size) = (0, 0, 0);
-    let mut n = 0;
     {
         let (before_keys, keys_region) = output.split_at_mut(keys_start);
         let keys_output = &mut keys_region[..capacity];
@@ -265,7 +264,6 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
                     i2 += 1;
                 }
             }
-            n += 1;
         }
         while i1 < n1 {
             keys_output
@@ -277,7 +275,6 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
                 .expect("flatmap merge value capacity")
                 .write(vs1[i1]);
             i1 += 1;
-            n += 1;
         }
         while i2 < n2 {
             keys_output
@@ -289,9 +286,9 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
                 .expect("flatmap merge value capacity")
                 .write(vs2[i2]);
             i2 += 1;
-            n += 1;
         }
     }
+    let n = n1 + n2 - unused_size;
     output[1].write(n as u64);
     output[keys_tuple_start].write((n as u64) << 6);
     if unused_size > 0 {
