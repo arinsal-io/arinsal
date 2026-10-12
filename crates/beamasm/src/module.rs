@@ -178,11 +178,6 @@ pub struct BeamModuleAssembler {
     dump_module: Option<String>,
     dump_functions: Vec<crate::dump::FunctionRecord>,
     dump_recording_function: bool,
-    /// Code offset at which `START`/`END`/`CTX` still hold the match cursor, and how many
-    /// bits that command proved remain. `position_is_valid` in
-    /// `emit_i_bs_match_test_heap` (instr_bs.cpp:2931, OTP-29.1.1), spanning the command
-    /// emits of one `bs_match`.
-    pub(super) bs_live_cursor: Option<(usize, u32)>,
 }
 
 /// Size of the `i_func_info` slot that precedes every function's call entry (erts places the
@@ -258,7 +253,6 @@ impl BeamModuleAssembler {
             dump_module: None,
             dump_functions: Vec::new(),
             dump_recording_function: false,
-            bs_live_cursor: None,
         }
     }
 
