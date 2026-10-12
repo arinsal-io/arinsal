@@ -1261,8 +1261,19 @@ impl Executor {
                 crate::trace_bp::schedule_time_break(process, ctx.pid(), false);
             }
         }
-        if process.native_pc.is_some() && process.reductions <= 0 {
-            process.reductions = budget.min(i32::MAX as u32) as i32;
+        // Port of erts/emulator/beam/erl_process.c:10435 (`p->fcalls = reds`), OTP-29.1.1.
+        // A normal slice replaces leftover FCALLS so the send after a code-permission
+        // release is not skipped by a reduction check that still sees only a few: that
+        // yield lets the waiter run and send `{Pid, locked}` first.
+        // A 1-reduction quantum is the scheduler budget that splits `loop_rec` from
+        // `wait`. Light BIFs do `subs FCALLS, #1; b.le yield` and resume at the same
+        // entry (instr_bif.cpp:399-400, OTP-29.1.1), so installing FCALLS=1 never
+        // enters the BIF. Leave a positive count alone in that case.
+        if process.native_pc.is_some() {
+            let reds = budget.min(i32::MAX as u32) as i32;
+            if reds > 1 || process.reductions <= 0 {
+                process.reductions = reds;
+            }
         }
         // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
         // export's code address), OTP-29.1.1: every process starts its function natively on
@@ -1309,13 +1320,15 @@ impl Executor {
         }
         let (mut need_x, need_fr) = self.vm.code.registers[process.module];
         if crate::beamasm_integration::enabled() {
-            // A native continuation's live X count is `c_p->arity + 1`, independent
-            // of the interpreter module whose register count sized this file.
-            let native_live = process
-                .cold
-                .as_ref()
-                .map_or(0, |cold| usize::from(cold.native_resume_live));
-            need_x = need_x.max(8).max(native_live);
+            // A native continuation's live X count is `c_p->arity + 1`
+            // (`header.arity`), independent of the interpreter module whose
+            // register count sized this file. The cold `native_resume_live`
+            // copy is at most that, or a small constant (5) already covered
+            // by the floor of 8. Reading the cold box here was a cache miss
+            // on every schedule-in.
+            need_x = need_x
+                .max(8)
+                .max(usize::from(process.header.arity).saturating_add(1));
         }
         if self.x.len() < need_x {
             let mut registers = self.x.to_vec();
@@ -1591,6 +1604,16 @@ impl Executor {
                             // Port of erts/emulator/beam/erl_process.c (schedule: reductions
                             // used = CONTEXT_REDS - FCALLS), OTP-29.1.1: native code counts down
                             // FCALLS; the scheduler charges what it used.
+                            // FCALLS and the scheduler budget are one counter in erts. A BIF
+                            // charge can zero the process counter while the slice still
+                            // has reductions; refilling avoids yielding before the next
+                            // instruction (the send after a code-permission release).
+                            if process.reductions <= 0
+                                && let Ok(remaining) = i32::try_from(ctx.remaining())
+                                && remaining > 0
+                            {
+                                process.reductions = remaining;
+                            }
                             let fcalls_before = process.reductions;
                             // A code change this scheduler committed waits for thread
                             // progress first: every other scheduler then finishes the slice it
@@ -2262,6 +2285,93 @@ impl Executor {
                                     }
                                     continue;
                                 }
+                                if target_pc == crate::bif_traps::bif_export_trap_pc() {
+                                    // Port of jit/arm/beam_asm_global.cpp:145
+                                    // (emit_bif_export_trap) and instr_bif.cpp:525-536
+                                    // (context_switch_simplified), OTP-29.1.1.
+                                    let schedule_out = process
+                                        .cold
+                                        .as_ref()
+                                        .and_then(|cold| cold.bif_trap.as_ref())
+                                        .is_some_and(|pending| pending.schedule_out);
+                                    if schedule_out {
+                                        if let Some(pending) = process
+                                            .cold
+                                            .as_mut()
+                                            .and_then(|cold| cold.bif_trap.as_mut())
+                                        {
+                                            pending.schedule_out = false;
+                                            pending.caller_module = process.module;
+                                            pending.caller_ip = process.ip;
+                                        }
+                                        crate::bif_traps::arm_export_trap(process);
+                                        process.cold_mut().native_retry = Some(target_pc);
+                                        process.native_pc = Some(code_ptr);
+                                        break Ok(RunState::Yield);
+                                    }
+                                    match crate::bif_traps::run_trapped_export(process, Some(ctx)) {
+                                        Some(Ok(crate::bif_traps::TrapResult::Yield {
+                                            ..
+                                        })) => {
+                                            if let Some(pending) = process
+                                                .cold
+                                                .as_mut()
+                                                .and_then(|cold| cold.bif_trap.as_mut())
+                                            {
+                                                pending.schedule_out = false;
+                                            }
+                                            crate::bif_traps::arm_export_trap(process);
+                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_pc = Some(code_ptr);
+                                            break Ok(RunState::Yield);
+                                        }
+                                        Some(Ok(crate::bif_traps::TrapResult::Done {
+                                            value,
+                                            ..
+                                        })) => {
+                                            process.x[0] = value;
+                                            if !resume_after_native_return(process) {
+                                                break Ok(RunState::Done(value));
+                                            }
+                                            continue;
+                                        }
+                                        Some(Ok(crate::bif_traps::TrapResult::Failed {
+                                            ..
+                                        })) => {
+                                            break Err(VmError::Unsupported(
+                                                "failed trapping BIF without exception".into(),
+                                            ));
+                                        }
+                                        // The continuation export raised. It is the same BIF
+                                        // failure erts reports with ERTS_BIF_ERROR_TRAPPED:
+                                        // catch sees it, and the process does not exit.
+                                        Some(Err(VmError::Trap(trap))) => {
+                                            process.cold_mut().native_error_pc = call_site_pc;
+                                            if process.heap.stack_get(0).is_some_and(|word| {
+                                                word.tagged_word() as usize == resume_pc
+                                            }) {
+                                                process.heap.release_stack(1);
+                                            }
+                                            if let Some(error) = crate::exceptions::resume(
+                                                &mut self.vm,
+                                                process,
+                                                Some(ctx),
+                                                trap,
+                                            )? {
+                                                break Err(error);
+                                            }
+                                            process.header.freason = 0;
+                                            process.header.fvalue = 0;
+                                            continue;
+                                        }
+                                        Some(Err(error)) => return Err(error),
+                                        None => {
+                                            break Err(VmError::Unsupported(
+                                                "missing BIF trap export".into(),
+                                            ));
+                                        }
+                                    }
+                                }
                                 let Some(export) =
                                     crate::beamasm_integration::export_dispatch(target_pc)
                                 else {
@@ -2412,10 +2522,19 @@ impl Executor {
                                                 Ok(crate::bif_traps::TrapResult::Yield {
                                                     ..
                                                 }) => {
-                                                    // The X registers hold the arguments as any collection
-                                                    // the BIF ran moved them; the copies are stale.
-                                                    process.cold_mut().native_retry =
-                                                        Some(target_pc);
+                                                    // The continuation export runs on the next
+                                                    // schedule-in. This call site is not redone.
+                                                    if let Some(pending) = process
+                                                        .cold
+                                                        .as_mut()
+                                                        .and_then(|cold| cold.bif_trap.as_mut())
+                                                    {
+                                                        pending.schedule_out = false;
+                                                    }
+                                                    crate::bif_traps::arm_export_trap(process);
+                                                    process.cold_mut().native_retry = Some(
+                                                        crate::bif_traps::bif_export_trap_pc(),
+                                                    );
                                                     process.native_pc = Some(code_ptr);
                                                     break Ok(RunState::Yield);
                                                 }
@@ -6675,6 +6794,24 @@ impl Process {
         budget: u32,
     ) -> Result<RunState, VmError> {
         let mut result = with_executor(data, runtime, |executor| executor.run(self, ctx, budget));
+        // BIF_TRAP context-switches to beam_bif_export_trap. The continuation is an export
+        // call, so the caller's CP stays on the stack and the backtrace PC is that trap.
+        if matches!(result, Ok(RunState::Yield))
+            && self
+                .cold
+                .as_ref()
+                .is_some_and(|cold| cold.bif_trap.is_some())
+        {
+            crate::bif_traps::note_export_trap(self);
+        }
+        // A native BIF yield returns before the interpreter's suspend check. erts leaves
+        // a suspended process out of the run queue (ERTS_PSFLG_SUSPENDED): the code-permission
+        // seize failure is `erts_suspend` plus `ERTS_BIF_YIELD`.
+        if matches!(result, Ok(RunState::Yield)) && runtime.suspend_total_of(ctx.pid()) > 0 {
+            self.cold_mut().suspend_parked = true;
+            runtime.note_status(ctx.pid(), "suspended");
+            result = Ok(RunState::Wait { timeout_ms: None });
+        }
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
             && let Err(error) = crate::signals::reschedule_deferred_sys_tasks(self, ctx)
         {
@@ -6889,8 +7026,11 @@ impl Vm {
             };
             crate::natives::proc::set_flag(&mut process, "priority", crate::signals::atom(name));
         }
+        // erl_init creates system processes on the boot scheduler, before other
+        // schedulers have left scheduler_wait. Spreading them wakes those
+        // schedulers and they steal the first user processes.
         let pid = scheduler
-            .spawn_priority(process, priority)
+            .spawn_priority_on(process, priority, 0)
             .map_err(|error| VmError::Unsupported(format!("system process {module}: {error}")))?;
         runtime.system_processes.lock().unwrap().insert(pid);
         Ok(pid)

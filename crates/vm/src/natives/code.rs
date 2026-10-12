@@ -102,14 +102,25 @@ fn resume_waiters(runtime: &Runtime, pids: Vec<Pid>) {
     if pids.is_empty() {
         return;
     }
+    // Port of erl_process.c:7305 (resume_process): rcount still above zero means a user
+    // suspend remains, and the process is not enqueued.
+    let wake: Vec<Pid> = pids
+        .into_iter()
+        .filter(|pid| runtime.resume_internal(*pid))
+        .collect();
+    signal_resumed(runtime, &wake);
+}
+
+fn signal_resumed(runtime: &Runtime, pids: &[Pid]) {
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
     for pid in pids {
-        if runtime.resume_internal(pid) {
-            // erts_resume schedules the waiter; the signal only reschedules it.
-            let _ = scheduler.signal(pid, pid, Signal::UnlinkAck(u64::MAX));
-        }
+        // resume_process calls add2runq immediately (erl_process.c:7305, 6868).
+        // The waiter joins its own run queue. That queue's scheduler is woken
+        // only if it sleeps. Another scheduler takes the waiter by stealing
+        // after it ran out of work, or by wakeup_other past its limit.
+        let _ = scheduler.signal(*pid, *pid, Signal::UnlinkAck(u64::MAX));
     }
 }
 
@@ -124,6 +135,8 @@ pub(crate) fn resume_suspended(runtime: &Runtime, pid: Pid) {
 fn reject_code_permissions(perm: &mut CodeModPermission, pid: Pid) -> Vec<Pid> {
     if perm.handover == Some(pid) {
         perm.handover = None;
+        // The process retries the BIF after GC (erl_gc.c:737). It is not put back on
+        // the queue here; the retry queues itself if the permission is still held.
         perm.release()
     } else {
         Vec::new()

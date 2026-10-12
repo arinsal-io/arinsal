@@ -1,7 +1,8 @@
 //! List BIFs. The per-element loops follow `erl_bif_lists.c` and `erl_bif_guard.c`.
 //!
-//! Most loops finish in one call; `erlang:'--'/2` exposes its staged walk to the
-//! VM so the scheduler can resume it through the same continuation as erts.
+//! Most loops finish in one call. `erlang:'--'/2` and `lists:reverse/2` expose
+//! their staged walks so the scheduler resumes them through the same
+//! continuations as erts.
 
 use arinsal_term::{
     ConsHeapChain, HeapAlloc, HeapReservation, Term, TermBuilder, atoms, exact_eq, loose_eq,
@@ -795,18 +796,66 @@ fn subtract_get_length_chunk(
     Ok(*iterator == Term::NIL)
 }
 
-fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_bif_lists.c:1246 (lists_reverse_2),
-    // lists_reverse_onheap, and lists_reverse_alloc, OTP-29.1.1.
-    // The reduction trap is a later task. The fill is CONS(hp, CAR, tail)
-    // with a raw heap-top bump, the same stores as the on-heap loop.
-    let list = args[0];
-    let tail = args[1];
+/// Cons cells one reduction may reverse on the alloc path.
+/// Port of `CELLS_PER_RED` at `erl_bif_lists.c:1148`, OTP-29.1.1.
+pub const REVERSE_CELLS_PER_RED: usize = 40;
+
+/// Arguments a `lists:reverse/2` trap resumes with.
+///
+/// Port of the `BIF_TRAP2` pair at `erl_bif_lists.c:1191` and `:1240`, OTP-29.1.1:
+/// the cells still to walk, and the reversed prefix built so far.
+pub struct ReverseCont {
+    list: Term,
+    tail: Term,
+}
+
+impl ReverseCont {
+    /// List cells not yet consed onto the result.
+    pub fn list(&self) -> Term {
+        self.list
+    }
+
+    /// Reversed prefix, the continuation's second argument.
+    pub fn tail(&self) -> Term {
+        self.tail
+    }
+}
+
+/// One chunk of `lists:reverse/2`.
+pub enum ReverseStep {
+    /// The input list was consumed.
+    Done(Term),
+    /// `BIF_TRAP2` to `lists:reverse/2` with this state.
+    Trap(ReverseCont),
+}
+
+fn charge_reverse_chunk(ctx: &mut Ctx<'_>, max_cells: usize, cells: usize) {
+    // A direct call passes `usize::MAX` and still reports no reductions. The
+    // trap passes a finite budget and accounts `REVERSE_CELLS_PER_RED` cells
+    // per reduction, matching `BUMP_REDS` in `lists_reverse_alloc`.
+    if max_cells != usize::MAX && cells > 0 {
+        ctx.charge_reductions(cells.div_ceil(REVERSE_CELLS_PER_RED));
+    }
+}
+
+/// Fill at most `max_cells` conses of `lists:reverse/2`.
+///
+/// Port of `lists_reverse_2`, `lists_reverse_onheap`, and `lists_reverse_alloc`
+/// (`erl_bif_lists.c:1144-1263`), OTP-29.1.1. `usize::MAX` finishes a finite
+/// list in this call (the direct BIF). A reduction-sized budget stops and
+/// returns [`ReverseStep::Trap`]. The on-heap loop and the exact-remainder
+/// alloc are one fill: `CONS(hp, CAR, tail)` with a raw heap-top bump.
+pub fn lists_reverse(
+    ctx: &mut Ctx<'_>,
+    list: Term,
+    tail: Term,
+    max_cells: usize,
+) -> Result<ReverseStep, BifError> {
     if list == Term::NIL {
-        return Ok(tail);
+        return Ok(ReverseStep::Done(tail));
     }
     // SAFETY: source cons cells stay live. Destination words come from one
-    // HAlloc of the young-heap window (or of the exact remainder).
+    // HAlloc of the young-heap window (or of the exact remainder of this chunk).
     unsafe {
         let mut list_bits = list.raw_bits();
         let mut tail_bits = tail.raw_bits();
@@ -814,7 +863,9 @@ fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             return Err(BADARG);
         }
         let nil_bits = Term::NIL.raw_bits();
-        if let Some(left) = ctx.heap.words_left()
+        let mut built = 0usize;
+        if max_cells > 0
+            && let Some(left) = ctx.heap.words_left()
             && left > 8
         {
             let words = left - 2;
@@ -822,13 +873,14 @@ fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             let mut alloc_top = reserved.cursor();
             // Two words per cell; `limit` is exclusive, so stop one word early.
             let alloc_end = reserved.limit().wrapping_sub(1);
-            while alloc_top < alloc_end && is_list_bits(list_bits) {
+            while alloc_top < alloc_end && is_list_bits(list_bits) && built < max_cells {
                 let (car, next) = car_cdr!(list_bits);
                 alloc_top.write(car);
                 alloc_top.add(1).write(tail_bits);
                 tail_bits = (alloc_top as u64) | 1;
                 alloc_top = alloc_top.add(2);
                 list_bits = next;
+                built += 1;
             }
             reserved.set_cursor(alloc_top);
         }
@@ -836,16 +888,27 @@ fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             if list_bits != nil_bits {
                 return Err(BADARG);
             }
-            return Ok(Term::from_raw_bits(tail_bits));
+            charge_reverse_chunk(ctx, max_cells, built);
+            return Ok(ReverseStep::Done(Term::from_raw_bits(tail_bits)));
         }
+        if built >= max_cells {
+            charge_reverse_chunk(ctx, max_cells, built);
+            return Ok(ReverseStep::Trap(ReverseCont {
+                list: Term::from_raw_bits(list_bits),
+                tail: Term::from_raw_bits(tail_bits),
+            }));
+        }
+        // Young-heap window is full (or was too small). Count at most the
+        // cells still in this chunk, then allocate that exact remainder.
+        let alloc_budget = max_cells - built;
         let mut count = 0usize;
         let mut scan = list_bits;
-        while is_list_bits(scan) {
+        while count < alloc_budget && is_list_bits(scan) {
             let (_, next) = car_cdr!(scan);
             count += 1;
             scan = next;
         }
-        if scan != nil_bits {
+        if !is_list_bits(scan) && scan != nil_bits {
             return Err(BADARG);
         }
         let words = count.checked_mul(2).ok_or(BifError::SystemLimit)?;
@@ -857,8 +920,32 @@ fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             tail_bits = (alloc_top as u64) | 1;
             alloc_top = alloc_top.add(2);
             list_bits = next;
+            built += 1;
         }
-        Ok(Term::from_raw_bits(tail_bits))
+        charge_reverse_chunk(ctx, max_cells, built);
+        if list_bits == nil_bits {
+            Ok(ReverseStep::Done(Term::from_raw_bits(tail_bits)))
+        } else {
+            Ok(ReverseStep::Trap(ReverseCont {
+                list: Term::from_raw_bits(list_bits),
+                tail: Term::from_raw_bits(tail_bits),
+            }))
+        }
+    }
+}
+
+fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // The VM trap passes a finite `max_cells`. A direct call finishes the list.
+    let mut list = args[0];
+    let mut tail = args[1];
+    loop {
+        match lists_reverse(ctx, list, tail, usize::MAX)? {
+            ReverseStep::Done(value) => return Ok(value),
+            ReverseStep::Trap(cont) => {
+                list = cont.list();
+                tail = cont.tail();
+            }
+        }
     }
 }
 
@@ -1198,5 +1285,106 @@ mod subtract_tests {
             compare(&local, &expected, CompareMode::Exact)
                 .unwrap_or_else(|error| panic!("resumed subtract mismatch for {args:?}: {error}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod reverse_chunk_tests {
+    use super::{ReverseStep, lists_reverse};
+    use crate::{Ctx, FragmentingHeap};
+    use arinsal_term::{HeapAlloc, ProcessHeap, Term, TermBuilder, exact_eq};
+
+    fn list_of(heap: &mut FragmentingHeap<'_>, n: usize) -> Term {
+        let values: Vec<_> = (0..n)
+            .map(|i| Term::small(i64::try_from(i).unwrap()).unwrap())
+            .collect();
+        TermBuilder::new(heap).list_from_slice(&values).unwrap()
+    }
+
+    fn chunked(ctx: &mut Ctx<'_>, source: Term, tail: Term, max_cells: usize) -> Term {
+        let mut list = source;
+        let mut acc = tail;
+        for _ in 0..64 {
+            match lists_reverse(ctx, list, acc, max_cells).unwrap() {
+                ReverseStep::Done(value) => return value,
+                ReverseStep::Trap(cont) => {
+                    assert_ne!(cont.list(), list, "chunk did not consume a cell");
+                    list = cont.list();
+                    acc = cont.tail();
+                }
+            }
+        }
+        panic!("reverse chunk made no progress");
+    }
+
+    #[test]
+    fn chunks_match_one_shot_reverse() {
+        let mut heap = ProcessHeap::with_words(4096);
+        let mut alloc = FragmentingHeap(&mut heap);
+        let source = list_of(&mut alloc, 20);
+        let tail = Term::small(99).unwrap();
+        let mut ctx = Ctx::new(&mut alloc);
+        let ReverseStep::Done(one_shot) =
+            lists_reverse(&mut ctx, source, tail, usize::MAX).unwrap()
+        else {
+            panic!("unbounded reverse trapped");
+        };
+        assert!(matches!(
+            lists_reverse(&mut ctx, source, tail, 3).unwrap(),
+            ReverseStep::Trap(_)
+        ));
+        let chunked = chunked(&mut ctx, source, tail, 3);
+        assert!(exact_eq(chunked, one_shot));
+    }
+
+    #[test]
+    fn alloc_path_chunk_matches_one_shot() {
+        let mut heap = ProcessHeap::with_words(512);
+        let mut alloc = FragmentingHeap(&mut heap);
+        let source = list_of(&mut alloc, 10);
+        let tail = Term::small(1).unwrap();
+        let left = HeapAlloc::words_left(&alloc).unwrap_or(0);
+        if left > 8 {
+            HeapAlloc::alloc(&mut alloc, left - 8).unwrap();
+        }
+        assert!(HeapAlloc::words_left(&alloc).unwrap_or(0) <= 8);
+        let mut ctx = Ctx::new(&mut alloc);
+        let ReverseStep::Done(one_shot) =
+            lists_reverse(&mut ctx, source, tail, usize::MAX).unwrap()
+        else {
+            panic!("unbounded reverse trapped");
+        };
+        assert!(matches!(
+            lists_reverse(&mut ctx, source, tail, 4).unwrap(),
+            ReverseStep::Trap(_)
+        ));
+        let chunked = chunked(&mut ctx, source, tail, 4);
+        assert!(exact_eq(chunked, one_shot));
+    }
+
+    #[test]
+    fn empty_list_keeps_the_tail() {
+        let mut heap = ProcessHeap::with_words(64);
+        let mut alloc = FragmentingHeap(&mut heap);
+        let mut ctx = Ctx::new(&mut alloc);
+        let tail = Term::small(7).unwrap();
+        let ReverseStep::Done(value) = lists_reverse(&mut ctx, Term::NIL, tail, 1).unwrap() else {
+            panic!("empty reverse trapped");
+        };
+        assert_eq!(value, tail);
+    }
+
+    #[test]
+    fn improper_list_is_badarg() {
+        let mut heap = ProcessHeap::with_words(256);
+        let mut alloc = FragmentingHeap(&mut heap);
+        let bad = TermBuilder::new(&mut alloc)
+            .cons(Term::small(1).unwrap(), Term::small(2).unwrap())
+            .unwrap();
+        let mut ctx = Ctx::new(&mut alloc);
+        assert!(matches!(
+            lists_reverse(&mut ctx, bad, Term::NIL, 10),
+            Err(crate::BifError::Badarg { .. })
+        ));
     }
 }

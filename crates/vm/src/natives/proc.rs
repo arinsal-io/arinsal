@@ -1190,6 +1190,10 @@ fn backtrace_with(
         Err(_) => "<unprintable>".into(),
     };
     let mut text = String::new();
+    // Port of erts/emulator/beam/erl_process.c:14916 (erts_program_counter_info prints p->i)
+    // and bif.h:322 (`p->i = beam_bif_export_trap`), OTP-29.1.1. A trapped BIF is not inside
+    // the caller's native function; the PC is the export-trap entry.
+    let export_trap = process.header.i as usize == crate::bif_traps::bif_export_trap_pc();
     let native_pc = process
         .native_pc
         .filter(|pc| crate::native_bridge::is_native_function_at(*pc))
@@ -1233,7 +1237,15 @@ fn backtrace_with(
             })
             .unwrap_or_else(|| "invalid".into())
     };
-    let _ = writeln!(text, "Program counter: {address:#018x} ({description})");
+    if export_trap {
+        let _ = writeln!(
+            text,
+            "Program counter: {:#018x} (unknown function)",
+            crate::bif_traps::bif_export_trap_pc()
+        );
+    } else {
+        let _ = writeln!(text, "Program counter: {address:#018x} ({description})");
+    }
     if !running {
         let arity = if native_pc.is_some() {
             usize::from(process.header.arity)
