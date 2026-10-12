@@ -99,7 +99,7 @@ pub(crate) fn copy_literal_area(
         // Port of beam_bif_load.c:1012 (erts_check_copy_literals_gc_need), OTP-29.1.1:
         // the heap may be inconsistent while GC is disabled, so do not scan it;
         // the collection is requested and delayed until GC is enabled.
-        if !process.gc_enabled {
+        if !process.heap.gc_enabled {
             reply_literal_area_copy(ctx, request, requester, atom("need_gc"))?;
             return Ok(());
         }

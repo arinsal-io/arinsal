@@ -147,7 +147,6 @@ pub struct Process {
     /// `erts_current_reductions` is this minus the live `c_p->fcalls`.
     pub(crate) native_reds_in: i32,
     pub(crate) reductions_used: u64,
-    pub(crate) gc_enabled: bool,
     pub(crate) gc_deferred: bool,
     /// erts `F_DELAY_GC`: set from `loop_rec` until `remove_message` or the wait, while x0
     /// may refer to a queued message whose data is still in its heap fragment.
@@ -1155,7 +1154,6 @@ impl Process {
             reductions: 4000,
             native_reds_in: 4000,
             reductions_used: 0,
-            gc_enabled: true,
             delay_gc: false,
             gc_deferred: false,
             uniq_counter: 0,
@@ -1237,7 +1235,7 @@ impl Process {
         {
             return Ok(());
         }
-        if !self.gc_enabled {
+        if !self.heap.gc_enabled {
             return Err(VmError::Trap(exceptions::Trap::error(Term::atom(
                 arinsal_term::atoms::SYSTEM_LIMIT,
             ))));
