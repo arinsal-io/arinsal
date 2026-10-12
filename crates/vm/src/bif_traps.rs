@@ -44,6 +44,7 @@ const IOLIST_CONTINUATION: &str = "erts_internal:list_to_bitstring_continue/1";
 const IOLIST_SIZE_CONTINUATION: &str = "erts_internal:iolist_size_continue/1";
 const BINARY_TO_TERM_CONTINUATION: &str = "erts_internal:binary_to_term_trap/1";
 const BINARY_COPY_CONTINUATION: &str = "erlang:binary_copy_trap/3";
+const BINARY_TO_LIST_CONTINUATION: &str = "erlang:binary_to_list/1";
 const TERM_TO_BINARY_CONTINUATION: &str = "erts_internal:term_to_binary_trap/1";
 const BINARY_SEARCH_CONTINUATION: &str = "erlang:binary_find_trap/3";
 const PTAB_LIST_CONTINUATION: &str = "erlang:ptab_list_continue/2";
@@ -474,6 +475,20 @@ const ENTRIES: &[Entry] = &[
         handler: iolist_to_binary,
     },
     Entry {
+        module: "erlang",
+        function: "binary_to_list",
+        arity: 1,
+        continuation: BINARY_TO_LIST_CONTINUATION,
+        handler: binary_to_list_trap,
+    },
+    Entry {
+        module: "erlang",
+        function: "binary_to_list",
+        arity: 3,
+        continuation: BINARY_TO_LIST_CONTINUATION,
+        handler: binary_to_list_trap,
+    },
+    Entry {
         module: "binary",
         function: "list_to_bin",
         arity: 1,
@@ -657,6 +672,56 @@ fn binary_split(
     )
 }
 
+// Port of erts/emulator/beam/binary.c:213-239 (binary_to_list_chunk), OTP-29.1.1.
+fn binary_to_list_trap(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    restore_gc: bool,
+) -> Result<TrapResult, BifError> {
+    if state.is_none() {
+        let bif = arinsal_bifs::lookup("erlang", "binary_to_list", args.len() as u8)
+            .ok_or(BifError::BADARG)?;
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        let reds_left = process.reductions.max(0) as usize;
+        ctx.set_reduction_budget(reds_left);
+        let value = bif(&mut ctx, args)?;
+        let reductions = ctx.reductions();
+        return match ctx.take_deferred().map(|trap| *trap) {
+            Some(arinsal_bifs::DeferredTrap::BinaryToList(walk)) => Ok(TrapResult::Yield {
+                continuation: BINARY_TO_LIST_CONTINUATION,
+                state: MagicRef::new(Mutex::new(walk)),
+                reductions,
+            }),
+            Some(_) => Err(BifError::BADARG),
+            None => Ok(TrapResult::Done { value, reductions }),
+        };
+    }
+    let state = Arc::clone(state.ok_or(BifError::BADARG)?);
+    let walk = state
+        .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
+        .ok_or(BifError::BADARG)?;
+    let mut walk = walk.lock().map_err(|_| BifError::SystemLimit)?;
+    let reds_left = process.reductions.max(0) as usize;
+    let chunk = reds_left.saturating_add(1).saturating_mul(256);
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let (value, used) = walk.step(&mut heap, chunk)?;
+    let reductions = used.div_ceil(256).min(u32::MAX as usize) as u32;
+    if let Some(value) = value {
+        process.set_gc_enabled(restore_gc);
+        Ok(TrapResult::Done { value, reductions })
+    } else {
+        drop(walk);
+        Ok(TrapResult::Yield {
+            continuation: BINARY_TO_LIST_CONTINUATION,
+            state,
+            reductions,
+        })
+    }
+}
+
 fn binary_search(
     process: &mut Process,
     args: &[Term],
@@ -665,8 +730,11 @@ fn binary_search(
     kind: arinsal_bifs::BinarySearchKind,
 ) -> Result<TrapResult, BifError> {
     // Port of erts/emulator/beam/erl_bif_binary.c:1433-1528 (do_binary_find), OTP-29.1.1.
+    // Port of erts/emulator/beam/erl_bif_binary.c:110 (get_reds), OTP-29.1.1.
     const SEARCH_LOOP_FACTOR: usize = 10;
-    let budget = (process.reductions.max(0) as usize).saturating_mul(SEARCH_LOOP_FACTOR);
+    let budget = (process.reductions.max(0) as usize)
+        .saturating_mul(SEARCH_LOOP_FACTOR)
+        .max(1);
     if let Some(state) = state {
         let state = Arc::clone(state);
         let search = state
@@ -1403,8 +1471,14 @@ pub(crate) fn call_light(
             state,
             reductions,
         }) => {
+            let binary_to_list_retry = continuation == BINARY_TO_LIST_CONTINUATION
+                && state
+                    .downcast_ref::<Mutex<arinsal_bifs::BinaryToListWalk>>()
+                    .and_then(|walk| walk.lock().ok())
+                    .is_some_and(|walk| walk.needs_initial_allocation());
             if continuation != PTAB_LIST_CONTINUATION
                 && continuation != CODE_PERMISSION_CONTINUATION
+                && !binary_to_list_retry
             {
                 process.set_gc_enabled(false);
             }
@@ -1449,7 +1523,16 @@ pub(crate) fn install_deferred_trap(
 ) {
     let (slice_reductions, all_reductions) = reductions_charged;
     let gc_was_enabled = process.heap.gc_enabled;
+    let mut disable_gc = true;
     let (continuation, state, reductions) = match *trap {
+        arinsal_bifs::DeferredTrap::BinaryToList(walk) => {
+            disable_gc = !walk.needs_initial_allocation();
+            (
+                BINARY_TO_LIST_CONTINUATION,
+                MagicRef::new(Mutex::new(walk)),
+                slice_reductions,
+            )
+        }
         arinsal_bifs::DeferredTrap::Key(cont) => (
             key_continuation(function),
             MagicRef::new(Mutex::new(cont)),
@@ -1479,7 +1562,9 @@ pub(crate) fn install_deferred_trap(
             slice_reductions,
         ),
     };
-    process.set_gc_enabled(false);
+    if disable_gc {
+        process.set_gc_enabled(false);
+    }
     let mut saved = [Term::NIL; 3];
     let arity = args.len().min(3);
     saved[..arity].copy_from_slice(&args[..arity]);

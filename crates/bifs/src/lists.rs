@@ -214,6 +214,8 @@ pub enum KeyOp {
 
 /// Continuation built only after a slice's counter runs out.
 pub enum DeferredTrap {
+    /// `erlang:binary_to_list/1` and `/3`.
+    BinaryToList(crate::pure::BinaryToListWalk),
     /// `lists:keyfind/3`, `keymember/3`, or `keysearch/3`.
     Key(KeyfindCont),
     /// `lists:member/2`.
