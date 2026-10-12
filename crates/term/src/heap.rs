@@ -318,7 +318,7 @@ pub trait HeapAlloc {
 ///
 /// Private on purpose: every caller passes a pointer it obtained from the allocator for the
 /// block it is filling, which is the one invariant a raw store needs.
-#[inline]
+#[inline(always)]
 fn store(ptr: *mut u64, value: u64) {
     // SAFETY: callers pass an in-bounds, initialized-or-reserved slot of a live heap block.
     unsafe { *ptr = value }
@@ -357,23 +357,33 @@ impl Default for Tuple3Chain {
 /// Build a list in input order inside one pre-reserved heap block.
 pub struct ConsHeapBuilder<'a, H: HeapAlloc + ?Sized> {
     reservation: HeapReservation<'a, H>,
+    cur: *mut u64,
     head: Term,
     last: Option<*mut u64>,
 }
 impl<'a, H: HeapAlloc + ?Sized> ConsHeapBuilder<'a, H> {
     /// Reserve space for at most `max_cells` cons cells.
+    /// Port of `HAlloc(p, 2 * max_cells)` in `erl_bif_lists.c:145-147`, OTP-29.1.1.
     pub fn new(heap: &'a mut H, max_cells: usize) -> Result<Self, TermError> {
         let words = max_cells.checked_mul(2).ok_or(TermError::SystemLimit)?;
+        let reservation = HeapReservation::new(heap, words)?;
+        let cur = reservation.cursor();
         Ok(Self {
-            reservation: HeapReservation::new(heap, words)?,
+            reservation,
+            cur,
             head: Term::NIL,
             last: None,
         })
     }
 
     /// Append a cell after the previous cell in input order.
+    #[inline(always)]
     pub fn push(&mut self, head: Term) -> Result<(), TermError> {
-        let cell = TermBuilder::new(&mut self.reservation).words(2)?;
+        let cell = self.cur;
+        if cell == self.reservation.limit() {
+            return Err(TermError::HeapFull);
+        }
+        self.cur = cell.wrapping_add(2);
         let term = Term::from_ptr(cell, 1);
         match self.last {
             Some(last) => store(last.wrapping_add(1), term.bits()),
@@ -387,22 +397,43 @@ impl<'a, H: HeapAlloc + ?Sized> ConsHeapBuilder<'a, H> {
     }
 
     /// Close the list with `tail` and release unused reserved heap words.
+    /// Port of final RHS linking and `HEAP_TOP` advancement in `erl_bif_lists.c:148-163`.
     pub fn finish(mut self, tail: Term) -> Term {
-        match self.last.take() {
+        let result = match self.last.take() {
             Some(last) => {
                 store(last.wrapping_add(1), tail.bits());
                 self.head
             }
             None => tail,
-        }
+        };
+        self.reservation.set_cursor(self.cur);
+        result
+    }
+
+    /// Finish a nonempty segment with an open tail so another heap block can follow it.
+    /// Port of the retained `result_cdr` slot in `erl_bif_lists.c:52-58`, OTP-29.1.1.
+    pub fn finish_open(mut self) -> Option<ConsHeapSegment> {
+        let segment = self.last.take().map(|last| ConsHeapSegment {
+            head: self.head,
+            last_cdr: last.wrapping_add(1) as usize,
+        });
+        self.reservation.set_cursor(self.cur);
+        segment
     }
 }
 impl<H: HeapAlloc + ?Sized> Drop for ConsHeapBuilder<'_, H> {
     fn drop(&mut self) {
         if let Some(last) = self.last.take() {
             store(last.wrapping_add(1), Term::NIL.bits());
+            self.reservation.set_cursor(self.cur);
         }
     }
+}
+
+/// A contiguous list segment whose final CDR can be linked to another segment.
+pub struct ConsHeapSegment {
+    head: Term,
+    last_cdr: usize,
 }
 
 /// An append-only list whose open tail can survive a BIF reduction trap.
@@ -422,6 +453,17 @@ impl ConsHeapChain {
             head: Term::NIL,
             result_cdr: None,
         }
+    }
+
+    /// Join a completed contiguous segment to this list and keep its tail open.
+    /// Port of the result CDR link in `erl_bif_lists.c:121-132`, OTP-29.1.1.
+    pub fn append_segment(&mut self, segment: ConsHeapSegment) {
+        if let Some(result_cdr) = self.result_cdr {
+            store(result_cdr as *mut u64, segment.head.bits());
+        } else {
+            self.head = segment.head;
+        }
+        self.result_cdr = Some(segment.last_cdr);
     }
 
     /// Append one input-order cell with the same heap-fragment slack as `HAllocX`.
@@ -1653,6 +1695,27 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     pub fn new(heap: &'a mut H) -> Self {
         Self { heap }
     }
+
+    /// Reserve one contiguous HAlloc block for `len` cons cells.
+    ///
+    /// Push heads in reverse list order, then call [`ConsListBuilder::finish`] with the final tail.
+    ///
+    /// Port of erts/emulator/beam/erl_map.c:1222 and :2277, OTP-29.1.1.
+    pub fn reserve_cons_list(&mut self, len: usize) -> Result<ConsListBuilder, TermError> {
+        let words = len.checked_mul(2).ok_or(TermError::SystemLimit)?;
+        let start = if words == 0 {
+            std::ptr::null_mut()
+        } else {
+            self.words(words)?
+        };
+        Ok(ConsListBuilder {
+            start: start as usize,
+            len,
+            written: 0,
+            head: Term::NIL,
+            first_cdr: None,
+        })
+    }
     pub(crate) fn words(&mut self, words: usize) -> Result<*mut u64, TermError> {
         self.heap.alloc(words).ok_or(TermError::HeapFull)
     }
@@ -2333,6 +2396,110 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     #[inline]
     pub fn local_ref(&mut self, ids: [u32; 3]) -> Result<Term, TermError> {
         Term::local_ref(self.heap, ids)
+    }
+}
+
+/// A contiguous list reservation returned by [`TermBuilder::reserve_cons_list`].
+pub struct ConsListBuilder {
+    start: usize,
+    len: usize,
+    written: usize,
+    head: Term,
+    first_cdr: Option<usize>,
+}
+
+impl ConsListBuilder {
+    /// Build the reservation by prepending an exact reverse-order sequence to `tail`.
+    /// The size check is outside the loop so each cell follows the HAlloc/CONS sequence directly.
+    /// Port of `while(n--) { res = CONS(hp, value, res); hp += 2; }` in
+    /// `erts/emulator/beam/erl_map.c:1222-1225` and :2277-2280, OTP-29.1.1.
+    #[inline]
+    pub fn prepend_exact_with_tail(
+        self,
+        mut values: impl Iterator<Item = Term>,
+        tail: Term,
+    ) -> Result<Term, TermError> {
+        if self.written != 0 {
+            return Err(TermError::BadArg);
+        }
+        let mut head = tail;
+        let mut cell = self.start as *mut u64;
+        let mut valid = true;
+        for _ in 0..self.len {
+            let value = values.next().unwrap_or_else(|| {
+                valid = false;
+                Term::NIL
+            });
+            store(cell, value.bits());
+            store(cell.wrapping_add(1), head.bits());
+            head = Term::from_ptr(cell, 1);
+            cell = cell.wrapping_add(2);
+        }
+        valid &= values.next().is_none();
+        if !valid {
+            return Err(TermError::BadArg);
+        }
+        Ok(head)
+    }
+
+    /// Fill the next reserved cons cell as an independent pair and return its term.
+    /// Port of `CONS(hp, key, value)` in `erts/emulator/beam/erl_map.c:521`, OTP-29.1.1.
+    #[inline(always)]
+    pub fn cons_cell(&mut self, head: Term, tail: Term) -> Result<Term, TermError> {
+        if self.written == self.len {
+            return Err(TermError::BadArg);
+        }
+        let cell = (self.start as *mut u64).wrapping_add(2 * self.written);
+        store(cell, head.bits());
+        store(cell.wrapping_add(1), tail.bits());
+        self.written += 1;
+        Ok(Term::from_ptr(cell, 1))
+    }
+
+    /// Allocate the next cell and link it to the list built so far.
+    ///
+    /// Push values in reverse output order to match `res = CONS(hp, value, res); hp += 2`.
+    /// Port of `CONS(hp, key, res)` in `erts/emulator/beam/erl_map.c:1225` and :2280.
+    #[inline(always)]
+    pub fn prepend(&mut self, value: Term) -> Result<(), TermError> {
+        if self.written == self.len {
+            return Err(TermError::BadArg);
+        }
+        let index = self.written;
+        let cell = (self.start as *mut u64).wrapping_add(2 * index);
+        store(cell, value.bits());
+        store(cell.wrapping_add(1), self.head.bits());
+        if index == 0 {
+            self.first_cdr = Some(cell.wrapping_add(1) as usize);
+        }
+        self.head = Term::from_ptr(cell, 1);
+        self.written += 1;
+        Ok(())
+    }
+
+    /// Finish the list with `tail`; every reserved cell must have been filled.
+    #[inline(always)]
+    pub fn finish(self, tail: Term) -> Result<Term, TermError> {
+        if self.written != self.len {
+            return Err(TermError::BadArg);
+        }
+        if self.len == 0 {
+            return Ok(tail);
+        }
+        store(
+            self.first_cdr.expect("nonempty list has first cell") as *mut u64,
+            tail.bits(),
+        );
+        Ok(self.head)
+    }
+
+    /// Finish a reservation filled with independent cons cells.
+    pub fn finish_cells(self) -> Result<(), TermError> {
+        if self.written == self.len {
+            Ok(())
+        } else {
+            Err(TermError::BadArg)
+        }
     }
 }
 

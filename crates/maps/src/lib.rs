@@ -991,11 +991,36 @@ fn flatmap_take<H: HeapAlloc + ?Sized>(
         merge::produce(heap, need_words).map_err(|_| MapError::HeapFull { need_words })?;
     let (tuple, rest) = output.split_at_mut(tuple_words);
     let (header, values) = rest.split_at_mut(FLATMAP_HEADER_WORDS);
+    if n > 1 {
+        tuple[0].write(((n - 1) as u64) << 6);
+    }
+    header[0].write(MAP_HEADER_FLATMAP);
+    header[1].write((n - 1) as u64);
     let found = if is_immed(key) {
-        let key = bits(key);
-        ks.iter().position(|&k| k == key)
+        let raw_key = bits(key);
+        let mut i = 0;
+        while i < n {
+            if ks[i] == raw_key {
+                break;
+            } else if i + 1 < n {
+                tuple[i + 1].write(ks[i]);
+                values[i].write(vs[i]);
+            }
+            i += 1;
+        }
+        (i < n).then_some(i)
     } else {
-        ks.iter().position(|&k| exact_eq(term(k), key))
+        let mut i = 0;
+        while i < n {
+            if exact_eq(term(ks[i]), key) {
+                break;
+            } else if i + 1 < n {
+                tuple[i + 1].write(ks[i]);
+                values[i].write(vs[i]);
+            }
+            i += 1;
+        }
+        (i < n).then_some(i)
     };
     let Some(found) = found else {
         heap.release(start.wrapping_add(need_words), start);
@@ -1004,13 +1029,10 @@ fn flatmap_take<H: HeapAlloc + ?Sized>(
     let keys = if n == 1 {
         arinsal_term::global_empty_tuple()
     } else {
-        tuple[0].write(((n - 1) as u64) << 6);
-        copy_skipping(&mut tuple[1..], ks, found);
+        tuple[found + 1..].write_copy_of_slice(&ks[found + 1..]);
+        values[found..].write_copy_of_slice(&vs[found + 1..]);
         boxed(start)
     };
-    copy_skipping(values, vs, found);
-    header[0].write(MAP_HEADER_FLATMAP);
-    header[1].write((n - 1) as u64);
     header[2].write(bits(keys));
     // The map header follows the key tuple inside the allocated block.
     let res = boxed(start.wrapping_add(tuple_words));
@@ -1109,17 +1131,6 @@ pub fn cons_pair<H: HeapAlloc + ?Sized>(
     words[3].write(bits(boxed(at)));
     words[4].write(bits(tail));
     Ok(cons(at.wrapping_add(3)))
-}
-
-/// `source` without its element at `skip`, into `out` (one word shorter).
-fn copy_skipping(out: &mut [std::mem::MaybeUninit<u64>], source: &[u64], skip: usize) {
-    let (before, after) = out.split_at_mut(skip);
-    for (slot, &word) in before.iter_mut().zip(&source[..skip]) {
-        slot.write(word);
-    }
-    for (slot, &word) in after.iter_mut().zip(&source[skip + 1..]) {
-        slot.write(word);
-    }
 }
 
 // erts MAP_HEADER_FLATMAP_SZ: header, size, key tuple.
@@ -1687,6 +1698,20 @@ pub fn keys(map: Term) -> MapResult<Vec<Term>> {
 pub fn values(map: Term) -> MapResult<Vec<Term>> {
     Ok(iter(map)?.map(|(_, v)| v).collect())
 }
+
+/// Iterate a flatmap's keys or values in the reverse order used to build
+/// `maps:keys/1` and `maps:values/1` result lists.
+///
+/// Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298, OTP-29.1.1.
+pub fn flatmap_projection(
+    map: CheckedFlatMap,
+    keys: bool,
+) -> impl DoubleEndedIterator<Item = Term> + ExactSizeIterator {
+    let (key_words, value_words, _) = merge::flatmap_kv_with_size(map.term(), map.size());
+    let words = if keys { key_words } else { value_words };
+    words.iter().copied().map(term)
+}
+
 /// Lookup several keys; absent keys return `None`.
 pub fn get_many(map: Term, keys: &[Term]) -> MapResult<Vec<Option<Term>>> {
     check(map)?;

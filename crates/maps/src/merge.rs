@@ -216,44 +216,81 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
     output[keys_tuple_start].write(0);
     let (mut i1, mut i2, mut unused_size) = (0, 0, 0);
     let mut n = 0;
-    while i1 < n1 && i2 < n2 {
-        let c = if ks1[i1] == ks2[i2] {
-            Ordering::Equal
-        } else {
-            key_cmp(term(ks1[i1]), term(ks2[i2]))
-        };
-        match c {
-            Ordering::Equal => {
-                output[keys_start + n].write(ks2[i2]);
-                output[values_start + n].write(vs2[i2]);
-                i1 += 1;
-                i2 += 1;
-                unused_size += 1;
+    {
+        let (before_keys, keys_region) = output.split_at_mut(keys_start);
+        let keys_output = &mut keys_region[..capacity];
+        let values_output = &mut before_keys[values_start..values_start + capacity];
+        let mut keys_output = keys_output.iter_mut();
+        let mut values_output = values_output.iter_mut();
+        while i1 < n1 && i2 < n2 {
+            let c = if ks1[i1] == ks2[i2] {
+                Ordering::Equal
+            } else {
+                key_cmp(term(ks1[i1]), term(ks2[i2]))
+            };
+            match c {
+                Ordering::Equal => {
+                    keys_output
+                        .next()
+                        .expect("flatmap merge key capacity")
+                        .write(ks2[i2]);
+                    values_output
+                        .next()
+                        .expect("flatmap merge value capacity")
+                        .write(vs2[i2]);
+                    i1 += 1;
+                    i2 += 1;
+                    unused_size += 1;
+                }
+                Ordering::Less => {
+                    keys_output
+                        .next()
+                        .expect("flatmap merge key capacity")
+                        .write(ks1[i1]);
+                    values_output
+                        .next()
+                        .expect("flatmap merge value capacity")
+                        .write(vs1[i1]);
+                    i1 += 1;
+                }
+                Ordering::Greater => {
+                    keys_output
+                        .next()
+                        .expect("flatmap merge key capacity")
+                        .write(ks2[i2]);
+                    values_output
+                        .next()
+                        .expect("flatmap merge value capacity")
+                        .write(vs2[i2]);
+                    i2 += 1;
+                }
             }
-            Ordering::Less => {
-                output[keys_start + n].write(ks1[i1]);
-                output[values_start + n].write(vs1[i1]);
-                i1 += 1;
-            }
-            Ordering::Greater => {
-                output[keys_start + n].write(ks2[i2]);
-                output[values_start + n].write(vs2[i2]);
-                i2 += 1;
-            }
+            n += 1;
         }
-        n += 1;
-    }
-    while i1 < n1 {
-        output[keys_start + n].write(ks1[i1]);
-        output[values_start + n].write(vs1[i1]);
-        i1 += 1;
-        n += 1;
-    }
-    while i2 < n2 {
-        output[keys_start + n].write(ks2[i2]);
-        output[values_start + n].write(vs2[i2]);
-        i2 += 1;
-        n += 1;
+        while i1 < n1 {
+            keys_output
+                .next()
+                .expect("flatmap merge key capacity")
+                .write(ks1[i1]);
+            values_output
+                .next()
+                .expect("flatmap merge value capacity")
+                .write(vs1[i1]);
+            i1 += 1;
+            n += 1;
+        }
+        while i2 < n2 {
+            keys_output
+                .next()
+                .expect("flatmap merge key capacity")
+                .write(ks2[i2]);
+            values_output
+                .next()
+                .expect("flatmap merge value capacity")
+                .write(vs2[i2]);
+            i2 += 1;
+            n += 1;
+        }
     }
     output[1].write(n as u64);
     output[keys_tuple_start].write((n as u64) << 6);
@@ -877,22 +914,56 @@ fn flatmap_if_small<H: HeapAlloc + ?Sized>(res: Term, heap: &mut H) -> Result<Te
 ///
 /// Port of erts/emulator/beam/erl_map.c:482-591 as transformed by YCF, OTP-29.1.1.
 pub struct HashmapFromPairs {
-    build: arinsal_term::HashmapBuild,
+    leaves: Option<arinsal_term::ConsListBuilder>,
+    entries: Vec<arinsal_term::HxNode>,
+    build: Option<arinsal_term::HashmapBuild>,
 }
 
 impl HashmapFromPairs {
-    /// Allocate the `[Key | Value]` leaves of `entries` (swizzled hash, key, value).
-    pub fn new<H: HeapAlloc + ?Sized>(
-        entries: &[(u64, Term, Term)],
-        heap: &mut H,
-    ) -> MapResult<Self> {
-        let hxns =
-            arinsal_term::hashmap_leaves_hashed(entries, heap).map_err(|_| MapError::HeapFull {
-                need_words: 2 * entries.len(),
+    /// Reserve the `[Key | Value]` leaves and hash-record array for `size` entries.
+    /// Port of `HAlloc(2 * size)` and the `hxnode_t` allocation in
+    /// `erts/emulator/beam/erl_map.c:508-512`, OTP-29.1.1.
+    pub fn new<H: HeapAlloc + ?Sized>(size: usize, heap: &mut H) -> MapResult<Self> {
+        let leaves = arinsal_term::TermBuilder::new(heap)
+            .reserve_cons_list(size)
+            .map_err(|_| MapError::HeapFull {
+                need_words: 2 * size,
             })?;
         Ok(Self {
-            build: arinsal_term::HashmapBuild::new(hxns),
+            leaves: Some(leaves),
+            entries: Vec::with_capacity(size),
+            build: None,
         })
+    }
+
+    /// Hash one validated pair and fill its leaf in the reserved heap block.
+    /// Port of `hashmap_restore_hash` and leaf setup in `erl_map.c:513-531`, OTP-29.1.1.
+    pub fn push(&mut self, key: Term, value: Term) -> MapResult<()> {
+        let hx = arinsal_term::hashmap_key_hash(key);
+        let leaves = self.leaves.as_mut().expect("leaf phase is active");
+        let val = leaves
+            .cons_cell(key, value)
+            .map_err(|_| MapError::HeapFull { need_words: 0 })?;
+        let index = self.entries.len();
+        self.entries.push(arinsal_term::HxNode {
+            hx,
+            skip: 1,
+            i: index,
+            val,
+        });
+        Ok(())
+    }
+
+    /// Finish leaf setup and begin the structural HAMT build.
+    pub fn finish_leaves(&mut self) {
+        self.leaves
+            .take()
+            .expect("leaf phase is active")
+            .finish_cells()
+            .expect("all reserved hashmap leaves were filled");
+        self.build = Some(arinsal_term::HashmapBuild::new(std::mem::take(
+            &mut self.entries,
+        )));
     }
 
     /// Continue with `reds` reductions left; the finished map, or `None` after a yield.
@@ -903,7 +974,13 @@ impl HashmapFromPairs {
     ) -> MapResult<Option<Term>> {
         // The process heap grows by fragments, so exhaustion is not expected here.
         let heap_full = |_| MapError::HeapFull { need_words: 0 };
-        let Some(res) = self.build.step(reds, heap).map_err(heap_full)? else {
+        let Some(res) = self
+            .build
+            .as_mut()
+            .expect("leaf setup finished")
+            .step(reds, heap)
+            .map_err(heap_full)?
+        else {
             return Ok(None);
         };
         flatmap_if_small(res, heap).map(Some).map_err(heap_full)

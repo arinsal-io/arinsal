@@ -231,6 +231,7 @@ pub(crate) const HEAD_ARRAY_HEADER: u64 = MAP | (2 << 6) | (1 << 8) | (0xffff <<
 /// Temporary hash/leaf record of the bulk HAMT constructors.
 ///
 /// Port of erts/emulator/beam/erl_map.c:80 (hxnode_t), OTP-29.1.1.
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct HxNode {
     /// Swizzled hash (path slots from the most significant nibble).

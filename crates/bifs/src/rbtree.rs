@@ -22,12 +22,12 @@ struct Node {
 }
 
 impl Node {
-    fn new(key: Term, parent: usize, is_red: bool) -> Self {
+    fn candidate(key: Term) -> Self {
         Self {
-            parent,
+            parent: NONE,
             left: NONE,
             right: NONE,
-            is_red: i32::from(is_red),
+            is_red: 0,
             key,
             count: 1,
         }
@@ -56,35 +56,43 @@ impl RbTree {
     /// Port of `erl_rbtree.h:1056-1139` (`insert_aux__` and
     /// `lookup_insert`), OTP-29.1.1.
     pub(super) fn insert(&mut self, key: Term) -> usize {
-        let mut parent = NONE;
+        let index = self.nodes.len();
+        // OTP writes key/count into the next arena slot before lookup_insert initializes
+        // its links and searches the tree. A duplicate leaves alloc unchanged, so pop the
+        // unlinked candidate after incrementing the existing node.
+        self.nodes.push(Node::candidate(key));
+        if self.root == NONE {
+            self.root = index;
+            return index;
+        }
+
         let mut cursor = self.root;
-        let mut direction = Ordering::Equal;
-        while cursor != NONE {
-            parent = cursor;
-            direction = subtract_term_cmp(key, self.nodes[cursor].key);
+        loop {
+            let direction = subtract_term_cmp(self.nodes[index].key, self.nodes[cursor].key);
             if direction == Ordering::Equal {
                 self.nodes[cursor].count += 1;
+                self.nodes.pop();
                 return cursor;
             }
-            cursor = if direction == Ordering::Less {
+            let child = if direction == Ordering::Less {
                 self.nodes[cursor].left
             } else {
                 self.nodes[cursor].right
             };
+            if child == NONE {
+                self.nodes[index].parent = cursor;
+                self.nodes[index].is_red = 1;
+                if direction == Ordering::Less {
+                    self.nodes[cursor].left = index;
+                } else {
+                    self.nodes[cursor].right = index;
+                }
+                break;
+            }
+            cursor = child;
         }
 
-        let index = self.nodes.len();
-        self.nodes.push(Node::new(key, parent, parent != NONE));
-        if parent == NONE {
-            self.root = index;
-            self.nodes[index].is_red = 0;
-        } else if direction == Ordering::Less {
-            self.nodes[parent].left = index;
-        } else {
-            self.nodes[parent].right = index;
-        }
-
-        if parent != NONE && self.is_red(parent) {
+        if self.is_red(cursor) {
             self.insert_fixup(index);
         }
         index
@@ -96,10 +104,11 @@ impl RbTree {
     pub(super) fn lookup(&self, key: Term) -> Option<usize> {
         let mut cursor = self.root;
         while cursor != NONE {
-            match subtract_term_cmp(key, self.nodes[cursor].key) {
+            let node = self.nodes[cursor];
+            match subtract_term_cmp(key, node.key) {
                 Ordering::Equal => return Some(cursor),
-                Ordering::Less => cursor = self.nodes[cursor].left,
-                Ordering::Greater => cursor = self.nodes[cursor].right,
+                Ordering::Less => cursor = node.left,
+                Ordering::Greater => cursor = node.right,
             }
         }
         None
