@@ -157,7 +157,7 @@ fn normalize(term: &OwnedTerm) -> OwnedTerm {
 fn assert_same(dir: &Path, erl: &RefErl, module: &str) {
     let expected = normalize(&reference(erl, module));
     let actual = normalize(&scheduled(dir, module));
-    assert_eq!(actual, expected, "{module}:run/0");
+    similar_asserts::assert_eq!(actual, expected, "{module}:run/0");
 }
 
 fn assert_crypto_same(erl: &RefErl, name: &str, body: &str) {
@@ -166,7 +166,7 @@ fn assert_crypto_same(erl: &RefErl, name: &str, body: &str) {
         "-module({name}).\n-export([run/0]).\nrun() ->\n    {{module, crypto}} = code:ensure_loaded(crypto),\n    {body}.\n"
     );
     compile_beam(erl, &dir, name, &source);
-    assert_eq!(
+    similar_asserts::assert_eq!(
         scheduled_cli(&dir, name),
         reference(erl, name),
         "{name}:run/0"
@@ -275,7 +275,7 @@ fn tracer_module_case(mode: &str, test_name: &str) {
     compile_beam(&erl, &dir, test_name, &source);
     let expected = reference(&erl, test_name);
     let actual = scheduled(&dir, test_name);
-    assert_eq!(actual, expected, "{test_name}:run/0");
+    similar_asserts::assert_eq!(actual, expected, "{test_name}:run/0");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -723,7 +723,7 @@ fn tracer_module_return_trace_and_nif_reload_cycles_match_erts() {
         dir.display()
     );
     compile_beam(&erl, &dir, "nifdyn_tracer_reload", &source);
-    assert_eq!(
+    similar_asserts::assert_eq!(
         scheduled_cli(&dir, "nifdyn_tracer_reload"),
         reference(&erl, "nifdyn_tracer_reload"),
         "nifdyn_tracer_reload:run/0"
@@ -847,7 +847,7 @@ fn tracer_reload_uses_new_nif_callbacks_like_erts() {
         byte_binary(&std::fs::read(dir.join("nifdyn_tracer_pin_v2.beam")).unwrap())
     );
     compile_beam(&erl, &dir, "nifdyn_tracer_pin_runner", &runner);
-    assert_eq!(
+    similar_asserts::assert_eq!(
         scheduled(&dir, "nifdyn_tracer_pin_runner"),
         reference(&erl, "nifdyn_tracer_pin_runner"),
         "tracer callbacks after NIF reload"
@@ -1107,8 +1107,9 @@ fn nif_api2_halt_callback_and_delay_match_erts() {
     let mut expected_events: Vec<_> = expected.lines().collect();
     actual_events.sort_unstable();
     expected_events.sort_unstable();
-    assert_eq!(
-        actual_events, expected_events,
+    similar_asserts::assert_eq!(
+        actual_events,
+        expected_events,
         "NIF halt events differ from erl"
     );
     assert!(
@@ -1123,5 +1124,115 @@ fn nif_api2_halt_callback_and_delay_match_erts() {
         expected.contains("on_halt\n"),
         "missing on-halt callback: {expected:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `enif_self`, `enif_send` and `enif_whereis_pid` from a scheduler and from a NIF-created
+/// thread: the caller identity a NIF sees is the process currently running on its scheduler.
+#[test]
+fn nif_thread_send_whereis_and_self_match_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping NIF thread send differential test");
+        return;
+    };
+    let dir = work_dir("thread_send");
+    compile_so(
+        &dir,
+        "nifthr",
+        r#"
+        #include "erl_nif.h"
+        typedef struct { ErlNifPid to; ERL_NIF_TERM name; ErlNifEnv* env; int sent; } job_t;
+        static ERL_NIF_TERM self_pid(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            ErlNifPid pid;
+            (void)argc; (void)argv;
+            if (!enif_self(env, &pid)) return enif_make_atom(env, "no_self");
+            return enif_make_pid(env, &pid);
+        }
+        static ERL_NIF_TERM env_send(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            ErlNifPid to, me;
+            ErlNifEnv* msg_env = enif_alloc_env();
+            ERL_NIF_TERM msg;
+            int sent;
+            (void)argc;
+            if (!enif_get_local_pid(env, argv[0], &to) || !enif_self(env, &me))
+                return enif_make_badarg(env);
+            msg = enif_make_tuple2(msg_env, enif_make_atom(msg_env, "from_env"),
+                                   enif_make_pid(msg_env, &me));
+            sent = enif_send(env, &to, msg_env, msg);
+            enif_free_env(msg_env);
+            return sent ? enif_make_atom(env, "ok") : enif_make_atom(env, "not_sent");
+        }
+        static void* thread_main(void* arg) {
+            job_t* job = (job_t*)arg;
+            ErlNifPid found;
+            ErlNifEnv* msg_env = enif_alloc_env();
+            ERL_NIF_TERM name = enif_make_copy(msg_env, job->name);
+            int known = enif_whereis_pid(NULL, name, &found);
+            ERL_NIF_TERM same = (known && enif_compare(enif_make_pid(msg_env, &found),
+                                                      enif_make_pid(msg_env, &job->to)) == 0)
+                ? enif_make_atom(msg_env, "true") : enif_make_atom(msg_env, "false");
+            ERL_NIF_TERM msg = enif_make_tuple3(msg_env, enif_make_atom(msg_env, "from_thread"),
+                enif_make_atom(msg_env, known ? "known" : "unknown"), same);
+            job->sent = enif_send(NULL, &job->to, msg_env, msg);
+            enif_free_env(msg_env);
+            return NULL;
+        }
+        static ERL_NIF_TERM thread_send(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            job_t job;
+            ErlNifTid tid;
+            (void)argc;
+            if (!enif_get_local_pid(env, argv[0], &job.to)) return enif_make_badarg(env);
+            job.env = enif_alloc_env();
+            job.name = enif_make_copy(job.env, argv[1]);
+            job.sent = 0;
+            if (enif_thread_create("nifthr", &tid, thread_main, &job, NULL) != 0)
+                return enif_make_atom(env, "no_thread");
+            enif_thread_join(tid, NULL);
+            enif_free_env(job.env);
+            return job.sent ? enif_make_atom(env, "ok") : enif_make_atom(env, "not_sent");
+        }
+        static ErlNifFunc funcs[] = {
+            {"self_pid", 0, self_pid, 0},
+            {"env_send", 1, env_send, 0},
+            {"thread_send", 2, thread_send, 0}};
+        ERL_NIF_INIT(nifthr, funcs, NULL, NULL, NULL, NULL)
+        "#,
+    );
+    let source = format!(
+        r#"-module(nifthr).
+        -export([run/0, self_pid/0, env_send/1, thread_send/2]).
+        -nifs([self_pid/0, env_send/1, thread_send/2]).
+        self_pid() -> erlang:nif_error(not_loaded).
+        env_send(_) -> erlang:nif_error(not_loaded).
+        thread_send(_, _) -> erlang:nif_error(not_loaded).
+        recv() -> receive M -> M after 2000 -> timeout end.
+        run() ->
+            ok = erlang:load_nif("{}", 0),
+            Parent = self(),
+            SelfOk = self_pid() =:= Parent,
+            true = register(nifthr_target, Parent),
+            Sent = thread_send(Parent, nifthr_target),
+            FromThread = recv(),
+            Missing = thread_send(Parent, nifthr_no_such_name),
+            FromThread2 = recv(),
+            %% Processes taking turns on the schedulers each see themselves as the caller.
+            Workers = [spawn(fun() ->
+                           Me = self(),
+                           Me = self_pid(),
+                           ok = env_send(Parent),
+                           ok = thread_send(Parent, nifthr_target),
+                           erlang:yield(),
+                           Parent ! {{worker, Me, self_pid() =:= Me}}
+                       end) || _ <- lists:seq(1, 8)],
+            Results = [receive {{worker, W, Same}} -> Same after 2000 -> timeout end
+                       || W <- Workers],
+            FromEnv = [receive {{from_env, W}} -> W after 2000 -> timeout end || W <- Workers],
+            Threads = [recv() || _ <- Workers],
+            unregister(nifthr_target),
+            {{SelfOk, Sent, FromThread, Missing, FromThread2, Results, FromEnv =:= Workers, Threads}}."#,
+        dir.join("nifthr").display()
+    );
+    compile_beam(&erl, &dir, "nifthr", &source);
+    assert_same(&dir, &erl, "nifthr");
     let _ = std::fs::remove_dir_all(&dir);
 }

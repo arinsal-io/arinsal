@@ -2,13 +2,52 @@
 //! queue with selective-receive save positions.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 
 const SIGNAL_BUFFER_COUNT: usize = 64;
 const BUFFER_CONTENTION_INSTALL_LIMIT: usize = 50;
 const BUFFER_FLUSH_ROUNDS: usize = 8192;
 const BUFFER_ENQUEUES_TO_KEEP: usize = BUFFER_FLUSH_ROUNDS + BUFFER_FLUSH_ROUNDS / 2;
+
+/// The erts process state word bits (`ERTS_PSFLG_*`).
+// Port of erts/emulator/beam/erl_process.h:1231-1340, OTP-29.1.1.
+pub mod psflg {
+    /// `ERTS_PSFLGS_ZERO_BIT_OFFSET`: three two-bit priority fields precede the flags.
+    const ZERO_BIT_OFFSET: u32 = 3 * 2;
+    const fn bit(n: u32) -> u32 {
+        1 << (ZERO_BIT_OFFSET + n)
+    }
+    /// `ERTS_PSFLG_EXITING`.
+    pub const EXITING: u32 = bit(5);
+    /// `ERTS_PSFLG_MSG_SIG_IN_Q`: message signals in the outer signal queue.
+    pub const MSG_SIG_IN_Q: u32 = bit(6);
+    /// `ERTS_PSFLG_ACTIVE`.
+    pub const ACTIVE: u32 = bit(7);
+    /// `ERTS_PSFLG_IN_RUNQ`.
+    pub const IN_RUNQ: u32 = bit(8);
+    /// `ERTS_PSFLG_RUNNING`.
+    pub const RUNNING: u32 = bit(9);
+    /// `ERTS_PSFLG_SUSPENDED`.
+    pub const SUSPENDED: u32 = bit(10);
+    /// `ERTS_PSFLG_NMSG_SIG_IN_Q`: non-message signals in the outer signal queue.
+    pub const NMSG_SIG_IN_Q: u32 = bit(13);
+    /// `ERTS_PSFLG_ACTIVE_SYS`.
+    pub const ACTIVE_SYS: u32 = bit(14);
+    /// `ERTS_PSFLG_RUNNING_SYS`.
+    pub const RUNNING_SYS: u32 = bit(15);
+    /// `ERTS_PSFLG_SIG_Q`: unhandled signals in the middle signal queue.
+    pub const SIG_Q: u32 = bit(19);
+    /// `ERTS_PSFLG_SIG_IN_Q`: either kind of signal in the outer signal queue.
+    pub const SIG_IN_Q: u32 = MSG_SIG_IN_Q | NMSG_SIG_IN_Q;
+}
+
+/// How a queued signal sets the in-queue state bits.
+pub trait InSignal {
+    /// A message signal (`ERTS_PSFLG_MSG_SIG_IN_Q`); otherwise a non-message signal
+    /// (`ERTS_PSFLG_NMSG_SIG_IN_Q`).
+    fn is_message(&self) -> bool;
+}
 
 /// The receiver exited and closed its in-queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,17 +62,12 @@ struct SignalBuffer<T> {
 
 type SignalBuffers<T> = [Mutex<SignalBuffer<T>>; SIGNAL_BUFFER_COUNT];
 
-enum Chunk<T> {
-    Single(T),
-    Block(VecDeque<T>),
-}
-
 /// The outer signal queue of a process.
 ///
 /// Port of erts/emulator/beam/erl_proc_sig_queue.h (`ErtsSignalInQueue`, `sig_inq` in
 /// `Process`) and erl_proc_sig_queue.c:712-800 (enqueue_signals), OTP-29.1.1: senders
 /// append at the tail under the msgq lock; the receiver splices the whole queue into its
-/// private queue under the same lock (erts_proc_sig_fetch).
+/// inner queue under the same lock (erts_proc_sig_fetch).
 ///
 /// Producers for one logical sender must serialize their calls to preserve
 /// sender order, just as execution of one Erlang process serializes sends.
@@ -49,6 +83,15 @@ pub struct Incoming<T> {
     /// enqueues fail. Port of erts/emulator/beam/erl_proc_sig_queue.c:712-800
     /// (enqueue_signals checks the receiver's exiting state under the msgq lock), OTP-29.1.1.
     closed: AtomicBool,
+    /// `p->state`: the erts process state word. It lives with the in-queue because every
+    /// enqueuer, the receiver and its native probe reach the process through this shared
+    /// structure.
+    // Port of erts/emulator/beam/erl_process.h:1231-1340 (ERTS_PSFLG_*), OTP-29.1.1.
+    state: AtomicU32,
+    /// Non-message signals among `pending`; with it a fetch leaves exactly the
+    /// MSG_SIG_IN_Q/NMSG_SIG_IN_Q bits of the signals still queued (erts re-sets them from
+    /// `msgs_in_slots`/`nonmsgs_in_slots` after racing buffer inserts, erl_proc_sig_queue.c:1450).
+    nmsgs: AtomicUsize,
     /// Signals delivered but not yet consumed by the receiver (send pressure).
     pub(crate) backlog: AtomicUsize,
     buffering_allowed: AtomicBool,
@@ -65,6 +108,8 @@ impl<T> Default for Incoming<T> {
         Self {
             msgq: Mutex::new(VecDeque::new()),
             pending: AtomicUsize::new(0),
+            state: AtomicU32::new(0),
+            nmsgs: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             backlog: AtomicUsize::new(0),
             buffering_allowed: AtomicBool::new(false),
@@ -79,6 +124,82 @@ impl<T> Default for Incoming<T> {
 }
 
 impl<T> Incoming<T> {
+    /// The erts process state word (`p->state`).
+    pub fn state(&self) -> &AtomicU32 {
+        &self.state
+    }
+
+    /// Set `ERTS_PSFLG_SIG_Q` while the receiver's middle signal queue holds unhandled
+    /// signals, and clear it once that queue is empty.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1385, 1407 (erts_proc_sig_fetch__ sets
+    // it) and 7017, 7110 (erts_proc_sig_handle_incoming clears it), OTP-29.1.1.
+    pub fn set_sig_q(&self, unhandled: bool) {
+        let state = self.state.load(Ordering::Relaxed);
+        if unhandled && state & psflg::SIG_Q == 0 {
+            self.state.fetch_or(psflg::SIG_Q, Ordering::Relaxed);
+        } else if !unhandled && state & psflg::SIG_Q != 0 {
+            self.state.fetch_and(!psflg::SIG_Q, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<T: InSignal> Incoming<T> {
+    /// Account `count` enqueued signals, `nmsgs` of them non-message signals, and set the
+    /// matching in-queue state bits.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:911-935 (enqueue_signals set_flags),
+    // OTP-29.1.1.
+    fn enqueued(&self, count: usize, nmsgs: usize) {
+        if nmsgs != 0 {
+            self.nmsgs.fetch_add(nmsgs, Ordering::Relaxed);
+        }
+        let mut set = 0;
+        if count > nmsgs {
+            set |= psflg::MSG_SIG_IN_Q;
+        }
+        if nmsgs != 0 {
+            set |= psflg::NMSG_SIG_IN_Q;
+        }
+        // `erts_atomic32_read_bor_nob`.
+        if self.state.load(Ordering::Relaxed) & set != set {
+            self.state.fetch_or(set, Ordering::Relaxed);
+        }
+    }
+
+    /// Account signals taken from the queue and leave the in-queue bits of what is still
+    /// queued (signals racing into the buffers).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1336-1495 (erts_proc_sig_fetch__
+    // clear_flags, then re-set for racing buffer inserts), OTP-29.1.1.
+    fn dequeued(&self, count: usize, nmsgs: usize) {
+        let left = self.pending.fetch_sub(count, Ordering::SeqCst) - count;
+        let left_nmsgs = if nmsgs != 0 {
+            self.nmsgs.fetch_sub(nmsgs, Ordering::Relaxed) - nmsgs
+        } else {
+            self.nmsgs.load(Ordering::Relaxed)
+        };
+        let mut keep = 0;
+        if left > left_nmsgs {
+            keep |= psflg::MSG_SIG_IN_Q;
+        }
+        if left_nmsgs != 0 {
+            keep |= psflg::NMSG_SIG_IN_Q;
+        }
+        let clear = psflg::SIG_IN_Q & !keep;
+        // `erts_atomic32_read_band_nob`.
+        if self.state.load(Ordering::Relaxed) & clear != 0 {
+            self.state.fetch_and(!clear, Ordering::Relaxed);
+        }
+    }
+
+    fn count_nmsgs<'a>(values: impl IntoIterator<Item = &'a T>) -> usize
+    where
+        T: 'a,
+    {
+        values
+            .into_iter()
+            .filter(|value| !value.is_message())
+            .count()
+    }
+
     /// Take the msgq lock; a busy lock counts as contention like erts' failed trylock.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:10661-10694, OTP-29.1.1.
     fn lock_msgq(&self) -> (std::sync::MutexGuard<'_, VecDeque<T>>, usize) {
@@ -96,8 +217,10 @@ impl<T> Incoming<T> {
         if self.buffers_enabled.load(Ordering::Acquire) {
             self.flush_buffers_locked(&mut queue, true);
         }
+        let nmsg = usize::from(!value.is_message());
         queue.push_back(value);
         self.pending.fetch_add(1, Ordering::SeqCst);
+        self.enqueued(1, nmsg);
     }
 
     /// Publish a signal through its sender's parallel buffer when buffering is enabled.
@@ -114,8 +237,10 @@ impl<T> Incoming<T> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(value);
         }
+        let nmsg = usize::from(!value.is_message());
         queue.push_back(value);
         self.pending.fetch_add(1, Ordering::SeqCst);
+        self.enqueued(1, nmsg);
         drop(queue);
         self.note_contention(contended);
         Ok(())
@@ -133,8 +258,10 @@ impl<T> Incoming<T> {
         if !buffer.alive {
             return Err(value);
         }
+        let nmsg = usize::from(!value.is_message());
         buffer.queue.push_back(value);
         self.pending.fetch_add(1, Ordering::SeqCst);
+        self.enqueued(1, nmsg);
         self.buffer_enqueues.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -262,8 +389,10 @@ impl<T> Incoming<T> {
             self.flush_buffers_locked(&mut queue, true);
         }
         let count = values.len();
+        let nmsgs = Self::count_nmsgs(values.iter());
         queue.extend(values.drain(..));
         self.pending.fetch_add(count, Ordering::SeqCst);
+        self.enqueued(count, nmsgs);
     }
 
     /// Publish a sender ordered block through the matching per sender buffers.
@@ -283,8 +412,10 @@ impl<T> Incoming<T> {
                 return Err(QueueClosed);
             }
             let count = values.len();
+            let nmsgs = Self::count_nmsgs(values.iter());
             queue.extend(values.drain(..));
             self.pending.fetch_add(count, Ordering::SeqCst);
+            self.enqueued(count, nmsgs);
             drop(queue);
             self.note_contention(contended);
             return Ok(());
@@ -299,28 +430,28 @@ impl<T> Incoming<T> {
                     values.extend(pending);
                     return Err(QueueClosed);
                 }
+                let nmsg = usize::from(!value.is_message());
                 queue.push_back(value);
                 self.pending.fetch_add(1, Ordering::SeqCst);
+                self.enqueued(1, nmsg);
             }
         }
         Ok(())
     }
 
     /// Close the queue for an exited receiver and move every signal still queued, buffered
-    /// ones included, to `private`; enqueues after this fail.
+    /// ones included, to `into`; enqueues after this fail.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c (erts_proc_sig_handle_exit takes the
     // remaining signals of an exiting process under the msgq lock), OTP-29.1.1.
-    pub fn close_into(&self, private: &mut Private<T>) -> usize {
+    pub fn close_into(&self, into: &mut VecDeque<T>) -> usize {
         let mut queue = self.msgq.lock().unwrap();
         self.closed.store(true, Ordering::Relaxed);
         self.uninstall_buffers_locked(&mut queue);
         let count = queue.len();
         if count != 0 {
-            private
-                .queue
-                .push_back(Chunk::Block(std::mem::take(&mut *queue)));
-            private.len += count;
-            self.pending.fetch_sub(count, Ordering::SeqCst);
+            let nmsgs = Self::count_nmsgs(queue.iter());
+            into.extend(queue.drain(..));
+            self.dequeued(count, nmsgs);
         }
         count
     }
@@ -331,30 +462,7 @@ impl<T> Incoming<T> {
         self.pending.load(Ordering::SeqCst) != 0
     }
 
-    /// Move the whole in-queue to the receiver's private queue.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch), OTP-29.1.1.
-    pub fn drain_into(&self, private: &mut Private<T>) -> usize {
-        let mut queue = self.msgq.lock().unwrap();
-        if self.buffers_enabled.load(Ordering::Acquire) {
-            self.flush_buffers_locked(&mut queue, true);
-        }
-        let count = queue.len();
-        match count {
-            0 => return 0,
-            1 => private
-                .queue
-                .push_back(Chunk::Single(queue.pop_front().expect("one signal"))),
-            _ => private
-                .queue
-                .push_back(Chunk::Block(std::mem::take(&mut *queue))),
-        }
-        self.pending.fetch_sub(count, Ordering::SeqCst);
-        drop(queue);
-        private.len += count;
-        count
-    }
-
-    /// Take the whole in-queue, in order, for a receiver whose private queue is idle: the
+    /// Take the whole in-queue, in order, for the receiver's inner queue: the
     /// receiver handles the signals and moves the messages into its own message queue.
     // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
     // queue is spliced onto the end of the inner queue under the msgq lock), OTP-29.1.1.
@@ -367,13 +475,42 @@ impl<T> Incoming<T> {
             self.flush_buffers_locked(&mut queue, true);
         }
         let count = queue.len();
+        let nmsgs = Self::count_nmsgs(queue.iter());
         // Both queues keep their storage: a fetch allocates nothing, like erts splicing
         // the outer signal list onto the inner one.
         into.extend(queue.drain(..));
-        self.pending.fetch_sub(count, Ordering::SeqCst);
+        self.dequeued(count, nmsgs);
     }
 
-    /// Fetch the oldest signal when `accept` takes it, for a receiver whose private queue
+    /// Take the whole in-queue when `accept` takes every queued signal; otherwise leave it.
+    /// Returns the number of signals taken.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__: an outer
+    // queue without non-message signals is spliced onto the message queue), OTP-29.1.1.
+    pub fn take_all_if(&self, accept: impl Fn(&T) -> bool, into: &mut VecDeque<T>) -> usize {
+        if !self.has_pending() {
+            return 0;
+        }
+        let mut queue = self.msgq.lock().unwrap();
+        if self.buffers_enabled.load(Ordering::Acquire) {
+            self.flush_buffers_locked(&mut queue, true);
+        }
+        if !queue.iter().all(accept) {
+            return 0;
+        }
+        let count = queue.len();
+        into.extend(queue.drain(..));
+        // `accept` took only messages.
+        self.dequeued(count, 0);
+        drop(queue);
+        let backlog = self.backlog.load(Ordering::Relaxed);
+        if backlog != 0 {
+            self.backlog
+                .fetch_sub(backlog.min(count), Ordering::Relaxed);
+        }
+        count
+    }
+
+    /// Fetch the oldest signal when `accept` takes it, for a receiver whose inner queue
     /// is empty. The receiver handles it in place, like erts' receive helper fetching
     /// the outer queue before matching.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper),
@@ -387,7 +524,8 @@ impl<T> Incoming<T> {
             return None;
         }
         let value = queue.pop_front();
-        self.pending.fetch_sub(1, Ordering::SeqCst);
+        let nmsgs = Self::count_nmsgs(value.iter());
+        self.dequeued(1, nmsgs);
         drop(queue);
         if self.backlog.load(Ordering::Relaxed) != 0 {
             self.backlog.fetch_sub(1, Ordering::Relaxed);
@@ -396,288 +534,57 @@ impl<T> Incoming<T> {
     }
 }
 
-/// Receiver-owned queue with a save position for selective receive.
-pub struct Private<T> {
-    queue: VecDeque<Chunk<T>>,
-    /// Storage reused by [`Incoming::take_all`] fetches.
-    fetch_buffer: VecDeque<T>,
-    len: usize,
-    save: usize,
-    markers: Vec<MarkerPosition>,
-    next_marker: u64,
-}
-
-/// Opaque handle returned by `recv_marker_reserve`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReceiveMarker(u64);
-
-struct MarkerPosition {
-    handle: ReceiveMarker,
-    reference: Option<u64>,
-    position: usize,
-}
-
-impl<T> Default for Private<T> {
-    fn default() -> Self {
-        Self {
-            queue: VecDeque::new(),
-            fetch_buffer: VecDeque::new(),
-            len: 0,
-            save: 0,
-            markers: Vec::new(),
-            next_marker: 0,
-        }
-    }
-}
-
-impl<T> Private<T> {
-    /// No events and no receive markers: nothing orders against the outer queue.
-    pub fn is_idle(&self) -> bool {
-        self.len == 0 && self.markers.is_empty()
-    }
-
-    /// Number of events available to the receiver.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether the private queue is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Whether an event remains at or after the selective receive save cursor.
-    pub fn has_saved(&self) -> bool {
-        self.save < self.len
-    }
-
-    /// The reusable fetch buffer, empty.
-    pub fn take_fetch_buffer(&mut self) -> VecDeque<T> {
-        std::mem::take(&mut self.fetch_buffer)
-    }
-
-    /// Put events taken with [`Incoming::take_all`] and not handled back in front of
-    /// everything else, in order; an empty buffer is kept for the next fetch.
-    pub fn restore_front(&mut self, values: VecDeque<T>) {
-        let count = values.len();
-        if count == 0 {
-            self.fetch_buffer = values;
-            return;
-        }
-        self.queue.push_front(Chunk::Block(values));
-        self.len += count;
-        self.save = 0;
-        for marker in &mut self.markers {
-            marker.position += count;
-        }
-    }
-
-    /// Pop the first event, preserving ordinary FIFO receive.
-    pub fn pop(&mut self) -> Option<T> {
-        let result = match self.queue.front_mut()? {
-            Chunk::Single(_) => match self.queue.pop_front() {
-                Some(Chunk::Single(value)) => Some(value),
-                _ => unreachable!(),
-            },
-            Chunk::Block(values) => {
-                let value = values.pop_front()?;
-                if values.is_empty() {
-                    self.queue.pop_front();
-                }
-                Some(value)
-            }
-        };
-        if result.is_some() {
-            self.len -= 1;
-            self.save = self.save.saturating_sub(1);
-            self.shift_markers(0);
-        }
-        result
-    }
-
-    /// Remove the first event at the selective receive save position.
-    pub fn pop_saved(&mut self) -> Option<T> {
-        let index = self.save;
-        let result = self.remove(index)?;
-        self.len -= 1;
-        self.shift_markers(index);
-        Some(result)
-    }
-
-    /// Begin a selective-receive scan at the current save position.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7135 (msgq save scan), OTP-29.1.1.
-    pub fn find_remove(&mut self, mut matches: impl FnMut(&T) -> bool) -> Option<T> {
-        let index = (self.save..self.len).find(|&i| self.get(i).is_some_and(&mut matches));
-        match index {
-            Some(index) => {
-                let result = self.remove(index);
-                self.len -= 1;
-                self.save = 0;
-                self.shift_markers(index);
-                result
-            }
-            None => {
-                self.save = self.len;
-                None
-            }
-        }
-    }
-
-    /// Re-scan previously skipped events after changing a receive pattern.
-    pub fn reset_save(&mut self) {
-        self.save = 0;
-    }
-
-    /// Position after the last event already scanned by selective receive.
-    pub fn save_position(&self) -> usize {
-        self.save
-    }
-
-    /// Reserve a position after all events currently in the private queue.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4351 (recv marker insertion), OTP-29.1.1.
-    pub fn marker_reserve(&mut self) -> ReceiveMarker {
-        let marker = ReceiveMarker(self.next_marker);
-        self.next_marker = self.next_marker.wrapping_add(1);
-        self.markers.push(MarkerPosition {
-            handle: marker,
-            reference: None,
-            position: self.len,
-        });
-        marker
-    }
-
-    /// Associate a reference key with a reserved marker.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4366 (recv marker binding), OTP-29.1.1.
-    pub fn marker_bind(&mut self, marker: ReceiveMarker, reference: u64) -> bool {
-        if let Some(entry) = self.markers.iter_mut().find(|entry| entry.handle == marker) {
-            entry.reference = Some(reference);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Set the save position to a bound marker.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4545 (recv marker save), OTP-29.1.1.
-    pub fn marker_use(&mut self, reference: u64) -> bool {
-        if let Some(entry) = self
-            .markers
-            .iter()
-            .find(|entry| entry.reference == Some(reference))
-        {
-            self.save = entry.position;
-            true
-        } else {
-            self.save = 0;
-            false
-        }
-    }
-
-    /// Whether an event remains between the save cursor and a marker.
-    pub fn marker_has_saved_before(&self, marker: ReceiveMarker) -> bool {
-        self.markers
-            .iter()
-            .find(|entry| entry.handle == marker)
-            .is_some_and(|entry| entry.position > self.save)
-    }
-
-    /// Remove the marker associated with a reference key.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:3999 (recv marker release), OTP-29.1.1.
-    pub fn marker_clear(&mut self, reference: u64) -> bool {
-        if let Some(index) = self
-            .markers
-            .iter()
-            .position(|entry| entry.reference == Some(reference))
-        {
-            self.markers.swap_remove(index);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn shift_markers(&mut self, removed: usize) {
-        for marker in &mut self.markers {
-            if marker.position > removed {
-                marker.position -= 1;
-            }
-        }
-    }
-
-    fn get(&self, mut index: usize) -> Option<&T> {
-        if self.len == self.queue.len() {
-            return match self.queue.get(index)? {
-                Chunk::Single(value) => Some(value),
-                Chunk::Block(values) => values.front(),
-            };
-        }
-        for chunk in &self.queue {
-            match chunk {
-                Chunk::Single(value) if index == 0 => return Some(value),
-                Chunk::Single(_) => index -= 1,
-                Chunk::Block(values) if index < values.len() => return values.get(index),
-                Chunk::Block(values) => index -= values.len(),
-            }
-        }
-        None
-    }
-
-    fn remove(&mut self, mut index: usize) -> Option<T> {
-        if self.len == self.queue.len() {
-            return match self.queue.remove(index)? {
-                Chunk::Single(value) => Some(value),
-                Chunk::Block(mut values) => {
-                    if values.len() == 1 {
-                        values.pop_front()
-                    } else {
-                        None
-                    }
-                }
-            };
-        }
-        for chunk_index in 0..self.queue.len() {
-            match &mut self.queue[chunk_index] {
-                Chunk::Single(_) if index == 0 => {
-                    return match self.queue.remove(chunk_index) {
-                        Some(Chunk::Single(value)) => Some(value),
-                        _ => unreachable!(),
-                    };
-                }
-                Chunk::Single(_) => index -= 1,
-                Chunk::Block(values) if index < values.len() => {
-                    let value = values.remove(index)?;
-                    if values.is_empty() {
-                        self.queue.remove(chunk_index);
-                    }
-                    return Some(value);
-                }
-                Chunk::Block(values) => index -= values.len(),
-            }
-        }
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    impl InSignal for i32 {
+        fn is_message(&self) -> bool {
+            *self >= 0
+        }
+    }
+
+    impl InSignal for (usize, usize) {
+        fn is_message(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
-    fn batch_order_and_save() {
+    fn in_queue_state_bits_follow_enqueue_and_fetch() {
         let input = Incoming::default();
-        let mut private = Private::default();
+        let mut inner = VecDeque::new();
+        let bits = |input: &Incoming<i32>| input.state().load(Ordering::SeqCst) & psflg::SIG_IN_Q;
+        assert_eq!(bits(&input), 0);
+        input.push(1);
+        assert_eq!(bits(&input), psflg::MSG_SIG_IN_Q);
+        input.push(-1);
+        assert_eq!(bits(&input), psflg::SIG_IN_Q);
+        assert_eq!(input.fetch_first_if(|_| true), Some(1));
+        assert_eq!(bits(&input), psflg::NMSG_SIG_IN_Q);
+        input.push(2);
+        input.take_all(&mut inner);
+        assert_eq!(bits(&input), 0);
+        input.push_block(vec![3, 4]);
+        assert_eq!(bits(&input), psflg::MSG_SIG_IN_Q);
+        assert_eq!(input.take_all_if(|value| *value >= 0, &mut inner), 2);
+        assert_eq!(bits(&input), 0);
+        assert_eq!(inner, VecDeque::from([-1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn batch_order() {
+        let input = Incoming::default();
+        let mut inner = VecDeque::new();
         for i in 0..10 {
             input.push(i);
         }
-        assert_eq!(input.drain_into(&mut private), 10);
-        assert_eq!(private.find_remove(|&x| x == 20), None);
-        assert_eq!(private.save_position(), 10);
+        input.take_all(&mut inner);
         input.push(20);
-        input.drain_into(&mut private);
-        assert_eq!(private.find_remove(|&x| x == 20), Some(20));
+        input.take_all(&mut inner);
         assert_eq!(
-            (0..10).map(|_| private.pop().unwrap()).collect::<Vec<_>>(),
-            (0..10).collect::<Vec<_>>()
+            inner.into_iter().collect::<Vec<_>>(),
+            (0..10).chain([20]).collect::<Vec<_>>()
         );
     }
 
@@ -687,7 +594,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let input = Arc::new(Incoming::default());
         let done = Arc::new(AtomicUsize::new(0));
-        let mut private = Private::default();
+        let mut inner = VecDeque::new();
         std::thread::scope(|scope| {
             for sender in 0..4 {
                 let input = input.clone();
@@ -700,13 +607,13 @@ mod tests {
                 });
             }
             while done.load(Ordering::Acquire) < 4 || input.has_pending() {
-                input.drain_into(&mut private);
+                input.take_all(&mut inner);
                 std::thread::yield_now();
             }
         });
-        input.drain_into(&mut private);
+        input.take_all(&mut inner);
         let mut expected = [0; 4];
-        while let Some((sender, sequence)) = private.pop() {
+        while let Some((sender, sequence)) = inner.pop_front() {
             assert_eq!(sequence, expected[sender]);
             expected[sender] += 1;
         }
@@ -716,45 +623,22 @@ mod tests {
     #[test]
     fn parallel_sender_buffer_flush_preserves_sender_order() {
         let input = Incoming::default();
-        let mut private = Private::default();
+        let mut inner = VecDeque::new();
         input.force_buffers_enabled();
         for sequence in 0..128 {
             input.push_routed(|| 17, sequence).unwrap();
         }
         assert!(input.has_pending());
-        assert_eq!(input.drain_into(&mut private), 128);
+        input.take_all(&mut inner);
         assert_eq!(
-            (0..128).map(|_| private.pop().unwrap()).collect::<Vec<_>>(),
+            inner.drain(..).collect::<Vec<_>>(),
             (0..128).collect::<Vec<_>>()
         );
 
         input.push_routed(|| 17, 128).unwrap();
         input.set_buffers_enabled(false);
         input.push_routed(|| 17, 129).unwrap();
-        assert_eq!(input.drain_into(&mut private), 2);
-        assert_eq!(private.pop(), Some(128));
-        assert_eq!(private.pop(), Some(129));
-    }
-
-    #[test]
-    fn marker_survives_detached_blocks_and_removal() {
-        let input = Incoming::default();
-        let mut private = Private::default();
-        input.push_block(vec![1, 2, 3]);
-        input.drain_into(&mut private);
-        let marker = private.marker_reserve();
-        assert!(private.marker_bind(marker, 19));
-        input.push_block(vec![4, 5]);
-        input.drain_into(&mut private);
-        assert_eq!(private.pop(), Some(1));
-        assert!(private.marker_use(19));
-        assert_eq!(private.find_remove(|&value| value == 4), Some(4));
-        assert_eq!(private.save_position(), 0);
-        assert!(private.marker_use(19));
-        assert_eq!(private.find_remove(|&value| value == 5), Some(5));
-        assert_eq!(private.pop(), Some(2));
-        assert_eq!(private.pop(), Some(3));
-        assert!(private.marker_clear(19));
-        assert!(!private.marker_use(19));
+        input.take_all(&mut inner);
+        assert_eq!(inner.drain(..).collect::<Vec<_>>(), [128, 129]);
     }
 }

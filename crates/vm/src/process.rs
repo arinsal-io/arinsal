@@ -5,8 +5,7 @@ use arinsal_beam::{BeamFile, Operand};
 use arinsal_beamasm::SchedulerRegisters;
 use arinsal_pterm::RetiredArea;
 use arinsal_sched::{
-    Config, Event, Payload, Pid, ReceiveMarker, RunCtx, RunOutcome, Scheduler, Signal, Task,
-    proc_flags,
+    Config, Event, Payload, Pid, RunCtx, RunOutcome, Scheduler, Signal, Task, proc_flags,
 };
 use arinsal_spec::Opcode;
 use arinsal_term::ptab::PtabIdRing;
@@ -439,6 +438,16 @@ impl MessageQueue {
 }
 
 impl Message {
+    /// A message whose term lives on the receiver's heap (sent there by
+    /// `erts_try_alloc_message_on_heap`), not in its own fragment.
+    fn is_heap_root(&self) -> bool {
+        self.term.is_pointer()
+            && self
+                .fragment
+                .as_ref()
+                .is_none_or(|fragment| fragment.heap.is_none())
+    }
+
     /// Build a scheduler-safe message from a self-contained term snapshot.
     pub(crate) fn from_owned(term: &arinsal_etf::OwnedTerm) -> Result<Self, VmError> {
         let mut heap = ProcessHeap::with_words(4096);
@@ -736,6 +745,25 @@ pub(crate) struct SuspendWaiter {
     pub(crate) target: Pid,
     pub(crate) ready: Message,
     pub(crate) exited: Message,
+}
+
+/// Port of erts/emulator/beam/erl_vm.h:53 (CONTEXT_REDS), OTP-29.1.1.
+pub(crate) const CONTEXT_REDS: i32 = 4000;
+/// Port of erts/emulator/beam/erl_proc_sig_queue.c:52 (ERTS_SIG_REDS_CNT_FACTOR), OTP-29.1.1.
+const SIG_REDS_CNT_FACTOR: i32 = 4;
+/// Port of erts/emulator/beam/erl_proc_sig_queue.h:284 (ERTS_SIG_HANDLE_REDS_MAX_PREFERED),
+/// OTP-29.1.1.
+pub(crate) const SIG_HANDLE_REDS_MAX_PREFERED: i32 = CONTEXT_REDS / 40;
+
+/// Outcome of [`Process::receive_helper`] (`*msgpp` / `*get_outp`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReceiveHelper {
+    /// A message is available at the save pointer.
+    Message,
+    /// No message in any queue: continue to the wait instruction.
+    Wait,
+    /// Out of reductions: yield and rerun `loop_rec`.
+    Yield,
 }
 
 const ALIAS_SLAB: usize = 4096;
@@ -1184,6 +1212,10 @@ pub struct SchedulerData {
 }
 
 struct Executor {
+    /// `esdp->current_process`, shared with this scheduler thread's NIF hub.
+    current_process: crate::natives::nif::CurrentProcess,
+    /// The scheduler thread's hub is bound to `current_process`.
+    hub_bound: bool,
     vm: Vm,
     x: crate::proc_create::ArgRegs,
     fr: Box<[f64]>,
@@ -1238,6 +1270,16 @@ impl Executor {
     ) -> Result<RunState, VmError> {
         process.header.self_pid = ctx.pid().to_term().expect("valid pid").tagged_word();
         process.self_pid = Some(ctx.pid());
+        // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule: esdp->current_process
+        // = p), OTP-29.1.1. A simulated scheduler shares its thread with other runtimes, so
+        // it binds the thread's hub on every turn.
+        if self.hub_bound && !ctx.simulated() {
+            self.current_process
+                .store(ctx.pid().data(), Ordering::Relaxed);
+        } else {
+            self.hub_bound =
+                crate::natives::nif::bind_scheduler_hub(process, &self.current_process);
+        }
         process.scheduler_id = ctx.scheduler_id().map_or(0, |id| id as u32);
         // Port of erts/emulator/beam/erl_process.h:2595 (erts_proc_sched_data): the process
         // turn uses the scheduler thread's reference and unique-integer counters.
@@ -1446,15 +1488,40 @@ impl Executor {
                     }
                     process.cold_mut().dirty_sys_gc = false;
                     process.run_dirty_gc()?;
-                    process.drain(ctx)?;
+                    // The signals are handled on the normal scheduler the process returns to.
                     break 'execution Ok(RunState::Yield);
                 }
-                if ctx.sys_task_run() {
-                    process.cold_mut().sys_task_point = true;
-                    let drained = process.drain(ctx);
-                    let executed =
-                        drained.and_then(|()| crate::signals::execute_sys_tasks(process, ctx));
-                    process.cold_mut().sys_task_point = false;
+                // Port of erts/emulator/beam/erl_process.c:10318-10351 (schedule: a process
+                // with signals queued handles them before Erlang code; with Erlang work to do
+                // and no dirty work, at most ERTS_SIG_HANDLE_REDS_MAX_PREFERED), OTP-29.1.1.
+                if ctx.sys_task_run()
+                    || !process.sig_cont_empty()
+                    || process.delayed_gc_due()
+                    || ctx.has_pending_input()
+                {
+                    let reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+                    let mut sig_reds =
+                        if process.cold.as_ref().is_some_and(|cold| cold.dirty_sys_gc) {
+                            reds
+                        } else {
+                            SIG_HANDLE_REDS_MAX_PREFERED
+                        };
+                    if ctx.sys_task_run() {
+                        process.cold_mut().sys_task_point = true;
+                    }
+                    let max_reds = sig_reds;
+                    let handled = process.handle_incoming(ctx, &mut sig_reds, max_reds, false);
+                    ctx.consume(u32::try_from(sig_reds).unwrap_or(0));
+                    let executed = handled.and_then(|_| {
+                        if ctx.sys_task_run() {
+                            crate::signals::execute_sys_tasks(process, ctx)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if ctx.sys_task_run() {
+                        process.cold_mut().sys_task_point = false;
+                    }
                     executed?;
                 }
                 // erts collects a process that is being scheduled in once signals have
@@ -1462,22 +1529,26 @@ impl Executor {
                 // iterations have already executed and their live X count is gc_live,
                 // not the switch-out arity.
                 let mut schedule_in_gc = true;
+                // Native code that exited only for a fetch reenters without a scheduling point.
+                let mut reenter = false;
                 loop {
-                    // A caught exception re-enters this loop without replenishing its process slice.
-                    if ctx.remaining() == 0 {
-                        break Ok(RunState::Yield);
-                    }
-                    if process.force_yield {
-                        process.force_yield = false;
-                        break Ok(RunState::Yield);
+                    if !std::mem::take(&mut reenter) {
+                        // A caught exception re-enters this loop without replenishing its process slice.
+                        if ctx.remaining() == 0 {
+                            break Ok(RunState::Yield);
+                        }
+                        if process.force_yield {
+                            process.force_yield = false;
+                            break Ok(RunState::Yield);
+                        }
+                        // g_proc_sched: a suspended process is not scheduled; a hibernating
+                        // one stays waiting until a message arrives, then continues at apply/3.
+                        if let Some(wait) = self.sched_preempt(process, ctx)? {
+                            break Ok(wait);
+                        }
                     }
                     if let Some(cold) = process.cold.as_mut() {
                         cold.native_transfer = false;
-                    }
-                    // g_proc_sched: a suspended process is not scheduled; a hibernating
-                    // one stays waiting until a message arrives, then continues at apply/3.
-                    if let Some(wait) = self.sched_preempt(process, ctx)? {
-                        break Ok(wait);
                     }
                     crate::dist::continue_fragmented_send(process, ctx)?;
                     // Port of erts/emulator/beam/erl_nif.c (erts_call_dirty_nif), OTP-29.1.1:
@@ -1564,16 +1635,9 @@ impl Executor {
                     }
                     if let Some(code_ptr) = process.native_pc {
                         crate::beamasm_integration::count_native_call();
-                        // Native receives look at the private queue only; fetch what arrived.
-                        // Signals handled here (process_info) still see the process suspended at
-                        // its native resume pc, as erts reads `c_p->i` while it waits.
-                        process.drain(ctx)?;
                         if schedule_in_gc {
                             schedule_in_gc = false;
                             collect_on_schedule_in(process)?;
-                        }
-                        if let Some(cold) = process.cold.as_mut() {
-                            cold.native_inline_fetch = ctx.private_is_idle();
                         }
                         process.native_pc = None;
                         process.header.self_pid =
@@ -1707,14 +1771,13 @@ impl Executor {
                             arinsal_beamasm::ExitReason::Yield => {
                                 crate::beamasm_integration::count_native_yield();
                                 if process.cold.as_mut().is_some_and(|cold| {
-                                    std::mem::take(&mut cold.native_signal_fetch)
+                                    std::mem::take(&mut cold.native_reserve_fetch)
                                 }) {
-                                    // Native `loop_rec` reached the end of the inner queue with
-                                    // signals in the outer one. Port of
-                                    // erts/emulator/beam/erl_proc_sig_queue.c:7730
-                                    // (erts_proc_sig_receive_helper), OTP-29.1.1: fetch and
-                                    // handle them within this slice (the drain before re-entry
-                                    // below), then rerun the `loop_rec`.
+                                    // Native `recv_marker_reserve` needs the outer queue
+                                    // fetched first. Port of erts/emulator/beam/
+                                    // erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
+                                    // OTP-29.1.1: fetch (no handling), then rerun the
+                                    // instruction in place: erts does not schedule out there.
                                     if process
                                         .cold
                                         .as_ref()
@@ -1722,6 +1785,32 @@ impl Executor {
                                     {
                                         process.cold_mut().signal_probe = ctx.signal_probe();
                                     }
+                                    process.fetch_signals(ctx)?;
+                                    reenter = true;
+                                    continue;
+                                }
+                                if process.cold.as_mut().is_some_and(|cold| {
+                                    std::mem::take(&mut cold.native_signal_fetch)
+                                }) {
+                                    // Native `loop_rec` reached the end of the message queue
+                                    // with signals to fetch or handle. Port of
+                                    // erts/emulator/beam/jit/arm/instr_msg.cpp:84-104
+                                    // (i_loop_rec_shared calls erts_proc_sig_receive_helper),
+                                    // OTP-29.1.1: the helper runs here, then the `loop_rec`
+                                    // reruns; a yield schedules out there.
+                                    if process
+                                        .cold
+                                        .as_ref()
+                                        .is_some_and(|cold| cold.signal_probe.is_none())
+                                    {
+                                        process.cold_mut().signal_probe = ctx.signal_probe();
+                                    }
+                                    let fcalls = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX);
+                                    let (used, _) = process.receive_helper(ctx, fcalls)?;
+                                    let used = u32::try_from(used).unwrap_or(0);
+                                    ctx.consume(used);
+                                    process.reductions_used =
+                                        process.reductions_used.saturating_add(u64::from(used));
                                     continue;
                                 }
                                 if let Some(timeout_ms) = process
@@ -1740,7 +1829,9 @@ impl Executor {
                                     let self_wait =
                                         std::mem::take(&mut process.cold_mut().native_wait_self);
                                     if self_wait {
-                                        process.drain(ctx)?;
+                                        // Queued messages never match; fetch them so the outer
+                                        // queue does not keep waking the process.
+                                        process.fetch_signals(ctx)?;
                                     } else if !Vm::mailbox_ready_to_wait(
                                         process,
                                         &mut Some(&mut *ctx),
@@ -2253,10 +2344,7 @@ impl Executor {
                                             if hibernate_stopped(process, ctx.pid()) =>
                                         {
                                             if hibernate_resumes_in_place(process, ctx.pid()) {
-                                                process.drain(ctx)?;
-                                                if process.inbox.is_empty() {
-                                                    hibernate_collect(process, ctx.pid())?;
-                                                }
+                                                hibernate_fetch_collect(process, ctx)?;
                                                 process.cold_mut().native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
                                                 break Ok(RunState::Wait { timeout_ms: None });
@@ -2265,9 +2353,7 @@ impl Executor {
                                             if let Some(cold) = process.cold.as_mut() {
                                                 cold.native_continuation_resume = false;
                                             }
-                                            process.drain(ctx)?;
-                                            if process.inbox.is_empty() {
-                                                hibernate_collect(process, ctx.pid())?;
+                                            if hibernate_fetch_collect(process, ctx)? {
                                                 if let Some(runtime) = process.runtime.clone() {
                                                     runtime.mark_hibernating(ctx.pid(), true);
                                                     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
@@ -2822,10 +2908,7 @@ impl Executor {
                                                 // hibernate/0 keeps its stack: after the wakeup the
                                                 // native call is retried and returns `ok` in place.
                                                 if hibernate_resumes_in_place(process, ctx.pid()) {
-                                                    process.drain(ctx)?;
-                                                    if process.inbox.is_empty() {
-                                                        hibernate_collect(process, ctx.pid())?;
-                                                    }
+                                                    hibernate_fetch_collect(process, ctx)?;
                                                     let cold = process.cold_mut();
                                                     cold.native_retry = Some(target_pc);
                                                     process.native_pc = Some(code_ptr);
@@ -2835,9 +2918,7 @@ impl Executor {
                                                 if let Some(cold) = process.cold.as_mut() {
                                                     cold.native_continuation_resume = false;
                                                 }
-                                                process.drain(ctx)?;
-                                                if process.inbox.is_empty() {
-                                                    hibernate_collect(process, ctx.pid())?;
+                                                if hibernate_fetch_collect(process, ctx)? {
                                                     if let Some(runtime) = process.runtime.clone() {
                                                         runtime.mark_hibernating(ctx.pid(), true);
                                                         // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
@@ -3030,9 +3111,7 @@ impl Executor {
                         continue;
                     }
                     if hibernate_stopped(process, ctx.pid()) {
-                        process.drain(ctx)?;
-                        if process.inbox.is_empty() {
-                            hibernate_collect(process, ctx.pid())?;
+                        if hibernate_fetch_collect(process, ctx)? {
                             if let Some(runtime) = process.runtime.clone() {
                                 runtime.mark_hibernating(ctx.pid(), true);
                                 // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
@@ -3140,6 +3219,24 @@ impl Executor {
                 }
             }
         })();
+        // erts keeps a process whose middle queue holds unhandled signals (ERTS_PSFLG_SIG_Q)
+        // scheduled for signal handling even when it waits (erl_process.c:10318-10351, with
+        // all reductions since it has no Erlang work); this scheduler only wakes a process for
+        // new input, so the rest is handled before it sleeps. Messages it produces end the
+        // wait like a new message would.
+        let result = match result {
+            Ok(RunState::Wait { timeout_ms })
+                if !process.sig_cont_empty() || process.delayed_gc_due() =>
+            {
+                let queued = process.inbox.len();
+                match process.handle_local_signals(ctx) {
+                    Ok(()) if process.inbox.len() == queued => Ok(RunState::Wait { timeout_ms }),
+                    Ok(()) => Ok(RunState::Yield),
+                    Err(error) => Err(error),
+                }
+            }
+            other => other,
+        };
         std::mem::swap(&mut process.x, &mut self.x);
         std::mem::swap(&mut process.fr, &mut self.fr);
         if matches!(
@@ -3480,6 +3577,22 @@ fn hibernate_resumes_in_place(process: &Process, pid: Pid) -> bool {
             .get(&pid)
             .is_some_and(|cont| cont.resume_in_place)
     })
+}
+
+/// `erts_hibernate`'s message check: fetch, and without messages collect and fetch again.
+/// Returns whether the message queue is still empty, so the process stops being active.
+// Port of erts/emulator/beam/beam_common.c:1584-1596 (erts_hibernate), OTP-29.1.1.
+fn hibernate_fetch_collect(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<bool, VmError> {
+    process.fetch_signals(ctx)?;
+    if !process.inbox.is_empty() {
+        return Ok(false);
+    }
+    hibernate_collect(process, ctx.pid())?;
+    process.fetch_signals(ctx)?;
+    Ok(process.inbox.is_empty())
 }
 
 /// `hibernate/3` with no waiting messages: shrink the heap to the `apply(M, F, A)`
@@ -4546,7 +4659,20 @@ impl Runtime {
 
 impl Process {
     fn absorb_exit_signals(&mut self, ctx: &mut RunCtx<'_, Message>) {
-        while let Some(Event { from, payload }) = ctx.receive() {
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:7426 (erts_proc_exit_handle_signal),
+        // OTP-29.1.1: the signals left in the inner queue come before the outer queue's.
+        let mut unhandled = std::mem::take(&mut self.sig_cont);
+        loop {
+            let Event { from, payload } = match unhandled.pop_front() {
+                Some(event) => {
+                    ctx.consume_fetched();
+                    event
+                }
+                None => match ctx.receive() {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
             match payload {
                 Payload::Signal(Signal::Monitor(reference)) => {
                     self.cold_mut().monitored_by.insert(reference, from);
@@ -5310,17 +5436,32 @@ impl Process {
         }
     }
 
-    pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
-        self.drain_until_marker(ctx, None)
-    }
-
-    /// Fetch every event before a reserved marker into the VM-owned mailbox.
-    pub(crate) fn drain_before_marker(
+    /// Handle the signals left in the middle queue without fetching.
+    pub(crate) fn handle_local_signals(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
-        marker: ReceiveMarker,
     ) -> Result<(), VmError> {
-        self.drain_until_marker(ctx, Some(marker))
+        loop {
+            let mut reds = CONTEXT_REDS;
+            if self.handle_incoming(ctx, &mut reds, CONTEXT_REDS, true)? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Handle every signal queued for this process: fetch once, then handle the middle queue
+    /// in `CONTEXT_REDS` rounds until it is empty.
+    // Port of erts/emulator/beam/erl_bif_info.c:4643-4652 (process_info on a process that
+    // handles its signals until done), OTP-29.1.1.
+    pub(crate) fn drain(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
+        let mut local_only = false;
+        loop {
+            let mut reds = CONTEXT_REDS;
+            if self.handle_incoming(ctx, &mut reds, CONTEXT_REDS, local_only)? {
+                return Ok(());
+            }
+            local_only = true;
+        }
     }
 
     /// Receive-trace a signal that was converted into a message.
@@ -5343,295 +5484,488 @@ impl Process {
         }
     }
 
-    fn drain_until_marker(
+    /// Move the outer signal queue into this process. Without unhandled signals in the
+    /// middle queue, and when the batch holds only ordinary messages and receive tracing is
+    /// off, the messages go straight to the message queue; otherwise the batch is appended to
+    /// the middle queue (`sig_cont`) for [`Self::handle_incoming`].
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
+    pub(crate) fn fetch_signals(&mut self, ctx: &mut RunCtx<'_, Message>) -> Result<(), VmError> {
+        let cont = !self.sig_cont_empty();
+        let start = self.sig_cont.len();
+        ctx.fetch_signals(&mut self.sig_cont);
+        if cont
+            || self.sig_cont.len() == start
+            || (crate::trace::active()
+                && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0)
+            || !self
+                .sig_cont
+                .iter()
+                .all(|event| Self::is_ordinary_message(&event.payload))
+        {
+            ctx.set_sig_q(!self.sig_cont_empty());
+            return Ok(());
+        }
+        while let Some(Event { from, payload }) = self.sig_cont.pop_front() {
+            self.sig_cont_taken += 1;
+            ctx.consume_fetched();
+            self.move_message(ctx, from, payload)?;
+        }
+        crate::natives::erts_debug::after_message_queue_change(self);
+        Ok(())
+    }
+
+    /// An ordinary message signal: it joins the message queue without being handled. A
+    /// priority message is an `ERTS_SIG_Q_OP_ALTACT_MSG` non-message signal in erts.
+    fn is_ordinary_message(payload: &Payload<Message>) -> bool {
+        match payload {
+            Payload::Message(message) | Payload::TimerMessage { message, .. } => {
+                !message.is_priority()
+            }
+            Payload::Timer { .. } => true,
+            Payload::Signal(_) => false,
+        }
+    }
+
+    /// Whether GC was enabled again with delayed GC tasks saved: erts moves them back to the
+    /// system task queue and sets `ERTS_PSFLG_ACTIVE_SYS`, so they run at the next
+    /// scheduling point even when the process waits.
+    // Port of erts/emulator/beam/erl_process.c:11823-11935 (erts_set_gc_state), OTP-29.1.1.
+    pub(crate) fn delayed_gc_due(&self) -> bool {
+        self.gc_enabled
+            && self
+                .cold
+                .as_ref()
+                .is_some_and(|cold| !cold.delayed_gc.is_empty())
+    }
+
+    /// Handle the signals of the middle queue (`sig_cont`) for at most `*reds` reductions
+    /// (and `max_reds` when the limit is stretched), after fetching the outer queue unless
+    /// `local_only`. Messages before the next unhandled signal move to the message queue; the
+    /// rest stays in the middle queue. `*reds` returns the reductions used. Returns whether
+    /// every signal was handled. An exit signal that terminates the process is the error.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:6229-7178
+    // (erts_proc_sig_handle_incoming), OTP-29.1.1.
+    pub(crate) fn handle_incoming(
         &mut self,
         ctx: &mut RunCtx<'_, Message>,
-        marker: Option<ReceiveMarker>,
-    ) -> Result<(), VmError> {
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c:6032 (private queue fetch) and
-        // erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch), OTP-29.1.1: with nothing fetched
-        // before, the outer queue's messages go straight into the message queue.
-        let mut fetched = if marker.is_none() {
-            ctx.fetch_incoming()
-        } else {
-            ctx.fetch_pending();
-            None
-        };
-        let result = (|| -> Result<(), VmError> {
-            if self.gc_enabled
-                && self
-                    .cold
-                    .as_ref()
-                    .is_some_and(|cold| !cold.delayed_gc.is_empty())
-            {
-                for task in std::mem::take(&mut self.cold_mut().delayed_gc) {
-                    match task {
-                        crate::proc_create::DelayedGc::Collect => self.force_gc()?,
-                        crate::proc_create::DelayedGc::Request(pending) => {
-                            crate::signals::reply_request(self, ctx, pending)?
-                        }
-                        crate::proc_create::DelayedGc::Literal {
-                            area_id,
-                            request,
-                            how,
-                            requester,
-                        } => crate::natives::sys::copy_literal_area(
-                            self, ctx, area_id, request, how, requester,
-                        )?,
+        reds: &mut i32,
+        max_reds: i32,
+        local_only: bool,
+    ) -> Result<bool, VmError> {
+        if !local_only {
+            self.fetch_signals(ctx)?;
+        }
+        if self.delayed_gc_due() {
+            for task in std::mem::take(&mut self.cold_mut().delayed_gc) {
+                match task {
+                    crate::proc_create::DelayedGc::Collect => self.force_gc()?,
+                    crate::proc_create::DelayedGc::Request(pending) => {
+                        crate::signals::reply_request(self, ctx, pending)?
                     }
-                }
-            }
-            loop {
-                if marker.is_some_and(|marker| !ctx.recv_marker_has_saved_before(marker)) {
-                    break;
-                }
-                let next = match fetched.as_mut().and_then(VecDeque::pop_front) {
-                    Some(event) => {
-                        ctx.consume_fetched();
-                        Some(event)
-                    }
-                    None => ctx.receive_saved(),
-                };
-                let Some(Event { from, payload }) = next else {
-                    break;
-                };
-                match payload {
-                    Payload::Message(message) => {
-                        let receive_traced = message.receive_traced;
-                        let priority = message.is_priority();
-                        let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
-                        let sender = from;
-                        let before = self.message_words_before();
-                        let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
-                        self.uncount_message_words(before);
-                        let trace_index = if priority {
-                            old_prio_len
-                        } else {
-                            self.inbox.len().saturating_sub(1)
-                        };
-                        if !receive_traced
-                            && let Some(term) = self.inbox.get(trace_index).copied()
-                            && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
-                        {
-                            crate::trace::receive_event(None, self, ctx, term, Some(sender));
-                        }
-                        self.cold_mut().prio_len = new_prio_len;
-                        if priority {
-                            let priority_term =
-                                self.inbox.get(old_prio_len).copied().ok_or_else(|| {
-                                    VmError::Unsupported(
-                                        "priority message missing after insertion".into(),
-                                    )
-                                })?;
-                            self.priority_item_inserted(old_prio_len, priority_term)?;
-                        }
-                    }
-                    Payload::TimerMessage { reference, message } => {
-                        self.retire_timer_reference(reference);
-                        let priority = message.is_priority();
-                        let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
-                        let before = self.message_words_before();
-                        let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
-                        self.uncount_message_words(before);
-                        self.cold_mut().prio_len = new_prio_len;
-                        if priority {
-                            let priority_term =
-                                self.inbox.get(old_prio_len).copied().ok_or_else(|| {
-                                    VmError::Unsupported(
-                                        "priority message missing after insertion".into(),
-                                    )
-                                })?;
-                            self.priority_item_inserted(old_prio_len, priority_term)?;
-                        }
-                    }
-                    Payload::Signal(arinsal_sched::Signal::Link) => {
-                        self.cold_mut().links.insert(from);
-                    }
-                    // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
-                    Payload::Signal(arinsal_sched::Signal::ProcSigBlock(milliseconds)) => {
-                        if milliseconds > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                milliseconds as u64,
-                            ));
-                        }
-                    }
-                    Payload::Signal(arinsal_sched::Signal::Unlink(id)) => {
-                        if let Some(cold) = self.cold.as_mut() {
-                            cold.links.remove(&from);
-                            cold.prio_links.remove(&from);
-                        }
-                        self.trace_getting_unlinked(ctx, from);
-                        let _ = ctx.signal(from, arinsal_sched::Signal::UnlinkAckSignal(id));
-                    }
-                    Payload::Signal(arinsal_sched::Signal::Monitor(reference)) => {
-                        self.cold_mut().monitored_by.insert(reference, from);
-                    }
-                    Payload::Signal(arinsal_sched::Signal::Demonitor(reference)) => {
-                        if let Some(cold) = self.cold.as_mut() {
-                            cold.monitored_by.remove(&reference);
-                        }
-                    }
-                    Payload::Signal(
-                        signal @ (arinsal_sched::Signal::Exit(_)
-                        | arinsal_sched::Signal::ExitLinked(_)),
-                    ) => {
-                        let (linked_exit, message) = match signal {
-                            arinsal_sched::Signal::ExitLinked(message) => (true, message),
-                            arinsal_sched::Signal::Exit(message) => (false, message),
-                            _ => unreachable!(),
-                        };
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:4685-4795
-                        // (handle_exit_signal), OTP-29.1.1: a link exit removes the link and a
-                        // process that survives it traces getting_unlinked.
-                        let priority = message.is_priority()
-                            || self
-                                .cold
-                                .as_ref()
-                                .is_some_and(|cold| cold.prio_links.contains(&from));
-                        let was_linked = linked_exit
-                            && self.cold.as_mut().is_some_and(|cold| {
-                                cold.prio_links.remove(&from);
-                                cold.links.remove(&from)
-                            });
-                        let reason = message.into_receiver(self)?;
-                        if reason == crate::signals::atom("kill") && !linked_exit {
-                            // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
-                            // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
-                            return Err(VmError::Trap(crate::exceptions::Trap::killed()));
-                        }
-                        if self.trap_exit {
-                            // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
-                            // A scheduler proxy stands in for a remote PID internally, but
-                            // EXIT messages expose the peer's original PID to Erlang code.
-                            let sender = from;
-                            let from = crate::dist::remote_pid_term(self, from)?
-                                .or_else(|| from.to_term())
-                                .ok_or_else(|| {
-                                    VmError::Unsupported("invalid signal sender pid".into())
-                                })?;
-                            let tuple =
-                                self.tuple(&[crate::signals::atom("EXIT"), from, reason])?;
-                            if priority {
-                                self.push_priority_message(tuple)?;
-                            } else {
-                                self.inbox.push_back(tuple);
-                            }
-                            self.trace_converted_signal(ctx, tuple, sender);
-                            if was_linked {
-                                self.trace_getting_unlinked(ctx, sender);
-                            }
-                            continue;
-                        }
-                        if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                            self.note_exit_reason(reason)?;
-                            return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
-                        }
-                        if was_linked {
-                            self.trace_getting_unlinked(ctx, from);
-                        }
-                    }
-                    // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
-                    Payload::Signal(arinsal_sched::Signal::PortExit { port, reason }) => {
-                        let port = port.into_receiver(self)?;
-                        let reason = reason.into_receiver(self)?;
-                        if reason == crate::signals::atom("kill") {
-                            return Err(VmError::Trap(crate::exceptions::Trap::killed()));
-                        }
-                        if self.trap_exit {
-                            let tuple =
-                                self.tuple(&[crate::signals::atom("EXIT"), port, reason])?;
-                            self.inbox.push_back(tuple);
-                            continue;
-                        }
-                        if reason != Term::atom(arinsal_term::atoms::NORMAL) {
-                            self.note_exit_reason(reason)?;
-                            return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
-                        }
-                    }
-                    Payload::Signal(arinsal_sched::Signal::MonitorNoproc(reference)) => {
-                        let queued = self.inbox.len();
-                        self.deliver_monitor_down(from, reference, crate::signals::atom("noproc"))?;
-                        self.trace_new_message(ctx, queued, from);
-                    }
-                    Payload::Signal(arinsal_sched::Signal::MonitorDown { reference, reason }) => {
-                        let reason = reason.into_receiver(self)?;
-                        let queued = self.inbox.len();
-                        self.deliver_monitor_down(from, reference, reason)?;
-                        self.trace_new_message(ctx, queued, from);
-                    }
-                    Payload::Timer { reference, message } => {
-                        let timer_id = message.timer_id;
-                        let term = message.into_receiver(self)?;
-                        let retired = self.retire_timer_reference(reference);
-                        let id = timer_id.or(retired).unwrap_or(reference.id());
-                        let reference = crate::signals::reference(self, id)?;
-                        let tuple =
-                            self.tuple(&[crate::signals::atom("timeout"), reference, term])?;
-                        self.inbox.push_back(tuple);
-                        self.trace_converted_signal(ctx, tuple, from);
-                    }
-                    Payload::Signal(arinsal_sched::Signal::UnlinkAck(id)) => {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.c:6794
-                        // (ERTS_SIG_Q_OP_PROCESS_INFO), OTP-29.1.1.
-                        // The scheduler signal enum has no request op; a nonzero
-                        // unlink-ack id is the wakeup for a queued request.
-                        if id != 0 {
-                            crate::signals::handle_request(self, ctx, id)?;
-                        }
-                    }
-                    Payload::Signal(arinsal_sched::Signal::UnlinkAckSignal(id)) => {
-                        if let Some(cold) = self.cold.as_mut()
-                            && cold.unlinking.get(&id) == Some(&from)
-                        {
-                            cold.unlinking.remove(&id);
-                            cold.links.remove(&from);
-                            cold.prio_links.remove(&from);
-                        }
-                    }
-                    Payload::Signal(arinsal_sched::Signal::Alias(_))
-                    | Payload::Signal(arinsal_sched::Signal::Unalias(_)) => {
-                        return Err(VmError::Unsupported("process aliases".into()));
-                    }
-                    Payload::Signal(arinsal_sched::Signal::GarbageCollect) => {
-                        if self.gc_enabled {
-                            self.force_gc()?;
-                        } else {
-                            self.cold_mut()
-                                .delayed_gc
-                                .push(crate::proc_create::DelayedGc::Collect);
-                        }
-                    }
-                    Payload::Signal(arinsal_sched::Signal::LiteralAreaCopy {
+                    crate::proc_create::DelayedGc::Literal {
                         area_id,
                         request,
                         how,
                         requester,
-                    }) => {
-                        if !self.gc_enabled && how != arinsal_sched::LiteralCopyHow::Init {
-                            self.cold_mut().delayed_gc.push(
-                                crate::proc_create::DelayedGc::Literal {
-                                    area_id,
-                                    request,
-                                    how,
-                                    requester,
-                                },
-                            );
-                        } else {
-                            crate::natives::sys::copy_literal_area(
-                                self, ctx, area_id, request, how, requester,
-                            )?;
-                        }
-                    }
+                    } => crate::natives::sys::copy_literal_area(
+                        self, ctx, area_id, request, how, requester,
+                    )?,
                 }
             }
-            Ok(())
-        })();
-        if let Some(rest) = fetched.take() {
-            ctx.restore_fetched(rest);
         }
-        result?;
+        let limit_in = *reds;
+        *reds = 0;
+        if self.sig_cont_empty() {
+            ctx.set_sig_q(false);
+            return Ok(true);
+        }
+        let mut limit = limit_in.saturating_mul(SIG_REDS_CNT_FACTOR);
+        let abs_lim = SIG_REDS_CNT_FACTOR.saturating_mul(max_reds);
+        if limit > abs_lim {
+            limit = abs_lim;
+        }
+        // The message queue as it was before this call: erts moves the handled part of the
+        // middle queue there only when it stops, so `stretch_limit` looks at this prefix.
+        let msgq_len = self.inbox.len();
+        let mut cnt = 0_i32;
+        let mut handled = false;
+        let result = loop {
+            // Messages up to the next non-message signal or receive marker.
+            let marker = loop {
+                if self.recv_marker_due() {
+                    break true;
+                }
+                match self.sig_cont.front() {
+                    Some(event) if Self::is_ordinary_message(&event.payload) => {
+                        let Event { from, payload } =
+                            self.sig_cont.pop_front().expect("front checked");
+                        self.sig_cont_taken += 1;
+                        ctx.consume_fetched();
+                        self.move_message(ctx, from, payload)?;
+                    }
+                    _ => break false,
+                }
+            };
+            if !marker && self.sig_cont.is_empty() {
+                break Ok(true);
+            }
+            if handled && !(cnt <= limit || self.stretch_limit(abs_lim, &mut limit, msgq_len)) {
+                break Ok(false);
+            }
+            handled = true;
+            if marker {
+                self.recv_marker_enter_msgq();
+                cnt += 1;
+                continue;
+            }
+            let Some(Event { from, payload }) = self.sig_cont.pop_front() else {
+                break Ok(true);
+            };
+            self.sig_cont_taken += 1;
+            ctx.consume_fetched();
+            match self.handle_signal(ctx, from, payload) {
+                Ok(cost) => cnt += cost + 1,
+                Err(error) => break Err(error),
+            }
+        };
+        // Port of erl_proc_sig_queue.c:7160 (`*redsp = cnt/ERTS_SIG_REDS_CNT_FACTOR + 1`).
+        *reds = cnt / SIG_REDS_CNT_FACTOR + 1;
+        ctx.set_sig_q(!self.sig_cont_empty());
+        let done = result?;
         crate::natives::erts_debug::after_message_queue_change(self);
+        Ok(done)
+    }
+
+    /// Stretch the limit by up to 100 reductions, to at most `abs_lim`, when `receive` has no
+    /// message to inspect and handling more signals may make one available.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7181-7250 (stretch_limit), OTP-29.1.1.
+    fn stretch_limit(&self, abs_lim: i32, limit: &mut i32, msgq_len: usize) -> bool {
+        if abs_lim == *limit {
+            return false;
+        }
+        // The save pointer is in the message queue at a message (receive markers are not
+        // queue entries here).
+        if self.receive_cursor < msgq_len {
+            return false;
+        }
+        *limit = (*limit + SIG_REDS_CNT_FACTOR * 100).min(abs_lim);
+        true
+    }
+
+    /// The receive helper `loop_rec` runs at the end of the message queue: fetch the outer
+    /// queue and handle signals until a message is available at the save pointer, the queues
+    /// are empty, or `fcalls` run out. Returns the reductions consumed. An exit signal that
+    /// terminates the process is the error.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7729-7860
+    // (erts_proc_sig_receive_helper), OTP-29.1.1.
+    pub(crate) fn receive_helper(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        fcalls: i32,
+    ) -> Result<(i32, ReceiveHelper), VmError> {
+        // `neg_o_reds` is nonzero only while saving calls (`save_calls`).
+        let mut left_reds = fcalls;
+        let mut consumed_reds = 0;
+        loop {
+            if self.sig_cont_empty() {
+                consumed_reds += 4;
+                left_reds -= 4;
+                self.fetch_signals(ctx)?;
+                // Messages may have been moved directly to the message queue.
+                if self.inbox.get(self.receive_cursor).is_some() {
+                    return Ok((consumed_reds, ReceiveHelper::Message));
+                }
+                if self.sig_cont_empty() {
+                    return Ok((consumed_reds, ReceiveHelper::Wait));
+                }
+                if left_reds <= 0 {
+                    break;
+                }
+            }
+            // At least the preferred amount of reductions.
+            let mut reds = SIG_HANDLE_REDS_MAX_PREFERED;
+            let max_reds = left_reds.max(reds);
+            self.handle_incoming(ctx, &mut reds, max_reds, true)?;
+            consumed_reds += reds;
+            left_reds -= reds;
+            if self.inbox.get(self.receive_cursor).is_some() {
+                return Ok((consumed_reds, ReceiveHelper::Message));
+            }
+            if left_reds <= 0 {
+                break;
+            }
+        }
+        Ok((consumed_reds, ReceiveHelper::Yield))
+    }
+
+    /// Move a message signal into the message queue.
+    fn move_message(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        from: Pid,
+        payload: Payload<Message>,
+    ) -> Result<(), VmError> {
+        match payload {
+            Payload::Message(message) => {
+                let receive_traced = message.receive_traced;
+                let priority = message.is_priority();
+                let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+                let sender = from;
+                let before = self.message_words_before();
+                let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
+                self.uncount_message_words(before);
+                let trace_index = if priority {
+                    old_prio_len
+                } else {
+                    self.inbox.len().saturating_sub(1)
+                };
+                if !receive_traced
+                    && let Some(term) = self.inbox.get(trace_index).copied()
+                    && crate::trace::flags(self, ctx.pid()) & crate::trace::RECEIVE != 0
+                {
+                    crate::trace::receive_event(None, self, ctx, term, Some(sender));
+                }
+                self.cold_mut().prio_len = new_prio_len;
+                if priority {
+                    let priority_term = self.inbox.get(old_prio_len).copied().ok_or_else(|| {
+                        VmError::Unsupported("priority message missing after insertion".into())
+                    })?;
+                    self.priority_item_inserted(old_prio_len, priority_term)?;
+                }
+            }
+            Payload::TimerMessage { reference, message } => {
+                self.retire_timer_reference(reference);
+                let priority = message.is_priority();
+                let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
+                let before = self.message_words_before();
+                let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
+                self.uncount_message_words(before);
+                self.cold_mut().prio_len = new_prio_len;
+                if priority {
+                    let priority_term = self.inbox.get(old_prio_len).copied().ok_or_else(|| {
+                        VmError::Unsupported("priority message missing after insertion".into())
+                    })?;
+                    self.priority_item_inserted(old_prio_len, priority_term)?;
+                }
+            }
+            Payload::Timer { reference, message } => {
+                let timer_id = message.timer_id;
+                let term = message.into_receiver(self)?;
+                let retired = self.retire_timer_reference(reference);
+                let id = timer_id.or(retired).unwrap_or(reference.id());
+                let reference = crate::signals::reference(self, id)?;
+                let tuple = self.tuple(&[crate::signals::atom("timeout"), reference, term])?;
+                self.inbox.push_back(tuple);
+                self.trace_converted_signal(ctx, tuple, from);
+            }
+            Payload::Signal(_) => unreachable!("move_message takes message signals"),
+        }
         Ok(())
+    }
+
+    /// Handle one non-message signal; returns its reduction count (`cnt`) in units of
+    /// 1/`ERTS_SIG_REDS_CNT_FACTOR` reduction, without the `cnt++` every signal costs.
+    // Port of the signal cases of erts/emulator/beam/erl_proc_sig_queue.c:6336-6968
+    // (erts_proc_sig_handle_incoming), OTP-29.1.1.
+    fn handle_signal(
+        &mut self,
+        ctx: &mut RunCtx<'_, Message>,
+        from: Pid,
+        payload: Payload<Message>,
+    ) -> Result<i32, VmError> {
+        let signal = match payload {
+            // ERTS_SIG_Q_OP_ALTACT_MSG: a priority message enters the priority queue.
+            payload @ (Payload::Message(_)
+            | Payload::TimerMessage { .. }
+            | Payload::Timer { .. }) => {
+                self.move_message(ctx, from, payload)?;
+                return Ok(0);
+            }
+            Payload::Signal(signal) => signal,
+        };
+        let cost = match signal {
+            arinsal_sched::Signal::Link => {
+                self.cold_mut().links.insert(from);
+                0
+            }
+            // Port of erl_bif_info.c:4998-5022 (proc_sig_block), OTP-29.1.1.
+            arinsal_sched::Signal::ProcSigBlock(milliseconds) => {
+                if milliseconds > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(milliseconds as u64));
+                }
+                0
+            }
+            arinsal_sched::Signal::Unlink(id) => {
+                // Port of erl_proc_sig_queue.c:6693-6713: removing the link costs 4.
+                let removed = self.cold.as_mut().is_some_and(|cold| {
+                    cold.prio_links.remove(&from);
+                    cold.links.remove(&from)
+                });
+                self.trace_getting_unlinked(ctx, from);
+                let _ = ctx.signal(from, arinsal_sched::Signal::UnlinkAckSignal(id));
+                if removed { 4 } else { 0 }
+            }
+            arinsal_sched::Signal::Monitor(reference) => {
+                self.cold_mut().monitored_by.insert(reference, from);
+                2
+            }
+            arinsal_sched::Signal::Demonitor(reference) => {
+                if let Some(cold) = self.cold.as_mut() {
+                    cold.monitored_by.remove(&reference);
+                }
+                2
+            }
+            signal @ (arinsal_sched::Signal::Exit(_) | arinsal_sched::Signal::ExitLinked(_)) => {
+                let (linked_exit, message) = match signal {
+                    arinsal_sched::Signal::ExitLinked(message) => (true, message),
+                    arinsal_sched::Signal::Exit(message) => (false, message),
+                    _ => unreachable!(),
+                };
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:4685-4795
+                // (handle_exit_signal), OTP-29.1.1: a link exit removes the link and a
+                // process that survives it traces getting_unlinked.
+                let priority = message.is_priority()
+                    || self
+                        .cold
+                        .as_ref()
+                        .is_some_and(|cold| cold.prio_links.contains(&from));
+                let was_linked = linked_exit
+                    && self.cold.as_mut().is_some_and(|cold| {
+                        cold.prio_links.remove(&from);
+                        cold.links.remove(&from)
+                    });
+                let reason = message.into_receiver(self)?;
+                if reason == crate::signals::atom("kill") && !linked_exit {
+                    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4782
+                    // (handle_exit_signal), OTP-29.1.1: `kill` exits without exception dispatch.
+                    return Err(VmError::Trap(crate::exceptions::Trap::killed()));
+                }
+                if self.trap_exit {
+                    // Port of erts/emulator/beam/external.c:3127-3141, OTP-29.1.1.
+                    // A scheduler proxy stands in for a remote PID internally, but
+                    // EXIT messages expose the peer's original PID to Erlang code.
+                    let sender = from;
+                    let from = crate::dist::remote_pid_term(self, from)?
+                        .or_else(|| from.to_term())
+                        .ok_or_else(|| VmError::Unsupported("invalid signal sender pid".into()))?;
+                    let tuple = self.tuple(&[crate::signals::atom("EXIT"), from, reason])?;
+                    if priority {
+                        self.push_priority_message(tuple)?;
+                    } else {
+                        self.inbox.push_back(tuple);
+                    }
+                    self.trace_converted_signal(ctx, tuple, sender);
+                    if was_linked {
+                        self.trace_getting_unlinked(ctx, sender);
+                    }
+                    // handle_exit_signal (erl_proc_sig_queue.c:4633-4800): converted, `cnt = 1`.
+                    return Ok(1);
+                }
+                if reason != Term::atom(arinsal_term::atoms::NORMAL) {
+                    self.note_exit_reason(reason)?;
+                    return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                }
+                if was_linked {
+                    self.trace_getting_unlinked(ctx, from);
+                }
+                // Ignored: `cnt = 1` plus one for destroying the signal.
+                2
+            }
+            // Port of erts/emulator/beam/io.c:3841-3891 (erts_deliver_port_exit), OTP-29.1.1.
+            arinsal_sched::Signal::PortExit { port, reason } => {
+                let port = port.into_receiver(self)?;
+                let reason = reason.into_receiver(self)?;
+                if reason == crate::signals::atom("kill") {
+                    return Err(VmError::Trap(crate::exceptions::Trap::killed()));
+                }
+                if self.trap_exit {
+                    let tuple = self.tuple(&[crate::signals::atom("EXIT"), port, reason])?;
+                    self.inbox.push_back(tuple);
+                    return Ok(1);
+                }
+                if reason != Term::atom(arinsal_term::atoms::NORMAL) {
+                    self.note_exit_reason(reason)?;
+                    return Err(VmError::Trap(crate::exceptions::Trap::exit(reason)));
+                }
+                2
+            }
+            arinsal_sched::Signal::MonitorNoproc(reference) => {
+                let queued = self.inbox.len();
+                self.deliver_monitor_down(from, reference, crate::signals::atom("noproc"))?;
+                self.trace_new_message(ctx, queued, from);
+                // convert_to_down_message (erl_proc_sig_queue.c:4838-5056).
+                8
+            }
+            arinsal_sched::Signal::MonitorDown { reference, reason } => {
+                let reason = reason.into_receiver(self)?;
+                let queued = self.inbox.len();
+                self.deliver_monitor_down(from, reference, reason)?;
+                self.trace_new_message(ctx, queued, from);
+                8
+            }
+            arinsal_sched::Signal::UnlinkAck(id) => {
+                // Port of erts/emulator/beam/erl_proc_sig_queue.c:6794
+                // (ERTS_SIG_Q_OP_PROCESS_INFO), OTP-29.1.1.
+                // The scheduler signal enum has no request op; a nonzero
+                // unlink-ack id is the wakeup for a queued request.
+                // handle_process_info (erl_proc_sig_queue.c:5312) costs at least 8.
+                if id != 0 {
+                    crate::signals::handle_request(self, ctx, id)?;
+                    8
+                } else {
+                    0
+                }
+            }
+            arinsal_sched::Signal::UnlinkAckSignal(id) => {
+                // Port of erl_proc_sig_queue.c:6745-6772: removing the link costs 4.
+                if let Some(cold) = self.cold.as_mut()
+                    && cold.unlinking.get(&id) == Some(&from)
+                {
+                    cold.unlinking.remove(&id);
+                    cold.links.remove(&from);
+                    cold.prio_links.remove(&from);
+                    4
+                } else {
+                    0
+                }
+            }
+            arinsal_sched::Signal::Alias(_) | arinsal_sched::Signal::Unalias(_) => {
+                return Err(VmError::Unsupported("process aliases".into()));
+            }
+            arinsal_sched::Signal::GarbageCollect => {
+                if self.gc_enabled {
+                    self.force_gc()?;
+                } else {
+                    self.cold_mut()
+                        .delayed_gc
+                        .push(crate::proc_create::DelayedGc::Collect);
+                }
+                0
+            }
+            arinsal_sched::Signal::LiteralAreaCopy {
+                area_id,
+                request,
+                how,
+                requester,
+            } => {
+                if !self.gc_enabled && how != arinsal_sched::LiteralCopyHow::Init {
+                    self.cold_mut()
+                        .delayed_gc
+                        .push(crate::proc_create::DelayedGc::Literal {
+                            area_id,
+                            request,
+                            how,
+                            requester,
+                        });
+                } else {
+                    crate::natives::sys::copy_literal_area(
+                        self, ctx, area_id, request, how, requester,
+                    )?;
+                }
+                0
+            }
+        };
+        Ok(cost)
     }
 }
 
@@ -5660,13 +5994,24 @@ impl Process {
     /// (erts_internal_dirty_process_handle_signals_1), OTP-29.1.1. Collections are deferred
     /// until the job returns, and an exit signal makes the process exiting: pending requests
     /// fail now and it terminates on a normal scheduler.
-    pub(crate) fn handle_dirty_signals(&mut self, vm: &mut Vm, ctx: &mut RunCtx<'_, Message>) {
+    ///
+    /// Signals are handled within the handler's reductions; returns `false` when some are
+    /// left (`more`), so the handler calls again.
+    pub(crate) fn handle_dirty_signals(
+        &mut self,
+        vm: &mut Vm,
+        ctx: &mut RunCtx<'_, Message>,
+    ) -> bool {
         if self.dirty_exiting() {
-            return;
+            return true;
         }
         let gc = self.set_gc_enabled(false);
-        let result = self.drain(ctx);
+        // `reds = ERTS_BIF_REDS_LEFT(BIF_P)` and one `erts_proc_sig_handle_incoming`.
+        let mut reds = i32::try_from(ctx.remaining()).unwrap_or(i32::MAX).max(1);
+        let max_reds = reds;
+        let result = self.handle_incoming(ctx, &mut reds, max_reds, false);
         self.set_gc_enabled(gc);
+        let done = !matches!(result, Ok(false));
         if let Err(error) = result {
             // Port of erts/emulator/beam/erl_process.c:10096 (need_forced_exit), OTP-29.1.1:
             // an exiting process is terminated while its dirty job keeps running.
@@ -5684,6 +6029,7 @@ impl Process {
         }
         // Replies, exit and DOWN signals must not wait for the dirty job to return.
         ctx.flush_pending();
+        done
     }
 
     /// Whether this process already exited while executing a dirty job.
@@ -5843,73 +6189,82 @@ impl Process {
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper)
     // and the message case of erts_proc_sig_handle_incoming, OTP-29.1.1.
     pub(crate) fn fetch_messages_in_place(&mut self) -> Result<usize, VmError> {
+        // Only the `erts_proc_sig_fetch` case that splices messages straight onto the message
+        // queue runs here: no unhandled signal in the middle queue, no receive tracing, and
+        // an outer queue of ordinary messages only.
+        if !self.sig_cont_empty() || crate::trace::active() {
+            return Ok(0);
+        }
         let Some(cold) = self.cold.as_mut() else {
             return Ok(0);
         };
-        if !cold.native_inline_fetch || !cold.delayed_gc.is_empty() || crate::trace::active() {
+        if !cold.delayed_gc.is_empty() {
             return Ok(0);
         }
         let Some(probe) = cold.signal_probe.take() else {
             return Ok(0);
         };
-        let fetched = self.fetch_outer_messages(&probe, false);
+        let fetched = probe.fetch_messages_if(|message| !message.is_priority(), &mut self.sig_cont);
         self.cold_mut().signal_probe = Some(probe);
-        let fetched = fetched?;
-        if fetched != 0 {
-            crate::natives::erts_debug::after_message_queue_change(self);
-        }
-        Ok(fetched)
-    }
-
-    /// Move outer-queue messages into the inbox before an on-heap collection.
-    ///
-    /// Non-message signals stay in front of later messages, matching
-    /// `erts_proc_sig_fetch` order. Tracing and a delayed GC still belong to
-    /// the scheduler drain, which roots those signals itself.
-    // Port of erts/emulator/beam/erl_gc.c:987-990 (`erts_garbage_collect` fetches
-    // when `FS_ON_HEAP_MSGQ`) and erl_proc_sig_queue.h:1997 (`erts_proc_sig_fetch`),
-    // OTP-29.1.1.
-    fn fetch_outer_queue_for_gc(&mut self) -> Result<(), VmError> {
-        if self.message_queue_data() != MessageQueueData::OnHeap {
-            return Ok(());
-        }
-        if self
-            .cold
-            .as_ref()
-            .is_some_and(|cold| !cold.delayed_gc.is_empty())
-            || crate::trace::active()
-        {
-            return Ok(());
-        }
-        let Some(probe) = self.cold.as_mut().and_then(|cold| cold.signal_probe.take()) else {
-            return Ok(());
-        };
-        let fetched = self.fetch_outer_messages(&probe, true);
-        self.cold_mut().signal_probe = Some(probe);
-        let fetched = fetched?;
-        if fetched != 0 {
-            crate::natives::erts_debug::after_message_queue_change(self);
-        }
-        Ok(())
-    }
-
-    fn fetch_outer_messages(
-        &mut self,
-        probe: &arinsal_sched::SignalProbe<Message>,
-        include_priority: bool,
-    ) -> Result<usize, VmError> {
-        let mut fetched = 0;
-        while let Some((_sender, message)) =
-            probe.fetch_message_if(|message| include_priority || !message.is_priority())
-        {
+        while let Some(Event { payload, .. }) = self.sig_cont.pop_front() {
+            self.sig_cont_taken += 1;
+            let Payload::Message(message) = payload else {
+                unreachable!("fetch_messages_if takes messages only");
+            };
             let old_prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
             let before = self.message_words_before();
             let new_prio_len = self.inbox.push_message(message, old_prio_len)?;
             self.uncount_message_words(before);
             self.cold_mut().prio_len = new_prio_len;
-            fetched += 1;
+        }
+        if fetched != 0 {
+            crate::natives::erts_debug::after_message_queue_change(self);
         }
         Ok(fetched)
+    }
+
+    /// Fetch the outer signal queue before an on-heap collection: messages a sender
+    /// installed on this heap while the process was not running are queued there and must
+    /// be roots. Like `erts_proc_sig_fetch`, an outer queue of ordinary messages joins the
+    /// message queue when the middle queue is empty; otherwise the whole queue is appended
+    /// to the middle queue, whose on-heap messages are roots too.
+    // Port of erts/emulator/beam/erl_gc.c:987-990 (`erts_garbage_collect` fetches when
+    // `FS_ON_HEAP_MSGQ`) and erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
+    fn fetch_outer_queue_for_gc(&mut self) -> Result<(), VmError> {
+        if self.message_queue_data() != MessageQueueData::OnHeap {
+            return Ok(());
+        }
+        if self.fetch_messages_in_place()? != 0 {
+            return Ok(());
+        }
+        let Some(probe) = self.cold.as_mut().and_then(|cold| cold.signal_probe.take()) else {
+            return Ok(());
+        };
+        probe.fetch_all(&mut self.sig_cont);
+        probe.set_sig_q(!self.sig_cont_empty());
+        self.cold_mut().signal_probe = Some(probe);
+        Ok(())
+    }
+
+    /// Index of the first middle-queue message whose term satisfies `matches`.
+    pub(crate) fn sig_cont_position(&self, matches: impl Fn(Term) -> bool) -> Option<usize> {
+        self.sig_cont.iter().position(|event| {
+            Self::sig_cont_message(&event.payload).is_some_and(|message| matches(message.term))
+        })
+    }
+
+    fn sig_cont_message(payload: &Payload<Message>) -> Option<&Message> {
+        match payload {
+            Payload::Message(message) | Payload::TimerMessage { message, .. } => Some(message),
+            _ => None,
+        }
+    }
+
+    fn sig_cont_message_mut(payload: &mut Payload<Message>) -> Option<&mut Message> {
+        match payload {
+            Payload::Message(message) | Payload::TimerMessage { message, .. } => Some(message),
+            _ => None,
+        }
     }
 
     fn message_words_before(&self) -> Option<i64> {
@@ -5958,6 +6313,7 @@ impl Process {
         if !hibernate
             && extra.is_empty()
             && self.inbox.is_empty()
+            && self.sig_cont.is_empty()
             && self.dictionary.is_none()
             && self.apply_inline_len == 0
             && self.cold.as_ref().is_none_or(|cold| {
@@ -6020,12 +6376,23 @@ impl Process {
         let dict_end = roots.len();
         let inline_len = usize::from(self.apply_inline_len);
         roots.extend_from_slice(&self.apply_inline[..inline_len]);
+        let mut nif_roots_len = 0;
         if let Some(cold) = self.cold.as_mut() {
             roots.extend_from_slice(&cold.apply_roots);
             if let Some(pending) = cold.nif_pending.as_mut() {
+                nif_roots_len = pending.roots_mut().len();
                 roots.extend_from_slice(pending.roots_mut());
             }
         }
+        // Port of erts/emulator/beam/erl_gc.c:2616 (setup_rootset walks the message queue and
+        // the middle signal queue, ERTS_FOREACH_SIG_PRIVQS), OTP-29.1.1: on-heap messages still
+        // waiting in the middle queue are roots too.
+        let cont_start = roots.len();
+        roots.extend(self.sig_cont.iter().filter_map(|event| {
+            Self::sig_cont_message(&event.payload)
+                .filter(|message| message.is_heap_root())
+                .map(|message| message.term)
+        }));
         // Port of erts/emulator/beam/erl_gc.c:832-901 (`trace_gc` around minor/major collections), OTP-29.1.1.
         let traced = self
             .self_pid
@@ -6113,7 +6480,17 @@ impl Process {
             cold.apply_roots
                 .copy_from_slice(&roots[apply_start..apply_end]);
             if let Some(pending) = cold.nif_pending.as_mut() {
-                pending.roots_mut().copy_from_slice(&roots[apply_end..]);
+                pending
+                    .roots_mut()
+                    .copy_from_slice(&roots[apply_end..apply_end + nif_roots_len]);
+            }
+        }
+        let mut cont_roots = roots[cont_start..].iter();
+        for event in &mut self.sig_cont {
+            if let Some(message) = Self::sig_cont_message_mut(&mut event.payload)
+                && message.is_heap_root()
+            {
+                message.term = *cont_roots.next().expect("middle queue GC root");
             }
         }
         if self.max_heap_peak != 0
@@ -6481,11 +6858,19 @@ fn with_executor<R>(
 #[inline(never)]
 fn new_executor(runtime: &Arc<Runtime>) -> Box<Executor> {
     Box::new(Executor {
+        current_process: Default::default(),
+        hub_bound: false,
         vm: Vm::shared_replica(runtime.code_scope, &runtime.paths),
         x: crate::proc_create::ArgRegs::empty(),
         fr: Box::new([]),
         native_registers: SchedulerRegisters::default(),
     })
+}
+
+impl arinsal_sched::SignalMessage for Message {
+    fn is_priority(&self) -> bool {
+        self.priority
+    }
 }
 
 impl Task for Process {

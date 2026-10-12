@@ -6,7 +6,7 @@
 //! `Arc`; only slot allocation and reuse take a lock. A generation increment
 //! prevents a recycled slot from resolving an old pid. Producers publish both
 //! messages and signals through one MPSC head. Worker-local slabs batch events
-//! by recipient; the receiver detaches ordered blocks into its private queue.
+//! by recipient; the receiver splices them into its inner queue.
 //! Sends from one logical process must be serialized to preserve sender order.
 //!
 //! The real scheduler gives each worker a run queue (a Chase-Lev deque fed by a
@@ -64,7 +64,7 @@ mod ports;
 mod thr_progress;
 mod timer;
 
-pub use mailbox::{Incoming, Private, ReceiveMarker};
+pub use mailbox::{InSignal, Incoming, psflg};
 pub use ports::{PortExecution, PortRunQueue, RunPort};
 pub use timer::TimerRef;
 
@@ -297,6 +297,34 @@ pub struct Event<M> {
     pub payload: Payload<M>,
 }
 
+/// A message envelope as the signal queue sees it.
+pub trait SignalMessage: Send + 'static {
+    /// A priority message: erts sends it as an `ERTS_SIG_Q_OP_ALTACT_MSG` non-message
+    /// signal (erl_proc_sig_queue.c:6888, handle_altact_msg), OTP-29.1.1.
+    fn is_priority(&self) -> bool {
+        false
+    }
+}
+
+impl SignalMessage for () {}
+impl SignalMessage for u32 {}
+impl SignalMessage for u64 {}
+impl SignalMessage for usize {}
+
+// Port of erts/emulator/beam/erl_proc_sig_queue.h (ERTS_SIG_IS_MSG: messages, including
+// timer timeouts, versus non-message signals), OTP-29.1.1.
+impl<M: SignalMessage> InSignal for Event<M> {
+    fn is_message(&self) -> bool {
+        match &self.payload {
+            Payload::Message(message) | Payload::TimerMessage { message, .. } => {
+                !message.is_priority()
+            }
+            Payload::Timer { .. } => true,
+            Payload::Signal(_) => false,
+        }
+    }
+}
+
 /// A task's cooperative scheduling result.
 pub enum RunOutcome {
     /// The task used its reductions budget and remains runnable.
@@ -381,7 +409,7 @@ pub fn current_scheduler_type() -> SchedulerType {
 /// A VM process or a benchmark dummy task.
 pub trait Task: Send + 'static {
     /// Opaque message envelope owned by the receiving process.
-    type Message: Send + 'static;
+    type Message: SignalMessage;
     /// Task-side part of one scheduler's data (`ErtsSchedulerData`): created once per normal,
     /// dirty or simulated scheduler and lent to every [`Task::run`] on it.
     type SchedulerData: Default + Send + 'static;
@@ -441,7 +469,8 @@ pub enum DirtySignals {
     Normal,
     /// Nothing was queued.
     Idle,
-    /// Another thread holds the task cell while the process is still dirty.
+    /// Another thread holds the task cell while the process is still dirty, or the
+    /// callback ran out of reductions before handling every signal.
     More,
     /// The callback handled the queued signals.
     Handled,
@@ -599,25 +628,37 @@ impl Clock for VirtualClock {
 #[derive(Clone)]
 pub struct SignalProbe<M>(Arc<Incoming<Event<M>>>);
 
-impl<M> SignalProbe<M> {
+impl<M: SignalMessage> SignalProbe<M> {
     /// Whether the outer signal queue holds unfetched signals.
     pub fn has_pending(&self) -> bool {
         self.0.has_pending()
     }
 
-    /// Fetch the oldest signal when it is a message that `accept` takes.
-    ///
-    /// Only valid while the receiver's private queue is empty; see
-    /// [`Incoming::fetch_first_if`].
-    pub fn fetch_message_if(&self, accept: impl FnOnce(&M) -> bool) -> Option<(Pid, M)> {
-        self.0
-            .fetch_first_if(
-                |event| matches!(&event.payload, Payload::Message(message) if accept(message)),
-            )
-            .map(|event| match event.payload {
-                Payload::Message(message) => (event.from, message),
-                _ => unreachable!("fetch_first_if accepted a message"),
-            })
+    /// Record whether the receiver's middle signal queue holds unhandled signals
+    /// (`ERTS_PSFLG_SIG_Q`).
+    pub fn set_sig_q(&self, unhandled: bool) {
+        self.0.set_sig_q(unhandled);
+    }
+
+    /// Move the whole outer queue to the end of `into`, the receiver's middle queue. Each
+    /// event taken from there is accounted with [`RunCtx::consume_fetched`].
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch), OTP-29.1.1.
+    pub fn fetch_all(&self, into: &mut VecDeque<Event<M>>) {
+        self.0.take_all(into);
+    }
+
+    /// Move the whole outer queue to `into` when it holds only messages that `accept` takes;
+    /// otherwise leave it for the scheduler. Returns the number of signals moved.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch__), OTP-29.1.1.
+    pub fn fetch_messages_if(
+        &self,
+        accept: impl Fn(&M) -> bool,
+        into: &mut VecDeque<Event<M>>,
+    ) -> usize {
+        self.0.take_all_if(
+            |event| matches!(&event.payload, Payload::Message(message) if accept(message)),
+            into,
+        )
     }
 }
 
@@ -629,7 +670,6 @@ impl<M> std::fmt::Debug for SignalProbe<M> {
 
 struct TaskCell<T: Task> {
     task: T,
-    private: Private<Event<T::Message>>,
 }
 
 /// Process-local words `erts_continue_exit_process` tests before taking a global table lock.
@@ -847,10 +887,7 @@ impl<T: Task> ProcessTable<T> {
             dirty: AtomicU8::new(0),
             dirty_runner: AtomicUsize::new(0),
             queued_prio: AtomicU8::new(0),
-            cell: Mutex::new(TaskCell {
-                task,
-                private: Private::default(),
-            }),
+            cell: Mutex::new(TaskCell { task }),
         });
         // Publication needs only the release store. Flushing the epoch bag on
         // every spawn forced a global reclamation check in the hot path.
@@ -3432,18 +3469,16 @@ impl<T: Task> TimerCallbackCtx<T::Message> for CallbackCtx<'_, T> {
     }
 }
 
-pub struct RunCtx<'a, M: Send + 'static> {
+pub struct RunCtx<'a, M: SignalMessage> {
     inner: &'a mut dyn ContextOps<M>,
     pid: Pid,
     input: &'a Incoming<Event<M>>,
-    private: &'a mut Private<Event<M>>,
     backlog: &'a AtomicUsize,
     bound_worker: &'a AtomicUsize,
     worker: Option<usize>,
     worker_count: usize,
     remaining: u32,
     budget: u32,
-    private_wake: bool,
     msacc_enabled: bool,
     wall_enabled: bool,
     gc_accounted_total: u64,
@@ -3459,7 +3494,7 @@ pub struct RunCtx<'a, M: Send + 'static> {
     simulated: bool,
 }
 
-trait ContextOps<M: Send + 'static> {
+trait ContextOps<M: SignalMessage> {
     fn process_priority(&self, pid: Pid) -> Option<Priority>;
     fn deliver(&mut self, from: Pid, to: Pid, payload: Payload<M>) -> Result<(), Error>;
     fn flush(&mut self);
@@ -3524,11 +3559,11 @@ trait ContextOps<M: Send + 'static> {
         &mut self,
         pid: Pid,
         remaining: u32,
-        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals;
 }
 
-impl<M: Send + 'static> RunCtx<'_, M> {
+impl<M: SignalMessage> RunCtx<'_, M> {
     fn consumed_event(&self) {
         if self.backlog.load(Ordering::Relaxed) != 0 {
             self.backlog.fetch_sub(1, Ordering::Relaxed);
@@ -3628,7 +3663,7 @@ impl<M: Send + 'static> RunCtx<'_, M> {
     pub fn handle_dirty_signals(
         &mut self,
         pid: Pid,
-        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>),
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, M>) -> bool,
     ) -> DirtySignals {
         self.inner.handle_dirty_signals(pid, self.remaining, handle)
     }
@@ -3768,123 +3803,37 @@ impl<M: Send + 'static> RunCtx<'_, M> {
         self.wall_enabled = enabled;
         self.inner.set_wall_accounting_enabled(enabled);
     }
-    /// Detach pending input and receive the oldest event.
+    /// Take the oldest signal from the outer signal queue, for a task without an inner
+    /// queue of its own (and for an exiting process absorbing what is left).
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:7730-7790 (erts_proc_sig_receive_helper
+    // fetches from the outer queue), OTP-29.1.1.
     pub fn receive(&mut self) -> Option<Event<M>> {
         self.inner.flush();
-        if let Some(event) = self.private.pop() {
-            self.consumed_event();
-            return Some(event);
-        }
-        self.input.drain_into(self.private);
-        let event = self.private.pop();
-        if event.is_some() {
-            self.consumed_event();
-        }
-        event
+        self.input.fetch_first_if(|_| true)
     }
-    /// Fetch one available signal snapshot into the receiver's private queue.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:1332 (erts_proc_sig_fetch), OTP-29.1.1.
-    pub fn fetch_pending(&mut self) -> bool {
+    /// Move every signal published to this process into `into`, after the signals it already
+    /// holds: the process's inner signal queue receives the outer one. Each event taken out of
+    /// `into` is accounted with [`Self::consume_fetched`].
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: the outer
+    // queue is appended to the inner one), OTP-29.1.1.
+    pub fn fetch_signals(&mut self, into: &mut VecDeque<Event<M>>) {
         self.inner.flush();
-        if self.input.has_pending() {
-            self.input.drain_into(self.private);
-        }
-        self.private_wake = self.private.has_saved();
-        self.private_wake
+        self.input.take_all(into);
     }
-    /// Fetch the outer signal queue for direct handling when the private queue is idle.
-    ///
-    /// Returns `None` after an ordinary [`Self::fetch_pending`] when the private queue still
-    /// holds events or markers: those come first. Each returned event is accounted with
-    /// [`Self::consume_fetched`]; unhandled ones go back with [`Self::restore_fetched`].
-    // Port of erts/emulator/beam/erl_proc_sig_queue.h:1997 (erts_proc_sig_fetch: one inner
-    // queue receives the outer one), OTP-29.1.1.
-    pub fn fetch_incoming(&mut self) -> Option<VecDeque<Event<M>>> {
-        if !self.private.is_idle() {
-            self.fetch_pending();
-            return None;
-        }
-        self.inner.flush();
-        self.private_wake = false;
-        let mut fetched = self.private.take_fetch_buffer();
-        self.input.take_all(&mut fetched);
-        Some(fetched)
+    /// Record whether this process's middle signal queue holds unhandled signals
+    /// (`ERTS_PSFLG_SIG_Q`).
+    pub fn set_sig_q(&self, unhandled: bool) {
+        self.input.set_sig_q(unhandled);
     }
-    /// Account one event taken by [`Self::fetch_incoming`].
+    /// Account one event taken from [`Self::fetch_signals`].
     pub fn consume_fetched(&self) {
         self.consumed_event();
     }
-    /// Return events taken by [`Self::fetch_incoming`] that were not handled.
-    pub fn restore_fetched(&mut self, events: VecDeque<Event<M>>) {
-        let restored = !events.is_empty();
-        self.private.restore_front(events);
-        if restored {
-            self.private_wake = self.private.has_saved();
-        }
-    }
-    /// Consume one event from a snapshot already fetched by [`Self::fetch_pending`].
-    pub fn receive_fetched(&mut self) -> Option<Event<M>> {
-        let event = self.private.pop();
-        if event.is_some() {
-            self.consumed_event();
-        }
-        event
-    }
-    /// Consume the next event at the current selective receive save position.
-    pub fn receive_saved(&mut self) -> Option<Event<M>> {
-        let event = self.private.pop_saved();
-        if event.is_some() {
-            self.consumed_event();
-        }
-        self.private_wake = self.private.has_saved();
-        event
-    }
-    /// Selectively remove an event after the save position.
-    pub fn receive_matching(&mut self, matches: impl FnMut(&Event<M>) -> bool) -> Option<Event<M>> {
-        self.inner.flush();
-        self.private_wake = false;
-        self.input.drain_into(self.private);
-        let event = self.private.find_remove(matches);
-        if event.is_some() {
-            self.consumed_event();
-        }
-        event
-    }
-    /// Restart a selective receive scan after changing the pattern.
     /// Record whether this slice ends active (runnable) or waiting.
     // Port of erts/emulator/beam/erl_process.c (ERTS_PSFLG_ACTIVE in the process state
     // word, read by erts_process_state2status), OTP-29.1.1.
     pub fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Release);
-    }
-    pub fn reset_save(&mut self) {
-        self.private.reset_save();
-    }
-    /// The private queue holds no events or markers (see [`Private::is_idle`]).
-    pub fn private_is_idle(&self) -> bool {
-        self.private.is_idle()
-    }
-    /// Reserve a receive marker after all currently published messages.
-    pub fn recv_marker_reserve(&mut self) -> ReceiveMarker {
-        self.inner.flush();
-        self.input.drain_into(self.private);
-        self.private.marker_reserve()
-    }
-    /// Bind a reserved marker to a VM-provided reference key.
-    pub fn recv_marker_bind(&mut self, marker: ReceiveMarker, reference: u64) -> bool {
-        self.private.marker_bind(marker, reference)
-    }
-    /// Start a selective scan at the bound marker, or at the head if it is absent.
-    pub fn recv_marker_use(&mut self, reference: u64) -> bool {
-        self.private.marker_use(reference)
-    }
-    /// Whether a fetched event remains before a receive marker.
-    pub fn recv_marker_has_saved_before(&self, marker: ReceiveMarker) -> bool {
-        self.private.marker_has_saved_before(marker)
-    }
-    /// Clear the marker bound to a VM-provided reference key.
-    pub fn recv_marker_clear(&mut self, reference: u64) -> bool {
-        self.private.marker_clear(reference)
     }
     /// Send an opaque envelope to another process.
     pub fn send(&mut self, to: Pid, msg: M) -> Result<(), Error> {
@@ -4119,7 +4068,7 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         &mut self,
         pid: Pid,
         remaining: u32,
-        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>),
+        handle: &mut dyn FnMut(&mut dyn std::any::Any, &mut RunCtx<'_, T::Message>) -> bool,
     ) -> DirtySignals {
         let inner = self.inner;
         let Some(process) = inner.table.lookup(pid) else {
@@ -4137,7 +4086,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if let Some(result) = state(&process) {
             return result;
         }
-        if !process.input.has_pending() {
+        // `state & (ERTS_PSFLG_SIG_Q | ERTS_PSFLG_NMSG_SIG_IN_Q | ERTS_PSFLG_MSG_SIG_IN_Q)`.
+        if process.input.state().load(Ordering::Acquire) & (psflg::SIG_Q | psflg::SIG_IN_Q) == 0
+            && !process.input.has_pending()
+        {
             return DirtySignals::Idle;
         }
         let mut cell = match process.cell.try_lock() {
@@ -4147,20 +4099,18 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if let Some(result) = state(&process) {
             return result;
         }
-        let TaskCell { task, private } = &mut *cell;
+        let TaskCell { task } = &mut *cell;
         let simulated = self.inner.sim.is_some();
         let mut ctx = RunCtx {
             inner: self,
             pid,
             input: &process.input,
-            private,
             backlog: &process.input.backlog,
             bound_worker: &process.bound_worker,
             worker: None,
             worker_count: inner.config.workers,
             remaining,
             budget: remaining,
-            private_wake: false,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
@@ -4172,8 +4122,11 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
             simulated,
         };
-        handle(task, &mut ctx);
-        DirtySignals::Handled
+        if handle(task, &mut ctx) {
+            DirtySignals::Handled
+        } else {
+            DirtySignals::More
+        }
     }
     fn deliver_sys_task(
         &mut self,
@@ -4992,7 +4945,7 @@ impl<T: Task> Scheduler<T> {
         if state == EXITED {
             return Err(SignalFreeError::NoProcess);
         }
-        if !inspectable(state) || has_pending_signals(&process) || !cell.private.is_empty() {
+        if !inspectable(state) || has_pending_signals(&process) {
             return Err(SignalFreeError::Busy);
         }
         Ok(inspect(&cell.task))
@@ -5385,6 +5338,43 @@ impl<T: Task> Scheduler<T> {
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
+mod in_signal_tests {
+    use super::*;
+
+    struct Envelope(bool);
+    impl SignalMessage for Envelope {
+        fn is_priority(&self) -> bool {
+            self.0
+        }
+    }
+
+    #[test]
+    fn priority_message_sets_nmsg_sig_in_q() {
+        let input: Incoming<Event<Envelope>> = Incoming::default();
+        let from = Pid::new(1, 0);
+        input.push(Event {
+            from,
+            payload: Payload::Message(Envelope(false)),
+        });
+        assert_eq!(
+            input.state().load(Ordering::SeqCst) & psflg::SIG_IN_Q,
+            psflg::MSG_SIG_IN_Q
+        );
+        input.push(Event {
+            from,
+            payload: Payload::Message(Envelope(true)),
+        });
+        assert_eq!(
+            input.state().load(Ordering::SeqCst) & psflg::SIG_IN_Q,
+            psflg::SIG_IN_Q
+        );
+        let mut inner = VecDeque::new();
+        assert_eq!(input.take_all_if(InSignal::is_message, &mut inner), 0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod msgq_stage_microbench {
     use super::*;
 
@@ -5438,20 +5428,21 @@ mod msgq_stage_microbench {
         }
         report("enqueue block", N, started);
 
-        let mut private = Private::default();
+        let mut inner_queue = VecDeque::new();
         let started = Instant::now();
-        let fetched = ingress.drain_into(&mut private);
-        assert_eq!(fetched, N);
+        ingress.take_all(&mut inner_queue);
+        assert_eq!(inner_queue.len(), N);
         report("fetch batch", N, started);
 
         let started = Instant::now();
         for expected in 0..N {
-            let event = private
-                .find_remove(
+            let index = inner_queue
+                .iter()
+                .position(
                     |event| matches!(event.payload, Payload::Message(value) if value == expected),
                 )
                 .unwrap();
-            std::hint::black_box(event);
+            std::hint::black_box(inner_queue.remove(index).unwrap());
         }
         report("receive match", N, started);
 
@@ -5477,7 +5468,6 @@ mod msgq_stage_microbench {
             local: None,
             deferred_monitor: None,
         };
-        let mut receive_private = Private::default();
         let backlog = AtomicUsize::new(N);
         let bound_worker = AtomicUsize::new(UNBOUND_WORKER);
         let user_priority = AtomicU8::new(Priority::Normal.index() as u8);
@@ -5487,14 +5477,12 @@ mod msgq_stage_microbench {
             inner: &mut receive_runner,
             pid: process,
             input: &input,
-            private: &mut receive_private,
             backlog: &backlog,
             bound_worker: &bound_worker,
             worker: None,
             worker_count: scheduler.inner.config.workers,
             remaining: 1_000,
             budget: 1_000,
-            private_wake: false,
             msacc_enabled: false,
             wall_enabled: false,
             gc_accounted_total: 0,
@@ -5507,9 +5495,12 @@ mod msgq_stage_microbench {
             simulated: scheduler.inner.sim.is_some(),
         };
         let started = Instant::now();
-        assert!(context.fetch_pending());
-        for _ in 0..N {
-            std::hint::black_box(context.receive_fetched().unwrap());
+        let mut fetched = VecDeque::new();
+        context.fetch_signals(&mut fetched);
+        assert_eq!(fetched.len(), N);
+        while let Some(event) = fetched.pop_front() {
+            context.consume_fetched();
+            std::hint::black_box(event);
         }
         report("RunCtx batch fetch + pop", N, started);
 
@@ -5564,7 +5555,7 @@ mod msgq_stage_microbench {
         let to = scheduler.spawn(Idle).unwrap();
         let target = scheduler.inner.table.lookup(to).unwrap();
         target.state.store(RUNNING, Ordering::Relaxed);
-        let mut private = Private::default();
+        let mut inner_queue = VecDeque::new();
         let started = Instant::now();
         for message in 0..N {
             let mut runner = Runner {
@@ -5581,12 +5572,12 @@ mod msgq_stage_microbench {
             .unwrap();
             runner.flush();
             if message % 32 == 31 {
-                target.input.drain_into(&mut private);
-                while private.pop().is_some() {}
+                target.input.take_all(&mut inner_queue);
+                inner_queue.clear();
             }
         }
-        target.input.drain_into(&mut private);
-        while private.pop().is_some() {}
+        target.input.take_all(&mut inner_queue);
+        inner_queue.clear();
         report("one send per runner slice", N, started);
     }
 
@@ -5627,10 +5618,10 @@ mod msgq_stage_microbench {
         let ready = scheduler.inner.sim.as_ref().unwrap().lock().unwrap();
         assert_eq!(ready.queue.len(), 1);
         drop(ready);
-        let mut private = Private::default();
-        process.input.drain_into(&mut private);
+        let mut inner_queue = VecDeque::new();
+        process.input.take_all(&mut inner_queue);
         let messages = (0..3)
-            .map(|_| match private.pop().unwrap().payload {
+            .map(|_| match inner_queue.pop_front().unwrap().payload {
                 Payload::Message(value) => value,
                 _ => panic!("unexpected control signal"),
             })
@@ -5923,26 +5914,24 @@ fn run_slice<'a, T: Task>(
         cell.task.finish_dirty_job(result);
     }
     drop(local_guard);
-    let (outcome, remaining, private_pending, active_ns) = {
+    let (outcome, remaining, active_ns) = {
         let mut runner = Runner {
             inner,
             local: local_cell,
             deferred_monitor: None,
         };
         let result = {
-            let TaskCell { task, private } = &mut *cell;
+            let TaskCell { task } = &mut *cell;
             let mut ctx = RunCtx {
                 inner: &mut runner,
                 pid: process.pid,
                 input: &process.input,
-                private,
                 backlog: &process.input.backlog,
                 bound_worker: &process.bound_worker,
                 worker,
                 worker_count: inner.config.workers,
                 remaining: budget,
                 budget,
-                private_wake: true,
                 msacc_enabled,
                 wall_enabled: accounting_flags & ACCOUNTING_WALL != 0,
                 gc_accounted_total: if msacc_enabled {
@@ -5977,12 +5966,7 @@ fn run_slice<'a, T: Task>(
             let active_ns = accounting_started.map_or(0, |started| {
                 started.elapsed().as_nanos().min(u64::MAX as u128) as u64
             });
-            (
-                outcome,
-                ctx.remaining,
-                ctx.private_wake && !ctx.private.is_empty(),
-                active_ns,
-            )
+            (outcome, ctx.remaining, active_ns)
         };
         runner.flush();
         result
@@ -6141,7 +6125,7 @@ fn run_slice<'a, T: Task>(
                     }
                 }
             }
-            if (private_pending || process.input.has_pending())
+            if process.input.has_pending()
                 && process
                     .state
                     .compare_exchange(WAITING, QUEUED, Ordering::AcqRel, Ordering::Acquire)
@@ -6165,14 +6149,9 @@ fn run_slice<'a, T: Task>(
             }
             // Close the in-queue under the msgq lock and reap what it still holds; a later
             // enqueue fails and the sender sees the process gone.
-            let mut private = Private::default();
-            let n = process.input.close_into(&mut private);
-            if n > 0 {
-                let mut events = Vec::with_capacity(n);
-                while let Some(event) = private.pop() {
-                    events.push(event);
-                }
-                cell.task.reap_signals(process.pid, events);
+            let mut remaining = VecDeque::new();
+            if process.input.close_into(&mut remaining) > 0 {
+                cell.task.reap_signals(process.pid, remaining.into());
             }
             inner.table.remove(process.pid);
         }
@@ -6251,7 +6230,7 @@ mod native_sender {
 ///
 /// Returns the message when this thread is no normal scheduler (dirty schedulers, other
 /// threads); the caller then sends it through [`Scheduler::send`].
-pub fn native_send<M: Send + 'static>(from: Pid, to: Pid, msg: M) -> Result<Result<(), Error>, M> {
+pub fn native_send<M: SignalMessage>(from: Pid, to: Pid, msg: M) -> Result<Result<(), Error>, M> {
     let mut msg = Some(msg);
     let sent = native_sender::with::<M, _>(|handle| {
         handle.send(from, to, msg.take().expect("message present"))

@@ -192,6 +192,45 @@ struct Hub {
     scheduler: Weak<Scheduler<Process>>,
     pid: Pid,
     runtime: Weak<crate::process::Runtime>,
+    /// The scheduler's current-process slot, on the hub a scheduler thread installed for
+    /// itself; copies handed out carry the resolved `pid` instead.
+    current: Option<CurrentProcess>,
+}
+
+/// A scheduler's `esdp->current_process`: written by the scheduler when it schedules a
+/// process in, read by the NIF services running on that scheduler thread.
+// Port of erts/emulator/beam/erl_process.h:687 (ErtsSchedulerData_::current_process) and
+// erl_process.c:10180 (erts_schedule sets it), OTP-29.1.1.
+pub(crate) type CurrentProcess = Arc<std::sync::atomic::AtomicU64>;
+
+impl Hub {
+    /// The process this hub acts for: the scheduler's current process when bound to one.
+    fn current_pid(&self) -> Pid {
+        self.current.as_ref().map_or(self.pid, |current| {
+            Pid::from_data(current.load(std::sync::atomic::Ordering::Relaxed))
+        })
+    }
+
+    /// A copy that keeps the current process as of now, like the hub value it replaces.
+    fn resolved(&self) -> Hub {
+        Hub {
+            pid: self.current_pid(),
+            current: None,
+            ..self.clone()
+        }
+    }
+
+    fn set_pid(&mut self, pid: Pid) {
+        match &self.current {
+            Some(current) => current.store(pid.data(), std::sync::atomic::Ordering::Relaxed),
+            None => self.pid = pid,
+        }
+    }
+}
+
+/// This thread's hub, resolved to its current process.
+fn thread_hub() -> Option<Hub> {
+    HUB.with(|hub| hub.borrow().as_ref().map(Hub::resolved))
 }
 
 /// The hub of the most recent NIF caller: NIF-created threads and the poller have no
@@ -199,8 +238,7 @@ struct Hub {
 static GLOBAL_HUB: Mutex<Option<Hub>> = Mutex::new(None);
 
 fn current_hub() -> Option<Hub> {
-    HUB.with(|hub| hub.borrow().clone())
-        .or_else(|| GLOBAL_HUB.lock().unwrap().clone())
+    thread_hub().or_else(|| GLOBAL_HUB.lock().unwrap().clone())
 }
 
 /// The runtime that owns `pid`: the calling thread's runtime when the pid lives there,
@@ -215,7 +253,11 @@ fn hub_for_pid(pid: Pid) -> Option<Hub> {
     };
     let current = current_hub();
     if let Some(hub) = current.as_ref().filter(|hub| owns(hub)) {
-        return Some(Hub { pid, ..hub.clone() });
+        return Some(Hub {
+            pid,
+            current: None,
+            ..hub.clone()
+        });
     }
     let registered = RUNTIME_HUBS
         .lock()
@@ -223,7 +265,11 @@ fn hub_for_pid(pid: Pid) -> Option<Hub> {
         .iter()
         .find(|hub| owns(hub))
         .cloned();
-    registered.or(current).map(|hub| Hub { pid, ..hub })
+    registered.or(current).map(|hub| Hub {
+        pid,
+        current: None,
+        ..hub
+    })
 }
 
 struct SelectRegistration {
@@ -607,7 +653,7 @@ impl PendingNif {
     /// runs on a shadow process whose heap fragments move to the real process.
     pub(crate) fn run_dirty(&mut self, heap: &mut arinsal_term::ProcessHeap) {
         let current = current_class();
-        let pid = HUB.with(|hub| hub.borrow().as_ref().and_then(|hub| hub.pid.to_term()));
+        let pid = thread_hub().and_then(|hub| hub.pid.to_term());
         let mut fragment = FragmentingHeap(heap);
         let mut ctx = Ctx::new(&mut fragment);
         let (function, trap) = (&self.function, &self.trap);
@@ -672,7 +718,7 @@ fn run_nif(ctx: &mut Ctx<'_>, pending: PendingNif) -> Result<Term, BifError> {
             return Err(BifError::Dirty(current));
         }
         None => {
-            let pid = HUB.with(|hub| hub.borrow().as_ref().and_then(|hub| hub.pid.to_term()));
+            let pid = thread_hub().and_then(|hub| hub.pid.to_term());
             function.call_on(ctx, trap.fptr, &trap.args, pid, current)
         }
     };
@@ -1189,8 +1235,8 @@ fn tracer_enabled(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if args.len() != 3 {
         return Err(BifError::BADARG);
     }
-    let alive = HUB.with(|hub| {
-        let hub = hub.borrow().clone()?;
+    let alive = (|| {
+        let hub = thread_hub()?;
         let scheduler = hub.scheduler.upgrade()?;
         if let Some(pid) = Pid::from_term(args[1]) {
             return Some(scheduler.lookup(pid));
@@ -1199,7 +1245,7 @@ fn tracer_enabled(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             return Some(false);
         }
         None
-    });
+    })();
     Ok(tracer_enabled_term(args, alive))
 }
 
@@ -1335,7 +1381,7 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Ok(atom("ok"));
     };
     if let Some(pid) = Pid::from_term(args[1])
-        && let Some(hub) = HUB.with(|hub| hub.borrow().clone())
+        && let Some(hub) = thread_hub()
         && let Some(scheduler) = hub.scheduler.upgrade()
         && let Ok(envelope) = Message::copy_from(message)
     {
@@ -1346,7 +1392,11 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 
 pub(crate) fn refresh_hub(process: &Process, ctx: &RunCtx<'_, Message>) {
     let pid = ctx.pid();
-    let current = HUB.with(|hub| hub.borrow().as_ref().is_some_and(|hub| hub.pid == pid));
+    let current = HUB.with(|hub| {
+        hub.borrow()
+            .as_ref()
+            .is_some_and(|hub| hub.current_pid() == pid)
+    });
     if !current {
         install_hub(process, ctx);
     }
@@ -1372,12 +1422,29 @@ pub(crate) fn refresh_hub_native(process: &Process) {
         // pid changes; erts does not republish a global process table for that.
         HUB.with(|hub| {
             if let Some(hub) = hub.borrow_mut().as_mut() {
-                hub.pid = *pid;
+                hub.set_pid(*pid);
             }
         });
         return;
     }
     install_hub_for(process, *pid);
+}
+
+/// Install this scheduler thread's hub for `process`'s runtime and bind it to the
+/// scheduler's current-process slot, so scheduling a process in is a plain store.
+/// Returns whether the hub is bound.
+pub(crate) fn bind_scheduler_hub(process: &Process, current: &CurrentProcess) -> bool {
+    let Some(pid) = process.self_pid else {
+        return false;
+    };
+    current.store(pid.data(), std::sync::atomic::Ordering::Relaxed);
+    install_hub_for(process, pid);
+    HUB.with(|hub| {
+        hub.borrow_mut().as_mut().is_some_and(|hub| {
+            hub.current = Some(Arc::clone(current));
+            true
+        })
+    })
 }
 
 fn install_hub_for(process: &Process, pid: Pid) {
@@ -1391,7 +1458,12 @@ fn install_hub_for(process: &Process, pid: Pid) {
     // scheduler thread registers nothing globally. Only the thread's caller changes.
     let runtime_id = Arc::as_ptr(runtime) as usize;
     if HUB_RUNTIME.get() == runtime_id
-        && HUB.with(|hub| hub.borrow_mut().as_mut().map(|hub| hub.pid = pid).is_some())
+        && HUB.with(|hub| {
+            hub.borrow_mut()
+                .as_mut()
+                .map(|hub| hub.set_pid(pid))
+                .is_some()
+        })
     {
         return;
     }
@@ -1399,6 +1471,7 @@ fn install_hub_for(process: &Process, pid: Pid) {
         scheduler: Arc::downgrade(&scheduler),
         pid,
         runtime: Arc::downgrade(runtime),
+        current: None,
     };
     HUB.with(|current| *current.borrow_mut() = Some(hub.clone()));
     HUB_RUNTIME.set(runtime_id);

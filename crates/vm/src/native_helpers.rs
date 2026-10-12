@@ -198,6 +198,19 @@ pub extern "C" fn arinsal_beamasm_recv_marker_reserve(header: *mut ProcessHeader
     let Some((process, _registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert),
+    // OTP-29.1.1: the outer queue is fetched before the marker is inserted. Signals waiting
+    // there (or a process without a probe yet) send the instruction to the scheduler, which
+    // fetches and reruns it.
+    let pending = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.signal_probe.as_ref())
+        .is_none_or(arinsal_sched::SignalProbe::has_pending);
+    if pending {
+        process.cold_mut().native_reserve_fetch = true;
+        return u64::from(arinsal_beamasm::receive::RECV_MARKER_FETCH);
+    }
     match process.reserve_receive_marker() {
         Ok(marker) => crate::native_hooks::raw(marker),
         Err(_) => {
@@ -251,9 +264,15 @@ pub extern "C" fn arinsal_beamasm_loop_rec(header: *mut ProcessHeader) -> u64 {
     if let Some(message) = process.inbox.get(process.receive_cursor) {
         return crate::native_hooks::raw(*message);
     }
-    // The inner queue is exhausted. Signals sent since the last fetch (by this process or
-    // any other) wait in the outer queue; the scheduler fetches and handles them. A process
-    // without a probe yet fetches once, which installs it.
+    // The message queue is exhausted. Signals left unhandled in the middle queue, or sent
+    // since the last fetch (by this process or any other) to the outer queue, go to the
+    // receive helper on the scheduler side. A process without a probe yet fetches once, which
+    // installs it.
+    if !process.sig_cont_empty() {
+        process.delay_gc = false;
+        process.cold_mut().native_signal_fetch = true;
+        return u64::from(arinsal_beamasm::receive::LOOP_REC_FETCH);
+    }
     let pending = process
         .cold
         .as_ref()

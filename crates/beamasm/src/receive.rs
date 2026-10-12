@@ -12,6 +12,10 @@ const FCALLS: Gpr = Gpr::w(22);
 
 /// Runtime callback which reserves a receive marker and returns its term.
 pub type RecvMarkerReserveHook = extern "C" fn(*mut ProcessHeader) -> u64;
+/// Value the `recv_marker_reserve` hook returns when the outer signal queue must be fetched
+/// before the marker is inserted: native code exits at the instruction so the scheduler
+/// fetches with its context, then reruns it (no term word equals it).
+pub const RECV_MARKER_FETCH: u16 = 1;
 /// Runtime callback which binds a marker to a reference.
 pub type RecvMarkerBindHook = extern "C" fn(*mut ProcessHeader, u64, u64);
 /// Runtime callback which clears a marker reference.
@@ -76,12 +80,30 @@ impl BeamModuleAssembler {
         dst: ArgVal,
         hooks: ReceiveHooks,
     ) -> Result<(), ModuleError> {
+        let entry = self.code.new_label();
+        let fetch = self.code.new_label();
+        let done = self.code.new_label();
+        self.code.bind(entry)?;
         self.emit_runtime_hook_with(
             hooks.recv_marker_reserve as usize,
             &[],
             6,
             crate::Update::HEAP_ALLOC,
         )?;
+        self.code
+            .emit(|e| e.cmp_imm(Gpr::x(0), RECV_MARKER_FETCH, false))?;
+        self.code.b_cond(Cond::Eq, fetch)?;
+        self.code.b(done)?;
+        // erts_msgq_recv_marker_insert fetches the outer queue first (erl_proc_sig_queue.h:2226).
+        // The fetch needs the scheduler context, so native code exits here and reruns the
+        // instruction; the live X registers are unknown at this instruction, so the whole
+        // register window is kept.
+        self.code.bind(fetch)?;
+        self.code.adr(Gpr::x(8), entry)?;
+        self.code.emit(|e| e.str_uoff(Gpr::x(8), Gpr::x(21), 72))?;
+        self.emit_yield_live(u8::MAX)?;
+        self.code.b(self.yield_label)?;
+        self.code.bind(done)?;
         self.store_operand(dst, Gpr::x(0))
     }
 

@@ -2440,7 +2440,9 @@ fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
 /// Port of erts/emulator/beam/io.c:1186-1200 (erts_schedule_proc2port_signal with a
 /// reply reference): no reply can be queued yet, so the receive that waits for it starts
 /// at the end of the message queue (`erts_msgq_set_save_end`).
-/// The reply can already be here when the port task ran first: the receive then starts at it.
+/// The reply can already be here when the port task ran first: the save pointer then
+/// stops at it, which is where `erts_msgq_set_save_end` before scheduling would leave it.
+// Port of erts/emulator/beam/erl_proc_sig_queue.h:2397 (erts_msgq_set_save_end), OTP-29.1.1.
 fn set_save_end(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
@@ -2449,19 +2451,28 @@ fn set_save_end(
     let Some(id) = crate::signals::ref_id(reference) else {
         return Ok(());
     };
-    process.drain(ctx)?;
+    let is_reply = |message: Term| {
+        tuple(message)
+            .is_some_and(|parts| parts.len() == 2 && crate::signals::ref_id(parts[0]) == Some(id))
+    };
+    // erts_proc_sig_fetch(c_p).
+    process.fetch_signals(ctx)?;
     let len = process.inbox.len();
     let start = process.receive_cursor.min(len);
-    let reply = (start..len).find(|&index| {
-        process
-            .inbox
-            .get(index)
-            .and_then(|message| tuple(*message))
-            .is_some_and(|parts| parts.len() == 2 && crate::signals::ref_id(parts[0]) == Some(id))
-    });
-    process.receive_cursor = reply.unwrap_or(len);
+    let reply = (start..len).find(|&index| process.inbox.get(index).is_some_and(|m| is_reply(*m)));
     if let Some(cold) = process.cold.as_mut() {
         cold.priority_resume_cursor = None;
+    }
+    if let Some(index) = reply {
+        process.receive_cursor = index;
+    } else if process.sig_cont_empty() {
+        // `c_p->sig_qs.save = c_p->sig_qs.last`.
+        process.receive_cursor = len;
+    } else {
+        // Unhandled signals in the middle queue: a receive marker passes through it and
+        // sets the save pointer when it enters the message queue.
+        let index = process.sig_cont_position(is_reply);
+        process.recv_marker_create_insert_set_save(index);
     }
     Ok(())
 }

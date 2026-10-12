@@ -71,7 +71,33 @@ scenario(8, _) ->
     Caught = try receive blipp -> wrong after blepp -> wrong end
              catch _:_ -> caught end,
     Received = receive init -> ok after 0 -> missing end,
-    {Caught, Received}.
+    {Caught, Received};
+scenario(9, N) ->
+    %% Exit signals still unhandled in the middle queue when the marker is reserved: the
+    %% marker goes after them, the receive helper handles them in reds-limited rounds.
+    process_flag(trap_exit, true),
+    Parent = self(),
+    Table = ets:new(flag, [public]),
+    spawn(fun() ->
+                  [exit(Parent, {x, I}) || I <- lists:seq(1, N)],
+                  Parent ! {old, N},
+                  ets:insert(Table, {done})
+          end),
+    spin(Table),
+    Ref = make_ref(),
+    self() ! {Ref, N + 1},
+    Value = receive {Ref, X1} -> X1 after 5000 -> timeout end,
+    Old = receive {old, X2} -> X2 after 5000 -> timeout end,
+    {Value, Old, count_exits(0)}.
+
+spin(Table) ->
+    case ets:lookup(Table, done) of
+        [] -> spin(Table);
+        _ -> ok
+    end.
+
+count_exits(Count) ->
+    receive {'EXIT', _, {x, _}} -> count_exits(Count + 1) after 0 -> Count end.
 
 monitor_loop(0, Count) -> Count;
 monitor_loop(N, Count) ->
@@ -113,6 +139,7 @@ fn receive_marker_scenarios_match_otp_29() {
         (6, 13),
         (7, 13),
         (8, 13),
+        (9, 20000),
     ] {
         let expected = reference.call(
             "recv_marker_diff",

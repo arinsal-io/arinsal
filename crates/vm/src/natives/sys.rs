@@ -362,15 +362,13 @@ fn call_bump_reductions(
 fn call_garbage_collect(
     _vm: &mut Vm,
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    _ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    // Port of erts/emulator/beam/erl_msacc.c:436 (GC state transition), OTP-29.1.1.
-    // Port of erl_proc_sig_queue.c:1332 (fetch pending CLA before GC), OTP-29.1.1.
-    // erts never waits for the literal area collector here: literals of an area
-    // being released stay referenced until the process handles its copy-literals
-    // request (erts_garbage_collect_literals).
-    process.drain(ctx)?;
+    // Port of erts/emulator/beam/bif.c:4077 (erts_internal_garbage_collect_1), OTP-29.1.1:
+    // no signal is handled here. The collection itself fetches the outer queue
+    // (erl_gc.c:987-990), and literals of an area being released stay referenced until
+    // the process handles its copy-literals request (erts_garbage_collect_literals).
     garbage_collect(process, args[0])
 }
 

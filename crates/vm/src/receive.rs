@@ -25,7 +25,23 @@ struct ReceiveMarker {
     priority_position: Option<usize>,
     inserted: u64,
     passes: u8,
-    scheduler: Option<arinsal_sched::ReceiveMarker>,
+    /// `in_sigq` without `in_msgq`: the marker waits in the middle signal queue (`sig_cont`)
+    /// and enters the message queue once every signal fetched before it was taken from there.
+    /// The value is the `sig_cont_taken` count at which that happens.
+    in_sigq: Option<u64>,
+    /// `set_save`: the save pointer moves past the marker when it enters the message queue.
+    set_save: bool,
+    /// `in_sigq < 0`: marked for removal when it enters the message queue.
+    remove: bool,
+}
+
+/// Where `recv_marker_use` leaves the save pointer.
+#[derive(Debug, PartialEq, Eq)]
+enum SetSave {
+    /// In the message queue, with the priority-queue position when one was recorded.
+    At(usize, Option<usize>),
+    /// The marker is still in the middle queue.
+    Pending,
 }
 
 /// Bounded receive-marker state corresponding to the erts marker block.
@@ -39,7 +55,7 @@ impl ReceiveMarkers {
     // Port of erl_proc_sig_queue.c:9358-9454 (priority insertion and save-marker placement), OTP-29.1.1.
     fn priority_inserted(&mut self, index: usize, message: &arinsal_etf::OwnedTerm) {
         for marker in self.slots.iter_mut().flatten() {
-            if marker.position >= index {
+            if marker.in_sigq.is_none() && marker.position >= index {
                 if let MarkerId::Bound(reference) = marker.id
                     && contains_reference(message, reference)
                     && marker.priority_position.is_none()
@@ -51,12 +67,7 @@ impl ReceiveMarkers {
         }
     }
 
-    fn reserve(
-        &mut self,
-        position: usize,
-        id: i64,
-        scheduler: Option<arinsal_sched::ReceiveMarker>,
-    ) {
+    fn reserve(&mut self, position: usize, in_sigq: Option<u64>, id: i64) {
         self.inserted = self.inserted.wrapping_add(1);
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4148
         // (recv_marker_reuse), OTP-29.1.1. Prefer an unused marker when full.
@@ -81,8 +92,35 @@ impl ReceiveMarkers {
             priority_position: None,
             inserted: self.inserted,
             passes: 0,
-            scheduler,
+            in_sigq,
+            set_save: false,
+            remove: false,
         });
+    }
+
+    /// Insert a marker into the middle queue before signal number `in_sigq` that sets the
+    /// save pointer when it enters the message queue and is removed there.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4366
+    // (erts_msgq_recv_marker_create_insert_set_save) and erl_proc_sig_queue.h:2151
+    // (erts_msgq_recv_marker_set_save__ clearing the pending set-save), OTP-29.1.1.
+    fn insert_set_save(&mut self, in_sigq: u64) {
+        for marker in self.slots.iter_mut().flatten() {
+            if marker.in_sigq.is_some() {
+                marker.set_save = false;
+            }
+        }
+        self.reserve(0, Some(in_sigq), 0);
+        let inserted = self.inserted;
+        if let Some(marker) = self
+            .slots
+            .iter_mut()
+            .flatten()
+            .find(|marker| marker.inserted == inserted)
+        {
+            marker.id = MarkerId::Cleared;
+            marker.set_save = true;
+            marker.remove = true;
+        }
     }
 
     fn bind(&mut self, id: i64, reference: Option<u64>) {
@@ -117,19 +155,27 @@ impl ReceiveMarkers {
         }
     }
 
-    fn set_save(&mut self, reference: u64) -> Option<(usize, Option<usize>)> {
+    fn set_save(&mut self, reference: u64) -> Option<SetSave> {
         let selected = self
             .slots
-            .iter()
+            .iter_mut()
             .flatten()
-            .find(|marker| marker.id == MarkerId::Bound(reference))
-            .copied()?;
+            .find(|marker| marker.id == MarkerId::Bound(reference))?;
+        // Port of erts/emulator/beam/erl_proc_sig_queue.h:2128
+        // (erts_msgq_recv_marker_pending_set_save__), OTP-29.1.1: a marker still in the
+        // middle queue sets the save pointer when it enters the message queue.
+        if selected.in_sigq.is_some() {
+            selected.set_save = true;
+            return Some(SetSave::Pending);
+        }
+        let selected = *selected;
         // Markers inserted at the same boundary after this one are passed
         // while erts advances its save pointer past the selected marker.
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2193
         // (erts_msgq_recv_marker_set_save__), OTP-29.1.1.
         for slot in &mut self.slots {
             if let Some(marker) = slot.as_mut()
+                && marker.in_sigq.is_none()
                 && marker.position == selected.position
                 && marker.inserted > selected.inserted
             {
@@ -139,14 +185,56 @@ impl ReceiveMarkers {
                 }
             }
         }
-        Some((selected.position, selected.priority_position))
+        Some(SetSave::At(selected.position, selected.priority_position))
+    }
+
+    /// Whether a marker waits in the middle queue right before the signal that is taken
+    /// as number `taken`.
+    fn due(&self, taken: u64) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|marker| marker.in_sigq == Some(taken))
+    }
+
+    /// Whether any marker still waits in the middle queue.
+    fn in_sigq(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|marker| marker.in_sigq.is_some())
+    }
+
+    /// Move the markers due at `taken` into the message queue at `position`; returns the
+    /// save position a pending `set_save` asked for.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:6895-6945 (ERTS_SIG_Q_OP_RECV_MARK),
+    // OTP-29.1.1.
+    fn enter_msgq(&mut self, taken: u64, position: usize) -> Option<usize> {
+        let mut save = None;
+        for slot in &mut self.slots {
+            if let Some(marker) = slot.as_mut()
+                && marker.in_sigq == Some(taken)
+            {
+                marker.in_sigq = None;
+                marker.position = position;
+                if std::mem::take(&mut marker.set_save) {
+                    save = Some(position);
+                }
+                // erl_proc_sig_queue.c:6899-6913: a marker marked for removal is
+                // deallocated as it enters the message queue.
+                if marker.remove {
+                    *slot = None;
+                }
+            }
+        }
+        save
     }
 
     fn position(&self, reference: u64) -> Option<usize> {
         self.slots
             .iter()
             .flatten()
-            .find(|marker| marker.id == MarkerId::Bound(reference))
+            .find(|marker| marker.id == MarkerId::Bound(reference) && marker.in_sigq.is_none())
             .map(|marker| marker.position)
     }
 
@@ -155,6 +243,7 @@ impl ReceiveMarkers {
         // (msgq_pass_recv_markers), OTP-29.1.1.
         for slot in &mut self.slots {
             if let Some(marker) = slot.as_mut()
+                && marker.in_sigq.is_none()
                 && marker.position == position
             {
                 marker.passes += 1;
@@ -166,7 +255,12 @@ impl ReceiveMarkers {
     }
 
     fn removed(&mut self, index: usize) {
-        for marker in self.slots.iter_mut().flatten() {
+        for marker in self
+            .slots
+            .iter_mut()
+            .flatten()
+            .filter(|m| m.in_sigq.is_none())
+        {
             if marker.position > index {
                 marker.position -= 1;
             }
@@ -184,7 +278,10 @@ impl ReceiveMarkers {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4591
         // (erts_msgq_remove_leading_recv_markers_set_save_first), OTP-29.1.1.
         for slot in &mut self.slots {
-            if slot.as_ref().is_some_and(|marker| marker.position == 0) {
+            if slot
+                .as_ref()
+                .is_some_and(|marker| marker.in_sigq.is_none() && marker.position == 0)
+            {
                 *slot = None;
             }
         }
@@ -302,28 +399,22 @@ impl Process {
         }
     }
 
-    /// Reserve a marker in the process queue only. Native code runs on messages the bridge
-    /// already fetched, so the scheduler-side marker (which bounds a later fetch) is not needed.
+    /// Insert a receive marker after everything fetched so far, or `undefined` when both the
+    /// message queue and the middle signal queue are empty. The caller fetched the outer
+    /// queue first.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.h:2226 (erts_msgq_recv_marker_insert)
+    // and erl_proc_sig_queue.c:4084 (erts_msgq_recv_marker_create_insert) with
+    // recv_marker_insert (erl_proc_sig_queue.c:4290), OTP-29.1.1.
     pub(crate) fn reserve_receive_marker(&mut self) -> Result<Term, VmError> {
-        self.reserve_receive_marker_inner(None)
-    }
-
-    pub(crate) fn reserve_scheduled_receive_marker(
-        &mut self,
-        scheduler: arinsal_sched::ReceiveMarker,
-    ) -> Result<Term, VmError> {
-        self.reserve_receive_marker_inner(Some(scheduler))
-    }
-
-    fn reserve_receive_marker_inner(
-        &mut self,
-        scheduler: Option<arinsal_sched::ReceiveMarker>,
-    ) -> Result<Term, VmError> {
-        // An empty queue has no boundary to mark. OTP returns `undefined`.
-        if self.inbox.is_empty() && scheduler.is_none() {
+        // `c_p->sig_qs.cont || c_p->sig_qs.first`.
+        let cont = !self.sig_cont_empty();
+        if !cont && self.inbox.is_empty() {
             return Ok(crate::signals::atom("undefined"));
         }
+        // Without a middle queue the marker goes to the end of the message queue; otherwise
+        // to the end of the middle queue.
         let position = self.inbox.len();
+        let in_sigq = cont.then(|| self.sig_cont_taken + self.sig_cont.len() as u64);
         let cold = self.cold_mut();
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4084
         // (recv_marker_uniq), OTP-29.1.1.
@@ -334,37 +425,70 @@ impl Process {
         cold.receive_marker_uniq += 1;
         cold.receive_markers
             .get_or_insert_with(|| Box::new(ReceiveMarkers::default()))
-            .reserve(position, id, scheduler);
+            .reserve(position, in_sigq, id);
         Ok(Term::small(id).expect("checked receive marker id"))
     }
 
-    pub(crate) fn bind_receive_marker(
-        &mut self,
-        marker: Term,
-        reference: Term,
-    ) -> Option<arinsal_sched::ReceiveMarker> {
+    /// Insert a removable set-save receive marker before the middle-queue signal at
+    /// `index`, or at the end of the middle queue.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:4366
+    // (erts_msgq_recv_marker_create_insert_set_save), OTP-29.1.1.
+    pub(crate) fn recv_marker_create_insert_set_save(&mut self, index: Option<usize>) {
+        let index = index.unwrap_or(self.sig_cont.len());
+        let in_sigq = self.sig_cont_taken + index as u64;
+        self.cold_mut()
+            .receive_markers
+            .get_or_insert_with(|| Box::new(ReceiveMarkers::default()))
+            .insert_set_save(in_sigq);
+    }
+
+    /// Whether the middle signal queue is empty (`!c_p->sig_qs.cont`): no fetched signal is
+    /// unhandled and no receive marker waits there.
+    pub(crate) fn sig_cont_empty(&self) -> bool {
+        self.sig_cont.is_empty()
+            && self
+                .cold
+                .as_ref()
+                .and_then(|cold| cold.receive_markers.as_ref())
+                .is_none_or(|markers| !markers.in_sigq())
+    }
+
+    /// Whether a receive marker sits before the next signal of the middle queue.
+    pub(crate) fn recv_marker_due(&self) -> bool {
+        self.cold
+            .as_ref()
+            .and_then(|cold| cold.receive_markers.as_ref())
+            .is_some_and(|markers| markers.due(self.sig_cont_taken))
+    }
+
+    /// Handle the receive markers at the head of the middle queue: they enter the message
+    /// queue at its end.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:6895-6945 (ERTS_SIG_Q_OP_RECV_MARK),
+    // OTP-29.1.1.
+    pub(crate) fn recv_marker_enter_msgq(&mut self) {
+        let position = self.inbox.len();
+        let taken = self.sig_cont_taken;
+        if let Some(save) = self
+            .cold
+            .as_mut()
+            .and_then(|cold| cold.receive_markers.as_mut())
+            .and_then(|markers| markers.enter_msgq(taken, position))
+        {
+            self.receive_cursor = save;
+            self.cold_mut().priority_resume_cursor = None;
+        }
+    }
+
+    pub(crate) fn bind_receive_marker(&mut self, marker: Term, reference: Term) {
         if let Some(id) = marker.as_small()
             && let Some(cold) = self.cold.as_mut()
             && let Some(markers) = cold.receive_markers.as_mut()
         {
-            let reference = crate::signals::ref_id(reference);
-            markers.bind(id, reference);
-            return reference.and_then(|reference| {
-                markers
-                    .slots
-                    .iter()
-                    .flatten()
-                    .find(|entry| entry.id == MarkerId::Bound(reference))
-                    .and_then(|entry| entry.scheduler)
-            });
+            markers.bind(id, crate::signals::ref_id(reference));
         }
-        None
     }
 
-    pub(crate) fn clear_receive_marker(
-        &mut self,
-        term: Term,
-    ) -> Option<arinsal_sched::ReceiveMarker> {
+    pub(crate) fn clear_receive_marker(&mut self, term: Term) {
         let id = crate::signals::ref_id(term)
             .map(MarkerId::Bound)
             .or_else(|| term.as_small().map(MarkerId::Reserved));
@@ -372,26 +496,29 @@ impl Process {
             && let Some(cold) = self.cold.as_mut()
             && let Some(markers) = cold.receive_markers.as_mut()
         {
-            let scheduler = markers
-                .slots
-                .iter()
-                .flatten()
-                .find(|entry| entry.id == id)
-                .and_then(|entry| entry.scheduler);
             markers.clear(id);
-            return scheduler;
         }
-        None
     }
 
     pub(crate) fn use_receive_marker(&mut self, term: Term) {
         if let Some(reference) = crate::signals::ref_id(term)
-            && let Some((position, priority_position)) = self
+            && let Some(set_save) = self
                 .cold
                 .as_mut()
                 .and_then(|cold| cold.receive_markers.as_mut())
                 .and_then(|markers| markers.set_save(reference))
         {
+            let (position, priority_position) = match set_save {
+                SetSave::At(position, priority_position) => (position, priority_position),
+                // Port of erts/emulator/beam/erl_proc_sig_queue.h:2128
+                // (erts_msgq_recv_marker_pending_set_save__), OTP-29.1.1: save at the end of
+                // the message queue, past the priority queue, so `loop_rec` handles signals.
+                SetSave::Pending => {
+                    self.cold_mut().priority_resume_cursor = None;
+                    self.receive_cursor = self.inbox.len();
+                    return;
+                }
+            };
             // Port of erts/emulator/beam/erl_proc_sig_queue.h:2281
             // (erts_msgq_recv_marker_set_save), OTP-29.1.1.
             let prio_len = self.cold.as_ref().map_or(0, |cold| cold.prio_len);
@@ -517,7 +644,7 @@ impl Process {
         self.cold_mut().prio_len = new_prio_len;
         let (term, token) = removed_message
             .ok_or_else(|| VmError::Unsupported("remove_message without current message".into()))?;
-        let mut ctx = ctx;
+
         // Native code removes messages without the run context; the process knows its pid.
         if token.is_some()
             && let Some(pid) = ctx
@@ -527,7 +654,7 @@ impl Process {
         {
             let message =
                 arinsal_term::to_owned(term).unwrap_or(arinsal_etf::OwnedTerm::atom("undefined"));
-            crate::seq_trace::on_receive(vm, self, ctx.as_deref_mut(), pid, token, message);
+            crate::seq_trace::on_receive(vm, self, ctx, pid, token, message);
         }
         // Port of erts/emulator/beam/erl_proc_sig_queue.h:2367
         // (erts_msgq_unlink_msg_set_save_first), OTP-29.1.1.
@@ -538,9 +665,6 @@ impl Process {
         }
         self.receive_deadline = None;
         self.receive_deadline_ms = None;
-        if let Some(run_ctx) = ctx {
-            run_ctx.reset_save();
-        }
         Ok(())
     }
 
@@ -634,7 +758,7 @@ impl Process {
 
 #[cfg(test)]
 mod tests {
-    use super::{MARKER_SLOTS, MarkerId, Process, ReceiveMarkers, Term};
+    use super::{MARKER_SLOTS, MarkerId, Process, ReceiveMarkers, SetSave, Term};
 
     #[test]
     fn marker_block_is_allocated_only_for_a_nonempty_mailbox() {
@@ -682,9 +806,9 @@ mod tests {
         let mut peak = 0;
         for reference in 1..=100_000 {
             let reservation = -i64::try_from(reference).unwrap();
-            markers.reserve(1, reservation, None);
+            markers.reserve(1, None, reservation);
             markers.bind(reservation, Some(reference));
-            assert_eq!(markers.set_save(reference), Some((1, None)));
+            assert_eq!(markers.set_save(reference), Some(SetSave::At(1, None)));
             peak = peak.max(markers.len());
             markers.clear(MarkerId::Bound(reference));
             markers.passed(1);
@@ -698,21 +822,21 @@ mod tests {
     fn marker_reuse_and_message_removal_preserve_boundaries() {
         let mut markers = ReceiveMarkers::default();
         let oldest = -1;
-        markers.reserve(2, oldest, None);
+        markers.reserve(2, None, oldest);
         markers.bind(oldest, Some(1));
         for reference in 2..=MARKER_SLOTS as u64 {
             let reservation = -i64::try_from(reference).unwrap();
-            markers.reserve(3, reservation, None);
+            markers.reserve(3, None, reservation);
             markers.bind(reservation, Some(reference));
         }
         let reservation = -9;
-        markers.reserve(4, reservation, None);
+        markers.reserve(4, None, reservation);
         markers.bind(reservation, Some(9));
         assert_eq!(markers.set_save(1), None);
-        assert_eq!(markers.set_save(9), Some((4, None)));
+        assert_eq!(markers.set_save(9), Some(SetSave::At(4, None)));
         assert_eq!(markers.len(), MARKER_SLOTS);
         markers.removed(0);
-        assert_eq!(markers.set_save(9), Some((3, None)));
+        assert_eq!(markers.set_save(9), Some(SetSave::At(3, None)));
         markers.removed(0);
         markers.removed(0);
         markers.removed(0);
@@ -723,12 +847,12 @@ mod tests {
     #[test]
     fn using_an_older_marker_passes_newer_markers_at_the_same_boundary() {
         let mut markers = ReceiveMarkers::default();
-        markers.reserve(2, -1, None);
+        markers.reserve(2, None, -1);
         markers.bind(-1, Some(1));
-        markers.reserve(2, -2, None);
+        markers.reserve(2, None, -2);
         markers.bind(-2, Some(2));
         for _ in 0..=super::MARKER_PASS_MAX {
-            assert_eq!(markers.set_save(1), Some((2, None)));
+            assert_eq!(markers.set_save(1), Some(SetSave::At(2, None)));
         }
         assert_eq!(markers.set_save(2), None);
         assert_eq!(markers.len(), 1);
