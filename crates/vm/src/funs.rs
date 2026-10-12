@@ -514,6 +514,49 @@ impl Vm {
         self.call_named_resolved(p, None, module, function, arity, tail, ctx)
     }
 
+    /// Make the call a BIF traps to. erts sets `c_p->i` to the export and leaves the trap
+    /// arguments in X, so the export runs as an ordinary call of the BIF (tail or not).
+    // Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*), OTP-29.1.1.
+    pub(crate) fn trap_to_export(
+        &mut self,
+        p: &mut Process,
+        trap: crate::ExportTrap,
+        tail: bool,
+        ctx: Option<&mut RunCtx<'_, Message>>,
+    ) -> Result<ImportOutcome, VmError> {
+        let (module, function, arity) = crate::bif_traps::continuation_parts(trap.continuation)
+            .ok_or_else(|| VmError::Unsupported("trap continuation is not an MFA".into()))?;
+        if arity != trap.args.len() {
+            return Err(VmError::Unsupported(format!(
+                "trap to {} with {} arguments",
+                trap.continuation,
+                trap.args.len()
+            )));
+        }
+        let module_atom = global_atoms()
+            .intern(module)
+            .map_err(|error| VmError::Unsupported(format!("trap module atom: {error:?}")))?;
+        let function_atom = global_atoms()
+            .intern(function)
+            .map_err(|error| VmError::Unsupported(format!("trap function atom: {error:?}")))?;
+        if p.x.len() < arity {
+            let mut registers = p.x.to_vec();
+            registers.resize(arity, Term::NIL);
+            p.x = registers.into();
+        }
+        p.x[..arity].copy_from_slice(&trap.args);
+        self.call_named_atoms(
+            p,
+            module_atom,
+            function_atom,
+            module,
+            function,
+            arity,
+            tail,
+            ctx,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)] // Preserve the call metadata without rebuilding an MFA tuple.
     fn call_named_atoms(
         &mut self,
@@ -669,7 +712,7 @@ impl Vm {
             ctx.as_deref_mut(),
         ) {
             return match result? {
-                crate::bif_traps::TrapResult::Done { value, .. } => {
+                crate::bif_traps::HandlerResult::Done { value, .. } => {
                     p.x[0] = value;
                     p.collect_bin_vheap_if_due(1)?;
                     if tail {
@@ -682,10 +725,10 @@ impl Vm {
                         Ok(ImportOutcome::Advanced)
                     }
                 }
-                crate::bif_traps::TrapResult::Failed { .. } => {
+                crate::bif_traps::HandlerResult::Failed { .. } => {
                     unreachable!("failed trapping BIFs become VM exceptions")
                 }
-                crate::bif_traps::TrapResult::Yield { .. } => Ok(ImportOutcome::Yield),
+                crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
             };
         }
         // `!` is an export alias for the process-aware `send/2` BIF.
@@ -705,6 +748,12 @@ impl Vm {
                 (ImportClass::Dynamic, 0),
             )
         {
+            let result = match result {
+                Err(VmError::TrapExport(trap)) => {
+                    return self.trap_to_export(p, trap, tail, Some(run));
+                }
+                result => result,
+            };
             p.x[0] = result?;
             if tail {
                 return Ok(match Self::ret(p) {

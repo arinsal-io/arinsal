@@ -6,7 +6,7 @@ use arinsal_term::{MagicRef, global_atoms};
 use smallvec::SmallVec;
 use std::sync::{Arc, Mutex};
 
-pub(crate) enum TrapResult {
+pub(crate) enum HandlerResult {
     Done {
         value: Term,
         reductions: u32,
@@ -22,13 +22,20 @@ pub(crate) enum TrapResult {
     },
 }
 
+/// What resuming a trapped call produces: a handler's result, or the Erlang export the trap
+/// calls (erts BIF_TRAP*: `c_p->i` is the export, the arguments are its X registers).
+pub(crate) enum ResumeResult {
+    Handler(HandlerResult),
+    Export(crate::ExportTrap),
+}
+
 pub(crate) type Handler = fn(
     &mut Process,
     &[Term],
     Option<&Arc<MagicRef>>,
     Option<arinsal_sched::Pid>,
     bool,
-) -> Result<TrapResult, BifError>;
+) -> Result<HandlerResult, BifError>;
 
 /// A trapping BIF and the continuation export it traps to.
 pub(crate) struct Entry {
@@ -105,7 +112,7 @@ fn lists_reverse(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let reds = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
     let max_cells = reds
         .saturating_mul(arinsal_bifs::REVERSE_CELLS_PER_RED)
@@ -125,8 +132,8 @@ fn lists_reverse(
     let step = arinsal_bifs::lists_reverse(&mut ctx, list, tail, max_cells)?;
     let reductions = ctx.reductions();
     Ok(match step {
-        arinsal_bifs::ReverseStep::Done(value) => TrapResult::Done { value, reductions },
-        arinsal_bifs::ReverseStep::Trap(cont) => TrapResult::Yield {
+        arinsal_bifs::ReverseStep::Done(value) => HandlerResult::Done { value, reductions },
+        arinsal_bifs::ReverseStep::Trap(cont) => HandlerResult::Yield {
             continuation: "lists:reverse/2",
             state: MagicRef::new(Mutex::new(cont)),
             reductions,
@@ -140,7 +147,7 @@ fn lists_member_trap(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let reds = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
     let max_iter = reds.saturating_mul(arinsal_bifs::MEMBER_PER_RED);
     let (term, list) = if let Some(state) = state {
@@ -158,7 +165,7 @@ fn lists_member_trap(
     let step = match arinsal_bifs::lists_member(&mut ctx, term, list, max_iter) {
         Ok(step) => step,
         Err(error) => {
-            return Ok(TrapResult::Failed {
+            return Ok(HandlerResult::Failed {
                 error,
                 reductions: ctx.reductions(),
             });
@@ -166,11 +173,11 @@ fn lists_member_trap(
     };
     let reductions = ctx.reductions();
     Ok(match step {
-        arinsal_bifs::MemberStep::Done(found) => TrapResult::Done {
+        arinsal_bifs::MemberStep::Done(found) => HandlerResult::Done {
             value: bool_atom(found),
             reductions,
         },
-        arinsal_bifs::MemberStep::More(cont) => TrapResult::Yield {
+        arinsal_bifs::MemberStep::More(cont) => HandlerResult::Yield {
             continuation: "lists:member/2",
             state: MagicRef::new(Mutex::new(cont)),
             reductions,
@@ -184,7 +191,7 @@ fn lists_key_trap(
     state: Option<&Arc<MagicRef>>,
     op: arinsal_bifs::KeyOp,
     continuation: &'static str,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let (key, pos, list) = if let Some(state) = state {
         let saved = state
             .downcast_ref::<Mutex<arinsal_bifs::KeyfindCont>>()
@@ -202,18 +209,18 @@ fn lists_key_trap(
         {
             Ok(step) => step,
             Err(error) => {
-                return Ok(TrapResult::Failed {
+                return Ok(HandlerResult::Failed {
                     error,
                     reductions: 0,
                 });
             }
         };
     Ok(match step {
-        arinsal_bifs::KeyOutcome::Done(value) => TrapResult::Done {
+        arinsal_bifs::KeyOutcome::Done(value) => HandlerResult::Done {
             value,
             reductions: 0,
         },
-        arinsal_bifs::KeyOutcome::More(cont) => TrapResult::Yield {
+        arinsal_bifs::KeyOutcome::More(cont) => HandlerResult::Yield {
             continuation,
             state: MagicRef::new(Mutex::new(cont)),
             reductions: process.reductions.max(0) as u32,
@@ -227,7 +234,7 @@ fn lists_keyfind(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     lists_key_trap(
         process,
         args,
@@ -243,7 +250,7 @@ fn lists_keymember(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     lists_key_trap(
         process,
         args,
@@ -259,7 +266,7 @@ fn lists_keysearch(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     lists_key_trap(
         process,
         args,
@@ -274,7 +281,7 @@ fn erlang_append(
     args: &[Term],
     state: Option<&Arc<MagicRef>>,
     continuation: &'static str,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let reds = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
     let cont = if let Some(state) = state {
         let mut saved = state
@@ -302,7 +309,7 @@ fn erlang_append(
     let step = match arinsal_bifs::lists_append(&mut ctx, cont, onheap, alloc) {
         Ok(step) => step,
         Err(error) => {
-            return Ok(TrapResult::Failed {
+            return Ok(HandlerResult::Failed {
                 error,
                 reductions: ctx.reductions(),
             });
@@ -310,8 +317,8 @@ fn erlang_append(
     };
     let reductions = ctx.reductions();
     Ok(match step {
-        arinsal_bifs::AppendStep::Done(value) => TrapResult::Done { value, reductions },
-        arinsal_bifs::AppendStep::More(next) => TrapResult::Yield {
+        arinsal_bifs::AppendStep::Done(value) => HandlerResult::Done { value, reductions },
+        arinsal_bifs::AppendStep::More(next) => HandlerResult::Yield {
             continuation,
             state: MagicRef::new(Mutex::new(next)),
             reductions,
@@ -325,7 +332,7 @@ fn erlang_plusplus(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     erlang_append(process, args, state, "erlang:++/2")
 }
 
@@ -335,7 +342,7 @@ fn erlang_append_bif(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     erlang_append(process, args, state, "erlang:append/2")
 }
 
@@ -630,7 +637,7 @@ fn binary_match(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     binary_search(
         process,
         args,
@@ -646,7 +653,7 @@ fn binary_matches(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     binary_search(
         process,
         args,
@@ -662,7 +669,7 @@ fn binary_split(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     binary_search(
         process,
         args,
@@ -679,7 +686,7 @@ fn binary_to_list_trap(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     if state.is_none() {
         let bif = arinsal_bifs::lookup("erlang", "binary_to_list", args.len() as u8)
             .ok_or(BifError::BADARG)?;
@@ -690,13 +697,13 @@ fn binary_to_list_trap(
         let value = bif(&mut ctx, args)?;
         let reductions = ctx.reductions();
         return match ctx.take_deferred().map(|trap| *trap) {
-            Some(arinsal_bifs::DeferredTrap::BinaryToList(walk)) => Ok(TrapResult::Yield {
+            Some(arinsal_bifs::DeferredTrap::BinaryToList(walk)) => Ok(HandlerResult::Yield {
                 continuation: BINARY_TO_LIST_CONTINUATION,
                 state: MagicRef::new(Mutex::new(walk)),
                 reductions,
             }),
             Some(_) => Err(BifError::BADARG),
-            None => Ok(TrapResult::Done { value, reductions }),
+            None => Ok(HandlerResult::Done { value, reductions }),
         };
     }
     let state = Arc::clone(state.ok_or(BifError::BADARG)?);
@@ -711,10 +718,10 @@ fn binary_to_list_trap(
     let reductions = used.div_ceil(256).min(u32::MAX as usize) as u32;
     if let Some(value) = value {
         process.set_gc_enabled(restore_gc);
-        Ok(TrapResult::Done { value, reductions })
+        Ok(HandlerResult::Done { value, reductions })
     } else {
         drop(walk);
-        Ok(TrapResult::Yield {
+        Ok(HandlerResult::Yield {
             continuation: BINARY_TO_LIST_CONTINUATION,
             state,
             reductions,
@@ -728,7 +735,7 @@ fn binary_search(
     state: Option<&Arc<MagicRef>>,
     restore_gc: bool,
     kind: arinsal_bifs::BinarySearchKind,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     // Port of erts/emulator/beam/erl_bif_binary.c:1433-1528 (do_binary_find), OTP-29.1.1.
     // Port of erts/emulator/beam/erl_bif_binary.c:110 (get_reds), OTP-29.1.1.
     const SEARCH_LOOP_FACTOR: usize = 10;
@@ -745,7 +752,7 @@ fn binary_search(
         let reductions = (work / SEARCH_LOOP_FACTOR) as u32;
         if !done {
             drop(search);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: BINARY_SEARCH_CONTINUATION,
                 state,
                 reductions,
@@ -759,7 +766,7 @@ fn binary_search(
     let (done, work) = search.step(budget);
     let reductions = (work / SEARCH_LOOP_FACTOR) as u32;
     if !done {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: BINARY_SEARCH_CONTINUATION,
             state: MagicRef::new(Mutex::new(search)),
             reductions,
@@ -772,11 +779,11 @@ fn finish_binary_search(
     process: &mut Process,
     search: &arinsal_bifs::BinarySearchWalk,
     reductions: u32,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
     let value = search.finish(&mut ctx)?;
-    Ok(TrapResult::Done { value, reductions })
+    Ok(HandlerResult::Done { value, reductions })
 }
 
 type MapsMergeState = Mutex<Option<arinsal_maps::HashmapMergeContext>>;
@@ -789,7 +796,7 @@ fn maps_from_list(
     state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     maps_build(process, args, state, pid, restore_gc, false)
 }
 
@@ -799,7 +806,7 @@ fn maps_from_keys(
     state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     maps_build(process, args, state, pid, restore_gc, true)
 }
 
@@ -820,7 +827,7 @@ fn maps_build(
     _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
     from_keys: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     const ITERATIONS_PER_RED: i64 = 40;
     let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
     let mut reds = initial;
@@ -841,11 +848,11 @@ fn maps_build(
         };
         let reductions = |reds| ycf_reductions(initial, reds, ITERATIONS_PER_RED);
         return Ok(match walk.step(&mut ctx, &mut reds)? {
-            Some(value) => TrapResult::Done {
+            Some(value) => HandlerResult::Done {
                 value,
                 reductions: reductions(reds),
             },
-            None => TrapResult::Yield {
+            None => HandlerResult::Yield {
                 continuation,
                 state: MagicRef::new(Mutex::new(Some(walk))),
                 reductions: reductions(reds),
@@ -861,7 +868,7 @@ fn maps_build(
     let walk = guard.as_mut().ok_or(BifError::BADARG)?;
     let Some(value) = walk.step(&mut ctx, &mut reds)? else {
         drop(guard);
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation,
             state,
             reductions: ycf_reductions(initial, reds, ITERATIONS_PER_RED),
@@ -869,7 +876,7 @@ fn maps_build(
     };
     *guard = None;
     drop(guard);
-    Ok(TrapResult::Done {
+    Ok(HandlerResult::Done {
         value,
         reductions: ycf_reductions(initial, reds, ITERATIONS_PER_RED),
     })
@@ -883,7 +890,7 @@ fn maps_keys(
     state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     maps_projection(process, args, state, pid, restore_gc, true)
 }
 
@@ -893,7 +900,7 @@ fn maps_values(
     state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     maps_projection(process, args, state, pid, restore_gc, false)
 }
 
@@ -904,7 +911,7 @@ fn maps_projection(
     _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
     keys: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     const ITERATIONS_PER_RED: i64 = 15;
     let initial = i64::from(process.reductions.max(0)) * ITERATIONS_PER_RED;
     let mut reds = initial;
@@ -920,7 +927,7 @@ fn maps_projection(
         let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);
         if !done {
             drop(guard);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: if keys {
                     MAPS_KEYS_CONTINUATION
                 } else {
@@ -934,7 +941,7 @@ fn maps_projection(
         drop(guard);
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
         let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value: walk.finish(&mut ctx),
             reductions,
         });
@@ -947,7 +954,7 @@ fn maps_projection(
     };
     let mut walk = match start {
         arinsal_bifs::ProjectionStart::Done(value) => {
-            return Ok(TrapResult::Done {
+            return Ok(HandlerResult::Done {
                 value,
                 reductions: 0,
             });
@@ -957,7 +964,7 @@ fn maps_projection(
     let done = walk.step(&mut reds);
     let reductions = ycf_reductions(initial, reds, ITERATIONS_PER_RED);
     if !done {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: if keys {
                 MAPS_KEYS_CONTINUATION
             } else {
@@ -970,7 +977,7 @@ fn maps_projection(
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
     let value = walk.finish(&mut ctx);
-    Ok(TrapResult::Done { value, reductions })
+    Ok(HandlerResult::Done { value, reductions })
 }
 
 // Port of erts/emulator/beam/erl_map.c:1257 (maps_merge_2), 1498 (maps_merge_trap_1) and
@@ -981,7 +988,7 @@ fn maps_merge(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     use arinsal_maps::{MAP_MERGE_LOOP_FACTOR, MergeStart};
     let initial_reds = (process.reductions.max(0) as isize).saturating_mul(MAP_MERGE_LOOP_FACTOR);
     let mut reds = initial_reds;
@@ -998,7 +1005,7 @@ fn maps_merge(
             .map_err(|_| BifError::SystemLimit)?;
         let Some(value) = merged else {
             drop(guard);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: MAPS_MERGE_CONTINUATION,
                 state,
                 reductions: process.reductions.max(0) as u32,
@@ -1007,7 +1014,7 @@ fn maps_merge(
         *guard = None;
         drop(guard);
         process.set_gc_enabled(restore_gc);
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value,
             reductions: ((initial_reds - reds) / MAP_MERGE_LOOP_FACTOR) as u32,
         });
@@ -1017,7 +1024,7 @@ fn maps_merge(
         let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
         match arinsal_bifs::maps_merge_start(&mut ctx, args)? {
             MergeStart::Done(value) => {
-                return Ok(TrapResult::Done {
+                return Ok(HandlerResult::Done {
                     value,
                     reductions: 0,
                 });
@@ -1029,13 +1036,13 @@ fn maps_merge(
         .map_err(|_| BifError::SystemLimit)?;
     let Some(value) = merged else {
         // BUMP_ALL_REDS before trapping.
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: MAPS_MERGE_CONTINUATION,
             state: MagicRef::new(MapsMergeState::new(Some(merge))),
             reductions: process.reductions.max(0) as u32,
         });
     };
-    Ok(TrapResult::Done {
+    Ok(HandlerResult::Done {
         value,
         reductions: ((initial_reds - reds) / MAP_MERGE_LOOP_FACTOR) as u32,
     })
@@ -1052,7 +1059,7 @@ pub(crate) fn execute(
     arity: usize,
     args: [Term; 3],
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-) -> Option<Result<TrapResult, VmError>> {
+) -> Option<Result<HandlerResult, VmError>> {
     let import_info = vm.code.modules.get(process.module).and_then(|module| {
         module.imports.get(import).map(|import| {
             (
@@ -1119,12 +1126,24 @@ fn continuation_is(continuation: &str, module: &str, function: &str, arity: usiz
 pub(crate) fn run_trapped_export(
     process: &mut Process,
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-) -> Option<Result<TrapResult, VmError>> {
+) -> Option<Result<ResumeResult, VmError>> {
     let (module, function, arity) = {
         let pending = process.cold.as_ref()?.bif_trap.as_ref()?;
         let (module, function, arity) = continuation_parts(pending.continuation)?;
         (module.to_owned(), function.to_owned(), arity)
     };
+    // An Erlang export has no Rust handler: the trap calls it with the saved arguments.
+    // Port of erts/emulator/beam/beam_common.c (BIF_TRAP: the trap export carries its own
+    // arguments), OTP-29.1.1.
+    if lookup_entry(&module, &function, arity).is_none() {
+        let pending = process.cold_mut().bif_trap.take()?;
+        process.set_gc_enabled(pending.gc_was_enabled);
+        clear_export_trap(process);
+        return Some(Ok(ResumeResult::Export(crate::ExportTrap {
+            continuation: pending.continuation,
+            args: pending.args[..pending.arity].to_vec(),
+        })));
+    }
     let args = [
         process.x.first().copied().unwrap_or(Term::NIL),
         process.x.get(1).copied().unwrap_or(Term::NIL),
@@ -1139,9 +1158,40 @@ pub(crate) fn run_trapped_export(
         args,
         ctx,
     )
+    .map(|result| result.map(ResumeResult::Handler))
 }
 
-fn continuation_parts(continuation: &str) -> Option<(&str, &str, usize)> {
+/// Install the trap state of a BIF that traps to an Erlang export. The scheduler then runs
+/// the export at `beam_bif_export_trap`, the way an export trap of a Rust continuation runs.
+// Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: at most three arguments in X0-X2),
+// OTP-29.1.1.
+pub(crate) fn install_export_trap(
+    process: &mut Process,
+    import: usize,
+    callee: (arinsal_term::Atom, arinsal_term::Atom),
+    trap: &crate::ExportTrap,
+) {
+    let arity = trap.args.len();
+    assert!(arity <= 3, "BIF traps pass at most three arguments");
+    let mut saved = [Term::NIL; 3];
+    saved[..arity].copy_from_slice(&trap.args);
+    let gc_was_enabled = process.heap.gc_enabled;
+    process.set_gc_enabled(false);
+    process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
+        caller_module: process.module,
+        caller_ip: process.ip,
+        schedule_out: true,
+        import,
+        continuation: trap.continuation,
+        state: MagicRef::new(Mutex::new(())),
+        gc_was_enabled,
+        arity,
+        callee,
+        args: saved,
+    });
+}
+
+pub(crate) fn continuation_parts(continuation: &str) -> Option<(&str, &str, usize)> {
     let (module, rest) = continuation.split_once(':')?;
     let (function, arity_text) = rest.rsplit_once('/')?;
     Some((module, function, arity_text.parse().ok()?))
@@ -1197,7 +1247,7 @@ pub(crate) fn execute_named(
     arity: usize,
     mut args: [Term; 3],
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
-) -> Option<Result<TrapResult, VmError>> {
+) -> Option<Result<HandlerResult, VmError>> {
     let gc_enabled_on_entry = process.heap.gc_enabled;
     let pending_site = process
         .cold
@@ -1329,14 +1379,14 @@ pub(crate) fn execute_named(
                 process, &report.0, &report.1, &args, error,
             ))
         }
-        Ok(TrapResult::Done { value, reductions }) => {
+        Ok(HandlerResult::Done { value, reductions }) => {
             process.cold_mut().bif_trap = None;
             clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
-            Ok(TrapResult::Done { value, reductions })
+            Ok(HandlerResult::Done { value, reductions })
         }
-        Ok(TrapResult::Failed { error, reductions }) => {
+        Ok(HandlerResult::Failed { error, reductions }) => {
             process.cold_mut().bif_trap = None;
             clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
@@ -1346,7 +1396,7 @@ pub(crate) fn execute_named(
                 process, &report.0, &report.1, &args, error,
             ))
         }
-        Ok(TrapResult::Yield {
+        Ok(HandlerResult::Yield {
             continuation,
             state,
             reductions,
@@ -1401,7 +1451,7 @@ pub(crate) fn execute_named(
                 },
             });
             charge(process, ctx, reductions);
-            Ok(TrapResult::Yield {
+            Ok(HandlerResult::Yield {
                 continuation,
                 state: process
                     .cold
@@ -1464,9 +1514,9 @@ pub(crate) fn call_light(
     let result = (entry.handler)(process, args, None, pid, gc_was_enabled);
     let (result, reductions) = match result {
         Err(error) => (Err(error), 0),
-        Ok(TrapResult::Done { value, reductions }) => (Ok(value), reductions),
-        Ok(TrapResult::Failed { error, reductions }) => (Err(error), reductions),
-        Ok(TrapResult::Yield {
+        Ok(HandlerResult::Done { value, reductions }) => (Ok(value), reductions),
+        Ok(HandlerResult::Failed { error, reductions }) => (Err(error), reductions),
+        Ok(HandlerResult::Yield {
             continuation,
             state,
             reductions,
@@ -1639,7 +1689,7 @@ fn code_permission(
     _state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     if !crate::natives::internal_state_enabled() {
         return Err(BifError::Error(Term::atom(
             global_atoms().intern("undef").unwrap(),
@@ -1668,12 +1718,12 @@ fn code_permission(
         crate::natives::code::release_code_mod_permission(&runtime);
     }
     if !acquire || crate::natives::code::try_seize_code_mod_permission(&runtime, pid) {
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value: Term::atom(global_atoms().intern("true").unwrap()),
             reductions: 1,
         });
     }
-    Ok(TrapResult::Yield {
+    Ok(HandlerResult::Yield {
         continuation: CODE_PERMISSION_CONTINUATION,
         state: MagicRef::new(acquire),
         reductions: 1,
@@ -1691,7 +1741,7 @@ fn subtract(
     state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
     gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     subtract_with(process, args, state, pid, gc_changed, SUBTRACT_CONTINUATION)
 }
 
@@ -1701,7 +1751,7 @@ fn subtract_named(
     state: Option<&Arc<MagicRef>>,
     pid: Option<arinsal_sched::Pid>,
     gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     subtract_with(process, args, state, pid, gc_changed, "erlang:subtract/2")
 }
 
@@ -1712,7 +1762,7 @@ fn subtract_with(
     _pid: Option<arinsal_sched::Pid>,
     _gc_changed: bool,
     continuation: &'static str,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let reductions_left = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
     if let Some(state) = state {
         let state = Arc::clone(state);
@@ -1723,8 +1773,8 @@ fn subtract_with(
             .map_err(|_| BifError::SystemLimit)?;
         let (result, reductions) = subtract_step(process, &mut walk, reductions_left)?;
         return Ok(match result {
-            Some(value) => TrapResult::Done { value, reductions },
-            None => TrapResult::Yield {
+            Some(value) => HandlerResult::Done { value, reductions },
+            None => HandlerResult::Yield {
                 continuation,
                 state: Arc::clone(&state),
                 reductions,
@@ -1735,8 +1785,8 @@ fn subtract_with(
     let mut walk = arinsal_bifs::SubtractWalk::new(args[0], args[1])?;
     let (result, reductions) = subtract_step(process, &mut walk, reductions_left)?;
     Ok(match result {
-        Some(value) => TrapResult::Done { value, reductions },
-        None => TrapResult::Yield {
+        Some(value) => HandlerResult::Done { value, reductions },
+        None => HandlerResult::Yield {
             continuation,
             state: MagicRef::new(Mutex::new(walk)),
             reductions,
@@ -1761,13 +1811,13 @@ fn list_to_binary(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let root = args[0];
     if !matches!(root.classify(), TermKind::List | TermKind::Nil) {
         return Err(BifError::BADARG);
     }
     if let Some(value) = arinsal_bifs::singleton_bitstring(root, 8)? {
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value,
             reductions: 1,
         });
@@ -1781,13 +1831,13 @@ fn iolist_to_binary(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let root = args[0];
     if root.classify() == TermKind::Bitstring {
         if !arinsal_bifs::bitstring_bit_len(root)?.is_multiple_of(8) {
             return Err(BifError::BADARG);
         }
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value: root,
             reductions: 1,
         });
@@ -1801,12 +1851,12 @@ fn list_to_bitstring(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     gc_changed: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     if !matches!(args[0].classify(), TermKind::List | TermKind::Nil) {
         return Err(BifError::BADARG);
     }
     if let Some(value) = arinsal_bifs::singleton_bitstring(args[0], 1)? {
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value,
             reductions: 1,
         });
@@ -1820,7 +1870,7 @@ fn iolist_size(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     const CHUNK: usize = 4096;
     let root = args[0];
     if let Some(state) = state {
@@ -1832,7 +1882,7 @@ fn iolist_size(
         let (done, reductions) = match walker.step(CHUNK) {
             Ok(progress) => progress,
             Err((error, reductions)) => {
-                return Ok(TrapResult::Failed {
+                return Ok(HandlerResult::Failed {
                     error,
                     reductions: reductions as u32,
                 });
@@ -1840,7 +1890,7 @@ fn iolist_size(
         };
         if !done {
             drop(walker);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: IOLIST_SIZE_CONTINUATION,
                 state,
                 reductions: reductions as u32,
@@ -1852,7 +1902,7 @@ fn iolist_size(
         let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
             .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
             .map_err(|_| BifError::SystemLimit)?;
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value,
             reductions: reductions as u32,
         });
@@ -1862,14 +1912,14 @@ fn iolist_size(
     let (done, reductions) = match walker.step(CHUNK) {
         Ok(progress) => progress,
         Err((error, reductions)) => {
-            return Ok(TrapResult::Failed {
+            return Ok(HandlerResult::Failed {
                 error,
                 reductions: reductions as u32,
             });
         }
     };
     if !done {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: IOLIST_SIZE_CONTINUATION,
             state: MagicRef::new(Mutex::new(walker)),
             reductions: reductions as u32,
@@ -1879,7 +1929,7 @@ fn iolist_size(
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .int_from_u64(u64::try_from(size).map_err(|_| BifError::SystemLimit)?)
         .map_err(|_| BifError::SystemLimit)?;
-    Ok(TrapResult::Done {
+    Ok(HandlerResult::Done {
         value,
         reductions: reductions as u32,
     })
@@ -1891,7 +1941,7 @@ fn iolist_conversion(
     state: Option<&Arc<MagicRef>>,
     bitstring: bool,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     const CHUNK: usize = 4096;
     if !matches!(root.classify(), TermKind::List | TermKind::Nil) {
         return Err(BifError::BADARG);
@@ -1905,7 +1955,7 @@ fn iolist_conversion(
         let (done, reductions) = match walker.step(CHUNK) {
             Ok(progress) => progress,
             Err((error, reductions)) => {
-                return Ok(TrapResult::Failed {
+                return Ok(HandlerResult::Failed {
                     error,
                     reductions: reductions as u32,
                 });
@@ -1913,7 +1963,7 @@ fn iolist_conversion(
         };
         if !done {
             drop(walker);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: IOLIST_CONTINUATION,
                 state,
                 reductions: reductions as u32,
@@ -1925,7 +1975,7 @@ fn iolist_conversion(
         let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
             .bitstring(&bytes, bits)
             .map_err(|_| BifError::SystemLimit)?;
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value,
             reductions: reductions as u32,
         });
@@ -1935,14 +1985,14 @@ fn iolist_conversion(
     let (done, reductions) = match walker.step(CHUNK) {
         Ok(progress) => progress,
         Err((error, reductions)) => {
-            return Ok(TrapResult::Failed {
+            return Ok(HandlerResult::Failed {
                 error,
                 reductions: reductions as u32,
             });
         }
     };
     if !done {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: IOLIST_CONTINUATION,
             state: MagicRef::new(Mutex::new(walker)),
             reductions: reductions as u32,
@@ -1952,7 +2002,7 @@ fn iolist_conversion(
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .bitstring(&bytes, bits)
         .map_err(|_| BifError::SystemLimit)?;
-    Ok(TrapResult::Done {
+    Ok(HandlerResult::Done {
         value,
         reductions: reductions as u32,
     })
@@ -1963,7 +2013,7 @@ fn iolist_binary_conversion(
     root: Term,
     state: Option<&Arc<MagicRef>>,
     _restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     const SIZE_YIELDS_PER_RED: usize = 8;
     let state = state.map(Arc::clone).unwrap_or_else(|| {
         MagicRef::new(Mutex::new(IolistBinaryPhase::Size(
@@ -1985,13 +2035,13 @@ fn iolist_binary_conversion(
                 Ok(progress) => progress,
                 Err((error, work)) => {
                     let reductions = work.div_ceil(SIZE_YIELDS_PER_RED) as u32;
-                    return Ok(TrapResult::Failed { error, reductions });
+                    return Ok(HandlerResult::Failed { error, reductions });
                 }
             };
             size_reductions = work.div_ceil(SIZE_YIELDS_PER_RED);
             if !done {
                 drop(phase);
-                return Ok(TrapResult::Yield {
+                return Ok(HandlerResult::Yield {
                     continuation: IOLIST_CONTINUATION,
                     state,
                     reductions: size_reductions as u32,
@@ -2005,7 +2055,7 @@ fn iolist_binary_conversion(
             )?;
             if byte_len == 0 {
                 *phase = IolistBinaryPhase::Done;
-                return Ok(TrapResult::Done {
+                return Ok(HandlerResult::Done {
                     value: output,
                     reductions: size_reductions as u32,
                 });
@@ -2018,7 +2068,7 @@ fn iolist_binary_conversion(
             available_reductions = available_reductions.saturating_sub(size_reductions);
             if available_reductions == 0 {
                 drop(phase);
-                return Ok(TrapResult::Yield {
+                return Ok(HandlerResult::Yield {
                     continuation: IOLIST_CONTINUATION,
                     state,
                     reductions: size_reductions as u32,
@@ -2045,13 +2095,13 @@ fn iolist_binary_conversion(
         Err((error, work)) => {
             let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
             arinsal_bifs::finish_iolist_binary_output(*output);
-            return Ok(TrapResult::Failed { error, reductions });
+            return Ok(HandlerResult::Failed { error, reductions });
         }
     };
     let reductions = (size_reductions + work.div_ceil(SIZE_YIELDS_PER_RED)) as u32;
     if !done {
         drop(phase);
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: IOLIST_CONTINUATION,
             state,
             reductions,
@@ -2059,7 +2109,7 @@ fn iolist_binary_conversion(
     }
     if walk.written() != *byte_len {
         arinsal_bifs::finish_iolist_binary_output(*output);
-        return Ok(TrapResult::Failed {
+        return Ok(HandlerResult::Failed {
             error: BifError::SystemLimit,
             reductions,
         });
@@ -2067,7 +2117,7 @@ fn iolist_binary_conversion(
     let result = *output;
     arinsal_bifs::finish_iolist_binary_output(result);
     *phase = IolistBinaryPhase::Done;
-    Ok(TrapResult::Done {
+    Ok(HandlerResult::Done {
         value: result,
         reductions,
     })
@@ -2079,7 +2129,7 @@ fn binary_to_term(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     const BYTES_PER_REDUCTION: usize = 128;
     // Port of erts/emulator/beam/external.c:116 (B2T_BYTES_PER_REDUCTION), OTP-29.1.1.
     let reds = (process.reductions.max(0) as usize).max(1);
@@ -2094,7 +2144,7 @@ fn binary_to_term(
         return match step {
             Ok((None, consumed)) => {
                 drop(decoder);
-                Ok(TrapResult::Yield {
+                Ok(HandlerResult::Yield {
                     continuation: BINARY_TO_TERM_CONTINUATION,
                     state,
                     reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
@@ -2102,14 +2152,14 @@ fn binary_to_term(
             }
             Ok((Some(value), consumed)) => {
                 process.set_gc_enabled(restore_gc);
-                Ok(TrapResult::Done {
+                Ok(HandlerResult::Done {
                     value,
                     reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
                 })
             }
             Err((error, consumed)) => {
                 process.set_gc_enabled(restore_gc);
-                Ok(TrapResult::Failed {
+                Ok(HandlerResult::Failed {
                     error: decode_trap_error(error),
                     reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
                 })
@@ -2119,21 +2169,21 @@ fn binary_to_term(
 
     let mut decoder = arinsal_bifs::DecodeWalk::new(args)?;
     match decode_step(process, &mut decoder, chunk_bytes) {
-        Ok((None, consumed)) => Ok(TrapResult::Yield {
+        Ok((None, consumed)) => Ok(HandlerResult::Yield {
             continuation: BINARY_TO_TERM_CONTINUATION,
             state: MagicRef::new(Mutex::new(decoder)),
             reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
         }),
         Ok((Some(value), consumed)) => {
             process.set_gc_enabled(restore_gc);
-            Ok(TrapResult::Done {
+            Ok(HandlerResult::Done {
                 value,
                 reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
             })
         }
         Err((error, consumed)) => {
             process.set_gc_enabled(restore_gc);
-            Ok(TrapResult::Failed {
+            Ok(HandlerResult::Failed {
                 error: decode_trap_error(error),
                 reductions: consumed.div_ceil(BYTES_PER_REDUCTION) as u32,
             })
@@ -2164,7 +2214,7 @@ fn binary_copy(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     // Port of erts/emulator/beam/erl_bif_binary.c:2380-2505, OTP-29.1.1.
     const COPY_BYTES_PER_REDUCTION: usize = 64;
     const CHUNK_BYTES: usize = 4000 * COPY_BYTES_PER_REDUCTION;
@@ -2190,7 +2240,7 @@ fn binary_copy(
         let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
             .binary(&[])
             .map_err(|_| BifError::SystemLimit)?;
-        return Ok(TrapResult::Done {
+        return Ok(HandlerResult::Done {
             value,
             reductions: 1,
         });
@@ -2211,7 +2261,7 @@ fn binary_copy(
         )?;
         if !done {
             drop(copy);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: BINARY_COPY_CONTINUATION,
                 state,
                 reductions,
@@ -2236,7 +2286,7 @@ fn binary_copy(
         COPY_BYTES_PER_REDUCTION,
     )?;
     if !done {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: BINARY_COPY_CONTINUATION,
             state: MagicRef::new(Mutex::new(copy)),
             reductions,
@@ -2274,11 +2324,11 @@ fn finish_binary_copy(
     process: &mut Process,
     bytes: &[u8],
     reductions: u32,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .binary(bytes)
         .map_err(|_| BifError::SystemLimit)?;
-    Ok(TrapResult::Done { value, reductions })
+    Ok(HandlerResult::Done { value, reductions })
 }
 
 fn term_to_binary(
@@ -2287,7 +2337,7 @@ fn term_to_binary(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     term_encode(process, args, state, restore_gc, false)
 }
 
@@ -2297,7 +2347,7 @@ fn term_to_iovec(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     term_encode(process, args, state, restore_gc, true)
 }
 
@@ -2307,7 +2357,7 @@ fn term_encode(
     state: Option<&Arc<MagicRef>>,
     restore_gc: bool,
     iovec: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     // Port of erts/emulator/beam/external.c:2449-2590, OTP-29.1.1.
     const TERM_TO_BINARY_LOOP_FACTOR: usize = 32;
     let chunk_work =
@@ -2322,7 +2372,7 @@ fn term_encode(
         let reductions = work.div_ceil(TERM_TO_BINARY_LOOP_FACTOR) as u32;
         if !done {
             drop(encoder_guard);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: TERM_TO_BINARY_CONTINUATION,
                 state,
                 reductions,
@@ -2338,7 +2388,7 @@ fn term_encode(
     let (done, work) = encoder.step(chunk_work)?;
     let reductions = work.div_ceil(TERM_TO_BINARY_LOOP_FACTOR) as u32;
     if !done {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: TERM_TO_BINARY_CONTINUATION,
             state: MagicRef::new(Mutex::new(encoder)),
             reductions,
@@ -2352,7 +2402,7 @@ fn finish_term_encode(
     encoder: arinsal_bifs::EncodeWalk,
     reductions: u32,
     iovec: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let value = if iovec {
@@ -2372,7 +2422,7 @@ fn finish_term_encode(
         let bytes = encoder.finish_binary_buffer()?;
         builder.binary(&bytes).map_err(|_| BifError::SystemLimit)?
     };
-    Ok(TrapResult::Done { value, reductions })
+    Ok(HandlerResult::Done { value, reductions })
 }
 
 /// Progress of one `erlang:processes/0` call.
@@ -2392,7 +2442,7 @@ fn processes(
     state: Option<&Arc<MagicRef>>,
     _pid: Option<arinsal_sched::Pid>,
     _restore_gc: bool,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     const INDICES_PER_RED: u32 = 25;
     const CHUNK_SIZE: u32 = 1000;
     const MIN_START_REDS: u32 = CHUNK_SIZE / INDICES_PER_RED;
@@ -2407,7 +2457,7 @@ fn processes(
         let (done, spent) = scan_process_table(&mut list, table_max, reds_left);
         if !done {
             drop(list);
-            return Ok(TrapResult::Yield {
+            return Ok(HandlerResult::Yield {
                 continuation: PTAB_LIST_CONTINUATION,
                 state,
                 reductions: spent,
@@ -2432,7 +2482,7 @@ fn processes(
         }
     };
     if reds_left < MIN_START_REDS {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: PTAB_LIST_CONTINUATION,
             state: MagicRef::new(Mutex::new(list)),
             reductions: 1,
@@ -2440,7 +2490,7 @@ fn processes(
     }
     let (done, spent) = scan_process_table(&mut list, table_max, reds_left);
     if !done {
-        return Ok(TrapResult::Yield {
+        return Ok(HandlerResult::Yield {
             continuation: PTAB_LIST_CONTINUATION,
             state: MagicRef::new(Mutex::new(list)),
             reductions: spent,
@@ -2475,11 +2525,11 @@ fn finish_processes(
     process: &mut Process,
     pid_terms: Vec<Term>,
     spent: u32,
-) -> Result<TrapResult, BifError> {
+) -> Result<HandlerResult, BifError> {
     let value = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
         .list_from_iter(pid_terms)
         .map_err(|_| BifError::SystemLimit)?;
-    Ok(TrapResult::Done {
+    Ok(HandlerResult::Done {
         value,
         reductions: spent,
     })

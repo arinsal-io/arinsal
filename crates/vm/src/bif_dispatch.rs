@@ -25,7 +25,13 @@ impl Vm {
             resolved,
             natives::NativeArgs::Registers(arity),
         );
-        if let Some(result) = result.as_mut() {
+        // A BIF that traps to an export returns THE_NON_VALUE: no collection runs after it, so
+        // the trap's saved arguments stay valid until the process resumes (erts BIF_TRAP keeps
+        // them in def_arg_reg, GC disabled while trapped).
+        if let Some(result) = result
+            .as_mut()
+            .filter(|result| !matches!(result, Err(VmError::TrapExport(_))))
+        {
             // Port of erts/emulator/beam/erl_gc.c:418-478 (erts_gc_after_bif_call_lhf with
             // `regs`), OTP-29.1.1: the argument registers are the BIF's arguments. A
             // collection inside the BIF (live = arity) already moved them, so the epilogue
@@ -156,15 +162,15 @@ impl Vm {
             crate::bif_traps::execute(self, p, index, arity, stored, ctx.as_deref_mut())
         {
             return match result? {
-                crate::bif_traps::TrapResult::Done { value, .. } => {
+                crate::bif_traps::HandlerResult::Done { value, .. } => {
                     p.write(dst, value)?;
                     p.ip += 1;
                     Ok(BifOpOutcome::Done(0))
                 }
-                crate::bif_traps::TrapResult::Failed { .. } => {
+                crate::bif_traps::HandlerResult::Failed { .. } => {
                     unreachable!("failed trapping BIFs become VM exceptions")
                 }
-                crate::bif_traps::TrapResult::Yield { .. } => Ok(BifOpOutcome::Yield),
+                crate::bif_traps::HandlerResult::Yield { .. } => Ok(BifOpOutcome::Yield),
             };
         }
         if arity == 2 && fast != FastBif::None {

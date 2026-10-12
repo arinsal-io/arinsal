@@ -651,34 +651,24 @@ fn light_demonitor_miss(
         demonitor_flags(args[1])?
     };
     if flush {
-        // The origin monitor is already gone, so a DOWN for this ref is in the
-        // inbox (or was never sent). An in-flight DOWN still sits with the
-        // monitor in the tree, which took the executor path above.
-        flush_monitor_inbox(process, id);
+        // The flush needs the receive that the Erlang export performs; the executor path traps.
+        return None;
     }
     Some(Ok(atom(if info { "false" } else { "true" })))
 }
 
-/// Drop `{_, Ref, _, _, _}` messages already in the inbox.
-// Port of erts/preloaded/src/erts_internal.erl:523 (flush_monitor_messages), OTP-29.1.1.
-pub(crate) fn flush_monitor_inbox(process: &mut Process, id: u64) {
-    if process.inbox.is_empty() {
-        return;
-    }
-    let start = process.receive_marker_position(id).unwrap_or(0);
-    let old_prio_len = process.cold.as_ref().map_or(0, |cold| cold.prio_len);
-    let (new_prio_len, removed) = process.inbox.retain_from(start, old_prio_len, |message| {
-        // SAFETY: Mailbox terms remain in the receiver's live heap.
-        unsafe { message.tuple_ref() }
-            .is_none_or(|tuple| tuple.len() != 5 || tuple.get(1).and_then(ref_id) != Some(id))
-    });
-    if process.cold.is_some() || new_prio_len != old_prio_len {
-        process.cold_mut().prio_len = new_prio_len;
-    }
-    for (removed_count, original_index) in removed.into_iter().enumerate() {
-        process.message_removed(original_index - removed_count);
-    }
+/// The trap of `demonitor(Ref, [flush])` when the monitor is already gone: the flush runs as
+/// `erts_internal:flush_monitor_messages(Ref, Multi, Res)`, with `Multi` false for a plain monitor.
+// Port of erts/emulator/beam/bif.c:640-654 (demonitor_2 flush_messages: BIF_TRAP3
+// flush_monitor_messages_trap), OTP-29.1.1.
+fn flush_monitor_trap(reference: Term, result: Term) -> VmError {
+    VmError::TrapExport(crate::ExportTrap {
+        continuation: FLUSH_MONITOR_CONTINUATION,
+        args: vec![reference, atom("false"), result],
+    })
 }
+
+const FLUSH_MONITOR_CONTINUATION: &str = "erts_internal:flush_monitor_messages/3";
 
 pub(crate) fn reference(process: &mut Process, id: u64) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
@@ -2227,15 +2217,15 @@ fn call_resolved(
             // Port of erts/emulator/beam/bif.c:640-654 (demonitor_2), OTP-29.1.1.
             // Flush runs only when the monitor is already gone (`am_false`). An
             // active process monitor just queues the demonitor signal.
-            if flush && !was_active {
-                process.drain(ctx)?;
-                flush_monitor_inbox(process, id);
-            }
-            Ok(atom(if options.contains(&atom("info")) && !was_active {
+            let result = atom(if options.contains(&atom("info")) && !was_active {
                 "false"
             } else {
                 "true"
-            }))
+            });
+            if flush && !was_active {
+                return Err(flush_monitor_trap(*reference, result));
+            }
+            Ok(result)
         }
         (SignalBif::Exit1, [reason]) => {
             process.note_exit_reason(*reason)?;

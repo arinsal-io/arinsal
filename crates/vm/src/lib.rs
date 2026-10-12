@@ -166,6 +166,19 @@ pub enum VmError {
     Raised(Box<exceptions::Raised>),
     /// Invalid or missing module.
     Load(String),
+    /// The BIF traps to an Erlang export: the caller makes this call and its result is the BIF's.
+    /// Port of erts/emulator/beam/bif.h:316-326 (BIF_TRAP*: `c_p->i` is the export, the arguments
+    /// are its X registers, freason TRAP), OTP-29.1.1.
+    TrapExport(ExportTrap),
+}
+
+/// An Erlang export a BIF traps to, with the arguments it is called with.
+#[derive(Debug)]
+pub struct ExportTrap {
+    /// The export as `module:function/arity`.
+    pub continuation: &'static str,
+    /// Arguments, X0 onwards.
+    pub args: Vec<Term>,
 }
 impl std::fmt::Display for VmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,6 +195,7 @@ impl std::fmt::Display for VmError {
             Self::Trap(_) => write!(f, "unhandled BEAM exception"),
             Self::Raised(raised) => raised.fmt(f),
             Self::Load(s) => write!(f, "{s}"),
+            Self::TrapExport(trap) => write!(f, "trap to {}", trap.continuation),
         }
     }
 }

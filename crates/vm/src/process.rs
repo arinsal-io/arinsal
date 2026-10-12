@@ -227,38 +227,6 @@ impl MessageQueue {
         self.entries.iter().map(|entry| &entry.term)
     }
 
-    /// Retain matching messages at or after a receive-marker boundary.
-    ///
-    /// Splitting first is intentional: flushing a monitor must not walk the
-    /// mailbox prefix that predates the monitor's marker.
-    pub(crate) fn retain_from(
-        &mut self,
-        start: usize,
-        prio_len: usize,
-        mut keep: impl FnMut(&Term) -> bool,
-    ) -> (usize, Vec<usize>) {
-        let start = start.min(self.entries.len());
-        let mut suffix = self.entries.split_off(start);
-        let mut index = start;
-        let mut new_prio_len = prio_len.min(start);
-        let mut removed = Vec::new();
-        suffix.retain(|entry| {
-            let entry_index = index;
-            index += 1;
-            if keep(&entry.term) {
-                if entry_index < prio_len {
-                    new_prio_len += 1;
-                }
-                true
-            } else {
-                removed.push(entry_index);
-                false
-            }
-        });
-        self.entries.append(&mut suffix);
-        (new_prio_len, removed)
-    }
-
     /// Remove a message, transferring any off-heap fragment into the process heap.
     // Port of erts/emulator/beam/erl_proc_sig_queue.c:7142 (message receive), OTP-29.1.1.
     pub(crate) fn remove_to_heap(
@@ -2422,9 +2390,9 @@ impl Executor {
                                         break Ok(RunState::Yield);
                                     }
                                     match crate::bif_traps::run_trapped_export(process, Some(ctx)) {
-                                        Some(Ok(crate::bif_traps::TrapResult::Yield {
-                                            ..
-                                        })) => {
+                                        Some(Ok(crate::bif_traps::ResumeResult::Handler(
+                                            crate::bif_traps::HandlerResult::Yield { .. },
+                                        ))) => {
                                             if let Some(pending) = process
                                                 .cold
                                                 .as_mut()
@@ -2437,19 +2405,53 @@ impl Executor {
                                             process.native_pc = Some(code_ptr);
                                             break Ok(RunState::Yield);
                                         }
-                                        Some(Ok(crate::bif_traps::TrapResult::Done {
-                                            value,
-                                            ..
-                                        })) => {
+                                        // The trapped BIF's continuation is an Erlang export: it is
+                                        // called with the saved arguments, and returns to the caller's
+                                        // native continuation. Port of erts/emulator/beam/beam_common.c
+                                        // (BIF_TRAP), OTP-29.1.1.
+                                        Some(Ok(crate::bif_traps::ResumeResult::Export(trap))) => {
+                                            process.cold_mut().native_apply = true;
+                                            let outcome = self.vm.trap_to_export(
+                                                process,
+                                                trap,
+                                                true,
+                                                Some(ctx),
+                                            );
+                                            process.cold_mut().native_apply = false;
+                                            match outcome? {
+                                                crate::ImportOutcome::Jump(_) => {
+                                                    self.vm.enter_native_at_jump(process)
+                                                }
+                                                crate::ImportOutcome::Advanced => {}
+                                                crate::ImportOutcome::Yield => {
+                                                    if process.native_pc.is_some()
+                                                        && native_transfer_continues(process, ctx)
+                                                    {
+                                                        continue;
+                                                    }
+                                                    break Ok(RunState::Yield);
+                                                }
+                                                crate::ImportOutcome::Returned(value) => {
+                                                    process.x[0] = value;
+                                                    if process.native_pc.is_none() {
+                                                        break Ok(RunState::Done(value));
+                                                    }
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        Some(Ok(crate::bif_traps::ResumeResult::Handler(
+                                            crate::bif_traps::HandlerResult::Done { value, .. },
+                                        ))) => {
                                             process.x[0] = value;
                                             if !resume_after_native_return(process) {
                                                 break Ok(RunState::Done(value));
                                             }
                                             continue;
                                         }
-                                        Some(Ok(crate::bif_traps::TrapResult::Failed {
-                                            ..
-                                        })) => {
+                                        Some(Ok(crate::bif_traps::ResumeResult::Handler(
+                                            crate::bif_traps::HandlerResult::Failed { .. },
+                                        ))) => {
                                             break Err(VmError::Unsupported(
                                                 "failed trapping BIF without exception".into(),
                                             ));
@@ -2631,7 +2633,7 @@ impl Executor {
                                             )
                                         {
                                             let outcome = match trapped {
-                                                Ok(crate::bif_traps::TrapResult::Yield {
+                                                Ok(crate::bif_traps::HandlerResult::Yield {
                                                     ..
                                                 }) => {
                                                     // The continuation export runs on the next
@@ -2650,7 +2652,7 @@ impl Executor {
                                                     process.native_pc = Some(code_ptr);
                                                     break Ok(RunState::Yield);
                                                 }
-                                                Ok(crate::bif_traps::TrapResult::Done {
+                                                Ok(crate::bif_traps::HandlerResult::Done {
                                                     value,
                                                     ..
                                                 }) => {
@@ -2658,7 +2660,7 @@ impl Executor {
                                                     process.collect_bin_vheap_if_due(1)?;
                                                     Some(Ok(process.x[0]))
                                                 }
-                                                Ok(crate::bif_traps::TrapResult::Failed {
+                                                Ok(crate::bif_traps::HandlerResult::Failed {
                                                     ..
                                                 }) => Some(Err(VmError::Unsupported(
                                                     "failed trapping BIF without exception".into(),
@@ -2727,6 +2729,26 @@ impl Executor {
                                                 (export.class, export.native_bits),
                                             );
                                             process.cold_mut().native_call_pc = 0;
+                                            // A BIF that traps to an Erlang export (erts BIF_TRAP*)
+                                            // context-switches to beam_bif_export_trap, which runs
+                                            // the export on schedule-in. Port of erts/emulator/beam/
+                                            // jit/arm/instr_bif.cpp (trap to the export), OTP-29.1.1.
+                                            let result = match result {
+                                                Some(Err(VmError::TrapExport(trap))) => {
+                                                    let callee =
+                                                        (export.module_atom, export.function_atom);
+                                                    crate::bif_traps::install_export_trap(
+                                                        process, target_pc, callee, &trap,
+                                                    );
+                                                    crate::bif_traps::arm_export_trap(process);
+                                                    process.cold_mut().native_retry = Some(
+                                                        crate::bif_traps::bif_export_trap_pc(),
+                                                    );
+                                                    process.native_pc = Some(code_ptr);
+                                                    break Ok(RunState::Yield);
+                                                }
+                                                other => other,
+                                            };
                                             if let (Some((module, function, args)), Some(result)) =
                                                 (&traced, &result)
                                             {
