@@ -1335,13 +1335,13 @@ pub(crate) extern "C" fn atom_to_list_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    identity: u64,
+    descriptor: u64,
+    _identity: u64,
 ) -> u64 {
     if let Some(raw) = atom_to_list_latin1(header) {
         return raw;
     }
-    allocating_bif(header, regs, identity, 1, |heap, arg| {
+    allocating_bif(header, regs, descriptor, 1, |heap, arg| {
         arinsal_bifs::atom_to_list_term(heap, arg)
     })
 }
@@ -1384,10 +1384,10 @@ pub(crate) extern "C" fn integer_to_binary_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    identity: u64,
+    descriptor: u64,
+    _identity: u64,
 ) -> u64 {
-    allocating_bif(header, regs, identity, 1, |heap, arg| {
+    allocating_bif(header, regs, descriptor, 1, |heap, arg| {
         arinsal_arith::integer_to_binary_decimal(arg, heap).map_err(arith_bif_error)
     })
 }
@@ -1396,7 +1396,7 @@ pub(crate) extern "C" fn integer_to_binary_light(
 fn allocating_bif(
     header: *mut ProcessHeader,
     regs: *mut u64,
-    identity: u64,
+    descriptor: u64,
     arity: usize,
     body: impl FnOnce(
         &mut arinsal_bifs::FragmentingHeap<'_>,
@@ -1429,7 +1429,8 @@ fn allocating_bif(
         }
         return crate::native_hooks::raw(value);
     }
-    let Some(export) = export_at(identity) else {
+    // The fragment passed `Export.info`; the descriptor is the export, so no table lookup.
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         crate::native_hooks::set_error(process, "badarg");
         process.sync_native_header();
         return 0;
@@ -1446,12 +1447,6 @@ fn arith_bif_error(error: arinsal_arith::ArithError) -> arinsal_bifs::BifError {
             arinsal_bifs::BifError::SystemLimit
         }
     }
-}
-
-fn export_at(identity: u64) -> Option<ExportDispatch> {
-    // The identity is the export slot. `export_dispatch` is the same descriptor
-    // `Export.info` publishes, cached per scheduler.
-    crate::beamasm_integration::export_dispatch(identity as usize)
 }
 
 fn trap_exit_atom() -> Term {
@@ -1528,8 +1523,8 @@ pub(crate) extern "C" fn make_ref_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    identity: u64,
+    descriptor: u64,
+    _identity: u64,
 ) -> u64 {
     if header.is_null() {
         return 0;
@@ -1543,10 +1538,10 @@ pub(crate) extern "C" fn make_ref_light(
         let top = htop as usize;
         let limit = (stop as usize).saturating_sub(arinsal_term::S_REDZONE * 8);
         let Some(state) = process.scheduler_ref_state else {
-            return make_ref_cold(header, identity);
+            return make_ref_cold(header, descriptor);
         };
         if htop.is_null() || stop.is_null() || top.saturating_add(24) > limit {
-            return make_ref_cold(header, identity);
+            return make_ref_cold(header, descriptor);
         }
         let ids = state.bump_ref_words();
         // ErtsORefThing: header, then the three 32-bit numbers packed as
@@ -1563,11 +1558,11 @@ pub(crate) extern "C" fn make_ref_light(
 }
 
 #[cold]
-fn make_ref_cold(header: *mut ProcessHeader, identity: u64) -> u64 {
+fn make_ref_cold(header: *mut ProcessHeader, descriptor: u64) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = export_at(identity) else {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
     make_ref_0(process, registers, export, false)
@@ -1622,8 +1617,7 @@ pub(crate) extern "C" fn plain_bif_light(
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    // The fragment loaded `Export.info` into this argument. `export_at` would
-    // hash the slot on every call.
+    // The fragment loaded `Export.info` into this argument, so the slot is not hashed.
     let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
