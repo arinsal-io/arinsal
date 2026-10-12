@@ -7,7 +7,7 @@ use arinsal_beamasm::{
     arith::ArithHelper,
     construct::GcHook,
     fun::FunCallTag,
-    guard::{CompareShared, GuardHelper, GuardHelper3},
+    guard::{CompareShared, EqLiteral, GuardHelper, GuardHelper3},
     module::{ArgVal, BeamModuleAssembler, FinalizedModule},
     types::{ArgType, TypedArg},
 };
@@ -17,6 +17,9 @@ use std::{
     fs,
     path::Path,
 };
+
+mod eq_literal;
+use eq_literal::classify_eq_literal;
 
 /// Runtime values and helper entry points needed while compiling a module.
 pub trait ModuleEnv {
@@ -124,6 +127,18 @@ pub trait ModuleEnv {
     /// Process-wide comparison fragments. The default is unset; the VM installs the real ones.
     fn compare_shared(&self) -> CompareShared {
         CompareShared::default()
+    }
+    /// Resolves an atom name to its VM term word, or `None` when the VM has no such atom.
+    fn atom_word_by_name(&self, _name: &str) -> Option<u64> {
+        None
+    }
+    /// Classifies a literal compared with `=:=` / `=/=`. The owned literal is decoded from the
+    /// module's literal table; the default treats every literal as `Generic`-decidable.
+    fn eq_literal(&self, beam: &BeamFile, index: u32) -> Result<EqLiteral, String> {
+        let term = beam.literal(index).map_err(|error| error.to_string())?;
+        Ok(classify_eq_literal(&term, &|name| {
+            self.atom_word_by_name(name)
+        }))
     }
     /// Guard slow path for checks that compare a tuple tag as well as its arity.
     fn guard_helper3(&self) -> GuardHelper3;
@@ -2031,6 +2046,20 @@ fn arg(
     }
 }
 
+/// The compile-time shape of an `=:=` / `=/=` right operand that is a literal; any other operand
+/// is `Generic`.
+fn eq_literal_operand(
+    value: Option<&SpecificOperand>,
+    beam: &BeamFile,
+    env: &impl ModuleEnv,
+) -> Result<EqLiteral, String> {
+    match value {
+        Some(SpecificOperand::Typed { reg, .. }) => eq_literal_operand(Some(reg), beam, env),
+        Some(SpecificOperand::Literal(index)) => env.eq_literal(beam, *index),
+        _ => Ok(EqLiteral::Generic),
+    }
+}
+
 fn typed_arg(
     value: Option<&SpecificOperand>,
     beam: &BeamFile,
@@ -2821,13 +2850,15 @@ fn emit_op(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                env.guard_helper(),
+                                &eq_literal_operand(args.get(2), beam, env)?,
+                                env.compare_shared().eq,
                             )?,
                             "is_ne_exact" => assembler.emit_is_ne_exact(
                                 typed_arg(args.get(1), beam, env)?,
                                 typed_arg(args.get(2), beam, env)?,
                                 fail,
-                                env.guard_helper(),
+                                &eq_literal_operand(args.get(2), beam, env)?,
+                                env.compare_shared().eq,
                             )?,
                             "is_eq" => assembler.emit_is_eq(lhs, rhs, fail, env.guard_helper())?,
                             "is_ne" => assembler.emit_is_ne(lhs, rhs, fail, env.guard_helper())?,

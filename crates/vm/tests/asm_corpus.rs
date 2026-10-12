@@ -40,6 +40,10 @@ impl CorpusEnv {
     }
 }
 
+extern "C" fn eq(_: u64, _: u64) -> i32 {
+    0
+}
+
 impl ModuleEnv for CorpusEnv {
     fn integer_literal(&self, _value: i64) -> Result<u64, String> {
         Ok(Term::NIL.tagged_word())
@@ -170,6 +174,12 @@ impl ModuleEnv for CorpusEnv {
     }
     fn guard_helper(&self) -> arinsal_beamasm::guard::GuardHelper {
         guard
+    }
+    fn compare_shared(&self) -> arinsal_beamasm::guard::CompareShared {
+        arinsal_beamasm::guard::CompareShared {
+            eq: (eq as extern "C" fn(u64, u64) -> i32) as usize,
+            ..Default::default()
+        }
     }
     fn guard_helper3(&self) -> arinsal_beamasm::guard::GuardHelper3 {
         guard3

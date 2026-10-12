@@ -11,6 +11,7 @@ const MODULES: &[&str] = &[
     "beamasm_hibernate",
     "beamasm_epp",
     "beamasm_sched",
+    "beamasm_eq_exact",
 ];
 
 /// OTP modules compiled natively alongside a fixture, for fixtures that exercise them.
