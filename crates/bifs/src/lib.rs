@@ -166,18 +166,95 @@ impl<'a> Ctx<'a> {
 /// Signature shared by all BIFs.
 pub type BifFn = fn(&mut Ctx<'_>, &[Term]) -> Result<Term, BifError>;
 
+/// A BIF body known when its table entry is compiled.
+///
+/// Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1: every
+/// BIF is its own function, so the VM entry that calls it is compiled per BIF.
+pub trait BifBody {
+    fn call(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>;
+}
+
+/// Receives the body of one BIF from [`visit_bif`].
+pub trait BifTableVisitor {
+    /// What the visitor makes of one BIF.
+    type Output;
+    fn entry<B: BifBody>(&mut self) -> Self::Output;
+}
+
+/// The function pointer of a BIF body: [`lookup`]'s visitor.
+struct FnPointer;
+
+impl BifTableVisitor for FnPointer {
+    type Output = BifFn;
+    fn entry<B: BifBody>(&mut self) -> BifFn {
+        B::call
+    }
+}
+
+/// Hands the body of `module:name/arity` to `visitor`, for the same BIFs [`lookup`]
+/// finds. `None` when this crate does not implement it.
+pub fn visit_bif<V: BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    visitor: &mut V,
+) -> Option<V::Output> {
+    if let Some(found) = arith::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = atomics::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = maps_bifs::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = time::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = sys::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = checksum::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = etf::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = lists::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    if let Some(found) = pure::lookup(module, name, arity, visitor) {
+        return Some(found);
+    }
+    unicode::lookup(module, name, arity, visitor)
+}
+
+/// One [`BifBody`] per BIF function of a module, named after the function, in
+/// that module's `bodies`.
+macro_rules! bif_bodies {
+    ($($bif:ident),* $(,)?) => {
+        #[allow(non_camel_case_types)]
+        mod bodies {
+            $(
+                pub(super) struct $bif;
+                impl $crate::BifBody for $bif {
+                    #[inline(always)]
+                    fn call(
+                        ctx: &mut $crate::Ctx<'_>,
+                        args: &[arinsal_term::Term],
+                    ) -> Result<arinsal_term::Term, $crate::BifError> {
+                        super::$bif(ctx, args)
+                    }
+                }
+            )*
+        }
+    };
+}
+pub(crate) use bif_bodies;
+
 /// Find the implementation of `module:name/arity`.
 pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    arith::lookup(module, name, arity)
-        .or_else(|| atomics::lookup(module, name, arity))
-        .or_else(|| maps_bifs::lookup(module, name, arity))
-        .or_else(|| time::lookup(module, name, arity))
-        .or_else(|| sys::lookup(module, name, arity))
-        .or_else(|| checksum::lookup(module, name, arity))
-        .or_else(|| etf::lookup(module, name, arity))
-        .or_else(|| lists::lookup(module, name, arity))
-        .or_else(|| pure::lookup(module, name, arity))
-        .or_else(|| unicode::lookup(module, name, arity))
+    visit_bif(module, name, arity, &mut FnPointer)
 }
 
 /// A [`HeapAlloc`] over a [`ProcessHeap`] that never fails: when the heap is

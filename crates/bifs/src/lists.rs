@@ -12,7 +12,7 @@ use arinsal_term::{
 mod rbtree;
 
 use crate::pure::{bool_term, integer, tuple_build};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 use rbtree::RbTree;
 
 const BADARG: BifError = BifError::BADARG;
@@ -37,16 +37,21 @@ fn is_list_bits(bits: u64) -> bool {
     bits & 2 == 0
 }
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    let f: BifFn = match (module, name, arity) {
-        ("erlang", "length", 1) => length,
-        ("erlang", "++" | "append", 2) => append,
-        ("erlang", "--" | "subtract", 2) => subtract,
-        ("lists", "reverse", 2) => reverse,
-        ("lists", "member", 2) => member,
-        ("lists", "keyfind", 3) => keyfind,
-        ("lists", "keymember", 3) => keymember,
-        ("lists", "keysearch", 3) => keysearch,
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
+    let f = match (module, name, arity) {
+        ("erlang", "length", 1) => v.entry::<bodies::length>(),
+        ("erlang", "++" | "append", 2) => v.entry::<bodies::append>(),
+        ("erlang", "--" | "subtract", 2) => v.entry::<bodies::subtract>(),
+        ("lists", "reverse", 2) => v.entry::<bodies::reverse>(),
+        ("lists", "member", 2) => v.entry::<bodies::member>(),
+        ("lists", "keyfind", 3) => v.entry::<bodies::keyfind>(),
+        ("lists", "keymember", 3) => v.entry::<bodies::keymember>(),
+        ("lists", "keysearch", 3) => v.entry::<bodies::keysearch>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -1561,7 +1566,6 @@ fn keysearch(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 
 #[cfg(test)]
 mod tests {
-    use super::lookup;
     use crate::{Ctx, FragmentingHeap};
     use arinsal_term::{ProcessHeap, Term, TermBuilder};
 
@@ -1573,7 +1577,7 @@ mod tests {
             .list_from_slice(&[Term::small(1).unwrap(), Term::small(2).unwrap()])
             .unwrap();
         let mut ctx = Ctx::new(&mut alloc);
-        let out = lookup("erlang", "++", 2).unwrap()(&mut ctx, &[list, Term::NIL]).unwrap();
+        let out = crate::lookup("erlang", "++", 2).unwrap()(&mut ctx, &[list, Term::NIL]).unwrap();
         assert_eq!(out, list);
     }
 }
@@ -1989,3 +1993,7 @@ mod trap_budget_tests {
         assert_eq!(same, lhs);
     }
 }
+
+crate::bif_bodies!(
+    length, append, subtract, reverse, member, keyfind, keymember, keysearch,
+);

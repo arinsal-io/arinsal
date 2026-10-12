@@ -5,18 +5,23 @@ use md5::{Digest, Md5};
 use num_traits::ToPrimitive;
 
 use crate::pure::{Heap, bigint, binary_bytes, iolist_bytes};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    let f: BifFn = match (module, name, arity) {
-        ("erlang", "crc32", 1 | 2) => crc32,
-        ("erlang", "adler32", 1 | 2) => adler32,
-        ("erlang", "crc32_combine", 3) => crc32_combine,
-        ("erlang", "adler32_combine", 3) => adler32_combine,
-        ("erlang", "md5", 1) => md5,
-        ("erlang", "md5_init", 0) => md5_init,
-        ("erlang", "md5_update", 2) => md5_update,
-        ("erlang", "md5_final", 1) => md5_final,
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
+    let f = match (module, name, arity) {
+        ("erlang", "crc32", 1 | 2) => v.entry::<bodies::crc32>(),
+        ("erlang", "adler32", 1 | 2) => v.entry::<bodies::adler32>(),
+        ("erlang", "crc32_combine", 3) => v.entry::<bodies::crc32_combine>(),
+        ("erlang", "adler32_combine", 3) => v.entry::<bodies::adler32_combine>(),
+        ("erlang", "md5", 1) => v.entry::<bodies::md5>(),
+        ("erlang", "md5_init", 0) => v.entry::<bodies::md5_init>(),
+        ("erlang", "md5_update", 2) => v.entry::<bodies::md5_update>(),
+        ("erlang", "md5_final", 1) => v.entry::<bodies::md5_final>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -233,3 +238,14 @@ fn md5_final(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let state = Md5State::from_bytes(&binary_bytes(args[0])?)?;
     binary(ctx, &state.final_digest())
 }
+
+crate::bif_bodies!(
+    crc32,
+    adler32,
+    crc32_combine,
+    adler32_combine,
+    md5,
+    md5_init,
+    md5_update,
+    md5_final,
+);

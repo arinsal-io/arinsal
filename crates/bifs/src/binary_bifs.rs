@@ -9,37 +9,44 @@ use arinsal_term::{
 };
 
 use crate::binary_mod::{SearchPattern, SearchWalk};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
 use super::*;
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    let bif: BifFn = match (module, name, arity) {
-        ("erlang", "byte_size", 1) => byte_size,
-        ("erlang", "bit_size", 1) => bit_size,
-        ("erlang", "binary_to_list", 1 | 3) => erlang_binary_to_list,
-        ("erlang", "list_to_binary", 1) => list_to_binary,
-        ("erlang", "iolist_to_binary", 1) => iolist_to_binary,
-        ("erlang", "iolist_to_iovec", 1) => iolist_to_iovec,
-        ("erlang", "iolist_size", 1) => iolist_size,
-        ("erlang", "bitstring_to_list", 1) => bitstring_to_list,
-        ("erlang", "list_to_bitstring", 1) => list_to_bitstring,
-        ("erlang", "split_binary", 2) => split_binary,
-        ("erlang", "binary_part", 2 | 3) | ("binary", "part", 2 | 3) => binary_part,
-        ("binary", "first", 1) => binary_first,
-        ("binary", "last", 1) => binary_last,
-        ("binary", "at", 2) => binary_at,
-        ("binary", "copy", 1 | 2) => binary_copy,
-        ("binary", "referenced_byte_size", 1) => referenced_byte_size,
-        ("binary", "longest_common_prefix", 1) => longest_common_prefix,
-        ("binary", "longest_common_suffix", 1) => longest_common_suffix,
-        ("binary", "compile_pattern", 1) => compile_pattern,
-        ("binary", "match", 2 | 3) => binary_match,
-        ("binary", "matches", 2 | 3) => binary_matches,
-        ("binary", "split", 2 | 3) => binary_split,
-        ("binary", "encode_unsigned", 1 | 2) => encode_unsigned,
-        ("binary", "decode_unsigned", 1 | 2) => decode_unsigned,
-        ("binary", "list_to_bin", 1) => list_to_binary,
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
+    let bif = match (module, name, arity) {
+        ("erlang", "byte_size", 1) => v.entry::<bodies::byte_size>(),
+        ("erlang", "bit_size", 1) => v.entry::<bodies::bit_size>(),
+        ("erlang", "binary_to_list", 1 | 3) => v.entry::<bodies::erlang_binary_to_list>(),
+        ("erlang", "list_to_binary", 1) => v.entry::<bodies::list_to_binary>(),
+        ("erlang", "iolist_to_binary", 1) => v.entry::<bodies::iolist_to_binary>(),
+        ("erlang", "iolist_to_iovec", 1) => v.entry::<bodies::iolist_to_iovec>(),
+        ("erlang", "iolist_size", 1) => v.entry::<bodies::iolist_size>(),
+        ("erlang", "bitstring_to_list", 1) => v.entry::<bodies::bitstring_to_list>(),
+        ("erlang", "list_to_bitstring", 1) => v.entry::<bodies::list_to_bitstring>(),
+        ("erlang", "split_binary", 2) => v.entry::<bodies::split_binary>(),
+        ("erlang", "binary_part", 2 | 3) | ("binary", "part", 2 | 3) => {
+            v.entry::<bodies::binary_part>()
+        }
+        ("binary", "first", 1) => v.entry::<bodies::binary_first>(),
+        ("binary", "last", 1) => v.entry::<bodies::binary_last>(),
+        ("binary", "at", 2) => v.entry::<bodies::binary_at>(),
+        ("binary", "copy", 1 | 2) => v.entry::<bodies::binary_copy>(),
+        ("binary", "referenced_byte_size", 1) => v.entry::<bodies::referenced_byte_size>(),
+        ("binary", "longest_common_prefix", 1) => v.entry::<bodies::longest_common_prefix>(),
+        ("binary", "longest_common_suffix", 1) => v.entry::<bodies::longest_common_suffix>(),
+        ("binary", "compile_pattern", 1) => v.entry::<bodies::compile_pattern>(),
+        ("binary", "match", 2 | 3) => v.entry::<bodies::binary_match>(),
+        ("binary", "matches", 2 | 3) => v.entry::<bodies::binary_matches>(),
+        ("binary", "split", 2 | 3) => v.entry::<bodies::binary_split>(),
+        ("binary", "encode_unsigned", 1 | 2) => v.entry::<bodies::encode_unsigned>(),
+        ("binary", "decode_unsigned", 1 | 2) => v.entry::<bodies::decode_unsigned>(),
+        ("binary", "list_to_bin", 1) => v.entry::<bodies::list_to_binary>(),
         _ => return None,
     };
     Some(bif)
@@ -1145,3 +1152,30 @@ fn decode_unsigned(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             .map_err(|_| BifError::SystemLimit)
     })
 }
+
+crate::bif_bodies!(
+    byte_size,
+    bit_size,
+    erlang_binary_to_list,
+    list_to_binary,
+    iolist_to_binary,
+    iolist_to_iovec,
+    iolist_size,
+    bitstring_to_list,
+    list_to_bitstring,
+    split_binary,
+    binary_part,
+    binary_first,
+    binary_last,
+    binary_at,
+    binary_copy,
+    referenced_byte_size,
+    longest_common_prefix,
+    longest_common_suffix,
+    compile_pattern,
+    binary_match,
+    binary_matches,
+    binary_split,
+    encode_unsigned,
+    decode_unsigned,
+);

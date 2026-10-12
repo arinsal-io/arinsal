@@ -6,25 +6,30 @@ use arinsal_term::{Term, atoms};
 use crate::pure::{
     bool_term, integer, list, make_list, make_list_from_reverse_exact_iter, tuple_build,
 };
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    let f: BifFn = match (module, name, arity) {
-        ("erlang", "map_size", 1) => map_size,
-        ("erlang", "map_get", 2) => map_get,
-        ("erlang", "is_map_key", 2) => is_map_key,
-        ("maps", "find", 2) => find,
-        ("maps", "get", 2) => get,
-        ("maps", "is_key", 2) => is_key,
-        ("maps", "from_list", 1) => from_list,
-        ("maps", "from_keys", 2) => from_keys,
-        ("maps", "keys", 1) => keys,
-        ("maps", "values", 1) => values,
-        ("maps", "merge", 2) => merge,
-        ("maps", "put", 3) => put,
-        ("maps", "remove", 2) => remove,
-        ("maps", "update", 3) => update,
-        ("maps", "take", 2) => take,
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
+    let f = match (module, name, arity) {
+        ("erlang", "map_size", 1) => v.entry::<bodies::map_size>(),
+        ("erlang", "map_get", 2) => v.entry::<bodies::map_get>(),
+        ("erlang", "is_map_key", 2) => v.entry::<bodies::is_map_key>(),
+        ("maps", "find", 2) => v.entry::<bodies::find>(),
+        ("maps", "get", 2) => v.entry::<bodies::get>(),
+        ("maps", "is_key", 2) => v.entry::<bodies::is_key>(),
+        ("maps", "from_list", 1) => v.entry::<bodies::from_list>(),
+        ("maps", "from_keys", 2) => v.entry::<bodies::from_keys>(),
+        ("maps", "keys", 1) => v.entry::<bodies::keys>(),
+        ("maps", "values", 1) => v.entry::<bodies::values>(),
+        ("maps", "merge", 2) => v.entry::<bodies::merge>(),
+        ("maps", "put", 3) => v.entry::<bodies::put>(),
+        ("maps", "remove", 2) => v.entry::<bodies::remove>(),
+        ("maps", "update", 3) => v.entry::<bodies::update>(),
+        ("maps", "take", 2) => v.entry::<bodies::take>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -360,3 +365,8 @@ fn take(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         None => Ok(Term::atom(atoms::ERROR)),
     }
 }
+
+crate::bif_bodies!(
+    map_size, map_get, is_map_key, find, get, is_key, from_list, from_keys, keys, values, merge,
+    put, remove, update, take,
+);

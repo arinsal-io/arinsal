@@ -1116,12 +1116,14 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
     // fragment calls this pointer directly, so the slice check has to be here
     // rather than only in `invoke_dispatch_bif`.
     if export.list_slice {
-        return Some(plain_bif_light as *const () as usize);
+        let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
+        return Some(own.map_or(plain_bif_light as *const () as usize, |e| e.list_slice));
     }
     // The kind is fixed when the export is created (`bif_table[].f`). The call
     // fragment branches to that pointer; it does not walk `invoke_dispatch_bif`.
     if export.light_bif.is_some() {
-        return Some(plain_bif_light as *const () as usize);
+        let own = crate::bif_table::entry(&export.module, &export.function, export.arity);
+        return Some(own.map_or(plain_bif_light as *const () as usize, |e| e.plain));
     }
     if export.light_process_bif.is_some() {
         return Some(process_bif_light as *const () as usize);
@@ -1205,13 +1207,13 @@ pub(crate) extern "C" fn yield_executor_bif(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
+    descriptor: u64,
     identity: u64,
 ) -> u64 {
     let Some((process, _)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = export_at(identity) else {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
     park_executor(process, export, identity)
@@ -1576,13 +1578,13 @@ pub(crate) extern "C" fn unique_integer_0_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    identity: u64,
+    descriptor: u64,
+    _identity: u64,
 ) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = export_at(identity) else {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
     unique_integer_n(process, registers, export, false, &[])
@@ -1593,13 +1595,13 @@ pub(crate) extern "C" fn unique_integer_1_light(
     header: *mut ProcessHeader,
     regs: *mut u64,
     _i: u64,
-    _entry: u64,
-    identity: u64,
+    descriptor: u64,
+    _identity: u64,
 ) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = export_at(identity) else {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
     let _ = regs;
@@ -1640,18 +1642,65 @@ pub(crate) extern "C" fn plain_bif_light(
     call_plain_bif(process, registers, export, bif, false)
 }
 
-/// A process BIF (`c_p` plus the register array), chosen when the export was created.
-pub(crate) extern "C" fn process_bif_light(
+/// `bif_table[].f` of one plain BIF: the body is this entry's own callee.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445 (`dynamic_runtime_call<3>(ARG8)`
+// calls `BIF(c_p, reg, I)` of that one BIF), OTP-29.1.1.
+pub(crate) extern "C" fn plain_bif_entry<B: arinsal_bifs::BifBody>(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
+    descriptor: u64,
+    _identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    call_plain_bif_body(process, registers, export, B::call, false)
+}
+
+/// `bif_table[].f` of one list BIF that traps on the reduction budget
+/// (`lists_member_2`, `keyfind`, ...).
+// Port of erts/emulator/beam/erl_bif_lists.c:1108,1302 (the BIF runs with
+// `ERTS_BIF_REDS_LEFT` and `BIF_TRAP`s through its export), OTP-29.1.1.
+pub(crate) extern "C" fn list_slice_bif_entry<B: arinsal_bifs::BifBody>(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
     identity: u64,
 ) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = export_at(identity) else {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    call_list_slice_bif(
+        process,
+        registers,
+        identity as usize,
+        export,
+        B::call,
+        false,
+    )
+    .unwrap_or(0)
+}
+
+/// A process BIF (`c_p` plus the register array), chosen when the export was created.
+pub(crate) extern "C" fn process_bif_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
     let Some(bif) = export.light_process_bif else {
@@ -1665,13 +1714,13 @@ pub(crate) extern "C" fn direct_bif_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
+    descriptor: u64,
     identity: u64,
 ) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = export_at(identity) else {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
     if let Some(raw) = call_direct_bif(process, registers, export, false) {
@@ -1689,13 +1738,13 @@ pub(crate) extern "C" fn trap_bif_light(
     header: *mut ProcessHeader,
     _regs: *mut u64,
     _i: u64,
-    _entry: u64,
+    descriptor: u64,
     identity: u64,
 ) -> u64 {
     let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
         return 0;
     };
-    let Some(export) = export_at(identity) else {
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
         return 0;
     };
     let Some(entry) = export.light_trap_bif else {
@@ -2231,7 +2280,7 @@ fn call_list_slice_bif(
     registers: &mut arinsal_beamasm::SchedulerRegisters,
     identity: usize,
     export: ExportDispatch,
-    bif: arinsal_bifs::BifFn,
+    bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> Result<Term, arinsal_bifs::BifError>,
     export_call: bool,
 ) -> Option<u64> {
     process.reductions = process.header.fcalls;
@@ -2299,6 +2348,18 @@ fn call_plain_bif(
     if let Some(raw) = fast_scheduler_bif(process, registers, export, export_call) {
         return raw;
     }
+    call_plain_bif_body(process, registers, export, bif, export_call)
+}
+
+/// [`call_plain_bif`] once the BIF is known not to be a scheduler counter.
+#[inline(always)]
+fn call_plain_bif_body(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    bif: impl Fn(&mut arinsal_bifs::Ctx<'_>, &[Term]) -> Result<Term, arinsal_bifs::BifError>,
+    export_call: bool,
+) -> u64 {
     process.reductions = process.header.fcalls;
     if export_call {
         charge_bif_reductions(process, 1);

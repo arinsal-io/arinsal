@@ -11,7 +11,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use crate::pure::{Heap, bigint, integer};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
 const BADARG: BifError = BifError::BADARG;
 const SIGNED_OPTION: u64 = 1;
@@ -39,21 +39,26 @@ impl Drop for Array {
     }
 }
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
     let function = match (module, name, arity) {
-        ("erts_internal", "atomics_new", 2) => atomics_new,
-        ("atomics", "get", 2) => atomics_get,
-        ("atomics", "put", 3) => atomics_put,
-        ("atomics", "add", 3) => atomics_add,
-        ("atomics", "add_get", 3) => atomics_add_get,
-        ("atomics", "exchange", 3) => atomics_exchange,
-        ("atomics", "compare_exchange", 4) => atomics_compare_exchange,
-        ("atomics", "info", 1) => atomics_info,
-        ("erts_internal", "counters_new", 1) => counters_new,
-        ("erts_internal", "counters_get", 2) => counters_get,
-        ("erts_internal", "counters_add", 3) => counters_add,
-        ("erts_internal", "counters_put", 3) => counters_put,
-        ("erts_internal", "counters_info", 1) => counters_info,
+        ("erts_internal", "atomics_new", 2) => v.entry::<bodies::atomics_new>(),
+        ("atomics", "get", 2) => v.entry::<bodies::atomics_get>(),
+        ("atomics", "put", 3) => v.entry::<bodies::atomics_put>(),
+        ("atomics", "add", 3) => v.entry::<bodies::atomics_add>(),
+        ("atomics", "add_get", 3) => v.entry::<bodies::atomics_add_get>(),
+        ("atomics", "exchange", 3) => v.entry::<bodies::atomics_exchange>(),
+        ("atomics", "compare_exchange", 4) => v.entry::<bodies::atomics_compare_exchange>(),
+        ("atomics", "info", 1) => v.entry::<bodies::atomics_info>(),
+        ("erts_internal", "counters_new", 1) => v.entry::<bodies::counters_new>(),
+        ("erts_internal", "counters_get", 2) => v.entry::<bodies::counters_get>(),
+        ("erts_internal", "counters_add", 3) => v.entry::<bodies::counters_add>(),
+        ("erts_internal", "counters_put", 3) => v.entry::<bodies::counters_put>(),
+        ("erts_internal", "counters_info", 1) => v.entry::<bodies::counters_info>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| function)
@@ -410,3 +415,19 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }
+
+crate::bif_bodies!(
+    atomics_new,
+    atomics_get,
+    atomics_put,
+    atomics_add,
+    atomics_add_get,
+    atomics_exchange,
+    atomics_compare_exchange,
+    atomics_info,
+    counters_new,
+    counters_get,
+    counters_add,
+    counters_put,
+    counters_info,
+);
