@@ -1952,7 +1952,7 @@ impl Vm {
         let mut module_generation = self.code_generation();
         let mut handle_module = module_id;
         loop {
-            if p.gc_enabled && p.gc_deferred {
+            if p.heap.gc_enabled && p.gc_deferred {
                 sync_cursor(p, htop, &mut heap_dirty);
                 p.service_deferred_gc()?;
                 (htop, stop) = p.heap.heap_cursor();

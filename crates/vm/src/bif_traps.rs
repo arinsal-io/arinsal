@@ -1130,7 +1130,7 @@ pub(crate) fn execute_named(
     mut args: [Term; 3],
     ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
 ) -> Option<Result<TrapResult, VmError>> {
-    let gc_enabled_on_entry = process.gc_enabled;
+    let gc_enabled_on_entry = process.heap.gc_enabled;
     let pending_site = process
         .cold
         .as_ref()
@@ -1388,7 +1388,7 @@ pub(crate) fn call_light(
     callee: (arinsal_term::Atom, arinsal_term::Atom),
     args: &[Term],
 ) -> LightTrap {
-    let gc_was_enabled = process.gc_enabled;
+    let gc_was_enabled = process.heap.gc_enabled;
     if entry.reserves_heap() {
         process.set_gc_enabled(false);
     }
@@ -1448,7 +1448,7 @@ pub(crate) fn install_deferred_trap(
     reductions_charged: (u32, u32),
 ) {
     let (slice_reductions, all_reductions) = reductions_charged;
-    let gc_was_enabled = process.gc_enabled;
+    let gc_was_enabled = process.heap.gc_enabled;
     let (continuation, state, reductions) = match *trap {
         arinsal_bifs::DeferredTrap::Key(cont) => (
             key_continuation(function),

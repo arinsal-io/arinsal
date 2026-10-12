@@ -1412,16 +1412,14 @@ fn allocating_bif(
     // scheduler file `enter_runtime` already resolved.
     let _ = regs;
     let arg = registers.x_reg_array[0];
-    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let entry_top = process.heap.heap_top_index();
     let result = {
         let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
         body(&mut fragment, arg)
     };
     let top = process.heap.heap_top_index();
-    if let Ok(value) = &result
-        && stop - top >= process.heap.mbuf_size()
-        && !process.heap.bin_vheap_gc_due()
-    {
+    // The light fragment tests the collection after this call (instr_bif.cpp:488-523).
+    if let Ok(value) = &result {
         let value = *value;
         registers.x_reg_array[0] = value;
         if top != entry_top {
@@ -1874,9 +1872,11 @@ fn try_light_monitor(
         charge_bif_reductions(process, 1);
     }
     let top = process.heap.heap_top_index();
+    // The light fragment tests the collection after its call (instr_bif.cpp:488-523); the
+    // export trampoline has no such test and checks it here.
     if let Ok(value) = &result
-        && stop - top >= process.heap.mbuf_size()
-        && !process.heap.bin_vheap_gc_due()
+        && (!export_call
+            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
@@ -2109,7 +2109,8 @@ fn call_direct_bif(
     }
     process.x[0] = value;
     let mut raw = crate::native_hooks::raw(value);
-    if process.heap.gc_desired() || process.heap.bin_vheap_gc_due() {
+    // The light fragment tests the collection after this call (instr_bif.cpp:488-523).
+    if export_call && (process.heap.gc_desired() || process.heap.bin_vheap_gc_due()) {
         if process.collect_bin_vheap_if_due(1).is_err() {
             crate::native_hooks::set_error(process, "system_limit");
             publish_dispatch_x(process, registers);
@@ -2244,8 +2245,8 @@ fn finish_counter_bif(
     // ERTS_IS_GC_DESIRED_INTERNAL: a value with no collection desired goes straight
     // back to XREG0. The check is the one `call_light_bif_shared` does after the BIF.
     if let Ok(value) = &result
-        && stop - top >= process.heap.mbuf_size()
-        && !process.heap.bin_vheap_gc_due()
+        && (!export_call
+            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
@@ -2314,8 +2315,8 @@ fn call_list_slice_bif(
     charge_bif_reductions(process, reductions);
     let top = process.heap.heap_top_index();
     if let Ok(value) = &result
-        && stop - top >= process.heap.mbuf_size()
-        && !process.heap.bin_vheap_gc_due()
+        && (!export_call
+            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
@@ -2371,11 +2372,12 @@ fn call_plain_bif_body(
     let reductions = ctx.reductions();
     charge_bif_reductions(process, reductions);
     let top = process.heap.heap_top_index();
-    // ERTS_IS_GC_DESIRED_INTERNAL: a value with no collection desired goes straight back to
-    // XREG0, and only the cursors the call changed are stored for the reload.
+    // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back to XREG0, and the native
+    // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). Only the
+    // export trampoline, which has no such test, checks it here.
     if let Ok(value) = &result
-        && stop - top >= process.heap.mbuf_size()
-        && !process.heap.bin_vheap_gc_due()
+        && (!export_call
+            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
@@ -2452,9 +2454,10 @@ fn call_process_bif(
         });
     }
     let top = process.heap.heap_top_index();
+    // The light fragment tests the collection after its call (instr_bif.cpp:488-523).
     if let Ok(value) = &result
-        && stop - top >= process.heap.mbuf_size()
-        && !process.heap.bin_vheap_gc_due()
+        && (!export_call
+            || (stop - top >= process.heap.mbuf_size() && !process.heap.bin_vheap_gc_due()))
     {
         let value = *value;
         registers.x_reg_array[0] = value;
@@ -2483,7 +2486,7 @@ fn process_bif_result(
     arity: usize,
     mut result: Result<Term, crate::exceptions::Trap>,
 ) -> u64 {
-    let collected = process.gc_enabled && process.heap.gc_desired();
+    let collected = process.heap.gc_enabled && process.heap.gc_desired();
     if collected {
         process
             .heap
@@ -2571,7 +2574,7 @@ fn plain_bif_result(
     arity: usize,
     mut result: Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
-    let collected = process.gc_enabled && process.heap.gc_desired();
+    let collected = process.heap.gc_enabled && process.heap.gc_desired();
     if collected && !gc_after_plain_bif(process, registers, arity, &mut result) {
         return 0;
     }
@@ -2593,6 +2596,44 @@ fn plain_bif_result(
         }
         Err(error) => plain_bif_error(process, export, &registers.x_reg_array[..arity], error),
     }
+}
+
+/// The light-BIF fragment's collection, run when its inline GC-desired test fails.
+/// `value` is the BIF's result term; `descriptor` is the export's `Export.info`.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:549-570 (gc_after_bif_call) and
+// erl_gc.c:418-478 (erts_gc_after_bif_call_lhf), OTP-29.1.1: the result is the only root
+// and the collection keeps the BIF's arguments live.
+#[cold]
+#[inline(never)]
+pub(crate) extern "C" fn arinsal_beamasm_light_bif_gc(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    value: u64,
+    descriptor: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    // The BIF's charge is in FCALLS; the sync below writes `reductions` back to it.
+    process.reductions = process.header.fcalls;
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    // erl_gc.c:428-445 (erts_gc_after_bif_call_lhf): with F_DISABLE_GC the result is returned
+    // without a collection.
+    if !process.heap.gc_enabled {
+        registers.x_reg_array[0] = crate::native_hooks::from_raw(value);
+        process.sync_native_cursors();
+        return value;
+    }
+    let arity = usize::from(export.arity);
+    plain_bif_result(
+        process,
+        registers,
+        export,
+        arity,
+        Ok(crate::native_hooks::from_raw(value)),
+    )
 }
 
 /// Collects after a BIF whose heap fragments outgrew the free heap; false when the

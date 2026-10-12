@@ -660,7 +660,7 @@ fn message_on_receiver_heap(
     } = counted;
     if words == 0
         || receiver.message_queue_data() != MessageQueueData::OnHeap
-        || !receiver.gc_enabled
+        || !receiver.heap.gc_enabled
         || receiver.heap.is_detached()
     {
         return Ok(None);
@@ -3616,7 +3616,7 @@ fn hibernate_collect(process: &mut Process, pid: Pid) -> Result<(), VmError> {
         3
     };
     process.gc_live = live;
-    if !process.gc_enabled {
+    if !process.heap.gc_enabled {
         return Ok(());
     }
     process.garbage_collect_hibernate(live).map(|_| ())
@@ -5552,7 +5552,7 @@ impl Process {
     /// scheduling point even when the process waits.
     // Port of erts/emulator/beam/erl_process.c:11823-11935 (erts_set_gc_state), OTP-29.1.1.
     pub(crate) fn delayed_gc_due(&self) -> bool {
-        self.gc_enabled
+        self.heap.gc_enabled
             && self
                 .cold
                 .as_ref()
@@ -5954,7 +5954,7 @@ impl Process {
                 return Err(VmError::Unsupported("process aliases".into()));
             }
             arinsal_sched::Signal::GarbageCollect => {
-                if self.gc_enabled {
+                if self.heap.gc_enabled {
                     self.force_gc()?;
                 } else {
                     self.cold_mut()
@@ -5969,7 +5969,7 @@ impl Process {
                 how,
                 requester,
             } => {
-                if !self.gc_enabled && how != arinsal_sched::LiteralCopyHow::Init {
+                if !self.heap.gc_enabled && how != arinsal_sched::LiteralCopyHow::Init {
                     self.cold_mut()
                         .delayed_gc
                         .push(crate::proc_create::DelayedGc::Literal {
@@ -6061,8 +6061,8 @@ impl Process {
     /// Set this process's `F_DISABLE_GC` equivalent and return its previous state.
     /// Port of erts/emulator/beam/erl_process.c:11823 (`erts_set_gc_state`), OTP-29.1.1.
     pub(crate) fn set_gc_enabled(&mut self, enabled: bool) -> bool {
-        let previous = self.gc_enabled;
-        self.gc_enabled = enabled;
+        let previous = self.heap.gc_enabled;
+        self.heap.gc_enabled = enabled;
         previous
     }
 
@@ -6073,7 +6073,7 @@ impl Process {
     pub(crate) fn gc_after_bif(&mut self, result: Term) -> Result<Term, VmError> {
         // ERTS_IS_GC_AFTER_BIF_DESIRED: heap fragments or a virtual binary heap over its size;
         // `F_DISABLE_GC` returns before any collection (erl_gc.c:403-415).
-        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.gc_enabled {
+        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.heap.gc_enabled {
             return Ok(result);
         }
         let mut roots = [result];
@@ -6097,7 +6097,7 @@ impl Process {
     /// Force collection with the current BEAM live-register count.
     // Port of erts/emulator/beam/erl_gc.c:1136 (`erts_garbage_collect_literals`), OTP-29.1.1.
     pub(crate) fn force_gc_live(&mut self, live: usize) -> Result<(), VmError> {
-        if !self.gc_enabled {
+        if !self.heap.gc_enabled {
             self.gc_deferred = true;
             return Ok(());
         }
@@ -6108,7 +6108,7 @@ impl Process {
     }
 
     pub(crate) fn service_deferred_gc(&mut self) -> Result<(), VmError> {
-        if self.gc_enabled && std::mem::take(&mut self.gc_deferred) {
+        if self.heap.gc_enabled && std::mem::take(&mut self.gc_deferred) {
             let live = self.gc_live;
             let stats = self.collect_heap_roots(live, &mut [], 0)?;
             // Port of erts/emulator/beam/erl_gc.c:922-932 (`garbage_collect` updates
@@ -6581,7 +6581,7 @@ impl Process {
     /// in X0 needs `live_x >= 1`.
     // Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED), OTP-29.1.1.
     pub(crate) fn collect_bin_vheap_if_due(&mut self, live_x: usize) -> Result<(), VmError> {
-        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.gc_enabled {
+        if !(self.heap.gc_desired() || self.heap.bin_vheap_gc_due()) || !self.heap.gc_enabled {
             return Ok(());
         }
         let live_x = live_x.min(self.x.len());
@@ -7297,7 +7297,7 @@ impl Process {
         // Port of erts/emulator/beam/erl_process.c:6747-6763 (schedule_out_process), OTP-29.1.1:
         // with GC disabled the dirty collection is dropped; the next collection does it.
         if !ctx.scheduler_type().is_dirty()
-            && !self.gc_enabled
+            && !self.heap.gc_enabled
             && let Some(cold) = self.cold.as_mut()
             && cold.dirty_gc.take().is_some()
             && cold.delayed_gc.is_empty()

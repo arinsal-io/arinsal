@@ -3046,7 +3046,7 @@ fn run_request(
 ) -> Result<(), VmError> {
     // Port of erts/emulator/beam/erl_process.c:10831 (save_gc_task), OTP-29.1.1:
     // a garbage_collect request waits (reply included) until GC is enabled again.
-    if !process.gc_enabled && matches!(pending.op, RemoteOp::Collect { .. }) {
+    if !process.heap.gc_enabled && matches!(pending.op, RemoteOp::Collect { .. }) {
         process
             .cold_mut()
             .delayed_gc

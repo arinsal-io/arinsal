@@ -91,7 +91,7 @@ pub(super) fn gc_after_bif(
     arguments: &mut [Term],
     result: &mut Result<Term, arinsal_bifs::BifError>,
 ) -> Result<(), VmError> {
-    if !process.gc_enabled || !process.heap.gc_desired() {
+    if !process.heap.gc_enabled || !process.heap.gc_desired() {
         return Ok(());
     }
     // Port of erl_gc.c:418-478 (`erts_gc_after_bif_call_lhf`), OTP-29.1.1:
@@ -191,7 +191,7 @@ pub(crate) fn gc_after_native_parts(
     value: Option<&mut Term>,
     raised: Option<&mut crate::exceptions::Trap>,
 ) -> Result<(), VmError> {
-    if !process.gc_enabled || !process.heap.gc_desired() {
+    if !process.heap.gc_enabled || !process.heap.gc_desired() {
         return Ok(());
     }
     if let Some(value) = value {

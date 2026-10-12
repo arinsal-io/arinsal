@@ -422,6 +422,9 @@ fn fragments() -> Option<&'static DispatchFragments> {
                         as usize,
                     light_bif: crate::native_helpers::arinsal_beamasm_call_light_bif_shared
                         as *const () as usize,
+                    light_bif_gc: crate::native_helpers::arinsal_beamasm_light_bif_gc as *const ()
+                        as usize,
+                    light_gc: light_gc_offsets(),
                     exception_resolver: crate::native_helpers::arinsal_beamasm_exception_resolver
                         as *const () as usize,
                     save_calls_export: crate::native_helpers::arinsal_beamasm_save_calls_export
@@ -2146,6 +2149,20 @@ pub(crate) fn print_stats() {
         NATIVE_YIELDS.load(Ordering::Relaxed),
         CALL_UNPORTED.load(Ordering::Relaxed)
     );
+}
+
+/// Offsets from `c_p` of the process fields the light-BIF fragment's collection test reads.
+// Port of erts/emulator/beam/erl_gc.h:132-139 (ERTS_IS_GC_DESIRED) and
+// erts/emulator/beam/jit/arm/instr_bif.cpp:488-523, OTP-29.1.1: the native code reads
+// `mbuf_sz`, `bin_vheap_sz`, `off_heap.overhead` and `F_DISABLE_GC` from the process itself.
+fn light_gc_offsets() -> arinsal_beamasm::dispatch::LightGcOffsets {
+    let heap = std::mem::offset_of!(crate::Process, heap);
+    arinsal_beamasm::dispatch::LightGcOffsets {
+        fragment_words: (heap + arinsal_term::ProcessHeap::FRAGMENT_WORDS_OFFSET) as u32,
+        bin_vheap: (heap + arinsal_term::ProcessHeap::BIN_VHEAP_OFFSET) as u32,
+        bin_vheap_size: (heap + arinsal_term::ProcessHeap::BIN_VHEAP_SIZE_OFFSET) as u32,
+        gc_enabled: (heap + arinsal_term::ProcessHeap::GC_ENABLED_OFFSET) as u32,
+    }
 }
 
 #[cfg(test)]
