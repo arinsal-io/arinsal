@@ -28,8 +28,8 @@ ensure_code_server() ->
         _ -> ok
     end.
 run() ->
-    ensure_code_server(),
     code:ensure_loaded(mix_loop5_eh),
+    ensure_code_server(),
     Old = erlang:process_flag(error_handler, mix_loop5_eh),
     {Old, missing_mod:nope(7)}.
 unloaded() ->

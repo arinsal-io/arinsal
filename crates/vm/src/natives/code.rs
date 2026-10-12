@@ -568,15 +568,12 @@ fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmErro
     // Port of erts/emulator/beam/beam_bif_load.c:150 (prepare_loading_2) and
     // beam_load.c (erts_prepare_loading), OTP-29.1.1: the code is loaded here, so
     // a malformed module is `{error, badfile}` before finish_loading.
-    let Ok(mut module) = arinsal_loader::load_with_instrumentations(
-        &beam,
-        vm.coverage_mode(),
-        crate::trace_bp::line_breakpoints_instrumented(),
-    ) else {
+    // Static NIF bodies and import classes are bound here, like erts' loader does for the
+    // static NIF table (erl_nif.c erts_load_static_nif at load_nif time).
+    let Ok(module) = vm.prepare_module(&beam, Some(&bytes)) else {
         let error = make_tuple(process, &[atom("error"), atom("badfile")])?;
         return Ok(error);
     };
-    crate::funs::set_module_uniq(&mut module, &bytes).map_err(|_| badarg())?;
     let prepared = Prepared {
         has_on_load: has_on_load_opcode(&beam),
         beam: Mutex::new(Some(beam)),
@@ -680,18 +677,10 @@ fn finish_stage(
         let staged = prepared.module.lock().unwrap().take();
         let module = match staged {
             Some(module) => module,
-            None => {
-                let mut module = match arinsal_loader::load_with_instrumentations(
-                    beam,
-                    vm.coverage_mode(),
-                    crate::trace_bp::line_breakpoints_instrumented(),
-                ) {
-                    Ok(module) => module,
-                    Err(_) => return make_tuple(process, &[atom("error"), atom("badfile")]),
-                };
-                crate::funs::set_module_uniq(&mut module, &bytes).map_err(|_| badarg())?;
-                module
-            }
+            None => match vm.prepare_module(beam, Some(&bytes)) {
+                Ok(module) => module,
+                Err(_) => return make_tuple(process, &[atom("error"), atom("badfile")]),
+            },
         };
         let registers = crate::process::register_requirements(beam);
         let meta = CodeMeta::from_beam(beam, Some(&bytes));

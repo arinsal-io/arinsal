@@ -181,18 +181,6 @@ impl CodeIndexes {
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    /// Whether an ended staging area is still waiting for the code-barrier commit.
-    ///
-    /// The commit is a thread-progress later operation on the scheduler that ended
-    /// staging (`beam_bif_load.c` `commit_code_ix`). arinsal loads some modules inline on the
-    /// scheduler thread (erts goes through the code server process), and waiting in `seize`
-    /// on the very thread whose later operation commits would never return to that aux
-    /// work, so such a process yields first and lets the operation run between processes.
-    pub(crate) fn commit_pending(&self) -> bool {
-        let permission = self.lock_permission();
-        permission.ended.is_some() && permission.owner != Some(std::thread::current().id())
-    }
-
     /// Takes the staging tables for this thread, waiting while another thread holds them.
     /// While an ended staging area waits for its commit only callers that change code in
     /// place (`join_ended`) get them: a new staging area waits for that commit, which the
@@ -223,12 +211,23 @@ impl CodeIndexes {
                     // before re-entering it.
                     // Port of erts/emulator/beam/erl_thr_progress.c:884-913
                     // (erts_thr_progress_prepare_wait / finalize_wait), OTP-29.1.1.
+                    // The wait deactivates this thread first, which can park it for a thread
+                    // that blocks progress: the permission lock must not be held across that,
+                    // so the wait relocks and rechecks the state under the lock.
+                    drop(permission);
                     arinsal_sched::thread_progress_wait(|| {
-                        drop(
-                            self.released
-                                .wait(permission)
-                                .unwrap_or_else(|error| error.into_inner()),
-                        );
+                        let guard = self.lock_permission();
+                        let free = match guard.owner {
+                            Some(owner) => owner == me,
+                            None => join_ended || guard.ended.is_none(),
+                        };
+                        if !free {
+                            drop(
+                                self.released
+                                    .wait(guard)
+                                    .unwrap_or_else(|error| error.into_inner()),
+                            );
+                        }
                     });
                     permission = self.lock_permission();
                 }
