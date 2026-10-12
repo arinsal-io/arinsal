@@ -18,6 +18,8 @@ pub mod psflg {
     const fn bit(n: u32) -> u32 {
         1 << (ZERO_BIT_OFFSET + n)
     }
+    /// `ERTS_PSFLG_FREE`.
+    pub const FREE: u32 = bit(4);
     /// `ERTS_PSFLG_EXITING`.
     pub const EXITING: u32 = bit(5);
     /// `ERTS_PSFLG_MSG_SIG_IN_Q`: message signals in the outer signal queue.
@@ -146,9 +148,12 @@ impl<T> Incoming<T> {
 impl<T: InSignal> Incoming<T> {
     /// Account `count` enqueued signals, `nmsgs` of them non-message signals, and set the
     /// matching in-queue state bits.
-    // Port of erts/emulator/beam/erl_proc_sig_queue.c:911-935 (enqueue_signals set_flags),
-    // OTP-29.1.1.
-    fn enqueued(&self, count: usize, nmsgs: usize) {
+    /// Returns the state word with the in-queue bits set. The one read-modify-write both sets
+    /// the bits and tells the sender whether the receiver was active, so the wake decision
+    /// needs no further load of the word.
+    // Port of erts/emulator/beam/erl_proc_sig_queue.c:911-935 and erl_proc_sig_queue.h:2080
+    // (erts_proc_notify_new_message works from the state returned by the bor), OTP-29.1.1.
+    fn enqueued(&self, count: usize, nmsgs: usize) -> u32 {
         if nmsgs != 0 {
             self.nmsgs.fetch_add(nmsgs, Ordering::Relaxed);
         }
@@ -159,10 +164,11 @@ impl<T: InSignal> Incoming<T> {
         if nmsgs != 0 {
             set |= psflg::NMSG_SIG_IN_Q;
         }
-        // `erts_atomic32_read_bor_nob`.
-        if self.state.load(Ordering::Relaxed) & set != set {
-            self.state.fetch_or(set, Ordering::Relaxed);
-        }
+        // `erts_atomic32_read_bor_nob`. Every change of the word is a read-modify-write, so
+        // this one and the receiver's transition to WAITING are totally ordered: either the
+        // returned word is not active and the sender wakes the receiver, or the receiver's
+        // transition returns the bit set here (the wake protocol in lib.rs).
+        self.state.fetch_or(set, Ordering::Relaxed) | set
     }
 
     /// Account signals taken from the queue and leave the in-queue bits of what is still
@@ -185,7 +191,9 @@ impl<T: InSignal> Incoming<T> {
         }
         let clear = psflg::SIG_IN_Q & !keep;
         // `erts_atomic32_read_band_nob`.
-        if self.state.load(Ordering::Relaxed) & clear != 0 {
+        // No read first: the word was just written by a sender, so a load would cost a second
+        // coherence transfer before the read-modify-write.
+        if clear != 0 {
             self.state.fetch_and(!clear, Ordering::Relaxed);
         }
     }
@@ -228,9 +236,9 @@ impl<T: InSignal> Incoming<T> {
     // and :712 (enqueue_signals), OTP-29.1.1. The sender's buffer slot is hashed only when
     // buffers are installed (erl_proc_sig_queue.c:10271-10288).
     /// Fails, giving the signal back, once the receiver closed its queue.
-    pub fn push_routed(&self, slot: impl FnOnce() -> usize, value: T) -> Result<(), T> {
+    pub fn push_routed(&self, slot: impl FnOnce() -> usize, value: T) -> Result<u32, T> {
         let value = match self.try_push_buffer(slot, value) {
-            Ok(()) => return Ok(()),
+            Ok(state) => return Ok(state),
             Err(value) => value,
         };
         let (mut queue, contended) = self.lock_msgq();
@@ -240,13 +248,13 @@ impl<T: InSignal> Incoming<T> {
         let nmsg = usize::from(!value.is_message());
         queue.push_back(value);
         self.pending.fetch_add(1, Ordering::SeqCst);
-        self.enqueued(1, nmsg);
+        let state = self.enqueued(1, nmsg);
         drop(queue);
         self.note_contention(contended);
-        Ok(())
+        Ok(state)
     }
 
-    fn try_push_buffer(&self, slot: impl FnOnce() -> usize, value: T) -> Result<(), T> {
+    fn try_push_buffer(&self, slot: impl FnOnce() -> usize, value: T) -> Result<u32, T> {
         if !self.buffers_enabled.load(Ordering::Acquire) {
             return Err(value);
         }
@@ -261,9 +269,9 @@ impl<T: InSignal> Incoming<T> {
         let nmsg = usize::from(!value.is_message());
         buffer.queue.push_back(value);
         self.pending.fetch_add(1, Ordering::SeqCst);
-        self.enqueued(1, nmsg);
+        let state = self.enqueued(1, nmsg);
         self.buffer_enqueues.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        Ok(state)
     }
 
     /// Enable the per sender buffers, or flush and disable them.
