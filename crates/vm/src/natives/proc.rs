@@ -1548,15 +1548,14 @@ pub(crate) fn fulfill_request(
                 Some(message) => Some(message.decode_into(process)?),
                 None => None,
             };
-            // Port of erts/emulator/beam/erl_process.c:9305 (erts_process_state2status), OTP-29.1.1:
-            // a process executing a dirty job is running, and so is one handling its signals
-            // on a dirty scheduler (ERTS_PSFLG_DIRTY_RUNNING_SYS).
-            let status = atom(if ctx.dirty_running() || ctx.scheduler_type().is_dirty() {
-                "running"
-            } else if crate::signals::is_waiting(process, ctx.pid()) {
+            // Port of erts/emulator/beam/erl_bif_info.c:1660-1685 (ERTS_PI_IX_STATUS) with
+            // erl_process.c:9305 (erts_process_state2status), OTP-29.1.1. The handler is the
+            // target itself, executing: RUNNING, RUNNING_SYS, DIRTY_RUNNING and
+            // DIRTY_RUNNING_SYS are all `running`, and only a parked process is `waiting`.
+            let status = atom(if crate::signals::is_waiting(process, ctx.pid()) {
                 "waiting"
             } else {
-                "runnable"
+                "running"
             });
             let info = process_info(None, process, ctx, item, status, false)?;
             make_tuple(process, &[reference, info])
