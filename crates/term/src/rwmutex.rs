@@ -80,6 +80,11 @@ impl<T> FrequentReadRwLock<T> {
         }
     }
 
+    /// Access the value exclusively borrowed through the lock itself.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
     /// Shared lock. Port of `rwmutex_freqread_rlock` (try path, then wait).
     pub fn read(&self) -> FrequentReadGuard<'_, T> {
         let index = reader_index();

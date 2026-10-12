@@ -76,7 +76,9 @@ pub(super) struct PamState {
 impl PamState {
     pub fn new() -> Self {
         Self {
-            heap: VecHeap::new(),
+            // Port of erl_db_util.c:431-455 (ERTS_DEFAULT_MS_HEAP_SIZE and
+            // match-pseudo-process cleanup), OTP-29.1.1.
+            heap: VecHeap::with_initial_chunk_words(128),
             esp: Vec::new(),
             sp: Vec::new(),
             variables: Vec::new(),

@@ -8,9 +8,10 @@ use catree::CATree;
 use tree::Node;
 
 use arinsal_term::{
-    Atom, ExportEntry, ExternalBinary, FunEntry, HeapAlloc, Identity, MagicRef, Node as TermNode,
-    Term, TermBuilder, TermError, TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq,
-    global_atoms, internal_hash, term_sequence,
+    Atom, ExportEntry, ExternalBinary, FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard,
+    FunEntry, HeapAlloc, Identity, MagicRef, Node as TermNode, Term, TermBuilder, TermError,
+    TermKind, VecHeap, WritableBinary, cmp, copy_term, exact_eq, global_atoms, internal_hash,
+    term_sequence,
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
@@ -1012,21 +1013,8 @@ impl StoredTerm {
         keypos: usize,
         prefix_words: usize,
     ) -> Result<Self, EtsError> {
-        if !compressed && let Some(pair) = Self::immediate_pair(term) {
-            let db_size_words = Self::accounted_words(term, keypos, false, prefix_words, 0);
-            return Ok(Self {
-                heap: ObjectHeap::new(),
-                term: Term::small(0).unwrap(),
-                inline_pair: Some(pair),
-                compressed_elements: Vec::new(),
-                compressed_magic_refs: Vec::new(),
-                compressed_bytes: 0,
-                db_size_words,
-                order: 0,
-                group_order: 0,
-                hvalue: 0,
-            });
-        }
+        // Port of erts/emulator/beam/erl_db_util.c:3559-3618 (db_store_term), OTP-29.1.1:
+        // even immediate two-element objects have a table-owned tuple in their DbTerm.
         Self::copy_heap_for_table(term, compressed, keypos, prefix_words)
     }
 
@@ -1622,7 +1610,7 @@ mod _obsolete_ordered_treap {
 
         fn select_range<H: HeapAlloc>(
             root: &Option<Box<Self>>,
-            state: &mut RangeSelection<'_, H>,
+            state: &mut RangeSelection<'_, '_, H>,
         ) -> Result<(), EtsError> {
             let Some(node) = root else {
                 return Ok(());
@@ -1648,13 +1636,11 @@ mod _obsolete_ordered_treap {
             if state.out.len() >= state.limit {
                 return Ok(());
             }
-            if !below
-                && !above
-                && let Some(result) = state
-                    .program
-                    .run(node.object.copy_out(state.dst)?, state.dst)?
-            {
-                state.out.push(result);
+            if !below && !above {
+                let term = node.object.term_for_filter(state.dst)?;
+                if let Some(result) = state.runner.run(term, state.dst)? {
+                    state.out.push(result);
+                }
             }
             if state.out.len() >= state.limit {
                 return Ok(());
@@ -1775,55 +1761,14 @@ mod _obsolete_hashmap_store {
     }
 }
 
-pub(crate) struct RangeSelection<'a, H: HeapAlloc> {
+pub(crate) struct RangeSelection<'a, 'program, H: HeapAlloc> {
     pub(crate) keypos: usize,
     pub(crate) bounds: match_spec::KeyBounds,
-    pub(crate) program: &'a match_spec::MatchProgram,
+    pub(crate) runner: &'a mut match_spec::MatchRunner<'program>,
     pub(crate) reverse: bool,
     pub(crate) limit: usize,
     pub(crate) dst: &'a mut H,
     pub(crate) out: Vec<Term>,
-}
-
-enum Matched<'a> {
-    Borrowed(&'a StoredTerm),
-    Owned(StoredTerm),
-}
-
-impl Matched<'_> {
-    fn tuple_len(&self) -> Option<usize> {
-        let object = match self {
-            Self::Borrowed(object) => object,
-            Self::Owned(object) => object,
-        };
-        if object.inline_pair.is_some() {
-            return Some(2);
-        }
-        term_sequence(object.term).map(|tuple| tuple.len())
-    }
-
-    fn copy_element_out<H: HeapAlloc>(&self, index: usize, dst: &mut H) -> Result<Term, EtsError> {
-        match self {
-            Self::Borrowed(object) => object.copy_element_out(index, dst),
-            Self::Owned(object) => object.copy_element_out(index, dst),
-        }
-    }
-
-    /// The object as a term that outlives this handle: a borrowed table object stays in
-    /// the table, an owned snapshot (CA-tree) is copied into `dst`.
-    fn term_outliving<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
-        match self {
-            Self::Borrowed(object) => object.term_for_filter(dst),
-            Self::Owned(object) => object.copy_out(dst),
-        }
-    }
-
-    fn term_for_filter<H: HeapAlloc>(&self, dst: &mut H) -> Result<Term, EtsError> {
-        match self {
-            Self::Borrowed(object) => object.term_for_filter(dst),
-            Self::Owned(object) => object.term_for_filter(dst),
-        }
-    }
 }
 
 struct ConstantRangeSelection<'a, H: HeapAlloc> {
@@ -1917,7 +1862,11 @@ impl Table {
                 Storage::CATree(CATree::new(options.keypos))
             }
         } else {
-            Storage::Hash(HashStorage::new(options.write_concurrency))
+            Storage::Hash(HashStorage::new(
+                options.write_concurrency,
+                options.decentralized_counters,
+                options.read_concurrency,
+            ))
         };
         let heir_data = options
             .heir
@@ -1946,9 +1895,9 @@ impl Table {
         match &self.storage {
             Storage::Ordered(root) => Node::count(root),
             Storage::CATree(tree) => tree.count(),
-            Storage::Hash(storage) => {
-                (storage.size as isize).wrapping_add(storage.size_bias) as usize
-            }
+            Storage::Hash(storage) => (storage.size() as isize)
+                .wrapping_add(storage.size_bias.load(AtomicOrdering::Relaxed))
+                as usize,
         }
     }
 
@@ -2080,10 +2029,11 @@ impl Table {
                     WriteConcurrency::Auto => storage.lock_count(),
                     WriteConcurrency::Fixed(count) => count,
                 };
-                let allocated_slots = storage.nslots.max(if lock_count > storage.nslots {
-                    storage.nslots + (lock_count - storage.nslots).div_ceil(2048) * 2048
+                let nslots = storage.nslots.load(AtomicOrdering::Relaxed);
+                let allocated_slots = nslots.max(if lock_count > nslots {
+                    nslots + (lock_count - nslots).div_ceil(2048) * 2048
                 } else {
-                    storage.nslots
+                    nslots
                 });
                 let extra_slots = allocated_slots.saturating_sub(256);
                 let ext_segments = extra_slots.div_ceil(2048);
@@ -2129,16 +2079,20 @@ impl Table {
                 } else {
                     0
                 };
-                312 + extra_slots
-                    + ext_table
-                    + fine_locks
-                    + read_lock
-                    + decentralized
-                    + storage
-                        .values()
-                        .chain(&storage.deleted)
-                        .map(|object| object.db_size_words)
-                        .sum::<usize>()
+                312 + extra_slots + ext_table + fine_locks + read_lock + decentralized + {
+                    let mut object_words = 0;
+                    storage.for_each_value(|object| {
+                        object_words += object.db_size_words;
+                    });
+                    object_words
+                        + storage
+                            .deleted
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .map(|object| object.db_size_words)
+                            .sum::<usize>()
+                }
             }
         }
     }
@@ -2164,6 +2118,12 @@ impl Table {
         let atom = |name: &str| -> Term { Term::atom(global_atoms().intern(name).unwrap()) };
         let bool_term = |value: bool| atom(if value { "true" } else { "false" });
         let int_term = |value: usize, dst: &mut H| -> Result<Term, EtsError> {
+            // Port of erts/emulator/beam/big.c:2247-2252 (erts_make_integer), OTP-29.1.1.
+            if let Ok(value) = i64::try_from(value)
+                && let Some(term) = Term::small(value)
+            {
+                return Ok(term);
+            }
             Ok(TermBuilder::new(dst).int_from_i128(value as i128)?)
         };
         match key {
@@ -2299,7 +2259,13 @@ impl Table {
             }
             Storage::Hash(storage) => {
                 let mut lengths = vec![0_usize; storage.active_slots()];
-                for object in storage.values().chain(&storage.deleted) {
+                storage.try_for_each_value(|object| {
+                    let slot = storage.slot_for_key(object.key(self.options.keypos));
+                    lengths[slot] += 1;
+                    Ok::<_, EtsError>(())
+                })?;
+                let deleted = storage.deleted.lock().unwrap();
+                for object in deleted.iter() {
                     let slot = storage.slot_for_key(object.key(self.options.keypos));
                     lengths[slot] += 1;
                 }
@@ -2309,7 +2275,7 @@ impl Table {
                 // erts widens them to Erlang floats. The inner chain deviation
                 // is float arithmetic; the expected deviation is double sqrt
                 // rounded back through float. Port of erl_db_hash.c:4105, OTP-29.1.1.
-                let nactive = storage.nactive as f32;
+                let nactive = storage.nactive() as f32;
                 let average_f = sum as f32 / nactive;
                 let deviation = ((square_sum as f32 - average_f * sum as f32) / nactive) as f64;
                 let expected_f = (f64::from(average_f) * (1.0 - 1.0 / f64::from(nactive))).sqrt();
@@ -2331,13 +2297,13 @@ impl Table {
                     storage.lock_count() as i64
                 };
                 Ok(builder.tuple(&[
-                    Term::small(storage.nactive as i64).ok_or(EtsError::BadArg)?,
+                    Term::small(storage.nactive() as i64).ok_or(EtsError::BadArg)?,
                     avg,
                     standard,
                     expected,
                     Term::small(*lengths.iter().min().unwrap_or(&0) as i64).unwrap(),
                     Term::small(*lengths.iter().max().unwrap_or(&0) as i64).unwrap(),
-                    Term::small(storage.deleted.len() as i64).unwrap(),
+                    Term::small(deleted.len() as i64).unwrap(),
                     Term::small(locks).unwrap(),
                 ])?)
             }
@@ -2380,13 +2346,165 @@ impl Table {
                 tree.insert(prepared.stored);
                 None
             }
+            Storage::Hash(storage)
+                if self.options.write_concurrency != WriteConcurrency::Disabled =>
+            {
+                self.max_arity
+                    .fetch_max(prepared.stored.arity(), AtomicOrdering::Relaxed);
+                storage.insert_shared(
+                    prepared.stored,
+                    prepared.hash,
+                    self.options.table_type,
+                    self.options.keypos,
+                    self.fixed > 0,
+                    false,
+                );
+                None
+            }
             _ => Some(prepared),
         }
+    }
+
+    /// Delete all objects at a key through the table's hash stripe.
+    pub fn delete_key_shared(&self, key: Term) -> bool {
+        let Storage::Hash(storage) = &self.storage else {
+            return false;
+        };
+        storage.delete_key_shared(key, ets_hash(key), self.options.keypos, self.fixed > 0);
+        true
+    }
+
+    /// Delete matching copies of one object through the table's hash stripe.
+    pub fn delete_object_shared(&self, object: Term) -> Result<bool, EtsError> {
+        let key = key_of(object, self.options.keypos)?;
+        let Storage::Hash(storage) = &self.storage else {
+            return Ok(false);
+        };
+        storage.delete_object_shared(
+            key,
+            ets_hash(key),
+            self.options.keypos,
+            object,
+            self.fixed > 0,
+        );
+        Ok(true)
+    }
+
+    /// Update small tuple counters under the key's hash stripe.
+    pub fn update_counter_in_place_shared(
+        &self,
+        key: Term,
+        operations: &[CounterOp],
+    ) -> Option<smallvec::SmallVec<[Term; 4]>> {
+        if self.options.table_type != TableType::Set {
+            return None;
+        }
+        let Storage::Hash(storage) = &self.storage else {
+            return None;
+        };
+        storage.update_counter_shared(key, ets_hash(key), self.options.keypos, operations)
+    }
+
+    /// Apply arbitrary precision counter operations under the hash key's write stripe.
+    pub fn update_counter_big_shared<H: HeapAlloc>(
+        &self,
+        key: Term,
+        operations: &[Option<BigCounterOp>],
+        default: Option<Term>,
+        dst: &mut H,
+    ) -> Result<Option<Vec<Term>>, EtsError> {
+        if self.options.table_type != TableType::Set {
+            return Ok(None);
+        }
+        let Storage::Hash(storage) = &self.storage else {
+            return Ok(None);
+        };
+        let mut results = None;
+        let changed = storage.update_or_insert_shared(
+            key,
+            ets_hash(key),
+            self.options.keypos,
+            self.fixed > 0,
+            |found| {
+                let mut heap = ObjectHeap::new();
+                let mut values = if let Some(found) = found {
+                    let current = found.term_for_filter(&mut heap)?;
+                    // SAFETY: `current` is owned by `heap` until the replacement is copied.
+                    let tuple = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
+                    tuple.iter().collect::<Vec<_>>()
+                } else if let Some(default) = default {
+                    self.default_object(key, default, &mut heap)?
+                } else {
+                    return Err(EtsError::BadArgCause("badkey"));
+                };
+                for operation in operations {
+                    let Some(operation) = operation else {
+                        return Err(EtsError::BadArg);
+                    };
+                    if operation.position == self.options.keypos {
+                        return Err(EtsError::BadArgCause("keypos"));
+                    }
+                    if operation.position == 0 || operation.position > values.len() {
+                        return Err(EtsError::BadArgCause("position"));
+                    }
+                    if integer_value(values[operation.position - 1]).is_none() {
+                        return Err(EtsError::BadArg);
+                    }
+                }
+                let mut returned = Vec::with_capacity(operations.len());
+                for operation in operations.iter().flatten() {
+                    let old_term = values[operation.position - 1];
+                    if let Some(small) = small_counter_step(old_term, operation)
+                        && let Some(next) = Term::small(small)
+                    {
+                        values[operation.position - 1] = next;
+                        returned.push(next);
+                        continue;
+                    }
+                    let old = integer_value(old_term).ok_or(EtsError::BadArg)?;
+                    let mut next = old + &operation.increment;
+                    if let Some((threshold, set_value)) = &operation.threshold
+                        && ((operation.increment >= BigInt::from(0) && next > *threshold)
+                            || (operation.increment < BigInt::from(0) && next < *threshold))
+                    {
+                        next = set_value.clone();
+                    }
+                    let next = TermBuilder::new(&mut heap).int_from_bigint(&next)?;
+                    values[operation.position - 1] = next;
+                    returned.push(copy_term(next, dst)?);
+                }
+                let tuple = TermBuilder::new(&mut heap).tuple(&values)?;
+                let replacement = StoredTerm::copy_for_table(
+                    tuple,
+                    self.options.compressed,
+                    self.options.keypos,
+                    2,
+                )?;
+                results = Some(returned);
+                Ok(Some(replacement))
+            },
+        )?;
+        Ok(changed.then(|| results.unwrap_or_default()))
     }
 
     /// Store an object built by [`Table::prepare_object`] like `insert` of a single object.
     pub fn insert_prepared(&mut self, prepared: PreparedObject) {
         self.put_hashed(prepared.stored, prepared.hash, false);
+    }
+
+    /// Insert a prepared object if its key has no live entry, under its hash stripe.
+    pub fn insert_new_prepared_shared(&self, prepared: PreparedObject) -> Result<bool, EtsError> {
+        let Storage::Hash(storage) = &self.storage else {
+            return Err(EtsError::BadArg);
+        };
+        Ok(storage.insert_shared(
+            prepared.stored,
+            prepared.hash,
+            self.options.table_type,
+            self.options.keypos,
+            self.fixed > 0,
+            true,
+        ))
     }
 
     /// Insert one or several objects. Validation and copying finish before mutation.
@@ -2446,20 +2564,6 @@ impl Table {
             Storage::Ordered(root) => *root = Some(Node::insert(root.take(), object, keypos)),
             Storage::CATree(tree) => tree.insert(object),
             Storage::Hash(storage) => {
-                let lock = if self.options.write_concurrency == WriteConcurrency::Disabled {
-                    None
-                } else {
-                    storage.lock_for_hash(hash)
-                };
-                let _guard = lock.as_ref().map(|lock| {
-                    let contended = lock.try_write().is_err();
-                    storage.note_contention(contended);
-                    if contended {
-                        lock.write().unwrap()
-                    } else {
-                        lock.try_write().ok().unwrap()
-                    }
-                });
                 let key = object.key(keypos);
                 let mut object = object;
                 object.hvalue = hash >> 1;
@@ -2474,35 +2578,45 @@ impl Table {
                     *old = object;
                     return;
                 }
-                if self.options.table_type == TableType::Set && storage.deleted.is_empty() {
-                    object.order = storage.next_order;
+                if self.options.table_type == TableType::Set
+                    && storage.deleted.get_mut().unwrap().is_empty()
+                {
+                    object.order = storage.next_order.fetch_add(1, AtomicOrdering::Relaxed);
                     object.group_order = object.order;
-                    storage.next_order += 1;
-                    storage.push_at(slot, object);
-                    storage.size += 1;
+                    storage.add_items(hash, 1);
+                    storage.push_at_key(slot, object, keypos);
                     storage.maybe_grow(self.fixed > 0, keypos);
                     return;
                 }
                 let mut live_order = None;
                 let mut existing_group_order = None;
                 if self.options.table_type != TableType::Set {
-                    for old in storage.objects_hash(hash) {
-                        if old.hvalue == (hash >> 1) && exact_eq(old.key(keypos), key) {
-                            existing_group_order.get_or_insert(old.group_order);
-                            if self.options.table_type == TableType::Bag
-                                && old.exact_eq_stored(&object)
-                            {
-                                live_order = Some(
-                                    live_order.map_or(old.order, |order: u64| order.max(old.order)),
-                                );
+                    storage.with_objects_hash(hash, |objects| {
+                        for old in objects {
+                            if old.hvalue == (hash >> 1) && exact_eq(old.key(keypos), key) {
+                                existing_group_order.get_or_insert(old.group_order);
+                                if self.options.table_type == TableType::Bag
+                                    && old.exact_eq_stored(&object)
+                                {
+                                    live_order = Some(
+                                        live_order
+                                            .map_or(old.order, |order: u64| order.max(old.order)),
+                                    );
+                                }
+                                // Port of erts/emulator/beam/erl_db_hash.c:1363-1451
+                                // (db_put_hash), OTP-29.1.1: duplicate_bag falls through to Lnew
+                                // as soon as its key is found; unlike bag it does not scan siblings.
+                                if self.options.table_type == TableType::DuplicateBag {
+                                    break;
+                                }
                             }
                         }
-                    }
+                    });
                 }
                 if self.options.table_type == TableType::Bag {
                     // Port of erts/emulator/beam/erl_db_hash.c:1300 (bag insertion), OTP-29.1.1.
-                    let deleted_order = storage
-                        .deleted
+                    let deleted_guard = storage.deleted.get_mut().unwrap();
+                    let deleted_order = deleted_guard
                         .iter()
                         .filter(|old| old.exact_eq_stored(&object))
                         .map(|old| old.order)
@@ -2512,21 +2626,19 @@ impl Table {
                         return;
                     }
                 }
-                let tombstone_order = storage
-                    .deleted
+                let deleted_guard = storage.deleted.get_mut().unwrap();
+                let tombstone_order = deleted_guard
                     .iter()
                     .find(|old| exact_eq(old.key(keypos), key))
                     .map(|old| old.group_order);
                 let revived_index = match self.options.table_type {
-                    TableType::Set => storage
-                        .deleted
+                    TableType::Set => deleted_guard
                         .iter()
                         .enumerate()
                         .filter(|(_, old)| exact_eq(old.key(keypos), key))
                         .max_by_key(|(_, old)| old.order)
                         .map(|(index, _)| index),
-                    TableType::Bag if !new_only => storage
-                        .deleted
+                    TableType::Bag if !new_only => deleted_guard
                         .iter()
                         .enumerate()
                         .filter(|(_, old)| old.exact_eq_stored(&object))
@@ -2534,18 +2646,17 @@ impl Table {
                         .map(|(index, _)| index),
                     _ => None,
                 };
-                let revived = revived_index.map(|index| storage.deleted.remove(index));
+                let revived = revived_index.map(|index| deleted_guard.remove(index));
                 if self.options.table_type == TableType::Set
                     && let Some(old) = &revived
                 {
                     object.order = old.order;
                     object.group_order = old.group_order;
-                    storage.push_at(slot, object);
-                    storage.size += 1;
+                    storage.push_at_order(slot, object);
+                    storage.add_items(hash, 1);
                     return;
                 }
-                object.order = storage.next_order;
-                storage.next_order += 1;
+                object.order = storage.next_order.fetch_add(1, AtomicOrdering::Relaxed);
                 object.group_order = if self.options.table_type == TableType::Set {
                     object.order
                 } else {
@@ -2558,8 +2669,12 @@ impl Table {
                 {
                     object.group_order = order;
                 }
-                storage.push_at(slot, object);
-                storage.size += 1;
+                if existing_group_order.is_none() && tombstone_order.is_some() {
+                    storage.push_at_order(slot, object);
+                } else {
+                    storage.push_at_key(slot, object, keypos);
+                }
+                storage.add_items(hash, 1);
                 storage.maybe_grow(self.fixed > 0, keypos);
             }
         }
@@ -2577,9 +2692,16 @@ impl Table {
 
     fn insert_new_mode(&mut self, objects: &[Term], single: bool) -> Result<bool, EtsError> {
         // Port of erts/emulator/beam/erl_db.c:2387 (ets_insert_new_2), OTP-29.1.1.
-        let mut prepared = Vec::with_capacity(objects.len());
         for &object in objects {
             key_of(object, self.options.keypos)?;
+        }
+        for &object in objects {
+            if self.member(key_of(object, self.options.keypos)?) {
+                return Ok(false);
+            }
+        }
+        let mut prepared = Vec::with_capacity(objects.len());
+        for &object in objects {
             prepared.push(StoredTerm::copy_for_table(
                 object,
                 self.options.compressed,
@@ -2591,12 +2713,6 @@ impl Table {
                 },
             )?);
         }
-        if prepared
-            .iter()
-            .any(|object| self.member(object.key(self.options.keypos)))
-        {
-            return Ok(false);
-        }
         for object in prepared {
             let hash = ets_hash(object.key(self.options.keypos));
             self.put_hashed(object, hash, single);
@@ -2604,48 +2720,78 @@ impl Table {
         Ok(true)
     }
 
-    /// First object stored under `key`, without collecting the whole bucket.
-    fn matching_first(&self, key: Term) -> Result<Option<Matched<'_>>, EtsError> {
+    /// Visit every live object stored under `key` before releasing its bucket lock.
+    fn try_for_matching(
+        &self,
+        key: Term,
+        mut visit: impl FnMut(&StoredTerm) -> Result<(), EtsError>,
+    ) -> Result<usize, EtsError> {
+        let mut count = 0;
         match &self.storage {
             Storage::Ordered(root) => {
-                Ok(Node::get(root, key, self.options.keypos).map(Matched::Borrowed))
+                if let Some(object) = Node::get(root, key, self.options.keypos) {
+                    visit(object)?;
+                    count = 1;
+                }
             }
-            Storage::CATree(tree) => tree
-                .matching(key)
-                .map(|objects| objects.into_iter().next().map(Matched::Owned)),
+            Storage::CATree(tree) => {
+                for object in tree.matching(key)? {
+                    visit(&object)?;
+                    count += 1;
+                }
+            }
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                Ok(storage
-                    .objects_hash(hash)
-                    .iter()
-                    .find(|object| {
-                        object.hvalue == (hash >> 1)
-                            && exact_eq(object.key(self.options.keypos), key)
-                    })
-                    .map(|node| Matched::Borrowed(&node.object)))
+                storage.with_objects_hash(hash, |objects| {
+                    for node in objects {
+                        if node.hvalue == (hash >> 1)
+                            && exact_eq(node.key(self.options.keypos), key)
+                        {
+                            visit(&node.object)?;
+                            count += 1;
+                        }
+                    }
+                    Ok::<_, EtsError>(())
+                })?;
             }
         }
+        Ok(count)
     }
 
-    fn matching(&self, key: Term) -> Result<Vec<Matched<'_>>, EtsError> {
+    /// Visit the newest live object under `key` while its bucket lock is held.
+    fn try_matching_first(
+        &self,
+        key: Term,
+        mut visit: impl FnMut(&StoredTerm) -> Result<(), EtsError>,
+    ) -> Result<bool, EtsError> {
+        let mut found = false;
         match &self.storage {
-            Storage::Ordered(root) => Ok(Node::get(root, key, self.options.keypos)
-                .map(Matched::Borrowed)
-                .into_iter()
-                .collect()),
-            Storage::CATree(tree) => tree
-                .matching(key)
-                .map(|objects| objects.into_iter().map(Matched::Owned).collect()),
-            Storage::Hash(storage) => Ok(storage
-                .objects_hash(ets_hash(key))
-                .iter()
-                .filter(|object| {
-                    object.hvalue == (ets_hash(key) >> 1)
-                        && exact_eq(object.key(self.options.keypos), key)
-                })
-                .map(|node| Matched::Borrowed(&node.object))
-                .collect()),
+            Storage::Ordered(root) => {
+                if let Some(object) = Node::get(root, key, self.options.keypos) {
+                    visit(object)?;
+                    found = true;
+                }
+            }
+            Storage::CATree(tree) => {
+                if let Some(object) = tree.matching(key)?.first() {
+                    visit(object)?;
+                    found = true;
+                }
+            }
+            Storage::Hash(storage) => {
+                let hash = ets_hash(key);
+                storage.with_objects_hash(hash, |objects| {
+                    if let Some(node) = objects.into_iter().find(|node| {
+                        node.hvalue == (hash >> 1) && exact_eq(node.key(self.options.keypos), key)
+                    }) {
+                        visit(&node.object)?;
+                        found = true;
+                    }
+                    Ok::<_, EtsError>(())
+                })?;
+            }
         }
+        Ok(found)
     }
 
     /// Copy all objects at a key into the caller's heap.
@@ -2681,14 +2827,15 @@ impl Table {
                 .map(|mut objects| (!objects.is_empty()).then(|| objects.remove(0))),
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                for object in storage.objects_hash(hash) {
-                    if object.hvalue == (hash >> 1)
-                        && exact_eq(object.key(self.options.keypos), key)
-                    {
-                        return object.copy_out(dst).map(Some);
-                    }
-                }
-                Ok(None)
+                storage.with_objects_hash(hash, |mut objects| {
+                    objects
+                        .find(|object| {
+                            object.hvalue == (hash >> 1)
+                                && exact_eq(object.key(self.options.keypos), key)
+                        })
+                        .map(|object| object.copy_out(dst))
+                        .transpose()
+                })
             }
         }
     }
@@ -2719,14 +2866,18 @@ impl Table {
             }
             Storage::CATree(tree) => objects.extend(tree.lookup(key, dst)?),
             Storage::Hash(storage) => {
-                for object in storage.objects_hash(hash) {
-                    if object.hvalue == (hash >> 1)
-                        && exact_eq(object.key(self.options.keypos), key)
-                    {
-                        objects.push(object.copy_out(dst)?);
+                let first = objects.len();
+                storage.with_objects_hash(hash, |bucket| {
+                    for object in bucket {
+                        if object.hvalue == (hash >> 1)
+                            && exact_eq(object.key(self.options.keypos), key)
+                        {
+                            objects.push(object.copy_out(dst)?);
+                        }
                     }
-                }
-                objects.reverse();
+                    Ok::<_, EtsError>(())
+                })?;
+                objects[first..].reverse();
             }
         }
         Ok(())
@@ -2740,8 +2891,10 @@ impl Table {
     fn member_hashed(&self, key: Term, hash: u64) -> bool {
         match &self.storage {
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos).is_some(),
-            Storage::Hash(storage) => storage.objects_hash(hash).iter().any(|object| {
-                object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key)
+            Storage::Hash(storage) => storage.with_objects_hash(hash, |objects| {
+                objects.into_iter().any(|object| {
+                    object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key)
+                })
             }),
             Storage::CATree(tree) => tree.member(key),
         }
@@ -2757,8 +2910,12 @@ impl Table {
         if position == 0 {
             return Err(EtsError::BadArg);
         }
-        let mut found = self.matching(key)?;
-        if found.is_empty() {
+        let mut found = Vec::new();
+        let count = self.try_for_matching(key, |object| {
+            found.push(object.copy_element_out(position - 1, dst)?);
+            Ok(())
+        })?;
+        if count == 0 {
             // Port of erts/emulator/beam/erl_db.c:2958-2960 (DB_ERROR_BADKEY), OTP-29.1.1.
             return Err(EtsError::BadArgCause("badkey"));
         }
@@ -2768,10 +2925,7 @@ impl Table {
         if matches!(&self.storage, Storage::Hash(_)) {
             found.reverse();
         }
-        found
-            .into_iter()
-            .map(|object| object.copy_element_out(position - 1, dst))
-            .collect()
+        Ok(found)
     }
 
     /// Copy one element from a set-like table without building an object list.
@@ -2796,15 +2950,15 @@ impl Table {
         match &self.storage {
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                storage
-                    .objects_hash(hash)
-                    .find(|object| {
-                        object.hvalue == hash >> 1
-                            && exact_eq(object.object.key(self.options.keypos), key)
-                    })
-                    .ok_or(EtsError::BadArgCause("badkey"))?
-                    .object
-                    .copy_element_out(position - 1, dst)
+                storage.with_objects_hash(hash, |mut objects| {
+                    objects
+                        .find(|object| {
+                            object.hvalue == hash >> 1
+                                && exact_eq(object.key(self.options.keypos), key)
+                        })
+                        .ok_or(EtsError::BadArgCause("badkey"))?
+                        .copy_element_out(position - 1, dst)
+                })
             }
             Storage::Ordered(root) => Node::get(root, key, self.options.keypos)
                 .ok_or(EtsError::BadArgCause("badkey"))?
@@ -2840,26 +2994,11 @@ impl Table {
             Storage::CATree(tree) => tree.delete(key),
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                let first_live_order = storage
-                    .objects_hash(hash)
-                    .filter(|object| {
-                        object.hvalue == (hash >> 1)
-                            && exact_eq(object.key(self.options.keypos), key)
-                    })
-                    .map(|object| object.order)
-                    .max();
-                let mut removed = storage.detach_matching(hash >> 1, |object| {
+                let (mut removed, count) = storage.detach_live_matching(hash >> 1, |object| {
                     object.hvalue == (hash >> 1) && exact_eq(object.key(self.options.keypos), key)
                 });
-                storage.size -= removed.len();
-                let fixed_delete = if fixed {
-                    first_live_order
-                        .and_then(|order| removed.iter().position(|object| object.order == order))
-                        .map(|index| removed.remove(index))
-                } else {
-                    None
-                };
-                if let Some(object) = fixed_delete {
+                storage.add_items(ets_hash(key), -(count as isize));
+                if fixed && let Some(object) = removed.take_first() {
                     storage.retain_fixed_delete(object);
                 }
                 if !fixed {
@@ -2884,28 +3023,19 @@ impl Table {
             Storage::CATree(tree) => tree.delete_object(key, object),
             Storage::Hash(storage) => {
                 let hash = ets_hash(key);
-                let first_live_order = storage
-                    .objects_hash(hash)
-                    .filter(|found| {
-                        found.hvalue == (hash >> 1) && exact_eq(found.key(self.options.keypos), key)
-                    })
-                    .map(|found| found.order)
-                    .max();
-                let mut removed = storage.detach_matching(hash >> 1, |found| {
+                let (mut removed, count) = storage.detach_live_matching(hash >> 1, |found| {
                     found.hvalue == (hash >> 1) && found.exact_eq_term(object)
                 });
-                storage.size -= removed.len();
-                let key_remains = storage.objects_hash(hash).any(|found| {
-                    found.hvalue == (hash >> 1) && exact_eq(found.key(self.options.keypos), key)
+                storage.add_items(hash, -(count as isize));
+                let key_remains = storage.with_objects_hash(hash, |objects| {
+                    objects.into_iter().any(|found| {
+                        found.hvalue == (hash >> 1) && exact_eq(found.key(self.options.keypos), key)
+                    })
                 });
-                let fixed_delete = if fixed && !key_remains {
-                    first_live_order
-                        .and_then(|order| removed.iter().position(|object| object.order == order))
-                        .map(|index| removed.remove(index))
-                } else {
-                    None
-                };
-                if let Some(object) = fixed_delete {
+                if fixed
+                    && !key_remains
+                    && let Some(object) = removed.take_first()
+                {
                     storage.retain_fixed_delete(object);
                 }
                 if !fixed {
@@ -2927,8 +3057,8 @@ impl Table {
             Storage::CATree(tree) => Garbage(GarbageKind::Tree(tree.take_all())),
             Storage::Hash(storage) => {
                 let garbage = storage.take_garbage(whole);
-                storage.size = 0;
-                storage.size_bias = 0;
+                storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.size_bias.store(0, AtomicOrdering::Relaxed);
                 Garbage(GarbageKind::Hash {
                     garbage,
                     keep: !whole && self.fixed > 0,
@@ -2949,7 +3079,7 @@ impl Table {
                     keep: true,
                 },
                 Storage::Hash(storage),
-            ) if fixed => garbage.step(reds, Some(&mut storage.deleted)),
+            ) if fixed => garbage.step(reds, Some(storage.deleted.get_mut().unwrap())),
             _ => garbage.step(reds),
         }
     }
@@ -2962,12 +3092,12 @@ impl Table {
             Storage::Hash(storage) => {
                 if self.fixed > 0 {
                     let objects = storage.take_all_buckets();
-                    storage.deleted.extend(objects);
+                    storage.deleted.get_mut().unwrap().extend(objects);
                 } else {
                     storage.clear_buckets();
                 }
-                storage.size = 0;
-                storage.size_bias = 0;
+                storage.size.store(0, AtomicOrdering::Relaxed);
+                storage.size_bias.store(0, AtomicOrdering::Relaxed);
             }
         }
     }
@@ -3035,12 +3165,15 @@ impl Table {
         let mut binaries = Vec::new();
         match &self.storage {
             Storage::Hash(storage) => {
-                for object in storage
-                    .objects(key)
-                    .filter(|object| exact_eq(object.key(self.options.keypos), key))
-                {
-                    binaries.extend(object.refc_binaries(dst)?);
-                }
+                let hash = ets_hash(key);
+                storage.with_objects_hash(hash, |objects| {
+                    for object in objects {
+                        if exact_eq(object.key(self.options.keypos), key) {
+                            binaries.extend(object.refc_binaries(dst)?);
+                        }
+                    }
+                    Ok::<_, EtsError>(())
+                })?;
             }
             Storage::Ordered(root) => {
                 if let Some(object) = Node::get(root, key, self.options.keypos) {
@@ -3063,10 +3196,11 @@ impl Table {
     pub fn all_binary_info<H: HeapAlloc>(&self, dst: &mut H) -> Result<Vec<Term>, EtsError> {
         let mut records = Vec::new();
         if let Storage::Hash(storage) = &self.storage {
-            for object in storage.values() {
+            storage.for_each_value(|object| {
                 records.extend(object.binary_refs());
-            }
-            for object in &storage.deleted {
+            });
+            let deleted = storage.deleted.lock().unwrap();
+            for object in deleted.iter() {
                 records.extend(object.binary_refs());
             }
         } else {
@@ -3113,15 +3247,18 @@ impl Table {
         let (pseudo_count, first_live_order) = if result.is_empty() {
             (0, None)
         } else if let Storage::Hash(storage) = &self.storage {
-            let first_live_order = storage
-                .objects(key)
-                .iter()
-                .filter(|object| exact_eq(object.key(self.options.keypos), key))
-                .map(|object| object.order)
-                .max();
+            let hash = ets_hash(key);
+            let first_live_order = storage.with_objects_hash(hash, |objects| {
+                objects
+                    .filter(|object| exact_eq(object.key(self.options.keypos), key))
+                    .map(|object| object.order)
+                    .max()
+            });
             let count = first_live_order.map_or(0, |order| {
                 storage
                     .deleted
+                    .lock()
+                    .unwrap()
                     .iter()
                     .filter(|deleted| {
                         exact_eq(deleted.key(self.options.keypos), key) && deleted.order < order
@@ -3134,9 +3271,11 @@ impl Table {
         };
         self.delete_key(key);
         if let Storage::Hash(storage) = &mut self.storage {
-            storage.size_bias -= pseudo_count as isize;
+            storage
+                .size_bias
+                .fetch_sub(pseudo_count as isize, AtomicOrdering::Relaxed);
             if let Some(order) = first_live_order {
-                storage.deleted.retain(|deleted| {
+                storage.deleted.get_mut().unwrap().retain(|deleted| {
                     !exact_eq(deleted.key(self.options.keypos), key) || deleted.order >= order
                 });
             }
@@ -3171,15 +3310,15 @@ impl Table {
                 if !storage.is_valid_slot(index) {
                     return Err(EtsError::BadArg);
                 }
-                if index == storage.nactive {
+                if index == storage.nactive() {
                     return Ok(None);
                 }
-                let objects = storage
-                    .slot_ordered(index, false)
-                    .into_iter()
-                    .rev()
-                    .map(|object| object.copy_out(dst))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut objects = Vec::new();
+                storage.try_with_slot_ordered(index, false, |object, _| {
+                    objects.push(object.copy_out(dst)?);
+                    Ok::<_, EtsError>(())
+                })?;
+                objects.reverse();
                 Ok(Some(TermBuilder::new(dst).list_from_iter(objects)?))
             }
         }
@@ -3213,25 +3352,25 @@ impl Table {
         };
         let keypos = self.options.keypos;
         let slot = storage.slot_for_key(key);
-        let bucket = storage.slot_ordered(slot, true);
-        let Some(position) = bucket
-            .iter()
-            .position(|object| exact_eq(object.key(keypos), key))
-        else {
+        let mut found = false;
+        let mut next = None;
+        storage.try_with_slot_ordered(slot, true, |object, deleted| {
+            if !found {
+                found = exact_eq(object.key(keypos), key);
+            } else if next.is_none() && !deleted && !exact_eq(object.key(keypos), key) {
+                next = Some(copy_term(object.key(keypos), dst)?);
+            }
+            Ok::<_, EtsError>(())
+        })?;
+        if !found {
             return Err(EtsError::BadArg);
-        };
-        let in_bucket = bucket.iter().skip(position + 1).find(|object| {
-            !exact_eq(object.key(keypos), key)
-                && !storage
-                    .deleted
-                    .iter()
-                    .any(|deleted| std::ptr::eq(**object, deleted))
-        });
-        in_bucket
-            .copied()
-            .or_else(|| storage.first_from_slot(slot + 1))
-            .map(|object| Ok(copy_term(object.key(keypos), dst)?))
-            .transpose()
+        }
+        if let Some(next) = next {
+            return Ok(Some(next));
+        }
+        Ok(storage
+            .with_first_from_slot(slot + 1, |object| copy_term(object.key(keypos), dst))
+            .transpose()?)
     }
 
     /// Ordered predecessor of any key.
@@ -3265,10 +3404,9 @@ impl Table {
             let Storage::Hash(storage) = &self.storage else {
                 unreachable!();
             };
-            return storage
-                .first_from_slot(0)
-                .map(|object| Ok(copy_term(object.key(self.options.keypos), dst)?))
-                .transpose();
+            return Ok(storage
+                .with_first_from_slot(0, |object| copy_term(object.key(self.options.keypos), dst))
+                .transpose()?);
         };
         let mut node = root.as_deref();
         let mut found = None;
@@ -3318,13 +3456,21 @@ impl Table {
         if let Storage::CATree(tree) = &self.storage {
             return tree.walk(false, dst);
         }
+        if let Storage::Hash(storage) = &self.storage {
+            // Port of erts/emulator/beam/erl_db_hash.c:2309-2335 (db_select_chunk_hash),
+            // reached by ets:tab2list/1 through ets:match_object/2.
+            let mut objects = Vec::new();
+            storage.try_for_each_value(|object| {
+                objects.push(object.copy_out(dst)?);
+                Ok::<_, EtsError>(())
+            })?;
+            objects.reverse();
+            return Ok(objects);
+        }
         let mut objects = Vec::new();
         match &self.storage {
             Storage::Ordered(root) => Node::walk(root, &mut objects),
-            Storage::CATree(_) => unreachable!("CA-tree handled above"),
-            Storage::Hash(storage) => {
-                objects.extend(storage.ordered(self.options.keypos).into_iter().rev())
-            }
+            Storage::CATree(_) | Storage::Hash(_) => unreachable!("storage handled above"),
         }
         objects
             .into_iter()
@@ -3436,7 +3582,7 @@ impl Table {
             if self.fixed == 0
                 && let Storage::Hash(storage) = &mut self.storage
             {
-                storage.deleted.clear();
+                storage.deleted.get_mut().unwrap().clear();
             }
             if self.fixed == 0 {
                 self.fixed_system_time = None;
@@ -3470,11 +3616,22 @@ impl Table {
             return Err(EtsError::BadArg);
         }
         let mut heap = VecHeap::new();
-        let mut values = if let Some(found) = self.matching(key)?.into_iter().next() {
-            let tuple_len = found.tuple_len().ok_or(EtsError::BadArg)?;
-            (0..tuple_len)
-                .map(|index| found.copy_element_out(index, &mut heap))
-                .collect::<Result<Vec<_>, _>>()?
+        let mut stored_values = None;
+        self.try_matching_first(key, |found| {
+            let tuple_len = if found.inline_pair.is_some() {
+                2
+            } else {
+                term_sequence(found.term).ok_or(EtsError::BadArg)?.len()
+            };
+            stored_values = Some(
+                (0..tuple_len)
+                    .map(|index| found.copy_element_out(index, &mut heap))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            Ok(())
+        })?;
+        let mut values = if let Some(values) = stored_values {
+            values
         } else if let Some(default) = default {
             self.default_object(key, default, &mut heap)?
         } else {
@@ -3497,6 +3654,75 @@ impl Table {
         let result = TermBuilder::new(&mut heap).tuple(&values)?;
         self.insert(&[result])?;
         Ok(true)
+    }
+
+    /// Apply tuple element replacements while holding the hash key's write stripe.
+    pub fn update_element_shared(
+        &self,
+        key: Term,
+        updates: &[Option<(usize, Term)>],
+        default: Option<Term>,
+    ) -> Result<bool, EtsError> {
+        if self.options.table_type != TableType::Set {
+            return Err(EtsError::BadArg);
+        }
+        let Storage::Hash(storage) = &self.storage else {
+            return Err(EtsError::BadArg);
+        };
+        let mut heap = VecHeap::new();
+        storage.update_or_insert_shared(
+            key,
+            ets_hash(key),
+            self.options.keypos,
+            self.fixed > 0,
+            |found| {
+                let mut values = if let Some(found) = found {
+                    (0..found.arity())
+                        .map(|index| found.copy_element_out(index, &mut heap))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else if let Some(default) = default {
+                    self.default_object(key, default, &mut heap)?
+                } else {
+                    return Ok(None);
+                };
+                for update in updates {
+                    let Some((position, _)) = *update else {
+                        return Err(EtsError::BadArg);
+                    };
+                    if position == self.options.keypos {
+                        return Err(EtsError::BadArgCause("keypos"));
+                    }
+                    if position == 0 || position > values.len() {
+                        return Err(EtsError::BadArgCause("position"));
+                    }
+                }
+                for &(position, value) in updates.iter().flatten() {
+                    values[position - 1] = copy_term(value, &mut heap)?;
+                }
+                let tuple = TermBuilder::new(&mut heap).tuple(&values)?;
+                Ok(Some(StoredTerm::copy_for_table(
+                    tuple,
+                    self.options.compressed,
+                    self.options.keypos,
+                    2,
+                )?))
+            },
+        )
+    }
+
+    /// Return and remove all objects at a key while holding its write stripe.
+    pub fn take_shared<H: HeapAlloc>(&self, key: Term, dst: &mut H) -> Result<Vec<Term>, EtsError> {
+        let Storage::Hash(storage) = &self.storage else {
+            return Err(EtsError::BadArg);
+        };
+        storage.take_shared(
+            key,
+            ets_hash(key),
+            self.options.keypos,
+            self.options.table_type,
+            self.fixed > 0,
+            dst,
+        )
     }
 
     /// The elements of `default` with the key element replaced, as
@@ -3622,14 +3848,16 @@ impl Table {
         // ObjectHeap allocates exactly what is asked; a VecHeap would zero a 1024-word chunk
         // for every counter bump.
         let mut heap = ObjectHeap::new();
-        let mut values = if let Some(found) = self.matching_first(key)? {
-            // The stored object stays alive until the replacement is inserted.
-            let current = found.term_outliving(&mut heap)?;
-            // SAFETY: current is owned by the table or the local heap until the insertion ends.
-            unsafe { current.tuple_ref() }
-                .ok_or(EtsError::BadArg)?
-                .iter()
-                .collect::<Vec<_>>()
+        let mut stored_values = None;
+        self.try_matching_first(key, |found| {
+            let current = found.term_for_filter(&mut heap)?;
+            // SAFETY: current is owned by the local heap until the replacement is inserted.
+            let values = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
+            stored_values = Some(values.iter().collect::<Vec<_>>());
+            Ok(())
+        })?;
+        let mut values = if let Some(values) = stored_values {
+            values
         } else if let Some(default) = default {
             self.default_object(key, default, &mut heap)?
         } else {
@@ -3701,6 +3929,7 @@ impl Table {
         dst: &mut H,
         context: &C,
     ) -> Result<Vec<Term>, EtsError> {
+        let mut runner = program.runner();
         if let Storage::CATree(tree) = &self.storage {
             let mut objects = tree.objects()?;
             if reverse {
@@ -3708,12 +3937,24 @@ impl Table {
             }
             let mut results = Vec::new();
             for object in objects {
-                if let Some(result) =
-                    program.run_with_context(object.term_for_filter(dst)?, dst, context)?
-                {
+                let term = object.term_for_filter(dst)?;
+                if let Some(result) = runner.run_with_context(term, dst, context)? {
                     results.push(result);
                 }
             }
+            return Ok(results);
+        }
+        if let Storage::Hash(storage) = &self.storage {
+            // Port of erts/emulator/beam/erl_db_hash.c:2315-2335 (db_select_chunk_hash).
+            let mut results = Vec::new();
+            storage.try_for_each_value(|object| {
+                let term = object.term_for_filter(dst)?;
+                if let Some(result) = runner.run_with_context(term, dst, context)? {
+                    results.push(result);
+                }
+                Ok::<_, EtsError>(())
+            })?;
+            results.reverse();
             return Ok(results);
         }
         let mut objects = Vec::new();
@@ -3724,19 +3965,14 @@ impl Table {
                     objects.reverse();
                 }
             }
-            Storage::Hash(storage) => objects.extend(storage.ordered(self.options.keypos)),
-            Storage::CATree(_) => unreachable!("CA-tree handled above"),
+            Storage::Hash(_) | Storage::CATree(_) => unreachable!("storage handled above"),
         }
         let mut results = Vec::new();
         for object in objects {
-            if let Some(result) =
-                program.run_with_context(object.term_for_filter(dst)?, dst, context)?
-            {
+            let term = object.term_for_filter(dst)?;
+            if let Some(result) = runner.run_with_context(term, dst, context)? {
                 results.push(result);
             }
-        }
-        if matches!(self.storage, Storage::Hash(_)) {
-            results.reverse();
         }
         Ok(results)
     }
@@ -3868,6 +4104,7 @@ impl Table {
             return Err(EtsError::BadArg);
         }
         let limit = continuation.limit;
+        let mut runner = program.runner();
         let mut rows = Vec::with_capacity(limit.min(1024));
         match &self.storage {
             Storage::Ordered(root) => {
@@ -3880,9 +4117,8 @@ impl Table {
                     &mut |object| {
                         let key = object.key(self.options.keypos);
                         continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                        if let Some(result) =
-                            program.run_with_context(object.term_for_filter(dst)?, dst, context)?
-                        {
+                        let term = object.term_for_filter(dst)?;
+                        if let Some(result) = runner.run_with_context(term, dst, context)? {
                             rows.push(result);
                         }
                         Ok(rows.len() == limit)
@@ -3898,9 +4134,8 @@ impl Table {
                 tree.scan_after(cursor, continuation.reverse, |object| {
                     let key = object.key(self.options.keypos);
                     continuation.last_key = Some(copy_term(key, &mut continuation._heap)?);
-                    if let Some(result) =
-                        program.run_with_context(object.term_for_filter(dst)?, dst, context)?
-                    {
+                    let term = object.term_for_filter(dst)?;
+                    if let Some(result) = runner.run_with_context(term, dst, context)? {
                         rows.push(result);
                     }
                     Ok(rows.len() == limit)
@@ -3914,21 +4149,22 @@ impl Table {
                 let mut match_list: VecDeque<_> = std::mem::take(&mut continuation.rest).into();
                 if continuation.started
                     && continuation.slot != usize::MAX
-                    && continuation.slot >= storage.nactive
+                    && continuation.slot >= storage.nactive()
                     && match_list.len() < limit
                 {
                     return Err(EtsError::BadArg);
                 }
                 let mut next_slot = continuation.slot;
-                while match_list.len() < limit && next_slot < storage.nactive {
-                    for object in storage.slot_ordered(next_slot, false) {
+                while match_list.len() < limit && next_slot < storage.nactive() {
+                    storage.try_with_slot_ordered(next_slot, false, |object, _| {
                         let term = object.copy_out(&mut continuation._heap)?;
                         if let Some(result) =
-                            program.run_with_context(term, &mut continuation._heap, context)?
+                            runner.run_with_context(term, &mut continuation._heap, context)?
                         {
                             match_list.push_front(result);
                         }
-                    }
+                        Ok::<_, EtsError>(())
+                    })?;
                     next_slot += 1;
                 }
                 let excess = match_list.len().saturating_sub(limit);
@@ -3940,13 +4176,13 @@ impl Table {
                     rows.push(copy_term(result, dst)?);
                 }
                 continuation.rest = rest;
-                continuation.slot = if next_slot >= storage.nactive {
+                continuation.slot = if next_slot >= storage.nactive() {
                     usize::MAX
                 } else {
                     next_slot
                 };
                 continuation.started = true;
-                let more = !continuation.rest.is_empty() || next_slot < storage.nactive;
+                let more = !continuation.rest.is_empty() || next_slot < storage.nactive();
                 Ok(SelectBatch {
                     continuation: (more && !rows.is_empty()).then_some(continuation),
                     rows,
@@ -3966,6 +4202,7 @@ impl Table {
         if limit == 0 {
             return Err(EtsError::BadArg);
         }
+        let mut runner = program.runner();
         if let Storage::Ordered(root) = &self.storage
             && let Some(bounds) = program.key_bounds(self.options.keypos)
         {
@@ -3985,7 +4222,7 @@ impl Table {
             let mut state = RangeSelection {
                 keypos: self.options.keypos,
                 bounds,
-                program,
+                runner: &mut runner,
                 reverse,
                 limit,
                 dst,
@@ -4000,7 +4237,7 @@ impl Table {
             let mut state = RangeSelection {
                 keypos: self.options.keypos,
                 bounds,
-                program,
+                runner: &mut runner,
                 reverse,
                 limit,
                 dst,
@@ -4016,13 +4253,27 @@ impl Table {
             }
             let mut results = Vec::new();
             for object in objects {
-                if let Some(result) = program.run(object.term_for_filter(dst)?, dst)? {
+                let term = object.term_for_filter(dst)?;
+                if let Some(result) = runner.run(term, dst)? {
                     results.push(result);
                 }
                 if results.len() >= limit {
                     break;
                 }
             }
+            return Ok(results);
+        }
+        if let Storage::Hash(storage) = &self.storage {
+            // Port of erts/emulator/beam/erl_db_hash.c:2315-2335 (db_select_chunk_hash).
+            let mut results = Vec::new();
+            storage.try_for_each_value_while(|object| {
+                let candidate = object.term_for_filter(dst)?;
+                if let Some(result) = runner.run(candidate, dst)? {
+                    results.push(result);
+                }
+                Ok::<_, EtsError>(results.len() < limit)
+            })?;
+            results.reverse();
             return Ok(results);
         }
         let mut objects = Vec::new();
@@ -4033,21 +4284,17 @@ impl Table {
                     objects.reverse();
                 }
             }
-            Storage::Hash(storage) => objects.extend(storage.ordered(self.options.keypos)),
-            Storage::CATree(_) => unreachable!("CA-tree handled above"),
+            Storage::Hash(_) | Storage::CATree(_) => unreachable!("storage handled above"),
         }
         let mut results = Vec::new();
         for object in objects {
             let candidate = object.term_for_filter(dst)?;
-            if let Some(result) = program.run(candidate, dst)? {
+            if let Some(result) = runner.run(candidate, dst)? {
                 results.push(result);
             }
             if results.len() >= limit {
                 break;
             }
-        }
-        if matches!(self.storage, Storage::Hash(_)) {
-            results.reverse();
         }
         Ok(results)
     }
@@ -4125,11 +4372,11 @@ impl Table {
                 })?
             }
             Storage::Hash(storage) => {
-                if continuation.slot >= storage.nactive {
+                if continuation.slot >= storage.nactive() {
                     return Err(EtsError::BadArg);
                 }
-                while continuation.slot < storage.nactive {
-                    for object in storage.slot_ordered(continuation.slot, false) {
+                while continuation.slot < storage.nactive() {
+                    storage.try_with_slot_ordered(continuation.slot, false, |object, _| {
                         if program
                             .run(object.term_for_filter(&mut scratch)?, &mut scratch)?
                             .is_some_and(|value| exact_eq(value, true_atom))
@@ -4137,13 +4384,14 @@ impl Table {
                             continuation.total += 1;
                         }
                         visited += 1;
-                    }
+                        Ok::<_, EtsError>(())
+                    })?;
                     continuation.slot += 1;
                     if visited >= budget {
                         break;
                     }
                 }
-                continuation.slot < storage.nactive
+                continuation.slot < storage.nactive()
             }
         };
         let count = continuation.total;
@@ -4161,7 +4409,7 @@ impl Table {
         let true_atom = Term::atom(global_true());
         let mut count = 0;
         if let Some(key) = program.exact_key_pattern(self.options.keypos) {
-            for object in self.matching(key)? {
+            self.try_for_matching(key, |object| {
                 let term = object.term_for_filter(&mut heap)?;
                 if program
                     .run(term, &mut heap)?
@@ -4169,7 +4417,8 @@ impl Table {
                 {
                     count += 1;
                 }
-            }
+                Ok(())
+            })?;
             return Ok(count);
         }
         let visit = |object: &StoredTerm| -> Result<(), EtsError> {
@@ -4183,7 +4432,7 @@ impl Table {
             Ok(())
         };
         match &self.storage {
-            Storage::Hash(storage) => storage.values().try_for_each(visit)?,
+            Storage::Hash(storage) => storage.try_for_each_value(visit)?,
             Storage::Ordered(root) => {
                 let mut objects = Vec::new();
                 Node::walk(root, &mut objects);
@@ -4211,7 +4460,7 @@ impl Table {
         let mut selected = Vec::new();
         let true_atom = Term::atom(global_true());
         if let Some(key) = program.exact_key_pattern(self.options.keypos) {
-            for object in self.matching(key)? {
+            self.try_for_matching(key, |object| {
                 let term = object.term_for_filter(&mut heap)?;
                 if program
                     .run(term, &mut heap)?
@@ -4219,7 +4468,8 @@ impl Table {
                 {
                     selected.push(copy_term(term, &mut heap)?);
                 }
-            }
+                Ok(())
+            })?;
             for object in selected.iter().copied() {
                 self.delete_object(object)?;
             }
@@ -4241,7 +4491,7 @@ impl Table {
         }
         match &self.storage {
             Storage::Hash(storage) => {
-                for object in storage.values() {
+                storage.try_for_each_value(|object| {
                     let term = object.term_for_filter(&mut heap)?;
                     if program
                         .run(term, &mut heap)?
@@ -4249,7 +4499,8 @@ impl Table {
                     {
                         selected.push(copy_term(term, &mut heap)?);
                     }
-                }
+                    Ok::<_, EtsError>(())
+                })?;
             }
             Storage::Ordered(root) => {
                 let mut objects = Vec::new();
@@ -4334,6 +4585,39 @@ impl Table {
         }
         Ok(count)
     }
+
+    /// Replace matches for one exact key while holding its hash stripe.
+    pub fn select_replace_key_shared(
+        &self,
+        program: &match_spec::MatchProgram,
+    ) -> Result<Option<usize>, EtsError> {
+        if self.options.table_type == TableType::Bag {
+            return Err(EtsError::BadArgCause("table_type"));
+        }
+        if !program.keeps_key(self.options.keypos) {
+            return Err(EtsError::BadArg);
+        }
+        let Some(key) = program.exact_key_pattern(self.options.keypos) else {
+            return Ok(None);
+        };
+        let Storage::Hash(storage) = &self.storage else {
+            return Ok(None);
+        };
+        let keypos = self.options.keypos;
+        let compressed = self.options.compressed;
+        let count = storage.replace_key_shared(key, ets_hash(key), keypos, |object| {
+            let mut heap = VecHeap::new();
+            let current = object.copy_out(&mut heap)?;
+            let Some(replacement) = program.run(current, &mut heap)? else {
+                return Ok::<Option<StoredTerm>, EtsError>(None);
+            };
+            let replacement = StoredTerm::copy_for_table(replacement, compressed, keypos, 2)?;
+            self.max_arity
+                .fetch_max(replacement.arity(), AtomicOrdering::Relaxed);
+            Ok(Some(replacement))
+        })?;
+        Ok(Some(count))
+    }
 }
 
 /// Storage detached from a table, released a slice of reductions at a time.
@@ -4380,7 +4664,7 @@ pub struct Registry {
     owned_tables: HashMap<Term, HashSet<Tid>>,
     /// Tables each process has fixed (erts `ERTS_P_FIXED_TABLES`).
     fixed_tables: HashMap<Term, HashSet<Tid>>,
-    match_programs: HashMap<u64, match_spec::MatchProgram>,
+    match_programs: std::sync::RwLock<HashMap<u64, Arc<match_spec::MatchProgram>>>,
 }
 
 struct TableSlot {
@@ -4395,85 +4679,93 @@ struct TableSlot {
 /// only guards the identity and name maps (erts `meta_main_tab` and `meta_name_tab`).
 pub type SharedTable = Arc<TableLock>;
 
-/// A table's reader/writer lock with one shard per scheduler group: a reader locks only its
-/// own shard, so concurrent lookups do not bounce one cache line; a writer locks every shard.
+/// A table rwmutex. erts selects its frequent-reader implementation when either
+/// `DB_FINE_LOCKED` or `DB_FREQ_READ` is set.
 ///
-/// Port of erts/emulator/beam/erl_db.c:446-500 (db_lock with `read_concurrency`, which uses
-/// reader groups of `erts_rwmtx`), OTP-29.1.1.
+/// Port of erts/emulator/beam/erl_db.c:683-695 (`db_init_lock`) and :446-500 (`db_lock`),
+/// OTP-29.1.1.
 pub struct TableLock {
-    lock: crossbeam_utils::sync::ShardedLock<Table>,
-    /// Writers waiting for the shards. Readers hold off while it is non-zero, so a writer
-    /// needs every shard free only for the moment the readers already inside drain.
-    writers_waiting: std::sync::atomic::AtomicUsize,
+    lock: TableRwLock<Table>,
+}
+
+enum TableRwLock<T> {
+    Normal(std::sync::RwLock<T>),
+    FrequentRead(FrequentReadRwLock<T>),
+}
+
+/// Shared access to a live table.
+pub enum TableReadGuard<'a, T> {
+    Normal(std::sync::RwLockReadGuard<'a, T>),
+    FrequentRead(FrequentReadGuard<'a, T>),
+}
+
+impl<T> std::ops::Deref for TableReadGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Normal(guard) => guard,
+            Self::FrequentRead(guard) => guard,
+        }
+    }
+}
+
+/// Exclusive access to a live table.
+pub enum TableWriteGuard<'a, T> {
+    Normal(std::sync::RwLockWriteGuard<'a, T>),
+    FrequentRead(FrequentWriteGuard<'a, T>),
+}
+
+impl<T> std::ops::Deref for TableWriteGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Normal(guard) => guard,
+            Self::FrequentRead(guard) => guard,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for TableWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Normal(guard) => guard,
+            Self::FrequentRead(guard) => guard,
+        }
+    }
 }
 
 impl TableLock {
-    fn new(table: Table) -> Self {
+    fn new(table: Table, frequent_read: bool) -> Self {
         Self {
-            lock: crossbeam_utils::sync::ShardedLock::new(table),
-            writers_waiting: std::sync::atomic::AtomicUsize::new(0),
+            lock: if frequent_read {
+                TableRwLock::FrequentRead(FrequentReadRwLock::new(table))
+            } else {
+                TableRwLock::Normal(std::sync::RwLock::new(table))
+            },
         }
     }
 
     /// Lock the table for reading.
-    pub fn read(&self) -> crossbeam_utils::sync::ShardedLockReadGuard<'_, Table> {
-        // Hold times are a lookup or an insert: spinning beats parking the scheduler thread
-        // (and the wake-up latency) for the few contended acquisitions.
-        let mut spins = 0_u32;
-        loop {
-            if self
-                .writers_waiting
-                .load(std::sync::atomic::Ordering::Relaxed)
-                == 0
-            {
-                match self.lock.try_read() {
-                    Ok(guard) => return guard,
-                    Err(std::sync::TryLockError::Poisoned(poison)) => return poison.into_inner(),
-                    Err(std::sync::TryLockError::WouldBlock) => {}
-                }
-            }
-            spins += 1;
-            if spins > 20_000 {
-                return self
-                    .lock
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            Self::backoff(spins);
+    pub fn read(&self) -> TableReadGuard<'_, Table> {
+        match &self.lock {
+            TableRwLock::Normal(lock) => TableReadGuard::Normal(
+                lock.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            TableRwLock::FrequentRead(lock) => TableReadGuard::FrequentRead(lock.read()),
         }
     }
 
     /// Lock the table for writing.
-    pub fn write(&self) -> crossbeam_utils::sync::ShardedLockWriteGuard<'_, Table> {
-        use std::sync::atomic::Ordering;
-        self.writers_waiting.fetch_add(1, Ordering::AcqRel);
-        let mut spins = 0_u32;
-        let guard = loop {
-            match self.lock.try_write() {
-                Ok(guard) => break guard,
-                Err(std::sync::TryLockError::Poisoned(poison)) => break poison.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {}
-            }
-            spins += 1;
-            if spins > 20_000 {
-                break self
-                    .lock
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            Self::backoff(spins);
-        };
-        self.writers_waiting.fetch_sub(1, Ordering::AcqRel);
-        guard
-    }
-
-    fn backoff(spins: u32) {
-        if spins < 64 {
-            for _ in 0..spins {
-                std::hint::spin_loop();
-            }
-        } else {
-            std::thread::yield_now();
+    pub fn write(&self) -> TableWriteGuard<'_, Table> {
+        match &self.lock {
+            TableRwLock::Normal(lock) => TableWriteGuard::Normal(
+                lock.write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            TableRwLock::FrequentRead(lock) => TableWriteGuard::FrequentRead(lock.write()),
         }
     }
 }
@@ -4490,7 +4782,7 @@ impl Registry {
             names: HashMap::new(),
             owned_tables: HashMap::new(),
             fixed_tables: HashMap::new(),
-            match_programs: HashMap::new(),
+            match_programs: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -4509,7 +4801,7 @@ impl Registry {
             let Some(table) = &slot.table else {
                 continue;
             };
-            let table = table.read();
+            let table = table.write();
             let mut heap = VecHeap::new();
             if let Ok(objects) = table.tab2list(&mut heap) {
                 for object in objects {
@@ -4523,7 +4815,7 @@ impl Registry {
     /// Count external identities retained by compiled match programs.
     pub fn match_program_identity_counts(&self) -> HashMap<(Atom, u32), usize> {
         let mut counts = HashMap::new();
-        for program in self.match_programs.values() {
+        for program in self.match_programs.read().unwrap().values() {
             for (node, count) in program.external_identity_counts() {
                 *counts.entry(node).or_default() += count;
             }
@@ -4560,7 +4852,10 @@ impl Registry {
                 table: None,
             });
         }
-        self.tables[index].table = Some(Arc::new(TableLock::new(table)));
+        self.tables[index].table = Some(Arc::new(TableLock::new(
+            table,
+            options.read_concurrency || options.write_concurrency != WriteConcurrency::Disabled,
+        )));
         self.owned_tables
             .entry(options.owner)
             .or_default()
@@ -4579,19 +4874,19 @@ impl Registry {
         slot.table.as_ref().ok_or(EtsError::NoTable)
     }
 
-    /// Lock a table for reading.
-    pub fn get(
-        &self,
-        tid: Tid,
-    ) -> Result<crossbeam_utils::sync::ShardedLockReadGuard<'_, Table>, EtsError> {
+    /// Lock a table exclusively while ETS hash storage is stripe-owned.
+    pub fn get(&self, tid: Tid) -> Result<TableWriteGuard<'_, Table>, EtsError> {
+        Ok(self.shared(tid)?.write())
+    }
+
+    /// Lock a table for a fine-grained key read.
+    // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock read mode), OTP-29.1.1.
+    pub fn get_shared(&self, tid: Tid) -> Result<TableReadGuard<'_, Table>, EtsError> {
         Ok(self.shared(tid)?.read())
     }
 
     /// Lock a table for writing.
-    pub fn get_mut(
-        &self,
-        tid: Tid,
-    ) -> Result<crossbeam_utils::sync::ShardedLockWriteGuard<'_, Table>, EtsError> {
+    pub fn get_mut(&self, tid: Tid) -> Result<TableWriteGuard<'_, Table>, EtsError> {
         Ok(self.shared(tid)?.write())
     }
 
@@ -4620,20 +4915,26 @@ impl Registry {
     }
 
     /// Retain a compiled match program while a user continuation may refer to it.
-    pub fn retain_match_program(&mut self, program: match_spec::MatchProgram) {
-        self.match_programs.insert(program.id(), program);
+    pub fn retain_match_program(&self, program: match_spec::MatchProgram) {
+        self.match_programs
+            .write()
+            .unwrap()
+            .insert(program.id(), Arc::new(program));
     }
 
     /// Resolve a compiled program from an ETS continuation reference.
-    pub fn match_program(&self, reference: Term) -> Option<&match_spec::MatchProgram> {
+    pub fn match_program(&self, reference: Term) -> Option<Arc<match_spec::MatchProgram>> {
         self.match_programs
+            .read()
+            .unwrap()
             .get(&match_spec::MatchProgram::reference_id(reference)?)
+            .cloned()
     }
 
     /// Release a compiled match program after its last continuation is consumed.
-    pub fn release_match_program(&mut self, reference: Term) -> bool {
+    pub fn release_match_program(&self, reference: Term) -> bool {
         match_spec::MatchProgram::reference_id(reference)
-            .is_some_and(|id| self.match_programs.remove(&id).is_some())
+            .is_some_and(|id| self.match_programs.write().unwrap().remove(&id).is_some())
     }
 
     /// Remove a table from the registry.

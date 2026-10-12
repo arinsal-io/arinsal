@@ -376,7 +376,7 @@ impl Node {
     /// Port of erts/emulator/beam/erl_db_tree.c:2753 (analyze_pattern), OTP-29.1.1.
     pub(super) fn select_range<H: HeapAlloc>(
         root: &Option<Box<Self>>,
-        state: &mut RangeSelection<'_, H>,
+        state: &mut RangeSelection<'_, '_, H>,
     ) -> Result<(), EtsError> {
         Self::select_range_checked(root, state, true, true)
     }
@@ -385,7 +385,7 @@ impl Node {
     // interior of the range costs one object run per key like erts's in-order walk.
     fn select_range_checked<H: HeapAlloc>(
         root: &Option<Box<Self>>,
-        state: &mut RangeSelection<'_, H>,
+        state: &mut RangeSelection<'_, '_, H>,
         check_below: bool,
         check_above: bool,
     ) -> Result<(), EtsError> {
@@ -417,13 +417,11 @@ impl Node {
         if state.out.len() >= state.limit {
             return Ok(());
         }
-        if !below
-            && !above
-            && let Some(result) = state
-                .program
-                .run(node.object.term_for_filter(state.dst)?, state.dst)?
-        {
-            state.out.push(result);
+        if !below && !above {
+            let term = node.object.term_for_filter(state.dst)?;
+            if let Some(result) = state.runner.run(term, state.dst)? {
+                state.out.push(result);
+            }
         }
         if state.out.len() >= state.limit {
             return Ok(());

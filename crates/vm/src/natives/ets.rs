@@ -267,6 +267,35 @@ impl RegistryAccess<'_> {
     }
 }
 
+enum TableGuard<'a> {
+    Read(arinsal_ets::TableReadGuard<'a, arinsal_ets::Table>),
+    Write(arinsal_ets::TableWriteGuard<'a, arinsal_ets::Table>),
+}
+
+impl std::ops::Deref for TableGuard<'_> {
+    type Target = arinsal_ets::Table;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Read(table) => table,
+            Self::Write(table) => table,
+        }
+    }
+}
+
+// Port of erts/emulator/beam/erl_db.c:446-500 (db_lock read/write modes), OTP-29.1.1.
+fn table_guard<'a>(
+    registry: &'a RegistryAccess<'_>,
+    tid: Tid,
+    shared: bool,
+) -> Result<TableGuard<'a>, VmError> {
+    if shared {
+        Ok(TableGuard::Read(registry.get_shared(tid).map_err(err)?))
+    } else {
+        Ok(TableGuard::Write(registry.get_mut(tid).map_err(err)?))
+    }
+}
+
 fn resolve(registry: &arinsal_ets::Registry, term: Term) -> Result<Tid, ResolveFail> {
     if let Some(tid) = Tid::from_term(term) {
         return if registry.shared(tid).is_ok() {
@@ -630,7 +659,7 @@ fn lookup_args_member(
 fn direct_lookup_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let key = args[1];
-    with_cached_table(process, args[0], |shared, _, process| {
+    with_cached_table(process, args[0], |shared, _options, process| {
         let table = shared.read();
         if table.is_detached() || !allowed(&table, caller, false) {
             return None;
@@ -666,7 +695,7 @@ fn direct_member(process: &mut Process, args: &[Term]) -> Option<Term> {
 fn direct_member_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
     let caller = direct_caller(process)?;
     let key = args[1];
-    with_cached_table(process, args[0], |shared, _, _| {
+    with_cached_table(process, args[0], |shared, _options, _| {
         let table = shared.read();
         if table.is_detached() || !allowed(&table, caller, false) {
             return None;
@@ -706,11 +735,8 @@ fn direct_insert_cached(process: &mut Process, args: &[Term]) -> Option<Term> {
         // The copy into table storage is the long part of an insert: do it before the
         // exclusive lock so readers are not held up behind it.
         let prepared = Table::prepare_object(options, object).ok()?;
-        // A CA tree (ordered_set with write_concurrency) takes its own route and base-node
-        // locks, so its writers share the table lock.
-        let prepared = if options.table_type == TableType::OrderedSet
-            && options.write_concurrency != WriteConcurrency::Disabled
-        {
+        // Fine-grained hash tables and CA trees take their bucket or route locks.
+        let prepared = if options.write_concurrency != WriteConcurrency::Disabled {
             let table = shared.read();
             if table.is_detached() || !allowed(&table, caller, true) {
                 return None;
@@ -750,7 +776,15 @@ fn direct_update_counter_cached(process: &mut Process, args: &[Term]) -> Option<
         {
             return None;
         }
-        let values = {
+        let values = if options.write_concurrency != WriteConcurrency::Disabled
+            && options.table_type == TableType::Set
+        {
+            let table = shared.read();
+            if table.is_detached() || !allowed(&table, caller, true) {
+                return None;
+            }
+            table.update_counter_in_place_shared(key, &operations)?
+        } else {
             let mut table = shared.write();
             if table.is_detached() || !allowed(&table, caller, true) {
                 return None;
@@ -774,12 +808,37 @@ fn insert_args(
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
+    // SAFETY: object terms remain in the caller's live process heap for this BIF.
+    let single = unsafe { objects.tuple_ref() }.is_some();
+    let shared = registry.shared(tid).map_err(err)?;
+    let options = shared.read().options;
+    if single
+        && options.write_concurrency != WriteConcurrency::Disabled
+        && options.table_type != TableType::OrderedSet
+    {
+        let table = shared.read();
+        if !allowed(&table, caller, true) {
+            return Err(badarg_cause("access"));
+        }
+        let prepared = Table::prepare_object(&options, objects).map_err(err)?;
+        let yes = if insert_new {
+            table.insert_new_prepared_shared(prepared).map_err(err)?
+        } else {
+            if table.insert_shared(prepared).is_some() {
+                return Err(badarg());
+            }
+            true
+        };
+        return Ok(if insert_new {
+            boolean_term(yes)
+        } else {
+            boolean_term(true)
+        });
+    }
     let mut table = registry.get_mut(tid).map_err(err)?;
     if !allowed(&table, caller, true) {
         return Err(badarg_cause("access"));
     }
-    // SAFETY: object terms remain in the caller's live process heap for this BIF.
-    let single = unsafe { objects.tuple_ref() }.is_some();
     let yes = if single {
         if insert_new {
             table.insert_new(&[objects]).map_err(err)?
@@ -813,7 +872,7 @@ fn lookup_args(
     let rt = process.runtime.as_ref().ok_or_else(badarg)?;
     let registry = rt.ets.read().unwrap();
     let tid = handle(&registry, target)?;
-    let table = registry.get(tid).map_err(err)?;
+    let table = registry.get_shared(tid).map_err(err)?;
     if !allowed(&table, caller, false) {
         return Err(badarg_cause("access"));
     }
@@ -823,6 +882,48 @@ fn lookup_args(
         let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
         let values = table.lookup(key, &mut heap).map_err(err)?;
         output_list(&mut heap, values)
+    }
+}
+
+fn lookup_element_locked(
+    table: &arinsal_ets::Table,
+    caller: Term,
+    key: Term,
+    position: usize,
+    default: Option<Term>,
+    heap: &mut arinsal_bifs::FragmentingHeap<'_>,
+) -> Result<Term, VmError> {
+    if !allowed(table, caller, false) {
+        return Err(badarg_cause("access"));
+    }
+    if default.is_none()
+        && !matches!(
+            table.options.table_type,
+            TableType::Bag | TableType::DuplicateBag
+        )
+    {
+        return table.lookup_element_one(key, position, heap).map_err(err);
+    }
+    let values = if let Some(default) = default {
+        match table
+            .lookup_element_default(key, position, default, heap)
+            .map_err(err)?
+        {
+            ElementLookup::Values(values) => values,
+            ElementLookup::Default(value) => return Ok(value),
+        }
+    } else {
+        table.lookup_element(key, position, heap).map_err(err)?
+    };
+    if matches!(
+        table.options.table_type,
+        TableType::Bag | TableType::DuplicateBag
+    ) {
+        TermBuilder::new(heap)
+            .list_from_iter(values)
+            .map_err(|_| badarg())
+    } else {
+        values.first().copied().ok_or_else(badarg)
     }
 }
 
@@ -1015,15 +1116,6 @@ fn call_inner(
             | (EtsBif::Delete, 1)
             | (EtsBif::GiveAway, _)
             | (EtsBif::SafeFixtable, _)
-            | (EtsBif::MatchSpecCompile, _)
-            | (
-                EtsBif::Select | EtsBif::SelectReverse | EtsBif::Match | EtsBif::MatchObject,
-                1
-            )
-            | (
-                EtsBif::Select | EtsBif::SelectReverse | EtsBif::Match | EtsBif::MatchObject,
-                3
-            )
     );
     let mut registry = if exclusive {
         RegistryAccess::Exclusive(rt.ets.write().unwrap())
@@ -1210,9 +1302,11 @@ fn call_inner(
                 Err(ResolveFail::Missing) => return Ok(atom("undefined")),
                 Err(ResolveFail::BadType) => return Err(badarg_cause("type")),
             };
-            let table = registry.get(tid).map_err(err)?;
-            let schedulers = rt.scheduler()?.scheduler_count();
+            // Port of erts/emulator/beam/erl_db.c:4532-4564 (ets_info_2, DB_INFO/LCK_READ),
+            // OTP-29.1.1.
+            let table = table_guard(&registry, tid, true)?;
             if args.len() == 1 {
+                let schedulers = rt.scheduler()?.scheduler_count();
                 table
                     .info_list_for_schedulers(atom("nonode@nohost"), &mut heap, schedulers)
                     .map_err(err)
@@ -1224,6 +1318,11 @@ fn call_inner(
                         .list_from_iter(values)
                         .map_err(|_| system_limit());
                 }
+                let schedulers = if key == "memory" {
+                    rt.scheduler()?.scheduler_count()
+                } else {
+                    1
+                };
                 table
                     .info_item_for_schedulers(key, atom("nonode@nohost"), &mut heap, schedulers)
                     .map_err(err)
@@ -1231,6 +1330,22 @@ fn call_inner(
         }
         (EtsBif::Delete, [target, key]) => {
             let tid = handle(&registry, *target)?;
+            if registry
+                .shared(tid)
+                .map_err(err)?
+                .read()
+                .options
+                .write_concurrency
+                != WriteConcurrency::Disabled
+            {
+                let table = registry.get_shared(tid).map_err(err)?;
+                if !allowed(&table, caller, true) {
+                    return Err(badarg_cause("access"));
+                }
+                if table.delete_key_shared(*key) {
+                    return Ok(atom("true"));
+                }
+            }
             let mut table = registry.get_mut(tid).map_err(err)?;
             if !allowed(&table, caller, true) {
                 return Err(badarg_cause("access"));
@@ -1242,7 +1357,7 @@ fn call_inner(
         // OTP-29.1.1.
         (EtsBif::LookupBinaryInfo, [target, key]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = registry.get_shared(tid).map_err(err)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1343,7 +1458,7 @@ fn call_inner(
         // OTP-29.1.1.
         (EtsBif::RawFirst, [target]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = registry.get_shared(tid).map_err(err)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1356,7 +1471,7 @@ fn call_inner(
         // OTP-29.1.1.
         (EtsBif::RawNext, [target, key]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = registry.get_shared(tid).map_err(err)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1367,6 +1482,23 @@ fn call_inner(
         }
         (EtsBif::Take, [target, key]) => {
             let tid = handle(&registry, *target)?;
+            if registry
+                .shared(tid)
+                .map_err(err)?
+                .read()
+                .options
+                .write_concurrency
+                != WriteConcurrency::Disabled
+            {
+                let table = registry.get_shared(tid).map_err(err)?;
+                if !allowed(&table, caller, true) {
+                    return Err(badarg_cause("access"));
+                }
+                if table.options.table_type != TableType::OrderedSet {
+                    let values = table.take_shared(*key, &mut heap).map_err(err)?;
+                    return output_list(&mut heap, values);
+                }
+            }
             let mut table = registry.get_mut(tid).map_err(err)?;
             if !allowed(&table, caller, true) {
                 return Err(badarg_cause("access"));
@@ -1376,7 +1508,7 @@ fn call_inner(
         }
         (EtsBif::Slot, [target, index]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = registry.get_shared(tid).map_err(err)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1389,7 +1521,7 @@ fn call_inner(
         }
         (EtsBif::First | EtsBif::Last, [target]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = table_guard(&registry, tid, true)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1405,7 +1537,7 @@ fn call_inner(
                 return Err(badarg());
             }
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = table_guard(&registry, tid, true)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1423,7 +1555,7 @@ fn call_inner(
         // first and prev as next (erl_db_hash.c:893).
         (EtsBif::FirstLookup | EtsBif::LastLookup, [target]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = table_guard(&registry, tid, true)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1440,7 +1572,7 @@ fn call_inner(
                 return Err(badarg());
             }
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = table_guard(&registry, tid, true)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1490,6 +1622,22 @@ fn call_inner(
         }
         (EtsBif::DeleteObject, [target, object]) => {
             let tid = handle(&registry, *target)?;
+            if registry
+                .shared(tid)
+                .map_err(err)?
+                .read()
+                .options
+                .write_concurrency
+                != WriteConcurrency::Disabled
+            {
+                let table = registry.get_shared(tid).map_err(err)?;
+                if !allowed(&table, caller, true) {
+                    return Err(badarg_cause("access"));
+                }
+                if table.delete_object_shared(*object).map_err(err)? {
+                    return Ok(atom("true"));
+                }
+            }
             let mut table = registry.get_mut(tid).map_err(err)?;
             if !allowed(&table, caller, true) {
                 return Err(badarg_cause("access"));
@@ -1543,7 +1691,7 @@ fn call_inner(
         | (EtsBif::Match, [target, spec])
         | (EtsBif::MatchObject, [target, spec]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = table_guard(&registry, tid, true)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1575,7 +1723,7 @@ fn call_inner(
         | (EtsBif::MatchObject, [target, spec, limit]) => {
             let tid = handle(&registry, *target)?;
             let (program, result, retain) = {
-                let table = registry.get(tid).map_err(err)?;
+                let table = table_guard(&registry, tid, true)?;
                 if !allowed(&table, caller, false) {
                     return Err(badarg_cause("access"));
                 }
@@ -1635,7 +1783,7 @@ fn call_inner(
                 (program, result, retain)
             };
             if retain {
-                registry.exclusive()?.retain_match_program(program);
+                registry.retain_match_program(program);
             }
             Ok(result)
         }
@@ -1649,7 +1797,7 @@ fn call_inner(
             // SAFETY: the continuation is rooted in the caller's process heap.
             let tuple = unsafe { continuation.tuple_ref() }.ok_or_else(badarg)?;
             let tid = Tid::from_term(tuple.get(0).ok_or_else(badarg)?).ok_or_else(badarg)?;
-            let table = registry.get(tid).map_err(err)?;
+            let table = table_guard(&registry, tid, true)?;
             if !allowed(&table, caller, false) {
                 return Err(badarg_cause("access"));
             }
@@ -1660,10 +1808,9 @@ fn call_inner(
             };
             let reference = tuple.get(program_pos).ok_or_else(badarg)?;
             let program = registry.match_program(reference).ok_or_else(badarg)?;
-            let state =
-                SelectContinuation::from_term(&table, program, *continuation).map_err(err)?;
+            let state = SelectContinuation::from_term(&table, &program, *continuation).map_err(err)?;
             let page = table
-                .select_chunk_continue(program, state, &mut heap)
+                .select_chunk_continue(&program, state, &mut heap)
                 .map_err(err)?;
             let keep_program = page.continuation.is_some();
             let rows = TermBuilder::new(&mut heap)
@@ -1685,14 +1832,14 @@ fn call_inner(
             }?;
             drop(table);
             if !keep_program {
-                registry.exclusive()?.release_match_program(reference);
+                registry.release_match_program(reference);
             }
             Ok(result)
         }
         (EtsBif::MatchSpecCompile, [spec]) => {
             let program = MatchProgram::compile(*spec).map_err(err)?;
             let reference = program.reference(&mut heap).map_err(err)?;
-            registry.exclusive()?.retain_match_program(program);
+            registry.retain_match_program(program);
             Ok(reference)
         }
         (EtsBif::IsCompiledMs, [value]) => {
@@ -1754,6 +1901,49 @@ fn call_inner(
         | (EtsBif::InternalSelectDelete, [target, spec])
         | (EtsBif::SelectReplace, [target, spec]) => {
             let tid = handle(&registry, *target)?;
+            if function == EtsBif::SelectReplace
+                && registry
+                    .shared(tid)
+                    .map_err(err)?
+                    .read()
+                    .options
+                    .write_concurrency
+                    != WriteConcurrency::Disabled
+            {
+                let table = registry.get_shared(tid).map_err(err)?;
+                if !allowed(&table, caller, true) {
+                    return Err(badarg_cause("access"));
+                }
+                if table.options.table_type == TableType::Bag {
+                    return Err(badarg_cause("table_type"));
+                }
+                if *spec == Term::NIL {
+                    return Term::small(0).ok_or_else(badarg);
+                }
+                let program = MatchProgram::compile(*spec).map_err(err)?;
+                if let Some(count) = table
+                    .select_replace_key_shared(&program)
+                    .map_err(err)?
+                {
+                    return TermBuilder::new(&mut heap)
+                        .int_from_i128(count as i128)
+                        .map_err(|_| badarg());
+                }
+            }
+            if function == EtsBif::SelectCount {
+                let table = registry.get_shared(tid).map_err(err)?;
+                if !allowed(&table, caller, false) {
+                    return Err(badarg_cause("access"));
+                }
+                if *spec == Term::NIL {
+                    return Term::small(0).ok_or_else(badarg);
+                }
+                let program = MatchProgram::compile(*spec).map_err(err)?;
+                let count = table.select_count(&program).map_err(err)?;
+                return TermBuilder::new(&mut heap)
+                    .int_from_i128(count as i128)
+                    .map_err(|_| badarg());
+            }
             let mut table = registry.get_mut(tid).map_err(err)?;
             if !allowed(&table, caller, function != EtsBif::SelectCount) {
                 return Err(badarg_cause("access"));
@@ -1780,47 +1970,41 @@ fn call_inner(
         (EtsBif::LookupElement, [target, key, position])
         | (EtsBif::LookupElement, [target, key, position, _]) => {
             let tid = handle(&registry, *target)?;
-            let table = registry.get(tid).map_err(err)?;
-            if !allowed(&table, caller, false) {
-                return Err(badarg_cause("access"));
-            }
             let pos =
                 usize::try_from(position.as_small().ok_or_else(badarg)?).map_err(|_| badarg())?;
-            if args.len() == 3
-                && !matches!(
-                    table.options.table_type,
-                    TableType::Bag | TableType::DuplicateBag
-                )
-            {
-                return table
-                    .lookup_element_one(*key, pos, &mut heap)
-                    .map_err(err);
-            }
-            let values = if args.len() == 4 {
-                match table
-                    .lookup_element_default(*key, pos, args[3], &mut heap)
-                    .map_err(err)?
-                {
-                    ElementLookup::Values(values) => values,
-                    ElementLookup::Default(value) => return Ok(value),
-                }
-            } else {
-                table.lookup_element(*key, pos, &mut heap).map_err(err)?
-            };
-            if matches!(
-                table.options.table_type,
-                TableType::Bag | TableType::DuplicateBag
-            ) {
-                TermBuilder::new(&mut heap)
-                    .list_from_iter(values)
-                    .map_err(|_| badarg())
-            } else {
-                values.first().copied().ok_or_else(badarg)
-            }
+            let table = registry.get_shared(tid).map_err(err)?;
+            lookup_element_locked(&table, caller, *key, pos, args.get(3).copied(), &mut heap)
         }
         (EtsBif::UpdateElement, [target, key, updates])
         | (EtsBif::UpdateElement, [target, key, updates, _]) => {
             let tid = handle(&registry, *target)?;
+            if registry
+                .shared(tid)
+                .map_err(err)?
+                .read()
+                .options
+                .write_concurrency
+                != WriteConcurrency::Disabled
+            {
+                let table = registry.get_shared(tid).map_err(err)?;
+                if table.options.table_type == TableType::Set {
+                    if !allowed(&table, caller, true) {
+                        return Err(badarg_cause("access"));
+                    }
+                    let default = default_object(&table, args.get(3).copied())?;
+                    let parsed = update_list(*updates, |entry| {
+                        match tuple_items(entry)?.as_slice() {
+                            [position_term, value] => Some((position(*position_term)?, *value)),
+                            _ => None,
+                        }
+                    });
+                    return Ok(boolean_term(
+                        table
+                            .update_element_shared(*key, &parsed, default)
+                            .map_err(err)?,
+                    ));
+                }
+            }
             let mut table = registry.get_mut(tid).map_err(err)?;
             if !allowed(&table, caller, true) {
                 return Err(badarg_cause("access"));
@@ -1840,6 +2024,66 @@ fn call_inner(
         (EtsBif::UpdateCounter, [target, key, operation])
         | (EtsBif::UpdateCounter, [target, key, operation, _]) => {
             let tid = handle(&registry, *target)?;
+            if registry
+                .shared(tid)
+                .map_err(err)?
+                .read()
+                .options
+                .write_concurrency
+                != WriteConcurrency::Disabled
+            {
+                let table = registry.get_shared(tid).map_err(err)?;
+                if table.options.table_type == TableType::Set {
+                    if !allowed(&table, caller, true) {
+                        return Err(badarg_cause("access"));
+                    }
+                    let default = default_object(&table, args.get(3).copied())?;
+                    let single = integer(*operation).is_some()
+                        || operation.classify() == TermKind::Tuple;
+                    if let Some((operations, _)) =
+                        small_counter_ops(table.options.keypos, *operation)
+                        && let Some(values) =
+                            table.update_counter_in_place_shared(*key, &operations)
+                    {
+                        return counter_results(&mut heap, &values, single);
+                    }
+                    let parse = |entry: Term| -> Option<BigCounterOp> {
+                        let (position_term, increment, threshold) =
+                            match tuple_items(entry)?.as_slice() {
+                                [position_term, increment] => (*position_term, *increment, None),
+                                [position_term, increment, threshold, warp] => (
+                                    *position_term,
+                                    *increment,
+                                    Some((integer(*threshold)?, integer(*warp)?)),
+                                ),
+                                _ => return None,
+                            };
+                        Some(BigCounterOp {
+                            position: position(position_term)?,
+                            increment: integer(increment)?,
+                            threshold,
+                        })
+                    };
+                    let operations = if let Some(increment) = integer(*operation) {
+                        vec![Some(BigCounterOp {
+                            position: table.options.keypos + 1,
+                            increment,
+                            threshold: None,
+                        })]
+                    } else {
+                        update_list(*operation, parse)
+                    };
+                    let values = table
+                        .update_counter_big_shared(*key, &operations, default, &mut heap)
+                        .map_err(err)?
+                        .ok_or_else(badarg)?;
+                    return if single {
+                        values.first().copied().ok_or_else(badarg)
+                    } else {
+                        output_list(&mut heap, values)
+                    };
+                }
+            }
             let mut table = registry.get_mut(tid).map_err(err)?;
             if !allowed(&table, caller, true) {
                 return Err(badarg_cause("access"));
