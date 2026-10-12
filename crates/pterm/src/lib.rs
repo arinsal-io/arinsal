@@ -721,6 +721,16 @@ impl Store {
                     Arc::strong_count(stored)
                 );
             }
+            if literal_trace()
+                && let RetiredStorage::Module(area) = &active.area
+            {
+                eprintln!(
+                    "literal_release module_area={} words={} area_refs={}",
+                    active.id,
+                    area.used_words(),
+                    Arc::strong_count(area)
+                );
+            }
             writer.retired.remove(&active.id);
             self.note_area_freed();
             if writer.retired_order.front() == Some(&active.id) {

@@ -188,6 +188,25 @@ pub(crate) fn native_code_range(
         .as_ref()
         .map(|version| version.code_range())
 }
+
+/// Native function metadata of the module version in slot `id`, when it was compiled by BeamAsm.
+pub(crate) fn native_code_version(
+    code_meta: &[Option<Arc<CodeMeta>>],
+    id: usize,
+) -> Option<&Arc<beamasm_integration::CompiledVersion>> {
+    code_meta.get(id)?.as_ref()?.beamasm.as_ref()
+}
+
+/// Whether `address` belongs to the native code of one compiled module version.
+// Port of erts/emulator/beam/beam_ranges.c:245-289 (erts_lookup_function_info), OTP-29.1.1.
+pub(crate) fn native_code_contains(
+    version: Option<&beamasm_integration::CompiledVersion>,
+    address: usize,
+) -> bool {
+    version.is_some_and(|version| {
+        version.contains_code(address) || version.native_function_for_pc(address).is_some()
+    })
+}
 impl CodeMeta {
     pub(crate) fn from_beam(beam: &BeamFile, bytes: Option<&[u8]>) -> Self {
         // OTP encodes -on_load as a Code instruction following that function's label.
@@ -542,7 +561,9 @@ pub(crate) fn retract_module_records(scope: u64, module: &str) {
 /// loader's code barrier before the commit.
 pub(crate) struct StagedLoad {
     /// `None` when the staging area was nested in an outer one, which commits it.
-    ended: Option<crate::code_ix::EndedStaging>,
+    pub(crate) ended: Option<crate::code_ix::EndedStaging>,
+    /// Set for a scheduler-backed load; its thread-progress callback owns the commit.
+    pub(crate) barrier_passed: Option<Arc<std::sync::atomic::AtomicBool>>,
     ids: Vec<usize>,
     /// Names of the staged modules.
     pub(crate) names: Vec<String>,
@@ -913,6 +934,7 @@ impl Vm {
         }
         Ok(StagedLoad {
             ended: staging.end(),
+            barrier_passed: None,
             ids,
             names,
             on_load,
@@ -923,6 +945,12 @@ impl Vm {
     /// returns the modules with `on_load`.
     // Port of erts/emulator/beam/beam_bif_load.c:301-320 (commit_code_ix), OTP-29.1.1.
     pub(crate) fn commit_staged(&mut self, staged: StagedLoad) -> Vec<String> {
+        debug_assert!(
+            staged
+                .barrier_passed
+                .as_ref()
+                .is_none_or(|passed| { passed.load(std::sync::atomic::Ordering::Acquire) })
+        );
         if let Some(ended) = staged.ended {
             ended.commit();
         }

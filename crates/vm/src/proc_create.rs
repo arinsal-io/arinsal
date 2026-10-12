@@ -786,8 +786,8 @@ pub(crate) struct ProcessCold {
     /// Result of a published `persistent_term` update, returned when the yielded
     /// updater runs again (erts resumes the suspended updater after `table_updater`).
     pub(crate) persistent_update_result: Option<Term>,
-    /// Modules a suspended `finish_loading/1` staged; they commit when it is rescheduled
-    /// after its code barrier, or when the loader exits first.
+    /// Modules a suspended `finish_loading/1` staged; the thread-progress callback commits
+    /// them and releases code-load permission before rescheduling the loader.
     pub(crate) finish_loading_commit: Option<crate::load::StagedLoad>,
     /// Breakpoint update a trace BIF caller finishes between code barriers while it holds
     /// the code modification permission.

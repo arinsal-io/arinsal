@@ -1094,7 +1094,7 @@ pub(crate) struct CompiledVersion {
     line_breakpoint_returns: Vec<(usize, usize)>,
     // Function, arity, call-NIF identity and the patch word that enables its body.
     nif_patches: Vec<(String, u8, usize, usize)>,
-    literal_heap: Option<Box<VecHeap>>,
+    literal_heap: Option<Arc<VecHeap>>,
     // The module's literal area, which native code refers to directly.
     _module_literals: arinsal_loader::LiteralArea,
     native_functions: Vec<crate::NativeFunction>,
@@ -1214,6 +1214,17 @@ impl CompiledVersion {
             .map(|native| native.start)
     }
 
+    /// Resolves a native PC to its function in this compiled module version.
+    // Port of erts/emulator/beam/beam_ranges.c:245-289 (erts_lookup_function_info), OTP-29.1.1.
+    pub(crate) fn native_function_for_pc(&self, pc: usize) -> Option<&crate::NativeFunction> {
+        let index = self
+            .native_functions
+            .partition_point(|function| function.start <= pc);
+        self.native_functions
+            .get(index.checked_sub(1)?)
+            .filter(|function| pc < function.end)
+    }
+
     /// Makes native entries of `function/arity` run the NIF `entry` loaded by `load_nif`.
     // Port of erts/emulator/beam/erl_nif.c:5050-5260 (patch_call_nif_early and the load_nif
     // finishers), OTP-29.1.1.
@@ -1245,17 +1256,6 @@ impl CompiledVersion {
     }
 }
 
-/// Literal heaps of purged native module versions. Process heaps may still reference their
-/// literals (a zero-capture fun, a constant), and no literal area collector copies them out
-/// yet (erts_literal_area_collector: nothing is queued), so they stay allocated, like the
-/// interpreter's literal areas.
-// The heaps stay boxed: literal terms point at them, so they must not move.
-#[allow(clippy::vec_box)]
-fn retired_literal_heaps() -> &'static std::sync::Mutex<Vec<Box<VecHeap>>> {
-    static RETIRED: OnceLock<std::sync::Mutex<Vec<Box<VecHeap>>>> = OnceLock::new();
-    RETIRED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
 impl Drop for CompiledVersion {
     fn drop(&mut self) {
         // Port of erts/emulator/beam/beam_bif_load.c (purge: fun entries of the purged code
@@ -1268,14 +1268,33 @@ impl Drop for CompiledVersion {
             for ix in 0..arinsal_term::ERTS_NUM_CODE_IX {
                 let target = entry.dispatch_target.address(ix);
                 if self.code_start <= target && target < self.code_end {
-                    entry.set_fun_code(ix, unloaded);
+                    // set_fun_code refuses a pending purge (erl_fun.c erts_set_fun_code).
+                    // fun_purge_foreach already stored the old address in the marker and
+                    // unloaded one index; the other indexes may still enter this area.
+                    if entry
+                        .pend_purge_address
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 0
+                    {
+                        entry.set_fun_code(ix, unloaded);
+                    } else {
+                        entry.dispatch_target.set_address(ix, unloaded);
+                    }
                 }
             }
         }
-        if let Some(heap) = self.literal_heap.take()
-            && let Ok(mut retired) = retired_literal_heaps().lock()
-        {
-            retired.push(heap);
+        if let Some(heap) = self.literal_heap.take() {
+            // Port of erts/emulator/beam/beam_bif_load.c:2341
+            // (erts_queue_release_literals), OTP-29.1.1: purged code literals
+            // are copied out by the same collector as interpreter literals.
+            if lifetime_trace_enabled() {
+                eprintln!(
+                    "[beamasm-lifetime] retire literal heap module={} words={}",
+                    self.module,
+                    heap.used_words()
+                );
+            }
+            arinsal_pterm::store_for(self.scope).retire_module_area(heap);
         }
         crate::native_helpers::release_nif_slots(
             self.nif_patches.iter().map(|(_, _, identity, _)| *identity),
@@ -1997,6 +2016,8 @@ pub(crate) fn compile(
             file_term: None,
         });
     }
+    // BeamCodeHeader.functions is ordered by code address for erts_lookup_function_info.
+    native_functions.sort_unstable_by_key(|function| function.start);
     if lifetime_trace_enabled() {
         eprintln!(
             "[beamasm-lifetime] compiled module={} range={:#x}..{:#x} native={}",
@@ -2042,7 +2063,7 @@ pub(crate) fn compile(
             .map(|(resume, site)| (code_start + resume, code_start + site))
             .collect(),
         nif_patches,
-        literal_heap: Some(literal_heap),
+        literal_heap: Some(Arc::from(literal_heap)),
         _module_literals: module.literal_area(),
         native_functions,
         native_targets,

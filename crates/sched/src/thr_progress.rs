@@ -711,17 +711,29 @@ fn reached(progress: &ThrProgress, val: u64) -> bool {
 /// :913 (erts_thr_progress_finalize_wait), OTP-29.1.1; the caller must not hold locks that
 /// a thread blocking progress needs.
 pub fn thread_progress_wait<R>(wait: impl FnOnce() -> R) -> R {
+    // Port of erts/emulator/beam/erl_process.c:3576-3579,3611,3660 (scheduler_wait): a thread
+    // that sleeps first stops counting as active, so the leader election sees no active
+    // thread and a waking thread is not missed, then prepares to wait. Skipping the
+    // deactivation leaves ERTS_THR_PRGR_LFLG_ACTIVE_MASK set, nobody becomes the leader,
+    // and a later operation queued by a thread that went idle never runs.
     let managed = with_tpd(|tpd| {
         tpd.map(|tpd| {
+            let was_active = tpd.active;
+            if was_active {
+                set_active(tpd, false);
+            }
             prepare_wait(tpd);
+            was_active
         })
-        .is_some()
     });
     let result = wait();
-    if managed {
+    if let Some(was_active) = managed {
         with_tpd(|tpd| {
             if let Some(tpd) = tpd {
                 finalize_wait(tpd);
+                if was_active && !tpd.active {
+                    set_active(tpd, true);
+                }
             }
         });
     }

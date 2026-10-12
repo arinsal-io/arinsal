@@ -3584,8 +3584,13 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     pub fn worker_id(&self) -> Option<usize> {
         self.worker
     }
-    /// Reject further mailbox publishes. In-flight publishers still land and
-    /// are drained before the pid leaves the process table.
+    /// Reject further mailbox publishes and delete this pid from the process table.
+    /// In-flight publishers that already resolved the slot still land; a later
+    /// enqueue sees the pid gone. The identifier may be reused immediately, so the
+    /// slice epilogue must not delete the slot again.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:14438-14456
+    /// (`erts_ptab_delete_element` at `ERTS_CONTINUE_EXIT_FREE`), OTP-29.1.1.
     pub fn begin_exit(&mut self) {
         self.inner.mark_exited(self.pid);
     }
@@ -4418,8 +4423,13 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         }
     }
     fn mark_exited(&mut self, pid: Pid) {
+        // Port of erts/emulator/beam/erl_process.c:14448-14456
+        // (`erts_ptab_delete_element` while this process is still current), OTP-29.1.1.
+        // One delete: the free-id ring hands the slot to the next spawn, and a second
+        // delete of the same pix would destroy that process.
         if let Some(process) = self.inner.table.lookup(pid) {
             process.state.store(EXITED, Ordering::SeqCst);
+            self.inner.table.remove(pid);
         }
     }
     fn start_timer(
@@ -6165,7 +6175,13 @@ fn run_slice<'a, T: Task>(
             if process.input.close_into(&mut remaining) > 0 {
                 cell.task.reap_signals(process.pid, remaining.into());
             }
-            inner.table.remove(process.pid);
+            // `begin_exit` already deleted the element (erts deletes once, at
+            // ERTS_CONTINUE_EXIT_FREE). The identifier may have been reused; deleting
+            // this pix again would free the new occupant. A forced exit that never
+            // reached `begin_exit` still owns the slot.
+            if inner.table.lookup(process.pid).is_some() {
+                inner.table.remove(process.pid);
+            }
         }
     }
     if let Some(local) = local {

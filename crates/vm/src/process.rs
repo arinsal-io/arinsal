@@ -2954,6 +2954,15 @@ impl Executor {
                                     // Like call_import: a module with -on_load is loaded through
                                     // the error handler and code server, which run its on_load.
                                     None => {
+                                        // The code-barrier commit is a later operation on this
+                                        // scheduler (beam_bif_load.c commit_code_ix). erts runs it
+                                        // between processes. Loading here would wait in seize and
+                                        // never return to that aux work.
+                                        if self.vm.code_ix.commit_pending() {
+                                            process.cold_mut().native_retry = Some(target_pc);
+                                            process.native_pc = Some(code_ptr);
+                                            break Ok(RunState::Yield);
+                                        }
                                         match if self.vm.unloaded_on_load(process, &export.module) {
                                             Err(VmError::Load("module has -on_load".into()))
                                         } else {
@@ -4762,8 +4771,15 @@ impl Process {
             .as_mut()
             .and_then(|cold| cold.finish_loading_commit.take())
         {
-            vm.commit_staged(staged);
-            if let Some(runtime) = &self.runtime {
+            let barrier_callback = staged.barrier_passed.is_some();
+            let barrier_passed = staged
+                .barrier_passed
+                .as_ref()
+                .is_none_or(|passed| passed.load(std::sync::atomic::Ordering::Acquire));
+            if barrier_passed {
+                vm.commit_staged(staged);
+            }
+            if !barrier_callback && let Some(runtime) = &self.runtime {
                 crate::natives::code::release_code_mod_permission(runtime);
             }
         }
@@ -4988,10 +5004,8 @@ impl Process {
             crate::trace::clear(self, ctx.pid());
         }
         crate::trace::clear_save_calls(self);
-        // Further publishes fail with `NoProcess` and the watcher synthesizes
-        // DOWN. Signals already queued are installed before we notify.
-        ctx.begin_exit();
-        self.absorb_exit_signals(ctx);
+        // ERTS_CONTINUE_EXIT_FREE releases the registered name before removing the pid from
+        // the process table. The name index is stored on the process-table entry.
         if ctx.exit_flags().load(Ordering::Acquire) & proc_flags::REG != 0
             && let Some(runtime) = &self.runtime
             && let Ok(scheduler) = runtime.scheduler()
@@ -5009,6 +5023,13 @@ impl Process {
                 scheduler.clear_registered_atom_index(ctx.pid(), index);
             }
         }
+        // Port of erts/emulator/beam/erl_process.c:14438-14456
+        // (ERTS_CONTINUE_EXIT_FREE), OTP-29.1.1: unregister the name, then mark the pid
+        // dead in the process table. Later exit phases process links, monitors and signals.
+        ctx.begin_exit();
+        // Further publishes fail with `NoProcess` and the watcher synthesizes DOWN.
+        // Signals already queued are installed before we notify.
+        self.absorb_exit_signals(ctx);
         let Some(cold) = self.cold.take() else {
             return;
         };
@@ -6577,9 +6598,7 @@ impl Process {
     // Port of erts/emulator/beam/beam_bif_load.c:1149 (check_process_code), OTP-29.1.1.
     // A process suspended in native code is checked by its native resume address and the
     // native continuation pointers on its stack; `self.module` is only its interpreter module.
-    pub(crate) fn references_code(&self, module: usize, native: Option<(usize, usize)>) -> bool {
-        let in_native =
-            |address: usize| native.is_some_and(|(start, end)| start <= address && address < end);
+    pub(crate) fn references_code(&self, module: usize, in_native: impl Fn(usize) -> bool) -> bool {
         // While native code runs (a signal handled from a runtime helper), `self.module` is
         // stale and the running function shows up through the native stack instead.
         match self.native_pc {
@@ -6624,7 +6643,7 @@ impl Process {
                     .stack_get(index + 2)
                     .and_then(Term::as_small)
                     .and_then(|address| usize::try_from(address).ok())
-                    .is_some_and(in_native)
+                    .is_some_and(&in_native)
             {
                 return true;
             }
@@ -7857,9 +7876,13 @@ mod layout_tests {
         for (index, word) in words.into_iter().enumerate() {
             process.heap.stack_set(index, word);
         }
-        assert!(process.references_code(usize::MAX, Some(range)));
-        assert!(!process.references_code(usize::MAX, Some((0x8000, 0x9000))));
-        assert!(!process.references_code(usize::MAX, None));
+        assert!(process.references_code(usize::MAX, |address| {
+            range.0 <= address && address < range.1
+        }));
+        assert!(
+            !process.references_code(usize::MAX, |address| (0x8000..0x9000).contains(&address))
+        );
+        assert!(!process.references_code(usize::MAX, |_| false));
     }
 
     #[test]
