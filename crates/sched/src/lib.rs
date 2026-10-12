@@ -3490,6 +3490,9 @@ pub struct RunCtx<'a, M: SignalMessage> {
     sys_task_run: bool,
     /// A dirty signal handler acts for a process whose dirty job is executing.
     dirty_running: bool,
+    /// A dirty signal handler acts for a process queued on a dirty run queue but not yet
+    /// executing (erts `ERTS_PSFLG_DIRTY_ACTIVE_SYS` without `ERTS_PSFLG_DIRTY_RUNNING`).
+    dirty_queued: bool,
     /// The turn runs on a simulated scheduler, whose thread steps other runtimes too.
     simulated: bool,
 }
@@ -3654,6 +3657,11 @@ impl<M: SignalMessage> RunCtx<'_, M> {
     /// Port of erts/emulator/beam/erl_process.h (`ERTS_PSFLG_DIRTY_RUNNING`), OTP-29.1.1.
     pub fn dirty_running(&self) -> bool {
         self.dirty_running
+    }
+    /// Whether a dirty signal handler acts for a process queued for a dirty scheduler and not
+    /// executing. Port of erts/emulator/beam/erl_process.h (`ERTS_PSFLG_DIRTY_ACTIVE_SYS`).
+    pub fn dirty_queued(&self) -> bool {
+        self.dirty_queued
     }
     /// Handle the queued signals of process `pid` while it is in a dirty state, with its
     /// task cell locked and a context acting as that process.
@@ -4120,6 +4128,8 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
             exit_flags: &process.exit_flags,
             sys_task_run: false,
             dirty_running: process.dirty_runner.load(Ordering::SeqCst) != 0,
+            dirty_queued: process.dirty.load(Ordering::SeqCst) != 0
+                && process.dirty_runner.load(Ordering::SeqCst) == 0,
             simulated,
         };
         if handle(task, &mut ctx) {
@@ -5492,6 +5502,7 @@ mod msgq_stage_microbench {
             exit_flags: &exit_flags,
             sys_task_run: false,
             dirty_running: false,
+            dirty_queued: false,
             simulated: scheduler.inner.sim.is_some(),
         };
         let started = Instant::now();
@@ -5945,6 +5956,7 @@ fn run_slice<'a, T: Task>(
                 exit_flags: &process.exit_flags,
                 sys_task_run,
                 dirty_running: false,
+                dirty_queued: false,
                 simulated: inner.sim.is_some(),
             };
             if msacc_enabled {

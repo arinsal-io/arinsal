@@ -1552,7 +1552,13 @@ pub(crate) fn fulfill_request(
             // erl_process.c:9305 (erts_process_state2status), OTP-29.1.1. The handler is the
             // target itself, executing: RUNNING, RUNNING_SYS, DIRTY_RUNNING and
             // DIRTY_RUNNING_SYS are all `running`, and only a parked process is `waiting`.
-            let status = atom(if crate::signals::is_waiting(process, ctx.pid()) {
+            // A process queued on a dirty run queue but not executing is `runnable`
+            // (ERTS_PSFLG_DIRTY_ACTIVE_SYS); the running states above take precedence.
+            let status = atom(if ctx.dirty_running() {
+                "running"
+            } else if ctx.dirty_queued() {
+                "runnable"
+            } else if crate::signals::is_waiting(process, ctx.pid()) {
                 "waiting"
             } else {
                 "running"
