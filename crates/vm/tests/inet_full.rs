@@ -289,15 +289,25 @@ local() ->
     end.
 
 reset() ->
+    %% gen_tcp_misc_SUITE:do_show_econnreset_passive connects and accepts
+    %% before the peer aborts. Closing from a concurrent acceptor before
+    %% SO_ERROR is read makes Darwin report the handshake as ECONNRESET.
     {ok, L} = listen([binary, {show_econnreset, true}]),
     {ok, Port} = inet:port(L),
-    spawn(fun() ->
+    Parent = self(),
+    Pid = spawn(fun() ->
         {ok, S} = gen_tcp:accept(L, 2000),
-        ok = inet:setopts(S, [{linger, {true, 0}}]),
-        gen_tcp:close(S)
+        Parent ! accepted,
+        receive close ->
+            ok = inet:setopts(S, [{linger, {true, 0}}]),
+            gen_tcp:close(S),
+            Parent ! closed
+        end
     end),
     {ok, C} = gen_tcp:connect({127,0,0,1}, Port, [{tcp_module, inet_tcp}, binary, {active, false}, {show_econnreset, true}], 2000),
-    receive after 100 -> ok end,
+    receive accepted -> ok after 2000 -> timeout end,
+    Pid ! close,
+    receive closed -> ok after 2000 -> timeout end,
     R = gen_tcp:recv(C, 1, 2000),
     gen_tcp:close(C),
     gen_tcp:close(L),

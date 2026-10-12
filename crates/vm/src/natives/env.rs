@@ -486,4 +486,9 @@ fn deliver_signal(target: SignalTarget, signal: i32) {
     if let Some(message) = message {
         let _ = scheduler.send(pid, pid, message);
     }
+    // The send wakes the server's scheduler only when that scheduler already
+    // sleeps. Poke the rest: a scheduler that publishes its sleeping flag after
+    // the send would otherwise stay in `scheduler_wait` and never run
+    // `erl_signal_server` (sys.c signal_notify_requested plus erts_sched_poke).
+    scheduler.poke_schedulers();
 }
