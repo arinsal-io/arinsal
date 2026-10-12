@@ -366,8 +366,8 @@ pub fn lists_append(
         let mut scan = list_bits;
         while count < alloc_budget && is_list_bits(scan) {
             let (_, next) = car_cdr!(scan);
-            count += 1;
             scan = next;
+            count += 1;
         }
         if !is_list_bits(scan) && scan != nil_bits {
             if !last_cdr.is_null() {

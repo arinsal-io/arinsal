@@ -77,6 +77,27 @@ fn process_heap_and_fragment() {
 }
 
 #[test]
+fn contiguous_list_builder_prepends_exact_sequence() {
+    let mut heap = VecHeap::new();
+    let mut builder = TermBuilder::new(&mut heap);
+    let list = builder
+        .reserve_cons_list(3)
+        .unwrap()
+        .prepend_exact_with_tail(
+            [3, 2, 1].map(|n| Term::small(n).unwrap()).into_iter(),
+            Term::NIL,
+        )
+        .unwrap();
+    assert_eq!(
+        to_owned(list).unwrap(),
+        OwnedTerm::List {
+            elems: vec![OwnedTerm::Int(1), OwnedTerm::Int(2), OwnedTerm::Int(3)],
+            tail: Box::new(OwnedTerm::Nil),
+        }
+    );
+}
+
+#[test]
 fn copy_and_owned_roundtrip() {
     let original = OwnedTerm::Tuple(vec![
         OwnedTerm::List {

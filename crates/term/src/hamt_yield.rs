@@ -67,22 +67,23 @@ enum SortKey {
     /// `hxnodecmpkey`: `CMP_TERM` order of the leaf keys.
     Key,
 }
+type NodeCompare = fn(&HxNode, &HxNode) -> i32;
 
-// Port of erts/emulator/beam/erl_map.c:1160-1186 (hxnodecmpkey, hxnodecmp), OTP-29.1.1.
-fn node_cmp(kind: SortKey, a: &HxNode, b: &HxNode) -> i32 {
-    match kind {
-        SortKey::Hash => match a.hx.cmp(&b.hx) {
-            Ordering::Less => 1,
-            Ordering::Equal => 0,
-            Ordering::Greater => -1,
-        },
-        SortKey::Key => {
-            match crate::heap::exact_flat_key_cmp(leaf_key(a.val), leaf_key(b.val), false) {
-                Ordering::Less => -1,
-                Ordering::Equal => 0,
-                Ordering::Greater => 1,
-            }
-        }
+// Port of erts/emulator/beam/erl_map.c:1160-1186 (hxnodecmp), OTP-29.1.1.
+fn node_cmp_hash(a: &HxNode, b: &HxNode) -> i32 {
+    match a.hx.cmp(&b.hx) {
+        Ordering::Less => 1,
+        Ordering::Equal => 0,
+        Ordering::Greater => -1,
+    }
+}
+
+// Port of erts/emulator/beam/erl_map.c:1160-1186 (hxnodecmpkey), OTP-29.1.1.
+fn node_cmp_key(a: &HxNode, b: &HxNode) -> i32 {
+    match crate::heap::exact_flat_key_cmp(leaf_key(a.val), leaf_key(b.val), false) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
     }
 }
 
@@ -122,10 +123,9 @@ struct Partition {
 /// erts_qsort_partion_array; the swap and the insertion sort do not yield).
 ///
 /// Recursion is an explicit stack of pending helper calls, run depth first in the order of the
-/// two recursive calls. The pivot hash of utils.c:3523 mixes the addresses of the comparison
-/// function and the array; here the array offset and the comparison kind stand in for them.
+/// two recursive calls.
 struct Qsort {
-    kind: SortKey,
+    compare: NodeCompare,
     stack: Vec<Frame>,
     part: Option<Partition>,
 }
@@ -135,7 +135,10 @@ impl Qsort {
         // utils.c:3687: the improved seed is only worth its cost for big arrays.
         let seed = if n > 128 { sched_local_random(0) } else { 1 };
         Self {
-            kind,
+            compare: match kind {
+                SortKey::Hash => node_cmp_hash,
+                SortKey::Key => node_cmp_key,
+            },
             stack: vec![Frame { base: 0, n, seed }],
             part: None,
         }
@@ -171,7 +174,7 @@ impl Qsort {
                 return true;
             };
             if frame.n <= 16 {
-                insertion_sort(self.kind, &mut nodes[frame.base..frame.base + frame.n]);
+                insertion_sort(self.compare, &mut nodes[frame.base..frame.base + frame.n]);
                 // YCF_CONSUME_REDS(nr_of_items * erts_fit_in_bits_int64(nr_of_items) * 2)
                 let bits = (u64::BITS - (frame.n as u64).leading_zeros()) as i64;
                 *reds -= frame.n as i64 * bits * 2;
@@ -184,16 +187,14 @@ impl Qsort {
         }
     }
 
-    // utils.c:3495-3530: pick the pivot, move it first and enter the fast path.
+    // Port of erts/emulator/beam/utils.c:3495-3530 (erts_qsort_partion_array), OTP-29.1.1.
     fn partition_start(&self, nodes: &mut [HxNode], frame: Frame) -> Partition {
-        let tag = match self.kind {
-            SortKey::Hash => 1,
-            SortKey::Key => 2,
-        };
+        let compare = self.compare as *const () as usize;
+        let base = nodes.as_ptr().wrapping_add(frame.base) as usize;
         let pivot_index = (random_hash_64_to_32(
             u64::from(frame.seed)
-                .wrapping_add(tag)
-                .wrapping_add(frame.base as u64)
+                .wrapping_add(compare as u64)
+                .wrapping_add(base as u64)
                 .wrapping_sub(frame.n as u64),
         ) as usize)
             % frame.n;
@@ -211,7 +212,7 @@ impl Qsort {
 
     /// Returns the pivot part `[start, end)` when the partition is done, `None` on a yield.
     fn partition_step(&mut self, nodes: &mut [HxNode], reds: &mut i64) -> Option<(usize, usize)> {
-        let kind = self.kind;
+        let compare = self.compare;
         let p = self.part.as_mut().expect("partition in flight");
         let base = p.frame.base;
         loop {
@@ -231,7 +232,7 @@ impl Qsort {
                     }
                 }
                 PartPhase::FastBody => {
-                    let c = node_cmp(kind, &nodes[p.curr], &nodes[base]);
+                    let c = compare(&nodes[p.curr], &nodes[base]);
                     if c < 0 {
                         p.curr += 1;
                         p.ph = PartPhase::FastTest;
@@ -260,7 +261,7 @@ impl Qsort {
                     }
                 }
                 PartPhase::SlowBody => {
-                    let c = node_cmp(kind, &nodes[p.pivot_part_end], &nodes[p.pivot_part_end - 1]);
+                    let c = compare(&nodes[p.pivot_part_end], &nodes[p.pivot_part_end - 1]);
                     if c == 0 {
                         p.pivot_part_end += 1;
                     } else if c < 0 {
@@ -286,7 +287,7 @@ fn swap(nodes: &mut [HxNode], i: usize, j: usize) {
 }
 
 // Port of erts/emulator/beam/utils.c:3590-3618 (erts_qsort_insertion_sort), OTP-29.1.1.
-fn insertion_sort(kind: SortKey, nodes: &mut [HxNode]) {
+fn insertion_sort(compare: NodeCompare, nodes: &mut [HxNode]) {
     if nodes.len() < 2 {
         return;
     }
@@ -296,7 +297,7 @@ fn insertion_sort(kind: SortKey, nodes: &mut [HxNode]) {
         let mut smallest_so_far = unsorted_start;
         let mut curr = smallest_so_far + 1;
         while curr <= end {
-            if node_cmp(kind, &nodes[curr], &nodes[smallest_so_far]) < 0 {
+            if compare(&nodes[curr], &nodes[smallest_so_far]) < 0 {
                 smallest_so_far = curr;
             }
             curr += 1;

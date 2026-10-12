@@ -3,7 +3,9 @@
 use arinsal_maps::{self, MapError, MapResult};
 use arinsal_term::{Term, atoms};
 
-use crate::pure::{bool_term, integer, list, make_list, tuple_build};
+use crate::pure::{
+    bool_term, integer, list, make_list, make_list_from_reverse_exact_iter, tuple_build,
+};
 use crate::{BifError, BifFn, Ctx};
 
 pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
@@ -125,23 +127,27 @@ pub enum ProjectionStart {
 impl MapsProjectionWalk {
     /// Validate the map argument and start (`maps_keys_1_helper`, `maps_values_1_helper`).
     pub fn start(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<ProjectionStart, BifError> {
-        mapped(ctx, arinsal_maps::size(map))?;
-        let Some(iter) = arinsal_term::MapReverseIter::new(map) else {
-            let items = mapped(
-                ctx,
-                if keys {
-                    arinsal_maps::keys(map)
-                } else {
-                    arinsal_maps::values(map)
-                },
-            )?;
-            return Ok(ProjectionStart::Done(make_list(ctx, items, Term::NIL)));
-        };
-        Ok(ProjectionStart::Walk(Self {
-            iter,
-            keys,
-            items: Vec::new(),
-        }))
+        let checked = mapped(ctx, arinsal_maps::checked_map(map))?;
+        match checked.kind() {
+            arinsal_maps::CheckedMapKind::Flatmap(flat) => {
+                // Port of erts/emulator/beam/erl_map.c:1207-1241 and :2262-2298,
+                // OTP-29.1.1. The exact-size flatmap array is consed into one HAlloc block.
+                let items = arinsal_maps::flatmap_projection(flat, keys);
+                Ok(ProjectionStart::Done(make_list_from_reverse_exact_iter(
+                    ctx,
+                    items,
+                    Term::NIL,
+                )))
+            }
+            arinsal_maps::CheckedMapKind::Hashmap(_) => {
+                let iter = arinsal_term::MapReverseIter::new(map).expect("checked hashmap");
+                Ok(ProjectionStart::Walk(Self {
+                    iter,
+                    keys,
+                    items: Vec::new(),
+                }))
+            }
+        }
     }
 
     /// Walk entries while `reds` (the YCF reduction counter) stays positive. Returns whether
@@ -181,7 +187,6 @@ const MAP_SMALL_MAP_LIMIT: usize = 32;
 ///
 /// Port of erts/emulator/beam/erl_map.c:278-366 (maps_from_keys_2_helper,
 /// maps_from_list_1_helper) and :482-591 (hashmap_from_validated_list), OTP-29.1.1. Both list
-/// loops cost one reduction per element; the construction below them is
 /// [`arinsal_term::HashmapBuild`]. The leaves are allocated together once every entry is hashed,
 /// where C allocates them before the loop and fills them in.
 pub struct MapsBuildWalk {
@@ -191,7 +196,6 @@ pub struct MapsBuildWalk {
     phase: BuildPhase,
     cursor: Term,
     size: usize,
-    entries: Vec<(u64, Term, Term)>,
     build: Option<arinsal_maps::HashmapFromPairs>,
 }
 
@@ -213,23 +217,30 @@ impl MapsBuildWalk {
             phase: BuildPhase::Validate,
             cursor: list,
             size: 0,
-            entries: Vec::new(),
             build: None,
         }
     }
 
     /// The key and value of a list element (`from_list` elements must be 2-tuples).
     fn element(&self, item: Term) -> Result<(Term, Term), BifError> {
-        Self::element_of(self.fill, item)
+        Self::element_of(self.fill, item, true)
     }
 
-    fn element_of(fill: Option<Term>, item: Term) -> Result<(Term, Term), BifError> {
+    fn element_after_validation(&self, item: Term) -> Result<(Term, Term), BifError> {
+        Self::element_of(self.fill, item, false)
+    }
+
+    fn element_of(
+        fill: Option<Term>,
+        item: Term,
+        check_arity: bool,
+    ) -> Result<(Term, Term), BifError> {
         if let Some(value) = fill {
             return Ok((item, value));
         }
         // SAFETY: the input list stays live while the call is trapped (GC is disabled).
         let tuple = unsafe { item.tuple_ref() }.ok_or(BifError::BADARG)?;
-        if tuple.len() != 2 {
+        if check_arity && tuple.len() != 2 {
             return Err(BifError::BADARG);
         }
         Ok((
@@ -273,31 +284,35 @@ impl MapsBuildWalk {
                         let pairs = std::iter::from_fn(|| {
                             let (head, tail) = Self::cell(cursor).ok()?;
                             cursor = tail;
-                            Self::element_of(fill, head).ok()
+                            Self::element_of(fill, head, false).ok()
                         });
                         let result = arinsal_maps::from_small_pairs(self.size, pairs, ctx.heap);
                         return mapped(ctx, result).map(Some);
                     }
                     self.cursor = self.list;
-                    self.entries.reserve(self.size);
+                    let build = arinsal_maps::HashmapFromPairs::new(self.size, ctx.heap);
+                    self.build = Some(mapped(ctx, build)?);
                     self.phase = BuildPhase::Leaves;
                 }
                 BuildPhase::Leaves => {
                     while self.cursor.tagged_word() & 3 == 1 {
                         *reds -= 1;
                         let (head, tail) = Self::cell(self.cursor)?;
-                        let (key, value) = self.element(head)?;
-                        self.entries
-                            .push((arinsal_term::hashmap_key_hash(key), key, value));
+                        let (key, value) = self.element_after_validation(head)?;
+                        self.build
+                            .as_mut()
+                            .expect("hashmap leaf builder")
+                            .push(key, value)
+                            .map_err(|error| map_error(ctx, error))?;
                         self.cursor = tail;
                         if *reds <= 0 {
                             return Ok(None);
                         }
                     }
-                    let built = arinsal_maps::HashmapFromPairs::new(&self.entries, ctx.heap);
-                    let build = mapped(ctx, built)?;
-                    self.entries = Vec::new();
-                    self.build = Some(build);
+                    self.build
+                        .as_mut()
+                        .expect("hashmap leaf builder")
+                        .finish_leaves();
                     self.phase = BuildPhase::Build;
                 }
                 BuildPhase::Build => {
