@@ -230,7 +230,7 @@ impl DispatchFragments {
             .map_err(|_| ExecError::InvalidSize("export trampoline"))?;
         code.bind(light_bif)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
-        emit_call_light_bif_shared(&mut code, light_bif_helper)
+        emit_call_light_bif_shared(&mut code, light_bif_helper, exception_resolver)
             .map_err(|_| ExecError::InvalidSize("light BIF fragment"))?;
         // Port of erts/emulator/beam/jit/arm/beam_asm_module.cpp:231-250
         // (emit_i_breakpoint_trampoline), OTP-29.1.1: the trampoline passes (c_p, identity,
@@ -665,25 +665,83 @@ fn emit_export_fragment(
         // The caller supplies c_p in x0 and the export identity in x1.
         Ok(())
     })?;
+    let helper_call = code.new_label();
+    let direct_done = code.new_label();
+    let direct_non_value = code.new_label();
+    let return_term = code.new_label();
+    code.emit(|encoder| {
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:730-776 (call_bif_shared),
+        // OTP-29.1.1: a BIF export calls `bif_table[].f` directly. The pointer is the
+        // one published on the export; zero stays on the helper (ordinary remote calls).
+        encoder.ldr_uoff(Gpr::x(8), Gpr::x(1), crate::bif::EXPORT_LIGHT_BIF_OFFSET)
+    })?;
+    code.cbz(Gpr::x(8), helper_call)?;
+    code.emit(|encoder| {
+        // A traced BIF still goes through the helper. Save-calls does not: that
+        // code index already entered `save_calls_export` (beam_asm_global.cpp:164).
+        // call_bif_shared itself has no trace check; the light fragment does
+        // (instr_bif.cpp:388-397) and an export entry has not.
+        encoder.ldr_uoff(
+            Gpr::w(9),
+            Gpr::x(1),
+            crate::bif::EXPORT_IS_BIF_TRACED_OFFSET,
+        )?;
+        encoder.cmp_imm(Gpr::w(9), 0, false)?;
+        Ok(())
+    })?;
+    code.b_cond(Cond::Ne, helper_call)?;
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:723-725, OTP-29.1.1:
+    // reductions are checked in module code, not in the BIF trampoline.
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-601, OTP-29.1.1.
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        // c_p->arity from the export, then (c_p, reg, I, Export.info). x4 stays
+        // the Export* the call site loaded. `info` is the descriptor, the same
+        // word the helper path loads; the BIF does not look the export up.
+        encoder.ldrb_uoff(Gpr::w(9), Gpr::x(1), crate::bif::EXPORT_ARITY_OFFSET as u16)?;
+        encoder.strb_uoff(Gpr::w(9), Gpr::x(21), 80)?;
+        encoder.ldr_uoff(Gpr::x(3), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.mov_reg(Gpr::x(4), Gpr::x(1))?;
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
+        encoder.blr(Gpr::x(8))
+    })?;
+    code.b(direct_done)?;
+    code.bind(helper_call)?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| {
         // Port of erts/emulator/beam/beam_jit_common.cpp (beam_jit_bif trampolines read the
         // BIF from their own Export), OTP-29.1.1: x2 = the export's descriptor word.
         encoder.ldr_uoff(Gpr::x(2), Gpr::x(1), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
-        encoder.blr(Gpr::x(17))?;
-        Ok(())
+        encoder.blr(Gpr::x(17))
     })?;
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:539-601, OTP-29.1.1.
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), 0, false))?;
-    code.b_cond(arinsal_a64::enc::Cond::Eq, raise_exception)?;
+    code.b_cond(Cond::Eq, raise_exception)?;
     code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), 1, false))?;
-    code.b_cond(arinsal_a64::enc::Cond::Eq, interpreted)?;
-    // A BIF returns through the call site after its result was published to X0.
+    code.b_cond(Cond::Eq, interpreted)?;
+    code.b(return_term)?;
+    code.bind(direct_done)?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.cbz(Gpr::x(0), direct_non_value)?;
+    code.b(return_term)?;
+    code.bind(direct_non_value)?;
     code.emit(|encoder| {
-        encoder.ldr_uoff(Gpr::x(25), Gpr::x(19), 0)?;
+        // THE_NON_VALUE with freason == TRAP, or with no reason, is the executor
+        // handoff (the helper's sentinel 1). Any other reason is the exception.
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 40)?;
+        encoder.cmp_imm(Gpr::x(9), TRAP_REASON, false)
+    })?;
+    code.b_cond(Cond::Eq, interpreted)?;
+    code.emit(|encoder| encoder.cmp_imm(Gpr::x(9), 0, false))?;
+    code.b_cond(Cond::Eq, interpreted)?;
+    code.b(raise_exception)?;
+    // A BIF returns its term in x0. The continuation pushed on entry stays on E.
+    code.bind(return_term)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(25), Gpr::x(0))?;
         encoder.ldr_post(Gpr::x(9), Gpr::x(20), 8)?;
         encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 32)?;
         encoder.ret(Gpr::x(30))
@@ -820,10 +878,16 @@ fn emit_raise_exception_fragment(
         encoder.blr(Gpr::x(17))
     })?;
     code.cbz(Gpr::x(0), exit)?;
-    // next_catch updates c_p->stop to the catch frame's resumed E. The
-    // resolver is a runtime call, so native registers must reload that cursor.
-    // Port of erts/emulator/beam/beam_common.c:545-561, OTP-29.1.1.
+    // handle_error wrote reg[0..3] (non-value, reason, raw trace, class) and
+    // the catch frame's E. Reload them: the resolver is a runtime call, so the
+    // X cache and the heap/stack cursors are stale.
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:327-334
+    // (leave_runtime then br to the handler) and beam_common.c:541-561, OTP-29.1.1.
     code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(25), Gpr::x(19), 0)?;
+        encoder.ldr_uoff(Gpr::x(26), Gpr::x(19), 8)?;
+        encoder.ldr_uoff(Gpr::x(27), Gpr::x(19), 16)?;
+        encoder.ldr_uoff(Gpr::x(28), Gpr::x(19), 24)?;
         encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)?;
         encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
         encoder.br(Gpr::x(0))
@@ -844,11 +908,16 @@ fn emit_raise_exception_fragment(
 /// the result in XREG0 or leaves native code on a trap, an error or a yield.
 // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-593 (emit_call_light_bif_shared),
 // OTP-29.1.1.
-fn emit_call_light_bif_shared(code: &mut CodeBuffer, helper: usize) -> Result<(), BufferError> {
+fn emit_call_light_bif_shared(
+    code: &mut CodeBuffer,
+    helper: usize,
+    resolver: usize,
+) -> Result<(), BufferError> {
     let trace = code.new_label();
     let yield_bif = code.new_label();
     let success = code.new_label();
     let trap = code.new_label();
+    let scheduler_error = code.new_label();
     // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:384-387, OTP-29.1.1:
     // spill the entry before the trace check. The trace path never returns here, and
     // the scheduler names the caller from this slot (`native_error_pc` / `tmp_mem[6]`).
@@ -878,6 +947,8 @@ fn emit_call_light_bif_shared(code: &mut CodeBuffer, helper: usize) -> Result<()
         Ok(())
     })?;
     emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    let helper_call = code.new_label();
+    let after_bif = code.new_label();
     code.emit(|encoder| {
         // `emit_enter_runtime_frame` made x29 the host frame, and `emit_enter_runtime`
         // stored that into `tmp_mem[2]`. The Erlang frame pointer is the x29 saved at
@@ -888,6 +959,26 @@ fn emit_call_light_bif_shared(code: &mut CodeBuffer, helper: usize) -> Result<()
             std::mem::offset_of!(crate::SchedulerRegisters, tmp_mem) as u32 + 2 * 8;
         encoder.ldr_uoff(Gpr::x(9), Gpr::sp(), 0)?;
         encoder.str_uoff(Gpr::x(9), Gpr::x(19), frame_pointer_slot)?;
+        // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445, OTP-29.1.1:
+        // `dynamic_runtime_call<3>(ARG8)` of the BIF itself. A zero pointer is a BIF
+        // the helper still dispatches (traps, the executor, save_calls already branched).
+        encoder.ldr_uoff(Gpr::x(8), Gpr::x(4), crate::bif::EXPORT_LIGHT_BIF_OFFSET)
+    })?;
+    code.cbz(Gpr::x(8), helper_call)?;
+    code.emit(|encoder| {
+        // (c_p, reg, I, Export.info). x19 is the register array; the entry pc was
+        // spilled at the top. ARG4 stays the Export* the call site loaded
+        // (instr_bif.cpp:434-445). `info` is the descriptor, the same word the
+        // helper path loads; the BIF does not look the export up.
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
+        encoder.ldr_uoff(Gpr::x(2), Gpr::x(19), 16_432)?;
+        encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
+        encoder.blr(Gpr::x(8))
+    })?;
+    code.b(after_bif)?;
+    code.bind(helper_call)?;
+    code.emit(|encoder| {
         // x0 = c_p, x1 = export, x2 = export (site; breakpoints use a real one),
         // x3 = the export's descriptor word.
         encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
@@ -895,9 +986,9 @@ fn emit_call_light_bif_shared(code: &mut CodeBuffer, helper: usize) -> Result<()
         encoder.mov_reg(Gpr::x(2), Gpr::x(4))?;
         encoder.ldr_uoff(Gpr::x(3), Gpr::x(4), crate::bif::EXPORT_INFO_OFFSET)?;
         encoder.mov_const(Gpr::x(17), helper as u64)?;
-        encoder.blr(Gpr::x(17))?;
-        Ok(())
+        encoder.blr(Gpr::x(17))
     })?;
+    code.bind(after_bif)?;
     emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
     code.emit(|encoder| encoder.cmp_imm(Gpr::x(0), THE_NON_VALUE, false))?;
     code.b_cond(Cond::Ne, success)?;
@@ -906,7 +997,35 @@ fn emit_call_light_bif_shared(code: &mut CodeBuffer, helper: usize) -> Result<()
         encoder.cmp_imm(Gpr::x(9), TRAP_REASON, false)
     })?;
     code.b_cond(Cond::Eq, trap)?;
-    // A non-value that is not a trap is an exception. The error pc was stored above.
+    // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:539-545 (`raise_exception_shared`),
+    // OTP-29.1.1. A catch stays in this fragment. No catch, or a null resolver, returns
+    // to the scheduler so `handle_error` keeps the BIF frame.
+    code.emit(|encoder| {
+        encoder.mov_const(Gpr::x(17), resolver as u64)?;
+        encoder.ldr_uoff(Gpr::x(9), Gpr::x(21), 0x40)
+    })?;
+    code.cbz(Gpr::x(17), scheduler_error)?;
+    code.cbz(Gpr::x(9), scheduler_error)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        encoder.mov_reg(Gpr::x(1), Gpr::x(19))?;
+        encoder.mov_reg(Gpr::x(2), Gpr::x(20))?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    code.cbz(Gpr::x(0), scheduler_error)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(17), Gpr::x(0))?;
+        encoder.ldp_post(Gpr::x(29), Gpr::x(30), Gpr::sp(), 16)?;
+        encoder.ldr_uoff(Gpr::x(25), Gpr::x(19), 0)?;
+        encoder.ldr_uoff(Gpr::x(26), Gpr::x(19), 8)?;
+        encoder.ldr_uoff(Gpr::x(27), Gpr::x(19), 16)?;
+        encoder.ldr_uoff(Gpr::x(28), Gpr::x(19), 24)?;
+        encoder.ldr_uoff(Gpr::x(20), Gpr::x(21), 8)?;
+        encoder.ldr_uoff(Gpr::x(23), Gpr::x(21), 0)?;
+        encoder.ldr_uoff(Gpr::w(22), Gpr::x(21), 32)?;
+        encoder.br(Gpr::x(17))
+    })?;
+    code.bind(scheduler_error)?;
     // `emit_leave_runtime` reloaded x29 from `tmp_mem[2]` (the Erlang frame pointer).
     // Pop the host frame without restoring that saved x29: it is the entry-time
     // pointer, and a collection may have moved it.
@@ -920,6 +1039,9 @@ fn emit_call_light_bif_shared(code: &mut CodeBuffer, helper: usize) -> Result<()
     code.emit(|encoder| {
         // Port of erts/emulator/beam/jit/arm/instr_bif.cpp:518-523, OTP-29.1.1.
         // x29 stays the Erlang frame pointer `emit_leave_runtime` reloaded.
+        // FCALLS may be 0 (`ERTS_VBUMP_ALL_REDS`); the next checked instruction
+        // yields. Returning here keeps the current code index, so the call that
+        // follows `process_flag(save_calls, _)` is not itself recorded.
         encoder.mov_reg(Gpr::x(25), Gpr::x(0))?;
         encoder.ldr_uoff(Gpr::x(30), Gpr::sp(), 8)?;
         encoder.add_imm(Gpr::sp(), Gpr::sp(), 16, false)?;

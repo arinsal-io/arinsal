@@ -46,6 +46,8 @@ impl ErtsAlcType {
     pub const ATOM_TXT: Self = Self("ATOM_TXT", 3);
     /// Function entries (`ERTS_ALC_T_FUN_ENTRY`).
     pub const FUN_ENTRY: Self = Self("FUN_ENTRY", 3);
+    /// Short-lived scratch (`ERTS_ALC_T_TMP`), the temporary allocator.
+    pub const TMP: Self = Self("TMP", 0);
 
     /// Name generated from `erl_alloc.types`.
     pub const fn name(self) -> &'static str {

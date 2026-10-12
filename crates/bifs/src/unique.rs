@@ -69,8 +69,18 @@ impl SchedulerRefState {
     /// Next ordinary-reference id. The pre-increment value is the one published,
     /// matching `value = esdp->ref++`.
     pub fn bump_ref(&self) -> u64 {
+        ordinary_ref_key(self.bump_ref_words())
+    }
+
+    /// Three reference words from `esdp->ref++`. No atomic: the cell belongs to
+    /// this scheduler thread.
+    // Port of erts/emulator/beam/erl_bif_unique.h:170-177 (erts_sched_make_ref_in_array),
+    // OTP-29.1.1. The counter stays in this thread's `Esdp`; `next_ref_words`
+    // reads it there, the same way `bump_ref` does.
+    #[inline(always)]
+    pub fn bump_ref_words(&self) -> [u32; 3] {
         debug_assert!(ESDP.with(|esdp| !esdp.bound.get() || esdp.thr_id.get() == self.thr_id));
-        ordinary_ref_key(next_ref_words())
+        next_ref_words()
     }
 
     /// Next non-monotonic `unique_integer` on this scheduler.

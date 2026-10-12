@@ -24,7 +24,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "dist_ctrl_get_opt", 2),
     ("erlang", "dist_ctrl_set_opt", 3),
     ("erlang", "dist_get_stat", 1),
-    ("erlang", "disconnect_node", 1),
+    // `disconnect_node/1` is `net_kernel:disconnect/1` in erlang.erl.
     ("erts_internal", "create_dist_channel", 3),
     ("erts_internal", "dist_spawn_request", 4),
     ("erts_internal", "new_connection", 1),
@@ -77,31 +77,8 @@ fn dispatch(
         ("erlang", "dist_ctrl_get_opt", 2) => get_opt(ctx, args[0], args[1]),
         ("erlang", "dist_ctrl_set_opt", 3) => set_opt(ctx, args[0], args[1], args[2]),
         ("erlang", "dist_get_stat", 1) => get_stat(process, ctx, args[0]),
-        ("erlang", "disconnect_node", 1) => disconnect_node(process, args[0]),
         _ => Err(badarg()),
     }
-}
-
-/// Port of erts/emulator/beam/dist.c (`disconnect_node`), OTP-29.1.1.
-fn disconnect_node(_process: &mut Process, node: Term) -> Result<Term, VmError> {
-    let node = owned(node)?;
-    let OwnedTerm::Atom(node) = &node else {
-        return Err(badarg());
-    };
-    let port_id = {
-        let tables = node_tables::lock();
-        tables
-            .entries
-            .get(node)
-            .filter(|entry| entry.connected)
-            .and_then(|entry| entry.dist.as_ref())
-            .and_then(|dist| dist.port_id)
-    };
-    let Some(port_id) = port_id else {
-        return Ok(boolean(false));
-    };
-    crate::inet_drv::disconnect_dist(port_id)?;
-    Ok(boolean(true))
 }
 
 /// Port of erts/emulator/beam/dist.c:5543 (erts_internal_get_dflags_0), OTP-29.1.1.

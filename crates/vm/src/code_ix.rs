@@ -54,6 +54,14 @@ pub(crate) struct CodeIndexes {
     /// Generation of each slot's tables, published after the tables: a scheduled-in process
     /// compares its code index with one atomic read, like `erts_active_code_ix()`.
     generations: [AtomicU64; ERTS_NUM_CODE_IX],
+    /// `bccix[ERTS_NUM_CODE_IX]`: one immutable catch table per code index. Readers load the
+    /// active slot; a staging area copies the active table and publishes its own.
+    catches: [ArcSwap<Vec<Option<crate::native_bridge::CatchTarget>>>; ERTS_NUM_CODE_IX],
+    /// `r[ERTS_NUM_CODE_IX]` in beam_ranges.c: sorted module ranges. Readers load the
+    /// active slot and binary-search it; publishing a new `Arc` takes no reader lock.
+    ranges: [ArcSwap<Vec<crate::native_bridge::ModuleRange>>; ERTS_NUM_CODE_IX],
+    /// Serializes clone-and-publish of a catch table. The hot path does not take it.
+    catch_publish: Mutex<()>,
     permission: Mutex<Permission>,
     released: Condvar,
     /// Bodies of loader-bound static NIFs and `load_nif` functions. `NativeBody` instructions
@@ -75,6 +83,11 @@ impl CodeIndexes {
             staging: AtomicU32::new(0),
             generations: std::array::from_fn(|_| AtomicU64::new(initial.generation)),
             tables: std::array::from_fn(|_| ArcSwap::new(Arc::clone(&initial))),
+            catches: std::array::from_fn(|_| ArcSwap::new(Arc::new(Vec::new()))),
+            ranges: std::array::from_fn(|_| {
+                ArcSwap::new(crate::native_bridge::scope0_code_ranges())
+            }),
+            catch_publish: Mutex::default(),
             permission: Mutex::default(),
             released: Condvar::new(),
             native_fns: RwLock::default(),
@@ -113,6 +126,59 @@ impl CodeIndexes {
         let generation = tables.generation;
         self.tables[ix].store(tables);
         self.generations[ix].store(generation, Ordering::Release);
+    }
+
+    /// Catch table of `erts_active_code_ix()`. The `Arc` is the published generation;
+    /// indexing it takes no lock.
+    // Port of erts/emulator/beam/beam_catches.c:146-154 (`beam_catches_car`), OTP-29.1.1.
+    pub(crate) fn active_catch_table(&self) -> Arc<Vec<Option<crate::native_bridge::CatchTarget>>> {
+        self.catches[self.active()].load_full()
+    }
+
+    /// Module ranges of `erts_active_code_ix()`.
+    // Port of erts/emulator/beam/beam_ranges.c:307-327 (`find_range` reads `r[erts_active_code_ix()]`
+    // with no lock), OTP-29.1.1.
+    pub(crate) fn code_ranges(&self) -> Arc<Vec<crate::native_bridge::ModuleRange>> {
+        self.ranges[self.active()].load_full()
+    }
+
+    /// Publishes `ranges` on every code index. The active index is what readers load;
+    /// the other slots must already hold it when a commit rotates `erts_active_code_ix`.
+    pub(crate) fn store_code_ranges(&self, ranges: Arc<Vec<crate::native_bridge::ModuleRange>>) {
+        for slot in &self.ranges {
+            slot.store(Arc::clone(&ranges));
+        }
+    }
+
+    /// Copies the active catch table into the staging code index.
+    // Port of erts/emulator/beam/beam_catches.c:89-99 (beam_catches_start_staging), OTP-29.1.1.
+    fn stage_catches(&self) {
+        let copy = Arc::new(self.catches[self.active()].load_full().as_ref().clone());
+        self.catches[self.staging()].store(copy);
+    }
+
+    /// Replaces one code index's catch table. Callers hold [`CodeIndexes::catch_publish`].
+    pub(crate) fn store_catch_table(
+        &self,
+        index: usize,
+        table: Vec<Option<crate::native_bridge::CatchTarget>>,
+    ) {
+        self.catches[index].store(Arc::new(table));
+    }
+
+    /// The catch table currently published at `index` (active or staging).
+    pub(crate) fn catch_table_at(
+        &self,
+        index: usize,
+    ) -> Arc<Vec<Option<crate::native_bridge::CatchTarget>>> {
+        self.catches[index].load_full()
+    }
+
+    /// Lock that orders clone-and-publish of catch tables. Not taken by readers.
+    pub(crate) fn lock_catch_publish(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.catch_publish
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// Takes the staging tables for this thread, waiting while another thread holds them.
@@ -199,6 +265,9 @@ impl CodeIndexes {
             copy.stage_fun_entries(self.active(), self.staging());
             self.lock_permission().work = Some(copy);
             crate::beamasm_integration::stage_dispatch(self.scope);
+            // Port of erts/emulator/beam/beam_catches.c:89-99 (beam_catches_start_staging),
+            // OTP-29.1.1: the staging code index starts as a copy of the active pool.
+            self.stage_catches();
         }
         Staging {
             code: Arc::clone(self),
@@ -591,6 +660,25 @@ pub(crate) fn for_scope(scope: u64) -> Arc<CodeIndexes> {
             .entry(scope)
             .or_insert_with(|| Arc::new(CodeIndexes::new(scope))),
     )
+}
+
+/// The code indexes of `scope` when that node already exists.
+pub(crate) fn existing_scope(scope: u64) -> Option<Arc<CodeIndexes>> {
+    scopes()
+        .read()
+        .ok()
+        .and_then(|scopes| scopes.get(&scope).cloned())
+}
+
+/// Every node's code indexes. Used while the native-function registry lock is held
+/// to publish a range; it does not take that lock itself.
+pub(crate) fn with_all_scopes(mut visit: impl FnMut(&CodeIndexes)) {
+    let Ok(nodes) = scopes().read() else {
+        return;
+    };
+    for indexes in nodes.values() {
+        visit(indexes);
+    }
 }
 
 /// Forgets the code indexes of a node whose code is gone.

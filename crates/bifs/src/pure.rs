@@ -372,7 +372,9 @@ fn element(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         .ok_or(BADARG)
 }
 fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1.
+    // Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1:
+    // one `HAlloc` of `arity + 1` words, `sys_memcpy` of the tuple, then the
+    // replaced element. No per-element closure.
     let index = args[0].as_small().ok_or(BADARG)?;
     if index < 1 {
         return Err(BADARG);
@@ -699,12 +701,45 @@ pub(super) fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
 fn atom_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let text = atom_name(args[0]).ok_or(BADARG)?;
-    Ok(make_list(
-        ctx,
-        text.chars().map(|c| Term::small(c as i64).unwrap()),
-        Term::NIL,
-    ))
+    atom_to_list_term(ctx.heap, args[0])
+}
+
+/// `atom_to_list/1`. ASCII names are consed straight from the atom bytes.
+// Port of erts/emulator/beam/bif.c:3186-3210 (atom_to_list_1), OTP-29.1.1:
+// the list is built on the process heap from the atom text. No intermediate
+// character vector.
+pub fn atom_to_list_term(heap: &mut dyn HeapAlloc, arg: Term) -> Result<Term, BifError> {
+    let text = atom_name(arg).ok_or(BADARG)?;
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return Ok(Term::NIL);
+    }
+    if bytes.iter().all(|byte| *byte < 0x80) {
+        return cons_units(
+            heap,
+            bytes.len(),
+            bytes.iter().rev().map(|byte| i64::from(*byte)),
+        );
+    }
+    let points: SmallVec<[i64; 16]> = text.chars().map(|point| point as i64).collect();
+    cons_units(heap, points.len(), points.into_iter().rev())
+}
+
+fn cons_units(
+    heap: &mut dyn HeapAlloc,
+    count: usize,
+    units: impl Iterator<Item = i64>,
+) -> Result<Term, BifError> {
+    let mut block = ConsBlock::new(heap, count);
+    let mut builder = TermBuilder::new(&mut block);
+    let mut result = Term::NIL;
+    for unit in units {
+        let head = Term::small(unit).ok_or(BADARG)?;
+        result = builder
+            .cons(head, result)
+            .map_err(|_| BifError::SystemLimit)?;
+    }
+    Ok(result)
 }
 fn list_to_atom(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of bif.c:3217 (list_to_atom_1) and utils.c:2862 (erts_unicode_list_to_buf),

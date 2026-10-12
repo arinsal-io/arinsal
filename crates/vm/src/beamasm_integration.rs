@@ -342,6 +342,12 @@ impl DispatchRegistry {
             target
                 .slot
                 .set_info(std::ptr::from_ref::<DispatchTarget>(target) as usize);
+            // Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1:
+            // every BIF's export is published with the function `call_light_bif_shared`
+            // branches to. The choice is made once, here, not by the call fragment.
+            if let Some(func) = crate::native_helpers::light_entry(target) {
+                target.slot.set_light_bif_func(func);
+            }
             target
         })
     }
@@ -1010,6 +1016,21 @@ pub(crate) fn export_dispatch(identity: usize) -> Option<ExportDispatch> {
     target_for_identity(identity)
 }
 
+/// `Export.info` as the light-BIF fragment loaded it.
+///
+/// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:434-445, OTP-29.1.1: the call
+/// site already holds the `Export*`, and `info` is the descriptor published at
+/// intern. The callee does not look the export up.
+pub(crate) fn export_from_info(info: u64) -> Option<ExportDispatch> {
+    if info == 0 {
+        return None;
+    }
+    // SAFETY: `intern_identity` leaks this `DispatchTarget` and stores its
+    // address in `Export.info` before any generated call can run. The export
+    // table never frees it.
+    Some(unsafe { &*(info as *const DispatchTarget) })
+}
+
 /// Shared fragment that exits native code so the scheduler can interpret a fun call.
 pub(crate) fn call_fun_unported_entry() -> usize {
     fragments().map_or(0, DispatchFragments::call_fun_unported)
@@ -1260,7 +1281,7 @@ impl Drop for CompiledVersion {
             self.nif_patches.iter().map(|(_, _, identity, _)| *identity),
         );
         crate::native_bridge::unregister_native_functions(&self.native_functions);
-        crate::native_bridge::unregister_native_catches(&self.catch_ids);
+        crate::native_bridge::unregister_native_catches(self.scope, &self.catch_ids);
         unpublish_module(self.scope, &self.native_targets);
         if lifetime_trace_enabled() {
             eprintln!(
@@ -1994,6 +2015,7 @@ pub(crate) fn compile(
         })
         .collect();
     let catch_ids = crate::native_bridge::register_native_catches(
+        scope,
         compiled.native.catch_base,
         &compiled.native.catch_table,
     );

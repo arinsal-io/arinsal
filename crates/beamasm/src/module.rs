@@ -148,6 +148,10 @@ pub struct BeamModuleAssembler {
     /// Arity of the function being emitted: the live X registers at its `i_test_yield`.
     function_arity: u8,
     pub(super) error_label: Label,
+    /// Address of `raise_exception_shared`'s resolver. `error_label` returns to the
+    /// scheduler instead; the light-BIF fragment calls this when a catch is active.
+    #[allow(dead_code)]
+    exception_resolver: usize,
     catch_patches: Vec<(usize, Label)>,
     /// Shared out-of-line `function_clause` raiser, bound in `finalize` when any function uses it.
     func_clause_stub: Option<Label>,
@@ -233,6 +237,7 @@ impl BeamModuleAssembler {
             yield_label,
             function_arity: 0,
             error_label,
+            exception_resolver: 0,
             catch_patches: Vec::new(),
             func_clause_stub: None,
             call_fun_error_stub: None,
@@ -254,6 +259,18 @@ impl BeamModuleAssembler {
             dump_functions: Vec::new(),
             dump_recording_function: false,
             bs_live_cursor: None,
+        }
+    }
+
+    /// Address of `handle_error`, used by the shared `error_label`.
+    pub fn set_exception_resolver(&mut self, resolver: usize) {
+        self.exception_resolver = resolver;
+    }
+
+    /// Points `error_label` at `resolver` when the module has not set one yet.
+    pub(super) fn ensure_exception_resolver(&mut self, resolver: usize) {
+        if self.exception_resolver == 0 && resolver != 0 {
+            self.exception_resolver = resolver;
         }
     }
 
@@ -704,22 +721,23 @@ impl BeamModuleAssembler {
     }
 
     /// Reads a process-dictionary value through the process runtime.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:319-329, OTP-29.1.1.
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:319-329 (`emit_i_get`), OTP-29.1.1.
+    // `emit_enter_runtime<>()` is an empty update set: `get/1` does not allocate, so
+    // HTOP, E, FCALLS and the callee-saved X cache are not stored or reloaded.
     pub fn emit_process_dictionary_get(
         &mut self,
         source: ArgVal,
         destination: ArgVal,
         helper: usize,
     ) -> Result<(), ModuleError> {
-        let source = self.source_reg(source)?;
-        self.emit_runtime_fragment_with(
-            helper,
-            &[source],
-            6,
-            crate::Update::HEAP_ALLOC
-                .union(crate::Update::REDUCTIONS)
-                .union(crate::Update::X_REGS),
-        )?;
+        self.mov_arg_to_reg(Gpr::x(1), source)?;
+        crate::emit_enter_runtime(&mut self.code, 6, crate::Update::NONE)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), C_P)?;
+            e.mov_const(Gpr::x(17), helper as u64)?;
+            e.blr(Gpr::x(17))
+        })?;
+        crate::emit_leave_runtime(&mut self.code, 6, crate::Update::NONE)?;
         self.store_register(destination, Gpr::x(0))
     }
 
@@ -1500,13 +1518,6 @@ impl BeamModuleAssembler {
         .tagged_word();
         if let Some(stub) = self.func_clause_stub.take() {
             self.code.bind(stub)?;
-            crate::emit_enter_runtime(
-                &mut self.code,
-                6,
-                crate::Update::HEAP_ALLOC
-                    .union(crate::Update::REDUCTIONS)
-                    .union(crate::Update::X_REGS),
-            )?;
             self.code.emit(|e| {
                 e.mov_const(Gpr::x(8), EXC_FUNCTION_CLAUSE)?;
                 e.str_uoff(Gpr::x(8), Gpr::x(21), 40)?;
@@ -1560,6 +1571,8 @@ impl BeamModuleAssembler {
             e.ret(Gpr::x(30))
         })?;
         self.code.bind(self.error_label)?;
+        // The scheduler runs `handle_error`. Resolving the catch in this fragment
+        // drops the BIF frame and `function_clause` argument list the scheduler records.
         self.code.emit(|e| {
             e.str_uoff(Gpr::x(30), SCHEDULER_REGS, 16_432)?;
             e.mov_reg(Gpr::x(0), Gpr::xzr())?;

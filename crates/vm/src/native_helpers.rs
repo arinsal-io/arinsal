@@ -131,9 +131,15 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
             crate::native_hooks::raw(value)
         }
         Err(_) => {
-            crate::native_hooks::set_error(process, "system_limit");
+            // The catch-end fragment stores this word and builds `{'EXIT', Word}`.
+            // A zero return is not a term and the fragment loads through it.
+            let fallback =
+                arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+                    .tuple(&[reason, arinsal_term::Term::NIL])
+                    .map(crate::native_hooks::raw)
+                    .unwrap_or_else(|_| crate::native_hooks::raw(reason));
             process.sync_native_header();
-            0
+            fallback
         }
     }
 }
@@ -721,27 +727,93 @@ fn scheduler_counter_entry(
 }
 
 /// Reads the active process dictionary for native `i_get` / `bif get` instructions.
-// Port of erts/emulator/beam/jit/arm/instr_common.cpp:319-329, OTP-29.1.1.
-// The lookup does not allocate, so the native heap cursors and X registers stay
-// where generated code left them. Copying the register file here showed up as
-// most of the gap against erts' `get/1`.
+// Port of erts/emulator/beam/erl_process_dict.c:463-471 (`erts_pd_hash_get`) and
+// jit/arm/instr_common.cpp:319-329 (`emit_i_get`), OTP-29.1.1.
+// The call is `Spec = 0`: HTOP is not stored, and the lookup does not allocate,
+// so the heap index is left where the last allocating call put it. A boxed key
+// is followed by its own pointer (`EQ`), not by that index.
 pub extern "C" fn arinsal_beamasm_process_dictionary_get(
     header: *mut ProcessHeader,
     key: u64,
 ) -> u64 {
-    if header.is_null() {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
         return 0;
+    };
+    dictionary_get(process, crate::native_hooks::from_raw(key))
+}
+
+/// `erlang:get/1` from the export's function pointer.
+// Port of erts/emulator/beam/erl_process_dict.c:324-330 (`get_1`), OTP-29.1.1.
+pub(crate) extern "C" fn get_1_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    _identity: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    // `x1` is the register array. Reading it through the scheduler file avoids a
+    // fresh pointer load: `enter_runtime` would also commit HTOP, which `get_1` does not.
+    let Some(key) = crate::native_hooks::x_reg(process, 0) else {
+        return 0;
+    };
+    dictionary_get(process, key)
+}
+
+/// `persistent_term:get/1` from the export's function pointer.
+// Port of erts/emulator/beam/erl_bif_persistent.c:380 (`persistent_term_get_1`), OTP-29.1.1.
+pub(crate) extern "C" fn persistent_term_get_1_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    _identity: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let Some(key) = crate::native_hooks::x_reg(process, 0) else {
+        return 0;
+    };
+    let found = process._persistent_terms.store().get(key);
+    match found {
+        Some(value) => crate::native_hooks::raw(value),
+        None => {
+            crate::native_hooks::set_error(process, "badarg");
+            0
+        }
     }
-    // SAFETY: ProcessHeader is the first repr(C) field of Process. Generated
-    // code calls this with the live process, and the key word is a caller-owned
-    // term that the lookup only reads.
-    let process = unsafe { &mut *header.cast::<crate::Process>() };
-    // Boxed keys are read through the heap. Commit the native cursors first;
-    // the lookup does not allocate, so they are not written back.
-    process
-        .heap
-        .set_native_cursors(process.header.htop, process.header.stop);
-    let key = crate::native_hooks::from_raw(key);
+}
+
+/// `persistent_term:get/2` from the export's function pointer.
+// Port of erts/emulator/beam/erl_bif_persistent.c:390 (`persistent_term_get_2`), OTP-29.1.1.
+pub(crate) extern "C" fn persistent_term_get_2_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    _identity: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let Some(key) = crate::native_hooks::x_reg(process, 0) else {
+        return 0;
+    };
+    let Some(default) = crate::native_hooks::x_reg(process, 1) else {
+        return 0;
+    };
+    let value = process
+        ._persistent_terms
+        .store()
+        .get(key)
+        .unwrap_or(default);
+    crate::native_hooks::raw(value)
+}
+
+fn dictionary_get(process: &crate::Process, key: Term) -> u64 {
     let value = process
         .dictionary
         .as_ref()
@@ -1008,6 +1080,609 @@ pub extern "C" fn arinsal_beamasm_line_breakpoint_cleanup(header: *mut ProcessHe
     }
     process.sync_native_header();
     live as u64
+}
+
+/// The function `call_light_bif_shared` branches to for this export.
+///
+/// Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1: each BIF
+/// has one function pointer, chosen when the export is created. Bodies that are
+/// their own C function come from [`crate::bif_table::special`]. Every other BIF
+/// uses the adapter for its kind. None of those pointers enter `invoke_dispatch_bif`.
+pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
+    if let Some(func) = crate::bif_table::special(&export.module, &export.function, export.arity) {
+        return Some(func);
+    }
+    // `trap_entry` clears `light_bif`, but keyfind/member/++/-- still run the
+    // plain body and trap only when the slice counter runs out. The export
+    // fragment calls this pointer directly, so the slice check has to be here
+    // rather than only in `invoke_dispatch_bif`.
+    if export.list_slice {
+        return Some(plain_bif_light as *const () as usize);
+    }
+    // The kind is fixed when the export is created (`bif_table[].f`). The call
+    // fragment branches to that pointer; it does not walk `invoke_dispatch_bif`.
+    if export.light_bif.is_some() {
+        return Some(plain_bif_light as *const () as usize);
+    }
+    if export.light_process_bif.is_some() {
+        return Some(process_bif_light as *const () as usize);
+    }
+    if export.direct_ets.is_some() {
+        return Some(direct_bif_light as *const () as usize);
+    }
+    if export.light_trap_bif.is_some() {
+        return Some(trap_bif_light as *const () as usize);
+    }
+    let bif = export.bif.is_some()
+        || matches!(
+            export.class,
+            arinsal_loader::ImportClass::Pure
+                | arinsal_loader::ImportClass::Native
+                | arinsal_loader::ImportClass::Dynamic
+                | arinsal_loader::ImportClass::Fun
+                | arinsal_loader::ImportClass::Unsupported
+        );
+    if bif {
+        Some(yield_executor_bif as *const () as usize)
+    } else {
+        None
+    }
+}
+
+/// `process_flag(trap_exit, Bool)` without leaving native code.
+///
+/// Port of erts/emulator/beam/bif.c (`process_flag_2`, the `trap_exit` arm), OTP-29.1.1.
+/// Any other flag is `BIF_TRAP`: the executor runs `process_flag_2`.
+pub(crate) extern "C" fn process_flag_light(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    entry: u64,
+    identity: u64,
+) -> u64 {
+    if let Some(raw) = trap_exit_flag(header, regs) {
+        return raw;
+    }
+    // `save_calls` must return in this native invocation. Trapping to the executor
+    // re-enters with `ERTS_SAVE_CALLS_CODE_IX` before the next call, which erts does
+    // not record (bif.c:1936, the BIF returns and the code index changes at the next
+    // schedule). FCALLS is already 0, so the next BIF's reduction check yields.
+    if let Some(raw) = save_calls_flag_light(header, regs) {
+        return raw;
+    }
+    yield_executor_bif(header, regs, i, entry, identity)
+}
+
+/// `erlang:self/0`. `c_p->common.id`, already the tagged pid on the header.
+// Port of erts/emulator/beam/bif.c (`self_0`), OTP-29.1.1.
+pub(crate) extern "C" fn self_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    _identity: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    process.header.self_pid
+}
+
+/// `erlang:node/0`.
+// Port of erts/emulator/beam/dist.c:6230 (`node_0`), OTP-29.1.1.
+pub(crate) extern "C" fn node_light(
+    _header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    _identity: u64,
+) -> u64 {
+    crate::native_hooks::raw(crate::natives::node::node_0_term())
+}
+
+/// A BIF the executor still owns. `THE_NON_VALUE` with the trap reason, so the
+/// fragment context-switches. This is not [`invoke_dispatch_bif`].
+pub(crate) extern "C" fn yield_executor_bif(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, _)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = export_at(identity) else {
+        return 0;
+    };
+    park_executor(process, export, identity)
+}
+
+/// `THE_NON_VALUE` + trap reason. The fragment context-switches into the executor.
+fn park_executor(process: &mut crate::Process, export: ExportDispatch, identity: u64) -> u64 {
+    process.header.arity = export.arity;
+    process.reductions = process.header.fcalls;
+    process.header.i = identity as *const u8 as *const _;
+    process.header.freason = 1 << 10;
+    process.sync_native_header();
+    0
+}
+
+fn save_calls_flag_light(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
+    if regs.is_null() {
+        return None;
+    }
+    let process = crate::native_hooks::process_from_header(header)?;
+    let name = crate::native_hooks::x_reg(process, 0)?;
+    if name != save_calls_atom() {
+        return None;
+    }
+    let value = crate::native_hooks::x_reg(process, 1)?;
+    match crate::natives::proc::save_calls_flag(process, value) {
+        Ok(term) => Some(crate::native_hooks::raw(term)),
+        Err(_) => {
+            crate::native_hooks::set_error(process, "badarg");
+            Some(0)
+        }
+    }
+}
+
+fn save_calls_atom() -> Term {
+    static ATOM: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    *ATOM.get_or_init(|| {
+        Term::atom(
+            arinsal_term::global_atoms()
+                .intern("save_calls")
+                .expect("save_calls"),
+        )
+    })
+}
+
+fn trap_exit_flag(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
+    if regs.is_null() {
+        return None;
+    }
+    // `reg[0]` and `reg[1]` are BIF_ARG_1 and BIF_ARG_2. The scheduler file is
+    // that array for the duration of native code (`x_reg`).
+    let process = crate::native_hooks::process_from_header(header)?;
+    let name = crate::native_hooks::x_reg(process, 0)?;
+    let value = crate::native_hooks::x_reg(process, 1)?;
+    if name != trap_exit_atom() {
+        return None;
+    }
+    let enabled = if value == bool_atom(true) {
+        true
+    } else if value == bool_atom(false) {
+        false
+    } else {
+        return None;
+    };
+    let old = process.trap_exit;
+    process.trap_exit = enabled;
+    Some(crate::native_hooks::raw(bool_atom(old)))
+}
+
+fn bool_atom(value: bool) -> Term {
+    Term::atom(if value {
+        arinsal_term::atoms::TRUE
+    } else {
+        arinsal_term::atoms::FALSE
+    })
+}
+
+/// `put/2` from `call_bif_shared`: the process dictionary, no executor.
+// Port of erts/emulator/beam/erl_process_dict.c:353-360 (put_2), OTP-29.1.1.
+pub(crate) extern "C" fn put_2_light(header: *mut ProcessHeader, regs: *mut u64, _i: u64) -> u64 {
+    if regs.is_null() {
+        return 0;
+    }
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let (Some(key), Some(value)) = (
+        crate::native_hooks::x_reg(process, 0),
+        crate::native_hooks::x_reg(process, 1),
+    ) else {
+        return 0;
+    };
+    // The export fragment already subtracted the call from FCALLS.
+    process.reductions = process.header.fcalls;
+    crate::native_hooks::raw(crate::natives::proc::dict_put(process, key, value))
+}
+
+/// `erase/1` from `call_bif_shared`.
+// Port of erts/emulator/beam/erl_process_dict.c:373-379 (erase_1), OTP-29.1.1.
+pub(crate) extern "C" fn erase_1_light(header: *mut ProcessHeader, regs: *mut u64, _i: u64) -> u64 {
+    if regs.is_null() {
+        return 0;
+    }
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let Some(key) = crate::native_hooks::x_reg(process, 0) else {
+        return 0;
+    };
+    process.reductions = process.header.fcalls;
+    crate::native_hooks::raw(crate::natives::proc::dict_erase(process, key))
+}
+
+/// `atom_to_list/1` as the BIF `call_light_bif_shared` branches to.
+// Port of erts/emulator/beam/bif.c:3186-3210 (`atom_to_list_1`) and
+// erl_unicode.c:1388-1395 (`erts_atom_to_string`: latin1 names are
+// `buf_to_intlist` of the atom bytes), OTP-29.1.1.
+pub(crate) extern "C" fn atom_to_list_light(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    if let Some(raw) = atom_to_list_latin1(header) {
+        return raw;
+    }
+    allocating_bif(header, regs, identity, 1, |heap, arg| {
+        arinsal_bifs::atom_to_list_term(heap, arg)
+    })
+}
+
+/// ASCII / single-byte latin1: one `HAlloc` and `buf_to_intlist`. `None` is a
+/// non-atom, a multi-byte name, or a heap that needs a fragment.
+fn atom_to_list_latin1(header: *mut ProcessHeader) -> Option<u64> {
+    let process = crate::native_hooks::process_from_header(header)?;
+    let arg = crate::native_hooks::x_reg(process, 0)?;
+    let text = arinsal_term::global_atoms().text(arg.as_atom()?)?;
+    let bytes = text.as_bytes();
+    // Atoms are stored as UTF-8. `latin1_chars == len` is exactly the
+    // single-byte case: each byte is already the code point, so
+    // `buf_to_intlist` matches `erts_utf8_to_list`.
+    if bytes.iter().any(|byte| *byte >= 0x80) {
+        return None;
+    }
+    process.reductions = process.header.fcalls;
+    if bytes.is_empty() {
+        return Some(crate::native_hooks::raw(Term::NIL));
+    }
+    // The fragment stored HTOP. Commit it so `HAlloc` bumps the same index,
+    // then publish the new pointer for `emit_leave_runtime`.
+    process.heap.set_native_cursors_at(
+        process.header.heap,
+        process.header.htop,
+        process.header.stop,
+    );
+    let term = arinsal_term::TermBuilder::new(&mut process.heap)
+        .byte_string_list(bytes)
+        .ok()?;
+    let top = process.heap.heap_top_index();
+    process.header.htop = native_htop(process, top);
+    Some(crate::native_hooks::raw(term))
+}
+
+/// `integer_to_binary/1` as the BIF `call_light_bif_shared` branches to.
+// Port of erts/emulator/beam/binary.c:80-127 (integer_to_binary), OTP-29.1.1.
+pub(crate) extern "C" fn integer_to_binary_light(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    allocating_bif(header, regs, identity, 1, |heap, arg| {
+        arinsal_arith::integer_to_binary_decimal(arg, heap).map_err(arith_bif_error)
+    })
+}
+
+/// Sync the native cursors, run an allocating BIF, and publish HTOP.
+fn allocating_bif(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    identity: u64,
+    arity: usize,
+    body: impl FnOnce(
+        &mut arinsal_bifs::FragmentingHeap<'_>,
+        Term,
+    ) -> Result<Term, arinsal_bifs::BifError>,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    // The caller (call_light_bif or the export fragment) already charged FCALLS.
+    process.reductions = process.header.fcalls;
+    // reg[0] is BIF_ARG_1, whether the fragment passed `regs` or left it in the
+    // scheduler file `enter_runtime` already resolved.
+    let _ = regs;
+    let arg = registers.x_reg_array[0];
+    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let result = {
+        let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        body(&mut fragment, arg)
+    };
+    let top = process.heap.heap_top_index();
+    if let Ok(value) = &result
+        && stop - top >= process.heap.mbuf_size()
+        && !process.heap.bin_vheap_gc_due()
+    {
+        let value = *value;
+        registers.x_reg_array[0] = value;
+        if top != entry_top {
+            process.header.htop = native_htop(process, top);
+        }
+        return crate::native_hooks::raw(value);
+    }
+    let Some(export) = export_at(identity) else {
+        crate::native_hooks::set_error(process, "badarg");
+        process.sync_native_header();
+        return 0;
+    };
+    plain_bif_result(process, registers, export, arity, result)
+}
+
+fn arith_bif_error(error: arinsal_arith::ArithError) -> arinsal_bifs::BifError {
+    match error {
+        arinsal_arith::ArithError::Badarg | arinsal_arith::ArithError::Badarith => {
+            arinsal_bifs::BifError::BADARG
+        }
+        arinsal_arith::ArithError::SystemLimit | arinsal_arith::ArithError::HeapFull { .. } => {
+            arinsal_bifs::BifError::SystemLimit
+        }
+    }
+}
+
+fn export_at(identity: u64) -> Option<ExportDispatch> {
+    // The identity is the export slot. `export_dispatch` is the same descriptor
+    // `Export.info` publishes, cached per scheduler.
+    crate::beamasm_integration::export_dispatch(identity as usize)
+}
+
+fn trap_exit_atom() -> Term {
+    static ATOM: std::sync::OnceLock<Term> = std::sync::OnceLock::new();
+    *ATOM.get_or_init(|| {
+        Term::atom(
+            arinsal_term::global_atoms()
+                .intern("trap_exit")
+                .expect("trap_exit"),
+        )
+    })
+}
+
+/// `setelement/3`: one bump and a copy of the tuple.
+// Port of erts/emulator/beam/bif.c:2976-3003 (setelement_3), OTP-29.1.1.
+pub(crate) extern "C" fn setelement_light(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    entry: u64,
+    identity: u64,
+) -> u64 {
+    match setelement_write(header, regs) {
+        Some(raw) => raw,
+        None => plain_bif_light(header, regs, i, entry, identity),
+    }
+}
+
+/// `Some` is the new tuple. `None` means the generic BIF body must run.
+fn setelement_write(header: *mut ProcessHeader, regs: *mut u64) -> Option<u64> {
+    if header.is_null() || regs.is_null() {
+        return None;
+    }
+    // SAFETY: reg[0..2] are BIF_ARG_1..3. A tuple's header is the word at the
+    // untagged pointer. HTOP was stored by `emit_enter_runtime`.
+    unsafe {
+        let index = crate::native_hooks::from_raw(*regs);
+        let tuple = crate::native_hooks::from_raw(*regs.add(1));
+        let value = *regs.add(2);
+        let ix = index.as_small().filter(|ix| *ix >= 1)?;
+        let src = tuple.raw_ptr();
+        let hdr = *src;
+        if hdr & 63 != 0 {
+            return None;
+        }
+        let arity = (hdr >> 6) as usize;
+        let slot = ix as usize;
+        if slot > arity {
+            return None;
+        }
+        let size = arity + 1;
+        let process = &mut *header.cast::<crate::Process>();
+        let htop = process.header.htop;
+        let stop = process.header.stop;
+        let top = htop as usize;
+        let limit = (stop as usize).saturating_sub(arinsal_term::S_REDZONE * 8);
+        if htop.is_null() || stop.is_null() || top.saturating_add(size.saturating_mul(8)) > limit {
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(src, htop, size);
+        htop.add(slot).write(value);
+        let next = htop.add(size);
+        process.header.htop = next;
+        process.heap.note_native_alloc(size);
+        process.reductions = process.header.fcalls;
+        Some((htop as u64) | 2)
+    }
+}
+
+/// `make_ref/0`. `HAlloc` of three words and `esdp->ref++`, then the term.
+// Port of erts/emulator/beam/erl_bif_unique.c:821-833 (`make_ref_0`) and
+// erl_bif_unique.h:190-198 (`erts_sched_make_ref_in_buffer`), OTP-29.1.1.
+pub(crate) extern "C" fn make_ref_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    if header.is_null() {
+        return 0;
+    }
+    // SAFETY: the light-BIF fragment passes c_p. HTOP and E were stored by
+    // `emit_enter_runtime`. The reference cell belongs to this scheduler thread.
+    unsafe {
+        let process = &mut *header.cast::<crate::Process>();
+        let htop = process.header.htop;
+        let stop = process.header.stop;
+        let top = htop as usize;
+        let limit = (stop as usize).saturating_sub(arinsal_term::S_REDZONE * 8);
+        let Some(state) = process.scheduler_ref_state else {
+            return make_ref_cold(header, identity);
+        };
+        if htop.is_null() || stop.is_null() || top.saturating_add(24) > limit {
+            return make_ref_cold(header, identity);
+        }
+        let ids = state.bump_ref_words();
+        // ErtsORefThing: header, then the three 32-bit numbers packed as
+        // `Term::local_ref` writes them.
+        *htop = (2 << 6) | 0x10;
+        *htop.add(1) = ((ids[0] as u64) << 32) | 0xffff_ffff;
+        *htop.add(2) = ((ids[2] as u64) << 32) | (ids[1] as u64);
+        let next = htop.add(3);
+        process.header.htop = next;
+        process.heap.note_native_alloc(3);
+        process.reductions = process.header.fcalls;
+        (htop as u64) | 2
+    }
+}
+
+#[cold]
+fn make_ref_cold(header: *mut ProcessHeader, identity: u64) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = export_at(identity) else {
+        return 0;
+    };
+    make_ref_0(process, registers, export, false)
+}
+
+/// `unique_integer/0` from the export's function pointer.
+pub(crate) extern "C" fn unique_integer_0_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = export_at(identity) else {
+        return 0;
+    };
+    unique_integer_n(process, registers, export, false, &[])
+}
+
+/// `unique_integer/1` from the export's function pointer.
+pub(crate) extern "C" fn unique_integer_1_light(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = export_at(identity) else {
+        return 0;
+    };
+    let _ = regs;
+    let arg = registers.x_reg_array[0];
+    unique_integer_n(process, registers, export, false, &[arg])
+}
+
+/// A plain BIF: call `bif_table[].f` and return. Trace and save_calls already
+/// branched to the helper in the fragment.
+// Port of erts/emulator/beam/beam_jit_common.cpp:588-621 (`beam_jit_call_bif`), OTP-29.1.1.
+pub(crate) extern "C" fn plain_bif_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    // The fragment loaded `Export.info` into this argument. `export_at` would
+    // hash the slot on every call.
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    // `lists:member/2`, `keyfind/3` and the other slice BIFs are this same body
+    // (`erl_bif_lists.c` `lists_member_2` / `keyfind`). The light entry used to
+    // scan without `ERTS_BIF_REDS_LEFT` and never trap.
+    if export.list_slice
+        && let Some(bif) = export.bif
+    {
+        return call_list_slice_bif(process, registers, identity as usize, export, bif, false)
+            .unwrap_or(0);
+    }
+    let Some(bif) = export.light_bif else {
+        return park_executor(process, export, identity);
+    };
+    call_plain_bif(process, registers, export, bif, false)
+}
+
+/// A process BIF (`c_p` plus the register array), chosen when the export was created.
+pub(crate) extern "C" fn process_bif_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = export_at(identity) else {
+        return 0;
+    };
+    let Some(bif) = export.light_process_bif else {
+        return park_executor(process, export, identity);
+    };
+    call_process_bif(process, registers, export, bif, false).unwrap_or(0)
+}
+
+/// An ETS or process-dictionary BIF whose body is `direct_ets`.
+pub(crate) extern "C" fn direct_bif_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = export_at(identity) else {
+        return 0;
+    };
+    if let Some(raw) = call_direct_bif(process, registers, export, false) {
+        return raw;
+    }
+    process.header.arity = export.arity;
+    process.header.i = identity as *const u8 as *const _;
+    process.header.freason = 1 << 10;
+    process.sync_native_header();
+    0
+}
+
+/// A trapping BIF. A value returns here; a trap is `THE_NON_VALUE`.
+pub(crate) extern "C" fn trap_bif_light(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    _entry: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = export_at(identity) else {
+        return 0;
+    };
+    let Some(entry) = export.light_trap_bif else {
+        return park_executor(process, export, identity);
+    };
+    call_trap_bif(process, registers, identity as usize, export, entry, false).unwrap_or(0)
 }
 
 // `export_call`: reached through an export entry, whose BIF trampoline charges the call one
@@ -1964,7 +2639,7 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
                 Some(export) => {
                     set_native_bif_error(process, &export.module, &export.function, args, error)
                 }
-                None => set_light_bif_error(process, error),
+                None => set_light_bif_error(process, &error),
             }
             process.sync_native_header();
             0
@@ -2068,7 +2743,13 @@ pub(crate) fn set_native_bif_error(
     args: &[Term],
     error: arinsal_bifs::BifError,
 ) {
-    set_light_bif_error(process, error);
+    set_light_bif_error(process, &error);
+    // A caught native failure still returns to the scheduler, which raises with this
+    // record (`native_bif_error`). The pending frame is `s->current` if a later
+    // `save_stacktrace` runs in-process (beam_common.c:903-925, OTP-29.1.1).
+    if process.header.catches > 0 {
+        crate::stacktrace::note_caught_bif_frame(process, module, function, args, &error);
+    }
     let (freason, fvalue) = (process.header.freason, process.header.fvalue);
     process.cold_mut().native_bif_error = Some(crate::proc_create::NativeBifError {
         module: module.to_owned(),
@@ -2080,20 +2761,31 @@ pub(crate) fn set_native_bif_error(
     });
 }
 
-fn set_light_bif_error(process: &mut crate::Process, error: arinsal_bifs::BifError) {
+fn set_light_bif_error(process: &mut crate::Process, error: &arinsal_bifs::BifError) {
     use arinsal_bifs::{BifError, Class};
+    // A new failure replaces any BIF frame left by the previous one.
+    crate::stacktrace::clear_pending_top(process);
+    // `raise/3`'s list is copied off-heap before `freason` changes, so a later
+    // collection cannot move the words the catch still has to return.
+    let explicit = match error {
+        BifError::Raise {
+            stacktrace: Some(trace),
+            ..
+        } => arinsal_term::to_owned(*trace).ok(),
+        _ => None,
+    };
     let (class, reason) = match error {
         BifError::Badarg { .. } => (1, crate::signals::atom("badarg")),
         BifError::Badarith => (1, crate::signals::atom("badarith")),
         BifError::SystemLimit => (1, crate::signals::atom("system_limit")),
-        BifError::Error(reason) => (1, reason),
+        BifError::Error(reason) => (1, *reason),
         BifError::Raise { class, reason, .. } => (
-            match class {
+            match *class {
                 Class::Error => 1,
                 Class::Exit => 2,
                 Class::Throw => 3,
             },
-            reason,
+            *reason,
         ),
         BifError::Unsupported(_) => (1, crate::signals::atom("undef")),
         // NIF bodies trap to the executor before reaching here (`trap_to_dirty_nif`).
@@ -2101,18 +2793,181 @@ fn set_light_bif_error(process: &mut crate::Process, error: arinsal_bifs::BifErr
     };
     process.header.freason = class;
     process.header.fvalue = crate::native_hooks::raw(reason);
+    let freason = process.header.freason;
+    let fvalue = process.header.fvalue;
+    process.cold_mut().explicit_raise = explicit.map(|trace| (freason, fvalue, trace));
+}
+
+/// The `raise/3` list for this failure, copied back onto the heap.
+///
+/// Port of erts/emulator/beam/bif.c:1643 (`c_p->ftrace = stacktrace` when the
+/// list is already a stacktrace), OTP-29.1.1. The catch's `build_stacktrace`
+/// then returns that list instead of walking native frames.
+fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
+    let owned = {
+        let cold = process.cold.as_mut()?;
+        let matches = cold
+            .explicit_raise
+            .as_ref()
+            .is_some_and(|(freason, fvalue, _)| {
+                *freason == process.header.freason && *fvalue == process.header.fvalue
+            });
+        if !matches {
+            return None;
+        }
+        cold.explicit_raise.take().map(|(_, _, trace)| trace)?
+    };
+    arinsal_term::from_owned(
+        &owned,
+        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+    )
+    .ok()
 }
 
 /// Resolves a native exception to the innermost catch handler, or 0 to let the scheduler exit.
 ///
-/// Always 0: the scheduler's `handle_error` port builds the raw stacktrace (which needs the
-/// loaded-module table) before it resumes a native or interpreted catch.
+/// Port of erts/emulator/beam/beam_common.c:449 (`handle_error`) and
+/// jit/arm/beam_asm_global.cpp:300 (`raise_exception_shared`), OTP-29.1.1.
+/// A caught error stays in native code: save a raw stacktrace, scan for the catch
+/// tag, and return the handler. The symbolic list is built later, only if the
+/// handler executes `build_stacktrace`.
 pub extern "C" fn arinsal_beamasm_exception_resolver(
-    _header: *mut ProcessHeader,
+    header: *mut ProcessHeader,
     _registers: *mut arinsal_beamasm::SchedulerRegisters,
     _stack: *mut u64,
 ) -> usize {
-    0
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    let (freason, catches) = (process.header.freason, process.header.catches);
+    // TRAP and raw re-raises stay on the scheduler. Primary classes are 1, 2, 3.
+    // Expanded errors (`badmatch`, `function_clause`, `case_clause`, …) use erts'
+    // `(index << 10) | EXC_ERROR`.
+    let primary = matches!(freason, 1..=3);
+    let function_clause = (freason >> 10) == 6 && freason & 0x3ff == 0x50;
+    let expanded = freason > 3 && freason & 0x3ff == 0x50 && freason & 4 == 0;
+    if catches == 0 || (!primary && !expanded) {
+        return 0;
+    }
+    // Port of erts/emulator/beam/jit/arm/beam_asm_global.cpp:300-318 (`raise_exception_shared`),
+    // OTP-29.1.1. The shared fragment already ran `emit_enter_runtime` and stored HTOP and E
+    // into `c_p`. `handle_error` runs once from that entry; it does not enter again.
+    // The heap indexes are those stored cursors (`c_p->htop`, `c_p->stop`).
+    process.heap.set_native_cursors_at(
+        process.header.heap,
+        process.header.htop,
+        process.header.stop,
+    );
+    let Some((process, registers)) = crate::native_hooks::scheduler_registers(process) else {
+        return 0;
+    };
+    // Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` reads the stack, and
+    // writes `stop` only at `found_catch`), OTP-29.1.1. `function_clause` is raised at the
+    // function entry, before `allocate`. Saving a trace before a search that misses moves
+    // the stack, and the scheduler then reports `exception_from` for tail-called frames.
+    // Look first, and leave a miss or an exception-trace frame to that unwind. A caught
+    // throw already has its handler, so it saves once and scans once.
+    if function_clause && !crate::native_bridge::native_catch_pending(process) {
+        process.sync_native_header();
+        return 0;
+    }
+    // A catch in a caller is the scheduler's unwind. Handling it here, then returning
+    // 0 when the handler is interpreted, consumes the tag and the error escapes.
+    if !crate::native_bridge::current_frame_catch(process) {
+        process.sync_native_header();
+        return 0;
+    }
+    let (class, reason) = if primary {
+        let class = match freason {
+            1 => arinsal_bifs::Class::Error,
+            2 => arinsal_bifs::Class::Exit,
+            _ => arinsal_bifs::Class::Throw,
+        };
+        (class, crate::native_hooks::from_raw(process.header.fvalue))
+    } else {
+        match expand_error_value(process) {
+            Some(reason) => (arinsal_bifs::Class::Error, reason),
+            None => {
+                process.sync_native_header();
+                return 0;
+            }
+        }
+    };
+    // The light-BIF fragment and `error_label` spill the raising pc at `tmp_mem[6]`
+    // (erts' `pc` argument to `save_stacktrace`). `p.ip` is the last interpreter
+    // instruction and names the wrong function while native code is running.
+    // The raising pc is stored raw. `build_stacktrace` resolves it; a registry
+    // lookup here is not part of erts' `save_stacktrace`.
+    let native_pc = {
+        let pc = registers.tmp_mem[6] as usize;
+        let probe = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
+        (pc != 0 && arinsal_term::may_be_native_code_pointer(probe)).then_some(pc)
+    };
+    // `erlang:raise/3` already built the list the catch must see (`bif.c:1643`).
+    // A native walk would name `eval_external_handler` instead of that list.
+    let trace = if let Some(trace) = take_explicit_raise(process) {
+        trace
+    } else {
+        let Ok(trace) = crate::stacktrace::save_lazy(process, class, native_pc) else {
+            process.sync_native_header();
+            return 0;
+        };
+        trace
+    };
+    let handler = match crate::native_bridge::next_catch(process, class, reason, trace, true) {
+        Some(crate::native_bridge::CatchHandler::Native(handler)) => handler,
+        Some(crate::native_bridge::CatchHandler::Interpreted) | None => {
+            process.sync_native_header();
+            return 0;
+        }
+    };
+    crate::stacktrace::clear_pending_top(process);
+    if let Some(cold) = process.cold.as_mut() {
+        // The branch below resumes the handler. The scheduler must not treat
+        // the next native exit as a continuation resume.
+        cold.native_continuation_resume = false;
+    }
+    let live = process.x.len().min(4);
+    registers.x_reg_array[..live].copy_from_slice(&process.x[..live]);
+    handler
+}
+
+/// Port of erts/emulator/beam/beam_common.c:742 (`expand_error_value`), OTP-29.1.1.
+fn expand_error_value(process: &mut crate::Process) -> Option<arinsal_term::Term> {
+    let index = process.header.freason >> 10;
+    let value = crate::native_hooks::from_raw(process.header.fvalue);
+    if index == 0 {
+        return Some(value);
+    }
+    // erts uses the predefined `am_*` atoms (`error.h` / `expand_error_value`).
+    // Interning the name hashes and takes the atom-table lock on every raise.
+    let tag = Term::atom(match index {
+        3 => arinsal_term::atoms::BADARG,
+        4 => arinsal_term::atoms::BADARITH,
+        5 => arinsal_term::atoms::BADMATCH,
+        6 => arinsal_term::atoms::FUNCTION_CLAUSE,
+        7 => arinsal_term::atoms::CASE_CLAUSE,
+        8 => arinsal_term::atoms::IF_CLAUSE,
+        9 => arinsal_term::atoms::UNDEF,
+        10 => arinsal_term::atoms::BADFUN,
+        11 => arinsal_term::atoms::BADARITY,
+        15 => arinsal_term::atoms::SYSTEM_LIMIT,
+        16 => arinsal_term::atoms::TRY_CLAUSE,
+        17 => arinsal_term::atoms::NOTSUP,
+        18 => arinsal_term::atoms::BADMAP,
+        19 => arinsal_term::atoms::BADKEY,
+        20 => arinsal_term::atoms::BADRECORD,
+        21 => arinsal_term::atoms::BADFIELD,
+        22 => arinsal_term::atoms::NOVALUE,
+        _ => return None,
+    });
+    if matches!(index, 5 | 7 | 10 | 11 | 16 | 18 | 19 | 20 | 21 | 22) {
+        arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+            .tuple(&[tag, value])
+            .ok()
+    } else {
+        Some(tag)
+    }
 }
 
 /// Resolves a fun call that missed the local-dispatch fast path.

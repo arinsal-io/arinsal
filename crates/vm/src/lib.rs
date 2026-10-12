@@ -5,6 +5,7 @@ mod bif_traps;
 mod fun_dispatch;
 // c_boot: Launcher entry point for the preloaded OTP boot process.
 mod bif_dispatch;
+mod bif_table;
 pub mod boot;
 mod calls;
 mod check_io;

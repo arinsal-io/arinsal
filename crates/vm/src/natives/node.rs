@@ -15,7 +15,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "halt", 2),
     ("erlang", "node", 0),
     ("erlang", "node", 1),
-    ("erlang", "is_alive", 0),
     ("erlang", "nodes", 0),
     ("erlang", "nodes", 1),
     ("erlang", "nodes", 2),
@@ -37,7 +36,6 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
         ("erlang", "halt", 2) => Some(call_halt2),
         ("erlang", "node", 0) => Some(call_node0),
         ("erlang", "node", 1) => Some(call_node1),
-        ("erlang", "is_alive", 0) => Some(call_is_alive0),
         ("erlang", "nodes", 0) => Some(call_nodes0),
         ("erlang", "nodes", 1) => Some(call_nodes1),
         ("erlang", "nodes", 2) => Some(call_nodes2),
@@ -64,15 +62,6 @@ fn call_node0(
     _args: &[Term],
 ) -> Result<Term, VmError> {
     Ok(local_node_term())
-}
-
-fn call_is_alive0(
-    _vm: &mut Vm,
-    _process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
-    _args: &[Term],
-) -> Result<Term, VmError> {
-    Ok(boolean(node_tables::lock().alive))
 }
 
 fn call_node1(
@@ -406,12 +395,13 @@ fn local_node_term() -> Term {
     Term::atom(global_atoms().intern(name).unwrap())
 }
 
-fn atom(name: &str) -> Term {
-    Term::atom(global_atoms().intern(name).unwrap())
+/// `erlang:node/0`. The light-BIF pointer calls this; it does not enter the executor.
+pub(crate) fn node_0_term() -> Term {
+    local_node_term()
 }
 
-fn boolean(value: bool) -> Term {
-    atom(if value { "true" } else { "false" })
+fn atom(name: &str) -> Term {
+    Term::atom(global_atoms().intern(name).unwrap())
 }
 
 fn error(reason: &str) -> VmError {

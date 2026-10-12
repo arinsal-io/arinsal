@@ -54,13 +54,8 @@ fn number(term: Term) -> Option<Number> {
             Some(Number::Float(f64::from_bits(unsafe { *p.add(1) })))
         }
         POS_BIG | NEG_BIG => {
-            // SAFETY: The header digit count describes initialized magnitude limbs.
-            let len = (h >> 6) as usize;
-            let mut digits = SmallVec::with_capacity(len);
-            for index in 0..len {
-                // SAFETY: The header digit count describes initialized magnitude limbs.
-                digits.push(unsafe { *p.add(index + 1) });
-            }
+            let mut digits = SmallVec::new();
+            term.with_bignum_digits_mut(|words| digits.extend_from_slice(words))?;
             Some(Number::Integer(Integer::Big {
                 negative: h & 63 == NEG_BIG,
                 digits,

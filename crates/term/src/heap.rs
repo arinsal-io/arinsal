@@ -940,6 +940,13 @@ impl ProcessHeap {
     // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:459-537 (emit_enter_runtime stores HTOP
     // and E into c_p as they are), OTP-29.1.1. The young-heap base is `c_p->heap`; the
     // indices are that base subtracted from the pointers, with no release-mode bounds check.
+    /// Record `words` just written at the native HTOP. The machine pointer and this
+    /// index stay one bump apart from the last sync.
+    #[inline(always)]
+    pub fn note_native_alloc(&mut self, words: usize) {
+        self.htop += words;
+    }
+
     #[inline(always)]
     pub fn set_native_cursors(&mut self, htop: *mut u64, stop: *mut u64) {
         self.commit_native_cursors(self.words.as_ptr() as usize, htop, stop);
@@ -1714,12 +1721,114 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         chain.last = Some(words);
         Ok(())
     }
+}
 
+/// File and line of one MFA frame: `[{file, File}, {line, Line}]`.
+///
+/// `file_atom` and `line_atom` are the predefined `file` and `line` atoms.
+/// `file` is the literal filename term (`fi->fname_ptr[file]`).
+pub struct MfaLocation {
+    /// The atom `file`.
+    pub file_atom: Term,
+    /// Literal filename.
+    pub file: Term,
+    /// The atom `line`.
+    pub line_atom: Term,
+    /// Source line as a small integer.
+    pub line: Term,
+}
+
+impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Box a positive bignum from little-endian digits without normalising to a small.
     pub fn pos_bignum_from_digits(&mut self, digits: &[u64]) -> Result<Term, TermError> {
-        let p = self.words(1 + digits.len())?;
-        self.write_bignum(p, digits.len(), Sign::Plus, |index| digits[index]);
+        self.pos_bignum_fill(digits.len(), |index| digits[index])
+    }
+
+    /// Allocate a positive bignum and store each digit once.
+    ///
+    /// Port of `HAlloc` plus the stores into `struct StackTrace` in
+    /// erts/emulator/beam/beam_common.c:884-893, OTP-29.1.1. `digit_at` runs while the
+    /// words are written; there is no separate zero-filled buffer.
+    pub fn pos_bignum_fill(
+        &mut self,
+        digits: usize,
+        digit_at: impl FnMut(usize) -> u64,
+    ) -> Result<Term, TermError> {
+        if digits == 0 || digits > 65_535 {
+            return Err(TermError::SystemLimit);
+        }
+        let p = self.words(1 + digits)?;
+        self.write_bignum(p, digits, Sign::Plus, digit_at);
         Ok(Term::from_ptr(p, 2))
+    }
+
+    /// Allocate a positive bignum header and leave the digits for the caller to fill.
+    ///
+    /// Port of `HAlloc` of `struct StackTrace` in beam_common.c:889-893, OTP-29.1.1.
+    /// The digit words are not a second buffer; `with_bignum_digits_mut` stores them.
+    pub fn pos_bignum_reserve(&mut self, digits: usize) -> Result<Term, TermError> {
+        if digits == 0 || digits > 65_535 {
+            return Err(TermError::SystemLimit);
+        }
+        let p = self.words(1 + digits)?;
+        store(p, ((digits as u64) << 6) | POS_BIG);
+        for index in 0..digits {
+            store(p.wrapping_add(1 + index), 0);
+        }
+        Ok(Term::from_ptr(p, 2))
+    }
+
+    /// Cons `{Module, Function, ArityOrArgs, Location}` onto `tail`.
+    ///
+    /// Without `location` the location is `[]`. The whole frame, including its
+    /// list cell, is one allocation.
+    // Port of erts/emulator/beam/utils.c:3430 (`erts_build_mfa_item`) and
+    // beam_common.c:1280 (`CONS` of that item), OTP-29.1.1.
+    pub fn cons_mfa_frame(
+        &mut self,
+        module: Term,
+        function: Term,
+        arity_or_args: Term,
+        location: Option<MfaLocation>,
+        tail: Term,
+    ) -> Result<Term, TermError> {
+        let words = if location.is_some() { 17 } else { 7 };
+        let hp = self.words(words)?;
+        let loc = if let Some(MfaLocation {
+            file_atom,
+            file: file_term,
+            line_atom,
+            line: line_term,
+        }) = location
+        {
+            store(hp, (2 << 6) | ARITY);
+            store(hp.wrapping_add(1), line_atom.bits());
+            store(hp.wrapping_add(2), line_term.bits());
+            let line_tuple = Term::from_ptr(hp, 2);
+            store(hp.wrapping_add(3), line_tuple.bits());
+            store(hp.wrapping_add(4), Term::NIL.bits());
+            let line_cons = Term::from_ptr(hp.wrapping_add(3), 1);
+            store(hp.wrapping_add(5), (2 << 6) | ARITY);
+            store(hp.wrapping_add(6), file_atom.bits());
+            store(hp.wrapping_add(7), file_term.bits());
+            let file_tuple = Term::from_ptr(hp.wrapping_add(5), 2);
+            store(hp.wrapping_add(8), file_tuple.bits());
+            store(hp.wrapping_add(9), line_cons.bits());
+            (Term::from_ptr(hp.wrapping_add(8), 1), 10)
+        } else {
+            (Term::NIL, 0)
+        };
+        let (loc, at) = loc;
+        store(hp.wrapping_add(at), (4 << 6) | ARITY);
+        store(hp.wrapping_add(at + 1), module.bits());
+        store(hp.wrapping_add(at + 2), function.bits());
+        store(hp.wrapping_add(at + 3), arity_or_args.bits());
+        store(hp.wrapping_add(at + 4), loc.bits());
+        let frame = Term::from_ptr(hp.wrapping_add(at), 2);
+        let cell = at + 5;
+        store(hp.wrapping_add(cell), frame.bits());
+        store(hp.wrapping_add(cell + 1), tail.bits());
+        Ok(Term::from_ptr(hp.wrapping_add(cell), 1))
     }
 
     /// Write `STRING_EXT` bytes as one contiguous run of cons cells.
@@ -1746,11 +1855,8 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Build a two-word cons cell.
     pub fn cons(&mut self, head: Term, tail: Term) -> Result<Term, TermError> {
         let p = self.words(2)?;
-        // SAFETY: two words were reserved.
-        unsafe {
-            *p = head.bits();
-            *p.add(1) = tail.bits();
-        }
+        store(p, head.bits());
+        store(p.wrapping_add(1), tail.bits());
         Ok(Term::from_ptr(p, 1))
     }
     /// Build a list in iteration order.
@@ -1780,11 +1886,8 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Box a 64-bit float, retaining its exact bit pattern.
     pub fn float(&mut self, value: f64) -> Result<Term, TermError> {
         let p = self.words(2)?;
-        // SAFETY: two words were reserved.
-        unsafe {
-            *p = (1 << 6) | FLOAT;
-            *p.add(1) = value.to_bits();
-        }
+        store(p, (1 << 6) | FLOAT);
+        store(p.wrapping_add(1), value.to_bits());
         Ok(Term::from_ptr(p, 2))
     }
     /// Select immediate or bignum storage for an `i64`.
@@ -1834,17 +1937,17 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         sign: Sign,
         mut digit_at: impl FnMut(usize) -> u64,
     ) {
-        // SAFETY: the allocation reserves one header word and `digits` digit words.
-        unsafe {
-            *p = ((digits as u64) << 6)
+        store(
+            p,
+            ((digits as u64) << 6)
                 | if sign == Sign::Minus {
                     NEG_BIG
                 } else {
                     POS_BIG
-                };
-            for index in 0..digits {
-                *p.add(index + 1) = digit_at(index);
-            }
+                },
+        );
+        for index in 0..digits {
+            store(p.wrapping_add(index + 1), digit_at(index));
         }
     }
     /// Build a byte-aligned binary.
@@ -2161,11 +2264,8 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
         entry: Arc<ExportEntry>,
     ) -> Result<Term, TermError> {
         let p = self.words(2)?;
-        // SAFETY: the two-word fun head was reserved.
-        unsafe {
-            *p = crate::fun::export_header(entry.arity);
-            *p.add(1) = Arc::as_ptr(&entry) as u64;
-        }
+        store(p, crate::fun::export_header(entry.arity));
+        store(p.wrapping_add(1), Arc::as_ptr(&entry) as u64);
         self.heap.retain_export(entry);
         Ok(Term::from_ptr(p, 2))
     }

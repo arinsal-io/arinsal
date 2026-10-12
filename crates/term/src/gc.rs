@@ -1012,6 +1012,7 @@ impl ProcessHeap {
     }
 
     /// Read a stack word relative to the current stack pointer.
+    #[inline]
     pub fn stack_get(&self, index: usize) -> Option<Term> {
         self.words.get(self.stop + index).map(|word| {
             // SAFETY: A live stack slot is initialized before collection.

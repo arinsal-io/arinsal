@@ -578,13 +578,45 @@ pub fn integer_to_binary<H: HeapAlloc + ?Sized>(
     base: Term,
     heap: &mut H,
 ) -> ArithResult {
-    // Port of erts/emulator/beam/binary.c:80 (integer_to_binary), OTP-29.1.1.
+    // Port of erts/emulator/beam/binary.c:80-116 (integer_to_binary), OTP-29.1.1.
+    // A small uses a stack buffer (`Sint_to_buf` into `char s[128]`), then
+    // `erts_new_binary_from_data`. A bignum still goes through a digit string.
+    let radix = base_value(base)?;
+    if let Some(value) = int.as_small() {
+        let mut buf = [0_u8; 72];
+        let digits = format_small(value, radix, &mut buf);
+        let need = 2 + digits.len().div_ceil(8);
+        return TermBuilder::new(&mut HeapProxy(heap))
+            .binary(digits)
+            .map_err(|e| construction_error(e, need));
+    }
     let s = text(int, base)?;
     let len = s.len();
     let need = if len <= 64 { 2 + len.div_ceil(8) } else { 8 };
     TermBuilder::new(&mut HeapProxy(heap))
         .binary(s.as_bytes())
         .map_err(|e| construction_error(e, need))
+}
+
+/// Decimal or other-base digits of a small, written into `buf` from the end.
+// Port of erts/emulator/beam/big.c (`Sint_to_buf`), OTP-29.1.1.
+fn format_small(value: i64, base: u32, buf: &mut [u8; 72]) -> &[u8] {
+    const DIGITS: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let mut magnitude = value.unsigned_abs();
+    let mut index = buf.len();
+    loop {
+        index -= 1;
+        buf[index] = DIGITS[(magnitude % u64::from(base)) as usize];
+        magnitude /= u64::from(base);
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        index -= 1;
+        buf[index] = b'-';
+    }
+    &buf[index..]
 }
 fn parse_bytes(bytes: &[u8], base: u32) -> Result<BigInt, ArithError> {
     // Port of erts/emulator/beam/big.c:4162 (chars_to_integer), OTP-29.1.1.

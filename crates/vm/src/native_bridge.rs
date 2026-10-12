@@ -2,7 +2,7 @@
 
 use super::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Symbolic information attached to one executable native code range.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,6 +71,267 @@ pub(crate) struct NativeStackFrame {
     pub file: Option<Arc<str>>,
 }
 
+/// One native function inside a module range. The line table is shared, not cloned per frame.
+#[derive(Clone)]
+pub(crate) struct FunctionRange {
+    start: usize,
+    end: usize,
+    module_atom: arinsal_term::Atom,
+    function_atom: arinsal_term::Atom,
+    arity: u8,
+    line: Option<u32>,
+    file_term: Option<Term>,
+    file: Option<Arc<str>>,
+    lines: Arc<[NativeLine]>,
+    /// `lines[i].address`, packed so `find_line` does not chase the filename Arc.
+    /// Port of beam_ranges.c:331 (`lookup_loc` binary-searches `func_tab` pointers,
+    /// then indexes `loc_tab`), OTP-29.1.1.
+    line_addrs: Arc<[usize]>,
+}
+
+/// One module's native code in the active code index, sorted by `start`.
+///
+/// Port of erts/emulator/beam/beam_ranges.c:33-66 (`Range`) and :245 (`erts_lookup_function_info`),
+/// OTP-29.1.1. `find_range` binary-searches the module, then the function inside it.
+#[derive(Clone)]
+pub(crate) struct ModuleRange {
+    start: usize,
+    end: usize,
+    module_atom: arinsal_term::Atom,
+    functions: Arc<[FunctionRange]>,
+    /// `functions[i].start`. `erts_lookup_function_info` binary-searches an array of
+    /// code pointers, not the function records (beam_ranges.c:262-278), OTP-29.1.1.
+    fn_starts: Arc<[usize]>,
+}
+
+fn scope0_ranges() -> &'static arc_swap::ArcSwap<Vec<ModuleRange>> {
+    static RANGES: OnceLock<arc_swap::ArcSwap<Vec<ModuleRange>>> = OnceLock::new();
+    RANGES.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(Vec::new())))
+}
+
+/// Scope-0 ranges a new node's code indexes start from.
+pub(crate) fn scope0_code_ranges() -> Arc<Vec<ModuleRange>> {
+    scope0_ranges().load_full()
+}
+
+fn function_range(info: &NativeFunction) -> FunctionRange {
+    let line_addrs: Arc<[usize]> = info.line_table.iter().map(|entry| entry.address).collect();
+    FunctionRange {
+        start: info.start,
+        end: info.end,
+        module_atom: info.module_atom,
+        function_atom: info.function_atom,
+        arity: info.arity,
+        line: info.line,
+        file_term: info.file_term,
+        file: info.file.clone(),
+        lines: Arc::from(info.line_table.as_slice()),
+        line_addrs,
+    }
+}
+
+fn module_range(
+    start: usize,
+    end: usize,
+    module_atom: arinsal_term::Atom,
+    functions: Vec<FunctionRange>,
+) -> ModuleRange {
+    let fn_starts: Arc<[usize]> = functions.iter().map(|function| function.start).collect();
+    ModuleRange {
+        start,
+        end,
+        module_atom,
+        functions: Arc::from(functions),
+        fn_starts,
+    }
+}
+
+/// Inserts `fun` into the sorted module ranges. Adjacent or overlapping functions of the
+/// same module share one range; a gap stays two ranges so another module can sit between them.
+fn insert_function_range(ranges: &mut Vec<ModuleRange>, fun: FunctionRange) {
+    if ranges.iter().any(|range| {
+        range
+            .functions
+            .iter()
+            .any(|function| function.start == fun.start)
+    }) {
+        return;
+    }
+    let module = fun.module_atom;
+    if let Some(index) = ranges.iter().position(|range| {
+        range.module_atom == module && fun.start <= range.end && range.start <= fun.end
+    }) {
+        let range = &ranges[index];
+        let mut functions = range.functions.to_vec();
+        let at = functions.partition_point(|function| function.start < fun.start);
+        let start = range.start.min(fun.start);
+        let end = range.end.max(fun.end);
+        functions.insert(at, fun);
+        ranges[index] = module_range(start, end, module, functions);
+        ranges.sort_by_key(|range| range.start);
+        return;
+    }
+    let start = fun.start;
+    let end = fun.end;
+    let entry = module_range(start, end, module, vec![fun]);
+    let index = ranges.partition_point(|range| range.start < start);
+    ranges.insert(index, entry);
+}
+
+fn remove_function_range(ranges: &mut Vec<ModuleRange>, start: usize) {
+    let Some(index) = ranges
+        .iter()
+        .position(|range| range.start <= start && start < range.end)
+    else {
+        return;
+    };
+    let module_atom = ranges[index].module_atom;
+    let functions = ranges[index]
+        .functions
+        .iter()
+        .filter(|function| function.start != start)
+        .cloned()
+        .collect::<Vec<_>>();
+    if functions.is_empty() {
+        ranges.remove(index);
+        return;
+    }
+    let range_start = functions
+        .iter()
+        .map(|function| function.start)
+        .min()
+        .unwrap_or(start);
+    let range_end = functions
+        .iter()
+        .map(|function| function.end)
+        .max()
+        .unwrap_or(start);
+    ranges[index] = module_range(range_start, range_end, module_atom, functions);
+    ranges.sort_by_key(|range| range.start);
+}
+
+fn rewrite_ranges(
+    indexes: &crate::code_ix::CodeIndexes,
+    change: impl FnOnce(&mut Vec<ModuleRange>),
+) {
+    let mut ranges = indexes.code_ranges().as_ref().clone();
+    change(&mut ranges);
+    indexes.store_code_ranges(Arc::new(ranges));
+}
+
+/// Publishes `info` into its node's active code-index ranges. Scope 0 is visible to every node.
+/// Callers hold the registry write lock, so two publishes cannot drop each other's insert.
+fn publish_function_range(info: &NativeFunction) {
+    let fun = function_range(info);
+    if info.scope == 0 {
+        let mut seed = scope0_ranges().load_full().as_ref().clone();
+        insert_function_range(&mut seed, fun);
+        let seed = Arc::new(seed);
+        scope0_ranges().store(Arc::clone(&seed));
+        crate::code_ix::with_all_scopes(|indexes| {
+            rewrite_ranges(indexes, |ranges| {
+                insert_function_range(ranges, function_range(info))
+            });
+        });
+        return;
+    }
+    rewrite_ranges(&crate::code_ix::for_scope(info.scope), |ranges| {
+        insert_function_range(ranges, fun);
+    });
+}
+
+fn unpublish_function_range(info: &NativeFunction) {
+    if info.scope == 0 {
+        let mut seed = scope0_ranges().load_full().as_ref().clone();
+        remove_function_range(&mut seed, info.start);
+        scope0_ranges().store(Arc::new(seed));
+        crate::code_ix::with_all_scopes(|indexes| {
+            rewrite_ranges(indexes, |ranges| remove_function_range(ranges, info.start));
+        });
+        return;
+    }
+    let Some(indexes) = crate::code_ix::existing_scope(info.scope) else {
+        return;
+    };
+    rewrite_ranges(&indexes, |ranges| remove_function_range(ranges, info.start));
+}
+
+/// `find_range` (beam_ranges.c:307-327), OTP-29.1.1. The search starts at the last module
+/// that matched (`r[active].mid`); a miss falls back to the binary search and stores the hit.
+fn find_range(ranges: &[ModuleRange], address: usize) -> Option<&ModuleRange> {
+    static RANGE_MID: AtomicUsize = AtomicUsize::new(0);
+    let len = ranges.len();
+    if len == 0 {
+        return None;
+    }
+    let cached = RANGE_MID.load(Ordering::Relaxed).min(len - 1);
+    let mid = &ranges[cached];
+    if address >= mid.start && address < mid.end {
+        return Some(mid);
+    }
+    let index = ranges.partition_point(|range| range.start <= address);
+    let found = index.checked_sub(1)?;
+    let range = ranges.get(found)?;
+    if address >= range.end {
+        return None;
+    }
+    RANGE_MID.store(found, Ordering::Relaxed);
+    Some(range)
+}
+
+/// `erts_lookup_function_info` over the ranges published with the active code index.
+// Port of erts/emulator/beam/beam_ranges.c:245-280 and :307-327, OTP-29.1.1.
+fn frame_in(ranges: &[ModuleRange], address: usize) -> Option<NativeStackFrame> {
+    let range = find_range(ranges, address)?;
+    let index = range.fn_starts.partition_point(|start| *start <= address);
+    let function = range.functions.get(index.checked_sub(1)?)?;
+    if address >= function.end {
+        return None;
+    }
+    // Port of beam_ranges.c:331 (`lookup_loc`): binary search the function's pc table,
+    // then read that one location. The filename Arc is not part of the search key.
+    let line = function
+        .line_addrs
+        .partition_point(|start| *start <= address)
+        .checked_sub(1)
+        .and_then(|index| function.lines.get(index))
+        .filter(|entry| entry.line != 0);
+    let file_term = line
+        .and_then(|entry| entry.file_term)
+        .or(function.file_term);
+    // `fi->fname_ptr[file]` is a literal. The string is only needed when it is absent.
+    let file = if file_term.is_some() {
+        None
+    } else {
+        line.map(|entry| Arc::clone(&entry.file))
+            .or_else(|| function.file.clone())
+    };
+    Some(NativeStackFrame {
+        module_atom: function.module_atom,
+        function_atom: function.function_atom,
+        arity: function.arity,
+        line: line.map(|entry| entry.line).or(function.line),
+        file_term,
+        file,
+    })
+}
+
+/// Stack frame for `address` in `ranges`, the active code index's module ranges.
+/// `None` ranges (a process with no node) falls back to the registry.
+// Port of erts/emulator/beam/beam_ranges.c:245 (`erts_lookup_function_info`), OTP-29.1.1.
+pub(crate) fn stack_frame_in(
+    ranges: Option<&[ModuleRange]>,
+    address: usize,
+) -> Option<NativeStackFrame> {
+    if !arinsal_term::may_be_native_code_pointer(address) {
+        return None;
+    }
+    let Some(ranges) = ranges else {
+        return native_stack_frame_at(address);
+    };
+    frame_in(ranges, address)
+}
+
 fn native_functions() -> &'static RwLock<Vec<NativeFunction>> {
     static FUNCTIONS: OnceLock<RwLock<Vec<NativeFunction>>> = OnceLock::new();
     FUNCTIONS.get_or_init(|| RwLock::new(Vec::new()))
@@ -81,65 +342,131 @@ fn native_generation() -> &'static AtomicU64 {
     &GENERATION
 }
 
+/// One catch-table slot. Native handlers are code addresses; interpreted handlers are a
+/// module id and an instruction index. Slots stay in the published table until the module
+/// is purged (`beam_catches_delmod`).
 #[derive(Clone, Copy, Debug)]
-enum CatchTarget {
+pub(crate) enum CatchTarget {
     Native(usize),
     Interpreted { module: usize, ip: usize },
 }
 
-fn catch_table() -> &'static RwLock<std::collections::HashMap<u32, CatchTarget>> {
-    static CATCHES: OnceLock<RwLock<std::collections::HashMap<u32, CatchTarget>>> = OnceLock::new();
-    CATCHES.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+/// Code scope of `process`, or 0 when it has no node.
+pub(crate) fn process_code_scope(process: &Process) -> u64 {
+    process
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.code_scope)
+        .unwrap_or(0)
+}
+
+fn catch_indexes(scope: u64) -> std::sync::Arc<crate::code_ix::CodeIndexes> {
+    crate::code_ix::for_scope(scope)
+}
+
+/// Catch table of the process node's `erts_active_code_ix()`.
+// Port of erts/emulator/beam/code_ix.h:362 and beam_catches.c:146, OTP-29.1.1.
+fn catch_table(process: &Process) -> Arc<Vec<Option<CatchTarget>>> {
+    process.runtime.as_ref().map_or_else(
+        || crate::code_ix::for_scope(process_code_scope(process)).active_catch_table(),
+        |runtime| runtime.active_catch_table(),
+    )
+}
+
+/// Port of erts/emulator/beam/beam_catches.c:146 (`beam_catches_car`), OTP-29.1.1.
+/// Indexes `bccix[erts_active_code_ix()]`. The active index is the node's atomic.
+fn catch_slot(scope: u64, index: u32) -> Option<CatchTarget> {
+    let table = crate::code_ix::for_scope(scope).active_catch_table();
+    let index = usize::try_from(index).ok()?;
+    table.get(index).copied().flatten()
+}
+
+/// Publishes `change` into the listed code indexes. Readers keep the previous `Arc`.
+fn publish_catches(scope: u64, indexes: &[usize], change: impl Fn(&mut Vec<Option<CatchTarget>>)) {
+    let code = catch_indexes(scope);
+    let _publish = code.lock_catch_publish();
+    let mut seen = [false; arinsal_term::ERTS_NUM_CODE_IX];
+    for &index in indexes {
+        if index >= arinsal_term::ERTS_NUM_CODE_IX || seen[index] {
+            continue;
+        }
+        seen[index] = true;
+        let mut table = code.catch_table_at(index).as_ref().clone();
+        change(&mut table);
+        code.store_catch_table(index, table);
+    }
+}
+
+fn place_catch(table: &mut Vec<Option<CatchTarget>>, index: u32, target: CatchTarget) {
+    let Some(index) = usize::try_from(index).ok() else {
+        return;
+    };
+    if table.len() <= index {
+        table.resize(index + 1, None);
+    }
+    table[index] = Some(target);
 }
 
 /// Whether a stack word is a catch tag registered by native code (`catch`/`try` in a BeamAsm
 /// frame), whose handler only `next_catch` can resolve.
-pub(crate) fn is_native_catch_tag(word: Term) -> bool {
+pub(crate) fn is_native_catch_tag(scope: u64, word: Term) -> bool {
     let raw = word.tagged_word();
     raw & 63 == 0x1b
-        && u32::try_from(raw >> 6).is_ok_and(|index| {
-            catch_table()
-                .read()
-                .is_ok_and(|table| matches!(table.get(&index), Some(CatchTarget::Native(_))))
-        })
+        && u32::try_from(raw >> 6)
+            .is_ok_and(|index| matches!(catch_slot(scope, index), Some(CatchTarget::Native(_))))
 }
 
-pub(crate) fn register_native_catches(base: u32, handlers: &[*const u8]) -> Vec<u32> {
+pub(crate) fn register_native_catches(scope: u64, base: u32, handlers: &[*const u8]) -> Vec<u32> {
     let ids = (0..handlers.len())
         .filter_map(|offset| u32::try_from(offset).ok()?.checked_add(base))
         .collect::<Vec<_>>();
-    if let Ok(mut catches) = catch_table().write() {
+    // Port of erts/emulator/beam/beam_catches.c:108-143 (`beam_catches_cons` writes the
+    // staging pool), OTP-29.1.1. The commit that ends this staging area makes that pool active.
+    let staging = catch_indexes(scope).staging();
+    publish_catches(scope, &[staging], |table| {
         for (&id, handler) in ids.iter().zip(handlers) {
-            catches.insert(id, CatchTarget::Native(*handler as usize));
+            place_catch(table, id, CatchTarget::Native(*handler as usize));
         }
-    }
+    });
     ids
 }
 
-pub(crate) fn unregister_native_catches(ids: &[u32]) {
-    if let Ok(mut catches) = catch_table().write() {
+pub(crate) fn unregister_native_catches(scope: u64, ids: &[u32]) {
+    // A purged module's handlers must not stay reachable from any code index still published.
+    let all = [0, 1, 2];
+    publish_catches(scope, &all, |table| {
         for id in ids {
-            catches.remove(id);
+            if let Ok(index) = usize::try_from(*id)
+                && let Some(slot) = table.get_mut(index)
+            {
+                *slot = None;
+            }
         }
-    }
+    });
 }
 
-pub(crate) fn register_interpreted_catch(index: u32, module: usize, ip: usize) {
-    if let Ok(mut catches) = catch_table().write() {
-        catches.insert(index, CatchTarget::Interpreted { module, ip });
-    }
+pub(crate) fn register_interpreted_catch(scope: u64, index: u32, module: usize, ip: usize) {
+    // Interpreter catches are installed while code runs, so the active table has to see
+    // them immediately. An open staging area copied the table at its start and would drop
+    // the slot at commit unless it is published there too.
+    let code = catch_indexes(scope);
+    let active = code.active();
+    let staging = code.staging();
+    publish_catches(scope, &[active, staging], |table| {
+        place_catch(table, index, CatchTarget::Interpreted { module, ip });
+    });
 }
 
-pub(crate) fn interpreted_catch(index: u32) -> Option<(usize, usize)> {
-    match catch_table().read().ok()?.get(&index).copied()? {
+pub(crate) fn interpreted_catch(scope: u64, index: u32) -> Option<(usize, usize)> {
+    match catch_slot(scope, index)? {
         CatchTarget::Interpreted { module, ip } => Some((module, ip)),
         CatchTarget::Native(_) => None,
     }
 }
 
 /// Native handler address of a catch-table index, if it names native code.
-pub(crate) fn native_catch(index: u32) -> Option<usize> {
-    match catch_table().read().ok()?.get(&index).copied()? {
+pub(crate) fn native_catch(scope: u64, index: u32) -> Option<usize> {
+    match catch_slot(scope, index)? {
         CatchTarget::Native(address) => Some(address),
         CatchTarget::Interpreted { .. } => None,
     }
@@ -150,23 +477,36 @@ pub(crate) enum CatchHandler {
     Interpreted,
 }
 
-pub(crate) fn next_catch(
-    process: &mut Process,
-    class: arinsal_bifs::Class,
-    reason: Term,
-    trace: Term,
-) -> Option<CatchHandler> {
+/// A catch the scan found. The stack is unchanged until [`commit_catch`].
+struct LocatedCatch {
+    /// Stack index of the catch tag.
+    index: usize,
+    /// Stack index `E` resumes at: the catching frame's first Y slot.
+    resume: usize,
+    target: CatchTarget,
+    /// An exception-trace frame sits above the catch. The scheduler unwind emits
+    /// `exception_from` for those frames; the native resolver leaves them to it.
+    traced: bool,
+}
+
+/// Port of erts/emulator/beam/beam_common.c:580-648 (`next_catch` up to `found_catch`),
+/// OTP-29.1.1. The scan only reads the stack and the active catch table. It does not move
+/// `stop`, so a miss leaves the scheduler's unwind the same stack erts would walk.
+fn locate_catch(process: &Process, native_only: bool) -> Option<LocatedCatch> {
     if process.header.catches == 0 {
         return None;
     }
+    let table = catch_table(process);
     let mut index = 0usize;
     let mut previous_cp = 0usize;
     let mut seen_cp = false;
+    let mut traced = false;
     while index < process.heap.stack_words() {
         let word = process.heap.stack_get(index)?;
         let raw = word.tagged_word();
         let address = raw as usize;
         if address == native_trace_return_address() {
+            traced = true;
             let actions = process
                 .heap
                 .stack_get(index + 3)
@@ -180,7 +520,9 @@ pub(crate) fn next_catch(
             index += words;
             continue;
         }
-        if native_function_at(address).is_some() {
+        // erts `is_CP`: a return address, not a term. The hull test is lock-free and has no
+        // false negatives; catch tags have low bits `0x1b`, so they are not mistaken for one.
+        if address & 3 == 0 && arinsal_term::may_be_native_code_pointer(address) {
             previous_cp = index;
             seen_cp = true;
             index += arinsal_term::CP_WORDS;
@@ -188,10 +530,14 @@ pub(crate) fn next_catch(
         }
         if raw & 63 == 0x1b
             && let Some(catch_index) = u32::try_from(raw >> 6).ok()
-            && let Some(target) = catch_table().read().ok()?.get(&catch_index).copied()
+            && let Some(target) = usize::try_from(catch_index)
+                .ok()
+                .and_then(|slot| table.get(slot).copied().flatten())
         {
-            process.heap.stack_set(index, Term::NIL);
-            let base = process.heap.heap_cursor().1;
+            if native_only && !matches!(target, CatchTarget::Native(_)) {
+                index += 1;
+                continue;
+            }
             // Both native and interpreted frames keep the caller-pushed CP above their Y slots
             // (a call pushes the CP, `allocate` then reserves the Y slots below it), so the
             // resumed E is the first Y slot after the last CP below the catch, or the stack top
@@ -201,38 +547,12 @@ pub(crate) fn next_catch(
             } else {
                 0
             };
-            process.heap.set_stack_pointer(base.wrapping_add(resume));
-            if process.x.len() < 4 {
-                let mut registers = process.x.to_vec();
-                registers.resize(4, Term::NIL);
-                process.x = registers.into();
-            }
-            // Port of erts/emulator/beam/beam_common.c:541-544 (handle_error), OTP-29.1.1:
-            // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
-            process.x[0] = Term::catch(0);
-            let class_atom = match class {
-                arinsal_bifs::Class::Error => crate::signals::atom("error"),
-                arinsal_bifs::Class::Exit => crate::signals::atom("exit"),
-                arinsal_bifs::Class::Throw => crate::signals::atom("throw"),
-            };
-            process.x[1] = reason;
-            process.x[2] = trace;
-            process.x[3] = class_atom;
-            process.exc_class = Some(class);
-            process.header.freason = 0;
-            process.sync_native_header();
-            return match target {
-                CatchTarget::Native(handler) => {
-                    process.cold_mut().native_continuation_resume = true;
-                    process.cold_mut().native_resume_live = 5;
-                    Some(CatchHandler::Native(handler))
-                }
-                CatchTarget::Interpreted { module, ip } => {
-                    process.module = module;
-                    process.ip = ip;
-                    Some(CatchHandler::Interpreted)
-                }
-            };
+            return Some(LocatedCatch {
+                index,
+                resume,
+                target,
+                traced,
+            });
         }
         if crate::stacktrace::decode_tag(word).is_some_and(|(handler, _, _)| !handler) {
             previous_cp = index;
@@ -243,6 +563,83 @@ pub(crate) fn next_catch(
         }
     }
     None
+}
+
+/// The innermost catch is in the frame that is running, with no return address above it.
+/// A catch in a caller stays with the scheduler: unwinding that frame in here and then
+/// returning 0 drops the tag, and the error escapes.
+pub(crate) fn current_frame_catch(process: &Process) -> bool {
+    locate_catch(process, true).is_some_and(|found| !found.traced && found.resume == 0)
+}
+
+/// Whether a native catch is on the stack and no exception-trace frame sits above it.
+/// Does not move the stack cursor. A traced catch stays with the scheduler unwind,
+/// which emits `exception_from` the way `next_catch` does in erts.
+pub(crate) fn native_catch_pending(process: &Process) -> bool {
+    locate_catch(process, true).is_some_and(|found| !found.traced)
+}
+
+fn exception_class_atom(class: arinsal_bifs::Class) -> Term {
+    // erts `exception_tag[]` (beam_common.c). These atoms are predefined; interning them
+    // on every throw is not part of the catch path.
+    let atom = match class {
+        arinsal_bifs::Class::Error => arinsal_term::atoms::ERROR,
+        arinsal_bifs::Class::Exit => arinsal_term::atoms::EXIT,
+        arinsal_bifs::Class::Throw => arinsal_term::atoms::THROW,
+    };
+    Term::atom(atom)
+}
+
+pub(crate) fn next_catch(
+    process: &mut Process,
+    class: arinsal_bifs::Class,
+    reason: Term,
+    trace: Term,
+    native_only: bool,
+) -> Option<CatchHandler> {
+    let LocatedCatch {
+        index,
+        resume,
+        target,
+        traced,
+    } = locate_catch(process, native_only)?;
+    // An exception-trace frame above the catch is emitted by the scheduler unwind
+    // (`exception_from`). erts does that inside `next_catch` before `found_catch`.
+    // The native resolver has no trace session, so it leaves the stack unmoved.
+    if native_only && traced {
+        return None;
+    }
+    // Port of erts/emulator/beam/beam_common.c:650-678 (`found_catch`): `stop` and the catch
+    // word are written only after the handler is known.
+    process.heap.stack_set(index, Term::NIL);
+    let base = process.heap.heap_cursor().1;
+    process.heap.set_stack_pointer(base.wrapping_add(resume));
+    if process.x.len() < 4 {
+        let mut registers = process.x.to_vec();
+        registers.resize(4, Term::NIL);
+        process.x = registers.into();
+    }
+    // Port of erts/emulator/beam/beam_common.c:541-544 (handle_error), OTP-29.1.1:
+    // x0 = non-value marker, x1 = reason, x2 = raw stacktrace, x3 = class.
+    process.x[0] = Term::catch(0);
+    process.x[1] = reason;
+    process.x[2] = trace;
+    process.x[3] = exception_class_atom(class);
+    process.exc_class = Some(class);
+    process.header.freason = 0;
+    process.sync_native_header();
+    match target {
+        CatchTarget::Native(handler) => {
+            process.cold_mut().native_continuation_resume = true;
+            process.cold_mut().native_resume_live = 5;
+            Some(CatchHandler::Native(handler))
+        }
+        CatchTarget::Interpreted { module, ip } => {
+            process.module = module;
+            process.ip = ip;
+            Some(CatchHandler::Interpreted)
+        }
+    }
 }
 
 fn register_bridge_continuation() -> Result<(), &'static str> {
@@ -289,6 +686,7 @@ pub fn register_native_function(info: NativeFunction) -> Result<(), &'static str
         return Err("native function ranges must not overlap");
     }
     functions.insert(index, info);
+    publish_function_range(&functions[index]);
     if crate::native_bridge::lifetime_trace_enabled() {
         let function = functions
             .iter()
@@ -312,6 +710,7 @@ pub(crate) fn unregister_native_functions(entries: &[NativeFunction]) {
     functions.retain(|registered| !entries.contains(registered));
     for entry in entries {
         arinsal_term::unregister_native_code_range(entry.start, entry.end);
+        unpublish_function_range(entry);
     }
     let removed = before - functions.len();
     if removed == 0 {
@@ -339,14 +738,15 @@ pub(crate) fn unregister_native_scope(scope: u64) {
     let mut removed = Vec::new();
     functions.retain(|function| {
         if function.scope == scope {
-            removed.push((function.start, function.end));
+            removed.push(function.clone());
             false
         } else {
             true
         }
     });
-    for (start, end) in removed {
-        arinsal_term::unregister_native_code_range(start, end);
+    for function in &removed {
+        arinsal_term::unregister_native_code_range(function.start, function.end);
+        unpublish_function_range(function);
     }
     native_generation().fetch_add(1, Ordering::Release);
 }
@@ -436,17 +836,23 @@ pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> 
         .checked_sub(1)
         .and_then(|index| function.line_table.get(index))
         .filter(|entry| entry.line != 0);
+    let file_term = line
+        .and_then(|entry| entry.file_term)
+        .or(function.file_term);
+    // `fi->fname_ptr[file]` is a literal. The string is only needed when it is absent.
+    let file = if file_term.is_some() {
+        None
+    } else {
+        line.map(|entry| Arc::clone(&entry.file))
+            .or_else(|| function.file.clone())
+    };
     Some(NativeStackFrame {
         module_atom: function.module_atom,
         function_atom: function.function_atom,
         arity: function.arity,
         line: line.map(|entry| entry.line).or(function.line),
-        file_term: line
-            .and_then(|entry| entry.file_term)
-            .or(function.file_term),
-        file: line
-            .map(|entry| Arc::clone(&entry.file))
-            .or_else(|| function.file.clone()),
+        file_term,
+        file,
     })
 }
 
@@ -599,6 +1005,10 @@ pub fn run_native(
         );
     }
     process.sync_header();
+    // Port of erts/emulator/beam/beam_common.c:2394 (`erts_current_reductions`), OTP-29.1.1:
+    // `REDS_IN` is FCALLS at slice entry. `process_info(reductions)` adds what this
+    // slice has consumed before the scheduler folds it into `reductions_used`.
+    process.native_reds_in = process.header.fcalls;
     process.header.i = code_ptr;
     process.header.arity = arity;
     let count = process.x.len().min(registers.x_reg_array.len());
