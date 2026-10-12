@@ -1289,11 +1289,17 @@ impl Executor {
         // `wait`. Light BIFs do `subs FCALLS, #1; b.le yield` and resume at the same
         // entry (instr_bif.cpp:399-400, OTP-29.1.1), so installing FCALLS=1 never
         // enters the BIF. Leave a positive count alone in that case.
+        let reds = budget.min(i32::MAX as u32) as i32;
         if process.native_pc.is_some() {
-            let reds = budget.min(i32::MAX as u32) as i32;
             if reds > 1 || process.reductions <= 0 {
                 process.reductions = reds;
             }
+        } else if process.reductions <= 0 && reds > 0 {
+            // Interpreted schedule-in. A trapping BIF charges FCALLS to 0 when it
+            // yields; the continuation (lists:member/2) reads that counter as its
+            // scan budget. Leaving it at 0 makes every resume yield without
+            // scanning, and the process never reaches halt.
+            process.reductions = reds;
         }
         // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
         // export's code address), OTP-29.1.1: every process starts its function natively on

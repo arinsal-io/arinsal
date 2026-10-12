@@ -2125,6 +2125,16 @@ impl<T: Task> Inner<T> {
                 moved.push(item);
             }
         }
+        if target != worker {
+            // Bound entries sit in the pinned injectors, not the ordinary run queue.
+            // Leave them there and the blocked scheduler parks with the only copy of
+            // the process (erl_process.c evacuate_run_queue moves every entry).
+            for priority in 0..self.pinned_injectors[worker].len() {
+                while let Some(item) = self.pinned_injectors[worker][priority].pop() {
+                    moved.push(item);
+                }
+            }
+        }
         for item in moved {
             if Self::is_current_entry(&item) {
                 local.migrate_queued(&item.process, target);
@@ -5201,6 +5211,16 @@ impl<T: Task> Scheduler<T> {
         self.inner.wake_all_workers();
     }
 
+    /// Wake every scheduler. A signal dispatcher is not a scheduler, so its enqueue
+    /// can lose the sleeping-flag race; the unconditional wake is the permit that
+    /// `Thread::park` still observes.
+    ///
+    /// Port of erts/emulator/beam/erl_process.c:1575 (`erts_sched_poke` from the
+    /// signal dispatcher), OTP-29.1.1.
+    pub fn poke_schedulers(&self) {
+        self.inner.wake_all_workers();
+    }
+
     /// Inspect or set the next free process table id for internal-state tests.
     ///
     /// Returns the data of the next pid to hand out (the invalid data when the table is full).
@@ -6362,14 +6382,58 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             inner.evacuate_offline_local(&mut *local);
             local.set_wall_enabled(false);
             local.set_msacc_state(MsaccState::Sleep);
+            // Port of erts/emulator/beam/erl_process.c:3404 (scheduler_wait), OTP-29.1.1.
+            // Publish the sleeping flag, then look again. An enqueue that does not
+            // see the flag advances work_epochs; one that does calls ssi_wake.
+            // Sleeping without this look loses the enqueue: the scheduler parks
+            // with work on its queue, and a later SIGTERM notify never runs.
+            let observed = inner.work_epochs[id].load(Ordering::SeqCst);
             inner.parked[id].store(true, Ordering::SeqCst);
+            let still_suspended = id >= inner.online_schedulers.load(Ordering::Acquire)
+                || (inner.scheduling_blocked.load(Ordering::Acquire)
+                    && id != inner.scheduling_blocker.load(Ordering::Acquire));
+            let arrived = inner.work_epochs[id].load(Ordering::SeqCst) != observed
+                || inner.run_queues[id].iter().any(|queue| !queue.is_empty())
+                || local.queues.iter().any(|queue| !queue.is_empty())
+                || !inner.port_queues[id].is_empty()
+                || inner.pinned_injectors[id]
+                    .iter()
+                    .any(|queue| !queue.is_empty())
+                || !inner.aux_work[id].is_empty()
+                || !inner.stats_requests[id].is_empty()
+                || inner.halt_requested.load(Ordering::Acquire)
+                || !still_suspended;
+            if arrived {
+                inner.parked[id].store(false, Ordering::SeqCst);
+                continue;
+            }
             let has_local_timers =
                 !local.pending_waits.is_empty() || local.timer_service.borrow().wheel.has_timers();
             thr_progress::scheduler_prepare_wait();
-            if has_local_timers {
-                thread::park_timeout(Duration::from_millis(10));
-            } else {
-                thread::park();
+            // Port of erl_process.c:3065 (sched_spin_wait): a wake that lands in this
+            // window clears `parked` and must not fall into a blocking park.
+            let mut spins = SCHED_TSE_SLEEP_SPINCOUNT;
+            let mut until_yield = SCHED_SPIN_UNTIL_YIELD;
+            while spins > 0 && inner.parked[id].load(Ordering::Acquire) {
+                std::hint::spin_loop();
+                until_yield -= 1;
+                if until_yield == 0 {
+                    until_yield = SCHED_SPIN_UNTIL_YIELD;
+                    thread::yield_now();
+                }
+                spins -= 1;
+            }
+            if inner.parked[id].load(Ordering::SeqCst) {
+                if has_local_timers {
+                    thread::park_timeout(Duration::from_millis(10));
+                } else {
+                    while inner.parked[id].load(Ordering::SeqCst)
+                        && !inner.stopped.load(Ordering::Acquire)
+                        && !inner.halt_requested.load(Ordering::Acquire)
+                    {
+                        thread::park();
+                    }
+                }
             }
             thr_progress::scheduler_finalize_wait();
             inner.parked[id].store(false, Ordering::SeqCst);

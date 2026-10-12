@@ -488,7 +488,10 @@ line() ->
     receive {P, {data, {noeol, <<"hello">>}}} -> receive {P, eof} -> port_close(P), ok after 5000 -> timeout end;
         _ -> timeout after 5000 -> timeout end.
 default_stdio() ->
-    P = open_port({spawn, "printf 'default_stdio\\n'"}, [{line, 64}]),
+    %% A command that exits races port_close/1: erts can reap the port first
+    %% and then port_close is badarg. cat stays up until the close.
+    P = open_port({spawn, "cat"}, [{line, 64}]),
+    port_command(P, "default_stdio\n"),
     receive {P, {data, {eol, "default_stdio"}}} -> port_close(P), ok
     after 5000 -> timeout end.
 status() ->
