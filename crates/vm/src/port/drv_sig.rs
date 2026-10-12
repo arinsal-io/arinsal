@@ -135,7 +135,7 @@ fn call_driver_output(
 /// `port_command` (`refp`); bang sends are asynchronous.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn output(
-    process: &Process,
+    process: &mut Process,
     ctx: Option<&mut RunCtx<'_, Message>>,
     caller: Pid,
     handle: &Arc<PortHandle>,
@@ -239,6 +239,13 @@ pub(crate) fn output(
     } else {
         (None, None)
     };
+    // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal): the caller moves its
+    // save pointer before the signal is scheduled, so the reply cannot be queued before it.
+    if let Some(ctx) = ctx.filter(|_| want_ref)
+        && set_save_end(process, ctx).is_err()
+    {
+        return PortOp::Dropped;
+    }
     let size = pieces.iter().map(|(bytes, _)| bytes.len()).sum();
     let task_handle = Arc::clone(handle);
     let task_drv = Arc::clone(drv);
@@ -326,6 +333,7 @@ fn imm_or_schedule(
 /// the reply term, or a reference the caller waits on.
 pub(crate) fn control(
     process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
     caller: Pid,
     drv: &Arc<DriverPort>,
     op: u32,
@@ -349,6 +357,8 @@ pub(crate) fn control(
         }
     }
     let (reply, reference) = Reply::new(caller, runtime.scheduler()?);
+    // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal), OTP-29.1.1.
+    set_save_end(process, ctx)?;
     let task_drv = Arc::clone(drv);
     let _ = drv.schedule_signal(ProcSig {
         caller: caller_data(caller),
@@ -478,7 +488,8 @@ fn trace_close_receive(runtime: &crate::process::Runtime, id: u64, from: Pid) {
 /// scheduled. `Err` is `badarg`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exit(
-    process: &Process,
+    process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, Message>>,
     caller: Pid,
     handle: &Arc<PortHandle>,
     drv: &Arc<DriverPort>,
@@ -512,6 +523,11 @@ pub(crate) fn exit(
     } else {
         (None, None)
     };
+    // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal), OTP-29.1.1.
+    if want_ref {
+        let ctx = ctx.ok_or_else(badarg)?;
+        set_save_end(process, ctx)?;
+    }
     let task_handle = Arc::clone(handle);
     schedule(drv, caller, move |op| {
         // Port of erts/emulator/beam/io.c:2212 (port_sig_exit), OTP-29.1.1.

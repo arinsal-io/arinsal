@@ -6246,13 +6246,6 @@ impl Process {
         Ok(())
     }
 
-    /// Index of the first middle-queue message whose term satisfies `matches`.
-    pub(crate) fn sig_cont_position(&self, matches: impl Fn(Term) -> bool) -> Option<usize> {
-        self.sig_cont.iter().position(|event| {
-            Self::sig_cont_message(&event.payload).is_some_and(|message| matches(message.term))
-        })
-    }
-
     fn sig_cont_message(payload: &Payload<Message>) -> Option<&Message> {
         match payload {
             Payload::Message(message) | Payload::TimerMessage { message, .. } => Some(message),
