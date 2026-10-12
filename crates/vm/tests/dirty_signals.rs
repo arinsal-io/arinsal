@@ -69,7 +69,8 @@ run(Path, Case) ->
         link_monitor -> {link_monitor(Cpu), link_monitor(Io)};
         exit_trapped -> {exit_trapped(Cpu), exit_trapped(Io)};
         high_priority -> high_priority(Cpu);
-        alive_check -> {alive_check(fun cpu_alive_wait/2), alive_check(fun io_alive_wait/2)}
+        alive_check -> {alive_check(fun cpu_alive_wait/2), alive_check(fun io_alive_wait/2)};
+        queued_status -> queued_status(fun cpu_sleep/1)
     end.
 
 start(Sleep) -> start(Sleep, fun() -> ok end).
@@ -114,11 +115,37 @@ exit_kill(Sleep) ->
 info(Sleep) ->
     P = start(Sleep),
     T0 = now_ms(),
-    %% `status` is a transient scheduler observation. It can be `runnable` on
-    %% Arinsal and `running` on OTP while both answer the request during the NIF.
+    %% `status` is not compared here: a process executing the NIF answers `running`
+    %% (ERTS_PSFLG_DIRTY_RUNNING) on OTP and Arinsal alike, see `queued_status/1`.
     Info = process_info(P, [trap_exit, priority, message_queue_len, links]),
     Fast = fast(T0),
     {Info, Fast, slept(P)}.
+
+%% Every dirty CPU scheduler sleeps in a NIF, so the next NIF call waits in the dirty queue:
+%% that process is queued for a dirty scheduler and not executing, which erts reports as
+%% `runnable` (ERTS_PSFLG_DIRTY_ACTIVE_SYS, erl_process.c:9305).
+queued_status(Sleep) ->
+    Me = self(),
+    Busy = [spawn(fun() -> Me ! {busy_started, self()}, Sleep(sleep_ms()), Me ! {busy_done, self()} end)
+            || _ <- lists:seq(1, erlang:system_info(dirty_cpu_schedulers))],
+    [receive {busy_started, B} -> ok end || B <- Busy],
+    [wait_dirty(B) || B <- Busy],
+    Q = spawn(fun() -> Sleep(sleep_ms()), Me ! {queued_done, self()} end),
+    Status = sample_runnable(Q, now_ms() + sleep_ms() div 2),
+    receive {queued_done, Q} -> ok after 5000 -> timeout end,
+    [receive {busy_done, B} -> ok after 5000 -> timeout end || B <- Busy],
+    Status.
+
+sample_runnable(Q, Deadline) ->
+    {status, Status} = process_info(Q, status),
+    case Status of
+        runnable -> runnable;
+        _ ->
+            case now_ms() < Deadline of
+                true -> receive after 1 -> sample_runnable(Q, Deadline) end;
+                false -> {last, Status}
+            end
+    end.
 
 group_leader_change(Sleep) ->
     New = spawn(fun() -> receive stop -> ok end end),
@@ -232,6 +259,7 @@ fn signals_to_long_dirty_nifs_are_handled_while_they_run() {
         "exit_trapped",
         "high_priority",
         "alive_check",
+        "queued_status",
     ] {
         let expected = match erl.call(module, "run", &[OwnedTerm::Atom(case.into())]) {
             CallResult::Ok(term) => term,
@@ -244,6 +272,14 @@ fn signals_to_long_dirty_nifs_are_handled_while_they_run() {
             Err(error) => panic!("{module}:run({case}) failed on Arinsal: {error}"),
         };
         assert_eq!(actual, expected, "{module}:run({case})");
+        if case == "queued_status" {
+            // The sampled process must have been seen queued, not after its NIF ran.
+            assert_eq!(
+                actual,
+                OwnedTerm::Atom("runnable".into()),
+                "queued status on OTP and Arinsal"
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
