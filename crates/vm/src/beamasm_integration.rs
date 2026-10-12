@@ -1632,11 +1632,21 @@ impl ModuleEnv for VmModuleEnv<'_> {
         crate::arinsal_beamasm_guard
     }
     fn compare_shared(&self) -> CompareShared {
-        fragments().map_or(CompareShared::default(), |fragments| CompareShared {
+        let mut shared = fragments().map_or(CompareShared::default(), |fragments| CompareShared {
             eq_exact: fragments.bif_is_eq_exact_shared(),
             ne_exact: fragments.bif_is_ne_exact_shared(),
             arith: fragments.arith_compare_shared(),
-        })
+            eq: 0,
+        });
+        // The general path of `=:=` / `=/=` calls `eq` directly, with or without fragments.
+        shared.eq = crate::native_hooks::arinsal_eq as *const () as usize;
+        shared
+    }
+    fn atom_word_by_name(&self, name: &str) -> Option<u64> {
+        global_atoms()
+            .intern(name)
+            .ok()
+            .map(|atom| raw_word(Term::atom(atom)))
     }
     fn guard_helper3(&self) -> GuardHelper3 {
         crate::arinsal_beamasm_guard3

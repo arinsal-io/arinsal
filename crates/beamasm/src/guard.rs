@@ -34,7 +34,35 @@ pub struct CompareShared {
     pub ne_exact: usize,
     /// `arith_compare_shared`: terms in x0/x1, the relation in the flags.
     pub arith: usize,
+    /// C `eq(Eterm, Eterm) -> int` (erts `eq`, utils.c:1125). Non-zero means equal; the general
+    /// path of `=:=` / `=/=` calls it directly, so it must be set before emitting those ops.
+    pub eq: usize,
 }
+
+/// Compile-time shape of a literal operand of `=:=` / `=/=`, classified by the VM from the owned
+/// literal. Shapes other than `Generic` are matched inline; `Generic` takes the `eq` call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EqLiteral {
+    /// No inline shape: the general path decides, as erts does for literals it cannot inline.
+    Generic,
+    /// A proper list of immediates. `words[i]` is the head of cell `i`; the tail is nil.
+    ListOfImmediates(Vec<u64>),
+    /// A tuple whose elements are all immediates: its header word, then the element words.
+    ShallowTuple { header: u64, elements: Vec<u64> },
+    /// `<<>>`.
+    EmptyBinary,
+    /// `#{}`.
+    EmptyMap,
+}
+
+/// Heap bitstring header tags (crates/term/src/lib.rs:120-121, erts `_TAG_HEADER_HEAP_BITS` and
+/// `HEADER_SUB_BITS`).
+const HEAP_BITS_HEADER: u64 = 0x20;
+const SUB_BITS_HEADER: u64 = 0x24;
+/// `MAP_HEADER_FLATMAP` (crates/term/src/lib.rs:126, erts `erl_map.h:185`).
+const MAP_HEADER_FLATMAP: u64 = 0x12c;
+/// The empty list / `[]` immediate word.
+const NIL_WORD: u64 = 0x3b;
 
 /// BIFs whose inline guard code raises `badarg` with the BIF itself as the top stack frame.
 /// `SchedulerRegisters::tmp_mem[7]` holds `index + 1` of the raising BIF; its arguments are in
@@ -1322,62 +1350,263 @@ impl BeamModuleAssembler {
         }
     }
 
-    /// Emits an exact equality guard.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1751-1898, OTP-29.1.1
+    /// Emits an exact equality guard. `literal` classifies the rhs when it is a literal and
+    /// `eq` is the C `eq` helper (`CompareShared::eq`).
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1751-1898 (emit_is_eq_exact),
+    // OTP-29.1.1.
     pub fn emit_is_eq_exact(
         &mut self,
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        helper: GuardHelper,
+        literal: &EqLiteral,
+        eq: usize,
     ) -> Result<(), ModuleError> {
-        let lhs = lhs.into();
-        let rhs = rhs.into();
-        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1844-1856, OTP-29.1.1.
-        if lhs.always_immediate() || rhs.always_immediate() {
-            return self.emit_exact_immediate_guard(lhs, rhs, fail, false);
-        }
-        if let Some((term, value)) = exact_immediate_operand(lhs.val, rhs.val) {
-            let left = self.source_reg(term)?;
-            self.emit_cmp_immediate_or_register(left, value)?;
-            let fail = self.label(fail);
-            self.code.b_cond(Cond::Ne, fail)?;
-            return Ok(());
-        }
-        let left = self.source_reg(lhs.val)?;
-        let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
-        self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(19, true, lhs.val, rhs.val, fail, helper)
+        self.emit_exact_eq(lhs.into(), rhs.into(), fail, literal, eq, false)
     }
 
-    /// Emits an exact inequality guard.
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1900-2053, OTP-29.1.1
+    /// Emits an exact inequality guard; see [`Self::emit_is_eq_exact`].
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1900-2053 (emit_is_ne_exact),
+    // OTP-29.1.1.
     pub fn emit_is_ne_exact(
         &mut self,
         lhs: impl Into<TypedArg>,
         rhs: impl Into<TypedArg>,
         fail: u32,
-        helper: GuardHelper,
+        literal: &EqLiteral,
+        eq: usize,
     ) -> Result<(), ModuleError> {
-        let lhs = lhs.into();
-        let rhs = rhs.into();
-        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2001-2013, OTP-29.1.1.
+        self.emit_exact_eq(lhs.into(), rhs.into(), fail, literal, eq, true)
+    }
+
+    /// Shared body of `=:=` (`fail_on_equal == false`) and `=/=`.
+    fn emit_exact_eq(
+        &mut self,
+        lhs: TypedArg,
+        rhs: TypedArg,
+        fail: u32,
+        literal: &EqLiteral,
+        eq: usize,
+        fail_on_equal: bool,
+    ) -> Result<(), ModuleError> {
+        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1844-1856 and 2001-2013
+        // (always_immediate cmp_arg), OTP-29.1.1.
         if lhs.always_immediate() || rhs.always_immediate() {
-            return self.emit_exact_immediate_guard(lhs, rhs, fail, true);
+            return self.emit_exact_immediate_guard(lhs, rhs, fail, fail_on_equal);
         }
         if let Some((term, value)) = exact_immediate_operand(lhs.val, rhs.val) {
             let left = self.source_reg(term)?;
             self.emit_cmp_immediate_or_register(left, value)?;
+            let cond = if fail_on_equal { Cond::Eq } else { Cond::Ne };
             let fail = self.label(fail);
-            self.code.b_cond(Cond::Eq, fail)?;
+            self.code.b_cond(cond, fail)?;
             return Ok(());
         }
+        if *literal != EqLiteral::Generic {
+            if !matches!(rhs.val, ArgVal::Literal(_)) {
+                return Err(ModuleError::InvalidOperand(
+                    "an inline literal shape needs a literal right operand",
+                ));
+            }
+            return self.emit_literal_exact_eq(lhs.val, literal, fail, fail_on_equal);
+        }
+        // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1857-1897 (general path of
+        // emit_is_eq_exact), OTP-29.1.1: compare the words, then call `eq` for the rest.
         let left = self.source_reg(lhs.val)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(11), left))?;
         let right = self.source_reg_into(rhs.val, Gpr::x(17))?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(12), right))?;
         self.code
-            .emit(|e| e.cmp_reg(left, right, arinsal_a64::enc::Shift::Lsl, 0))?;
-        self.emit_comparison(20, false, lhs.val, rhs.val, fail, helper)
+            .emit(|e| e.cmp_reg(Gpr::x(11), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
+        let done = self.code.new_label();
+        let fail_label = self.label(fail);
+        // Same word: `=:=` holds and `=/=` fails.
+        self.code
+            .b_cond(Cond::Eq, if fail_on_equal { fail_label } else { done })?;
+        // Port of erts/emulator/beam/jit/beam_asm.hpp:1941-1955 (emit_are_both_immediate),
+        // OTP-29.1.1. Two different immediates are never exactly equal.
+        let both = Shifted {
+            reg: Gpr::x(12),
+            shift: arinsal_a64::enc::Shift::Lsl,
+            amount: 0,
+        };
+        self.code.emit(|e| {
+            e.and_reg(Gpr::x(8), Gpr::x(11), both)?;
+            e.and_imm(Gpr::x(8), Gpr::x(8), 3)?;
+            e.cmp_imm(Gpr::x(8), 3, false)
+        })?;
+        self.code
+            .b_cond(Cond::Eq, if fail_on_equal { done } else { fail_label })?;
+        self.emit_exact_eq_call(eq)?;
+        // `eq` returns non-zero when the terms are equal.
+        if fail_on_equal {
+            self.code.cbnz(Gpr::x(0), fail_label)?;
+        } else {
+            self.code.cbz(Gpr::x(0), fail_label)?;
+        }
+        self.code.bind(done)?;
+        Ok(())
+    }
+
+    /// Calls the C `eq(Eterm, Eterm)` on x11/x12 and leaves its result in x0 (zero extended).
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1866-1875 (emit_enter_runtime,
+    // runtime_call<eq>, emit_leave_runtime), OTP-29.1.1. No registers are published, as in erts:
+    // `eq` does not allocate or read process state.
+    fn emit_exact_eq_call(&mut self, eq: usize) -> Result<(), ModuleError> {
+        if eq == 0 {
+            return Err(ModuleError::InvalidOperand(
+                "the eq helper is not installed for exact comparisons",
+            ));
+        }
+        emit_enter_runtime(&mut self.code, 0, Update::NONE)?;
+        self.code.emit(|e| {
+            e.mov_reg(Gpr::x(0), Gpr::x(11))?;
+            e.mov_reg(Gpr::x(1), Gpr::x(12))?;
+            e.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            e.mov_const(Gpr::x(17), eq as u64)?;
+            e.blr(Gpr::x(17))
+        })?;
+        emit_leave_runtime(&mut self.code, 0, Update::NONE)?;
+        self.code.emit(|e| {
+            e.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+            // `eq` returns a C int: only the low word of x0 is defined.
+            e.and_imm(Gpr::x(0), Gpr::x(0), 0xffff_ffff)
+        })?;
+        Ok(())
+    }
+
+    /// Inline match of a literal shape against `lhs`. The mismatch branch goes to `fail` for
+    /// `=:=`; for `=/=` a full match jumps to `fail` and a mismatch falls through.
+    fn emit_literal_exact_eq(
+        &mut self,
+        lhs: ArgVal,
+        literal: &EqLiteral,
+        fail: u32,
+        fail_on_equal: bool,
+    ) -> Result<(), ModuleError> {
+        let fail_label = self.label(fail);
+        let mismatch = if fail_on_equal {
+            self.code.new_label()
+        } else {
+            fail_label
+        };
+        let value = self.source_reg(lhs)?;
+        self.code.emit(|e| e.mov_reg(Gpr::x(11), value))?;
+        match literal {
+            EqLiteral::Generic => {
+                return Err(ModuleError::InvalidOperand(
+                    "a generic literal has no inline shape",
+                ));
+            }
+            EqLiteral::ListOfImmediates(words) => {
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1756-1770 (inlined list
+                // test) and is_eq_exact_list_shared, OTP-29.1.1: walk the cells, compare each
+                // head word, and require nil after the last one.
+                if words.is_empty() {
+                    return Err(ModuleError::InvalidOperand(
+                        "an empty list literal is nil, not a list shape",
+                    ));
+                }
+                self.emit_tag_check_and_untag(1, mismatch)?;
+                for (index, word) in words.iter().enumerate() {
+                    self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 0))?;
+                    self.emit_word_match(*word, mismatch)?;
+                    self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 8))?;
+                    if index + 1 < words.len() {
+                        self.emit_tag_check_on_x13(1, mismatch)?;
+                    } else {
+                        self.emit_word_match(NIL_WORD, mismatch)?;
+                    }
+                }
+            }
+            EqLiteral::ShallowTuple { header, elements } => {
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1772-1790 and
+                // is_eq_exact_shallow_boxed_shared, OTP-29.1.1: the boxed header and every
+                // element word must match.
+                self.emit_tag_check_and_untag(2, mismatch)?;
+                let header_and_elements = std::iter::once(*header).chain(elements.iter().copied());
+                for (index, word) in header_and_elements.enumerate() {
+                    let offset = (index * 8) as u32;
+                    self.code
+                        .emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), offset))?;
+                    self.emit_word_match(word, mismatch)?;
+                }
+            }
+            EqLiteral::EmptyBinary => {
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1792-1827 (empty binary
+                // test), OTP-29.1.1: a heap bitstring has size 0 in word 1, a sub-bitstring
+                // has start == end in words 2 and 3.
+                self.emit_tag_check_and_untag(2, mismatch)?;
+                let sub_bits = self.code.new_label();
+                let done = self.code.new_label();
+                self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 0))?;
+                self.code.emit(|e| e.and_imm(Gpr::x(13), Gpr::x(13), 63))?;
+                self.code
+                    .emit(|e| e.cmp_imm(Gpr::x(13), SUB_BITS_HEADER as u16, false))?;
+                self.code.b_cond(Cond::Eq, sub_bits)?;
+                self.code
+                    .emit(|e| e.cmp_imm(Gpr::x(13), HEAP_BITS_HEADER as u16, false))?;
+                self.code.b_cond(Cond::Ne, mismatch)?;
+                self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 8))?;
+                self.code.cbnz(Gpr::x(13), mismatch)?;
+                self.code.b(done)?;
+                self.code.bind(sub_bits)?;
+                self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 16))?;
+                self.code.emit(|e| e.ldr_uoff(Gpr::x(14), Gpr::x(12), 24))?;
+                self.code
+                    .emit(|e| e.cmp_reg(Gpr::x(13), Gpr::x(14), arinsal_a64::enc::Shift::Lsl, 0))?;
+                self.code.b_cond(Cond::Ne, mismatch)?;
+                self.code.bind(done)?;
+            }
+            EqLiteral::EmptyMap => {
+                // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1828-1846 (empty map
+                // test), OTP-29.1.1: a flatmap header with a zero size word.
+                self.emit_tag_check_and_untag(2, mismatch)?;
+                self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 0))?;
+                self.emit_word_match(MAP_HEADER_FLATMAP, mismatch)?;
+                self.code.emit(|e| e.ldr_uoff(Gpr::x(13), Gpr::x(12), 8))?;
+                self.code.cbnz(Gpr::x(13), mismatch)?;
+            }
+        }
+        if fail_on_equal {
+            self.code.b(fail_label)?;
+            self.code.bind(mismatch)?;
+        }
+        Ok(())
+    }
+
+    /// Checks the primary tag of x11 and untags it into x12.
+    fn emit_tag_check_and_untag(&mut self, tag: u16, mismatch: Label) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(8), Gpr::x(11), 3)?;
+            e.cmp_imm(Gpr::x(8), tag, false)
+        })?;
+        self.code.b_cond(Cond::Ne, mismatch)?;
+        self.code
+            .emit(|e| e.and_imm(Gpr::x(12), Gpr::x(11), !7_u64))?;
+        Ok(())
+    }
+
+    /// Checks the primary tag of x13 (the next cell) and untags it into x12.
+    fn emit_tag_check_on_x13(&mut self, tag: u16, mismatch: Label) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.and_imm(Gpr::x(8), Gpr::x(13), 3)?;
+            e.cmp_imm(Gpr::x(8), tag, false)
+        })?;
+        self.code.b_cond(Cond::Ne, mismatch)?;
+        self.code
+            .emit(|e| e.and_imm(Gpr::x(12), Gpr::x(13), !7_u64))?;
+        Ok(())
+    }
+
+    /// Branches to `mismatch` unless x13 holds `word`.
+    fn emit_word_match(&mut self, word: u64, mismatch: Label) -> Result<(), ModuleError> {
+        self.code.emit(|e| {
+            e.mov_const(Gpr::x(14), word)?;
+            e.cmp_reg(Gpr::x(13), Gpr::x(14), arinsal_a64::enc::Shift::Lsl, 0)
+        })?;
+        self.code.b_cond(Cond::Ne, mismatch)?;
+        Ok(())
     }
 
     // Port of erts/emulator/beam/jit/arm/instr_common.cpp:1844-1856 and 2001-2013

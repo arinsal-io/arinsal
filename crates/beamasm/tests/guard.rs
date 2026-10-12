@@ -3,6 +3,7 @@ use std::{cell::RefCell, cmp::Ordering, collections::HashMap, process::Command, 
 use arinsal_a64::enc::Gpr;
 use arinsal_beamasm::{
     ExitReason, ProcessHeader, SchedulerRegisters, enter_native,
+    guard::EqLiteral,
     module::{ArgVal, BeamModuleAssembler, ModuleError},
     rt,
     types::{ArgType, TypedArg, type_id},
@@ -724,7 +725,15 @@ fn native_is_function2() {
 fn native_is_eq_exact() {
     let f = terms();
     native_guard(
-        |a| a.emit_is_eq_exact(ArgVal::X(0), ArgVal::X(1), 2, guard_helper),
+        |a| {
+            a.emit_is_eq_exact(
+                ArgVal::X(0),
+                ArgVal::X(1),
+                2,
+                &EqLiteral::Generic,
+                (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
         f.one,
         f.one_float,
         false,
@@ -749,17 +758,42 @@ fn typed_atom_exact_compare_does_not_call_the_runtime() {
         },
     );
     native_guard(
-        |a| a.emit_is_eq_exact(typed, ArgVal::X(1), 2, exploding_helper),
+        |a| {
+            a.emit_is_eq_exact(
+                typed,
+                ArgVal::X(1),
+                2,
+                &EqLiteral::Generic,
+                (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
         atom,
         atom,
         true,
     );
     native_guard(
-        |a| a.emit_is_ne_exact(typed, ArgVal::X(1), 2, exploding_helper),
+        |a| {
+            a.emit_is_ne_exact(
+                typed,
+                ArgVal::X(1),
+                2,
+                &EqLiteral::Generic,
+                (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
         atom,
         fixture.tuple,
         true,
     );
+}
+
+/// The C `eq` the general path calls: exact equality of two terms.
+extern "C" fn eq_helper(a: u64, b: u64) -> i32 {
+    i32::from(exact_eq(rt::fixture_term(a), rt::fixture_term(b)))
+}
+
+extern "C" fn exploding_eq(_: u64, _: u64) -> i32 {
+    panic!("always-immediate comparison must not call the runtime");
 }
 
 extern "C" fn exploding_helper(_: *mut ProcessHeader, _: u32, _: u64, _: u64) -> u64 {
@@ -775,7 +809,8 @@ fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
                 ArgVal::X(0),
                 ArgVal::Immediate(bits(fixture.one)),
                 2,
-                guard_helper,
+                &EqLiteral::Generic,
+                (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
         fixture.one,
@@ -788,7 +823,8 @@ fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
                 ArgVal::X(0),
                 ArgVal::Immediate(bits(fixture.one)),
                 2,
-                guard_helper,
+                &EqLiteral::Generic,
+                (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
             )
         },
         fixture.one_float,
@@ -797,7 +833,15 @@ fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
     );
     let atom = Term::atom(global_atoms().intern("guard_alpha").unwrap());
     native_guard(
-        |a| a.emit_is_eq_exact(ArgVal::X(0), ArgVal::Immediate(bits(atom)), 2, guard_helper),
+        |a| {
+            a.emit_is_eq_exact(
+                ArgVal::X(0),
+                ArgVal::Immediate(bits(atom)),
+                2,
+                &EqLiteral::Generic,
+                (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
         atom,
         atom,
         true,
@@ -807,7 +851,15 @@ fn exact_comparisons_against_small_and_atom_immediates_are_inline() {
 fn native_is_ne_exact() {
     let f = terms();
     native_guard(
-        |a| a.emit_is_ne_exact(ArgVal::X(0), ArgVal::X(1), 2, guard_helper),
+        |a| {
+            a.emit_is_ne_exact(
+                ArgVal::X(0),
+                ArgVal::X(1),
+                2,
+                &EqLiteral::Generic,
+                (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
         f.one,
         f.one_float,
         true,
@@ -836,13 +888,29 @@ fn unequal_immediates_skip_the_compare_helper() {
         true,
     );
     native_guard(
-        |a| a.emit_is_eq_exact(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
+        |a| {
+            a.emit_is_eq_exact(
+                ArgVal::X(0),
+                ArgVal::X(1),
+                2,
+                &EqLiteral::Generic,
+                (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
         alpha,
         beta,
         false,
     );
     native_guard(
-        |a| a.emit_is_ne_exact(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
+        |a| {
+            a.emit_is_ne_exact(
+                ArgVal::X(0),
+                ArgVal::X(1),
+                2,
+                &EqLiteral::Generic,
+                (exploding_eq as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
         alpha,
         beta,
         true,
@@ -1446,4 +1514,216 @@ fn native_type_guards_match_otp_29() {
             );
         }
     }
+}
+
+/// Literal terms and the values compared with them, for the inline `=:=` / `=/=` shapes.
+struct ShapeFixture {
+    _heap: ProcessHeap,
+    c: Term,
+    one: Term,
+    three: Term,
+    one_float: Term,
+    pair_c3: Term,
+    pair_c4: Term,
+    pair_d3: Term,
+    triple_c3c: Term,
+    pair_c_float: Term,
+    map_one: Term,
+    map_empty: Term,
+    list1: Term,
+    list_c: Term,
+    list_11: Term,
+    bin_empty: Term,
+    bin_one: Term,
+}
+
+fn shape_fixture() -> ShapeFixture {
+    let mut heap = ProcessHeap::with_words(2048);
+    let mut b = TermBuilder::new(&mut heap);
+    let c = Term::atom(global_atoms().intern("guard_c").unwrap());
+    let d = Term::atom(global_atoms().intern("guard_d").unwrap());
+    let one = small(1);
+    let three = small(3);
+    let one_float = b.float(1.0).unwrap();
+    let pair_c3 = b.tuple(&[c, three]).unwrap();
+    let pair_c4 = b.tuple(&[c, small(4)]).unwrap();
+    let pair_d3 = b.tuple(&[d, three]).unwrap();
+    let triple_c3c = b.tuple(&[c, three, c]).unwrap();
+    let pair_c_float = b.tuple(&[c, one_float]).unwrap();
+    let map_one = b.flatmap_from_pairs(&[(c, one)]).unwrap();
+    let map_empty = b.flatmap_from_pairs(&[]).unwrap();
+    let list1 = b.cons(one, Term::NIL).unwrap();
+    let list_c = b.cons(c, Term::NIL).unwrap();
+    let list_11 = b.cons(one, list1).unwrap();
+    let bin_empty = b.binary(&[]).unwrap();
+    let bin_one = b.binary(&[0xa5]).unwrap();
+    ShapeFixture {
+        _heap: heap,
+        c,
+        one,
+        three,
+        one_float,
+        pair_c3,
+        pair_c4,
+        pair_d3,
+        triple_c3c,
+        pair_c_float,
+        map_one,
+        map_empty,
+        list1,
+        list_c,
+        list_11,
+        bin_empty,
+        bin_one,
+    }
+}
+
+/// Checks `=:=` and `=/=` against a literal shape for each `(value, equal)` case.
+fn check_shape(shape: &EqLiteral, literal: Term, cases: &[(Term, bool)]) {
+    for &(value, equal) in cases {
+        native_guard(
+            |a| {
+                a.emit_is_eq_exact(
+                    ArgVal::X(0),
+                    ArgVal::Literal(bits(literal)),
+                    2,
+                    shape,
+                    (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
+                )
+            },
+            value,
+            literal,
+            equal,
+        );
+        native_guard(
+            |a| {
+                a.emit_is_ne_exact(
+                    ArgVal::X(0),
+                    ArgVal::Literal(bits(literal)),
+                    2,
+                    shape,
+                    (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
+                )
+            },
+            value,
+            literal,
+            !equal,
+        );
+    }
+}
+
+#[test]
+fn shallow_tuple_literal_matches_inline() {
+    let f = shape_fixture();
+    let shape = EqLiteral::ShallowTuple {
+        header: 2 << 6,
+        elements: vec![bits(f.c), bits(f.three)],
+    };
+    check_shape(
+        &shape,
+        f.pair_c3,
+        &[
+            (f.pair_c3, true),
+            // Wrong element: same arity and header.
+            (f.pair_c4, false),
+            (f.pair_d3, false),
+            // Wrong arity.
+            (f.triple_c3c, false),
+            // Wrong header: a map with the same first word count.
+            (f.map_one, false),
+            // Element is boxed (a float) and must not match an immediate.
+            (f.pair_c_float, false),
+            // Non-boxed operand.
+            (f.three, false),
+            (f.c, false),
+        ],
+    );
+}
+
+#[test]
+fn list_of_immediates_literal_matches_inline() {
+    let f = shape_fixture();
+    check_shape(
+        &EqLiteral::ListOfImmediates(vec![bits(f.one)]),
+        f.list1,
+        &[
+            (f.list1, true),
+            // Wrong head.
+            (f.list_c, false),
+            // Wrong length: the tail is a cons, not nil.
+            (f.list_11, false),
+            // Non-boxed and wrong-tag operands.
+            (f.three, false),
+            (f.pair_c3, false),
+        ],
+    );
+    check_shape(
+        &EqLiteral::ListOfImmediates(vec![bits(f.one), bits(f.one)]),
+        f.list_11,
+        &[(f.list_11, true), (f.list1, false), (f.list_c, false)],
+    );
+}
+
+#[test]
+fn empty_binary_literal_matches_inline() {
+    let f = shape_fixture();
+    check_shape(
+        &EqLiteral::EmptyBinary,
+        f.bin_empty,
+        &[
+            (f.bin_empty, true),
+            (f.bin_one, false),
+            (f.three, false),
+            (f.pair_c3, false),
+        ],
+    );
+}
+
+#[test]
+fn empty_map_literal_matches_inline() {
+    let f = shape_fixture();
+    check_shape(
+        &EqLiteral::EmptyMap,
+        f.map_empty,
+        &[
+            (f.map_empty, true),
+            (f.map_one, false),
+            (f.pair_c3, false),
+            (f.three, false),
+        ],
+    );
+}
+
+#[test]
+fn generic_literal_takes_the_eq_call() {
+    let f = shape_fixture();
+    // `1 =:= 1.0` is false: the float is boxed and only the general path can tell.
+    native_guard(
+        |a| {
+            a.emit_is_eq_exact(
+                ArgVal::X(0),
+                ArgVal::Literal(bits(f.one_float)),
+                2,
+                &EqLiteral::Generic,
+                (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
+        f.one,
+        f.one_float,
+        false,
+    );
+    native_guard(
+        |a| {
+            a.emit_is_eq_exact(
+                ArgVal::X(0),
+                ArgVal::Literal(bits(f.one_float)),
+                2,
+                &EqLiteral::Generic,
+                (eq_helper as extern "C" fn(u64, u64) -> i32) as usize,
+            )
+        },
+        f.one_float,
+        f.one_float,
+        true,
+    );
 }
