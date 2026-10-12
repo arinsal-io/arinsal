@@ -1020,6 +1020,105 @@ fn map_error_reasons_match_otp() {
 }
 
 #[test]
+fn one_byte_pattern_search_matches_otp_29() {
+    let reference = RefErl::shared().expect("OTP 29 reference");
+    let subject = O::Binary(b"abracadabra".to_vec());
+    let aye = O::Binary(b"a".to_vec());
+    let zee = O::Binary(b"z".to_vec());
+    let dash = O::Binary(b"-".to_vec());
+    let dashed = O::Binary(b"a-b-a".to_vec());
+    let scope_hit = list(vec![O::Tuple(vec![
+        atom("scope"),
+        O::Tuple(vec![O::Int(3), O::Int(5)]),
+    ])]);
+    let scope_miss = list(vec![O::Tuple(vec![
+        atom("scope"),
+        O::Tuple(vec![O::Int(1), O::Int(2)]),
+    ])]);
+    let scope_dash = list(vec![O::Tuple(vec![
+        atom("scope"),
+        O::Tuple(vec![O::Int(2), O::Int(3)]),
+    ])]);
+    let cases = [
+        ("match", vec![subject.clone(), aye.clone()]),
+        ("match", vec![subject.clone(), zee.clone()]),
+        (
+            "match",
+            vec![subject.clone(), aye.clone(), scope_hit.clone()],
+        ),
+        (
+            "match",
+            vec![subject.clone(), aye.clone(), scope_miss.clone()],
+        ),
+        ("matches", vec![subject.clone(), aye.clone()]),
+        ("matches", vec![subject.clone(), zee.clone()]),
+        (
+            "matches",
+            vec![subject.clone(), aye.clone(), scope_hit.clone()],
+        ),
+        ("matches", vec![O::Binary(Vec::new()), aye.clone()]),
+        ("split", vec![dashed.clone(), dash.clone()]),
+        ("split", vec![subject.clone(), zee.clone()]),
+        (
+            "split",
+            vec![dashed.clone(), dash.clone(), scope_dash.clone()],
+        ),
+    ];
+    for (name, args) in cases {
+        let actual = call("binary", name, &args);
+        let expected = reference.call("binary", name, &args);
+        assert!(
+            equivalent(&actual, &expected),
+            "binary:{name} {args:?}: {actual:?} != {expected:?}"
+        );
+    }
+
+    // A compiled 1-byte pattern is still Boyer–Moore (`words == 1` in
+    // do_binary_match_compile). erl's compile_pattern result matches the raw pattern.
+    let mut heap = ProcessHeap::with_words(1024);
+    let mut allocator = FragmentingHeap(&mut heap);
+    let subject_term = from_owned(&subject, &mut allocator).unwrap();
+    let aye_term = from_owned(&aye, &mut allocator).unwrap();
+    let dash_term = from_owned(&dash, &mut allocator).unwrap();
+    let dashed_term = from_owned(&dashed, &mut allocator).unwrap();
+    let scope_term = from_owned(&scope_hit, &mut allocator).unwrap();
+    let mut ctx = Ctx::new(&mut allocator);
+    let compile = lookup("binary", "compile_pattern", 1).unwrap();
+    let aye_pattern = compile(&mut ctx, &[aye_term]).unwrap();
+    let dash_pattern = compile(&mut ctx, &[dash_term]).unwrap();
+    let compiled_cases: &[(&str, u8, Vec<_>, &str)] = &[
+        (
+            "match",
+            2,
+            vec![subject_term, aye_pattern],
+            "binary:match(<<\"abracadabra\">>, binary:compile_pattern(<<\"a\">>))",
+        ),
+        (
+            "matches",
+            3,
+            vec![subject_term, aye_pattern, scope_term],
+            "binary:matches(<<\"abracadabra\">>, binary:compile_pattern(<<\"a\">>), [{scope,{3,5}}])",
+        ),
+        (
+            "split",
+            2,
+            vec![dashed_term, dash_pattern],
+            "binary:split(<<\"a-b-a\">>, binary:compile_pattern(<<\"-\">>))",
+        ),
+    ];
+    for (name, arity, args, expr) in compiled_cases {
+        let bif = lookup("binary", name, *arity).unwrap();
+        let mut ctx = Ctx::new(&mut allocator);
+        let actual = CallResult::Ok(to_owned(bif(&mut ctx, args).unwrap()).unwrap());
+        let expected = CallResult::Ok(reference.eval(expr).unwrap());
+        assert!(
+            equivalent(&actual, &expected),
+            "compiled binary:{name}: {actual:?} != {expected:?}"
+        );
+    }
+}
+
+#[test]
 fn binary_match_accepts_unaligned_subbinary() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let mut heap = ProcessHeap::with_words(128);

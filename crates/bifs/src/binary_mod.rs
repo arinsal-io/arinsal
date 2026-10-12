@@ -452,8 +452,16 @@ impl SearchWalk {
                 work = work.saturating_add((last + offset) / MC_LOOP_FACTOR);
                 *position += offset;
             } else {
+                // Port of bm_find_first_match (erl_bif_binary.c:862-874): a memchr
+                // miss never reaches the shift. create_bmdata leaves goodshift and
+                // badshift unallocated when the pattern length is 1, so the search
+                // is memchr only (erl_bif_binary.c:467-497).
                 work = work.saturating_add(mem_read / MC_LOOP_FACTOR);
                 *position = position.saturating_add(mem_read);
+                if width > end || *position > end - width {
+                    *done = true;
+                }
+                break;
             }
             if *position > end - width {
                 *done = true;
@@ -612,5 +620,46 @@ impl SearchWalk {
             *done = true;
         }
         (*done, work)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search(
+        bytes: &[u8],
+        needle: &[u8],
+        scope: (usize, usize),
+        first_only: bool,
+    ) -> Vec<(usize, usize)> {
+        let pattern = Arc::new(SearchPattern::compile(&[needle.to_vec()]).unwrap());
+        let mut walk = SearchWalk::new(bytes.len(), pattern, scope, first_only);
+        let mut steps = 0;
+        while !walk.step(bytes, 1).0 {
+            steps += 1;
+            assert!(steps < bytes.len() + 2, "search made no progress");
+        }
+        walk.finish()
+    }
+
+    #[test]
+    fn one_byte_pattern_one_reduction_window_matches_a_full_scan() {
+        let bytes = b"zzzzzzzzzzza-z-a";
+        for (needle, scope, first_only, expected) in [
+            (&b"a"[..], (0, bytes.len()), true, vec![(11, 1)]),
+            (&b"z"[..], (0, bytes.len()), true, vec![(0, 1)]),
+            (&b"q"[..], (0, bytes.len()), true, vec![]),
+            (&b"a"[..], (0, bytes.len()), false, vec![(11, 1), (15, 1)]),
+            (&b"-"[..], (0, bytes.len()), false, vec![(12, 1), (14, 1)]),
+            (&b"a"[..], (1, 3), true, vec![]),
+            (&b"a"[..], (11, 16), false, vec![(11, 1), (15, 1)]),
+        ] {
+            assert_eq!(
+                search(bytes, needle, scope, first_only),
+                expected,
+                "needle={needle:?} scope={scope:?} first_only={first_only}"
+            );
+        }
     }
 }
