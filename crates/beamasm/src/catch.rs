@@ -478,18 +478,23 @@ impl BeamModuleAssembler {
         self.emit_error(value, EXC_BADRECORD, resolver)
     }
 
-    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:2830-2853, OTP-29.1.1: the value
-    // is wrapped by the runtime from the error code (beam_common.c:742, expand_error_value).
+    // Port of erts/emulator/beam/jit/arm/instr_common.cpp:81-87 (`emit_error`) and
+    // beam_asm_global.cpp:239-249 (`emit_raise_exception` → the shared fragment), OTP-29.1.1.
+    // `freason` and `fvalue` are stored, then control goes to `error_label`
+    // (`raise_exception_shared`). The fragment is not entered inline at the site.
     fn emit_error(
         &mut self,
         reason: ArgVal,
         freason: u64,
         resolver: ExceptionResolver,
     ) -> Result<(), ModuleError> {
+        self.ensure_exception_resolver(resolver as usize);
         let value = self.source_reg(reason)?;
-        self.code.emit(|e| e.mov_reg(TMP2, value))?;
-        self.code.emit(|e| e.mov_const(TMP3, freason))?;
-        self.emit_exception_transfer(TMP3, TMP2, Gpr::xzr(), resolver)
+        self.code.emit(|e| {
+            e.mov_const(TMP3, freason)?;
+            e.stp(TMP3, value, C_P, 40)
+        })?;
+        self.branch_error()
     }
 }
 

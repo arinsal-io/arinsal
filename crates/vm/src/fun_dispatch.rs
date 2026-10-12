@@ -16,6 +16,11 @@ pub(crate) fn set_thread_code_scope(scope: u64) {
     CODE_SCOPE.with(|cell| cell.set(scope));
 }
 
+/// The node this thread runs code for, or 0 when none was recorded.
+pub(crate) fn code_scope() -> u64 {
+    CODE_SCOPE.with(Cell::get)
+}
+
 /// Export fun lookup for the term crate.
 // Port of erts/emulator/beam/export.c:200-245 (erts_export_get_or_make_stub), OTP-29.1.1.
 fn export_stub_hook(module: Atom, function: Atom, arity: u8) -> Option<Arc<ExportEntry>> {

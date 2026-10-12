@@ -228,6 +228,7 @@ fn process_info(
         .map(atom)
         .collect()
     };
+    let info_reds = i32::try_from(keys.len()).unwrap_or(i32::MAX);
     let mut pairs = Vec::new();
     for key in keys {
         if let Some((lookup_key, selector)) = dictionary_lookup(key) {
@@ -298,8 +299,24 @@ fn process_info(
                         .map_or(0, |dictionary| dictionary.memory_bytes())) as i64,
             )
             .ok_or_else(badarg)?,
-            "reductions" => Term::small(process.reductions_used.min(i64::MAX as u64) as i64)
-                .ok_or_else(badarg)?,
+            "reductions" => {
+                // Port of erts/emulator/beam/beam_common.c:2394 (`erts_current_reductions`)
+                // and erl_bif_info.c:2115, OTP-29.1.1. Only the process inside native code
+                // adds `REDS_IN - fcalls`; a yielded process already folded that into `reds`.
+                let inflight = if process.heap.native_active() && process.self_pid == Some(pid) {
+                    u64::try_from(process.native_reds_in.saturating_sub(process.header.fcalls))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                Term::small(
+                    process
+                        .reductions_used
+                        .saturating_add(inflight)
+                        .min(i64::MAX as u64) as i64,
+                )
+                .ok_or_else(badarg)?
+            }
             "status" => {
                 // Suspend count wins over the waiting/runnable/running atom the
                 // caller (local BIF or remote request) passed in.
@@ -643,6 +660,23 @@ fn process_info(
         }
         pairs.push(make_tuple(process, &[key, value])?);
     }
+    // Port of erts/emulator/beam/erl_bif_info.c:1601 (`(*reds)++`) and :1424
+    // (`BUMP_REDS`), OTP-29.1.1. One reduction per requested item, after the
+    // value is built, so this call's bump is visible to the next `process_info`.
+    // Remote requests bump the caller, not the target this function just read.
+    if drain_inbox {
+        // The executor runs this BIF outside the native slice (`native_active` is
+        // false), so FCALLS is the next slice's budget. Count the bump in `reds`.
+        // Inside the slice, lowering FCALLS is what `erts_current_reductions` sees.
+        if process.heap.native_active() {
+            process.reductions = process.reductions.saturating_sub(info_reds);
+            process.header.fcalls = process.header.fcalls.saturating_sub(info_reds);
+        } else {
+            process.reductions_used = process
+                .reductions_used
+                .saturating_add(u64::try_from(info_reds).unwrap_or(0));
+        }
+    }
     if list_form || all_form {
         make_list(process, pairs)
     } else {
@@ -908,7 +942,6 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erts_internal", "group_leader", 2),
     ("erts_internal", "group_leader", 3),
     ("erlang", "processes", 0),
-    ("erlang", "processes_next", 1),
     ("erlang", "pid_to_list", 1),  // elixir_loop1
     ("erlang", "ref_to_list", 1),  // mix_loop6
     ("erlang", "port_to_list", 1), // mix_loop6
@@ -942,7 +975,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "spawn_request_abandon", 1),
     ("erts_internal", "processes_next", 1),
     ("erts_internal", "trace", 3),
-    ("erlang", "trace", 3),
+    // `erlang:trace/3` loads the tracer module, then calls `erts_internal:trace/3`.
     ("erlang", "trace_info", 2),
     ("erts_internal", "trace", 4),
     ("erts_internal", "trace_pattern", 3),
@@ -1787,20 +1820,27 @@ pub(crate) fn direct_dictionary(
     }
 }
 
-fn dict_put(process: &mut Process, key: Term, value: Term) -> Term {
+fn undefined_atom() -> Term {
+    Term::atom(arinsal_term::atoms::UNDEFINED)
+}
+
+/// `put/2`. A missing key returns `undefined` without interning the name.
+// Port of erts/emulator/beam/erl_process_dict.c:353-360 (put_2), OTP-29.1.1.
+pub(crate) fn dict_put(process: &mut Process, key: Term, value: Term) -> Term {
     process
         .dictionary
         .get_or_insert_with(crate::proc_create::ProcDict::default)
         .put(key, value)
-        .unwrap_or_else(|| atom("undefined"))
+        .unwrap_or_else(undefined_atom)
 }
 
-fn dict_erase(process: &mut Process, key: Term) -> Term {
-    process
-        .dictionary
-        .as_mut()
-        .and_then(|dictionary| dictionary.erase(key))
-        .unwrap_or_else(|| atom("undefined"))
+/// `erase/1`. An empty dictionary returns `undefined` without walking a table.
+// Port of erts/emulator/beam/erl_process_dict.c:373-394 (erase_1, pd_hash_erase), OTP-29.1.1.
+pub(crate) fn dict_erase(process: &mut Process, key: Term) -> Term {
+    let Some(dictionary) = process.dictionary.as_mut() else {
+        return undefined_atom();
+    };
+    dictionary.erase(key).unwrap_or_else(undefined_atom)
 }
 
 /// Dispatch process-local BIFs that use the scheduler context.
@@ -1830,11 +1870,11 @@ fn call_values(
     }
     // `erlang:spawn_request/1..5` is a BEAM wrapper. Only the internal entry
     // is a BIF; claiming the name here would turn `/3` into `badarg`.
-    if matches!(function, "spawn_request" | "dist_spawn_request") && module != "erts_internal" {
-        return None;
-    }
-    // Erlang wrappers around these BIFs must keep running as BEAM.
-    if function == "trace" && module != "erts_internal" {
+    if matches!(
+        function,
+        "spawn_request" | "dist_spawn_request" | "processes_next" | "trace"
+    ) && module != "erts_internal"
+    {
         return None;
     }
     if function == "fun_info_mfa" && module != "erlang" {
@@ -2067,12 +2107,9 @@ fn call_values(
             ("processes_next", [cursor]) if module == "erts_internal" => {
                 processes_next(process, ctx, *cursor)
             }
-            ("processes_next", [iterator]) if module == "erlang" => {
-                erlang_processes_next(process, ctx, *iterator)
-            }
             // Port of erts/emulator/beam/erl_bif_trace.c:889-918 (erts_internal_trace_3/4),
             // OTP-29.1.1.
-            ("trace", [spec, how, flags]) if module == "erts_internal" || module == "erlang" => {
+            ("trace", [spec, how, flags]) if module == "erts_internal" => {
                 let (spec, how, flags) = (*spec, *how, *flags);
                 with_code_mod_permission(vm, process, ctx, |vm, process, ctx| {
                     trace(vm, process, ctx, 0, spec, how, flags)
@@ -2169,7 +2206,10 @@ pub(crate) fn process_flag_save_calls_bif(
 
 /// Replaces the saved-call buffer and returns the previous size.
 // Port of erts/emulator/beam/bif.c:1907-1950 (process_flag save_calls), OTP-29.1.1.
-fn save_calls_flag(process: &mut Process, value: Term) -> Result<Term, crate::exceptions::Trap> {
+pub(crate) fn save_calls_flag(
+    process: &mut Process,
+    value: Term,
+) -> Result<Term, crate::exceptions::Trap> {
     let n = value
         .as_small()
         .filter(|n| (0..=10_000).contains(n))
@@ -4807,50 +4847,6 @@ fn processes_next(
     let next = Term::small(i64::from(scan_end)).ok_or_else(badarg)?;
     let batch = make_list(process, pid_terms)?;
     make_tuple(process, &[next, batch])
-}
-
-// Port of erts/preloaded/src/erlang.erl:5655-5665, OTP-29.1.1.
-// Port of erts/preloaded/src/erlang.erl:5655 (processes_next/1), OTP-29.1.1: the
-// iterator `{Ref, Batch}` is stepped in place; the remaining batch is shared, not copied.
-fn erlang_processes_next(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    iterator: Term,
-) -> Result<Term, VmError> {
-    fn step(process: &mut Process, reference: Term, batch: Term) -> Result<Term, VmError> {
-        // SAFETY: The batch list is rooted in the caller's iterator for this BIF.
-        let (pid, rest) = unsafe { batch.cons_ref() }.ok_or_else(badarg)?;
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let mut builder = TermBuilder::new(&mut heap);
-        let next = builder
-            .tuple(&[reference, rest])
-            .map_err(|error| VmError::Unsupported(format!("process iterator: {error:?}")))?;
-        builder
-            .tuple(&[pid, next])
-            .map_err(|error| VmError::Unsupported(format!("process iterator: {error:?}")))
-    }
-
-    let (mut reference, batch) = tuple2(iterator).ok_or_else(badarg)?;
-    if batch.classify() == TermKind::List {
-        return step(process, reference, batch);
-    }
-    if batch != Term::NIL {
-        return Err(badarg());
-    }
-    loop {
-        let next = processes_next(process, ctx, reference)?;
-        if next == atom("none") {
-            return Ok(next);
-        }
-        let (next_reference, batch) = tuple2(next).ok_or_else(badarg)?;
-        if batch.classify() == TermKind::List {
-            return step(process, next_reference, batch);
-        }
-        if batch != Term::NIL {
-            return Err(badarg());
-        }
-        reference = next_reference;
-    }
 }
 
 // Port of erts/emulator/beam/erl_bif_info.c:4011 (fun_info_mfa_1), OTP-29.1.1.

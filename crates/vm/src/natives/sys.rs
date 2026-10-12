@@ -248,7 +248,7 @@ pub(crate) const IMPLEMENTED: &[(&str, &str, u8)] = &[
     ("erlang", "display", 1),
     ("erlang", "display_string", 2),
     ("erts_internal", "term_to_string", 2),
-    ("erts_internal", "term_to_string", 1),
+    // `term_to_string/1` is `term_to_string(T, undefined)` in erts_internal.erl.
     ("erlang", "statistics", 1),
     ("erlang", "bump_reductions", 1),
     ("erts_internal", "garbage_collect", 1),
@@ -271,7 +271,6 @@ pub(crate) fn handler(module: &str, function: &str, arity: u8) -> Option<Handler
         ("erlang", "display", 1) => Some(call_display),
         ("erlang", "display_string", 2) => Some(call_display_string),
         ("erts_internal", "term_to_string", 2) => Some(call_term_to_string),
-        ("erts_internal", "term_to_string", 1) => Some(call_term_to_string_unlimited),
         ("erlang", "statistics", 1) => Some(call_statistics),
         ("erlang", "bump_reductions", 1) => Some(call_bump_reductions),
         ("erts_internal", "garbage_collect", 1) => Some(call_garbage_collect),
@@ -330,16 +329,6 @@ fn call_term_to_string(
     args: &[Term],
 ) -> Result<Term, VmError> {
     term_to_string(process, args)
-}
-
-fn call_term_to_string_unlimited(
-    _vm: &mut Vm,
-    process: &mut Process,
-    _ctx: &mut RunCtx<'_, Message>,
-    args: &[Term],
-) -> Result<Term, VmError> {
-    // Port of erts_internal.erl:1150-1153 (term_to_string/1), OTP-29.1.1.
-    term_to_string(process, &[args[0], atom("undefined")])
 }
 
 fn call_statistics(
@@ -583,6 +572,10 @@ impl PersistentTermUpdate {
             // suspended until thread progress), OTP-29.1.1. This bounds the update rate the
             // same way and keeps the collector queue as short as in erts.
             ctx.block_thread_progress(std::time::Duration::ZERO);
+            // The old table is unreachable once every scheduler has passed a
+            // progress point (`get` does not yield). Port of
+            // erl_bif_persistent.c:1175 (`table_updater`), OTP-29.1.1.
+            store.reclaim_old_tables();
         }
         if store.retired_generation() != self.retired {
             // Port of erts/emulator/beam/beam_bif_load.c:2341 (erts_queue_release_literals),

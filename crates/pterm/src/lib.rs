@@ -6,7 +6,7 @@
 //! process copies live references before atomically acknowledging its barrier.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, Weak};
 
 use arinsal_bifs::{BifError, BifFn, Ctx};
@@ -14,7 +14,8 @@ use arinsal_term::{
     ExportEntry, FunEntry, HeapAlloc, LiteralArea, Node, Term, TermBuilder, TermError, VecHeap,
     copy_term, exact_eq, global_atoms, internal_hash, size_object,
 };
-use crossbeam_epoch::{Atomic, Owned, pin};
+#[cfg(test)]
+use crossbeam_epoch::pin;
 use crossbeam_queue::SegQueue;
 
 static GLOBAL: LazyLock<Store> = LazyLock::new(Store::new);
@@ -102,15 +103,16 @@ fn assert_stored_send_sync() {
     assert_send_sync::<Stored>();
 }
 
-fn deref_table<'g>(shared: crossbeam_epoch::Shared<'g, Table>) -> &'g Table {
+fn deref_table<'a>(ptr: *const Table) -> &'a Table {
     assert!(
-        !shared.is_null(),
+        !ptr.is_null(),
         "persistent-term tables are installed before any load"
     );
-    // SAFETY: Store::new and publish store a non-null Owned table with Release.
-    // Callers load under the guard that produced `shared`, so the table stays
-    // initialized for 'g. Acquire loads synchronize with that publication.
-    unsafe { shared.deref() }
+    // SAFETY: Store::new and publish store a non-null Box with Release.
+    // The table is not freed until reclaim_old_tables (after thread progress)
+    // or Drop. Callers do not hold this reference across that reclaim.
+    // Acquire loads synchronize with that publication.
+    unsafe { &*ptr }
 }
 
 // Port of erts/emulator/beam/erl_bif_persistent.c:42 (Parameters for the hash table), OTP-29.1.1
@@ -257,11 +259,15 @@ struct ActiveArea {
 
 /// A process-independent persistent-term table.
 ///
-/// Reads pin an epoch and load a single immutable table. Writers serialize,
-/// clone the table, and publish it atomically. Term pointers returned by reads
-/// remain valid through the VM protocol described in this module.
+/// Reads load the table pointer with acquire and do not pin an epoch. Writers
+/// serialize, clone the table, and publish it atomically. The previous table is
+/// freed only after thread progress, the same window erts uses for
+/// `erts_schedule_thr_prgr_later_op`. Term pointers returned by reads stay
+/// valid through the VM protocol described in this module.
 pub struct Store {
-    table: Atomic<Table>,
+    table: AtomicPtr<Table>,
+    /// Tables replaced by `publish`, freed by [`Store::reclaim_old_tables`].
+    old_tables: Mutex<Vec<usize>>,
     writer: Mutex<Writer>,
     active_area: RwLock<Option<Arc<ActiveArea>>>,
     /// Set before `active_area` becomes `Some`, cleared after it becomes `None`.
@@ -291,7 +297,8 @@ impl Store {
     /// Create an empty store.
     pub fn new() -> Self {
         Self {
-            table: Atomic::new(Table::new()),
+            table: AtomicPtr::new(Box::into_raw(Box::new(Table::new()))),
+            old_tables: Mutex::new(Vec::new()),
             writer: Mutex::new(Writer {
                 next_area: 1,
                 retired: HashMap::new(),
@@ -411,11 +418,12 @@ impl Store {
     // Port of erts/emulator/beam/erl_bif_persistent.c:358 (persistent_term_get), OTP-29.1.1
     pub fn get(&self, key: Term) -> Option<Term> {
         let hash = lookup_hash(key);
-        let guard = pin();
-        let table = self
-            .table
-            .load(std::sync::atomic::Ordering::Acquire, &guard);
-        let table = deref_table(table);
+        // Port of erts/emulator/beam/erl_bif_persistent.c:358 (`erts_atomic_read_nob`
+        // of `the_hash_table`), OTP-29.1.1. The load is not pinned: `publish` does
+        // not destroy the previous table until `reclaim_old_tables`, which runs
+        // only after thread progress or when this `Store` is dropped. `get` does
+        // not yield, so it cannot overlap that reclaim.
+        let table = deref_table(self.table.load(Ordering::Acquire));
         let idx = table.lookup(key, hash);
         table.bucket(idx).as_ref().map(|item| item.value)
     }
@@ -433,10 +441,7 @@ impl Store {
     fn put_inner(&self, key: Term, value: Term, only_new: bool) -> Result<bool, TermError> {
         let hash = lookup_hash(key);
         let mut writer = self.lock_writer();
-        let guard = pin();
-        let current = self
-            .table
-            .load(std::sync::atomic::Ordering::Acquire, &guard);
+        let current = self.table.load(Ordering::Acquire);
         let current_table = deref_table(current);
 
         let idx = current_table.lookup(key, hash);
@@ -482,7 +487,7 @@ impl Store {
 
         // Port of erts/emulator/beam/erl_bif_persistent.c:275 (TRAPPING_COPY_TABLE), OTP-29.1.1
         // Table copying is completed before publication; the frozen BIF ABI has no trap result.
-        self.publish(next, current, &guard);
+        self.publish(next, current);
         Ok(true)
     }
     /// Remove a key; return whether it existed.
@@ -490,10 +495,7 @@ impl Store {
     pub fn erase(&self, key: Term) -> bool {
         let hash = lookup_hash(key);
         let mut writer = self.lock_writer();
-        let guard = pin();
-        let current = self
-            .table
-            .load(std::sync::atomic::Ordering::Acquire, &guard);
+        let current = self.table.load(Ordering::Acquire);
         let current_table = deref_table(current);
 
         let idx = current_table.lookup(key, hash);
@@ -536,21 +538,18 @@ impl Store {
             }
         }
         self.retire(&mut writer, old);
-        self.publish(next, current, &guard);
+        self.publish(next, current);
         true
     }
     /// Atomically erase all persistent terms, as `erts_internal:erase_persistent_terms/0`.
     // Port of erts/emulator/beam/erl_bif_persistent.c:1142 (mark_for_deletion), OTP-29.1.1
     pub fn clear(&self) {
         let mut writer = self.lock_writer();
-        let guard = pin();
-        let current = self
-            .table
-            .load(std::sync::atomic::Ordering::Acquire, &guard);
+        let current = self.table.load(Ordering::Acquire);
         for (_, stored) in deref_table(current).entries() {
             self.retire(&mut writer, Arc::clone(stored));
         }
-        self.publish(Table::new(), current, &guard);
+        self.publish(Table::new(), current);
     }
     fn retire(&self, writer: &mut Writer, old: Arc<Stored>) {
         // Port of erts/emulator/beam/erl_bif_persistent.c:1229 (delete_tuple), OTP-29.1.1
@@ -591,29 +590,40 @@ impl Store {
         writer.retired_order.push_back(id);
         self.retired_generation.fetch_add(1, Ordering::Release);
     }
-    fn publish(
-        &self,
-        next: Table,
-        current: crossbeam_epoch::Shared<'_, Table>,
-        guard: &crossbeam_epoch::Guard,
-    ) {
-        // Port of erts/emulator/beam/erl_bif_persistent.c:1175 (table_updater), OTP-29.1.1
+    fn publish(&self, next: Table, current: *mut Table) {
         self.table
-            .store(Owned::new(next), std::sync::atomic::Ordering::Release);
+            .store(Box::into_raw(Box::new(next)), Ordering::Release);
         self.updates.fetch_add(1, Ordering::Release);
-        // SAFETY: only the writer publishes tables; pinned readers may finish
-        // before the old table and its Arc owners are destroyed.
-        unsafe { guard.defer_destroy(current) };
-        guard.flush();
+        // Port of erts/emulator/beam/erl_bif_persistent.c:1175 (`table_updater` frees
+        // the old table from a thread-progress later op, not from the publisher),
+        // OTP-29.1.1. The pointer stays live for any `get` that already loaded it.
+        self.old_tables
+            .lock()
+            .expect("persistent-term old tables poisoned")
+            .push(current as usize);
+    }
+
+    /// Drop tables queued by [`Store::publish`].
+    ///
+    /// Call only after thread progress (every scheduler has left `get`) or from
+    /// `Drop`, when no reader can still hold a queued pointer.
+    pub fn reclaim_old_tables(&self) {
+        let pending = std::mem::take(
+            &mut *self
+                .old_tables
+                .lock()
+                .expect("persistent-term old tables poisoned"),
+        );
+        for bits in pending {
+            // SAFETY: `bits` is a Box `publish` replaced. No `get` still holds it:
+            // the caller waited for thread progress, or this `Store` is being dropped.
+            unsafe { drop(Box::from_raw(bits as *mut Table)) };
+        }
     }
     /// Snapshot count and allocated bytes, including the table and live areas.
     // Port of erts/emulator/beam/erl_bif_persistent.c:569 (persistent_term_info_0), OTP-29.1.1
     pub fn info(&self) -> (usize, usize) {
-        let guard = pin();
-        let current = self
-            .table
-            .load(std::sync::atomic::Ordering::Acquire, &guard);
-        let table = deref_table(current);
+        let table = deref_table(self.table.load(Ordering::Acquire));
         // Port of erts/emulator/beam/erl_bif_persistent.c:970 (memory), OTP-29.1.1
         let bytes = 96 // sizeof(HashTable) + offsetof(HashTable, term) is 96 in erl
             + (table.allocated - 1) * 8 // term array inside HashTable
@@ -625,20 +635,14 @@ impl Store {
     }
     /// Visit a consistent snapshot of all key/value pairs.
     pub fn for_each(&self, mut visit: impl FnMut(Term, Term)) {
-        let guard = pin();
-        let current = self
-            .table
-            .load(std::sync::atomic::Ordering::Acquire, &guard);
-        let table = deref_table(current);
+        let table = deref_table(self.table.load(Ordering::Acquire));
         for (_, item) in table.entries() {
             visit(item.key, item.value);
         }
     }
     /// Capture the current table without retaining the table epoch guard.
     pub fn snapshot(&self) -> Snapshot {
-        let guard = pin();
-        let current = self.table.load(Ordering::Acquire, &guard);
-        let table = deref_table(current);
+        let table = deref_table(self.table.load(Ordering::Acquire));
         Snapshot {
             allocated: table.allocated,
             num_entries: table.num_entries,
@@ -992,12 +996,10 @@ impl Default for Store {
 }
 impl Drop for Store {
     fn drop(&mut self) {
-        let guard = pin();
-        let current = self
-            .table
-            .load(std::sync::atomic::Ordering::Relaxed, &guard);
+        self.reclaim_old_tables();
+        let current = self.table.load(Ordering::Relaxed);
         // SAFETY: dropping Store requires exclusive ownership; no reader can still use it.
-        unsafe { drop(current.into_owned()) };
+        unsafe { drop(Box::from_raw(current)) };
     }
 }
 
@@ -1377,6 +1379,9 @@ mod tests {
         assert!(weak.upgrade().is_some());
         assert!(store.acknowledge(&second, area_id));
         assert!(!store.collector_switch_area());
+        // The replaced table still owns an `Arc` of the retired area until thread
+        // progress frees it. This test has no concurrent reader, so reclaim here.
+        store.reclaim_old_tables();
         for _ in 0..32 {
             let guard = pin();
             guard.flush();

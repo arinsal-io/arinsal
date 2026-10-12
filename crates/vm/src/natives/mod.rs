@@ -479,7 +479,11 @@ fn proc_claims(module: &str, function: &str) -> bool {
     if module != "erlang" && module != "erts_internal" {
         return false;
     }
-    if matches!(function, "spawn_request" | "dist_spawn_request") && module != "erts_internal" {
+    if matches!(
+        function,
+        "spawn_request" | "dist_spawn_request" | "processes_next" | "trace"
+    ) && module != "erts_internal"
+    {
         return false;
     }
     if function == "fun_info_mfa" && module != "erlang" {

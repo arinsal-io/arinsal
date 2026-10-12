@@ -154,6 +154,23 @@ impl Term {
             negative: header & 63 == NEG_BIG,
         })
     }
+
+    /// Run `body` on the magnitude digits of a bignum. The heap must not move during `body`.
+    ///
+    /// Port of the `struct StackTrace` bignum container in
+    /// erts/emulator/beam/error.h:222 and beam_common.c:888-893, OTP-29.1.1: the digits are
+    /// raw words, not terms, so a caller can update a field in place.
+    pub fn with_bignum_digits_mut<R>(self, body: impl FnOnce(&mut [u64]) -> R) -> Option<R> {
+        let header = self.header()?;
+        if header & 63 != POS_BIG && header & 63 != NEG_BIG {
+            return None;
+        }
+        let len = (header >> 6) as usize;
+        // SAFETY: the header digit count is the allocation length past the header word.
+        let digits =
+            unsafe { std::slice::from_raw_parts_mut(self.raw_ptr().add(1).cast_mut(), len) };
+        Some(body(digits))
+    }
     /// Borrow a flatmap's keys and values.
     ///
     /// # Safety

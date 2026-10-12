@@ -143,6 +143,9 @@ pub struct Process {
     /// Largest total heap size seen at a collection entry since the last `max_heap_size` check.
     pub(crate) max_heap_peak: usize,
     pub(crate) reductions: i32,
+    /// `REDS_IN`: FCALLS at the start of the current native slice.
+    /// `erts_current_reductions` is this minus the live `c_p->fcalls`.
+    pub(crate) native_reds_in: i32,
     pub(crate) reductions_used: u64,
     pub(crate) gc_enabled: bool,
     pub(crate) gc_deferred: bool,
@@ -853,6 +856,19 @@ pub(crate) struct ProcessCold {
     ///
     /// The heap owns the copied terms so a collection inside `-on_load` cannot move them.
     pub(crate) entry_args_after_on_load: Option<EntryArgsAfterOnLoad>,
+    /// Modules and off-heap pieces referenced by heap-resident raw stacktraces.
+    /// The bignum stores a slot; the `Arc` stays alive for the process, the way
+    /// erts' `ErtsCodeMFA *` stays valid while the module is loaded.
+    pub(crate) trace_keep: Option<Box<crate::stacktrace::TraceKeep>>,
+    /// BIF MFA of a caught native failure. `save_stacktrace` keeps it as `s->current`
+    /// without the uncaught path's `String` box; cleared once the trace is taken.
+    pub(crate) pending_trace_top: Option<crate::stacktrace::PendingTop>,
+    /// Stack list from `erlang:raise/3`, keyed by that failure's `freason` and `fvalue`.
+    ///
+    /// Port of erts/emulator/beam/bif.c:1641-1688 (`raise_3` stores the caller's list
+    /// in `c_p->ftrace`), OTP-29.1.1. Native code keeps the register file in
+    /// `header.ftrace`, so the list stays here until the catch reads it.
+    pub(crate) explicit_raise: Option<(u64, u64, arinsal_etf::OwnedTerm)>,
 }
 
 /// Entry arguments held aside while `-on_load` runs as that process's first function.
@@ -1132,6 +1148,7 @@ impl Process {
             gc_live: 0,
             max_heap_peak: 0,
             reductions: 4000,
+            native_reds_in: 4000,
             reductions_used: 0,
             gc_enabled: true,
             delay_gc: false,

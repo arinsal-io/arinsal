@@ -428,26 +428,6 @@ pub(crate) fn dist_output(id: u64, data: &[u8]) -> Result<bool, VmError> {
     Ok(sock.inner.lock().unwrap().busy)
 }
 
-/// Close a distribution socket after `erlang:disconnect_node/1`.
-pub(crate) fn disconnect_dist(id: u64) -> Result<(), VmError> {
-    let Some(sock) = registry().lock().unwrap().get(&id).cloned() else {
-        return Ok(());
-    };
-    let owner = sock.handle.owner_pid();
-    {
-        let mut inner = sock.inner.lock().unwrap();
-        if inner.peer_closed {
-            return Ok(());
-        }
-        inner.peer_closed = true;
-        inner.fd.take();
-        inner.phase = Phase::Closed;
-    }
-    emit(&sock, Out::TcpClosed { owner });
-    poke();
-    Ok(())
-}
-
 enum SendOutcome {
     Reply(Option<&'static str>),
     Deferred,

@@ -1623,6 +1623,7 @@ pub fn compile_parsed_module_with_options(
         // reserved for hard assemble failures below, not for missing trampolines.
 
         assembler = BeamModuleAssembler::new();
+        assembler.set_exception_resolver(env.exception_resolver() as usize);
         assembler.enable_dump(&beam.module);
         for lambda in &beam.lambdas {
             if !native_labels.contains(&lambda.label) {
@@ -2229,6 +2230,15 @@ fn tuple_byte_offset(value: Option<&SpecificOperand>) -> Result<u32, String> {
         .ok_or_else(|| "tuple element offset overflow".to_owned())?
         .checked_mul(8)
         .ok_or_else(|| "tuple element offset overflow".to_owned())
+}
+
+fn erlang_get_import(beam: &BeamFile, index: u32) -> bool {
+    let Some(import) = beam.imports.get(index as usize) else {
+        return false;
+    };
+    beam.atom(import.module_atom) == Some("erlang")
+        && beam.atom(import.function_atom) == Some("get")
+        && import.arity == 1
 }
 
 fn emit_op(
@@ -3087,13 +3097,24 @@ fn emit_op(
                     "BIF operand must be an import".to_owned(),
                 ));
             };
-            let identity = env
-                .plain_bif_identity(beam, import)
-                .ok_or_else(|| EmitError::Operand("BIF import is not a plain BIF".to_owned()))?;
             let mut sources = Vec::with_capacity(arity);
             for index in 0..arity {
                 sources.push(value(index)?);
             }
+            // Port of erts/emulator/beam/jit/arm/ops.tab:768 (`bif erlang:get/1` => `get`)
+            // and common_generators.tab (`gen.get` => `i_get`), OTP-29.1.1.
+            if arity == 1 && erlang_get_import(beam, import) {
+                return assembler
+                    .emit_process_dictionary_get(
+                        sources[0],
+                        value(bif_at + 1)?,
+                        env.process_dictionary_get_helper(),
+                    )
+                    .map_err(EmitError::from);
+            }
+            let identity = env
+                .plain_bif_identity(beam, import)
+                .ok_or_else(|| EmitError::Operand("BIF import is not a plain BIF".to_owned()))?;
             assembler.emit_bif_by_identity(
                 identity,
                 &sources,

@@ -5,7 +5,7 @@ use arinsal_arith::{ArithError, ArithResult};
 use arinsal_beamasm::{ProcessHeader, SchedulerRegisters};
 use arinsal_bifs::BifError;
 use arinsal_maps::MapError;
-use arinsal_term::{Term, TermBuilder, TermKind, cmp, cmp_exact, exact_eq, global_atoms, loose_eq};
+use arinsal_term::{Term, TermBuilder, TermKind, cmp, cmp_exact, exact_eq, loose_eq};
 use num_traits::ToPrimitive;
 use std::cmp::Ordering;
 
@@ -114,7 +114,9 @@ pub(crate) fn enter_runtime<'a>(
     scheduler_registers(process)
 }
 
-fn scheduler_registers(process: &mut Process) -> Option<(&mut Process, &mut SchedulerRegisters)> {
+pub(crate) fn scheduler_registers(
+    process: &mut Process,
+) -> Option<(&mut Process, &mut SchedulerRegisters)> {
     let registers = process.header.ftrace.cast::<SchedulerRegisters>();
     if registers.is_null() {
         return None;
@@ -145,6 +147,15 @@ pub(crate) fn process_from_header<'a>(header: *mut ProcessHeader) -> Option<&'a 
     Some(unsafe { &mut *header.cast::<Process>() })
 }
 
+/// `reg[index]`, the X register the light-BIF fragment passes as `x1`.
+///
+/// `c_p->ftrace` is the scheduler register file for the duration of native code.
+/// The word is copied out, so the caller does not borrow the register array.
+pub(crate) fn x_reg(process: &mut Process, index: usize) -> Option<Term> {
+    let (_, registers) = scheduler_registers(process)?;
+    registers.x_reg_array.get(index).copied()
+}
+
 fn publish_x(process: &Process, registers: &mut SchedulerRegisters) {
     for (destination, term) in registers
         .x_reg_array
@@ -157,11 +168,11 @@ fn publish_x(process: &Process, registers: &mut SchedulerRegisters) {
 }
 
 pub(crate) fn set_error(process: &mut Process, name: &str) {
-    if let Ok(atom) = global_atoms().intern(name) {
-        process.header.freason = 1;
-        // SAFETY: Atom terms are immediate values with no heap lifetime.
-        process.header.fvalue = unsafe { Term::atom(atom).raw_bits() };
-    }
+    // `am_badarg` and the other built-in error atoms. Interning the reason on
+    // every `persistent_term:get/1` miss took the atom-table lock.
+    let term = crate::signals::atom(name);
+    process.header.freason = 1;
+    process.header.fvalue = term.tagged_word();
 }
 
 pub(crate) fn raw(term: Term) -> u64 {

@@ -371,7 +371,7 @@ pub(super) fn bif_error_with_atoms(
 }
 
 // Port of erts/emulator/beam/bif.c:1464-1499 (error_3 option validation), OTP-29.1.1.
-fn error_info_option(options: &Term) -> Option<OwnedTerm> {
+pub(crate) fn error_info_option(options: &Term) -> Option<OwnedTerm> {
     let owned = to_owned(*options).ok()?;
     let OwnedTerm::List { elems, tail } = &owned else {
         return None;
@@ -700,9 +700,11 @@ pub(super) fn resume(
         // Port of erts/emulator/beam/beam_common.c:581-680 (next_catch), OTP-29.1.1: the
         // frames above were unwound here (with their exception trace events); a catch in a
         // native frame is resumed by the native catch search.
-        if crate::native_bridge::is_native_catch_tag(word)
-            && let Some(handler) =
-                crate::native_bridge::next_catch(p, trap.class, trap.reason, trace)
+        if crate::native_bridge::is_native_catch_tag(
+            crate::native_bridge::process_code_scope(p),
+            word,
+        ) && let Some(handler) =
+            crate::native_bridge::next_catch(p, trap.class, trap.reason, trace, false)
         {
             let target = match handler {
                 crate::native_bridge::CatchHandler::Native(handler) => {
@@ -866,8 +868,10 @@ fn save_raw(
         .cold
         .as_deref_mut()
         .map_or(0, |cold| std::mem::take(&mut cold.native_error_pc));
-    let native_pc =
-        Some(error_pc).filter(|&pc| pc != 0 && crate::native_bridge::is_native_function_at(pc));
+    let native_pc = Some(error_pc).filter(|&pc| {
+        let probe = pc & !arinsal_beamasm::module::RETURN_SITE_TAG;
+        pc != 0 && arinsal_term::may_be_native_code_pointer(probe)
+    });
     let mut raw = stacktrace::RawTrace::default();
     stacktrace::capture(
         &mut raw,
@@ -882,6 +886,7 @@ fn save_raw(
         &p.heap,
         depth,
     )?;
+    stacktrace::take_pending_top(p, &mut raw);
     stacktrace::store(p, raw)
 }
 
@@ -896,6 +901,10 @@ pub(super) fn materialize(p: &mut Process, trace: Term) -> Result<Term, VmError>
         return Ok(Term::NIL);
     }
     // The saved trace stays behind the term: the same one can be rebuilt by a later raise.
+    // A plain raw bignum is built from one temporary frame array and one heap block.
+    if let Some(result) = stacktrace::build_direct(p, trace) {
+        return result;
+    }
     match stacktrace::with_saved(trace, |raw| stacktrace::build_saved(p, raw)) {
         Some(result) => result,
         None => Ok(trace),

@@ -1284,8 +1284,7 @@ pub fn lists_member(
 ) -> Result<MemberStep, BifError> {
     if list == Term::NIL {
         return Ok(MemberStep::Done(false));
-    }
-    // SAFETY: a list tag denotes two live words. Offsets -1 and +7 are CAR/CDR.
+    } // SAFETY: a list tag denotes two live words. Offsets -1 and +7 are CAR/CDR.
     unsafe {
         let term_bits = term.raw_bits();
         let mut list_bits = list.raw_bits();
