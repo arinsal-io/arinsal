@@ -11,7 +11,8 @@ use crate::hamt::{
     HAMT_MAX_LEVEL, HEAD_ARRAY_HEADER, HxNode, boxed_object_words, cdepth, child_range,
     head_bitmap_header, leaf_key, maskval, node_bitmap_header, produce_words,
 };
-use crate::{HeapAlloc, Term, TermError, TermKind};
+use crate::{HeapAlloc, HeapBlockBuilder, Term, TermBuilder, TermError, TermKind};
+use smallvec::{SmallVec, smallvec};
 use std::cell::Cell;
 use std::cmp::Ordering;
 
@@ -32,6 +33,9 @@ thread_local! {
     /// `esdp->rand_state`: per-scheduler counter hashed by `erts_sched_local_random`.
     static RAND_STATE: Cell<u64> = const { Cell::new(0) };
 }
+
+// Port of HALLOC_EXTRA in erts/emulator/beam/erl_map.c:112, OTP-29.1.1.
+const HALLOC_EXTRA: usize = 200;
 
 // Port of erts/emulator/beam/erl_process.h:3038 (erts_sched_local_random_hash_64_to_32_shift),
 // OTP-29.1.1.
@@ -126,7 +130,7 @@ struct Partition {
 /// two recursive calls.
 struct Qsort {
     compare: NodeCompare,
-    stack: Vec<Frame>,
+    stack: SmallVec<[Frame; 8]>,
     part: Option<Partition>,
 }
 
@@ -139,7 +143,7 @@ impl Qsort {
                 SortKey::Hash => node_cmp_hash,
                 SortKey::Key => node_cmp_key,
             },
-            stack: vec![Frame { base: 0, n, seed }],
+            stack: smallvec![Frame { base: 0, n, seed }],
             part: None,
         }
     }
@@ -488,7 +492,7 @@ struct SortedUnique {
     elems: usize,
     i: usize,
     n_colliders: usize,
-    words: Vec<u64>,
+    pending: Option<HeapBlockBuilder>,
 }
 
 impl SortedUnique {
@@ -500,7 +504,7 @@ impl SortedUnique {
             elems: 1,
             i: 0,
             n_colliders: 0,
-            words: Vec::new(),
+            pending: None,
         }
     }
 
@@ -542,8 +546,10 @@ impl SortedUnique {
                         tick!(self, reds, 1, SortedPhase::JBody);
                     }
                     self.n_colliders = self.jx - self.ix;
-                    self.words.clear();
-                    self.words.push((self.n_colliders as u64) << 6);
+                    let mut builder = TermBuilder::new(heap)
+                        .reserve_boxed_words(self.n_colliders + 1, HALLOC_EXTRA)?;
+                    builder.write_header((self.n_colliders as u64) << 6)?;
+                    self.pending = Some(builder);
                     self.i = 0;
                     self.ph = SortedPhase::ForTest;
                 }
@@ -558,12 +564,19 @@ impl SortedUnique {
                     self.ph = SortedPhase::ForEnd;
                 }
                 SortedPhase::ForBody => {
-                    self.words.push(hxns[self.ix + self.i].val.bits());
+                    self.pending
+                        .as_mut()
+                        .expect("collision node allocation")
+                        .write_term(hxns[self.ix + self.i].val)?;
                     self.i += 1;
                     self.ph = SortedPhase::ForTest;
                 }
                 SortedPhase::ForEnd => {
-                    hxns[self.ix].val = produce_words(heap, &self.words)?;
+                    hxns[self.ix].val = self
+                        .pending
+                        .take()
+                        .expect("collision node allocation")
+                        .finish()?;
                     hxns[self.ix].skip = self.n_colliders;
                     self.ix = self.jx;
                     if self.ix < n {
@@ -639,8 +652,8 @@ struct Chunked {
     sz: usize,
     elems: usize,
     res: Term,
-    stack: Vec<u64>,
-    words: Vec<u64>,
+    stack: SmallVec<[u64; 16]>,
+    pending: Option<HeapBlockBuilder>,
 }
 
 impl Chunked {
@@ -662,8 +675,8 @@ impl Chunked {
             sz: 0,
             elems: 0,
             res: Term::NIL,
-            stack: Vec::new(),
-            words: Vec::new(),
+            stack: SmallVec::new(),
+            pending: None,
         }
     }
 
@@ -673,10 +686,10 @@ impl Chunked {
         dc: usize,
         res: Term,
     ) -> Result<Term, TermError> {
-        produce_words(
-            heap,
-            &[node_bitmap_header(1 << maskval(level_hash, dc)), res.bits()],
-        )
+        let mut builder = TermBuilder::new(heap).reserve_boxed_words(2, HALLOC_EXTRA)?;
+        builder.write_header(node_bitmap_header(1 << maskval(level_hash, dc)))?;
+        builder.write_term(res)?;
+        builder.finish()
     }
 
     fn pop(&mut self) -> u64 {
@@ -848,9 +861,11 @@ impl Chunked {
                     // collisions.
                     self.hdr |= 1 << self.slot;
                     self.sz = (self.hdr as u16).count_ones() as usize;
-                    self.words.clear();
-                    self.words.push(node_bitmap_header(self.hdr));
-                    self.words.push(self.res.bits());
+                    let mut builder =
+                        TermBuilder::new(heap).reserve_boxed_words(self.sz + 1, HALLOC_EXTRA)?;
+                    builder.write_header(node_bitmap_header(self.hdr))?;
+                    builder.write_term(self.res)?;
+                    self.pending = Some(builder);
                     self.sz -= 1;
                     self.ph = C::L7Test;
                 }
@@ -863,11 +878,18 @@ impl Chunked {
                 }
                 C::L7Body => {
                     let word = self.pop();
-                    self.words.push(word);
+                    self.pending
+                        .as_mut()
+                        .expect("bitmap node allocation")
+                        .write_term_bits(word)?;
                     self.ph = C::L7Test;
                 }
                 C::L6End => {
-                    self.res = produce_words(heap, &self.words)?;
+                    self.res = self
+                        .pending
+                        .take()
+                        .expect("bitmap node allocation")
+                        .finish()?;
                     // Pop the next hdr; it is pushed back if it is not needed.
                     self.hdr = self.pop();
                     self.d -= 1;
@@ -915,9 +937,11 @@ impl Chunked {
                     self.slot = maskval(self.v, self.dn);
                     self.hdr |= 1 << self.slot;
                     self.sz = (self.hdr as u16).count_ones() as usize;
-                    self.words.clear();
-                    self.words.push(node_bitmap_header(self.hdr));
-                    self.words.push(self.res.bits());
+                    let mut builder =
+                        TermBuilder::new(heap).reserve_boxed_words(self.sz + 1, HALLOC_EXTRA)?;
+                    builder.write_header(node_bitmap_header(self.hdr))?;
+                    builder.write_term(self.res)?;
+                    self.pending = Some(builder);
                     self.sz -= 1;
                     self.ph = C::L10Test;
                 }
@@ -930,11 +954,18 @@ impl Chunked {
                 }
                 C::L10Body => {
                     let word = self.pop();
-                    self.words.push(word);
+                    self.pending
+                        .as_mut()
+                        .expect("bitmap node allocation")
+                        .write_term_bits(word)?;
                     self.ph = C::L10Test;
                 }
                 C::L9End => {
-                    self.res = produce_words(heap, &self.words)?;
+                    self.res = self
+                        .pending
+                        .take()
+                        .expect("bitmap node allocation")
+                        .finish()?;
                     self.hdr = self.pop();
                     self.dn -= 1;
                     self.ph = C::L9Test;
@@ -944,14 +975,15 @@ impl Chunked {
                     self.slot = maskval(self.v, self.dn);
                     self.hdr |= 1 << self.slot;
                     self.sz = (self.hdr as u16).count_ones() as usize;
-                    self.words.clear();
-                    self.words.push(if self.hdr == 0xffff {
+                    let mut builder = TermBuilder::new(heap).reserve_boxed_words(self.sz + 2, 0)?;
+                    builder.write_header(if self.hdr == 0xffff {
                         HEAD_ARRAY_HEADER
                     } else {
                         head_bitmap_header(self.hdr)
-                    });
-                    self.words.push(self.size as u64);
-                    self.words.push(self.res.bits());
+                    })?;
+                    builder.write_header(self.size as u64)?;
+                    builder.write_term(self.res)?;
+                    self.pending = Some(builder);
                     self.sz -= 1;
                     self.ph = C::L11Test;
                 }
@@ -964,11 +996,14 @@ impl Chunked {
                 }
                 C::L11Body => {
                     let word = self.pop();
-                    self.words.push(word);
+                    self.pending
+                        .as_mut()
+                        .expect("map head allocation")
+                        .write_term_bits(word)?;
                     self.ph = C::L11Test;
                 }
                 C::RootEnd => {
-                    let root = produce_words(heap, &self.words)?;
+                    let root = self.pending.take().expect("map head allocation").finish()?;
                     debug_assert!(self.stack.is_empty());
                     return Ok(Some(root));
                 }
