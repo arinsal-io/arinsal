@@ -1103,7 +1103,11 @@ fn parse_step(
     budget: usize,
     input_complete: bool,
 ) -> Result<Option<(Term, usize)>, BifError> {
-    for _ in 0..budget {
+    // Port of erts/emulator/beam/external.c:116 (`B2T_BYTES_PER_REDUCTION` 128) and
+    // the dec_term reds loop, OTP-29.1.1. `budget` is a byte limit. A tag that
+    // starts inside the limit may finish past it; the next call then traps.
+    let byte_limit = r.at.saturating_add(budget);
+    while r.at < byte_limit {
         let tag = r.u8()?;
         let result: Option<(Term, Shape)> = match tag {
             97 | 98 => {

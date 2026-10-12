@@ -30,7 +30,7 @@ mod unicode;
 mod unique;
 
 pub use etf::{DecodeWalk, EncodeWalk};
-pub use lists::SubtractWalk;
+pub use lists::{REVERSE_CELLS_PER_RED, ReverseCont, ReverseStep, SubtractWalk, lists_reverse};
 pub use maps_bifs::maps_merge_start;
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use pure::{

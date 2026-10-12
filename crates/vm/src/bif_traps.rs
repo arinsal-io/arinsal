@@ -55,7 +55,92 @@ const MAPS_FROM_KEYS_CONTINUATION: &str = "maps:from_keys/2";
 const SUBTRACT_CONTINUATION: &str = "erlang:--/2";
 const CONTEXT_REDS: usize = 4000;
 
+/// `beam_bif_export_trap`. `BIF_TRAP` points `c_p->i` here; it is not a BEAM function, so a
+/// backtrace names it "unknown function".
+// Port of erts/emulator/beam/bif.h:316-326 (ERTS_BIF_PREP_TRAP under BEAMASM) and
+// jit/arm/beam_asm_global.cpp:145 (emit_bif_export_trap), OTP-29.1.1.
+pub(crate) fn bif_export_trap_pc() -> usize {
+    bif_export_trap as *const () as usize
+}
+
+fn bif_export_trap() {}
+
+/// A trapped BIF is scheduled out at `beam_bif_export_trap` with the caller's return
+/// address on the stack, the way `emit_enter_erlang_frame` leaves it for the export call.
+pub(crate) fn note_export_trap(process: &mut Process) {
+    let resume = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.native_retry_site)
+        .map(|(pc, _)| pc)
+        .filter(|pc| crate::native_bridge::is_native_function_at(*pc));
+    if let Some(resume) = resume {
+        let top = process
+            .heap
+            .stack_get(0)
+            .map(|word| word.tagged_word() as usize)
+            .unwrap_or(0);
+        // The export trampoline and the light-BIF trap path already pushed this CP.
+        if top != resume {
+            let _ = process.push_native_continuation(resume);
+        }
+    }
+    // `push_native_continuation` republishes the header and clears `i`.
+    process.header.i = bif_export_trap as *const u8 as *const _;
+}
+
+fn clear_export_trap(process: &mut Process) {
+    if process.header.i as usize == bif_export_trap_pc() {
+        process.header.i = std::ptr::null();
+    }
+}
+
+// Port of erts/emulator/beam/erl_bif_lists.c:1246 (lists_reverse_2), OTP-29.1.1.
+// The fill lives in `arinsal_bifs::lists_reverse` (on-heap, then alloc). This
+// handler only supplies the reduction budget and the trap state.
+fn lists_reverse(
+    process: &mut Process,
+    args: &[Term],
+    state: Option<&Arc<MagicRef>>,
+    _pid: Option<arinsal_sched::Pid>,
+    _gc_changed: bool,
+) -> Result<TrapResult, BifError> {
+    let reds = process.reductions.max(0).min(CONTEXT_REDS as i32) as usize;
+    let max_cells = reds
+        .saturating_mul(arinsal_bifs::REVERSE_CELLS_PER_RED)
+        .max(1);
+    let (list, tail) = if let Some(state) = state {
+        let saved = state
+            .downcast_ref::<Mutex<arinsal_bifs::ReverseCont>>()
+            .ok_or(BifError::BADARG)?
+            .lock()
+            .map_err(|_| BifError::SystemLimit)?;
+        (saved.list(), saved.tail())
+    } else {
+        (args[0], args[1])
+    };
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+    let step = arinsal_bifs::lists_reverse(&mut ctx, list, tail, max_cells)?;
+    let reductions = ctx.reductions();
+    Ok(match step {
+        arinsal_bifs::ReverseStep::Done(value) => TrapResult::Done { value, reductions },
+        arinsal_bifs::ReverseStep::Trap(cont) => TrapResult::Yield {
+            continuation: "lists:reverse/2",
+            state: MagicRef::new(Mutex::new(cont)),
+            reductions,
+        },
+    })
+}
+
 const ENTRIES: &[Entry] = &[
+    Entry {
+        module: "lists",
+        function: "reverse",
+        arity: 2,
+        continuation: "lists:reverse/2",
+        handler: lists_reverse,
+    },
     Entry {
         module: "erlang",
         function: "--",
@@ -671,9 +756,107 @@ pub(crate) fn execute(
 /// at the current call site (an import index, or [`APPLY_TRAP_KEY`]).
 /// Whether `module:function/arity` is a BIF that may trap to a continuation.
 pub(crate) fn traps(module: &str, function: &str, arity: u8) -> bool {
+    lookup_entry(module, function, usize::from(arity)).is_some()
+}
+
+fn lookup_entry(module: &str, function: &str, arity: usize) -> Option<&'static Entry> {
     ENTRIES
         .iter()
-        .any(|entry| entry.module == module && entry.function == function && entry.arity == arity)
+        .find(|entry| {
+            entry.module == module
+                && entry.function == function
+                && usize::from(entry.arity) == arity
+        })
+        .or_else(|| {
+            ENTRIES
+                .iter()
+                .find(|entry| continuation_is(entry.continuation, module, function, arity))
+        })
+}
+
+fn continuation_is(continuation: &str, module: &str, function: &str, arity: usize) -> bool {
+    let Some((mod_name, rest)) = continuation.split_once(':') else {
+        return false;
+    };
+    let Some((fun_name, arity_text)) = rest.rsplit_once('/') else {
+        return false;
+    };
+    mod_name == module && fun_name == function && arity_text.parse::<usize>().ok() == Some(arity)
+}
+
+/// Run the trap continuation export. `beam_bif_export_trap` does this on schedule-in:
+/// the continuation is an ordinary call, and only that call may trap again.
+pub(crate) fn run_trapped_export(
+    process: &mut Process,
+    ctx: Option<&mut arinsal_sched::RunCtx<'_, process::Message>>,
+) -> Option<Result<TrapResult, VmError>> {
+    let (module, function, arity) = {
+        let pending = process.cold.as_ref()?.bif_trap.as_ref()?;
+        let (module, function, arity) = continuation_parts(pending.continuation)?;
+        (module.to_owned(), function.to_owned(), arity)
+    };
+    let args = [
+        process.x.first().copied().unwrap_or(Term::NIL),
+        process.x.get(1).copied().unwrap_or(Term::NIL),
+        process.x.get(2).copied().unwrap_or(Term::NIL),
+    ];
+    execute_named(
+        process,
+        &module,
+        &function,
+        bif_export_trap_pc(),
+        arity,
+        args,
+        ctx,
+    )
+}
+
+fn continuation_parts(continuation: &str) -> Option<(&str, &str, usize)> {
+    let (module, rest) = continuation.split_once(':')?;
+    let (function, arity_text) = rest.rsplit_once('/')?;
+    Some((module, function, arity_text.parse().ok()?))
+}
+
+/// The BIF a trap error is blamed on. `ERTS_BIF_ERROR_TRAPPED` names `sp->bif`, the
+/// export that first trapped, not the continuation that was running when it failed.
+fn original_trap_report(
+    process: &Process,
+    module_name: &str,
+    function_name: &str,
+    arity: usize,
+    continuation_resume: bool,
+) -> (String, String, usize) {
+    if continuation_resume
+        && let Some(pending) = process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.bif_trap.as_ref())
+    {
+        let module = global_atoms()
+            .text(pending.callee.0)
+            .unwrap_or(module_name)
+            .to_owned();
+        let function = global_atoms()
+            .text(pending.callee.1)
+            .unwrap_or(function_name)
+            .to_owned();
+        return (module, function, pending.arity);
+    }
+    (module_name.to_owned(), function_name.to_owned(), arity)
+}
+
+/// Point `c_p->i` at `beam_bif_export_trap` and record the continuation export's arity.
+pub(crate) fn arm_export_trap(process: &mut Process) {
+    if let Some(arity) = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .and_then(|pending| continuation_parts(pending.continuation))
+        .map(|(_, _, arity)| arity)
+    {
+        process.header.arity = arity as u8;
+    }
+    process.header.i = bif_export_trap as *const u8 as *const _;
 }
 
 pub(crate) fn execute_named(
@@ -696,8 +879,17 @@ pub(crate) fn execute_named(
                 pending.import == import,
             )
         });
-    let pending_matches = pending_site == Some((true, true));
-    if pending_site.is_some_and(|(same_site, _)| !same_site) {
+    // The continuation export is an ordinary call of its own MFA. It is not a retry of
+    // the call site that first trapped, so the site check does not name it.
+    let continuation_resume = process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.bif_trap.as_ref())
+        .is_some_and(|pending| {
+            continuation_is(pending.continuation, module_name, function_name, arity)
+        });
+    let pending_matches = pending_site == Some((true, true)) || continuation_resume;
+    if pending_site.is_some_and(|(same_site, _)| !same_site) && !continuation_resume {
         // A trap continuation belongs to exactly one interrupted call. An
         // exception can redirect control without re-entering that call, so
         // discard its state before dispatching a call from another site. The
@@ -713,11 +905,7 @@ pub(crate) fn execute_named(
     {
         return None;
     }
-    let entry = ENTRIES.iter().find(|entry| {
-        entry.module == module_name
-            && entry.function == function_name
-            && usize::from(entry.arity) == arity
-    });
+    let entry = lookup_entry(module_name, function_name, arity);
     let pending = pending_matches
         .then(|| {
             process
@@ -771,39 +959,61 @@ pub(crate) fn execute_named(
         process.set_gc_enabled(false);
     }
     let resumed = state.is_some();
-    let result = handler(process, &args[..arity], state.as_ref(), pid, gc_was_enabled);
+    // The continuation export has its own arity (binary_copy_trap/3, binary_to_term_trap/1).
+    // The handler still sees the original BIF's arguments, which the trap state kept.
+    let call_arity = if resumed {
+        process
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.bif_trap.as_ref())
+            .map(|pending| pending.arity)
+            .unwrap_or(arity)
+    } else {
+        arity
+    };
+    let result = handler(
+        process,
+        &args[..call_arity.min(args.len())],
+        state.as_ref(),
+        pid,
+        gc_was_enabled,
+    );
+    // Captured before the match drops the trap state. A continuation failure is still
+    // the original BIF's error (erl_iolist.c ERTS_BIF_ERROR_TRAPPED1(c_p, reason, sp->bif, sp->arg)).
+    let report = original_trap_report(
+        process,
+        module_name,
+        function_name,
+        arity,
+        continuation_resume,
+    );
     Some(match result {
         Err(error) => {
             process.cold_mut().bif_trap = None;
+            clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             // Re-enabling GC may collect: the X registers, not the copies, hold the live
             // arguments.
-            let args = call_args(process, &args, arity, resumed);
+            let args = call_args(process, &args, report.2, resumed);
             Err(exceptions::bif_error(
-                process,
-                module_name,
-                function_name,
-                &args,
-                error,
+                process, &report.0, &report.1, &args, error,
             ))
         }
         Ok(TrapResult::Done { value, reductions }) => {
             process.cold_mut().bif_trap = None;
+            clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
             Ok(TrapResult::Done { value, reductions })
         }
         Ok(TrapResult::Failed { error, reductions }) => {
             process.cold_mut().bif_trap = None;
+            clear_export_trap(process);
             process.set_gc_enabled(gc_was_enabled);
             charge(process, ctx, reductions);
-            let args = call_args(process, &args, arity, resumed);
+            let args = call_args(process, &args, report.2, resumed);
             Err(exceptions::bif_error(
-                process,
-                module_name,
-                function_name,
-                &args,
-                error,
+                process, &report.0, &report.1, &args, error,
             ))
         }
         Ok(TrapResult::Yield {
@@ -821,6 +1031,26 @@ pub(crate) fn execute_named(
             {
                 process.set_gc_enabled(false);
             }
+            // A later slice of the continuation must keep blaming the BIF that trapped,
+            // not the continuation export that is running now.
+            let (callee, trap_arity) = if resumed {
+                process
+                    .cold
+                    .as_ref()
+                    .and_then(|cold| cold.bif_trap.as_ref())
+                    .map(|pending| (pending.callee, pending.arity))
+                    .expect("resumed trap")
+            } else {
+                (
+                    (
+                        global_atoms().intern(module_name).expect("BIF module atom"),
+                        global_atoms()
+                            .intern(function_name)
+                            .expect("BIF function atom"),
+                    ),
+                    arity,
+                )
+            };
             process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
                 caller_module: process.module,
                 caller_ip: process.ip,
@@ -829,13 +1059,8 @@ pub(crate) fn execute_named(
                 continuation,
                 state,
                 gc_was_enabled,
-                arity,
-                callee: (
-                    global_atoms().intern(module_name).expect("BIF module atom"),
-                    global_atoms()
-                        .intern(function_name)
-                        .expect("BIF function atom"),
-                ),
+                arity: trap_arity,
+                callee,
                 args: if resumed {
                     args
                 } else {
@@ -1414,7 +1639,9 @@ fn binary_to_term(
     restore_gc: bool,
 ) -> Result<TrapResult, BifError> {
     const BYTES_PER_REDUCTION: usize = 128;
-    let chunk_bytes = (process.reductions.max(0) as usize).saturating_mul(BYTES_PER_REDUCTION);
+    // Port of erts/emulator/beam/external.c:116 (B2T_BYTES_PER_REDUCTION), OTP-29.1.1.
+    let reds = (process.reductions.max(0) as usize).max(1);
+    let chunk_bytes = reds.saturating_mul(BYTES_PER_REDUCTION);
     if let Some(state) = state {
         let state = Arc::clone(state);
         let decoder = state

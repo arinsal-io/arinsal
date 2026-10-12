@@ -1224,8 +1224,9 @@ fn call_trap_bif(
                 process.module,
                 process.ip,
             );
-            process.header.arity = export.arity;
-            process.header.i = identity as *const u8 as *const _;
+            // BIF_TRAP sets c_p->i to beam_bif_export_trap. The fragment loads that
+            // address and context-switches; schedule-in calls the continuation export.
+            crate::bif_traps::arm_export_trap(process);
             process.header.freason = 1 << 10;
             process.sync_native_header();
             None
