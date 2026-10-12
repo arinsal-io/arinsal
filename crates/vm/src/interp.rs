@@ -1701,7 +1701,13 @@ impl Vm {
         let ctx = ctx
             .as_deref_mut()
             .ok_or_else(|| VmError::Unsupported("receive requires a scheduler".into()))?;
-        process.drain(ctx)?;
+        // erts reaches `wait` from `loop_rec` with the message queue lock held: nothing can
+        // arrive in between. Here signals that arrived since (or are left in the middle queue)
+        // send the process back to `loop_rec`, whose receive helper handles them.
+        process.fetch_signals(ctx)?;
+        if !process.sig_cont_empty() {
+            return Ok(false);
+        }
         Ok(process.receive_cursor >= process.inbox.len())
     }
 
@@ -3729,11 +3735,25 @@ impl Vm {
                     // Port of erts/emulator/beam/emu/msg_instrs.tab:84 (i_loop_rec runs
                     // signal handling with `c_p->arity = 0`), OTP-29.1.1.
                     p.gc_live = 0;
-                    let ctx = ctx.as_deref_mut().ok_or_else(|| {
-                        VmError::Unsupported("receive requires a scheduler".into())
-                    })?;
-                    p.drain(ctx)?;
-                    (htop, stop) = p.heap.heap_cursor();
+                    // Port of erts/emulator/beam/emu/msg_instrs.tab:76-110, OTP-29.1.1: at the
+                    // end of the message queue the receive helper fetches and handles signals.
+                    if p.inbox.get(p.receive_cursor).is_none() {
+                        let ctx = ctx.as_deref_mut().ok_or_else(|| {
+                            VmError::Unsupported("receive requires a scheduler".into())
+                        })?;
+                        let fcalls = ctx.remaining().min(budget - consumed) as i32;
+                        let (used, outcome) = p.receive_helper(ctx, fcalls)?;
+                        let used = used.max(0) as u32;
+                        consumed = consumed.saturating_add(used).min(budget);
+                        ctx.consume(used);
+                        (htop, stop) = p.heap.heap_cursor();
+                        if outcome == process::ReceiveHelper::Yield {
+                            // `goto loop_rec__`: schedule out at this `loop_rec`.
+                            p.delay_gc = false;
+                            p.force_yield = true;
+                            continue;
+                        }
+                    }
                     if !p.loop_rec(dst)? {
                         // SAFETY: The label was resolved within this code allocation.
                         ip = unsafe { base.add(empty as usize) };
@@ -3799,9 +3819,6 @@ impl Vm {
                     let remaining = match p.wait_timeout(value) {
                         Ok(remaining) => remaining,
                         Err(error) => {
-                            if let Some(ctx) = ctx.as_deref_mut() {
-                                ctx.reset_save();
-                            }
                             return Err(error);
                         }
                     };
@@ -3826,11 +3843,6 @@ impl Vm {
                         crate::trace::timeout_event(Some(self), p, ctx);
                     }
                     p.timeout();
-                    if let Some(ctx) = ctx.as_deref_mut() {
-                        // Port of erts/emulator/beam/erl_proc_sig_queue.h:2331
-                        // (`erts_msgq_set_save_first`), OTP-29.1.1.
-                        ctx.reset_save();
-                    }
                 }
                 Instr::IsTaggedTuple {
                     fail,
@@ -3965,46 +3977,24 @@ impl Vm {
                         VmError::Unsupported("receive marker requires scheduler".into())
                     })?;
                     // Port of erts/emulator/beam/erl_proc_sig_queue.h:2226
-                    // (erts_msgq_recv_marker_insert), OTP-29.1.1.
-                    let scheduler_marker = ctx.recv_marker_reserve();
-                    p.drain_before_marker(ctx, scheduler_marker)?;
-                    let marker = p.reserve_scheduled_receive_marker(scheduler_marker)?;
+                    // (erts_msgq_recv_marker_insert), OTP-29.1.1: fetch the outer signal
+                    // queue, then insert the marker after everything fetched.
+                    p.fetch_signals(ctx)?;
+                    let marker = p.reserve_receive_marker()?;
                     p.write(dst, marker)?;
                 }
                 Instr::RecvMarkerBind { marker, reference } => {
                     let marker = p.read(marker)?;
                     let reference = p.read(reference)?;
-                    if let Some(marker) = p.bind_receive_marker(marker, reference)
-                        && let Some(reference) = crate::signals::ref_id(reference)
-                    {
-                        ctx.as_deref_mut()
-                            .ok_or_else(|| {
-                                VmError::Unsupported("receive marker requires scheduler".into())
-                            })?
-                            .recv_marker_bind(marker, reference);
-                    }
+                    p.bind_receive_marker(marker, reference);
                 }
                 Instr::RecvMarkerClear { reference } => {
                     let reference = p.read(reference)?;
                     p.clear_receive_marker(reference);
-                    if let Some(reference) = crate::signals::ref_id(reference) {
-                        ctx.as_deref_mut()
-                            .ok_or_else(|| {
-                                VmError::Unsupported("receive marker requires scheduler".into())
-                            })?
-                            .recv_marker_clear(reference);
-                    }
                 }
                 Instr::RecvMarkerUse { reference } => {
                     let reference = p.read(reference)?;
                     p.use_receive_marker(reference);
-                    if let Some(reference) = crate::signals::ref_id(reference) {
-                        ctx.as_deref_mut()
-                            .ok_or_else(|| {
-                                VmError::Unsupported("receive marker requires scheduler".into())
-                            })?
-                            .recv_marker_use(reference);
-                    }
                 }
                 Instr::Unsupported(reason) => {
                     if module.unsupported_reasons[reason as usize] == "opcode on_load" {

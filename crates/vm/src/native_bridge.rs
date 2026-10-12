@@ -1028,10 +1028,8 @@ pub fn run_native(
     process.header.ftrace = (registers as *mut SchedulerRegisters).cast();
     registers.tmp_mem[3] = 0;
     process.heap.set_native_allocation(true);
-    // Port of erts/emulator/beam/erl_process.c:10180 (erts_schedule sets esdp->current_process when
-    // the process is scheduled in), OTP-29.1.1: the BIFs and NIF services native code calls
-    // find their scheduler through the hub installed once per slice, not on every call.
-    crate::natives::nif::refresh_hub_native(process);
+    // The scheduler set `esdp->current_process` when it scheduled the process in
+    // (Executor::run), so the NIF services native code calls already see this process.
     if crate::native_bridge::lifetime_trace_enabled() {
         eprintln!(
             "[beamasm-lifetime] enter code={code_address:#x} owner={}",

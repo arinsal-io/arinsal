@@ -1326,15 +1326,13 @@ fn dirty_process_handle_signals(
         return Ok(atom("false"));
     };
     let result = ctx.handle_dirty_signals(pid, &mut |task, target_ctx| {
-        if let Some(target) = task.downcast_mut::<Process>() {
-            target.handle_dirty_signals(vm, target_ctx);
-        }
+        task.downcast_mut::<Process>()
+            .is_none_or(|target| target.handle_dirty_signals(vm, target_ctx))
     });
     Ok(atom(match result {
         arinsal_sched::DirtySignals::NoProc => "noproc",
         arinsal_sched::DirtySignals::Normal => "normal",
         arinsal_sched::DirtySignals::More => "more",
-        // erts handles every queued signal within the reduction budget; so does `drain`.
         arinsal_sched::DirtySignals::Idle | arinsal_sched::DirtySignals::Handled => "ok",
     }))
 }
@@ -2075,23 +2073,12 @@ fn call_resolved(
                         return Err(VmError::Unsupported(format!("monitor: {error}")));
                     }
                     // The target stopped accepting monitor signals before this request.
-                    let reason = atom("noproc");
-                    let object = monitor_object(process, name.as_deref(), *target)?;
-                    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-                    let down = TermBuilder::new(&mut heap)
-                        .tuple(&[tag, ref_term, atom("process"), object, reason])
-                        .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
-                    process.inbox.push_back(down);
+                    send_noproc_down(process, ctx, id, name.as_deref(), Some(pid), *target, tag)?;
                 } else {
                     rt.update_published_monitored_by(pid, ctx.pid(), id, true);
                 }
             } else {
-                let object = monitor_object(process, name.as_deref(), *target)?;
-                let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-                let down = TermBuilder::new(&mut heap)
-                    .tuple(&[tag, ref_term, atom("process"), object, atom("noproc")])
-                    .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
-                process.inbox.push_back(down);
+                send_noproc_down(process, ctx, id, name.as_deref(), pid, *target, tag)?;
             }
             Ok(ref_term)
         }
@@ -3285,6 +3272,54 @@ fn monitor_options(args: &[Term]) -> Result<(Term, bool, bool), VmError> {
 }
 
 /// The object of a local process monitor's `DOWN`: `{Name, node()}` for a name, else the pid.
+/// The `noproc` DOWN of a monitor whose target does not exist. It is a monitor-down signal
+/// to the monitoring process itself, so it queues behind the signals sent before it and
+/// enters the message queue after a receive marker reserved before the monitor call.
+// Port of erts/emulator/beam/bif.c:790-823 (monitor: erts_proc_sig_send_monitor_down with
+// am_noproc), OTP-29.1.1.
+fn send_noproc_down(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    id: u64,
+    name: Option<&str>,
+    target_pid: Option<Pid>,
+    target: Term,
+    tag: Term,
+) -> Result<(), VmError> {
+    // A named target is reported by name; the signal sender is then irrelevant.
+    let from = target_pid.or_else(|| name.map(|_| ctx.pid()));
+    if let Some(from) = from
+        && let Some(runtime) = process.runtime.clone()
+    {
+        let cold = process.cold_mut();
+        cold.monitors.insert(id, from);
+        if let Some(name) = name {
+            cold.monitor_names.insert(id, name.to_owned());
+        }
+        let reason = Message::copy_from(atom("noproc"))?;
+        return runtime
+            .scheduler()?
+            .signal(
+                from,
+                ctx.pid(),
+                Signal::MonitorDown {
+                    reference: id,
+                    reason,
+                },
+            )
+            .map_err(|error| VmError::Unsupported(format!("monitor: {error}")));
+    }
+    // A pid of another incarnation of this node: no local sender to report it.
+    let object = monitor_object(process, name, target)?;
+    let reference = reference(process, id)?;
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let down = TermBuilder::new(&mut heap)
+        .tuple(&[tag, reference, atom("process"), object, atom("noproc")])
+        .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
+    process.inbox.push_back(down);
+    Ok(())
+}
+
 pub(crate) fn monitor_object(
     process: &mut Process,
     name: Option<&str>,

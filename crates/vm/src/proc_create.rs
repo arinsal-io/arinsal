@@ -172,6 +172,12 @@ pub struct Process {
     /// `F_HIBERNATED`: the heap holds exactly the live data of a hibernated process.
     pub(crate) hibernated: bool,
     pub(crate) inbox: process::MessageQueue,
+    /// `sig_qs.cont`: signals fetched from the outer queue and not handled yet.
+    /// Port of erts/emulator/beam/erl_process.h (ErtsSignalInQueue `sig_qs`), OTP-29.1.1.
+    pub(crate) sig_cont: std::collections::VecDeque<arinsal_sched::Event<crate::process::Message>>,
+    /// Signals taken from the front of `sig_cont` so far; receive markers inserted into the
+    /// middle queue are positioned by it.
+    pub(crate) sig_cont_taken: u64,
     pub(crate) receive_cursor: usize,
     pub(crate) receive_deadline: Option<std::time::Instant>,
     pub(crate) receive_deadline_ms: Option<u64>,
@@ -746,11 +752,10 @@ pub(crate) struct ProcessCold {
     pub(crate) native_wait_self: bool,
     /// Native `loop_rec` scheduled out so the scheduler fetches the outer signal queue.
     pub(crate) native_signal_fetch: bool,
+    /// Native `recv_marker_reserve` exited for the scheduler to fetch the outer signal queue.
+    pub(crate) native_reserve_fetch: bool,
     /// The process's outer signal queue: native `loop_rec` probes it and fetches messages.
     pub(crate) signal_probe: Option<arinsal_sched::SignalProbe<crate::process::Message>>,
-    /// The scheduler-side private queue was empty when native code was entered, so native
-    /// `loop_rec` may fetch messages from the outer queue in place.
-    pub(crate) native_inline_fetch: bool,
     /// The last slice ended because the process is suspended, not because it waits in a
     /// receive: it stays active (runnable once resumed).
     pub(crate) suspend_parked: bool,
@@ -1163,6 +1168,8 @@ impl Process {
             scheduler_ref_state: None,
             hibernated: false,
             inbox: process::MessageQueue::default(),
+            sig_cont: std::collections::VecDeque::new(),
+            sig_cont_taken: 0,
             receive_cursor: 0,
             receive_deadline: None,
             receive_deadline_ms: None,
