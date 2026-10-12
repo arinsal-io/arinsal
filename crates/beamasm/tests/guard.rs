@@ -814,6 +814,48 @@ fn native_is_ne_exact() {
     );
 }
 #[test]
+fn unequal_immediates_skip_the_compare_helper() {
+    let fixture = terms();
+    let alpha = fixture
+        .values
+        .iter()
+        .find(|(name, _)| *name == "atom")
+        .unwrap()
+        .1;
+    let beta = Term::atom(global_atoms().intern("guard_beta").unwrap());
+    native_guard(
+        |a| a.emit_is_eq(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
+        alpha,
+        beta,
+        false,
+    );
+    native_guard(
+        |a| a.emit_is_ne(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
+        alpha,
+        beta,
+        true,
+    );
+    native_guard(
+        |a| a.emit_is_eq_exact(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
+        alpha,
+        beta,
+        false,
+    );
+    native_guard(
+        |a| a.emit_is_ne_exact(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
+        alpha,
+        beta,
+        true,
+    );
+    native_guard(
+        |a| a.emit_is_eq(ArgVal::X(0), ArgVal::X(1), 2, exploding_helper),
+        alpha,
+        alpha,
+        true,
+    );
+}
+
+#[test]
 fn native_is_eq() {
     let f = terms();
     native_guard(

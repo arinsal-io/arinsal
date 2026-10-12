@@ -867,17 +867,34 @@ impl BeamModuleAssembler {
         self.code.emit(|e| e.mov_reg(Gpr::x(12), right))?;
         self.code
             .emit(|e| e.cmp_reg(Gpr::x(11), Gpr::x(12), arinsal_a64::enc::Shift::Lsl, 0))?;
-        let slow = self.code.new_label();
         let done = self.code.new_label();
+        let fail_label = self.label(fail);
         if equal_result {
-            self.code.b_cond(Cond::Ne, slow)?;
-            self.code.b(done)?;
+            // Same word: == and =:= both succeed.
+            self.code.b_cond(Cond::Eq, done)?;
         } else {
-            let fail_label = self.label(fail);
+            // Same word: /= and =/= both fail.
             self.code.b_cond(Cond::Eq, fail_label)?;
-            self.code.b(slow)?;
         }
-        self.code.bind(slow)?;
+        // Port of erts/emulator/beam/jit/arm/beam_asm.hpp:1941-1955
+        // (emit_are_both_immediate) and instr_common.cpp:2064-2071, OTP-29.1.1.
+        // Two immediates that are not the same word are neither == nor =:=
+        // (1 == 1.0 stays on the helper path: a float is boxed).
+        let both = Shifted {
+            reg: Gpr::x(12),
+            shift: arinsal_a64::enc::Shift::Lsl,
+            amount: 0,
+        };
+        self.code.emit(|e| {
+            e.and_reg(Gpr::x(8), Gpr::x(11), both)?;
+            e.and_imm(Gpr::x(8), Gpr::x(8), 3)?;
+            e.cmp_imm(Gpr::x(8), 3, false)
+        })?;
+        if equal_result {
+            self.code.b_cond(Cond::Eq, fail_label)?;
+        } else {
+            self.code.b_cond(Cond::Eq, done)?;
+        }
         self.emit_guard_helper(op, lhs, rhs, fail, runtime)?;
         self.code.bind(done)?;
         Ok(())
