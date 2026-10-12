@@ -16,6 +16,7 @@ const CASES: &[&str] = &[
     "transit",
     "transit_info",
     "tail_queued",
+    "gc_queued",
 ];
 
 const SOURCE: &str = r#"-module(demonitor_flush_trap).
@@ -49,7 +50,17 @@ run(Case) ->
             P ! stop,
             wait_down(M),
             Self ! last,
-            tail_demonitor(M)
+            tail_demonitor(M);
+        gc_queued ->
+            P ! stop,
+            wait_down(M),
+            %% Many queued messages and a large live heap: collections run while the flush
+            %% is trapped and while it receives, so the trapped arguments must be roots.
+            [Self ! {filler, N} || N <- lists:seq(1, 3000)],
+            Live = [{live, N, lists:seq(1, 40)} || N <- lists:seq(1, 4000)],
+            Last = length(Live),
+            R2 = erlang:demonitor(M, [flush]),
+            {R2, Last}
     end,
     {R, messages(), Keep}.
 

@@ -1137,11 +1137,12 @@ pub(crate) fn run_trapped_export(
     // arguments), OTP-29.1.1.
     if lookup_entry(&module, &function, arity).is_none() {
         let pending = process.cold_mut().bif_trap.take()?;
-        process.set_gc_enabled(pending.gc_was_enabled);
         clear_export_trap(process);
+        // The arguments are the live X registers the trap left (erts BIF_TRAPn, reg[0..n]).
+        let args = process.x[..pending.arity].to_vec();
         return Some(Ok(ResumeResult::Export(crate::ExportTrap {
             continuation: pending.continuation,
-            args: pending.args[..pending.arity].to_vec(),
+            args,
         })));
     }
     let args = [
@@ -1173,10 +1174,16 @@ pub(crate) fn install_export_trap(
 ) {
     let arity = trap.args.len();
     assert!(arity <= 3, "BIF traps pass at most three arguments");
-    let mut saved = [Term::NIL; 3];
-    saved[..arity].copy_from_slice(&trap.args);
+    // erts BIF_TRAPn writes the arguments to reg[0..n] and sets c_p->arity: they are the live
+    // X registers of the export call, rooted like any other. GC stays enabled while trapped.
+    if process.x.len() < arity {
+        let mut registers = process.x.to_vec();
+        registers.resize(arity, Term::NIL);
+        process.x = registers.into();
+    }
+    process.x[..arity].copy_from_slice(&trap.args);
+    process.gc_live = arity;
     let gc_was_enabled = process.heap.gc_enabled;
-    process.set_gc_enabled(false);
     process.cold_mut().bif_trap = Some(crate::proc_create::BifTrapPending {
         caller_module: process.module,
         caller_ip: process.ip,
@@ -1187,7 +1194,8 @@ pub(crate) fn install_export_trap(
         gc_was_enabled,
         arity,
         callee,
-        args: saved,
+        // Export traps keep their arguments in X; this field is for BIF continuations only.
+        args: [Term::NIL; 3],
     });
 }
 
@@ -2533,4 +2541,52 @@ fn finish_processes(
         value,
         reductions: spent,
     })
+}
+
+#[cfg(test)]
+mod export_trap_tests {
+    use super::*;
+    use arinsal_etf::OwnedTerm;
+
+    /// A collection between the trap and its resume must keep the trapped arguments: they are
+    /// live X registers now, not state that is only valid while GC is disabled.
+    #[test]
+    fn export_trap_arguments_survive_a_collection_while_trapped() {
+        let mut process = Process::new();
+        let tuple = TermBuilder::new(&mut process.heap)
+            .tuple(&[Term::small(7).unwrap(), Term::small(8).unwrap()])
+            .unwrap();
+        let false_atom = Term::atom(global_atoms().intern("false").unwrap());
+        let true_atom = Term::atom(global_atoms().intern("true").unwrap());
+        let trap = crate::ExportTrap {
+            continuation: "erts_internal:flush_monitor_messages/3",
+            args: vec![tuple, false_atom, true_atom],
+        };
+        let callee = (
+            global_atoms().intern("erlang").unwrap(),
+            global_atoms().intern("demonitor").unwrap(),
+        );
+        install_export_trap(&mut process, 0, callee, &trap);
+        assert!(process.heap.gc_enabled, "export traps keep GC enabled");
+
+        // A collection while the process is scheduled out: the live X registers are the roots.
+        process
+            .collect_heap_roots(process.gc_live, &mut [], 0)
+            .unwrap();
+
+        let Some(Ok(ResumeResult::Export(resumed))) = run_trapped_export(&mut process, None) else {
+            panic!("the export trap resumes as an export call");
+        };
+        assert_eq!(
+            resumed.continuation,
+            "erts_internal:flush_monitor_messages/3"
+        );
+        assert_eq!(
+            arinsal_term::to_owned(resumed.args[0]).unwrap(),
+            OwnedTerm::Tuple(vec![OwnedTerm::Int(7), OwnedTerm::Int(8)])
+        );
+        assert_eq!(resumed.args[1], false_atom);
+        assert_eq!(resumed.args[2], true_atom);
+        assert!(process.cold.as_ref().is_none_or(|c| c.bif_trap.is_none()));
+    }
 }
