@@ -16,14 +16,19 @@ use smallvec::{SmallVec, smallvec};
 use std::ops::{Deref, DerefMut};
 
 use crate::pure::{Heap, integer, make_list, tuple_build};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    let f: BifFn = match (module, name, arity) {
-        ("erlang", "term_to_binary", 1 | 2) => term_to_binary,
-        ("erlang", "term_to_iovec", 1 | 2) => term_to_iovec,
-        ("erlang", "external_size", 1 | 2) => external_size,
-        ("erlang", "binary_to_term", 1 | 2) => binary_to_term,
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
+    let f = match (module, name, arity) {
+        ("erlang", "term_to_binary", 1 | 2) => v.entry::<bodies::term_to_binary>(),
+        ("erlang", "term_to_iovec", 1 | 2) => v.entry::<bodies::term_to_iovec>(),
+        ("erlang", "external_size", 1 | 2) => v.entry::<bodies::external_size>(),
+        ("erlang", "binary_to_term", 1 | 2) => v.entry::<bodies::binary_to_term>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -1788,3 +1793,5 @@ mod map_sort_tests {
         assert_eq!(keys, (0..33).collect::<Vec<_>>());
     }
 }
+
+crate::bif_bodies!(term_to_binary, term_to_iovec, external_size, binary_to_term,);

@@ -6,7 +6,7 @@ use std::time::Instant;
 use arinsal_term::{Term, TermBuilder, global_atoms};
 
 use crate::pure::{Heap, atom_name, tuple_build};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
 static PERF_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static EMU_FLAVOR_JIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -16,13 +16,18 @@ pub fn set_emu_flavor_jit(jit: bool) {
     EMU_FLAVOR_JIT.store(jit, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
     let f = match (module, name, arity) {
-        ("erlang", "system_info", 1) => system_info,
-        ("erts_internal", "no_aux_work_threads", 0) => no_aux_work_threads,
-        ("os", "getenv", 1) => getenv,
-        ("os", "getpid", 0) => getpid,
-        ("os", "perf_counter", 0) => perf_counter,
+        ("erlang", "system_info", 1) => v.entry::<bodies::system_info>(),
+        ("erts_internal", "no_aux_work_threads", 0) => v.entry::<bodies::no_aux_work_threads>(),
+        ("os", "getenv", 1) => v.entry::<bodies::getenv>(),
+        ("os", "getpid", 0) => v.entry::<bodies::getpid>(),
+        ("os", "perf_counter", 0) => v.entry::<bodies::perf_counter>(),
         _ => return None,
     };
     if module == "os" || arinsal_spec::bif_lookup(module, name, arity).is_some() {
@@ -297,3 +302,11 @@ pub extern "C" fn sys_perf_counter() -> u64 {
 fn perf_counter(ctx: &mut Ctx<'_>, _args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, sys_perf_counter())
 }
+
+crate::bif_bodies!(
+    system_info,
+    no_aux_work_threads,
+    getenv,
+    getpid,
+    perf_counter,
+);

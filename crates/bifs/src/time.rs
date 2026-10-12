@@ -10,7 +10,7 @@ use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 
 use crate::pure::{Heap, atom_name, bigint, tuple_arity, tuple_build, tuple_element};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
 const NATIVE: i128 = 1_000_000_000;
 static START: OnceLock<Instant> = OnceLock::new();
@@ -22,24 +22,37 @@ pub fn initialize_time_origin() {
     START.get_or_init(Instant::now);
 }
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
     // `convert_time_unit/3` is an erlang.erl wrapper, absent from bif.tab.
     if (module, name, arity) == ("erlang", "convert_time_unit", 3) {
-        return Some(convert_time_unit);
+        return Some(v.entry::<bodies::convert_time_unit>());
     }
-    let f: BifFn = match (module, name, arity) {
-        ("erlang", "monotonic_time", 0 | 1) => monotonic_time,
-        ("erlang", "time_offset", 0 | 1) => time_offset,
-        ("erlang", "timestamp", 0) | ("os", "timestamp", 0) => timestamp,
-        ("erlang", "now", 0) => now,
-        ("erlang", "time", 0) => time,
-        ("erlang", "date", 0) => date,
-        ("erlang", "localtime", 0) => localtime,
-        ("erlang", "universaltime", 0) => universaltime,
-        ("erlang", "universaltime_to_localtime", 1) => universaltime_to_localtime,
-        ("erlang", "localtime_to_universaltime", 2) => localtime_to_universaltime,
-        ("erlang", "universaltime_to_posixtime", 1) => universaltime_to_posixtime,
-        ("erlang", "posixtime_to_universaltime", 1) => posixtime_to_universaltime,
+    let f = match (module, name, arity) {
+        ("erlang", "monotonic_time", 0 | 1) => v.entry::<bodies::monotonic_time>(),
+        ("erlang", "time_offset", 0 | 1) => v.entry::<bodies::time_offset>(),
+        ("erlang", "timestamp", 0) | ("os", "timestamp", 0) => v.entry::<bodies::timestamp>(),
+        ("erlang", "now", 0) => v.entry::<bodies::now>(),
+        ("erlang", "time", 0) => v.entry::<bodies::time>(),
+        ("erlang", "date", 0) => v.entry::<bodies::date>(),
+        ("erlang", "localtime", 0) => v.entry::<bodies::localtime>(),
+        ("erlang", "universaltime", 0) => v.entry::<bodies::universaltime>(),
+        ("erlang", "universaltime_to_localtime", 1) => {
+            v.entry::<bodies::universaltime_to_localtime>()
+        }
+        ("erlang", "localtime_to_universaltime", 2) => {
+            v.entry::<bodies::localtime_to_universaltime>()
+        }
+        ("erlang", "universaltime_to_posixtime", 1) => {
+            v.entry::<bodies::universaltime_to_posixtime>()
+        }
+        ("erlang", "posixtime_to_universaltime", 1) => {
+            v.entry::<bodies::posixtime_to_universaltime>()
+        }
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -409,3 +422,19 @@ fn calendar_from_tm(value: tm) -> Calendar {
         second: value.tm_sec as u32,
     }
 }
+
+crate::bif_bodies!(
+    monotonic_time,
+    time_offset,
+    timestamp,
+    now,
+    time,
+    date,
+    localtime,
+    universaltime,
+    universaltime_to_localtime,
+    localtime_to_universaltime,
+    universaltime_to_posixtime,
+    posixtime_to_universaltime,
+    convert_time_unit,
+);

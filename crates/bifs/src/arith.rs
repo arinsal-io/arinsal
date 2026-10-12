@@ -3,34 +3,39 @@
 use arinsal_arith::{self, ArithError};
 use arinsal_term::{Term, global_atoms};
 
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    let f: BifFn = match (module, name, arity) {
-        ("erlang", "+", 2) => add,
-        ("erlang", "-", 2) => sub,
-        ("erlang", "*", 2) => mul,
-        ("erlang", "/", 2) => fdiv,
-        ("erlang", "div", 2) => int_div,
-        ("erlang", "rem", 2) => rem,
-        ("erlang", "band", 2) => band,
-        ("erlang", "bor", 2) => bor,
-        ("erlang", "bxor", 2) => bxor,
-        ("erlang", "bsl", 2) => bsl,
-        ("erlang", "bsr", 2) => bsr,
-        ("erlang", "bnot", 1) => bnot,
-        ("erlang", "-", 1) => neg,
-        ("erlang", "+", 1) => plus,
-        ("erlang", "abs", 1) => abs,
-        ("erlang", "float", 1) => to_float,
-        ("erlang", "trunc", 1) => trunc,
-        ("erlang", "round", 1) => round,
-        ("erlang", "ceil", 1) => ceil,
-        ("erlang", "floor", 1) => floor,
-        ("erlang", "integer_to_list", 1 | 2) => integer_to_list,
-        ("erlang", "integer_to_binary", 1 | 2) => integer_to_binary,
-        ("erts_internal", "list_to_integer", 2) => list_to_integer,
-        ("erts_internal", "binary_to_integer", 2) => binary_to_integer,
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
+    let f = match (module, name, arity) {
+        ("erlang", "+", 2) => v.entry::<bodies::add>(),
+        ("erlang", "-", 2) => v.entry::<bodies::sub>(),
+        ("erlang", "*", 2) => v.entry::<bodies::mul>(),
+        ("erlang", "/", 2) => v.entry::<bodies::fdiv>(),
+        ("erlang", "div", 2) => v.entry::<bodies::int_div>(),
+        ("erlang", "rem", 2) => v.entry::<bodies::rem>(),
+        ("erlang", "band", 2) => v.entry::<bodies::band>(),
+        ("erlang", "bor", 2) => v.entry::<bodies::bor>(),
+        ("erlang", "bxor", 2) => v.entry::<bodies::bxor>(),
+        ("erlang", "bsl", 2) => v.entry::<bodies::bsl>(),
+        ("erlang", "bsr", 2) => v.entry::<bodies::bsr>(),
+        ("erlang", "bnot", 1) => v.entry::<bodies::bnot>(),
+        ("erlang", "-", 1) => v.entry::<bodies::neg>(),
+        ("erlang", "+", 1) => v.entry::<bodies::plus>(),
+        ("erlang", "abs", 1) => v.entry::<bodies::abs>(),
+        ("erlang", "float", 1) => v.entry::<bodies::to_float>(),
+        ("erlang", "trunc", 1) => v.entry::<bodies::trunc>(),
+        ("erlang", "round", 1) => v.entry::<bodies::round>(),
+        ("erlang", "ceil", 1) => v.entry::<bodies::ceil>(),
+        ("erlang", "floor", 1) => v.entry::<bodies::floor>(),
+        ("erlang", "integer_to_list", 1 | 2) => v.entry::<bodies::integer_to_list>(),
+        ("erlang", "integer_to_binary", 1 | 2) => v.entry::<bodies::integer_to_binary>(),
+        ("erts_internal", "list_to_integer", 2) => v.entry::<bodies::list_to_integer>(),
+        ("erts_internal", "binary_to_integer", 2) => v.entry::<bodies::binary_to_integer>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -198,3 +203,30 @@ fn cons(term: Term) -> Option<(Term, Term)> {
     // SAFETY: argument terms keep their owning heap live and stable during the BIF.
     unsafe { term.cons_ref() }
 }
+
+crate::bif_bodies!(
+    add,
+    sub,
+    mul,
+    fdiv,
+    int_div,
+    rem,
+    band,
+    bor,
+    bxor,
+    bsl,
+    bsr,
+    bnot,
+    neg,
+    plus,
+    abs,
+    to_float,
+    trunc,
+    round,
+    ceil,
+    floor,
+    integer_to_list,
+    integer_to_binary,
+    list_to_integer,
+    binary_to_integer,
+);

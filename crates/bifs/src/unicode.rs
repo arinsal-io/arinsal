@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use arinsal_term::{Term, TermBuilder, TermKind, global_atoms};
 
 use crate::pure::{Heap, bool_term, tuple_build};
-use crate::{BifError, BifFn, Ctx};
+use crate::{BifError, Ctx};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Encoding {
@@ -17,16 +17,21 @@ enum Encoding {
     Utf32Le,
 }
 
-pub(super) fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
-    let f: BifFn = match (module, name, arity) {
-        ("unicode", "characters_to_binary", 2) => characters_to_binary,
-        ("unicode", "characters_to_list", 2) => characters_to_list,
-        ("prim_file", "internal_name2native", 1) => internal_name2native,
-        ("prim_file", "internal_native2name", 1) => internal_native2name,
-        ("prim_file", "internal_normalize_utf8", 1) => internal_normalize_utf8,
-        ("prim_file", "is_translatable", 1) => is_translatable,
-        ("file", "native_name_encoding", 0) => native_name_encoding,
-        ("io", "printable_range", 0) => printable_range,
+pub(super) fn lookup<V: crate::BifTableVisitor>(
+    module: &str,
+    name: &str,
+    arity: u8,
+    v: &mut V,
+) -> Option<V::Output> {
+    let f = match (module, name, arity) {
+        ("unicode", "characters_to_binary", 2) => v.entry::<bodies::characters_to_binary>(),
+        ("unicode", "characters_to_list", 2) => v.entry::<bodies::characters_to_list>(),
+        ("prim_file", "internal_name2native", 1) => v.entry::<bodies::internal_name2native>(),
+        ("prim_file", "internal_native2name", 1) => v.entry::<bodies::internal_native2name>(),
+        ("prim_file", "internal_normalize_utf8", 1) => v.entry::<bodies::internal_normalize_utf8>(),
+        ("prim_file", "is_translatable", 1) => v.entry::<bodies::is_translatable>(),
+        ("file", "native_name_encoding", 0) => v.entry::<bodies::native_name_encoding>(),
+        ("io", "printable_range", 0) => v.entry::<bodies::printable_range>(),
         _ => return None,
     };
     arinsal_spec::bif_lookup(module, name, arity).map(|_| f)
@@ -1923,3 +1928,14 @@ const COMPOSITIONS: &[([u16; 4], u8, u16)] = &[
     ([12442, 12504, 0, 0], 2, 12506),
     ([12442, 12507, 0, 0], 2, 12509),
 ];
+
+crate::bif_bodies!(
+    characters_to_binary,
+    characters_to_list,
+    internal_name2native,
+    internal_native2name,
+    internal_normalize_utf8,
+    is_translatable,
+    native_name_encoding,
+    printable_range,
+);
