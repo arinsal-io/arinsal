@@ -2976,16 +2976,11 @@ impl Executor {
                                     // Like call_import: a module with -on_load is loaded through
                                     // the error handler and code server, which run its on_load.
                                     None => {
-                                        // The code-barrier commit is a later operation on this
-                                        // scheduler (beam_bif_load.c commit_code_ix). erts runs it
-                                        // between processes. Loading here would wait in seize and
-                                        // never return to that aux work.
-                                        if self.vm.code_ix.commit_pending() {
-                                            process.cold_mut().native_retry = Some(target_pc);
-                                            process.native_pc = Some(code_ptr);
-                                            break Ok(RunState::Yield);
-                                        }
-                                        match if self.vm.unloaded_on_load(process, &export.module) {
+                                        // Port of beam_common.c (call_error_handler): with the code
+                                        // server up, the error handler loads the module.
+                                        match if self.vm.unloaded_on_load(process, &export.module)
+                                            || self.vm.should_autoload(process, &export.module)
+                                        {
                                             Err(VmError::Load("module has -on_load".into()))
                                         } else {
                                             self.vm.load_named(&export.module)

@@ -733,7 +733,11 @@ impl Vm {
     }
 
     /// Prepares a module instance from a parsed BEAM file: loader, fun identities, static NIFs.
-    fn prepare_module(&self, beam: &BeamFile, bytes: Option<&[u8]>) -> Result<Module, VmError> {
+    pub(crate) fn prepare_module(
+        &self,
+        beam: &BeamFile,
+        bytes: Option<&[u8]>,
+    ) -> Result<Module, VmError> {
         let mut module = arinsal_loader::load_with_instrumentations(
             beam,
             self.coverage_mode(),
@@ -1205,7 +1209,15 @@ impl Vm {
         process: &Process,
         name: &str,
     ) -> Result<usize, VmError> {
+        self.refresh_code();
         let was_loaded = self.code.loaded.contains_key(name);
+        // Port of erts/emulator/beam/beam_common.c (call_error_handler), OTP-29.1.1: once the
+        // code server runs, a call into a module that is not loaded goes through
+        // error_handler:undefined_function/3, and the code server loads it with the staging and
+        // code barrier protocol. The scheduler thread never loads it inline.
+        if !was_loaded && self.should_autoload(process, name) {
+            return Err(VmError::Load(format!("module {name} not found")));
+        }
         let id = self.load_named(name)?;
         if !was_loaded && crate::trace_bp::any_on_load_pattern(process) {
             crate::natives::code::apply_on_load_patterns(self, process, name);
