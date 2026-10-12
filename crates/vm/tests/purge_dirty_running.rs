@@ -1,6 +1,6 @@
 //! A process queued before a second `load_module` must run its first call with the old code, so
-//! `purge_module` finds it executing a dirty BIF in the old version and kills it
-//! (dirty_nif_SUITE:code_purge). The loader yields at the code barrier before committing.
+//! `purge_module` finds it in a different old-code function after a dirty BIF and kills it
+//! (dirty_nif_SUITE:code_purge). The loader stays suspended until the code barrier commits.
 
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
@@ -8,7 +8,8 @@ use arinsal_vm::Vm;
 const TARGET: &str = r#"
 -module(dpr_target).
 -export([func/1]).
-func(Fun) -> Fun(), blipp:blapp().
+func(Fun) -> dirty_continuation(Fun).
+dirty_continuation(Fun) -> Fun(), blipp:blapp().
 "#;
 
 const DRIVER: &str = r#"
@@ -67,5 +68,5 @@ fn purge_kills_process_running_dirty_bif_in_old_code() {
         .eval_scheduled("dpr_driver", "run", &[], 4, None)
         .map(|value| value.term)
         .unwrap_or_else(|error| panic!("dpr_driver:run: {error}"));
-    assert_eq!(expected, CallResult::Ok(actual));
+    similar_asserts::assert_eq!(expected, CallResult::Ok(actual));
 }

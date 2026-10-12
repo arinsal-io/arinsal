@@ -181,6 +181,18 @@ impl CodeIndexes {
             .unwrap_or_else(|error| error.into_inner())
     }
 
+    /// Whether an ended staging area is still waiting for the code-barrier commit.
+    ///
+    /// The commit is a thread-progress later operation on the scheduler that ended
+    /// staging (`beam_bif_load.c` `commit_code_ix`). arinsal loads some modules inline on the
+    /// scheduler thread (erts goes through the code server process), and waiting in `seize`
+    /// on the very thread whose later operation commits would never return to that aux
+    /// work, so such a process yields first and lets the operation run between processes.
+    pub(crate) fn commit_pending(&self) -> bool {
+        let permission = self.lock_permission();
+        permission.ended.is_some() && permission.owner != Some(std::thread::current().id())
+    }
+
     /// Takes the staging tables for this thread, waiting while another thread holds them.
     /// While an ended staging area waits for its commit only callers that change code in
     /// place (`join_ended`) get them: a new staging area waits for that commit, which the
@@ -295,7 +307,7 @@ impl CodeIndexes {
         // Commit under the lock: no thread may copy the active tables into a new staging
         // area before they are the committed ones.
         if let Some(tables) = tables {
-            self.commit_tables(tables);
+            self.commit_tables(tables, false);
         }
         drop(permission);
         self.released.notify_all();
@@ -303,11 +315,13 @@ impl CodeIndexes {
 
     /// Publishes `tables` as the staging code index's tables and makes that index active.
     // Port of erts/emulator/beam/code_ix.c:142-171 (erts_commit_staging_code_ix), OTP-29.1.1.
-    fn commit_tables(&self, mut tables: CodeTables) {
+    fn commit_tables(&self, mut tables: CodeTables, code_barrier_pending: bool) {
         tables.generation = next_generation();
         let tables = Arc::new(tables);
         self.store_slot(self.staging(), Arc::clone(&tables));
-        self.commit();
+        // Ended staging commits from the thread-progress later operation, which already
+        // supplied this code change's barrier.
+        self.commit_with_barrier(code_barrier_pending);
         // The oldest code index is only read again once staging copies into it.
         self.store_slot(self.staging(), tables);
     }
@@ -499,12 +513,14 @@ impl CodeIndexes {
 
     /// Makes the staging index active and opens the next one for staging.
     // Port of erts/emulator/beam/code_ix.c:142-171 (erts_commit_staging_code_ix), OTP-29.1.1.
-    pub(crate) fn commit(&self) {
+    fn commit_with_barrier(&self, code_barrier_pending: bool) {
         let ix = self.staging();
         self.active.store(ix as u32, Ordering::Release);
         self.staging
             .store(((ix + 1) % ERTS_NUM_CODE_IX) as u32, Ordering::Release);
-        CODE_BARRIER_PENDING.set(true);
+        if code_barrier_pending {
+            CODE_BARRIER_PENDING.set(true);
+        }
     }
 
     /// The code index a process runs native code with: `ERTS_SAVE_CALLS_CODE_IX` while it
@@ -621,7 +637,7 @@ impl Drop for Staging {
             }
         };
         if let Some(tables) = committed {
-            self.code.commit_tables(tables);
+            self.code.commit_tables(tables, true);
         }
         self.code.release();
     }
@@ -696,11 +712,11 @@ mod tests {
     fn commit_rotates_through_the_code_indexes() {
         let indexes = CodeIndexes::new(0);
         assert_eq!((indexes.active(), indexes.staging()), (0, 0));
-        indexes.commit();
+        indexes.commit_with_barrier(true);
         assert_eq!((indexes.active(), indexes.staging()), (0, 1));
-        indexes.commit();
+        indexes.commit_with_barrier(true);
         assert_eq!((indexes.active(), indexes.staging()), (1, 2));
-        indexes.commit();
+        indexes.commit_with_barrier(true);
         assert_eq!((indexes.active(), indexes.staging()), (2, 0));
         assert_eq!(indexes.process_code_ix(false), 2);
         assert_eq!(indexes.process_code_ix(true), ERTS_SAVE_CALLS_CODE_IX);
@@ -738,6 +754,24 @@ mod tests {
             Some(7)
         );
         drop(next);
+        crate::beamasm_integration::release_code_scope(scope);
+    }
+
+    #[test]
+    fn ended_staging_committed_after_thread_progress_does_not_schedule_a_second_barrier() {
+        let (scope, code) = node();
+        let staging = code.start_staging();
+        staging.with(|tables| {
+            tables.loaded.insert("barrier_mod".into(), 11);
+        });
+        let ended = staging.end().unwrap();
+        assert!(!take_code_barrier());
+        ended.commit();
+        assert!(code.active_tables().loaded.contains_key("barrier_mod"));
+        assert!(!take_code_barrier());
+
+        drop(code.start_staging());
+        assert!(take_code_barrier());
         crate::beamasm_integration::release_code_scope(scope);
     }
 

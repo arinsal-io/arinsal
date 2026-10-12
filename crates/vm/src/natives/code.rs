@@ -11,8 +11,8 @@ use arinsal_sched::{LiteralCopyHow, RunCtx, Signal};
 use arinsal_spec::Opcode;
 use arinsal_term::{MagicRef, Term, TermBuilder, atoms, from_owned, global_atoms, to_owned};
 use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The code modification permission of a node.
 /// Port of erts/emulator/beam/code_ix.c:52-79 (`struct code_permission`,
@@ -619,22 +619,31 @@ fn release_code_load_permission(process: &Process, pid: Option<Pid>) {
 fn finish(
     vm: &mut Vm,
     process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, crate::process::Message>>,
     pid: Option<Pid>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    // The loader resumed after its code barrier: commit_code_ix commits, releases the
-    // permission, and the loader returns (ERTS_BIF_YIELD_RETURN).
+    if process.runtime.is_some() && ctx.is_none() {
+        return Err(VmError::Unsupported(
+            "finish_loading requires its scheduler context".into(),
+        ));
+    }
+    // The barrier callback committed the code index and released the permission before waking
+    // the loader; this retry refreshes its VM view and returns (ERTS_BIF_YIELD_RETURN).
     if let Some(staged) = process
         .cold
         .as_mut()
         .and_then(|cold| cold.finish_loading_commit.take())
     {
+        let barrier_callback = staged.barrier_passed.is_some();
         let result = finish_commit(vm, process, staged);
-        release_code_load_permission(process, pid);
+        if !barrier_callback {
+            release_code_load_permission(process, pid);
+        }
         return result;
     }
     seize_code_load_permission(process, pid)?;
-    let result = finish_stage(vm, process, args);
+    let result = finish_stage(vm, process, ctx, pid, args);
     // A staged load keeps the permission until its commit.
     if !matches!(result, Err(VmError::Yield)) {
         release_code_load_permission(process, pid);
@@ -644,7 +653,13 @@ fn finish(
 
 /// The staging half of `finish_loading/1`; yields when the load is staged and waits for its
 /// commit.
-fn finish_stage(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
+fn finish_stage(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: Option<&mut RunCtx<'_, crate::process::Message>>,
+    pid: Option<Pid>,
+    args: &[Term],
+) -> Result<Term, VmError> {
     let Some(codes) = args.first().and_then(|term| list(*term)) else {
         return Err(badarg());
     };
@@ -701,7 +716,24 @@ fn finish_stage(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Ter
             for prepared in prepared_refs {
                 prepared.release();
             }
-            process.cold_mut().finish_loading_commit = Some(staged);
+            let mut staged = staged;
+            if let (Some(runtime), Some(pid), Some(ctx)) = (process.runtime.clone(), pid, ctx) {
+                let ended = staged.ended.take();
+                let barrier_passed = Arc::new(AtomicBool::new(false));
+                staged.barrier_passed = Some(Arc::clone(&barrier_passed));
+                process.cold_mut().finish_loading_commit = Some(staged);
+                runtime.suspend_internal(pid);
+                ctx.thread_progress_later(move || {
+                    if let Some(ended) = ended {
+                        ended.commit();
+                    }
+                    barrier_passed.store(true, Ordering::Release);
+                    release_code_mod_permission(&runtime);
+                    resume_suspended(&runtime, pid);
+                });
+            } else {
+                process.cold_mut().finish_loading_commit = Some(staged);
+            }
             Err(VmError::Yield)
         }
         Err(("system_limit", _)) => {
@@ -762,7 +794,10 @@ fn check_process_code(vm: &Vm, process: &Process, name: &str) -> bool {
     let Some(&old) = vm.code.old.get(name) else {
         return false;
     };
-    process.references_code(old, crate::load::native_code_range(&vm.code.code_meta, old))
+    let native = crate::load::native_code_version(&vm.code.code_meta, old);
+    process.references_code(old, |address| {
+        crate::load::native_code_contains(native.map(Arc::as_ref), address)
+    })
 }
 
 // Port of erts/emulator/beam/erl_bif_coverage.c:50-116, OTP-29.1.1.
@@ -1078,7 +1113,10 @@ fn module_id_referenced(
     code_meta: &[Option<std::sync::Arc<crate::load::CodeMeta>>],
     id: usize,
 ) -> bool {
-    process.references_code(id, crate::load::native_code_range(code_meta, id))
+    let native = crate::load::native_code_version(code_meta, id);
+    process.references_code(id, |address| {
+        crate::load::native_code_contains(native.map(Arc::as_ref), address)
+    })
 }
 
 // Port of erts/emulator/beam/beam_bif_load.c:2112-2330 (erts_internal_purge_module_2), OTP-29.1.1.
@@ -1393,7 +1431,10 @@ fn call_values(
         ("erts_internal", "beamfile_module_md5", 1) => Some(beamfile_module_md5(process, args[0])),
         ("erts_internal", "prepare_loading", 2) => Some(prepare(vm, process, args)),
         ("erlang", "has_prepared_code_on_load", 1) => Some(has_prepared_code_on_load(args[0])),
-        ("erlang", "finish_loading", 1) => Some(finish(vm, process, Some(ctx.pid()), args)),
+        ("erlang", "finish_loading", 1) => {
+            let pid = ctx.pid();
+            Some(finish(vm, process, Some(ctx), Some(pid), args))
+        }
         ("erlang", "module_loaded", 1) => Some((|| {
             let name = module_name(args[0]).ok_or_else(badarg)?;
             Ok(Term::atom(if vm.code.loaded.contains_key(&name) {
@@ -1628,8 +1669,8 @@ mod tests {
     /// Runs `finish_loading/1` as the scheduler does: the loader yields at its code barrier
     /// and its rescheduled call commits.
     pub(super) fn finish_now(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Term {
-        match finish(vm, process, None, args) {
-            Err(VmError::Yield) => finish(vm, process, None, args).unwrap(),
+        match finish(vm, process, None, None, args) {
+            Err(VmError::Yield) => finish(vm, process, None, None, args).unwrap(),
             other => other.unwrap(),
         }
     }

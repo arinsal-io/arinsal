@@ -1427,7 +1427,9 @@ fn request_system_task(
             let old = vm.code.old.get(&module).copied();
             let op = RemoteOp::CheckProcessCode {
                 module: old,
-                native: old.and_then(|old| crate::load::native_code_range(&vm.code.code_meta, old)),
+                native: old.and_then(|old| {
+                    crate::load::native_code_version(&vm.code.code_meta, old).cloned()
+                }),
                 async_request: Some(Message::copy_from(req_id)?),
                 kill: false,
             };
@@ -2533,8 +2535,8 @@ pub(crate) enum RemoteOp {
     CheckProcessCode {
         /// Old code of the checked module; `None` when it has none (the result is `false`).
         module: Option<usize>,
-        /// Native code range of the old module version, when BeamAsm compiled it.
-        native: Option<(usize, usize)>,
+        /// Native function ranges of the old module version, when BeamAsm compiled it.
+        native: Option<std::sync::Arc<crate::beamasm_integration::CompiledVersion>>,
         async_request: Option<Message>,
         kill: bool,
     },

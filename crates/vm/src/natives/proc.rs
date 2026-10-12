@@ -1603,7 +1603,11 @@ pub(crate) fn fulfill_request(
         } => {
             // Port of erts/emulator/beam/beam_bif_load.c (erts_check_process_code), OTP-29.1.1:
             // a module without old code is never referenced.
-            let references = module.is_some_and(|module| process.references_code(module, native));
+            let references = module.is_some_and(|module| {
+                process.references_code(module, |address| {
+                    crate::load::native_code_contains(native.as_deref(), address)
+                })
+            });
             if kill && references {
                 let reason = Message::copy_from(atom("kill"))?;
                 ctx.signal(ctx.pid(), Signal::Exit(reason))

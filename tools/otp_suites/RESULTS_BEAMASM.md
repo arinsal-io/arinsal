@@ -12,7 +12,10 @@
 | `bs_match_misc_SUITE` | 20 | 20/20 | 20/20 | 0 | 0 | none |
 | `bs_match_tail_SUITE` | 4 | 4/4 | 4/4 | 0 | 0 | none |
 | `bs_utf_SUITE` | 8 | 8/8 | 0/8 | 8 | -9 | bad_construction: missing; utf16_illegal_sequences: missing; utf16_roundtrip: missing; utf32_illegal_sequences: missing; utf32_roundtrip: missing; utf8_big_file: missing; utf8_illegal_sequences: missing; utf8_roundtrip: missing |
+| `code_SUITE` | 29 | 27/29 | 27/29 | 0 | 0 | none |
 | `counters_SUITE` | 6 | 6/6 | 6/6 | 0 | 0 | none |
+| `dirty_bif_SUITE` | 13 | 8/13 | 8/13 | 0 | 0 | none |
+| `dirty_nif_SUITE` | 25 | 10/25 | 10/25 | 0 | 0 | none |
 | `erts_debug_SUITE` | 8 | 7/8 | 7/8 | 0 | 0 | none |
 | `exception_SUITE` | 16 | 15/16 | 15/16 | 0 | 0 | none |
 | `float_SUITE` | 15 | 14/15 | 13/15 | 1 | 0 | fp_drv: failed {badarg |
