@@ -1,8 +1,8 @@
 //! List BIFs. The per-element loops follow `erl_bif_lists.c` and `erl_bif_guard.c`.
 //!
-//! Most loops finish in one call. `erlang:'--'/2` and `lists:reverse/2` expose
-//! their staged walks so the scheduler resumes them through the same
-//! continuations as erts.
+//! `erlang:'++'/2`, `erlang:'--'/2`, `lists:member/2`, `lists:keyfind/3`
+//! (and keymember/keysearch), and `lists:reverse/2` stop on the same reduction
+//! budget as erts and resume through the same continuations.
 
 use arinsal_term::{
     ConsHeapChain, HeapAlloc, HeapReservation, Term, TermBuilder, atoms, exact_eq, loose_eq,
@@ -78,41 +78,208 @@ fn length(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, proper_len(args[0])?)
 }
 
-fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_bif_lists.c:176 (lists_append_onheap) and
-    // :111 (lists_append_alloc), OTP-29.1.1. The reduction trap is a later task;
-    // a list that fits is copied with one bump of the free window.
-    let list = args[0];
-    let rhs = args[1];
-    if list == Term::NIL {
-        return Ok(rhs);
+/// Cells of `erlang:'++'/2` per reduction on the alloc path.
+/// Port of `CELLS_PER_RED` at `erl_bif_lists.c:112`, OTP-29.1.1.
+pub const APPEND_ALLOC_PER_RED: usize = 40;
+/// Cells of `erlang:'++'/2` per reduction on the on-heap path.
+/// Port of `CELLS_PER_RED` at `erl_bif_lists.c:177`, OTP-29.1.1.
+pub const APPEND_ONHEAP_PER_RED: usize = 60;
+/// Elements scanned per reduction when `++` only checks a nil right-hand side.
+/// Port of `ELEMENTS_PER_RED` at `erl_bif_lists.c:62`, OTP-29.1.1.
+pub const APPEND_EMPTY_PER_RED: usize = 32;
+/// Elements of `lists:member/2` per reduction.
+/// Port of `16 * ERTS_BIF_REDS_LEFT` at `erl_bif_lists.c:1115`, OTP-29.1.1.
+pub const MEMBER_PER_RED: usize = 16;
+/// Elements of `lists:keyfind/3` before it traps. Not scaled by reductions left.
+/// Port of `10 * CONTEXT_REDS` at `erl_bif_lists.c:1304`, OTP-29.1.1.
+pub const KEYFIND_MAX_ITER: usize = 10 * 4_000;
+
+/// Resume state of `erlang:'++'/2`.
+///
+/// Port of `ErtsAppendContext` at `erl_bif_lists.c:47-55`, OTP-29.1.1.
+pub struct AppendCont {
+    lhs_original: Term,
+    rhs: Term,
+    iterator: Term,
+    result: Term,
+    /// Last cons written, or `[]` when the result is still empty. Its tail is `[]`
+    /// until the next chunk or the final right-hand side overwrites it.
+    last: Term,
+}
+
+impl AppendCont {
+    /// Start from the two arguments of `++`.
+    pub fn start(lhs: Term, rhs: Term) -> Self {
+        Self {
+            lhs_original: lhs,
+            rhs,
+            iterator: lhs,
+            result: Term::NIL,
+            last: Term::NIL,
+        }
     }
-    if rhs == Term::NIL {
-        proper_len(list)?;
-        return Ok(list);
+
+    /// List cells not yet copied.
+    pub fn iterator(&self) -> Term {
+        self.iterator
+    }
+
+    /// Right-hand side. Nil selects the scan-only budget.
+    pub fn rhs(&self) -> Term {
+        self.rhs
+    }
+}
+
+/// One chunk of `erlang:'++'/2`.
+pub enum AppendStep {
+    /// The left-hand side was consumed.
+    Done(Term),
+    /// `BIF_TRAP2` with this context.
+    More(AppendCont),
+}
+
+/// Resume arguments of `lists:member/2`.
+pub struct MemberCont {
+    term: Term,
+    list: Term,
+}
+
+impl MemberCont {
+    /// Element being sought.
+    pub fn term(&self) -> Term {
+        self.term
+    }
+
+    /// Cons not yet visited.
+    pub fn list(&self) -> Term {
+        self.list
+    }
+}
+
+/// One chunk of `lists:member/2`.
+pub enum MemberStep {
+    /// `true` or `false`.
+    Done(bool),
+    /// `BIF_TRAP2` with the term and the remaining list.
+    More(MemberCont),
+}
+
+/// Resume arguments of `lists:keyfind/3` and its wrappers.
+pub struct KeyfindCont {
+    key: Term,
+    pos: Term,
+    list: Term,
+}
+
+impl KeyfindCont {
+    /// Key that was sought.
+    pub fn key(&self) -> Term {
+        self.key
+    }
+
+    /// 1-based tuple position.
+    pub fn pos(&self) -> Term {
+        self.pos
+    }
+
+    /// Cons not yet visited.
+    pub fn list(&self) -> Term {
+        self.list
+    }
+}
+
+/// One chunk of `keyfind` before keymember/keysearch wrap the tuple.
+pub enum KeyfindStep {
+    /// The matching tuple, or `None` for `false`.
+    Done(Option<Term>),
+    /// `BIF_TRAP3` with the key, the position, and the remaining list.
+    More(KeyfindCont),
+}
+
+/// Which export wraps a `keyfind` result.
+#[derive(Clone, Copy)]
+pub enum KeyOp {
+    /// `lists:keyfind/3`.
+    Find,
+    /// `lists:keymember/3`.
+    Member,
+    /// `lists:keysearch/3`.
+    Search,
+}
+
+/// Continuation built only after a slice's counter runs out.
+pub enum DeferredTrap {
+    /// `lists:keyfind/3`, `keymember/3`, or `keysearch/3`.
+    Key(KeyfindCont),
+    /// `lists:member/2`.
+    Member(MemberCont),
+    /// `erlang:'++'/2` or `erlang:append/2`.
+    Append(AppendCont),
+    /// `erlang:'--'/2` or `erlang:subtract/2`.
+    Subtract(SubtractWalk),
+}
+
+/// A finished key BIF, or a trap back to the same export.
+pub enum KeyOutcome {
+    /// The Erlang return value.
+    Done(Term),
+    /// Resume arguments.
+    More(KeyfindCont),
+}
+
+/// Copy at most `onheap_cells` conses onto the young heap, then at most
+/// `alloc_cells` more. `usize::MAX` finishes a finite list.
+///
+/// Port of `append_continue`, `lists_append_onheap`, `lists_append_alloc`, and
+/// `append_empty_rhs` (`erl_bif_lists.c:61-251`), OTP-29.1.1.
+pub fn lists_append(
+    ctx: &mut Ctx<'_>,
+    state: AppendCont,
+    onheap_cells: usize,
+    alloc_cells: usize,
+) -> Result<AppendStep, BifError> {
+    if state.iterator == Term::NIL {
+        let value = if state.result != Term::NIL {
+            state.result
+        } else if state.rhs == Term::NIL {
+            state.lhs_original
+        } else {
+            state.rhs
+        };
+        return Ok(AppendStep::Done(value));
+    }
+    if state.rhs == Term::NIL && state.result == Term::NIL {
+        return append_empty_rhs(ctx, state, onheap_cells);
     }
     // SAFETY: source cons cells stay live. Destination words come from one
-    // HAlloc of the young-heap window (or of the exact remainder). CAR/CDR use
-    // the tagged offsets from lists_append_onheap; the previous CDR slot is
-    // linked with make_list, and the right-hand side is stored once at the end.
+    // HAlloc of the young-heap window (or of this chunk's remainder). CAR/CDR
+    // use the tagged offsets from lists_append_onheap; the previous CDR slot
+    // is linked with make_list, and the right-hand side is stored once at the end.
     unsafe {
-        let mut list_bits = list.raw_bits();
-        let rhs_bits = rhs.raw_bits();
+        let mut list_bits = state.iterator.raw_bits();
+        let rhs_bits = state.rhs.raw_bits();
         if !is_list_bits(list_bits) {
             return Err(BADARG);
         }
         let nil_bits = Term::NIL.raw_bits();
-        let mut head_bits = nil_bits;
-        let mut last_cdr: *mut u64 = std::ptr::null_mut();
-        if let Some(left) = ctx.heap.words_left()
+        let mut head_bits = state.result.raw_bits();
+        let mut last_cdr: *mut u64 = if state.last == Term::NIL {
+            std::ptr::null_mut()
+        } else {
+            (state.last.raw_bits() as *mut u8).add(7).cast()
+        };
+        let mut built_onheap = 0usize;
+        let mut ran_onheap = false;
+        if onheap_cells > 0
+            && let Some(left) = ctx.heap.words_left()
             && left > 8
         {
+            ran_onheap = true;
             let words = left - 2;
             let mut reserved = HeapReservation::new(ctx.heap, words).expect("infallible BIF heap");
             let mut alloc_top = reserved.cursor();
-            // Two words per cell; `limit` is exclusive, so stop one word early.
             let alloc_end = reserved.limit().wrapping_sub(1);
-            while alloc_top < alloc_end && is_list_bits(list_bits) {
+            while alloc_top < alloc_end && is_list_bits(list_bits) && built_onheap < onheap_cells {
                 let (car, next) = car_cdr!(list_bits);
                 let cell = (alloc_top as u64) | 1;
                 if last_cdr.is_null() {
@@ -124,35 +291,96 @@ fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
                 last_cdr = alloc_top.add(1);
                 alloc_top = alloc_top.add(2);
                 list_bits = next;
+                built_onheap += 1;
             }
             reserved.set_cursor(alloc_top);
         }
+        let finite = onheap_cells != usize::MAX;
+        let lhs_original = state.lhs_original;
+        let rhs_term = state.rhs;
+        let charge = |ctx: &mut Ctx<'_>, built_onheap: usize, built_alloc: usize| {
+            if finite {
+                ctx.charge_reductions(
+                    built_onheap / APPEND_ONHEAP_PER_RED + built_alloc / APPEND_ALLOC_PER_RED,
+                );
+            }
+        };
+        let pause = |ctx: &mut Ctx<'_>,
+                     list_bits: u64,
+                     head_bits: u64,
+                     last_cdr: *mut u64,
+                     built_onheap: usize,
+                     built_alloc: usize|
+         -> AppendStep {
+            if finite {
+                ctx.charge_reductions(
+                    built_onheap / APPEND_ONHEAP_PER_RED + built_alloc / APPEND_ALLOC_PER_RED,
+                );
+            }
+            let last = if last_cdr.is_null() {
+                Term::NIL
+            } else {
+                Term::from_raw_bits((last_cdr as u64).wrapping_sub(8) | 1)
+            };
+            AppendStep::More(AppendCont {
+                lhs_original,
+                rhs: rhs_term,
+                iterator: Term::from_raw_bits(list_bits),
+                result: Term::from_raw_bits(head_bits),
+                last,
+            })
+        };
         if !is_list_bits(list_bits) {
             if list_bits != nil_bits {
-                // An improper list must not leave the last tail slot uninitialized.
                 if !last_cdr.is_null() {
                     last_cdr.write(nil_bits);
                 }
+                charge(ctx, built_onheap, 0);
                 return Err(BADARG);
             }
             if last_cdr.is_null() {
-                return Ok(rhs);
+                return Ok(AppendStep::Done(rhs_term));
             }
             last_cdr.write(rhs_bits);
-            return Ok(Term::from_raw_bits(head_bits));
+            charge(ctx, built_onheap, 0);
+            return Ok(AppendStep::Done(Term::from_raw_bits(head_bits)));
         }
+        // lists_append_onheap falls into alloc only while more than one
+        // reduction of its budget remains. A young heap of 8 words or fewer
+        // skips on-heap and uses the alloc budget (append_continue).
+        let alloc_budget = if alloc_cells == usize::MAX {
+            usize::MAX
+        } else if !ran_onheap {
+            alloc_cells
+        } else {
+            let cells_left = onheap_cells.saturating_sub(built_onheap);
+            if cells_left > APPEND_ONHEAP_PER_RED {
+                let reds_after = (onheap_cells / APPEND_ONHEAP_PER_RED)
+                    .saturating_sub(built_onheap / APPEND_ONHEAP_PER_RED);
+                reds_after.saturating_mul(APPEND_ALLOC_PER_RED)
+            } else {
+                0
+            }
+        };
         let mut count = 0usize;
         let mut scan = list_bits;
-        while is_list_bits(scan) {
+        while count < alloc_budget && is_list_bits(scan) {
             let (_, next) = car_cdr!(scan);
             count += 1;
             scan = next;
         }
-        if scan != nil_bits {
+        if !is_list_bits(scan) && scan != nil_bits {
             if !last_cdr.is_null() {
                 last_cdr.write(nil_bits);
             }
+            charge(ctx, built_onheap, count);
             return Err(BADARG);
+        }
+        if count == 0 {
+            if !last_cdr.is_null() {
+                last_cdr.write(nil_bits);
+            }
+            return Ok(pause(ctx, list_bits, head_bits, last_cdr, built_onheap, 0));
         }
         let words = count.checked_mul(2).ok_or(BifError::SystemLimit)?;
         let alloc_top = HeapAlloc::alloc(ctx.heap, words).expect("infallible BIF heap");
@@ -170,14 +398,106 @@ fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             hp = hp.add(2);
             list_bits = next;
         }
+        if is_list_bits(list_bits) {
+            last_cdr.write(nil_bits);
+            return Ok(pause(
+                ctx,
+                list_bits,
+                head_bits,
+                last_cdr,
+                built_onheap,
+                count,
+            ));
+        }
         last_cdr.write(rhs_bits);
-        Ok(Term::from_raw_bits(head_bits))
+        charge(ctx, built_onheap, count);
+        Ok(AppendStep::Done(Term::from_raw_bits(head_bits)))
+    }
+}
+
+fn append_empty_rhs(
+    ctx: &mut Ctx<'_>,
+    state: AppendCont,
+    budget: usize,
+) -> Result<AppendStep, BifError> {
+    let mut iterator = state.iterator;
+    let mut scanned = 0usize;
+    while scanned < budget {
+        match cons_cell(iterator) {
+            Some((_, tail)) => {
+                iterator = tail;
+                scanned += 1;
+            }
+            None => {
+                if iterator != Term::NIL {
+                    return Err(BADARG);
+                }
+                if budget != usize::MAX {
+                    ctx.charge_reductions(scanned / APPEND_EMPTY_PER_RED);
+                }
+                return Ok(AppendStep::Done(state.lhs_original));
+            }
+        }
+    }
+    if budget != usize::MAX {
+        ctx.charge_reductions(scanned / APPEND_EMPTY_PER_RED);
+    }
+    // A budget that lands exactly on the end is a finish, not a trap
+    // (append_empty_rhs checks is_nil after the counted loop).
+    if iterator == Term::NIL {
+        return Ok(AppendStep::Done(state.lhs_original));
+    }
+    Ok(AppendStep::More(AppendCont { iterator, ..state }))
+}
+
+fn append(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // The VM trap passes a finite budget. A direct call finishes the list.
+    if args[0] == Term::NIL {
+        return Ok(args[1]);
+    }
+    let budget = ctx.reduction_budget();
+    if budget != usize::MAX {
+        let state = AppendCont::start(args[0], args[1]);
+        let (onheap, alloc) = if args[1] == Term::NIL {
+            (budget.saturating_mul(APPEND_EMPTY_PER_RED), 0)
+        } else {
+            (
+                budget.saturating_mul(APPEND_ONHEAP_PER_RED),
+                budget.saturating_mul(APPEND_ALLOC_PER_RED),
+            )
+        };
+        return match lists_append(ctx, state, onheap, alloc)? {
+            AppendStep::Done(value) => Ok(value),
+            AppendStep::More(cont) => {
+                // Trap state is built only when this slice's counter runs out.
+                ctx.defer_trap(DeferredTrap::Append(cont));
+                Ok(Term::NIL)
+            }
+        };
+    }
+    let mut state = AppendCont::start(args[0], args[1]);
+    loop {
+        match lists_append(ctx, state, usize::MAX, usize::MAX)? {
+            AppendStep::Done(value) => return Ok(value),
+            AppendStep::More(next) => state = next,
+        }
     }
 }
 
 fn subtract(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_lists.c:367-1020 (subtract stages),
-    // OTP-29.1.1. Runtime dispatch uses `SubtractWalk` to retain this state on trap.
+    // OTP-29.1.1. A finite budget is one slice of `SubtractWalk`; the walk is
+    // boxed only when that slice traps. An unbounded call is the direct BIF.
+    if ctx.reduction_budget() != usize::MAX {
+        let mut walk = SubtractWalk::new(args[0], args[1])?;
+        return match walk.step(ctx, ctx.reduction_budget())? {
+            Some(value) => Ok(value),
+            None => {
+                ctx.defer_trap(DeferredTrap::Subtract(walk));
+                Ok(Term::NIL)
+            }
+        };
+    }
     if !matches!(
         args[0].classify(),
         arinsal_term::TermKind::List | arinsal_term::TermKind::Nil
@@ -949,47 +1269,106 @@ fn reverse(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     }
 }
 
-fn member(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/erl_bif_lists.c:1108 (lists_member_2), OTP-29.1.1.
-    // Two loops, as in the C: an immediate compares by word (`ldur` CAR, `cmp`,
-    // `ldur` CDR, test list bit 1). Only a boxed term falls through to `eq`.
-    // The reduction counter is a later task.
-    let term = args[0];
-    let list = args[1];
+/// Scan at most `max_iter` conses of `lists:member/2`.
+///
+/// `max_iter` is `16 * ERTS_BIF_REDS_LEFT` (`erl_bif_lists.c:1115`). `usize::MAX`
+/// finishes a finite list. A full chunk charges `div_ceil(scanned, 16)`, which is
+/// `BUMP_ALL_REDS` when the chunk is exactly one reduction budget and
+/// `BIF_RET2`'s `reds_left - max_iter/16` otherwise.
+#[inline(always)]
+pub fn lists_member(
+    ctx: &mut Ctx<'_>,
+    term: Term,
+    list: Term,
+    max_iter: usize,
+) -> Result<MemberStep, BifError> {
+    if list == Term::NIL {
+        return Ok(MemberStep::Done(false));
+    }
     // SAFETY: a list tag denotes two live words. Offsets -1 and +7 are CAR/CDR.
     unsafe {
         let term_bits = term.raw_bits();
         let mut list_bits = list.raw_bits();
         let nil_bits = Term::NIL.raw_bits();
-        if term_bits & 3 == 3 {
-            while is_list_bits(list_bits) {
-                let (car, next) = car_cdr!(list_bits);
-                if car == term_bits {
-                    return Ok(bool_term(true));
-                }
-                list_bits = next;
-            }
-        } else {
-            while is_list_bits(list_bits) {
-                let (car, next) = car_cdr!(list_bits);
-                if car == term_bits || exact_eq(Term::from_raw_bits(car), term) {
-                    return Ok(bool_term(true));
-                }
-                list_bits = next;
-            }
-        }
-        if list_bits != nil_bits {
+        if !is_list_bits(list_bits) {
             return Err(BADARG);
         }
+        let finite = max_iter != usize::MAX;
+        let charge = |ctx: &mut Ctx<'_>, scanned: usize| {
+            if finite {
+                ctx.charge_reductions(scanned.div_ceil(MEMBER_PER_RED));
+            }
+        };
+        let mut scanned = 0usize;
+        let step = if term_bits & 3 == 3 {
+            let mut found = false;
+            while is_list_bits(list_bits) {
+                if scanned >= max_iter {
+                    charge(ctx, scanned);
+                    return Ok(MemberStep::More(MemberCont {
+                        term,
+                        list: Term::from_raw_bits(list_bits),
+                    }));
+                }
+                scanned += 1;
+                let (car, next) = car_cdr!(list_bits);
+                if car == term_bits {
+                    found = true;
+                    break;
+                }
+                list_bits = next;
+            }
+            found
+        } else {
+            let mut found = false;
+            while is_list_bits(list_bits) {
+                if scanned >= max_iter {
+                    charge(ctx, scanned);
+                    return Ok(MemberStep::More(MemberCont {
+                        term,
+                        list: Term::from_raw_bits(list_bits),
+                    }));
+                }
+                scanned += 1;
+                let (car, next) = car_cdr!(list_bits);
+                if car == term_bits || exact_eq(Term::from_raw_bits(car), term) {
+                    found = true;
+                    break;
+                }
+                list_bits = next;
+            }
+            found
+        };
+        if !step && list_bits != nil_bits {
+            charge(ctx, scanned);
+            return Err(BADARG);
+        }
+        charge(ctx, scanned);
+        Ok(MemberStep::Done(step))
     }
-    Ok(bool_term(false))
 }
 
-fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
+fn member(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    // Port of erts/emulator/beam/erl_bif_lists.c:1108 (lists_member_2), OTP-29.1.1.
+    // Two loops, as in the C: an immediate compares by word. Only a boxed term
+    // falls through to `eq`. The counter traps only when `16 * reds_left` runs out.
+    let max_iter = ctx.reduction_budget().saturating_mul(MEMBER_PER_RED);
+    match lists_member(ctx, args[0], args[1], max_iter)? {
+        MemberStep::Done(found) => Ok(bool_term(found)),
+        MemberStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Member(cont));
+            Ok(Term::NIL)
+        }
+    }
+}
+
+#[inline]
+fn key_search(args: &[Term], max_iter: usize) -> Result<KeyfindStep, BifError> {
     // Port of erts/emulator/beam/erl_bif_lists.c:1302 (keyfind), OTP-29.1.1.
     // Three loops: a small key also matches a float of the same value, any other
-    // immediate compares by word, and a boxed key uses `==`. The reduction trap
-    // is a later task. A hit returns the tuple without reading the rest.
+    // immediate compares by word, and a boxed key uses `==`. `max_iter` is
+    // `10 * CONTEXT_REDS` (not scaled by reductions left). A hit returns the
+    // tuple without reading the rest and without bumping reductions.
     let pos = args[1].as_small().ok_or(BADARG)?;
     if pos < 1 {
         return Err(BADARG);
@@ -1004,10 +1383,19 @@ fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
         let key_bits = key.raw_bits();
         let mut list_bits = list.raw_bits();
         let nil_bits = Term::NIL.raw_bits();
+        let mut scanned = 0usize;
         let found = if let Some(small) = key.as_small() {
             let float_key = small as f64;
             let mut found = None;
             while is_list_bits(list_bits) {
+                if scanned >= max_iter {
+                    return Ok(KeyfindStep::More(KeyfindCont {
+                        key,
+                        pos: args[1],
+                        list: Term::from_raw_bits(list_bits),
+                    }));
+                }
+                scanned += 1;
                 let (car, next) = car_cdr!(list_bits);
                 list_bits = next;
                 if car & 1 != 0 {
@@ -1041,6 +1429,14 @@ fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
         } else if key_bits & 3 == 3 {
             let mut found = None;
             while is_list_bits(list_bits) {
+                if scanned >= max_iter {
+                    return Ok(KeyfindStep::More(KeyfindCont {
+                        key,
+                        pos: args[1],
+                        list: Term::from_raw_bits(list_bits),
+                    }));
+                }
+                scanned += 1;
                 let (car, next) = car_cdr!(list_bits);
                 list_bits = next;
                 if car & 1 != 0 {
@@ -1060,6 +1456,14 @@ fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
         } else {
             let mut found = None;
             while is_list_bits(list_bits) {
+                if scanned >= max_iter {
+                    return Ok(KeyfindStep::More(KeyfindCont {
+                        key,
+                        pos: args[1],
+                        list: Term::from_raw_bits(list_bits),
+                    }));
+                }
+                scanned += 1;
                 let (car, next) = car_cdr!(list_bits);
                 list_bits = next;
                 if car & 1 != 0 {
@@ -1082,26 +1486,78 @@ fn key_search(args: &[Term]) -> Result<Option<Term>, BifError> {
             return Err(BADARG);
         }
         if let Some(bits) = found {
-            Ok(Some(Term::from_raw_bits(bits)))
+            Ok(KeyfindStep::Done(Some(Term::from_raw_bits(bits))))
         } else {
-            Ok(None)
+            Ok(KeyfindStep::Done(None))
         }
     }
 }
 
-fn keyfind(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(key_search(args)?.unwrap_or(bool_term(false)))
+/// One reduction-budget slice of keyfind, keymember, or keysearch.
+pub fn lists_key(
+    ctx: &mut Ctx<'_>,
+    op: KeyOp,
+    key: Term,
+    pos: Term,
+    list: Term,
+    max_iter: usize,
+) -> Result<KeyOutcome, BifError> {
+    match key_search(&[key, pos, list], max_iter)? {
+        KeyfindStep::More(cont) => Ok(KeyOutcome::More(cont)),
+        KeyfindStep::Done(found) => {
+            let value = match op {
+                KeyOp::Find => found.unwrap_or(bool_term(false)),
+                KeyOp::Member => bool_term(found.is_some()),
+                KeyOp::Search => match found {
+                    Some(tuple) => tuple_build(ctx, &[Term::atom(atoms::VALUE), tuple]),
+                    None => bool_term(false),
+                },
+            };
+            Ok(KeyOutcome::Done(value))
+        }
+    }
 }
 
-fn keymember(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(bool_term(key_search(args)?.is_some()))
+fn key_limit(ctx: &Ctx<'_>) -> usize {
+    // `10 * CONTEXT_REDS`, not scaled by reductions left (erl_bif_lists.c:1304).
+    if ctx.reduction_budget() == usize::MAX {
+        usize::MAX
+    } else {
+        KEYFIND_MAX_ITER
+    }
+}
+
+fn keyfind(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    match key_search(args, key_limit(ctx))? {
+        KeyfindStep::Done(found) => Ok(found.unwrap_or(bool_term(false))),
+        KeyfindStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Key(cont));
+            Ok(Term::NIL)
+        }
+    }
+}
+
+fn keymember(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    match key_search(args, key_limit(ctx))? {
+        KeyfindStep::Done(found) => Ok(bool_term(found.is_some())),
+        KeyfindStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Key(cont));
+            Ok(Term::NIL)
+        }
+    }
 }
 
 fn keysearch(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    Ok(match key_search(args)? {
-        Some(value) => tuple_build(ctx, &[Term::atom(atoms::VALUE), value]),
-        None => bool_term(false),
-    })
+    match key_search(args, key_limit(ctx))? {
+        KeyfindStep::Done(found) => Ok(match found {
+            Some(tuple) => tuple_build(ctx, &[Term::atom(atoms::VALUE), tuple]),
+            None => bool_term(false),
+        }),
+        KeyfindStep::More(cont) => {
+            ctx.defer_trap(DeferredTrap::Key(cont));
+            Ok(Term::NIL)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1386,5 +1842,151 @@ mod reverse_chunk_tests {
             lists_reverse(&mut ctx, bad, Term::NIL, 10),
             Err(crate::BifError::Badarg { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod trap_budget_tests {
+    use super::{
+        AppendCont, AppendStep, KeyOp, KeyOutcome, MemberStep, lists_append, lists_key,
+        lists_member,
+    };
+    use crate::{Ctx, FragmentingHeap};
+    use arinsal_term::{ProcessHeap, Term, TermBuilder, exact_eq};
+
+    fn list_of(heap: &mut FragmentingHeap<'_>, n: i64) -> Term {
+        let values: Vec<_> = (1..=n).map(|i| Term::small(i).unwrap()).collect();
+        TermBuilder::new(heap).list_from_slice(&values).unwrap()
+    }
+
+    #[test]
+    fn member_chunks_match_one_shot_and_charge_per_sixteen() {
+        let mut heap = ProcessHeap::with_words(4096);
+        let mut alloc = FragmentingHeap(&mut heap);
+        let list = list_of(&mut alloc, 20);
+        let miss = Term::small(99).unwrap();
+        let mut ctx = Ctx::new(&mut alloc);
+        let MemberStep::Done(found) = lists_member(&mut ctx, miss, list, usize::MAX).unwrap()
+        else {
+            panic!("unbounded member trapped");
+        };
+        assert!(!found);
+        assert_eq!(ctx.reductions(), 0);
+
+        let mut ctx = Ctx::new(&mut alloc);
+        let mut rest = list;
+        let mut steps = 0u32;
+        loop {
+            match lists_member(&mut ctx, miss, rest, 16).unwrap() {
+                MemberStep::Done(found) => {
+                    assert!(!found);
+                    break;
+                }
+                MemberStep::More(cont) => {
+                    assert_ne!(cont.list(), rest);
+                    rest = cont.list();
+                    steps += 1;
+                }
+            }
+        }
+        assert_eq!(steps, 1);
+        // 16 cells then 4: ceil(16/16) + ceil(4/16) = 2, the same as one 20-cell call.
+        assert_eq!(ctx.reductions(), 2);
+
+        let mut ctx = Ctx::new(&mut alloc);
+        let MemberStep::Done(true) =
+            lists_member(&mut ctx, Term::small(7).unwrap(), list, 16).unwrap()
+        else {
+            panic!("hit inside the first chunk");
+        };
+        assert_eq!(ctx.reductions(), 1);
+    }
+
+    #[test]
+    fn keyfind_chunk_stops_at_the_budget_and_a_short_hit_is_free() {
+        let mut heap = ProcessHeap::with_words(4096);
+        let mut alloc = FragmentingHeap(&mut heap);
+        let mut tuples = Vec::new();
+        {
+            let mut builder = TermBuilder::new(&mut alloc);
+            for i in 1..=10 {
+                let n = Term::small(i).unwrap();
+                tuples.push(builder.tuple(&[n, n]).unwrap());
+            }
+        }
+        let list = TermBuilder::new(&mut alloc)
+            .list_from_slice(&tuples)
+            .unwrap();
+        let key = Term::small(8).unwrap();
+        let pos = Term::small(1).unwrap();
+        let mut ctx = Ctx::new(&mut alloc);
+        let mut rest = list;
+        let mut steps = 0u32;
+        let found = loop {
+            match lists_key(&mut ctx, KeyOp::Find, key, pos, rest, 3).unwrap() {
+                KeyOutcome::Done(value) => break value,
+                KeyOutcome::More(cont) => {
+                    rest = cont.list();
+                    steps += 1;
+                }
+            }
+        };
+        assert_eq!(steps, 2);
+        assert!(exact_eq(found, tuples[7]));
+        assert_eq!(ctx.reductions(), 0);
+
+        let five = TermBuilder::new(&mut alloc)
+            .list_from_slice(&tuples[..5])
+            .unwrap();
+        let mut ctx = Ctx::new(&mut alloc);
+        let KeyOutcome::Done(hit) = lists_key(
+            &mut ctx,
+            KeyOp::Find,
+            Term::small(1).unwrap(),
+            pos,
+            five,
+            10 * 4_000,
+        )
+        .unwrap() else {
+            panic!("five-element keyfind trapped");
+        };
+        assert!(exact_eq(hit, tuples[0]));
+        assert_eq!(ctx.reductions(), 0);
+    }
+
+    #[test]
+    fn append_chunks_match_one_shot() {
+        let mut heap = ProcessHeap::with_words(4096);
+        let mut alloc = FragmentingHeap(&mut heap);
+        let lhs = list_of(&mut alloc, 20);
+        let rhs = Term::small(7).unwrap();
+        let mut ctx = Ctx::new(&mut alloc);
+        let AppendStep::Done(one_shot) = lists_append(
+            &mut ctx,
+            AppendCont::start(lhs, rhs),
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap() else {
+            panic!("unbounded append trapped");
+        };
+        let mut state = AppendCont::start(lhs, rhs);
+        let chunked = loop {
+            match lists_append(&mut ctx, state, 5, 5).unwrap() {
+                AppendStep::Done(value) => break value,
+                AppendStep::More(next) => state = next,
+            }
+        };
+        assert!(exact_eq(one_shot, chunked));
+
+        let mut ctx = Ctx::new(&mut alloc);
+        let mut state = AppendCont::start(lhs, Term::NIL);
+        let same = loop {
+            match lists_append(&mut ctx, state, 4, 0).unwrap() {
+                AppendStep::Done(value) => break value,
+                AppendStep::More(next) => state = next,
+            }
+        };
+        assert_eq!(same, lhs);
     }
 }
