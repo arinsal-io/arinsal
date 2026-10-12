@@ -2437,42 +2437,29 @@ fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
     }
 }
 
-/// Port of erts/emulator/beam/io.c:1186-1200 (erts_schedule_proc2port_signal with a
-/// reply reference): no reply can be queued yet, so the receive that waits for it starts
-/// at the end of the message queue (`erts_msgq_set_save_end`).
-/// The reply can already be here when the port task ran first: the save pointer then
-/// stops at it, which is where `erts_msgq_set_save_end` before scheduling would leave it.
+/// Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal, the caller side of a
+/// reply reference), OTP-29.1.1: called before the port signal is scheduled, so the reply cannot
+/// be queued before the save pointer moves. The receive that waits for the reply then starts at
+/// the end of the message queue.
 // Port of erts/emulator/beam/erl_proc_sig_queue.h:2397 (erts_msgq_set_save_end), OTP-29.1.1.
-fn set_save_end(
+pub(crate) fn set_save_end(
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
-    reference: Term,
 ) -> Result<(), VmError> {
-    let Some(id) = crate::signals::ref_id(reference) else {
-        return Ok(());
-    };
-    let is_reply = |message: Term| {
-        tuple(message)
-            .is_some_and(|parts| parts.len() == 2 && crate::signals::ref_id(parts[0]) == Some(id))
-    };
     // erts_proc_sig_fetch(c_p).
     process.fetch_signals(ctx)?;
     let len = process.inbox.len();
-    let start = process.receive_cursor.min(len);
-    let reply = (start..len).find(|&index| process.inbox.get(index).is_some_and(|m| is_reply(*m)));
     if let Some(cold) = process.cold.as_mut() {
         cold.priority_resume_cursor = None;
     }
-    if let Some(index) = reply {
-        process.receive_cursor = index;
-    } else if process.sig_cont_empty() {
+    if process.sig_cont_empty() {
         // `c_p->sig_qs.save = c_p->sig_qs.last`.
         process.receive_cursor = len;
     } else {
         // Unhandled signals in the middle queue: a receive marker passes through it and
         // sets the save pointer when it enters the message queue.
-        let index = process.sig_cont_position(is_reply);
-        process.recv_marker_create_insert_set_save(index);
+        // erts_msgq_recv_marker_create_insert_set_save(c_p, NIL): the marker goes to the end.
+        process.recv_marker_create_insert_set_save(None);
     }
     Ok(())
 }
@@ -2997,12 +2984,7 @@ pub(crate) fn family(
         ("port_command", [port, data, _]) if module == "erts_internal" => {
             port_command(process, ctx, *port, *data, args)
         }
-        ("port_close", [port]) if module == "erts_internal" => {
-            port_close(process, ctx.pid(), *port).and_then(|result| {
-                set_save_end(process, ctx, result)?;
-                Ok(result)
-            })
-        }
+        ("port_close", [port]) if module == "erts_internal" => port_close(process, ctx, *port),
         ("port_connect", [port, pid]) if module == "erts_internal" => {
             connect(process, *port, *pid, None)
         }
@@ -3010,10 +2992,7 @@ pub(crate) fn family(
         // Spawn and fd ports have no driver control. The internal BIF returns the
         // atom `badarg`; `erlang:port_control/3` turns that atom into an exception.
         ("port_control", [port, op, data]) if module == "erts_internal" => {
-            port_control(process, ctx.pid(), *port, *op, *data).and_then(|result| {
-                set_save_end(process, ctx, result)?;
-                Ok(result)
-            })
+            port_control(process, ctx, *port, *op, *data)
         }
         // Port of erts/emulator/beam/erl_bif_port.c:263 (erts_internal_port_call_3), OTP-29.1.1.
         // Spawn/fd/inet ports here have no driver call path; return the atom `badarg`.
@@ -3044,11 +3023,12 @@ fn copied_reason(reason: Term) -> Option<Message> {
 // Non-inet ports still return the atom `badarg`. `tcp_inet` returns a byte list.
 fn port_control(
     process: &mut Process,
-    caller: Pid,
+    ctx: &mut RunCtx<'_, Message>,
     port: Term,
     op: Term,
     data: Term,
 ) -> Result<Term, VmError> {
+    let caller = ctx.pid();
     let Some(id) = port.as_port() else {
         return Ok(atom("badarg"));
     };
@@ -3060,7 +3040,7 @@ fn port_control(
         return Ok(atom("badarg"));
     };
     if let Some(drv_port) = handle.driver.get() {
-        return driver_control(process, caller, drv_port, op, data);
+        return driver_control(process, ctx, caller, drv_port, op, data);
     }
     if !handle.inet {
         return Ok(atom("badarg"));
@@ -3171,6 +3151,7 @@ fn io_pieces(term: Term, out: &mut Vec<(Vec<u8>, bool)>) -> Option<()> {
 // io.c:4268 (erts_port_control) for a loaded driver.
 fn driver_control(
     process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
     caller: Pid,
     drv_port: &Arc<arinsal_drv::DriverPort>,
     op: Term,
@@ -3184,7 +3165,7 @@ fn driver_control(
         return Ok(atom("badarg"));
     }
     let bytes = pieces.into_iter().flat_map(|(b, _)| b).collect::<Vec<_>>();
-    drv_sig::control(process, caller, drv_port, opcode, bytes)
+    drv_sig::control(process, ctx, caller, drv_port, opcode, bytes)
 }
 
 /// Next local port id for `open_port`, or `system_limit` when the port table is full.
@@ -3262,11 +3243,7 @@ fn port_command(
                 drv_sig::PortOp::BusyScheduled(reference)
                 | drv_sig::PortOp::Scheduled(reference) => {
                     return match reference {
-                        Some(reference) => {
-                            let reference = drv_sig::reference_term(process, reference)?;
-                            set_save_end(process, ctx, reference)?;
-                            Ok(reference)
-                        }
+                        Some(reference) => drv_sig::reference_term(process, reference),
                         None => Ok(atom("true")),
                     };
                 }
@@ -3565,7 +3542,12 @@ fn close_inner(process: &Process, term: Term, trace_receive: bool) -> Result<Ter
 }
 
 // Port of erts/emulator/beam/erl_bif_port.c:233 (erts_internal_port_close_1), OTP-29.1.1.
-fn port_close(process: &mut Process, caller: Pid, port: Term) -> Result<Term, VmError> {
+fn port_close(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    port: Term,
+) -> Result<Term, VmError> {
+    let caller = ctx.pid();
     if let Some(id) = port.as_port()
         && let Some(handle) = process
             .runtime
@@ -3576,7 +3558,17 @@ fn port_close(process: &mut Process, caller: Pid, port: Term) -> Result<Term, Vm
         // The `{Caller, close}` receive trace is emitted when the exit signal executes
         // (drv_sig::exit, io.c:2196 call_deliver_port_exit).
         let normal = OwnedTerm::Atom("normal".into());
-        return match drv_sig::exit(process, caller, &handle, &drv, false, caller, normal, true) {
+        return match drv_sig::exit(
+            process,
+            Some(ctx),
+            caller,
+            &handle,
+            &drv,
+            false,
+            caller,
+            normal,
+            true,
+        ) {
             Ok(Some(reference)) => drv_sig::reference_term(process, reference),
             Ok(None) => Ok(atom("true")),
             // erl_bif_port.c:405: a dropped close answers `badarg`.
@@ -3620,7 +3612,17 @@ pub(crate) fn exit_port(
         let reason = to_owned(reason).map_err(|_| badarg())?;
         let pid = ctx.pid();
         // An exit signal to a port that is gone is dropped (bif.c:1794).
-        let _ = drv_sig::exit(process, pid, &handle, &drv, false, pid, reason, false);
+        let _ = drv_sig::exit(
+            process,
+            Some(ctx),
+            pid,
+            &handle,
+            &drv,
+            false,
+            pid,
+            reason,
+            false,
+        );
         return Ok(());
     }
     crate::trace::emit_port_event(runtime, id, crate::trace::PORTS, "closed", &[reason]);
@@ -4186,7 +4188,11 @@ pub(crate) fn nif_port_command(
     true
 }
 
-pub(crate) fn send_message(process: &Process, port: Term, message: Term) -> Result<(), VmError> {
+pub(crate) fn send_message(
+    process: &mut Process,
+    port: Term,
+    message: Term,
+) -> Result<(), VmError> {
     send_message_inner(process, port, message, false, None).map(|_| ())
 }
 
@@ -4232,11 +4238,11 @@ pub(crate) fn send_from_process(
 type DrvTarget = Option<(Arc<PortHandle>, Arc<arinsal_drv::DriverPort>)>;
 
 fn send_message_inner(
-    process: &Process,
+    process: &mut Process,
     port: Term,
     message: Term,
     nosuspend: bool,
-    ctx: Option<&mut RunCtx<'_, Message>>,
+    mut ctx: Option<&mut RunCtx<'_, Message>>,
 ) -> Result<(PortSend, DrvTarget), VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let runtime = process.runtime.as_ref().ok_or_else(badarg)?;
@@ -4275,7 +4281,17 @@ fn send_message_inner(
         }
         if parts[1] == atom("close") {
             let normal = OwnedTerm::Atom("normal".into());
-            let _ = drv_sig::exit(process, sender, &handle, drv, true, from, normal, false);
+            let _ = drv_sig::exit(
+                process,
+                ctx.as_deref_mut(),
+                sender,
+                &handle,
+                drv,
+                true,
+                from,
+                normal,
+                false,
+            );
         } else {
             let command = tuple(parts[1]).unwrap_or_default();
             let pid = Pid::from_term(command[1]).ok_or_else(badarg)?;
