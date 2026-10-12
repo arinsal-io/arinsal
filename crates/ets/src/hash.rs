@@ -1,15 +1,20 @@
 //! ETS hash storage with OTP's segmented linear-hash directory.
 
 use crate::{EtsError, StoredTerm, TableType, WriteConcurrency};
-use arinsal_term::{HeapAlloc, Term, global_atoms, internal_hash};
+use arinsal_term::{
+    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, HeapAlloc, Term, global_atoms,
+    internal_hash,
+};
 use parking_lot::RwLock as FastRwLock;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 const FIRST_SEGMENT: usize = 256;
 const EXT_SEGMENT: usize = 2048;
+const NLOCKS_WITH_ITEM_COUNTERS: usize = 64;
 
 /// Port of erts/emulator/beam/erl_term_hashing.c:1770 (make_internal_hash), OTP-29.1.1.
 /// The scalar path avoids constructing the term-walk stack for immediate integers.
@@ -57,63 +62,9 @@ pub(super) struct HashBucket {
     head: Option<Box<HashDbTerm>>,
 }
 
-// The first OTP segment is intentionally smaller than every later segment.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "ports OTP's distinct segment bucket capacities"
-)]
-enum Segment {
-    First([HashBucket; FIRST_SEGMENT]),
-    Extended([HashBucket; EXT_SEGMENT]),
-}
-
-impl Segment {
-    fn first() -> Self {
-        Self::First(std::array::from_fn(|_| HashBucket::default()))
-    }
-
-    fn extended() -> Self {
-        Self::Extended(std::array::from_fn(|_| HashBucket::default()))
-    }
-
-    fn get(&self, index: usize) -> &HashBucket {
-        match self {
-            Self::First(buckets) => &buckets[index],
-            Self::Extended(buckets) => &buckets[index],
-        }
-    }
-
-    fn get_mut(&mut self, index: usize) -> &mut HashBucket {
-        match self {
-            Self::First(buckets) => &mut buckets[index],
-            Self::Extended(buckets) => &mut buckets[index],
-        }
-    }
-
-    fn iter(&self) -> std::slice::Iter<'_, HashBucket> {
-        match self {
-            Self::First(buckets) => buckets.as_slice().iter(),
-            Self::Extended(buckets) => buckets.as_slice().iter(),
-        }
-    }
-
-    fn iter_mut(&mut self) -> std::slice::IterMut<'_, HashBucket> {
-        match self {
-            Self::First(buckets) => buckets.as_mut_slice().iter_mut(),
-            Self::Extended(buckets) => buckets.as_mut_slice().iter_mut(),
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct HashIter<'a> {
     next: Option<&'a HashDbTerm>,
-}
-
-impl<'a> HashIter<'a> {
-    pub(super) fn iter(self) -> Self {
-        self
-    }
 }
 
 impl<'a> Iterator for HashIter<'a> {
@@ -139,52 +90,258 @@ impl<'a> Iterator for HashIterMut<'a> {
     }
 }
 
+pub(super) struct RemovedHashTerms {
+    head: Option<Box<HashDbTerm>>,
+}
+
+impl RemovedHashTerms {
+    pub(super) fn take_first(&mut self) -> Option<StoredTerm> {
+        let mut first = self.head.take()?;
+        self.head = first.next.take();
+        Some(first.object)
+    }
+}
+
+impl Drop for RemovedHashTerms {
+    fn drop(&mut self) {
+        while let Some(mut node) = self.head.take() {
+            self.head = node.next.take();
+        }
+    }
+}
+
+struct Stripe {
+    buckets: StripeBuckets,
+    nitems: AtomicIsize,
+}
+
+enum StripeBuckets {
+    Plain(Vec<HashBucket>),
+    Normal(RwLock<Vec<HashBucket>>),
+    FrequentRead(FrequentReadRwLock<Vec<HashBucket>>),
+}
+
+enum StripeReadGuard<'a> {
+    Plain(&'a Vec<HashBucket>),
+    Normal(std::sync::RwLockReadGuard<'a, Vec<HashBucket>>),
+    FrequentRead(FrequentReadGuard<'a, Vec<HashBucket>>),
+}
+
+impl std::ops::Deref for StripeReadGuard<'_> {
+    type Target = Vec<HashBucket>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Plain(buckets) => buckets,
+            Self::Normal(guard) => guard,
+            Self::FrequentRead(guard) => guard,
+        }
+    }
+}
+
+enum StripeWriteGuard<'a> {
+    Normal(std::sync::RwLockWriteGuard<'a, Vec<HashBucket>>),
+    FrequentRead(FrequentWriteGuard<'a, Vec<HashBucket>>),
+}
+
+impl std::ops::Deref for StripeWriteGuard<'_> {
+    type Target = Vec<HashBucket>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Normal(guard) => guard,
+            Self::FrequentRead(guard) => guard,
+        }
+    }
+}
+
+impl std::ops::DerefMut for StripeWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Normal(guard) => guard,
+            Self::FrequentRead(guard) => guard,
+        }
+    }
+}
+
+impl StripeBuckets {
+    // Port of erl_db_hash.c:403-416 (RLOCK_HASH is NULL for non-fine tables) and
+    // :1035-1041 (DB_FREQ_READ selects frequent-read stripe locks), OTP-29.1.1.
+    fn new(bucket_count: usize, fine_grained: bool, frequent_read: bool) -> Self {
+        let buckets = || {
+            std::iter::repeat_with(HashBucket::default)
+                .take(bucket_count)
+                .collect()
+        };
+        if !fine_grained {
+            Self::Plain(buckets())
+        } else if frequent_read {
+            Self::FrequentRead(FrequentReadRwLock::new(buckets()))
+        } else {
+            Self::Normal(RwLock::new(buckets()))
+        }
+    }
+
+    fn read(&self) -> StripeReadGuard<'_> {
+        match self {
+            Self::Plain(buckets) => StripeReadGuard::Plain(buckets),
+            Self::Normal(lock) => StripeReadGuard::Normal(lock.read().unwrap()),
+            Self::FrequentRead(lock) => StripeReadGuard::FrequentRead(lock.read()),
+        }
+    }
+
+    fn write(&self) -> StripeWriteGuard<'_> {
+        match self {
+            Self::Plain(_) => panic!("non-fine hash stripe cannot be write-locked"),
+            Self::Normal(lock) => StripeWriteGuard::Normal(lock.write().unwrap()),
+            Self::FrequentRead(lock) => StripeWriteGuard::FrequentRead(lock.write()),
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut Vec<HashBucket> {
+        match self {
+            Self::Plain(buckets) => buckets,
+            Self::Normal(lock) => lock.get_mut().unwrap(),
+            Self::FrequentRead(lock) => lock.get_mut(),
+        }
+    }
+}
+
+impl Stripe {
+    fn new(bucket_count: usize, fine_grained: bool, frequent_read: bool) -> Self {
+        Self {
+            buckets: StripeBuckets::new(bucket_count, fine_grained, frequent_read),
+            nitems: AtomicIsize::new(0),
+        }
+    }
+}
+
+fn stripe_bucket_count_before(end: usize, stripe: usize, nlocks: usize) -> usize {
+    if end <= stripe {
+        0
+    } else {
+        1 + (end - 1 - stripe) / nlocks
+    }
+}
+
+fn stripe_bucket_count_in(start: usize, end: usize, stripe: usize, nlocks: usize) -> usize {
+    stripe_bucket_count_before(end, stripe, nlocks)
+        - stripe_bucket_count_before(start, stripe, nlocks)
+}
+
+fn split_bucket(
+    source: &mut HashBucket,
+    destination: &mut HashBucket,
+    new_slot: usize,
+    mask: usize,
+) {
+    let mut current = source.head.take();
+    let (mut keep, mut moved) = (None, None);
+    let (mut keep_tail, mut moved_tail) = (&mut keep, &mut moved);
+    while let Some(mut node) = current {
+        current = node.next.take();
+        if node.pseudo_deleted {
+            continue;
+        }
+        if node.hvalue as usize & mask == new_slot {
+            *moved_tail = Some(node);
+            moved_tail = &mut moved_tail.as_mut().unwrap().next;
+        } else {
+            *keep_tail = Some(node);
+            keep_tail = &mut keep_tail.as_mut().unwrap().next;
+        }
+    }
+    source.head = keep;
+    destination.head = moved;
+}
+
+fn purge_pseudo_deleted(mut current: Option<Box<HashDbTerm>>) -> Option<Box<HashDbTerm>> {
+    let mut live = None;
+    let mut tail = &mut live;
+    while let Some(mut node) = current {
+        current = node.next.take();
+        if !node.pseudo_deleted {
+            *tail = Some(node);
+            tail = &mut tail.as_mut().unwrap().next;
+        }
+    }
+    live
+}
+
 /// Port of erts/emulator/beam/erl_db_hash.c:164-170, OTP-29.1.1.
 pub(super) struct HashStorage {
-    // OTP stores segment pointers in the segment table, so segment allocation remains stable.
-    segments: Vec<Box<Segment>>,
-    pub(super) next_order: u64,
-    pub(super) size: usize,
-    pub(super) size_bias: isize,
-    pub(super) nactive: usize,
-    pub(super) deleted: Vec<StoredTerm>,
-    szm: usize,
-    pub(super) nslots: usize,
-    lock_slots: RwLock<Vec<Arc<RwLock<()>>>>,
+    stripes: Box<[Stripe]>,
+    nlocks: usize,
+    pub(super) next_order: AtomicU64,
+    pub(super) size: AtomicIsize,
+    pub(super) size_bias: AtomicIsize,
+    pub(super) nactive: AtomicUsize,
+    pub(super) deleted: Mutex<Vec<StoredTerm>>,
+    szm: AtomicUsize,
+    pub(super) nslots: AtomicUsize,
+    initial_slots: usize,
     auto_lock_count: AtomicUsize,
-    auto_adapt: bool,
+    decentralized_counters: bool,
+    resize_lock: Mutex<()>,
 }
 
 impl HashStorage {
-    /// Port of erts/emulator/beam/erl_db_hash.c:1007-1018, OTP-29.1.1.
-    pub(super) fn new(write_concurrency: WriteConcurrency) -> Self {
+    /// Port of erts/emulator/beam/erl_db_hash.c:1017-1050, OTP-29.1.1.
+    pub(super) fn new(
+        write_concurrency: WriteConcurrency,
+        decentralized_counters: bool,
+        read_concurrency: bool,
+    ) -> Self {
         let locks = match write_concurrency {
+            WriteConcurrency::Disabled if decentralized_counters => NLOCKS_WITH_ITEM_COUNTERS,
             WriteConcurrency::Disabled => 1,
-            WriteConcurrency::Enabled => 64,
-            WriteConcurrency::Auto => 64,
-            WriteConcurrency::Fixed(count) => count,
+            WriteConcurrency::Enabled | WriteConcurrency::Auto => 64,
+            WriteConcurrency::Fixed(count) => {
+                let count = count.max(if decentralized_counters {
+                    NLOCKS_WITH_ITEM_COUNTERS
+                } else {
+                    64
+                });
+                1 << (usize::BITS - count.leading_zeros() - 1)
+            }
         };
+        let mut initial_slots = FIRST_SEGMENT;
+        while locks > initial_slots {
+            initial_slots += EXT_SEGMENT;
+        }
         Self {
-            segments: vec![Box::new(Segment::first())],
-            next_order: 0,
-            size: 0,
-            size_bias: 0,
-            nactive: FIRST_SEGMENT,
-            deleted: Vec::new(),
-            szm: FIRST_SEGMENT - 1,
-            nslots: FIRST_SEGMENT,
-            lock_slots: RwLock::new((0..locks).map(|_| Arc::new(RwLock::new(()))).collect()),
+            stripes: (0..locks)
+                .map(|stripe| {
+                    Stripe::new(
+                        stripe_bucket_count_in(0, initial_slots, stripe, locks),
+                        write_concurrency != WriteConcurrency::Disabled,
+                        read_concurrency,
+                    )
+                })
+                .collect(),
+            nlocks: locks,
+            next_order: AtomicU64::new(0),
+            size: AtomicIsize::new(0),
+            size_bias: AtomicIsize::new(0),
+            nactive: AtomicUsize::new(FIRST_SEGMENT),
+            deleted: Mutex::new(Vec::new()),
+            szm: AtomicUsize::new(FIRST_SEGMENT - 1),
+            nslots: AtomicUsize::new(initial_slots),
+            initial_slots,
             auto_lock_count: AtomicUsize::new(locks),
-            auto_adapt: write_concurrency == WriteConcurrency::Auto,
+            decentralized_counters,
+            resize_lock: Mutex::new(()),
         }
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:207-217, OTP-29.1.1.
     #[inline]
     pub(super) fn slot_index(&self, hval: u64) -> usize {
-        let index = hval as usize & self.szm;
-        if index >= self.nactive {
-            index & (self.szm >> 1)
+        let nactive = self.nactive.load(Ordering::Acquire);
+        let szm = self.szm.load(Ordering::Acquire);
+        let index = hval as usize & szm;
+        if index >= nactive {
+            index & (szm >> 1)
         } else {
             index
         }
@@ -196,71 +353,665 @@ impl HashStorage {
         ets_hash(term) >> 1
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:280-281, OTP-29.1.1.
-    #[inline]
-    fn hash_to_lock(&self, hval: u64) -> usize {
-        hval as usize & (self.auto_lock_count.load(Ordering::Relaxed) - 1)
-    }
-
     /// Port of erts/emulator/beam/erl_db_hash.c:1041-1067, OTP-29.1.1.
     pub(super) fn lock_count(&self) -> usize {
         self.auto_lock_count.load(Ordering::Relaxed)
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1041-1067, OTP-29.1.1.
-    pub(super) fn note_contention(&self, contended: bool) {
-        if contended
-            && self.auto_adapt
-            && let Ok(old) =
-                self.auto_lock_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                        (n < 8192).then_some(n * 2)
-                    })
-        {
-            let mut slots = self.lock_slots.write().unwrap();
-            let old_len = slots.len();
-            slots.extend((old_len..old * 2).map(|_| Arc::new(RwLock::new(()))));
-        }
-    }
-
-    /// Port of erts/emulator/beam/erl_db_hash.c:1526-1528, OTP-29.1.1.
-    pub(super) fn lock_for_hash(&self, hval: u64) -> Option<Arc<RwLock<()>>> {
-        (self.lock_count() > 1)
-            .then(|| Arc::clone(&self.lock_slots.read().unwrap()[self.hash_to_lock(hval)]))
+    #[inline]
+    pub(super) fn size(&self) -> usize {
+        self.size.load(Ordering::Relaxed).max(0) as usize
     }
 
     #[inline]
-    fn segment_bucket(&self, slot: usize) -> &HashBucket {
-        if slot < FIRST_SEGMENT {
-            self.segments[0].get(slot)
-        } else {
-            self.segments[1 + (slot - FIRST_SEGMENT) / EXT_SEGMENT]
-                .get((slot - FIRST_SEGMENT) % EXT_SEGMENT)
+    pub(super) fn add_items(&self, hval: u64, delta: isize) -> isize {
+        if self.decentralized_counters {
+            let counter = &self.stripes[hval as usize % NLOCKS_WITH_ITEM_COUNTERS].nitems;
+            counter.fetch_add(delta, Ordering::Relaxed);
         }
+        self.size.fetch_add(delta, Ordering::Relaxed) + delta
+    }
+
+    #[inline]
+    fn estimated_items(&self, hval: u64) -> isize {
+        if self.decentralized_counters {
+            self.stripes[hval as usize % NLOCKS_WITH_ITEM_COUNTERS]
+                .nitems
+                .load(Ordering::Relaxed)
+                * NLOCKS_WITH_ITEM_COUNTERS as isize
+        } else {
+            self.size.load(Ordering::Relaxed)
+        }
+    }
+
+    #[inline]
+    pub(super) fn nactive(&self) -> usize {
+        self.nactive.load(Ordering::Acquire)
+    }
+
+    /// Port of erts/emulator/beam/erl_db_hash.c:1526-1528, OTP-29.1.1.
+    #[inline]
+    fn stripe_index(&self, slot: usize) -> usize {
+        slot % self.nlocks
     }
 
     #[inline]
     fn segment_bucket_mut(&mut self, slot: usize) -> &mut HashBucket {
-        if slot < FIRST_SEGMENT {
-            self.segments[0].get_mut(slot)
+        self.stripes[self.stripe_index(slot)]
+            .buckets
+            .get_mut()
+            .get_mut(slot / self.nlocks)
+            .unwrap()
+    }
+
+    /// Hold the bucket's hash stripe while its borrowed terms are consumed.
+    // Port of erts/emulator/beam/erl_db_hash.c:404-419 (RLOCK_HASH), OTP-29.1.1.
+    fn with_bucket<R>(&self, slot: usize, visit: impl FnOnce(&HashBucket) -> R) -> Option<R> {
+        let stripe = &self.stripes[self.stripe_index(slot)];
+        let buckets = stripe.buckets.read();
+        (slot < self.nactive()).then(|| visit(&buckets[slot / self.nlocks]))
+    }
+
+    /// Keep the key's write stripe held through the complete bucket mutation.
+    // Port of erts/emulator/beam/erl_db_hash.c:491-499 (WLOCK_HASH), OTP-29.1.1.
+    fn with_hash_bucket_mut<R>(
+        &self,
+        hvalue: u64,
+        visit: impl FnOnce(usize, &mut HashBucket) -> R,
+    ) -> R {
+        let mut visit = Some(visit);
+        loop {
+            let slot = self.slot_index(hvalue);
+            let stripe = &self.stripes[self.stripe_index(slot)];
+            let mut buckets = stripe.buckets.write();
+            if self.slot_index(hvalue) == slot {
+                return visit.take().unwrap()(slot, &mut buckets[slot / self.nlocks]);
+            }
+        }
+    }
+
+    /// Insert a prepared object under its hash stripe.
+    // Port of erts/emulator/beam/erl_db_hash.c:1363-1460 (db_put_hash), OTP-29.1.1.
+    pub(super) fn insert_shared(
+        &self,
+        mut object: StoredTerm,
+        hash: u64,
+        table_type: TableType,
+        keypos: usize,
+        fixed: bool,
+        new_only: bool,
+    ) -> bool {
+        let hvalue = hash >> 1;
+        object.hvalue = hvalue;
+        let mut inserted = false;
+        let mut accepted = true;
+        self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
+            let key = object.key(keypos);
+            let mut link = &mut bucket.head;
+            while link.as_ref().is_some_and(|node| {
+                node.hvalue != hvalue || !exact_key(node.object.key(keypos), key)
+            }) {
+                link = &mut link.as_mut().unwrap().next;
+            }
+            let group_order = link.as_ref().map(|node| node.object.group_order);
+            if table_type == TableType::Set
+                && let Some(node) = link.as_mut()
+            {
+                if new_only && !node.pseudo_deleted {
+                    accepted = false;
+                    return;
+                }
+                object.order = node.object.order;
+                object.group_order = node.object.group_order;
+                if node.pseudo_deleted {
+                    node.pseudo_deleted = false;
+                    inserted = true;
+                    self.add_items(hash, 1);
+                }
+                node.object = object;
+                return;
+            }
+            if new_only {
+                let mut node = link.as_deref();
+                while let Some(current) = node {
+                    if current.hvalue != hvalue || !exact_key(current.object.key(keypos), key) {
+                        break;
+                    }
+                    if !current.pseudo_deleted {
+                        accepted = false;
+                        return;
+                    }
+                    node = current.next.as_deref();
+                }
+            }
+            if table_type == TableType::Bag {
+                let revived = {
+                    let mut cursor = &mut *link;
+                    let mut at_group_head = true;
+                    let mut revived = None;
+                    while let Some(node) = cursor.as_deref_mut() {
+                        if node.hvalue != hvalue || !exact_key(node.object.key(keypos), key) {
+                            break;
+                        }
+                        if node.object.exact_eq_stored(&object) {
+                            if !node.pseudo_deleted {
+                                return;
+                            }
+                            node.pseudo_deleted = false;
+                            inserted = true;
+                            self.add_items(hash, 1);
+                            if !at_group_head {
+                                let mut node = cursor.take().unwrap();
+                                *cursor = node.next.take();
+                                revived = Some(node);
+                            } else {
+                                return;
+                            }
+                            break;
+                        }
+                        cursor = &mut cursor.as_mut().unwrap().next;
+                        at_group_head = false;
+                    }
+                    revived
+                };
+                if let Some(mut node) = revived {
+                    node.next = link.take();
+                    *link = Some(node);
+                    return;
+                }
+            }
+
+            object.order = self.next_order.fetch_add(1, Ordering::Relaxed);
+            object.group_order = group_order.unwrap_or(object.order);
+            let new = Box::new(HashDbTerm {
+                next: link.take(),
+                hvalue,
+                pseudo_deleted: false,
+                object,
+            });
+            *link = Some(new);
+            inserted = true;
+            self.add_items(hash, 1);
+        });
+        if inserted && accepted {
+            self.grow_after_insert(hash, fixed);
+        }
+        accepted
+    }
+
+    /// Delete all objects at a key while holding its write stripe.
+    // Port of erts/emulator/beam/erl_db_hash.c:1613-1666 (db_erase_hash), OTP-29.1.1.
+    pub(super) fn delete_key_shared(&self, key: Term, hash: u64, keypos: usize, fixed: bool) {
+        self.delete_matching_shared(key, hash, keypos, fixed, |_| true);
+    }
+
+    // Port of erts/emulator/beam/erl_db.c:1494-1683 (do_update_counter), OTP-29.1.1.
+    pub(super) fn update_counter_shared(
+        &self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        operations: &[crate::CounterOp],
+    ) -> Option<smallvec::SmallVec<[Term; 4]>> {
+        self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            let mut node = bucket.head.as_deref_mut();
+            let object = loop {
+                let current = node?;
+                if !current.pseudo_deleted
+                    && current.hvalue == hash >> 1
+                    && exact_key(current.object.key(keypos), key)
+                {
+                    break &mut current.object;
+                }
+                node = current.next.as_deref_mut();
+            };
+            if !object.compressed_elements.is_empty() {
+                return None;
+            }
+            let mut updated: smallvec::SmallVec<[(usize, i64); 4]> = smallvec::SmallVec::new();
+            let mut results = smallvec::SmallVec::new();
+            for operation in operations {
+                if operation.position == keypos || operation.position == 0 {
+                    return None;
+                }
+                let index = operation.position - 1;
+                let old = match updated.iter().rev().find(|(at, _)| *at == index) {
+                    Some(&(_, value)) => value,
+                    None => object.tuple_element(index)?.as_small()?,
+                };
+                let mut next = old.checked_add(operation.increment)?;
+                if let Some((threshold, reset)) = operation.threshold
+                    && if operation.increment < 0 {
+                        next < threshold
+                    } else {
+                        next > threshold
+                    }
+                {
+                    next = reset;
+                }
+                results.push(Term::small(next)?);
+                updated.push((index, next));
+            }
+            for (index, value) in updated {
+                if !object.set_immediate_element(index, Term::small(value)?) {
+                    return None;
+                }
+            }
+            Some(results)
+        })
+    }
+
+    // Port of erts/emulator/beam/erl_db.c:1371-1442 (do_update_element) and :1494-1683
+    // (do_update_counter), OTP-29.1.1.
+    pub(super) fn update_or_insert_shared<E>(
+        &self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        fixed: bool,
+        update: impl FnOnce(Option<&StoredTerm>) -> Result<Option<StoredTerm>, E>,
+    ) -> Result<bool, E> {
+        let hvalue = hash >> 1;
+        let mut update = Some(update);
+        let (changed, inserted) = self.with_hash_bucket_mut(hvalue, |_slot, bucket| {
+            let mut link = &mut bucket.head;
+            while link.as_ref().is_some_and(|node| {
+                node.hvalue != hvalue || !exact_key(node.object.key(keypos), key)
+            }) {
+                link = &mut link.as_mut().unwrap().next;
+            }
+            let found = link
+                .as_ref()
+                .filter(|node| !node.pseudo_deleted)
+                .map(|node| &node.object);
+            let Some(mut replacement) = update.take().unwrap()(found)? else {
+                return Ok((false, false));
+            };
+            replacement.hvalue = hvalue;
+            if let Some(node) = link.as_mut() {
+                let revived = node.pseudo_deleted;
+                replacement.order = node.object.order;
+                replacement.group_order = node.object.group_order;
+                node.object = replacement;
+                if revived {
+                    node.pseudo_deleted = false;
+                    self.add_items(hash, 1);
+                    return Ok((true, true));
+                }
+                return Ok((true, false));
+            }
+            replacement.order = self.next_order.fetch_add(1, Ordering::Relaxed);
+            replacement.group_order = replacement.order;
+            let new = Box::new(HashDbTerm {
+                next: link.take(),
+                hvalue,
+                pseudo_deleted: false,
+                object: replacement,
+            });
+            *link = Some(new);
+            self.add_items(hash, 1);
+            Ok((true, true))
+        })?;
+        if inserted {
+            self.grow_after_insert(hash, fixed);
+        }
+        Ok(changed)
+    }
+
+    // Port of erts/emulator/beam/erl_db_hash.c:1613-1666 (db_erase_hash), OTP-29.1.1.
+    pub(super) fn delete_object_shared(
+        &self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        object: Term,
+        fixed: bool,
+    ) {
+        self.delete_matching_shared(key, hash, keypos, fixed, |stored| {
+            stored.exact_eq_term(object)
+        });
+    }
+
+    // Port of erts/emulator/beam/erl_db_hash.c:2949-3005 (db_take_hash), OTP-29.1.1.
+    pub(super) fn take_shared<H: HeapAlloc>(
+        &self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        table_type: TableType,
+        fixed: bool,
+        dst: &mut H,
+    ) -> Result<Vec<Term>, EtsError> {
+        let mut removed_count = 0;
+        let mut values = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            let mut values = Vec::new();
+            let mut current = bucket.head.as_deref();
+            let mut found = false;
+            while let Some(node) = current {
+                if !node.pseudo_deleted
+                    && node.hvalue == hash >> 1
+                    && exact_key(node.object.key(keypos), key)
+                {
+                    found = true;
+                    values.push(node.object.copy_out(dst)?);
+                    if !matches!(table_type, TableType::Bag | TableType::DuplicateBag) {
+                        break;
+                    }
+                } else if found {
+                    break;
+                }
+                current = node.next.as_deref();
+            }
+            let mut link = &mut bucket.head;
+            let mut first = true;
+            while let Some(mut node) = link.take() {
+                if !node.pseudo_deleted
+                    && node.hvalue == hash >> 1
+                    && exact_key(node.object.key(keypos), key)
+                {
+                    removed_count += 1;
+                    if fixed && first {
+                        node.pseudo_deleted = true;
+                        *link = Some(node);
+                        link = &mut link.as_mut().unwrap().next;
+                        first = false;
+                    } else {
+                        *link = node.next.take();
+                    }
+                    if !matches!(table_type, TableType::Bag | TableType::DuplicateBag) {
+                        break;
+                    }
+                } else {
+                    *link = Some(node);
+                    link = &mut link.as_mut().unwrap().next;
+                }
+            }
+            if removed_count != 0 {
+                self.add_items(hash, -(removed_count as isize));
+            }
+            Ok::<_, EtsError>(values)
+        })?;
+        if matches!(table_type, TableType::Bag | TableType::DuplicateBag) {
+            values.reverse();
+        }
+        if removed_count != 0 && !fixed {
+            self.shrink_after_delete_shared(self.estimated_items(hash));
+        }
+        Ok(values)
+    }
+
+    // Port of erts/emulator/beam/erl_db_hash.c:2870-2905 (db_select_replace_hash), OTP-29.1.1.
+    pub(super) fn replace_key_shared<E>(
+        &self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        mut replace: impl FnMut(&StoredTerm) -> Result<Option<StoredTerm>, E>,
+    ) -> Result<usize, E> {
+        self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            let mut count = 0;
+            let mut node = bucket.head.as_deref_mut();
+            while let Some(current) = node {
+                if !current.pseudo_deleted
+                    && current.hvalue == hash >> 1
+                    && exact_key(current.object.key(keypos), key)
+                    && let Some(mut replacement) = replace(&current.object)?
+                {
+                    replacement.order = current.object.order;
+                    replacement.group_order = current.object.group_order;
+                    replacement.hvalue = current.hvalue;
+                    current.object = replacement;
+                    count += 1;
+                }
+                node = current.next.as_deref_mut();
+            }
+            Ok(count)
+        })
+    }
+
+    fn delete_matching_shared(
+        &self,
+        key: Term,
+        hash: u64,
+        keypos: usize,
+        fixed: bool,
+        mut matches: impl FnMut(&StoredTerm) -> bool,
+    ) {
+        let (mut removed, count) = self.with_hash_bucket_mut(hash >> 1, |_slot, bucket| {
+            let mut link = &mut bucket.head;
+            let mut removed = RemovedHashTerms { head: None };
+            let mut tail = &mut removed.head;
+            let mut count = 0;
+            while let Some(mut node) = link.take() {
+                if !node.pseudo_deleted
+                    && node.hvalue == hash >> 1
+                    && exact_key(node.object.key(keypos), key)
+                    && matches(&node.object)
+                {
+                    *link = node.next.take();
+                    *tail = Some(node);
+                    tail = &mut tail.as_mut().unwrap().next;
+                    count += 1;
+                } else {
+                    *link = Some(node);
+                    link = &mut link.as_mut().unwrap().next;
+                }
+            }
+            if count != 0 {
+                self.add_items(hash, -(count as isize));
+            }
+            (removed, count)
+        });
+        if fixed && let Some(object) = removed.take_first() {
+            self.deleted.lock().unwrap().push(object);
+        }
+        if count != 0 && !fixed {
+            let nitems = self.estimated_items(hash);
+            self.shrink_after_delete_shared(nitems);
+        }
+    }
+
+    fn shrink_after_delete_shared(&self, nitems: isize) {
+        // Port of erts/emulator/beam/erl_db_hash.c:757-761 (try_shrink), OTP-29.1.1.
+        if nitems >= self.shrink_limit() as isize {
+            return;
+        }
+        let _resize = self.resize_lock.lock().unwrap();
+        for _ in 0..5 {
+            let nslots = self.nslots.load(Ordering::Relaxed);
+            if nitems >= ((nslots.saturating_sub(EXT_SEGMENT)) / 2) as isize {
+                break;
+            }
+            let old_active = self.nactive();
+            if old_active <= FIRST_SEGMENT {
+                break;
+            }
+            let source = old_active - 1;
+            let low_mask = self.szm.load(Ordering::Relaxed) >> 1;
+            let destination = source & low_mask;
+            let stripe_index = self.stripe_index(source);
+            debug_assert_eq!(stripe_index, self.stripe_index(destination));
+            let mut buckets = self.stripes[stripe_index].buckets.write();
+            if self.nactive() != old_active {
+                drop(buckets);
+                break;
+            }
+            self.nactive.store(source, Ordering::Release);
+            if destination == 0 {
+                self.szm.store(low_mask, Ordering::Release);
+            }
+            let source_index = source / self.nlocks;
+            let destination_index = destination / self.nlocks;
+            let mut source_head = buckets[source_index].head.take();
+            if let Some(mut head) = source_head.take() {
+                let mut tail = &mut head;
+                while tail.next.is_some() {
+                    tail = tail.next.as_mut().unwrap();
+                }
+                tail.next = buckets[destination_index].head.take();
+                buckets[destination_index].head = purge_pseudo_deleted(Some(head));
+            }
+            drop(buckets);
+            if nslots - source >= EXT_SEGMENT {
+                let new_slots = self.nslots.fetch_sub(EXT_SEGMENT, Ordering::Relaxed) - EXT_SEGMENT;
+                for (index, stripe) in self.stripes.iter().enumerate() {
+                    stripe.buckets.write().truncate(stripe_bucket_count_before(
+                        new_slots,
+                        index,
+                        self.nlocks,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Port of erts/emulator/beam/erl_db_hash.c:3648-3731 (grow), OTP-29.1.1.
+    fn grow_after_insert(&self, hash: u64, fixed: bool) {
+        if fixed {
+            return;
+        }
+        // Port of erts/emulator/beam/erl_db_hash.c:3993-4001 (db_finalize_dbterm_hash),
+        // OTP-29.1.1.
+        if self.estimated_items(hash) <= self.nactive() as isize {
+            return;
+        }
+        let _resize = self.resize_lock.lock().unwrap();
+        let nitems = self.estimated_items(hash);
+        let old_active = self.nactive();
+        if nitems <= old_active as isize {
+            return;
+        }
+        let old_slots = self.nslots.load(Ordering::Relaxed);
+        if old_active == old_slots {
+            let end = old_slots + EXT_SEGMENT;
+            for (index, stripe) in self.stripes.iter().enumerate() {
+                stripe.buckets.write().extend(
+                    std::iter::repeat_with(HashBucket::default).take(stripe_bucket_count_in(
+                        old_slots,
+                        end,
+                        index,
+                        self.nlocks,
+                    )),
+                );
+            }
+            self.nslots.store(end, Ordering::Relaxed);
+        }
+        let old_mask = self.szm.load(Ordering::Relaxed);
+        let (source, new_mask) = if old_active <= old_mask {
+            (old_active & (old_mask >> 1), old_mask)
         } else {
-            self.segments[1 + (slot - FIRST_SEGMENT) / EXT_SEGMENT]
-                .get_mut((slot - FIRST_SEGMENT) % EXT_SEGMENT)
+            (0, (old_mask << 1) | 1)
+        };
+        let destination = old_active;
+        let source_lock = self.stripe_index(source);
+        let destination_lock = self.stripe_index(destination);
+        if source_lock == destination_lock {
+            let mut buckets = self.stripes[source_lock].buckets.write();
+            let source_index = source / self.nlocks;
+            let destination_index = destination / self.nlocks;
+            if source_index < destination_index {
+                let (left, right) = buckets.split_at_mut(destination_index);
+                split_bucket(
+                    &mut left[source_index],
+                    &mut right[0],
+                    destination,
+                    new_mask,
+                );
+            } else {
+                let (left, right) = buckets.split_at_mut(source_index);
+                split_bucket(
+                    &mut right[0],
+                    &mut left[destination_index],
+                    destination,
+                    new_mask,
+                );
+            }
+        } else if source_lock < destination_lock {
+            let mut source_buckets = self.stripes[source_lock].buckets.write();
+            let mut destination_buckets = self.stripes[destination_lock].buckets.write();
+            split_bucket(
+                &mut source_buckets[source / self.nlocks],
+                &mut destination_buckets[destination / self.nlocks],
+                destination,
+                new_mask,
+            );
+        } else {
+            let mut destination_buckets = self.stripes[destination_lock].buckets.write();
+            let mut source_buckets = self.stripes[source_lock].buckets.write();
+            split_bucket(
+                &mut source_buckets[source / self.nlocks],
+                &mut destination_buckets[destination / self.nlocks],
+                destination,
+                new_mask,
+            );
+        }
+        self.szm.store(new_mask, Ordering::Relaxed);
+        self.nactive.store(old_active + 1, Ordering::Release);
+    }
+
+    pub(super) fn with_objects_hash<R>(
+        &self,
+        hval: u64,
+        visit: impl FnOnce(HashIter<'_>) -> R,
+    ) -> R {
+        let hvalue = hval >> 1;
+        loop {
+            let slot = self.slot_index(hvalue);
+            let stripe = &self.stripes[self.stripe_index(slot)];
+            let buckets = stripe.buckets.read();
+            if self.slot_index(hvalue) == slot {
+                return visit(HashIter {
+                    next: buckets[slot / self.nlocks].head.as_deref(),
+                });
+            }
         }
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1107-1110,1155-1157, OTP-29.1.1.
-    pub(super) fn objects(&self, key: Term) -> HashIter<'_> {
-        self.objects_hash(ets_hash(key))
+    pub(super) fn try_for_each_value<E>(
+        &self,
+        mut visit: impl FnMut(&StoredTerm) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.try_for_each_value_while(|object| {
+            visit(object)?;
+            Ok(true)
+        })
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1155-1157, OTP-29.1.1.
-    #[inline]
-    pub(super) fn objects_hash(&self, hval: u64) -> HashIter<'_> {
-        let bucket = self.segment_bucket(self.slot_index(hval >> 1));
-        HashIter {
-            next: bucket.head.as_deref(),
+    pub(super) fn for_each_value(&self, mut visit: impl FnMut(&StoredTerm)) {
+        for slot in 0..self.nactive() {
+            let _ = self.with_bucket(slot, |bucket| {
+                for node in (HashIter {
+                    next: bucket.head.as_deref(),
+                }) {
+                    visit(&node.object);
+                }
+            });
         }
+    }
+
+    pub(super) fn try_for_each_value_while<E>(
+        &self,
+        mut visit: impl FnMut(&StoredTerm) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        for slot in 0..self.nactive() {
+            let Some(keep_going) = self.with_bucket(slot, |bucket| {
+                for node in (HashIter {
+                    next: bucket.head.as_deref(),
+                }) {
+                    if !visit(&node.object)? {
+                        return Ok::<_, E>(false);
+                    }
+                }
+                Ok(true)
+            }) else {
+                continue;
+            };
+            let keep_going = keep_going?;
+            if !keep_going {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The live object at `key` in a set table, for an update in place.
@@ -286,13 +1037,18 @@ impl HashStorage {
     ///
     /// Port of erts/emulator/beam/erl_db_hash.c:4173-4194, OTP-29.1.1.
     pub(super) fn raw_first(&self, keypos: usize) -> Option<Term> {
-        (0..self.nactive).find_map(|slot| {
-            HashIter {
-                next: self.segment_bucket(slot).head.as_deref(),
+        for slot in 0..self.nactive() {
+            if let Some(Some(key)) = self.with_bucket(slot, |bucket| {
+                HashIter {
+                    next: bucket.head.as_deref(),
+                }
+                .next()
+                .map(|object| object.key(keypos))
+            }) {
+                return Some(key);
             }
-            .next()
-            .map(|object| object.key(keypos))
-        })
+        }
+        None
     }
 
     /// Return a key's raw successor, preserving the hash directory walk order.
@@ -300,34 +1056,48 @@ impl HashStorage {
     /// Port of erts/emulator/beam/erl_db_hash.c:4196-4231, OTP-29.1.1.
     pub(super) fn raw_next(&self, key: Term, keypos: usize) -> Result<Option<Term>, EtsError> {
         let hash = ets_hash(key) >> 1;
-        let slot = self.slot_index(hash);
-        let mut found = false;
-        for node in (HashIter {
-            next: self.segment_bucket(slot).head.as_deref(),
-        }) {
-            if !found {
-                if node.hvalue == hash && exact_key(node.object.key(keypos), key) {
-                    found = true;
+        loop {
+            let slot = self.slot_index(hash);
+            let mut found = false;
+            let Some(in_slot) = self.with_bucket(slot, |bucket| {
+                let mut successor = None;
+                for node in (HashIter {
+                    next: bucket.head.as_deref(),
+                }) {
+                    if !found {
+                        if node.hvalue == hash && exact_key(node.object.key(keypos), key) {
+                            found = true;
+                        }
+                        continue;
+                    }
+                    if node.hvalue != hash || !exact_key(node.object.key(keypos), key) {
+                        successor = Some(node.object.key(keypos));
+                        break;
+                    }
                 }
+                successor
+            }) else {
                 continue;
+            };
+            if in_slot.is_some() {
+                return Ok(in_slot);
             }
-            if node.hvalue != hash || !exact_key(node.object.key(keypos), key) {
-                return Ok(Some(node.object.key(keypos)));
+            if !found {
+                return Err(EtsError::BadArg);
             }
-        }
-        if !found {
-            return Err(EtsError::BadArg);
-        }
-        for slot in slot + 1..self.nactive {
-            if let Some(node) = (HashIter {
-                next: self.segment_bucket(slot).head.as_deref(),
-            })
-            .next()
-            {
-                return Ok(Some(node.object.key(keypos)));
+            for slot in slot + 1..self.nactive() {
+                if let Some(Some(key)) = self.with_bucket(slot, |bucket| {
+                    HashIter {
+                        next: bucket.head.as_deref(),
+                    }
+                    .next()
+                    .map(|node| node.object.key(keypos))
+                }) {
+                    return Ok(Some(key));
+                }
             }
+            return Ok(None);
         }
-        Ok(None)
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3883-3885, OTP-29.1.1.
@@ -346,30 +1116,59 @@ impl HashStorage {
         None
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1363-1440, OTP-29.1.1.
-    pub(super) fn push_at(&mut self, slot: usize, object: StoredTerm) {
+    /// Port of erts/emulator/beam/erl_db_hash.c:1363-1450 (db_put_hash), OTP-29.1.1.
+    pub(super) fn push_at_key(&mut self, slot: usize, object: StoredTerm, keypos: usize) {
         let hvalue = object.hvalue;
+        let key = object.key(keypos);
         let bucket = self.segment_bucket_mut(slot);
-        let mut node = Box::new(HashDbTerm {
-            next: bucket.head.take(),
+        let mut link = &mut bucket.head;
+        while link
+            .as_ref()
+            .is_some_and(|node| node.hvalue != hvalue || !exact_key(node.object.key(keypos), key))
+        {
+            link = &mut link.as_mut().unwrap().next;
+        }
+        let node = Box::new(HashDbTerm {
+            next: link.take(),
             hvalue,
             pseudo_deleted: false,
             object,
         });
-        node.object.hvalue = hvalue;
-        bucket.head = Some(node);
+        *link = Some(node);
+    }
+
+    /// Restore an object at its former place after a fixed-table deletion.
+    pub(super) fn push_at_order(&mut self, slot: usize, object: StoredTerm) {
+        let hvalue = object.hvalue;
+        let order = (object.group_order, u64::MAX - object.order);
+        let bucket = self.segment_bucket_mut(slot);
+        let mut link = &mut bucket.head;
+        while link
+            .as_ref()
+            .is_some_and(|node| (node.object.group_order, u64::MAX - node.object.order) < order)
+        {
+            link = &mut link.as_mut().unwrap().next;
+        }
+        let node = Box::new(HashDbTerm {
+            next: link.take(),
+            hvalue,
+            pseudo_deleted: false,
+            object,
+        });
+        *link = Some(node);
     }
 
     pub(super) fn take_all_buckets(&mut self) -> Vec<StoredTerm> {
-        let mut objects = Vec::with_capacity(self.size);
-        for segment in &mut self.segments {
-            for bucket in segment.iter_mut() {
-                let mut node = bucket.head.take();
-                while let Some(mut current) = node {
-                    node = current.next.take();
-                    objects.push(current.object);
-                }
+        let mut objects = Vec::with_capacity(self.size());
+        for slot in 0..self.nactive() {
+            let mut node = self.segment_bucket_mut(slot).head.take();
+            while let Some(mut current) = node {
+                node = current.next.take();
+                objects.push(current.object);
             }
+        }
+        for stripe in self.stripes.iter() {
+            stripe.nitems.store(0, Ordering::Relaxed);
         }
         objects
     }
@@ -378,53 +1177,65 @@ impl HashStorage {
     // Port of erts/emulator/beam/erl_db_hash.c:4017 (db_delete_all_objects_hash:
     // db_free_table_continue_hash + db_create_hash), OTP-29.1.1.
     pub(super) fn clear_buckets(&mut self) {
-        self.segments.clear();
-        self.segments.push(Box::new(Segment::first()));
-        self.nactive = FIRST_SEGMENT;
-        self.szm = FIRST_SEGMENT - 1;
-        self.nslots = FIRST_SEGMENT;
+        for (index, stripe) in self.stripes.iter_mut().enumerate() {
+            let buckets = stripe.buckets.get_mut();
+            buckets.clear();
+            buckets.extend(std::iter::repeat_with(HashBucket::default).take(
+                stripe_bucket_count_in(0, self.initial_slots, index, self.nlocks),
+            ));
+            stripe.nitems.store(0, Ordering::Relaxed);
+        }
+        self.nactive.store(FIRST_SEGMENT, Ordering::Release);
+        self.szm.store(FIRST_SEGMENT - 1, Ordering::Release);
+        self.nslots.store(self.initial_slots, Ordering::Release);
     }
 
     /// Detach all buckets (and, for a table being deleted, the pseudo-deleted list) so they can
     /// be released a few segments at a time, leaving the initial single-segment layout.
     // Port of erts/emulator/beam/erl_db_hash.c:3122 (db_free_table_continue_hash), OTP-29.1.1.
     pub(super) fn take_garbage(&mut self, with_deleted: bool) -> HashGarbage {
-        let segments = std::mem::take(&mut self.segments);
+        let nslots = self.nslots.load(Ordering::Relaxed);
+        let mut segments = Vec::new();
+        let mut start = 0;
+        let mut end = FIRST_SEGMENT;
+        while start < nslots {
+            let mut segment = Vec::with_capacity(end - start);
+            for slot in start..end.min(nslots) {
+                let stripe = &mut self.stripes[slot % self.nlocks];
+                segment.push(std::mem::take(
+                    &mut stripe.buckets.get_mut()[slot / self.nlocks],
+                ));
+            }
+            segments.push(segment);
+            start = end;
+            end += EXT_SEGMENT;
+        }
         self.clear_buckets();
         HashGarbage {
             segments,
             deleted: if with_deleted {
-                std::mem::take(&mut self.deleted)
+                std::mem::take(self.deleted.get_mut().unwrap())
             } else {
                 Vec::new()
             },
         }
     }
 
-    pub(super) fn values(&self) -> impl Iterator<Item = &StoredTerm> {
-        self.segments
-            .iter()
-            .flat_map(|segment| segment.iter())
-            .flat_map(|bucket| HashIter {
-                next: bucket.head.as_deref(),
-            })
-            .map(|node| &node.object)
-    }
-
     pub(super) fn key_count(&self, keypos: usize) -> usize {
         let mut count = 0;
-        for slot in 0..self.nactive {
-            let mut keys = Vec::new();
-            let mut iter = HashIter {
-                next: self.segment_bucket(slot).head.as_deref(),
-            };
-            for object in &mut iter {
-                let key = object.key(keypos);
-                if !keys.iter().any(|&old| arinsal_term::exact_eq(old, key)) {
-                    keys.push(key);
-                    count += 1;
+        for slot in 0..self.nactive() {
+            let _ = self.with_bucket(slot, |bucket| {
+                let mut keys = Vec::new();
+                for object in (HashIter {
+                    next: bucket.head.as_deref(),
+                }) {
+                    let key = object.key(keypos);
+                    if !keys.iter().any(|&old| arinsal_term::exact_eq(old, key)) {
+                        keys.push(key);
+                        count += 1;
+                    }
                 }
-            }
+            });
         }
         count
     }
@@ -435,46 +1246,48 @@ impl HashStorage {
         mut replace: impl FnMut(&StoredTerm) -> Result<Option<StoredTerm>, EtsError>,
     ) -> Result<usize, EtsError> {
         let mut count = 0;
-        for object in self.values_mut() {
-            if let Some(mut replacement) = replace(object)? {
-                replacement.order = object.order;
-                replacement.group_order = object.group_order;
-                replacement.hvalue = object.hvalue;
-                *object = replacement;
-                count += 1;
+        for slot in 0..self.nactive() {
+            let mut node = self.segment_bucket_mut(slot).head.as_deref_mut();
+            while let Some(current) = node {
+                if !current.pseudo_deleted
+                    && let Some(mut replacement) = replace(&current.object)?
+                {
+                    replacement.order = current.object.order;
+                    replacement.group_order = current.object.group_order;
+                    replacement.hvalue = current.object.hvalue;
+                    current.object = replacement;
+                    count += 1;
+                }
+                node = current.next.as_deref_mut();
             }
         }
         Ok(count)
     }
 
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut StoredTerm> {
-        self.segments
-            .iter_mut()
-            .flat_map(|segment| segment.iter_mut())
-            .flat_map(|bucket| HashIterMut {
-                next: bucket.head.as_deref_mut(),
-            })
-    }
-
-    /// Port of erts/emulator/beam/erl_db_hash.c:3973-3984, OTP-29.1.1.
-    pub(super) fn detach_matching(
+    /// Unlink live terms into the same intrusive free list used by `db_erase_hash`.
+    // Port of erts/emulator/beam/erl_db_hash.c:1620-1690 (db_erase_hash), OTP-29.1.1.
+    pub(super) fn detach_live_matching(
         &mut self,
         hval: u64,
         mut predicate: impl FnMut(&StoredTerm) -> bool,
-    ) -> Vec<StoredTerm> {
+    ) -> (RemovedHashTerms, usize) {
         let slot = self.slot_index(hval);
         let mut link = &mut self.segment_bucket_mut(slot).head;
-        let mut removed = Vec::new();
+        let mut removed = RemovedHashTerms { head: None };
+        let mut tail = &mut removed.head;
+        let mut count = 0;
         while let Some(mut node) = link.take() {
-            if predicate(&node.object) {
+            if !node.pseudo_deleted && predicate(&node.object) {
                 *link = node.next.take();
-                removed.push(node.object);
+                *tail = Some(node);
+                tail = &mut tail.as_mut().unwrap().next;
+                count += 1;
             } else {
                 *link = Some(node);
                 link = &mut link.as_mut().unwrap().next;
             }
         }
-        removed
+        (removed, count)
     }
 
     /// Unlink every live object for which `predicate` holds while walking the buckets once.
@@ -486,8 +1299,9 @@ impl HashStorage {
         mut predicate: impl FnMut(&StoredTerm) -> Result<bool, E>,
     ) -> Result<usize, E> {
         let mut removed = 0;
+        let mut per_lock = [0isize; NLOCKS_WITH_ITEM_COUNTERS];
         let mut failure = None;
-        'slots: for slot in 0..self.nactive {
+        'slots: for slot in 0..self.nactive() {
             let mut link = &mut self.segment_bucket_mut(slot).head;
             while let Some(mut node) = link.take() {
                 let selected = if node.pseudo_deleted {
@@ -497,8 +1311,10 @@ impl HashStorage {
                 };
                 match selected {
                     Ok(true) => {
+                        let counter = node.hvalue as usize % NLOCKS_WITH_ITEM_COUNTERS;
                         *link = node.next.take();
                         removed += 1;
+                        per_lock[counter] += 1;
                     }
                     Ok(false) => {
                         *link = Some(node);
@@ -512,7 +1328,14 @@ impl HashStorage {
                 }
             }
         }
-        self.size -= removed;
+        self.size.fetch_sub(removed as isize, Ordering::Relaxed);
+        if self.decentralized_counters {
+            for (index, count) in per_lock.into_iter().enumerate() {
+                self.stripes[index]
+                    .nitems
+                    .fetch_sub(count, Ordering::Relaxed);
+            }
+        }
         match failure {
             Some(error) => Err(error),
             None => Ok(removed),
@@ -521,17 +1344,17 @@ impl HashStorage {
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3973-3984, OTP-29.1.1.
     pub(super) fn retain_fixed_delete(&mut self, object: StoredTerm) {
-        self.deleted.push(object);
+        self.deleted.get_mut().unwrap().push(object);
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:1745-1750, OTP-29.1.1.
     pub(super) fn active_slots(&self) -> usize {
-        self.nactive
+        self.nactive()
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:1624-1626, OTP-29.1.1.
     pub(super) fn is_valid_slot(&self, slot: usize) -> bool {
-        slot <= self.nactive
+        slot <= self.nactive()
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3883-3885, OTP-29.1.1.
@@ -539,86 +1362,105 @@ impl HashStorage {
         self.slot_index(Self::make_hash(key))
     }
 
-    /// Port of erts/emulator/beam/erl_db_hash.c:1990-2010, OTP-29.1.1.
-    pub(super) fn ordered(&self, keypos: usize) -> Vec<&StoredTerm> {
-        // Buckets already are in slot order, so only each short chain needs sorting.
-        let _ = keypos;
-        let mut objects: Vec<&StoredTerm> = Vec::new();
-        for slot in 0..self.nactive {
-            let start = objects.len();
-            objects.extend(
-                HashIter {
-                    next: self.segment_bucket(slot).head.as_deref(),
-                }
-                .map(|node| &node.object),
-            );
-            if objects.len() - start > 1 {
-                objects[start..]
-                    .sort_unstable_by_key(|object| (object.group_order, u64::MAX - object.order));
-            }
-        }
-        objects
-    }
-
     /// Objects of one slot in traversal order, optionally with fixed-table pseudo-deleted ones.
     ///
     /// Port of erts/emulator/beam/erl_db_hash.c:4196-4231 (db_next_hash), OTP-29.1.1: a
     /// traversal step only walks the key's own bucket and the following buckets, never the
     /// whole table.
-    pub(super) fn slot_ordered(&self, slot: usize, with_deleted: bool) -> Vec<&StoredTerm> {
-        let mut objects: Vec<&StoredTerm> = HashIter {
-            next: self.segment_bucket(slot).head.as_deref(),
+    pub(super) fn try_with_slot_ordered<E>(
+        &self,
+        slot: usize,
+        with_deleted: bool,
+        mut visit: impl FnMut(&StoredTerm, bool) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if let Some(result) = self.with_bucket(slot, |bucket| {
+            let mut objects: Vec<(&StoredTerm, bool)> = HashIter {
+                next: bucket.head.as_deref(),
+            }
+            .map(|node| (&node.object, false))
+            .collect();
+            let deleted = with_deleted.then(|| self.deleted.lock().unwrap());
+            if let Some(deleted) = deleted.as_ref() {
+                objects.extend(
+                    deleted
+                        .iter()
+                        .filter(|object| self.slot_index(object.hvalue) == slot)
+                        .map(|object| (object, true)),
+                );
+                objects.sort_unstable_by_key(|(object, _)| {
+                    (object.group_order, u64::MAX - object.order)
+                });
+            }
+            for (object, deleted) in objects {
+                visit(object, deleted)?;
+            }
+            Ok(())
+        }) {
+            result
+        } else {
+            Ok(())
         }
-        .map(|node| &node.object)
-        .collect();
-        if with_deleted {
-            objects.extend(
-                self.deleted
-                    .iter()
-                    .filter(|object| self.slot_index(object.hvalue) == slot),
-            );
-        }
-        objects.sort_unstable_by_key(|object| (object.group_order, u64::MAX - object.order));
-        objects
     }
 
     /// First live object of the first non-empty slot at or after `slot`, in traversal order.
-    pub(super) fn first_from_slot(&self, slot: usize) -> Option<&StoredTerm> {
-        (slot..self.nactive).find_map(|slot| {
-            HashIter {
-                next: self.segment_bucket(slot).head.as_deref(),
+    pub(super) fn with_first_from_slot<R>(
+        &self,
+        slot: usize,
+        mut visit: impl FnMut(&StoredTerm) -> R,
+    ) -> Option<R> {
+        for slot in slot..self.nactive() {
+            if let Some(Some(result)) = self.with_bucket(slot, |bucket| {
+                HashIter {
+                    next: bucket.head.as_deref(),
+                }
+                .next()
+                .map(|node| visit(&node.object))
+            }) {
+                return Some(result);
             }
-            .map(|node| &node.object)
-            .min_by_key(|object| (object.group_order, u64::MAX - object.order))
-        })
+        }
+        None
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3411-3444, OTP-29.1.1.
     fn ensure_slot(&mut self) {
-        if self.nactive == self.nslots {
-            self.segments.push(Box::new(Segment::extended()));
-            self.nslots += EXT_SEGMENT;
+        let nactive = self.nactive();
+        let nslots = self.nslots.load(Ordering::Relaxed);
+        if nactive == nslots {
+            let start = nslots;
+            let end = start + EXT_SEGMENT;
+            for (index, stripe) in self.stripes.iter_mut().enumerate() {
+                stripe.buckets.get_mut().extend(
+                    std::iter::repeat_with(HashBucket::default).take(stripe_bucket_count_in(
+                        start,
+                        end,
+                        index,
+                        self.nlocks,
+                    )),
+                );
+            }
+            self.nslots.fetch_add(EXT_SEGMENT, Ordering::Relaxed);
         }
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3648-3731 (grow), OTP-29.1.1.
     #[inline]
     pub(super) fn maybe_grow(&mut self, fixed: bool, _keypos: usize) {
-        if fixed || self.size <= self.nactive {
+        if fixed || self.size() <= self.nactive() {
             return;
         }
         self.ensure_slot();
-        let old_active = self.nactive;
-        let old_mask = self.szm;
+        let old_active = self.nactive();
+        let old_mask = self.szm.load(Ordering::Relaxed);
         let source = if old_active <= old_mask {
             old_active & (old_mask >> 1)
         } else {
-            self.szm = (old_mask << 1) | 1;
+            self.szm.store((old_mask << 1) | 1, Ordering::Relaxed);
             0
         };
         let new_slot = old_active;
-        self.nactive += 1;
-        let mask = self.szm;
+        self.nactive.store(old_active + 1, Ordering::Release);
+        let mask = self.szm.load(Ordering::Relaxed);
         let mut current = self.segment_bucket_mut(source).head.take();
         if current.is_none() {
             return;
@@ -643,24 +1485,26 @@ impl HashStorage {
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3350-3398, OTP-29.1.1.
     fn shrink_limit(&self) -> usize {
-        if self.nslots < 4352 {
+        let nslots = self.nslots.load(Ordering::Relaxed);
+        if nslots < 4352 {
             0
         } else {
-            (self.nslots - EXT_SEGMENT) / 2
+            (nslots - EXT_SEGMENT) / 2
         }
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:3743-3800 (shrink), OTP-29.1.1.
     fn shrink(&mut self) {
-        if self.nactive <= FIRST_SEGMENT {
+        let nactive = self.nactive();
+        if nactive <= FIRST_SEGMENT {
             return;
         }
-        let source = self.nactive - 1;
-        let mask = self.szm >> 1;
+        let source = nactive - 1;
+        let mask = self.szm.load(Ordering::Relaxed) >> 1;
         let destination = source & mask;
-        self.nactive = source;
+        self.nactive.store(source, Ordering::Release);
         if destination == 0 {
-            self.szm = mask;
+            self.szm.store(mask, Ordering::Relaxed);
         }
         let mut source_head = self.segment_bucket_mut(source).head.take();
         if let Some(mut head) = source_head.take() {
@@ -671,31 +1515,35 @@ impl HashStorage {
             tail.next = self.segment_bucket_mut(destination).head.take();
             self.segment_bucket_mut(destination).head = Some(head);
         }
-        if self.nslots - source >= EXT_SEGMENT {
-            self.nslots -= EXT_SEGMENT;
-            self.segments.pop();
+        let nslots = self.nslots.load(Ordering::Relaxed);
+        if nslots - source >= EXT_SEGMENT {
+            let nslots = self.nslots.fetch_sub(EXT_SEGMENT, Ordering::Relaxed) - EXT_SEGMENT;
+            for (index, stripe) in self.stripes.iter_mut().enumerate() {
+                stripe
+                    .buckets
+                    .get_mut()
+                    .truncate(stripe_bucket_count_before(nslots, index, self.nlocks));
+            }
         }
     }
 
     /// Port of erts/emulator/beam/erl_db_hash.c:757-760, OTP-29.1.1.
     pub(super) fn shrink_after_delete(&mut self, _keypos: usize) {
         for _ in 0..5 {
-            if self.size >= self.shrink_limit() || self.nactive <= FIRST_SEGMENT {
+            if self.size() >= self.shrink_limit() || self.nactive() <= FIRST_SEGMENT {
                 break;
             }
-            let source = self.nactive - 1;
-            let destination = source & (self.szm >> 1);
+            let source = self.nactive() - 1;
+            let destination = source & (self.szm.load(Ordering::Relaxed) >> 1);
             let mut ranks = HashMap::new();
             let mut rank = 0_u64;
             for slot in [source, destination] {
-                let mut ordered = self
-                    .values()
-                    .filter(|object| self.slot_index(object.hvalue) == slot)
-                    .collect::<Vec<_>>();
-                ordered
-                    .sort_unstable_by_key(|object| (object.group_order, u64::MAX - object.order));
+                let ordered = HashIter {
+                    next: self.segment_bucket_mut(slot).head.as_deref(),
+                };
                 let mut last_group = None;
                 for object in ordered {
+                    let object = &object.object;
                     if last_group != Some(object.group_order) {
                         rank += 1;
                         last_group = Some(object.group_order);
@@ -703,9 +1551,14 @@ impl HashStorage {
                     ranks.insert(object.order, rank);
                 }
             }
-            for object in self.values_mut() {
-                if let Some(&rank) = ranks.get(&object.order) {
-                    object.group_order = rank;
+            for slot in [source, destination] {
+                let mut objects = HashIterMut {
+                    next: self.segment_bucket_mut(slot).head.as_deref_mut(),
+                };
+                for object in &mut objects {
+                    if let Some(&rank) = ranks.get(&object.order) {
+                        object.group_order = rank;
+                    }
                 }
             }
             self.shrink();
@@ -1182,7 +2035,7 @@ fn exact_key(left: Term, right: Term) -> bool {
 
 /// Bucket storage detached from a table, released incrementally.
 pub struct HashGarbage {
-    segments: Vec<Box<Segment>>,
+    segments: Vec<Vec<HashBucket>>,
     deleted: Vec<StoredTerm>,
 }
 

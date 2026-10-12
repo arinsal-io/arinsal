@@ -36,6 +36,14 @@ pub struct MatchProgram {
     trace: bool,
 }
 
+/// Match pseudo-process state kept for one whole table traversal.
+// Port of erts/emulator/beam/erl_db_hash.c:1835-1850 (match_traverse reuses the process
+// match state for each DbTerm), OTP-29.1.1.
+pub(crate) struct MatchRunner<'a> {
+    program: &'a MatchProgram,
+    state: pam::PamState,
+}
+
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Process and tracing values supplied by the VM when a match program runs.
@@ -764,6 +772,13 @@ fn validate_construct(
 }
 
 impl MatchProgram {
+    pub(crate) fn runner(&self) -> MatchRunner<'_> {
+        MatchRunner {
+            program: self,
+            state: pam::PamState::new(),
+        }
+    }
+
     /// Count external identities retained by a compiled program.
     pub fn external_identity_counts(&self) -> HashMap<(Atom, u32), usize> {
         let mut counts = HashMap::new();
@@ -1015,7 +1030,7 @@ impl MatchProgram {
             .unwrap_or_else(|| Box::new(pam::PamState::new()));
         let result = self.run_program(object, dst, context, &mut state);
         if state.heap.used_words() != 0 {
-            state.heap = VecHeap::new();
+            state.heap.reset(128);
         }
         STATE.set(Some(state));
         result
@@ -1230,6 +1245,31 @@ impl MatchProgram {
         }
         self.guard_bounds(keypos)?;
         Some(Term::atom(global_atoms().intern("true").ok()?))
+    }
+}
+
+impl MatchRunner<'_> {
+    pub(crate) fn run<H: HeapAlloc>(
+        &mut self,
+        object: Term,
+        dst: &mut H,
+    ) -> Result<Option<Term>, EtsError> {
+        self.run_with_context(object, dst, &EmptyContext)
+    }
+
+    pub(crate) fn run_with_context<H: HeapAlloc, C: MatchContext>(
+        &mut self,
+        object: Term,
+        dst: &mut H,
+        context: &C,
+    ) -> Result<Option<Term>, EtsError> {
+        let result = self
+            .program
+            .run_program(object, dst, context, &mut self.state);
+        if self.state.heap.used_words() != 0 {
+            self.state.heap.reset(128);
+        }
+        result
     }
 }
 

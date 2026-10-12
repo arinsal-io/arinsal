@@ -1511,6 +1511,12 @@ unsafe impl Sync for VecHeap {}
 impl VecHeap {
     /// Create a standalone heap.
     pub fn new() -> Self {
+        Self::with_initial_chunk_words(1024)
+    }
+
+    /// Create a growable heap whose first chunk has `words` capacity.
+    pub fn with_initial_chunk_words(words: usize) -> Self {
+        let words = words.max(1);
         Self {
             chunks: Vec::new(),
             off_heap: Vec::new(),
@@ -1522,8 +1528,29 @@ impl VecHeap {
             magic: Vec::new(),
             used: 0,
             total_used: 0,
-            chunk_words: 1024,
+            chunk_words: words,
         }
+    }
+
+    /// Clear allocated values and reuse the first chunk at the given initial capacity.
+    pub fn reset(&mut self, initial_chunk_words: usize) {
+        while self.chunks.len() > 1 {
+            let chunk = self.chunks.pop().unwrap();
+            #[cfg(any(feature = "validate-terms", debug_assertions, test))]
+            crate::validate::forget_stable_range(chunk.as_ptr() as usize);
+            drop(chunk);
+        }
+        self.off_heap.clear();
+        self.writable.clear();
+        self.external.clear();
+        self.nodes.clear();
+        self.funs.clear();
+        self.exports.clear();
+        self.magic.clear();
+        self.used = 0;
+        self.total_used = 0;
+        let literal = self.chunk_words & LITERAL_HEAP_BIT;
+        self.chunk_words = initial_chunk_words.max(1) | literal;
     }
     /// Create a stable heap for module literal terms.
     pub fn new_literal() -> Self {
@@ -1532,8 +1559,8 @@ impl VecHeap {
         heap
     }
     fn with_literal_chunk_words(words: usize) -> Self {
-        let mut heap = Self::new();
-        heap.chunk_words = words.max(1) | LITERAL_HEAP_BIT;
+        let mut heap = Self::with_initial_chunk_words(words);
+        heap.chunk_words |= LITERAL_HEAP_BIT;
         heap
     }
     fn is_literal_area(&self) -> bool {
@@ -2637,7 +2664,20 @@ impl Term {
 }
 #[cfg(test)]
 mod heap_block_tests {
-    use super::{HeapAlloc, ProcessHeap};
+    use super::{HeapAlloc, ProcessHeap, VecHeap};
+
+    #[test]
+    fn vec_heap_reset_reuses_the_first_chunk_and_discards_overflow() {
+        let mut heap = VecHeap::with_initial_chunk_words(8);
+        let first = heap.alloc(8).unwrap();
+        heap.alloc(8).unwrap();
+        similar_asserts::assert_eq!(heap.chunks.len(), 2);
+
+        heap.reset(8);
+
+        similar_asserts::assert_eq!(heap.chunks.len(), 1);
+        similar_asserts::assert_eq!(heap.alloc(8).unwrap(), first);
+    }
 
     #[test]
     fn realloc_preserves_the_user_prefix_and_can_shrink() {

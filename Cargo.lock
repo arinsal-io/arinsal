@@ -186,7 +186,6 @@ dependencies = [
  "arinsal-etf",
  "arinsal-maps",
  "arinsal-term",
- "crossbeam-utils",
  "num-bigint",
  "num-traits",
  "parking_lot",

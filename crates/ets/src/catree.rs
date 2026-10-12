@@ -587,7 +587,7 @@ impl CATree {
     /// Port of erts/emulator/beam/erl_db_catree.c:2085 (db_select_catree), OTP-29.1.1.
     pub(crate) fn select_range<H: HeapAlloc>(
         &self,
-        state: &mut RangeSelection<'_, H>,
+        state: &mut RangeSelection<'_, '_, H>,
     ) -> Result<(), EtsError> {
         let routes = self.routes.load();
         let iter: Box<dyn Iterator<Item = &RouteEntry>> = if state.reverse {
