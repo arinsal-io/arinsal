@@ -30,7 +30,12 @@ mod unicode;
 mod unique;
 
 pub use etf::{DecodeWalk, EncodeWalk};
-pub use lists::{REVERSE_CELLS_PER_RED, ReverseCont, ReverseStep, SubtractWalk, lists_reverse};
+pub use lists::{
+    APPEND_ALLOC_PER_RED, APPEND_EMPTY_PER_RED, APPEND_ONHEAP_PER_RED, AppendCont, AppendStep,
+    DeferredTrap, KEYFIND_MAX_ITER, KeyOp, KeyOutcome, KeyfindCont, MEMBER_PER_RED, MemberCont,
+    MemberStep, REVERSE_CELLS_PER_RED, ReverseCont, ReverseStep, SubtractWalk, lists_append,
+    lists_key, lists_member, lists_reverse,
+};
 pub use maps_bifs::maps_merge_start;
 pub use maps_bifs::{MapsBuildWalk, MapsProjectionWalk, ProjectionStart};
 pub use pure::{
@@ -109,6 +114,10 @@ pub struct Ctx<'a> {
     /// Infallible allocator (see the crate docs).
     pub heap: &'a mut dyn HeapAlloc,
     reductions: u32,
+    /// `usize::MAX` runs the BIF to completion. A finite budget is one scheduler
+    /// slice; the BIF records [`lists::DeferredTrap`] only when that slice runs out.
+    budget: usize,
+    deferred: Option<Box<lists::DeferredTrap>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -116,7 +125,29 @@ impl<'a> Ctx<'a> {
         Ctx {
             heap,
             reductions: 0,
+            budget: usize::MAX,
+            deferred: None,
         }
+    }
+
+    /// Reductions left for this call. `usize::MAX` means do not trap.
+    pub fn reduction_budget(&self) -> usize {
+        self.budget
+    }
+
+    /// One scheduler slice, from `ERTS_BIF_REDS_LEFT`.
+    pub fn set_reduction_budget(&mut self, budget: usize) {
+        self.budget = budget;
+    }
+
+    /// Remember a continuation. The VM installs it only after this call returns.
+    pub fn defer_trap(&mut self, trap: lists::DeferredTrap) {
+        self.deferred = Some(Box::new(trap));
+    }
+
+    /// Take a continuation the BIF deferred, if the slice ran out.
+    pub fn take_deferred(&mut self) -> Option<Box<lists::DeferredTrap>> {
+        self.deferred.take()
     }
 
     /// Charge work performed by this BIF so the VM can schedule large calls.

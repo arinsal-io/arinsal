@@ -157,6 +157,11 @@ pub(crate) struct DispatchTarget {
     pub native_bits: usize,
     /// The BIF has a continuation entry in `bif_traps`; others skip that table on every call.
     pub trap_entry: bool,
+    /// `lists:keyfind/3`, `member/2`, `++` and `--`. Set once at intern so the
+    /// light-BIF path does not compare the MFA strings on every call. The scan
+    /// still runs as the plain BIF; trap state is built only when its counter
+    /// runs out.
+    pub list_slice: bool,
     /// Runs the BIF inside native code, without a trap back into the executor.
     /// ETS uses this, and so do `erlang:put/2` and `erlang:erase/1`: those are
     /// heap BIFs in erts (`call_ext`), and trapping once per key dominated the
@@ -284,6 +289,16 @@ impl DispatchRegistry {
     ) -> &'static DispatchTarget {
         self.by_identity.entry(identity).or_insert_with(|| {
             let mut leaked = DispatchTarget::clone(entry);
+            leaked.list_slice = matches!(
+                (
+                    leaked.module.as_str(),
+                    leaked.function.as_str(),
+                    leaked.arity
+                ),
+                ("lists", "keyfind" | "keymember" | "keysearch", 3)
+                    | ("lists", "member", 2)
+                    | ("erlang", "++" | "append" | "--" | "subtract", 2)
+            );
             leaked.light_bif = leaked
                 .bif
                 .filter(|_| leaked.direct_ets.is_none() && !leaked.runs_in_executor());
@@ -478,6 +493,7 @@ pub(crate) fn export_get_or_make_stub(
             slot: new_export_slot(mfa, trampoline, save_calls),
             scope,
             trap_entry: crate::bif_traps::traps(&module, &function, mfa.2),
+            list_slice: false,
             direct_ets: crate::natives::ets::direct_entry(&module, &function, mfa.2)
                 .or_else(|| crate::natives::proc::direct_dictionary(&module, &function, mfa.2)),
             module: module.clone(),
@@ -541,6 +557,7 @@ fn import_entries(scope: u64, module: &arinsal_loader::Module) -> Option<Vec<usi
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
                 trap_entry: crate::bif_traps::traps(&import.module, &import.function, import.arity),
+                list_slice: false,
                 direct_ets: crate::natives::ets::direct_entry(
                     &import.module,
                     &import.function,
@@ -590,6 +607,7 @@ fn bif_mfa_entry(module: &str, function: &str, arity: u8) -> Option<usize> {
             slot: new_export_slot(key, trampoline, save_calls),
             scope: 0,
             trap_entry: crate::bif_traps::traps(module, function, arity),
+            list_slice: false,
             direct_ets: crate::natives::ets::direct_entry(module, function, arity)
                 .or_else(|| crate::natives::proc::direct_dictionary(module, function, arity)),
             module: module.to_owned(),
@@ -630,6 +648,7 @@ fn publish_module(scope: u64, module: &arinsal_loader::Module, native: &[(Mfa, u
                 slot: new_export_slot(mfa, trampoline, save_calls),
                 scope,
                 trap_entry: crate::bif_traps::traps(&module.name, &export.function, export.arity),
+                list_slice: false,
                 direct_ets: crate::natives::ets::direct_entry(
                     &module.name,
                     &export.function,

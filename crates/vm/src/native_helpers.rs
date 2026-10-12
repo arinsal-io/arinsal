@@ -1041,6 +1041,15 @@ fn invoke_dispatch_bif(
         let export_checks = export_call
             && (registers.active_code_ix == crate::code_ix::ERTS_SAVE_CALLS_CODE_IX as u64
                 || crate::trace_bp::any_pattern());
+        // trap_entry makes runs_in_executor() true, which clears light_bif. The
+        // list scan still uses export.bif; trap state is built only when its
+        // counter runs out. `list_slice` is one byte set at intern.
+        if export.list_slice
+            && !export_checks
+            && let Some(bif) = export.bif
+        {
+            return call_list_slice_bif(process, registers, identity, export, bif, export_call);
+        }
         if let Some(bif) = export.light_bif
             && !export_checks
             && !export.trap_entry
@@ -1518,6 +1527,70 @@ fn finish_counter_bif(
         usize::from(export.arity),
         result,
     )
+}
+
+/// Same return as [`call_plain_bif`] when the slice finishes. `None` when the BIF
+/// deferred a continuation and this call context-switches.
+#[inline(always)]
+fn call_list_slice_bif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    identity: usize,
+    export: ExportDispatch,
+    bif: arinsal_bifs::BifFn,
+    export_call: bool,
+) -> Option<u64> {
+    process.reductions = process.header.fcalls;
+    if export_call {
+        charge_bif_reductions(process, 1);
+    }
+    let arity = usize::from(export.arity);
+    let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
+    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    ctx.set_reduction_budget(process.reductions.max(0) as usize);
+    let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
+    if let Some(trap) = ctx.take_deferred() {
+        let slice = ctx.reductions();
+        let all = process.reductions.max(0) as u32;
+        let mut args = [Term::NIL; 3];
+        args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
+        crate::bif_traps::install_deferred_trap(
+            process,
+            identity,
+            (export.module_atom, export.function_atom),
+            export.function.as_str(),
+            &args[..arity],
+            trap,
+            (slice, all),
+        );
+        process
+            .heap
+            .set_frame_pointer(registers.tmp_mem[2] as usize);
+        debug_assert_native_heap(process);
+        crate::bif_traps::arm_export_trap(process);
+        process.header.freason = 1 << 10;
+        process.sync_native_header();
+        return None;
+    }
+    let reductions = ctx.reductions();
+    charge_bif_reductions(process, reductions);
+    let top = process.heap.heap_top_index();
+    if let Ok(value) = &result
+        && stop - top >= process.heap.mbuf_size()
+        && !process.heap.bin_vheap_gc_due()
+    {
+        let value = *value;
+        registers.x_reg_array[0] = value;
+        if top != entry_top {
+            process.header.htop = native_htop(process, top);
+        }
+        if process.header.fcalls != process.reductions {
+            process.header.fcalls = process.reductions;
+        }
+        return Some(crate::native_hooks::raw(value));
+    }
+    Some(plain_bif_result(process, registers, export, arity, result))
 }
 
 /// Calls a BIF that runs on the scheduler straight from native code.
