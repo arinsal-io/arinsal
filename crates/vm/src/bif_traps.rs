@@ -1486,6 +1486,72 @@ pub(crate) fn light_entry(module: &str, function: &str, arity: u8) -> Option<&'s
         .find(|entry| entry.module == module && entry.function == function && entry.arity == arity)
 }
 
+/// The body of one trapping BIF, compiled into its own light entry (`native_helpers::
+/// trap_bif_entry`). The common run is a direct call; the trap state is built only when
+/// the run yields.
+pub(crate) trait TrapBody {
+    /// The first run of the BIF. `restore_gc` is the process's collection state on entry.
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError>;
+}
+
+/// `maps:keys/1`.
+pub(crate) struct MapsKeys;
+/// `maps:values/1`.
+pub(crate) struct MapsValues;
+/// `maps:merge/2`.
+pub(crate) struct MapsMerge;
+/// `maps:from_list/1`.
+pub(crate) struct MapsFromList;
+
+impl TrapBody for MapsKeys {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        maps_keys(process, args, None, pid, restore_gc)
+    }
+}
+
+impl TrapBody for MapsValues {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        maps_values(process, args, None, pid, restore_gc)
+    }
+}
+
+impl TrapBody for MapsMerge {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        maps_merge(process, args, None, pid, restore_gc)
+    }
+}
+
+impl TrapBody for MapsFromList {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        maps_from_list(process, args, None, pid, restore_gc)
+    }
+}
+
 /// Outcome of a trapping BIF run from a light BIF call.
 pub(crate) enum LightTrap {
     /// The BIF finished: its value or its error, like any light BIF's result.
@@ -1520,6 +1586,20 @@ pub(crate) fn call_light(
     }
     let pid = process.self_pid;
     let result = (entry.handler)(process, args, None, pid, gc_was_enabled);
+    finish_light(process, import, callee, args, gc_was_enabled, result)
+}
+
+/// The result of a trapping BIF's first run, as a light BIF call sees it: a value, an error,
+/// or the trap it installs (`BIF_TRAP`).
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:378-540 (call_light_bif_shared), OTP-29.1.1.
+pub(crate) fn finish_light(
+    process: &mut Process,
+    import: usize,
+    callee: (arinsal_term::Atom, arinsal_term::Atom),
+    args: &[Term],
+    gc_was_enabled: bool,
+    result: Result<HandlerResult, BifError>,
+) -> LightTrap {
     let (result, reductions) = match result {
         Err(error) => (Err(error), 0),
         Ok(HandlerResult::Done { value, reductions }) => (Ok(value), reductions),
@@ -1651,7 +1731,7 @@ fn key_continuation(function: &str) -> &'static str {
 
 /// Charges a light trapping BIF's reductions against FCALLS (BUMP_REDS, bif.h); the call site
 /// has charged the call itself.
-fn charge_light(process: &mut Process, reductions: u32) {
+pub(crate) fn charge_light(process: &mut Process, reductions: u32) {
     process.reductions = process
         .reductions
         .saturating_sub(reductions.min(i32::MAX as u32) as i32);

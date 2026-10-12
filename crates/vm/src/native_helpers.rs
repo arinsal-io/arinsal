@@ -1132,6 +1132,11 @@ pub(crate) fn light_entry(export: ExportDispatch) -> Option<usize> {
         return Some(direct_bif_light as *const () as usize);
     }
     if export.light_trap_bif.is_some() {
+        if let Some(func) =
+            crate::bif_table::trap_entry(&export.module, &export.function, export.arity)
+        {
+            return Some(func);
+        }
         return Some(trap_bif_light as *const () as usize);
     }
     let bif = export.bif.is_some()
@@ -1941,41 +1946,162 @@ fn call_trap_bif(
             return Some(0);
         }
     }
+    let entry_top = process.heap.heap_top_index();
     let mut args = [Term::NIL; 3];
     args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
     let callee = (export.module_atom, export.function_atom);
     let outcome = crate::bif_traps::call_light(process, entry, identity, callee, &args[..arity]);
     match outcome {
-        crate::bif_traps::LightTrap::Returned(result) => {
-            Some(plain_bif_result(process, registers, export, arity, result))
+        crate::bif_traps::LightTrap::Returned(result) => Some(light_trap_result(
+            process,
+            registers,
+            export,
+            arity,
+            entry_top,
+            export_call,
+            result,
+        )),
+        crate::bif_traps::LightTrap::Trapped => arm_light_trap(process, registers, export),
+    }
+}
+
+/// A trapping BIF's result. A light call's value returns straight to the fragment, which
+/// tests the collection itself (instr_bif.cpp:488-523); an export call and an error take
+/// the collecting path.
+#[inline(always)]
+fn light_trap_result(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+    arity: usize,
+    entry_top: usize,
+    export_call: bool,
+    result: Result<Term, arinsal_bifs::BifError>,
+) -> u64 {
+    match result {
+        Ok(value) if !export_call => light_value_return(process, registers, entry_top, value),
+        result => plain_bif_result(process, registers, export, arity, result),
+    }
+}
+
+/// The fast return of a light BIF's value: X0, the heap top if it moved, and FCALLS.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:518-523 (call_light_bif_shared returns X0
+// to the call site), OTP-29.1.1.
+#[inline(always)]
+fn light_value_return(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    entry_top: usize,
+    value: Term,
+) -> u64 {
+    registers.x_reg_array[0] = value;
+    let top = process.heap.heap_top_index();
+    if top != entry_top {
+        process.header.htop = native_htop(process, top);
+    }
+    if process.header.fcalls != process.reductions {
+        process.header.fcalls = process.reductions;
+    }
+    crate::native_hooks::raw(value)
+}
+
+/// The trap state of a light BIF that yielded (`BIF_TRAP`): the caller resumes through the
+/// continuation export when the scheduler runs the process again.
+// Port of erts/emulator/beam/bif.h:316-326 (ERTS_BIF_PREP_TRAP), OTP-29.1.1.
+fn arm_light_trap(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    export: ExportDispatch,
+) -> Option<u64> {
+    {
+        // The scheduler resumes the caller's frame chain from the process.
+        process
+            .heap
+            .set_frame_pointer(registers.tmp_mem[2] as usize);
+        debug_assert_native_heap(process);
+        debug_assert_eq!(
+            process.heap.frame_pointer(),
+            registers.tmp_mem[2] as usize,
+            "light trapping BIF frame pointer is outside its process heap: mfa={}:{}/{}, candidate={:#x}, heap={:#x}..{:#x}, live_stack={:#x}..{:#x}, module={}, ip={:#x}",
+            export.module,
+            export.function,
+            export.arity,
+            registers.tmp_mem[2],
+            process.heap.heap_bounds().0 as usize,
+            process.heap.heap_bounds().1 as usize,
+            process.heap.heap_cursor().1 as usize,
+            process.heap.heap_bounds().1 as usize,
+            process.module,
+            process.ip,
+        );
+        // BIF_TRAP sets c_p->i to beam_bif_export_trap. The fragment loads that
+        // address and context-switches; schedule-in calls the continuation export.
+        crate::bif_traps::arm_export_trap(process);
+        process.header.freason = 1 << 10;
+        process.sync_native_header();
+        None
+    }
+}
+
+/// The light entry of one trapping BIF, compiled for its body `T` when the export is
+/// created (`bif_table`). It has the signature of `trap_bif_light`.
+// Port of erts/emulator/beam/erl_bif_table.c (`bif_table[].f`), OTP-29.1.1: a BIF with its own
+// C function is called from the fragment directly; BIF_TRAP is taken only when the body yields.
+pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    if export.light_trap_bif.is_none() {
+        return park_executor(process, export, identity);
+    }
+    trap_body_call::<T>(process, registers, identity as usize, export).unwrap_or(0)
+}
+
+/// [`call_trap_bif`] for a body known at compile time: a finished run returns at once.
+#[inline(always)]
+fn trap_body_call<T: crate::bif_traps::TrapBody>(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    identity: usize,
+    export: ExportDispatch,
+) -> Option<u64> {
+    process.reductions = process.header.fcalls;
+    let arity = usize::from(export.arity);
+    let entry_top = process.heap.heap_top_index();
+    let mut args = [Term::NIL; 3];
+    args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
+    let gc_was_enabled = process.heap.gc_enabled;
+    let pid = process.self_pid;
+    match T::run(process, &args[..arity], pid, gc_was_enabled) {
+        Ok(crate::bif_traps::HandlerResult::Done { value, reductions }) => {
+            process.set_gc_enabled(gc_was_enabled);
+            crate::bif_traps::charge_light(process, reductions);
+            Some(light_value_return(process, registers, entry_top, value))
         }
-        crate::bif_traps::LightTrap::Trapped => {
-            // The scheduler resumes the caller's frame chain from the process.
-            process
-                .heap
-                .set_frame_pointer(registers.tmp_mem[2] as usize);
-            debug_assert_native_heap(process);
-            debug_assert_eq!(
-                process.heap.frame_pointer(),
-                registers.tmp_mem[2] as usize,
-                "light trapping BIF frame pointer is outside its process heap: mfa={}:{}/{}, candidate={:#x}, heap={:#x}..{:#x}, live_stack={:#x}..{:#x}, module={}, ip={:#x}",
-                export.module,
-                export.function,
-                export.arity,
-                registers.tmp_mem[2],
-                process.heap.heap_bounds().0 as usize,
-                process.heap.heap_bounds().1 as usize,
-                process.heap.heap_cursor().1 as usize,
-                process.heap.heap_bounds().1 as usize,
-                process.module,
-                process.ip,
-            );
-            // BIF_TRAP sets c_p->i to beam_bif_export_trap. The fragment loads that
-            // address and context-switches; schedule-in calls the continuation export.
-            crate::bif_traps::arm_export_trap(process);
-            process.header.freason = 1 << 10;
-            process.sync_native_header();
-            None
+        other => {
+            let callee = (export.module_atom, export.function_atom);
+            match crate::bif_traps::finish_light(
+                process,
+                identity,
+                callee,
+                &args[..arity],
+                gc_was_enabled,
+                other,
+            ) {
+                crate::bif_traps::LightTrap::Returned(result) => Some(light_trap_result(
+                    process, registers, export, arity, entry_top, false, result,
+                )),
+                crate::bif_traps::LightTrap::Trapped => arm_light_trap(process, registers, export),
+            }
         }
     }
 }
