@@ -804,13 +804,13 @@ impl Vm {
             ctx.as_deref_mut(),
         ) {
             return match result? {
-                crate::bif_traps::TrapResult::Done { value, .. } => {
+                crate::bif_traps::HandlerResult::Done { value, .. } => {
                     self.finish_native_value(p, tail, value)
                 }
-                crate::bif_traps::TrapResult::Failed { .. } => {
+                crate::bif_traps::HandlerResult::Failed { .. } => {
                     unreachable!("failed trapping BIFs become VM exceptions")
                 }
-                crate::bif_traps::TrapResult::Yield { .. } => Ok(ImportOutcome::Yield),
+                crate::bif_traps::HandlerResult::Yield { .. } => Ok(ImportOutcome::Yield),
             };
         }
         let class = self.import_class(p.module, index)?;
@@ -904,7 +904,13 @@ impl Vm {
                 if let Some((module, function, args)) = traced {
                     self.trace_native_return(p, run, &module, &function, &args, &result);
                 }
-                let value = result?;
+                let value = match result {
+                    // The BIF traps to an Erlang export: the export runs as this call's continuation.
+                    Err(VmError::TrapExport(trap)) => {
+                        return self.trap_to_export(p, trap, tail, Some(run));
+                    }
+                    result => result?,
+                };
                 if module_name == "erlang"
                     && function_name == "call_on_load_function"
                     && p.module != caller_module_id

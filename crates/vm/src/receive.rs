@@ -229,15 +229,6 @@ impl ReceiveMarkers {
         }
         save
     }
-
-    fn position(&self, reference: u64) -> Option<usize> {
-        self.slots
-            .iter()
-            .flatten()
-            .find(|marker| marker.id == MarkerId::Bound(reference) && marker.in_sigq.is_none())
-            .map(|marker| marker.position)
-    }
-
     fn passed(&mut self, position: usize) {
         // Port of erts/emulator/beam/erl_proc_sig_queue.c:4431
         // (msgq_pass_recv_markers), OTP-29.1.1.
@@ -340,15 +331,6 @@ fn contains_reference(term: &arinsal_etf::OwnedTerm, reference: u64) -> bool {
 }
 
 impl Process {
-    /// Return the mailbox boundary associated with a live internal reference.
-    pub(crate) fn receive_marker_position(&self, reference: u64) -> Option<usize> {
-        self.cold
-            .as_ref()?
-            .receive_markers
-            .as_ref()?
-            .position(reference)
-    }
-
     /// Preserve the old save boundary while priority entries are scanned first.
     // Port of erl_proc_sig_queue.c:9358-9454 (insert_prepared_prio_msg_attached), OTP-29.1.1.
     pub(crate) fn priority_item_inserted(

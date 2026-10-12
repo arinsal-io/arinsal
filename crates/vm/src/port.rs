@@ -2442,12 +2442,12 @@ fn wake_suspended(scheduler: &Scheduler<Process>, pids: Vec<Pid>) {
 /// be queued before the save pointer moves. The receive that waits for the reply then starts at
 /// the end of the message queue.
 // Port of erts/emulator/beam/erl_proc_sig_queue.h:2397 (erts_msgq_set_save_end), OTP-29.1.1.
-pub(crate) fn set_save_end(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-) -> Result<(), VmError> {
-    // erts_proc_sig_fetch(c_p).
-    process.fetch_signals(ctx)?;
+pub(crate) fn set_save_end(process: &mut Process, ctx: &mut RunCtx<'_, Message>) {
+    // erts_proc_sig_fetch(c_p). Fetching links queued messages and cannot fail: `push_message`
+    // only appends, so the Result is an internal invariant.
+    process
+        .fetch_signals(ctx)
+        .expect("fetching signals links queued messages and cannot fail");
     let len = process.inbox.len();
     if let Some(cold) = process.cold.as_mut() {
         cold.priority_resume_cursor = None;
@@ -2461,7 +2461,6 @@ pub(crate) fn set_save_end(
         // erts_msgq_recv_marker_create_insert_set_save(c_p, NIL): the marker goes to the end.
         process.recv_marker_create_insert_set_save(None);
     }
-    Ok(())
 }
 
 /// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend) with a busy port: `false`

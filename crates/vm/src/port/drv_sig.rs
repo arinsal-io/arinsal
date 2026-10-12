@@ -241,10 +241,8 @@ pub(crate) fn output(
     };
     // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal): the caller moves its
     // save pointer before the signal is scheduled, so the reply cannot be queued before it.
-    if let Some(ctx) = ctx.filter(|_| want_ref)
-        && set_save_end(process, ctx).is_err()
-    {
-        return PortOp::Dropped;
+    if let Some(ctx) = ctx.filter(|_| want_ref) {
+        set_save_end(process, ctx);
     }
     let size = pieces.iter().map(|(bytes, _)| bytes.len()).sum();
     let task_handle = Arc::clone(handle);
@@ -358,7 +356,7 @@ pub(crate) fn control(
     }
     let (reply, reference) = Reply::new(caller, runtime.scheduler()?);
     // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal), OTP-29.1.1.
-    set_save_end(process, ctx)?;
+    set_save_end(process, ctx);
     let task_drv = Arc::clone(drv);
     let _ = drv.schedule_signal(ProcSig {
         caller: caller_data(caller),
@@ -525,8 +523,9 @@ pub(crate) fn exit(
     };
     // Port of erts/emulator/beam/io.c:1203 (erts_schedule_proc2port_signal), OTP-29.1.1.
     if want_ref {
-        let ctx = ctx.ok_or_else(badarg)?;
-        set_save_end(process, ctx)?;
+        // A reply reference is only created for a process caller, which always has a context.
+        let ctx = ctx.expect("a reply reference is created only for a process caller");
+        set_save_end(process, ctx);
     }
     let task_handle = Arc::clone(handle);
     schedule(drv, caller, move |op| {
