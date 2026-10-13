@@ -89,6 +89,23 @@ pub(crate) fn suspended_bit(runtime: &Runtime, pid: Pid) -> bool {
         .unwrap_or(false)
 }
 
+/// An ordered signal from the running process `me`, without a turn context (erts sends these
+/// from `c_p`).
+fn send_signal(
+    process: &Process,
+    me: Pid,
+    to: Pid,
+    signal: Signal<Message>,
+) -> Result<(), arinsal_sched::Error> {
+    let scheduler = process
+        .runtime
+        .as_ref()
+        .ok_or(arinsal_sched::Error::NoProcess)?
+        .scheduler()
+        .map_err(|_| arinsal_sched::Error::NoProcess)?;
+    scheduler.signal_ordered(me, to, signal)
+}
+
 /// What `erts_internal_suspend_process_2` decided (erl_process.c:9013-9163).
 pub(crate) struct SuspendOutcome {
     /// The suspend count of this process changed (`res` is `true`).
@@ -105,7 +122,7 @@ pub(crate) struct SuspendOutcome {
 /// gets the suspend signal.
 pub(crate) fn suspend_remote(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    origin: Pid,
     target: Pid,
     unless_suspending: bool,
     asynchronous: bool,
@@ -136,7 +153,6 @@ pub(crate) fn suspend_remote(
         .cold_mut()
         .suspend_monitors
         .insert(target, Arc::clone(&monitor));
-    let origin = ctx.pid();
     let direct = process
         .runtime
         .as_ref()
@@ -150,7 +166,9 @@ pub(crate) fn suspend_remote(
         Some(Ok(())) => (false, false),
         Some(Err(arinsal_sched::SignalFreeError::NoProcess)) => (false, true),
         _ => {
-            let sent = ctx.signal(
+            let sent = send_signal(
+                process,
+                origin,
                 target,
                 Signal::Suspend {
                     shared: SharedPayload(monitor),
@@ -173,19 +191,19 @@ pub(crate) fn suspend_remote(
 /// the suspend. A target that is gone is answered here, on the requester itself.
 pub(crate) fn send_sync_suspend(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    me: Pid,
     target: Pid,
     tag: Term,
     reply: Term,
     asynchronous: bool,
 ) -> Result<(), VmError> {
     let signal = Signal::SyncSuspend {
-        requester: ctx.pid(),
+        requester: me,
         tag: Message::copy_from(tag)?,
         reply: reply.as_atom().map_or(0, |atom| atom.0),
         async_: asynchronous,
     };
-    if ctx.signal(target, signal).is_err() {
+    if send_signal(process, me, target, signal).is_err() {
         let gone = crate::signals::atom(if asynchronous { "badarg" } else { "exited" });
         let message = process.tuple(&[tag, gone])?;
         // Not a traced `!`: the reply is queued without a send trace (erl_proc_sig_queue.c:3237).
@@ -230,11 +248,7 @@ pub(crate) fn sync_reply(
 
 /// `resume_process_1` (erl_process.c:9181): drops one suspend of `target` this process holds.
 /// `None` when this process holds none.
-pub(crate) fn resume_remote(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    target: Pid,
-) -> Option<()> {
+pub(crate) fn resume_remote(process: &mut Process, me: Pid, target: Pid) -> Option<()> {
     let monitor = process
         .cold
         .as_ref()?
@@ -243,7 +257,9 @@ pub(crate) fn resume_remote(
         .clone();
     if monitor.sub() == 0 {
         process.cold_mut().suspend_monitors.remove(&target);
-        let _ = ctx.signal(
+        let _ = send_signal(
+            process,
+            me,
             target,
             Signal::SuspendRelease {
                 shared: SharedPayload(monitor),

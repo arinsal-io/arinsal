@@ -5287,6 +5287,12 @@ impl<T: Task> Scheduler<T> {
             reference,
         )
     }
+    /// User priority of a live process.
+    pub fn process_priority(&self, pid: Pid) -> Option<Priority> {
+        self.inner.table.with_live(pid, |process| {
+            Priority::from_index(process.user_priority.load(Ordering::Acquire))
+        })
+    }
     /// Send an ordered signal from a process running on this thread, without a turn context.
     /// The erts BIF path (`erts_proc_sig_send_*` from `c_p`) holds a process monitor on the
     /// scheduler, so this shares the turn's delivery rules and needs no `RunCtx`.

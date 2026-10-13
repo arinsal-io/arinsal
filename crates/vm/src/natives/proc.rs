@@ -2487,7 +2487,7 @@ fn call_values(
             ("suspend_process", [pid, options]) if module == "erts_internal" => {
                 suspend_process(process, ctx, *pid, *options)
             }
-            ("resume_process", [pid]) => resume_process(process, ctx, *pid),
+            ("resume_process", [pid]) => resume_process(process, *pid),
             ("spawn_request", [module, function, args, options]) => {
                 spawn_request(vm, process, ctx, *module, *function, *args, *options)
             }
@@ -2826,30 +2826,54 @@ fn suspend_process(
     target: Term,
     options: Term,
 ) -> Result<Term, VmError> {
-    if Pid::from_term(target) == Some(ctx.pid()) {
-        return Ok(atom("badarg"));
+    let (result, requested) = suspend_core(process, ctx.pid(), target, options)?;
+    if let Some(target_pid) = requested {
+        // Port of erts/emulator/beam/erl_proc_sig_queue.c:3192-3233
+        // (`erts_proc_sig_send_sync_suspend`), OTP-29.1.1: prioritize the target after queuing
+        // the synchronous or tagged suspend reply request.
+        crate::signals::elevate_for_signal_request(process, ctx, target_pid)?;
+    }
+    Ok(result)
+}
+
+/// The body of `erts_internal_suspend_process_2` for the running process `me`. The pid is set
+/// when a reply request was queued, which asks for the target's signal handling priority to be
+/// raised.
+fn suspend_core(
+    process: &mut Process,
+    me: Pid,
+    target: Term,
+    options: Term,
+) -> Result<(Term, Option<Pid>), VmError> {
+    use arinsal_term::atoms;
+    if Pid::from_term(target) == Some(me) {
+        return Ok((Term::atom(atoms::BADARG), None));
     }
     let Some(target_pid) = Pid::from_term(target) else {
-        return Ok(atom("badarg"));
+        return Ok((Term::atom(atoms::BADARG), None));
     };
     let parsed = match parse_suspend_options(options) {
-        None => return Ok(atom("badopt")),
+        None => return Ok((Term::atom(atoms::BADOPT), None)),
         Some(parsed) => parsed,
     };
     let outcome = match crate::suspend::suspend_remote(
         process,
-        ctx,
+        me,
         target_pid,
         parsed.unless_suspending,
         parsed.asynchronous,
     ) {
-        Err(()) => return Ok(atom("system_limit")),
+        Err(()) => return Ok((Term::atom(atoms::SYSTEM_LIMIT), None)),
         Ok(outcome) => outcome,
     };
     // Port of erts/emulator/beam/erl_process.c:9061-9163, OTP-29.1.1: a synchronous suspend on a
     // monitor that is not active yet, and every tagged asynchronous suspend, is answered by a
     // reply message once the target handled the request queued behind the suspend.
-    let result = atom(if outcome.changed { "true" } else { "false" });
+    let result = Term::atom(if outcome.changed {
+        atoms::TRUE
+    } else {
+        atoms::FALSE
+    });
     let reference = if outcome.sync {
         let id = arinsal_bifs::next_ref_id();
         Some(
@@ -2862,29 +2886,59 @@ fn suspend_process(
     } else {
         None
     };
+    let mut requested = None;
     if let Some(tag) = reference.or(parsed.tag) {
         let default = if reference.is_some() {
             result
         } else {
-            atom("suspended")
+            Term::atom(atoms::SUSPENDED)
         };
         crate::suspend::send_sync_suspend(
             process,
-            ctx,
+            me,
             target_pid,
             tag,
             default,
             reference.is_none(),
         )?;
-        // Port of erts/emulator/beam/erl_proc_sig_queue.c:3192-3233
-        // (`erts_proc_sig_send_sync_suspend`), OTP-29.1.1: prioritize the target after queuing
-        // the synchronous or tagged suspend reply request.
-        crate::signals::elevate_for_signal_request(process, ctx, target_pid)?;
+        requested = Some(target_pid);
     }
     if outcome.noproc && !parsed.asynchronous {
-        return Ok(atom("badarg"));
+        return Ok((Term::atom(atoms::BADARG), requested));
     }
-    Ok(reference.unwrap_or(result))
+    Ok((reference.unwrap_or(result), requested))
+}
+
+/// `erts_internal:suspend_process/2` called directly from native code (`c_p` only). A target
+/// whose signal handling priority would have to be raised takes the executor.
+// Port of erts/emulator/beam/erl_process.c:9013 (erts_internal_suspend_process_2), OTP-29.1.1.
+pub(crate) fn suspend_process_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target, options] = args else {
+        return None;
+    };
+    if crate::trace::active() {
+        return None;
+    }
+    let me = process.self_pid?;
+    let target_pid = Pid::from_term(*target)?;
+    let scheduler = process.runtime.as_ref()?.scheduler().ok()?;
+    let mine = scheduler.process_priority(me)?;
+    match scheduler.process_priority(target_pid) {
+        Some(other) if crate::signals::sys_index(other) > crate::signals::sys_index(mine) => {
+            return None;
+        }
+        _ => {}
+    }
+    match suspend_core(process, me, *target, *options) {
+        Ok((result, _)) => Some(Ok(result)),
+        Err(VmError::Trap(trap)) => Some(Err(trap)),
+        Err(_) => Some(Err(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::SYSTEM_LIMIT,
+        )))),
+    }
 }
 
 struct SuspendOptions {
@@ -2902,12 +2956,12 @@ fn parse_suspend_options(options: Term) -> Option<SuspendOptions> {
         // SAFETY: The option list stays rooted for this BIF call.
         let (head, tail) = unsafe { current.cons_ref() }?;
         current = tail;
-        if head == atom("unless_suspending") {
+        if head == Term::atom(arinsal_term::atoms::UNLESS_SUSPENDING) {
             unless_suspending = true;
-        } else if head == atom("asynchronous") {
+        } else if head == Term::atom(arinsal_term::atoms::ASYNCHRONOUS) {
             asynchronous = true;
         } else if let Some((key, value)) = tuple2(head)
-            && key == atom("asynchronous")
+            && key == Term::atom(arinsal_term::atoms::ASYNCHRONOUS)
         {
             asynchronous = true;
             tag = Some(value);
@@ -2926,27 +2980,38 @@ fn parse_suspend_options(options: Term) -> Option<SuspendOptions> {
 }
 
 // Port of erts/emulator/beam/erl_process.c:9181 (`resume_process_1`), OTP-29.1.1.
-fn resume_process(
-    process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
-    target: Term,
-) -> Result<Term, VmError> {
-    if Pid::from_term(target) == Some(ctx.pid()) {
-        return Err(badarg());
-    }
-    let Some(target_pid) = Pid::from_term(target) else {
-        return Err(badarg());
-    };
-    let runtime = process
-        .runtime
-        .clone()
-        .ok_or_else(|| VmError::Unsupported("resume requires a scheduler".into()))?;
-    if !runtime.scheduler()?.lookup(target_pid) {
-        return Err(badarg());
-    }
-    match crate::suspend::resume_remote(process, ctx, target_pid) {
+fn resume_process(process: &mut Process, target: Term) -> Result<Term, VmError> {
+    match resume_process_light(process, &[target]) {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(trap)) => Err(VmError::Trap(trap)),
         None => Err(badarg()),
-        Some(()) => Ok(atom("true")),
+    }
+}
+
+/// `erlang:resume_process/1` called directly from native code (`c_p` only).
+// Port of erts/emulator/beam/erl_process.c:9181 (resume_process_1), OTP-29.1.1.
+pub(crate) fn resume_process_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target] = args else {
+        return None;
+    };
+    if crate::trace::active() {
+        return None;
+    }
+    let me = process.self_pid?;
+    let badarg = || {
+        Some(Err(crate::exceptions::Trap::error(Term::atom(
+            arinsal_term::atoms::BADARG,
+        ))))
+    };
+    let Some(target_pid) = Pid::from_term(*target).filter(|pid| *pid != me) else {
+        return badarg();
+    };
+    match crate::suspend::resume_remote(process, me, target_pid) {
+        None => badarg(),
+        Some(()) => Some(Ok(Term::atom(arinsal_term::atoms::TRUE))),
     }
 }
 
