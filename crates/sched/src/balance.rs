@@ -277,7 +277,7 @@ pub(crate) struct Balance {
     /// Used run queues (`balance_info.no_runqs` used part).
     no_used_runqs: AtomicUsize,
     /// Published migration paths (`erts_migration_paths`).
-    paths: Mutex<Arc<Vec<MigrationPath>>>,
+    paths: arc_swap::ArcSwap<Vec<MigrationPath>>,
     /// `paths[ix].flags`, readable without taking the paths lock.
     path_flags: Vec<AtomicU32>,
     compact_load: bool,
@@ -301,7 +301,7 @@ impl Balance {
             n: AtomicU64::new(0),
             no_active_runqs: AtomicUsize::new(online),
             no_used_runqs: AtomicUsize::new(online),
-            paths: Mutex::new(Arc::new(vec![MigrationPath::NONE; schedulers])),
+            paths: arc_swap::ArcSwap::from_pointee(vec![MigrationPath::NONE; schedulers]),
             path_flags: (0..schedulers).map(|_| AtomicU32::new(0)).collect(),
             compact_load,
         }
@@ -370,15 +370,14 @@ impl Balance {
     }
 
     pub(crate) fn migration_paths(&self) -> Arc<Vec<MigrationPath>> {
-        self.paths.lock().unwrap().clone()
+        self.paths.load_full()
     }
 
     fn publish(&self, paths: Vec<MigrationPath>) {
-        let mut published = self.paths.lock().unwrap();
         for (ix, path) in paths.iter().enumerate() {
             self.path_flags[ix].store(path.flags, Ordering::Release);
         }
-        *published = Arc::new(paths);
+        self.paths.store(Arc::new(paths));
     }
 
     /// Port of erts/emulator/beam/erl_process.c:2930 (sched_waiting) and erl_process.c:2942
@@ -398,7 +397,8 @@ impl Balance {
         if self.path_flags(c_rq) & flg_emigrate(prio) == 0 {
             return None;
         }
-        let paths = self.migration_paths();
+        // Port of erts/emulator/beam/erl_process.h:2486 (reads `rq->mpaths` in place), OTP-29.1.1.
+        let paths = self.paths.load();
         let mp = &paths[c_rq];
         let flags = mp.flags;
         if flags & flg_emigrate(prio) == 0 {

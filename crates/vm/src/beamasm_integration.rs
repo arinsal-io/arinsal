@@ -2106,7 +2106,11 @@ fn raw_word(term: Term) -> u64 {
 }
 
 pub(crate) fn count_native_call() {
-    NATIVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    // Debug statistics only: a counter shared by every scheduler thread is a contended
+    // cache line on the scheduling path.
+    if crate::debug_env::beamasm_stats() {
+        NATIVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 /// Counts an interpreter slice; `at_native_entry` marks one that started at a function entry
 /// which has native code (a process that erts would have started natively).
@@ -2128,10 +2132,18 @@ pub fn interp_slices() -> u64 {
 }
 
 pub(crate) fn count_native_yield() {
-    NATIVE_YIELDS.fetch_add(1, Ordering::Relaxed);
+    // Debug statistics only: a counter shared by every scheduler thread is a contended
+    // cache line on the scheduling path.
+    if crate::debug_env::beamasm_stats() {
+        NATIVE_YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 pub(crate) fn count_call_unported() {
-    CALL_UNPORTED.fetch_add(1, Ordering::Relaxed);
+    // Debug statistics only: a counter shared by every scheduler thread is a contended
+    // cache line on the scheduling path.
+    if crate::debug_env::beamasm_stats() {
+        CALL_UNPORTED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub(crate) fn print_stats() {
