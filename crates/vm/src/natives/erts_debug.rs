@@ -1741,11 +1741,17 @@ fn node_and_dist_references(process: &mut Process) -> Result<Term, VmError> {
             || (HashMap::new(), HashMap::new(), HashMap::new()),
             |runtime| {
                 let ets = runtime.ets.read().unwrap();
-                let timers = runtime.timers.lock().unwrap();
+                // Timer messages live on their scheduler's wheel; ask the wheels on demand.
                 let mut timer_counts = HashMap::new();
-                for (id, message) in runtime.timer_messages.lock().unwrap().iter() {
-                    if timers.contains_key(id) {
-                        count_owned_external_identities(message, &mut timer_counts);
+                if let Ok(scheduler) = runtime.scheduler() {
+                    for message in scheduler
+                        .map_bif_timer_messages(|message| {
+                            arinsal_term::to_owned(message.term()).ok()
+                        })
+                        .into_iter()
+                        .flatten()
+                    {
+                        count_owned_external_identities(&message, &mut timer_counts);
                     }
                 }
                 (

@@ -387,6 +387,9 @@ impl TimerTree {
     }
 }
 
+/// Marks a timer id taken from an Erlang reference key, apart from the sequential ids.
+pub(crate) const REF_KEY_TIMER_BIT: u64 = 1 << 63;
+
 /// Reference returned by a timer operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TimerRef {
@@ -403,6 +406,38 @@ impl TimerRef {
     /// Stable numeric identity for the VM's reference representation.
     pub fn id(self) -> u64 {
         self.id
+    }
+
+    /// The reference key a BIF timer was started with, `None` for other timers.
+    pub fn ref_key(self) -> Option<u64> {
+        (self.id & REF_KEY_TIMER_BIT != 0).then_some(self.id & !REF_KEY_TIMER_BIT)
+    }
+
+    /// The timer a reference key names: its wheel is the scheduler whose thread id the key
+    /// carries, so no table maps references to timers.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): the scheduler is
+    // found through erts_get_ref_numbers_thr_id, OTP-29.1.1. `workers` is the scheduler count;
+    // keys made on other threads (dirty schedulers) are spread by their counter.
+    pub fn from_ref_key(key: u64, workers: usize) -> TimerRef {
+        let thr_id = (key >> 48) as usize;
+        let worker = if (1..=workers).contains(&thr_id) {
+            thr_id - 1
+        } else {
+            (key & ((1 << 48) - 1)) as usize % workers
+        };
+        TimerRef {
+            worker,
+            id: key | REF_KEY_TIMER_BIT,
+        }
+    }
+}
+
+fn payload_message<M>(payload: &TimerPayload<M>) -> Option<&M> {
+    match payload {
+        TimerPayload::Message(_, message, _) | TimerPayload::ResolvedMessage(_, message, _) => {
+            Some(message)
+        }
+        _ => None,
     }
 }
 
@@ -718,6 +753,22 @@ impl<M> Wheel<M> {
         for (remaining, payload) in self.paused.remove(&pid).unwrap_or_default() {
             self.insert(next_id(), now.saturating_add(remaining.max(1)), payload);
         }
+    }
+
+    /// Messages of the BIF timers (`send_after`, `start_timer`) of this wheel, paused ones
+    /// included, for the debug node-reference accounting.
+    pub(crate) fn bif_timer_messages(&self) -> Vec<&M> {
+        let live = self
+            .entries
+            .iter()
+            .filter(|(id, _)| **id & REF_KEY_TIMER_BIT != 0)
+            .filter_map(|(_, entry)| payload_message(&entry.payload));
+        let held = self
+            .paused
+            .values()
+            .flatten()
+            .filter_map(|(_, payload)| payload_message(payload));
+        live.chain(held).collect()
     }
 
     fn remove_target_entry(&mut self, id: u64, payload: &TimerPayload<M>) {

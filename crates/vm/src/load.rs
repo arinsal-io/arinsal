@@ -27,6 +27,70 @@ impl<T: Clone> std::ops::DerefMut for SharedTable<T> {
     }
 }
 
+/// A module name usable as a [`ModuleIndex`] key: an atom, or text that is resolved to one.
+pub(crate) trait ModuleKey {
+    fn atom(&self) -> Option<Atom>;
+}
+
+impl ModuleKey for Atom {
+    fn atom(&self) -> Option<Atom> {
+        Some(*self)
+    }
+}
+
+impl ModuleKey for str {
+    fn atom(&self) -> Option<Atom> {
+        global_atoms().get(self)
+    }
+}
+
+impl ModuleKey for String {
+    fn atom(&self) -> Option<Atom> {
+        self.as_str().atom()
+    }
+}
+
+impl<K: ModuleKey + ?Sized> ModuleKey for &K {
+    fn atom(&self) -> Option<Atom> {
+        (**self).atom()
+    }
+}
+
+/// Current modules by name atom: module.c's `module_tables[ix]` is keyed by the module atom
+/// index, so a lookup from a BIF hashes a word, not a string.
+// Port of erts/emulator/beam/module.c:47 (module_tables), OTP-29.1.1.
+#[derive(Clone, Default)]
+pub(crate) struct ModuleIndex(
+    HashMap<Atom, usize, std::hash::BuildHasherDefault<crate::process::IdHasher>>,
+);
+
+impl ModuleIndex {
+    pub(crate) fn get<K: ModuleKey + ?Sized>(&self, key: &K) -> Option<&usize> {
+        self.0.get(&key.atom()?)
+    }
+
+    pub(crate) fn contains_key<K: ModuleKey + ?Sized>(&self, key: &K) -> bool {
+        key.atom().is_some_and(|atom| self.0.contains_key(&atom))
+    }
+
+    pub(crate) fn insert(&mut self, name: &str, id: usize) -> Option<usize> {
+        let atom = global_atoms().intern(name).ok()?;
+        self.0.insert(atom, id)
+    }
+
+    pub(crate) fn remove<K: ModuleKey + ?Sized>(&mut self, key: &K) -> Option<usize> {
+        self.0.remove(&key.atom()?)
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().filter_map(|atom| global_atoms().text(*atom))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &usize> {
+        self.0.values()
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct FunKey {
     module: Atom,
@@ -87,7 +151,7 @@ pub(crate) struct CodeTables {
     /// The published version of these tables; see [`crate::code_ix::next_generation`].
     pub(crate) generation: u64,
     pub(crate) modules: SharedTable<Vec<Arc<Module>>>,
-    pub(crate) loaded: SharedTable<HashMap<String, usize>>,
+    pub(crate) loaded: SharedTable<ModuleIndex>,
     pub(crate) old: SharedTable<HashMap<String, usize>>,
     pub(crate) pending_on_load: SharedTable<HashMap<String, usize>>,
     pub(crate) deleted: SharedTable<std::collections::HashSet<String>>,
@@ -430,7 +494,7 @@ impl CodeTables {
             code_scope,
             generation: crate::code_ix::next_generation(),
             modules: SharedTable::new(Vec::new()),
-            loaded: SharedTable::new(HashMap::new()),
+            loaded: SharedTable::new(ModuleIndex::default()),
             old: SharedTable::new(HashMap::new()),
             pending_on_load: SharedTable::new(HashMap::new()),
             deleted: SharedTable::new(std::collections::HashSet::new()),
@@ -504,7 +568,7 @@ impl CodeTables {
 
     /// Makes instance `id` the current code of `name` and returns the instance it replaces.
     pub(crate) fn make_current(&mut self, name: &str, id: usize) -> Option<usize> {
-        let previous = self.loaded.insert(name.to_owned(), id);
+        let previous = self.loaded.insert(name, id);
         activate_module_records(self.code_scope, &self.modules[id]);
         self.deleted.remove(name);
         self.known_modules.insert(name.to_owned());

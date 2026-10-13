@@ -773,7 +773,6 @@ pub(crate) fn start_timer_bif(
     // A dead pid gets a ref but no timer entry; an unresolved name can become registered
     // before its timer expires.
     let id = rt.next_ref();
-    let timer_message = arinsal_term::to_owned(message).ok();
     let message = Message::copy_from(message)?.with_timer_id(id);
     // setup_bif_timer: a timer for a process that does not exist is never created.
     if let Some(pid) = pid
@@ -791,33 +790,19 @@ pub(crate) fn start_timer_bif(
             ms,
             message,
             wrapped,
-            std::sync::Arc::new(move || {
-                let target = runtime.reg.whereis_proc(name);
-                if target.is_none() {
-                    runtime.timers.lock().unwrap().remove(&id);
-                    runtime.timer_messages.lock().unwrap().remove(&id);
-                }
-                target
-            }),
+            std::sync::Arc::new(move || runtime.reg.whereis_proc(name)),
         )
     }
     .map_err(|error| VmError::Unsupported(format!("timer: {error}")))?;
-    rt.timers.lock().unwrap().insert(id, timer);
-    if let Some(message) = timer_message {
-        rt.timer_messages.lock().unwrap().insert(id, message);
-    }
-    // The timer belongs to its receiving process (erts keeps it in the receiver's bif-timer
-    // tree) and is cancelled when that process exits; name-addressed timers have no owner.
-    if let Some(pid) = pid {
-        // Owned BIF timers are p->bif_timers (erl_process.c:14301). Exit cancels them only
-        // when this word is set.
-        if rt.publish_proc_flag(pid, arinsal_sched::proc_flags::OWNED_TIMERS) {
-            rt.timer_owners.lock().unwrap().insert(id, pid);
-        }
-        if !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid)) {
-            // The receiver exited meanwhile; its exit may already have swept its timers.
-            rt.cancel_owned_timers(pid);
-        }
+    // The timer is on the wheel of the scheduler the reference names and, when aimed at a
+    // process, linked to it through that process' bif-timer word (erl_hl_timer.c:1832), so exit
+    // cancels it without any table of timers.
+    if let Some(pid) = pid
+        && !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid))
+        && let Ok(scheduler) = rt.scheduler()
+    {
+        // The receiver exited meanwhile; its exit may already have swept its timers.
+        scheduler.cancel_timer_async(timer, |_| {});
     }
     reference(process, id)
 }
@@ -1414,14 +1399,10 @@ pub(crate) fn timer_query_sync(
         return Ok(done);
     }
     let rt = runtime(process)?;
-    let timer = if cancel {
-        rt.timer_owners.lock().unwrap().remove(&id);
-        let timer = rt.timers.lock().unwrap().remove(&id);
-        rt.timer_messages.lock().unwrap().remove(&id);
-        timer
-    } else {
-        rt.timers.lock().unwrap().get(&id).copied()
-    };
+    let timer = rt
+        .scheduler()
+        .ok()
+        .map(|scheduler| scheduler.timer_for_ref_key(id));
     access_timer_sync(process, caller, reference, timer, cancel, info)
 }
 
@@ -1443,6 +1424,13 @@ fn access_timer_sync(
     let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) else {
         return Ok(atom(if info { "false" } else { "ok" }));
     };
+    // The owning scheduler answers directly, without a request or a reply.
+    if let Some(remaining) = scheduler.try_access_timer_local(timer, cancel) {
+        let value = remaining
+            .and_then(|ms| Term::small(ms as i64))
+            .unwrap_or_else(|| atom("false"));
+        return Ok(if info { value } else { atom("ok") });
+    }
     let state = std::sync::Arc::new(Mutex::new(TimerAccess::Pending));
     let answer = std::sync::Arc::clone(&state);
     let callback = move |remaining: Option<u64>| {
@@ -2755,7 +2743,10 @@ fn call_resolved(
             }
             let rt = runtime(process)?;
             if options.asynchronous {
-                let timer = rt.timers.lock().unwrap().get(&id).copied();
+                let timer = rt
+                    .scheduler()
+                    .ok()
+                    .map(|scheduler| scheduler.timer_for_ref_key(id));
                 if options.info {
                     let reference = arinsal_term::to_owned(*reference).map_err(|error| {
                         VmError::Unsupported(format!("timer reference snapshot: {error:?}"))
@@ -2763,11 +2754,7 @@ fn call_resolved(
                     if let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) {
                         let target = ctx.pid();
                         let reply_scheduler = scheduler.clone();
-                        let runtime = process.runtime.as_ref().unwrap().clone();
                         scheduler.cancel_timer_async(timer, move |remaining| {
-                            runtime.timer_owners.lock().unwrap().remove(&id);
-                            runtime.timers.lock().unwrap().remove(&id);
-                            runtime.timer_messages.lock().unwrap().remove(&id);
                             let value = remaining.map_or_else(
                                 || OwnedTerm::atom("false"),
                                 |ms| {
@@ -2788,9 +2775,6 @@ fn call_resolved(
                             }
                         });
                     } else {
-                        rt.timer_owners.lock().unwrap().remove(&id);
-                        rt.timers.lock().unwrap().remove(&id);
-                        rt.timer_messages.lock().unwrap().remove(&id);
                         let term = OwnedTerm::Tuple(vec![
                             OwnedTerm::atom("cancel_timer"),
                             reference,
@@ -2801,16 +2785,7 @@ fn call_resolved(
                         }
                     }
                 } else if let (Some(timer), Ok(scheduler)) = (timer, rt.scheduler()) {
-                    let runtime = process.runtime.as_ref().unwrap().clone();
-                    scheduler.cancel_timer_async(timer, move |_| {
-                        runtime.timer_owners.lock().unwrap().remove(&id);
-                        runtime.timers.lock().unwrap().remove(&id);
-                        runtime.timer_messages.lock().unwrap().remove(&id);
-                    });
-                } else {
-                    rt.timer_owners.lock().unwrap().remove(&id);
-                    rt.timers.lock().unwrap().remove(&id);
-                    rt.timer_messages.lock().unwrap().remove(&id);
+                    scheduler.cancel_timer_async(timer, move |_| {});
                 }
                 return Ok(atom("ok"));
             }
@@ -2830,7 +2805,10 @@ fn call_resolved(
                 return timer_query_sync(process, ctx.pid(), *reference, false, options.info);
             }
             let rt = runtime(process)?;
-            let timer = rt.timers.lock().unwrap().get(&id).copied();
+            let timer = rt
+                .scheduler()
+                .ok()
+                .map(|scheduler| scheduler.timer_for_ref_key(id));
             if options.asynchronous {
                 let reference = arinsal_term::to_owned(*reference).map_err(|error| {
                     VmError::Unsupported(format!("timer reference snapshot: {error:?}"))

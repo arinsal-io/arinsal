@@ -735,7 +735,7 @@ mod tests {
         let staging = code.start_staging();
         assert_eq!(staging.ix(), staging_ix);
         staging.with(|tables| {
-            tables.loaded.insert("staged_mod".into(), 7);
+            tables.loaded.insert("staged_mod", 7);
         });
         // Running code still sees the active index without the change.
         assert!(!code.active_tables().loaded.contains_key("staged_mod"));
@@ -762,7 +762,7 @@ mod tests {
         let (scope, code) = node();
         let staging = code.start_staging();
         staging.with(|tables| {
-            tables.loaded.insert("barrier_mod".into(), 11);
+            tables.loaded.insert("barrier_mod", 11);
         });
         let ended = staging.end().unwrap();
         assert!(!take_code_barrier());
@@ -782,7 +782,7 @@ mod tests {
         let (active, staging_ix) = (code.active(), code.staging());
         let staging = code.start_staging();
         staging.with(|tables| {
-            tables.loaded.insert("aborted_mod".into(), 1);
+            tables.loaded.insert("aborted_mod", 1);
         });
         staging.abort();
         assert_eq!((code.active(), code.staging()), (active, staging_ix));
@@ -817,7 +817,7 @@ mod tests {
         let outer = code.start_staging();
         let inner = code.start_staging();
         inner.with(|tables| {
-            tables.loaded.insert("inner_mod".into(), 2);
+            tables.loaded.insert("inner_mod", 2);
         });
         drop(inner);
         assert_eq!(code.active_generation(), generation);
@@ -845,7 +845,7 @@ mod tests {
                 .is_err()
         );
         staging.with(|tables| {
-            tables.loaded.insert("first_mod".into(), 3);
+            tables.loaded.insert("first_mod", 3);
         });
         drop(staging);
         // The second loader stages on top of the first one's committed tables.

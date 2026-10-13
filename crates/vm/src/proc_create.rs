@@ -833,7 +833,7 @@ pub(crate) struct ProcessCold {
     /// multi-scheduling block of its runtime.
     pub(crate) have_blocked_multi_scheduling: bool,
     pub(crate) dictionary_heap: arinsal_term::VecHeap,
-    pub(crate) flags: HashMap<String, Term>,
+    pub(crate) flags: ProcFlags,
     pub(crate) monitor_nodes: usize,
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
@@ -1480,5 +1480,64 @@ mod procdict_tests {
         }
         assert_eq!(dict.len(), 0);
         assert!(dict.entries().next().is_none());
+    }
+}
+
+/// `process_flag/2` values kept on the process: erts stores these as struct fields (`p->flags`, `async_dist`, `p->sig_qs.flags`, `ERTS_PSD_*`), not behind string keys. A field is
+/// `None` until the flag is first set; readers then report the erts default.
+#[derive(Default)]
+pub(crate) struct ProcFlags {
+    pub(crate) error_handler: Option<Term>,
+    pub(crate) priority: Option<Term>,
+    pub(crate) message_queue_data: Option<Term>,
+    pub(crate) sensitive: Option<Term>,
+    pub(crate) async_dist: Option<Term>,
+    pub(crate) priority_messages: Option<Term>,
+    pub(crate) save_calls: Option<Term>,
+    pub(crate) group_leader: Option<Term>,
+    pub(crate) fullsweep_after: Option<Term>,
+    pub(crate) min_heap_size: Option<Term>,
+    pub(crate) min_bin_vheap_size: Option<Term>,
+}
+
+impl ProcFlags {
+    fn slot(&mut self, name: &str) -> &mut Option<Term> {
+        match name {
+            "error_handler" => &mut self.error_handler,
+            "priority" => &mut self.priority,
+            "message_queue_data" => &mut self.message_queue_data,
+            "sensitive" => &mut self.sensitive,
+            "async_dist" => &mut self.async_dist,
+            "priority_messages" => &mut self.priority_messages,
+            "save_calls" => &mut self.save_calls,
+            "group_leader" => &mut self.group_leader,
+            "fullsweep_after" => &mut self.fullsweep_after,
+            "min_heap_size" => &mut self.min_heap_size,
+            "min_bin_vheap_size" => &mut self.min_bin_vheap_size,
+            other => unreachable!("unknown process flag {other}"),
+        }
+    }
+
+    /// The value of a flag by name, for the cold `process_info` paths.
+    pub(crate) fn get(&self, name: &str) -> Option<Term> {
+        match name {
+            "error_handler" => self.error_handler,
+            "priority" => self.priority,
+            "message_queue_data" => self.message_queue_data,
+            "sensitive" => self.sensitive,
+            "async_dist" => self.async_dist,
+            "priority_messages" => self.priority_messages,
+            "save_calls" => self.save_calls,
+            "group_leader" => self.group_leader,
+            "fullsweep_after" => self.fullsweep_after,
+            "min_heap_size" => self.min_heap_size,
+            "min_bin_vheap_size" => self.min_bin_vheap_size,
+            _ => None,
+        }
+    }
+
+    /// Stores a flag and returns the previous value.
+    pub(crate) fn insert(&mut self, name: &str, value: Term) -> Option<Term> {
+        self.slot(name).replace(value)
     }
 }

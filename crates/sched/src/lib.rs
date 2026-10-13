@@ -421,6 +421,11 @@ pub trait SignalMessage: Send + 'static {
     fn is_priority(&self) -> bool {
         false
     }
+    /// The Erlang reference key of a BIF timer message: the timer is created with the key as its
+    /// identity, so the reference alone finds it.
+    fn timer_ref_key(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl SignalMessage for () {}
@@ -3151,11 +3156,20 @@ impl<T: Task> Inner<T> {
             return Err(Error::NoProcess);
         };
         let fallback = pid.number() as usize % self.timer_commands.len();
-        let worker = owner
+        let forced = match &payload {
+            TimerPayload::Message(_, message, _) | TimerPayload::ResolvedMessage(_, message, _) => {
+                message.timer_ref_key()
+            }
+            _ => None,
+        }
+        .map(|key| TimerRef::from_ref_key(key, self.timer_commands.len()));
+        let worker = forced
+            .map(|forced| forced.worker)
+            .or(owner)
             .or_else(|| local.as_deref().map(|local| local.worker_id))
             .filter(|worker| *worker < self.timer_commands.len())
             .unwrap_or(fallback);
-        let id = self.next_timer.fetch_add(1, Ordering::Relaxed);
+        let id = forced.map_or_else(|| self.next_timer.fetch_add(1, Ordering::Relaxed), |f| f.id);
         // Port of erts/emulator/beam/erl_hl_timer.c:1832-1840 (setup_bif_timer), OTP-29.1.1:
         // a timer aimed at a local process is linked to that receiver.
         if ms != 0
@@ -3278,6 +3292,27 @@ impl<T: Task> Inner<T> {
         // Port of erts/emulator/beam/erl_hl_timer.c:2083 (bif_timer_access_request),
         // OTP-29.1.1: the owner answers from its next aux point.
         self.request_aux_work_one(reference.worker, Arc::new(|_| {}));
+    }
+
+    /// Cancels or reads a timer when the calling thread owns its wheel: the answer is immediate
+    /// and nothing is allocated. `None` when another scheduler owns the wheel.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): the owning scheduler
+    // accesses its btm tree directly, only a foreign scheduler goes through a request.
+    fn try_access_timer_local(&self, reference: TimerRef, cancel: bool) -> Option<Option<u64>> {
+        if self.sim_timers.is_some() {
+            return None;
+        }
+        let service = self.owner_timer_service_synced(reference.worker)?;
+        let now = self.clock.now_ms();
+        let mut service = service.borrow_mut();
+        Some(if cancel {
+            service
+                .wheel
+                .cancel_at(reference.id, now)
+                .map(|(remaining, _)| remaining)
+        } else {
+            service.wheel.remaining_at(reference.id, now)
+        })
     }
 
     /// Synchronous read for threads outside the scheduler (tests, drivers).
@@ -5414,6 +5449,95 @@ impl<T: Task> Scheduler<T> {
     pub fn send_after(&self, pid: Pid, ms: u64, msg: T::Message) -> Result<TimerRef, Error> {
         self.inner
             .start_timer(pid, ms, TimerPayload::Message(pid, msg, false), None, None)
+    }
+    /// Maps the messages of every BIF timer through `f`, one result per timer.
+    ///
+    /// Each wheel belongs to its scheduler thread, so the other schedulers answer as aux work
+    /// (erl_hl_timer.c reaches a foreign timer the same way); the wheel of the calling thread is
+    /// read directly. Gives up on a scheduler that does not answer within two seconds.
+    pub fn map_bif_timer_messages<R: Send + 'static>(
+        &self,
+        f: impl Fn(&T::Message) -> R + Send + Sync + 'static,
+    ) -> Vec<R> {
+        let f = Arc::new(f);
+        let workers = self.inner.timer_commands.len();
+        let mut results = Vec::new();
+        let (reply, receiver) = mpsc::channel();
+        let mut pending = 0;
+        for worker in 0..workers {
+            if let Some(sim) = self.inner.sim_timers.as_ref() {
+                if let Some(wheel) = sim.get(worker) {
+                    results.extend(
+                        wheel
+                            .lock()
+                            .unwrap()
+                            .bif_timer_messages()
+                            .into_iter()
+                            .map(&*f),
+                    );
+                }
+            } else if let Some(service) = self.inner.owner_timer_service(worker) {
+                results.extend(
+                    service
+                        .borrow()
+                        .wheel
+                        .bif_timer_messages()
+                        .into_iter()
+                        .map(&*f),
+                );
+            } else {
+                let f = Arc::clone(&f);
+                let reply = reply.clone();
+                let inner = Arc::clone(&self.inner);
+                self.inner.request_aux_work_one(
+                    worker,
+                    Arc::new(move |running| {
+                        let found = inner.owner_timer_service(running).map(|service| {
+                            service
+                                .borrow()
+                                .wheel
+                                .bif_timer_messages()
+                                .into_iter()
+                                .map(&*f)
+                                .collect::<Vec<_>>()
+                        });
+                        let _ = reply.send(found.unwrap_or_default());
+                    }),
+                );
+                pending += 1;
+            }
+        }
+        drop(reply);
+        for _ in 0..pending {
+            match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(found) => results.extend(found),
+                Err(_) => break,
+            }
+        }
+        results
+    }
+
+    /// The number of BIF timers on the wheel of `worker`, read from that scheduler's thread.
+    pub fn bif_timer_count(&self, worker: usize) -> usize {
+        if let Some(sim) = self.inner.sim_timers.as_ref() {
+            return sim
+                .get(worker)
+                .map_or(0, |wheel| wheel.lock().unwrap().bif_timer_messages().len());
+        }
+        self.inner.owner_timer_service(worker).map_or(0, |service| {
+            service.borrow().wheel.bif_timer_messages().len()
+        })
+    }
+
+    /// [`TimerRef`] access without a request when this thread owns the wheel; see
+    /// [`Inner::try_access_timer_local`]. The outer `None` means a request is needed.
+    pub fn try_access_timer_local(&self, timer: TimerRef, cancel: bool) -> Option<Option<u64>> {
+        self.inner.try_access_timer_local(timer, cancel)
+    }
+
+    /// The BIF timer created with Erlang reference key `key`; see [`TimerRef::from_ref_key`].
+    pub fn timer_for_ref_key(&self, key: u64) -> TimerRef {
+        TimerRef::from_ref_key(key, self.inner.timer_commands.len())
     }
     /// Hold every BIF timer aimed at `pid` until [`Scheduler::resume_target_timers`]; used
     /// while the process is suspended.
