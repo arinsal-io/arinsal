@@ -221,7 +221,7 @@ fn bind_static_nifs(module: &mut Module, code_ix: &crate::code_ix::CodeIndexes) 
         else {
             continue;
         };
-        let Some(index) = code_ix.push_native_fn(native) else {
+        let Some(index) = code_ix.push_native_fn(crate::natives::nif::NativeFn::Bif(native)) else {
             continue;
         };
         if let Some(body) = module.code.get_mut(entry.saturating_add(1)) {
@@ -1076,11 +1076,20 @@ impl Vm {
         }
     }
 
-    /// NIF body `index` of a `NativeBody` instruction.
-    pub(crate) fn native_fn(&self, index: usize) -> Option<arinsal_bifs::BifFn> {
+    /// NIF body `index` of a `NativeBody` instruction, borrowed from this VM's cache.
+    pub(crate) fn native_fn(
+        &self,
+        index: usize,
+    ) -> Option<std::borrow::Cow<'_, crate::natives::nif::NativeFn>> {
         match self.native_fns.get(index) {
-            Some(native) => *native,
-            None => self.code_ix.native_fns().get(index).copied().flatten(),
+            Some(native) => native.as_ref().map(std::borrow::Cow::Borrowed),
+            None => self
+                .code_ix
+                .native_fns()
+                .get(index)
+                .cloned()
+                .flatten()
+                .map(std::borrow::Cow::Owned),
         }
     }
 
