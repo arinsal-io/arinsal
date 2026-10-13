@@ -163,8 +163,8 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     })
 }
 
-struct Heap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -206,7 +206,7 @@ fn call(
         .map(|term| to_owned(*term).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
     let result = op(&args)?;
-    from_owned(&result, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)
+    from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 fn atom(name: &str) -> O {
     O::atom(name)
@@ -619,7 +619,7 @@ pub fn invoke(ctx: &mut Ctx<'_>, name: &str, args: &[Term]) -> Result<Term, BifE
             && let Some(owned) = magic_pattern(*pattern)?
         {
             adapted[pattern_index] =
-                from_owned(&owned, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)?;
+                from_owned(&owned, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)?;
         }
     }
     let bif = lookup("re", name, args.len() as u8).ok_or(BifError::BADARG)?;
@@ -680,7 +680,7 @@ fn magic_compile_result(ctx: &mut Ctx<'_>, result: Term) -> Result<Term, BifErro
         return Err(BifError::BADARG);
     };
     let serialized = serialized.clone();
-    let mut heap = Heap(ctx.heap);
+    let mut heap = Heap(&mut ctx.heap);
     let mut terms = pattern[..4]
         .iter()
         .map(|item| from_owned(item, &mut heap).map_err(|_| BifError::SystemLimit))

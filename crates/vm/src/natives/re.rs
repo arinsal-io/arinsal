@@ -1,6 +1,6 @@
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
-use arinsal_bifs::{Ctx, FragmentingHeap};
+use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_sched::RunCtx;
 use arinsal_term::Term;
 
@@ -45,8 +45,8 @@ fn call_values(
     }
     arinsal_re::lookup(module, function, arity)?;
     let result = {
-        let mut heap = FragmentingHeap(&mut process.heap);
-        let mut ctx = Ctx::new(&mut heap);
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        let mut ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
         arinsal_re::invoke(&mut ctx, function, args)
     };
     Some(result.map_err(|error| exceptions::bif_error(process, module, function, args, error)))

@@ -1,6 +1,6 @@
 mod support;
 
-use arinsal_bifs::{Ctx, FragmentingHeap, copy_bitstring_range, lookup};
+use arinsal_bifs::{Ctx, ProcessHeapHandle, copy_bitstring_range, lookup};
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, TermBuilder, from_owned, to_owned};
@@ -354,7 +354,7 @@ fn compiled_patterns_match_plain_patterns() {
         let needle = O::Binary(vec![1, (n % 255) as u8]);
         let haystack = O::Binary(vec![0, 1, (n % 255) as u8, 1]);
         let mut heap = ProcessHeap::with_words(1024);
-        let mut allocator = FragmentingHeap(&mut heap);
+        let mut allocator = ProcessHeapHandle(&mut heap);
         let needle_term = from_owned(&needle, &mut allocator).expect("needle term");
         let haystack_term = from_owned(&haystack, &mut allocator).expect("haystack term");
         let compile = lookup("binary", "compile_pattern", 1).expect("compile_pattern/1");
@@ -506,7 +506,7 @@ fn referenced_byte_size_keeps_subbinary_owner() {
     let subbinary = builder
         .sub_binary(original, 100 * 8, 100 * 8)
         .expect("subbinary");
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let mut ctx = Ctx::new(&mut allocator);
     let bif = lookup("binary", "referenced_byte_size", 1).expect("BIF");
     let actual = arinsal_difftest::CallResult::Ok(
@@ -765,7 +765,7 @@ fn clock_and_dst_behavior() {
         }
     }
     let mut heap = ProcessHeap::with_words(128);
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let mut ctx = Ctx::new(&mut allocator);
     let bif = lookup("erlang", "monotonic_time", 0).expect("monotonic_time BIF");
     let started = std::time::Instant::now();
@@ -793,7 +793,7 @@ fn binary_search_megabyte_benchmark() {
         .expect("tail");
     let patterns = builder.cons(needle, tail).expect("patterns");
     let single = lookup("binary", "match", 2).expect("match BIF");
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let mut ctx = Ctx::new(&mut allocator);
     let started = std::time::Instant::now();
     for _ in 0..200 {
@@ -827,7 +827,7 @@ fn map_bifs_handle_hamt() {
         .collect::<Vec<_>>();
     let map = arinsal_maps::from_pairs(&pairs, &mut heap).expect("HAMT");
     assert!(map.is_hashmap());
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let mut ctx = Ctx::new(&mut allocator);
     let bif = lookup("maps", "get", 2).expect("maps:get/2");
     for n in 0..40 {
@@ -852,7 +852,7 @@ fn system_info_snifs_matches_otp() {
     let reference = RefErl::shared().expect("OTP 29 reference");
     let expected = reference.call("erlang", "system_info", &[atom("snifs")]);
     let mut heap = ProcessHeap::with_words(16_384);
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let selector = arinsal_term::from_owned(&atom("snifs"), &mut allocator).unwrap();
     let mut ctx = Ctx::new(&mut allocator);
     let actual = lookup("erlang", "system_info", 1).unwrap()(&mut ctx, &[selector]).unwrap();
@@ -1076,7 +1076,7 @@ fn one_byte_pattern_search_matches_otp_29() {
     // A compiled 1-byte pattern is still Boyer–Moore (`words == 1` in
     // do_binary_match_compile). erl's compile_pattern result matches the raw pattern.
     let mut heap = ProcessHeap::with_words(1024);
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let subject_term = from_owned(&subject, &mut allocator).unwrap();
     let aye_term = from_owned(&aye, &mut allocator).unwrap();
     let dash_term = from_owned(&dash, &mut allocator).unwrap();
@@ -1128,7 +1128,7 @@ fn binary_match_accepts_unaligned_subbinary() {
         .expect("backing");
     let subject = builder.sub_binary(backing, 1, 8).expect("subbinary");
     let needle = builder.binary(&[0b1000_0001]).expect("needle");
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let mut ctx = Ctx::new(&mut allocator);
     let bif = lookup("binary", "match", 2).expect("BIF");
     let actual = arinsal_difftest::CallResult::Ok(
@@ -1160,7 +1160,7 @@ fn binary_reads_and_bit_copies_handle_unaligned_subbinary() {
     copy_bitstring_range(subject, 8, &mut aligned_copy, 8).expect("aligned copy");
     assert_eq!(aligned_copy, [0b1000_0000]);
 
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let reference_subject = O::Binary(vec![0b1000_0001, 0b1000_0000]);
     for (module, name, args) in [
         ("erlang", "binary_to_list", vec![subject]),

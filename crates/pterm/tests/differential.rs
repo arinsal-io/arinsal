@@ -1,11 +1,12 @@
-use arinsal_bifs::{BifError, Ctx};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_difftest::{CallResult, CompareMode, RefErl, compare};
 use arinsal_etf::OwnedTerm;
 use arinsal_pterm::lookup;
-use arinsal_term::{VecHeap, from_owned, to_owned};
+use arinsal_term::{ProcessHeap, from_owned, to_owned};
 
 fn local(name: &str, args: &[OwnedTerm]) -> CallResult {
-    let mut heap = VecHeap::new();
+    let mut process_heap = ProcessHeap::with_words(1024);
+    let mut heap = ProcessHeapHandle(&mut process_heap);
     let args: Vec<_> = args
         .iter()
         .map(|arg| from_owned(arg, &mut heap).unwrap())

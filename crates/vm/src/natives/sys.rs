@@ -497,8 +497,8 @@ fn call_values(
         }
         let before = PersistentTermUpdate::snapshot(store);
         let result = {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-            let mut bif_ctx = Ctx::new(&mut heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+            let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
             bif(store, &mut bif_ctx, args)
         };
         let published = result.is_ok() && before.published();
@@ -664,7 +664,7 @@ fn get_all_step(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> Result<
         let (next_cursor, (key, value)) = next_entry
             .ok_or_else(|| VmError::Unsupported("persistent get/0 snapshot entry".into()))?;
         let result = (|| {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let key = copy_term(key, &mut heap).map_err(|_| {
                 VmError::Trap(crate::exceptions::Trap::error(crate::signals::atom(
                     "system_limit",
@@ -759,7 +759,7 @@ fn term_to_string(process: &mut Process, args: &[Term]) -> Result<Term, VmError>
     let bytes = rendered
         .bytes()
         .map(|byte| Term::small(i64::from(byte)).unwrap());
-    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .list_from_iter(bytes)
         .map_err(|error| VmError::Unsupported(format!("term_to_string allocation: {error:?}")))
 }
@@ -2146,7 +2146,7 @@ fn owned_system_info(
 ) -> Result<Term, VmError> {
     arinsal_term::from_owned(
         &value,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .map_err(|_| badarg())
 }
@@ -2154,7 +2154,7 @@ fn owned_system_info(
 fn max_integer(process: &mut Process) -> Result<Term, VmError> {
     const MAX_BIG_BITS: usize = 65_535 * 64;
     let value = (num_bigint::BigInt::from(1_u8) << MAX_BIG_BITS) - 1;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .int_from_bigint(&value)
         .map_err(|_| badarg())
@@ -2242,7 +2242,7 @@ fn ethread_info(process: &mut Process) -> Result<Term, VmError> {
     ];
     arinsal_term::from_owned(
         &list(entries),
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .map_err(|error| VmError::Unsupported(format!("ethread_info result: {error:?}")))
 }
@@ -2543,7 +2543,7 @@ fn cpu_topology_info(process: &mut Process) -> Result<Term, VmError> {
     match current {
         Some(topology) => arinsal_term::from_owned(
             &topology,
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map_err(|_| badarg()),
         None => Ok(atom("undefined")),
@@ -2576,7 +2576,7 @@ fn set_cpu_topology(
         Some(topology) => {
             let term = arinsal_term::from_owned(
                 &topology,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .map_err(|_| badarg())?;
             Ok(term)
@@ -3046,7 +3046,7 @@ fn send_deprecation_warning(process: &mut Process, ctx: &mut RunCtx<'_, Message>
         .try_into()
         .unwrap_or(i64::MAX);
     let event = (|| -> Result<Term, VmError> {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
         let warning = builder.string_to_list(text).map_err(|_| badarg())?;
         let format = builder.string_to_list("~s~n").map_err(|_| badarg())?;
@@ -3830,7 +3830,7 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
         ),
         (atom("size"), size),
     ];
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .flatmap_from_pairs(&pairs)
         .map_err(|error| VmError::Unsupported(format!("max_heap_size map: {error:?}")))
@@ -4029,7 +4029,7 @@ fn rewrite_root(
     if !references_retired(process, term, areas, index) {
         return Ok((term, false));
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let copied = copy_term_preserving_sharing_with_cache(term, &mut heap, shared_copy)
         .map_err(|error| VmError::Unsupported(format!("literal copy {error:?}")))?;
     Ok((copied, true))
@@ -4559,7 +4559,7 @@ pub(crate) fn non_neg(process: &mut Process, value: u64) -> Result<Term, VmError
     {
         return Ok(term);
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .int_from_bigint(&num_bigint::BigInt::from(value))
         .map_err(|_| badarg())
@@ -4584,7 +4584,7 @@ fn tagged(process: &mut Process, name: &str, value: u64) -> Result<Term, VmError
 }
 
 fn tuple(process: &mut Process, terms: &[Term]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .tuple(terms)
         .map_err(|_| badarg())
@@ -4593,7 +4593,7 @@ fn tuple(process: &mut Process, terms: &[Term]) -> Result<Term, VmError> {
 fn cons_list(process: &mut Process, terms: &[Term]) -> Result<Term, VmError> {
     let mut list = Term::NIL;
     for term in terms.iter().rev() {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         list = TermBuilder::new(&mut heap)
             .cons(*term, list)
             .map_err(|_| badarg())?;
@@ -4622,7 +4622,7 @@ fn map(process: &mut Process, pairs: &[(&str, Term)]) -> Result<Term, VmError> {
         .iter()
         .map(|(key, value)| (atom(key), *value))
         .collect();
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     arinsal_maps::from_list(&pairs, &mut heap).map_err(|_| badarg())
 }
 
@@ -5146,7 +5146,7 @@ mod tests {
             let mut process = Process::new();
             let input = from_owned(
                 &O::Tuple(vec![O::Atom("allocator".into()), O::Atom(name.into())]),
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .unwrap();
             let actual = system_info(&Vm::new([]), &mut process, None, input)
@@ -5166,7 +5166,7 @@ mod tests {
             let mut process = Process::new();
             let input = from_owned(
                 &selector,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .unwrap();
             let actual = system_info(&Vm::new([]), &mut process, None, input)
@@ -5223,7 +5223,7 @@ mod tests {
             let mut process = Process::new();
             let input = from_owned(
                 &O::Tuple(vec![O::Atom("allocator".into()), O::Atom(name.into())]),
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .unwrap();
             actual_infos.push(
@@ -5269,7 +5269,7 @@ mod tests {
                 O::Atom("allocator".into()),
                 O::Atom("mseg_alloc".into()),
             ]),
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .unwrap();
         let actual = system_info(&Vm::new([]), &mut process, None, input)
@@ -5298,7 +5298,7 @@ mod tests {
                 O::Atom("allocator".into()),
                 O::Atom("test_alloc".into()),
             ]),
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .unwrap();
         let actual = system_info(&Vm::new([]), &mut process, None, input)

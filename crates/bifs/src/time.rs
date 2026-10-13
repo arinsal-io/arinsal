@@ -64,7 +64,7 @@ fn convert_time_unit(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
     let to = unit(args[2])?;
     let numerator = value * to;
     let result = floor_div(numerator, from);
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&result)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -117,7 +117,7 @@ fn scaled(ctx: &mut Ctx<'_>, value: i128, args: &[Term]) -> Result<Term, BifErro
     let denominator = BigInt::from(NATIVE);
     // Port of erts/emulator/beam/erl_time_sup.c (time unit conversion), OTP-29.1.1.
     let result = floor_div(numerator, denominator);
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&result)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -317,7 +317,7 @@ fn localtime_to_universaltime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, 
 }
 fn universaltime_to_posixtime(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let secs = unix_from_calendar(parse_datetime(args[0])?).ok_or(BifError::BADARG)?;
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_i64(secs)
         .map_err(|_| BifError::SystemLimit)
 }

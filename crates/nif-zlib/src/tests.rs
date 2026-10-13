@@ -992,11 +992,11 @@ fn direct_nif_chunk_size_edges() {
 
 #[test]
 fn public_dispatch_and_pid_api() {
-    use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
+    use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
     use arinsal_term::{ProcessHeap, from_owned, to_owned};
     fn invoke(name: &str, args: &[O], pid: Option<O>) -> Result<O, O> {
         let mut heap = ProcessHeap::with_words(256);
-        let mut alloc = FragmentingHeap(&mut heap);
+        let mut alloc = ProcessHeapHandle(&mut heap);
         let terms = args
             .iter()
             .map(|v| from_owned(v, &mut alloc).unwrap())

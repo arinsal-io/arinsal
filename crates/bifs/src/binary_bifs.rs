@@ -112,7 +112,7 @@ fn erlang_binary_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifEr
             || size < budget.saturating_mul(B2L_BYTES_PER_REDUCTION)
             || (size < min_reds * B2L_BYTES_PER_REDUCTION && budget > resched_reds);
         let reservation = {
-            let mut builder = TermBuilder::new(ctx.heap);
+            let mut builder = TermBuilder::new(&mut ctx.heap);
             builder
                 .reserve_cons_list(len)
                 .map_err(|_| BifError::SystemLimit)?
@@ -178,9 +178,9 @@ impl BinaryToListWalk {
     }
 
     /// Fill at most one scheduler chunk, visiting the source from its end.
-    pub fn step(
+    pub fn step<H: HeapAlloc + ?Sized>(
         &mut self,
-        heap: &mut dyn HeapAlloc,
+        heap: &mut H,
         max_bytes: usize,
     ) -> Result<(Option<Term>, usize), BifError> {
         if self.list.is_none() {
@@ -324,7 +324,7 @@ fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
                     if bytes.len() > COPY_THRESHOLD {
                         if !copied.is_empty() {
                             segments.push(
-                                TermBuilder::new(&mut Heap(ctx.heap))
+                                TermBuilder::new(&mut Heap(&mut ctx.heap))
                                     .binary(&copied)
                                     .expect("infallible BIF heap"),
                             );
@@ -351,12 +351,12 @@ fn iolist_to_iovec(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     ctx.charge_reductions(total);
     if !copied.is_empty() {
         segments.push(
-            TermBuilder::new(&mut Heap(ctx.heap))
+            TermBuilder::new(&mut Heap(&mut ctx.heap))
                 .binary(&copied)
                 .expect("infallible BIF heap"),
         );
     }
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .list_from_iter(segments)
         .expect("infallible BIF heap"))
 }
@@ -659,7 +659,10 @@ impl IolistCopyWalk {
 }
 
 /// Allocate the final writable binary before the iolist copy pass.
-pub fn allocate_iolist_binary(heap: &mut dyn HeapAlloc, byte_len: usize) -> Result<Term, BifError> {
+pub fn allocate_iolist_binary<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
+    byte_len: usize,
+) -> Result<Term, BifError> {
     if byte_len == 0 {
         return TermBuilder::new(&mut super::Heap(heap))
             .binary(&[])
@@ -698,7 +701,7 @@ pub(crate) fn write_binary(
     fill: impl FnOnce(&mut [u8]) -> Result<(), BifError>,
 ) -> Result<Term, BifError> {
     if byte_len == 0 {
-        return Ok(TermBuilder::new(&mut Heap(ctx.heap))
+        return Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
             .binary(&[])
             .expect("infallible BIF heap"));
     }
@@ -706,11 +709,11 @@ pub(crate) fn write_binary(
     if !ctx.heap.supports_writable_binary() {
         let mut bytes = vec![0; byte_len];
         fill(&mut bytes)?;
-        return TermBuilder::new(&mut Heap(ctx.heap))
+        return TermBuilder::new(&mut Heap(&mut ctx.heap))
             .binary(&bytes)
             .map_err(|_| BifError::SystemLimit);
     }
-    let result = allocate_iolist_binary(ctx.heap, byte_len)?;
+    let result = allocate_iolist_binary(&mut ctx.heap, byte_len)?;
     with_iolist_binary_output(result, fill)?;
     finish_iolist_binary_output(result);
     Ok(result)
@@ -744,7 +747,7 @@ fn bitstring_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         .collect::<Vec<_>>();
     if view.bit_len() % 8 != 0 {
         values.push(
-            TermBuilder::new(&mut Heap(ctx.heap))
+            TermBuilder::new(&mut Heap(&mut ctx.heap))
                 .bitstring(&data[full..], view.bit_len() % 8)
                 .expect("infallible BIF heap"),
         );
@@ -782,7 +785,7 @@ fn list_to_bitstring(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
         }
     }
     ctx.charge_reductions(data.len());
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .bitstring(&data, bits)
         .expect("infallible BIF heap"))
 }
@@ -818,7 +821,7 @@ fn binary_part(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if position < 0 || length < 0 || end > (bits / 8) as i64 {
         return Err(BADARG);
     }
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .sub_binary(args[0], position as usize * 8, length as usize * 8)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -831,7 +834,7 @@ fn split_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Err(BADARG);
     }
     let split_at = usize::try_from(at).map_err(|_| BADARG)? * 8;
-    let mut heap = Heap(ctx.heap);
+    let mut heap = Heap(&mut ctx.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let left = builder
         .sub_binary(args[0], 0, split_at)
@@ -885,7 +888,7 @@ fn binary_copy(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let count = usize::try_from(count).map_err(|_| BifError::SystemLimit)?;
     let source_len = bits / 8;
     if count == 0 || source_len == 0 {
-        return Ok(TermBuilder::new(&mut Heap(ctx.heap))
+        return Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
             .binary(&[])
             .expect("infallible BIF heap"));
     }
@@ -1021,7 +1024,7 @@ fn compile_pattern(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let patterns = patterns(args[0])?;
     let compiled = Arc::new(SearchPattern::compile(&patterns)?);
     let tag = Term::atom(global_atoms().intern(compiled.tag()).expect("atom"));
-    let reference = TermBuilder::new(&mut Heap(ctx.heap))
+    let reference = TermBuilder::new(&mut Heap(&mut ctx.heap))
         .magic_ref(MagicRef::new(compiled))
         .map_err(|_| BifError::SystemLimit)?;
     Ok(tuple_build(ctx, &[tag, reference]))
@@ -1166,7 +1169,7 @@ impl BinarySearchWalk {
                     }
                 }
                 let values = {
-                    let mut heap = Heap(ctx.heap);
+                    let mut heap = Heap(&mut ctx.heap);
                     let mut builder = TermBuilder::new(&mut heap);
                     ranges
                         .into_iter()
@@ -1256,7 +1259,7 @@ fn encode_unsigned(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if byte_order(args)? {
         bytes.reverse();
     }
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(&bytes)
         .expect("infallible BIF heap"))
 }
@@ -1270,7 +1273,7 @@ fn decode_unsigned(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         } else {
             BigInt::from_bytes_be(Sign::Plus, bytes)
         };
-        TermBuilder::new(&mut Heap(ctx.heap))
+        TermBuilder::new(&mut Heap(&mut ctx.heap))
             .int_from_bigint(&value)
             .map_err(|_| BifError::SystemLimit)
     })

@@ -131,8 +131,8 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     lookup_entry(module, name, arity)
 }
 
-struct Heap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -169,7 +169,7 @@ fn call(
         .map(|a| to_owned(*a).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
     let result = f(&args)?;
-    from_owned(&result, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)
+    from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 
 macro_rules! entries {

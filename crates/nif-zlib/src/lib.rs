@@ -100,8 +100,8 @@ pub(crate) fn owner_check(expected: &Option<O>, caller: &Option<O>) -> Result<()
     }
 }
 
-struct Heap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -153,7 +153,7 @@ pub fn call_with_pid(
         "zstd" => zstd::dispatch(name, &owned, &pid),
         _ => return Err(BifError::Unsupported("unknown NIF module")),
     };
-    let mut heap = Heap(ctx.heap);
+    let mut heap = Heap(&mut ctx.heap);
     match result {
         Ok(term) => from_owned(&term, &mut heap).map_err(|_| BifError::SystemLimit),
         Err(Fault::Badarg) => Err(BifError::BADARG),

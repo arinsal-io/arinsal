@@ -6,8 +6,8 @@ use std::io::Write;
 use std::sync::Arc;
 
 use arinsal_term::{
-    ExportEntry, FunEntry, FunRef, Identity, Node, Term, TermBuilder, TermKind, cmp_exact,
-    global_atoms,
+    ExportEntry, FunEntry, FunRef, HeapAlloc, Identity, Node, Term, TermBuilder, TermKind,
+    cmp_exact, global_atoms,
 };
 use flate2::{Compression, Decompress, FlushDecompress, Status};
 use num_bigint::{BigInt, Sign};
@@ -729,6 +729,15 @@ impl EncodeWalk {
     }
 }
 
+/// Encode one term with the default `term_to_binary/1` options without running its BIF body.
+///
+/// Port of erts/emulator/beam/external.c:3305 (`erts_term_to_binary`), OTP-29.1.1.
+pub fn encode_term_to_binary(term: Term) -> Result<Vec<u8>, BifError> {
+    let mut walk = EncodeWalk::new(&[term])?;
+    walk.step(usize::MAX)?;
+    walk.finish_binary()
+}
+
 fn encode_plain_with_splits(term: Term, opts: EncodeOpts) -> Result<EncodedWithSplits, BifError> {
     let mut walk = EncodeWalk::start(term, opts);
     walk.step(usize::MAX)?;
@@ -780,7 +789,7 @@ fn encode_bytes(plain: Vec<u8>, opts: EncodeOpts) -> Result<Vec<u8>, BifError> {
 }
 
 fn result_binary(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Term, BifError> {
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(bytes)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -944,12 +953,12 @@ struct Frame {
     shapes: SmallVec<[Shape; 4]>,
 }
 
-fn built(
-    ctx: &mut Option<&mut Ctx<'_>>,
-    f: impl FnOnce(&mut TermBuilder<'_, Heap<'_>>) -> Result<Term, arinsal_term::TermError>,
+fn built<H: HeapAlloc>(
+    ctx: &mut Option<&mut Ctx<'_, H>>,
+    f: impl FnOnce(&mut TermBuilder<'_, Heap<'_, H>>) -> Result<Term, arinsal_term::TermError>,
 ) -> Result<Term, BifError> {
     if let Some(ctx) = ctx.as_deref_mut() {
-        let mut heap = Heap(ctx.heap);
+        let mut heap = Heap(&mut ctx.heap);
         f(&mut TermBuilder::new(&mut heap)).map_err(|e| match e {
             arinsal_term::TermError::SystemLimit => BifError::SystemLimit,
             _ => BifError::BADARG,
@@ -983,8 +992,8 @@ fn finish(frame: Frame, ctx: &mut Option<&mut Ctx<'_>>) -> Result<(Term, Shape),
                 .collect();
             if ctx.is_some() {
                 let ctx = ctx.as_deref_mut().unwrap();
-                let map =
-                    arinsal_maps::from_pairs(&pairs, ctx.heap).map_err(|_| BifError::BADARG)?;
+                let map = arinsal_maps::from_pairs(&pairs, &mut ctx.heap)
+                    .map_err(|_| BifError::BADARG)?;
                 if arinsal_maps::size(map).map_err(|_| BifError::BADARG)? != pairs.len() {
                     return Err(BifError::BADARG);
                 }
@@ -1199,12 +1208,12 @@ fn parse_step(
                 let n = r.u16()? as usize;
                 let raw = r.take(n)?;
                 let tail = if let Some(ctx) = ctx.as_deref_mut() {
-                    TermBuilder::new(ctx.heap).byte_string_list(raw).map_err(
-                        |error| match error {
+                    TermBuilder::new(&mut ctx.heap)
+                        .byte_string_list(raw)
+                        .map_err(|error| match error {
                             arinsal_term::TermError::SystemLimit => BifError::SystemLimit,
                             _ => BifError::BADARG,
-                        },
-                    )?
+                        })?
                 } else {
                     Term::NIL
                 };
@@ -1221,7 +1230,8 @@ fn parse_step(
                 count_ok(count, r.bytes.len() - r.at, input_complete)?;
                 if count == 0 {
                     let t = if let Some(ctx) = ctx.as_deref_mut() {
-                        arinsal_maps::from_pairs(&[], ctx.heap).map_err(|_| BifError::BADARG)?
+                        arinsal_maps::from_pairs(&[], &mut ctx.heap)
+                            .map_err(|_| BifError::BADARG)?
                     } else {
                         Term::NIL
                     };
@@ -1651,8 +1661,6 @@ impl DecodeWalk {
         byte_budget: usize,
         ctx: &mut Ctx<'_>,
     ) -> Result<(Option<Term>, usize), (BifError, usize)> {
-        let mut heap = Heap(&mut *ctx.heap);
-        let mut parser_ctx = Ctx::new(&mut heap);
         let mut consumed = 0;
         if let Some(checked) = self.checked_root {
             while !self.inflate_done && consumed < byte_budget.max(1) {
@@ -1670,7 +1678,7 @@ impl DecodeWalk {
                     .take()
                     .ok_or((BifError::BADARG, consumed))?;
                 return self
-                    .wrap_used(&mut parser_ctx, term, checked)
+                    .wrap_used(ctx, term, checked)
                     .map(|value| (Some(value), consumed))
                     .map_err(|error| (error, consumed));
             }
@@ -1687,7 +1695,7 @@ impl DecodeWalk {
                 &mut self.reader,
                 &mut self.stack,
                 self.safe,
-                Some(&mut parser_ctx),
+                Some(ctx),
                 tags,
                 !self.compressed || self.inflate_done,
             ) {
@@ -1706,7 +1714,7 @@ impl DecodeWalk {
                         return Err((BifError::BADARG, consumed));
                     }
                     let value = self
-                        .wrap_used(&mut parser_ctx, term, checked)
+                        .wrap_used(ctx, term, checked)
                         .map_err(|error| (error, consumed))?;
                     return Ok((Some(value), consumed));
                 }

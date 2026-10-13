@@ -225,7 +225,11 @@ impl CallMatchContext {
     // trace results live on the tracee heap), OTP-29.1.1.
     fn take_message(&self, process: &mut Process) -> Option<Term> {
         let (_heap, term) = self.message.borrow_mut().take()?;
-        copy_term(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)).ok()
+        copy_term(
+            term,
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        )
+        .ok()
     }
 
     fn take_trace_actions(&self) -> Vec<(String, VecHeap, Vec<Term>)> {
@@ -1181,7 +1185,10 @@ fn module_tracer_alive(
     let Some(tracee) = tracee else {
         return false;
     };
-    let Ok(state) = from_owned(state, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)) else {
+    let Ok(state) = from_owned(
+        state,
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+    ) else {
         return false;
     };
     let result = crate::natives::nif::invoke_tracer(
@@ -1776,14 +1783,14 @@ fn run_call_match(
         None
     };
     // Port of erts/emulator/beam/erl_trace.c:1266-1267, OTP-29.1.1.
-    let against = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    let against = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .list_from_iter(args.iter().copied())
         .map_err(|error| VmError::Unsupported(format!("trace subject: {error:?}")))?;
     let program = spec
         .program(|source| {
             let specification = from_owned(
                 source,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .map_err(|_| ())?;
             arinsal_ets::match_spec::MatchProgram::compile_trace(specification).map_err(|_| ())
@@ -1809,7 +1816,7 @@ fn run_call_match(
     let result = program
         .run_with_context(
             against,
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             &context,
         )
         .map_err(|error| VmError::Unsupported(format!("trace match spec execution: {error:?}")))?;
@@ -2088,7 +2095,10 @@ fn module_call_enabled(
     };
     let (Some(tracee), Ok(state)) = (
         pid.to_term(),
-        from_owned(state, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)),
+        from_owned(
+            state,
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        ),
     ) else {
         return Some(false);
     };
@@ -2202,9 +2212,11 @@ fn emit_meta(
             }
         }
         Tracer::Module { module, state, .. } => {
-            let Some(state) =
-                from_owned(state, &mut arinsal_bifs::FragmentingHeap(&mut process.heap)).ok()
-            else {
+            let Some(state) = from_owned(
+                state,
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            )
+            .ok() else {
                 return;
             };
             crate::natives::nif::refresh_hub(process, ctx);
@@ -2488,12 +2500,12 @@ fn call_mfa_term(
                 .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
         );
     } else {
-        let args = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        let args = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
             .list_from_iter(args.iter().copied())
             .map_err(|error| VmError::Unsupported(format!("trace args: {error:?}")))?;
         values.push(args);
     }
-    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&values)
         .map_err(|error| VmError::Unsupported(format!("trace call: {error:?}")))
 }
@@ -2544,7 +2556,7 @@ fn caller_info(
                         Term::small(i64::from(native.arity))
                             .ok_or_else(|| VmError::Unsupported("caller arity".into()))?,
                     ];
-                    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                     let caller = TermBuilder::new(&mut heap)
                         .tuple(&mfa)
                         .map_err(|error| VmError::Unsupported(format!("caller MFA: {error:?}")))?;
@@ -2618,7 +2630,7 @@ fn caller_info(
         ),
         Term::small(i64::from(arity)).ok_or_else(|| VmError::Unsupported("caller arity".into()))?,
     ];
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let caller = TermBuilder::new(&mut heap)
         .tuple(&mfa)
         .map_err(|error| VmError::Unsupported(format!("caller MFA: {error:?}")))?;
@@ -2853,29 +2865,29 @@ pub(crate) fn native_return_events(
             }
             None
         };
-        let mfa = match mfa {
-            Some(mfa) => mfa,
-            None => {
-                let built = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                    .tuple(&[
-                        Term::atom(
-                            global_atoms()
-                                .intern(&function.module)
-                                .map_err(|_| VmError::Unsupported("trace module atom".into()))?,
-                        ),
-                        Term::atom(
-                            global_atoms()
-                                .intern(&function.function)
-                                .map_err(|_| VmError::Unsupported("trace function atom".into()))?,
-                        ),
-                        Term::small(i64::from(function.arity))
-                            .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
-                    ])
-                    .map_err(|error| VmError::Unsupported(format!("trace MFA: {error:?}")))?;
-                mfa = Some(built);
-                built
-            }
-        };
+        let mfa =
+            match mfa {
+                Some(mfa) => mfa,
+                None => {
+                    let built =
+                        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
+                            .tuple(&[
+                                Term::atom(global_atoms().intern(&function.module).map_err(
+                                    |_| VmError::Unsupported("trace module atom".into()),
+                                )?),
+                                Term::atom(global_atoms().intern(&function.function).map_err(
+                                    |_| VmError::Unsupported("trace function atom".into()),
+                                )?),
+                                Term::small(i64::from(function.arity))
+                                    .ok_or_else(|| VmError::Unsupported("trace arity".into()))?,
+                            ])
+                            .map_err(|error| {
+                                VmError::Unsupported(format!("trace MFA: {error:?}"))
+                            })?;
+                    mfa = Some(built);
+                    built
+                }
+            };
         let name = if exception {
             "exception_from"
         } else {
@@ -2982,7 +2994,7 @@ fn return_event_inner(
     );
     let arity = Term::small(i64::from(arity))
         .ok_or_else(|| VmError::Unsupported("trace return arity".into()))?;
-    let mfa = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    let mfa = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&[module, function, arity])
         .map_err(|error| VmError::Unsupported(format!("trace return MFA: {error:?}")))?;
     let fields = if exception {
@@ -3043,7 +3055,7 @@ pub(crate) fn bif_return_events(
     };
     // Only call time and memory frames: no event carries the MFA.
     let mfa = if actions.iter().any(|action| action.acc.is_none()) {
-        TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
             .tuple(&[
                 atom_of(module)?,
                 atom_of(function)?,
@@ -3261,7 +3273,7 @@ fn emit_return_to(
             Term::small(i64::from(arity))
                 .ok_or_else(|| VmError::Unsupported("return_to arity".into()))?,
         ];
-        TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
             .tuple(&values)
             .map_err(|error| VmError::Unsupported(format!("return_to MFA: {error:?}")))?
     } else {
@@ -3618,7 +3630,7 @@ fn emit_filtered_without_ctx(
                 // Port of erts/emulator/nifs/common/erl_tracer_nif.c:237-253,
                 // OTP-29.1.1: the port copies this term synchronously.
                 let Ok(event) =
-                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .tuple(&values)
                 else {
                     continue;
@@ -3683,7 +3695,7 @@ pub(crate) fn running_mfa(
         };
         (&*module.name, function, arity)
     };
-    let tuple = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    let tuple = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&[
             Term::atom(
                 global_atoms()
@@ -3762,7 +3774,7 @@ fn emit_filtered(
                 };
                 let dump = process_dump_for(&specification, vm.as_deref(), process, ctx);
                 let against =
-                    match TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .list_from_iter(arguments.iter().copied())
                     {
                         Ok(against) => against,
@@ -3770,7 +3782,7 @@ fn emit_filtered(
                     };
                 let specification = match from_owned(
                     &specification,
-                    &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                    &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                 ) {
                     Ok(specification) => specification,
                     Err(_) => continue,
@@ -3789,7 +3801,7 @@ fn emit_filtered(
                 );
                 let result = program.run_with_context(
                     against,
-                    &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                    &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                     &context,
                 );
                 crate::natives::sys::set_trace_control_word_value(
@@ -3884,7 +3896,7 @@ fn deliver(
     // in the tracee env, then enif_send copies it), OTP-29.1.1. A full heap must not drop
     // the event, so the tuple may land in a heap fragment.
     let Ok(event) =
-        TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap)).tuple(&values)
+        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap)).tuple(&values)
     else {
         return;
     };
@@ -3913,10 +3925,14 @@ fn timestamp_term(process: &mut Process, flags: u64) -> Option<Term> {
     if flags & (TIMESTAMP | STRICT_MONOTONIC_TIMESTAMP | MONOTONIC_TIMESTAMP) == 0 {
         return None;
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     if flags & TIMESTAMP != 0 {
         let now = arinsal_bifs::lookup("erlang", "now", 0)?;
-        return now(&mut arinsal_bifs::Ctx::new(&mut heap), &[]).ok();
+        return now(
+            &mut arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions),
+            &[],
+        )
+        .ok();
     }
     let monotonic = TermBuilder::new(&mut heap)
         .int_from_i128(arinsal_bifs::monotonic_time_nanos())
@@ -3947,7 +3963,7 @@ fn emit_module(
     }
     let Some(state) = from_owned(
         owned_state,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .ok() else {
         return;
@@ -4011,7 +4027,7 @@ fn emit_module(
             crate::signals::atom("monotonic"),
         ));
     }
-    let Ok(options) = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    let Ok(options) = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .flatmap_from_pairs(&options)
     else {
         return;

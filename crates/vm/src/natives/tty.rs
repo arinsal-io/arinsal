@@ -9,7 +9,7 @@
 
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
-use arinsal_bifs::{Ctx, FragmentingHeap};
+use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
 use arinsal_sched::{Pid, RunCtx, Scheduler};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, from_owned, global_atoms};
@@ -457,8 +457,8 @@ fn call_values(
     let native = arinsal_nif_tty::lookup(module, function, arity)?;
     note_caller(process, ctx);
     let result = {
-        let mut heap = FragmentingHeap(&mut process.heap);
-        let mut bif_ctx = Ctx::new(&mut heap);
+        let mut heap = ProcessHeapHandle(&mut process.heap);
+        let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
         native(&mut bif_ctx, args)
     };
     Some(result.map_err(|error| exceptions::bif_error(process, module, function, args, error)))

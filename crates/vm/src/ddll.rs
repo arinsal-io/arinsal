@@ -119,7 +119,7 @@ fn badarg() -> VmError {
 }
 
 fn build(process: &mut Process, value: &O) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     from_owned(value, &mut heap).map_err(|_| badarg())
 }
 
@@ -613,7 +613,7 @@ pub(crate) fn try_load(
         Ok((ok_term, Some(reference))) => {
             let reference = crate::signals::reference(process, reference)?;
             let ok_term = build(process, &ok_term)?;
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             TermBuilder::new(&mut heap)
                 .tuple(&[atom("ok"), ok_term, reference])
                 .map_err(|_| badarg())
@@ -878,7 +878,7 @@ pub(crate) fn try_unload(
         Ok((ok_term, Some(reference))) => {
             let reference = crate::signals::reference(process, reference)?;
             let ok_term = build(process, &ok_term)?;
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             TermBuilder::new(&mut heap)
                 .tuple(&[atom("ok"), ok_term, reference])
                 .map_err(|_| badarg())
@@ -975,7 +975,7 @@ pub(crate) fn info(process: &mut Process, args: &[Term]) -> Result<Term, VmError
 }
 
 fn pid_counts(process: &mut Process, items: &[(Pid, i64)]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut list = Term::NIL;
     for (pid, count) in items.iter().rev() {
         let pid = pid.to_term().ok_or_else(badarg)?;
@@ -1042,7 +1042,7 @@ pub(crate) fn monitor(
     };
     let (kind, tag) = immediate.expect("immediate notification");
     let reference = crate::signals::reference(process, arinsal_bifs::next_ref_id())?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let message = TermBuilder::new(&mut heap)
         .tuple(&[atom(kind), reference, atom("driver"), name_term, atom(tag)])
         .map_err(|_| badarg())?;

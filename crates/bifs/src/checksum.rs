@@ -85,7 +85,7 @@ fn adler32_combine(_: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 
 fn binary(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Term, BifError> {
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(bytes)
         .map_err(|_| BifError::SystemLimit)
 }

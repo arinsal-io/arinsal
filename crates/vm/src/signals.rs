@@ -623,7 +623,7 @@ fn light_ref(process: &mut Process) -> Result<Term, crate::exceptions::Trap> {
     match Term::local_ref(&mut process.heap, words) {
         Ok(term) => Ok(term),
         Err(_) => {
-            let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             Term::local_ref(&mut fragment, words)
                 .map_err(|_| crate::exceptions::Trap::error(atom("system_limit")))
         }
@@ -808,7 +808,7 @@ pub(crate) fn start_timer_bif(
 }
 
 pub(crate) fn reference(process: &mut Process, id: u64) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     Term::local_ref(&mut heap, arinsal_bifs::ordinary_ref_words(id))
         .map_err(|error| VmError::Unsupported(format!("reference allocation: {error:?}")))
 }
@@ -991,7 +991,7 @@ pub(crate) fn erl_create_process(
     // with copy_struct_litopt and the three arg registers take mod, func and the copy), OTP-29.1.1.
     let literals = arinsal_term::LiteralAreas::current();
     let copied_args = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut child.heap);
         arinsal_term::copy_term_litopt(args, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?
     };
@@ -1023,10 +1023,10 @@ pub(crate) fn erl_create_process(
         parent.cold_mut().links.insert(pid);
     }
     if crate::trace::spawn_interested(parent, parent_pid) {
-        let arg_list = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
+        let arg_list = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
             .list_from_iter(args_list.iter().copied())
             .map_err(|error| VmError::Unsupported(format!("spawn trace args: {error:?}")))?;
-        let mfa = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
+        let mfa = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut parent.heap))
             .tuple(&[module, function, arg_list])
             .map_err(|error| VmError::Unsupported(format!("spawn trace MFA: {error:?}")))?;
         crate::trace::spawned(vm, parent, ctx, pid, mfa, so.link);
@@ -1049,7 +1049,7 @@ pub(crate) fn erl_create_process(
             .to_term()
             .ok_or_else(|| VmError::Unsupported("pid limit".into()))?;
         let message = {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut parent.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut parent.heap);
             TermBuilder::new(&mut heap)
                 .tuple(&[reply.tag, reply.reference, atom("ok"), pid_term])
                 .map_err(|error| VmError::Unsupported(format!("spawn reply: {error:?}")))?
@@ -1114,7 +1114,7 @@ fn spawn_mfa_with_priority(
         return Ok(pid_term);
     };
     let ref_term = reference(parent, id)?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut parent.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut parent.heap);
     TermBuilder::new(&mut heap)
         .tuple(&[pid_term, ref_term])
         .map_err(|error| VmError::Unsupported(format!("spawn result: {error:?}")))
@@ -1583,7 +1583,7 @@ fn deliver(
 }
 
 fn task_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .tuple(values)
         .map_err(|error| VmError::Unsupported(format!("system task tuple: {error:?}")))
@@ -2430,7 +2430,7 @@ fn call_resolved(
                 .into_iter()
                 .map(Term::atom)
                 .collect();
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             TermBuilder::new(&mut heap)
                 .list_from_iter(names)
                 .map_err(|error| VmError::Unsupported(format!("registered list: {error:?}")))
@@ -2611,7 +2611,7 @@ fn call_resolved(
                     object.clone(),
                     true,
                 )? {
-                    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                     let object = arinsal_term::from_owned(&object, &mut heap)
                         .map_err(|_| badarg("monitor/2"))?;
                     let down = TermBuilder::new(&mut heap)
@@ -2626,7 +2626,7 @@ fn call_resolved(
                 }
                 Ok(reference_term)
             } else {
-                let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                 let object = arinsal_term::from_owned(&object, &mut heap)
                     .map_err(|_| badarg("monitor/2"))?;
                 let down = TermBuilder::new(&mut heap)
@@ -3677,7 +3677,7 @@ fn send_noproc_down(
     // A pid of another incarnation of this node: no local sender to report it.
     let object = monitor_object(process, name, target)?;
     let reference = reference(process, id)?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let down = TermBuilder::new(&mut heap)
         .tuple(&[tag, reference, atom("process"), object, atom("noproc")])
         .map_err(|error| VmError::Unsupported(format!("DOWN tuple: {error:?}")))?;
@@ -3694,7 +3694,7 @@ pub(crate) fn monitor_object(
         return Ok(target);
     };
     let node = crate::node_tables::lock().local_name.clone();
-    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&[atom(name), atom(&node)])
         .map_err(|error| VmError::Unsupported(format!("monitor object: {error:?}")))
 }
@@ -3815,7 +3815,7 @@ fn link_noproc_term(process: &mut Process, target: Term, priority: bool) -> Resu
     let reason = atom("noproc");
     if process.trap_exit {
         let pid_term = target;
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let exit = TermBuilder::new(&mut heap)
             .tuple(&[atom("EXIT"), pid_term, reason])
             .map_err(|_| system_limit())?;
@@ -3917,7 +3917,7 @@ fn is_process_alive_2(
         Submit::Sent(_) => Ok(atom("ok")),
         Submit::Dead => {
             // Port of erl_proc_sig_queue.c:3065-3070: reply `{Ref, false}` to self.
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let reply = TermBuilder::new(&mut heap)
                 .tuple(&[reference, atom("false")])
                 .map_err(|_| system_limit())?;
@@ -3948,7 +3948,7 @@ fn trace_delivered(
     }
     let id = runtime(process)?.next_ref();
     let reference = reference(process, id)?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let message = TermBuilder::new(&mut heap)
         .tuple(&[atom("trace_delivered"), target, reference])
         .map_err(|_| system_limit())?;

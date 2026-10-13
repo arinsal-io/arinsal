@@ -2,9 +2,9 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
 
-use arinsal_bifs::Ctx;
+use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_nif::{LoadInfo, load_nif};
-use arinsal_term::{Term, TermBuilder, VecHeap, global_atoms};
+use arinsal_term::{ProcessHeap, Term, TermBuilder, VecHeap, global_atoms};
 
 fn main() {
     let path = std::env::args().nth(1).expect("NIF path");
@@ -28,11 +28,12 @@ fn main() {
         },
     )
     .unwrap();
+    let mut output_heap = ProcessHeap::with_words(4096);
     println!("loaded {module}: {} functions", library.functions().len());
     if module == "nb" {
         let args = [Term::small(2).unwrap(), Term::small(3).unwrap()];
         for (name, args) in [("noop", &args[..1]), ("add", &args[..])] {
-            let mut ctx = Ctx::new(&mut heap);
+            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
             let result = library
                 .lookup(name, args.len())
                 .unwrap()
@@ -40,7 +41,7 @@ fn main() {
                 .unwrap();
             println!("{name}: {}", result.as_small().unwrap());
         }
-        let mut ctx = Ctx::new(&mut heap);
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
         for (name, args) in [("noop", &args[..1]), ("add", &args[..])] {
             let callback = library.lookup(name, args.len()).unwrap();
             let count = 5_000_000;
@@ -71,7 +72,7 @@ fn main() {
             ("ng_crypto_one_time_nif", vec![aes, key, iv, abc, yes]),
         ];
         for (name, args) in calls {
-            let mut ctx = Ctx::new(&mut heap);
+            let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
             let result = library
                 .lookup(name, args.len())
                 .unwrap()

@@ -187,7 +187,8 @@ impl Vm {
             let bif = self.code.modules[p.module].imports[index]
                 .bif_fn()
                 .ok_or_else(|| VmError::Unsupported("pure BIF".into()))?;
-            let (result, reductions) = calls::call_bif_metered(&mut p.heap, bif, args);
+            let (result, reductions) =
+                calls::call_bif_metered(&mut p.heap, &mut p.reductions, bif, args);
             let result = match result {
                 Ok(value) => Ok(value),
                 Err(error) => {
@@ -228,7 +229,7 @@ impl Vm {
             if let Some(result) = native {
                 (result, 0)
             } else if let Some(bif) = bif {
-                match calls::call_bif_catch(&mut p.heap, bif, args) {
+                match calls::call_bif_catch(&mut p.heap, &mut p.reductions, bif, args) {
                     Ok(Ok(value)) => (Ok(value), 0),
                     Ok(Err(error)) => (
                         Err(exceptions::bif_error_with_atoms(
@@ -266,9 +267,6 @@ impl Vm {
             return Ok(BifOpOutcome::Done(0));
         }
         // Port of erts/emulator/beam/erl_arith.c:56-85, OTP-29.1.1.
-        p.reductions = p
-            .reductions
-            .saturating_sub(bif_reductions.min(i32::MAX as u32) as i32);
         p.reductions_used = p.reductions_used.saturating_add(u64::from(bif_reductions));
         match result {
             Ok(value) => {

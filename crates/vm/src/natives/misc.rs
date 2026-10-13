@@ -69,9 +69,10 @@ pub(crate) fn call(
         if module == "erlang" && function == "decode_packet" && args.len() == 3 {
             let bif = arinsal_packet::lookup(module, function, 3).expect("registered packet BIF");
             return Some(
-                crate::calls::call_bif(&mut process.heap, bif, args).map_err(|error| {
-                    crate::exceptions::direct_bif_error(process, module, function, args, error)
-                }),
+                crate::calls::call_bif(&mut process.heap, &mut process.reductions, bif, args)
+                    .map_err(|error| {
+                        crate::exceptions::direct_bif_error(process, module, function, args, error)
+                    }),
             );
         }
         let result = match (module, function, args.len()) {
@@ -130,7 +131,7 @@ fn profile_get(process: &mut Process) -> Result<Term, VmError> {
             tail: Box::new(O::Nil),
         },
     ]);
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     from_owned(&result, &mut heap).map_err(|_| badarg())
 }
 
@@ -215,7 +216,7 @@ pub(crate) fn profile_scheduler_event(
     }
     let profile = profile().lock().unwrap().clone();
     let target = profile_target(&profile)?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let message = from_owned(
         &O::Tuple(vec![
             O::Atom("profile".into()),
@@ -258,7 +259,7 @@ pub(crate) fn profile_port_event(
         profile_timestamp(profile.timestamp),
     ]);
     let mut heap = arinsal_term::ProcessHeap::new();
-    let Ok(message) = from_owned(&message, &mut arinsal_bifs::FragmentingHeap(&mut heap)) else {
+    let Ok(message) = from_owned(&message, &mut arinsal_bifs::ProcessHeapHandle(&mut heap)) else {
         return;
     };
     if let Ok(message) = Message::copy_from(message) {
@@ -348,7 +349,7 @@ pub(crate) fn profile_process_event(
     ]);
     let Ok(message) = from_owned(
         &message,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     ) else {
         return;
     };
@@ -402,7 +403,7 @@ fn dist_ext_to_term(process: &mut Process, args: &[Term]) -> Result<Term, VmErro
         return Err(badarg());
     }
     let owned = arinsal_etf::decode_dist_ext_with_atom_table(cache, bytes).map_err(|_| badarg())?;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     from_owned(&owned, &mut heap).map_err(|_| badarg())
 }
 
@@ -438,7 +439,7 @@ fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmErr
     };
     let rest = O::list(bytes[end..].iter().map(|b| O::Int(i64::from(*b))).collect());
     let (rest, float) = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let rest = from_owned(&rest, &mut heap).map_err(|_| badarg())?;
         let float = TermBuilder::new(&mut heap)
             .float(number)
@@ -449,7 +450,7 @@ fn string_list_to_float(process: &mut Process, term: Term) -> Result<Term, VmErr
 }
 
 fn tuple(process: &mut Process, items: &[Term]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .tuple(items)
         .map_err(|_| badarg())

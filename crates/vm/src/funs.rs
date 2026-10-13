@@ -2,7 +2,7 @@
 
 use crate::process::Message;
 use crate::{EvalResult, ImportOutcome, Process, Vm, VmError, calls, exceptions};
-use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_loader::{Arg, ImportClass, Instr, Module};
 use arinsal_sched::RunCtx;
 use arinsal_term::{ExportEntry, FunRef, Term, TermBuilder, TermKind, global_atoms};
@@ -805,8 +805,8 @@ impl Vm {
             .or_else(|| crate::natives::static_nif_lookup(module, function, arity as u8))
         {
             let (result, bif_reductions) = {
-                let mut heap = FragmentingHeap(&mut p.heap);
-                let mut bif_ctx = Ctx::new(&mut heap);
+                let mut heap = ProcessHeapHandle(&mut p.heap);
+                let mut bif_ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     bif(&mut bif_ctx, &p.x[..arity])
                 }))

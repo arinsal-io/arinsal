@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 
 #[test]
@@ -8,7 +8,7 @@ use arinsal_term::{ProcessHeap, Term, TermBuilder, global_atoms};
 fn ten_mib_utf8_to_list_and_back() {
     let data = vec![b'a'; 10 * 1024 * 1024];
     let mut heap = ProcessHeap::with_words(22_000_000);
-    let mut alloc = FragmentingHeap(&mut heap);
+    let mut alloc = ProcessHeapHandle(&mut heap);
     let input = TermBuilder::new(&mut alloc).binary(&data).unwrap();
     let utf8 = Term::atom(global_atoms().intern("utf8").unwrap());
     let to_list = lookup("unicode", "characters_to_list", 2).unwrap();

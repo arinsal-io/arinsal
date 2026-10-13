@@ -188,7 +188,7 @@ fn string(process: &mut Process, value: &str) -> Result<Term, VmError> {
     let mut tail = Term::NIL;
     for ch in value.chars().rev() {
         let code = Term::small(i64::from(ch as u32)).ok_or_else(badarg)?;
-        let mut heap = crate::FragmentingHeap(&mut process.heap);
+        let mut heap = crate::ProcessHeapHandle(&mut process.heap);
         tail = TermBuilder::new(&mut heap)
             .cons(code, tail)
             .map_err(|_| badarg())?;
@@ -203,7 +203,7 @@ fn env_all(process: &mut Process) -> Result<Term, VmError> {
     for (key, value) in entries.into_iter().rev() {
         let key = string(process, &key.to_string_lossy())?;
         let value = string(process, &value.to_string_lossy())?;
-        let mut heap = crate::FragmentingHeap(&mut process.heap);
+        let mut heap = crate::ProcessHeapHandle(&mut process.heap);
         let pair = TermBuilder::new(&mut heap)
             .tuple(&[key, value])
             .map_err(|_| badarg())?;

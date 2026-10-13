@@ -306,12 +306,82 @@ pub trait HeapAlloc {
     fn supports_magic(&self) -> bool {
         false
     }
-    /// Give back the unused words `[start, end)` at the end of the latest allocation.
+    /// Whether `HRelease` must mark this unused block with a heap filler.
     ///
-    /// The caller has already covered the hole with a heap filler
-    /// (`erts_write_heap_filler`), so allocators that cannot lower their top keep it.
+    /// Process heaps omit the filler when the block ends at `HEAP_TOP`; fragments and
+    /// non-top blocks need one so heap scans do not mistake the hole for terms.
+    fn release_needs_filler(&self, _end: *mut u64, _start: *mut u64) -> bool {
+        true
+    }
+    /// Give back the unused words `[start, end)` at the end of the latest allocation.
     // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease), OTP-29.1.1.
     fn release(&mut self, _end: *mut u64, _start: *mut u64) {}
+}
+
+impl<H: HeapAlloc + ?Sized> HeapAlloc for &mut H {
+    fn alloc(&mut self, words: usize) -> Option<*mut u64> {
+        (**self).alloc(words)
+    }
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        (**self).alloc_with_extra(words, extra)
+    }
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        (**self).alloc_fragment_only(words)
+    }
+    fn words_left(&self) -> Option<usize> {
+        (**self).words_left()
+    }
+    fn retain_binary(&mut self, binary: Arc<RefcBinary>) {
+        (**self).retain_binary(binary)
+    }
+    fn retain_writable_binary(&mut self, binary: Arc<WritableBinary>) -> Result<(), TermError> {
+        (**self).retain_writable_binary(binary)
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), TermError> {
+        (**self).retain_writable_binary_with_apparent_size(binary, apparent_size_bits)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        (**self).update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+    }
+    fn supports_writable_binary(&self) -> bool {
+        (**self).supports_writable_binary()
+    }
+    fn retain_external_binary(&mut self, binary: Arc<ExternalBinary>) -> Result<(), TermError> {
+        (**self).retain_external_binary(binary)
+    }
+    fn supports_external_binary(&self) -> bool {
+        (**self).supports_external_binary()
+    }
+    fn retain_node(&mut self, node: Arc<Node>) {
+        (**self).retain_node(node)
+    }
+    fn retain_fun(&mut self, entry: Arc<FunEntry>) {
+        (**self).retain_fun(entry)
+    }
+    fn retain_export(&mut self, entry: Arc<ExportEntry>) {
+        (**self).retain_export(entry)
+    }
+    fn retain_magic(&mut self, owner: Arc<crate::MagicRef>) {
+        (**self).retain_magic(owner)
+    }
+    fn supports_magic(&self) -> bool {
+        (**self).supports_magic()
+    }
+    fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
+        (**self).release_needs_filler(end, start)
+    }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        (**self).release(end, start)
+    }
 }
 
 /// Store one word into a block the caller owns (`HAlloc` memory, a reservation or a patched slot).
@@ -573,7 +643,9 @@ impl<'a, H: HeapAlloc + ?Sized> HeapReservation<'a, H> {
     fn release_tail(&mut self) {
         let words = (self.end as usize - self.cur as usize) / 8;
         if words > 0 {
-            store(self.cur, ((words as u64 - 1) << 6) | POS_BIG);
+            if self.heap.release_needs_filler(self.end, self.cur) {
+                store(self.cur, ((words as u64 - 1) << 6) | POS_BIG);
+            }
             self.heap.release(self.end, self.cur);
             self.cur = self.end;
         }
@@ -899,6 +971,7 @@ impl ProcessHeap {
     }
     /// Runtime heap allocation boundary, leaving the stack redzone unused.
     // Port of erts/emulator/beam/erl_process.h:990-998, OTP-29.1.1.
+    #[inline(always)]
     pub fn heap_limit_words(&self) -> usize {
         self.htop.max(self.stop.saturating_sub(crate::S_REDZONE))
     }
@@ -909,20 +982,24 @@ impl ProcessHeap {
     }
     /// Allocate on the young heap only when `HAlloc` stays below `HEAP_LIMIT`.
     // Port of erts/emulator/beam/erl_vm.h:150-162 (HAllocX), OTP-29.1.1.
+    #[inline(always)]
     pub fn alloc_halloc(&mut self, words: usize) -> Option<*mut u64> {
         if self.detached {
             return self.owners.detached.as_deref_mut()?.alloc(words);
         }
-        if words > self.heap_limit_words().saturating_sub(self.htop) {
+        let top = self.htop;
+        let limit = self.heap_limit_words();
+        let end = top.checked_add(words)?;
+        if end > limit {
             return None;
         }
         let ptr = self
             .words
             .as_ptr()
-            .wrapping_add(self.htop)
+            .wrapping_add(top)
             .cast::<u64>()
             .cast_mut();
-        self.htop += words;
+        self.htop = end;
         Some(ptr)
     }
     /// Whether generated code is running on this heap (set by the native bridge).
@@ -1296,6 +1373,15 @@ impl HeapAlloc for ProcessHeap {
     }
     // Port of erts/emulator/beam/erl_vm.h:164-173 (HRelease) and erl_process.h:1586-1598
     // (erts_heap_frag_shrink), OTP-29.1.1.
+    fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
+        if start == end || self.detached {
+            return start != end;
+        }
+        let base = self.words.as_ptr() as usize;
+        let top = base + self.htop * 8;
+        let address = start as usize;
+        !(address >= base && address < top && end as usize == top)
+    }
     fn release(&mut self, end: *mut u64, start: *mut u64) {
         if self.detached {
             if let Some(heap) = self.owners.detached.as_deref_mut() {
@@ -1730,6 +1816,30 @@ impl Default for LiteralArea {
 pub struct TermBuilder<'a, H: HeapAlloc + ?Sized> {
     pub(crate) heap: &'a mut H,
 }
+
+/// A reserved tuple whose elements can be filled in place before it is returned.
+pub struct TupleBuilder<'a> {
+    start: *mut u64,
+    len: usize,
+    _heap: std::marker::PhantomData<&'a mut ()>,
+}
+
+impl TupleBuilder<'_> {
+    /// Replace one zero-based tuple element.
+    pub fn set(&mut self, index: usize, value: Term) -> Result<(), TermError> {
+        if index >= self.len {
+            return Err(TermError::BadArg);
+        }
+        store(self.start.wrapping_add(index + 1), value.bits());
+        Ok(())
+    }
+
+    /// Return the filled tuple.
+    pub fn finish(self) -> Term {
+        Term::from_ptr(self.start, 2)
+    }
+}
+
 impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Attach a builder to a heap.
     pub fn new(heap: &'a mut H) -> Self {
@@ -1785,6 +1895,33 @@ impl<'a, H: HeapAlloc + ?Sized> TermBuilder<'a, H> {
     /// Build a tuple with OTP's arity header.
     pub fn tuple(&mut self, values: &[Term]) -> Result<Term, TermError> {
         self.tuple_iter(values.len(), values.iter().copied())
+    }
+
+    /// Reserve and initialize a nonempty tuple so a BIF can apply indexed updates in place.
+    /// Port of the `HAlloc` and element stores in `make_tuple_3`,
+    /// erts/emulator/beam/bif.c:3033-3074, OTP-29.1.1.
+    pub fn reserve_tuple(
+        &mut self,
+        len: usize,
+        initial: Term,
+    ) -> Result<TupleBuilder<'_>, TermError> {
+        if len == 0 || len > (1 << 24) - 1 {
+            return Err(if len == 0 {
+                TermError::BadArg
+            } else {
+                TermError::SystemLimit
+            });
+        }
+        let start = self.words(len + 1)?;
+        store(start, (len as u64) << 6 | ARITY);
+        for index in 0..len {
+            store(start.wrapping_add(index + 1), initial.bits());
+        }
+        Ok(TupleBuilder {
+            start,
+            len,
+            _heap: std::marker::PhantomData,
+        })
     }
 
     /// Build a tuple from an exact-length iterator without staging its elements.

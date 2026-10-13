@@ -1,6 +1,6 @@
-use arinsal_bifs::Ctx;
+use arinsal_bifs::{Ctx, ProcessHeapHandle};
 use arinsal_nif::{LoadInfo, load_nif};
-use arinsal_term::{Term, TermBuilder, VecHeap};
+use arinsal_term::{ProcessHeap, Term, TermBuilder, VecHeap};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -49,6 +49,7 @@ fn benchmark_nif_callbacks() {
     let list = TermBuilder::new(&mut heap)
         .list_from_iter([1, 2, 3].map(|n| Term::small(n).unwrap()))
         .unwrap();
+    let mut output_heap = ProcessHeap::with_words(4096);
     for (name, args, expected) in [
         ("noop", vec![Term::small(7).unwrap()], 7),
         ("dnoop", vec![Term::small(7).unwrap()], 7),
@@ -60,7 +61,7 @@ fn benchmark_nif_callbacks() {
         ("bsum", vec![binary], 6),
         ("lsum", vec![list], 6),
     ] {
-        let mut ctx = Ctx::new(&mut heap);
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
         assert_eq!(
             lib.lookup(name, args.len())
                 .unwrap()

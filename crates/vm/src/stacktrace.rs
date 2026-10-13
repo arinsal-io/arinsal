@@ -2,7 +2,7 @@
 
 use crate::{Process, VmError};
 use arinsal_alloc::typed::{AllocBlock, ErtsAlcType};
-use arinsal_bifs::{Class, FragmentingHeap};
+use arinsal_bifs::{Class, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::Module;
 use arinsal_term::{
@@ -1790,14 +1790,14 @@ pub(super) fn build_saved(
                 info: *info,
             }),
             StoredTopFrame::CurrentArgs(args) => Ok(TopFrame::CurrentArgs(
-                from_owned(args, &mut FragmentingHeap(&mut p.heap))
+                from_owned(args, &mut ProcessHeapHandle(&mut p.heap))
                     .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))?,
             )),
             StoredTopFrame::CurrentArgsWithInfo(args, info) => {
                 let args = args
                     .as_ref()
                     .map(|args| {
-                        from_owned(args, &mut FragmentingHeap(&mut p.heap))
+                        from_owned(args, &mut ProcessHeapHandle(&mut p.heap))
                             .map_err(|e| VmError::Unsupported(format!("exception args {e:?}")))
                     })
                     .transpose()?;

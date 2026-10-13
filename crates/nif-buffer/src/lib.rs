@@ -38,8 +38,8 @@ fn handles() -> &'static Mutex<HashMap<u64, Arc<BufferHandle>>> {
     HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-struct Heap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -97,7 +97,7 @@ fn call(
         .map(|arg| to_owned(*arg).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
     let value = op(&args)?;
-    from_owned(&value, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)
+    from_owned(&value, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 
 fn atom(name: &str) -> O {

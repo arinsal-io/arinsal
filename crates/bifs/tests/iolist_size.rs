@@ -1,4 +1,4 @@
-use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_difftest::RefErl;
 use arinsal_term::{ProcessHeap, TermBuilder, to_owned};
 
@@ -16,7 +16,7 @@ fn iolist_size_counts_shared_binary_graph_without_flattening() {
         .expect("OTP computes iolist_size of a shared term graph");
 
     let mut process_heap = ProcessHeap::with_words(1024);
-    let mut allocator = FragmentingHeap(&mut process_heap);
+    let mut allocator = ProcessHeapHandle(&mut process_heap);
     let mut builder = TermBuilder::new(&mut allocator);
     let mut value = builder.binary(&vec![1; 1 << 20]).expect("leaf binary");
     for _ in 0..17 {

@@ -99,13 +99,13 @@ fn bytes<'a>(term: Term) -> Result<Cow<'a, [u8]>, BifError> {
 }
 
 fn binary(ctx: &mut Ctx<'_>, data: &[u8]) -> Term {
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(data)
         .expect("infallible BIF heap")
 }
 
 fn cons(ctx: &mut Ctx<'_>, head: Term, tail: Term) -> Term {
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .cons(head, tail)
         .expect("infallible BIF heap")
 }
@@ -310,7 +310,7 @@ impl Output {
         match self {
             Self::Binary(bytes) => binary(ctx, &bytes),
             Self::List(points) => {
-                let mut heap = Heap(ctx.heap);
+                let mut heap = Heap(&mut ctx.heap);
                 let mut builder = TermBuilder::new(&mut heap);
                 let mut tail = Term::NIL;
                 for cp in points.into_iter().rev() {

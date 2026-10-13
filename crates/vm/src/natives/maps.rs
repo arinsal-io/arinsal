@@ -322,7 +322,7 @@ fn hamt_next(
     // Iterator terms are {K,V,Next} (4 words), list terms a pair plus a cons cell (5 words).
     let words_per_elem = if list_mode { 5 } else { 4 };
     let orig_elems = elems;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut region =
         HeapReservation::new(&mut heap, words_per_elem * elems).map_err(|_| system_limit())?;
     let mut chain = Tuple3Chain::new();
@@ -494,7 +494,7 @@ fn flat_next(
     if (n as i64) < index {
         return Err(badarg());
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     arinsal_maps::flatmap_next_checked(map, n, list_mode, acc, &mut heap)
         .map_err(|_| system_limit())
 }
@@ -507,7 +507,7 @@ fn ordered_next(
 ) -> Result<Term, Trap> {
     let orig_elems = (process.reductions / ORDERED_ITER_FACTOR).max(1) as usize;
     let mut elems = orig_elems;
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut region = HeapReservation::new(&mut heap, 4 * elems + 2).map_err(|_| system_limit())?;
     let mut builder = TermBuilder::new(&mut region);
     let mut chain = Tuple3Chain::new();

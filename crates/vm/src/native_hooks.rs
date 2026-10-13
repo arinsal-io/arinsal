@@ -261,11 +261,11 @@ fn with_fragment_alloc(
     process: &mut Process,
     lhs: Term,
     rhs: Term,
-    operation: impl FnOnce(Term, Term, &mut arinsal_bifs::FragmentingHeap<'_>) -> ArithResult,
+    operation: impl FnOnce(Term, Term, &mut arinsal_bifs::ProcessHeapHandle<'_>) -> ArithResult,
 ) -> Result<Term, ArithError> {
     // OTP arithmetic slow paths allocate into heap fragments and therefore
     // cannot move E, HTOP, or the register roots under a reductions-only update.
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     operation(lhs, rhs, &mut heap)
 }
 
@@ -451,7 +451,7 @@ fn int128_to_big(
     if sign != 0 {
         magnitude = -magnitude;
     }
-    let built = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    let built = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .int_from_bigint(&magnitude);
     let answer = match built {
         Ok(term) => raw(term),
@@ -653,7 +653,7 @@ fn set_light_error(process: &mut Process, error: &BifError) {
 /// Builds `error:{Tag, Value}` for a guard BIF failure.
 fn tagged_error(process: &mut Process, tag: &str, value: Term) -> BifError {
     let tag = crate::signals::atom(tag);
-    match TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    match TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(&[tag, value])
     {
         Ok(reason) => BifError::Error(reason),

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arinsal_bifs::{BifError, Ctx, FragmentingHeap};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_etf::{OwnedTerm as O, decode};
 use arinsal_term::{ProcessHeap, from_owned, to_owned};
 use similar_asserts::assert_eq;
@@ -21,7 +21,7 @@ fn tuple(a: O, b: O) -> O {
 }
 fn call(name: &str, args: &[O]) -> Result<O, BifError> {
     let mut heap = ProcessHeap::with_words(2048);
-    let mut alloc = FragmentingHeap(&mut heap);
+    let mut alloc = ProcessHeapHandle(&mut heap);
     let terms = args
         .iter()
         .map(|a| from_owned(a, &mut alloc).unwrap())

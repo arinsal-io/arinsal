@@ -65,7 +65,7 @@ pub(super) fn lookup<V: crate::BifTableVisitor>(
 }
 
 fn new_ref(ctx: &mut Ctx<'_>, array: Array) -> Result<Term, BifError> {
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .magic_ref(MagicRef::new(array))
         .map_err(|_| BifError::SystemLimit)
 }
@@ -145,7 +145,7 @@ fn output(ctx: &mut Ctx<'_>, array: &Array, value: i64) -> Result<Term, BifError
     } else {
         BigInt::from(value as u64)
     };
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&value)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -293,11 +293,11 @@ fn atomics_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             integer(ctx, len(array) * 8 + 32)?,
         ),
     ];
-    from_list(&pairs, ctx.heap).map_err(|_| BifError::SystemLimit)
+    from_list(&pairs, &mut ctx.heap).map_err(|_| BifError::SystemLimit)
 }
 
 fn int_term(ctx: &mut Ctx<'_>, value: BigInt) -> Result<Term, BifError> {
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&value)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -384,7 +384,7 @@ fn counters_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             (Term::atom(global_atoms().intern("size").unwrap()), size),
             (Term::atom(global_atoms().intern("memory").unwrap()), memory),
         ],
-        ctx.heap,
+        &mut ctx.heap,
     )
     .map_err(|_| BifError::SystemLimit)
 }
@@ -404,7 +404,8 @@ mod tests {
                 signed: true,
                 dropped: Some(dropped.clone()),
             };
-            let mut ctx = Ctx::new(&mut heap);
+            let mut allocator = crate::ProcessHeapHandle(&mut heap);
+            let mut ctx = Ctx::new(&mut allocator);
             let reference = new_ref(&mut ctx, array).unwrap();
             assert!(reference.is_magic_ref());
         }

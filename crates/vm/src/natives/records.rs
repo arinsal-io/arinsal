@@ -3,7 +3,7 @@
 use super::NativeArgs;
 use crate::process::Message;
 use crate::{Process, Vm, VmError, exceptions};
-use arinsal_bifs::FragmentingHeap;
+use arinsal_bifs::ProcessHeapHandle;
 use arinsal_sched::RunCtx;
 use arinsal_term::{
     Atom, Term, TermBuilder, TermKind, from_owned, global_atoms, record_map_pairs, term_sequence,
@@ -39,14 +39,15 @@ fn system_limit() -> VmError {
 }
 
 fn error_with_value(process: &mut Process, reason: &str, value: Term) -> VmError {
-    match TermBuilder::new(&mut FragmentingHeap(&mut process.heap)).tuple(&[atom(reason), value]) {
+    match TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap)).tuple(&[atom(reason), value])
+    {
         Ok(reason) => VmError::Trap(exceptions::Trap::error(reason)),
         Err(_) => system_limit(),
     }
 }
 
 fn badfield(process: &mut Process, module: Atom, name: Atom, key: Term) -> VmError {
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let record_id = match builder.tuple(&[Term::atom(module), Term::atom(name)]) {
         Ok(value) => value,
@@ -100,17 +101,17 @@ fn create(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
             return Err(badarg());
         };
         let Some(key) = values[0].as_atom() else {
-            let record_id = TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+            let record_id = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
                 .tuple(&[Term::atom(module), Term::atom(name)])
                 .map_err(|_| system_limit())?;
-            let badfield = TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+            let badfield = TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
                 .tuple(&[record_id, values[0]])
                 .map_err(|_| system_limit())?;
             return Err(error_with_value(process, "badfield", badfield));
         };
         parsed.push((key, values[1]));
     }
-    TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .native_record(module, name, exported, &parsed)
         .map_err(|error| match error {
             arinsal_term::TermError::BadArg => badarg(),
@@ -157,7 +158,7 @@ fn update(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     if let Some((key, _)) = changes.get(next) {
         return Err(badfield(process, snapshot.module, snapshot.name, *key));
     }
-    TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .update_native_record(
             &snapshot,
             &changes
@@ -200,7 +201,7 @@ fn definition(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmE
     } else {
         arinsal_term::atoms::FALSE
     });
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut defaults = Vec::with_capacity(record.fields.len());
     for (field, default) in &record.fields {
         let field = Term::atom(global_atoms().intern(field).map_err(|_| system_limit())?);
@@ -234,7 +235,7 @@ fn get_field_names(process: &mut Process, term: Term) -> Result<Term, VmError> {
     let Some(record) = term.record_snapshot() else {
         return Err(error_with_value(process, "badrecord", term));
     };
-    TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .list_from_iter(record.fields.into_iter().map(Term::atom))
         .map_err(|_| system_limit())
 }

@@ -21,8 +21,8 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     (module == "erlang" && name == "decode_packet" && arity == 3).then_some(decode_packet)
 }
 
-struct Heap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -129,8 +129,8 @@ fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     };
     let ty = to_owned(*ty).map_err(|_| BifError::BADARG)?;
     let Some(ty) = type_of(&ty) else {
-        let cause =
-            from_owned(&atom("badopt"), &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)?;
+        let cause = from_owned(&atom("badopt"), &mut Heap(&mut ctx.heap))
+            .map_err(|_| BifError::SystemLimit)?;
         return Err(BifError::Badarg { cause: Some(cause) });
     };
     let data = to_owned(*data).map_err(|_| BifError::BADARG)?;
@@ -168,7 +168,7 @@ fn decode_packet(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             tuple(vec![atom("ok"), packet, O::Binary(rest.to_vec())])
         }
     };
-    from_owned(&value, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)
+    from_owned(&value, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 
 fn http_term(http: HttpPacket, binary: bool) -> O {

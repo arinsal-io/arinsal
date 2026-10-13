@@ -28,10 +28,25 @@ const BADARG: BifError = BifError::BADARG;
 use crate::unique::next_ref_words;
 pub use crate::unique::{next_ref_id, next_unique_monotonic};
 
-pub(super) struct Heap<'a>(pub(super) &'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+pub(super) struct Heap<'a, H: HeapAlloc + ?Sized>(pub(super) &'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
+    }
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        self.0.alloc_with_extra(words, extra)
+    }
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        self.0.alloc_fragment_only(words)
+    }
+    fn words_left(&self) -> Option<usize> {
+        self.0.words_left()
+    }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        self.0.release(end, start)
+    }
+    fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
+        self.0.release_needs_filler(end, start)
     }
     fn retain_binary(&mut self, value: Arc<arinsal_term::RefcBinary>) {
         self.0.retain_binary(value)
@@ -42,11 +57,37 @@ impl HeapAlloc for Heap<'_> {
     ) -> Result<(), arinsal_term::TermError> {
         self.0.retain_writable_binary(value)
     }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        value: Arc<arinsal_term::WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), arinsal_term::TermError> {
+        self.0
+            .retain_writable_binary_with_apparent_size(value, apparent_size_bits)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.0
+            .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+    }
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()
     }
     fn retain_node(&mut self, value: Arc<Node>) {
         self.0.retain_node(value)
+    }
+    fn retain_external_binary(
+        &mut self,
+        value: Arc<ExternalBinary>,
+    ) -> Result<(), arinsal_term::TermError> {
+        self.0.retain_external_binary(value)
+    }
+    fn supports_external_binary(&self) -> bool {
+        self.0.supports_external_binary()
     }
     fn retain_fun(&mut self, value: Arc<FunEntry>) {
         self.0.retain_fun(value)
@@ -64,14 +105,14 @@ impl HeapAlloc for Heap<'_> {
 
 // Consecutive cons cells must not request a fresh heap fragment per element.
 // Each BIF reserves its output cells once and hands them to TermBuilder.
-struct ConsBlock<'a> {
-    backing: &'a mut dyn HeapAlloc,
+struct ConsBlock<'a, H: HeapAlloc + ?Sized> {
+    backing: &'a mut H,
     next: *mut u64,
     remaining: usize,
 }
 
-impl<'a> ConsBlock<'a> {
-    fn new(backing: &'a mut dyn HeapAlloc, cells: usize) -> Self {
+impl<'a, H: HeapAlloc + ?Sized> ConsBlock<'a, H> {
+    fn new(backing: &'a mut H, cells: usize) -> Self {
         let words = cells
             .checked_mul(2)
             .expect("list size exceeds address space");
@@ -84,7 +125,7 @@ impl<'a> ConsBlock<'a> {
     }
 }
 
-impl HeapAlloc for ConsBlock<'_> {
+impl<H: HeapAlloc + ?Sized> HeapAlloc for ConsBlock<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         if words > self.remaining {
             return self.backing.alloc(words);
@@ -96,6 +137,22 @@ impl HeapAlloc for ConsBlock<'_> {
         self.remaining -= words;
         Some(result)
     }
+    fn alloc_with_extra(&mut self, words: usize, extra: usize) -> Option<*mut u64> {
+        if words <= self.remaining / 8 {
+            self.alloc(words)
+        } else {
+            self.backing.alloc_with_extra(words, extra)
+        }
+    }
+    fn alloc_fragment_only(&mut self, words: usize) -> Option<*mut u64> {
+        self.backing.alloc_fragment_only(words)
+    }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        self.backing.release(end, start)
+    }
+    fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
+        self.backing.release_needs_filler(end, start)
+    }
     fn retain_binary(&mut self, value: Arc<arinsal_term::RefcBinary>) {
         self.backing.retain_binary(value)
     }
@@ -104,6 +161,23 @@ impl HeapAlloc for ConsBlock<'_> {
         value: Arc<arinsal_term::WritableBinary>,
     ) -> Result<(), TermError> {
         self.backing.retain_writable_binary(value)
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        binary: Arc<arinsal_term::WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), TermError> {
+        self.backing
+            .retain_writable_binary_with_apparent_size(binary, apparent_size_bits)
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        self.backing
+            .update_writable_binary_overhead(source, old_size_bits, new_size_bits)
     }
     fn supports_writable_binary(&self) -> bool {
         self.backing.supports_writable_binary()
@@ -268,7 +342,7 @@ pub(super) fn integer(ctx: &mut Ctx<'_>, value: usize) -> Result<Term, BifError>
     if let Some(small) = i64::try_from(value).ok().and_then(Term::small) {
         return Ok(small);
     }
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_i128(value as i128)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -340,7 +414,7 @@ pub(super) fn make_list(
     if items.is_empty() {
         return result;
     }
-    let mut heap = ConsBlock::new(ctx.heap, items.len());
+    let mut heap = ConsBlock::new(&mut ctx.heap, items.len());
     let mut builder = TermBuilder::new(&mut heap);
     for item in items.into_iter().rev() {
         result = builder.cons(item, result).expect("infallible BIF heap");
@@ -358,7 +432,7 @@ pub(super) fn make_list_from_reverse_exact_iter(
     if count == 0 {
         return tail;
     }
-    let mut heap = Heap(ctx.heap);
+    let mut heap = Heap(&mut ctx.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let list = builder
         .reserve_cons_list(count)
@@ -368,7 +442,7 @@ pub(super) fn make_list_from_reverse_exact_iter(
 }
 
 pub(super) fn tuple_build(ctx: &mut Ctx<'_>, values: &[Term]) -> Term {
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .tuple(values)
         .expect("infallible BIF heap")
 }
@@ -409,7 +483,7 @@ fn setelement(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Err(BADARG);
     }
     let replacement = args[2];
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .tuple_from_fn(arity, |slot, _| {
             if slot + 1 == index as usize {
                 replacement
@@ -513,7 +587,7 @@ pub fn make_ref(ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/erl_bif_unique.c:821-833 (make_ref_0), OTP-29.1.1.
     // `erts_sched_make_ref_in_buffer` writes the three words straight into the
     // heap buffer; the id is not packed and unpacked on the way.
-    Term::local_ref(ctx.heap, next_ref_words()).map_err(|_| BifError::SystemLimit)
+    Term::local_ref(&mut ctx.heap, next_ref_words()).map_err(|_| BifError::SystemLimit)
 }
 
 /// `erlang:unique_integer/0` and `/1` counter step, before the term is built.
@@ -570,7 +644,7 @@ pub fn unique_integer(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError
         crate::unique::UniqueInt::Small(value) => {
             Ok(Term::small(value).expect("unique integer small"))
         }
-        crate::unique::UniqueInt::Big(value) => TermBuilder::new(&mut Heap(ctx.heap))
+        crate::unique::UniqueInt::Big(value) => TermBuilder::new(&mut Heap(&mut ctx.heap))
             .int_from_bigint(&value)
             .map_err(|_| BifError::SystemLimit),
     }
@@ -601,7 +675,7 @@ fn system_time(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| BifError::SystemLimit)?;
     let value = BigInt::from(elapsed.as_nanos()) * units_per_second / 1_000_000_000_u64;
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&value)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -615,20 +689,62 @@ fn tuple_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     Ok(make_list(ctx, values.iter(), Term::NIL))
 }
 fn list_to_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3789 (list_to_tuple_1), OTP-29.1.1.
-    // Check proper-list length before allocating the output tuple.
-    let values = list_with_limit(args[0], MAX_TUPLE_SIZE)?;
-    Ok(tuple_build(ctx, &values))
+    // Port of erts/emulator/beam/bif.c:3789-3808 (list_to_tuple_1), OTP-29.1.1.
+    let mut len = 0usize;
+    for_each_cons(args[0], |_| {
+        if len == MAX_TUPLE_SIZE {
+            return Err(BADARG);
+        }
+        len += 1;
+        Ok(())
+    })?;
+    if len == 0 {
+        return Ok(TermBuilder::new(&mut ctx.heap)
+            .tuple_from_fn(0, |_, _| unreachable!())
+            .expect("empty tuple is static"));
+    }
+    let mut builder = TermBuilder::new(&mut ctx.heap);
+    let mut tuple = builder
+        .reserve_tuple(len, Term::NIL)
+        .map_err(|_| BifError::SystemLimit)?;
+    let mut index = 0usize;
+    for_each_cons(args[0], |value| {
+        tuple.set(index, value).expect("validated tuple index");
+        index += 1;
+        Ok(())
+    })?;
+    Ok(tuple.finish())
 }
 fn make_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    // Port of erts/emulator/beam/bif.c:3006,3027 (make_tuple_2/3), OTP-29.1.1.
+    // Port of erts/emulator/beam/bif.c:3006-3076 (make_tuple_2/3), OTP-29.1.1.
     let n = args[0].as_small().ok_or(BADARG)?;
     if n < 0 || check_tuple_arity(n as usize).is_err() {
         return Err(BADARG);
     }
-    let mut values = vec![args[1]; n as usize];
+    let arity = n as usize;
+    if arity == 0 {
+        if args.len() == 3 {
+            for_each_cons(args[2], |entry| {
+                if tuple_arity(entry)? != 2 {
+                    return Err(BADARG);
+                }
+                let index = tuple_element(entry, 0)?.as_small().ok_or(BADARG)?;
+                if index < 1 || index > n {
+                    return Err(BADARG);
+                }
+                Ok(())
+            })?;
+        }
+        return Ok(TermBuilder::new(&mut ctx.heap)
+            .tuple_from_fn(0, |_, _| unreachable!())
+            .expect("empty tuple is static"));
+    }
+    let mut builder = TermBuilder::new(&mut ctx.heap);
+    let mut tuple = builder
+        .reserve_tuple(arity, args[1])
+        .map_err(|_| BifError::SystemLimit)?;
     if args.len() == 3 {
-        for entry in list(args[2])? {
+        for_each_cons(args[2], |entry| {
             if tuple_arity(entry)? != 2 {
                 return Err(BADARG);
             }
@@ -636,10 +752,13 @@ fn make_tuple(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             if index < 1 || index > n {
                 return Err(BADARG);
             }
-            values[index as usize - 1] = tuple_element(entry, 1)?;
-        }
+            tuple
+                .set(index as usize - 1, tuple_element(entry, 1)?)
+                .expect("tuple index was validated");
+            Ok(())
+        })?;
     }
-    Ok(tuple_build(ctx, &values))
+    Ok(tuple.finish())
 }
 fn append_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // Port of erts/emulator/beam/bif.c:3083 (append_element_2), OTP-29.1.1.
@@ -647,7 +766,7 @@ fn append_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let arity = source.len();
     check_tuple_arity(arity + 1)?;
     let appended = args[1];
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .tuple_from_fn(arity + 1, |slot, _| {
             if slot == arity {
                 appended
@@ -670,7 +789,7 @@ fn delete_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if index as usize > arity {
         return Err(BADARG);
     }
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .tuple_from_fn(arity - 1, |slot, _| {
             source
                 .element(if slot + 1 < index as usize {
@@ -694,7 +813,7 @@ fn insert_element(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Err(BADARG);
     }
     let inserted = args[2];
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .tuple_from_fn(arity + 1, |slot, _| {
             if slot + 1 == index as usize {
                 inserted
@@ -725,14 +844,14 @@ pub(super) fn atom_name(term: Term) -> Option<&'static str> {
     global_atoms().text(term.as_atom()?)
 }
 fn atom_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    atom_to_list_term(ctx.heap, args[0])
+    atom_to_list_term(&mut ctx.heap, args[0])
 }
 
 /// `atom_to_list/1`. ASCII names are consed straight from the atom bytes.
 // Port of erts/emulator/beam/bif.c:3186-3210 (atom_to_list_1), OTP-29.1.1:
 // the list is built on the process heap from the atom text. No intermediate
 // character vector.
-pub fn atom_to_list_term(heap: &mut dyn HeapAlloc, arg: Term) -> Result<Term, BifError> {
+pub fn atom_to_list_term<H: HeapAlloc + ?Sized>(heap: &mut H, arg: Term) -> Result<Term, BifError> {
     let text = atom_name(arg).ok_or(BADARG)?;
     let bytes = text.as_bytes();
     if bytes.is_empty() {
@@ -749,8 +868,8 @@ pub fn atom_to_list_term(heap: &mut dyn HeapAlloc, arg: Term) -> Result<Term, Bi
     cons_units(heap, points.len(), points.into_iter().rev())
 }
 
-fn cons_units(
-    heap: &mut dyn HeapAlloc,
+fn cons_units<H: HeapAlloc + ?Sized>(
+    heap: &mut H,
     count: usize,
     units: impl Iterator<Item = i64>,
 ) -> Result<Term, BifError> {
@@ -881,7 +1000,7 @@ fn atom_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             Some(true) => table.utf8_literal(atom).ok_or(BADARG),
             Some(false) => {
                 let bytes = table.latin1_bytes(atom).ok_or(BADARG)?;
-                Ok(TermBuilder::new(&mut Heap(ctx.heap))
+                Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
                     .binary(&bytes)
                     .expect("infallible BIF heap"))
             }
@@ -1024,7 +1143,7 @@ fn float_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 }
 fn float_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let text = formatted_float(args)?;
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(text.as_bytes())
         .expect("infallible BIF heap"))
 }
@@ -1038,14 +1157,14 @@ fn list_to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let value = arinsal_float::list_to_float(&bytes).map_err(|_| BADARG)?;
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .float(value)
         .expect("infallible BIF heap"))
 }
 fn binary_to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     binary_bifs::with_binary_input(args[0], |bytes| {
         let value = arinsal_float::list_to_float(bytes).map_err(|_| BADARG)?;
-        Ok(TermBuilder::new(&mut Heap(ctx.heap))
+        Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
             .float(value)
             .expect("infallible BIF heap"))
     })
@@ -1062,16 +1181,109 @@ fn integer_text(args: &[Term]) -> Result<String, BifError> {
     Ok(bigint(args[0])?.to_str_radix(base as u32).to_uppercase())
 }
 fn integer_to_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let text = integer_text(args)?;
-    Ok(make_list(
-        ctx,
-        text.bytes().map(|b| Term::small(b as i64).unwrap()),
-        Term::NIL,
-    ))
+    // Port of erts/emulator/beam/bif.c:3266-3329 (integer_to_list), OTP-29.1.1.
+    let base = if args.len() == 2 {
+        args[1].as_small().ok_or(BADARG)?
+    } else {
+        10
+    };
+    if !(2..=36).contains(&base) {
+        return Err(BADARG);
+    }
+    if let Some(value) = args[0].as_small() {
+        // Port of `Sint_to_buf` in erts/emulator/beam/utils.c:2994-3038, OTP-29.1.1.
+        let mut bytes = [0u8; 128];
+        let mut start = bytes.len();
+        let mut magnitude = value.unsigned_abs();
+        loop {
+            start -= 1;
+            let digit = (magnitude % base as u64) as u8;
+            bytes[start] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'A' + digit - 10
+            };
+            magnitude /= base as u64;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            start -= 1;
+            bytes[start] = b'-';
+        }
+        return Ok(make_list(
+            ctx,
+            bytes[start..]
+                .iter()
+                .copied()
+                .map(|byte| Term::small(byte as i64).unwrap()),
+            Term::NIL,
+        ));
+    }
+    let value = bigint(args[0])?;
+    let (sign, mut digits) = value.to_u64_digits();
+    let base = base as u64;
+    let mut largest_power = 1_u64;
+    let mut digits_per_word = 0;
+    while let Some(next) = largest_power.checked_mul(base) {
+        largest_power = next;
+        digits_per_word += 1;
+    }
+    let mut builder = TermBuilder::new(&mut ctx.heap);
+    let mut result = Term::NIL;
+    // Port of `write_big_simple` / `erts_big_to_list` in erts/emulator/beam/big.c:2613-2670
+    // and :3301-3310, OTP-29.1.1. The source divides by the largest base power per limb pass.
+    while digits.last().is_some_and(|digit| *digit != 0) {
+        let mut remainder = 0u128;
+        for digit in digits.iter_mut().rev() {
+            let value = (remainder << 64) | *digit as u128;
+            *digit = (value / largest_power as u128) as u64;
+            remainder = value % largest_power as u128;
+        }
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+        let chunk_digits = if digits.is_empty() {
+            let mut count = 0;
+            while remainder != 0 {
+                let digit = (remainder % base as u128) as u8;
+                remainder /= base as u128;
+                push_integer_digit(&mut builder, &mut result, digit);
+                count += 1;
+            }
+            count
+        } else {
+            for _ in 0..digits_per_word {
+                let digit = (remainder % base as u128) as u8;
+                remainder /= base as u128;
+                push_integer_digit(&mut builder, &mut result, digit);
+            }
+            digits_per_word
+        };
+        debug_assert!(chunk_digits > 0);
+    }
+    if sign == Sign::Minus {
+        result = builder
+            .cons(Term::small(b'-' as i64).unwrap(), result)
+            .expect("infallible BIF heap");
+    }
+    Ok(result)
+}
+
+fn push_integer_digit(builder: &mut TermBuilder<'_, impl HeapAlloc>, result: &mut Term, digit: u8) {
+    let byte = if digit < 10 {
+        b'0' + digit
+    } else {
+        b'A' + digit - 10
+    };
+    *result = builder
+        .cons(Term::small(byte as i64).unwrap(), *result)
+        .expect("infallible BIF heap");
 }
 fn integer_to_binary(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     let text = integer_text(args)?;
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .binary(text.as_bytes())
         .expect("infallible BIF heap"))
 }
@@ -1454,7 +1666,7 @@ fn debug_copy_shared(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError>
     {
         return Err(BifError::BADARG);
     }
-    copy_term(args[0], ctx.heap).map_err(|_| BifError::SystemLimit)
+    copy_term(args[0], &mut ctx.heap).map_err(|_| BifError::SystemLimit)
 }
 fn debug_flat_size(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     integer(ctx, flat_size(args[0]))
@@ -1584,7 +1796,7 @@ fn numeric_float(term: Term) -> Result<f64, BifError> {
 fn abs(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     // SAFETY: The source float heap remains live during this call.
     if let Some(view) = unsafe { args[0].float_ref() } {
-        return Ok(TermBuilder::new(&mut Heap(ctx.heap))
+        return Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
             .float(view.get().abs())
             .expect("infallible BIF heap"));
     }
@@ -1594,7 +1806,7 @@ fn abs(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     } else {
         value
     };
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&positive)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -1604,7 +1816,7 @@ fn to_float(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
         return Ok(args[0]);
     }
     let value = bigint(args[0])?.to_f64().ok_or(BADARG)?;
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .float(value)
         .expect("infallible BIF heap"))
 }
@@ -1615,7 +1827,7 @@ fn float_integer(ctx: &mut Ctx<'_>, term: Term, op: fn(f64) -> f64) -> Result<Te
         return Ok(term);
     };
     let value = BigInt::from_f64(op(view.get())).ok_or(BADARG)?;
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&value)
         .map_err(|_| BifError::SystemLimit)
 }
@@ -1635,7 +1847,7 @@ fn math_result(ctx: &mut Ctx<'_>, result: f64) -> Result<Term, BifError> {
     if !result.is_finite() {
         return Err(BifError::Badarith);
     }
-    Ok(TermBuilder::new(&mut Heap(ctx.heap))
+    Ok(TermBuilder::new(&mut Heap(&mut ctx.heap))
         .float(result)
         .expect("infallible BIF heap"))
 }

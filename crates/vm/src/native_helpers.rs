@@ -123,7 +123,7 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
     let reason = crate::native_hooks::from_raw(reason_raw);
     let trace = crate::native_hooks::from_raw(trace_raw);
     let result = crate::exceptions::materialize(None, process, trace).and_then(|stacktrace| {
-        arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+        arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .tuple(&[reason, stacktrace])
             .map_err(|error| crate::VmError::Unsupported(format!("stacktrace tuple {error:?}")))
     });
@@ -136,7 +136,7 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
             // The catch-end fragment stores this word and builds `{'EXIT', Word}`.
             // A zero return is not a term and the fragment loads through it.
             let fallback =
-                arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+                arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
                     .tuple(&[reason, arinsal_term::Term::NIL])
                     .map(crate::native_hooks::raw)
                     .unwrap_or_else(|_| crate::native_hooks::raw(reason));
@@ -493,9 +493,11 @@ pub(crate) fn static_nif_job(
         crate::natives::tty::note_caller_native(process);
     }
     let args = process.x.get(..usize::from(arity))?.to_vec();
+    let fcalls = process.reductions;
     Some(crate::dirty::static_nif_job(move |heap| {
+        let mut fcalls = fcalls;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::calls::call_bif(heap, entry, &args)
+            crate::calls::call_bif(heap, &mut fcalls, entry, &args)
         }))
         .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))))
     }))
@@ -537,8 +539,14 @@ pub(crate) fn run_static_nif(
     let result = match done {
         Some(result) => result,
         None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pending {
-            Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
-            None => crate::calls::call_bif(&mut process.heap, entry, &args),
+            Some(pending) => crate::natives::nif::resume_pending(
+                &mut process.heap,
+                &mut process.reductions,
+                pending,
+            ),
+            None => {
+                crate::calls::call_bif(&mut process.heap, &mut process.reductions, entry, &args)
+            }
         }))
         .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error")))),
     };
@@ -606,6 +614,7 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::calls::call_bif(
             &mut process.heap,
+            &mut process.reductions,
             entry,
             &process.x[..usize::from(nif.arity)],
         )
@@ -1522,7 +1531,7 @@ fn allocating_bif(
     descriptor: u64,
     arity: usize,
     body: impl FnOnce(
-        &mut arinsal_bifs::FragmentingHeap<'_>,
+        &mut arinsal_bifs::ProcessHeapHandle<'_>,
         Term,
     ) -> Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
@@ -1537,7 +1546,7 @@ fn allocating_bif(
     let arg = registers.x_reg_array[0];
     let entry_top = process.heap.heap_top_index();
     let result = {
-        let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         body(&mut fragment, arg)
     };
     let top = process.heap.heap_top_index();
@@ -1814,6 +1823,66 @@ pub(crate) extern "C" fn list_slice_nonalloc_entry<B: arinsal_bifs::BifBody>(
     .unwrap_or(0)
 }
 
+/// `lists:member/2`'s BIF-table entry. The successful call needs no export lookup.
+// Port of erts/emulator/beam/erl_bif_lists.c:1108-1142 and bif.h:71-84, OTP-29.1.1.
+pub(crate) extern "C" fn list_member_entry(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+        return 0;
+    };
+    process.reductions = process.header.fcalls;
+    let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
+    let (result, deferred) = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+        let result = arinsal_bifs::lists_member_bif(&mut ctx, &args);
+        (result, ctx.take_deferred())
+    };
+    if process.header.fcalls != process.reductions {
+        process.header.fcalls = process.reductions;
+    }
+    if let Some(trap) = deferred {
+        let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+            return 0;
+        };
+        crate::native_hooks::convert_native_cursors(process);
+        crate::bif_traps::install_deferred_trap(
+            process,
+            identity as usize,
+            (export.module_atom, export.function_atom),
+            export.function.as_str(),
+            &args,
+            trap,
+        );
+        process
+            .heap
+            .set_frame_pointer(registers.tmp_mem[2] as usize);
+        debug_assert_native_heap(process);
+        crate::bif_traps::arm_export_trap(process);
+        process.header.freason = 1 << 10;
+        process.sync_native_header();
+        return 0;
+    }
+    match result {
+        Ok(value) => {
+            registers.x_reg_array[0] = value;
+            crate::native_hooks::raw(value)
+        }
+        Err(error) => {
+            let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+                return 0;
+            };
+            crate::native_hooks::convert_native_cursors(process);
+            plain_bif_result(process, registers, export, 2, Err(error))
+        }
+    }
+}
+
 /// The value of a non-allocating list BIF, or `None` when it traps or fails (the caller then
 /// converts the cursors and runs the full path).
 #[inline(always)]
@@ -1825,17 +1894,15 @@ fn nonalloc_list_fast(
 ) -> Option<u64> {
     process.reductions = process.header.fcalls;
     let arity = usize::from(export.arity);
-    let (reductions, value) = {
-        let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
-        ctx.set_reduction_budget(process.reductions.max(0) as usize);
+    let value = {
+        let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
         let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
         if ctx.take_deferred().is_some() {
             return None;
         }
-        (ctx.reductions(), result.ok()?)
+        result.ok()?
     };
-    charge_bif_reductions(process, reductions);
     registers.x_reg_array[0] = value;
     if process.header.fcalls != process.reductions {
         process.header.fcalls = process.reductions;
@@ -2276,25 +2343,23 @@ pub(crate) extern "C" fn list_reverse_entry(
     let gc_was_enabled = process.heap.gc_enabled;
     let reds = process.reductions.clamp(0, 4000) as usize;
     let max_cells = reds
-        .saturating_mul(arinsal_bifs::REVERSE_CELLS_PER_RED)
+        .saturating_mul(arinsal_bifs::REVERSE_ONHEAP_CELLS_PER_RED)
         .max(1);
     let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
-    let (step, reductions) = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-        let step = arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells);
-        (step, ctx.reductions())
+    let step = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+        arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells)
     };
     let result = match step {
         Ok(arinsal_bifs::ReverseStep::Done(value)) => {
             process.set_gc_enabled(gc_was_enabled);
-            crate::bif_traps::charge_light(process, reductions);
             return light_value_return(process, registers, entry_top, value);
         }
         Ok(arinsal_bifs::ReverseStep::Trap(cont)) => Ok(crate::bif_traps::HandlerResult::Yield {
             continuation: "lists:reverse/2",
             state: arinsal_term::MagicRef::new(std::sync::Mutex::new(cont)),
-            reductions,
+            reductions: 0,
         }),
         Err(error) => Err(error),
     };
@@ -2571,7 +2636,7 @@ fn make_ref_in_fragment(
     process: &mut crate::Process,
     words: [u32; 3],
 ) -> Result<Term, arinsal_bifs::BifError> {
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     Term::local_ref(&mut fragment, words).map_err(|_| arinsal_bifs::BifError::SystemLimit)
 }
 
@@ -2591,7 +2656,7 @@ fn unique_integer_n(
             Ok(Term::small(value).expect("unique integer"))
         }
         Ok(arinsal_bifs::UniqueInt::Big(value)) => {
-            let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             arinsal_term::TermBuilder::new(&mut fragment)
                 .int_from_bigint(&value)
                 .map_err(|_| arinsal_bifs::BifError::SystemLimit)
@@ -2666,13 +2731,11 @@ fn call_list_slice_bif(
     }
     let arity = usize::from(export.arity);
     let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
-    ctx.set_reduction_budget(process.reductions.max(0) as usize);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     if let Some(trap) = ctx.take_deferred() {
-        let slice = ctx.reductions();
-        let all = process.reductions.max(0) as u32;
+        drop(ctx);
         let mut args = [Term::NIL; 3];
         args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
         crate::bif_traps::install_deferred_trap(
@@ -2682,7 +2745,6 @@ fn call_list_slice_bif(
             export.function.as_str(),
             &args[..arity],
             trap,
-            (slice, all),
         );
         process
             .heap
@@ -2693,8 +2755,7 @@ fn call_list_slice_bif(
         process.sync_native_header();
         return None;
     }
-    let reductions = ctx.reductions();
-    charge_bif_reductions(process, reductions);
+    drop(ctx);
     let top = process.heap.heap_top_index();
     if let Ok(value) = &result
         && (!export_call
@@ -2748,11 +2809,10 @@ fn call_plain_bif_body(
     let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     // The result is matched where the BIF wrote it: moving it first would read it back with
     // wider loads than the BIF's stores.
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
-    let reductions = ctx.reductions();
-    charge_bif_reductions(process, reductions);
+    drop(ctx);
     let top = process.heap.heap_top_index();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back to XREG0, and the native
     // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). Only the
@@ -3115,11 +3175,10 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
     process.reductions = process.header.fcalls;
     let entry_top = process.heap.heap_top_index();
     // Matched where the BIF wrote it, like the light BIF path.
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
     let result = bif(&mut ctx, args);
-    let reductions = ctx.reductions();
-    charge_bif_reductions(process, reductions);
+    drop(ctx);
     let top = process.heap.heap_top_index();
     if top != entry_top {
         process.header.htop = process.heap.word_address(top);
@@ -3148,7 +3207,7 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
 
 /// Raises `error:{Tag, Value}` from a native helper.
 fn set_tagged_error(process: &mut crate::Process, tag: &str, value: Term) {
-    let tuple = arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+    let tuple = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
         .tuple(&[crate::signals::atom(tag), value]);
     match tuple {
         Ok(reason) => {
@@ -3346,7 +3405,7 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
     };
     arinsal_term::from_owned(
         &owned,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .ok()
 }
@@ -3482,7 +3541,7 @@ fn expand_error_value(process: &mut crate::Process) -> Option<arinsal_term::Term
         _ => return None,
     });
     if matches!(index, 5 | 7 | 10 | 11 | 16 | 18 | 19 | 20 | 21 | 22) {
-        arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+        arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .tuple(&[tag, value])
             .ok()
     } else {
@@ -3804,7 +3863,7 @@ fn map_single(
         crate::native_hooks::from_raw(map),
     );
     // HAlloc: these helpers never collect, so the heap may spill into fragments.
-    let mut heap = crate::FragmentingHeap(&mut process.heap);
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
     let result = if exact {
         arinsal_maps::update(map, key, value, &mut heap)
     } else {
@@ -3888,7 +3947,7 @@ fn arinsal_beamasm_map_change(
     let x = &registers.x_reg_array;
     let arg = |i: usize| x[base + i];
     let map = x[source_slot];
-    let mut heap = crate::FragmentingHeap(&mut process.heap);
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
     let result = match change {
         MapChange::New => arinsal_maps::gc_new_map(n, arg, &mut heap),
         MapChange::Assoc => arinsal_maps::gc_update_map_assoc(map, n, arg, &mut heap),
