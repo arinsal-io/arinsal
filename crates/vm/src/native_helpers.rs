@@ -2138,6 +2138,71 @@ pub(crate) extern "C" fn trap_bif_entry<T: crate::bif_traps::TrapBody>(
     trap_body_call::<T>(process, registers, identity as usize, export).unwrap_or(0)
 }
 
+/// `lists:reverse/2` as its own light entry. The common call runs the body directly and
+/// returns the list; a partial result (budget spent) takes the handler's yield path.
+// Port of erts/emulator/beam/erl_bif_lists.c:1144-1263 (lists_reverse_2), OTP-29.1.1: the BIF
+// is one function with its own budget, and BIF_TRAP is taken only when the budget runs out.
+pub(crate) extern "C" fn list_reverse_entry(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime(header) else {
+        return 0;
+    };
+    let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+        return 0;
+    };
+    if export.light_trap_bif.is_none() {
+        return park_executor(process, export, identity);
+    }
+    process.reductions = process.header.fcalls;
+    let entry_top = process.heap.heap_top_index();
+    let gc_was_enabled = process.heap.gc_enabled;
+    let reds = process.reductions.clamp(0, 4000) as usize;
+    let max_cells = reds
+        .saturating_mul(arinsal_bifs::REVERSE_CELLS_PER_RED)
+        .max(1);
+    let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
+    let (step, reductions) = {
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        let step = arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells);
+        (step, ctx.reductions())
+    };
+    let result = match step {
+        Ok(arinsal_bifs::ReverseStep::Done(value)) => {
+            process.set_gc_enabled(gc_was_enabled);
+            crate::bif_traps::charge_light(process, reductions);
+            return light_value_return(process, registers, entry_top, value);
+        }
+        Ok(arinsal_bifs::ReverseStep::Trap(cont)) => Ok(crate::bif_traps::HandlerResult::Yield {
+            continuation: "lists:reverse/2",
+            state: arinsal_term::MagicRef::new(std::sync::Mutex::new(cont)),
+            reductions,
+        }),
+        Err(error) => Err(error),
+    };
+    let callee = (export.module_atom, export.function_atom);
+    match crate::bif_traps::finish_light(
+        process,
+        identity as usize,
+        callee,
+        &args,
+        gc_was_enabled,
+        result,
+    ) {
+        crate::bif_traps::LightTrap::Returned(result) => {
+            light_trap_result(process, registers, export, 2, entry_top, false, result)
+        }
+        crate::bif_traps::LightTrap::Trapped => {
+            arm_light_trap(process, registers, export).unwrap_or(0)
+        }
+    }
+}
+
 /// [`call_trap_bif`] for a body known at compile time: a finished run returns at once.
 #[inline(always)]
 fn trap_body_call<T: crate::bif_traps::TrapBody>(
