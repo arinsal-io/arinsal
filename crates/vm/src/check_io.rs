@@ -142,6 +142,10 @@ struct Poller {
     waker: Arc<Waker>,
     next_token: AtomicUsize,
     registrations: Arc<Mutex<HashMap<usize, (RawFd, RegistrationKind)>>>,
+    /// Shared with the poll thread; `driver_select` changes the kernel poll set
+    /// directly through it, as erts_io_control does from the selecting thread.
+    registry: mio::Registry,
+    selects: Arc<Mutex<DriverSelects>>,
 }
 
 static POLLER: OnceLock<Poller> = OnceLock::new();
@@ -153,15 +157,20 @@ fn poller() -> &'static Poller {
         let (tx, rx) = mpsc::channel();
         let registrations = Arc::new(Mutex::new(HashMap::new()));
         let worker_registrations = Arc::clone(&registrations);
+        let registry = poll.registry().try_clone().expect("clone poller registry");
+        let selects = Arc::new(Mutex::new(DriverSelects::default()));
+        let worker_selects = Arc::clone(&selects);
         thread::Builder::new()
             .name("arinsal-check-io".into())
-            .spawn(move || poll_loop(poll, rx, worker_registrations))
+            .spawn(move || poll_loop(poll, rx, worker_registrations, worker_selects))
             .expect("start shared kqueue poller");
         Poller {
             tx,
             waker,
             next_token: AtomicUsize::new(1),
             registrations,
+            registry,
+            selects,
         }
     })
 }
@@ -320,6 +329,7 @@ fn poll_loop(
     mut poll: Poll,
     rx: Receiver<Command>,
     registrations: Arc<Mutex<HashMap<usize, (RawFd, RegistrationKind)>>>,
+    selects: Arc<Mutex<DriverSelects>>,
 ) {
     // Port of erts/emulator/beam/erl_check_io.c:1933 (erts_check_io), OTP-29.1.1.
     let mut events = Events::with_capacity(EVENT_CAPACITY);
@@ -364,6 +374,14 @@ fn poll_loop(
                 continue;
             }
             let token = event.token();
+            let delivery = selects
+                .lock()
+                .unwrap()
+                .triggered(poll.registry(), token, event);
+            if let Some(delivery) = delivery {
+                delivery();
+                continue;
+            }
             let Some(active_registration) = active.get_mut(&token) else {
                 continue;
             };
@@ -574,6 +592,223 @@ fn remove_registration(
     }
 }
 
+/// Readiness callback of a persistent driver selection (`iready`/`oready`).
+pub(crate) type SelectCallback = Arc<dyn Fn(RawFd, Ready) + Send + Sync>;
+
+/// Persistent `driver_select` state of one descriptor.
+///
+/// Port of the `ErtsDrvEventState` fields `events` (selected by the driver) and
+/// `active_events` (armed in the poll set) from
+/// erts/emulator/sys/common/erl_check_io.c, OTP-29.1.1. A fired event leaves
+/// `active` until the driver's port task ran (`notify_executed`), as ERTS'
+/// one-shot poll set does.
+struct DriverSelect {
+    fd: RawFd,
+    owner: u64,
+    events: InterestSet,
+    active: InterestSet,
+    ready: SelectCallback,
+}
+
+#[derive(Default)]
+struct DriverSelects {
+    by_fd: HashMap<RawFd, Token>,
+    by_token: HashMap<Token, DriverSelect>,
+}
+
+fn union(a: InterestSet, b: InterestSet) -> InterestSet {
+    InterestSet {
+        readable: a.readable || b.readable,
+        writable: a.writable || b.writable,
+    }
+}
+
+fn minus(a: InterestSet, b: InterestSet) -> InterestSet {
+    InterestSet {
+        readable: a.readable && !b.readable,
+        writable: a.writable && !b.writable,
+    }
+}
+
+/// `erts_io_control` with `ERTS_POLL_OP_MOD`/`DEL`: put exactly `active` in the
+/// kernel poll set for `fd`.
+fn io_control(registry: &mio::Registry, fd: RawFd, token: Token, active: InterestSet) {
+    let source = SourceFd(&fd);
+    match poll_interest(active) {
+        // kqueue's EV_ADD both adds and modifies a filter; mio deletes the
+        // filters left out of `interest`.
+        Some(interest) => {
+            let _ = registry.reregister(&mut { source }, token, interest);
+        }
+        None => {
+            let _ = registry.deregister(&mut { source });
+        }
+    }
+}
+
+impl DriverSelects {
+    /// The poll thread saw `event` for `token`.
+    ///
+    /// Port of erts/emulator/sys/common/erl_check_io.c:2018-2109, OTP-29.1.1:
+    /// disregard events that are not active, clear the fired ones from
+    /// `active_events`, re-enable the rest (`ERTS_POLL_OP_MOD`), then run oready
+    /// and iready. An error or hang-up triggers every active event (:2018-2027).
+    fn triggered(
+        &mut self,
+        registry: &mio::Registry,
+        token: Token,
+        event: &mio::event::Event,
+    ) -> Option<Box<dyn FnOnce()>> {
+        let state = self.by_token.get_mut(&token)?;
+        let hangup = event.is_error() || event.is_read_closed() || event.is_write_closed();
+        let seen = InterestSet {
+            readable: event.is_readable() || hangup,
+            writable: event.is_writable() || hangup,
+        };
+        let fired = InterestSet {
+            readable: seen.readable && state.active.readable,
+            writable: seen.writable && state.active.writable,
+        };
+        if !fired.readable && !fired.writable {
+            return Some(Box::new(|| {}));
+        }
+        state.active = minus(state.active, fired);
+        io_control(registry, state.fd, token, state.active);
+        let ready = Ready {
+            readable: fired.readable && event.is_readable(),
+            writable: fired.writable && event.is_writable(),
+            closed: event.is_read_closed() || event.is_write_closed(),
+            error: event.is_error(),
+        };
+        let (fd, callback) = (state.fd, Arc::clone(&state.ready));
+        Some(Box::new(move || callback(fd, ready)))
+    }
+}
+
+/// Select or deselect `fd` for the driver identified by `owner`.
+///
+/// Port of erts/emulator/sys/common/erl_check_io.c:988-1225 (`driver_select`),
+/// OTP-29.1.1: newly selected events are armed at once; events already selected
+/// stay as they are (a fired event is re-armed by `notify_executed` after its
+/// port task ran); deselected events leave the poll set. Selecting a descriptor
+/// that another owner still holds takes it over, as `drv_select_steal` does.
+/// The kernel poll set is changed from the calling thread; the poll thread is not
+/// woken.
+pub(crate) fn driver_select(
+    fd: RawFd,
+    owner: u64,
+    events: InterestSet,
+    ready: SelectCallback,
+) -> io::Result<()> {
+    let poller = poller();
+    let mut selects = poller.selects.lock().unwrap();
+    if let Some(token) = selects.by_fd.get(&fd).copied()
+        && selects.by_token[&token].owner != owner
+    {
+        selects.by_token.remove(&token);
+        selects.by_fd.remove(&fd);
+    }
+    let token = match selects.by_fd.get(&fd).copied() {
+        Some(token) => token,
+        None => {
+            if !events.readable && !events.writable {
+                return Ok(());
+            }
+            let token = Token(poller.next_token.fetch_add(1, Ordering::Relaxed));
+            selects.by_fd.insert(fd, token);
+            selects.by_token.insert(
+                token,
+                DriverSelect {
+                    fd,
+                    owner,
+                    events: InterestSet {
+                        readable: false,
+                        writable: false,
+                    },
+                    active: InterestSet {
+                        readable: false,
+                        writable: false,
+                    },
+                    ready: Arc::clone(&ready),
+                },
+            );
+            token
+        }
+    };
+    let state = selects.by_token.get_mut(&token).expect("selected fd");
+    state.ready = ready;
+    let added = minus(events, state.events);
+    let removed = minus(state.events, events);
+    state.events = events;
+    let active = minus(union(state.active, added), removed);
+    let changed =
+        active.readable != state.active.readable || active.writable != state.active.writable;
+    state.active = active;
+    if changed {
+        io_control(&poller.registry, fd, token, active);
+    }
+    if !events.readable && !events.writable {
+        selects.by_token.remove(&token);
+        selects.by_fd.remove(&fd);
+    }
+    Ok(())
+}
+
+/// Re-arm the events whose port task has run.
+///
+/// Port of erts/emulator/sys/common/erl_check_io.c:546-640
+/// (`erts_io_notify_port_task_executed`), OTP-29.1.1: an event that is still
+/// selected but no longer active goes back into the poll set.
+pub(crate) fn notify_executed(fd: RawFd, owner: u64, executed: InterestSet) {
+    let poller = poller();
+    let mut selects = poller.selects.lock().unwrap();
+    let Some(token) = selects.by_fd.get(&fd).copied() else {
+        return;
+    };
+    let state = selects.by_token.get_mut(&token).expect("selected fd");
+    if state.owner != owner {
+        return;
+    }
+    let rearm = minus(
+        InterestSet {
+            readable: executed.readable && state.events.readable,
+            writable: executed.writable && state.events.writable,
+        },
+        state.active,
+    );
+    if rearm.readable || rearm.writable {
+        state.active = union(state.active, rearm);
+        io_control(&poller.registry, fd, token, state.active);
+    }
+}
+
+/// Drop every selection `owner` holds on `fd` (`driver_select(..., ERL_DRV_USE, 0)`)
+/// before the descriptor is closed or replaced.
+pub(crate) fn driver_deselect(fd: RawFd, owner: u64) {
+    let poller = poller();
+    let mut selects = poller.selects.lock().unwrap();
+    let Some(token) = selects.by_fd.get(&fd).copied() else {
+        return;
+    };
+    if selects.by_token[&token].owner != owner {
+        return;
+    }
+    if let Some(state) = selects.by_token.remove(&token)
+        && (state.active.readable || state.active.writable)
+    {
+        io_control(
+            &poller.registry,
+            fd,
+            token,
+            InterestSet {
+                readable: false,
+                writable: false,
+            },
+        );
+    }
+    selects.by_fd.remove(&fd);
+}
+
 pub(crate) struct DebugInfo {
     pub used_fds: usize,
     pub driver_selects: usize,
@@ -582,12 +817,14 @@ pub(crate) struct DebugInfo {
 
 pub(crate) fn debug_info() -> DebugInfo {
     let registrations = poller().registrations.lock().unwrap();
+    let selects = poller().selects.lock().unwrap();
     let used_fds = registrations
         .values()
         .map(|(fd, _)| *fd)
+        .chain(selects.by_fd.keys().copied())
         .collect::<std::collections::HashSet<_>>()
         .len();
-    let mut driver_selects = 0;
+    let mut driver_selects = selects.by_fd.len();
     let mut nif_selects = 0;
     for (_, kind) in registrations.values() {
         match kind {
@@ -760,6 +997,76 @@ mod tests {
         assert!(read_rx.recv_timeout(Duration::from_secs(2)).unwrap());
         deregister(read_registration);
         deregister(write_registration);
+        assert_eq!(debug_info().used_fds, 0);
+    }
+
+    #[test]
+    fn check_io_driver_select_is_one_shot_until_task_executed() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let readable = InterestSet {
+            readable: true,
+            writable: false,
+        };
+        driver_select(
+            fd,
+            7,
+            readable,
+            Arc::new(move |_, ready| {
+                let _ = tx.lock().unwrap().send(ready);
+            }),
+        )
+        .unwrap();
+        writer.write_all(b"x").unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().readable);
+        // Fired and not yet executed: more data does not deliver again.
+        writer.write_all(b"y").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        // The task ran without reading: re-arming reports the pending data.
+        notify_executed(fd, 7, readable);
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().readable);
+        assert_eq!(debug_info().driver_selects, 1);
+        driver_deselect(fd, 7);
+        notify_executed(fd, 7, readable);
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(debug_info().used_fds, 0);
+    }
+
+    #[test]
+    fn check_io_driver_select_off_drops_event_and_other_owner_steals() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let fd = reader.as_raw_fd();
+        let (tx, rx) = mpsc::channel::<u64>();
+        let callback = |owner: u64| -> SelectCallback {
+            let tx = Mutex::new(tx.clone());
+            Arc::new(move |_, _| {
+                let _ = tx.lock().unwrap().send(owner);
+            })
+        };
+        let readable = InterestSet {
+            readable: true,
+            writable: false,
+        };
+        let none = InterestSet {
+            readable: false,
+            writable: false,
+        };
+        driver_select(fd, 1, readable, callback(1)).unwrap();
+        driver_select(fd, 1, none, callback(1)).unwrap();
+        writer.write_all(b"x").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        driver_select(fd, 1, readable, callback(1)).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        // A new owner of the same descriptor number replaces the old selection.
+        driver_select(fd, 2, readable, callback(2)).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+        driver_deselect(fd, 1);
+        assert_eq!(debug_info().driver_selects, 1);
+        driver_deselect(fd, 2);
         assert_eq!(debug_info().used_fds, 0);
     }
 }
