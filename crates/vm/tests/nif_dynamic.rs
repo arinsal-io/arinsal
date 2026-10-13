@@ -295,6 +295,49 @@ fn tracer_mod_sequential_tracer_matches_erts() {
 }
 
 #[test]
+fn load_nif_from_module_loaded_off_the_code_path_matches_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    let dir = work_dir("offpath");
+    let late = dir.join("late");
+    std::fs::create_dir_all(&late).unwrap();
+    let library = compile_so(
+        &late,
+        "nifdyn_offpath",
+        r#"
+        #include "erl_nif.h"
+        static ERL_NIF_TERM add(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            int a, b;
+            (void)argc;
+            if (!enif_get_int(env, argv[0], &a) || !enif_get_int(env, argv[1], &b))
+                return enif_make_badarg(env);
+            return enif_make_int(env, a + b);
+        }
+        static ErlNifFunc funcs[] = {{"add", 2, add, 0}};
+        ERL_NIF_INIT(nifdyn_offpath, funcs, NULL, NULL, NULL, NULL)
+        "#,
+    );
+    let module_src = format!(
+        "-module(nifdyn_offpath).\n-export([init/0, add/2]).\n-nifs([add/2]).\ninit() -> erlang:load_nif(\"{}\", []).\nadd(_, _) -> erlang:nif_error(undef).\n",
+        library.display()
+    );
+    let beam = erl
+        .compile_named("nifdyn_offpath", &module_src, &[])
+        .unwrap_or_else(|error| panic!("compile nifdyn_offpath: {error}"));
+    let beam_path = late.join("nifdyn_offpath.beam");
+    std::fs::write(&beam_path, &beam).unwrap();
+    let runner_src = format!(
+        "-module(nifdyn_offpath_run).\n-export([run/0]).\nrun() ->\n    {{ok, Bin}} = prim_file:read_file(\"{}\"),\n    {{module, nifdyn_offpath}} = erlang:load_module(nifdyn_offpath, Bin),\n    Loaded = nifdyn_offpath:init(),\n    {{Loaded, nifdyn_offpath:add(20, 22)}}.\n",
+        beam_path.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_offpath_run", &runner_src);
+    assert_same(&dir, &erl, "nifdyn_offpath_run");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn load_errors_and_roundtrip_match_erts() {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping dynamic NIF differential test");

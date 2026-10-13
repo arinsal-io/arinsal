@@ -518,18 +518,33 @@ fn filename_bytes(term: Term) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn declared_nifs(vm: &Vm, module: &str) -> Result<HashSet<(String, u8)>, String> {
-    let file = format!("{module}.beam");
-    let path = vm
-        .paths
-        .iter()
-        .map(|dir| dir.join(&file))
-        .find(|path| path.is_file())
-        .ok_or_else(|| format!("module {module} beam not found"))?;
-    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-    let beam = arinsal_beam::parse(&bytes).map_err(|error| error.to_string())?;
+/// Which functions of the loaded `module` may become NIFs: the ones marked by `nif_start`, or
+/// `None` when the module has no `nif_start` at all, in which case any function may.
+///
+/// Port of erts/emulator/beam/erl_nif.c:4700-4704 (check_is_nifable) and
+/// erts/emulator/beam/jit/asm_load.c:651-661 (`are_nifs` is allocated at the first
+/// `nif_start` and stays NULL without one), OTP-29.1.1. As in erts, the loaded instance is the
+/// authority: `load_nif` works on the caller's loaded code (erl_nif.c:4844-4866,
+/// `this_mi->code_hdr`), not on a `.beam` file. That also covers modules that are not on the
+/// boot code path: Mix adds dependency ebins with `code:add_paths/1` at runtime, and
+/// `erlang:load_module/2` takes bytes from anywhere. No file is read.
+fn declared_nifs(
+    vm: &Vm,
+    module_id: usize,
+    module: &str,
+) -> Result<Option<HashSet<(String, u8)>>, String> {
+    let meta = vm
+        .code
+        .code_meta
+        .get(module_id)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| format!("module {module} is not loaded"))?;
+    Ok(nif_declarations(&meta.beam))
+}
+
+fn nif_declarations(beam: &arinsal_beam::BeamFile) -> Option<HashSet<(String, u8)>> {
     let mut current: Option<(String, u8)> = None;
-    let mut declared = HashSet::new();
+    let mut declared: Option<HashSet<(String, u8)>> = None;
     for instruction in &beam.code.instructions {
         match instruction.op {
             arinsal_spec::Opcode::FuncInfo => {
@@ -554,6 +569,7 @@ fn declared_nifs(vm: &Vm, module: &str) -> Result<HashSet<(String, u8)>, String>
                 current = Some((name, arity));
             }
             arinsal_spec::Opcode::NifStart => {
+                let declared = declared.get_or_insert_with(HashSet::new);
                 if let Some(function) = &current {
                     declared.insert(function.clone());
                 }
@@ -561,7 +577,7 @@ fn declared_nifs(vm: &Vm, module: &str) -> Result<HashSet<(String, u8)>, String>
             _ => {}
         }
     }
-    Ok(declared)
+    declared
 }
 
 fn dyn_call<const N: usize>(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
@@ -873,7 +889,7 @@ fn validate_image(
         .modules
         .get(module_id)
         .ok_or_else(|| format!("module {caller} is not loaded"))?;
-    let declared = declared_nifs(vm, caller)?;
+    let declared = declared_nifs(vm, module_id, caller)?;
     let mut seen = HashSet::new();
     let mut binds = Vec::new();
     for (index, function) in image.functions().iter().enumerate() {
@@ -891,7 +907,10 @@ fn validate_image(
                 function.name, function.arity
             ));
         };
-        if !declared.contains(&(function.name.clone(), arity)) {
+        if declared
+            .as_ref()
+            .is_some_and(|declared| !declared.contains(&(function.name.clone(), arity)))
+        {
             return Err(format!(
                 "Function not declared as nif {caller}:{}/{}",
                 function.name, function.arity
