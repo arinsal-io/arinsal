@@ -1,6 +1,6 @@
 //! Scheduler-local timer wheel and long timer index.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -387,6 +387,27 @@ impl TimerTree {
     }
 }
 
+/// A map keyed by timer id: one multiply, no SipHash. Timer ids are counters and reference
+/// keys, not adversarial input.
+type IdMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
+
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) ^ u64::from(byte);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
 /// Marks a timer id taken from an Erlang reference key, apart from the sequential ids.
 pub(crate) const REF_KEY_TIMER_BIT: u64 = 1 << 63;
 
@@ -441,6 +462,14 @@ fn payload_message<M>(payload: &TimerPayload<M>) -> Option<&M> {
     }
 }
 
+/// A change of a receiver's bif-timer tree (`p->bif_timers`, erl_hl_timer.c).
+pub(crate) enum LinkEvent<M> {
+    Link(Pid, u64),
+    Unlink(Pid, u64),
+    /// A timer taken off the wheel for a suspended receiver, with the time it had left.
+    Stash(Pid, u64, TimerPayload<M>),
+}
+
 /// Work emitted when a timer expires.
 pub(crate) enum TimerPayload<M> {
     Message(Pid, M, bool),
@@ -464,17 +493,10 @@ pub(crate) enum TimerCommand<M> {
         id: u64,
         callback: Box<dyn FnOnce(Option<u64>) + Send>,
     },
-    CancelTarget {
-        pid: Pid,
-    },
+    /// Cancel the timers of `ids` (this wheel's entries of the receiver's bif-timer tree).
+    CancelTarget { ids: Vec<u64> },
     /// Hold the BIF timers aimed at `pid` (a suspended process).
-    PauseTarget {
-        pid: Pid,
-    },
-    /// Re-arm the held timers of `pid` with their remaining time.
-    ResumeTarget {
-        pid: Pid,
-    },
+    PauseTarget { pid: Pid, ids: Vec<u64> },
 }
 
 /// A receive timeout cancelled by another thread (erts canceled-timer queue).
@@ -516,12 +538,14 @@ pub(crate) struct Wheel<M> {
     bump_pending: Vec<u64>,
     bump_cursor: usize,
     high_level: TimerTree,
-    entries: HashMap<u64, Entry<M>>,
-    target_entries: HashMap<Pid, HashSet<u64>>,
+    entries: IdMap<Entry<M>>,
+    /// Link and unlink events for the receivers' bif-timer trees, applied by the scheduler
+    /// after each wheel operation (the wheel itself does not see processes).
+    link_events: std::collections::VecDeque<LinkEvent<M>>,
+    /// The scheduler that owns this wheel; it is the value of the receivers' tree entries.
+    worker: usize,
     /// Cached [`Wheel::next_timeout`]; valid until the wheel reaches it or its timers change.
     next_timeout: Option<u64>,
-    /// Timers held while their destination is suspended, with the time they had left.
-    paused: HashMap<Pid, Vec<(u64, TimerPayload<M>)>>,
 }
 
 impl<M> Wheel<M> {
@@ -537,10 +561,10 @@ impl<M> Wheel<M> {
             bump_pending: Vec::new(),
             bump_cursor: 0,
             high_level: TimerTree::new(),
-            entries: HashMap::new(),
-            target_entries: HashMap::new(),
+            entries: IdMap::default(),
+            link_events: std::collections::VecDeque::new(),
+            worker: 0,
             next_timeout: None,
-            paused: HashMap::new(),
         }
     }
 
@@ -610,18 +634,10 @@ impl<M> Wheel<M> {
 
     // Port of erts/emulator/beam/erl_hl_timer.c:2661-2695, OTP-29.1.1.
     pub(crate) fn insert(&mut self, id: u64, deadline: u64, payload: TimerPayload<M>) {
-        // Port of erts/emulator/beam/erl_hl_timer.c:1838 (setup_bif_timer), OTP-29.1.1: a timer
-        // started for a process whose timers are paused is created paused.
-        if let TimerPayload::Message(target, _, _) = &payload
-            && let Some(held) = self.paused.get_mut(target)
-        {
-            held.push((deadline.saturating_sub(self.now), payload));
-            return;
-        }
         let order = self.next_order;
         self.next_order = self.next_order.wrapping_add(1);
         if let TimerPayload::Message(target, _, _) = &payload {
-            self.target_entries.entry(*target).or_default().insert(id);
+            self.link_events.push_back(LinkEvent::Link(*target, id));
         }
         let entry = Entry {
             deadline,
@@ -725,38 +741,23 @@ impl<M> Wheel<M> {
     }
 
     // Port of erts/emulator/beam/erl_hl_timer.c:67-68 and erl_process.c:14300-14304,
-    // OTP-29.1.1. Process exit cancels all BIF timers whose destination is the exiting process.
-    pub(crate) fn cancel_target(&mut self, pid: Pid) -> usize {
-        // erts_destroy_paused_bif_timers (erl_hl_timer.c:2988): paused timers die with the process.
-        self.paused.remove(&pid);
-        let ids = self.target_entries.remove(&pid).unwrap_or_default();
-        ids.into_iter()
-            .filter(|id| self.cancel_at(*id, self.now).is_some())
+    // OTP-29.1.1. Process exit cancels all BIF timers whose destination is the exiting process;
+    // `ids` are the timers of this wheel in the receiver's bif-timer tree.
+    pub(crate) fn cancel_target(&mut self, ids: &[u64]) -> usize {
+        ids.iter()
+            .filter(|id| self.cancel_at(**id, self.now).is_some())
             .count()
     }
 
-    /// The next timer aimed at `pid` is created paused (erl_hl_timer.c:1838).
-    pub(crate) fn ensure_paused(&mut self, pid: Pid) {
-        self.paused.entry(pid).or_default();
-    }
-
-    // Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers), OTP-29.1.1.
-    pub(crate) fn pause_target(&mut self, pid: Pid, now: u64) {
-        let ids = self.target_entries.remove(&pid).unwrap_or_default();
-        let mut held = Vec::new();
+    // Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers), OTP-29.1.1: each
+    // timer leaves the wheel and is stored, with the time it had left, in the receiver's
+    // paused list (create_paused_bif_timer + access_btm cancel).
+    pub(crate) fn pause_target(&mut self, pid: Pid, ids: &[u64], now: u64) {
         for id in ids {
-            if let Some(timer) = self.cancel_at(id, now) {
-                held.push(timer);
+            if let Some((remaining, payload)) = self.cancel_at(*id, now) {
+                self.link_events
+                    .push_back(LinkEvent::Stash(pid, remaining, payload));
             }
-        }
-        self.paused.entry(pid).or_default().extend(held);
-    }
-
-    // Port of erts/emulator/beam/erl_hl_timer.c:2949 (erts_resume_paused_bif_timers), OTP-29.1.1:
-    // each held timer is re-armed with a fresh identity and its remaining time.
-    pub(crate) fn resume_target(&mut self, pid: Pid, now: u64, mut next_id: impl FnMut() -> u64) {
-        for (remaining, payload) in self.paused.remove(&pid).unwrap_or_default() {
-            self.insert(next_id(), now.saturating_add(remaining.max(1)), payload);
         }
     }
 
@@ -768,24 +769,29 @@ impl<M> Wheel<M> {
             .iter()
             .filter(|(id, _)| **id & REF_KEY_TIMER_BIT != 0)
             .filter_map(|(_, entry)| payload_message(&entry.payload));
-        let held = self
-            .paused
-            .values()
-            .flatten()
-            .filter_map(|(_, payload)| payload_message(payload));
-        live.chain(held).collect()
+        live.collect()
     }
 
     fn remove_target_entry(&mut self, id: u64, payload: &TimerPayload<M>) {
-        let TimerPayload::Message(target, _, _) = payload else {
-            return;
-        };
-        if let Some(ids) = self.target_entries.get_mut(target) {
-            ids.remove(&id);
-            if ids.is_empty() {
-                self.target_entries.remove(target);
-            }
+        if let TimerPayload::Message(target, _, _) = payload {
+            self.link_events.push_back(LinkEvent::Unlink(*target, id));
         }
+    }
+
+    pub(crate) fn for_worker(mut self, worker: usize) -> Self {
+        self.worker = worker;
+        self
+    }
+
+    pub(crate) fn worker(&self) -> usize {
+        self.worker
+    }
+
+    /// The link changes since the last call; the scheduler applies them to the receivers.
+    /// The oldest unapplied change; the queue keeps its capacity, so creating a timer does not
+    /// allocate for it.
+    pub(crate) fn pop_link_event(&mut self) -> Option<LinkEvent<M>> {
+        self.link_events.pop_front()
     }
 
     #[cfg(test)]
@@ -1110,7 +1116,7 @@ mod tests {
         wheel.insert(2, 20, TimerPayload::Message(target, 2, true));
         wheel.insert(3, 30, TimerPayload::Message(other, 3, false));
 
-        assert_eq!(wheel.cancel_target(target), 2);
+        assert_eq!(wheel.cancel_target(&[1, 2]), 2);
         assert_eq!(wheel.remaining(1), None);
         assert_eq!(wheel.remaining(2), None);
         assert_eq!(wheel.remaining(3), Some(30));

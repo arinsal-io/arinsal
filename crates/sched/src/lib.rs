@@ -74,7 +74,7 @@ use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use crossbeam_queue::SegQueue;
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{
@@ -84,13 +84,36 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use timer::{CanceledTimer, TimerCommand, TimerPayload, Wheel};
+use timer::{CanceledTimer, LinkEvent, TimerCommand, TimerPayload, Wheel};
 
 type ErasedTimerService = (usize, Box<dyn Any>);
+
+/// The timer service of each scheduler this thread owns, by scheduler set. A thread owns one
+/// in practice, so a scan of a few entries beats hashing; erts reaches the service straight
+/// from `esdp`.
+struct OwnerServices(Vec<(usize, ErasedTimerService)>);
+
+impl OwnerServices {
+    fn get(&self, inner_id: &usize) -> Option<&ErasedTimerService> {
+        self.0
+            .iter()
+            .find(|(id, _)| id == inner_id)
+            .map(|(_, service)| service)
+    }
+
+    fn insert(&mut self, inner_id: usize, service: ErasedTimerService) {
+        self.remove(&inner_id);
+        self.0.push((inner_id, service));
+    }
+
+    fn remove(&mut self, inner_id: &usize) {
+        self.0.retain(|(id, _)| id != inner_id);
+    }
+}
 type SchedulerAuxWork = Arc<dyn Fn(usize) + Send + Sync + 'static>;
 
 thread_local! {
-    static OWNER_TIMER_SERVICES: RefCell<HashMap<usize, ErasedTimerService>> = RefCell::new(HashMap::new());
+    static OWNER_TIMER_SERVICES: RefCell<OwnerServices> = const { RefCell::new(OwnerServices(Vec::new())) };
 }
 
 const QUEUED: u8 = 0;
@@ -793,11 +816,14 @@ struct RealClock(Instant);
 impl Clock for RealClock {
     fn now_ms(&self) -> u64 {
         let elapsed = self.0.elapsed();
-        let whole_ms = elapsed.as_millis() as u64;
         // Port of erts/emulator/beam/erl_hl_timer.c:670-679
         // (get_timeout_pos), OTP-29.1.1: millisecond deadlines round up so
-        // positive timers do not expire before their requested interval.
-        whole_ms.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
+        // positive timers do not expire before their requested interval. 64-bit math only:
+        // `as_millis` divides in 128 bits.
+        elapsed
+            .as_secs()
+            .saturating_mul(1000)
+            .saturating_add(u64::from(elapsed.subsec_nanos().div_ceil(1_000_000)))
     }
 }
 
@@ -970,9 +996,11 @@ struct Process<T: Task> {
     /// the wheels that hold the receiver's timers, so a process without timers disturbs no
     /// other scheduler.
     bif_timer_wheels: AtomicU64,
-    /// `p->paused_bif_timers != NULL` (erl_hl_timer.c:2864): the process is suspended, so a BIF
-    /// timer aimed at it is created paused (erl_hl_timer.c:1838, setup_bif_timer).
-    bif_timers_paused: AtomicBool,
+    /// `p->bif_timers`: the BIF timers aimed at this process, timer id to the scheduler whose
+    /// wheel holds it. Inserted when the timer is created, removed when it fires or is
+    /// canceled, and walked on exit (erts_cancel_bif_timers). The lock is the timer's own
+    /// (ERTS_PROC_LOCK_BTM), not a global one.
+    btm: Mutex<ProcBtm<T::Message>>,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
     exit_flags: AtomicU32,
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
@@ -1093,7 +1121,10 @@ impl<T: Task> ProcessTable<T> {
             wait_epoch: AtomicU64::new(0),
             timer_epoch_used: AtomicBool::new(false),
             bif_timer_wheels: AtomicU64::new(0),
-            bif_timers_paused: AtomicBool::new(false),
+            btm: Mutex::new(ProcBtm {
+                tree: std::collections::BTreeMap::new(),
+                paused: None,
+            }),
             exit_flags: AtomicU32::new(0),
             reg_atom: AtomicU32::new(u32::MAX),
             wait_timer: AtomicU64::new(0),
@@ -2642,58 +2673,174 @@ impl<T: Task> Inner<T> {
         }
     }
 
+    /// Applies the receiver-tree changes `wheel` recorded since the last call.
+    // Port of erts/emulator/beam/erl_hl_timer.c:1832 (setup_bif_timer links the timer into
+    // `p->bif_timers`) and :1500 (unlink on expiry or cancel), OTP-29.1.1.
+    fn apply_link_events(&self, wheel: &mut Wheel<T::Message>) {
+        let worker = wheel.worker();
+        // Applying an event can record more (a timer created for a paused receiver is
+        // canceled again), so run until the wheel has none.
+        while let Some(event) = wheel.pop_link_event() {
+            {
+                match event {
+                    LinkEvent::Link(pid, id) => {
+                        let stashed = self.table.with_live(pid, |process| {
+                            // Port of erts/emulator/beam/erl_hl_timer.c:1838 (setup_bif_timer):
+                            // a timer for a process whose timers are paused is created paused.
+                            // The paused check and the link are one step under the paused lock,
+                            // so a pause started meanwhile sees this timer in the tree.
+                            let mut btm = process.btm.lock().unwrap();
+                            if btm.paused.is_some() {
+                                return true;
+                            }
+                            btm.tree.insert(id, worker);
+                            false
+                        });
+                        if stashed == Some(true)
+                            && let Some((remaining, payload)) =
+                                wheel.cancel_at(id, self.clock.now_ms())
+                        {
+                            self.stash_paused(wheel, pid, remaining, payload);
+                        }
+                    }
+                    LinkEvent::Unlink(pid, id) => {
+                        self.table.with_live(pid, |process| {
+                            process.btm.lock().unwrap().tree.remove(&id);
+                        });
+                    }
+                    LinkEvent::Stash(pid, remaining, payload) => {
+                        self.stash_paused(wheel, pid, remaining, payload);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adds a timer to the receiver's paused list; when the receiver was resumed in the
+    /// meantime, the timer goes back on `wheel` with a fresh identity.
+    fn stash_paused(
+        &self,
+        wheel: &mut Wheel<T::Message>,
+        pid: Pid,
+        remaining: u64,
+        payload: TimerPayload<T::Message>,
+    ) {
+        let rejected = {
+            let mut payload = Some(payload);
+            self.table.with_live(pid, |process| {
+                if let Some(paused) = process.btm.lock().unwrap().paused.as_mut() {
+                    paused
+                        .list
+                        .push((remaining, payload.take().expect("payload present")));
+                }
+            });
+            payload
+        };
+        if let Some(payload) = rejected {
+            let now = self.clock.now_ms();
+            wheel.insert(
+                self.next_timer.fetch_add(1, Ordering::Relaxed),
+                now.saturating_add(remaining.max(1)),
+                payload,
+            );
+        }
+    }
+
+    fn destroy_paused_bif_timers(&self, pid: Pid) {
+        // Port of erts/emulator/beam/erl_hl_timer.c:2988 (erts_destroy_paused_bif_timers).
+        self.table.with_live(pid, |process| {
+            process.btm.lock().unwrap().paused.take();
+        });
+    }
+
+    /// The timers of `pid` that `worker`'s wheel holds, from the receiver's tree.
+    fn bif_timer_ids(&self, pid: Pid, worker: usize) -> Vec<u64> {
+        self.table
+            .with_live(pid, |process| {
+                process
+                    .btm
+                    .lock()
+                    .unwrap()
+                    .tree
+                    .iter()
+                    .filter(|(_, owner)| **owner == worker)
+                    .map(|(id, _)| *id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Ask every timer wheel to pause or resume the timers aimed at `pid`.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2874 (erts_pause_bif_timers) and :2949
+    // (erts_resume_paused_bif_timers), OTP-29.1.1: the paused list and its count belong to the
+    // process; nested pauses only count.
     fn broadcast_target_timers(&self, pid: Pid, pause: bool) {
+        let Some(process) = self.table.lookup(pid) else {
+            return;
+        };
+        if !pause {
+            self.resume_bif_timers(pid, &process);
+            return;
+        }
+        {
+            let mut btm = process.btm.lock().unwrap();
+            if let Some(paused) = btm.paused.as_mut() {
+                paused.count += 1;
+                return;
+            }
+            btm.paused = Some(PausedBifTimers {
+                count: 1,
+                list: Vec::new(),
+            });
+        }
+        // Exit has to destroy the paused list (erts_destroy_paused_bif_timers).
+        process.bif_timer_wheels.store(u64::MAX, Ordering::Release);
+        proc_flags::publish(&process.exit_flags, proc_flags::BIF_TIMERS);
         if let Some(timers) = self.sim_timers.as_ref() {
             let now = self.clock.now_ms();
             for wheel in timers {
                 let mut wheel = wheel.lock().unwrap();
-                if pause {
-                    wheel.pause_target(pid, now);
-                } else {
-                    wheel.resume_target(pid, now, || {
-                        self.next_timer.fetch_add(1, Ordering::Relaxed)
-                    });
-                }
+                let ids = self.bif_timer_ids(pid, wheel.worker());
+                wheel.pause_target(pid, &ids, now);
+                self.apply_link_events(&mut wheel);
             }
             return;
         }
-        // Port of erts/emulator/beam/erl_hl_timer.c:2864 (erts_pause_bif_timers) and :2949
-        // (erts_resume_paused_bif_timers), OTP-29.1.1: the process remembers that its timers are
-        // paused, and only the wheels that hold its timers are visited.
-        let Some(process) = self.table.lookup(pid) else {
-            return;
-        };
-        if pause {
-            process.bif_timers_paused.store(true, Ordering::SeqCst);
-        } else {
-            process.bif_timers_paused.store(false, Ordering::SeqCst);
-        }
-        let wheels = process.bif_timer_wheels.load(Ordering::SeqCst);
         for (worker, queue) in self.timer_commands.iter().enumerate() {
-            if wheels & timer_wheel_bit(worker) == 0 {
+            let ids = self.bif_timer_ids(pid, worker);
+            if ids.is_empty() {
                 continue;
             }
-            queue.push(if pause {
-                TimerCommand::PauseTarget { pid }
-            } else {
-                TimerCommand::ResumeTarget { pid }
-            });
+            queue.push(TimerCommand::PauseTarget { pid, ids });
             self.wake_worker(worker);
         }
     }
 
-    /// The receiver of a BIF timer about to enter a wheel when its timers are paused.
-    fn paused_receiver(&self, payload: &TimerPayload<T::Message>) -> Option<Pid> {
-        let TimerPayload::Message(target, _, _) = payload else {
-            return None;
+    /// The last resume re-arms the held timers with the time they had left, each with a fresh
+    /// identity, on the resuming scheduler's wheel.
+    fn resume_bif_timers(&self, pid: Pid, process: &Process<T>) {
+        let list = {
+            let mut btm = process.btm.lock().unwrap();
+            let Some(held) = btm.paused.as_mut() else {
+                return;
+            };
+            held.count -= 1;
+            if held.count > 0 {
+                return;
+            }
+            btm.paused.take().map(|held| held.list).unwrap_or_default()
         };
-        self.table
-            .with_live(*target, |process| {
-                process.bif_timers_paused.load(Ordering::SeqCst)
-            })
-            .filter(|paused| *paused)
-            .map(|_| *target)
+        let worker = self
+            .current_worker()
+            .filter(|worker| *worker < self.timer_commands.len())
+            .unwrap_or(pid.number() as usize % self.timer_commands.len());
+        for (remaining, payload) in list {
+            process
+                .bif_timer_wheels
+                .fetch_or(timer_wheel_bit(worker), Ordering::AcqRel);
+            let id = self.next_timer.fetch_add(1, Ordering::Relaxed);
+            let _ = self.insert_timer(worker, id, payload, None, remaining.max(1));
+        }
     }
 
     fn owner_timer_service(&self, worker: usize) -> Option<Rc<RefCell<TimerService<T::Message>>>> {
@@ -3003,11 +3150,13 @@ impl<T: Task> Inner<T> {
                 // OTP-29.1.1.
                 let due = {
                     let mut service = local.timer_service.borrow_mut();
-                    if service.wheel.next_timeout().is_some_and(|next| now >= next) {
+                    let due = if service.wheel.next_timeout().is_some_and(|next| now >= next) {
                         service.wheel.advance(now)
                     } else {
                         Vec::new()
-                    }
+                    };
+                    self.apply_link_events(&mut service.wheel);
+                    due
                 };
                 for (id, event) in due {
                     self.fire_timer(worker, id, event, Some(local));
@@ -3034,7 +3183,12 @@ impl<T: Task> Inner<T> {
             return;
         }
         let now = self.clock.now_ms();
-        let due = wheel.lock().unwrap().advance(now);
+        let due = {
+            let mut wheel = wheel.lock().unwrap();
+            let due = wheel.advance(now);
+            self.apply_link_events(&mut wheel);
+            due
+        };
         for (id, event) in due {
             self.fire_timer(worker, id, event, None);
         }
@@ -3066,9 +3220,6 @@ impl<T: Task> Inner<T> {
                     if !service.wheel.has_timers() {
                         let _ = service.wheel.advance(self.clock.now_ms());
                     }
-                    if let Some(target) = self.paused_receiver(&payload) {
-                        service.wheel.ensure_paused(target);
-                    }
                     service.wheel.insert(id, deadline, payload);
                 }
                 TimerCommand::Read { id, callback } => {
@@ -3081,20 +3232,11 @@ impl<T: Task> Inner<T> {
                         .map(|(remaining, _)| remaining);
                     callback(remaining);
                 }
-                TimerCommand::CancelTarget { pid } => {
-                    service.wheel.cancel_target(pid);
+                TimerCommand::CancelTarget { ids } => {
+                    service.wheel.cancel_target(&ids);
                 }
-                TimerCommand::PauseTarget { pid } => {
-                    service.wheel.pause_target(pid, self.clock.now_ms());
-                }
-                TimerCommand::ResumeTarget { pid } => {
-                    let now = self.clock.now_ms();
-                    if !service.wheel.has_timers() {
-                        let _ = service.wheel.advance(now);
-                    }
-                    service.wheel.resume_target(pid, now, || {
-                        self.next_timer.fetch_add(1, Ordering::Relaxed)
-                    });
+                TimerCommand::PauseTarget { pid, ids } => {
+                    service.wheel.pause_target(pid, &ids, self.clock.now_ms());
                 }
             }
         }
@@ -3102,6 +3244,7 @@ impl<T: Task> Inner<T> {
         while let Some(canceled) = canceled_queue.pop() {
             service.wheel.cancel_at(canceled.id, self.clock.now_ms());
         }
+        self.apply_link_events(&mut service.wheel);
     }
 
     /// The owner's wheel with every request queued before this call applied, so a
@@ -3283,6 +3426,20 @@ impl<T: Task> Inner<T> {
             self.fire_timer(worker, id, payload, local);
             return Ok(TimerRef { worker, id });
         }
+        self.insert_timer(worker, id, payload, local, ms)
+    }
+
+    /// Puts a timer with identity `id` on the wheel of `worker`: directly when the caller owns
+    /// the wheel, as a request to the owner otherwise.
+    // Port of erts/emulator/beam/erl_hl_timer.c:2661-2695 (create_tw_timer / create_hl_timer).
+    fn insert_timer(
+        &self,
+        worker: usize,
+        id: u64,
+        payload: TimerPayload<T::Message>,
+        local: Option<&mut Local<T>>,
+        ms: u64,
+    ) -> Result<TimerRef, Error> {
         let now = self.clock.now_ms();
         let deadline = now.saturating_add(ms.max(1));
         if let Some(local) = local.filter(|local| local.worker_id == worker) {
@@ -3290,19 +3447,15 @@ impl<T: Task> Inner<T> {
             if !service.wheel.has_timers() {
                 let _ = service.wheel.advance(now);
             }
-            if let Some(target) = self.paused_receiver(&payload) {
-                service.wheel.ensure_paused(target);
-            }
             service.wheel.insert(id, deadline, payload);
+            self.apply_link_events(&mut service.wheel);
         } else if let Some(service) = self.owner_timer_service(worker) {
             let mut service = service.borrow_mut();
             if !service.wheel.has_timers() {
                 let _ = service.wheel.advance(now);
             }
-            if let Some(target) = self.paused_receiver(&payload) {
-                service.wheel.ensure_paused(target);
-            }
             service.wheel.insert(id, deadline, payload);
+            self.apply_link_events(&mut service.wheel);
         } else if let Some(timers) = self.sim_timers.as_ref() {
             let Some(wheel) = timers.get(worker) else {
                 return Err(Error::NoProcess);
@@ -3312,6 +3465,7 @@ impl<T: Task> Inner<T> {
                 let _ = wheel.advance(now);
             }
             wheel.insert(id, deadline, payload);
+            self.apply_link_events(&mut wheel);
         } else if let Some(queue) = self.timer_commands.get(worker) {
             // Port of erts/emulator/beam/erl_hl_timer.c:2731 (erts_start_timer_callback),
             // OTP-29.1.1: a thread that does not own the wheel schedules the insertion as
@@ -3358,10 +3512,10 @@ impl<T: Task> Inner<T> {
             let remaining = timers
                 .get(reference.worker)
                 .and_then(|wheel| {
-                    wheel
-                        .lock()
-                        .unwrap()
-                        .cancel_at(reference.id, self.clock.now_ms())
+                    let mut wheel = wheel.lock().unwrap();
+                    let canceled = wheel.cancel_at(reference.id, self.clock.now_ms());
+                    self.apply_link_events(&mut wheel);
+                    canceled
                 })
                 .map(|entry| entry.0);
             callback(remaining);
@@ -3370,11 +3524,12 @@ impl<T: Task> Inner<T> {
         if let Some(service) = self.owner_timer_service_synced(reference.worker) {
             // The wheel's own `now` lags the clock between advances; remaining
             // time is measured against the current time.
-            let remaining = service
-                .borrow_mut()
-                .wheel
-                .cancel_at(reference.id, self.clock.now_ms())
-                .map(|(remaining, _)| remaining);
+            let remaining = {
+                let mut service = service.borrow_mut();
+                let canceled = service.wheel.cancel_at(reference.id, self.clock.now_ms());
+                self.apply_link_events(&mut service.wheel);
+                canceled.map(|(remaining, _)| remaining)
+            };
             callback(remaining);
             return;
         }
@@ -3400,13 +3555,22 @@ impl<T: Task> Inner<T> {
             return None;
         }
         let service = self.owner_timer_service_synced(reference.worker)?;
+        self.access_service_timer(&service, reference, cancel)
+    }
+
+    /// The access itself, on the wheel of the scheduler the caller runs on.
+    fn access_service_timer(
+        &self,
+        service: &Rc<RefCell<TimerService<T::Message>>>,
+        reference: TimerRef,
+        cancel: bool,
+    ) -> Option<Option<u64>> {
         let now = self.clock.now_ms();
         let mut service = service.borrow_mut();
         Some(if cancel {
-            service
-                .wheel
-                .cancel_at(reference.id, now)
-                .map(|(remaining, _)| remaining)
+            let canceled = service.wheel.cancel_at(reference.id, now);
+            self.apply_link_events(&mut service.wheel);
+            canceled.map(|(remaining, _)| remaining)
         } else {
             service.wheel.remaining_at(reference.id, now)
         })
@@ -4489,13 +4653,18 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     fn cancel_target_timers(&mut self, pid: Pid) {
         if let Some(timers) = self.inner.sim_timers.as_ref() {
             for wheel in timers {
-                wheel.lock().unwrap().cancel_target(pid);
+                let mut wheel = wheel.lock().unwrap();
+                let ids = self.inner.bif_timer_ids(pid, wheel.worker());
+                wheel.cancel_target(&ids);
+                self.inner.apply_link_events(&mut wheel);
             }
+            self.inner.destroy_paused_bif_timers(pid);
             return;
         }
         // Port of erts/emulator/beam/erl_hl_timer.c:2455 (erts_cancel_bif_timers), OTP-29.1.1:
         // only the wheels holding the receiver's timers are visited; a canceled timer on
         // another scheduler is handed to it as aux work.
+        self.inner.destroy_paused_bif_timers(pid);
         let wheels = self.inner.table.lookup(pid).map_or(u64::MAX, |process| {
             process.bif_timer_wheels.swap(0, Ordering::AcqRel)
         });
@@ -4510,20 +4679,26 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
         if let Some(local) = self.local.map(RefCell::borrow_mut).as_deref_mut()
             && wheels & timer_wheel_bit(local.worker_id) != 0
         {
-            local.timer_service.borrow_mut().wheel.cancel_target(pid);
+            let ids = self.inner.bif_timer_ids(pid, local.worker_id);
+            let mut service = local.timer_service.borrow_mut();
+            service.wheel.cancel_target(&ids);
+            self.inner.apply_link_events(&mut service.wheel);
         }
         for worker in 0..self.inner.timer_commands.len() {
             if Some(worker) == current_worker || wheels & timer_wheel_bit(worker) == 0 {
                 continue;
             }
+            let ids = self.inner.bif_timer_ids(pid, worker);
             if let Some(service) = self.inner.owner_timer_service(worker) {
-                service.borrow_mut().wheel.cancel_target(pid);
+                let mut service = service.borrow_mut();
+                service.wheel.cancel_target(&ids);
+                self.inner.apply_link_events(&mut service.wheel);
                 continue;
             }
             let Some(queue) = self.inner.timer_commands.get(worker) else {
                 continue;
             };
-            queue.push(TimerCommand::CancelTarget { pid });
+            queue.push(TimerCommand::CancelTarget { ids });
             self.inner.wake_worker(worker);
         }
     }
@@ -4860,7 +5035,7 @@ impl<T: Task> Scheduler<T> {
                 worker_id,
                 balance: balance.clone(),
                 timer_service: TimerService {
-                    wheel: Wheel::new(now),
+                    wheel: Wheel::new(now).for_worker(worker_id),
                     commands: timer_commands[worker_id].clone(),
                     canceled: canceled_timers[worker_id].clone(),
                 },
@@ -4895,8 +5070,11 @@ impl<T: Task> Scheduler<T> {
                 .map(|_| std::array::from_fn(|_| SegQueue::new()))
                 .collect(),
             stealers,
-            sim_timers: simulated
-                .then(|| (0..workers).map(|_| Mutex::new(Wheel::new(now))).collect()),
+            sim_timers: simulated.then(|| {
+                (0..workers)
+                    .map(|worker| Mutex::new(Wheel::new(now).for_worker(worker)))
+                    .collect()
+            }),
             timer_commands,
             canceled_timers,
             next_timer: AtomicU64::new(1),
@@ -5697,6 +5875,14 @@ impl<T: Task> Scheduler<T> {
     /// [`Inner::try_access_timer_local`]. The outer `None` means a request is needed.
     pub fn try_access_timer_local(&self, timer: TimerRef, cancel: bool) -> Option<Option<u64>> {
         self.inner.try_access_timer_local(timer, cancel)
+    }
+
+    /// The number of BIF timers in `pid`'s bif-timer tree (`p->bif_timers`).
+    pub fn bif_timers_of(&self, pid: Pid) -> usize {
+        self.inner
+            .table
+            .with_live(pid, |process| process.btm.lock().unwrap().tree.len())
+            .unwrap_or(0)
     }
 
     /// The BIF timer created with Erlang reference key `key`; see [`TimerRef::from_ref_key`].
@@ -6677,6 +6863,9 @@ trait NativeSend<M> {
         msg: M,
         wrapped: bool,
     ) -> Result<Result<TimerRef, Error>, M>;
+    /// Cancel or read the BIF timer with reference key `key` when this scheduler's wheel owns
+    /// it. The outer `None` means another scheduler owns it, or no wheel is reachable here.
+    fn access_bif_timer(&self, key: u64, cancel: bool) -> Option<Option<u64>>;
 }
 
 /// The handle a normal scheduler thread installs for native code: its own run queue state
@@ -6726,6 +6915,27 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
             Some(&mut local),
             None,
         ))
+    }
+
+    // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): the reference carries
+    // the scheduler id; when it is the calling scheduler, its own btm tree answers.
+    fn access_bif_timer(&self, key: u64, cancel: bool) -> Option<Option<u64>> {
+        if self.inner.sim_timers.is_some() {
+            return None;
+        }
+        let reference = TimerRef::from_ref_key(key, self.inner.timer_commands.len());
+        let local = self.local.upgrade()?;
+        let service = {
+            let local = local.try_borrow().ok()?;
+            if local.worker_id != reference.worker {
+                return None;
+            }
+            Rc::clone(&local.timer_service)
+        };
+        if let Ok(mut borrowed) = service.try_borrow_mut() {
+            self.inner.run_timer_commands(&mut borrowed);
+        }
+        self.inner.access_service_timer(&service, reference, cancel)
     }
 
     fn start_resolved_timer(
@@ -6823,6 +7033,13 @@ pub fn native_start_timer<M: SignalMessage>(
         Some(Err(msg)) => Err(msg),
         None => Err(msg.take().expect("message not sent")),
     }
+}
+
+/// Cancels or reads the BIF timer with reference key `key` from native code, on the calling
+/// scheduler's own wheel. `None` when another scheduler owns the timer or the thread is no
+/// normal scheduler; the caller then goes through a request.
+pub fn native_access_timer<M: SignalMessage>(key: u64, cancel: bool) -> Option<Option<u64>> {
+    native_sender::with::<M, _>(|handle| handle.access_bif_timer(key, cancel)).flatten()
 }
 
 /// [`native_start_timer`] for a target resolved when the timer expires.
@@ -7302,6 +7519,22 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     OWNER_TIMER_SERVICES.with(|services| {
         services.borrow_mut().remove(&inner_id);
     });
+}
+
+/// What the receiver's BTM lock (`ERTS_PROC_LOCK_BTM`) protects: `p->bif_timers`, the BIF
+/// timers aimed at the process (timer id to the scheduler whose wheel holds it), inserted when
+/// the timer is created, removed when it fires or is canceled and walked on exit
+/// (erts_cancel_bif_timers); and `p->paused_bif_timers`, set while a suspend holds them, with the
+/// timers taken off the wheels and the time each had left.
+struct ProcBtm<M> {
+    tree: std::collections::BTreeMap<u64, usize>,
+    paused: Option<PausedBifTimers<M>>,
+}
+
+/// Port of erts/emulator/beam/erl_process.h (`ErtsPausedBifTimers`), OTP-29.1.1.
+struct PausedBifTimers<M> {
+    count: u32,
+    list: Vec<(u64, TimerPayload<M>)>,
 }
 
 /// Bit of `Process::bif_timer_wheels` for scheduler `worker`'s timer wheel.

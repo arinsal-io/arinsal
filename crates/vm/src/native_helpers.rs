@@ -1399,6 +1399,23 @@ fn timer_query_native(header: *mut ProcessHeader, descriptor: u64, cancel: bool)
         true
     };
     let reference = registers.x_reg_array[0];
+    // Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer): a reference made on
+    // this scheduler names a timer on its own wheel, which answers without any request.
+    if process.pending_signal_waiter.is_none()
+        && let Some(key) = crate::signals::ref_id(reference)
+        && let Some(remaining) =
+            arinsal_sched::native_access_timer::<crate::process::Message>(key, cancel)
+    {
+        let term = if !info {
+            crate::signals::atom("ok")
+        } else {
+            remaining
+                .and_then(|ms| Term::small(ms as i64))
+                .unwrap_or_else(|| crate::signals::atom("false"))
+        };
+        registers.x_reg_array[0] = term;
+        return Some(crate::native_hooks::raw(term));
+    }
     let term =
         crate::signals::timer_query_sync(process, process.self_pid?, reference, cancel, info)
             .ok()?;

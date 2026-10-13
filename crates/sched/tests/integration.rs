@@ -472,6 +472,39 @@ fn pid_generation_and_timer_firing() {
 }
 
 #[test]
+fn bif_timer_tree_follows_create_fire_cancel_and_exit() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let sched = Scheduler::simulation(
+        Config {
+            max_processes: 4,
+            ..Config::default()
+        },
+        3,
+    );
+    let pid = sched.spawn(CountTask(counter)).unwrap();
+    sched.step();
+    assert_eq!(sched.bif_timers_of(pid), 0);
+    let fires = sched.start_timer(pid, 10, ()).unwrap();
+    let cancelled = sched.start_timer(pid, 20, ()).unwrap();
+    let kept = sched.send_after(pid, 30, ()).unwrap();
+    assert_eq!(sched.bif_timers_of(pid), 3);
+    assert_eq!(sched.cancel_timer(cancelled), Some(20));
+    assert_eq!(sched.bif_timers_of(pid), 2);
+    sched.advance_ms(10).unwrap();
+    assert_eq!(sched.cancel_timer(fires), None);
+    assert_eq!(sched.bif_timers_of(pid), 1);
+    sched.pause_target_timers(pid);
+    assert_eq!(sched.bif_timers_of(pid), 0);
+    sched.resume_target_timers(pid);
+    assert_eq!(sched.bif_timers_of(pid), 1);
+    assert_eq!(
+        sched.cancel_timer(kept),
+        None,
+        "resume re-arms with a fresh identity"
+    );
+}
+
+#[test]
 fn timer_envelope_and_wait_timeout_cancellation() {
     struct Timed {
         runs: Arc<AtomicUsize>,
