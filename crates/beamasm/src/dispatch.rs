@@ -33,6 +33,8 @@ pub struct DispatchFragments {
     apply_fixed_offset: usize,
     apply2_offset: usize,
     apply3_offset: usize,
+    /// The beam_run_process stub (erl_process.c:12616): start and end addresses, when built.
+    run_process_offsets: Option<(usize, usize)>,
     save_calls_export_offset: usize,
     apply_fun_offset: usize,
     unloaded_fun_offset: usize,
@@ -102,6 +104,9 @@ pub struct DispatchRuntimeHelpers {
     pub compare: CompareHelpers,
     /// Native line-breakpoint helpers.
     pub line_breakpoint: LineBreakpointHelpers,
+    /// `apply/3` resolver of the run-process stub (`arinsal_beamasm_apply3_resolver`). Zero builds
+    /// no stub.
+    pub apply3_resolver: usize,
 }
 
 /// Sentinel `CallUnported.target_pc` for a fun call that must resume in the interpreter.
@@ -212,6 +217,7 @@ impl DispatchFragments {
             save_calls_fun: save_calls_fun_helper,
             compare,
             line_breakpoint: LineBreakpointHelpers::default(),
+            apply3_resolver: 0,
         })
     }
 
@@ -230,6 +236,7 @@ impl DispatchFragments {
             save_calls_fun: save_calls_fun_helper,
             compare,
             line_breakpoint: line_breakpoint_helpers,
+            apply3_resolver,
         } = helpers;
         let mut code = CodeBuffer::new();
         let export = code.new_label();
@@ -242,6 +249,7 @@ impl DispatchFragments {
         let apply_fixed = code.new_label();
         let apply2 = code.new_label();
         let apply3 = code.new_label();
+        let run_process = code.new_label();
         let save_calls_export = code.new_label();
         let apply_fun = code.new_label();
         let unloaded_fun = code.new_label();
@@ -292,6 +300,14 @@ impl DispatchFragments {
                 .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
             emit_unported_fragment(&mut code, sentinel)
                 .map_err(|_| ExecError::InvalidSize("apply unported fragment"))?;
+        }
+        // Port of erts/emulator/beam/beam_emu.c:693-694 (beam_run_process = op_i_apply_only): the
+        // start stub applies X0..X2 and branches to the resolved code, as a tail call.
+        code.bind(run_process)
+            .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
+        if apply3_resolver != 0 {
+            emit_run_process_fragment(&mut code, apply3_resolver)
+                .map_err(|_| ExecError::InvalidSize("run-process fragment"))?;
         }
         code.bind(save_calls_export)
             .map_err(|_| ExecError::InvalidSize("dispatch fragment"))?;
@@ -348,6 +364,8 @@ impl DispatchFragments {
             apply_fixed_offset: labels[&apply_fixed],
             apply2_offset: labels[&apply2],
             apply3_offset: labels[&apply3],
+            run_process_offsets: (apply3_resolver != 0)
+                .then(|| (labels[&run_process], labels[&save_calls_export])),
             save_calls_export_offset: labels[&save_calls_export],
             apply_fun_offset: labels[&apply_fun],
             unloaded_fun_offset: labels[&unloaded_fun],
@@ -404,6 +422,16 @@ impl DispatchFragments {
     /// Entry that hands `apply/2` to the interpreter.
     pub fn apply2_unported(&self) -> usize {
         self.memory.ptr_at(self.apply2_offset) as usize
+    }
+
+    /// The beam_run_process stub: `(start, end)` addresses, or `None` when it was not built.
+    pub fn run_process(&self) -> Option<(usize, usize)> {
+        self.run_process_offsets.map(|(start, end)| {
+            (
+                self.memory.ptr_at(start) as usize,
+                self.memory.ptr_at(end) as usize,
+            )
+        })
     }
 
     /// Entry that hands `apply/3` to the interpreter.
@@ -1387,6 +1415,32 @@ fn emit_restore_and_exit_frame(code: &mut CodeBuffer, frame_bytes: u16) -> Resul
 ///
 /// Expects the call continuation in `x30` (set by the caller before the branch); any
 /// argument the scheduler needs (the arity, the fun) is already published in `c_p`.
+/// The beam_run_process stub: `apply/3` on X0..X2 through the runtime resolver, then a tail branch
+/// to the resolved code (erts `emit_variable_apply` + `emit_i_apply_only`, instr_call.cpp:205-261).
+/// The process starts with no Erlang frame: the continuation in x30 is the exit bridge, so it is
+/// kept, not popped. The resolver returns the target, or the interpreter fragment.
+// Port of erts/emulator/beam/jit/arm/instr_call.cpp:205-261 (emit_variable_apply, emit_i_apply_only),
+// erts/emulator/beam/beam_emu.c:693-694 (beam_run_process), OTP-29.1.1.
+fn emit_run_process_fragment(code: &mut CodeBuffer, resolver: usize) -> Result<(), BufferError> {
+    // All cached X registers: the resolved target's arguments may be any of them.
+    emit_enter_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.mov_reg(Gpr::x(0), Gpr::x(21))?;
+        // The resolver may run Erlang code (traps, error handlers); the caller's x30 is kept in the
+        // header, as the module-level apply does (bif.rs emit_bif_runtime_call).
+        encoder.str_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+        encoder.mov_const(Gpr::x(17), resolver as u64)?;
+        encoder.blr(Gpr::x(17))
+    })?;
+    emit_leave_runtime(code, 6, RUNTIME_UPDATE)?;
+    code.emit(|encoder| {
+        encoder.ldr_uoff(Gpr::x(30), Gpr::x(21), 72)?;
+        encoder.mov_reg(Gpr::x(14), Gpr::x(0))?;
+        encoder.br(Gpr::x(14))
+    })?;
+    Ok(())
+}
+
 fn emit_unported_fragment(code: &mut CodeBuffer, sentinel: usize) -> Result<(), BufferError> {
     code.emit(|encoder| {
         // Preserve the native continuation as a BEAM CP for the interpreter return path.
