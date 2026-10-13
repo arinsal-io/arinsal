@@ -45,6 +45,12 @@ impl HeapAlloc for Heap<'_> {
     fn supports_writable_binary(&self) -> bool {
         self.0.supports_writable_binary()
     }
+    fn retain_external_binary(&mut self, value: Arc<ExternalBinary>) -> Result<(), TermError> {
+        self.0.retain_external_binary(value)
+    }
+    fn supports_external_binary(&self) -> bool {
+        self.0.supports_external_binary()
+    }
     fn retain_node(&mut self, value: Arc<Node>) {
         self.0.retain_node(value)
     }

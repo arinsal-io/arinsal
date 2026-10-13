@@ -295,6 +295,49 @@ fn tracer_mod_sequential_tracer_matches_erts() {
 }
 
 #[test]
+fn sub_binaries_of_a_resource_binary_match_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    let dir = work_dir("resbin");
+    let library = compile_so(
+        &dir,
+        "nifdyn_resbin",
+        r#"
+        #include "erl_nif.h"
+        static ErlNifResourceType* buffer_type;
+        static int load(ErlNifEnv* env, void** priv, ERL_NIF_TERM info) {
+            (void)priv; (void)info;
+            buffer_type = enif_open_resource_type(env, NULL, "nifdyn_resbin_buffer", NULL,
+                                                  ERL_NIF_RT_CREATE, NULL);
+            return buffer_type ? 0 : 1;
+        }
+        static ERL_NIF_TERM make(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            int i;
+            char* data;
+            ERL_NIF_TERM binary;
+            (void)argc; (void)argv;
+            data = enif_alloc_resource(buffer_type, 200);
+            for (i = 0; i < 200; i++) data[i] = (char)('a' + i % 26);
+            binary = enif_make_resource_binary(env, data, data, 200);
+            enif_release_resource(data);
+            return binary;
+        }
+        static ErlNifFunc funcs[] = {{"make", 0, make, 0}};
+        ERL_NIF_INIT(nifdyn_resbin, funcs, load, NULL, NULL, NULL)
+        "#,
+    );
+    let source = format!(
+        "-module(nifdyn_resbin).\n-export([run/0, make/0]).\n-nifs([make/0]).\nrun() ->\n    ok = erlang:load_nif(\"{}\", []),\n    B = make(),\n    Part = binary_part(B, 100, 80),\n    {{Head, Tail}} = split_binary(B, 120),\n    Nested = binary_part(Part, 10, 70),\n    Small = binary_part(B, 0, 4),\n    {{SmallHead, _}} = split_binary(B, 4),\n    {{byte_size(B), Part, Head, Tail, binary:part(B, {{199, -99}}), Nested, binary:copy(Nested), Small, SmallHead}}.\nmake() -> erlang:nif_error(undef).\n",
+        library.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_resbin", &source);
+    assert_same(&dir, &erl, "nifdyn_resbin");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn load_errors_and_roundtrip_match_erts() {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping dynamic NIF differential test");
