@@ -1127,8 +1127,13 @@ pub(crate) struct CompiledVersion {
     line_breakpoints: Vec<(u32, usize, u32)>,
     // Return addresses of enabled line-breakpoint hits, ascending.
     line_breakpoint_returns: Vec<(usize, usize)>,
-    // Function, arity, call-NIF identity and the patch word that enables its body.
+    // Function, arity, call-NIF site (an index into `nif_sites`) and the patch word that
+    // enables its body.
     nif_patches: Vec<(String, u8, usize, usize)>,
+    // Every call-NIF site compiled into this version's code, which refers to their addresses;
+    // each site is boxed so its address stays put.
+    #[allow(clippy::vec_box)]
+    nif_sites: Vec<Box<crate::native_helpers::NativeNifSite>>,
     literal_heap: Option<Arc<VecHeap>>,
     // The module's literal area, which native code refers to directly.
     _module_literals: arinsal_loader::LiteralArea,
@@ -1260,25 +1265,39 @@ impl CompiledVersion {
             .filter(|function| pc < function.end)
     }
 
-    /// Makes native entries of `function/arity` run the NIF `entry` loaded by `load_nif`.
-    // Port of erts/emulator/beam/erl_nif.c:5050-5260 (patch_call_nif_early and the load_nif
-    // finishers), OTP-29.1.1.
-    pub(crate) fn bind_nif(&self, function: &str, arity: u8, entry: arinsal_bifs::BifFn) -> bool {
-        let Some((_, _, identity, offset)) = self
-            .nif_patches
+    fn nif_patch(&self, function: &str, arity: u8) -> Option<(usize, usize)> {
+        self.nif_patches
             .iter()
             .find(|(name, found, _, _)| name == function && *found == arity)
-        else {
+            .map(|(_, _, site, offset)| (*site, *offset))
+    }
+
+    /// Writes the `call_nif` operands of `function/arity`, loaded by `load_nif`, into its
+    /// call-NIF site.
+    // Port of erts/emulator/beam/erl_nif.c:5149-5160 (load_nif_1st_finisher), OTP-29.1.1.
+    pub(crate) fn bind_nif(
+        &self,
+        function: &str,
+        arity: u8,
+        native: crate::natives::nif::NativeFn,
+    ) -> bool {
+        self.nif_patch(function, arity)
+            .and_then(|(site, _)| self.nif_sites.get(site))
+            .is_some_and(|site| site.bind(native))
+    }
+
+    /// Makes native entries of `function/arity` run their bound NIF.
+    // Port of erts/emulator/beam/erl_nif.c:5248-5250 (load_nif_2nd_finisher removes the
+    // call_nif_early breakpoint), OTP-29.1.1.
+    pub(crate) fn enable_nif(&self, function: &str, arity: u8) -> bool {
+        let Some((_, offset)) = self.nif_patch(function, arity) else {
             return false;
         };
-        if !crate::native_helpers::bind_nif_slot(*identity, entry) {
-            return false;
-        }
         let Ok(mut memory) = self.memory.lock() else {
             return false;
         };
         memory
-            .write_bytes(*offset, &0xd503_201f_u32.to_le_bytes())
+            .write_bytes(offset, &0xd503_201f_u32.to_le_bytes())
             .is_ok()
     }
 
@@ -1331,9 +1350,6 @@ impl Drop for CompiledVersion {
             }
             arinsal_pterm::store_for(self.scope).retire_module_area(heap);
         }
-        crate::native_helpers::release_nif_slots(
-            self.nif_patches.iter().map(|(_, _, identity, _)| *identity),
-        );
         crate::native_bridge::unregister_native_functions(&self.native_functions);
         crate::native_bridge::unregister_native_catches(self.scope, &self.catch_ids);
         unpublish_module(self.scope, &self.native_targets);
@@ -1396,8 +1412,9 @@ struct VmModuleEnv<'a> {
     module_name: String,
     code_index: usize,
     module_id: u32,
-    // Call-NIF bodies reserved for functions a later load_nif may replace.
-    dynamic_nifs: std::cell::RefCell<HashMap<(String, u8), usize>>,
+    // Call-NIF sites of functions a later load_nif may replace.
+    dynamic_nifs:
+        std::cell::RefCell<HashMap<(String, u8), Box<crate::native_helpers::NativeNifSite>>>,
     _lifetime: std::marker::PhantomData<&'a BeamFile>,
 }
 
@@ -1643,20 +1660,17 @@ impl ModuleEnv for VmModuleEnv<'_> {
     }
 
     fn dynamic_nif_body(&self, name: &str, arity: u8) -> Option<(usize, usize)> {
-        let identity = *self
-            .dynamic_nifs
-            .borrow_mut()
-            .entry((name.to_owned(), arity))
-            .or_insert_with(|| {
-                crate::native_helpers::reserve_nif_slot(
-                    self.module_name.clone(),
-                    name.to_owned(),
-                    arity,
-                )
-            });
+        let mut sites = self.dynamic_nifs.borrow_mut();
+        let site = sites.entry((name.to_owned(), arity)).or_insert_with(|| {
+            crate::native_helpers::NativeNifSite::new(
+                self.module_name.clone(),
+                name.to_owned(),
+                arity,
+            )
+        });
         Some((
-            identity,
-            crate::native_helpers::arinsal_beamasm_static_nif as *const () as usize,
+            std::ptr::from_ref::<crate::native_helpers::NativeNifSite>(site) as usize,
+            crate::native_helpers::arinsal_beamasm_call_nif as *const () as usize,
         ))
     }
 
@@ -1927,7 +1941,14 @@ pub(crate) fn compile(
     }
     // Fun entries whose dispatch this version may publish; purging the version resets them.
     let lambda_entries = env.lambda_entries.values().cloned().collect::<Vec<_>>();
-    let reserved = env.dynamic_nifs.take();
+    // Every site stays with the code: the code of a function whose compilation failed may
+    // still hold the address of its site.
+    let mut site_index = HashMap::new();
+    let mut nif_sites = Vec::new();
+    for (key, site) in env.dynamic_nifs.take() {
+        site_index.insert(key, nif_sites.len());
+        nif_sites.push(site);
+    }
     let nif_patches = compiled
         .native
         .nif_patches
@@ -1937,16 +1958,10 @@ pub(crate) fn compile(
                 .functions
                 .iter()
                 .find(|function| function.label == label)?;
-            let identity = *reserved.get(&(function.name.clone(), function.arity))?;
-            Some((function.name.clone(), function.arity, identity, offset))
+            let site = *site_index.get(&(function.name.clone(), function.arity))?;
+            Some((function.name.clone(), function.arity, site, offset))
         })
         .collect::<Vec<_>>();
-    let unused = reserved
-        .values()
-        .copied()
-        .filter(|identity| !nif_patches.iter().any(|patch| patch.2 == *identity))
-        .collect::<Vec<_>>();
-    crate::native_helpers::release_nif_slots(unused);
     drop(env);
     MODULES.fetch_add(1, Ordering::Relaxed);
     NATIVE.fetch_add(runtime_functions.len() as u64, Ordering::Relaxed);
@@ -2116,6 +2131,7 @@ pub(crate) fn compile(
             .map(|(resume, site)| (code_start + resume, code_start + site))
             .collect(),
         nif_patches,
+        nif_sites,
         literal_heap: Some(Arc::from(literal_heap)),
         _module_literals: module.literal_area(),
         native_functions,

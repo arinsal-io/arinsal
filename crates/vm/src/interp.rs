@@ -2325,10 +2325,10 @@ impl Vm {
                                 &mut p.reductions,
                                 pending,
                             ),
-                            None => calls::call_bif(
+                            None => natives::nif::call_native(
                                 &mut p.heap,
                                 &mut p.reductions,
-                                native,
+                                &native,
                                 &p.x[..arity],
                             ),
                         }
