@@ -1,0 +1,4 @@
+run,config,after_boot_footprint_mib,after_boot_rss_mib,idle_footprint_mib,idle_rss_mib,lifetime_max_footprint_mib,boot_cpu_s,boot_cpu_user_s,boot_cpu_sys_s,idle_interval_s,idle_cpu_s,nthreads,idle_cores,erlang_memory_total_mib,erlang_memory_processes_mib,erlang_memory_binary_mib,erlang_memory_ets_mib,erlang_memory_system_mib,erlang_memory_code_mib,erlang_memory_atom_mib
+idle-erts,erts,179.8916,218.6719,172.0010,210.7812,180.8291,3.4063,2.1980,1.2084,31.0430,1.9223,156,0.0619,76.3877,20.7988,0.5174,1.7724,55.5889,17.9198,0.9613
+idle-arinsal-patched,arinsal-patched,479.5638,618.6250,481.0951,621.7969,481.0951,6.0134,5.2887,0.7247,31.0320,2.8892,156,0.0931,33.4804,9.6260,0.3874,1.2716,23.8544,19.8991,2.1195
+idle-arinsal-fast,arinsal-fast,481.1107,615.8594,482.3295,617.0625,482.3295,5.8034,5.0827,0.7207,31.0170,2.8266,156,0.0911,33.4079,9.5586,0.3885,1.2716,23.8494,19.8991,2.1224

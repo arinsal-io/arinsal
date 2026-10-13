@@ -1,0 +1,56 @@
+# crashed-arinsal-fast-2/server.log, panic messages and frames (std/core source lines removed)
+thread '8_scheduler' (42820088) panicked at crates/term/src/internal_hash.rs:404:26:
+unsupported term kind in internal_hash: Invalid
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: arinsal_term::internal_hash::internal_salted_hash
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/term/src/internal_hash.rs:404:26
+   3: arinsal_term::internal_hash::internal_hash
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/term/src/internal_hash.rs:109:5
+   4: arinsal_ets::hash::ets_hash
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/hash.rs:31:5
+   5: <arinsal_ets::Table>::insert
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/lib.rs:2514:24
+   6: <arinsal_ets::Table>::update_counter_big
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/ets/src/lib.rs:3910:14
+   7: arinsal_vm::natives::ets::call_inner
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:2126:18
+   8: arinsal_vm::natives::ets::direct_bif::<38>
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:537:18
+   9: arinsal_vm::natives::ets::direct_update_counter::{closure#0}
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:765:21
+  10: <core::option::Option<arinsal_term::Term>>::or_else::<arinsal_vm::natives::ets::direct_update_counter::{closure#0}>
+  11: arinsal_vm::natives::ets::direct_update_counter
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/natives/ets.rs:765:10
+  12: arinsal_vm::native_helpers::call_direct_bif
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:2367:17
+  13: arinsal_vm::native_helpers::direct_bif_light
+             at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:1795:24
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+thread '8_scheduler' (42820088) panicked at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/core/src/panicking.rs:225:5:
+panic in a function that cannot unwind
+stack backtrace:
+   0:        0x1032cbaac - std[5d97c59e5e5fafcc]::backtrace_rs::backtrace::libunwind::trace
+   1:        0x1032cbaac - std[5d97c59e5e5fafcc]::backtrace_rs::backtrace::trace_unsynchronized::<std[5d97c59e5e5fafcc]::sys::backtrace::_print_fmt::{closure#1}>
+   2:        0x1032cbaac - std[5d97c59e5e5fafcc]::sys::backtrace::_print_fmt
+   3:        0x1032cbaac - <<std[5d97c59e5e5fafcc]::sys::backtrace::BacktraceLock>::print::DisplayBacktrace as core[663bb9e1522ba5ef]::fmt::Display>::fmt
+   4:        0x10327b308 - <core[663bb9e1522ba5ef]::fmt::rt::Argument>::fmt
+   5:        0x10327b308 - core[663bb9e1522ba5ef]::fmt::write
+   6:        0x1032d1dac - <std[5d97c59e5e5fafcc]::sys::stdio::unix::Stderr as std[5d97c59e5e5fafcc]::io::Write>::write_fmt
+   7:        0x1032ae720 - <std[5d97c59e5e5fafcc]::sys::backtrace::BacktraceLock>::print
+   8:        0x1032ae720 - std[5d97c59e5e5fafcc]::panicking::default_hook::{closure#0}
+   9:        0x1032c2be0 - std[5d97c59e5e5fafcc]::panicking::default_hook
+  10:        0x1032c2f40 - std[5d97c59e5e5fafcc]::panicking::panic_with_hook
+  11:        0x1032ae7cc - std[5d97c59e5e5fafcc]::panicking::panic_handler::{closure#0}
+  12:        0x1032a5d3c - std[5d97c59e5e5fafcc]::sys::backtrace::__rust_end_short_backtrace::<std[5d97c59e5e5fafcc]::panicking::panic_handler::{closure#0}, !>
+  13:        0x1032af468 - __rustc[100742bb89c490cb]::rust_begin_unwind
+  14:        0x1033ab010 - core[663bb9e1522ba5ef]::panicking::panic_nounwind_fmt::runtime
+  15:        0x1033ab010 - core[663bb9e1522ba5ef]::panicking::panic_nounwind_fmt
+  16:        0x1033aaf98 - core[663bb9e1522ba5ef]::panicking::panic_nounwind
+  17:        0x1033ab0ec - core[663bb9e1522ba5ef]::panicking::panic_cannot_unwind
+  18:        0x1030bcdb8 - arinsal_vm[80b08a9cab2d61f3]::native_helpers::direct_bif_light
+                               at /Users/sts/dev/sq/ingest-profile/arinsal-wt/crates/vm/src/native_helpers.rs:1782:1
+

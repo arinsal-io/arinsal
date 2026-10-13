@@ -1,0 +1,202 @@
+diff --git a/crates/bifs/src/pure.rs b/crates/bifs/src/pure.rs
+index 54c1e02..01942b1 100644
+--- a/crates/bifs/src/pure.rs
++++ b/crates/bifs/src/pure.rs
+@@ -45,6 +45,15 @@ impl HeapAlloc for Heap<'_> {
+     fn supports_writable_binary(&self) -> bool {
+         self.0.supports_writable_binary()
+     }
++    // EXPERIMENT (ingest-profile): forward resource-backed (enif_make_resource_binary)
++    // owners, so binary_part/split_binary on an ADBC Arrow buffer can make a sub-binary
++    // instead of failing with system_limit.
++    fn retain_external_binary(&mut self, value: Arc<ExternalBinary>) -> Result<(), TermError> {
++        self.0.retain_external_binary(value)
++    }
++    fn supports_external_binary(&self) -> bool {
++        self.0.supports_external_binary()
++    }
+     fn retain_node(&mut self, value: Arc<Node>) {
+         self.0.retain_node(value)
+     }
+diff --git a/crates/bifs/src/sys.rs b/crates/bifs/src/sys.rs
+index 82faf15..04cc7cb 100644
+--- a/crates/bifs/src/sys.rs
++++ b/crates/bifs/src/sys.rs
+@@ -116,6 +116,8 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+         }
+         "atom_count" | "process_count" | "port_count" => integer(ctx, 0),
+         "machine" => string(ctx, "BEAM"),
++        // EXPERIMENT (ingest-profile): ERTS reports its configure triple here.
++        "system_architecture" => string(ctx, &system_architecture()),
+         // Port of erts/emulator/beam/erl_bif_info.c (system_info emu_flavor), OTP-29.1.1.
+         "emu_flavor" => Ok(atom(
+             if EMU_FLAVOR_JIT.load(std::sync::atomic::Ordering::Relaxed) {
+@@ -206,6 +208,26 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+     }
+ }
+ 
++// EXPERIMENT (ingest-profile): `<arch>-apple-darwin<uname -r>` like ERTS's
++// configure triple on macOS (e.g. "aarch64-apple-darwin24.6.0").
++fn system_architecture() -> String {
++    let arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { std::env::consts::ARCH };
++    // SAFETY: uname fills a caller-owned struct and retains no pointers.
++    let release = unsafe {
++        let mut name: libc::utsname = std::mem::zeroed();
++        if libc::uname(&mut name) == 0 {
++            std::ffi::CStr::from_ptr(name.release.as_ptr()).to_string_lossy().into_owned()
++        } else {
++            String::new()
++        }
++    };
++    if cfg!(target_os = "macos") {
++        format!("{arch}-apple-darwin{release}")
++    } else {
++        format!("{arch}-unknown-{}-gnu", std::env::consts::OS)
++    }
++}
++
+ fn atom_list(ctx: &mut Ctx<'_>, names: &[&str]) -> Result<Term, BifError> {
+     let mut list = Term::NIL;
+     for name in names.iter().rev() {
+diff --git a/crates/ets/src/lib.rs b/crates/ets/src/lib.rs
+index 00bd269..864498a 100644
+--- a/crates/ets/src/lib.rs
++++ b/crates/ets/src/lib.rs
+@@ -2940,13 +2940,13 @@ impl Table {
+         if position == 0 {
+             return Err(EtsError::BadArg);
+         }
+-        if position > self.max_arity.load(AtomicOrdering::Relaxed) {
+-            return Err(if self.member(key) {
+-                EtsError::BadArg
+-            } else {
+-                EtsError::BadArgCause("badkey")
+-            });
+-        }
++        // EXPERIMENT (ingest-profile): the `max_arity` shortcut is skipped. The
++        // write_concurrency hash paths (insert_new_prepared_shared,
++        // update_or_insert_shared) store objects without raising `max_arity`, so on
++        // a `[:set, write_concurrency: true]` table whose objects all arrived via
++        // insert_new / update_counter-with-default, lookup_element/3 raised badarg
++        // for a present key (Elixir Registry.lookup/2 returned []).
++        // copy_element_out already rejects an out-of-range position.
+         match &self.storage {
+             Storage::Hash(storage) => {
+                 let hash = ets_hash(key);
+diff --git a/crates/vm/build.rs b/crates/vm/build.rs
+index 28cc3de..f235e95 100644
+--- a/crates/vm/build.rs
++++ b/crates/vm/build.rs
+@@ -16,7 +16,7 @@ fn main() {
+     so_bindtodevice_cfg();
+     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+     let mut table = String::from("&[");
+-    for index in 0..160 {
++    for index in 0..1024 { // EXPERIMENT (ingest-profile): was 160
+         table.push_str(&format!("dyn_call::<{index}>,"));
+     }
+     table.push(']');
+diff --git a/crates/vm/src/inet_drv.rs b/crates/vm/src/inet_drv.rs
+index 7fbaa67..d2c6159 100644
+--- a/crates/vm/src/inet_drv.rs
++++ b/crates/vm/src/inet_drv.rs
+@@ -564,6 +564,11 @@ fn dispatch(sock: &Arc<Sock>, caller: Pid, cmd: i64, data: &[u8]) -> Vec<u8> {
+             REQ_GETSTATUS => getstatus(&inner),
+             TCP_REQ_RECV => recv_req(&mut inner, caller, data),
+             TCP_REQ_SHUTDOWN => shutdown_sock(&inner, data),
++            // EXPERIMENT (ingest-profile): TCP_REQ_SENDFILE (inet_int.hrl 45) is not
++            // ported. Answer enotsup, which file:sendfile/5 turns into its
++            // read-and-send fallback, instead of exbadport, which it returns as is
++            // (Bandit/ThousandIsland send_file then fails every ranged response).
++            45 => err_bytes("enotsup"),
+             _ => err_bytes("exbadport"),
+         }
+     };
+diff --git a/crates/vm/src/natives/nif.rs b/crates/vm/src/natives/nif.rs
+index 9de43f3..93e2df7 100644
+--- a/crates/vm/src/natives/nif.rs
++++ b/crates/vm/src/natives/nif.rs
+@@ -21,7 +21,8 @@ use crate::calls;
+ use crate::process::Message;
+ use crate::{Process, Vm, VmError};
+ 
+-const TRAMPOLINES: usize = 160;
++// EXPERIMENT (ingest-profile): was 160; Explorer alone declares ~300 NIFs.
++const TRAMPOLINES: usize = 1024;
+ 
+ const TRACER_FUNCTIONS: &[(&str, u8)] = &[
+     ("trace", 5),
+@@ -518,16 +519,35 @@ fn filename_bytes(term: Term) -> Option<Vec<u8>> {
+     Some(bytes)
+ }
+ 
+-fn declared_nifs(vm: &Vm, module: &str) -> Result<HashSet<(String, u8)>, String> {
+-    let file = format!("{module}.beam");
+-    let path = vm
+-        .paths
+-        .iter()
+-        .map(|dir| dir.join(&file))
+-        .find(|path| path.is_file())
+-        .ok_or_else(|| format!("module {module} beam not found"))?;
+-    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+-    let beam = arinsal_beam::parse(&bytes).map_err(|error| error.to_string())?;
++fn declared_nifs(
++    vm: &Vm,
++    module_id: usize,
++    module: &str,
++) -> Result<HashSet<(String, u8)>, String> {
++    // EXPERIMENT (ingest-profile): prefer the BEAM the loader already parsed for
++    // this module. Mix adds dependency ebins with code:add_paths at runtime, so
++    // `vm.paths` (boot paths) does not contain them and the disk lookup fails
++    // with "module Elixir.Adbc.Nif beam not found".
++    let loaded = vm
++        .code
++        .code_meta
++        .get(module_id)
++        .and_then(|meta| meta.as_ref())
++        .map(|meta| meta.beam.clone());
++    let beam = match loaded {
++        Some(beam) => beam,
++        None => {
++            let file = format!("{module}.beam");
++            let path = vm
++                .paths
++                .iter()
++                .map(|dir| dir.join(&file))
++                .find(|path| path.is_file())
++                .ok_or_else(|| format!("module {module} beam not found"))?;
++            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
++            arinsal_beam::parse(&bytes).map_err(|error| error.to_string())?
++        }
++    };
+     let mut current: Option<(String, u8)> = None;
+     let mut declared = HashSet::new();
+     for instruction in &beam.code.instructions {
+@@ -873,7 +893,7 @@ fn validate_image(
+         .modules
+         .get(module_id)
+         .ok_or_else(|| format!("module {caller} is not loaded"))?;
+-    let declared = declared_nifs(vm, caller)?;
++    let declared = declared_nifs(vm, module_id, caller)?;
+     let mut seen = HashSet::new();
+     let mut binds = Vec::new();
+     for (index, function) in image.functions().iter().enumerate() {
+diff --git a/crates/vm/src/natives/sys.rs b/crates/vm/src/natives/sys.rs
+index 5da6155..4b21354 100644
+--- a/crates/vm/src/natives/sys.rs
++++ b/crates/vm/src/natives/sys.rs
+@@ -139,7 +139,13 @@ pub(crate) fn copy_literal_area(
+ }
+ 
+ fn has_literal_area_roots(process: &Process, area: &RetiredArea) -> bool {
+-    let heap = process.heap.has_heap_reference(|term| area.contains(term));
++    // EXPERIMENT (ingest-profile): the linear heap scan panicked with
++    // "invalid boxed subtag 0x4" (hamt.rs boxed_object_words) on a smolquery
++    // process during a persistent_term/literal-area release. Skip it and assume
++    // the heap references the area, which makes every process take the
++    // collection path (rewrite_roots + full sweep) instead of being scanned.
++    let _ = |term| area.contains(term);
++    let heap = true;
+     // Only the live X registers are roots; dead ones may hold stale pointers.
+     let live = process.gc_live.min(process.x.len());
+     let roots = process.x[..live]

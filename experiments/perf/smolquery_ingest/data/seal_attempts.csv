@@ -1,0 +1,14 @@
+run,attempt,result,segments,duration_s,start_s_after_window_start
+full-erts-1,1,ok,28,14.8467,0.7660
+full-erts-1,2,ok,148,110.8537,15.6176
+full-erts-2,1,ok,29,15.0175,0.6864
+full-erts-2,2,ok,147,114.2888,15.7088
+full-erts-3,1,ok,32,3.1727,0.6891
+full-erts-3,2,error,68,37.7227,3.8657
+full-erts-3,3,error,68,29.9129,95.5237
+full-arinsal-patched-1,1,error,36,143.6978,1.6535
+full-arinsal-patched-2,1,error,34,144.6583,2.0172
+full-arinsal-patched-3,1,error,35,144.7921,1.9092
+full-arinsal-fast-1,1,error,41,121.0699,1.0413
+full-arinsal-fast-3,1,error,38,122.3238,0.9003
+rate90k-erts,1,ok,31,14.4048,1.0202

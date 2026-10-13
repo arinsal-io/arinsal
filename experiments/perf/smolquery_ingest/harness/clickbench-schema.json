@@ -1,0 +1,431 @@
+{
+  "id": "hits",
+  "clustering": [
+    "CounterID",
+    "EventDate",
+    "UserID",
+    "EventTime"
+  ],
+  "schema": [
+    {
+      "name": "WatchID",
+      "type": "INT64"
+    },
+    {
+      "name": "JavaEnable",
+      "type": "INT64"
+    },
+    {
+      "name": "Title",
+      "type": "STRING"
+    },
+    {
+      "name": "GoodEvent",
+      "type": "INT64"
+    },
+    {
+      "name": "EventTime",
+      "type": "TIMESTAMP"
+    },
+    {
+      "name": "EventDate",
+      "type": "DATE"
+    },
+    {
+      "name": "CounterID",
+      "type": "INT64"
+    },
+    {
+      "name": "ClientIP",
+      "type": "INT64"
+    },
+    {
+      "name": "RegionID",
+      "type": "INT64"
+    },
+    {
+      "name": "UserID",
+      "type": "INT64"
+    },
+    {
+      "name": "CounterClass",
+      "type": "INT64"
+    },
+    {
+      "name": "OS",
+      "type": "INT64"
+    },
+    {
+      "name": "UserAgent",
+      "type": "INT64"
+    },
+    {
+      "name": "URL",
+      "type": "STRING"
+    },
+    {
+      "name": "Referer",
+      "type": "STRING"
+    },
+    {
+      "name": "IsRefresh",
+      "type": "INT64"
+    },
+    {
+      "name": "RefererCategoryID",
+      "type": "INT64"
+    },
+    {
+      "name": "RefererRegionID",
+      "type": "INT64"
+    },
+    {
+      "name": "URLCategoryID",
+      "type": "INT64"
+    },
+    {
+      "name": "URLRegionID",
+      "type": "INT64"
+    },
+    {
+      "name": "ResolutionWidth",
+      "type": "INT64"
+    },
+    {
+      "name": "ResolutionHeight",
+      "type": "INT64"
+    },
+    {
+      "name": "ResolutionDepth",
+      "type": "INT64"
+    },
+    {
+      "name": "FlashMajor",
+      "type": "INT64"
+    },
+    {
+      "name": "FlashMinor",
+      "type": "INT64"
+    },
+    {
+      "name": "FlashMinor2",
+      "type": "STRING"
+    },
+    {
+      "name": "NetMajor",
+      "type": "INT64"
+    },
+    {
+      "name": "NetMinor",
+      "type": "INT64"
+    },
+    {
+      "name": "UserAgentMajor",
+      "type": "INT64"
+    },
+    {
+      "name": "UserAgentMinor",
+      "type": "STRING"
+    },
+    {
+      "name": "CookieEnable",
+      "type": "INT64"
+    },
+    {
+      "name": "JavascriptEnable",
+      "type": "INT64"
+    },
+    {
+      "name": "IsMobile",
+      "type": "INT64"
+    },
+    {
+      "name": "MobilePhone",
+      "type": "INT64"
+    },
+    {
+      "name": "MobilePhoneModel",
+      "type": "STRING"
+    },
+    {
+      "name": "Params",
+      "type": "STRING"
+    },
+    {
+      "name": "IPNetworkID",
+      "type": "INT64"
+    },
+    {
+      "name": "TraficSourceID",
+      "type": "INT64"
+    },
+    {
+      "name": "SearchEngineID",
+      "type": "INT64"
+    },
+    {
+      "name": "SearchPhrase",
+      "type": "STRING"
+    },
+    {
+      "name": "AdvEngineID",
+      "type": "INT64"
+    },
+    {
+      "name": "IsArtifical",
+      "type": "INT64"
+    },
+    {
+      "name": "WindowClientWidth",
+      "type": "INT64"
+    },
+    {
+      "name": "WindowClientHeight",
+      "type": "INT64"
+    },
+    {
+      "name": "ClientTimeZone",
+      "type": "INT64"
+    },
+    {
+      "name": "ClientEventTime",
+      "type": "TIMESTAMP"
+    },
+    {
+      "name": "SilverlightVersion1",
+      "type": "INT64"
+    },
+    {
+      "name": "SilverlightVersion2",
+      "type": "INT64"
+    },
+    {
+      "name": "SilverlightVersion3",
+      "type": "INT64"
+    },
+    {
+      "name": "SilverlightVersion4",
+      "type": "INT64"
+    },
+    {
+      "name": "PageCharset",
+      "type": "STRING"
+    },
+    {
+      "name": "CodeVersion",
+      "type": "INT64"
+    },
+    {
+      "name": "IsLink",
+      "type": "INT64"
+    },
+    {
+      "name": "IsDownload",
+      "type": "INT64"
+    },
+    {
+      "name": "IsNotBounce",
+      "type": "INT64"
+    },
+    {
+      "name": "FUniqID",
+      "type": "INT64"
+    },
+    {
+      "name": "OriginalURL",
+      "type": "STRING"
+    },
+    {
+      "name": "HID",
+      "type": "INT64"
+    },
+    {
+      "name": "IsOldCounter",
+      "type": "INT64"
+    },
+    {
+      "name": "IsEvent",
+      "type": "INT64"
+    },
+    {
+      "name": "IsParameter",
+      "type": "INT64"
+    },
+    {
+      "name": "DontCountHits",
+      "type": "INT64"
+    },
+    {
+      "name": "WithHash",
+      "type": "INT64"
+    },
+    {
+      "name": "HitColor",
+      "type": "STRING"
+    },
+    {
+      "name": "LocalEventTime",
+      "type": "TIMESTAMP"
+    },
+    {
+      "name": "Age",
+      "type": "INT64"
+    },
+    {
+      "name": "Sex",
+      "type": "INT64"
+    },
+    {
+      "name": "Income",
+      "type": "INT64"
+    },
+    {
+      "name": "Interests",
+      "type": "INT64"
+    },
+    {
+      "name": "Robotness",
+      "type": "INT64"
+    },
+    {
+      "name": "RemoteIP",
+      "type": "INT64"
+    },
+    {
+      "name": "WindowName",
+      "type": "INT64"
+    },
+    {
+      "name": "OpenerName",
+      "type": "INT64"
+    },
+    {
+      "name": "HistoryLength",
+      "type": "INT64"
+    },
+    {
+      "name": "BrowserLanguage",
+      "type": "STRING"
+    },
+    {
+      "name": "BrowserCountry",
+      "type": "STRING"
+    },
+    {
+      "name": "SocialNetwork",
+      "type": "STRING"
+    },
+    {
+      "name": "SocialAction",
+      "type": "STRING"
+    },
+    {
+      "name": "HTTPError",
+      "type": "INT64"
+    },
+    {
+      "name": "SendTiming",
+      "type": "INT64"
+    },
+    {
+      "name": "DNSTiming",
+      "type": "INT64"
+    },
+    {
+      "name": "ConnectTiming",
+      "type": "INT64"
+    },
+    {
+      "name": "ResponseStartTiming",
+      "type": "INT64"
+    },
+    {
+      "name": "ResponseEndTiming",
+      "type": "INT64"
+    },
+    {
+      "name": "FetchTiming",
+      "type": "INT64"
+    },
+    {
+      "name": "SocialSourceNetworkID",
+      "type": "INT64"
+    },
+    {
+      "name": "SocialSourcePage",
+      "type": "STRING"
+    },
+    {
+      "name": "ParamPrice",
+      "type": "INT64"
+    },
+    {
+      "name": "ParamOrderID",
+      "type": "STRING"
+    },
+    {
+      "name": "ParamCurrency",
+      "type": "STRING"
+    },
+    {
+      "name": "ParamCurrencyID",
+      "type": "INT64"
+    },
+    {
+      "name": "OpenstatServiceName",
+      "type": "STRING"
+    },
+    {
+      "name": "OpenstatCampaignID",
+      "type": "STRING"
+    },
+    {
+      "name": "OpenstatAdID",
+      "type": "STRING"
+    },
+    {
+      "name": "OpenstatSourceID",
+      "type": "STRING"
+    },
+    {
+      "name": "UTMSource",
+      "type": "STRING"
+    },
+    {
+      "name": "UTMMedium",
+      "type": "STRING"
+    },
+    {
+      "name": "UTMCampaign",
+      "type": "STRING"
+    },
+    {
+      "name": "UTMContent",
+      "type": "STRING"
+    },
+    {
+      "name": "UTMTerm",
+      "type": "STRING"
+    },
+    {
+      "name": "FromTag",
+      "type": "STRING"
+    },
+    {
+      "name": "HasGCLID",
+      "type": "INT64"
+    },
+    {
+      "name": "RefererHash",
+      "type": "INT64"
+    },
+    {
+      "name": "URLHash",
+      "type": "INT64"
+    },
+    {
+      "name": "CLID",
+      "type": "INT64"
+    }
+  ]
+}

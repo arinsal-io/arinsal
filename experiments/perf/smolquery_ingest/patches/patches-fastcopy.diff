@@ -1,0 +1,22 @@
+diff --git a/crates/term/src/owned.rs b/crates/term/src/owned.rs
+index 613ff87..81bcade 100644
+--- a/crates/term/src/owned.rs
++++ b/crates/term/src/owned.rs
+@@ -336,7 +336,16 @@ pub fn to_owned(root: Term) -> Result<OwnedTerm, TermError> {
+                     // SAFETY: source heap and backing bytes remain live.
+                     let view = unsafe { term.binary_ref().unwrap() };
+                     let mut bytes = vec![0_u8; view.bit_len().div_ceil(8)];
+-                    for i in 0..view.bit_len() {
++                    // EXPERIMENT (ingest-profile, perf): byte-aligned fast path. The
++                    // bit loop below costs ~8 ns/byte, which made every prim_file
++                    // write of a 24 MB spool body take ~200 ms (nif-file converts
++                    // its arguments with to_owned).
++                    let aligned = view.start_bit() % 8 == 0 && view.bit_len() % 8 == 0;
++                    if aligned {
++                        let start = view.start_bit() / 8;
++                        bytes.copy_from_slice(&view.bytes()[start..start + view.bit_len() / 8]);
++                    }
++                    for i in (if aligned { view.bit_len() } else { 0 })..view.bit_len() {
+                         let bit = (view.bytes()[(view.start_bit() + i) / 8]
+                             >> (7 - (view.start_bit() + i) % 8))
+                             & 1;

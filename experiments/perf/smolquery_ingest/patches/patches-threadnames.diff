@@ -1,0 +1,23 @@
+diff --git a/crates/sched/src/lib.rs b/crates/sched/src/lib.rs
+index 3a79e6c..e5d78db 100644
+--- a/crates/sched/src/lib.rs
++++ b/crates/sched/src/lib.rs
+@@ -4807,9 +4807,15 @@ impl<T: Task> Scheduler<T> {
+         if !simulated {
+             for (id, local) in locals.into_iter().enumerate() {
+                 let inner = inner.clone();
+-                threads.push(thread::spawn(move || {
+-                    worker_loop(inner, id, local.into_local())
+-                }));
++                // EXPERIMENT (ingest-profile, instrumentation only): name normal
++                // scheduler threads so per-thread CPU can tell them from native
++                // (DuckDB) threads, which are unnamed.
++                threads.push(
++                    thread::Builder::new()
++                        .name(format!("{}_scheduler", id + 1))
++                        .spawn(move || worker_loop(inner, id, local.into_local()))
++                        .expect("spawn scheduler thread"),
++                );
+             }
+             // Port of erts/emulator/beam/erl_process.c:8890 (erts_start_schedulers, dirty
+             // scheduler threads), OTP-29.1.1.
