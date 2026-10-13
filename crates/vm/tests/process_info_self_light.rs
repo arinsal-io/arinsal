@@ -102,7 +102,87 @@ scenario(25) ->
         R = process_info(self(), [dictionary, current_function]),
         Parent ! {Ref, R}
     end),
-    receive {Ref, R} -> R end.
+    receive {Ref, R} -> R end;
+scenario(26) ->
+    P = idle(), [P ! M || M <- [a, b, c]], wait_waiting(P),
+    R = process_info(P, [message_queue_len, trap_exit, status, registered_name, priority]),
+    stop(P), R;
+scenario(27) ->
+    P = spawn(fun() -> ok end), M = monitor(process, P),
+    receive {'DOWN', M, _, _, _} -> ok end,
+    {process_info(P, message_queue_len), process_info(P, [status, heap_size]),
+     process_info(P, registered_name)};
+scenario(28) ->
+    P = idle(), register(remote_reg, P), wait_waiting(P),
+    R = {process_info(P, registered_name), process_info(P, [registered_name, status])},
+    unregister(remote_reg),
+    R2 = {process_info(P, registered_name), process_info(P, [registered_name])},
+    stop(P), {R, R2};
+scenario(29) ->
+    P = idle(), [P ! M || M <- [a, b]], wait_waiting(P),
+    R = process_info(P, [messages, message_queue_len, dictionary]),
+    stop(P), R;
+scenario(30) ->
+    P = idle(), wait_waiting(P),
+    R = {catch_badarg(fun() -> process_info(P, bogus) end),
+         catch_badarg(fun() -> process_info(P, [message_queue_len, bogus]) end),
+         process_info(P, [])},
+    stop(P), R;
+scenario(31) ->
+    P = idle(), wait_waiting(P),
+    L = process_info(P, [heap_size, stack_size, reductions, min_heap_size, fullsweep_after,
+                         max_heap_size, message_queue_data, trace, error_handler, async_dist,
+                         priority_messages, group_leader]),
+    [{heap_size, H}, {stack_size, S}, {reductions, Rd} | Rest] = L,
+    true = is_integer(H) andalso is_integer(S) andalso is_integer(Rd),
+    {group_leader, GL} = lists:last(Rest),
+    Plain = lists:droplast(Rest),
+    stop(P), {Plain, GL =:= group_leader()};
+scenario(32) ->
+    P = spawn(fun() -> process_flag(trap_exit, true), idle_loop() end), wait_waiting(P),
+    R = process_info(P, trap_exit), stop(P), R;
+scenario(33) ->
+    P = idle(), wait_waiting(P),
+    true = erlang:suspend_process(P),
+    R = process_info(P, status),
+    true = erlang:resume_process(P),
+    stop(P), R;
+scenario(34) ->
+    P = idle(), wait_waiting(P), Ref = monitor(process, P),
+    R = process_info(P, [message_queue_len, status]),
+    true = erlang:demonitor(Ref, [flush]),
+    stop(P), R;
+scenario(35) ->
+    P = idle(), wait_waiting(P),
+    R = process_info(P, [current_function, initial_call, links, monitors, monitored_by]),
+    stop(P),
+    [{current_function, F}, {initial_call, I}, {links, L}, {monitors, M}, {monitored_by, MB}] = R,
+    {F, I, L =:= [], M, MB};
+scenario(36) ->
+    Parent = self(), Ref = make_ref(),
+    P = idle(), wait_waiting(P),
+    {parent, PP} = process_info(P, parent),
+    spawn(fun() -> {parent, X} = process_info(self(), parent), Parent ! {Ref, X =:= Parent} end),
+    receive {Ref, Own} -> ok end,
+    stop(P), {PP =:= self(), Own};
+scenario(37) ->
+    P = idle(), wait_waiting(P),
+    R = {process_info(P, initial_call), process_info(P, garbage_collection),
+         process_info(P, [last_calls, sequential_trace_token, initial_call])},
+    stop(P), R;
+scenario(38) ->
+    P = spawn(fun() -> process_flag(save_calls, 5), idle_loop() end), wait_waiting(P),
+    R = process_info(P, last_calls), stop(P), R.
+
+idle() -> spawn(fun idle_loop/0).
+idle_loop() -> receive stop -> ok end.
+stop(P) -> M = monitor(process, P), P ! stop, receive {'DOWN', M, _, _, _} -> ok end.
+wait_waiting(P) ->
+    case process_info(P, status) of
+        {status, waiting} -> ok;
+        _ -> erlang:yield(), wait_waiting(P)
+    end.
+catch_badarg(F) -> try F() catch error:badarg -> badarg end.
 
 flush() -> receive _ -> flush() after 0 -> ok end.
 "#;
@@ -144,6 +224,14 @@ fn run_scenarios(scenarios: &[i64]) -> Vec<String> {
         }
     }
     mismatches
+}
+
+// Items of another process: read under its lock when it is idle, else through a request signal.
+#[test]
+fn process_info_remote_items_match_otp_29() {
+    let scenarios: Vec<i64> = (26..=38).collect();
+    let mismatches = run_scenarios(&scenarios);
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]

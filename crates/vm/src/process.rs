@@ -4270,8 +4270,9 @@ impl Runtime {
         module: &str,
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
+        parent: &arinsal_etf::OwnedTerm,
     ) -> Result<Pid, VmError> {
-        self.spawn_mfa_scheduled(module, function, args, false, None)
+        self.spawn_mfa_scheduled(module, function, args, false, None, Some(parent))
     }
 
     /// Create a distributed child with its remote link installed before it can run.
@@ -4282,8 +4283,9 @@ impl Runtime {
         function: &str,
         args: &[arinsal_etf::OwnedTerm],
         linker: Pid,
+        parent: &arinsal_etf::OwnedTerm,
     ) -> Result<Pid, VmError> {
-        self.spawn_mfa_scheduled(module, function, args, false, Some(linker))
+        self.spawn_mfa_scheduled(module, function, args, false, Some(linker), Some(parent))
     }
 
     fn spawn_mfa_scheduled(
@@ -4293,6 +4295,7 @@ impl Runtime {
         args: &[arinsal_etf::OwnedTerm],
         scheduled: bool,
         linker: Option<Pid>,
+        parent: Option<&arinsal_etf::OwnedTerm>,
     ) -> Result<Pid, VmError> {
         let (module_id, ip) = {
             let code = self.code.active_tables();
@@ -4316,6 +4319,11 @@ impl Runtime {
         child.set_runtime(Some(Arc::clone(self)));
         child.cold_mut().group_leader = None;
         child.initial_mfa = mfa_atoms(module, function, args.len() as u8);
+        // Port of erts/emulator/beam/erl_process.c:12756-12767 (erl_create_process p->parent),
+        // OTP-29.1.1: a remote parent is kept as its external pid.
+        if let Some(parent) = parent {
+            child.cold_mut().parent_external = Some(parent.clone());
+        }
         if let Some(linker) = linker {
             child.cold_mut().links.insert(linker);
         }

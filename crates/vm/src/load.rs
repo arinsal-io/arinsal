@@ -575,8 +575,22 @@ impl CodeTables {
         previous
     }
 
-    /// Frees the slot of a purged instance.
-    pub(crate) fn release(&mut self, id: usize) {
+    /// Frees the slot of a purged instance and returns its native code, which the caller
+    /// unpublishes (`CompiledVersion::unpublish`) once it may stage, like the explicit free of
+    /// the old code header in erts `erts_internal:purge_module/2` `complete`. Nothing unpublishes
+    /// from a destructor.
+    // Port of erts/emulator/beam/beam_bif_load.c (purge_module complete: delete_code frees the
+    // old code explicitly under the code modification permission), OTP-29.1.1.
+    #[must_use]
+    pub(crate) fn release(
+        &mut self,
+        id: usize,
+    ) -> Option<Arc<beamasm_integration::CompiledVersion>> {
+        let native = self
+            .code_meta
+            .get(id)
+            .and_then(Option::as_ref)
+            .and_then(|meta| meta.beamasm.clone());
         crate::trace_bp::clear_module_line_breakpoints(self.code_scope, id);
         // Port of erts/emulator/beam/erl_nif.c (erts_unload_nif on purge), OTP-29.1.1: a NIF
         // library belongs to its code instance, so purging it lets a later load bind again.
@@ -597,6 +611,7 @@ impl CodeTables {
             &mut self.free_ids,
             id,
         );
+        native
     }
 }
 
@@ -852,13 +867,18 @@ impl Vm {
         let registers = process::register_requirements(&beam);
         let mut meta = CodeMeta::from_beam(&beam, Some(bytes));
         let staging = self.code_ix.start_staging();
+        let mut released = None;
         let module_id = staging.with(|tables| {
             if let Some(old_id) = tables.old.remove(&name) {
-                tables.release(old_id);
+                released = tables.release(old_id);
             }
             tables.intern_fun_entries(&mut module);
             tables.next_module_id()
         });
+        // The caller holds the staging permission, so this stages without waiting.
+        if let Some(native) = released {
+            native.unpublish();
+        }
         let module = Arc::new(module);
         self.compile_native(&module, &mut meta, module_id);
         let id = staging.with(|tables| {
@@ -1352,5 +1372,49 @@ impl Vm {
             .get(name)
             .copied()
             .ok_or_else(|| VmError::Load(format!("module {name} not found")))
+    }
+}
+
+#[cfg(test)]
+mod purge_free_tests {
+    use crate::Vm;
+    use std::process::Command;
+
+    fn beam(source: &str) -> Option<Vec<u8>> {
+        let dir = std::env::temp_dir().join(format!("arinsal-purge-free-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(dir.join("purge_free_mod.erl"), source).ok()?;
+        let status = Command::new("erlc")
+            .arg("-o")
+            .arg(&dir)
+            .arg(dir.join("purge_free_mod.erl"))
+            .status()
+            .ok()?;
+        let bytes = status
+            .success()
+            .then(|| std::fs::read(dir.join("purge_free_mod.beam")).ok())
+            .flatten();
+        let _ = std::fs::remove_dir_all(&dir);
+        bytes
+    }
+
+    // Freeing old code is explicit (purge `complete`): dropping the last reference to a
+    // version never stages, so it cannot wait for the permission a prepared purge holds.
+    #[test]
+    fn dropping_freed_native_code_does_not_wait_for_the_purge_permission() {
+        let Some(beam) = beam("-module(purge_free_mod).\n-export([f/0]).\nf() -> ok.\n") else {
+            eprintln!("erlc unavailable; skipping purge free test");
+            return;
+        };
+        let mut vm = Vm::new([]);
+        // A module whose load did not make it current (a failed on_load) stays published, so
+        // freeing it has to unpublish its exports.
+        let id = vm.load_bytes(&beam).unwrap();
+        vm.purge_state.hold_stage_permission_for_test(true);
+        let released = vm.code_ix.update_active(|tables| tables.release(id));
+        vm.refresh_code();
+        let native = released.expect("native code of the old version");
+        drop(native);
+        vm.purge_state.hold_stage_permission_for_test(false);
     }
 }

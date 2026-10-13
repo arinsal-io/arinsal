@@ -1568,9 +1568,9 @@ fn handle_spawn_request(
             .transpose()?;
         let child = if link {
             let watcher = watcher.ok_or_else(badarg)?;
-            runtime.spawn_mfa_unscheduled_linked(module, function, &args, watcher)
+            runtime.spawn_mfa_unscheduled_linked(module, function, &args, watcher, &from)
         } else {
-            runtime.spawn_mfa_unscheduled(module, function, &args)
+            runtime.spawn_mfa_unscheduled(module, function, &args, &from)
         };
         if let Ok(child) = child {
             result = local_pid_owned(child);
@@ -1697,9 +1697,9 @@ fn handle_spawn_request_port(
     let spawn_result = if spawn_opts_acceptable(options) {
         if link {
             let watcher = watcher.ok_or_else(badarg)?;
-            runtime.spawn_mfa_unscheduled_linked(mod_name, fun_name, &arg_list, watcher)
+            runtime.spawn_mfa_unscheduled_linked(mod_name, fun_name, &arg_list, watcher, &from)
         } else {
-            runtime.spawn_mfa_unscheduled(mod_name, fun_name, &arg_list)
+            runtime.spawn_mfa_unscheduled(mod_name, fun_name, &arg_list, &from)
         }
     } else {
         Err(VmError::Unsupported("bad spawn options".into()))

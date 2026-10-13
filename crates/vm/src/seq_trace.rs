@@ -70,6 +70,20 @@ fn badarg() -> VmError {
         "badarg",
     )))
 }
+/// The process's token for `process_info(Pid, sequential_trace_token)`, read without clearing
+/// a stale one. Port of erts/emulator/beam/erl_bif_info.c:2140 (ERTS_PI_IX_SEQUENTIAL_TRACE_TOKEN),
+/// OTP-29.1.1.
+pub(crate) fn token_of(process: &Process) -> Option<Token> {
+    process
+        .seq_trace_token
+        .as_deref()
+        .filter(|token| token.epoch == epoch().load(Ordering::Relaxed))
+        .cloned()
+}
+/// The token as the term `process_info` reports, built on `process`.
+pub(crate) fn token_term_on(process: &mut Process, token: Option<&Token>) -> Result<Term, VmError> {
+    token_term(process, token)
+}
 fn token(process: &mut Process) -> Option<Token> {
     if process
         .seq_trace_token
