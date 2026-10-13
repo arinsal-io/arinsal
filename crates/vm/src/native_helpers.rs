@@ -1703,7 +1703,11 @@ pub(crate) extern "C" fn process_bif_light(
     let Some(bif) = export.light_process_bif else {
         return park_executor(process, export, identity);
     };
-    call_process_bif(process, registers, export, bif, false).unwrap_or(0)
+    match call_process_bif(process, registers, export, bif, false) {
+        Some(raw) => raw,
+        // The entry declined before any side effect: the executor runs the whole BIF.
+        None => park_executor(process, export, identity),
+    }
 }
 
 /// An ETS or process-dictionary BIF whose body is `direct_ets`.
@@ -2077,17 +2081,23 @@ fn trap_body_call<T: crate::bif_traps::TrapBody>(
     process.reductions = process.header.fcalls;
     let arity = usize::from(export.arity);
     let entry_top = process.heap.heap_top_index();
-    let mut args = [Term::NIL; 3];
-    args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
     let gc_was_enabled = process.heap.gc_enabled;
     let pid = process.self_pid;
-    match T::run(process, &args[..arity], pid, gc_was_enabled) {
+    // The body reads its arguments in place; a copy is taken only when a trap must keep them.
+    match T::run(
+        process,
+        &registers.x_reg_array[..arity],
+        pid,
+        gc_was_enabled,
+    ) {
         Ok(crate::bif_traps::HandlerResult::Done { value, reductions }) => {
             process.set_gc_enabled(gc_was_enabled);
             crate::bif_traps::charge_light(process, reductions);
             Some(light_value_return(process, registers, entry_top, value))
         }
         other => {
+            let mut args = [Term::NIL; 3];
+            args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
             let callee = (export.module_atom, export.function_atom);
             match crate::bif_traps::finish_light(
                 process,
