@@ -3149,8 +3149,7 @@ impl Executor {
                             .as_ref()
                             .is_some_and(|runtime| runtime.suspend_total_of(ctx.pid()) > 0)
                     {
-                        process.cold_mut().suspend_parked = true;
-                        break Ok(RunState::Wait { timeout_ms: None });
+                        break park_suspended(process, ctx);
                     }
                     let trap = match result {
                         // Port of erts/preloaded/src/erts_internal.erl:152 (await_result), OTP-29.1.1.
@@ -3383,19 +3382,10 @@ impl Executor {
         };
         let pid = ctx.pid();
         if runtime.suspend_total_of(pid) > 0 {
-            process.cold_mut().sys_task_point = true;
-            let drained = process.drain(ctx);
-            let executed = drained.and_then(|()| crate::signals::execute_sys_tasks(process, ctx));
-            process.cold_mut().sys_task_point = false;
-            executed?;
-            // The resumer's wake-up signal may have been consumed by the drain above: re-check
-            // so a resume racing with this suspension is not lost (otherwise the process
-            // waits forever).
-            if runtime.suspend_total_of(pid) == 0 {
-                return Ok(None);
-            }
-            process.cold_mut().suspend_parked = true;
-            return Ok(Some(RunState::Wait { timeout_ms: None }));
+            return match park_suspended(process, ctx)? {
+                RunState::Yield => Ok(None),
+                parked => Ok(Some(parked)),
+            };
         }
         if let Some(shift) = runtime.take_pause_shift(process) {
             if let Some(deadline) = process.receive_deadline.as_mut() {
@@ -6699,6 +6689,35 @@ impl Message {
     }
 }
 
+/// A suspended process that would run on is parked instead. Its queued signals are handled
+/// first: a suspended process only handles signals (erts schedules it for them as system
+/// tasks), and one parked with unhandled signals in its middle queue would never run again.
+/// Returns `Yield` when the drain resumed the process, so it keeps running.
+// Port of erts/emulator/beam/erl_process.c:9742 (ERTS_PSFLG_SUSPENDED processes are scheduled for
+// ERTS_PSFLG_ACTIVE_SYS signal handling only), OTP-29.1.1.
+fn park_suspended(
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+) -> Result<RunState, VmError> {
+    let pid = ctx.pid();
+    process.cold_mut().sys_task_point = true;
+    let drained = process.drain(ctx);
+    let executed = drained.and_then(|()| crate::signals::execute_sys_tasks(process, ctx));
+    process.cold_mut().sys_task_point = false;
+    executed?;
+    // The resumer's wake-up signal may have been consumed by the drain above: re-check so a
+    // resume racing with this suspension is not lost.
+    if process
+        .runtime
+        .as_ref()
+        .is_none_or(|runtime| runtime.suspend_total_of(pid) == 0)
+    {
+        return Ok(RunState::Yield);
+    }
+    process.cold_mut().suspend_parked = true;
+    Ok(RunState::Wait { timeout_ms: None })
+}
+
 impl Task for Process {
     type Message = Message;
     type SchedulerData = SchedulerData;
@@ -7044,8 +7063,7 @@ impl Process {
         // a suspended process out of the run queue (ERTS_PSFLG_SUSPENDED): the code-permission
         // seize failure is `erts_suspend` plus `ERTS_BIF_YIELD`.
         if matches!(result, Ok(RunState::Yield)) && runtime.suspend_total_of(ctx.pid()) > 0 {
-            self.cold_mut().suspend_parked = true;
-            result = Ok(RunState::Wait { timeout_ms: None });
+            result = park_suspended(self, ctx);
         }
         if matches!(result, Ok(RunState::Yield | RunState::Wait { .. }))
             && let Err(error) = crate::signals::reschedule_deferred_sys_tasks(self, ctx)
