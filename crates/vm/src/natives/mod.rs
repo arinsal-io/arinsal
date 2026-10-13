@@ -363,6 +363,13 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "whereis" && arity == 1 {
         return Some(crate::signals::whereis_bif);
     }
+    // erts `register_2` / `unregister_1` are plain BIFs that take `c_p` only (register.c).
+    if module == "erlang" && function == "register" && arity == 2 {
+        return Some(crate::signals::register_light);
+    }
+    if module == "erlang" && function == "unregister" && arity == 1 {
+        return Some(crate::signals::unregister_light);
+    }
     maps::process_bif(module, function, arity)
 }
 

@@ -1624,6 +1624,68 @@ macro_rules! resolved_signal_handler {
 resolved_signal_handler!(spawn3, Spawn3);
 resolved_signal_handler!(spawn_link3, SpawnLink3);
 resolved_signal_handler!(spawn_opt4, SpawnOpt4);
+/// `register(Name, Pid)` called directly from native code (erts `register_2` with `c_p`).
+/// Only the success path runs here: tracing, ports, and every error return `None` before the
+/// registry is touched, and the executor then runs the full BIF.
+// Port of erts/emulator/beam/register.c:184-240 (erts_register_name), OTP-29.1.1.
+pub(crate) fn register_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [name, id] = args else {
+        return None;
+    };
+    if crate::trace::active() {
+        return None;
+    }
+    let name = name.as_atom()?;
+    if name == arinsal_term::atoms::UNDEFINED {
+        return None;
+    }
+    let pid = Pid::from_term(*id)?;
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    let scheduler = rt.scheduler().ok()?;
+    let mut table = rt.reg.write();
+    if !scheduler.lookup(pid)
+        || scheduler.registered_atom_index(pid).is_some()
+        || table.contains(name)
+        || !rt.publish_proc_flag(pid, arinsal_sched::proc_flags::REG)
+    {
+        return None;
+    }
+    table.insert_proc(name, pid);
+    scheduler.set_registered_atom_index(pid, name.0);
+    drop(table);
+    Some(Ok(atom("true")))
+}
+
+/// `unregister(Name)` called directly from native code: a registered process name, with
+/// tracing off. Everything else returns `None` before the registry changes.
+// Port of erts/emulator/beam/register.c:507-519 (erts_unregister_name), OTP-29.1.1.
+pub(crate) fn unregister_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [name] = args else {
+        return None;
+    };
+    if crate::trace::active() {
+        return None;
+    }
+    let name = name.as_atom()?;
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    let mut table = rt.reg.write();
+    let Some(crate::register::RegId::Proc(pid)) = table.fetch(name) else {
+        return None;
+    };
+    let _ = table.erase(name);
+    if let Ok(scheduler) = rt.scheduler() {
+        scheduler.clear_registered_atom_index(pid, name.0);
+    }
+    drop(table);
+    Some(Ok(atom("true")))
+}
+
 resolved_signal_handler!(register2, Register2);
 resolved_signal_handler!(unregister1, Unregister1);
 resolved_signal_handler!(whereis1, Whereis1);
