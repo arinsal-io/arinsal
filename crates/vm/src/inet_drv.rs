@@ -2933,6 +2933,11 @@ fn drop_pending(inner: &mut Inner, caller: Pid, aref: u16) {
 }
 
 fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
+    // Port of erts/emulator/sys/common/erl_check_io.c:2098-2109, OTP-29.1.1: oready
+    // runs before iready for one fd.
+    if writable_ready {
+        tcp_inet_output(sock);
+    }
     satisfy(sock);
     let eof = pull(sock);
     satisfy(sock);
@@ -2978,6 +2983,63 @@ fn try_io(sock: &Arc<Sock>, writable_ready: bool) {
     emit_ready(sock);
     let busy = sock.inner.lock().unwrap().busy;
     crate::dist::distribution_port_state_changed(&sock.runtime, sock.id, busy);
+}
+
+/// Write queued output once the poll set reports the connected socket writable.
+///
+/// Port of erts/emulator/drivers/common/inet_drv.c:14289-14361, OTP-29.1.1
+/// (`tcp_inet_output`, connected branch): send from the driver queue until it is
+/// empty or the socket would block, and drop the busy state at the low watermark
+/// (`release_unbusy`; the deferred `inet_reply` goes out through `emit_ready`).
+/// The output callback runs whether or not the owner has a receive pending, so a
+/// passive socket whose owner is blocked in `gen_tcp:send/2` still drains. The
+/// write selection follows the queue: `io_loop` selects for write only while
+/// `sendq` is non-empty (inet_drv.c:14302-14303 deselects when it is empty).
+fn tcp_inet_output(sock: &Arc<Sock>) {
+    let failure = {
+        let mut inner = sock.inner.lock().unwrap();
+        if inner.phase != Phase::Connected || inner.sendq.is_empty() {
+            return;
+        }
+        let Some(err) = flush_send(&mut inner) else {
+            return;
+        };
+        // Port of inet_drv.c:13690-13720 (tcp_send_error) and :13613-13688
+        // (tcp_send_or_shutdown_error), OTP-29.1.1: the blocked senders get the
+        // error reply; an active socket also gets `tcp_closed`.
+        let waits = std::mem::take(&mut inner.send_waits);
+        match send_failed(&mut inner, err) {
+            SendOutcome::Failed { error, active } => (waits, error, active),
+            SendOutcome::Reply(_) | SendOutcome::Deferred => return,
+        }
+    };
+    let (waits, error, active) = failure;
+    for wait in waits {
+        emit(
+            sock,
+            Out::InetReply {
+                caller: wait.caller,
+                ids: wait.ids,
+                error: Some(error),
+            },
+        );
+    }
+    if active {
+        let owner = sock.handle.owner_pid();
+        if error == "econnreset" {
+            emit(
+                sock,
+                Out::TcpError {
+                    owner,
+                    reason: "econnreset",
+                },
+            );
+        }
+        emit(sock, Out::TcpClosed { owner });
+        if sock.inner.lock().unwrap().exit_on_close {
+            crate::port::abandon_port(&sock.runtime, sock.id);
+        }
+    }
 }
 
 fn deliver_pending_close(sock: &Arc<Sock>) {
