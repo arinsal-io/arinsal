@@ -429,16 +429,10 @@ fn process_info(
             {
                 // elixir_loop1: OTP reports hibernate/0 while the stack is retained.
                 let arity = process
-                    .runtime
+                    .cold
                     .as_ref()
-                    .and_then(|runtime| {
-                        runtime
-                            .hibernating
-                            .lock()
-                            .unwrap()
-                            .get(&pid)
-                            .map(|cont| if cont.resume_in_place { 0 } else { 3 })
-                    })
+                    .and_then(|cold| cold.hibernate.as_ref())
+                    .map(|cont| if cont.resume_in_place { 0 } else { 3 })
                     .unwrap_or(3);
                 make_tuple(
                     process,
@@ -2460,16 +2454,12 @@ fn hibernate(
     process.x[2] = args;
     process.gc_live = 3;
     process.receive_cursor = 0;
-    runtime
-        .ever_hibernated
-        .store(true, std::sync::atomic::Ordering::Release);
-    runtime.hibernating.lock().unwrap().insert(
-        ctx.pid(),
-        crate::process::HibernateCont {
-            stop: true,
-            resume_in_place: false, // elixir_loop1
-        },
-    );
+    // Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the parked
+    // continuation is process state.
+    process.cold_mut().hibernate = Some(crate::process::HibernateCont {
+        stop: true,
+        resume_in_place: false, // elixir_loop1
+    });
     runtime.mark_hibernating(ctx.pid(), true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
     process.cold_mut().hibernate_sched = true;
@@ -2483,25 +2473,19 @@ fn hibernate_zero(process: &mut Process, ctx: &RunCtx<'_, Message>) -> Result<Te
         .clone()
         .ok_or_else(|| VmError::Unsupported("hibernate requires a scheduler".into()))?;
     let pid = ctx.pid();
-    runtime
-        .ever_hibernated
-        .store(true, std::sync::atomic::Ordering::Release);
-    let mut parked = runtime.hibernating.lock().unwrap();
-    if parked
-        .get(&pid)
+    if process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.hibernate.as_ref())
         .is_some_and(|cont| cont.resume_in_place && !cont.stop)
     {
-        parked.remove(&pid);
+        process.cold_mut().hibernate = None;
         return Ok(atom("ok"));
     }
-    parked.insert(
-        pid,
-        crate::process::HibernateCont {
-            stop: true,
-            resume_in_place: true,
-        },
-    );
-    drop(parked);
+    process.cold_mut().hibernate = Some(crate::process::HibernateCont {
+        stop: true,
+        resume_in_place: true,
+    });
     runtime.mark_hibernating(pid, true);
     // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
     process.cold_mut().hibernate_sched = true;

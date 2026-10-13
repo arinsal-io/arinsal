@@ -368,9 +368,8 @@ fn stack_frames(process: &mut Process, pid_term: Term, max_size: Term) -> Result
     let pid = inspect_pid(process, pid_term)?;
     let max_size = nonnegative(max_size)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
-    let hibernation = hibernation_arity(&runtime, pid);
     let Some(frames) = runtime.inspect_suspended(pid, |target, modules| {
-        inspect_frames(target, modules, max_size, hibernation)
+        inspect_frames(target, modules, max_size, hibernation_arity(target))
     }) else {
         return Ok(atom("running"));
     };
@@ -396,9 +395,8 @@ fn peek_stack_frame_slot(
     let slot = nonnegative(slot_term)?;
     let max_size = nonnegative(max_size_term)?;
     let runtime = process.runtime.clone().ok_or_else(badarg)?;
-    let hibernation = hibernation_arity(&runtime, pid);
     let Some(value) = runtime.inspect_suspended(pid, |target, modules| {
-        inspect_frames(target, modules, max_size, hibernation)
+        inspect_frames(target, modules, max_size, hibernation_arity(target))
             .iter()
             .find(|frame_info| frame_number(frame_info) == Some(frame))
             .and_then(|frame| frame_slots(frame).get(slot).cloned())
@@ -467,13 +465,13 @@ enum FramePc {
     Native(usize),
 }
 
-/// Arity of the `erlang:hibernate` call a hibernating process is parked in.
-fn hibernation_arity(runtime: &crate::process::Runtime, pid: Pid) -> Option<u8> {
-    runtime
-        .hibernating
-        .lock()
-        .unwrap()
-        .get(&pid)
+/// Arity of the `erlang:hibernate` call a hibernating process is parked in (read from the
+/// suspended target itself, as erl_debugger.c reads `p`).
+fn hibernation_arity(target: &Process) -> Option<u8> {
+    target
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.hibernate.as_ref())
         .map(|cont| if cont.resume_in_place { 0 } else { 3 })
 }
 

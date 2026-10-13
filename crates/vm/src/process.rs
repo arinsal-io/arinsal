@@ -870,8 +870,6 @@ pub(crate) struct Runtime {
     /// Whether `pauses` has an entry; readers skip the lock while it is false.
     pub(crate) pauses_any: AtomicBool,
     pub(crate) published: Mutex<HashMap<Pid, Published>>,
-    pub(crate) hibernating: Mutex<HashMap<Pid, HibernateCont>>,
-    pub(crate) ever_hibernated: AtomicBool,
     pub(crate) debug_wait_active: AtomicBool,
     /// `erlang:system_flag/2` settings of this runtime.
     pub(crate) system_flags: Mutex<crate::natives::sys::SystemFlags>,
@@ -2356,9 +2354,9 @@ impl Executor {
                                         // (erts_hibernate), OTP-29.1.1: apply(erlang, hibernate, _)
                                         // discarded the stack like a direct call.
                                         Err(VmError::Unsupported(_))
-                                            if hibernate_stopped(process, ctx.pid()) =>
+                                            if hibernate_stopped(process) =>
                                         {
-                                            if hibernate_resumes_in_place(process, ctx.pid()) {
+                                            if hibernate_resumes_in_place(process) {
                                                 hibernate_fetch_collect(process, ctx)?;
                                                 process.cold_mut().native_retry = Some(target_pc);
                                                 process.native_pc = Some(code_ptr);
@@ -2972,11 +2970,11 @@ impl Executor {
                                             // the stack, so the native caller is gone; the process
                                             // resumes through apply/3 like the interpreter's path.
                                             Err(VmError::Unsupported(_))
-                                                if hibernate_stopped(process, ctx.pid()) =>
+                                                if hibernate_stopped(process) =>
                                             {
                                                 // hibernate/0 keeps its stack: after the wakeup the
                                                 // native call is retried and returns `ok` in place.
-                                                if hibernate_resumes_in_place(process, ctx.pid()) {
+                                                if hibernate_resumes_in_place(process) {
                                                     hibernate_fetch_collect(process, ctx)?;
                                                     let cold = process.cold_mut();
                                                     cold.native_retry = Some(target_pc);
@@ -3183,7 +3181,7 @@ impl Executor {
                     {
                         continue;
                     }
-                    if hibernate_stopped(process, ctx.pid()) {
+                    if hibernate_stopped(process) {
                         if hibernate_fetch_collect(process, ctx)? {
                             if let Some(runtime) = process.runtime.clone() {
                                 runtime.mark_hibernating(ctx.pid(), true);
@@ -3468,11 +3466,10 @@ impl Executor {
                 return Ok(Some(RunState::Wait { timeout_ms: None }));
             }
             // elixir_loop1: unlike hibernate/3, hibernate/0 keeps its stack.
-            let resume_in_place = runtime
-                .hibernating
-                .lock()
-                .unwrap()
-                .get(&pid)
+            let resume_in_place = process
+                .cold
+                .as_ref()
+                .and_then(|cold| cold.hibernate.as_ref())
                 .is_some_and(|cont| cont.resume_in_place);
             if resume_in_place {
                 runtime.mark_hibernating(pid, false);
@@ -3496,11 +3493,10 @@ impl Executor {
             .runtime
             .clone()
             .ok_or_else(|| VmError::Unsupported("hibernate without a scheduler".into()))?;
-        runtime
-            .hibernating
-            .lock()
-            .unwrap()
-            .remove(&pid)
+        process
+            .cold_mut()
+            .hibernate
+            .take()
             .ok_or_else(|| VmError::Unsupported("hibernate continuation missing".into()))?;
         runtime.mark_hibernating(pid, false);
         // Port of erts `F_HIBERNATE_SCHED` in `p->flags`: the process tests its own flag.
@@ -3653,15 +3649,12 @@ pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError>
 }
 
 // g_proc_sched
-fn hibernate_resumes_in_place(process: &Process, pid: Pid) -> bool {
-    process.runtime.as_ref().is_some_and(|runtime| {
-        runtime
-            .hibernating
-            .lock()
-            .unwrap()
-            .get(&pid)
-            .is_some_and(|cont| cont.resume_in_place)
-    })
+fn hibernate_resumes_in_place(process: &Process) -> bool {
+    process
+        .cold
+        .as_ref()
+        .and_then(|cold| cold.hibernate.as_ref())
+        .is_some_and(|cont| cont.resume_in_place)
 }
 
 /// `erts_hibernate`'s message check: fetch, and without messages collect and fetch again.
@@ -3675,7 +3668,7 @@ fn hibernate_fetch_collect(
     if !process.inbox.is_empty() {
         return Ok(false);
     }
-    hibernate_collect(process, ctx.pid())?;
+    hibernate_collect(process)?;
     process.fetch_signals(ctx)?;
     Ok(process.inbox.is_empty())
 }
@@ -3683,10 +3676,10 @@ fn hibernate_fetch_collect(
 /// `hibernate/3` with no waiting messages: shrink the heap to the `apply(M, F, A)`
 /// arguments in X0..X2. Run after the BIF has unwound so no caller keeps stale terms.
 // Port of erts/emulator/beam/beam_common.c:1584-1592 (erts_hibernate), OTP-29.1.1.
-fn hibernate_collect(process: &mut Process, pid: Pid) -> Result<(), VmError> {
+fn hibernate_collect(process: &mut Process) -> Result<(), VmError> {
     // hibernate/0 reaches erts_hibernate with arity 0: no X register is live and the
     // stack stays a root. hibernate/3 keeps apply(M, F, A) in X0..X2.
-    let live = if hibernate_resumes_in_place(process, pid) {
+    let live = if hibernate_resumes_in_place(process) {
         0
     } else {
         3
@@ -3698,15 +3691,14 @@ fn hibernate_collect(process: &mut Process, pid: Pid) -> Result<(), VmError> {
     process.garbage_collect_hibernate(live).map(|_| ())
 }
 
-fn hibernate_stopped(process: &Process, pid: Pid) -> bool {
-    let Some(runtime) = &process.runtime else {
-        return false;
-    };
-    if !runtime.ever_hibernated.load(Ordering::Acquire) {
-        return false;
-    }
-    let mut parked = runtime.hibernating.lock().unwrap();
-    let Some(cont) = parked.get_mut(&pid) else {
+// Port of erts/emulator/beam/beam_common.c:1568 (erts_hibernate), OTP-29.1.1: the parked
+// continuation is process state (`cold.hibernate`), read and cleared by the process itself.
+fn hibernate_stopped(process: &mut Process) -> bool {
+    let Some(cont) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.hibernate.as_mut())
+    else {
         return false;
     };
     if !cont.stop {
@@ -4508,9 +4500,6 @@ impl Runtime {
             let mut pauses = self.pauses.lock().unwrap();
             pauses.remove(&pid);
             self.pauses_any.store(!pauses.is_empty(), Ordering::Release);
-        }
-        if self.ever_hibernated.load(Ordering::Acquire) {
-            self.hibernating.lock().unwrap().remove(&pid);
         }
         // `note_status` publishes PUBLISHED only when it inserts a slot. Exit skips the map
         // when this process never had one (erl_process.c keeps status on the process struct).
@@ -7661,8 +7650,6 @@ impl Vm {
             pauses: Mutex::new(HashMap::new()),
             pauses_any: AtomicBool::new(false),
             published: Mutex::new(HashMap::new()),
-            hibernating: Mutex::new(HashMap::new()),
-            ever_hibernated: AtomicBool::new(false),
             debug_wait_active: AtomicBool::new(false),
             system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
             multi_scheduling: Mutex::new(MultiScheduling::default()),
