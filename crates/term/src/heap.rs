@@ -1203,8 +1203,11 @@ impl ProcessHeap {
         self.fragment_words = self
             .fragment_words
             .saturating_add(u32::try_from(adopted_words).unwrap_or(u32::MAX));
+        // Only the words below the heap top hold objects; the rest of the block is not cleared.
+        // Port of erts/emulator/beam/erl_message.h:72-78 (ErlHeapFragment `used_size`), OTP-29.1.1.
+        let used = source.htop;
         let block = std::mem::take(&mut source.words).into_alloc_block();
-        let used = block.len();
+        let used = used.min(block.len());
         self.fragments.push(Fragment::Block {
             memory: block,
             used,

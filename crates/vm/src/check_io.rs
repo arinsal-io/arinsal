@@ -107,6 +107,9 @@ pub(crate) struct InterestSet {
 enum RegistrationKind {
     Driver,
     Nif,
+    /// A wake-up pipe of the Rust runtime's own I/O threads. erts has no such descriptor, so
+    /// the `check_io_debug` counters leave it out.
+    Internal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -166,6 +169,7 @@ fn poller() -> &'static Poller {
     })
 }
 
+#[cfg(test)]
 /// Wait on a set of descriptors through the shared, one-shot poll set.
 ///
 /// The returned descriptor is removed from the poll set before this function
@@ -174,26 +178,39 @@ pub(crate) fn wait_any(fds: &[(RawFd, InterestSet)]) -> io::Result<Option<(RawFd
     wait_any_timeout(fds, None)
 }
 
+#[cfg(test)]
 /// Wait with an optional deadline; timeout removes all registrations.
 pub(crate) fn wait_any_timeout(
     fds: &[(RawFd, InterestSet)],
     timeout: Option<std::time::Duration>,
 ) -> io::Result<Option<(RawFd, Ready)>> {
-    wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver)
+    wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, None)
 }
 
-/// Wait for one NIF selection with an optional deadline.
-pub(crate) fn wait_any_nif_timeout(
+/// Like [`wait_any_timeout`], with `wake` the caller's own wake-up descriptor, which
+/// `check_io_debug` does not count.
+pub(crate) fn wait_any_timeout_wake(
     fds: &[(RawFd, InterestSet)],
     timeout: Option<std::time::Duration>,
+    wake: RawFd,
 ) -> io::Result<Option<(RawFd, Ready)>> {
-    wait_any_timeout_kind(fds, timeout, RegistrationKind::Nif)
+    wait_any_timeout_kind(fds, timeout, RegistrationKind::Driver, Some(wake))
+}
+
+/// Wait for one NIF selection with an optional deadline; `wake` the caller's own wake-up descriptor.
+pub(crate) fn wait_any_nif_timeout_wake(
+    fds: &[(RawFd, InterestSet)],
+    timeout: Option<std::time::Duration>,
+    wake: RawFd,
+) -> io::Result<Option<(RawFd, Ready)>> {
+    wait_any_timeout_kind(fds, timeout, RegistrationKind::Nif, Some(wake))
 }
 
 fn wait_any_timeout_kind(
     fds: &[(RawFd, InterestSet)],
     timeout: Option<std::time::Duration>,
     kind: RegistrationKind,
+    wake: Option<RawFd>,
 ) -> io::Result<Option<(RawFd, Ready)>> {
     if fds.is_empty() {
         return Ok(None);
@@ -211,7 +228,11 @@ fn wait_any_timeout_kind(
                 id,
                 fd: *fd,
                 interests: *interests,
-                kind,
+                kind: if Some(*fd) == wake {
+                    RegistrationKind::Internal
+                } else {
+                    kind
+                },
                 ready: Box::new({
                     let ready_tx = ready_tx.clone();
                     move |fd, ready| {
@@ -584,6 +605,7 @@ pub(crate) fn debug_info() -> DebugInfo {
     let registrations = poller().registrations.lock().unwrap();
     let used_fds = registrations
         .values()
+        .filter(|(_, kind)| !matches!(kind, RegistrationKind::Internal))
         .map(|(fd, _)| *fd)
         .collect::<std::collections::HashSet<_>>()
         .len();
@@ -593,6 +615,7 @@ pub(crate) fn debug_info() -> DebugInfo {
         match kind {
             RegistrationKind::Driver => driver_selects += 1,
             RegistrationKind::Nif => nif_selects += 1,
+            RegistrationKind::Internal => {}
         }
     }
     DebugInfo {

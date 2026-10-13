@@ -1876,6 +1876,19 @@ mod tests {
     }
 
     #[test]
+    fn adopted_message_fragment_exposes_only_the_words_below_its_heap_top() {
+        // The message heap block is not cleared; words above its heap top are not objects, so a
+        // literal-area scan must not walk them (heap fragment `used_size`).
+        let mut message_heap = ProcessHeap::with_words(256);
+        message_heap.htop = 3;
+        let mut heap = ProcessHeap::with_words(64);
+        heap.adopt_message_fragment(message_heap).unwrap();
+        assert_eq!(heap.fragments.len(), 1);
+        assert_eq!(heap.fragments[0].len(), 3);
+        assert_eq!(heap.message_data_size(), 3);
+    }
+
+    #[test]
     fn minor_collection_does_not_reallocate_an_empty_owner_box() {
         let mut heap = ProcessHeap::with_words(128);
         heap.old_words = ProcessHeap::with_words(128).words;

@@ -62,7 +62,11 @@ fn built(
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_priv_data(e: *mut ErlNifEnv) -> *mut c_void {
-    env(e).priv_data
+    let env = env(e);
+    match &env.priv_cell {
+        Some(cell) => cell.load(std::sync::atomic::Ordering::Relaxed),
+        None => env.priv_data,
+    }
 }
 unsafe extern "C" {
     fn malloc(n: usize) -> *mut c_void;

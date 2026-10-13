@@ -80,7 +80,7 @@ pub(crate) use libloading::os::unix::Library;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[allow(non_upper_case_globals)]
@@ -362,6 +362,9 @@ pub struct ErlNifEnv {
     options: EnvOptions,
     heap: EnvHeap,
     priv_data: *mut c_void,
+    /// The `priv_data` slot a load or upgrade callback writes through its `void **priv`
+    /// argument; `enif_priv_data` reads it during the callback (erts `env->mod_nif->priv_data`).
+    priv_cell: Option<Arc<AtomicPtr<c_void>>>,
     module: Option<String>,
     library: Option<Arc<Library>>,
     pid: Option<Term>,
@@ -378,6 +381,7 @@ impl ErlNifEnv {
             heap: EnvHeap::Owned(Box::new(VecHeap::new())),
             options: EnvOptions::default(),
             priv_data: ptr::null_mut(),
+            priv_cell: None,
             module: None,
             library: None,
             pid: None,
@@ -397,6 +401,7 @@ impl ErlNifEnv {
             heap: EnvHeap::Bound(raw),
             options: EnvOptions::default(),
             priv_data: ptr::null_mut(),
+            priv_cell: None,
             module: None,
             library: None,
             pid,
@@ -751,29 +756,39 @@ impl NifImage {
     }
     /// Run the load callback and return the callable library.
     pub fn commit(self, term: Term) -> Result<NifLibrary, NifError> {
-        self.finish(term, None)
+        self.finish(term, None, None)
+    }
+    /// Like [`NifImage::commit`], for a load called by process `pid`, which `enif_self` reports
+    /// inside the callback (erts binds the load environment to the calling process).
+    pub fn commit_for(self, term: Term, pid: Option<Term>) -> Result<NifLibrary, NifError> {
+        self.finish(term, None, pid)
     }
     fn finish(
         mut self,
         term: Term,
         old_priv_data: Option<&mut *mut c_void>,
+        pid: Option<Term>,
     ) -> Result<NifLibrary, NifError> {
         let mut env = ErlNifEnv::independent();
+        env.pid = pid;
         env.module = Some(self.module.clone());
         env.library = Some(Arc::clone(&self.library));
         env.options.loading = true;
-        let mut priv_data = ptr::null_mut();
+        let cell = Arc::new(AtomicPtr::new(ptr::null_mut()));
+        env.priv_cell = Some(Arc::clone(&cell));
         let code = if let Some(old) = old_priv_data {
             let upgrade = self.upgrade.ok_or(NifError::UpgradeUnsupported)?;
             // SAFETY: this loaded library declares its upgrade ABI and both data pointers are live.
-            unsafe { upgrade(&mut env, &mut priv_data, old, term) }
+            unsafe { upgrade(&mut env, cell.as_ptr(), old, term) }
         } else if let Some(load) = self.load {
             // SAFETY: the library's callback follows its declared entry ABI.
-            unsafe { load(&mut env, &mut priv_data, term) }
+            unsafe { load(&mut env, cell.as_ptr(), term) }
         } else {
             0
         };
         env.options.loading = false;
+        env.priv_cell = None;
+        let priv_data = cell.load(Ordering::Relaxed);
         if code != 0 {
             return Err(NifError::LoadRejected(code));
         }
@@ -953,7 +968,7 @@ pub fn upgrade_nif(
     info: LoadInfo<'_>,
     old: &mut NifLibrary,
 ) -> Result<NifLibrary, NifError> {
-    open_nif(path, info.module)?.finish(info.term, Some(&mut old.priv_data))
+    open_nif(path, info.module)?.finish(info.term, Some(&mut old.priv_data), None)
 }
 unsafe extern "C" {
     fn arinsal_nif_shim_anchor();

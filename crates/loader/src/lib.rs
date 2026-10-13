@@ -380,6 +380,9 @@ pub struct Module {
     pub functions: Vec<(usize, String, u8)>,
     /// Function atoms parallel to `functions`.
     pub function_atoms: Vec<Atom>,
+    /// Functions whose code starts with `nif_start`: the stubs `erlang:load_nif/2` may bind
+    /// (erts `ERTS_NIF_START`, beam_load.c).
+    pub nif_stubs: Vec<(String, u8)>,
     /// Owning function for `JitHook::on_entry`, or `u32::MAX` when none applies.
     ///
     /// Slot `ip` holds the last function whose `func_info` offset is strictly
@@ -442,6 +445,7 @@ impl Clone for Module {
             unsupported_reasons: self.unsupported_reasons.clone(),
             functions: self.functions.clone(),
             function_atoms: self.function_atoms.clone(),
+            nif_stubs: self.nif_stubs.clone(),
             on_entry_fn: self.on_entry_fn.clone(),
             entry_arity: self.entry_arity.clone(),
             breakpoint_originals: self.breakpoint_originals.clone(),
@@ -1134,7 +1138,8 @@ pub fn load_with_instrumentations(
     let mut current_line = None;
     let mut unsupported = HashMap::new();
     let mut unsupported_reasons = Vec::new();
-    let mut functions = Vec::new();
+    let mut functions: Vec<(usize, String, u8)> = Vec::new();
+    let mut nif_stubs: Vec<(String, u8)> = Vec::new();
     let mut function_atoms = Vec::new();
     let mut debug_line_points = Vec::new();
     let mut debug_line_items = Vec::new();
@@ -1176,6 +1181,9 @@ pub fn load_with_instrumentations(
         }
         // nif_start only marks a NIF stub's entry; it executes nothing.
         if instruction.op == Opcode::NifStart {
+            if let Some((_, name, arity)) = functions.last() {
+                nif_stubs.push((name.clone(), *arity));
+            }
             continue;
         }
         if file.module == "erts_internal"
@@ -1631,6 +1639,7 @@ pub fn load_with_instrumentations(
         unsupported_reasons,
         functions,
         function_atoms,
+        nif_stubs,
         on_entry_fn,
         entry_arity,
         breakpoint_originals,

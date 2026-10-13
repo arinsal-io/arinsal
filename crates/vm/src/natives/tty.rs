@@ -332,12 +332,13 @@ fn poll_loop(wake_read: RawFd) {
         fds.push((wake_read, interest));
         fds.extend(snapshot.iter().map(|(_, fd)| (*fd, interest)));
         // Port of one-shot `driver_select`/`enif_select` wake delivery.
-        let (ready_fd, ready) = match crate::check_io::wait_any_nif_timeout(&fds, None) {
-            Ok(Some(ready)) => ready,
-            Ok(None) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => continue,
-        };
+        let (ready_fd, ready) =
+            match crate::check_io::wait_any_nif_timeout_wake(&fds, None, wake_read) {
+                Ok(Some(ready)) => ready,
+                Ok(None) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => continue,
+            };
         if ready_fd == wake_read && (ready.readable || ready.closed || ready.error) {
             let mut buf = [0u8; 64];
             loop {

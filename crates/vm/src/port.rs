@@ -2733,7 +2733,7 @@ fn worker(
         if !handle.state.lock().unwrap().closed {
             // Port of `erts_check_io` one-shot readiness delivery; every
             // operation is re-registered after this worker handles the event.
-            let result = crate::check_io::wait_any(&fds);
+            let result = crate::check_io::wait_any_timeout_wake(&fds, None, wake_r);
             match result {
                 Ok(Some((ready_fd, ready))) => {
                     input_ready = Some(ready_fd) == read_fd
@@ -4449,6 +4449,60 @@ fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
         .list_from_iter(values)
         .map_err(|e| VmError::Unsupported(format!("ports list: {e:?}")))
 }
+/// `port_info` of port zero, the forker driver's port.
+// Port of erts/emulator/beam/io.c (port_info) for the port erts creates in
+// erts/emulator/sys/unix/sys_drivers.c:291 (forker_init), OTP-29.1.1.
+fn forker_port_info(process: &mut Process, item: Option<Term>) -> Result<Term, VmError> {
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    let name = TermBuilder::new(&mut heap)
+        .string_to_list("forker")
+        .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;
+    let connected = Pid::from_data(0).to_term().ok_or_else(badarg)?;
+    let zero = Term::small(0).unwrap();
+    let fields = [
+        ("name", name),
+        ("links", Term::NIL),
+        ("id", zero),
+        ("connected", connected),
+        ("input", zero),
+        ("output", zero),
+        ("os_pid", atom("undefined")),
+        ("monitors", Term::NIL),
+        ("monitored_by", Term::NIL),
+        ("memory", zero),
+        ("queue_size", zero),
+        ("locking", atom("driver_level")),
+        ("parallelism", atom("false")),
+    ];
+    if let Some(item) = item {
+        let key = global_atoms()
+            .text(item.as_atom().ok_or_else(badarg)?)
+            .ok_or_else(badarg)?;
+        if key == "registered_name" {
+            return Ok(Term::NIL);
+        }
+        let value = fields
+            .iter()
+            .find_map(|(name, value)| (*name == key).then_some(*value))
+            .ok_or_else(badarg)?;
+        return TermBuilder::new(&mut heap)
+            .tuple(&[item, value])
+            .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")));
+    }
+    let tuples: Vec<Term> = fields
+        .into_iter()
+        .take(7)
+        .map(|(key, value)| {
+            TermBuilder::new(&mut heap)
+                .tuple(&[atom(key), value])
+                .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    TermBuilder::new(&mut heap)
+        .list_from_iter(tuples)
+        .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
+}
+
 fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Term, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let Some(handle) = process
@@ -4456,7 +4510,12 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .as_ref()
         .and_then(|r| r.ports.lock().unwrap().get(&id).cloned())
     else {
-        return Ok(atom("undefined"));
+        // The forker is port zero and has no handle here (see `ports`).
+        return if id == 0 {
+            forker_port_info(process, item)
+        } else {
+            Ok(atom("undefined"))
+        };
     };
     let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let name = TermBuilder::new(&mut heap)
