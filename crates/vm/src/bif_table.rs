@@ -22,6 +22,21 @@ pub(crate) fn special(module: &str, function: &str, arity: u8) -> Option<usize> 
             crate::signals::is_process_alive_light as *const () as usize
         }
         ("erlang", "process_flag", 2) => process_flag_light as *const () as usize,
+        ("erlang", "send_after", 3 | 4) => {
+            crate::native_helpers::timer_start_light::<true> as *const () as usize
+        }
+        ("erlang", "start_timer", 3 | 4) => {
+            crate::native_helpers::timer_start_light::<false> as *const () as usize
+        }
+        ("erlang", "cancel_timer", 1 | 2) => {
+            crate::native_helpers::timer_query_light::<true> as *const () as usize
+        }
+        ("erlang", "read_timer", 1 | 2) => {
+            crate::native_helpers::timer_query_light::<false> as *const () as usize
+        }
+        ("erlang", "group_leader", 0) => {
+            crate::native_helpers::group_leader_0_light as *const () as usize
+        }
         ("erlang", "put", 2) => put_2_light as *const () as usize,
         ("erlang", "get", 1) => get_1_light as *const () as usize,
         ("erlang", "erase", 1) => erase_1_light as *const () as usize,

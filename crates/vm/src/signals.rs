@@ -670,6 +670,158 @@ fn flush_monitor_trap(reference: Term, result: Term) -> VmError {
 
 const FLUSH_MONITOR_CONTINUATION: &str = "erts_internal:flush_monitor_messages/3";
 
+/// Where `send_after/start_timer` put the timer: the scheduler context of the executor, or the
+/// calling scheduler's wheel reached from native code.
+pub(crate) trait TimerSink {
+    fn schedule_timer(
+        &mut self,
+        target: Pid,
+        ms: u64,
+        message: Message,
+        wrapped: bool,
+    ) -> Result<arinsal_sched::TimerRef, String>;
+    fn schedule_resolved_timer(
+        &mut self,
+        ms: u64,
+        message: Message,
+        wrapped: bool,
+        resolve: std::sync::Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+    ) -> Result<arinsal_sched::TimerRef, String>;
+}
+
+impl TimerSink for RunCtx<'_, Message> {
+    fn schedule_timer(
+        &mut self,
+        target: Pid,
+        ms: u64,
+        message: Message,
+        wrapped: bool,
+    ) -> Result<arinsal_sched::TimerRef, String> {
+        RunCtx::schedule_timer(self, target, ms, message, wrapped).map_err(|e| e.to_string())
+    }
+    fn schedule_resolved_timer(
+        &mut self,
+        ms: u64,
+        message: Message,
+        wrapped: bool,
+        resolve: std::sync::Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+    ) -> Result<arinsal_sched::TimerRef, String> {
+        RunCtx::schedule_resolved_timer(self, ms, message, wrapped, move || resolve())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The calling normal scheduler's timer wheel, reached from native code without a `RunCtx`.
+pub(crate) struct NativeTimers(pub(crate) Pid);
+
+impl TimerSink for NativeTimers {
+    fn schedule_timer(
+        &mut self,
+        target: Pid,
+        ms: u64,
+        message: Message,
+        wrapped: bool,
+    ) -> Result<arinsal_sched::TimerRef, String> {
+        match arinsal_sched::native_start_timer(self.0, target, ms, message, wrapped) {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("no native scheduler".into()),
+        }
+    }
+    fn schedule_resolved_timer(
+        &mut self,
+        ms: u64,
+        message: Message,
+        wrapped: bool,
+        resolve: std::sync::Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+    ) -> Result<arinsal_sched::TimerRef, String> {
+        match arinsal_sched::native_start_resolved_timer(self.0, ms, resolve, message, wrapped) {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("no native scheduler".into()),
+        }
+    }
+}
+
+/// `erlang:send_after/3,4` and `erlang:start_timer/3,4`.
+// Port of erts/emulator/beam/erl_hl_timer.c:1804-1850 (`erts_create_bif_timer`,
+// `setup_bif_timer`) and erl_bif_timer.c, OTP-29.1.1.
+pub(crate) fn start_timer_bif(
+    process: &mut Process,
+    sink: &mut dyn TimerSink,
+    args: &[Term],
+    send_after: bool,
+) -> Result<Term, VmError> {
+    let (time, target, message) = (args[0], args[1], args[2]);
+    let absolute = args
+        .get(3)
+        .map(|options| timer_start_options(*options))
+        .transpose()?
+        .unwrap_or(false);
+    let time = time.as_small().ok_or_else(|| badarg("timer/3"))?;
+    let ms = if absolute {
+        let now = arinsal_bifs::monotonic_time_milliseconds();
+        (i128::from(time) - now).clamp(0, i128::from(u64::MAX)) as u64
+    } else {
+        u64::try_from(time).map_err(|_| badarg("timer/3"))?
+    };
+    let pid = Pid::from_term(target);
+    let registered_name = if pid.is_none() {
+        Some(target.as_atom().ok_or_else(|| badarg("timer/3"))?)
+    } else {
+        None
+    };
+    let rt = process.runtime.clone().ok_or_else(|| badarg("timer/3"))?;
+    // A dead pid gets a ref but no timer entry; an unresolved name can become registered
+    // before its timer expires.
+    let id = rt.next_ref();
+    let timer_message = arinsal_term::to_owned(message).ok();
+    let message = Message::copy_from(message)?.with_timer_id(id);
+    // setup_bif_timer: a timer for a process that does not exist is never created.
+    if let Some(pid) = pid
+        && !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid))
+    {
+        return reference(process, id);
+    }
+    let wrapped = !send_after;
+    let timer = if let Some(pid) = pid {
+        sink.schedule_timer(pid, ms, message, wrapped)
+    } else {
+        let runtime = rt.clone();
+        let name = registered_name.expect("resolved timer name");
+        sink.schedule_resolved_timer(
+            ms,
+            message,
+            wrapped,
+            std::sync::Arc::new(move || {
+                let target = runtime.reg.whereis_proc(name);
+                if target.is_none() {
+                    runtime.timers.lock().unwrap().remove(&id);
+                    runtime.timer_messages.lock().unwrap().remove(&id);
+                }
+                target
+            }),
+        )
+    }
+    .map_err(|error| VmError::Unsupported(format!("timer: {error}")))?;
+    rt.timers.lock().unwrap().insert(id, timer);
+    if let Some(message) = timer_message {
+        rt.timer_messages.lock().unwrap().insert(id, message);
+    }
+    // The timer belongs to its receiving process (erts keeps it in the receiver's bif-timer
+    // tree) and is cancelled when that process exits; name-addressed timers have no owner.
+    if let Some(pid) = pid {
+        // Owned BIF timers are p->bif_timers (erl_process.c:14301). Exit cancels them only
+        // when this word is set.
+        if rt.publish_proc_flag(pid, arinsal_sched::proc_flags::OWNED_TIMERS) {
+            rt.timer_owners.lock().unwrap().insert(id, pid);
+        }
+        if !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid)) {
+            // The receiver exited meanwhile; its exit may already have swept its timers.
+            rt.cancel_owned_timers(pid);
+        }
+    }
+    reference(process, id)
+}
+
 pub(crate) fn reference(process: &mut Process, id: u64) -> Result<Term, VmError> {
     let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
     Term::local_ref(&mut heap, arinsal_bifs::ordinary_ref_words(id))
@@ -1207,12 +1359,12 @@ fn timer_start_options(term: Term) -> Result<bool, VmError> {
 }
 
 #[derive(Clone, Copy)]
-struct TimerQueryOptions {
-    asynchronous: bool,
-    info: bool,
+pub(crate) struct TimerQueryOptions {
+    pub(crate) asynchronous: bool,
+    pub(crate) info: bool,
 }
 
-fn timer_query_options(term: Term, cancel: bool) -> Result<TimerQueryOptions, VmError> {
+pub(crate) fn timer_query_options(term: Term, cancel: bool) -> Result<TimerQueryOptions, VmError> {
     let mut asynchronous = false;
     let mut info = true;
     for option in list(term).ok_or_else(|| badarg("timer options"))? {
@@ -1259,6 +1411,39 @@ enum TimerAccess {
     },
 }
 
+/// Synchronous `cancel_timer/1,2` (`cancel`) and `read_timer/1,2`: the timer's answer, or the
+/// reply wait when another scheduler's wheel owns it.
+// Port of erts/emulator/beam/erl_hl_timer.c:2083-2200 (bif_timer_access_request,
+// erts_cancel_bif_timer / erts_read_bif_timer), OTP-29.1.1.
+pub(crate) fn timer_query_sync(
+    process: &mut Process,
+    caller: Pid,
+    reference: Term,
+    cancel: bool,
+    info: bool,
+) -> Result<Term, VmError> {
+    let id = ref_id(reference).ok_or_else(|| {
+        badarg(if cancel {
+            "cancel_timer/1"
+        } else {
+            "read_timer/1"
+        })
+    })?;
+    if let Some(done) = poll(process)? {
+        return Ok(done);
+    }
+    let rt = runtime(process)?;
+    let timer = if cancel {
+        rt.timer_owners.lock().unwrap().remove(&id);
+        let timer = rt.timers.lock().unwrap().remove(&id);
+        rt.timer_messages.lock().unwrap().remove(&id);
+        timer
+    } else {
+        rt.timers.lock().unwrap().get(&id).copied()
+    };
+    access_timer_sync(process, caller, reference, timer, cancel, info)
+}
+
 /// Synchronous `cancel_timer`/`read_timer`.
 ///
 /// Port of erts/emulator/beam/erl_hl_timer.c:2237 (access_bif_timer), OTP-29.1.1: the
@@ -1267,7 +1452,7 @@ enum TimerAccess {
 /// scheduler thread ever blocks on another one.
 fn access_timer_sync(
     process: &mut Process,
-    ctx: &mut RunCtx<'_, Message>,
+    caller: Pid,
     timer_reference: Term,
     timer: Option<arinsal_sched::TimerRef>,
     cancel: bool,
@@ -1336,7 +1521,7 @@ fn access_timer_sync(
         save: process.inbox.len(),
     });
     *guard = TimerAccess::Parked {
-        target: ctx.pid(),
+        target: caller,
         reply,
         info,
         scheduler,
@@ -2565,94 +2750,15 @@ fn call_resolved(
         (SignalBif::IsProcessExecutingDirty1, [pid]) => is_process_executing_dirty(process, *pid),
         (SignalBif::TraceCleanerCheck0, []) => Ok(atom("false")),
         (SignalBif::TraceCleanerSend1, [to]) => trace_cleaner_send(process, ctx, *to),
-        (SignalBif::SendAfter3, [time, target, message])
-        | (SignalBif::SendAfter4, [time, target, message, _])
-        | (SignalBif::StartTimer3, [time, target, message])
-        | (SignalBif::StartTimer4, [time, target, message, _]) => {
-            let absolute = args
-                .get(3)
-                .map(|options| timer_start_options(*options))
-                .transpose()?
-                .unwrap_or(false);
-            let time = time.as_small().ok_or_else(|| badarg("timer/3"))?;
-            let ms = if absolute {
-                let now = arinsal_bifs::monotonic_time_milliseconds();
-                (i128::from(time) - now).clamp(0, i128::from(u64::MAX)) as u64
-            } else {
-                u64::try_from(time).map_err(|_| badarg("timer/3"))?
-            };
-            let pid = Pid::from_term(*target);
-            let registered_name = if pid.is_none() {
-                Some(target.as_atom().ok_or_else(|| badarg("timer/3"))?)
-            } else {
-                None
-            };
-            let rt = process.runtime.clone().ok_or_else(|| badarg("timer/3"))?;
-            // Port of erts/emulator/beam/erl_hl_timer.c:1804-1850, OTP-29.1.1.
-            // A dead pid gets a ref but no timer entry; an unresolved name can
-            // become registered before its timer expires.
-            let id = rt.next_ref();
-            let timer_message = arinsal_term::to_owned(*message).ok();
-            let message = Message::copy_from(*message)?.with_timer_id(id);
-            // Port of erts/emulator/beam/erl_hl_timer.c (setup_bif_timer), OTP-29.1.1: a timer for a
-            // process that does not exist is never created.
-            if let Some(pid) = pid
-                && !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid))
-            {
-                return reference(process, id);
-            }
-            let timer = if matches!(entry, SignalBif::SendAfter3 | SignalBif::SendAfter4) {
-                if let Some(pid) = pid {
-                    ctx.schedule_timer(pid, ms, message, false)
-                } else {
-                    let runtime = rt.clone();
-                    let name = registered_name.expect("resolved timer name");
-                    ctx.schedule_resolved_timer(ms, message, false, move || {
-                        let target = runtime.reg.whereis_proc(name);
-                        if target.is_none() {
-                            runtime.timers.lock().unwrap().remove(&id);
-                            runtime.timer_messages.lock().unwrap().remove(&id);
-                        }
-                        target
-                    })
-                }
-            } else {
-                if let Some(pid) = pid {
-                    ctx.schedule_timer(pid, ms, message, true)
-                } else {
-                    let runtime = rt.clone();
-                    let name = registered_name.expect("resolved timer name");
-                    ctx.schedule_resolved_timer(ms, message, true, move || {
-                        let target = runtime.reg.whereis_proc(name);
-                        if target.is_none() {
-                            runtime.timers.lock().unwrap().remove(&id);
-                            runtime.timer_messages.lock().unwrap().remove(&id);
-                        }
-                        target
-                    })
-                }
-            }
-            .map_err(|error| VmError::Unsupported(format!("timer: {error}")))?;
-            rt.timers.lock().unwrap().insert(id, timer);
-            if let Some(message) = timer_message {
-                rt.timer_messages.lock().unwrap().insert(id, message);
-            }
-            // The timer belongs to its receiving process (erts keeps it in the receiver's
-            // bif-timer tree) and is cancelled when that process exits; name-addressed timers
-            // have no owner.
-            if let Some(pid) = pid {
-                // Owned BIF timers are p->bif_timers (erl_process.c:14301). Exit cancels
-                // them only when this word is set.
-                if rt.publish_proc_flag(pid, arinsal_sched::proc_flags::OWNED_TIMERS) {
-                    rt.timer_owners.lock().unwrap().insert(id, pid);
-                }
-                if !rt.scheduler().is_ok_and(|scheduler| scheduler.lookup(pid)) {
-                    // The receiver exited meanwhile; its exit may already have swept its timers.
-                    rt.cancel_owned_timers(pid);
-                }
-            }
-            reference(process, id)
-        }
+        (SignalBif::SendAfter3, [..])
+        | (SignalBif::SendAfter4, [..])
+        | (SignalBif::StartTimer3, [..])
+        | (SignalBif::StartTimer4, [..]) => start_timer_bif(
+            process,
+            ctx,
+            args,
+            matches!(entry, SignalBif::SendAfter3 | SignalBif::SendAfter4),
+        ),
         (SignalBif::CancelTimer1, [reference]) | (SignalBif::CancelTimer2, [reference, _]) => {
             let options = if let Some(options) = args.get(1) {
                 timer_query_options(*options, true)?
@@ -2663,10 +2769,8 @@ fn call_resolved(
                 }
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("cancel_timer/1"))?;
-            if !options.asynchronous
-                && let Some(done) = poll(process)?
-            {
-                return Ok(done);
+            if !options.asynchronous {
+                return timer_query_sync(process, ctx.pid(), *reference, true, options.info);
             }
             let rt = runtime(process)?;
             if options.asynchronous {
@@ -2729,10 +2833,7 @@ fn call_resolved(
                 }
                 return Ok(atom("ok"));
             }
-            rt.timer_owners.lock().unwrap().remove(&id);
-            let timer = rt.timers.lock().unwrap().remove(&id);
-            rt.timer_messages.lock().unwrap().remove(&id);
-            access_timer_sync(process, ctx, *reference, timer, true, options.info)
+            unreachable!("synchronous cancel_timer returned above")
         }
         (SignalBif::ReadTimer1, [reference]) | (SignalBif::ReadTimer2, [reference, _]) => {
             let options = if let Some(options) = args.get(1) {
@@ -2744,10 +2845,8 @@ fn call_resolved(
                 }
             };
             let id = ref_id(*reference).ok_or_else(|| badarg("read_timer/1"))?;
-            if !options.asynchronous
-                && let Some(done) = poll(process)?
-            {
-                return Ok(done);
+            if !options.asynchronous {
+                return timer_query_sync(process, ctx.pid(), *reference, false, options.info);
             }
             let rt = runtime(process)?;
             let timer = rt.timers.lock().unwrap().get(&id).copied();
@@ -2787,7 +2886,7 @@ fn call_resolved(
                 }
                 return Ok(atom("ok"));
             }
-            access_timer_sync(process, ctx, *reference, timer, false, options.info)
+            unreachable!("synchronous read_timer returned above")
         }
         (SignalBif::SpawnSystemProcess3, [module, function, args]) => {
             let pid = spawn_mfa(

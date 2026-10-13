@@ -331,13 +331,34 @@ fn call_term_to_string(
     term_to_string(process, args)
 }
 
+/// `erlang:statistics/1` for the items that need no scheduler context, called from native code.
+/// The others (reductions, run queues, scheduler wall time, microstate accounting) read the
+/// scheduler's counters through the executor.
+// Port of erts/emulator/beam/erl_bif_info.c (statistics_1, `runtime`, `wall_clock`,
+// `garbage_collection`, `io`), OTP-29.1.1.
+pub(crate) fn statistics_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [key] = args else {
+        return None;
+    };
+    if !matches!(
+        atom_name(*key)?,
+        "runtime" | "wall_clock" | "garbage_collection" | "io"
+    ) {
+        return None;
+    }
+    statistics(process, None, *key).ok().map(Ok)
+}
+
 fn call_statistics(
-    vm: &mut Vm,
+    _vm: &mut Vm,
     process: &mut Process,
     ctx: &mut RunCtx<'_, Message>,
     args: &[Term],
 ) -> Result<Term, VmError> {
-    statistics(vm, process, Some(ctx), args[0])
+    statistics(process, Some(ctx), args[0])
 }
 
 fn call_bump_reductions(
@@ -2369,7 +2390,6 @@ fn atom_bytes() -> (u64, u64) {
 }
 
 fn statistics(
-    _vm: &Vm,
     process: &mut Process,
     ctx: Option<&mut RunCtx<'_, Message>>,
     key: Term,
@@ -5307,7 +5327,7 @@ mod tests {
             let expected = reference.call("erlang", "statistics", &[OwnedTerm::atom(selector)]);
             let mut heap = VecHeap::new();
             let input = from_owned(&OwnedTerm::atom(selector), &mut heap).unwrap();
-            let actual = statistics(&Vm::new([]), &mut Process::new(), None, input)
+            let actual = statistics(&mut Process::new(), None, input)
                 .and_then(|term| to_owned(term).map_err(|_| badarg()))
                 .unwrap();
             match (&actual, &expected) {
@@ -5357,8 +5377,7 @@ mod tests {
             let mut input_heap = VecHeap::new();
             let input = from_owned(&OwnedTerm::atom(key), &mut input_heap).unwrap();
             let mut process = Process::new();
-            let vm = Vm::new([]);
-            let actual = statistics(&vm, &mut process, None, input)
+            let actual = statistics(&mut process, None, input)
                 .and_then(|term| to_owned(term).map_err(|_| badarg()));
             match (actual, expected) {
                 (Ok(OwnedTerm::Int(_)), CallResult::Ok(OwnedTerm::Int(_)))
@@ -5372,11 +5391,11 @@ mod tests {
         }
         let mut heap = VecHeap::new();
         let micro = from_owned(&OwnedTerm::atom("microstate_accounting"), &mut heap).unwrap();
-        let actual = statistics(&Vm::new([]), &mut Process::new(), None, micro)
+        let actual = statistics(&mut Process::new(), None, micro)
             .and_then(|term| to_owned(term).map_err(|_| badarg()))
             .expect("microstate");
         assert_eq!(actual, OwnedTerm::atom("undefined"));
         let invalid = from_owned(&OwnedTerm::atom("invalid"), &mut heap).unwrap();
-        assert!(statistics(&Vm::new([]), &mut Process::new(), None, invalid).is_err());
+        assert!(statistics(&mut Process::new(), None, invalid).is_err());
     }
 }

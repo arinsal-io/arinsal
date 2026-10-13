@@ -1181,7 +1181,19 @@ pub(crate) extern "C" fn process_flag_light(
     if let Some(raw) = save_calls_flag_light(header, regs) {
         return raw;
     }
+    if let Some(raw) = process_flag_ctxfree_light(header) {
+        return raw;
+    }
     yield_executor_bif(header, regs, i, entry, identity)
+}
+
+/// `process_flag/2` for the flags that need no scheduler context.
+fn process_flag_ctxfree_light(header: *mut ProcessHeader) -> Option<u64> {
+    let (process, registers) = crate::native_hooks::enter_runtime(header)?;
+    let (name, value) = (registers.x_reg_array[0], registers.x_reg_array[1]);
+    let previous = crate::natives::proc::process_flag_ctxfree(process, name, value)?;
+    registers.x_reg_array[0] = previous;
+    Some(crate::native_hooks::raw(previous))
 }
 
 /// `erlang:self/0`. `c_p->common.id`, already the tagged pid on the header.
@@ -1197,6 +1209,105 @@ pub(crate) extern "C" fn self_light(
         return 0;
     };
     process.header.self_pid
+}
+
+/// `erlang:send_after/3,4` (`SEND_AFTER`) and `erlang:start_timer/3,4` from the light-BIF
+/// fragment. The timer is started on the calling scheduler's wheel; anything the fast path
+/// declines (bad arguments, a thread without a normal scheduler) is redone by the executor.
+// Port of erts/emulator/beam/erl_hl_timer.c:1804-1850 (erts_create_bif_timer reaches the wheel
+// of `esdp`), OTP-29.1.1.
+pub(crate) extern "C" fn timer_start_light<const SEND_AFTER: bool>(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    if let Some(raw) = timer_start_native(header, descriptor, SEND_AFTER) {
+        return raw;
+    }
+    yield_executor_bif(header, regs, i, descriptor, identity)
+}
+
+fn timer_start_native(
+    header: *mut ProcessHeader,
+    descriptor: u64,
+    send_after: bool,
+) -> Option<u64> {
+    let (process, registers) = crate::native_hooks::enter_runtime(header)?;
+    let export = crate::beamasm_integration::export_from_info(descriptor)?;
+    let arity = usize::from(export.arity);
+    let mut args = [Term::NIL; 4];
+    args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
+    let mut sink = crate::signals::NativeTimers(process.self_pid?);
+    let term =
+        crate::signals::start_timer_bif(process, &mut sink, &args[..arity], send_after).ok()?;
+    let top = process.heap.heap_top_index();
+    process.header.htop = native_htop(process, top);
+    registers.x_reg_array[0] = term;
+    Some(crate::native_hooks::raw(term))
+}
+
+/// `erlang:cancel_timer/1,2` (`CANCEL`) and `erlang:read_timer/1,2` from the light-BIF fragment.
+/// The synchronous form answers here when the timer lives on the calling scheduler's wheel;
+/// when another scheduler owns it the caller waits for the reply in the executor, and the
+/// asynchronous form is the executor's.
+// Port of erts/emulator/beam/erl_hl_timer.c:2083-2200 (bif_timer_access_request,
+// erts_cancel_bif_timer / erts_read_bif_timer), OTP-29.1.1.
+pub(crate) extern "C" fn timer_query_light<const CANCEL: bool>(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    if let Some(raw) = timer_query_native(header, descriptor, CANCEL) {
+        return raw;
+    }
+    yield_executor_bif(header, regs, i, descriptor, identity)
+}
+
+fn timer_query_native(header: *mut ProcessHeader, descriptor: u64, cancel: bool) -> Option<u64> {
+    let (process, registers) = crate::native_hooks::enter_runtime(header)?;
+    let export = crate::beamasm_integration::export_from_info(descriptor)?;
+    let info = if export.arity == 2 {
+        let options = crate::signals::timer_query_options(registers.x_reg_array[1], cancel).ok()?;
+        if options.asynchronous {
+            return None;
+        }
+        options.info
+    } else {
+        true
+    };
+    let reference = registers.x_reg_array[0];
+    let term =
+        crate::signals::timer_query_sync(process, process.self_pid?, reference, cancel, info)
+            .ok()?;
+    let top = process.heap.heap_top_index();
+    process.header.htop = native_htop(process, top);
+    registers.x_reg_array[0] = term;
+    Some(crate::native_hooks::raw(term))
+}
+
+/// `erlang:group_leader/0`: the calling process's group leader, an immediate pid.
+// Port of erts/emulator/beam/bif.c (`group_leader_0`: `BIF_RET(BIF_P->group_leader)`),
+// OTP-29.1.1.
+pub(crate) extern "C" fn group_leader_0_light(
+    header: *mut ProcessHeader,
+    regs: *mut u64,
+    i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some(process) = crate::native_hooks::process_from_header(header) else {
+        return 0;
+    };
+    if let Some(pid) = process.self_pid
+        && let Some(leader) = process.group_leader_pid(pid).to_term()
+    {
+        return crate::native_hooks::raw(leader);
+    }
+    yield_executor_bif(header, regs, i, descriptor, identity)
 }
 
 /// `erlang:node/0`.
