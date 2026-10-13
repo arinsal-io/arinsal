@@ -240,7 +240,7 @@ def kernels(runs: int) -> None:
     beam = ROOT / "tmp/pf_exec"
     beam.mkdir(parents=True, exist_ok=True)
     compiled = run(
-        ["erlc", "-o", str(beam), str(ROOT / "experiments/perf/pf_exec/kernels.erl")],
+        ["erlc", "-o", str(beam), str(ROOT / "crates/vm/tests/fixtures/kernels.erl")],
         ROOT,
         None,
         timeout=60,

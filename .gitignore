@@ -21,6 +21,6 @@ AGENTS.md
 /tests/e2e/results/
 /tests/otp/results/
 __pycache__/
-experiments/**/target/
+experiments/
 .debug/
 tests/otp/**/*.beam
