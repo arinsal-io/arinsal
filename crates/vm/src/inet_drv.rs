@@ -311,7 +311,7 @@ pub(crate) fn detach(id: u64) {
     let pending = {
         let mut inner = sock.inner.lock().unwrap();
         // Port of erts/emulator/drivers/common/inet_drv.c:12718-12725 (tcp_inet_flush)
-        // and :11906-11916 (tcp_inet_stop), OTP-29.1.1: a port stopped during sendfile
+        // and :11906-11918 (tcp_inet_stop), OTP-29.1.1: a port stopped during sendfile
         // discards its queue and closes the dup'ed file descriptor.
         if inner.sendfile.is_some() {
             inner.sendq.clear();
@@ -3038,7 +3038,7 @@ fn emit(sock: &Sock, out: Out) {
             .and_then(|data| TermBuilder::new(&mut heap).tuple(&[port, data]).ok())
             .map(|term| (*owner, term)),
         Out::Sendfile { owner, result } => {
-            // Port of inet_drv.c:14029-14043 ({sendfile, S, {ok, SentLow, SentHigh}}) and
+            // Port of inet_drv.c:14032-14043 ({sendfile, S, {ok, SentLow, SentHigh}}) and
             // :14055-14072 ({sendfile, S, {error, Reason}}), OTP-29.1.1.
             let status = match result {
                 Ok(bytes_sent) => TermBuilder::new(&mut heap)
@@ -3743,16 +3743,22 @@ fn on_eof(sock: &Arc<Sock>) {
         let active = active_is(&inner.active);
         let owner = sock.handle.owner_pid();
         let reason = close_atom(&inner);
-        // Port of erts/emulator/drivers/common/inet_drv.c:12805-12810 (tcp_recv_closed,
-        // ENOTCONN) and :12863-12867 (tcp_recv_error, here ECONNRESET), OTP-29.1.1: both
-        // abort a sendfile with {error, closed} before any other close reporting.
+        // Port of erts/emulator/drivers/common/inet_drv.c:12805-12810 (tcp_recv_closed
+        // aborts with ENOTCONN) and :12863-12867 (tcp_recv_error aborts with its err),
+        // OTP-29.1.1, before any other close reporting. `pull` ends the stream on a
+        // zero-byte read (closed) or ECONNRESET, which it records in `inner.reset`.
         if inner.sendfile.is_some() {
+            let err = if inner.reset {
+                libc::ECONNRESET
+            } else {
+                libc::ENOTCONN
+            };
             drop(inner);
             emit(
                 sock,
                 Out::Sendfile {
                     owner,
-                    result: Err(tcp_sendfile_aborted(libc::ENOTCONN)),
+                    result: Err(tcp_sendfile_aborted(err)),
                 },
             );
             inner = sock.inner.lock().unwrap();
