@@ -722,12 +722,17 @@ fn filename_bytes(term: Term) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// The functions `module` declares as NIF stubs: those whose code starts with `nif_start`.
-// Port of erts/emulator/beam/erl_nif.c (erts_load_nif checks `BeamIsOpCode(..., op_nif_start)`
-// of the loaded code), OTP-29.1.1. The loaded module is the source, not a beam file on a path,
-// so a module loaded from a binary works.
-fn declared_nifs(module: &arinsal_loader::Module) -> HashSet<(String, u8)> {
-    module.nif_stubs.iter().cloned().collect()
+/// The functions `module` declares as NIF stubs: those whose code starts with `nif_start`, or
+/// `None` when the module has no `nif_start` at all, in which case any function may become a NIF.
+// Port of erts/emulator/beam/erl_nif.c:4700-4704 (check_is_nifable: `!are_nifs ||
+// are_nifs[func_ix]`) with `are_nifs` from erts/emulator/beam/jit/asm_load.c:651-661 (allocated
+// at the first `nif_start`, NULL without one), OTP-29.1.1. The loaded module is the source, not
+// a beam file on a path, so a module loaded from a binary works.
+fn declared_nifs(module: &arinsal_loader::Module) -> Option<HashSet<(String, u8)>> {
+    module
+        .nif_stubs
+        .as_ref()
+        .map(|stubs| stubs.iter().cloned().collect())
 }
 
 /// A dirty NIF call or `enif_schedule_nif` continuation waiting for a scheduler of
@@ -1039,7 +1044,10 @@ fn validate_image(
                 function.name, function.arity
             ));
         };
-        if !declared.contains(&(function.name.clone(), arity)) {
+        if declared
+            .as_ref()
+            .is_some_and(|declared| !declared.contains(&(function.name.clone(), arity)))
+        {
             return Err(format!(
                 "Function not declared as nif {caller}:{}/{}",
                 function.name, function.arity

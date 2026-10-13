@@ -859,6 +859,80 @@ fn load_nif_from_module_loaded_off_the_code_path_matches_erts() {
 }
 
 #[test]
+fn load_nif_binds_any_function_of_a_module_without_nif_start_like_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    let dir = work_dir("nostart");
+    let library = compile_so(
+        &dir,
+        "nifdyn_nostart",
+        r#"
+        #include "erl_nif.h"
+        static ERL_NIF_TERM add(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            int a, b;
+            (void)argc;
+            if (!enif_get_int(env, argv[0], &a) || !enif_get_int(env, argv[1], &b))
+                return enif_make_badarg(env);
+            return enif_make_int(env, a + b);
+        }
+        static ERL_NIF_TERM twice(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            int a;
+            (void)argc;
+            if (!enif_get_int(env, argv[0], &a))
+                return enif_make_badarg(env);
+            return enif_make_int(env, 2 * a);
+        }
+        static ErlNifFunc funcs[] = {{"add", 2, add, 0}, {"twice", 1, twice, 0}};
+        ERL_NIF_INIT(nifdyn_nostart, funcs, NULL, NULL, NULL, NULL)
+        "#,
+    );
+    let module_src = format!(
+        "-module(nifdyn_nostart).\n-export([run/0, add/2]).\nrun() ->\n    Loaded = load(erlang),\n    {{Loaded, try add(20, 22) catch error:A -> A end, try twice(21) catch error:T -> T end}}.\nload(M) -> M:load_nif(\"{}\", []).\nadd(_, _) -> erlang:nif_error(undef).\ntwice(_) -> erlang:nif_error(undef).\n",
+        library.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_nostart", &module_src);
+    assert_same(&dir, &erl, "nifdyn_nostart");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_nif_rejects_a_function_missing_from_nifs_like_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    let dir = work_dir("undeclared");
+    let library = compile_so(
+        &dir,
+        "nifdyn_undeclared",
+        r#"
+        #include "erl_nif.h"
+        static ERL_NIF_TERM add(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            (void)argc;
+            (void)argv;
+            return enif_make_int(env, 1);
+        }
+        static ERL_NIF_TERM sub(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+            (void)argc;
+            (void)argv;
+            return enif_make_int(env, 2);
+        }
+        static ErlNifFunc funcs[] = {{"add", 2, add, 0}, {"sub", 2, sub, 0}};
+        ERL_NIF_INIT(nifdyn_undeclared, funcs, NULL, NULL, NULL, NULL)
+        "#,
+    );
+    let module_src = format!(
+        "-module(nifdyn_undeclared).\n-export([run/0, add/2, sub/2]).\n-nifs([add/2]).\nrun() ->\n    Loaded = erlang:load_nif(\"{}\", []),\n    {{Loaded, try add(1, 2) catch error:A -> A end}}.\nadd(_, _) -> erlang:nif_error(undef).\nsub(_, _) -> 0.\n",
+        library.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_undeclared", &module_src);
+    assert_same(&dir, &erl, "nifdyn_undeclared");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn load_errors_and_roundtrip_match_erts() {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping dynamic NIF differential test");
