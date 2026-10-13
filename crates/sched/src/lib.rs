@@ -1162,7 +1162,7 @@ struct LocalInit<T: Task> {
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
     profile_active: bool,
-    last_process: Option<Arc<Process<T>>>,
+    last_process: Option<Pid>,
     metric_deltas: Vec<i64>,
     dirty_metrics: Vec<usize>,
     metric_marked: Vec<bool>,
@@ -2927,6 +2927,10 @@ impl<T: Task> Inner<T> {
     /// erl_hl_timer.c (scheduled_start_callback_timer, handle_canceled_queue), OTP-29.1.1:
     /// the owning scheduler answers from its aux work; requesters never wait on it.
     fn run_timer_commands(&self, service: &mut TimerService<T::Message>) {
+        // Most scheduling rounds have nothing queued: skip the queue handle clones.
+        if service.commands.is_empty() && service.canceled.is_empty() {
+            return;
+        }
         let commands = service.commands.clone();
         while let Some(command) = commands.pop() {
             match command {
@@ -3306,7 +3310,7 @@ struct Local<T: Task> {
     pending_waits: Vec<PendingWait<T>>,
     check_time_reds: u32,
     profile_active: bool,
-    last_process: Option<Arc<Process<T>>>,
+    last_process: Option<Pid>,
     metric_deltas: Vec<i64>,
     dirty_metrics: Vec<usize>,
     metric_marked: Vec<bool>,
@@ -6613,7 +6617,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
             if !local.profile_active {
                 let count = inner.active_schedulers.fetch_add(1, Ordering::Relaxed) + 1;
                 local.profile_active = true;
-                if let Some(process) = local.last_process.clone() {
+                if let Some(process) = local.last_process.and_then(|pid| inner.table.lookup(pid)) {
                     profile_scheduler_transition(&inner, &process, id, true, count, &mut *local);
                 }
             }
@@ -6710,7 +6714,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
                 local.profile_active = true;
                 profile_scheduler_transition(&inner, &item.process, id, true, count, &mut *local);
             }
-            local.last_process = Some(item.process.clone());
+            local.last_process = Some(item.process.pid);
             let reductions = local.reductions;
             // The chosen process is off the run queue. Release the lock for the
             // slice so another scheduler can steal work that is still queued.
@@ -6771,7 +6775,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
         if local.profile_active {
             let count = inner.active_schedulers.fetch_sub(1, Ordering::Relaxed) - 1;
             local.profile_active = false;
-            if let Some(process) = local.last_process.clone() {
+            if let Some(process) = local.last_process.and_then(|pid| inner.table.lookup(pid)) {
                 profile_scheduler_transition(&inner, &process, id, false, count, &mut *local);
             }
         }

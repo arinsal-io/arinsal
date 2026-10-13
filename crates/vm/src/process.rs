@@ -859,12 +859,16 @@ pub(crate) struct Runtime {
     suspend_waiters: Mutex<Vec<SuspendWaiter>>,
     pub(crate) suspend_total: Mutex<HashMap<Pid, u32>>,
     pub(crate) ever_suspended: AtomicBool,
+    /// Whether `suspend_total` has an entry; readers skip the lock while it is false.
+    pub(crate) suspended_any: AtomicBool,
     /// The code modification permission (`code_ix.c` `code_mod_permission`) of this node.
     pub(crate) code_mod_permission: Mutex<crate::natives::code::CodeModPermission>,
     /// This node's breakpoint tables and active breakpoint index.
     pub(crate) breakpoints: Arc<crate::trace_bp::BpNode>,
     /// Suspend-monitor pauses of receive and BIF timers (`erts_pause_proc_timer`).
     pub(crate) pauses: Mutex<HashMap<Pid, TimerPause>>,
+    /// Whether `pauses` has an entry; readers skip the lock while it is false.
+    pub(crate) pauses_any: AtomicBool,
     pub(crate) published: Mutex<HashMap<Pid, Published>>,
     pub(crate) hibernating: Mutex<HashMap<Pid, HibernateCont>>,
     pub(crate) ever_hibernated: AtomicBool,
@@ -964,6 +968,31 @@ impl MultiScheduling {
         } else {
             &mut self.blockers
         }
+    }
+}
+
+/// The locked suspend counts; dropping it publishes whether any process is still suspended.
+struct SuspendTotals<'a> {
+    guard: std::sync::MutexGuard<'a, HashMap<Pid, u32>>,
+    any: &'a AtomicBool,
+}
+
+impl std::ops::Deref for SuspendTotals<'_> {
+    type Target = HashMap<Pid, u32>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for SuspendTotals<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for SuspendTotals<'_> {
+    fn drop(&mut self) {
+        self.any.store(!self.guard.is_empty(), Ordering::Release);
     }
 }
 
@@ -3372,6 +3401,18 @@ impl Executor {
         process: &mut Process,
         ctx: &mut RunCtx<'_, Message>,
     ) -> Result<Option<RunState>, VmError> {
+        // Nothing to do at most scheduling points: no suspend, no timer pause and no
+        // hibernation. Checked before the runtime handle is cloned.
+        if let Some(runtime) = process.runtime.as_deref()
+            && runtime.suspend_total_of(ctx.pid()) == 0
+            && !runtime.pauses_any.load(Ordering::Acquire)
+            && !process
+                .cold
+                .as_ref()
+                .is_some_and(|cold| cold.hibernate_sched)
+        {
+            return Ok(None);
+        }
         let Some(runtime) = process.runtime.clone() else {
             return Ok(None);
         };
@@ -4029,15 +4070,23 @@ impl Runtime {
     // g_proc_sched. Port of erts/emulator/beam/erl_process.c:9013
     // (`erts_internal_suspend_process_2`), OTP-29.1.1.
     pub(crate) fn suspend_total_of(&self, target: Pid) -> u32 {
-        if !self.ever_suspended.load(Ordering::Acquire) {
+        // No process is suspended in the common case: one load instead of the map lock
+        // (erts tests ERTS_PSFLG_SUSPENDED in the state word).
+        if !self.suspended_any.load(Ordering::Acquire) {
             return 0;
         }
-        self.suspend_total
-            .lock()
-            .unwrap()
+        self.lock_suspend_totals()
             .get(&target)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The suspend counts, locked; the guard publishes whether any entry remains.
+    fn lock_suspend_totals(&self) -> SuspendTotals<'_> {
+        SuspendTotals {
+            guard: self.suspend_total.lock().unwrap(),
+            any: &self.suspended_any,
+        }
     }
 
     /// Whether `target` is suspended: a suspend signal still queued behind its running (for
@@ -4141,7 +4190,7 @@ impl Runtime {
             }
         }
         {
-            let mut totals = self.suspend_total.lock().unwrap();
+            let mut totals = self.lock_suspend_totals();
             *totals.entry(target).or_insert(0) += 1;
         }
         if by != target {
@@ -4218,12 +4267,7 @@ impl Runtime {
     /// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend), OTP-29.1.1.
     pub(crate) fn suspend_internal(&self, target: Pid) {
         self.ever_suspended.store(true, Ordering::Release);
-        *self
-            .suspend_total
-            .lock()
-            .unwrap()
-            .entry(target)
-            .or_insert(0) += 1;
+        *self.lock_suspend_totals().entry(target).or_insert(0) += 1;
         self.note_status(target, "suspended");
     }
 
@@ -4231,7 +4275,7 @@ impl Runtime {
     /// Port of erts/emulator/beam/erl_process.c:9402 (erts_resume), OTP-29.1.1.
     pub(crate) fn resume_internal(&self, target: Pid) -> bool {
         let wake = {
-            let mut totals = self.suspend_total.lock().unwrap();
+            let mut totals = self.lock_suspend_totals();
             let Some(total) = totals.get_mut(&target) else {
                 return false;
             };
@@ -4279,7 +4323,7 @@ impl Runtime {
             self.resume_timers(target, 1);
         }
         let wake = {
-            let mut totals = self.suspend_total.lock().unwrap();
+            let mut totals = self.lock_suspend_totals();
             let total = totals.entry(target).or_insert(0);
             *total = total.saturating_sub(1);
             let wake = *total == 0;
@@ -4320,7 +4364,7 @@ impl Runtime {
         }
         let mut wake = Vec::new();
         {
-            let mut totals = self.suspend_total.lock().unwrap();
+            let mut totals = self.lock_suspend_totals();
             for (target, count) in held {
                 if target != by {
                     self.resume_timers(target, count);
@@ -4359,6 +4403,7 @@ impl Runtime {
                 shift: std::time::Duration::ZERO,
             });
             pause.count += count;
+            self.pauses_any.store(true, Ordering::Release);
             pause.count == count
         };
         if first && let Ok(scheduler) = self.scheduler() {
@@ -4389,7 +4434,8 @@ impl Runtime {
 
     /// Time the process spent suspended since it last asked; shifts its receive deadline.
     pub(crate) fn take_pause_shift(&self, pid: Pid) -> Option<std::time::Duration> {
-        if !self.ever_suspended.load(Ordering::Acquire) {
+        // Called at every scheduling point: skip the map lock while no pause exists.
+        if !self.pauses_any.load(Ordering::Acquire) {
             return None;
         }
         let mut pauses = self.pauses.lock().unwrap();
@@ -4399,6 +4445,7 @@ impl Runtime {
         }
         let shift = pause.shift;
         pauses.remove(&pid);
+        self.pauses_any.store(!pauses.is_empty(), Ordering::Release);
         Some(shift)
     }
 
@@ -4434,8 +4481,10 @@ impl Runtime {
         if self.ever_suspended.load(Ordering::Acquire) {
             self.drop_suspend_waiters(pid);
         }
-        if self.ever_suspended.load(Ordering::Acquire) {
-            self.pauses.lock().unwrap().remove(&pid);
+        if self.pauses_any.load(Ordering::Acquire) {
+            let mut pauses = self.pauses.lock().unwrap();
+            pauses.remove(&pid);
+            self.pauses_any.store(!pauses.is_empty(), Ordering::Release);
         }
         if self.ever_hibernated.load(Ordering::Acquire) {
             self.hibernating.lock().unwrap().remove(&pid);
@@ -4449,7 +4498,7 @@ impl Runtime {
             self.published.lock().unwrap().remove(&pid);
         }
         if self.ever_suspended.load(Ordering::Acquire) {
-            self.suspend_total.lock().unwrap().remove(&pid);
+            self.lock_suspend_totals().remove(&pid);
             self.suspend_counts
                 .lock()
                 .unwrap()
@@ -7598,9 +7647,11 @@ impl Vm {
             suspend_waiters: Mutex::new(Vec::new()),
             suspend_total: Mutex::new(HashMap::new()),
             ever_suspended: AtomicBool::new(false),
+            suspended_any: AtomicBool::new(false),
             code_mod_permission: Mutex::new(crate::natives::code::CodeModPermission::default()),
             breakpoints: Arc::new(crate::trace_bp::BpNode::new(self.code_scope)),
             pauses: Mutex::new(HashMap::new()),
+            pauses_any: AtomicBool::new(false),
             published: Mutex::new(HashMap::new()),
             hibernating: Mutex::new(HashMap::new()),
             ever_hibernated: AtomicBool::new(false),
