@@ -3835,7 +3835,11 @@ impl Table {
         let mut heap = ObjectHeap::new();
         let mut stored_values = None;
         self.try_matching_first(key, |found| {
-            let current = found.term_for_filter(&mut heap)?;
+            // erts reads and updates the stored object in place under the write lock
+            // (erl_db.c:1532 db_lookup_dbterm, erl_db_catree.c:2369-2385). A CA tree hands
+            // the visitor a copy that is dropped when the lookup returns, so the elements
+            // are copied into the local heap rather than borrowed from `found`.
+            let current = found.term_for_match(&mut heap)?;
             // SAFETY: current is owned by the local heap until the replacement is inserted.
             let values = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
             stored_values = Some(values.iter().collect::<Vec<_>>());

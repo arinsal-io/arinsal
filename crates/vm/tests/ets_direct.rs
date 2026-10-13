@@ -6,7 +6,7 @@ use arinsal_vm::Vm;
 const SOURCE: &str = r#"
 -module(ets_direct_diff).
 -export([compressed_roundtrip/0, access_and_deleted/0, concurrent_inserts/0, native_loop/0,
-         tail_delete/0, tail_delete_in_fun/0]).
+         tail_delete/0, tail_delete_in_fun/0, catree_update_counter/0]).
 
 sample_terms() ->
     [{"abc", abc, 42, -7, 1.5, <<1,2,3>>, [a|b], {nested, {deep, [1,2,3]}}},
@@ -114,6 +114,33 @@ loop(T, N, Acc) ->
     M = case ets:member(T, K) of true -> 1; false -> 0 end,
     ets:insert(T, {tag, 1000 + (N rem 7)}),
     loop(T, N - 1, Acc + Hits + M).
+
+%% `ets:update_counter/3,4` on an ordered_set with write_concurrency (a CA tree) whose
+%% objects keep boxed terms: the update must read the stored object, not a copy freed
+%% before the replacement is built (smolquery's telemetry counters, keyed by
+%% `{Name, Labels}`, aborted the VM there).
+catree_update_counter() ->
+    Self = self(),
+    T = ets:new(t, [ordered_set, public, {write_concurrency, true}]),
+    Keys = [{<<"series_", (integer_to_binary(I))/binary>>, [{kind, I}, {node, <<"n">>}]}
+            || I <- lists:seq(1, 40)],
+    Ps = [spawn_link(fun() ->
+              R = [begin
+                       K = lists:nth(1 + (N * P) rem 40, Keys),
+                       _ = ets:update_counter(T, K, {2, 1}, {K, 0, 0}),
+                       Big = ets:update_counter(T, K, [{3, 1 bsl 62}, {2, 0}], {K, 0, 0}),
+                       ets:insert(T, {{junk, P, N}, lists:seq(1, 20), <<N:64>>}),
+                       ets:delete(T, {junk, P, N - 1}),
+                       length(Big)
+                   end || N <- lists:seq(1, 3000)],
+              Self ! {done, self(), lists:sum(R)}
+          end) || P <- lists:seq(1, 4)],
+    Sums = [receive {done, Pid, S} -> S end || Pid <- Ps],
+    Rows = [Row || {{B, _}, _, _} = Row <- ets:tab2list(T), is_binary(B)],
+    {Sums, Rows, lists:sum([C || {_, C, _} <- Rows]),
+     ets:update_counter(T, hd(Keys), {2, -1}, {hd(Keys), 0, 0}),
+     ets:update_counter(T, {absent, [x]}, {2, 5}, {{absent, [x]}, 1, 0}),
+     ets:lookup(T, {absent, [x]})}.
 "#;
 
 #[test]
@@ -140,6 +167,11 @@ fn tail_call_of_yielding_delete_matches_otp_29() {
 #[test]
 fn native_loop_matches_otp_29() {
     assert_same("native_loop");
+}
+
+#[test]
+fn catree_update_counter_matches_otp_29() {
+    assert_same("catree_update_counter");
 }
 
 fn assert_same(function: &str) {
