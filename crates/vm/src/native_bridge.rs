@@ -1144,7 +1144,7 @@ pub fn run_native(
                     .collect::<Vec<_>>()
             );
         }
-        let args = arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+        let args = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .list_from_iter(args)
             .map_err(|error| VmError::Unsupported(format!("function_clause args {error:?}")))?;
         let mut trap = exceptions::native_trap(1, process.header.fvalue)?;
@@ -1193,7 +1193,7 @@ pub fn run_native(
         let error = if process.header.freason == arinsal_beamasm::guard::EXC_BADMAP {
             let value = crate::native_hooks::from_raw(process.header.fvalue);
             let reason =
-                arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+                arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
                     .tuple(&[crate::signals::atom("badmap"), value])
                     .map_err(|error| VmError::Unsupported(format!("badmap {error:?}")))?;
             arinsal_bifs::BifError::Error(reason)
@@ -1253,7 +1253,7 @@ pub fn run_native(
         let reason = if index == 8 {
             tag
         } else {
-            arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+            arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
                 .tuple(&[tag, value])
                 .map_err(|error| VmError::Unsupported(format!("error value {error:?}")))?
         };

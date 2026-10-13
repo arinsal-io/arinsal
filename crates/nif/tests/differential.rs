@@ -1,6 +1,6 @@
-use arinsal_bifs::{BifError, Ctx};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle};
 use arinsal_nif::{LoadInfo, load_nif, take_test_messages};
-use arinsal_term::{Term, VecHeap, to_owned};
+use arinsal_term::{ProcessHeap, Term, to_owned};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -73,7 +73,7 @@ fn c_api_groups_match_otp() {
         },
     )
     .unwrap();
-    let mut heap = VecHeap::new();
+    let mut heap = ProcessHeap::with_words(65_536);
     let mut actual = Vec::new();
     for (name, args) in [
         ("basic", vec![Term::small(42).unwrap()]),
@@ -98,7 +98,7 @@ fn c_api_groups_match_otp() {
         ("send_probe", vec![]),
         ("exception_probe", vec![]),
     ] {
-        let mut ctx = Ctx::new(&mut heap);
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut heap));
         let callback = nif.lookup(name, args.len()).unwrap();
         let result = if name == "send_probe" {
             callback.call_with_pid(&mut ctx, &args, Term::pid(1, 0))
@@ -124,8 +124,8 @@ fn c_api_groups_match_otp() {
         arinsal_etf::OwnedTerm::Atom("delivered".into())
     );
     drop(heap);
-    let mut check_heap = VecHeap::new();
-    let mut ctx = Ctx::new(&mut check_heap);
+    let mut check_heap = ProcessHeap::with_words(1024);
+    let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut check_heap));
     let destroyed = nif
         .lookup("dtor_count", 0)
         .unwrap()

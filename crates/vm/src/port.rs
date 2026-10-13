@@ -1282,7 +1282,7 @@ fn start_dyn_driver(
         let reference = runtime.next_ref();
         *handle.async_open.lock().unwrap() = Some((reference, ctx.pid()));
         drv_port.expect_init_ack();
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         return TermBuilder::new(&mut heap)
             .local_ref(arinsal_bifs::ordinary_ref_words(reference))
             .map_err(|_| badarg());
@@ -2130,7 +2130,7 @@ pub(crate) fn cloexec_publish<R>(body: impl FnOnce() -> R) -> R {
     body()
 }
 
-fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
+pub(crate) fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
     cloexec_publish(|| {
         unsafe extern "C" {
             fn dup(fd: i32) -> i32;
@@ -2466,16 +2466,18 @@ pub(crate) fn set_save_end(process: &mut Process, ctx: &mut RunCtx<'_, Message>)
 /// Port of erts/emulator/beam/erl_process.c:9369 (erts_suspend) with a busy port: `false`
 /// when the port stopped being busy, and the operation is to be retried at once.
 fn suspend_on_busy(
-    process: &Process,
+    process: &mut Process,
     handle: &PortHandle,
     drv: &arinsal_drv::DriverPort,
     pid: Pid,
 ) -> bool {
-    let Some(runtime) = process.runtime.as_ref() else {
+    let Some(runtime) = process.runtime.clone() else {
         return false;
     };
     // Suspended before it is queued on the port, so a resume racing with this cannot be lost.
-    runtime.suspend_internal(pid);
+    if process.self_pid == Some(pid) {
+        crate::suspend::suspend_self(process);
+    }
     if !drv.save_suspend_process(packed_pid(pid)) {
         runtime.resume_internal(pid);
         return false;
@@ -2733,7 +2735,7 @@ fn worker(
         if !handle.state.lock().unwrap().closed {
             // Port of `erts_check_io` one-shot readiness delivery; every
             // operation is re-registered after this worker handles the event.
-            let result = crate::check_io::wait_any(&fds);
+            let result = crate::check_io::wait_any_timeout_wake(&fds, None, wake_r);
             match result {
                 Ok(Some((ready_fd, ready))) => {
                     input_ready = Some(ready_fd) == read_fd
@@ -2953,7 +2955,7 @@ pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> b
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
     let owned = handle.data.lock().unwrap().clone();
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     from_owned(&owned, &mut heap).map_err(|_| badarg())
 }
 
@@ -3100,7 +3102,7 @@ fn port_call(
         let Ok((term, _)) = arinsal_etf::decode_prefix(&reply) else {
             return Ok(atom("badarg"));
         };
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let term = from_owned(&term, &mut heap).map_err(|_| badarg())?;
         return TermBuilder::new(&mut heap)
             .tuple(&[atom("ok"), term])
@@ -4409,19 +4411,19 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
         .map(|handle| handle.owner_pid())
         .ok_or_else(badarg)?;
     let encoded = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
         let encode = arinsal_bifs::lookup("erlang", "term_to_binary", 1).ok_or_else(badarg)?;
         encode(&mut ctx, &[event]).map_err(|_| badarg())?
     };
     let command = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .tuple(&[atom("command"), encoded])
             .map_err(|_| badarg())?
     };
     let envelope = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .tuple(&[owner.to_term().ok_or_else(badarg)?, command])
             .map_err(|_| badarg())?
@@ -4444,11 +4446,65 @@ fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
                 .filter_map(|id| Term::port(*id)),
         );
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .list_from_iter(values)
         .map_err(|e| VmError::Unsupported(format!("ports list: {e:?}")))
 }
+/// `port_info` of port zero, the forker driver's port.
+// Port of erts/emulator/beam/io.c (port_info) for the port erts creates in
+// erts/emulator/sys/unix/sys_drivers.c:291 (forker_init), OTP-29.1.1.
+fn forker_port_info(process: &mut Process, item: Option<Term>) -> Result<Term, VmError> {
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
+    let name = TermBuilder::new(&mut heap)
+        .string_to_list("forker")
+        .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;
+    let connected = Pid::from_data(0).to_term().ok_or_else(badarg)?;
+    let zero = Term::small(0).unwrap();
+    let fields = [
+        ("name", name),
+        ("links", Term::NIL),
+        ("id", zero),
+        ("connected", connected),
+        ("input", zero),
+        ("output", zero),
+        ("os_pid", atom("undefined")),
+        ("monitors", Term::NIL),
+        ("monitored_by", Term::NIL),
+        ("memory", zero),
+        ("queue_size", zero),
+        ("locking", atom("driver_level")),
+        ("parallelism", atom("false")),
+    ];
+    if let Some(item) = item {
+        let key = global_atoms()
+            .text(item.as_atom().ok_or_else(badarg)?)
+            .ok_or_else(badarg)?;
+        if key == "registered_name" {
+            return Ok(Term::NIL);
+        }
+        let value = fields
+            .iter()
+            .find_map(|(name, value)| (*name == key).then_some(*value))
+            .ok_or_else(badarg)?;
+        return TermBuilder::new(&mut heap)
+            .tuple(&[item, value])
+            .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")));
+    }
+    let tuples: Vec<Term> = fields
+        .into_iter()
+        .take(7)
+        .map(|(key, value)| {
+            TermBuilder::new(&mut heap)
+                .tuple(&[atom(key), value])
+                .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    TermBuilder::new(&mut heap)
+        .list_from_iter(tuples)
+        .map_err(|e| VmError::Unsupported(format!("port info: {e:?}")))
+}
+
 fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Term, VmError> {
     let id = port.as_port().ok_or_else(badarg)?;
     let Some(handle) = process
@@ -4456,9 +4512,14 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
         .as_ref()
         .and_then(|r| r.ports.lock().unwrap().get(&id).cloned())
     else {
-        return Ok(atom("undefined"));
+        // The forker is port zero and has no handle here (see `ports`).
+        return if id == 0 {
+            forker_port_info(process, item)
+        } else {
+            Ok(atom("undefined"))
+        };
     };
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let name = TermBuilder::new(&mut heap)
         .string_to_list(&handle.name)
         .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;

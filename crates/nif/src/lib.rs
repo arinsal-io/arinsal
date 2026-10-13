@@ -72,7 +72,7 @@ pub const C_SHIM_EXPORTS: &[&str] = &[
     "enif_free_iovec",
 ];
 
-use arinsal_bifs::{BifError, Ctx, SchedulerClass};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle, SchedulerClass};
 use arinsal_term::{
     ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, VecHeap, WritableBinary,
 };
@@ -80,7 +80,7 @@ pub(crate) use libloading::os::unix::Library;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[allow(non_upper_case_globals)]
@@ -200,24 +200,60 @@ layout_check!(ErlNifResourceTypeInit, SIZE_ErlNifResourceTypeInit,
 const _: () = assert!(size_of::<Term>() == layout::SIZE_ERL_NIF_TERM);
 
 enum EnvHeap {
-    Owned(VecHeap),
-    Bound(*mut dyn HeapAlloc),
+    Owned(Box<VecHeap>),
+    Bound(*mut ProcessHeapHandle<'static>),
+}
+impl EnvHeap {
+    fn bound_mut(heap: *mut ProcessHeapHandle<'static>) -> &'static mut ProcessHeapHandle<'static> {
+        // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
+        unsafe { &mut *heap }
+    }
+    fn bound_ref(heap: *mut ProcessHeapHandle<'static>) -> &'static ProcessHeapHandle<'static> {
+        // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
+        unsafe { &*heap }
+    }
 }
 impl HeapAlloc for EnvHeap {
     fn alloc(&mut self, n: usize) -> Option<*mut u64> {
         match self {
             Self::Owned(h) => h.alloc(n),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).alloc(n) },
+            Self::Bound(h) => Self::bound_mut(*h).alloc(n),
+        }
+    }
+    fn alloc_with_extra(&mut self, n: usize, extra: usize) -> Option<*mut u64> {
+        match self {
+            Self::Owned(h) => h.alloc_with_extra(n, extra),
+            Self::Bound(h) => Self::bound_mut(*h).alloc_with_extra(n, extra),
+        }
+    }
+    fn alloc_fragment_only(&mut self, n: usize) -> Option<*mut u64> {
+        match self {
+            Self::Owned(h) => h.alloc_fragment_only(n),
+            Self::Bound(h) => Self::bound_mut(*h).alloc_fragment_only(n),
+        }
+    }
+    fn words_left(&self) -> Option<usize> {
+        match self {
+            Self::Owned(h) => h.words_left(),
+            Self::Bound(h) => Self::bound_ref(*h).words_left(),
+        }
+    }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        match self {
+            Self::Owned(h) => h.release(end, start),
+            Self::Bound(h) => Self::bound_mut(*h).release(end, start),
+        }
+    }
+    fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
+        match self {
+            Self::Owned(h) => h.release_needs_filler(end, start),
+            Self::Bound(h) => Self::bound_ref(*h).release_needs_filler(end, start),
         }
     }
     fn retain_binary(&mut self, x: Arc<arinsal_term::RefcBinary>) {
         match self {
             Self::Owned(h) => h.retain_binary(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_binary(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_binary(x),
         }
     }
     fn retain_writable_binary(
@@ -226,17 +262,42 @@ impl HeapAlloc for EnvHeap {
     ) -> Result<(), arinsal_term::TermError> {
         match self {
             Self::Owned(h) => h.retain_writable_binary(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_writable_binary(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_writable_binary(x),
+        }
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        x: Arc<WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), arinsal_term::TermError> {
+        match self {
+            Self::Owned(h) => h.retain_writable_binary_with_apparent_size(x, apparent_size_bits),
+            Self::Bound(h) => {
+                Self::bound_mut(*h).retain_writable_binary_with_apparent_size(x, apparent_size_bits)
+            }
+        }
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        match self {
+            Self::Owned(h) => {
+                h.update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+            }
+            Self::Bound(h) => Self::bound_mut(*h).update_writable_binary_overhead(
+                source,
+                old_size_bits,
+                new_size_bits,
+            ),
         }
     }
     fn supports_writable_binary(&self) -> bool {
         match self {
             Self::Owned(h) => h.supports_writable_binary(),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&**h).supports_writable_binary() },
+            Self::Bound(h) => Self::bound_ref(*h).supports_writable_binary(),
         }
     }
     fn retain_external_binary(
@@ -245,59 +306,43 @@ impl HeapAlloc for EnvHeap {
     ) -> Result<(), arinsal_term::TermError> {
         match self {
             Self::Owned(h) => h.retain_external_binary(x),
-            Self::Bound(h) => {
-                // SAFETY: The bound heap remains live and exclusive for this callback.
-                unsafe { (&mut **h).retain_external_binary(x) }
-            }
+            Self::Bound(h) => Self::bound_mut(*h).retain_external_binary(x),
         }
     }
     fn supports_external_binary(&self) -> bool {
         match self {
             Self::Owned(h) => h.supports_external_binary(),
-            Self::Bound(h) => {
-                // SAFETY: The bound heap remains live for this callback.
-                unsafe { (&**h).supports_external_binary() }
-            }
+            Self::Bound(h) => Self::bound_ref(*h).supports_external_binary(),
         }
     }
     fn retain_node(&mut self, x: Arc<Node>) {
         match self {
             Self::Owned(h) => h.retain_node(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_node(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_node(x),
         }
     }
     fn retain_fun(&mut self, x: Arc<FunEntry>) {
         match self {
             Self::Owned(h) => h.retain_fun(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_fun(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_fun(x),
         }
     }
     fn retain_export(&mut self, x: Arc<ExportEntry>) {
         match self {
             Self::Owned(h) => h.retain_export(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_export(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_export(x),
         }
     }
     fn retain_magic(&mut self, x: Arc<MagicRef>) {
         match self {
             Self::Owned(h) => h.retain_magic(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_magic(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_magic(x),
         }
     }
     fn supports_magic(&self) -> bool {
         match self {
             Self::Owned(h) => h.supports_magic(),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&**h).supports_magic() },
+            Self::Bound(h) => Self::bound_ref(*h).supports_magic(),
         }
     }
 }
@@ -317,6 +362,9 @@ pub struct ErlNifEnv {
     options: EnvOptions,
     heap: EnvHeap,
     priv_data: *mut c_void,
+    /// The `priv_data` slot a load or upgrade callback writes through its `void **priv`
+    /// argument; `enif_priv_data` reads it during the callback (erts `env->mod_nif->priv_data`).
+    priv_cell: Option<Arc<AtomicPtr<c_void>>>,
     module: Option<String>,
     library: Option<Arc<Library>>,
     pid: Option<Term>,
@@ -330,9 +378,10 @@ impl ErlNifEnv {
     /// Create a process-independent environment with stable owned allocations.
     pub fn independent() -> Self {
         Self {
-            heap: EnvHeap::Owned(VecHeap::new()),
+            heap: EnvHeap::Owned(Box::new(VecHeap::new())),
             options: EnvOptions::default(),
             priv_data: ptr::null_mut(),
+            priv_cell: None,
             module: None,
             library: None,
             pid: None,
@@ -345,13 +394,14 @@ impl ErlNifEnv {
     }
     /// Bind a callback to the caller's infallible heap.
     /// The environment must be dropped before the heap can move or be reused.
-    pub fn bound(heap: &mut dyn HeapAlloc, pid: Option<Term>) -> Self {
+    pub fn bound(heap: &mut ProcessHeapHandle<'_>, pid: Option<Term>) -> Self {
         // SAFETY: the caller keeps this exclusive heap borrow alive for the callback.
-        let raw = unsafe { std::mem::transmute::<&mut dyn HeapAlloc, *mut dyn HeapAlloc>(heap) };
+        let raw = (heap as *mut ProcessHeapHandle<'_>).cast::<ProcessHeapHandle<'static>>();
         Self {
             heap: EnvHeap::Bound(raw),
             options: EnvOptions::default(),
             priv_data: ptr::null_mut(),
+            priv_cell: None,
             module: None,
             library: None,
             pid,
@@ -395,6 +445,8 @@ pub enum NifError {
     LoadRejected(i32),
     /// The new library does not provide an upgrade callback.
     UpgradeUnsupported,
+    /// Upgrade callback rejected the load information.
+    UpgradeRejected(i32),
 }
 impl std::fmt::Display for NifError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -410,7 +462,8 @@ pub struct NifFunction {
     pub arity: u32,
     pub fptr: NifFn,
     pub flags: u32,
-    priv_data: *mut c_void,
+    /// The library's `priv_data`, shared so an upgrade of a newer library can replace it.
+    priv_data: Arc<AtomicPtr<c_void>>,
     halt_calls: Arc<HaltCalls>,
 }
 impl NifFunction {
@@ -418,13 +471,17 @@ impl NifFunction {
     ///
     /// Continuations scheduled with `enif_schedule_nif` run inline; use
     /// [`NifFunction::call_on`] where they may have to move to another scheduler.
-    pub fn call(&self, ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    pub fn call(
+        &self,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
+        args: &[Term],
+    ) -> Result<Term, BifError> {
         self.call_with_pid(ctx, args, None)
     }
     /// Invoke with the calling process ID for `enif_self` and `enif_send`.
     pub fn call_with_pid(
         &self,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
         args: &[Term],
         pid: Option<Term>,
     ) -> Result<Term, BifError> {
@@ -453,7 +510,7 @@ impl NifFunction {
     /// the caller reschedules the process on the requested scheduler class.
     pub fn call_on(
         &self,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
         fptr: NifFn,
         args: &[Term],
         pid: Option<Term>,
@@ -473,14 +530,14 @@ impl NifFunction {
     }
     fn step(
         &self,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
         fptr: NifFn,
         args: &[Term],
         pid: Option<Term>,
     ) -> Result<NifCall, BifError> {
         let _call = (self.flags != 0).then(|| self.halt_calls.enter()).flatten();
-        let mut env = ErlNifEnv::bound(ctx.heap, pid);
-        env.priv_data = self.priv_data;
+        let mut env = ErlNifEnv::bound(&mut ctx.heap, pid);
+        env.priv_data = self.priv_data.load(Ordering::Acquire);
         // SAFETY: the pointer belongs to a loaded library; arguments remain live.
         let result = unsafe { fptr(&mut env, args.len() as c_int, args.as_ptr()) };
         if let Some(reason) = env.pending {
@@ -615,15 +672,19 @@ mod halt_tests {
         waiter.join().unwrap();
     }
 }
-/// Loaded library and copied function table. Drop calls the unload callback.
+/// Loaded library and copied function table. [`NifLibrary::close`] (or Drop) calls the unload
+/// callback.
 pub struct NifLibrary {
-    _library: Arc<Library>,
+    /// The `dlopen` handle, released by [`NifLibrary::close`].
+    library: Mutex<Option<Arc<Library>>>,
+    closed: AtomicBool,
     module: String,
     functions: Vec<NifFunction>,
     unload: Option<UnloadFn>,
     on_halt: Option<extern "C" fn(*mut c_void)>,
     on_unload_thread: Option<extern "C" fn(*mut c_void)>,
-    priv_data: *mut c_void,
+    /// `erl_module_nif.priv_data`, which an upgrade of a newer library may replace.
+    priv_data: Arc<AtomicPtr<c_void>>,
     halt_calls: Arc<HaltCalls>,
     on_halt_called: AtomicBool,
 }
@@ -655,12 +716,36 @@ impl NifLibrary {
         if !self.on_halt_called.swap(true, Ordering::AcqRel)
             && let Some(callback) = self.on_halt
         {
-            callback(self.priv_data);
+            callback(self.priv_data.load(Ordering::Acquire));
         }
     }
     /// Wait for calls in a library that requested `ERL_NIF_OPT_DELAY_HALT`.
     pub fn wait_for_halt_calls(&self) {
         self.halt_calls.wait();
+    }
+    /// Run the unload callbacks and release the `dlopen` handle, once. No function of the
+    /// library may be called afterwards.
+    // Port of erts/emulator/beam/erl_nif.c:2602-2618 (really_close_dynlib), OTP-29.1.1.
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let priv_data = self.priv_data.load(Ordering::Acquire);
+        if let Some(callback) = self.on_unload_thread {
+            callback(priv_data);
+        }
+        if let Some(unload) = self.unload {
+            let mut env = ErlNifEnv::independent();
+            env.module = Some(self.module.clone());
+            // SAFETY: the library is still open; its handle is released below.
+            unsafe { unload(&mut env, priv_data) };
+        }
+        drop(
+            self.library
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
+        );
     }
 }
 // SAFETY: after `load` returns, OTP invokes NIF entry points from any scheduler.
@@ -673,15 +758,7 @@ unsafe impl Sync for NifLibrary {}
 
 impl Drop for NifLibrary {
     fn drop(&mut self) {
-        if let Some(callback) = self.on_unload_thread {
-            callback(self.priv_data);
-        }
-        if let Some(unload) = self.unload {
-            let mut env = ErlNifEnv::independent();
-            env.module = Some(self.module.clone());
-            // SAFETY: the library stays open until Drop completes.
-            unsafe { unload(&mut env, self.priv_data) };
-        }
+        self.close();
     }
 }
 /// A loaded NIF image whose `load` callback has not run yet.
@@ -702,43 +779,86 @@ impl NifImage {
     }
     /// Run the load callback and return the callable library.
     pub fn commit(self, term: Term) -> Result<NifLibrary, NifError> {
-        self.finish(term, None)
+        self.finish(term, None, None)
+    }
+    /// Like [`NifImage::commit`], for a load called by process `pid`, which `enif_self` reports
+    /// inside the callback (erts binds the load environment to the calling process).
+    pub fn commit_for(self, term: Term, pid: Option<Term>) -> Result<NifLibrary, NifError> {
+        self.finish(term, None, pid)
+    }
+    /// Run the upgrade callback with the private data of `old`, the library of the previous
+    /// code of the module, and return the callable library.
+    // Port of erts/emulator/beam/erl_nif.c:4956-4979 (erts_load_nif upgrade), OTP-29.1.1:
+    // the callback may replace the old library's `priv_data`; a veto restores it.
+    pub fn upgrade(
+        self,
+        term: Term,
+        old: &NifLibrary,
+        pid: Option<Term>,
+    ) -> Result<NifLibrary, NifError> {
+        if self.upgrade.is_none() {
+            return Err(NifError::UpgradeUnsupported);
+        }
+        let prev_old_data = old.priv_data.load(Ordering::Acquire);
+        let mut old_data = prev_old_data;
+        let result = self.finish(term, Some(&mut old_data), pid);
+        old.priv_data.store(
+            if result.is_ok() {
+                old_data
+            } else {
+                prev_old_data
+            },
+            Ordering::Release,
+        );
+        result
     }
     fn finish(
         mut self,
         term: Term,
         old_priv_data: Option<&mut *mut c_void>,
+        pid: Option<Term>,
     ) -> Result<NifLibrary, NifError> {
         let mut env = ErlNifEnv::independent();
+        env.pid = pid;
         env.module = Some(self.module.clone());
         env.library = Some(Arc::clone(&self.library));
         env.options.loading = true;
-        let mut priv_data = ptr::null_mut();
+        let cell = Arc::new(AtomicPtr::new(ptr::null_mut()));
+        env.priv_cell = Some(Arc::clone(&cell));
+        let upgrading = old_priv_data.is_some();
         let code = if let Some(old) = old_priv_data {
             let upgrade = self.upgrade.ok_or(NifError::UpgradeUnsupported)?;
             // SAFETY: this loaded library declares its upgrade ABI and both data pointers are live.
-            unsafe { upgrade(&mut env, &mut priv_data, old, term) }
+            unsafe { upgrade(&mut env, cell.as_ptr(), old, term) }
         } else if let Some(load) = self.load {
             // SAFETY: the library's callback follows its declared entry ABI.
-            unsafe { load(&mut env, &mut priv_data, term) }
+            unsafe { load(&mut env, cell.as_ptr(), term) }
         } else {
             0
         };
         env.options.loading = false;
+        env.priv_cell = None;
         if code != 0 {
-            return Err(NifError::LoadRejected(code));
+            return Err(if upgrading {
+                NifError::UpgradeRejected(code)
+            } else {
+                NifError::LoadRejected(code)
+            });
         }
+        // The slot the callback wrote stays the library's `priv_data`.
+        let priv_data = cell;
         let halt_calls = Arc::new(HaltCalls {
             enabled: env.options.flags & 1 != 0,
             in_flight: Mutex::new(0),
             idle: Condvar::new(),
         });
         for function in &mut self.functions {
-            function.priv_data = priv_data;
+            function.priv_data = Arc::clone(&priv_data);
             function.halt_calls = Arc::clone(&halt_calls);
         }
         Ok(NifLibrary {
-            _library: self.library,
+            library: Mutex::new(Some(self.library)),
+            closed: AtomicBool::new(false),
             module: self.module,
             functions: self.functions,
             unload: self.unload,
@@ -877,7 +997,7 @@ pub fn open_nif(path: &Path, module: &str) -> Result<NifImage, NifError> {
             arity,
             fptr,
             flags,
-            priv_data: ptr::null_mut(),
+            priv_data: Arc::default(),
             halt_calls: Arc::new(HaltCalls {
                 enabled: false,
                 in_flight: Mutex::new(0),
@@ -902,9 +1022,9 @@ pub fn load_nif(path: &Path, info: LoadInfo<'_>) -> Result<NifLibrary, NifError>
 pub fn upgrade_nif(
     path: &Path,
     info: LoadInfo<'_>,
-    old: &mut NifLibrary,
+    old: &NifLibrary,
 ) -> Result<NifLibrary, NifError> {
-    open_nif(path, info.module)?.finish(info.term, Some(&mut old.priv_data))
+    open_nif(path, info.module)?.upgrade(info.term, old, None)
 }
 unsafe extern "C" {
     fn arinsal_nif_shim_anchor();

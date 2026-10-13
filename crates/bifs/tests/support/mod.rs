@@ -1,4 +1,4 @@
-use arinsal_bifs::{BifError, Class, Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{BifError, Class, Ctx, ProcessHeapHandle, lookup};
 use arinsal_difftest::CallResult;
 use arinsal_etf::OwnedTerm;
 use arinsal_term::{ProcessHeap, from_owned, to_owned};
@@ -8,7 +8,7 @@ pub fn call(module: &str, name: &str, args: &[OwnedTerm]) -> CallResult {
         return CallResult::TransportError(format!("missing {module}:{name}/{}", args.len()));
     };
     let mut heap = ProcessHeap::with_words(1024);
-    let mut allocator = FragmentingHeap(&mut heap);
+    let mut allocator = ProcessHeapHandle(&mut heap);
     let terms = args
         .iter()
         .map(|value| from_owned(value, &mut allocator).expect("test argument"))

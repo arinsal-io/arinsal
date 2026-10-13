@@ -10,8 +10,7 @@ struct StaticNif {
     module: String,
     function: String,
     arity: u8,
-    // None until `load_nif` binds a reserved call-NIF body.
-    entry: Option<arinsal_bifs::BifFn>,
+    entry: arinsal_bifs::BifFn,
 }
 
 fn native_fun_owners() -> &'static std::sync::Mutex<
@@ -123,7 +122,7 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
     let reason = crate::native_hooks::from_raw(reason_raw);
     let trace = crate::native_hooks::from_raw(trace_raw);
     let result = crate::exceptions::materialize(None, process, trace).and_then(|stacktrace| {
-        arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+        arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .tuple(&[reason, stacktrace])
             .map_err(|error| crate::VmError::Unsupported(format!("stacktrace tuple {error:?}")))
     });
@@ -136,7 +135,7 @@ pub extern "C" fn arinsal_beamasm_add_stacktrace(
             // The catch-end fragment stores this word and builds `{'EXIT', Word}`.
             // A zero return is not a term and the fragment loads through it.
             let fallback =
-                arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+                arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
                     .tuple(&[reason, arinsal_term::Term::NIL])
                     .map(crate::native_hooks::raw)
                     .unwrap_or_else(|_| crate::native_hooks::raw(reason));
@@ -436,42 +435,42 @@ pub(crate) fn register_static_nif(
             module,
             function,
             arity,
-            entry: Some(entry),
+            entry,
         },
     );
     identity
 }
 
-/// Reserves the identity of a native call-NIF body that `load_nif` may bind later.
-pub(crate) fn reserve_nif_slot(module: String, function: String, arity: u8) -> usize {
-    let identity = NEXT_STATIC_NIF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static_nifs().lock().unwrap().insert(
-        identity,
-        StaticNif {
+/// Identity in `native_dirty_nif` of a call-NIF body bound by `load_nif`: the process's
+/// `nif_pending` carries the library and function. Static NIF identities start at 1.
+pub(crate) const BOUND_NIF: usize = 0;
+
+/// The call-NIF body of a function of native code that `load_nif` may replace. The body is
+/// compiled with the address of its site and calls [`arinsal_beamasm_call_nif`] with it.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:956-992 (emit_call_nif embeds Func, NifMod
+// and DirtyFunc in the function's code) and erl_nif.c:5149-5160 (load_nif_1st_finisher
+// copies them there), OTP-29.1.1: the site of the function holds the operands itself.
+pub(crate) struct NativeNifSite {
+    module: String,
+    function: String,
+    arity: u8,
+    /// The `call_nif` operands, written once by `load_nif` before the body is enabled.
+    call: std::sync::OnceLock<crate::natives::nif::NativeFn>,
+}
+
+impl NativeNifSite {
+    pub(crate) fn new(module: String, function: String, arity: u8) -> Box<Self> {
+        Box::new(Self {
             module,
             function,
             arity,
-            entry: None,
-        },
-    );
-    identity
-}
+            call: std::sync::OnceLock::new(),
+        })
+    }
 
-/// Binds the NIF a reserved call-NIF body runs.
-pub(crate) fn bind_nif_slot(identity: usize, entry: arinsal_bifs::BifFn) -> bool {
-    static_nifs()
-        .lock()
-        .unwrap()
-        .get_mut(&identity)
-        .map(|nif| nif.entry = Some(entry))
-        .is_some()
-}
-
-/// Forgets the call-NIF bodies of a purged native module version.
-pub(crate) fn release_nif_slots(identities: impl IntoIterator<Item = usize>) {
-    let mut nifs = static_nifs().lock().unwrap();
-    for identity in identities {
-        nifs.remove(&identity);
+    /// Writes the operands; a site is bound once, like the code of one module instance.
+    pub(crate) fn bind(&self, native: crate::natives::nif::NativeFn) -> bool {
+        self.call.set(native).is_ok()
     }
 }
 
@@ -485,7 +484,7 @@ pub(crate) fn static_nif_job(
 ) -> Option<arinsal_sched::DirtyJob> {
     let (module, arity, entry) = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&identity)?;
-        Some((nif.module.clone(), nif.arity, nif.entry?))
+        Some((nif.module.clone(), nif.arity, nif.entry))
     })?;
     // The job runs on this thread; NIF services find the process through these.
     crate::natives::nif::refresh_hub_native(process);
@@ -493,27 +492,33 @@ pub(crate) fn static_nif_job(
         crate::natives::tty::note_caller_native(process);
     }
     let args = process.x.get(..usize::from(arity))?.to_vec();
+    let fcalls = process.reductions;
     Some(crate::dirty::static_nif_job(move |heap| {
+        let mut fcalls = fcalls;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::calls::call_bif(heap, entry, &args)
+            crate::calls::call_bif(heap, &mut fcalls, entry, &args)
         }))
         .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))))
     }))
 }
 
 /// Runs a static NIF with the arguments in `process.x`, for a dirty NIF call the executor
-/// performs on a dirty scheduler, or takes the result of its dirty job.
+/// performs on a dirty scheduler, or takes the result of its dirty job. [`BOUND_NIF`]
+/// resumes the call of a NIF bound by `load_nif` that the process carries.
 pub(crate) fn run_static_nif(
     process: &mut crate::Process,
     identity: usize,
 ) -> Result<Term, crate::VmError> {
+    if identity == BOUND_NIF {
+        return run_bound_nif(process);
+    }
     let nif = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&identity)?;
         Some((
             nif.module.clone(),
             nif.function.clone(),
             nif.arity,
-            nif.entry?,
+            nif.entry,
         ))
     });
     let Some((module, function, arity, entry)) = nif else {
@@ -537,12 +542,111 @@ pub(crate) fn run_static_nif(
     let result = match done {
         Some(result) => result,
         None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match pending {
-            Some(pending) => crate::natives::nif::resume_pending(&mut process.heap, pending),
-            None => crate::calls::call_bif(&mut process.heap, entry, &args),
+            Some(pending) => crate::natives::nif::resume_pending(
+                &mut process.heap,
+                &mut process.reductions,
+                pending,
+            ),
+            None => {
+                crate::calls::call_bif(&mut process.heap, &mut process.reductions, entry, &args)
+            }
         }))
         .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error")))),
     };
     result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
+}
+
+/// Resumes the dirty call or continuation of a NIF bound by `load_nif` that native code
+/// handed to the executor.
+// Port of erts/emulator/beam/erl_nif.c:426-520 (erts_call_dirty_nif), OTP-29.1.1.
+fn run_bound_nif(process: &mut crate::Process) -> Result<Term, crate::VmError> {
+    let Some(pending) = process
+        .cold
+        .as_mut()
+        .and_then(|cold| cold.nif_pending.take())
+    else {
+        return Err(crate::VmError::Trap(crate::exceptions::Trap::error(
+            crate::signals::atom("undef"),
+        )));
+    };
+    let (module, function, arity) = {
+        let (module, function, arity) = pending.trace_mfa();
+        (module.to_owned(), function.to_owned(), usize::from(arity))
+    };
+    crate::natives::nif::refresh_hub_native(process);
+    let args = process.x.get(..arity).unwrap_or_default().to_vec();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::natives::nif::resume_pending(&mut process.heap, &mut process.reductions, pending)
+    }))
+    .unwrap_or_else(|_| Err(arinsal_bifs::BifError::Error(crate::signals::atom("error"))));
+    result.map_err(|error| crate::exceptions::bif_error(process, &module, &function, &args, error))
+}
+
+/// Moves the arguments of a native call-NIF body into `process.x`.
+fn enter_native_nif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    arity: u8,
+) {
+    process
+        .heap
+        .set_frame_pointer(registers.tmp_mem[2] as usize);
+    process.reductions = process.header.fcalls;
+    // The arguments live in the native X register array, not in `process.x`, when native code
+    // reaches the NIF body directly (local or tail call).
+    if process.x.len() < usize::from(arity) {
+        let mut x = process.x.to_vec();
+        x.resize(usize::from(arity), Term::NIL);
+        process.x = x.into();
+    }
+    for (destination, raw) in process
+        .x
+        .iter_mut()
+        .zip(registers.x_reg_array.iter().copied())
+        .take(usize::from(arity))
+    {
+        *destination = raw;
+    }
+}
+
+/// Returns the result of a native call-NIF body to native code: the result term, a trap to
+/// the dirty scheduler executor or an exception.
+fn leave_native_nif(
+    process: &mut crate::Process,
+    registers: &mut arinsal_beamasm::SchedulerRegisters,
+    result: std::thread::Result<Result<Term, arinsal_bifs::BifError>>,
+    (identity, module, function, arity): (usize, &str, &str, u8),
+) -> u64 {
+    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
+    match result {
+        Ok(Ok(value)) => {
+            process.x[0] = value;
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            crate::native_hooks::raw(value)
+        }
+        Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
+            // Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and
+            // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
+            // continuation the executor runs on a scheduler of `class`.
+            if let Some(pending) = crate::natives::nif::take_rescheduled() {
+                process.cold_mut().nif_pending = Some(pending);
+            }
+            trap_to_dirty_nif(process, identity, class)
+        }
+        Ok(Err(error)) => {
+            let args = process.x[..usize::from(arity)].to_vec();
+            set_native_bif_error(process, module, function, &args, error);
+            publish_dispatch_x(process, registers);
+            process.sync_native_header();
+            0
+        }
+        Err(_) => {
+            crate::native_hooks::set_error(process, "error");
+            process.sync_native_header();
+            0
+        }
+    }
 }
 
 /// Calls a static NIF body through the same BIF function used by NativeBody.
@@ -551,40 +655,19 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
         return 0;
     };
-    let Some((nif, entry)) = static_nifs().lock().ok().and_then(|nifs| {
+    let Some(nif) = static_nifs().lock().ok().and_then(|nifs| {
         let nif = nifs.get(&(identity as usize))?;
-        Some((
-            StaticNif {
-                module: nif.module.clone(),
-                function: nif.function.clone(),
-                arity: nif.arity,
-                entry: nif.entry,
-            },
-            nif.entry?,
-        ))
+        Some(StaticNif {
+            module: nif.module.clone(),
+            function: nif.function.clone(),
+            arity: nif.arity,
+            entry: nif.entry,
+        })
     }) else {
         crate::native_hooks::set_error(process, "undef");
         return 0;
     };
-    process
-        .heap
-        .set_frame_pointer(registers.tmp_mem[2] as usize);
-    process.reductions = process.header.fcalls;
-    // The arguments live in the native X register array, not in `process.x`, when native code
-    // reaches the NIF body directly (local or tail call).
-    if process.x.len() < usize::from(nif.arity) {
-        let mut x = process.x.to_vec();
-        x.resize(usize::from(nif.arity), Term::NIL);
-        process.x = x.into();
-    }
-    for (destination, raw) in process
-        .x
-        .iter_mut()
-        .zip(registers.x_reg_array.iter().copied())
-        .take(usize::from(nif.arity))
-    {
-        *destination = raw;
-    }
+    enter_native_nif(process, registers, nif.arity);
     // Port of erts/emulator/beam/erl_nif.c (schedule_dirty_nif / erts_call_dirty_nif),
     // OTP-29.1.1: a dirty NIF called on a normal scheduler first moves the process to a
     // dirty scheduler; the executor runs it there and returns to this body's caller.
@@ -606,40 +689,50 @@ pub extern "C" fn arinsal_beamasm_static_nif(header: *mut ProcessHeader, identit
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::calls::call_bif(
             &mut process.heap,
-            entry,
+            &mut process.reductions,
+            nif.entry,
             &process.x[..usize::from(nif.arity)],
         )
     }));
-    registers.tmp_mem[2] = process.heap.frame_pointer() as u64;
-    match result {
-        Ok(Ok(value)) => {
-            process.x[0] = value;
-            publish_dispatch_x(process, registers);
-            process.sync_native_header();
-            crate::native_hooks::raw(value)
-        }
-        Ok(Err(arinsal_bifs::BifError::Dirty(class))) => {
-            // Port of erts/emulator/beam/erl_nif.c:3460 (static_schedule_dirty_nif) and
-            // erl_nif.c:3540 (enif_schedule_nif), OTP-29.1.1: the call traps to a
-            // continuation the executor runs on a scheduler of `class`.
-            if let Some(pending) = crate::natives::nif::take_rescheduled() {
-                process.cold_mut().nif_pending = Some(pending);
-            }
-            trap_to_dirty_nif(process, identity as usize, class)
-        }
-        Ok(Err(error)) => {
-            let args = process.x[..usize::from(nif.arity)].to_vec();
-            set_native_bif_error(process, &nif.module, &nif.function, &args, error);
-            publish_dispatch_x(process, registers);
-            process.sync_native_header();
-            0
-        }
-        Err(_) => {
-            crate::native_hooks::set_error(process, "error");
-            process.sync_native_header();
-            0
-        }
-    }
+    leave_native_nif(
+        process,
+        registers,
+        result,
+        (identity as usize, &nif.module, &nif.function, nif.arity),
+    )
+}
+
+/// Calls the NIF that `load_nif` bound to a native call-NIF body.
+// Port of erts/emulator/beam/jit/arm/instr_bif.cpp:863-900 (call_nif_shared loads Func and
+// NifMod from the function's code) and erts/emulator/beam/jit/beam_jit_common.cpp:623-677
+// (beam_jit_call_nif), OTP-29.1.1.
+pub extern "C" fn arinsal_beamasm_call_nif(header: *mut ProcessHeader, site: u64) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::process_and_registers(header) else {
+        return 0;
+    };
+    // SAFETY: `site` is the address this call-NIF body was compiled with: a boxed
+    // `NativeNifSite` owned by the `CompiledVersion` whose code is executing, which keeps the
+    // box until it frees that code.
+    let site = unsafe { &*(site as usize as *const NativeNifSite) };
+    let Some(native) = site.call.get() else {
+        crate::native_hooks::set_error(process, "undef");
+        return 0;
+    };
+    enter_native_nif(process, registers, site.arity);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::natives::nif::call_native(
+            &mut process.heap,
+            &mut process.reductions,
+            native,
+            &process.x[..usize::from(site.arity)],
+        )
+    }));
+    leave_native_nif(
+        process,
+        registers,
+        result,
+        (BOUND_NIF, &site.module, &site.function, site.arity),
+    )
 }
 
 /// Leave native code through the dirty NIF dispatch trap; the executor runs NIF
@@ -1522,7 +1615,7 @@ fn allocating_bif(
     descriptor: u64,
     arity: usize,
     body: impl FnOnce(
-        &mut arinsal_bifs::FragmentingHeap<'_>,
+        &mut arinsal_bifs::ProcessHeapHandle<'_>,
         Term,
     ) -> Result<Term, arinsal_bifs::BifError>,
 ) -> u64 {
@@ -1537,7 +1630,7 @@ fn allocating_bif(
     let arg = registers.x_reg_array[0];
     let entry_top = process.heap.heap_top_index();
     let result = {
-        let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         body(&mut fragment, arg)
     };
     let top = process.heap.heap_top_index();
@@ -1814,6 +1907,66 @@ pub(crate) extern "C" fn list_slice_nonalloc_entry<B: arinsal_bifs::BifBody>(
     .unwrap_or(0)
 }
 
+/// `lists:member/2`'s BIF-table entry. The successful call needs no export lookup.
+// Port of erts/emulator/beam/erl_bif_lists.c:1108-1142 and bif.h:71-84, OTP-29.1.1.
+pub(crate) extern "C" fn list_member_entry(
+    header: *mut ProcessHeader,
+    _regs: *mut u64,
+    _i: u64,
+    descriptor: u64,
+    identity: u64,
+) -> u64 {
+    let Some((process, registers)) = crate::native_hooks::enter_runtime_no_cursors(header) else {
+        return 0;
+    };
+    process.reductions = process.header.fcalls;
+    let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
+    let (result, deferred) = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+        let result = arinsal_bifs::lists_member_bif(&mut ctx, &args);
+        (result, ctx.take_deferred())
+    };
+    if process.header.fcalls != process.reductions {
+        process.header.fcalls = process.reductions;
+    }
+    if let Some(trap) = deferred {
+        let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+            return 0;
+        };
+        crate::native_hooks::convert_native_cursors(process);
+        crate::bif_traps::install_deferred_trap(
+            process,
+            identity as usize,
+            (export.module_atom, export.function_atom),
+            export.function.as_str(),
+            &args,
+            trap,
+        );
+        process
+            .heap
+            .set_frame_pointer(registers.tmp_mem[2] as usize);
+        debug_assert_native_heap(process);
+        crate::bif_traps::arm_export_trap(process);
+        process.header.freason = 1 << 10;
+        process.sync_native_header();
+        return 0;
+    }
+    match result {
+        Ok(value) => {
+            registers.x_reg_array[0] = value;
+            crate::native_hooks::raw(value)
+        }
+        Err(error) => {
+            let Some(export) = crate::beamasm_integration::export_from_info(descriptor) else {
+                return 0;
+            };
+            crate::native_hooks::convert_native_cursors(process);
+            plain_bif_result(process, registers, export, 2, Err(error))
+        }
+    }
+}
+
 /// The value of a non-allocating list BIF, or `None` when it traps or fails (the caller then
 /// converts the cursors and runs the full path).
 #[inline(always)]
@@ -1825,17 +1978,15 @@ fn nonalloc_list_fast(
 ) -> Option<u64> {
     process.reductions = process.header.fcalls;
     let arity = usize::from(export.arity);
-    let (reductions, value) = {
-        let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
-        ctx.set_reduction_budget(process.reductions.max(0) as usize);
+    let value = {
+        let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
         let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
         if ctx.take_deferred().is_some() {
             return None;
         }
-        (ctx.reductions(), result.ok()?)
+        result.ok()?
     };
-    charge_bif_reductions(process, reductions);
     registers.x_reg_array[0] = value;
     if process.header.fcalls != process.reductions {
         process.header.fcalls = process.reductions;
@@ -2276,25 +2427,23 @@ pub(crate) extern "C" fn list_reverse_entry(
     let gc_was_enabled = process.heap.gc_enabled;
     let reds = process.reductions.clamp(0, 4000) as usize;
     let max_cells = reds
-        .saturating_mul(arinsal_bifs::REVERSE_CELLS_PER_RED)
+        .saturating_mul(arinsal_bifs::REVERSE_ONHEAP_CELLS_PER_RED)
         .max(1);
     let args = [registers.x_reg_array[0], registers.x_reg_array[1]];
-    let (step, reductions) = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
-        let step = arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells);
-        (step, ctx.reductions())
+    let step = {
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
+        arinsal_bifs::lists_reverse(&mut ctx, args[0], args[1], max_cells)
     };
     let result = match step {
         Ok(arinsal_bifs::ReverseStep::Done(value)) => {
             process.set_gc_enabled(gc_was_enabled);
-            crate::bif_traps::charge_light(process, reductions);
             return light_value_return(process, registers, entry_top, value);
         }
         Ok(arinsal_bifs::ReverseStep::Trap(cont)) => Ok(crate::bif_traps::HandlerResult::Yield {
             continuation: "lists:reverse/2",
             state: arinsal_term::MagicRef::new(std::sync::Mutex::new(cont)),
-            reductions,
+            reductions: 0,
         }),
         Err(error) => Err(error),
     };
@@ -2571,7 +2720,7 @@ fn make_ref_in_fragment(
     process: &mut crate::Process,
     words: [u32; 3],
 ) -> Result<Term, arinsal_bifs::BifError> {
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     Term::local_ref(&mut fragment, words).map_err(|_| arinsal_bifs::BifError::SystemLimit)
 }
 
@@ -2591,7 +2740,7 @@ fn unique_integer_n(
             Ok(Term::small(value).expect("unique integer"))
         }
         Ok(arinsal_bifs::UniqueInt::Big(value)) => {
-            let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             arinsal_term::TermBuilder::new(&mut fragment)
                 .int_from_bigint(&value)
                 .map_err(|_| arinsal_bifs::BifError::SystemLimit)
@@ -2666,13 +2815,11 @@ fn call_list_slice_bif(
     }
     let arity = usize::from(export.arity);
     let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
-    ctx.set_reduction_budget(process.reductions.max(0) as usize);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
     if let Some(trap) = ctx.take_deferred() {
-        let slice = ctx.reductions();
-        let all = process.reductions.max(0) as u32;
+        drop(ctx);
         let mut args = [Term::NIL; 3];
         args[..arity].copy_from_slice(&registers.x_reg_array[..arity]);
         crate::bif_traps::install_deferred_trap(
@@ -2682,7 +2829,6 @@ fn call_list_slice_bif(
             export.function.as_str(),
             &args[..arity],
             trap,
-            (slice, all),
         );
         process
             .heap
@@ -2693,8 +2839,7 @@ fn call_list_slice_bif(
         process.sync_native_header();
         return None;
     }
-    let reductions = ctx.reductions();
-    charge_bif_reductions(process, reductions);
+    drop(ctx);
     let top = process.heap.heap_top_index();
     if let Ok(value) = &result
         && (!export_call
@@ -2748,11 +2893,10 @@ fn call_plain_bif_body(
     let (entry_top, stop) = (process.heap.heap_top_index(), process.heap.stack_index());
     // The result is matched where the BIF wrote it: moving it first would read it back with
     // wider loads than the BIF's stores.
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
     let result = bif(&mut ctx, &registers.x_reg_array[..arity]);
-    let reductions = ctx.reductions();
-    charge_bif_reductions(process, reductions);
+    drop(ctx);
     let top = process.heap.heap_top_index();
     // ERTS_IS_GC_DESIRED_INTERNAL: a value goes straight back to XREG0, and the native
     // light-BIF fragment tests the collection itself (instr_bif.cpp:488-523). Only the
@@ -3115,11 +3259,10 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
     process.reductions = process.header.fcalls;
     let entry_top = process.heap.heap_top_index();
     // Matched where the BIF wrote it, like the light BIF path.
-    let mut fragment = arinsal_bifs::FragmentingHeap(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, &mut process.reductions);
     let result = bif(&mut ctx, args);
-    let reductions = ctx.reductions();
-    charge_bif_reductions(process, reductions);
+    drop(ctx);
     let top = process.heap.heap_top_index();
     if top != entry_top {
         process.header.htop = process.heap.word_address(top);
@@ -3148,7 +3291,7 @@ pub(crate) extern "C" fn arinsal_beamasm_bif_by_identity(
 
 /// Raises `error:{Tag, Value}` from a native helper.
 fn set_tagged_error(process: &mut crate::Process, tag: &str, value: Term) {
-    let tuple = arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+    let tuple = arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
         .tuple(&[crate::signals::atom(tag), value]);
     match tuple {
         Ok(reason) => {
@@ -3346,7 +3489,7 @@ fn take_explicit_raise(process: &mut crate::Process) -> Option<Term> {
     };
     arinsal_term::from_owned(
         &owned,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .ok()
 }
@@ -3482,7 +3625,7 @@ fn expand_error_value(process: &mut crate::Process) -> Option<arinsal_term::Term
         _ => return None,
     });
     if matches!(index, 5 | 7 | 10 | 11 | 16 | 18 | 19 | 20 | 21 | 22) {
-        arinsal_term::TermBuilder::new(&mut crate::FragmentingHeap(&mut process.heap))
+        arinsal_term::TermBuilder::new(&mut crate::ProcessHeapHandle(&mut process.heap))
             .tuple(&[tag, value])
             .ok()
     } else {
@@ -3804,7 +3947,7 @@ fn map_single(
         crate::native_hooks::from_raw(map),
     );
     // HAlloc: these helpers never collect, so the heap may spill into fragments.
-    let mut heap = crate::FragmentingHeap(&mut process.heap);
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
     let result = if exact {
         arinsal_maps::update(map, key, value, &mut heap)
     } else {
@@ -3888,7 +4031,7 @@ fn arinsal_beamasm_map_change(
     let x = &registers.x_reg_array;
     let arg = |i: usize| x[base + i];
     let map = x[source_slot];
-    let mut heap = crate::FragmentingHeap(&mut process.heap);
+    let mut heap = crate::ProcessHeapHandle(&mut process.heap);
     let result = match change {
         MapChange::New => arinsal_maps::gc_new_map(n, arg, &mut heap),
         MapChange::Assoc => arinsal_maps::gc_update_map_assoc(map, n, arg, &mut heap),

@@ -146,8 +146,8 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     })
 }
 
-struct Heap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -184,7 +184,7 @@ fn call(
         .map(|a| to_owned(*a).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
     let result = f(&args)?;
-    from_owned(&result, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)
+    from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 fn atom(s: &str) -> O {
     O::atom(s)
@@ -408,7 +408,7 @@ pub fn selection(resource: &O) -> Result<Option<Selection>, BifError> {
 /// Called when `tty_select/2` or a successful `read_nif/3` arms input notification.
 ///
 /// `token` is the address of the `ProcessHeap` inside the calling process when
-/// the NIF runs on a [`arinsal_bifs::FragmentingHeap`]. The VM maps that address
+/// the NIF runs on a [`arinsal_bifs::ProcessHeapHandle`]. The VM maps that address
 /// to the scheduler pid. A zero token means the heap shape was not recognized.
 pub type ArmHook = fn(usize, RawFd, O, O);
 
@@ -423,26 +423,12 @@ fn arm_hook() -> Option<ArmHook> {
     *ARM_HOOK.lock().unwrap()
 }
 
-/// Address of the process heap wrapped by a one-word `FragmentingHeap`.
-///
-/// The VM registry uses this as the key recorded before the NIF runs.
+/// Address of the process heap wrapped by the current BIF handle.
 pub fn heap_token(ctx: &mut Ctx<'_>) -> usize {
     if arm_hook().is_none() {
         return 0;
     }
-    let obj: &mut dyn HeapAlloc = ctx.heap;
-    // SAFETY: `Ctx::heap` is a trait object. On this ABI the fat pointer is
-    // (data, vtable). The VM only installs the arm hook for NIFs invoked with
-    // `FragmentingHeap`, whose sole field is the `ProcessHeap` pointer. The
-    // pointer is used as a map key; a mismatch skips delivery.
-    let parts: [*mut (); 2] = unsafe { std::mem::transmute_copy(&obj) };
-    let data = parts[0];
-    if data.is_null() {
-        return 0;
-    }
-    // SAFETY: data is the FragmentingHeap address; its first word is the ProcessHeap pointer used only as a map key.
-    let heap = unsafe { *(data.cast::<*mut ()>()) };
-    heap as usize
+    std::ptr::from_mut(&mut *ctx.heap.0).addr()
 }
 
 fn notify_armed(token: usize, fd: RawFd, tty: &O, reference: &O) {

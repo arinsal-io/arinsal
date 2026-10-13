@@ -485,7 +485,12 @@ fn route_incoming(
                 watcher,
                 target,
                 if *op == 19 {
-                    Signal::Monitor(reference)
+                    arinsal_sched::Signal::Monitor {
+                        reference,
+                        shared: arinsal_sched::SharedPayload(
+                            crate::proc_create::default_monitor_data(),
+                        ),
+                    }
                 } else {
                     Signal::Demonitor(reference)
                 },
@@ -1157,7 +1162,12 @@ fn route_incoming_port(
             remember_remote_monitor_ref(handle, reference, &parts[3], *op == 19)?;
             if let Some(target) = target {
                 let signal = if *op == 19 {
-                    Signal::Monitor(reference)
+                    arinsal_sched::Signal::Monitor {
+                        reference,
+                        shared: arinsal_sched::SharedPayload(
+                            crate::proc_create::default_monitor_data(),
+                        ),
+                    }
                 } else {
                     Signal::Demonitor(reference)
                 };
@@ -1570,7 +1580,16 @@ fn handle_spawn_request(
                 remember_remote_monitor_ref(handle, ref_id, &reference, true)?;
                 let watcher = watcher.ok_or_else(badarg)?;
                 scheduler
-                    .signal(watcher, child, Signal::Monitor(ref_id))
+                    .signal(
+                        watcher,
+                        child,
+                        arinsal_sched::Signal::Monitor {
+                            reference: ref_id,
+                            shared: arinsal_sched::SharedPayload(
+                                crate::proc_create::default_monitor_data(),
+                            ),
+                        },
+                    )
                     .map_err(|error| VmError::Unsupported(format!("spawn monitor arm: {error}")))?;
             }
         }
@@ -1712,7 +1731,16 @@ fn handle_spawn_request_port(
             }
             runtime
                 .scheduler()?
-                .signal(watcher, child, Signal::Monitor(ref_id))
+                .signal(
+                    watcher,
+                    child,
+                    arinsal_sched::Signal::Monitor {
+                        reference: ref_id,
+                        shared: arinsal_sched::SharedPayload(
+                            crate::proc_create::default_monitor_data(),
+                        ),
+                    },
+                )
                 .map_err(|error| VmError::Unsupported(format!("spawn monitor arm: {error}")))?;
             if crate::debug_env::trace_dist() {
                 eprintln!("DIST_SPAWN_MONITOR_ARMED");
@@ -2461,11 +2489,7 @@ fn finish_port_enqueue(
     should_suspend: bool,
 ) -> Result<(), VmError> {
     if should_suspend {
-        let suspended = process.runtime.as_ref().is_some_and(|runtime| {
-            runtime
-                .suspend(sender, sender, false, false)
-                .unwrap_or(false)
-        });
+        let suspended = suspend_dist_sender(process, sender);
         if suspended {
             process.force_yield = true;
             let mut tables = node_tables::lock();
@@ -2623,13 +2647,7 @@ pub(crate) fn continue_fragmented_send(
             false
         }
     };
-    if busy
-        && process.runtime.as_ref().is_some_and(|runtime| {
-            runtime
-                .suspend(sender, sender, false, false)
-                .unwrap_or(false)
-        })
-    {
+    if busy && suspend_dist_sender(process, sender) {
         process.force_yield = true;
         let mut tables = node_tables::lock();
         if let Some(state) = tables.entries.values_mut().find_map(|entry| {
@@ -2725,12 +2743,24 @@ fn flush_port_output(runtime: &crate::process::Runtime, port_id: u64) -> Result<
     Ok(())
 }
 
+/// Suspends a dist sender: the running process takes it on itself, another process receives it as a
+/// signal (erts_suspend on a busy sender). True when the suspend was taken or sent.
+fn suspend_dist_sender(process: &mut Process, sender: Pid) -> bool {
+    if process.self_pid == Some(sender) {
+        return crate::suspend::suspend_self_true(process);
+    }
+    process
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.suspend_internal_remote(sender))
+}
+
 fn resume_dist_senders(runtime: &crate::process::Runtime, senders: Vec<Pid>) {
     let Ok(scheduler) = runtime.scheduler() else {
         return;
     };
     for sender in senders {
-        if runtime.resume(sender, sender) == Some(true) {
+        if runtime.resume_internal(sender) {
             let _ = scheduler.signal(sender, sender, Signal::UnlinkAck(0));
         }
     }

@@ -1,7 +1,8 @@
 use arinsal_bifs::Ctx;
+use arinsal_bifs::ProcessHeapHandle;
 use arinsal_etf::OwnedTerm;
 use arinsal_nif::{LoadInfo, load_nif};
-use arinsal_term::{Term, TermBuilder, VecHeap, global_atoms, to_owned};
+use arinsal_term::{ProcessHeap, Term, TermBuilder, VecHeap, global_atoms, to_owned};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -65,13 +66,14 @@ fn otp_crypto_callbacks_match_erl() {
     let iv = builder.binary(&[0; 16]).unwrap();
     let hmac_key = builder.binary(b"key").unwrap();
     let mut actual = Vec::new();
+    let mut output_heap = ProcessHeap::with_words(4096);
     for (name, args) in [
         ("hash_nif", vec![sha, abc]),
         ("mac_nif", vec![hmac, sha, hmac_key, abc]),
         ("strong_rand_bytes_nif", vec![Term::small(32).unwrap()]),
         ("ng_crypto_one_time_nif", vec![aes, key, iv, abc, yes]),
     ] {
-        let mut ctx = Ctx::new(&mut heap);
+        let mut ctx = Ctx::with_allocator(ProcessHeapHandle(&mut output_heap));
         let t = nif
             .lookup(name, args.len())
             .unwrap()

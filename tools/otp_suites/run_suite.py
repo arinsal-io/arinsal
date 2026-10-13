@@ -92,8 +92,16 @@ def build_native(name: str, source_dir: pathlib.Path) -> None:
         raise RuntimeError(f"native build failed for {name}_SUITE ({proc.returncode}):\n{proc.stdout[-4000:]}")
 
 
+# Test directory searched first; set by the `app:suite` form of the suite argument.
+PREFERRED_BASE: pathlib.Path | None = None
+APP_BASES = {"erts": "erts/emulator/test", "kernel": "lib/kernel/test", "stdlib": "lib/stdlib/test"}
+
+
 def suite_dir(name: str) -> pathlib.Path:
-    for base in (OTP / "erts/emulator/test", OTP / "lib/kernel/test", OTP / "lib/stdlib/test"):
+    bases = [OTP / "erts/emulator/test", OTP / "lib/kernel/test", OTP / "lib/stdlib/test"]
+    if PREFERRED_BASE is not None:
+        bases.insert(0, PREFERRED_BASE)
+    for base in bases:
         if (base / f"{name}_SUITE.erl").is_file():
             return base
     raise ValueError(f"suite not found: {name}_SUITE.erl")
@@ -149,8 +157,15 @@ def run_one(exe: str, name: str, logdir: pathlib.Path, build: pathlib.Path, limi
             # fail the whole suite, as OTP's own test makefiles only build listed modules.
             suite_text = (directory / f"{name}_SUITE.erl").read_text(encoding="utf-8", errors="replace")
             for src in directory.glob("*.erl"):
-                if not (directory / f"{src.stem}.beam").is_file() and src.stem not in suite_text:
-                    src.unlink()
+                if not (directory / f"{src.stem}.beam").is_file():
+                    if src.stem in suite_text:
+                        # The suite reads this source itself (code_SUITE compiles code_a_test
+                        # to a binary in init_per_suite), so keep it, and keep ct's own make
+                        # step away: it would fail the run on the module name mismatch.
+                        if "auto_compile" not in extra:
+                            extra += ",{auto_compile,false}"
+                    else:
+                        src.unlink()
         expr = (
             "R=ct:run_test([{dir,\"" + str(directory) + "\"},{suite," + name
             + "_SUITE},{logdir,\"" + str(logdir) + "\"}" + extra + "]), io:format(\"OTP_SUITE_RESULT=~p~n\",[R]), halt()."
@@ -303,12 +318,17 @@ def update_table(name: str, erl: dict[str, tuple[str, str]], arin: dict[str, tup
             if suite_failure:
                 detail = f"{detail}; suite-level: {suite_failure}"
         entries.append(f"| `{name}_SUITE` | {len(cases)} | {eok}/{len(cases)} | {aok}/{len(cases)} | {len(mismatch)} | {arin_rc} | {detail.replace('|', '&#124;')} |")
+    import fcntl
+    # Parallel suite runs update the same table; serialise the read-modify-write.
+    lock = open(str(results_path) + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
     old = results_path.read_text(encoding="utf-8") if results_path.exists() else "# OTP 29.1.1 suite pilot results\n\n| Suite | Cases | erl pass | Arinsal pass | erl-pass/Arinsal-not | Arinsal exit | First failure line / notes |\n|---|---:|---:|---:|---:|---:|---|\n"
     lines = [line for line in old.splitlines() if not line.startswith(f"| `{name}_SUITE` |")]
     lines.extend(" ".join(entry.split()) for entry in entries)
     header = lines[:3]
     rows = sorted((line for line in lines[3:] if line.count("|") >= 2), key=lambda line: line.split("|", 2)[1].strip())
     results_path.write_text("\n".join(header + rows) + "\n", encoding="utf-8")
+    lock.close()
 
 
 def _acquire_global_slot() -> None:
@@ -344,6 +364,11 @@ def main() -> int:
     parser.add_argument("--case-factor", type=float, default=10.0, help="per-case limit = max(floor, factor * erl case time)")
     args = parser.parse_args()
     results_path = RESULTS_BEAMASM if args.beamasm else RESULTS
+    global PREFERRED_BASE
+    if ":" in args.suite:
+        # `kernel:code` picks lib/kernel/test/code_SUITE over the erts suite of the same name.
+        app, args.suite = args.suite.split(":", 1)
+        PREFERRED_BASE = OTP / APP_BASES[app]
     suites = PILOT if args.suite == "all-pilot" else [args.suite.removesuffix("_SUITE")]
     partial = bool(args.case or args.group)
     arinsal = args.arinsal or str(ROOT / ("target/fastrel/arinsal" if args.fast else "target/release/arinsal"))

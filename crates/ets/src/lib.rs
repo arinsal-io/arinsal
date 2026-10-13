@@ -1833,7 +1833,6 @@ pub struct Table {
     /// Creation options and owner metadata.
     pub options: TableOptions,
     storage: Storage,
-    max_arity: AtomicUsize,
     fixed: usize,
     fixed_system_time: Option<StoredTerm>,
     fixed_monotonic_time: Option<StoredTerm>,
@@ -1879,7 +1878,6 @@ impl Table {
             tid,
             options,
             storage,
-            max_arity: AtomicUsize::new(0),
             fixed: 0,
             fixed_system_time: None,
             fixed_monotonic_time: None,
@@ -2341,16 +2339,12 @@ impl Table {
     pub fn insert_shared(&self, prepared: PreparedObject) -> Option<PreparedObject> {
         match &self.storage {
             Storage::CATree(tree) => {
-                self.max_arity
-                    .fetch_max(prepared.stored.arity(), AtomicOrdering::Relaxed);
                 tree.insert(prepared.stored);
                 None
             }
             Storage::Hash(storage)
                 if self.options.write_concurrency != WriteConcurrency::Disabled =>
             {
-                self.max_arity
-                    .fetch_max(prepared.stored.arity(), AtomicOrdering::Relaxed);
                 storage.insert_shared(
                     prepared.stored,
                     prepared.hash,
@@ -2557,8 +2551,6 @@ impl Table {
     }
 
     fn put_hashed(&mut self, object: StoredTerm, hash: u64, new_only: bool) {
-        self.max_arity
-            .fetch_max(object.arity(), AtomicOrdering::Relaxed);
         let keypos = self.options.keypos;
         match &mut self.storage {
             Storage::Ordered(root) => *root = Some(Node::insert(root.take(), object, keypos)),
@@ -2939,13 +2931,6 @@ impl Table {
     ) -> Result<Term, EtsError> {
         if position == 0 {
             return Err(EtsError::BadArg);
-        }
-        if position > self.max_arity.load(AtomicOrdering::Relaxed) {
-            return Err(if self.member(key) {
-                EtsError::BadArg
-            } else {
-                EtsError::BadArgCause("badkey")
-            });
         }
         match &self.storage {
             Storage::Hash(storage) => {
@@ -3850,7 +3835,11 @@ impl Table {
         let mut heap = ObjectHeap::new();
         let mut stored_values = None;
         self.try_matching_first(key, |found| {
-            let current = found.term_for_filter(&mut heap)?;
+            // erts reads and updates the stored object in place under the write lock
+            // (erl_db.c:1532 db_lookup_dbterm, erl_db_catree.c:2369-2385). A CA tree hands
+            // the visitor a copy that is dropped when the lookup returns, so the elements
+            // are copied into the local heap rather than borrowed from `found`.
+            let current = found.term_for_match(&mut heap)?;
             // SAFETY: current is owned by the local heap until the replacement is inserted.
             let values = unsafe { current.tuple_ref() }.ok_or(EtsError::BadArg)?;
             stored_values = Some(values.iter().collect::<Vec<_>>());
@@ -4552,7 +4541,6 @@ impl Table {
         let keypos = self.options.keypos;
         let compressed = self.options.compressed;
         if let Storage::Hash(storage) = &mut self.storage {
-            let mut max_arity = self.max_arity.load(AtomicOrdering::Relaxed);
             let count = storage.replace_each(|object| {
                 let mut heap = VecHeap::new();
                 let current = object.copy_out(&mut heap)?;
@@ -4560,10 +4548,8 @@ impl Table {
                     return Ok(None);
                 };
                 let replacement = StoredTerm::copy_for_table(replacement, compressed, keypos, 2)?;
-                max_arity = max_arity.max(replacement.arity());
                 Ok(Some(replacement))
             })?;
-            self.max_arity.store(max_arity, AtomicOrdering::Relaxed);
             return Ok(count);
         }
         let mut heap = VecHeap::new();
@@ -4612,8 +4598,6 @@ impl Table {
                 return Ok::<Option<StoredTerm>, EtsError>(None);
             };
             let replacement = StoredTerm::copy_for_table(replacement, compressed, keypos, 2)?;
-            self.max_arity
-                .fetch_max(replacement.arity(), AtomicOrdering::Relaxed);
             Ok(Some(replacement))
         })?;
         Ok(Some(count))

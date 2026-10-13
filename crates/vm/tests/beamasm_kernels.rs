@@ -12,7 +12,7 @@ fn beam_asm_kernels_match_erts() {
     let dir = std::env::temp_dir().join(format!("arinsal-beamasm-kernels-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../experiments/perf/pf_exec/kernels.erl");
+        .join("tests/fixtures/kernels.erl");
     let compiled = Command::new("erlc")
         .arg("-o")
         .arg(&dir)

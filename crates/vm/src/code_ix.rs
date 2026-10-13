@@ -66,7 +66,7 @@ pub(crate) struct CodeIndexes {
     released: Condvar,
     /// Bodies of loader-bound static NIFs and `load_nif` functions. `NativeBody` instructions
     /// patched into code index them; released slots are reused after code purge.
-    native_fns: RwLock<Arc<Vec<Option<arinsal_bifs::BifFn>>>>,
+    native_fns: RwLock<Arc<Vec<Option<crate::natives::nif::NativeFn>>>>,
     /// `erts_coverage_mode`: applies to modules loaded after it is set.
     coverage_mode: Mutex<arinsal_loader::CoverageMode>,
     pub(crate) purge_state: Arc<crate::natives::code::PurgeState>,
@@ -446,7 +446,7 @@ impl CodeIndexes {
     }
 
     /// The NIF bodies `NativeBody` instructions index.
-    pub(crate) fn native_fns(&self) -> Arc<Vec<Option<arinsal_bifs::BifFn>>> {
+    pub(crate) fn native_fns(&self) -> Arc<Vec<Option<crate::natives::nif::NativeFn>>> {
         Arc::clone(
             &self
                 .native_fns
@@ -457,7 +457,7 @@ impl CodeIndexes {
 
     /// Stores a NIF body in a free slot or appends one and returns its index.
     // Port of erts/emulator/beam/erl_nif.c:5334-5360 (erts_unload_nif), OTP-29.1.1.
-    pub(crate) fn push_native_fn(&self, function: arinsal_bifs::BifFn) -> Option<u32> {
+    pub(crate) fn push_native_fn(&self, function: crate::natives::nif::NativeFn) -> Option<u32> {
         let mut table = self
             .native_fns
             .write()
@@ -814,9 +814,11 @@ mod tests {
     #[test]
     fn purged_native_body_slots_are_reused() {
         let (scope, code) = node();
-        let native = arinsal_bifs::lookup("erlang", "length", 1).unwrap();
-        let first = code.push_native_fn(native).unwrap();
-        let second = code.push_native_fn(native).unwrap();
+        let native = crate::natives::nif::NativeFn::Bif(
+            arinsal_bifs::lookup("erlang", "length", 1).unwrap(),
+        );
+        let first = code.push_native_fn(native.clone()).unwrap();
+        let second = code.push_native_fn(native.clone()).unwrap();
         assert_eq!((first, second), (0, 1));
         code.release_native_fn(first as usize);
         assert_eq!(code.native_fns().len(), 2);

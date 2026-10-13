@@ -107,7 +107,7 @@ fn execute_put_record(
             let value = record_field_value(p, snapshot.module, snapshot.name, *field)?;
             return Err(record_trap(p, "badfield", value));
         }
-        let record = TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+        let record = TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
             .update_native_record(&snapshot, &pairs)
             .map_err(|_| VmError::Unsupported("native record update".into()))?;
         p.write(destination, record)?;
@@ -174,7 +174,7 @@ fn execute_put_record(
             values[index] = pairs[next].1;
             next += 1;
         } else if let Some(default) = default {
-            values[index] = arinsal_term::from_owned(default, &mut FragmentingHeap(&mut p.heap))
+            values[index] = arinsal_term::from_owned(default, &mut ProcessHeapHandle(&mut p.heap))
                 .map_err(|_| VmError::Unsupported("native record default allocation".into()))?;
         } else if missing.is_none() {
             // A field without a default must be given; the error is delayed so that
@@ -194,7 +194,7 @@ fn execute_put_record(
         .iter()
         .map(|(field, index, _)| (*field, values[*index]))
         .collect();
-    let record = TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+    let record = TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
         .native_record(module_atom, name_atom, definition.is_exported, &fields)
         .map_err(|_| VmError::Unsupported("native record allocation".into()))?;
     p.write(destination, record)?;
@@ -510,7 +510,7 @@ fn execute_tuple_bif(
         let arity = tuple_arity(tuple);
         match (index, arity) {
             (Some(index), Some(arity)) if index < arity => Some(
-                TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+                TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
                     .tuple_from_fn(arity, |element, _| {
                         if element == index {
                             args[2]
@@ -569,7 +569,7 @@ fn call_fast_tuple_bif(
             let tuple_arity = tuple_arity(tuple);
             match (index, tuple_arity) {
                 (Some(index), Some(tuple_arity)) if index < tuple_arity => {
-                    TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+                    TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
                         .tuple_from_fn(tuple_arity, |element, _| {
                             if element == index {
                                 args[2]
@@ -679,7 +679,9 @@ fn execute_guard_bif(
         p.gc_live = live;
         let result = arith::small(import.fast, left, right)
             .map(Ok)
-            .unwrap_or_else(|| calls::call_bif(&mut p.heap, bif, &[left, right]));
+            .unwrap_or_else(|| {
+                calls::call_bif(&mut p.heap, &mut p.reductions, bif, &[left, right])
+            });
         if let Ok(value) = result {
             write_fast_x(p, dst, value)?;
             p.ip += 1;
@@ -1575,8 +1577,8 @@ impl Vm {
             .or_else(|| natives::static_nif_lookup(module, function, args.len() as u8))
         {
             let result = {
-                let mut heap = FragmentingHeap(&mut process.heap);
-                let mut ctx = Ctx::new(&mut heap);
+                let mut heap = ProcessHeapHandle(&mut process.heap);
+                let mut ctx = Ctx::with_fcalls(&mut heap, &mut process.reductions);
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bif(&mut ctx, args)))
                     .map_err(|_| VmError::Unsupported(format!("BIF {frame} panicked")))?
             };
@@ -1612,7 +1614,7 @@ impl Vm {
         // meets a term outside its heap and the literal areas.
         let literals = arinsal_term::LiteralAreas::current();
         for (register, &arg) in process.x.iter_mut().zip(args) {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             *register = arinsal_term::copy_term_litopt(arg, &mut heap, &literals)
                 .map_err(|error| VmError::Unsupported(format!("eval argument copy: {error:?}")))?;
         }
@@ -1840,7 +1842,7 @@ impl Vm {
                 let amount = $amount;
                 if amount != 0 {
                     p.reductions_used = p.reductions_used.saturating_add(u64::from(amount));
-                    reds = reds.saturating_sub(amount.min(i32::MAX as u32) as i32);
+                    reds = p.reductions;
                     consumed = consumed.saturating_add(amount).min(budget);
                     if let Some(run) = ctx.as_deref_mut() {
                         run.consume(amount);
@@ -2025,7 +2027,12 @@ impl Vm {
             // SAFETY: The loader resolves branch targets within this allocation
             // and appends CodeEnd for a fallthrough past the last BEAM opcode.
             let fetched = unsafe { *ip };
-            if (consumed == budget || p.force_yield)
+            // Port of emit_call_light_bif_shared's post-BIF return in
+            // erts/emulator/beam/jit/arm/instr_bif.cpp:378-535, OTP-29.1.1:
+            // FCALLS exhaustion does not replace the BIF result; yielding is
+            // handled at a switchable instruction boundary like emit_i_test_yield
+            // in instr_common.cpp:3097-3118.
+            if (consumed == budget || reds <= 0 || p.force_yield)
                 && let Some(live) = switch_out_live(module, fetched)
             {
                 p.force_yield = false;
@@ -2115,7 +2122,7 @@ impl Vm {
                                     .map_err(|_| debug_line_system_limit())?;
                                 let arguments = p.x[..arity].to_vec();
                                 let argument_list = TermBuilder::new(
-                                    &mut arinsal_bifs::FragmentingHeap(&mut p.heap),
+                                    &mut arinsal_bifs::ProcessHeapHandle(&mut p.heap),
                                 )
                                 .list_from_iter(arguments)
                                 .map_err(|_| debug_line_system_limit())?;
@@ -2313,8 +2320,17 @@ impl Vm {
                     let pending = p.cold.as_mut().and_then(|cold| cold.nif_pending.take());
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match pending {
-                            Some(pending) => natives::nif::resume_pending(&mut p.heap, pending),
-                            None => calls::call_bif(&mut p.heap, native, &p.x[..arity]),
+                            Some(pending) => natives::nif::resume_pending(
+                                &mut p.heap,
+                                &mut p.reductions,
+                                pending,
+                            ),
+                            None => natives::nif::call_native(
+                                &mut p.heap,
+                                &mut p.reductions,
+                                &native,
+                                &p.x[..arity],
+                            ),
                         }
                     }));
                     let result = match result {
@@ -2644,20 +2660,12 @@ impl Vm {
                             // instruction or CodeEnd in this allocation.
                             ip = unsafe { ip.add(1) };
                             let charge = bif_reductions.saturating_add(1);
-                            reds = reds.saturating_sub(charge.min(i32::MAX as u32) as i32);
+                            // The BIF body changed the process FCALLS through Ctx. Keep the
+                            // interpreter's cached value in step without charging it again.
+                            reds = p.reductions;
                             consumed = consumed.saturating_add(charge).min(budget);
                             if let Some(run) = ctx.as_deref_mut() {
                                 run.consume(charge);
-                            }
-                            if reds == 0 || consumed == budget {
-                                // Only the BIF result in X0 is live after the call.
-                                p.gc_live = 1;
-                                sync_cursor(p, htop, &mut heap_dirty);
-                                // SAFETY: `ip` remains inside the current module allocation.
-                                p.ip = unsafe { ip.offset_from(base) } as usize;
-                                p.module = module_id;
-                                p.reductions = 4000;
-                                return Ok(RunState::Yield);
                             }
                             continue;
                         }
@@ -2718,20 +2726,12 @@ impl Vm {
                                 // instruction or CodeEnd in this allocation.
                                 ip = unsafe { ip.add(1) };
                                 let charge = bif_reductions.saturating_add(1);
-                                reds = reds.saturating_sub(charge.min(i32::MAX as u32) as i32);
+                                // The BIF body changed the process FCALLS through Ctx. Keep the
+                                // interpreter's cached value in step without charging it again.
+                                reds = p.reductions;
                                 consumed = consumed.saturating_add(charge).min(budget);
                                 if let Some(run) = ctx.as_deref_mut() {
                                     run.consume(charge);
-                                }
-                                if reds == 0 || consumed == budget {
-                                    // Only the BIF result in X0 is live after the call.
-                                    p.gc_live = 1;
-                                    sync_cursor(p, htop, &mut heap_dirty);
-                                    // SAFETY: `ip` remains inside the current module allocation.
-                                    p.ip = unsafe { ip.offset_from(base) } as usize;
-                                    p.module = module_id;
-                                    p.reductions = 4000;
-                                    return Ok(RunState::Yield);
                                 }
                                 if let Some(resume) = p
                                     .cold
@@ -3294,8 +3294,8 @@ impl Vm {
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
-                            let mut heap = FragmentingHeap(&mut p.heap);
-                            let mut ctx = Ctx::new(&mut heap);
+                            let mut heap = ProcessHeapHandle(&mut p.heap);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, right]);
                             (result, ctx.reductions())
@@ -3361,8 +3361,8 @@ impl Vm {
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
-                            let mut heap = FragmentingHeap(&mut p.heap);
-                            let mut ctx = Ctx::new(&mut heap);
+                            let mut heap = ProcessHeapHandle(&mut p.heap);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, right]);
                             (result, ctx.reductions())
@@ -3423,8 +3423,8 @@ impl Vm {
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
-                            let mut heap = FragmentingHeap(&mut p.heap);
-                            let mut ctx = Ctx::new(&mut heap);
+                            let mut heap = ProcessHeapHandle(&mut p.heap);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, value]);
                             (result, ctx.reductions())
@@ -3485,8 +3485,8 @@ impl Vm {
                             .ok_or_else(|| VmError::Unsupported("arithmetic BIF".into()))?;
                         sync_cursor(p, htop, &mut heap_dirty);
                         let (result, bif_reductions) = {
-                            let mut heap = FragmentingHeap(&mut p.heap);
-                            let mut ctx = Ctx::new(&mut heap);
+                            let mut heap = ProcessHeapHandle(&mut p.heap);
+                            let mut ctx = Ctx::with_fcalls(&mut heap, &mut p.reductions);
                             // ---- vm_exc ----
                             let result = bif(&mut ctx, &[left, value]);
                             (result, ctx.reductions())

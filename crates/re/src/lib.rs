@@ -89,6 +89,8 @@ unsafe extern "C" {
         ovector: *mut usize,
         ovec_count: u32,
         loop_budget: i32,
+        session: *mut *mut c_void,
+        mode: i32,
     ) -> MatchResult;
 }
 
@@ -100,6 +102,12 @@ impl Drop for Code {
     }
 }
 impl Code {
+    /// The code's address, giving up ownership; a [`RunState`] frees it.
+    fn into_raw(self) -> usize {
+        let address = self.0 as usize;
+        std::mem::forget(self);
+        address
+    }
     fn info(&self, what: u32) -> u32 {
         let mut value = 0;
         // SAFETY: `self.0` is a live PCRE2 code and `value` is writable.
@@ -163,8 +171,8 @@ pub fn lookup(module: &str, name: &str, arity: u8) -> Option<BifFn> {
     })
 }
 
-struct Heap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for Heap<'_> {
+struct Heap<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for Heap<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -206,7 +214,7 @@ fn call(
         .map(|term| to_owned(*term).map_err(|_| BifError::BADARG))
         .collect::<Result<Vec<_>, _>>()?;
     let result = op(&args)?;
-    from_owned(&result, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)
+    from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)
 }
 fn atom(name: &str) -> O {
     O::atom(name)
@@ -619,7 +627,7 @@ pub fn invoke(ctx: &mut Ctx<'_>, name: &str, args: &[Term]) -> Result<Term, BifE
             && let Some(owned) = magic_pattern(*pattern)?
         {
             adapted[pattern_index] =
-                from_owned(&owned, &mut Heap(ctx.heap)).map_err(|_| BifError::SystemLimit)?;
+                from_owned(&owned, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)?;
         }
     }
     let bif = lookup("re", name, args.len() as u8).ok_or(BifError::BADARG)?;
@@ -680,7 +688,7 @@ fn magic_compile_result(ctx: &mut Ctx<'_>, result: Term) -> Result<Term, BifErro
         return Err(BifError::BADARG);
     };
     let serialized = serialized.clone();
-    let mut heap = Heap(ctx.heap);
+    let mut heap = Heap(&mut ctx.heap);
     let mut terms = pattern[..4]
         .iter()
         .map(|item| from_owned(item, &mut heap).map_err(|_| BifError::SystemLimit))
@@ -873,102 +881,231 @@ enum MatchFailure {
     Badarg,
     Limit(&'static str),
 }
-fn match_once(
-    code: &Code,
+/// A match that ran out of its loop budget, with everything needed to continue it.
+///
+/// Port of erts/emulator/beam/erl_bif_re.c:1660-1680 (`RestartContext`), OTP-29.1.1. The
+/// compiled code, the subject copy and the PCRE2 match state are owned here; the addresses
+/// are plain integers so the state can sit in a magic reference.
+pub struct RunState {
+    code: usize,
+    subject: Vec<u8>,
+    session: usize,
+    unicode: bool,
+    flags: u32,
+    offset: usize,
+    matches: Vec<O>,
+    phase: Phase,
+}
+#[derive(Clone, Copy)]
+enum Phase {
+    /// The next match starts at `offset`.
+    Main,
+    /// An empty match at `start` is retried anchored and non-empty (`PCRE2_NOTEMPTY_ATSTART`).
+    Retry { start: usize },
+}
+impl RunState {
+    fn code(&self) -> std::mem::ManuallyDrop<Code> {
+        std::mem::ManuallyDrop::new(Code(self.code as *mut c_void))
+    }
+}
+impl Drop for RunState {
+    fn drop(&mut self) {
+        if self.session != 0 {
+            let mut ovector = [0usize; 0];
+            ffi_match(
+                self.code,
+                &[],
+                0,
+                0,
+                (-1, -1),
+                &mut ovector,
+                0,
+                0,
+                &mut self.session,
+                1,
+            );
+        }
+        drop(Code(self.code as *mut c_void));
+    }
+}
+
+/// The only call into the PCRE2 matcher. `session` is the unfinished match state, zero when
+/// there is none; mode 1 frees it.
+#[allow(clippy::too_many_arguments)]
+fn ffi_match(
+    code: usize,
     subject: &[u8],
     offset: usize,
     flags: u32,
-    opts: &Options,
-) -> Result<Option<(i32, Vec<usize>)>, MatchFailure> {
-    let count = code.info(INFO_CAPTURES) as usize + 1;
-    let mut ovector = vec![UNSET; count * 2];
-    // SAFETY: the pointers cover live byte and ovector buffers; `code` is live.
+    limits: (i32, i32),
+    ovector: &mut [usize],
+    count: u32,
+    budget: i32,
+    session: &mut usize,
+    mode: i32,
+) -> MatchResult {
+    let mut slot = *session as *mut c_void;
+    // SAFETY: the pointers cover live byte and ovector buffers; `code` is a live PCRE2 code
+    // and, while `session` is set, `code` and `subject` are the ones it was started with.
     let result = unsafe {
         ar_re_match(
-            code.0,
+            code as *const c_void,
             subject.as_ptr(),
             subject.len(),
             offset,
             flags,
-            opts.match_limit,
-            opts.depth_limit,
+            limits.0,
+            limits.1,
             ovector.as_mut_ptr(),
-            count as u32,
-            LOOP_BUDGET.with(Cell::get),
+            count,
+            budget,
+            &mut slot,
+            mode,
         )
     };
-    LAST_LOOP_COUNT.with(|count| count.set(result.loops_consumed));
+    *session = slot as usize;
+    result
+}
+
+enum Slice {
+    Done(Option<(i32, Vec<usize>)>),
+    Yield,
+}
+/// Runs or resumes one `pcre2_match`, for at most `budget` loops.
+fn match_slice(
+    state: &mut RunState,
+    offset: usize,
+    flags: u32,
+    opts: &Options,
+    budget: i32,
+    loops: &mut u64,
+) -> Result<Slice, MatchFailure> {
+    let count = state.code().info(INFO_CAPTURES) as usize + 1;
+    let mut ovector = vec![UNSET; count * 2];
+    let result = ffi_match(
+        state.code,
+        &state.subject,
+        offset,
+        flags,
+        (opts.match_limit, opts.depth_limit),
+        &mut ovector,
+        count as u32,
+        budget,
+        &mut state.session,
+        0,
+    );
+    *loops += result.loops_consumed;
     match result.rc {
-        rc if rc > 0 => Ok(Some((rc, ovector))),
-        -1 | -52 | -63 => Ok(None),
+        PCRE2_ERROR_LOOP_LIMIT => Ok(Slice::Yield),
+        rc if rc > 0 => Ok(Slice::Done(Some((rc, ovector)))),
+        -1 | -52 | -63 => Ok(Slice::Done(None)),
         -47 if opts.report_errors => Err(MatchFailure::Limit("match_limit")),
         -53 if opts.report_errors => Err(MatchFailure::Limit("match_limit_recursion")),
-        -47 | -53 => Ok(None),
+        -47 | -53 => Ok(Slice::Done(None)),
         _ => Err(MatchFailure::Badarg),
     }
 }
-fn match_result(
-    code: &Code,
-    subject: &[u8],
+const PCRE2_ERROR_LOOP_LIMIT: i32 = -76;
+
+/// What a slice of a run produced.
+enum Step {
+    Done(O),
+    Yield,
+}
+
+/// Port of lib/stdlib/src/re.erl:1823-1906 (do_grun/loopexec), OTP-29.1.1, as a state machine
+/// that can stop in the middle of any match and continue later.
+fn advance(
+    state: &mut RunState,
     opts: &Options,
-    unicode: bool,
-    first: bool,
-) -> Result<O, BifError> {
-    // Port of lib/stdlib/src/re.erl:1823-1906 (do_grun/loopexec), OTP-29.1.1.
-    let (selection, kind) = selection(code, opts.capture.as_ref())?;
-    let mut flags = opts.match_flags;
-    if !first {
-        flags |= NO_UTF_CHECK;
-    }
-    let mut offset = opts.offset;
-    let mut matches = Vec::new();
+    budget: i32,
+    loops: &mut u64,
+) -> Result<Step, BifError> {
+    let (selection, kind) = {
+        let code = state.code();
+        selection(&code, opts.capture.as_ref())?
+    };
     loop {
-        if offset > subject.len() {
-            break;
-        }
-        let found = match_once(code, subject, offset, flags, opts);
-        let (rc, ov) = match found {
-            Ok(Some(value)) => value,
-            Ok(None) => break,
-            Err(MatchFailure::Limit(reason)) => return Ok(error(atom(reason))),
-            Err(MatchFailure::Badarg) => return Err(BifError::BADARG),
-        };
-        let start = ov[0];
-        let end = ov[1];
-        if !matches!(selection, Selection::None) {
-            matches.push(capture_values(
-                code, &selection, kind, rc, &ov, subject, unicode,
-            ));
-        } else {
-            matches.push(O::Nil);
-        }
-        if !opts.global {
-            break;
-        }
-        if end > start {
-            offset = end;
-        } else {
-            let retry = match match_once(code, subject, offset, flags | ANCHORED | 8, opts) {
-                Ok(value) => value,
-                Err(MatchFailure::Limit(reason)) => return Ok(error(atom(reason))),
-                Err(MatchFailure::Badarg) => return Err(BifError::BADARG),
-            };
-            if let Some((retry_rc, retry_ov)) = retry
-                && retry_ov[1] > retry_ov[0]
-            {
-                matches.push(capture_values(
-                    code, &selection, kind, retry_rc, &retry_ov, subject, unicode,
-                ));
-                offset = retry_ov[1];
-                flags |= NO_UTF_CHECK;
-                continue;
+        match state.phase {
+            Phase::Main => {
+                if state.offset > state.subject.len() {
+                    break;
+                }
+                let found = match match_slice(state, state.offset, state.flags, opts, budget, loops)
+                {
+                    Ok(Slice::Yield) => return Ok(Step::Yield),
+                    Ok(Slice::Done(found)) => found,
+                    Err(MatchFailure::Limit(reason)) => return Ok(Step::Done(error(atom(reason)))),
+                    Err(MatchFailure::Badarg) => return Err(BifError::BADARG),
+                };
+                let Some((rc, ov)) = found else {
+                    break;
+                };
+                let start = ov[0];
+                let end = ov[1];
+                if !matches!(selection, Selection::None) {
+                    let code = state.code();
+                    let value = capture_values(
+                        &code,
+                        &selection,
+                        kind,
+                        rc,
+                        &ov,
+                        &state.subject,
+                        state.unicode,
+                    );
+                    state.matches.push(value);
+                } else {
+                    state.matches.push(O::Nil);
+                }
+                if !opts.global {
+                    break;
+                }
+                if end > start {
+                    state.offset = end;
+                    state.flags |= NO_UTF_CHECK;
+                } else {
+                    state.phase = Phase::Retry { start };
+                }
             }
-            if start >= subject.len() {
-                break;
-            }
-            offset = start
-                + if unicode {
-                    let b = subject[start];
+            Phase::Retry { start } => {
+                let retry = match match_slice(
+                    state,
+                    state.offset,
+                    state.flags | ANCHORED | 8,
+                    opts,
+                    budget,
+                    loops,
+                ) {
+                    Ok(Slice::Yield) => return Ok(Step::Yield),
+                    Ok(Slice::Done(found)) => found,
+                    Err(MatchFailure::Limit(reason)) => return Ok(Step::Done(error(atom(reason)))),
+                    Err(MatchFailure::Badarg) => return Err(BifError::BADARG),
+                };
+                state.phase = Phase::Main;
+                if let Some((retry_rc, retry_ov)) = retry
+                    && retry_ov[1] > retry_ov[0]
+                {
+                    let code = state.code();
+                    let value = capture_values(
+                        &code,
+                        &selection,
+                        kind,
+                        retry_rc,
+                        &retry_ov,
+                        &state.subject,
+                        state.unicode,
+                    );
+                    state.matches.push(value);
+                    state.offset = retry_ov[1];
+                    state.flags |= NO_UTF_CHECK;
+                    continue;
+                }
+                if start >= state.subject.len() {
+                    break;
+                }
+                let step = if state.unicode {
+                    let b = state.subject[start];
                     if b & 0xe0 == 0xc0 {
                         2
                     } else if b & 0xf0 == 0xe0 {
@@ -978,60 +1115,188 @@ fn match_result(
                     } else {
                         1
                     }
-                } else if matches!(code.info(INFO_NEWLINE), 3..=5)
-                    && subject.get(start..start + 2) == Some(b"\r\n")
+                } else if matches!(state.code().info(INFO_NEWLINE), 3..=5)
+                    && state.subject.get(start..start + 2) == Some(b"\r\n")
                 {
                     2
                 } else {
                     1
                 };
+                state.offset = start + step;
+                state.flags |= NO_UTF_CHECK;
+            }
         }
-        flags |= NO_UTF_CHECK;
     }
+    let mut matches = std::mem::take(&mut state.matches);
     if matches.is_empty() {
-        return Ok(atom("nomatch"));
+        return Ok(Step::Done(atom("nomatch")));
     }
-    if opts.global {
+    Ok(Step::Done(if opts.global {
         if matches!(selection, Selection::None) {
-            Ok(atom("match"))
+            atom("match")
         } else {
-            Ok(pair(atom("match"), O::list(matches)))
+            pair(atom("match"), O::list(matches))
         }
     } else if matches!(selection, Selection::None) {
-        Ok(atom("match"))
+        atom("match")
     } else {
-        Ok(pair(atom("match"), matches.remove(0)))
+        pair(atom("match"), matches.remove(0))
+    }))
+}
+
+/// Where a `re:run`/`re:internal_run` call stands after one slice.
+pub enum Progress {
+    /// The finished result.
+    Done(Term),
+    /// The loop budget ran out; resume with this state.
+    Yield(Box<RunState>),
+}
+
+/// Loops PCRE2 runs per reduction (`LOOP_FACTOR`, erl_bif_re.c:42).
+pub const LOOP_FACTOR: i32 = 16;
+
+/// Runs `re:run/2,3` or `re:internal_run/4` for at most `loop_budget` PCRE2 loops. `state` is
+/// the unfinished run of an earlier slice, with the call's original arguments. Gives the
+/// progress and the loops used.
+///
+/// Port of erts/emulator/beam/erl_bif_re.c:1495-1795 (re_run) and :1841-1900 (re_exec_trap),
+/// OTP-29.1.1.
+pub fn run_slice(
+    ctx: &mut Ctx<'_>,
+    name: &str,
+    args: &[Term],
+    state: Option<Box<RunState>>,
+    loop_budget: i32,
+) -> Result<(Progress, u64), BifError> {
+    let mut adapted = args.to_vec();
+    let pattern_index = 1;
+    if let Some(pattern) = args.get(pattern_index)
+        && let Some(owned) = magic_pattern(*pattern)?
+    {
+        adapted[pattern_index] =
+            from_owned(&owned, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)?;
+    }
+    let owned = adapted
+        .iter()
+        .map(|term| to_owned(*term).map_err(|_| BifError::BADARG))
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = match (name, owned.len()) {
+        _ if state.is_some() => false,
+        ("run", 2 | 3) => true,
+        ("internal_run", 4) => match atom_name(&owned[3]) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(BifError::BADARG),
+        },
+        _ => return Err(BifError::BADARG),
+    };
+    let (step, loops) = run_owned_slice(&owned, first, state, loop_budget)?;
+    match step {
+        (Step::Done(result), _) => Ok((
+            Progress::Done(
+                from_owned(&result, &mut Heap(&mut ctx.heap)).map_err(|_| BifError::SystemLimit)?,
+            ),
+            loops,
+        )),
+        (Step::Yield, state) => Ok((Progress::Yield(state), loops)),
     }
 }
-fn run_owned(args: &[O], first: bool) -> Result<O, BifError> {
+
+fn run_owned_slice(
+    args: &[O],
+    first: bool,
+    state: Option<Box<RunState>>,
+    loop_budget: i32,
+) -> Result<((Step, Box<RunState>), u64), BifError> {
     let opts = options(args.get(2).unwrap_or(&O::Nil))?;
-    if opts.export {
-        return Err(BifError::BADARG);
-    }
-    let compiled = matches!(&args[1], O::Tuple(fields) if fields.len() == 5);
-    let (code, unicode) = if compiled {
-        if opts.unique_compile {
-            return Err(BifError::BADARG);
-        }
-        let (code, unicode) = decode(&args[1])?;
-        if opts.newline != 0 && opts.newline != code.info(INFO_NEWLINE) {
-            return Err(BifError::BADARG);
-        }
-        if opts.bsr != 0 && opts.bsr != code.info(INFO_BSR) {
-            return Err(BifError::BADARG);
-        }
-        (code, unicode)
-    } else {
-        let pattern = iodata(&args[1], opts.unicode)?;
-        match compile_code(&pattern, &opts) {
-            Ok(code) => (code, opts.unicode),
-            Err((err, pos)) if opts.report_errors => return Ok(compile_error(err, pos, true)),
-            Err(_) => return Err(BifError::BADARG),
+    let mut state = match state {
+        Some(state) => state,
+        None => {
+            if opts.export {
+                return Err(BifError::BADARG);
+            }
+            let compiled = matches!(&args[1], O::Tuple(fields) if fields.len() == 5);
+            let (code, unicode) = if compiled {
+                if opts.unique_compile {
+                    return Err(BifError::BADARG);
+                }
+                let (code, unicode) = decode(&args[1])?;
+                if opts.newline != 0 && opts.newline != code.info(INFO_NEWLINE) {
+                    return Err(BifError::BADARG);
+                }
+                if opts.bsr != 0 && opts.bsr != code.info(INFO_BSR) {
+                    return Err(BifError::BADARG);
+                }
+                (code, unicode)
+            } else {
+                let pattern = iodata(&args[1], opts.unicode)?;
+                match compile_code(&pattern, &opts) {
+                    Ok(code) => (code, opts.unicode),
+                    Err((err, pos)) if opts.report_errors => {
+                        return Ok((
+                            (
+                                Step::Done(compile_error(err, pos, true)),
+                                Box::new(RunState::empty()),
+                            ),
+                            0,
+                        ));
+                    }
+                    Err(_) => return Err(BifError::BADARG),
+                }
+            };
+            let subject = iodata(&args[0], unicode)?;
+            if opts.offset > subject.len() && !opts.global {
+                return Err(BifError::BADARG);
+            }
+            Box::new(RunState {
+                code: code.into_raw(),
+                subject,
+                session: 0,
+                unicode,
+                flags: if first {
+                    opts.match_flags
+                } else {
+                    opts.match_flags | NO_UTF_CHECK
+                },
+                offset: opts.offset,
+                matches: Vec::new(),
+                phase: Phase::Main,
+            })
         }
     };
-    let subject = iodata(&args[0], unicode)?;
-    if opts.offset > subject.len() && !opts.global {
-        return Err(BifError::BADARG);
+    let mut loops = 0;
+    let step = advance(&mut state, &opts, loop_budget, &mut loops)?;
+    Ok(((step, state), loops))
+}
+impl RunState {
+    /// A state that owns nothing, for results that need no match.
+    fn empty() -> Self {
+        RunState {
+            code: 0,
+            subject: Vec::new(),
+            session: 0,
+            unicode: false,
+            flags: 0,
+            offset: 0,
+            matches: Vec::new(),
+            phase: Phase::Main,
+        }
     }
-    match_result(&code, &subject, &opts, unicode, first)
+}
+
+fn run_owned(args: &[O], first: bool) -> Result<O, BifError> {
+    // The synchronous entry: resume until the match is done.
+    let mut state = None;
+    let mut total = 0;
+    let result = loop {
+        let ((step, next), loops) =
+            run_owned_slice(args, first, state.take(), LOOP_BUDGET.with(Cell::get))?;
+        total += loops;
+        match step {
+            Step::Done(result) => break result,
+            Step::Yield => state = Some(next),
+        }
+    };
+    LAST_LOOP_COUNT.with(|count| count.set(total));
+    Ok(result)
 }

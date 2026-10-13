@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arinsal_bifs::{BifError, BifFn, Ctx, FragmentingHeap, SchedulerClass};
+use arinsal_bifs::{BifError, BifFn, Ctx, ProcessHeapHandle, SchedulerClass};
 use arinsal_loader::Instr;
 use arinsal_sched::{Pid, RunCtx, Scheduler, SchedulerType};
 use arinsal_term::{
@@ -20,8 +20,6 @@ use arinsal_term::{
 use crate::calls;
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
-
-const TRAMPOLINES: usize = 160;
 
 const TRACER_FUNCTIONS: &[(&str, u8)] = &[
     ("trace", 5),
@@ -46,7 +44,7 @@ const TRACER_FUNCTIONS: &[(&str, u8)] = &[
 
 struct CachedTracerCallbacks {
     generation: u64,
-    callbacks: HashMap<(String, u8), BifFn>,
+    callbacks: HashMap<(String, u8), NativeFn>,
 }
 
 static TRACER_CALLBACKS: OnceLock<Mutex<HashMap<(u64, String), CachedTracerCallbacks>>> =
@@ -66,7 +64,7 @@ pub(crate) fn invalidate_tracer_callbacks(scope: u64) {
         .retain(|(cached_scope, _), _| *cached_scope != scope);
 }
 
-fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Option<BifFn> {
+fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Option<NativeFn> {
     let code = vm.code_ix.active_tables();
     let generation = code.generation;
     let key = (vm.code_scope, module_name.to_owned());
@@ -77,7 +75,7 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
         if let Some(cached) = cache.get(&key)
             && cached.generation == generation
         {
-            return cached.callbacks.get(&(function.to_owned(), arity)).copied();
+            return cached.callbacks.get(&(function.to_owned(), arity)).cloned();
         }
     }
 
@@ -104,12 +102,12 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
             else {
                 continue;
             };
-            if let Some(callback) = native_fns.get(*index as usize).copied().flatten() {
+            if let Some(callback) = native_fns.get(*index as usize).cloned().flatten() {
                 callbacks.insert((name.to_owned(), expected_arity), callback);
             }
         }
     }
-    let selected = callbacks.get(&(function.to_owned(), arity)).copied();
+    let selected = callbacks.get(&(function.to_owned(), arity)).cloned();
     tracer_callbacks()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -123,54 +121,260 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
     selected
 }
 
-struct DynSlot {
-    library: Arc<arinsal_nif::NifLibrary>,
-    index: usize,
-    /// The code scope and module instance the library is bound to.
+/// A NIF library bound to one module instance by `load_nif`.
+// Port of erts/emulator/beam/erl_nif.c:93-124 (struct erl_module_nif), OTP-29.1.1. The `Arc`
+// count plays `refc`: the code patched with the library's [`NifBinding`]s and the module
+// instance (its [`MODULE_NIFS`] entry) refer to the struct. `dynlib_refc` counts the module
+// instance and every ongoing dirty call or scheduled continuation; when it reaches zero the
+// library is closed (`unload` runs), whatever still refers to the struct.
+pub(crate) struct ModuleNif {
+    library: arinsal_nif::NifLibrary,
+    /// `mod` and `mi_copy`: the code scope and the module instance the library is loaded into.
     owner: (u64, usize),
+    dynlib_refc: std::sync::atomic::AtomicUsize,
+    /// `ERTS_MOD_NIF_FLG_LOADING` until every function is published: callers then wait for
+    /// the publication, as `call_nif_early` does.
+    publishing: std::sync::atomic::AtomicBool,
+    /// The schedulers that run the aux work closing the library.
+    scheduler: Weak<Scheduler<Process>>,
 }
 
-/// Unload the NIF library bound to module instance `id` of `scope`, freeing its trampolines.
+impl ModuleNif {
+    fn function(&self, index: usize) -> Result<&arinsal_nif::NifFunction, BifError> {
+        self.library.function(index).ok_or(BifError::BADARG)
+    }
+
+    /// Drop one `dynlib_refc` reference; the last one closes the library.
+    // Port of erts/emulator/beam/erl_nif.c:3362-3368 (nfunc_cleanup_nif_mod) and 5369-5370
+    // (erts_unload_nif), OTP-29.1.1.
+    fn dynlib_deref(self: &Arc<Self>) {
+        if self
+            .dynlib_refc
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            close_dynlib(Arc::clone(self));
+        }
+    }
+}
+
+/// Close a library whose last `dynlib_refc` reference is gone: the unload callbacks run as aux
+/// work of the calling normal scheduler, or of the first one when called elsewhere.
+// Port of erts/emulator/beam/erl_nif.c:2542-2557 (close_dynlib) and 2559-2618
+// (close_dynlib_aux, really_close_dynlib), OTP-29.1.1. Arinsal does not seize the code
+// modification permission for it.
+fn close_dynlib(lib: Arc<ModuleNif>) {
+    let Some(scheduler) = lib.scheduler.upgrade() else {
+        lib.library.close();
+        return;
+    };
+    let sched_ix = arinsal_sched::current_normal_scheduler().unwrap_or(0);
+    scheduler.request_aux_work(sched_ix, move || lib.library.close());
+}
+
+/// One `dynlib_refc` reference held by a dirty call or `enif_schedule_nif` continuation.
+// Port of erts/emulator/beam/erl_nif.c:394-398 (schedule: the first scheduling of a call
+// takes a reference) and 3362-3368 (nfunc_cleanup_nif_mod drops it), OTP-29.1.1.
+pub(crate) struct ScheduledNif(Arc<ModuleNif>);
+
+impl ScheduledNif {
+    fn new(lib: &Arc<ModuleNif>) -> Self {
+        lib.dynlib_refc
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(lib))
+    }
+}
+
+impl Drop for ScheduledNif {
+    fn drop(&mut self) {
+        self.0.dynlib_deref();
+    }
+}
+
+impl std::ops::Deref for ScheduledNif {
+    type Target = ModuleNif;
+
+    fn deref(&self) -> &ModuleNif {
+        &self.0
+    }
+}
+
+/// `erts_nif_call_tab_lock`: held while the functions of a library are published.
+static NIF_CALL_TAB_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// The `call_nif` operands patched into the code of one NIF function.
+// Port of erts/emulator/beam/erl_nif.c:4903-4940 (stub->code.call_nif), OTP-29.1.1:
+// `call_nif[1]` is the function called on a normal scheduler, `call_nif[2]` the library and
+// `call_nif[3]` the dirty function. For a dirty NIF `call_nif[1]` is
+// static_schedule_dirty_{io,cpu}_nif (erl_nif.c:3437-3483), which `flags` selects here.
+#[derive(Clone)]
+pub(crate) struct NifBinding {
+    lib: Arc<ModuleNif>,
+    fptr: arinsal_nif::NifFn,
+    flags: u32,
+    /// The `ErlNifFunc` of the library entry.
+    index: u32,
+}
+
+/// One function of a library being loaded and the code it replaces.
+// Port of erts/emulator/beam/erl_nif.c:4628-4641 (ErtsNifBeamStub), OTP-29.1.1.
+struct NifStub {
+    /// `code_info_ptr`: the entry of the Erlang function the NIF replaces.
+    entry: usize,
+    /// `info.mfa` function name and arity.
+    name: String,
+    arity: u8,
+    /// `code.call_nif`.
+    call: NifBinding,
+}
+
+/// What a `NativeBody` instruction runs: a Rust body or a NIF of a loaded library.
+#[derive(Clone)]
+pub(crate) enum NativeFn {
+    /// A loader-bound static NIF or BIF body.
+    Bif(BifFn),
+    /// A function of a library loaded by `load_nif`.
+    Nif(NifBinding),
+}
+
+/// Invoke a native body with the arguments of the function it replaces.
+pub(crate) fn call_native(
+    heap: &mut arinsal_term::ProcessHeap,
+    fcalls: &mut i32,
+    native: &NativeFn,
+    args: &[Term],
+) -> Result<Term, BifError> {
+    match native {
+        NativeFn::Bif(function) => calls::call_bif(heap, fcalls, *function, args),
+        NativeFn::Nif(binding) => binding.call(heap, fcalls, args),
+    }
+}
+
+impl NifBinding {
+    /// Run the NIF for the calling process.
+    // Port of erts/emulator/beam/emu/bif_instrs.tab:480-543 (call_nif) and
+    // erts/emulator/beam/jit/beam_jit_common.cpp:623-677 (beam_jit_call_nif), OTP-29.1.1:
+    // `call_nif[1]` runs with `call_nif[2]` as the environment's library and takes no
+    // reference to it; the code of a running call is not purged. A dirty NIF's
+    // `call_nif[1]` (static_schedule_dirty_nif, erl_nif.c:3437-3471) moves the process to a
+    // dirty scheduler instead.
+    pub(crate) fn call(
+        &self,
+        heap: &mut arinsal_term::ProcessHeap,
+        fcalls: &mut i32,
+        args: &[Term],
+    ) -> Result<Term, BifError> {
+        let lib = &self.lib;
+        // Port of erts/emulator/beam/erl_nif.c:5109-5122 (erts_call_nif_early), OTP-29.1.1: a
+        // function reached while its library is being published waits until every function of
+        // the library is.
+        if lib.publishing.load(std::sync::atomic::Ordering::Acquire) {
+            drop(
+                NIF_CALL_TAB_LOCK
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            );
+        }
+        let index = self.index as usize;
+        let function = lib.function(index)?;
+        if args.len() != function.arity as usize {
+            return Err(BifError::BADARG);
+        }
+        let mut fragment = ProcessHeapHandle(heap);
+        let mut ctx = Ctx::with_fcalls(&mut fragment, fcalls);
+        if self.flags != 0 {
+            let trap = arinsal_nif::NifTrap {
+                fptr: self.fptr,
+                flags: self.flags,
+                args: args.to_vec(),
+            };
+            return run_nif(
+                &mut ctx,
+                PendingNif {
+                    lib: ScheduledNif::new(lib),
+                    index,
+                    trap,
+                    done: None,
+                },
+            );
+        }
+        let pid = thread_hub().and_then(|hub| hub.pid.to_term());
+        match function.call_on(&mut ctx, self.fptr, args, pid, current_class())? {
+            arinsal_nif::NifCall::Return(value) => Ok(value),
+            arinsal_nif::NifCall::Schedule(trap) => reschedule(PendingNif {
+                lib: ScheduledNif::new(lib),
+                index,
+                trap,
+                done: None,
+            }),
+        }
+    }
+}
+
+/// Unload the NIF library bound to module instance `id` of `scope`.
 // Port of erts/emulator/beam/beam_bif_load.c:2254-2258 (purge complete) and
-// erts/emulator/beam/erl_nif.c:5334-5360 (erts_unload_nif), OTP-29.1.1: purging a code instance
-// unloads its library; `unload` runs once no NIF call of it is still in flight.
+// erts/emulator/beam/erl_nif.c:5334-5373 (erts_unload_nif), OTP-29.1.1: purging a code
+// instance drops its `dynlib_refc` reference; the library closes once no dirty call or
+// scheduled continuation of it is left.
 pub(crate) fn unload_instance(scope: u64, id: usize) {
     let released = {
-        let mut slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
-        slots
-            .iter_mut()
-            .filter(|slot| slot.as_ref().is_some_and(|slot| slot.owner == (scope, id)))
-            .filter_map(Option::take)
-            .collect::<Vec<_>>()
+        let mut libs = MODULE_NIFS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (released, kept) = std::mem::take(&mut *libs)
+            .into_iter()
+            .partition::<Vec<_>, _>(|lib| lib.owner == (scope, id));
+        *libs = kept;
+        released
     };
-    // The library's `unload` callback runs outside the slot lock.
-    drop(released);
+    for lib in released {
+        lib.dynlib_deref();
+    }
 }
 
-static SLOTS: Mutex<Vec<Option<DynSlot>>> = Mutex::new(Vec::new());
+/// The library loaded into module instance `id` of `scope` (`erl_module_instance.nif`).
+fn instance_nif(scope: u64, id: usize) -> Option<Arc<ModuleNif>> {
+    MODULE_NIFS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .find(|lib| lib.owner == (scope, id))
+        .cloned()
+}
+
+/// Name and arity of the functions of the library loaded into module instance `id` of
+/// `scope`, in the order of its entry.
+// Port of erts/emulator/beam/erl_nif.c:5406-5411 (erts_nif_get_funcs), OTP-29.1.1.
+pub(crate) fn instance_nif_functions(scope: u64, id: usize) -> Option<Vec<(String, u32)>> {
+    let lib = instance_nif(scope, id)?;
+    Some(
+        lib.library
+            .functions()
+            .into_iter()
+            .map(|(name, arity, _, _)| (name, arity))
+            .collect(),
+    )
+}
+
+/// `erl_module_instance.nif` of every module instance with a loaded library. Only loading,
+/// purging and halting read it; a NIF call reaches its library through its [`NifBinding`].
+static MODULE_NIFS: Mutex<Vec<Arc<ModuleNif>>> = Mutex::new(Vec::new());
 /// Runtimes whose processes have called NIFs. erts has one runtime and one process
 /// table; a pid is resolved against the tables registered here (see [`hub_for_pid`]).
 static RUNTIME_HUBS: Mutex<Vec<Hub>> = Mutex::new(Vec::new());
 static SOCKET_REACTOR: OnceLock<Arc<NifSelectReactor>> = OnceLock::new();
 
-fn halt_libraries() -> Vec<Arc<arinsal_nif::NifLibrary>> {
-    let slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
-    let mut libraries: Vec<Arc<arinsal_nif::NifLibrary>> = Vec::new();
-    for slot in slots.iter().flatten() {
-        if !libraries
-            .iter()
-            .any(|library| Arc::ptr_eq(library, &slot.library))
-        {
-            libraries.push(Arc::clone(&slot.library));
-        }
-    }
-    libraries
+fn halt_libraries() -> Vec<Arc<ModuleNif>> {
+    MODULE_NIFS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
 }
 
 /// Port of erts/emulator/beam/erl_nif.c:5566-5595 (`erts_nif_notify_halt`), OTP-29.1.1.
 pub(crate) fn notify_halt() {
-    for library in halt_libraries() {
-        library.execute_on_halt();
+    for lib in halt_libraries() {
+        lib.library.execute_on_halt();
     }
 }
 
@@ -182,8 +386,8 @@ pub(crate) fn execute_late_on_halt() {
 
 /// Port of erts/emulator/beam/erl_nif.c:5626-5649 (`erts_nif_wait_calls`), OTP-29.1.1.
 pub(crate) fn wait_for_halt_calls() {
-    for library in halt_libraries() {
-        library.wait_for_halt_calls();
+    for lib in halt_libraries() {
+        lib.library.wait_for_halt_calls();
     }
 }
 
@@ -453,12 +657,12 @@ fn alloc(error: impl std::fmt::Debug) -> VmError {
 }
 
 fn tuple(process: &mut Process, items: &[Term]) -> Result<Term, VmError> {
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap).tuple(items).map_err(alloc)
 }
 
 fn charlist(process: &mut Process, text: &str) -> Result<Term, VmError> {
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let mut list = Term::NIL;
     for ch in text.chars().rev() {
@@ -518,82 +722,12 @@ fn filename_bytes(term: Term) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-fn declared_nifs(vm: &Vm, module: &str) -> Result<HashSet<(String, u8)>, String> {
-    let file = format!("{module}.beam");
-    let path = vm
-        .paths
-        .iter()
-        .map(|dir| dir.join(&file))
-        .find(|path| path.is_file())
-        .ok_or_else(|| format!("module {module} beam not found"))?;
-    let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-    let beam = arinsal_beam::parse(&bytes).map_err(|error| error.to_string())?;
-    let mut current: Option<(String, u8)> = None;
-    let mut declared = HashSet::new();
-    for instruction in &beam.code.instructions {
-        match instruction.op {
-            arinsal_spec::Opcode::FuncInfo => {
-                let name = instruction
-                    .args
-                    .get(1)
-                    .and_then(|arg| match arg {
-                        arinsal_beam::Operand::Atom(index) if *index > 0 => {
-                            beam.atoms.get(*index as usize - 1).cloned()
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "?".into());
-                let arity = instruction
-                    .args
-                    .get(2)
-                    .and_then(|arg| match arg {
-                        arinsal_beam::Operand::U(value) => u8::try_from(*value).ok(),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                current = Some((name, arity));
-            }
-            arinsal_spec::Opcode::NifStart => {
-                if let Some(function) = &current {
-                    declared.insert(function.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(declared)
-}
-
-fn dyn_call<const N: usize>(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let (library, function) = {
-        let slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
-        let Some(slot) = slots.get(N).and_then(|slot| slot.as_ref()) else {
-            return Err(BifError::BADARG);
-        };
-        let function = slot
-            .library
-            .function(slot.index)
-            .cloned()
-            .ok_or(BifError::BADARG)?;
-        (Arc::clone(&slot.library), function)
-    };
-    if args.len() != function.arity as usize {
-        return Err(BifError::BADARG);
-    }
-    let trap = arinsal_nif::NifTrap {
-        fptr: function.fptr,
-        flags: function.flags,
-        args: args.to_vec(),
-    };
-    run_nif(
-        ctx,
-        PendingNif {
-            library,
-            function,
-            trap,
-            done: None,
-        },
-    )
+/// The functions `module` declares as NIF stubs: those whose code starts with `nif_start`.
+// Port of erts/emulator/beam/erl_nif.c (erts_load_nif checks `BeamIsOpCode(..., op_nif_start)`
+// of the loaded code), OTP-29.1.1. The loaded module is the source, not a beam file on a path,
+// so a module loaded from a binary works.
+fn declared_nifs(module: &arinsal_loader::Module) -> HashSet<(String, u8)> {
+    module.nif_stubs.iter().cloned().collect()
 }
 
 /// A dirty NIF call or `enif_schedule_nif` continuation waiting for a scheduler of
@@ -602,8 +736,10 @@ fn dyn_call<const N: usize>(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, Bi
 ///
 /// Port of erts/emulator/beam/erl_nfunc_sched.h (`ErtsNativeFunc` trap wrapper), OTP-29.1.1.
 pub(crate) struct PendingNif {
-    library: Arc<arinsal_nif::NifLibrary>,
-    function: arinsal_nif::NifFunction,
+    /// The library of the NIF; the scheduled call keeps it loaded (`dynlib_refc`).
+    lib: ScheduledNif,
+    /// The `ErlNifFunc` of the library entry that was called.
+    index: usize,
     trap: arinsal_nif::NifTrap,
     /// Outcome of the call once a dirty scheduler executed it as a dirty job; its heap
     /// is already part of the process heap.
@@ -639,11 +775,10 @@ impl PendingNif {
 
     /// MFA of the NIF entry or continuation that this dirty job invokes.
     pub(crate) fn trace_mfa(&self) -> (&str, &str, u8) {
-        (
-            self.library.module_name(),
-            &self.function.name,
-            self.function.arity as u8,
-        )
+        let (name, arity) = self.lib.function(self.index).map_or(("?", 0), |function| {
+            (function.name.as_str(), function.arity)
+        });
+        (self.lib.library.module_name(), name, arity as u8)
     }
 
     /// Execute the call on the current dirty scheduler without the process: results are
@@ -654,11 +789,13 @@ impl PendingNif {
     pub(crate) fn run_dirty(&mut self, heap: &mut arinsal_term::ProcessHeap) {
         let current = current_class();
         let pid = thread_hub().and_then(|hub| hub.pid.to_term());
-        let mut fragment = FragmentingHeap(heap);
-        let mut ctx = Ctx::new(&mut fragment);
-        let (function, trap) = (&self.function, &self.trap);
+        let mut fragment = ProcessHeapHandle(heap);
+        let mut fcalls = 4_000;
+        let mut ctx = Ctx::with_fcalls(&mut fragment, &mut fcalls);
+        let (lib, index, trap) = (&self.lib, self.index, &self.trap);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            function.call_on(&mut ctx, trap.fptr, &trap.args, pid, current)
+            lib.function(index)?
+                .call_on(&mut ctx, trap.fptr, &trap.args, pid, current)
         }))
         .unwrap_or_else(|_| {
             Err(BifError::Error(Term::atom(
@@ -697,8 +834,8 @@ fn run_nif(ctx: &mut Ctx<'_>, pending: PendingNif) -> Result<Term, BifError> {
         return Err(BifError::Dirty(target));
     }
     let PendingNif {
-        library,
-        function,
+        lib,
+        index,
         trap,
         done,
     } = pending;
@@ -709,8 +846,8 @@ fn run_nif(ctx: &mut Ctx<'_>, pending: PendingNif) -> Result<Term, BifError> {
         None if current != SchedulerClass::Normal && target == current => {
             RESCHEDULED.with(|slot| {
                 *slot.borrow_mut() = Some(PendingNif {
-                    library,
-                    function,
+                    lib,
+                    index,
                     trap,
                     done: None,
                 })
@@ -719,30 +856,38 @@ fn run_nif(ctx: &mut Ctx<'_>, pending: PendingNif) -> Result<Term, BifError> {
         }
         None => {
             let pid = thread_hub().and_then(|hub| hub.pid.to_term());
-            function.call_on(ctx, trap.fptr, &trap.args, pid, current)
+            lib.function(index)?
+                .call_on(ctx, trap.fptr, &trap.args, pid, current)
         }
     };
     match result? {
         arinsal_nif::NifCall::Return(value) => Ok(value),
-        arinsal_nif::NifCall::Schedule(trap) => {
-            let target = arinsal_nif::scheduler_class(trap.flags);
-            RESCHEDULED.with(|slot| {
-                *slot.borrow_mut() = Some(PendingNif {
-                    library,
-                    function,
-                    trap,
-                    done: None,
-                })
-            });
-            Err(BifError::Dirty(target))
-        }
+        arinsal_nif::NifCall::Schedule(trap) => reschedule(PendingNif {
+            lib,
+            index,
+            trap,
+            done: None,
+        }),
     }
+}
+
+/// Hand an `enif_schedule_nif` continuation to the VM, which runs it on a scheduler of the
+/// class its flags select.
+// Port of erts/emulator/beam/erl_nif.c:3540-3583 (enif_schedule_nif), OTP-29.1.1.
+fn reschedule(pending: PendingNif) -> Result<Term, BifError> {
+    let target = arinsal_nif::scheduler_class(pending.trap.flags);
+    RESCHEDULED.with(|slot| *slot.borrow_mut() = Some(pending));
+    Err(BifError::Dirty(target))
 }
 
 impl PendingNif {
     /// A plain (non-dirty) NIF entry runs wherever the process executes.
     fn is_entry(&self) -> bool {
-        self.trap.flags == 0 && self.trap.fptr as usize == self.function.fptr as usize
+        self.trap.flags == 0
+            && self
+                .lib
+                .function(self.index)
+                .is_ok_and(|function| self.trap.fptr as usize == function.fptr as usize)
     }
 }
 
@@ -754,10 +899,11 @@ pub(crate) fn take_rescheduled() -> Option<PendingNif> {
 /// Resume a rescheduled NIF continuation on the current scheduler.
 pub(crate) fn resume_pending(
     heap: &mut arinsal_term::ProcessHeap,
+    fcalls: &mut i32,
     pending: PendingNif,
 ) -> Result<Term, BifError> {
-    let mut fragment = arinsal_bifs::FragmentingHeap(heap);
-    let mut ctx = Ctx::new(&mut fragment);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
+    let mut ctx = Ctx::with_fcalls(&mut fragment, fcalls);
     run_nif(&mut ctx, pending)
 }
 
@@ -774,17 +920,12 @@ pub(crate) fn invoke_tracer(
     let native = specialized
         .and_then(|specialized| tracer_callback(vm, module, specialized, arity))
         .or_else(|| tracer_callback(vm, module, function, arity))?;
-    calls::call_bif(&mut process.heap, native, args).ok()
+    call_native(&mut process.heap, &mut process.reductions, &native, args).ok()
 }
 
 pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {
     tracer_callback(vm, module_name, "enabled", 3).is_some()
         && tracer_callback(vm, module_name, "trace", 5).is_some()
-}
-
-fn trampolines() -> &'static [BifFn] {
-    const TABLE: &[BifFn] = include!(concat!(env!("OUT_DIR"), "/nif_trampolines.rs"));
-    TABLE
 }
 
 /// Binds the NIF library `key` to its module instance in the active code index; the patched
@@ -813,7 +954,7 @@ fn patch_native(module: &arinsal_loader::Module, entry: usize, index: u32) -> Re
     Ok(())
 }
 
-fn push_native(vm: &mut Vm, function: BifFn) -> Result<u32, VmError> {
+fn push_native(vm: &mut Vm, function: NativeFn) -> Result<u32, VmError> {
     vm.code_ix
         .push_native_fn(function)
         .ok_or_else(|| VmError::Unsupported("native table".into()))
@@ -858,6 +999,13 @@ fn nif_open_error(
                 "Upgrade not supported by this NIF library.",
             );
         }
+        arinsal_nif::NifError::UpgradeRejected(code) => {
+            return error_reason(
+                process,
+                "upgrade",
+                &format!("Library upgrade-call unsuccessful ({code})."),
+            );
+        }
     };
     error_reason(process, "bad_lib", &message)
 }
@@ -873,7 +1021,7 @@ fn validate_image(
         .modules
         .get(module_id)
         .ok_or_else(|| format!("module {caller} is not loaded"))?;
-    let declared = declared_nifs(vm, caller)?;
+    let declared = declared_nifs(module);
     let mut seen = HashSet::new();
     let mut binds = Vec::new();
     for (index, function) in image.functions().iter().enumerate() {
@@ -914,76 +1062,141 @@ fn validate_image(
     Ok(binds)
 }
 
-fn install_dynamic(
+/// Bind the functions of `library`, loaded for module instance `module_id`, to the code they
+/// replace and make them callable.
+// Port of erts/emulator/beam/erl_nif.c:4840-4942 (the ErtsNifFinish stubs), 4997-5007
+// (`this_mi->nif = lib`, then patch_call_nif_early under erts_nif_call_tab_lock) and 5124-5297
+// (load_nif_1st_finisher, load_nif_2nd_finisher, load_nif_3rd_finisher and
+// release_beam_stubs), OTP-29.1.1. Every function gets a stub holding the `call_nif` operands.
+// The first finisher writes them into the code; the functions are then enabled together
+// under the call table lock, and a call that reaches one of them meanwhile waits for the
+// lock like erts_call_nif_early; the third finisher frees the stubs. The operands are complete
+// before any function is enabled, so the `erts_nif_call_tab` hash erts reads in that window is
+// not needed.
+fn install_stubs(
     vm: &mut Vm,
     module_id: usize,
-    library: Arc<arinsal_nif::NifLibrary>,
+    library: arinsal_nif::NifLibrary,
+    binds: &[(usize, usize)],
+    scheduler: Weak<Scheduler<Process>>,
+) -> Result<(), VmError> {
+    let lib = Arc::new(ModuleNif {
+        library,
+        owner: (vm.code_scope, module_id),
+        dynlib_refc: std::sync::atomic::AtomicUsize::new(1),
+        publishing: std::sync::atomic::AtomicBool::new(true),
+        scheduler,
+    });
+    let result = finish_stubs(vm, module_id, &lib, binds);
+    match result {
+        Ok(()) => MODULE_NIFS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(lib),
+        // Port of erts/emulator/beam/erl_nif.c:5019-5031 (erts_load_nif error path), OTP-29.1.1:
+        // a library that did not get bound is released.
+        Err(_) => lib.dynlib_deref(),
+    }
+    result
+}
+
+fn finish_stubs(
+    vm: &mut Vm,
+    module_id: usize,
+    lib: &Arc<ModuleNif>,
     binds: &[(usize, usize)],
 ) -> Result<(), VmError> {
-    let owner = (vm.code_scope, module_id);
-    let assigned = {
-        let mut slots = SLOTS.lock().unwrap_or_else(|poison| poison.into_inner());
-        // Trampolines of purged libraries are reused.
-        let free = slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, used)| used.is_none().then_some(slot))
-            .chain(slots.len()..TRAMPOLINES)
-            .take(binds.len())
-            .collect::<Vec<_>>();
-        if free.len() < binds.len() {
-            return Err(VmError::Unsupported("dynamic NIF table is full".into()));
-        }
-        for (&slot, (_, index)) in free.iter().zip(binds) {
-            if slot >= slots.len() {
-                slots.resize_with(slot + 1, || None);
-            }
-            slots[slot] = Some(DynSlot {
-                library: Arc::clone(&library),
-                index: *index,
-                owner,
-            });
-        }
-        free
-    };
-    for (&slot, (entry, _)) in assigned.iter().zip(binds) {
-        let function = trampolines()
-            .get(slot)
-            .copied()
-            .ok_or_else(|| VmError::Unsupported("dynamic NIF trampoline".into()))?;
-        let index = push_native(vm, function)?;
-        patch_native(&vm.code.modules[module_id], *entry, index)?;
-        bind_native_code(vm, module_id, *entry, function)?;
+    let module = Arc::clone(&vm.code.modules[module_id]);
+    let finish = binds
+        .iter()
+        .map(|&(entry, index)| {
+            let function = lib.function(index).map_err(|_| badarg())?;
+            let (_, name, arity) = module
+                .functions
+                .iter()
+                .find(|(start, _, _)| *start == entry)
+                .ok_or_else(|| VmError::Unsupported("nif entry".into()))?;
+            Ok(NifStub {
+                entry,
+                name: name.clone(),
+                arity: *arity,
+                call: NifBinding {
+                    lib: Arc::clone(lib),
+                    fptr: function.fptr,
+                    flags: function.flags,
+                    index: u32::try_from(index)
+                        .map_err(|_| VmError::Unsupported("nif index".into()))?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, VmError>>()?;
+    // load_nif_1st_finisher: the `call_nif` operands of every function.
+    let mut bodies = Vec::with_capacity(finish.len());
+    for stub in &finish {
+        let native = NativeFn::Nif(stub.call.clone());
+        bodies.push(push_native(vm, native.clone())?);
+        bind_native_code(vm, module_id, &stub.name, stub.arity, native)?;
     }
+    // patch_call_nif_early and load_nif_2nd_finisher: all functions run the NIFs at once.
+    {
+        let _publication = NIF_CALL_TAB_LOCK
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for (stub, body) in finish.iter().zip(bodies) {
+            patch_native(&module, stub.entry, body)?;
+            enable_native_code(vm, module_id, &stub.name, stub.arity)?;
+        }
+        lib.publishing
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    // load_nif_3rd_finisher and release_beam_stubs: the code holds the operands now.
+    drop(finish);
     Ok(())
 }
 
-/// Makes the module's native code run the NIF too, like the interpreter's patched entry.
-// Port of erts/emulator/beam/erl_nif.c:5050-5106 (patch_call_nif_early), OTP-29.1.1.
-fn bind_native_code(
+/// The native code of `module_id`, when the module was compiled by BeamAsm.
+fn native_version(
     vm: &Vm,
     module_id: usize,
-    entry: usize,
-    function: BifFn,
-) -> Result<(), VmError> {
-    let Some(version) = vm
-        .code
+) -> Option<Arc<crate::beamasm_integration::CompiledVersion>> {
+    vm.code
         .code_meta
         .get(module_id)
         .and_then(|meta| meta.as_ref())
         .and_then(|meta| meta.beamasm.clone())
-    else {
+}
+
+/// Write the `call_nif` operands of `name/arity` into the module's native code.
+// Port of erts/emulator/beam/erl_nif.c:5149-5160 (load_nif_1st_finisher copies the call_nif
+// sequence behind the function prologue), OTP-29.1.1.
+fn bind_native_code(
+    vm: &Vm,
+    module_id: usize,
+    name: &str,
+    arity: u8,
+    native: NativeFn,
+) -> Result<(), VmError> {
+    let Some(version) = native_version(vm, module_id) else {
         return Ok(());
     };
-    let Some((_, name, arity)) = vm.code.modules[module_id]
-        .functions
-        .iter()
-        .find(|(start, _, _)| *start == entry)
-    else {
-        return Err(VmError::Unsupported("nif entry".into()));
-    };
     // A function without native code runs in the interpreter, which is patched already.
-    if version.has_native_function(name, *arity) && !version.bind_nif(name, *arity, function) {
+    if version.has_native_function(name, arity) && !version.bind_nif(name, arity, native) {
+        return Err(VmError::Unsupported(format!(
+            "native code of {name}/{arity} has no NIF patch site"
+        )));
+    }
+    Ok(())
+}
+
+/// Make the module's native code of `name/arity` run its NIF, like the interpreter's
+/// patched entry.
+// Port of erts/emulator/beam/erl_nif.c:5248-5250 (load_nif_2nd_finisher removes the
+// call_nif_early breakpoint), OTP-29.1.1.
+fn enable_native_code(vm: &Vm, module_id: usize, name: &str, arity: u8) -> Result<(), VmError> {
+    let Some(version) = native_version(vm, module_id) else {
+        return Ok(());
+    };
+    if version.has_native_function(name, arity) && !version.enable_nif(name, arity) {
         return Err(VmError::Unsupported(format!(
             "native code of {name}/{arity} has no NIF patch site"
         )));
@@ -992,31 +1205,33 @@ fn bind_native_code(
 }
 
 fn bind_tracer(vm: &mut Vm, module_id: usize) -> Result<(), VmError> {
-    let functions = vm.code.modules[module_id].functions.clone();
-    let enabled = functions
-        .iter()
-        .find_map(|(entry, name, arity)| (name == "enabled" && *arity == 3).then_some(*entry));
-    let trace = functions
-        .iter()
-        .find_map(|(entry, name, arity)| (name == "trace" && *arity == 5).then_some(*entry));
-    let (Some(enabled), Some(trace)) = (enabled, trace) else {
+    let module = Arc::clone(&vm.code.modules[module_id]);
+    let find = |wanted: &str, wanted_arity: u8| {
+        module.functions.iter().find_map(|(entry, name, arity)| {
+            (name == wanted && *arity == wanted_arity).then_some(*entry)
+        })
+    };
+    let (Some(enabled), Some(trace)) = (find("enabled", 3), find("trace", 5)) else {
         return Err(VmError::Unsupported(
             "erl_tracer enabled/3 or trace/5 is missing".into(),
         ));
     };
-    let enabled_index = push_native(vm, tracer_enabled)?;
-    patch_native(&vm.code.modules[module_id], enabled, enabled_index)?;
-    bind_native_code(vm, module_id, enabled, tracer_enabled)?;
-    let trace_index = push_native(vm, tracer_trace)?;
-    patch_native(&vm.code.modules[module_id], trace, trace_index)?;
-    bind_native_code(vm, module_id, trace, tracer_trace)?;
+    for (entry, name, arity, body) in [
+        (enabled, "enabled", 3, tracer_enabled as BifFn),
+        (trace, "trace", 5, tracer_trace as BifFn),
+    ] {
+        let index = push_native(vm, NativeFn::Bif(body))?;
+        bind_native_code(vm, module_id, name, arity, NativeFn::Bif(body))?;
+        patch_native(&module, entry, index)?;
+        enable_native_code(vm, module_id, name, arity)?;
+    }
     Ok(())
 }
 
 fn load_dynamic(
     vm: &mut Vm,
     process: &mut Process,
-    caller_id: usize,
+    (caller_id, prev_id): (usize, Option<usize>),
     caller: &str,
     path: &[u8],
     info: Term,
@@ -1030,11 +1245,26 @@ fn load_dynamic(
         Ok(binds) => binds,
         Err(message) => return error_reason(process, "bad_lib", &message),
     };
-    let library = match image.commit(info) {
-        Ok(library) => Arc::new(library),
+    // Port of erts/emulator/beam/erl_nif.c:4956-4987 (erts_load_nif), OTP-29.1.1: when the
+    // previous code of the module has a NIF library the new one is upgraded from it, else
+    // loaded. erts runs the upgrade with thread progress blocked; Arinsal does not block the
+    // other schedulers.
+    let pid = process.self_pid.and_then(|pid| pid.to_term());
+    let prev = prev_id.and_then(|id| instance_nif(vm.code_scope, id));
+    let committed = match &prev {
+        Some(prev) => image.upgrade(info, &prev.library, pid),
+        None => image.commit_for(info, pid),
+    };
+    let library = match committed {
+        Ok(library) => library,
         Err(error) => return nif_open_error(process, path, error),
     };
-    install_dynamic(vm, caller_id, library, &binds)?;
+    let scheduler = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok())
+        .map_or_else(Weak::new, |scheduler| Arc::downgrade(&scheduler));
+    install_stubs(vm, caller_id, library, &binds, scheduler)?;
     Ok(atom("ok"))
 }
 
@@ -1107,6 +1337,18 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
         .copied()
         .or(caller_instance)
         .ok_or_else(|| VmError::Unsupported("load_nif caller".into()))?;
+    // Port of erts/emulator/beam/erl_nif.c:4758-4772 (erts_load_nif), OTP-29.1.1: `prev_mi` is
+    // the old code, or for a pending on_load instance the current code when there is one.
+    let prev_id = if vm.code.pending_on_load.get(&caller) == Some(&caller_id) {
+        vm.code
+            .loaded
+            .get(&caller)
+            .or_else(|| vm.code.old.get(&caller))
+    } else {
+        vm.code.old.get(&caller)
+    }
+    .copied()
+    .filter(|&id| id != caller_id);
     if caller == "erlang" {
         return error_reason(
             process,
@@ -1136,7 +1378,7 @@ fn load_nif(vm: &mut Vm, process: &mut Process, args: &[Term]) -> Result<Term, V
             atom("ok")
         }
         _ => {
-            let term = load_dynamic(vm, process, caller_id, &caller, &bytes, info)?;
+            let term = load_dynamic(vm, process, (caller_id, prev_id), &caller, &bytes, info)?;
             if term != atom("ok") {
                 return Ok(term);
             }
@@ -1335,7 +1577,7 @@ fn build_trace<H: HeapAlloc>(heap: &mut H, args: &[Term]) -> Option<Term> {
 
 fn deliver_trace(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, args: &[Term]) {
     let message = {
-        let mut heap = FragmentingHeap(&mut process.heap);
+        let mut heap = ProcessHeapHandle(&mut process.heap);
         build_trace(&mut heap, args)
     };
     let Some(message) = message else {
@@ -1350,9 +1592,9 @@ fn deliver_trace(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, args: &[
     }
 }
 
-struct DynHeap<'a>(&'a mut dyn HeapAlloc);
+struct HeapAdapter<'a, H: HeapAlloc + ?Sized>(&'a mut H);
 
-impl HeapAlloc for DynHeap<'_> {
+impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -1377,7 +1619,7 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if Pid::from_term(args[1]).is_none() && args[1].as_port().is_none() {
         return Ok(atom("ok"));
     }
-    let Some(message) = build_trace(&mut DynHeap(ctx.heap), args) else {
+    let Some(message) = build_trace(&mut HeapAdapter(&mut ctx.heap), args) else {
         return Ok(atom("ok"));
     };
     if let Some(pid) = Pid::from_term(args[1])
