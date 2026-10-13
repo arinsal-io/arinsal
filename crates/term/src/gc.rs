@@ -823,9 +823,13 @@ impl ProcessHeap {
         if self.frame_pointer != 0 {
             self.frame_pointer = rebase_address(self.frame_pointer, stack_move);
         }
-        // erl_gc.c:563 (erts_write_heap_filler): no stale stack words stay in the hole.
+        // erl_gc.c:563-566: the hole above htop is one heap filler (erts_write_heap_filler), not
+        // a clear of every word. A scan of the abandoned heap steps over it in O(1).
         let used = self.htop;
-        self.words.words_mut()[used..].fill(0);
+        let hole = self.words.len().saturating_sub(used);
+        if hole > 0 {
+            self.words.words_mut()[used] = ((hole as u64 - 1) << 6) | crate::POS_BIG;
+        }
         let abandoned = std::mem::replace(&mut self.words, next);
         if self.abandoned_heap().is_some() {
             // Port of erl_gc.c:546-558: the active heap already is a fragment; it joins
