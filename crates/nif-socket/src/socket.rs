@@ -1444,7 +1444,7 @@ pub(super) fn dispatch(name: &str, args: &[O]) -> Result<O, BifError> {
 mod tests {
     use super::*;
     use crate::{BlockingReactor, set_reactor};
-    use arinsal_bifs::{Ctx, FragmentingHeap};
+    use arinsal_bifs::{Ctx, ProcessHeapHandle};
     use arinsal_term::{ProcessHeap, from_owned, to_owned};
     use std::os::fd::IntoRawFd;
     use std::process::Command;
@@ -1464,7 +1464,7 @@ mod tests {
     }
     fn invoke_bif(module: &str, op: &str, args: &[O]) -> O {
         let mut heap = ProcessHeap::with_words(2048);
-        let mut alloc = FragmentingHeap(&mut heap);
+        let mut alloc = ProcessHeapHandle(&mut heap);
         let terms = args
             .iter()
             .map(|arg| {

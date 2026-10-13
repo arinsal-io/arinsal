@@ -1,7 +1,7 @@
 //! BEAM exception tags, handlers, and exception terms.
 
 use crate::{Process, Vm, VmError, stacktrace};
-use arinsal_bifs::{BifError, Class, FragmentingHeap};
+use arinsal_bifs::{BifError, Class, ProcessHeapHandle};
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::{Arg, Module};
 use arinsal_spec::Opcode;
@@ -211,13 +211,13 @@ pub(crate) fn trace_class_reason(
 }
 
 pub(super) fn tuple(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
         .tuple(values)
         .map_err(|e| VmError::Unsupported(format!("exception tuple {e:?}")))
 }
 
 fn list(p: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
         .list_from_iter(values.iter().copied())
         .map_err(|e| VmError::Unsupported(format!("exception list {e:?}")))
 }
@@ -935,7 +935,7 @@ fn strip_top_location(p: &mut Process, trace: Term) -> Result<Term, VmError> {
             Term::NIL,
         ],
     )?;
-    TermBuilder::new(&mut FragmentingHeap(&mut p.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut p.heap))
         .cons(frame, tail)
         .map_err(|e| VmError::Unsupported(format!("raw stacktrace {e:?}")))
 }

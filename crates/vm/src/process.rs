@@ -336,7 +336,7 @@ impl MessageQueue {
             }
             let updated = copy_term_preserving_sharing_with_cache(
                 entry.term,
-                &mut arinsal_bifs::FragmentingHeap(heap),
+                &mut arinsal_bifs::ProcessHeapHandle(heap),
                 &mut shared_copy,
             )
             .map_err(|error| VmError::Unsupported(format!("literal message copy {error:?}")))?;
@@ -394,7 +394,7 @@ impl MessageQueue {
 
     /// Return terms copied out of queue-owned storage for `process_info(messages)`.
     pub(crate) fn copied_terms(&self, heap: &mut ProcessHeap) -> Result<Vec<Term>, VmError> {
-        let mut target = arinsal_bifs::FragmentingHeap(heap);
+        let mut target = arinsal_bifs::ProcessHeapHandle(heap);
         self.entries
             .iter()
             .map(|entry| {
@@ -568,7 +568,7 @@ impl Message {
             // Port of erts/emulator/beam/erl_message.c:943 (copy_message), OTP-29.1.1.
             // The receiver owns its process lock while draining, so queued terms
             // can be copied directly into its managed heap.
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             let term = if self
                 .fragment
                 .as_ref()
@@ -1475,7 +1475,12 @@ impl Executor {
                             }
                         }
                     };
-                    let mut result = crate::calls::call_bif(&mut process.heap, bif, &args);
+                    let mut result = crate::calls::call_bif(
+                        &mut process.heap,
+                        &mut process.reductions,
+                        bif,
+                        &args,
+                    );
                     crate::calls::gc_after_bif(process, &mut args, &mut result)?;
                     match result {
                         Ok(value) => break 'execution Ok(RunState::Done(value)),
@@ -2247,7 +2252,7 @@ impl Executor {
                                                         {
                                                             let list = {
                                                                 let mut heap =
-                                                                    arinsal_bifs::FragmentingHeap(
+                                                                    arinsal_bifs::ProcessHeapHandle(
                                                                         &mut process.heap,
                                                                     );
                                                                 TermBuilder::new(&mut heap)
@@ -3767,7 +3772,7 @@ fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
     } else {
         raised.reason.clone()
     };
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     match arinsal_term::from_owned(&owned, &mut heap) {
         Ok(reason) => reason,
         Err(conversion_error) => {
@@ -3933,7 +3938,7 @@ fn report_max_heap(
     let group_leader = process.group_leader.and_then(Pid::to_term);
     let bool_atom = |on: bool| crate::signals::atom(if on { "true" } else { "false" });
     let built = (|| -> Result<Term, VmError> {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
         let format = builder
             .list_from_iter(
@@ -4767,7 +4772,7 @@ impl Runtime {
             child.cold_mut().initial_bif = Some((module.to_owned(), function.to_owned(), arity));
         }
         for (index, owned) in args.iter().enumerate() {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut child.heap);
             child.x[index] = arinsal_term::from_owned(owned, &mut heap)
                 .map_err(|_| VmError::Unsupported("spawn argument copy failed".into()))?;
         }
@@ -4842,7 +4847,7 @@ impl Process {
     }
 
     fn tuple(&mut self, elements: &[Term]) -> Result<Term, VmError> {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut self.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
         TermBuilder::new(&mut heap)
             .tuple(elements)
             .map_err(|error| VmError::Unsupported(format!("signal tuple: {error:?}")))
@@ -6781,7 +6786,7 @@ impl Process {
             return Ok(());
         }
         let tag = if let Some(owned) = tag_owned {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut self.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut self.heap);
             arinsal_term::from_owned(&owned, &mut heap)
                 .map_err(|error| VmError::Unsupported(format!("monitor tag: {error:?}")))?
         } else {
@@ -6848,7 +6853,7 @@ fn report_process_error(process: &mut Process, ctx: &mut RunCtx<'_, Message>, re
         } else {
             "Error in process ~p with exit value:~n~p~n"
         };
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let mut builder = TermBuilder::new(&mut heap);
         let format = builder
             .list_from_iter(
@@ -7734,7 +7739,7 @@ impl Vm {
         // a collection never meets a term outside its heap and the literal areas.
         let literals = arinsal_term::LiteralAreas::current();
         for (register, &arg) in process.x.iter_mut().zip(args) {
-            let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+            let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
             *register = arinsal_term::copy_term_litopt(arg, &mut heap, &literals)
                 .map_err(|error| VmError::Load(format!("first process arguments: {error:?}")))?;
         }

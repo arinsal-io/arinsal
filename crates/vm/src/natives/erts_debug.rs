@@ -301,7 +301,7 @@ fn send_system_monitor_event(
     ]);
     if let Ok(term) = from_owned(
         &event,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     ) && let Ok(message) = Message::copy_from(term)
     {
         let _ = scheduler.send(pid, receiver, message);
@@ -379,7 +379,7 @@ fn after_schedule_one(process: &mut Process, elapsed_nanoseconds: u64, state: &S
     ]);
     if let Ok(term) = from_owned(
         &event,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     ) && let Ok(message) = Message::copy_from(term)
         && let Ok(scheduler) = runtime.scheduler()
     {
@@ -527,7 +527,7 @@ fn after_message_queue_change_one(process: &mut Process, state: &SystemMonitorSt
     ]);
     if let Ok(term) = from_owned(
         &event,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     ) && let Ok(message) = Message::copy_from(term)
         && let Ok(scheduler) = runtime.scheduler()
     {
@@ -652,7 +652,7 @@ fn notify_busy_dist_port_one(
             creation: 0,
         },
     ]);
-    if let Ok(term) = from_owned(&event, &mut arinsal_bifs::FragmentingHeap(&mut heap))
+    if let Ok(term) = from_owned(&event, &mut arinsal_bifs::ProcessHeapHandle(&mut heap))
         && let Ok(message) = Message::copy_from(term)
         && let Ok(scheduler) = runtime.scheduler()
     {
@@ -712,19 +712,19 @@ fn arg_name(term: Term) -> Option<String> {
 }
 
 fn int(process: &mut Process, value: usize) -> Result<Term, VmError> {
-    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .int_from_i128(value as i128)
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
 fn list(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .list_from_iter(values.iter().copied())
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
 fn tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .tuple(values)
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
@@ -783,7 +783,8 @@ fn dirty_send_message(env: &DirtyTestEnv, heap: &mut ProcessHeap, to: Term, tag:
     ) else {
         return;
     };
-    let Ok(message) = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(heap)).tuple(&[tag, me])
+    let Ok(message) =
+        TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(heap)).tuple(&[tag, me])
     else {
         return;
     };
@@ -817,11 +818,11 @@ fn dirty_test_body(
             let mut copies = Vec::with_capacity(1000);
             for _ in 0..1000 {
                 copies.push(
-                    copy_term(value, &mut arinsal_bifs::FragmentingHeap(heap))
+                    copy_term(value, &mut arinsal_bifs::ProcessHeapHandle(heap))
                         .map_err(system_limit)?,
                 );
             }
-            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(heap))
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(heap))
                 .list_from_iter(copies.iter().copied())
                 .map_err(system_limit)
         }
@@ -876,10 +877,10 @@ fn dirty_test_body(
             }
             let big = from_owned(
                 &OwnedTerm::BigInt(big),
-                &mut arinsal_bifs::FragmentingHeap(heap),
+                &mut arinsal_bifs::ProcessHeapHandle(heap),
             )
             .map_err(system_limit)?;
-            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(heap))
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(heap))
                 .tuple(&[atom("ok"), big])
                 .map_err(system_limit)
         }
@@ -961,7 +962,7 @@ fn copy_shared(process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     };
     arinsal_term::copy_shared(
         args[0],
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         copy_literals,
     )
     .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
@@ -1019,7 +1020,7 @@ fn map_info(process: &mut Process, value: Term) -> Result<Term, VmError> {
             stack.extend(children.into_iter().map(|child| (child, next_depth)));
         }
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let (leaf_info, bitmap_info, collision_info) = {
         let mut small_tuple = |values: &[usize]| {
@@ -1103,7 +1104,7 @@ fn unaligned_bitstring(process: &mut Process, args: &[Term]) -> Result<Term, VmE
         let target_bit = index + offset;
         target[target_bit / 8] |= bit << (7 - target_bit % 8);
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let binary = builder
         .binary(&target)
@@ -1279,7 +1280,7 @@ fn gather_allocator_info(
     };
     let reference = from_owned(
         &fields[5],
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
     let message = if carrier {
@@ -1313,9 +1314,12 @@ fn internal_state_tuple_get(
     {
         // Port of erts/emulator/beam/erl_bif_info.c:4834-4835, OTP-29.1.1.
         let hash = OwnedTerm::BigInt(BigInt::from(arinsal_term::internal_hash(*value)));
-        return from_owned(&hash, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-            .map(Some)
-            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
+        return from_owned(
+            &hash,
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        )
+        .map(Some)
+        .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
     }
     let Ok(owned) = to_owned(selector) else {
         return Ok(None);
@@ -1344,7 +1348,7 @@ fn internal_state_tuple_get(
             return Ok(None);
         };
         let bytes = arinsal_etf::encode(term, options);
-        return TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        return TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
             .binary(&bytes)
             .map(Some)
             .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
@@ -1363,7 +1367,7 @@ fn internal_state_tuple_get(
             - BigInt::from(576_460_752_303_423_488_i64);
         return from_owned(
             &OwnedTerm::BigInt(result),
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map(Some)
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
@@ -1402,13 +1406,16 @@ fn internal_state_tuple_get(
         arinsal_term::term_sequence(selector).and_then(|parts| parts.get(1).copied());
     match (name.as_str(), value) {
         ("internal_hash", value) => {
-            let value = from_owned(value, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
+            let value = from_owned(
+                value,
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            )
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
             let hash = arinsal_term::internal_hash(value);
             let result = OwnedTerm::BigInt(hash.into());
             from_owned(
                 &result,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .map(Some)
             .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
@@ -1921,7 +1928,7 @@ fn internal_monitor_list_from(
         let tag = tag
             .as_ref()
             .map(|tag| {
-                from_owned(tag, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                from_owned(tag, &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                     .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
             })
             .transpose()?
@@ -2052,17 +2059,20 @@ fn internal_state_get(
         Some("mmap") => Ok(atom("undefined")),
         Some("stack_check") => Ok(Term::small(1_026_385).unwrap()),
         Some("unique_monotonic_integer_state") => {
-            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(UNIQUE_MONOTONIC_INTEGER_STATE.load(Ordering::Relaxed) as i128)
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
         }
         Some("persistent_term") => {
             let map = OwnedTerm::Map(vec![(OwnedTerm::atom("table"), OwnedTerm::Int(64))]);
-            from_owned(&map, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
+            from_owned(
+                &map,
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            )
+            .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
         }
         Some("min_unique_monotonic_integer" | "min_unique_integer") => {
-            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(-576_460_752_303_423_488)
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
         }
@@ -2074,7 +2084,7 @@ fn internal_state_get(
                 .as_ref()
                 .and_then(|runtime| runtime.scheduler().ok())
                 .map_or(0, |scheduler| scheduler.balance_checks());
-            TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(i128::from(checks))
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
         }
@@ -2158,7 +2168,7 @@ fn internal_state_get(
                 .map(|scheduler| scheduler.test_next_process_id(false, 0));
             match next {
                 Some(next) => {
-                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .int_from_i128(i128::from(next))
                         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
                 }
@@ -2172,7 +2182,7 @@ fn internal_state_get(
                 .and_then(|runtime| crate::port::test_next_port_id(runtime, false, 0));
             match next {
                 Some(next) => {
-                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .int_from_i128(next as i128)
                         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
                 }
@@ -2387,7 +2397,7 @@ fn internal_state_set(
             };
             return match result {
                 Some(result) => {
-                    TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+                    TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                         .int_from_i128(result)
                         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
                 }
@@ -2640,7 +2650,7 @@ fn internal_state_set(
             let reference = TermBuilder::new(&mut process.heap)
                 .magic_ref(owner)
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
-            let address = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            let address = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .int_from_i128(address as i128)
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?;
             return tuple(process, &[reference, address]);
@@ -2657,7 +2667,7 @@ fn internal_state_set(
                 return Ok(atom("false"));
             }
             bytes.resize(size, 0);
-            return TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+            return TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
                 .binary(&bytes)
                 .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))));
         }
@@ -2784,7 +2794,7 @@ fn system_monitor_get(process: &mut Process, session: Term) -> Result<Term, VmEr
     ]);
     from_owned(
         &owned,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
@@ -2952,7 +2962,7 @@ fn system_monitor_set(
                 state.receiver,
                 OwnedTerm::list(monitor_options_for_trace_info(&state.options)),
             ]),
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))?
     } else {

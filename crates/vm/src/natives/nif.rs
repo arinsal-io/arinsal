@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arinsal_bifs::{BifError, BifFn, Ctx, FragmentingHeap, SchedulerClass};
+use arinsal_bifs::{BifError, BifFn, Ctx, ProcessHeapHandle, SchedulerClass};
 use arinsal_loader::Instr;
 use arinsal_sched::{Pid, RunCtx, Scheduler, SchedulerType};
 use arinsal_term::{
@@ -453,12 +453,12 @@ fn alloc(error: impl std::fmt::Debug) -> VmError {
 }
 
 fn tuple(process: &mut Process, items: &[Term]) -> Result<Term, VmError> {
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap).tuple(items).map_err(alloc)
 }
 
 fn charlist(process: &mut Process, text: &str) -> Result<Term, VmError> {
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     let mut builder = TermBuilder::new(&mut heap);
     let mut list = Term::NIL;
     for ch in text.chars().rev() {
@@ -654,8 +654,9 @@ impl PendingNif {
     pub(crate) fn run_dirty(&mut self, heap: &mut arinsal_term::ProcessHeap) {
         let current = current_class();
         let pid = thread_hub().and_then(|hub| hub.pid.to_term());
-        let mut fragment = FragmentingHeap(heap);
-        let mut ctx = Ctx::new(&mut fragment);
+        let mut fragment = ProcessHeapHandle(heap);
+        let mut fcalls = 4_000;
+        let mut ctx = Ctx::with_fcalls(&mut fragment, &mut fcalls);
         let (function, trap) = (&self.function, &self.trap);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             function.call_on(&mut ctx, trap.fptr, &trap.args, pid, current)
@@ -754,10 +755,11 @@ pub(crate) fn take_rescheduled() -> Option<PendingNif> {
 /// Resume a rescheduled NIF continuation on the current scheduler.
 pub(crate) fn resume_pending(
     heap: &mut arinsal_term::ProcessHeap,
+    fcalls: &mut i32,
     pending: PendingNif,
 ) -> Result<Term, BifError> {
-    let mut fragment = arinsal_bifs::FragmentingHeap(heap);
-    let mut ctx = Ctx::new(&mut fragment);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
+    let mut ctx = Ctx::with_fcalls(&mut fragment, fcalls);
     run_nif(&mut ctx, pending)
 }
 
@@ -774,7 +776,7 @@ pub(crate) fn invoke_tracer(
     let native = specialized
         .and_then(|specialized| tracer_callback(vm, module, specialized, arity))
         .or_else(|| tracer_callback(vm, module, function, arity))?;
-    calls::call_bif(&mut process.heap, native, args).ok()
+    calls::call_bif(&mut process.heap, &mut process.reductions, native, args).ok()
 }
 
 pub(crate) fn has_tracer_nifs(vm: &Vm, module_name: &str) -> bool {
@@ -1335,7 +1337,7 @@ fn build_trace<H: HeapAlloc>(heap: &mut H, args: &[Term]) -> Option<Term> {
 
 fn deliver_trace(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, args: &[Term]) {
     let message = {
-        let mut heap = FragmentingHeap(&mut process.heap);
+        let mut heap = ProcessHeapHandle(&mut process.heap);
         build_trace(&mut heap, args)
     };
     let Some(message) = message else {
@@ -1350,9 +1352,9 @@ fn deliver_trace(process: &mut Process, _ctx: &mut RunCtx<'_, Message>, args: &[
     }
 }
 
-struct DynHeap<'a>(&'a mut dyn HeapAlloc);
+struct HeapAdapter<'a, H: HeapAlloc + ?Sized>(&'a mut H);
 
-impl HeapAlloc for DynHeap<'_> {
+impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -1377,7 +1379,7 @@ fn tracer_trace(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     if Pid::from_term(args[1]).is_none() && args[1].as_port().is_none() {
         return Ok(atom("ok"));
     }
-    let Some(message) = build_trace(&mut DynHeap(ctx.heap), args) else {
+    let Some(message) = build_trace(&mut HeapAdapter(&mut ctx.heap), args) else {
         return Ok(atom("ok"));
     };
     if let Some(pid) = Pid::from_term(args[1])

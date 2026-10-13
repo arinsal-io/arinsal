@@ -64,7 +64,7 @@ use arinsal_beam::BeamFile;
 use arinsal_beamasm::{ExitReason, ProcessHeader, SchedulerRegisters};
 // vm_binparse2
 use arinsal_bifs::Ctx;
-use arinsal_bifs::FragmentingHeap;
+use arinsal_bifs::ProcessHeapHandle;
 use arinsal_bits::MatchOps;
 use arinsal_loader::{
     Arg, FastBif, GenericOp, ImportClass, ImportFastOp, Instr, Module, SelectTable,

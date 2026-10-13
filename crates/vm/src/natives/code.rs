@@ -3,7 +3,7 @@
 use crate::process::Runtime;
 use crate::{CodeMeta, Process, Vm, VmError, exceptions};
 use arinsal_beam::BeamFile;
-use arinsal_bifs::FragmentingHeap;
+use arinsal_bifs::ProcessHeapHandle;
 use arinsal_etf::OwnedTerm;
 use arinsal_loader::CoverageMode;
 use arinsal_sched::Pid;
@@ -394,13 +394,13 @@ fn make_list(
     process: &mut Process,
     values: impl IntoIterator<Item = Term>,
 ) -> Result<Term, VmError> {
-    TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .list_from_iter(values)
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
 
 fn make_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    TermBuilder::new(&mut FragmentingHeap(&mut process.heap))
+    TermBuilder::new(&mut ProcessHeapHandle(&mut process.heap))
         .tuple(values)
         .map_err(|_| VmError::Trap(exceptions::Trap::error(atom("system_limit"))))
 }
@@ -497,13 +497,13 @@ fn module_info(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, Vm
                     .map(|bytes| arinsal_etf::decode(bytes).map_err(|_| badarg()))
                     .transpose()?
                     .unwrap_or(OwnedTerm::Nil);
-                let mut heap = FragmentingHeap(&mut process.heap);
+                let mut heap = ProcessHeapHandle(&mut process.heap);
                 from_owned(&value, &mut heap).map_err(|_| badarg())
             }
             // Port of erts/emulator/beam/erl_bif_info.c:5913 (md5_of_module), OTP-29.1.1.
             "md5" => {
                 let md5 = meta.md5.ok_or_else(badarg)?;
-                let mut heap = FragmentingHeap(&mut process.heap);
+                let mut heap = ProcessHeapHandle(&mut process.heap);
                 from_owned(&OwnedTerm::Binary(md5.to_vec()), &mut heap).map_err(|_| badarg())
             }
             _ => Err(badarg()),
@@ -984,7 +984,7 @@ fn beamfile_chunk(process: &mut Process, args: &[Term]) -> Result<Term, VmError>
     let result = arinsal_loader::beamfile_chunk(bytes, id).map_err(|_| badarg())?;
     match result {
         Some(chunk) => {
-            let mut heap = FragmentingHeap(&mut process.heap);
+            let mut heap = ProcessHeapHandle(&mut process.heap);
             from_owned(&OwnedTerm::Binary(chunk), &mut heap).map_err(|_| system_limit())
         }
         None => Ok(atom("undefined")),
@@ -1000,7 +1000,7 @@ fn beamfile_module_md5(process: &mut Process, binary: Term) -> Result<Term, VmEr
         return Ok(atom("undefined"));
     }
     let md5 = arinsal_loader::module_uniq(bytes).map_err(|_| badarg())?;
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     from_owned(&OwnedTerm::Binary(md5.to_vec()), &mut heap).map_err(|_| system_limit())
 }
 
@@ -1099,7 +1099,7 @@ fn get_debug_info(vm: &Vm, process: &mut Process, module: Term) -> Result<Term, 
             ]),
         ]));
     }
-    let mut heap = FragmentingHeap(&mut process.heap);
+    let mut heap = ProcessHeapHandle(&mut process.heap);
     from_owned(&list(result), &mut heap).map_err(|_| system_limit())
 }
 
@@ -1684,7 +1684,7 @@ mod tests {
         for bytes in binaries {
             let beam = arinsal_beam::parse(bytes).unwrap();
             let binary = {
-                let mut heap = FragmentingHeap(&mut process.heap);
+                let mut heap = ProcessHeapHandle(&mut process.heap);
                 from_owned(&OwnedTerm::Binary(bytes.to_vec()), &mut heap).unwrap()
             };
             let prepared = prepare(vm, &mut process, &[atom(&beam.module), binary]).unwrap();
@@ -2120,7 +2120,7 @@ mod tests {
                 let terms: Vec<_> = args
                     .iter()
                     .map(|arg| {
-                        let mut heap = FragmentingHeap(&mut process.heap);
+                        let mut heap = ProcessHeapHandle(&mut process.heap);
                         from_owned(arg, &mut heap).unwrap()
                     })
                     .collect();

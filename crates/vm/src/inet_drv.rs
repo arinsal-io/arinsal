@@ -2481,7 +2481,7 @@ fn put_u64(out: &mut Vec<u8>, val: u64) {
 
 // g_inet_udp
 pub(crate) fn byte_list(process: &mut Process, bytes: &[u8]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .list_from_iter(bytes.iter().map(|b| Term::small(i64::from(*b)).unwrap()))
         .map_err(|error| VmError::Unsupported(format!("inet control reply: {error:?}")))

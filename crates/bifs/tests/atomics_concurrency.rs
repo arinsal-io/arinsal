@@ -1,4 +1,4 @@
-use arinsal_bifs::{Ctx, FragmentingHeap, lookup};
+use arinsal_bifs::{Ctx, ProcessHeapHandle, lookup};
 use arinsal_etf::OwnedTerm as O;
 use arinsal_term::{ProcessHeap, Term, copy_term, to_owned};
 use std::thread;
@@ -22,7 +22,7 @@ fn run_parallel_add(counters: bool) -> O {
         )
     };
     let reference = {
-        let mut owner_allocator = FragmentingHeap(&mut owner_heap);
+        let mut owner_allocator = ProcessHeapHandle(&mut owner_heap);
         let mut ctx = Ctx::new(&mut owner_allocator);
         lookup(module, name, args.len() as u8).unwrap()(&mut ctx, &args).unwrap()
     };
@@ -32,7 +32,7 @@ fn run_parallel_add(counters: bool) -> O {
         let mut heap = ProcessHeap::with_words(64);
         let reference = copy_term(reference, &mut heap).unwrap();
         workers.push(thread::spawn(move || {
-            let mut allocator = FragmentingHeap(&mut heap);
+            let mut allocator = ProcessHeapHandle(&mut heap);
             let args = [reference, Term::small(1).unwrap(), Term::small(1).unwrap()];
             let bif = if counters {
                 lookup("erts_internal", "counters_add", 3).unwrap()
@@ -49,7 +49,7 @@ fn run_parallel_add(counters: bool) -> O {
         worker.join().unwrap();
     }
 
-    let mut allocator = FragmentingHeap(&mut owner_heap);
+    let mut allocator = ProcessHeapHandle(&mut owner_heap);
     let args = [reference, Term::small(1).unwrap()];
     let (module, name) = if counters {
         ("erts_internal", "counters_get")

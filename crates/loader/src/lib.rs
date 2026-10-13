@@ -782,20 +782,6 @@ impl Decoder<'_> {
     }
 }
 
-/// Call a resolved pure BIF or static NIF.
-///
-/// `args` is a view of the caller's registers (or a stack copy of them).
-/// This does not allocate. The interpreter and the JIT share this entry.
-#[inline(always)]
-pub fn call_bif(
-    heap: &mut dyn arinsal_term::HeapAlloc,
-    target: BifFn,
-    args: &[Term],
-) -> Result<Term, arinsal_bifs::BifError> {
-    let mut ctx = arinsal_bifs::Ctx::new(heap);
-    target(&mut ctx, args)
-}
-
 /// Resolve one parsed BEAM module without rejecting unknown executable opcodes.
 pub fn load(file: &BeamFile) -> Result<Module, LoadError> {
     load_with_coverage(file, CoverageMode::None)

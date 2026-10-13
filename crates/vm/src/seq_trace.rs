@@ -126,15 +126,18 @@ pub(crate) fn set_system_tracer(
     };
     let mut current = tracer().lock().unwrap();
     let old = std::mem::replace(&mut *current, next);
-    from_owned(&old, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .map_err(|e| VmError::Unsupported(format!("seq tracer: {e:?}")))
+    from_owned(
+        &old,
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+    )
+    .map_err(|e| VmError::Unsupported(format!("seq tracer: {e:?}")))
 }
 
 pub(crate) fn system_tracer_info(process: &mut Process) -> Result<Term, VmError> {
     let value = tracer().lock().unwrap().clone();
     let value = from_owned(
         &value,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .map_err(|e| VmError::Unsupported(format!("seq tracer info: {e:?}")))?;
     TermBuilder::new(&mut process.heap)
@@ -171,8 +174,11 @@ fn token_term(process: &mut Process, token: Option<&Token>) -> Result<Term, VmEr
     let mut values = Vec::with_capacity(fields.len());
     for field in &fields {
         values.push(
-            from_owned(field, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                .map_err(|e| VmError::Unsupported(format!("seq token: {e:?}")))?,
+            from_owned(
+                field,
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+            )
+            .map_err(|e| VmError::Unsupported(format!("seq token: {e:?}")))?,
         );
     }
     TermBuilder::new(&mut process.heap)
@@ -271,8 +277,11 @@ pub(crate) fn clear_all() {
 }
 
 fn term(process: &mut Process, owned: &OwnedTerm) -> Result<Term, VmError> {
-    from_owned(owned, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .map_err(|e| VmError::Unsupported(format!("seq_trace term: {e:?}")))
+    from_owned(
+        owned,
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+    )
+    .map_err(|e| VmError::Unsupported(format!("seq_trace term: {e:?}")))
 }
 fn emit(
     vm: Option<&mut Vm>,
@@ -526,8 +535,11 @@ fn set_component(
     };
     current.epoch = epoch().load(Ordering::Relaxed);
     put(process, Some(current));
-    from_owned(&old, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .map_err(|e| VmError::Unsupported(format!("seq token result: {e:?}")))
+    from_owned(
+        &old,
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+    )
+    .map_err(|e| VmError::Unsupported(format!("seq token result: {e:?}")))
 }
 // Port of erts/emulator/beam/erl_process.h:1820-1832 (SEQ_TRACE_* flags), OTP-29.1.1.
 fn flag_bit(name: &str) -> Option<u64> {
@@ -583,7 +595,7 @@ fn info(process: &mut Process, _pid: Pid, component: Term) -> Result<Term, VmErr
         .ok_or_else(badarg)?;
     let value = from_owned(
         &value,
-        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
     )
     .map_err(|e| VmError::Unsupported(format!("seq info: {e:?}")))?;
     let key = term(process, &OwnedTerm::Atom(name.to_string()))?;

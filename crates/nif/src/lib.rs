@@ -72,7 +72,7 @@ pub const C_SHIM_EXPORTS: &[&str] = &[
     "enif_free_iovec",
 ];
 
-use arinsal_bifs::{BifError, Ctx, SchedulerClass};
+use arinsal_bifs::{BifError, Ctx, ProcessHeapHandle, SchedulerClass};
 use arinsal_term::{
     ExportEntry, ExternalBinary, FunEntry, HeapAlloc, MagicRef, Node, Term, VecHeap, WritableBinary,
 };
@@ -200,24 +200,60 @@ layout_check!(ErlNifResourceTypeInit, SIZE_ErlNifResourceTypeInit,
 const _: () = assert!(size_of::<Term>() == layout::SIZE_ERL_NIF_TERM);
 
 enum EnvHeap {
-    Owned(VecHeap),
-    Bound(*mut dyn HeapAlloc),
+    Owned(Box<VecHeap>),
+    Bound(*mut ProcessHeapHandle<'static>),
+}
+impl EnvHeap {
+    fn bound_mut(heap: *mut ProcessHeapHandle<'static>) -> &'static mut ProcessHeapHandle<'static> {
+        // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
+        unsafe { &mut *heap }
+    }
+    fn bound_ref(heap: *mut ProcessHeapHandle<'static>) -> &'static ProcessHeapHandle<'static> {
+        // SAFETY: `ErlNifEnv::bound` ties this pointer to the synchronous callback lifetime.
+        unsafe { &*heap }
+    }
 }
 impl HeapAlloc for EnvHeap {
     fn alloc(&mut self, n: usize) -> Option<*mut u64> {
         match self {
             Self::Owned(h) => h.alloc(n),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).alloc(n) },
+            Self::Bound(h) => Self::bound_mut(*h).alloc(n),
+        }
+    }
+    fn alloc_with_extra(&mut self, n: usize, extra: usize) -> Option<*mut u64> {
+        match self {
+            Self::Owned(h) => h.alloc_with_extra(n, extra),
+            Self::Bound(h) => Self::bound_mut(*h).alloc_with_extra(n, extra),
+        }
+    }
+    fn alloc_fragment_only(&mut self, n: usize) -> Option<*mut u64> {
+        match self {
+            Self::Owned(h) => h.alloc_fragment_only(n),
+            Self::Bound(h) => Self::bound_mut(*h).alloc_fragment_only(n),
+        }
+    }
+    fn words_left(&self) -> Option<usize> {
+        match self {
+            Self::Owned(h) => h.words_left(),
+            Self::Bound(h) => Self::bound_ref(*h).words_left(),
+        }
+    }
+    fn release(&mut self, end: *mut u64, start: *mut u64) {
+        match self {
+            Self::Owned(h) => h.release(end, start),
+            Self::Bound(h) => Self::bound_mut(*h).release(end, start),
+        }
+    }
+    fn release_needs_filler(&self, end: *mut u64, start: *mut u64) -> bool {
+        match self {
+            Self::Owned(h) => h.release_needs_filler(end, start),
+            Self::Bound(h) => Self::bound_ref(*h).release_needs_filler(end, start),
         }
     }
     fn retain_binary(&mut self, x: Arc<arinsal_term::RefcBinary>) {
         match self {
             Self::Owned(h) => h.retain_binary(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_binary(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_binary(x),
         }
     }
     fn retain_writable_binary(
@@ -226,17 +262,42 @@ impl HeapAlloc for EnvHeap {
     ) -> Result<(), arinsal_term::TermError> {
         match self {
             Self::Owned(h) => h.retain_writable_binary(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_writable_binary(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_writable_binary(x),
+        }
+    }
+    fn retain_writable_binary_with_apparent_size(
+        &mut self,
+        x: Arc<WritableBinary>,
+        apparent_size_bits: usize,
+    ) -> Result<(), arinsal_term::TermError> {
+        match self {
+            Self::Owned(h) => h.retain_writable_binary_with_apparent_size(x, apparent_size_bits),
+            Self::Bound(h) => {
+                Self::bound_mut(*h).retain_writable_binary_with_apparent_size(x, apparent_size_bits)
+            }
+        }
+    }
+    fn update_writable_binary_overhead(
+        &mut self,
+        source: Term,
+        old_size_bits: usize,
+        new_size_bits: usize,
+    ) {
+        match self {
+            Self::Owned(h) => {
+                h.update_writable_binary_overhead(source, old_size_bits, new_size_bits)
+            }
+            Self::Bound(h) => Self::bound_mut(*h).update_writable_binary_overhead(
+                source,
+                old_size_bits,
+                new_size_bits,
+            ),
         }
     }
     fn supports_writable_binary(&self) -> bool {
         match self {
             Self::Owned(h) => h.supports_writable_binary(),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&**h).supports_writable_binary() },
+            Self::Bound(h) => Self::bound_ref(*h).supports_writable_binary(),
         }
     }
     fn retain_external_binary(
@@ -245,59 +306,43 @@ impl HeapAlloc for EnvHeap {
     ) -> Result<(), arinsal_term::TermError> {
         match self {
             Self::Owned(h) => h.retain_external_binary(x),
-            Self::Bound(h) => {
-                // SAFETY: The bound heap remains live and exclusive for this callback.
-                unsafe { (&mut **h).retain_external_binary(x) }
-            }
+            Self::Bound(h) => Self::bound_mut(*h).retain_external_binary(x),
         }
     }
     fn supports_external_binary(&self) -> bool {
         match self {
             Self::Owned(h) => h.supports_external_binary(),
-            Self::Bound(h) => {
-                // SAFETY: The bound heap remains live for this callback.
-                unsafe { (&**h).supports_external_binary() }
-            }
+            Self::Bound(h) => Self::bound_ref(*h).supports_external_binary(),
         }
     }
     fn retain_node(&mut self, x: Arc<Node>) {
         match self {
             Self::Owned(h) => h.retain_node(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_node(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_node(x),
         }
     }
     fn retain_fun(&mut self, x: Arc<FunEntry>) {
         match self {
             Self::Owned(h) => h.retain_fun(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_fun(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_fun(x),
         }
     }
     fn retain_export(&mut self, x: Arc<ExportEntry>) {
         match self {
             Self::Owned(h) => h.retain_export(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_export(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_export(x),
         }
     }
     fn retain_magic(&mut self, x: Arc<MagicRef>) {
         match self {
             Self::Owned(h) => h.retain_magic(x),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&mut **h).retain_magic(x) },
+            Self::Bound(h) => Self::bound_mut(*h).retain_magic(x),
         }
     }
     fn supports_magic(&self) -> bool {
         match self {
             Self::Owned(h) => h.supports_magic(),
-            Self::Bound(h) =>
-            // SAFETY: The environment and loaded library remain live throughout this callback.
-            unsafe { (&**h).supports_magic() },
+            Self::Bound(h) => Self::bound_ref(*h).supports_magic(),
         }
     }
 }
@@ -330,7 +375,7 @@ impl ErlNifEnv {
     /// Create a process-independent environment with stable owned allocations.
     pub fn independent() -> Self {
         Self {
-            heap: EnvHeap::Owned(VecHeap::new()),
+            heap: EnvHeap::Owned(Box::new(VecHeap::new())),
             options: EnvOptions::default(),
             priv_data: ptr::null_mut(),
             module: None,
@@ -345,9 +390,9 @@ impl ErlNifEnv {
     }
     /// Bind a callback to the caller's infallible heap.
     /// The environment must be dropped before the heap can move or be reused.
-    pub fn bound(heap: &mut dyn HeapAlloc, pid: Option<Term>) -> Self {
+    pub fn bound(heap: &mut ProcessHeapHandle<'_>, pid: Option<Term>) -> Self {
         // SAFETY: the caller keeps this exclusive heap borrow alive for the callback.
-        let raw = unsafe { std::mem::transmute::<&mut dyn HeapAlloc, *mut dyn HeapAlloc>(heap) };
+        let raw = (heap as *mut ProcessHeapHandle<'_>).cast::<ProcessHeapHandle<'static>>();
         Self {
             heap: EnvHeap::Bound(raw),
             options: EnvOptions::default(),
@@ -418,13 +463,17 @@ impl NifFunction {
     ///
     /// Continuations scheduled with `enif_schedule_nif` run inline; use
     /// [`NifFunction::call_on`] where they may have to move to another scheduler.
-    pub fn call(&self, ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
+    pub fn call(
+        &self,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
+        args: &[Term],
+    ) -> Result<Term, BifError> {
         self.call_with_pid(ctx, args, None)
     }
     /// Invoke with the calling process ID for `enif_self` and `enif_send`.
     pub fn call_with_pid(
         &self,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
         args: &[Term],
         pid: Option<Term>,
     ) -> Result<Term, BifError> {
@@ -453,7 +502,7 @@ impl NifFunction {
     /// the caller reschedules the process on the requested scheduler class.
     pub fn call_on(
         &self,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
         fptr: NifFn,
         args: &[Term],
         pid: Option<Term>,
@@ -473,13 +522,13 @@ impl NifFunction {
     }
     fn step(
         &self,
-        ctx: &mut Ctx<'_>,
+        ctx: &mut Ctx<'_, ProcessHeapHandle<'_>>,
         fptr: NifFn,
         args: &[Term],
         pid: Option<Term>,
     ) -> Result<NifCall, BifError> {
         let _call = (self.flags != 0).then(|| self.halt_calls.enter()).flatten();
-        let mut env = ErlNifEnv::bound(ctx.heap, pid);
+        let mut env = ErlNifEnv::bound(&mut ctx.heap, pid);
         env.priv_data = self.priv_data;
         // SAFETY: the pointer belongs to a loaded library; arguments remain live.
         let result = unsafe { fptr(&mut env, args.len() as c_int, args.as_ptr()) };

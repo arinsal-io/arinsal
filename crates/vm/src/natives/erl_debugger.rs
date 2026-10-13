@@ -46,8 +46,11 @@ fn integer(value: usize) -> O {
 }
 
 fn from_owned_term(process: &mut Process, value: &O) -> Result<Term, VmError> {
-    from_owned(value, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-        .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))
+    from_owned(
+        value,
+        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+    )
+    .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))
 }
 
 fn bool_term(value: bool) -> O {

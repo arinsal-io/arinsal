@@ -1090,8 +1090,8 @@ impl RetiredArea {
     }
 }
 
-struct DynHeap<'a>(&'a mut dyn HeapAlloc);
-impl HeapAlloc for DynHeap<'_> {
+struct HeapAdapter<'a, H: HeapAlloc + ?Sized>(&'a mut H);
+impl<H: HeapAlloc + ?Sized> HeapAlloc for HeapAdapter<'_, H> {
     fn alloc(&mut self, words: usize) -> Option<*mut u64> {
         self.0.alloc(words)
     }
@@ -1121,7 +1121,7 @@ fn system_limit(_: TermError) -> BifError {
     BifError::SystemLimit
 }
 fn number(ctx: &mut Ctx<'_>, number: usize) -> Result<Term, BifError> {
-    TermBuilder::new(&mut DynHeap(ctx.heap))
+    TermBuilder::new(&mut HeapAdapter(&mut ctx.heap))
         .int_from_i128(number as i128)
         .map_err(system_limit)
 }
@@ -1168,7 +1168,7 @@ fn info_in(store: &Store, ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifErro
                 memory,
             ),
         ],
-        ctx.heap,
+        &mut ctx.heap,
     )
     .map_err(|_| BifError::SystemLimit)
 }
@@ -1177,11 +1177,11 @@ fn get_all_in(store: &Store, ctx: &mut Ctx<'_>, _: &[Term]) -> Result<Term, BifE
     store.for_each(|key, value| {
         if let Ok(tail) = result {
             result = (|| {
-                let key = copy_term(key, &mut DynHeap(ctx.heap)).map_err(system_limit)?;
-                let pair = TermBuilder::new(&mut DynHeap(ctx.heap))
+                let key = copy_term(key, &mut HeapAdapter(&mut ctx.heap)).map_err(system_limit)?;
+                let pair = TermBuilder::new(&mut HeapAdapter(&mut ctx.heap))
                     .tuple(&[key, value])
                     .map_err(system_limit)?;
-                TermBuilder::new(&mut DynHeap(ctx.heap))
+                TermBuilder::new(&mut HeapAdapter(&mut ctx.heap))
                     .cons(pair, tail)
                     .map_err(system_limit)
             })();

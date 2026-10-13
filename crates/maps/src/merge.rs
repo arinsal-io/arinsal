@@ -142,7 +142,7 @@ fn hashmap_subtree_size(node: Term) -> usize {
 }
 
 /// Map a fallible heap construction to the public map error type. Runtime BIFs
-/// use `FragmentingHeap`, so heap exhaustion is only possible for callers that
+/// use `ProcessHeapHandle`, so heap exhaustion is only possible for callers that
 /// deliberately supply a finite standalone heap.
 pub(crate) fn allocation_result<T>(result: Result<T, TermError>) -> MapResult<T> {
     match result {

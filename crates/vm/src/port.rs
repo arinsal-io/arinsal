@@ -1282,7 +1282,7 @@ fn start_dyn_driver(
         let reference = runtime.next_ref();
         *handle.async_open.lock().unwrap() = Some((reference, ctx.pid()));
         drv_port.expect_init_ack();
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         return TermBuilder::new(&mut heap)
             .local_ref(arinsal_bifs::ordinary_ref_words(reference))
             .map_err(|_| badarg());
@@ -2953,7 +2953,7 @@ pub(crate) fn runtime_port_live(runtime: &crate::process::Runtime, id: u64) -> b
 fn port_get_data(process: &mut Process, port: Term) -> Result<Term, VmError> {
     let handle = lookup_port(process, port)?;
     let owned = handle.data.lock().unwrap().clone();
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     from_owned(&owned, &mut heap).map_err(|_| badarg())
 }
 
@@ -3100,7 +3100,7 @@ fn port_call(
         let Ok((term, _)) = arinsal_etf::decode_prefix(&reply) else {
             return Ok(atom("badarg"));
         };
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let term = from_owned(&term, &mut heap).map_err(|_| badarg())?;
         return TermBuilder::new(&mut heap)
             .tuple(&[atom("ok"), term])
@@ -4409,19 +4409,19 @@ pub(crate) fn trace_command(process: &mut Process, port: Term, event: Term) -> R
         .map(|handle| handle.owner_pid())
         .ok_or_else(badarg)?;
     let encoded = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::new(&mut heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
+        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
         let encode = arinsal_bifs::lookup("erlang", "term_to_binary", 1).ok_or_else(badarg)?;
         encode(&mut ctx, &[event]).map_err(|_| badarg())?
     };
     let command = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .tuple(&[atom("command"), encoded])
             .map_err(|_| badarg())?
     };
     let envelope = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .tuple(&[owner.to_term().ok_or_else(badarg)?, command])
             .map_err(|_| badarg())?
@@ -4444,7 +4444,7 @@ fn ports(_vm: &mut Vm, process: &mut Process) -> Result<Term, VmError> {
                 .filter_map(|id| Term::port(*id)),
         );
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .list_from_iter(values)
         .map_err(|e| VmError::Unsupported(format!("ports list: {e:?}")))
@@ -4458,7 +4458,7 @@ fn port_info(process: &mut Process, port: Term, item: Option<Term>) -> Result<Te
     else {
         return Ok(atom("undefined"));
     };
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     let name = TermBuilder::new(&mut heap)
         .string_to_list(&handle.name)
         .map_err(|e| VmError::Unsupported(format!("port info name: {e:?}")))?;

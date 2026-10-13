@@ -61,14 +61,14 @@ fn make_list(
     process: &mut Process,
     values: impl IntoIterator<Item = Term>,
 ) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .list_from_iter(values)
         .map_err(|error| VmError::Unsupported(format!("process list allocation: {error:?}")))
 }
 
 fn make_tuple(process: &mut Process, values: &[Term]) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .tuple(values)
         .map_err(|error| VmError::Unsupported(format!("process tuple allocation: {error:?}")))
@@ -658,7 +658,7 @@ fn process_info_item_monitors(process: &mut Process, pid: Pid) -> Result<Term, V
             .map(|p| make_tuple(process, &[atom("process"), p]))
             .collect::<Result<Vec<_>, _>>()?;
         let port_monitors = crate::port::monitors_by(process, pid);
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         let vals = vals
             .into_iter()
             .chain(port_monitors.into_iter().filter_map(|object| {
@@ -700,7 +700,7 @@ fn process_info_item_backtrace(
     Ok({
         let running = status == atom("running");
         let text = backtrace_text(vm, process, running)?;
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
         TermBuilder::new(&mut heap)
             .binary(&text)
             .map_err(|e| VmError::Unsupported(format!("backtrace binary: {e:?}")))?
@@ -922,7 +922,7 @@ fn process_info_item_priority_messages(process: &mut Process) -> Result<Term, Vm
 }
 
 fn charlist(process: &mut Process, value: &str) -> Result<Term, VmError> {
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .string_to_list(value)
         .map_err(|error| VmError::Unsupported(format!("charlist allocation: {error:?}")))
@@ -1090,7 +1090,7 @@ fn list_to_ref(process: &mut Process, chars: Term) -> Result<Term, VmError> {
     for (slot, value) in ints[1..].iter().rev().enumerate() {
         refn[slot] = *value;
     }
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     Term::local_ref(&mut heap, refn)
         .map_err(|_| VmError::Trap(crate::exceptions::Trap::error(atom("system_limit"))))
 }
@@ -1793,7 +1793,7 @@ pub(crate) fn process_info_light(
         pairs[index] = make_tuple(process, &[tuple_key, value]).ok()?;
     }
     charge_info_reductions(process, info_reds);
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .list_from_slice(&pairs[..keys.len()])
         .ok()
@@ -2316,7 +2316,7 @@ fn call_values(
                     global_atoms().text(node).ok_or_else(badarg)?.to_string()
                 };
                 let value = format!("<{node}.{index}.{serial}>");
-                let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+                let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
                 TermBuilder::new(&mut heap)
                     .string_to_list(&value)
                     .map_err(|error| {
@@ -2870,7 +2870,7 @@ fn suspend_process(
         let (tag, ready, exited) = if sync {
             let id = arinsal_bifs::next_ref_id();
             let reference = Term::local_ref(
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                 arinsal_bifs::ordinary_ref_words(id),
             )
             .map_err(|error| VmError::Unsupported(format!("suspend reference: {error:?}")))?;
@@ -3366,7 +3366,7 @@ fn max_heap_map(process: &mut Process, limit: crate::process::MaxHeap) -> Result
         ),
         (atom("size"), size),
     ];
-    let mut heap = arinsal_bifs::FragmentingHeap(&mut process.heap);
+    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
     TermBuilder::new(&mut heap)
         .flatmap_from_pairs(&pairs)
         .map_err(|error| VmError::Unsupported(format!("max_heap_size map: {error:?}")))
@@ -3812,7 +3812,7 @@ fn trace_session_create(
     let name = atom_name(name).ok_or_else(badarg)?;
     let (id, weak_id) = crate::trace::create_session(process, name.clone(), tracer);
     let handle = crate::trace::session_handle(process, id);
-    let reference = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+    let reference = TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
         .magic_ref(handle)
         .map_err(|_| badarg())?;
     let name = Term::atom(global_atoms().intern(&name).map_err(|_| badarg())?);
@@ -3892,7 +3892,7 @@ fn trace_tracer_term(process: &mut Process, tracer: crate::trace::Tracer) -> Res
             let module = Term::atom(global_atoms().intern(&module).map_err(|_| badarg())?);
             let state = arinsal_term::from_owned(
                 &state,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .map_err(|_| badarg())?;
             make_tuple(process, &[module, state])?
@@ -3945,7 +3945,7 @@ fn trace_session_info(
         });
         let options = arinsal_term::from_owned(
             &arinsal_etf::OwnedTerm::list(options),
-            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
         )
         .map_err(|_| badarg())?;
         return make_tuple(process, &[spec, options]);
@@ -3978,7 +3978,7 @@ fn trace_session_info(
         } else if let Some(match_spec) = match_spec {
             arinsal_term::from_owned(
                 &match_spec,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .map_err(|_| badarg())?
         } else {
@@ -4124,7 +4124,7 @@ fn trace_session_info(
                             Term::atom(global_atoms().intern(&module).expect("tracer module atom"));
                         let state = arinsal_term::from_owned(
                             &state,
-                            &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                         )
                         .unwrap_or_else(|_| atom("undefined"));
                         make_tuple(process, &[module, state]).unwrap_or_else(|_| atom("undefined"))
@@ -4159,7 +4159,7 @@ fn trace_info(
         } else if let Some(match_spec) = match_spec {
             arinsal_term::from_owned(
                 &match_spec,
-                &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
             )
             .map_err(|_| badarg())?
         } else {
@@ -4269,7 +4269,7 @@ fn trace_info(
                         Term::atom(global_atoms().intern(&module).expect("tracer module atom"));
                     let state = arinsal_term::from_owned(
                         &state,
-                        &mut arinsal_bifs::FragmentingHeap(&mut process.heap),
+                        &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
                     )
                     .unwrap_or_else(|_| atom("undefined"));
                     make_tuple(process, &[module, state]).unwrap_or_else(|_| atom("undefined"))
@@ -4385,8 +4385,11 @@ fn trace_info_function(
         return make_tuple(process, &[item, atom("false")]);
     }
     let owned = |process: &mut Process, term: &arinsal_etf::OwnedTerm| {
-        arinsal_term::from_owned(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-            .map_err(|_| badarg())
+        arinsal_term::from_owned(
+            term,
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        )
+        .map_err(|_| badarg())
     };
     let (traced, mut match_spec) = if info.got & GOT_GLOBAL != 0 {
         (atom("global"), Term::NIL)
@@ -4415,7 +4418,7 @@ fn trace_info_function(
         if info.got & GOT_COUNT == 0 {
             return Ok(atom("false"));
         }
-        arinsal_term::TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut process.heap))
+        arinsal_term::TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(&mut process.heap))
             .int_from_i64(info.count as i64)
             .map_err(|_| badarg())
     };
@@ -4446,7 +4449,7 @@ fn trace_info_function(
         };
         let mut tuples = Vec::new();
         for (pid, count, words) in entries {
-            let words = arinsal_term::TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(
+            let words = arinsal_term::TermBuilder::new(&mut arinsal_bifs::ProcessHeapHandle(
                 &mut process.heap,
             ))
             .int_from_i64(*words)
@@ -4571,10 +4574,11 @@ fn trace_info_on_load(process: &mut Process, session: u64, item: Term) -> Result
     };
     let flags = state.flags;
     let owned = |process: &mut Process, term: &Option<arinsal_etf::OwnedTerm>| match term {
-        Some(term) => {
-            arinsal_term::from_owned(term, &mut arinsal_bifs::FragmentingHeap(&mut process.heap))
-                .map_err(|_| badarg())
-        }
+        Some(term) => arinsal_term::from_owned(
+            term,
+            &mut arinsal_bifs::ProcessHeapHandle(&mut process.heap),
+        )
+        .map_err(|_| badarg()),
         None => Ok(Term::NIL),
     };
     let traced = if !flags.breakpoint {

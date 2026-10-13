@@ -1,6 +1,5 @@
 //! Independent environments, time, ETF, and VM extension hooks.
 use crate::{ErlNifBinary, ErlNifEnv, terms};
-use arinsal_bifs::Ctx;
 use arinsal_term::{Term, TermBuilder, VecHeap, copy_term, from_owned};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::hint::black_box;
@@ -380,31 +379,21 @@ pub extern "C" fn enif_make_monitor_term(e: *mut ErlNifEnv, m: *const [u8; 32]) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn enif_term_to_binary(
-    e: *mut ErlNifEnv,
+    _e: *mut ErlNifEnv,
     value: Term,
     out: *mut ErlNifBinary,
 ) -> c_int {
     if out.is_null() {
         return 0;
     };
-    // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    let env = unsafe { &mut *e };
-    let mut ctx = Ctx::new(&mut env.heap);
-    let Some(f) = arinsal_bifs::lookup("erlang", "term_to_binary", 1) else {
+    let Ok(encoded) = arinsal_bifs::encode_term_to_binary(value) else {
         return 0;
     };
-    let Ok(encoded) = f(&mut ctx, &[value]) else {
-        return 0;
-    };
-    let mut b = ErlNifBinary::default();
-    if terms::enif_inspect_binary(e, encoded, &mut b) == 0 {
-        return 0;
-    };
-    if terms::enif_alloc_binary(b.size, out) == 0 {
+    if terms::enif_alloc_binary(encoded.len(), out) == 0 {
         return 0;
     };
     // SAFETY: The NIF caller or VM hook retains this storage for the callback.
-    unsafe { ptr::copy_nonoverlapping(b.data, (*out).data, b.size) };
+    unsafe { ptr::copy_nonoverlapping(encoded.as_ptr(), (*out).data, encoded.len()) };
     1
 }
 #[unsafe(no_mangle)]

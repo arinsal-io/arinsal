@@ -46,7 +46,7 @@ fn integer(ctx: &mut Ctx<'_>, value: u64) -> Result<Term, BifError> {
     {
         return Ok(term);
     }
-    TermBuilder::new(&mut Heap(ctx.heap))
+    TermBuilder::new(&mut Heap(&mut ctx.heap))
         .int_from_bigint(&num_bigint::BigInt::from(value))
         .map_err(|_| BifError::SystemLimit)
 }
@@ -54,7 +54,7 @@ fn string(ctx: &mut Ctx<'_>, value: &str) -> Result<Term, BifError> {
     let mut tail = Term::NIL;
     for ch in value.chars().rev() {
         let code = i64::from(ch as u32);
-        tail = TermBuilder::new(&mut Heap(ctx.heap))
+        tail = TermBuilder::new(&mut Heap(&mut ctx.heap))
             .cons(Term::small(code).ok_or(BifError::SystemLimit)?, tail)
             .map_err(|_| BifError::SystemLimit)?;
     }
@@ -111,7 +111,7 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
                 (atom("error_logger"), atom("true")),
                 (atom("include_shared_binaries"), atom("false")),
             ];
-            let mut heap = Heap(ctx.heap);
+            let mut heap = Heap(&mut ctx.heap);
             arinsal_maps::from_list(&map_items, &mut heap).map_err(|_| BifError::SystemLimit)
         }
         "atom_count" | "process_count" | "port_count" => integer(ctx, 0),
@@ -142,7 +142,7 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
             let mut list = Term::NIL;
             for (name, value) in entries.into_iter().rev() {
                 let pair = tuple_build(ctx, &[atom(name), Term::small(value).unwrap()]);
-                list = TermBuilder::new(&mut Heap(ctx.heap))
+                list = TermBuilder::new(&mut Heap(&mut ctx.heap))
                     .cons(pair, list)
                     .map_err(|_| BifError::SystemLimit)?;
             }
@@ -195,7 +195,7 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
                             Term::small(i64::from(bif.arity)).unwrap(),
                         ],
                     );
-                    list = TermBuilder::new(&mut Heap(ctx.heap))
+                    list = TermBuilder::new(&mut Heap(&mut ctx.heap))
                         .cons(entry, list)
                         .map_err(|_| BifError::SystemLimit)?;
                 }
@@ -209,7 +209,7 @@ fn system_info(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
 fn atom_list(ctx: &mut Ctx<'_>, names: &[&str]) -> Result<Term, BifError> {
     let mut list = Term::NIL;
     for name in names.iter().rev() {
-        list = TermBuilder::new(&mut Heap(ctx.heap))
+        list = TermBuilder::new(&mut Heap(&mut ctx.heap))
             .cons(atom(name), list)
             .map_err(|_| BifError::SystemLimit)?;
     }
@@ -280,7 +280,7 @@ fn clock_source(ctx: &mut Ctx<'_>, clock_id: &str, monotonic: bool) -> Result<Te
     pairs.push(pair(ctx, "time", time)?);
     let mut list = Term::NIL;
     for entry in pairs.into_iter().rev() {
-        list = TermBuilder::new(&mut Heap(ctx.heap))
+        list = TermBuilder::new(&mut Heap(&mut ctx.heap))
             .cons(entry, list)
             .map_err(|_| BifError::SystemLimit)?;
     }

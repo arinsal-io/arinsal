@@ -57,28 +57,30 @@ pub(super) fn push_continuation(
     Ok(())
 }
 
-/// Invoke a resolved pure BIF or static NIF without allocating.
+/// Invoke a resolved pure BIF or static NIF on the process heap.
 ///
-/// `args` views the caller's X registers. The same entry is
-/// [`arinsal_loader::call_bif`], which the JIT can call without a VM borrow.
+/// `args` views the caller's X registers, and BIF reductions mutate `fcalls` directly.
 #[inline(always)]
 pub fn call_bif(
     heap: &mut arinsal_term::ProcessHeap,
+    fcalls: &mut i32,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
 ) -> Result<arinsal_term::Term, arinsal_bifs::BifError> {
-    let mut fragment = arinsal_bifs::FragmentingHeap(heap);
-    arinsal_loader::call_bif(&mut fragment, target, args)
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, fcalls);
+    target(&mut ctx, args)
 }
 
 /// Invoke a BIF and return its reported work for scheduler accounting.
 pub(crate) fn call_bif_metered(
     heap: &mut arinsal_term::ProcessHeap,
+    fcalls: &mut i32,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
 ) -> (Result<arinsal_term::Term, arinsal_bifs::BifError>, u32) {
-    let mut fragment = arinsal_bifs::FragmentingHeap(heap);
-    let mut ctx = arinsal_bifs::Ctx::new(&mut fragment);
+    let mut fragment = arinsal_bifs::ProcessHeapHandle(heap);
+    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut fragment, fcalls);
     let result = target(&mut ctx, args);
     (result, ctx.reductions())
 }
@@ -270,11 +272,12 @@ pub(crate) fn gc_after_native_parts(
 /// [`call_bif`] with the panic landing the interpreter already used.
 pub(super) fn call_bif_catch(
     heap: &mut arinsal_term::ProcessHeap,
+    fcalls: &mut i32,
     target: arinsal_bifs::BifFn,
     args: &[arinsal_term::Term],
 ) -> Result<Result<arinsal_term::Term, arinsal_bifs::BifError>, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        call_bif(heap, target, args)
+        call_bif(heap, fcalls, target, args)
     }))
     .map_err(|_| ())
 }
@@ -327,7 +330,9 @@ impl Vm {
         bif: arinsal_bifs::BifFn,
         arity: usize,
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
-        let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
+        let untraced = |p: &mut Process| {
+            calls::call_bif_metered(&mut p.heap, &mut p.reductions, bif, &p.x[..arity])
+        };
         if crate::trace::saves_calls(p)
             && let Some(import) = self
                 .code
@@ -372,7 +377,9 @@ impl Vm {
         bif: arinsal_bifs::BifFn,
         arity: usize,
     ) -> (Result<Term, arinsal_bifs::BifError>, u32) {
-        let untraced = |p: &mut Process| calls::call_bif_metered(&mut p.heap, bif, &p.x[..arity]);
+        let untraced = |p: &mut Process| {
+            calls::call_bif_metered(&mut p.heap, &mut p.reductions, bif, &p.x[..arity])
+        };
         if !crate::trace_bp::any_pattern()
             || !crate::trace_bp::selects(p, module, function, arity as u8)
         {
@@ -757,9 +764,8 @@ impl Vm {
         };
         let value = p.gc_after_bif(value)?;
         let charge = bif_reductions.saturating_add(1);
-        p.reductions = p
-            .reductions
-            .saturating_sub(charge.min(i32::MAX as u32) as i32);
+        // The BIF body has already applied its BUMP_REDS directly to FCALLS.
+        p.reductions = p.reductions.saturating_sub(1);
         let exhausted = ctx.is_some_and(|run| !run.consume(charge));
         let outcome = self.finish_native_value(p, tail, value)?;
         if exhausted && matches!(outcome, ImportOutcome::Advanced | ImportOutcome::Jump(_)) {
