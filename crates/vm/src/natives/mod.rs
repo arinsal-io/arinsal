@@ -371,6 +371,12 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
         return Some(crate::signals::unregister_light);
     }
     // erts `monitor_2`, `demonitor_1/2`, `unlink_1` and `exit_2` take `c_p` only for a local pid.
+    if module == "erts_internal" && function == "suspend_process" && arity == 2 {
+        return Some(proc::suspend_process_light);
+    }
+    if module == "erlang" && function == "resume_process" && arity == 1 {
+        return Some(proc::resume_process_light);
+    }
     if module == "erlang" && function == "monitor" && arity == 2 {
         return Some(crate::signals::monitor_light);
     }

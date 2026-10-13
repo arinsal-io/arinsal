@@ -3033,7 +3033,7 @@ impl Requests {
     }
 }
 
-fn sys_index(priority: Priority) -> usize {
+pub(crate) fn sys_index(priority: Priority) -> usize {
     match priority {
         Priority::Max => 0,
         Priority::High => 1,
