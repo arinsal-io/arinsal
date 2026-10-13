@@ -2897,7 +2897,13 @@ impl<T: Task> Inner<T> {
             }
             // Port of erts/emulator/beam/erl_hl_timer.c:1922-1964 (access_btm), OTP-29.1.1:
             // expired timers cannot be canceled successfully.
-            self.apply_timer_commands(local);
+            let queued = {
+                let service = local.timer_service.borrow();
+                !service.commands.is_empty() || !service.canceled.is_empty()
+            };
+            if queued {
+                self.apply_timer_commands(local);
+            }
             return;
         }
         let Some(timers) = self.sim_timers.as_ref() else {

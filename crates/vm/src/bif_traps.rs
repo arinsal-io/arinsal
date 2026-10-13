@@ -1541,6 +1541,20 @@ impl TrapBody for MapsMerge {
     }
 }
 
+/// `lists:reverse/2`.
+pub(crate) struct ListsReverse;
+
+impl TrapBody for ListsReverse {
+    fn run(
+        process: &mut Process,
+        args: &[Term],
+        pid: Option<arinsal_sched::Pid>,
+        restore_gc: bool,
+    ) -> Result<HandlerResult, BifError> {
+        lists_reverse(process, args, None, pid, restore_gc)
+    }
+}
+
 impl TrapBody for MapsFromList {
     fn run(
         process: &mut Process,
