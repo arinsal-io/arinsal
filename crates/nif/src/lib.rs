@@ -672,9 +672,12 @@ mod halt_tests {
         waiter.join().unwrap();
     }
 }
-/// Loaded library and copied function table. Drop calls the unload callback.
+/// Loaded library and copied function table. [`NifLibrary::close`] (or Drop) calls the unload
+/// callback.
 pub struct NifLibrary {
-    _library: Arc<Library>,
+    /// The `dlopen` handle, released by [`NifLibrary::close`].
+    library: Mutex<Option<Arc<Library>>>,
+    closed: AtomicBool,
     module: String,
     functions: Vec<NifFunction>,
     unload: Option<UnloadFn>,
@@ -720,6 +723,30 @@ impl NifLibrary {
     pub fn wait_for_halt_calls(&self) {
         self.halt_calls.wait();
     }
+    /// Run the unload callbacks and release the `dlopen` handle, once. No function of the
+    /// library may be called afterwards.
+    // Port of erts/emulator/beam/erl_nif.c:2602-2618 (really_close_dynlib), OTP-29.1.1.
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let priv_data = self.priv_data.load(Ordering::Acquire);
+        if let Some(callback) = self.on_unload_thread {
+            callback(priv_data);
+        }
+        if let Some(unload) = self.unload {
+            let mut env = ErlNifEnv::independent();
+            env.module = Some(self.module.clone());
+            // SAFETY: the library is still open; its handle is released below.
+            unsafe { unload(&mut env, priv_data) };
+        }
+        drop(
+            self.library
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
+        );
+    }
 }
 // SAFETY: after `load` returns, OTP invokes NIF entry points from any scheduler.
 // `priv_data` is published before the library is callable and the host does not
@@ -731,16 +758,7 @@ unsafe impl Sync for NifLibrary {}
 
 impl Drop for NifLibrary {
     fn drop(&mut self) {
-        let priv_data = self.priv_data.load(Ordering::Acquire);
-        if let Some(callback) = self.on_unload_thread {
-            callback(priv_data);
-        }
-        if let Some(unload) = self.unload {
-            let mut env = ErlNifEnv::independent();
-            env.module = Some(self.module.clone());
-            // SAFETY: the library stays open until Drop completes.
-            unsafe { unload(&mut env, priv_data) };
-        }
+        self.close();
     }
 }
 /// A loaded NIF image whose `load` callback has not run yet.
@@ -839,7 +857,8 @@ impl NifImage {
             function.halt_calls = Arc::clone(&halt_calls);
         }
         Ok(NifLibrary {
-            _library: self.library,
+            library: Mutex::new(Some(self.library)),
+            closed: AtomicBool::new(false),
             module: self.module,
             functions: self.functions,
             unload: self.unload,

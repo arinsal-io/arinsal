@@ -122,21 +122,85 @@ fn tracer_callback(vm: &Vm, module_name: &str, function: &str, arity: u8) -> Opt
 }
 
 /// A NIF library bound to one module instance by `load_nif`.
-// Port of erts/emulator/beam/erl_nif.c:93-124 (struct erl_module_nif), OTP-29.1.1. The strong
-// count plays `dynlib_refc`: the module instance (its [`MODULE_NIFS`] entry) and every ongoing
-// call keep the native code loaded. The weak count plays `refc`: code patched with the
-// library's [`NifBinding`]s still refers to the struct after the library is unloaded.
+// Port of erts/emulator/beam/erl_nif.c:93-124 (struct erl_module_nif), OTP-29.1.1. The `Arc`
+// count plays `refc`: the code patched with the library's [`NifBinding`]s and the module
+// instance (its [`MODULE_NIFS`] entry) refer to the struct. `dynlib_refc` counts the module
+// instance and every ongoing dirty call or scheduled continuation; when it reaches zero the
+// library is closed (`unload` runs), whatever still refers to the struct.
 pub(crate) struct ModuleNif {
     library: arinsal_nif::NifLibrary,
     /// `mod` and `mi_copy`: the code scope and the module instance the library is loaded into.
     owner: (u64, usize),
+    dynlib_refc: std::sync::atomic::AtomicUsize,
+    /// `ERTS_MOD_NIF_FLG_LOADING` until every function is published: callers then wait for
+    /// the publication, as `call_nif_early` does.
+    publishing: std::sync::atomic::AtomicBool,
+    /// The schedulers that run the aux work closing the library.
+    scheduler: Weak<Scheduler<Process>>,
 }
 
 impl ModuleNif {
     fn function(&self, index: usize) -> Result<&arinsal_nif::NifFunction, BifError> {
         self.library.function(index).ok_or(BifError::BADARG)
     }
+
+    /// Drop one `dynlib_refc` reference; the last one closes the library.
+    // Port of erts/emulator/beam/erl_nif.c:3362-3368 (nfunc_cleanup_nif_mod) and 5369-5370
+    // (erts_unload_nif), OTP-29.1.1.
+    fn dynlib_deref(self: &Arc<Self>) {
+        if self
+            .dynlib_refc
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            close_dynlib(Arc::clone(self));
+        }
+    }
 }
+
+/// Close a library whose last `dynlib_refc` reference is gone: the unload callbacks run as aux
+/// work of the calling normal scheduler, or of the first one when called elsewhere.
+// Port of erts/emulator/beam/erl_nif.c:2542-2557 (close_dynlib) and 2559-2618
+// (close_dynlib_aux, really_close_dynlib), OTP-29.1.1. Arinsal does not seize the code
+// modification permission for it.
+fn close_dynlib(lib: Arc<ModuleNif>) {
+    let Some(scheduler) = lib.scheduler.upgrade() else {
+        lib.library.close();
+        return;
+    };
+    let sched_ix = arinsal_sched::current_normal_scheduler().unwrap_or(0);
+    scheduler.request_aux_work(sched_ix, move || lib.library.close());
+}
+
+/// One `dynlib_refc` reference held by a dirty call or `enif_schedule_nif` continuation.
+// Port of erts/emulator/beam/erl_nif.c:394-398 (schedule: the first scheduling of a call
+// takes a reference) and 3362-3368 (nfunc_cleanup_nif_mod drops it), OTP-29.1.1.
+pub(crate) struct ScheduledNif(Arc<ModuleNif>);
+
+impl ScheduledNif {
+    fn new(lib: &Arc<ModuleNif>) -> Self {
+        lib.dynlib_refc
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(lib))
+    }
+}
+
+impl Drop for ScheduledNif {
+    fn drop(&mut self) {
+        self.0.dynlib_deref();
+    }
+}
+
+impl std::ops::Deref for ScheduledNif {
+    type Target = ModuleNif;
+
+    fn deref(&self) -> &ModuleNif {
+        &self.0
+    }
+}
+
+/// `erts_nif_call_tab_lock`: held while the functions of a library are published.
+static NIF_CALL_TAB_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// The `call_nif` operands patched into the code of one NIF function.
 // Port of erts/emulator/beam/erl_nif.c:4903-4940 (stub->code.call_nif), OTP-29.1.1:
@@ -145,7 +209,7 @@ impl ModuleNif {
 // static_schedule_dirty_{io,cpu}_nif (erl_nif.c:3437-3483), which `flags` selects here.
 #[derive(Clone)]
 pub(crate) struct NifBinding {
-    lib: Weak<ModuleNif>,
+    lib: Arc<ModuleNif>,
     fptr: arinsal_nif::NifFn,
     flags: u32,
     /// The `ErlNifFunc` of the library entry.
@@ -190,7 +254,8 @@ impl NifBinding {
     /// Run the NIF for the calling process.
     // Port of erts/emulator/beam/emu/bif_instrs.tab:480-543 (call_nif) and
     // erts/emulator/beam/jit/beam_jit_common.cpp:623-677 (beam_jit_call_nif), OTP-29.1.1:
-    // `call_nif[1]` runs with `call_nif[2]` as the environment's library. A dirty NIF's
+    // `call_nif[1]` runs with `call_nif[2]` as the environment's library and takes no
+    // reference to it; the code of a running call is not purged. A dirty NIF's
     // `call_nif[1]` (static_schedule_dirty_nif, erl_nif.c:3437-3471) moves the process to a
     // dirty scheduler instead.
     pub(crate) fn call(
@@ -199,9 +264,17 @@ impl NifBinding {
         fcalls: &mut i32,
         args: &[Term],
     ) -> Result<Term, BifError> {
-        let Some(lib) = self.lib.upgrade() else {
-            return Err(BifError::BADARG);
-        };
+        let lib = &self.lib;
+        // Port of erts/emulator/beam/erl_nif.c:5109-5122 (erts_call_nif_early), OTP-29.1.1: a
+        // function reached while its library is being published waits until every function of
+        // the library is.
+        if lib.publishing.load(std::sync::atomic::Ordering::Acquire) {
+            drop(
+                NIF_CALL_TAB_LOCK
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            );
+        }
         let index = self.index as usize;
         let function = lib.function(index)?;
         if args.len() != function.arity as usize {
@@ -218,7 +291,7 @@ impl NifBinding {
             return run_nif(
                 &mut ctx,
                 PendingNif {
-                    lib,
+                    lib: ScheduledNif::new(lib),
                     index,
                     trap,
                     done: None,
@@ -229,7 +302,7 @@ impl NifBinding {
         match function.call_on(&mut ctx, self.fptr, args, pid, current_class())? {
             arinsal_nif::NifCall::Return(value) => Ok(value),
             arinsal_nif::NifCall::Schedule(trap) => reschedule(PendingNif {
-                lib,
+                lib: ScheduledNif::new(lib),
                 index,
                 trap,
                 done: None,
@@ -241,8 +314,8 @@ impl NifBinding {
 /// Unload the NIF library bound to module instance `id` of `scope`.
 // Port of erts/emulator/beam/beam_bif_load.c:2254-2258 (purge complete) and
 // erts/emulator/beam/erl_nif.c:5334-5373 (erts_unload_nif), OTP-29.1.1: purging a code
-// instance drops its reference to the library; `unload` runs once no call of it is in flight
-// (`dynlib_refc` reaches zero, close_dynlib at erl_nif.c:2542-2557).
+// instance drops its `dynlib_refc` reference; the library closes once no dirty call or
+// scheduled continuation of it is left.
 pub(crate) fn unload_instance(scope: u64, id: usize) {
     let released = {
         let mut libs = MODULE_NIFS
@@ -254,8 +327,9 @@ pub(crate) fn unload_instance(scope: u64, id: usize) {
         *libs = kept;
         released
     };
-    // The library's `unload` callback runs outside the lock.
-    drop(released);
+    for lib in released {
+        lib.dynlib_deref();
+    }
 }
 
 /// The library loaded into module instance `id` of `scope` (`erl_module_instance.nif`).
@@ -662,8 +736,8 @@ fn declared_nifs(module: &arinsal_loader::Module) -> HashSet<(String, u8)> {
 ///
 /// Port of erts/emulator/beam/erl_nfunc_sched.h (`ErtsNativeFunc` trap wrapper), OTP-29.1.1.
 pub(crate) struct PendingNif {
-    /// The library of the NIF; an ongoing call keeps it loaded (`dynlib_refc`).
-    lib: Arc<ModuleNif>,
+    /// The library of the NIF; the scheduled call keeps it loaded (`dynlib_refc`).
+    lib: ScheduledNif,
     /// The `ErlNifFunc` of the library entry that was called.
     index: usize,
     trap: arinsal_nif::NifTrap,
@@ -990,23 +1064,48 @@ fn validate_image(
 
 /// Bind the functions of `library`, loaded for module instance `module_id`, to the code they
 /// replace and make them callable.
-// Port of erts/emulator/beam/erl_nif.c:4840-4942 (the ErtsNifFinish stubs), 4997 (`this_mi->nif
-// = lib`) and 5124-5297 (load_nif_1st_finisher, load_nif_2nd_finisher, load_nif_3rd_finisher
-// and release_beam_stubs), OTP-29.1.1. Every function gets a stub holding the `call_nif`
-// operands; the first finisher writes them into the code, the second enables the code, the
-// third frees the stubs. erts publishes the functions through `call_nif_early` and the
-// `erts_nif_call_tab` hash until the first finisher ran; here no code refers to the library
-// before its operands are complete, so neither is needed.
+// Port of erts/emulator/beam/erl_nif.c:4840-4942 (the ErtsNifFinish stubs), 4997-5007
+// (`this_mi->nif = lib`, then patch_call_nif_early under erts_nif_call_tab_lock) and 5124-5297
+// (load_nif_1st_finisher, load_nif_2nd_finisher, load_nif_3rd_finisher and
+// release_beam_stubs), OTP-29.1.1. Every function gets a stub holding the `call_nif` operands.
+// The first finisher writes them into the code; the functions are then enabled together
+// under the call table lock, and a call that reaches one of them meanwhile waits for the
+// lock like erts_call_nif_early; the third finisher frees the stubs. The operands are complete
+// before any function is enabled, so the `erts_nif_call_tab` hash erts reads in that window is
+// not needed.
 fn install_stubs(
     vm: &mut Vm,
     module_id: usize,
     library: arinsal_nif::NifLibrary,
     binds: &[(usize, usize)],
+    scheduler: Weak<Scheduler<Process>>,
 ) -> Result<(), VmError> {
     let lib = Arc::new(ModuleNif {
         library,
         owner: (vm.code_scope, module_id),
+        dynlib_refc: std::sync::atomic::AtomicUsize::new(1),
+        publishing: std::sync::atomic::AtomicBool::new(true),
+        scheduler,
     });
+    let result = finish_stubs(vm, module_id, &lib, binds);
+    match result {
+        Ok(()) => MODULE_NIFS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(lib),
+        // Port of erts/emulator/beam/erl_nif.c:5019-5031 (erts_load_nif error path), OTP-29.1.1:
+        // a library that did not get bound is released.
+        Err(_) => lib.dynlib_deref(),
+    }
+    result
+}
+
+fn finish_stubs(
+    vm: &mut Vm,
+    module_id: usize,
+    lib: &Arc<ModuleNif>,
+    binds: &[(usize, usize)],
+) -> Result<(), VmError> {
     let module = Arc::clone(&vm.code.modules[module_id]);
     let finish = binds
         .iter()
@@ -1022,7 +1121,7 @@ fn install_stubs(
                 name: name.clone(),
                 arity: *arity,
                 call: NifBinding {
-                    lib: Arc::downgrade(&lib),
+                    lib: Arc::clone(lib),
                     fptr: function.fptr,
                     flags: function.flags,
                     index: u32::try_from(index)
@@ -1031,10 +1130,6 @@ fn install_stubs(
             })
         })
         .collect::<Result<Vec<_>, VmError>>()?;
-    MODULE_NIFS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .push(lib);
     // load_nif_1st_finisher: the `call_nif` operands of every function.
     let mut bodies = Vec::with_capacity(finish.len());
     for stub in &finish {
@@ -1042,10 +1137,17 @@ fn install_stubs(
         bodies.push(push_native(vm, native.clone())?);
         bind_native_code(vm, module_id, &stub.name, stub.arity, native)?;
     }
-    // load_nif_2nd_finisher: the functions run the NIFs.
-    for (stub, body) in finish.iter().zip(bodies) {
-        patch_native(&module, stub.entry, body)?;
-        enable_native_code(vm, module_id, &stub.name, stub.arity)?;
+    // patch_call_nif_early and load_nif_2nd_finisher: all functions run the NIFs at once.
+    {
+        let _publication = NIF_CALL_TAB_LOCK
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for (stub, body) in finish.iter().zip(bodies) {
+            patch_native(&module, stub.entry, body)?;
+            enable_native_code(vm, module_id, &stub.name, stub.arity)?;
+        }
+        lib.publishing
+            .store(false, std::sync::atomic::Ordering::Release);
     }
     // load_nif_3rd_finisher and release_beam_stubs: the code holds the operands now.
     drop(finish);
@@ -1157,7 +1259,12 @@ fn load_dynamic(
         Ok(library) => library,
         Err(error) => return nif_open_error(process, path, error),
     };
-    install_stubs(vm, caller_id, library, &binds)?;
+    let scheduler = process
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.scheduler().ok())
+        .map_or_else(Weak::new, |scheduler| Arc::downgrade(&scheduler));
+    install_stubs(vm, caller_id, library, &binds, scheduler)?;
     Ok(atom("ok"))
 }
 

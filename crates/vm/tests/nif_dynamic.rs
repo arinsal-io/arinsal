@@ -477,7 +477,7 @@ fn library_with_more_nifs_than_the_old_table_matches_erts() {
         library.display()
     );
     compile_beam(&erl, &dir, "nifdyn_wide", &module_src);
-    assert_same(&dir, &erl, "nifdyn_wide");
+    assert_same_jit_and_interp(&dir, &erl, "nifdyn_wide");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
