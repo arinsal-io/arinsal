@@ -3,9 +3,7 @@
 use arinsal_maps::{self, MapError, MapResult};
 use arinsal_term::{Term, atoms};
 
-use crate::pure::{
-    bool_term, integer, list, make_list, make_list_from_reverse_exact_iter, tuple_build,
-};
+use crate::pure::{bool_term, integer, make_list_from_reverse_exact_iter, tuple_build};
 use crate::{BifError, Ctx};
 
 pub(super) fn lookup<V: crate::BifTableVisitor>(
@@ -83,42 +81,42 @@ fn find(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
     }
 }
 fn from_list(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let mut pairs = Vec::new();
-    for item in list(args[0])? {
-        // SAFETY: argument heap is live for the BIF call.
-        let tuple = unsafe { item.tuple_ref() }.ok_or(BifError::BADARG)?;
-        if tuple.len() != 2 {
-            return Err(BifError::BADARG);
-        }
-        pairs.push((tuple.get(0).unwrap(), tuple.get(1).unwrap()));
-    }
-    let result = arinsal_maps::from_list(&pairs, &mut ctx.heap);
-    mapped(ctx, result)
+    let mut walk = MapsBuildWalk::from_list(args[0]);
+    let mut reds = i64::MAX;
+    walk.step(ctx, &mut reds)?.ok_or(BifError::BADARG)
 }
 fn from_keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let keys = list(args[0])?;
-    let result = arinsal_maps::from_keys(&keys, args[1], &mut ctx.heap);
-    mapped(ctx, result)
+    let mut walk = MapsBuildWalk::from_keys(args[0], args[1]);
+    let mut reds = i64::MAX;
+    walk.step(ctx, &mut reds)?.ok_or(BifError::BADARG)
 }
 fn keys(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let items = mapped(ctx, arinsal_maps::keys(args[0]))?;
-    Ok(make_list(ctx, items, Term::NIL))
+    projection(ctx, args[0], true)
 }
 fn values(ctx: &mut Ctx<'_>, args: &[Term]) -> Result<Term, BifError> {
-    let items = mapped(ctx, arinsal_maps::values(args[0]))?;
-    Ok(make_list(ctx, items, Term::NIL))
+    projection(ctx, args[0], false)
+}
+
+fn projection(ctx: &mut Ctx<'_>, map: Term, keys: bool) -> Result<Term, BifError> {
+    match MapsProjectionWalk::start(ctx, map, keys)? {
+        ProjectionStart::Done(value) => Ok(value),
+        ProjectionStart::Walk(mut walk) => {
+            let mut reds = i64::MAX;
+            while !walk.step(&mut reds) {}
+            Ok(walk.finish())
+        }
+    }
 }
 
 /// Resumable `maps:keys/1` / `maps:values/1` over a hashmap.
 ///
 /// Port of erts/emulator/beam/erl_map.c:2801-2880 (hashmap_keys, hashmap_values), OTP-29.1.1:
-/// the entries are walked backwards and consed on, one reduction per entry. The partial list
-/// cannot be written into heap space across yields in safe code, so the visited items wait in
-/// a vector and are consed when the walk ends.
+/// the entries are walked backwards and consed on, one reduction per entry. The full output
+/// block is reserved before the walk, so each step writes its cons cell directly into it.
 pub struct MapsProjectionWalk {
     iter: arinsal_term::MapReverseIter,
     keys: bool,
-    items: Vec<Term>,
+    output: arinsal_term::ConsListBuilder,
 }
 
 /// Outcome of starting a projection.
@@ -146,11 +144,11 @@ impl MapsProjectionWalk {
             }
             arinsal_maps::CheckedMapKind::Hashmap(_) => {
                 let iter = arinsal_term::MapReverseIter::new(map).expect("checked hashmap");
-                Ok(ProjectionStart::Walk(Self {
-                    iter,
-                    keys,
-                    items: Vec::new(),
-                }))
+                // Port of erl_map.c:2847 / :2888: reserve the entire CONS block before walking.
+                let output = arinsal_term::TermBuilder::new(&mut ctx.heap)
+                    .reserve_cons_list(checked.size())
+                    .expect("infallible BIF heap");
+                Ok(ProjectionStart::Walk(Self { iter, keys, output }))
             }
         }
     }
@@ -159,7 +157,10 @@ impl MapsProjectionWalk {
     /// the walk is complete.
     pub fn step(&mut self, reds: &mut i64) -> bool {
         for (key, value) in self.iter.by_ref() {
-            self.items.push(if self.keys { key } else { value });
+            let item = if self.keys { key } else { value };
+            self.output
+                .prepend(item)
+                .expect("reserved projection list length");
             *reds -= 1;
             if *reds <= 0 {
                 return false;
@@ -169,9 +170,10 @@ impl MapsProjectionWalk {
     }
 
     /// Cons the visited items; the backwards walk leaves them in reverse list order.
-    pub fn finish(mut self, ctx: &mut Ctx<'_>) -> Term {
-        self.items.reverse();
-        make_list(ctx, self.items, Term::NIL)
+    pub fn finish(self) -> Term {
+        self.output
+            .finish(Term::NIL)
+            .expect("all hashmap entries were projected")
     }
 }
 

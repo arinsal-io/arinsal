@@ -5,7 +5,7 @@ const C1: u64 = 0x87c3_7b91_1142_53d5;
 const C2: u64 = 0x4cf5_ad43_2745_937f;
 
 // Port of erts/emulator/beam/erl_term_hashing.c:1750 (ihash_mix64), OTP-29.1.1.
-#[inline]
+#[inline(always)]
 fn mix64(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -105,8 +105,13 @@ impl Jobs {
 }
 /// OTP `erts_internal_hash` for terms on this VM's heap.
 /// Port of `erts/emulator/beam/erl_term_hashing.c:1770` (`make_internal_hash`), OTP-29.1.1.
+#[inline(always)]
 pub fn internal_hash(term: Term) -> u64 {
-    internal_salted_hash(term, 0)
+    if term.bits() & 3 == 3 {
+        mix64(term.bits())
+    } else {
+        internal_salted_hash(term, 0)
+    }
 }
 /// `erts_internal_hash` of an immediate term given by its word, as the loader computes
 /// for `i_get_map_element_hash` and the JIT's `emit_internal_hash_helper` does inline.

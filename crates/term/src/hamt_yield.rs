@@ -15,6 +15,7 @@ use crate::{HeapAlloc, HeapBlockBuilder, Term, TermBuilder, TermError, TermKind}
 use smallvec::{SmallVec, smallvec};
 use std::cell::Cell;
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 /// Consume `$n` reductions and leave the machine in phase `$next`; yields when the budget is
 /// used up. Port of the code YCF generates for `YCF_CONSUME_REDS` (ycf_yield_fun.c:592-610).
@@ -31,7 +32,17 @@ macro_rules! tick {
 
 thread_local! {
     /// `esdp->rand_state`: per-scheduler counter hashed by `erts_sched_local_random`.
-    static RAND_STATE: Cell<u64> = const { Cell::new(0) };
+    static RAND_STATE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+static NOSCHED_RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the term builder's `esdp->rand_state` from its owning scheduler data address.
+///
+/// Port of erts/emulator/beam/erl_process.c:6083 (init_scheduler_data), OTP-29.1.1.
+pub fn initialize_scheduler_random(scheduler_data: *const ()) {
+    let address = scheduler_data as usize as u64;
+    RAND_STATE.with(|state| state.set(Some(address.wrapping_add(address << 32))));
 }
 
 // Port of HALLOC_EXTRA in erts/emulator/beam/erl_map.c:112, OTP-29.1.1.
@@ -51,16 +62,15 @@ fn random_hash_64_to_32(mut key: u64) -> u32 {
 
 // Port of erts/emulator/beam/erl_process.h:3054 (erts_sched_local_random), OTP-29.1.1.
 fn sched_local_random(additional_seed: u64) -> u32 {
-    RAND_STATE.with(|state| {
-        let mut value = state.get();
-        if value == 0 {
-            // erl_process.c:6083 seeds from the scheduler's own address.
-            let address = std::ptr::from_ref(state) as usize as u64;
-            value = address.wrapping_add(address << 32);
+    let value = RAND_STATE.with(|state| match state.get() {
+        Some(value) => {
+            state.set(Some(value.wrapping_add(1)));
+            Some(value)
         }
-        state.set(value.wrapping_add(1));
-        random_hash_64_to_32(value.wrapping_add(additional_seed))
-    })
+        None => None,
+    });
+    let value = value.unwrap_or_else(|| NOSCHED_RANDOM_STATE.fetch_add(1, AtomicOrdering::Relaxed));
+    random_hash_64_to_32(value.wrapping_add(additional_seed))
 }
 
 /// Which `erts_qsort` comparison a sort uses.
@@ -281,6 +291,23 @@ impl Qsort {
             }
         }
     }
+}
+
+/// Sort HAMT records with `erts_qsort` outside a yielding BIF body.
+///
+/// Port of erts/emulator/beam/utils.c:3685-3689 (erts_qsort), OTP-29.1.1.
+pub(crate) fn qsort_nodes(nodes: &mut [HxNode], key_order: bool) {
+    if nodes.len() < 2 {
+        return;
+    }
+    let kind = if key_order {
+        SortKey::Key
+    } else {
+        SortKey::Hash
+    };
+    let mut qsort = Qsort::new(kind, nodes.len());
+    let mut reductions = i64::MAX;
+    assert!(qsort.step(nodes, &mut reductions));
 }
 
 // Port of erts/emulator/beam/utils.c:3466-3484 (erts_qsort_swap), OTP-29.1.1.

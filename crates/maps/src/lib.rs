@@ -11,6 +11,7 @@
 use arinsal_term::{
     HeapAlloc, Term, TermError, TermKind, cmp, exact_eq, global_atoms, internal_hash,
 };
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 
 mod merge;
@@ -277,8 +278,9 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
     is_update: bool,
     heap: &mut H,
 ) -> MapResult<Term> {
-    let mut path = [(map, 0_u32, 0_u32); MAX_HAMT_DEPTH];
-    let mut depth = 0;
+    // Port of `DECLARE_ESTACK` in erts/emulator/beam/global.h:337, OTP-29.1.1:
+    // start with 16 uninitialized inline slots and grow only when the path needs them.
+    let mut path: SmallVec<[(Term, u32, u32); 16]> = SmallVec::new();
     let mut node = map;
     let mut level = 0;
     let hash = internal_hash(key);
@@ -336,8 +338,7 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
                     new_key = false;
                 }
                 need_words += 1 + arity + usize::from(!found);
-                path[depth] = (node, index as u32, if found { 0 } else { FRAME_INSERT });
-                depth += 1;
+                path.push((node, index as u32, if found { 0 } else { FRAME_INSERT }));
                 break;
             }
 
@@ -345,8 +346,7 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
             let index = slot(hash, level);
             if kind == 2 {
                 need_words += 18;
-                path[depth] = (node, index as u32, index as u32);
-                depth += 1;
+                path.push((node, index as u32, index as u32));
                 node = term(*ptr.add(2 + index));
                 level += 1;
                 continue;
@@ -361,12 +361,11 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
             }
             need_words +=
                 1 + usize::from(kind == 3) + bitmap.count_ones() as usize + usize::from(!occupied);
-            path[depth] = (
+            path.push((
                 node,
                 child_index as u32,
                 index as u32 | if occupied { 0 } else { FRAME_INSERT },
-            );
-            depth += 1;
+            ));
             if !occupied {
                 break;
             }
@@ -440,7 +439,7 @@ fn hashmap_insert<H: HeapAlloc + ?Sized>(
             }
         }
 
-        for &(frame, compact_index, meta) in path[..depth].iter().rev() {
+        for &(frame, compact_index, meta) in path.iter().rev() {
             let source = frame.raw_ptr();
             let h = *source;
             let added = meta & FRAME_INSERT != 0;
@@ -1123,7 +1122,11 @@ fn flatmap_take<H: HeapAlloc + ?Sized>(
         (i < n).then_some(i)
     };
     let Some(found) = found else {
-        heap.release(start.wrapping_add(need_words), start);
+        let end = start.wrapping_add(need_words);
+        if heap.release_needs_filler(end, start) {
+            output[0].write(((need_words as u64 - 1) << 6) | POS_BIG_SUBTAG);
+        }
+        heap.release(end, start);
         return Ok(None);
     };
     let keys = if n == 1 {
@@ -1249,8 +1252,10 @@ macro_rules! release {
     ($heap:expr, $end:expr, $start:expr) => {{
         let (end, start): (*mut u64, *mut u64) = ($end, $start);
         let words = (end as usize).saturating_sub(start as usize) / 8;
-        if words > 0 {
+        if words > 0 && HeapAlloc::release_needs_filler($heap, end, start) {
             start.write(((words as u64 - 1) << 6) | POS_BIG_SUBTAG);
+        }
+        if words > 0 {
             HeapAlloc::release($heap, end, start);
         }
     }};
@@ -1291,8 +1296,13 @@ pub fn put<H: HeapAlloc + ?Sized>(
     value: Term,
     heap: &mut H,
 ) -> MapResult<Term> {
-    check(map)?;
-    if map.is_hashmap() {
+    // `erts_maps_put` branches once on the map header; keep the validated
+    // header for the flatmap/HAMT dispatch instead of classifying the term twice.
+    // Port of erts/emulator/beam/erl_map.c:2105-2111 (erts_maps_put), OTP-29.1.1.
+    let Some(header) = map.header().filter(|header| header & 63 == MAP) else {
+        return Err(MapError::Badmap(map));
+    };
+    if header & 0xc0 != 0 {
         return hashmap_insert(map, key, value, false, heap);
     }
     // SAFETY: check() established a live flatmap; every write stays inside the
@@ -1316,6 +1326,7 @@ pub fn put<H: HeapAlloc + ?Sized>(
         }
         let ks = term(*mp.add(2)).raw_ptr().add(1);
         let vs = mp.add(FLATMAP_HEADER_WORDS);
+        let raw_key = bits(key);
 
         // Only allocate for values, assuming the key tuple stays intact.
         let first = FLATMAP_HEADER_WORDS + n;
@@ -1326,22 +1337,33 @@ pub fn put<H: HeapAlloc + ?Sized>(
         *shp.add(1) = n as u64;
         *shp.add(2) = *mp.add(2);
         let hp = shp.add(FLATMAP_HEADER_WORDS);
-        let raw_key = bits(key);
         let immed = is_immed(key);
         let mut i = 0;
-        while i < n {
-            let candidate = *ks.add(i);
-            if candidate == raw_key || (!immed && exact_eq(term(candidate), key)) {
-                if *vs.add(i) == bits(value) {
-                    release!(heap, shp.add(first), shp);
-                    return Ok(map);
+        if immed {
+            while i < n {
+                if *ks.add(i) == raw_key {
+                    break;
                 }
-                *hp.add(i) = bits(value);
-                std::ptr::copy_nonoverlapping(vs.add(i + 1), hp.add(i + 1), n - i - 1);
-                return Ok(boxed(shp));
+                *hp.add(i) = *vs.add(i);
+                i += 1;
             }
-            *hp.add(i) = *vs.add(i);
-            i += 1;
+        } else {
+            while i < n {
+                if exact_eq(term(*ks.add(i)), key) {
+                    break;
+                }
+                *hp.add(i) = *vs.add(i);
+                i += 1;
+            }
+        }
+        if i < n {
+            if *vs.add(i) == bits(value) {
+                release!(heap, shp.add(first), shp);
+                return Ok(map);
+            }
+            *hp.add(i) = bits(value);
+            std::ptr::copy_nonoverlapping(vs.add(i + 1), hp.add(i + 1), n - i - 1);
+            return Ok(boxed(shp));
         }
 
         // The map grows.
@@ -1422,18 +1444,32 @@ pub fn update<H: HeapAlloc + ?Sized>(
         let hp = shp.add(FLATMAP_HEADER_WORDS);
         let raw_key = bits(key);
         let immed = is_immed(key);
-        for i in 0..n {
-            let candidate = *ks.add(i);
-            if candidate == raw_key || (!immed && exact_eq(term(candidate), key)) {
-                if *vs.add(i) == bits(value) {
-                    release!(heap, shp.add(need_words), shp);
-                    return Ok(map);
+        let mut i = 0;
+        if immed {
+            while i < n {
+                if *ks.add(i) == raw_key {
+                    break;
                 }
-                *hp.add(i) = bits(value);
-                std::ptr::copy_nonoverlapping(vs.add(i + 1), hp.add(i + 1), n - i - 1);
-                return Ok(boxed(shp));
+                *hp.add(i) = *vs.add(i);
+                i += 1;
             }
-            *hp.add(i) = *vs.add(i);
+        } else {
+            while i < n {
+                if exact_eq(term(*ks.add(i)), key) {
+                    break;
+                }
+                *hp.add(i) = *vs.add(i);
+                i += 1;
+            }
+        }
+        if i < n {
+            if *vs.add(i) == bits(value) {
+                release!(heap, shp.add(need_words), shp);
+                return Ok(map);
+            }
+            *hp.add(i) = bits(value);
+            std::ptr::copy_nonoverlapping(vs.add(i + 1), hp.add(i + 1), n - i - 1);
+            return Ok(boxed(shp));
         }
         release!(heap, shp.add(need_words), shp);
         Err(MapError::Badkey(key))

@@ -7108,6 +7108,7 @@ fn worker_loop<T: Task>(inner: Arc<Inner<T>>, id: usize, local: Local<T>) {
     // Port of erts/emulator/beam/erl_process.c:5994 (init_scheduler_data), OTP-29.1.1: one
     // data block per scheduler, owned by its thread for the scheduler's lifetime.
     let mut scheduler_data = T::SchedulerData::default();
+    arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&scheduler_data).cast());
     native_sender::install(Rc::new(WorkerSender {
         inner: Arc::clone(&inner),
         local: Rc::downgrade(&local_cell),
@@ -7597,6 +7598,7 @@ fn dirty_scheduler_loop<T: Task>(inner: Arc<Inner<T>>, kind: DirtyKind, index: u
     // Port of erts/emulator/beam/erl_process.c:5994 (init_scheduler_data for a dirty
     // scheduler), OTP-29.1.1.
     let mut scheduler_data = T::SchedulerData::default();
+    arinsal_term::initialize_scheduler_random(std::ptr::from_ref(&scheduler_data).cast());
     let pool = &inner.dirty[kind.index()];
     let thread = &pool.threads[index];
     let slot = pool.first_slot + index;

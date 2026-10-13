@@ -297,26 +297,31 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
             if n == n1 && keys1.is_literal() && !keys2.is_literal() {
                 map2.flatmap_replace_keys(keys1);
             }
-            output[0].write(heap_filler_header(words_needed));
-            heap.release(output_ptr.wrapping_add(words_needed), output_ptr);
+            let end = output_ptr.wrapping_add(words_needed);
+            if heap.release_needs_filler(end, output_ptr) {
+                output[0].write(heap_filler_header(words_needed));
+            }
+            heap.release(end, output_ptr);
             return Ok(map2);
         } else if n == n1 {
             output[2].write(bits(keys1));
             let release_from = values_start + n;
-            output[release_from].write(heap_filler_header(words_needed - release_from));
-            heap.release(
-                output_ptr.wrapping_add(words_needed),
-                output_ptr.wrapping_add(release_from),
-            );
+            let start = output_ptr.wrapping_add(release_from);
+            let end = output_ptr.wrapping_add(words_needed);
+            if heap.release_needs_filler(end, start) {
+                output[release_from].write(heap_filler_header(words_needed - release_from));
+            }
+            heap.release(end, start);
             return Ok(boxed(output_ptr));
         } else {
             output[values_start + n].write(heap_filler_header(unused_size));
             let release_from = keys_start + n;
-            output[release_from].write(heap_filler_header(words_needed - release_from));
-            heap.release(
-                output_ptr.wrapping_add(words_needed),
-                output_ptr.wrapping_add(release_from),
-            );
+            let start = output_ptr.wrapping_add(release_from);
+            let end = output_ptr.wrapping_add(words_needed);
+            if heap.release_needs_filler(end, start) {
+                output[release_from].write(heap_filler_header(words_needed - release_from));
+            }
+            heap.release(end, start);
         }
     }
     let merged = boxed(output_ptr);
@@ -338,7 +343,6 @@ fn flatmap_merge<H: HeapAlloc + ?Sized>(
 /// Port of erts/emulator/beam/erl_map.c:1467-1476, OTP-29.1.1. `srcA`/`srcB`
 /// are pointers into the parent's child words in erts; here they are a node
 /// and a word index, or the root term held by the frame itself.
-#[derive(Clone, Copy)]
 struct Frame {
     node_a: Term,
     node_b: Term,
@@ -350,7 +354,7 @@ struct Frame {
     /// `&1`: unique A content in this node; `&2`: unique B content.
     mix: u8,
     ix: usize,
-    array: [u64; 16],
+    array: SmallVec<[u64; 16]>,
 }
 
 #[derive(Clone, Copy)]
@@ -436,7 +440,7 @@ impl HashmapMergeContext {
             rbm: 0,
             mix: 0,
             ix: 0,
-            array: [0; 16],
+            array: SmallVec::new(),
         });
         Self {
             size: hashmap_size(map_a) + hashmap_size(map_b),
@@ -497,8 +501,12 @@ fn merge_collision_node<H: HeapAlloc + ?Sized>(
     debug_assert!(arity >= 2);
     words[0].write((arity as u64) << 6);
     if out < capacity {
-        words[out].write(heap_filler_header(capacity - out));
-        heap.release(ptr.wrapping_add(capacity), ptr.wrapping_add(out));
+        let start = ptr.wrapping_add(out);
+        let end = ptr.wrapping_add(capacity);
+        if heap.release_needs_filler(end, start) {
+            words[out].write(heap_filler_header(capacity - out));
+        }
+        heap.release(end, start);
     }
     Ok(boxed(ptr))
 }
@@ -618,7 +626,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     ctx.lvl -= 1;
                     let child_mix = ctx.stack.pop().expect("merge stack").mix;
                     let sp = ctx.stack.last_mut().expect("merge stack");
-                    sp.array[sp.ix] = bits(child);
+                    sp.array.push(bits(child));
                     sp.ix += 1;
                     sp.mix |= child_mix;
                     if sp.rbm != 0 {
@@ -628,6 +636,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                 } else if ctx.lvl < HAMT_MAX_LEVEL {
                     let sp = ctx.stack.last_mut().expect("merge stack");
                     sp.ix = 0;
+                    sp.array.clear();
                     sp.rbm = sp.abm | sp.bbm;
                     debug_assert!(!(sp.rbm == 0 && ctx.lvl > 0));
                 } else {
@@ -666,12 +675,12 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                         clash = true;
                         break;
                     }
-                    sp.array[sp.ix] = bits(sp.src_a.next());
+                    sp.array.push(bits(sp.src_a.next()));
                     sp.ix += 1;
                     sp.mix |= 1;
                 } else {
                     debug_assert!(sp.bbm & bit != 0);
-                    sp.array[sp.ix] = bits(sp.src_b.next());
+                    sp.array.push(bits(sp.src_b.next()));
                     sp.ix += 1;
                     sp.mix |= 2;
                 }
@@ -689,7 +698,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     rbm: 0,
                     mix: 0,
                     ix: 0,
-                    array: [0; 16],
+                    array: SmallVec::new(),
                 });
                 continue 'traverse;
             }
@@ -716,7 +725,7 @@ fn hashmap_merge_loop<H: HeapAlloc + ?Sized>(
                     // Port of sys_memcpy(hp, sp->array, sp->ix * sizeof(Eterm)),
                     // erl_map.c:1793, OTP-29.1.1.
                     words[header_words..header_words + sp.ix]
-                        .write_copy_of_slice(&sp.array[..sp.ix]);
+                        .write_copy_of_slice(sp.array.as_slice());
                     boxed(ptr)
                 }
                 mix => unreachable!("strange mix {mix}"),
@@ -898,12 +907,37 @@ fn flatmap_if_small<H: HeapAlloc + ?Sized>(res: Term, heap: &mut H) -> Result<Te
     if hashmap_size(res) > LIMIT {
         return Ok(res);
     }
-    let mut entries = Vec::with_capacity(hashmap_size(res));
-    super::collect(res, &mut entries);
-    entries.sort_by(|a, b| key_cmp(a.0, b.0));
-    let ks: SmallVec<[Term; LIMIT]> = entries.iter().map(|p| p.0).collect();
-    let vs: SmallVec<[Term; LIMIT]> = entries.iter().map(|p| p.1).collect();
-    flatmap_from_sorted(&ks, &vs, heap)
+    // Port of erl_map.c:555-588 (`hashmap_from_validated_list`): write the
+    // iterator entries into the final flatmap block, then sort key/value slots
+    // in place with erts_validate_and_sort_flatmap (erl_map.c:3187-3212).
+    let size = hashmap_size(res);
+    let words = 4 + 2 * size;
+    let (block, ptr) = arinsal_term::alloc_terms(heap, words)?;
+    block[0] = term((size as u64) << 6);
+    let map_at = 1 + size;
+    block[map_at] = term(MAP_HEADER_FLATMAP);
+    block[map_at + 1] = term(size as u64);
+    block[map_at + 2] = term(ptr as u64 | 2);
+    let (before_values, values) = block.split_at_mut(4 + size);
+    let keys = &mut before_values[1..1 + size];
+    let values = &mut values[..size];
+    let mut iter = arinsal_term::MapReverseIter::new(res).expect("hashmap result");
+    for (key, value) in keys.iter_mut().zip(values.iter_mut()) {
+        let (next_key, next_value) = iter.next().expect("hashmap size matches iterator");
+        *key = next_key;
+        *value = next_value;
+    }
+    assert!(iter.next().is_none());
+
+    for index in 1..size {
+        let mut at = index;
+        while at > 0 && key_cmp(keys[at], keys[at - 1]) == Ordering::Less {
+            keys.swap(at, at - 1);
+            values.swap(at, at - 1);
+            at -= 1;
+        }
+    }
+    Ok(boxed(ptr.wrapping_add(map_at)))
 }
 
 /// Yielding `hashmap_from_validated_list` from the point where the input list has been walked

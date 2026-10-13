@@ -78,7 +78,7 @@ pub struct MapRuntime {
     pub update_assoc: MapUpdateHelper,
     /// Runtime exact update; zero signals a missing key.
     pub update_exact: MapUpdateHelper,
-    /// Single-pair associative update (`erts_maps_put`): key, value, map.
+    /// Single-pair associative update (`erts_maps_put`): key, value, map, live X count.
     pub put_single: MapUpdateHelper,
     /// Shared single-pair exact update fragment (`erts_maps_update`).
     pub update_single_exact_shared: usize,
@@ -990,7 +990,7 @@ impl BeamModuleAssembler {
 
     // Port of erts/emulator/beam/jit/arm/instr_map.cpp:579-598,686-694, OTP-29.1.1: a
     // single pair goes to `erts_maps_put`/`erts_maps_update` in argument registers; those
-    // never collect, and `erts_maps_update` writes its result through `TMP_MEM1`.
+    // helpers consume the operands directly. `erts_maps_update` writes through `TMP_MEM1`.
     fn emit_map_single(
         &mut self,
         src: ArgVal,
