@@ -1726,8 +1726,9 @@ pub(crate) fn monitor_light(
     Some(Ok(ref_term))
 }
 
-/// `demonitor(Ref)` / `demonitor(Ref, [])` called directly from native code (erts bif.c:437-454,
-/// the local monitor case). Flush and info, aliases, port and remote monitors take the executor.
+/// `demonitor(Ref)` / `demonitor(Ref, Opts)` called directly from native code (erts bif.c:437-454
+/// and the local monitor case). Aliases, port and remote monitors take the executor. A flush
+/// with the monitor already gone traps to `flush_monitor_messages`, so that case also falls back.
 // Port of erts/emulator/beam/bif.c:437-454 (demonitor), OTP-29.1.1.
 pub(crate) fn demonitor_light(
     process: &mut Process,
@@ -1738,9 +1739,10 @@ pub(crate) fn demonitor_light(
         [reference, options] => (*reference, *options),
         _ => return None,
     };
-    if options != Term::NIL || crate::trace::active() {
+    if crate::trace::active() {
         return None;
     }
+    let (flush, info) = demonitor_flags(options)?;
     let id = ref_id(reference)?;
     let cold = process.cold.as_ref()?;
     if cold.aliases.contains(&id)
@@ -1749,17 +1751,26 @@ pub(crate) fn demonitor_light(
     {
         return None;
     }
+    let active = cold.monitors.get(&id).copied();
+    if active.is_none() && flush {
+        return None;
+    }
     let me = process.self_pid?;
     let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
-    if let Some(pid) = process.cold_mut().monitors.remove(&id) {
+    let scheduler = rt.scheduler().ok()?;
+    let result = if let Some(pid) = active {
+        process.cold_mut().monitors.remove(&id);
         rt.update_published_monitored_by(pid, me, id, false);
-        // The executor ignores a dead target here as well.
-        let _ = rt
-            .scheduler()
-            .ok()?
-            .signal_ordered(me, pid, arinsal_sched::Signal::Demonitor(id));
-    }
-    Some(Ok(atom("true")))
+        // erts consumes the held process monitor instead of sending the demonitor when it can
+        // (erl_proc_sig_queue.c:1104). The executor ignores a dead target here as well.
+        if !flush || !scheduler.cancel_pending_monitor(pid, id) {
+            let _ = scheduler.signal_ordered(me, pid, arinsal_sched::Signal::Demonitor(id));
+        }
+        atom("true")
+    } else {
+        atom(if info { "false" } else { "true" })
+    };
+    Some(Ok(result))
 }
 
 /// `unlink(Pid)` called directly from native code (erts unlink_1 with `c_p`) with tracing off.
