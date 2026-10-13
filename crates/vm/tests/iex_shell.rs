@@ -2,30 +2,57 @@ use similar_asserts::assert_eq;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Concurrent IEx startup can drop the OTP PTY prompt under test load.
 static IEX_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn shim_dir() -> &'static Path {
-    static SHIM: OnceLock<PathBuf> = OnceLock::new();
-    SHIM.get_or_init(|| {
+/// A directory holding an `erl` symlink to the release binary. It is unique per use (a reused
+/// pid must not meet a stale directory) and is removed again when the test thread ends.
+struct ShimDir(PathBuf);
+
+impl ShimDir {
+    fn new() -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let binary = root.join("target/release/arinsal");
         assert!(binary.is_file(), "build target/release/arinsal first");
-        let dir = std::env::temp_dir().join(format!("arinsal-iex-shell-{}", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "arinsal-iex-shell-{}-{}-{nanos}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(binary.canonicalize().unwrap(), dir.join("erl")).unwrap();
-        dir
-    })
+        Self(dir)
+    }
+}
+
+impl Drop for ShimDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+thread_local! {
+    // The thread-local destructor runs when the test thread exits.
+    static SHIM: ShimDir = ShimDir::new();
+}
+
+fn shim_dir() -> PathBuf {
+    SHIM.with(|shim| shim.0.clone())
 }
 
 fn env_path(shim: bool) -> String {
     let base = std::env::var_os("PATH").unwrap_or_default();
     let mut paths = Vec::new();
     if shim {
-        paths.push(shim_dir().to_path_buf());
+        paths.push(shim_dir());
     }
     paths.extend(std::env::split_paths(&base));
     std::env::join_paths(paths)

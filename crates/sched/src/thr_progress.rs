@@ -704,6 +704,24 @@ fn reached(progress: &ThrProgress, val: u64) -> bool {
     progress.has_reached(val)
 }
 
+/// Whether the first later operation of this managed thread became runnable: the global
+/// thread progress value reached it.
+///
+/// Port of erts/emulator/beam/erl_process.c:2285-2320 (handle_thr_prgr_later_op compares the
+/// first operation with `erts_thr_progress_current()`), OTP-29.1.1. `scheduler_wait` publishes
+/// its sleeping flags first and then looks at this again, so a wakeup that came before the
+/// flags were set is not lost.
+pub(crate) fn scheduler_later_op_ready() -> bool {
+    with_tpd(|tpd| {
+        tpd.is_some_and(|tpd| {
+            let current = tpd.progress.current.load(Ordering::Acquire);
+            tpd.later_ops
+                .front()
+                .is_some_and(|(later, _)| has_reached_this(current, *later))
+        })
+    })
+}
+
 /// Run a blocking wait without holding back thread progress: a waiting managed thread
 /// counts as waiting, so a thread blocking progress never waits for it.
 ///
