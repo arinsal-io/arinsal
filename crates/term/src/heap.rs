@@ -2816,10 +2816,11 @@ pub struct BinaryRef<'a> {
     start: usize,
     bits: usize,
     referenced_size: usize,
+    off_heap: bool,
 }
-impl BinaryRef<'_> {
+impl<'a> BinaryRef<'a> {
     /// Whole backing bytes; unused bits may be present at the ends.
-    pub fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
     /// Number of significant bits.
@@ -2833,6 +2834,11 @@ impl BinaryRef<'_> {
     /// Size in bytes of the backing binary owner, or the heap bitstring itself.
     pub fn referenced_size(&self) -> usize {
         self.referenced_size
+    }
+    /// Whether an off-heap binary (refc, external or writable) owns the bytes, like a
+    /// non-null `BinRef` from `ERTS_GET_BITSTRING_REF` in erts; on-heap bitstrings do not.
+    pub fn is_off_heap(&self) -> bool {
+        self.off_heap
     }
 }
 impl Term {
@@ -2857,13 +2863,15 @@ impl Term {
                 start: 0,
                 bits,
                 referenced_size: bits.div_ceil(8),
+                off_heap: false,
             })
         } else if header & 63 == SUB_BITS {
             // SAFETY: SUB_BITS stores start/end and a live original in word four.
             let (start, end, original) =
                 unsafe { (*p.add(2) as usize, *p.add(3) as usize, Term(*p.add(4))) };
             let adjustment = owner_adjustment(original) * 8;
-            let (base, referenced_size) = if original.header().is_some_and(|h| h & 63 == BIN_REF) {
+            let off_heap = original.header().is_some_and(|h| h & 63 == BIN_REF);
+            let (base, referenced_size) = if off_heap {
                 // Port of erts/emulator/beam/erl_bif_binary.c:2520-2530, OTP-29.1.1.
                 // SAFETY: original is a retained BinRef and the caller prevents mutation.
                 unsafe {
@@ -2896,6 +2904,7 @@ impl Term {
                 start: start - adjustment,
                 bits: end - start,
                 referenced_size,
+                off_heap,
             })
         } else {
             None
