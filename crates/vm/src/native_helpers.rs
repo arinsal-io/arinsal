@@ -3987,7 +3987,6 @@ fn map_single(
         crate::native_hooks::from_raw(value),
         crate::native_hooks::from_raw(map),
     );
-    // HAlloc: these helpers never collect, so the heap may spill into fragments.
     let mut heap = crate::ProcessHeapHandle(&mut process.heap);
     let result = if exact {
         arinsal_maps::update(map, key, value, &mut heap)
@@ -3998,7 +3997,9 @@ fn map_single(
         Ok(term) => {
             // HAlloc advances HTOP; the map update leaves E unchanged.
             process.header.htop = process.heap.heap_cursor().0;
-            if let Some(registers) = registers {
+            if exact {
+                let registers =
+                    registers.expect("exact map update enters with scheduler registers");
                 debug_assert_eq!(
                     result_pointer,
                     registers.tmp_mem.as_mut_ptr() as usize as u64

@@ -1049,10 +1049,8 @@ fn maps_projection(
         }
         let walk = guard.take().ok_or(BifError::BADARG)?;
         drop(guard);
-        let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-        let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
         return Ok(HandlerResult::Done {
-            value: walk.finish(&mut ctx),
+            value: walk.finish(),
             reductions,
         });
     }
@@ -1084,9 +1082,7 @@ fn maps_projection(
             reductions,
         });
     }
-    let mut heap = arinsal_bifs::ProcessHeapHandle(&mut process.heap);
-    let mut ctx = arinsal_bifs::Ctx::with_fcalls(&mut heap, &mut process.reductions);
-    let value = walk.finish(&mut ctx);
+    let value = walk.finish();
     Ok(HandlerResult::Done { value, reductions })
 }
 

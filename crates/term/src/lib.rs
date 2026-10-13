@@ -54,7 +54,7 @@ pub use hamt::{
     hashmap_key_hash, hashmap_leaves, hashmap_leaves_hashed, hashmap_node_children,
     swizzle_map_hash,
 };
-pub use hamt_yield::{HashmapBuild, MapReverseIter};
+pub use hamt_yield::{HashmapBuild, MapReverseIter, initialize_scheduler_random};
 pub use hash::{make_hash, make_hash2, phash, phash2, phash2_range};
 pub use heap::{
     AdoptError, BinaryRef, CP_WORDS, ConsHeapBuilder, ConsHeapChain, ConsHeapSegment,

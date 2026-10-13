@@ -258,6 +258,7 @@ impl HxNode {
 /// Reverse the 4-bit path slots of `hash` so that sorting orders by HAMT path.
 ///
 /// Port of erts/emulator/beam/erl_map.c:4170 (swizzle_map_hash), OTP-29.1.1.
+#[inline(always)]
 pub fn swizzle_map_hash(hash: u64) -> u64 {
     const MASK: u64 = 0xF0F0_F0F0_F0F0_F0F0;
     let result = hash.swap_bytes();
@@ -327,6 +328,7 @@ pub(crate) fn produce_words<H: HeapAlloc + ?Sized>(
 ///
 /// Port of erts/emulator/beam/erl_map.c:731-732 (hashmap_make_hash, swizzle_map_hash),
 /// OTP-29.1.1.
+#[inline(always)]
 pub fn hashmap_key_hash(key: Term) -> u64 {
     swizzle_map_hash(internal_hash(key))
 }
@@ -388,8 +390,7 @@ pub fn hashmap_from_unsorted_array<H: HeapAlloc + ?Sized>(
 ) -> Result<Option<Term>, TermError> {
     let n = hxns.len();
     assert!(n > 0);
-    // hxnodecmp sorts by descending swizzled hash.
-    hxns.sort_unstable_by_key(|node| std::cmp::Reverse(node.hx));
+    crate::hamt_yield::qsort_nodes(hxns, false);
     let mut ix = 0;
     let mut cx = 0;
     while ix < n - 1 {
@@ -398,10 +399,7 @@ pub fn hashmap_from_unsorted_array<H: HeapAlloc + ?Sized>(
             while jx < n && hxns[ix].hx == hxns[jx].hx {
                 jx += 1;
             }
-            // hxnodecmpkey: CMP_TERM order of the keys within the region.
-            hxns[ix..jx].sort_unstable_by(|a, b| {
-                crate::heap::exact_flat_key_cmp(leaf_key(a.val), leaf_key(b.val), false)
-            });
+            crate::hamt_yield::qsort_nodes(&mut hxns[ix..jx], true);
             while ix < jx {
                 let mut lx = ix;
                 loop {
