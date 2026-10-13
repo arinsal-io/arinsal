@@ -2130,7 +2130,7 @@ pub(crate) fn cloexec_publish<R>(body: impl FnOnce() -> R) -> R {
     body()
 }
 
-fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
+pub(crate) fn duplicate_fd(fd: RawFd) -> std::io::Result<OwnedFd> {
     cloexec_publish(|| {
         unsafe extern "C" {
             fn dup(fd: i32) -> i32;

@@ -27,7 +27,16 @@ run(Case) ->
         names -> names();
         udp -> udp();
         sctp -> sctp();
-        inet6 -> inet6()
+        inet6 -> inet6();
+        sendfile -> sendfile();
+        sendfile_large -> sendfile_large();
+        sendfile_ranges -> sendfile_ranges();
+        sendfile_queued -> sendfile_queued();
+        sendfile_errors -> sendfile_errors();
+        sendfile_raw -> sendfile_raw();
+        sendfile_reset -> sendfile_reset();
+        sendfile_active_true -> sendfile_active_true();
+        sendfile_active_once -> sendfile_active_once()
     end.
 
 tcp(Extra) ->
@@ -183,6 +192,215 @@ inet6() ->
     {ok, P} = inet:port(L),
     ok = gen_tcp:close(L),
     is_integer(P) andalso P > 0.
+
+sendfile() ->
+    Payload = list_to_binary([integer_to_list(N) || N <- lists:seq(1, 20000)]),
+    Path = "/tmp/inet_tcp_diff_sendfile_" ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = prim_file:write_file(Path, Payload),
+    {ok, L} = gen_tcp:listen(0, tcp([binary, {active, false}])),
+    {ok, Port} = inet:port(L),
+    Parent = self(),
+    spawn(fun() ->
+        {ok, S} = gen_tcp:accept(L, 2000),
+        {ok, Got} = gen_tcp:recv(S, byte_size(Payload), 2000),
+        Parent ! {received, Got}
+    end),
+    {ok, C} = gen_tcp:connect({127,0,0,1}, Port, tcp([binary, {active, false}]), 2000),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    Sent = file:sendfile(Fd, C, 0, 0, []),
+    Ranged = file:sendfile(Fd, C, 10, 5, []),
+    ok = file:close(Fd),
+    Received = receive {received, Bin} -> Bin =:= Payload after 2000 -> timeout end,
+    gen_tcp:close(C),
+    gen_tcp:close(L),
+    ok = prim_file:delete(Path),
+    {Sent, Ranged, Received}.
+
+sf_file(Payload) ->
+    Path = "/tmp/inet_tcp_diff_sendfile_" ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = prim_file:write_file(Path, Payload),
+    Path.
+
+sf_pair(Opts, Receiver) ->
+    {ok, L} = gen_tcp:listen(0, tcp([binary, {active, false}])),
+    {ok, Port} = inet:port(L),
+    Parent = self(),
+    spawn(fun() ->
+        {ok, S} = gen_tcp:accept(L, 2000),
+        Parent ! {received, Receiver(S)}
+    end),
+    {ok, C} = gen_tcp:connect({127,0,0,1}, Port, tcp([binary | Opts]), 2000),
+    {L, C}.
+
+sf_received() ->
+    receive {received, Got} -> Got after 10000 -> timeout end.
+
+sf_recv_all(S, Acc) ->
+    case gen_tcp:recv(S, 0, 2000) of
+        {ok, Bin} -> sf_recv_all(S, [Acc, Bin]);
+        {error, closed} -> iolist_to_binary(Acc);
+        {error, Reason} -> {error, Reason, iolist_size(Acc)}
+    end.
+
+sf_slow_reader(S) ->
+    timer:sleep(200),
+    sf_recv_all(S, []).
+
+sf_cleanup(L, C, Path) ->
+    gen_tcp:close(C),
+    gen_tcp:close(L),
+    ok = prim_file:delete(Path).
+
+sf_big() ->
+    binary:copy(<<"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/">>, 128 * 1024).
+
+sendfile_large() ->
+    Payload = sf_big(),
+    Path = sf_file(Payload),
+    {L, C} = sf_pair([{active, false}], fun sf_slow_reader/1),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    Sent = file:sendfile(Fd, C, 0, 0, []),
+    ok = file:close(Fd),
+    ok = gen_tcp:close(C),
+    Got = sf_received(),
+    sf_cleanup(L, C, Path),
+    {Sent, Got =:= Payload}.
+
+sendfile_ranges() ->
+    Payload = binary:part(sf_big(), 0, 1000000),
+    Size = byte_size(Payload),
+    Path = sf_file(Payload),
+    {L, C} = sf_pair([{active, false}], fun sf_slow_reader/1),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    Ranges = [{0, 0}, {100, 1000}, {Size - 10, 0}, {Size - 10, 100},
+              {12345, 600000}, {Size, 0}, {Size, 10}, {Size + 5, 10}],
+    Results = [file:sendfile(Fd, C, Off, Len, []) || {Off, Len} <- Ranges],
+    Expected = iolist_to_binary(
+                 [case Len of
+                      0 when Off >= Size -> <<>>;
+                      0 -> binary:part(Payload, Off, Size - Off);
+                      _ when Off >= Size -> <<>>;
+                      _ -> binary:part(Payload, Off, min(Len, Size - Off))
+                  end || {Off, Len} <- Ranges]),
+    ok = file:close(Fd),
+    ok = gen_tcp:close(C),
+    Got = sf_received(),
+    sf_cleanup(L, C, Path),
+    {Results, Got =:= Expected}.
+
+sendfile_queued() ->
+    File = binary:copy(<<"file">>, 256 * 1024),
+    Path = sf_file(File),
+    Before = binary:copy(<<"before">>, 1024 * 1024),
+    After = <<"after">>,
+    {L, C} = sf_pair([{active, false}], fun sf_slow_reader/1),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    ok = gen_tcp:send(C, Before),
+    {ok, [{send_pend, Pending}]} = inet:getstat(C, [send_pend]),
+    Sent = file:sendfile(Fd, C, 0, 0, []),
+    ok = gen_tcp:send(C, After),
+    ok = file:close(Fd),
+    ok = gen_tcp:close(C),
+    Got = sf_received(),
+    sf_cleanup(L, C, Path),
+    {Pending > 0, Sent, Got =:= <<Before/binary, File/binary, After/binary>>}.
+
+sendfile_errors() ->
+    Path = sf_file(<<"abc">>),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    {ok, L} = gen_tcp:listen(0, tcp([binary, {active, false}])),
+    Unconnected = file:sendfile(Fd, L, 0, 0, []),
+    {ok, Port} = inet:port(L),
+    {ok, C} = gen_tcp:connect({127,0,0,1}, Port, tcp([binary, {active, false}]), 2000),
+    ok = gen_tcp:close(C),
+    Closed = file:sendfile(Fd, C, 0, 0, []),
+    Parent = self(),
+    {ok, C2} = gen_tcp:connect({127,0,0,1}, Port, tcp([binary, {active, false}]), 2000),
+    spawn(fun() ->
+        {ok, Fd2} = file:open(Path, [raw, read, binary]),
+        Parent ! {not_owner, file:sendfile(Fd2, C2, 0, 0, [])}
+    end),
+    NotOwner = receive {not_owner, R} -> R after 2000 -> timeout end,
+    Negative = file:sendfile(Fd, C2, -1, 0, []),
+    ok = file:close(Fd),
+    ok = gen_tcp:close(C2),
+    ok = gen_tcp:close(L),
+    ok = prim_file:delete(Path),
+    {Unconnected, Closed, NotOwner, Negative}.
+
+sendfile_raw() ->
+    Payload = sf_big(),
+    Size = byte_size(Payload),
+    Path = sf_file(Payload),
+    {L, C} = sf_pair([{active, false}], fun sf_slow_reader/1),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    Handle = prim_file:get_handle(Fd),
+    Op = 16#03f1a300 + 45,
+    BadLen = erlang:port_control(C, Op, <<1, 2, 3>>),
+    BadFd = erlang:port_control(C, Op, [<<-1:32/native>>, <<0:64>>, <<10:64>>]),
+    First = erlang:port_control(C, Op, [Handle, <<0:64>>, <<Size:64>>]),
+    Again = erlang:port_control(C, Op, [Handle, <<0:64>>, <<Size:64>>]),
+    Done = receive {sendfile, C, Res} -> Res after 10000 -> timeout end,
+    Zero = erlang:port_control(C, Op, [Handle, <<0:64>>, <<0:64>>]),
+    ZeroDone = receive {sendfile, C, Res2} -> Res2 after 10000 -> timeout end,
+    ok = file:close(Fd),
+    ok = gen_tcp:close(C),
+    Got = sf_received(),
+    sf_cleanup(L, C, Path),
+    {BadLen, BadFd, First, Again, Done, Zero, ZeroDone, Got =:= Payload}.
+
+sendfile_reset() ->
+    Path = sf_file(sf_big()),
+    Parent = self(),
+    {L, C} = sf_pair([{active, false}],
+                     fun(S) ->
+                         ok = inet:setopts(S, [{linger, {true, 0}}]),
+                         ok = gen_tcp:close(S),
+                         Parent ! reset,
+                         reset
+                     end),
+    receive reset -> ok after 2000 -> timeout end,
+    timer:sleep(100),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    Sent = file:sendfile(Fd, C, 0, 0, []),
+    After = gen_tcp:send(C, <<"x">>),
+    ok = file:close(Fd),
+    Got = sf_received(),
+    sf_cleanup(L, C, Path),
+    {Sent, After, Got}.
+
+sf_active_reader(Mode, Size) ->
+    fun(S) ->
+        ok = inet:setopts(S, [{active, Mode}]),
+        sf_active_loop(S, Mode, Size, [])
+    end.
+
+sf_active_loop(_S, _Mode, Left, Acc) when Left =< 0 ->
+    iolist_to_binary(Acc);
+sf_active_loop(S, Mode, Left, Acc) ->
+    receive
+        {tcp, S, Bin} ->
+            Mode =:= once andalso inet:setopts(S, [{active, once}]),
+            sf_active_loop(S, Mode, Left - byte_size(Bin), [Acc, Bin]);
+        {tcp_closed, S} -> {closed, iolist_size(Acc)}
+    after 5000 -> {timeout, iolist_size(Acc)}
+    end.
+
+sf_active(Mode, SenderOpts) ->
+    Payload = sf_big(),
+    Path = sf_file(Payload),
+    {L, C} = sf_pair(SenderOpts, sf_active_reader(Mode, byte_size(Payload))),
+    {ok, Fd} = file:open(Path, [raw, read, binary]),
+    Sent = file:sendfile(Fd, C, 0, 0, []),
+    ok = file:close(Fd),
+    Got = sf_received(),
+    sf_cleanup(L, C, Path),
+    Stray = receive {sendfile, _, _} = M -> M after 100 -> none end,
+    {Sent, Got =:= Payload, Stray}.
+
+sendfile_active_true() -> sf_active(true, [{active, true}]).
+
+sendfile_active_once() -> sf_active(once, [{active, once}]).
 "#
 }
 
@@ -215,6 +433,15 @@ fn gen_tcp_matches_erts() {
         "names",
         "inet6",
         "udp",
+        "sendfile",
+        "sendfile_large",
+        "sendfile_ranges",
+        "sendfile_queued",
+        "sendfile_errors",
+        "sendfile_raw",
+        "sendfile_reset",
+        "sendfile_active_true",
+        "sendfile_active_once",
     ] {
         let input = OwnedTerm::Atom(case.into());
         let expected = reference.call("inet_tcp_diff", "run", std::slice::from_ref(&input));
