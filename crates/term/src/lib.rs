@@ -85,7 +85,9 @@ pub use region::{
     BuiltList, DEFAULT_REGION_LIST_CONS, GrowingList, RegionBuilder, RegionRoots,
     SEND_COPY_LIMIT_WORDS, SharedRoot, is_region_term, region_owner, seal_for_send,
 };
-pub use rwmutex::{FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, set_reader_group};
+pub use rwmutex::{
+    FrequentReadGuard, FrequentReadRwLock, FrequentWriteGuard, set_reader_group, set_reader_groups,
+};
 pub use views::{BigRef, FlatMapRef, FloatRef, ListIter};
 
 use std::fmt;
