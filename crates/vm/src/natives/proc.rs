@@ -79,6 +79,38 @@ pub(crate) fn user_priority(process: &Process) -> Priority {
         .unwrap_or(Priority::Normal)
 }
 
+/// `process_flag/2` for the flags that need no scheduler context, called from native code. The
+/// others (`priority`, `message_queue_data`, `scheduler`, `monitor_nodes`, `max_heap_size`, ...)
+/// take the executor.
+// Port of erts/emulator/beam/bif.c:1955-2250 (process_flag_2), OTP-29.1.1.
+pub(crate) fn process_flag_ctxfree(process: &mut Process, name: Term, value: Term) -> Option<Term> {
+    let name = atom_name(name)?;
+    if !matches!(
+        name.as_str(),
+        "error_handler" | "async_dist" | "fullsweep_after" | "min_heap_size" | "min_bin_vheap_size"
+    ) {
+        return None;
+    }
+    flag(process, &name, value).ok()
+}
+
+/// `erts_internal:group_leader/2` with the caller as target: it sets its own leader.
+// Port of erts/emulator/beam/bif.c:4914 (erts_internal_group_leader_2), OTP-29.1.1.
+pub(crate) fn group_leader_self_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [leader, target] = args else {
+        return None;
+    };
+    let leader = Pid::from_term(*leader)?;
+    if Pid::from_term(*target)? != process.self_pid? {
+        return None;
+    }
+    set_group_leader(process, leader).ok()?;
+    Some(Ok(atom("true")))
+}
+
 fn flag(process: &mut Process, name: &str, value: Term) -> Result<Term, VmError> {
     let previous = match name {
         "trap_exit" => {

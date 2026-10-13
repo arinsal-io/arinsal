@@ -834,9 +834,9 @@ pub(crate) struct Runtime {
     /// `process_reg` (`regtab_rwmtx`). Names are atom indexes, not strings.
     pub(crate) reg: crate::register::RegisterTable,
     aliases: AliasTable,
-    pub(crate) timers: Mutex<HashMap<u64, arinsal_sched::TimerRef>>,
-    pub(crate) timer_owners: Mutex<HashMap<u64, Pid>>,
-    pub(crate) timer_messages: Mutex<HashMap<u64, arinsal_etf::OwnedTerm>>,
+    pub(crate) timers: Mutex<IdMap<arinsal_sched::TimerRef>>,
+    pub(crate) timer_owners: Mutex<IdMap<Pid>>,
+    pub(crate) timer_messages: Mutex<IdMap<arinsal_etf::OwnedTerm>>,
     pub(crate) next_trace_weak_id: AtomicU64,
     pub(crate) ports: Mutex<HashMap<u64, Arc<crate::port::PortHandle>>>,
     pub(crate) system_monitor: Mutex<Option<crate::natives::erts_debug::SystemMonitorState>>,
@@ -989,6 +989,27 @@ impl std::ops::DerefMut for SuspendTotals<'_> {
 impl Drop for SuspendTotals<'_> {
     fn drop(&mut self) {
         self.any.store(!self.guard.is_empty(), Ordering::Release);
+    }
+}
+
+/// A hash map keyed by a counter id (timer ids, reference ids): one multiply, no SipHash.
+pub(crate) type IdMap<V> = HashMap<u64, V, std::hash::BuildHasherDefault<IdHasher>>;
+
+/// Fibonacci hashing of one `u64` key; the counters it hashes are not adversarial.
+#[derive(Default)]
+pub(crate) struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) ^ u64::from(byte);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
 }
 
@@ -7624,9 +7645,9 @@ impl Vm {
             scheduler: OnceLock::new(),
             reg: crate::register::RegisterTable::new(),
             aliases: AliasTable::new(),
-            timers: Mutex::new(HashMap::new()),
-            timer_owners: Mutex::new(HashMap::new()),
-            timer_messages: Mutex::new(HashMap::new()),
+            timers: Mutex::new(IdMap::default()),
+            timer_owners: Mutex::new(IdMap::default()),
+            timer_messages: Mutex::new(IdMap::default()),
             next_trace_weak_id: AtomicU64::new(0),
             ports: Mutex::new(HashMap::new()),
             system_monitor: Mutex::new(None),

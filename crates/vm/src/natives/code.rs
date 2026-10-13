@@ -528,6 +528,49 @@ fn module_name(term: Term) -> Option<String> {
         .map(|name| name.to_string())
 }
 
+/// `erlang:module_loaded/1` called directly from native code.
+// Port of erts/emulator/beam/beam_bif_load.c:2548 (module_loaded_1), OTP-29.1.1: the module
+// table of the active code index.
+pub(crate) fn module_loaded_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [module] = args else {
+        return None;
+    };
+    let name = global_atoms().text(module.as_atom()?)?;
+    let tables = process.runtime.as_ref()?.active_code_tables();
+    Some(Ok(Term::atom(if tables.loaded.contains_key(name) {
+        atoms::TRUE
+    } else {
+        atoms::FALSE
+    })))
+}
+
+/// `erlang:function_exported/3` called directly from native code.
+// Port of erts/emulator/beam/beam_bif_load.c:2574 (function_exported_3), OTP-29.1.1.
+pub(crate) fn function_exported_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [module, function, arity] = args else {
+        return None;
+    };
+    let module = global_atoms().text(module.as_atom()?)?;
+    let function = global_atoms().text(function.as_atom()?)?;
+    let arity = u8::try_from(arity.as_small().filter(|n| (0..=255).contains(n))?).ok()?;
+    let tables = process.runtime.as_ref()?.active_code_tables();
+    let exported = tables
+        .loaded
+        .get(module)
+        .is_some_and(|id| tables.modules[*id].export_slot(function, arity).is_some());
+    Some(Ok(Term::atom(if exported {
+        atoms::TRUE
+    } else {
+        atoms::FALSE
+    })))
+}
+
 fn prepare(vm: &Vm, process: &mut Process, args: &[Term]) -> Result<Term, VmError> {
     let Some(name) = args.first().and_then(|arg| module_name(*arg)) else {
         return Err(badarg());

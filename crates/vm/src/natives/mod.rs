@@ -386,6 +386,17 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "exit" && arity == 2 {
         return Some(crate::signals::exit2_light);
     }
+    if module == "erts_internal" && function == "group_leader" && arity == 2 {
+        return Some(proc::group_leader_self_light);
+    }
+    if module == "erlang" {
+        match (function, arity) {
+            ("statistics", 1) => return Some(sys::statistics_light),
+            ("module_loaded", 1) => return Some(code::module_loaded_light),
+            ("function_exported", 3) => return Some(code::function_exported_light),
+            _ => {}
+        }
+    }
     maps::process_bif(module, function, arity)
 }
 

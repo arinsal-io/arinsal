@@ -6370,6 +6370,25 @@ trait NativeSend<M> {
     /// enqueued there directly. Gives the message back when the scheduler-local state is
     /// not available.
     fn send(&self, from: Pid, to: Pid, msg: M) -> Result<Result<(), Error>, M>;
+    /// Start a message timer for `target` owned by `owner` on this scheduler's wheel.
+    /// Gives the message back when the scheduler-local state is not available.
+    fn start_timer(
+        &self,
+        owner: Pid,
+        target: Pid,
+        ms: u64,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<Result<TimerRef, Error>, M>;
+    /// [`NativeSend::start_timer`] for a target resolved when the timer expires.
+    fn start_resolved_timer(
+        &self,
+        owner: Pid,
+        ms: u64,
+        resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+        msg: M,
+        wrapped: bool,
+    ) -> Result<Result<TimerRef, Error>, M>;
 }
 
 /// The handle a normal scheduler thread installs for native code: its own run queue state
@@ -6394,6 +6413,50 @@ impl<T: Task> NativeSend<T::Message> for WorkerSender<T> {
         Ok(self
             .inner
             .deliver(from, to, Payload::Message(msg), Some(&mut local)))
+    }
+
+    fn start_timer(
+        &self,
+        owner: Pid,
+        target: Pid,
+        ms: u64,
+        msg: T::Message,
+        wrapped: bool,
+    ) -> Result<Result<TimerRef, Error>, T::Message> {
+        let Some(local) = self.local.upgrade() else {
+            return Err(msg);
+        };
+        let Ok(mut local) = local.try_borrow_mut() else {
+            return Err(msg);
+        };
+        // Port of erts/emulator/beam/erl_hl_timer.c (erts_create_bif_timer on the calling
+        // scheduler's timer wheel), OTP-29.1.1.
+        Ok(self.inner.start_timer(
+            owner,
+            ms,
+            TimerPayload::Message(target, msg, wrapped),
+            Some(&mut local),
+            None,
+        ))
+    }
+
+    fn start_resolved_timer(
+        &self,
+        owner: Pid,
+        ms: u64,
+        resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+        msg: T::Message,
+        wrapped: bool,
+    ) -> Result<Result<TimerRef, Error>, T::Message> {
+        let Some(local) = self.local.upgrade() else {
+            return Err(msg);
+        };
+        let Ok(mut local) = local.try_borrow_mut() else {
+            return Err(msg);
+        };
+        Ok(self
+            .inner
+            .start_resolved_timer(owner, ms, resolve, msg, wrapped, Some(&mut local)))
     }
 }
 
@@ -6438,6 +6501,61 @@ pub fn native_send<M: SignalMessage>(from: Pid, to: Pid, msg: M) -> Result<Resul
         handle.send(from, to, msg.take().expect("message present"))
     });
     match sent {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(msg)) => Err(msg),
+        None => Err(msg.take().expect("message not sent")),
+    }
+}
+
+/// Start a message timer from native code on the calling scheduler's timer wheel.
+///
+/// Gives the message back when this thread is no normal scheduler (dirty schedulers, other
+/// threads); the caller then goes through the scheduler context instead.
+// Port of erts/emulator/beam/erl_hl_timer.c (erts_create_bif_timer reaches the timer wheel
+// through the calling scheduler's `esdp`), OTP-29.1.1.
+pub fn native_start_timer<M: SignalMessage>(
+    owner: Pid,
+    target: Pid,
+    ms: u64,
+    msg: M,
+    wrapped: bool,
+) -> Result<Result<TimerRef, Error>, M> {
+    let mut msg = Some(msg);
+    let started = native_sender::with::<M, _>(|handle| {
+        handle.start_timer(
+            owner,
+            target,
+            ms,
+            msg.take().expect("message present"),
+            wrapped,
+        )
+    });
+    match started {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(msg)) => Err(msg),
+        None => Err(msg.take().expect("message not sent")),
+    }
+}
+
+/// [`native_start_timer`] for a target resolved when the timer expires.
+pub fn native_start_resolved_timer<M: SignalMessage>(
+    owner: Pid,
+    ms: u64,
+    resolve: Arc<dyn Fn() -> Option<Pid> + Send + Sync>,
+    msg: M,
+    wrapped: bool,
+) -> Result<Result<TimerRef, Error>, M> {
+    let mut msg = Some(msg);
+    let started = native_sender::with::<M, _>(|handle| {
+        handle.start_resolved_timer(
+            owner,
+            ms,
+            Arc::clone(&resolve),
+            msg.take().expect("message present"),
+            wrapped,
+        )
+    });
+    match started {
         Some(Ok(result)) => Ok(result),
         Some(Err(msg)) => Err(msg),
         None => Err(msg.take().expect("message not sent")),
