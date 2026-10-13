@@ -6,7 +6,7 @@ use arinsal_vm::Vm;
 const SOURCE: &str = r#"
 -module(proc_sched).
 -export([
-    hibernate/0, suspend_order/0, suspend_opts/0, suspend_replies/0, suspend_exit/0, suspend_timer/0, suspend_busy/0, suspend_self/0, resume_plain/0,
+    hibernate/0, suspend_order/0, suspend_opts/0, suspend_replies/0, suspend_exit/0, suspend_timer/0, suspend_busy/0, suspend_self/0, suspend_stress/0, resume_plain/0,
     suspend_badopt/0, hibernate_heap_size/0, spawn_ok/0, spawn_missing/0, spawn_badopt/0, spawn_error_only/0,
     spawn_success_only_bad/0, spawn_reply_no/0, spawn_tag/0, spawn_link_order/0,
     spawn_monitor_ref/0, spawn_remote/0, spawn_bad_list/0, spawn_bad_fun/0,
@@ -164,6 +164,17 @@ suspend_busy() ->
 busy(Parent, N) ->
     receive after 0 -> ok end,
     busy(Parent, N + 1).
+
+suspend_stress() ->
+    %% A suspended process must keep handling its signals: the suspend and sync reply queued
+    %% behind a release were once left unhandled when it parked.
+    P = spawn(fun() -> receive stop -> ok end end),
+    [begin erlang:suspend_process(P, [asynchronous]), erlang:resume_process(P) end
+     || _ <- lists:seq(1, 5000)],
+    [begin erlang:suspend_process(P), erlang:resume_process(P) end
+     || _ <- lists:seq(1, 20000)],
+    P ! stop,
+    ok.
 
 suspend_self() -> caught(fun() -> erlang:suspend_process(self()) end).
 
@@ -355,6 +366,7 @@ fn proc_sched_matches_otp_29() {
         "suspend_exit",
         "suspend_timer",
         "suspend_busy",
+        "suspend_stress",
         "suspend_self",
         "resume_plain",
         "suspend_badopt",
