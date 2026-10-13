@@ -447,13 +447,44 @@ fn fragments() -> Option<&'static DispatchFragments> {
                         cleanup: crate::native_helpers::arinsal_beamasm_line_breakpoint_cleanup
                             as *const () as usize,
                     },
+                    apply3_resolver: crate::native_helpers::arinsal_beamasm_apply3_resolver
+                        as *const () as usize,
                 },
             )
             .ok()?;
             crate::fun_dispatch::init(fragments.unloaded_fun(), fragments.save_calls_fun());
+            if let Some((start, end)) = fragments.run_process() {
+                // The beam_run_process stub is a code range of its own (no module), so
+                // `enter_native_function` finds its arity: apply/3 takes three arguments.
+                // The stub has no module or function name, and erts creates no atom for it: the
+                // atom fields name an existing atom, so registration interns nothing at boot.
+                let names = arinsal_term::global_atoms();
+                let module = "$beam_run_process";
+                let undefined = names.get("undefined").expect("predefined atom");
+                let info = crate::NativeFunction {
+                    scope: 0,
+                    start,
+                    end,
+                    module: module.to_owned(),
+                    module_atom: undefined,
+                    function: module.to_owned(),
+                    function_atom: undefined,
+                    arity: 3,
+                    line: None,
+                    file: None,
+                    file_term: None,
+                    line_table: Vec::new(),
+                };
+                crate::register_native_function(info).expect("register run-process stub");
+            }
             Some(fragments)
         })
         .as_ref()
+}
+
+/// The beam_run_process stub, `(start, end)`, when native code is in use.
+pub(crate) fn run_process_entry() -> Option<(usize, usize)> {
+    fragments().and_then(DispatchFragments::run_process)
 }
 
 /// The unresolved or interpreted export entry used to distinguish an export table stub from

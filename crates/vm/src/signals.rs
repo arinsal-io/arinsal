@@ -557,7 +557,7 @@ fn each_list_item(term: Term, mut visit: impl FnMut(Term)) -> Option<()> {
     (current == Term::NIL).then_some(())
 }
 
-fn list(term: Term) -> Option<Vec<Term>> {
+pub(crate) fn list(term: Term) -> Option<Vec<Term>> {
     let mut values = Vec::new();
     each_list_item(term, |head| values.push(head))?;
     Some(values)
@@ -953,16 +953,6 @@ pub(crate) fn erl_create_process(
         .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?;
     let scheduler = rt.scheduler()?;
     let defaults = crate::natives::sys::gc_spawn_defaults(Some(&rt));
-    // The child starts at the spawned function's export when it exists. Otherwise it starts at
-    // erlang:apply/3 with mod, func and args in X0..X2, so an undefined function fails in the
-    // child (`undef`), as erts does, and the spawn itself succeeds. erts always starts at its
-    // `beam_run_process` apply_only instruction (erl_process.c:12616), which arinsal has no
-    // static instruction for yet; see the report.
-    let export = vm.spawn_export(m, f, args_list.len() as u8).ok();
-    let (module_id, entry) = match export {
-        Some(target) => target,
-        None => crate::process::erlang_apply_entry(vm)?,
-    };
     let mut child = Process::with_spawn_registers(args_list.len().max(3), 0);
     child.set_runtime(parent.runtime.clone());
     // Port of erts/emulator/beam/erl_process.c:12594 (min_heap_size rounded up by
@@ -1000,9 +990,10 @@ pub(crate) fn erl_create_process(
     }
     // `p->u.initial` is the spawned MFA, reported by process_info(initial_call); `p->i` is the
     // apply/3 entry the child starts at.
-    child.module = module_id;
-    child.ip = entry;
-    child.initial_call = Some((module_id, entry));
+    // Port of erts/emulator/beam/erl_process.c:12616 (`p->i = beam_run_process`): the child starts at
+    // the apply_only sentinel; its first run applies X0..X2 (Vm::resolve_run_process).
+    child.module = crate::process::RUN_PROCESS;
+    child.ip = 0;
     child.initial_mfa = Some((m, f, args_list.len() as u8));
     if let Ok(arity) = u8::try_from(args_list.len())
         && is_bif_export(m, f, arity)
@@ -1019,19 +1010,9 @@ pub(crate) fn erl_create_process(
         arinsal_term::copy_term_litopt(args, &mut heap, &literals)
             .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?
     };
-    if export.is_some() {
-        for (index, term) in list(copied_args)
-            .ok_or_else(|| badarg("erlang:spawn/3"))?
-            .into_iter()
-            .enumerate()
-        {
-            child.x[index] = term;
-        }
-    } else {
-        child.x[0] = module;
-        child.x[1] = function;
-        child.x[2] = copied_args;
-    }
+    child.x[0] = module;
+    child.x[1] = function;
+    child.x[2] = copied_args;
     // The link and monitor must be on the child before enqueue. Another scheduler can run
     // `code_server`'s on_load fun to `exit/1` before a Monitor signal sent after `spawn` is
     // delivered, and the DOWN is then lost. Port of erts/emulator/beam/erl_process.c

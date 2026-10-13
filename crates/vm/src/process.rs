@@ -1380,6 +1380,23 @@ impl Executor {
         // Port of erts/emulator/beam/erl_process.c:13152 (erl_create_process, sets I to the
         // export's code address), OTP-29.1.1: every process starts its function natively on
         // its first run; later runs continue wherever its interpreted or native continuation is.
+        // erts starts a spawned process at beam_run_process; its first run applies the MFA.
+        if !process.entry_started && process.module == RUN_PROCESS {
+            match crate::beamasm_integration::run_process_entry()
+                .filter(|_| crate::beamasm_integration::enabled())
+            {
+                // The native start is the beam_run_process stub, which applies X0..X2 itself. The
+                // process meanwhile holds erlang:apply/3 with those arguments, so the stub's
+                // interpreter fallback runs there (native_bridge.rs apply3 resolver).
+                Some((start, _)) => {
+                    let (module_id, entry) = erlang_apply_entry(&mut self.vm)?;
+                    process.module = module_id;
+                    process.ip = entry;
+                    process.native_pc = Some(start);
+                }
+                None => self.vm.resolve_run_process(process)?,
+            }
+        }
         let first_run = !std::mem::replace(&mut process.entry_started, true);
         if first_run
             && process.native_pc.is_none()
@@ -3656,6 +3673,43 @@ fn resume_after_native_return(process: &mut Process) -> bool {
 /// Port of erts/emulator/beam/erl_node_container_utils.h:128 (internal_pid_index), OTP-29.1.1.
 pub(crate) fn pid_table_index(pid: Pid) -> u32 {
     arinsal_term::ptab::process_table_layout().data2pix(pid.data())
+}
+
+/// Module id of the apply_only start point (erts `beam_run_process`, erl_process.c:12616). A
+/// process spawned but not yet run holds it in `module`; no module has this id.
+pub(crate) const RUN_PROCESS: usize = usize::MAX;
+
+impl Vm {
+    /// First run of a spawned process: erts' apply_only instruction (beam_common.c:1434 `apply`)
+    /// on X0..X2 (module, function, argument list). The export is the target when it exists;
+    /// otherwise the process starts at erlang:apply/3, so an undefined function fails in the
+    /// child with `undef`, as in erts.
+    pub(crate) fn resolve_run_process(&mut self, process: &mut Process) -> Result<(), VmError> {
+        let module = process.x[0]
+            .as_atom()
+            .ok_or_else(|| VmError::Unsupported("run_process module".into()))?;
+        let function = process.x[1]
+            .as_atom()
+            .ok_or_else(|| VmError::Unsupported("run_process function".into()))?;
+        let args = crate::signals::list(process.x[2])
+            .ok_or_else(|| VmError::Unsupported("run_process arguments".into()))?;
+        let (module_id, ip) = match self.spawn_export(module, function, args.len() as u8) {
+            Ok((module_id, ip)) => {
+                for (index, term) in args.iter().enumerate() {
+                    process.x[index] = *term;
+                }
+                (module_id, ip)
+            }
+            Err(_) => {
+                let (module_id, entry) = erlang_apply_entry(self)?;
+                (module_id, entry)
+            }
+        };
+        process.module = module_id;
+        process.ip = ip;
+        process.initial_call = Some((module_id, ip));
+        Ok(())
+    }
 }
 
 pub(crate) fn erlang_apply_entry(vm: &mut Vm) -> Result<(usize, usize), VmError> {
