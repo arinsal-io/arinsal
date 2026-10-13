@@ -370,6 +370,22 @@ pub(crate) fn process_bif(module: &str, function: &str, arity: u8) -> Option<Pro
     if module == "erlang" && function == "unregister" && arity == 1 {
         return Some(crate::signals::unregister_light);
     }
+    // erts `monitor_2`, `demonitor_1/2`, `unlink_1` and `exit_2` take `c_p` only for a local pid.
+    if module == "erlang" && function == "monitor" && arity == 2 {
+        return Some(crate::signals::monitor_light);
+    }
+    if module == "erlang" && function == "demonitor" && (arity == 1 || arity == 2) {
+        return Some(crate::signals::demonitor_light);
+    }
+    if module == "erlang" && function == "link" && arity == 1 {
+        return Some(crate::signals::link_light);
+    }
+    if module == "erlang" && function == "unlink" && arity == 1 {
+        return Some(crate::signals::unlink_light);
+    }
+    if module == "erlang" && function == "exit" && arity == 2 {
+        return Some(crate::signals::exit2_light);
+    }
     maps::process_bif(module, function, arity)
 }
 

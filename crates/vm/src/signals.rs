@@ -1686,6 +1686,165 @@ pub(crate) fn unregister_light(
     Some(Ok(atom("true")))
 }
 
+/// `monitor(process, Pid)` called directly from native code (erts `monitor_2`, bif.c:782-784
+/// and the local arm of erts_proc_sig_send_monitor). Only a live local pid with the default
+/// options takes this path; everything else returns `None` before any state changes.
+// Port of erts/emulator/beam/erl_proc_sig_queue.c:1090-1150 (erts_proc_sig_send_monitor),
+// OTP-29.1.1: the monitor is sent through the scheduler's held-monitor slot.
+pub(crate) fn monitor_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [kind, target] = args else {
+        return None;
+    };
+    if *kind != atom("process") || crate::trace::active() {
+        return None;
+    }
+    let me = process.self_pid?;
+    let pid = Pid::from_term(*target)?;
+    if pid == me {
+        return None;
+    }
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    if !rt.scheduler().ok()?.lookup(pid) {
+        return None;
+    }
+    let id = rt.next_ref();
+    let ref_term = reference(process, id).ok()?;
+    process.cold_mut().monitors.insert(id, pid);
+    if rt
+        .scheduler()
+        .ok()?
+        .signal_ordered(me, pid, arinsal_sched::Signal::Monitor(id))
+        .is_err()
+    {
+        process.cold_mut().monitors.remove(&id);
+        return None;
+    }
+    rt.update_published_monitored_by(pid, me, id, true);
+    Some(Ok(ref_term))
+}
+
+/// `demonitor(Ref)` / `demonitor(Ref, [])` called directly from native code (erts bif.c:437-454,
+/// the local monitor case). Flush and info, aliases, port and remote monitors take the executor.
+// Port of erts/emulator/beam/bif.c:437-454 (demonitor), OTP-29.1.1.
+pub(crate) fn demonitor_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let (reference, options) = match args {
+        [reference] => (*reference, Term::NIL),
+        [reference, options] => (*reference, *options),
+        _ => return None,
+    };
+    if options != Term::NIL || crate::trace::active() {
+        return None;
+    }
+    let id = ref_id(reference)?;
+    let cold = process.cold.as_ref()?;
+    if cold.aliases.contains(&id)
+        || cold.dist_monitors.contains(&id)
+        || cold.port_monitors.contains_key(&id)
+    {
+        return None;
+    }
+    let me = process.self_pid?;
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    if let Some(pid) = process.cold_mut().monitors.remove(&id) {
+        rt.update_published_monitored_by(pid, me, id, false);
+        // The executor ignores a dead target here as well.
+        let _ = rt
+            .scheduler()
+            .ok()?
+            .signal_ordered(me, pid, arinsal_sched::Signal::Demonitor(id));
+    }
+    Some(Ok(atom("true")))
+}
+
+/// `unlink(Pid)` called directly from native code (erts unlink_1 with `c_p`) with tracing off.
+// Port of erts/emulator/beam/bif.c (unlink_1), OTP-29.1.1.
+pub(crate) fn unlink_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target] = args else {
+        return None;
+    };
+    if crate::trace::active() {
+        return None;
+    }
+    let pid = Pid::from_term(*target)?;
+    let me = process.self_pid?;
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    let id = rt.next_ref();
+    process.cold_mut().unlinking.insert(id, pid);
+    rt.update_published_link(me, pid, false);
+    let _ = rt
+        .scheduler()
+        .ok()?
+        .signal_ordered(me, pid, arinsal_sched::Signal::Unlink(id));
+    Some(Ok(atom("true")))
+}
+
+/// `link(Pid)` called directly from native code (erts link_2 with `c_p`) for a live local pid
+/// other than the caller. A dead target, a self link and tracing take the executor.
+// Port of erts/emulator/beam/bif.c:1286 (link_2) and bif.c:180 (link_opt), OTP-29.1.1.
+pub(crate) fn link_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target] = args else {
+        return None;
+    };
+    if crate::trace::active() {
+        return None;
+    }
+    let pid = Pid::from_term(*target)?;
+    let me = process.self_pid?;
+    if pid == me {
+        return None;
+    }
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    if !rt.scheduler().ok()?.lookup(pid) {
+        return None;
+    }
+    // A refused signal means the target is gone: leave the link state untouched and let the
+    // executor answer noproc.
+    rt.scheduler()
+        .ok()?
+        .signal_ordered(me, pid, arinsal_sched::Signal::Link)
+        .ok()?;
+    process.cold_mut().links.insert(pid);
+    process.cold_mut().prio_links.remove(&pid);
+    rt.update_published_link(me, pid, true);
+    Some(Ok(atom("true")))
+}
+
+/// `exit(Pid, Reason)` called directly from native code (erts bif.c:1721 send_exit_signal_bif)
+/// for a local pid other than the caller.
+// Port of erts/emulator/beam/bif.c:1721 (send_exit_signal_bif), OTP-29.1.1.
+pub(crate) fn exit2_light(
+    process: &mut Process,
+    args: &[Term],
+) -> Option<Result<Term, crate::exceptions::Trap>> {
+    let [target, reason] = args else {
+        return None;
+    };
+    let pid = Pid::from_term(*target)?;
+    let me = process.self_pid?;
+    if pid == me {
+        return None;
+    }
+    let message = Message::copy_from(*reason).ok()?;
+    let rt = std::sync::Arc::clone(process.runtime.as_ref()?);
+    let _ = rt
+        .scheduler()
+        .ok()?
+        .signal_ordered(me, pid, arinsal_sched::Signal::Exit(message));
+    Some(Ok(atom("true")))
+}
+
 resolved_signal_handler!(register2, Register2);
 resolved_signal_handler!(unregister1, Unregister1);
 resolved_signal_handler!(whereis1, Whereis1);
