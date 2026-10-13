@@ -840,7 +840,7 @@ pub(crate) fn debug_info() -> DebugInfo {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -848,11 +848,14 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// Serializes tests that count the process-global poll set (`debug_info`).
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn check_io_one_shot_rearms_after_delivery() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(b"x").unwrap();
         let interest = InterestSet {
@@ -874,7 +877,9 @@ mod tests {
 
     #[test]
     fn check_io_many_concurrent_sockets() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let mut pairs = (0..24)
             .map(|_| UnixStream::pair().unwrap())
             .collect::<Vec<_>>();
@@ -899,7 +904,9 @@ mod tests {
 
     #[test]
     fn check_io_deselect_suppresses_delivery() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let (tx, rx) = mpsc::channel();
         let registration = register(
@@ -921,7 +928,9 @@ mod tests {
 
     #[test]
     fn check_io_stop_is_delivered_once() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (reader, writer) = UnixStream::pair().unwrap();
         let (tx, rx) = mpsc::channel();
         let _registration = register(
@@ -943,7 +952,9 @@ mod tests {
 
     #[test]
     fn check_io_deregister_after_ready_is_idempotent() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (reader, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(b"x").unwrap();
         let (tx, rx) = mpsc::channel();
@@ -965,7 +976,9 @@ mod tests {
 
     #[test]
     fn check_io_read_and_write_share_one_socket_registration() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let (read_tx, read_rx) = mpsc::channel();
         let (write_tx, write_rx) = mpsc::channel();
@@ -1002,7 +1015,9 @@ mod tests {
 
     #[test]
     fn check_io_driver_select_is_one_shot_until_task_executed() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let fd = reader.as_raw_fd();
         let (tx, rx) = mpsc::channel();
@@ -1037,7 +1052,9 @@ mod tests {
 
     #[test]
     fn check_io_driver_select_off_drops_event_and_other_owner_steals() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let fd = reader.as_raw_fd();
         let (tx, rx) = mpsc::channel::<u64>();

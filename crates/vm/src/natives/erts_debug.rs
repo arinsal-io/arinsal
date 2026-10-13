@@ -3074,6 +3074,9 @@ mod check_io_tests {
 
     #[test]
     fn check_io_debug_counts_live_nif_selection() {
+        let _guard = crate::check_io::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let previous = INTERNAL_STATE.swap(true, Ordering::Relaxed);
         let (reader, _writer) = UnixStream::pair().unwrap();
         let registration = crate::check_io::register(
