@@ -6,7 +6,7 @@ use arinsal_vm::Vm;
 const MODULE: &str = "re_run_yield";
 const SOURCE: &str = r#"
 -module(re_run_yield).
--export([kill/0, same_result/0]).
+-export([kill/0, same_result/0, kill_internal/0, internal_result/0]).
 kill() ->
     Subject = binary:copy(<<"hejsan">>, 100000),
     {ok, Compiled} = re:compile(<<"\\w+\\d">>, []),
@@ -16,6 +16,17 @@ kill() ->
          exit(Pid, kill),
          receive {'DOWN', MRef, process, Pid, Reason} -> Reason after 5000 -> timeout end
      end || RE <- [<<"\\w+\\d">>, Compiled]].
+kill_internal() ->
+    Subject = binary:copy(<<"hejsan">>, 100000),
+    {Pid, MRef} = spawn_monitor(fun() -> re:internal_run(Subject, <<"\\w+\\d">>, [], true) end),
+    erlang:yield(),
+    exit(Pid, kill),
+    receive {'DOWN', MRef, process, Pid, Reason} -> Reason after 5000 -> timeout end.
+internal_result() ->
+    S = binary:copy(<<"abc123 def456 ">>, 2000),
+    [re:internal_run(S, <<"\\d+">>, [{capture, all, binary}], true),
+     re:internal_run(S, <<"[a-z]+">>, [{offset, 40}], false),
+     (try re:internal_run(S, <<"\\d+">>, [], unknown) catch error:E -> {caught, E} end)].
 same_result() ->
     S = binary:copy(<<"abc123 def456 ">>, 2000),
     [re:run(S, <<"\\d+">>, [global, {capture, all, binary}]),
@@ -41,6 +52,14 @@ fn both(function: &str) -> (CallResult, CallResult) {
 fn a_long_match_can_be_killed() {
     let (expected, actual) = both("kill");
     assert_eq!(expected, actual);
+}
+
+#[test]
+fn internal_run_traps_with_the_restart_state() {
+    for function in ["kill_internal", "internal_result"] {
+        let (expected, actual) = both(function);
+        assert_eq!(expected, actual, "{function}");
+    }
 }
 
 #[test]
