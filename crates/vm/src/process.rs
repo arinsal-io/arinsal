@@ -4707,8 +4707,7 @@ impl Runtime {
         child.ip = ip;
         child.set_runtime(Some(Arc::clone(self)));
         child.cold_mut().group_leader = None;
-        child.cold_mut().initial_call =
-            Some((module.to_owned(), function.to_owned(), args.len() as u8));
+        child.initial_mfa = mfa_atoms(module, function, args.len() as u8);
         if let Some(linker) = linker {
             child.cold_mut().links.insert(linker);
         }
@@ -7502,7 +7501,7 @@ impl Vm {
         process.ip = ip;
         process.initial_call = Some((module_id, ip));
         process.set_runtime(Some(Arc::clone(runtime)));
-        process.cold_mut().initial_call = Some((module.to_owned(), function.to_owned(), 0));
+        process.initial_mfa = mfa_atoms(module, function, 0);
         if priority != arinsal_sched::Priority::Normal {
             let name = match priority {
                 arinsal_sched::Priority::Max => "max",
@@ -7703,8 +7702,7 @@ impl Vm {
                 .map_err(|error| VmError::Load(format!("first process arguments: {error:?}")))?;
         }
         process.set_runtime(Some(runtime.clone()));
-        process.cold_mut().initial_call =
-            Some((module.to_owned(), function.to_owned(), args.len() as u8));
+        process.initial_mfa = mfa_atoms(module, function, args.len() as u8);
         process.entry = true;
         // Port of erts/emulator/beam/beam_bif_load.c:793 (call_on_load_function_1), OTP-29.1.1.
         // A direct `eval_scheduled` has no `code_server` to run `-on_load` before the call.
@@ -7856,6 +7854,17 @@ fn scheduler_class(kind: arinsal_sched::SchedulerType) -> arinsal_bifs::Schedule
         arinsal_sched::SchedulerType::DirtyCpu => arinsal_bifs::SchedulerClass::DirtyCpu,
         arinsal_sched::SchedulerType::DirtyIo => arinsal_bifs::SchedulerClass::DirtyIo,
     }
+}
+
+/// `p->u.initial` for a system or spawned MFA given by name (atoms, as erts keeps them).
+fn mfa_atoms(
+    module: &str,
+    function: &str,
+    arity: u8,
+) -> Option<(arinsal_term::Atom, arinsal_term::Atom, u8)> {
+    let module = crate::signals::atom(module).as_atom()?;
+    let function = crate::signals::atom(function).as_atom()?;
+    Some((module, function, arity))
 }
 
 #[cfg(test)]

@@ -688,23 +688,6 @@ pub(crate) fn ref_id(term: Term) -> Option<u64> {
     }
 }
 
-fn arm_child_link_monitor(
-    child: &mut Process,
-    parent: arinsal_sched::Pid,
-    linked: bool,
-    monitored: bool,
-) -> Option<u64> {
-    if linked {
-        child.cold_mut().links.insert(parent);
-    }
-    if !monitored {
-        return None;
-    }
-    let id = arinsal_bifs::next_ref_id();
-    child.cold_mut().monitored_by.insert(id, parent);
-    Some(id)
-}
-
 #[allow(clippy::too_many_arguments)] // spawn_opt flags stay positional; packing them hides the monitor race.
 fn spawn_mfa(
     vm: &mut Vm,
@@ -757,8 +740,216 @@ fn is_bif_export(module: arinsal_term::Atom, function: arinsal_term::Atom, arity
         .contains(&(module, function, arity))
 }
 
-#[allow(clippy::too_many_arguments)] // spawn_opt flags stay positional; packing them hides the monitor race.
+#[allow(clippy::too_many_arguments)]
+// spawn_opt flags stay positional; packing them hides the monitor race.
 // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1.
+/// Spawn options of `erl_create_process` (erl_process.c:12437, `ErlSpawnOpts`).
+pub(crate) struct ErlSpawnOpts {
+    pub link: bool,
+    pub monitor: Option<SpawnMonitor>,
+    pub min_heap: Option<usize>,
+    pub min_bin_vheap: Option<usize>,
+    pub fullsweep: Option<u16>,
+    pub max_heap: Option<crate::process::MaxHeap>,
+    pub off_heap_queue: Option<bool>,
+    pub scheduler: Option<usize>,
+    pub priority: Priority,
+    /// The spawn_request reply the parent gets (erl_process.c:13146), if one is asked for.
+    pub reply: Option<SpawnReply>,
+}
+
+/// The spawn_request reply: `{Tag, Ref, ok, Pid}` sent to the parent before the child runs.
+pub(crate) struct SpawnReply {
+    pub tag: Term,
+    pub reference: Term,
+}
+
+/// The monitor the parent creates on the child. `id` is preallocated by `spawn_request`;
+/// otherwise `erl_create_process` allocates it.
+pub(crate) struct SpawnMonitor {
+    pub id: Option<u64>,
+    pub tag: Option<arinsal_etf::OwnedTerm>,
+    pub alias: bool,
+}
+
+/// What `erl_create_process` returns: the child and the monitor it set up, if any.
+pub(crate) struct CreatedProcess {
+    pub pid: Pid,
+    pub monitor: Option<u64>,
+}
+
+// Port of erts/emulator/beam/erl_process.c:12437 (erl_create_process), OTP-29.1.1. Every spawn
+// variant comes through here: the child starts at erlang:apply/3 with `mod`, `func` and `args`
+// in X0..X2, its links and monitors exist before it is inserted, and it is scheduled last.
+pub(crate) fn erl_create_process(
+    vm: &mut Vm,
+    parent: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    mfa: (Term, Term, Term),
+    so: ErlSpawnOpts,
+) -> Result<CreatedProcess, VmError> {
+    let (module, function, args) = mfa;
+    let m = module.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
+    let f = function.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
+    let args_list = list(args).ok_or_else(|| badarg("erlang:spawn/3"))?;
+    if args_list.len() > 1024 {
+        return Err(badarg("erlang:spawn/3"));
+    }
+    let rt = parent
+        .runtime
+        .clone()
+        .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?;
+    let scheduler = rt.scheduler()?;
+    let defaults = crate::natives::sys::gc_spawn_defaults(Some(&rt));
+    // The child starts at the spawned function's export when it exists. Otherwise it starts at
+    // erlang:apply/3 with mod, func and args in X0..X2, so an undefined function fails in the
+    // child (`undef`), as erts does, and the spawn itself succeeds. erts always starts at its
+    // `beam_run_process` apply_only instruction (erl_process.c:12616), which arinsal has no
+    // static instruction for yet; see the report.
+    let export = vm.spawn_export(m, f, args_list.len() as u8).ok();
+    let (module_id, entry) = match export {
+        Some(target) => target,
+        None => crate::process::erlang_apply_entry(vm)?,
+    };
+    let mut child = Process::with_spawn_registers(args_list.len().max(3), 0);
+    child.set_runtime(parent.runtime.clone());
+    // Port of erts/emulator/beam/erl_process.c:12594 (min_heap_size rounded up by
+    // erts_next_heap_size), OTP-29.1.1.
+    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
+        parent.runtime.as_deref(),
+        so.min_heap,
+        false,
+    );
+    if so.min_heap.is_some() {
+        child.heap = arinsal_term::ProcessHeap::with_words(min_heap.max(64));
+    }
+    child.heap.set_min_heap_size(min_heap);
+    // Port of erts/emulator/beam/erl_process.c:12222 (erts_parse_spawn_opts), OTP-29.1.1: an
+    // explicit min_bin_vheap_size alone takes the runtime default when no other heap option is set.
+    let min_bin_vheap =
+        if so.min_bin_vheap.is_some() && so.min_heap.is_none() && so.max_heap.is_none() {
+            defaults.min_bin_vheap_size as usize
+        } else {
+            crate::natives::sys::normalize_spawn_heap_minimum(
+                parent.runtime.as_deref(),
+                so.min_bin_vheap,
+                true,
+            )
+        };
+    child.heap.set_min_bin_vheap_size(min_bin_vheap as u64);
+    let fullsweep_after = so.fullsweep.unwrap_or(defaults.fullsweep_after);
+    child.heap.set_fullsweep_after(fullsweep_after);
+    let max_heap = so.max_heap.unwrap_or(defaults.max_heap_size);
+    if !crate::natives::proc::is_default_max_heap(max_heap) {
+        child.cold_mut().max_heap = max_heap;
+    }
+    if let Some(off_heap) = so.off_heap_queue {
+        child.cold_mut().off_heap_msgq = off_heap;
+    }
+    // `p->u.initial` is the spawned MFA, reported by process_info(initial_call); `p->i` is the
+    // apply/3 entry the child starts at.
+    child.module = module_id;
+    child.ip = entry;
+    child.initial_call = Some((module_id, entry));
+    child.initial_mfa = Some((m, f, args_list.len() as u8));
+    if let Ok(arity) = u8::try_from(args_list.len())
+        && is_bif_export(m, f, arity)
+        && let (Some(m_name), Some(f_name)) = (atom_name(module), atom_name(function))
+    {
+        child.cold_mut().initial_bif = Some((m_name, f_name, arity));
+    }
+    child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
+    // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is copied
+    // with copy_struct_litopt and the three arg registers take mod, func and the copy), OTP-29.1.1.
+    let literals = arinsal_term::LiteralAreas::current();
+    let copied_args = {
+        let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
+        arinsal_term::copy_term_litopt(args, &mut heap, &literals)
+            .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?
+    };
+    if export.is_some() {
+        for (index, term) in list(copied_args)
+            .ok_or_else(|| badarg("erlang:spawn/3"))?
+            .into_iter()
+            .enumerate()
+        {
+            child.x[index] = term;
+        }
+    } else {
+        child.x[0] = module;
+        child.x[1] = function;
+        child.x[2] = copied_args;
+    }
+    // The link and monitor must be on the child before enqueue. Another scheduler can run
+    // `code_server`'s on_load fun to `exit/1` before a Monitor signal sent after `spawn` is
+    // delivered, and the DOWN is then lost. Port of erts/emulator/beam/erl_process.c
+    // (spawn_opt monitor before schedule), OTP-29.1.1.
+    let parent_pid = ctx.pid();
+    if so.link {
+        child.cold_mut().links.insert(parent_pid);
+    }
+    let monitor_id = so
+        .monitor
+        .as_ref()
+        .map(|monitor| monitor.id.unwrap_or_else(arinsal_bifs::next_ref_id));
+    if let Some(id) = monitor_id {
+        child.cold_mut().monitored_by.insert(id, parent_pid);
+    }
+    let pid = if let Some(scheduler_id) = so.scheduler {
+        scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, so.priority)
+    } else {
+        scheduler.spawn_unscheduled_with_priority(child, so.priority)
+    }
+    .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
+    if so.link {
+        parent.cold_mut().links.insert(pid);
+    }
+    if crate::trace::spawn_interested(parent, parent_pid) {
+        let arg_list = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
+            .list_from_iter(args_list.iter().copied())
+            .map_err(|error| VmError::Unsupported(format!("spawn trace args: {error:?}")))?;
+        let mfa = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
+            .tuple(&[module, function, arg_list])
+            .map_err(|error| VmError::Unsupported(format!("spawn trace MFA: {error:?}")))?;
+        crate::trace::spawned(vm, parent, ctx, pid, mfa, so.link);
+    }
+    if let (Some(id), Some(monitor)) = (monitor_id, so.monitor.as_ref()) {
+        parent.cold_mut().monitors.insert(id, pid);
+        if let Some(tag) = monitor.tag.clone() {
+            parent.cold_mut().monitor_tags.insert(id, tag);
+        }
+        if monitor.alias {
+            parent.cold_mut().aliases.insert(id);
+            rt.alias_bind(id, Some(parent_pid));
+        }
+    }
+    if let Some(reply) = so.reply {
+        // Port of erts/emulator/beam/erl_process.c:13146 (erts_send_local_spawn_reply), OTP-29.1.1:
+        // the reply is queued from the child before the child can run, so the parent sees it
+        // ahead of anything the child sends.
+        let pid_term = pid
+            .to_term()
+            .ok_or_else(|| VmError::Unsupported("pid limit".into()))?;
+        let message = {
+            let mut heap = arinsal_bifs::FragmentingHeap(&mut parent.heap);
+            TermBuilder::new(&mut heap)
+                .tuple(&[reply.tag, reply.reference, atom("ok"), pid_term])
+                .map_err(|error| VmError::Unsupported(format!("spawn reply: {error:?}")))?
+        };
+        let envelope = Message::copy_from(message)?;
+        scheduler
+            .send(pid, parent_pid, envelope)
+            .map_err(|error| VmError::Unsupported(format!("spawn_reply: {error}")))?;
+    }
+    ctx.schedule_spawn(pid)
+        .map_err(|error| VmError::Unsupported(format!("schedule spawn: {error}")))?;
+    Ok(CreatedProcess {
+        pid,
+        monitor: monitor_id,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // spawn_opt flags stay positional; the BIF callers pass them so.
 fn spawn_mfa_with_priority(
     vm: &mut Vm,
     parent: &mut Process,
@@ -772,117 +963,43 @@ fn spawn_mfa_with_priority(
     scheduler_id: Option<usize>,
     priority: Priority,
 ) -> Result<Term, VmError> {
-    let (module, function, args) = mfa;
-    let m = module.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
-    let f = function.as_atom().ok_or_else(|| badarg("erlang:spawn/3"))?;
-    let args = list(args).ok_or_else(|| badarg("erlang:spawn/3"))?;
-    if args.len() > 1024 {
-        return Err(badarg("erlang:spawn/3"));
-    }
-    let (module_id, ip) = vm.spawn_export(m, f, args.len() as u8)?;
-    let mut child = Process::with_spawn_registers(args.len(), 0);
-    if let Some(words) = min_heap_size {
-        // Port of erts/emulator/beam/erl_process.c:12594 (erl_create_process, min_heap_size
-        // rounded up by erts_next_heap_size), OTP-29.1.1.
-        let words = crate::natives::sys::normalize_spawn_heap_minimum(
-            parent.runtime.as_deref(),
-            Some(words),
-            false,
-        );
-        child.heap = arinsal_term::ProcessHeap::with_words(words.max(64));
-        child.heap.set_min_heap_size(words);
-    }
-    let min_heap = crate::natives::sys::normalize_spawn_heap_minimum(
-        parent.runtime.as_deref(),
-        min_heap_size,
-        false,
-    );
-    child.heap.set_min_heap_size(min_heap);
-    child.module = module_id;
-    child.ip = ip;
-    child.initial_call = Some((module_id, ip));
-    // Port of erts/emulator/beam/erl_process.c:12940-13152 (erl_create_process), OTP-29.1.1:
-    // a spawned MFA naming a BIF runs the BIF itself, not the erlang.erl stub.
-    if let Ok(arity) = u8::try_from(args.len())
-        && is_bif_export(m, f, arity)
-        && let (Some(m_name), Some(f_name)) = (atom_name(module), atom_name(function))
-    {
-        child.cold_mut().initial_bif = Some((m_name, f_name, arity));
-    }
-    child.set_runtime(parent.runtime.clone());
-    // `p->u.initial` is the export the child starts at (`initial_call` module/ip).
-    // String copies and a cold record are not part of erl_create_process.
-    child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
-    // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: the whole `args`
-    // list is copied with size_object_litopt/copy_struct_litopt, its elements then move to the
-    // X registers), OTP-29.1.1. The list cells stay on the child heap, where call_memory counts
-    // them.
-    let literals = arinsal_term::LiteralAreas::current();
-    let copied_args = {
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut child.heap);
-        arinsal_term::copy_term_litopt(mfa.2, &mut heap, &literals)
-            .map_err(|error| VmError::Unsupported(format!("spawn arguments: {error:?}")))?
-    };
-    for (index, term) in list(copied_args)
-        .ok_or_else(|| badarg("erlang:spawn/3"))?
-        .into_iter()
-        .enumerate()
-    {
-        child.x[index] = term;
-    }
-    let rt = parent
-        .runtime
-        .clone()
-        .ok_or_else(|| VmError::Unsupported("spawn requires a scheduler".into()))?;
-    let scheduler = rt.scheduler()?;
-    // The link and monitor must be on the child before enqueue. Another
-    // scheduler can run `code_server`'s on_load fun to `exit/1` before a
-    // Monitor signal sent after `spawn` is delivered, and the DOWN is then lost.
-    // Port of erts/emulator/beam/erl_process.c (spawn_opt monitor before schedule), OTP-29.1.1.
+    // Spawn options reach the child set-up through the thread-local tuning, as erts passes
+    // `ErlSpawnOpts` down; `take` clears it on every path.
     let tuning = SpawnTuning::take();
-    tuning.apply_to_child(&mut child);
-    let monitor_id = arm_child_link_monitor(&mut child, ctx.pid(), linked, monitored);
-    let pid = if let Some(scheduler_id) = scheduler_id {
-        scheduler.spawn_unscheduled_on_with_priority(child, scheduler_id, priority)
-    } else {
-        scheduler.spawn_unscheduled_with_priority(child, priority)
-    }
-    .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-    if linked {
-        parent.cold_mut().links.insert(pid);
-    }
-    let pid_term = pid
+    let created = erl_create_process(
+        vm,
+        parent,
+        ctx,
+        mfa,
+        ErlSpawnOpts {
+            link: linked,
+            monitor: monitored.then_some(SpawnMonitor {
+                id: None,
+                tag: monitor_tag,
+                alias: monitor_alias,
+            }),
+            min_heap: min_heap_size,
+            min_bin_vheap: tuning.min_bin_vheap,
+            fullsweep: tuning.fullsweep,
+            max_heap: tuning.max_heap,
+            off_heap_queue: tuning.off_heap_queue,
+            scheduler: scheduler_id,
+            priority,
+            reply: None,
+        },
+    )?;
+    let pid_term = created
+        .pid
         .to_term()
         .ok_or_else(|| VmError::Unsupported("pid limit".into()))?;
-    if crate::trace::spawn_interested(parent, ctx.pid()) {
-        let arg_list = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
-            .list_from_iter(args.iter().copied())
-            .map_err(|error| VmError::Unsupported(format!("spawn trace args: {error:?}")))?;
-        let mfa = TermBuilder::new(&mut arinsal_bifs::FragmentingHeap(&mut parent.heap))
-            .tuple(&[module, function, arg_list])
-            .map_err(|error| VmError::Unsupported(format!("spawn trace MFA: {error:?}")))?;
-        crate::trace::spawned(vm, parent, ctx, pid, mfa, linked);
-    }
-    if let Some(id) = monitor_id {
-        parent.cold_mut().monitors.insert(id, pid);
-        if let Some(tag) = monitor_tag {
-            parent.cold_mut().monitor_tags.insert(id, tag);
-        }
-        if monitor_alias {
-            parent.cold_mut().aliases.insert(id);
-            rt.alias_bind(id, Some(ctx.pid()));
-        }
-        ctx.schedule_spawn(pid)
-            .map_err(|error| VmError::Unsupported(format!("schedule spawn: {error}")))?;
-        let ref_term = reference(parent, id)?;
-        let mut heap = arinsal_bifs::FragmentingHeap(&mut parent.heap);
-        return TermBuilder::new(&mut heap)
-            .tuple(&[pid_term, ref_term])
-            .map_err(|error| VmError::Unsupported(format!("spawn result: {error:?}")));
-    }
-    ctx.schedule_spawn(pid)
-        .map_err(|error| VmError::Unsupported(format!("schedule spawn: {error}")))?;
-    Ok(pid_term)
+    let Some(id) = created.monitor else {
+        return Ok(pid_term);
+    };
+    let ref_term = reference(parent, id)?;
+    let mut heap = arinsal_bifs::FragmentingHeap(&mut parent.heap);
+    TermBuilder::new(&mut heap)
+        .tuple(&[pid_term, ref_term])
+        .map_err(|error| VmError::Unsupported(format!("spawn result: {error:?}")))
 }
 
 /// `spawn_opt` GC and mailbox options that the child must carry from its first slice.
@@ -912,43 +1029,6 @@ impl SpawnTuning {
 
     fn take() -> SpawnTuning {
         SPAWN_TUNING.with(std::cell::Cell::take)
-    }
-
-    fn apply_to_child(&self, child: &mut Process) {
-        if let Some(fullsweep) = self.fullsweep {
-            child.heap.set_fullsweep_after(fullsweep);
-            child.cold_mut().flags.insert(
-                "fullsweep_after".to_owned(),
-                Term::small(i64::from(fullsweep)).unwrap(),
-            );
-        }
-        if let Some(words) = self.min_bin_vheap {
-            let words = crate::natives::sys::normalize_spawn_heap_minimum(
-                child.runtime.as_deref(),
-                Some(words),
-                true,
-            );
-            child.heap.set_min_bin_vheap_size(words as u64);
-            child.cold_mut().flags.insert(
-                "min_bin_vheap_size".to_owned(),
-                Term::small(words as i64).unwrap(),
-            );
-        }
-        // Port of erts/emulator/beam/erl_process.c:12565 (erl_create_process sets
-        // `p->max_heap_size` before the process is linked into the table), OTP-29.1.1.
-        let max_heap = self.max_heap.unwrap_or_else(|| {
-            crate::natives::sys::gc_spawn_defaults(child.runtime.as_deref()).max_heap_size
-        });
-        if !crate::natives::proc::is_default_max_heap(max_heap) {
-            child.cold_mut().max_heap = max_heap;
-        }
-        if let Some(off_heap) = self.off_heap_queue {
-            child.cold_mut().off_heap_msgq = off_heap;
-            child.cold_mut().flags.insert(
-                "message_queue_data".to_owned(),
-                atom(if off_heap { "off_heap" } else { "on_heap" }),
-            );
-        }
     }
 }
 

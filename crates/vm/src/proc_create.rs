@@ -135,6 +135,8 @@ pub struct Process {
     pub(crate) module: usize,
     pub(crate) ip: usize,
     pub(crate) initial_call: Option<(usize, usize)>,
+    /// `p->u.initial` (erl_process.c:12693): the MFA the process was spawned with, as atoms.
+    pub(crate) initial_mfa: Option<(arinsal_term::Atom, arinsal_term::Atom, u8)>,
     pub(crate) native_pc: Option<usize>,
     /// The entry process has been scheduled once (its native start is decided then).
     pub(crate) entry_started: bool,
@@ -814,9 +816,6 @@ pub(crate) struct ProcessCold {
     pub(crate) exit_reason: Option<Term>,
     /// Spawned MFA entry that resolves to a runtime BIF export.
     pub(crate) initial_bif: Option<(String, String, u8)>,
-    /// Spawn MFA reported by `process_info(Pid, initial_call)`
-    /// (erts: `ErtsProcess.u.initial`, set by `erts_create_process`).
-    pub(crate) initial_call: Option<(String, String, u8)>,
     /// GC requests received while GC was disabled (`erts_set_gc_state`); replayed
     /// once it is enabled again. Port of erl_process.c:10831 (`save_gc_task`).
     pub(crate) delayed_gc: Vec<DelayedGc>,
@@ -1151,6 +1150,7 @@ impl Process {
             module: 0,
             ip: 0,
             initial_call: None,
+            initial_mfa: None,
             native_pc: None,
             entry_started: false,
             gc_live: 0,
