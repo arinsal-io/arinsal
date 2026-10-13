@@ -1,9 +1,10 @@
 use arinsal_difftest::{CallResult, RefErl};
 use arinsal_vm::Vm;
+use similar_asserts::assert_eq;
 
 const SOURCE: &str = r#"
 -module(ets_vm_diff).
--export([basic/0, private_access/0, heir/0, owner_exit/0, giveaway/0, errors/0, fixed_locks/0, private_fixed_concurrency/0, compressed_fun/0, fun_roundtrips/0, select_chunk_ends/0, match_zero_variable/0, fix_time/0, binary_info/0, compressed_binary_info/0]).
+-export([basic/0, private_access/0, heir/0, owner_exit/0, giveaway/0, errors/0, fixed_locks/0, private_fixed_concurrency/0, compressed_fun/0, fun_roundtrips/0, select_chunk_ends/0, match_zero_variable/0, fix_time/0, binary_info/0, compressed_binary_info/0, concurrent_ordered_binary_info/0]).
 id(X) -> X.
 local_fun(X) -> X + 1.
 basic() ->
@@ -106,6 +107,10 @@ compressed_binary_info() ->
   T=ets:new(compressed_binary_info,[set,compressed]),
   B=list_to_binary(lists:seq(1,100)), true=ets:insert(T,{B,key}),
   Info=ets:info(T,binary), {length(Info),element(2,hd(Info)),byte_size(id(B))}.
+concurrent_ordered_binary_info() ->
+  T=ets:new(concurrent_ordered_binary_info,[ordered_set,public,{write_concurrency,true}]),
+  B=binary:copy(<<9>>,100), true=ets:insert(T,[{3,B},{1,B},{2,B}]),
+  lists:sort([{element(2,I),element(3,I)} || I <- ets:info(T,binary)]).
 "#;
 
 #[test]
@@ -132,6 +137,7 @@ fn ets_process_semantics_match_otp_29() {
         "fix_time",
         "binary_info",
         "compressed_binary_info",
+        "concurrent_ordered_binary_info",
     ] {
         let expected = reference.call("ets_vm_diff", function, &[]);
         let mut vm = Vm::new([]);

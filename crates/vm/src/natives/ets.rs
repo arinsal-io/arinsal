@@ -283,6 +283,15 @@ impl std::ops::Deref for TableGuard<'_> {
     }
 }
 
+impl std::ops::DerefMut for TableGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Write(table) => table,
+            Self::Read(_) => panic!("cannot mutably access a read-locked ETS table"),
+        }
+    }
+}
+
 // Port of erts/emulator/beam/erl_db.c:446-500 (db_lock read/write modes), OTP-29.1.1.
 fn table_guard<'a>(
     registry: &'a RegistryAccess<'_>,
@@ -499,7 +508,8 @@ pub(crate) fn direct_entry(module: &str, function: &str, arity: u8) -> Option<Di
         ("new", 2) => Some(direct_bif::<{ EtsBif::New as u8 }>),
         ("whereis", 1) => Some(direct_bif::<{ EtsBif::Whereis as u8 }>),
         ("rename", 2) => Some(direct_bif::<{ EtsBif::Rename as u8 }>),
-        ("info", 1 | 2) => Some(direct_bif::<{ EtsBif::Info as u8 }>),
+        ("info", 1) => Some(direct_bif::<{ EtsBif::Info as u8 }>),
+        ("info", 2) => Some(direct_info_2),
         ("delete", 2) => Some(direct_bif::<{ EtsBif::Delete as u8 }>),
         ("take", 2) => Some(direct_bif::<{ EtsBif::Take as u8 }>),
         ("slot", 2) => Some(direct_bif::<{ EtsBif::Slot as u8 }>),
@@ -536,6 +546,16 @@ fn direct_bif<const BIF: u8>(process: &mut Process, args: &[Term]) -> Option<Ter
     let function = EtsBif::from_u8(BIF);
     let result = call_inner(process, None, caller, function, args);
     finish_direct(process, function.name(), args, result)
+}
+
+/// `ets:info/2`: the `binary` item traps to an Erlang export, which only the scheduler path runs.
+// Port of erts/emulator/beam/erl_db.c:4541-4542 (ets_info_2: BIF_TRAP1 ets_info_binary_trap),
+// OTP-29.1.1.
+fn direct_info_2(process: &mut Process, args: &[Term]) -> Option<Term> {
+    if args.get(1).copied() == Some(atom("binary")) {
+        return None;
+    }
+    direct_bif::<{ EtsBif::Info as u8 }>(process, args)
 }
 
 /// Value of a finished direct call, or `Some` dummy with `freason` set after the failure has
@@ -1304,20 +1324,15 @@ fn call_inner(
             };
             // Port of erts/emulator/beam/erl_db.c:4532-4564 (ets_info_2, DB_INFO/LCK_READ),
             // OTP-29.1.1.
-            let table = table_guard(&registry, tid, true)?;
             if args.len() == 1 {
+                let table = table_guard(&registry, tid, true)?;
                 let schedulers = rt.scheduler()?.scheduler_count();
                 table
                     .info_list_for_schedulers(atom("nonode@nohost"), &mut heap, schedulers)
                     .map_err(err)
             } else {
                 let key = info_item_name(args[1]).ok_or_else(badarg)?;
-                if key == "binary" {
-                    let values = table.all_binary_info(&mut heap).map_err(err)?;
-                    return TermBuilder::new(&mut heap)
-                        .list_from_iter(values)
-                        .map_err(|_| system_limit());
-                }
+                let table = table_guard(&registry, tid, true)?;
                 let schedulers = if key == "memory" {
                     rt.scheduler()?.scheduler_count()
                 } else {
@@ -2473,7 +2488,34 @@ ets_entry!(entry_setopts, SetOpts, 2, "ets", "setopts");
 ets_entry!(entry_whereis, Whereis, 1, "ets", "whereis");
 ets_entry!(entry_rename, Rename, 2, "ets", "rename");
 ets_entry!(entry_info_1, Info, 1, "ets", "info");
-ets_entry!(entry_info_2, Info, 2, "ets", "info");
+fn entry_info_2(
+    vm: &mut Vm,
+    process: &mut Process,
+    ctx: &mut RunCtx<'_, Message>,
+    args: super::NativeArgs<'_>,
+) -> Option<Result<Term, VmError>> {
+    if args.len() != 2 {
+        return Some(Err(badarg()));
+    }
+    let (Some(target), Some(item)) = (args.get(process, 0), args.get(process, 1)) else {
+        return Some(Err(badarg()));
+    };
+    if item == atom("binary") {
+        // Port of erts/emulator/beam/erl_db.c:4541-4542 (ets_info_2 traps to
+        // ets_info_binary_trap), OTP-29.1.1. The Erlang export owns the walk so
+        // each raw ETS operation has its own reductions and releases its table lock.
+        return Some(Err(VmError::TrapExport(crate::ExportTrap {
+            continuation: "erts_internal:ets_info_binary/1",
+            args: vec![target],
+        })));
+    }
+    let _ = vm;
+    let ctx_pid = ctx.pid();
+    Some(args.with_values(process, |process, values| {
+        let result = call_inner(process, Some(ctx), ctx_pid, EtsBif::Info, values);
+        bif_frame("ets", "info", values, result)
+    }))
+}
 ets_entry!(entry_delete_1, Delete, 1, "ets", "delete");
 ets_entry!(entry_delete_2, Delete, 2, "ets", "delete");
 ets_entry!(entry_take, Take, 2, "ets", "take");
