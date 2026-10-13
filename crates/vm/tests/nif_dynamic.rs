@@ -295,6 +295,46 @@ fn tracer_mod_sequential_tracer_matches_erts() {
 }
 
 #[test]
+fn library_with_more_nifs_than_the_old_table_matches_erts() {
+    let Ok(erl) = RefErl::start() else {
+        eprintln!("erl unavailable; skipping dynamic NIF differential test");
+        return;
+    };
+    const COUNT: usize = 300;
+    let dir = work_dir("wide");
+    let mut c_source = String::from("#include \"erl_nif.h\"\n");
+    for index in 0..COUNT {
+        c_source.push_str(&format!(
+            "static ERL_NIF_TERM f{index}(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {{ (void)argc; (void)argv; return enif_make_int(env, {index}); }}\n"
+        ));
+    }
+    c_source.push_str("static ErlNifFunc funcs[] = {");
+    for index in 0..COUNT {
+        c_source.push_str(&format!("{{\"f{index}\", 0, f{index}, 0}},"));
+    }
+    c_source.push_str("};\nERL_NIF_INIT(nifdyn_wide, funcs, NULL, NULL, NULL, NULL)\n");
+    let library = compile_so(&dir, "nifdyn_wide", &c_source);
+    let names = (0..COUNT)
+        .map(|index| format!("f{index}/0"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let stubs = (0..COUNT)
+        .map(|index| format!("f{index}() -> erlang:nif_error(undef).\n"))
+        .collect::<String>();
+    let calls = (0..COUNT)
+        .map(|index| format!("f{index}()"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let module_src = format!(
+        "-module(nifdyn_wide).\n-export([run/0, {names}]).\n-nifs([{names}]).\nrun() ->\n    Loaded = erlang:load_nif(\"{}\", []),\n    Values = [{calls}],\n    {{Loaded, length(Values), lists:sum(Values), hd(Values), lists:last(Values)}}.\n{stubs}",
+        library.display()
+    );
+    compile_beam(&erl, &dir, "nifdyn_wide", &module_src);
+    assert_same(&dir, &erl, "nifdyn_wide");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn load_errors_and_roundtrip_match_erts() {
     let Ok(erl) = RefErl::start() else {
         eprintln!("erl unavailable; skipping dynamic NIF differential test");

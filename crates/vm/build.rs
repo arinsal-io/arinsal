@@ -16,12 +16,22 @@ fn main() {
     so_bindtodevice_cfg();
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let mut table = String::from("&[");
-    for index in 0..160 {
+    for index in 0..DYNAMIC_NIF_TRAMPOLINES {
         table.push_str(&format!("dyn_call::<{index}>,"));
     }
     table.push(']');
     fs::write(out.join("nif_trampolines.rs"), table).expect("write trampoline table");
+    fs::write(
+        out.join("nif_trampoline_count.rs"),
+        DYNAMIC_NIF_TRAMPOLINES.to_string(),
+    )
+    .expect("write trampoline count");
 }
+
+/// How many dynamically loaded NIF functions can be bound at once, across every loaded
+/// library. erts has no such limit; one real application (Explorer's Polars backend alone
+/// declares 436 NIFs, plus ADBC and crypto) needs several hundred.
+const DYNAMIC_NIF_TRAMPOLINES: usize = 1024;
 
 /// erts handles `bind_to_device` only `#ifdef SO_BINDTODEVICE` (inet_drv.c:7847, 9598,
 /// OTP-29.1.1), so the option exists exactly when the platform headers define it.

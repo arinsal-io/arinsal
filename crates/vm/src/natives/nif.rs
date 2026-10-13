@@ -21,7 +21,7 @@ use crate::calls;
 use crate::process::Message;
 use crate::{Process, Vm, VmError};
 
-const TRAMPOLINES: usize = 160;
+const TRAMPOLINES: usize = include!(concat!(env!("OUT_DIR"), "/nif_trampoline_count.rs"));
 
 const TRACER_FUNCTIONS: &[(&str, u8)] = &[
     ("trace", 5),
