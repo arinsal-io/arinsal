@@ -848,7 +848,6 @@ fn spawn_mfa_with_priority(
         scheduler.spawn_unscheduled_with_priority(child, priority)
     }
     .map_err(|error| VmError::Unsupported(format!("spawn: {error}")))?;
-    tuning.register(&rt, pid);
     if linked {
         parent.cold_mut().links.insert(pid);
     }
@@ -935,6 +934,14 @@ impl SpawnTuning {
                 Term::small(words as i64).unwrap(),
             );
         }
+        // Port of erts/emulator/beam/erl_process.c:12565 (erl_create_process sets
+        // `p->max_heap_size` before the process is linked into the table), OTP-29.1.1.
+        let max_heap = self.max_heap.unwrap_or_else(|| {
+            crate::natives::sys::gc_spawn_defaults(child.runtime.as_deref()).max_heap_size
+        });
+        if !crate::natives::proc::is_default_max_heap(max_heap) {
+            child.cold_mut().max_heap = max_heap;
+        }
         if let Some(off_heap) = self.off_heap_queue {
             child.cold_mut().off_heap_msgq = off_heap;
             child.cold_mut().flags.insert(
@@ -942,10 +949,6 @@ impl SpawnTuning {
                 atom(if off_heap { "off_heap" } else { "on_heap" }),
             );
         }
-    }
-
-    fn register(&self, runtime: &Runtime, pid: Pid) {
-        crate::natives::proc::register_spawn_max_heap(runtime, pid, self.max_heap);
     }
 }
 

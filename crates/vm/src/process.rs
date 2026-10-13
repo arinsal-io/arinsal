@@ -872,8 +872,6 @@ pub(crate) struct Runtime {
     pub(crate) published: Mutex<HashMap<Pid, Published>>,
     pub(crate) hibernating: Mutex<HashMap<Pid, HibernateCont>>,
     pub(crate) ever_hibernated: AtomicBool,
-    pub(crate) max_heaps: Mutex<HashMap<Pid, MaxHeap>>,
-    pub(crate) ever_max_heap: AtomicBool,
     pub(crate) debug_wait_active: AtomicBool,
     /// `erlang:system_flag/2` settings of this runtime.
     pub(crate) system_flags: Mutex<crate::natives::sys::SystemFlags>,
@@ -3753,18 +3751,22 @@ fn exit_reason_from(process: &mut Process, error: &VmError) -> Term {
     }
 }
 
+impl Process {
+    /// Whether this process has a `max_heap_size` limit. The peak is tracked only then.
+    fn max_heap_limited(&self) -> bool {
+        self.cold
+            .as_ref()
+            .is_some_and(|cold| cold.max_heap.size != 0)
+    }
+}
+
 // g_proc_sched. Port of erl_gc.c:3730 (`has_reached_max_heap_size`) and
 // erl_gc.c:3741 (`reached_max_heap_size`), OTP-29.1.1.
 fn heap_limit_kills(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> bool {
-    let Some(runtime) = process.runtime.clone() else {
-        return false;
-    };
-    if !runtime.ever_max_heap.load(Ordering::Acquire) {
-        return false;
-    }
     let snapshot = {
-        let mut heaps = runtime.max_heaps.lock().unwrap();
-        let Some(limit) = heaps.get_mut(&ctx.pid()) else {
+        // Port of erts/emulator/beam/erl_process.h (`p->max_heap_size`), OTP-29.1.1: the limit
+        // is a field of the process itself, so only the process reads or writes it.
+        let Some(mut limit) = process.cold.as_ref().map(|cold| cold.max_heap) else {
             return false;
         };
         if limit.size == 0 {
@@ -3781,8 +3783,9 @@ fn heap_limit_kills(process: &mut Process, ctx: &mut RunCtx<'_, Message>) -> boo
         let log = limit.log && !limit.reported;
         if log {
             limit.reported = true;
+            process.cold_mut().max_heap = limit;
         }
-        (log, limit.kill, *limit, used)
+        (log, limit.kill, limit, used)
     };
     let (log, kill, limit, used) = snapshot;
     if log {
@@ -4508,9 +4511,6 @@ impl Runtime {
         }
         if self.ever_hibernated.load(Ordering::Acquire) {
             self.hibernating.lock().unwrap().remove(&pid);
-        }
-        if self.ever_max_heap.load(Ordering::Acquire) {
-            self.max_heaps.lock().unwrap().remove(&pid);
         }
         // `note_status` publishes PUBLISHED only when it inserts a slot. Exit skips the map
         // when this process never had one (erl_process.c keeps status on the process struct).
@@ -6423,10 +6423,7 @@ impl Process {
                     && cold.call_memory.is_empty()
             })
             && self.max_heap_peak == 0
-            && self
-                .runtime
-                .as_ref()
-                .is_none_or(|runtime| !runtime.ever_max_heap.load(Ordering::Acquire))
+            && !self.max_heap_limited()
             && self
                 .self_pid
                 .is_none_or(|pid| crate::trace::flags(self, pid) & crate::trace::GC == 0)
@@ -6442,11 +6439,7 @@ impl Process {
         }
         // Port of erts/emulator/beam/erl_gc.c:3730 (`has_reached_max_heap_size`) call in
         // `garbage_collect`, OTP-29.1.1: the limit is judged on the pre-collection size.
-        if self
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
-        {
+        if self.max_heap_limited() {
             self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }
         let (indices, mut roots) = self.inbox.gc_root_snapshot();
@@ -6593,12 +6586,7 @@ impl Process {
                 message.term = *cont_roots.next().expect("middle queue GC root");
             }
         }
-        if self.max_heap_peak != 0
-            || self
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.ever_max_heap.load(Ordering::Acquire))
-        {
+        if self.max_heap_peak != 0 || self.max_heap_limited() {
             self.max_heap_peak = self.max_heap_peak.max(self.heap.total_heap_size_words());
         }
         crate::natives::erts_debug::after_collection(self, stats.nanoseconds);
@@ -7675,8 +7663,6 @@ impl Vm {
             published: Mutex::new(HashMap::new()),
             hibernating: Mutex::new(HashMap::new()),
             ever_hibernated: AtomicBool::new(false),
-            max_heaps: Mutex::new(HashMap::new()),
-            ever_max_heap: AtomicBool::new(false),
             debug_wait_active: AtomicBool::new(false),
             system_flags: Mutex::new(crate::natives::sys::SystemFlags::boot()),
             multi_scheduling: Mutex::new(MultiScheduling::default()),
