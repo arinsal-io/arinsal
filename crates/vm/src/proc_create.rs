@@ -185,6 +185,9 @@ pub struct Process {
     pub(crate) cold: Option<Box<ProcessCold>>,
     /// `p->group_leader`. Kept on the process so a spawn does not allocate `ProcessCold`.
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
+    /// `p->parent` (erl_process.c:12756): the spawning process, `None` (`undefined`) for the
+    /// first process; a remote parent's external pid is `ProcessCold::parent_external`.
+    pub(crate) parent: Option<arinsal_sched::Pid>,
     /// `p->u.terminate`. erts reuses the initial-call union; a side `ProcessCold` would
     /// allocate on every exit.
     pub(crate) exit_cont: Option<Box<ExitCont>>,
@@ -889,6 +892,8 @@ pub(crate) struct ProcessCold {
     pub(crate) flags: ProcFlags,
     pub(crate) monitor_nodes: usize,
     pub(crate) group_leader: Option<arinsal_sched::Pid>,
+    /// `p->parent` when the spawning process is external (a distributed spawn request).
+    pub(crate) parent_external: Option<arinsal_etf::OwnedTerm>,
     pub(crate) receive_markers: Option<Box<receive::ReceiveMarkers>>,
     pub(crate) receive_marker_uniq: i64,
     pub(crate) links: Tracked<std::collections::BTreeSet<arinsal_sched::Pid>>,
@@ -1236,6 +1241,7 @@ impl Process {
             receive_deadline_ms: None,
             cold: None,
             group_leader: None,
+            parent: None,
             exit_cont: None,
             apply_inline: [Term::NIL; 3],
             apply_inline_len: 0,

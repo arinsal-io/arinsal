@@ -987,6 +987,7 @@ pub(crate) fn erl_create_process(
         child.cold_mut().initial_bif = Some((m_name, f_name, arity));
     }
     child.group_leader = Some(parent.group_leader_pid(ctx.pid()));
+    child.parent = Some(ctx.pid());
     // Port of erts/emulator/beam/erl_process.c:12546,12638 (erl_create_process: `args` is copied
     // with copy_struct_litopt and the three arg registers take mod, func and the copy), OTP-29.1.1.
     let literals = arinsal_term::LiteralAreas::current();

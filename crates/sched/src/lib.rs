@@ -847,12 +847,17 @@ impl Clock for VirtualClock {
 /// alive; a probe of an exited process reports nothing pending.
 // Port of erts/emulator/beam/erl_process.h:1291 (ERTS_PSFLG_MSG_SIG_IN_Q), OTP-29.1.1.
 #[derive(Clone)]
-pub struct SignalProbe<M>(Arc<Incoming<Event<M>>>);
+pub struct SignalProbe<M>(Arc<Incoming<Event<M>>>, Arc<AtomicU32>);
 
 impl<M: SignalMessage> SignalProbe<M> {
     /// Whether the outer signal queue holds unfetched signals.
     pub fn has_pending(&self) -> bool {
         self.0.has_pending()
+    }
+
+    /// The process's state flags ([`proc_flags`]), read without a table lookup.
+    pub fn proc_flags(&self) -> &AtomicU32 {
+        &self.1
     }
 
     /// Record whether the receiver's middle signal queue holds unhandled signals
@@ -1002,7 +1007,7 @@ struct Process<T: Task> {
     /// (ERTS_PROC_LOCK_BTM), not a global one.
     btm: Mutex<ProcBtm<T::Message>>,
     /// See [`proc_flags`]. Read on exit without the process cell lock.
-    exit_flags: AtomicU32,
+    exit_flags: Arc<AtomicU32>,
     /// `p->common.u.alive.reg->name`, or [`u32::MAX`] when the process has no name.
     /// Port of erts/emulator/beam/erl_process.h (`common.u.alive.reg`), OTP-29.1.1.
     reg_atom: AtomicU32,
@@ -1125,7 +1130,7 @@ impl<T: Task> ProcessTable<T> {
                 tree: std::collections::BTreeMap::new(),
                 paused: None,
             }),
-            exit_flags: AtomicU32::new(0),
+            exit_flags: Arc::new(AtomicU32::new(0)),
             reg_atom: AtomicU32::new(u32::MAX),
             wait_timer: AtomicU64::new(0),
             input: Arc::default(),
@@ -4844,7 +4849,10 @@ impl<T: Task> ContextOps<T::Message> for Runner<'_, T> {
     }
     fn signal_probe(&mut self, pid: Pid) -> Option<SignalProbe<T::Message>> {
         let process = self.lookup(pid)?;
-        Some(SignalProbe(Arc::clone(&process.input)))
+        Some(SignalProbe(
+            Arc::clone(&process.input),
+            Arc::clone(&process.exit_flags),
+        ))
     }
     fn total_reductions(&self) -> u64 {
         if self.inner.sim.is_some() {
@@ -5455,32 +5463,35 @@ impl<T: Task> Scheduler<T> {
     ) -> Result<R, SignalFreeError> {
         let inspectable = |state| state == WAITING || state == QUEUED;
         let has_pending_signals = |process: &Process<T>| process.input.has_pending();
-        let process = self
-            .inner
+        // Port of erts/emulator/beam/erl_process.c:14836 (erts_try_lock_sig_free_proc):
+        // `erts_proc_lookup_raw` takes no reference, then one try-lock attempt and a second
+        // look at the state and the signal queue.
+        self.inner
             .table
-            .lookup(pid)
-            .ok_or(SignalFreeError::NoProcess)?;
-        let state = process.run_state().load(Ordering::Acquire);
-        if state == EXITED {
-            return Err(SignalFreeError::NoProcess);
-        }
-        if !inspectable(state) || has_pending_signals(&process) {
-            return Err(SignalFreeError::Busy);
-        }
-        // ERTS uses `erts_proc_trylock`; waiting for a running target here would
-        // turn a cheap process_info into a scheduler stall.
-        let cell = match process.cell.try_lock() {
-            Ok(cell) => cell,
-            Err(_) => return Err(SignalFreeError::Busy),
-        };
-        let state = process.run_state().load(Ordering::Acquire);
-        if state == EXITED {
-            return Err(SignalFreeError::NoProcess);
-        }
-        if !inspectable(state) || has_pending_signals(&process) {
-            return Err(SignalFreeError::Busy);
-        }
-        Ok(inspect(&cell.task))
+            .with_live(pid, |process| {
+                let state = process.run_state().load(Ordering::Acquire);
+                if state == EXITED {
+                    return Err(SignalFreeError::NoProcess);
+                }
+                if !inspectable(state) || has_pending_signals(process) {
+                    return Err(SignalFreeError::Busy);
+                }
+                // ERTS uses `erts_proc_trylock`; waiting for a running target here would
+                // turn a cheap process_info into a scheduler stall.
+                let cell = match process.cell.try_lock() {
+                    Ok(cell) => cell,
+                    Err(_) => return Err(SignalFreeError::Busy),
+                };
+                let state = process.run_state().load(Ordering::Acquire);
+                if state == EXITED {
+                    return Err(SignalFreeError::NoProcess);
+                }
+                if !inspectable(state) || has_pending_signals(process) {
+                    return Err(SignalFreeError::Busy);
+                }
+                Ok(inspect(&cell.task))
+            })
+            .unwrap_or(Err(SignalFreeError::NoProcess))
     }
     /// Mutate a task through its main lock while it is not executing and its signal queue is
     /// empty; otherwise the caller must send a signal.

@@ -251,6 +251,13 @@ impl PurgeState {
         }
     }
 
+    /// Acts as a prepared purge with fun entries, for tests of the staging wait.
+    #[cfg(test)]
+    pub(crate) fn hold_stage_permission_for_test(&self, held: bool) {
+        self.inner.lock().unwrap().holds_stage_permission = held;
+        self.stage_released.notify_all();
+    }
+
     /// Whether a prepared purge currently holds the code staging permission.
     pub(crate) fn stage_permission_held(&self) -> bool {
         self.inner.lock().unwrap().holds_stage_permission
@@ -1238,6 +1245,7 @@ fn purge(
             let code_ix = vm.code_ix.active();
             state.complete_fun_purge(code_ix);
             // g_code_fix: drop the old version's slot once nothing references it.
+            let mut freed = Vec::new();
             let removed = vm.code_ix.update_active(|tables| {
                 let pending = std::mem::take(&mut *tables.condemned);
                 let mut keep = Vec::new();
@@ -1245,7 +1253,7 @@ fn purge(
                     if module_id_referenced(process, &tables.code_meta, id) {
                         keep.push(id);
                     } else {
-                        tables.release(id);
+                        freed.extend(tables.release(id));
                     }
                 }
                 let removed = tables.old.remove(name);
@@ -1256,7 +1264,7 @@ fn purge(
                     if module_id_referenced(process, &tables.code_meta, id) {
                         keep.push(id);
                     } else {
-                        tables.release(id);
+                        freed.extend(tables.release(id));
                     }
                 }
                 *tables.condemned = keep;
@@ -1264,6 +1272,13 @@ fn purge(
             });
             vm.refresh_code();
             resume = state.finish(false, code_ix);
+            // The purge no longer holds the stage permission: free the native code explicitly,
+            // under the code modification permission this call holds, then let it drop.
+            // Port of erts/emulator/beam/beam_bif_load.c (erts_internal_purge_module_2 complete),
+            // OTP-29.1.1.
+            for native in freed {
+                native.unpublish();
+            }
             removed
         }
     };

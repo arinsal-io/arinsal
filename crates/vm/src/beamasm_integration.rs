@@ -1304,6 +1304,11 @@ impl CompiledVersion {
     pub(crate) fn publish(&self, module: &arinsal_loader::Module) {
         publish_module(self.scope, module, &self.native_targets);
     }
+    /// Sends native callers of this version's exports to the export trampoline. Run when the
+    /// version is freed explicitly (purge `complete`, a load that reclaims it), never from drop.
+    pub(crate) fn unpublish(&self) {
+        unpublish_module(self.scope, &self.native_targets);
+    }
     /// The half-open address range of this version's native code.
     pub(crate) fn code_range(&self) -> (usize, usize) {
         (self.code_start, self.code_end)
@@ -1352,7 +1357,6 @@ impl Drop for CompiledVersion {
         }
         crate::native_bridge::unregister_native_functions(&self.native_functions);
         crate::native_bridge::unregister_native_catches(self.scope, &self.catch_ids);
-        unpublish_module(self.scope, &self.native_targets);
         if lifetime_trace_enabled() {
             eprintln!(
                 "[beamasm-lifetime] CodeMemory drop module={} range={:#x}..{:#x}",
