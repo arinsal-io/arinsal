@@ -79,9 +79,6 @@ pub(crate) struct FunctionRange {
     module_atom: arinsal_term::Atom,
     function_atom: arinsal_term::Atom,
     arity: u8,
-    line: Option<u32>,
-    file_term: Option<Term>,
-    file: Option<Arc<str>>,
     /// `loc_tab` entries retain the literal filename term used by the module.
     // Port of erts/emulator/beam/beam_ranges.c:353-357, OTP-29.1.1.
     locs: Arc<[LineLoc]>,
@@ -91,10 +88,10 @@ pub(crate) struct FunctionRange {
     line_addrs: Arc<[usize]>,
 }
 
-#[derive(Clone, Copy)]
 struct LineLoc {
     line: u32,
     file_term: Option<Term>,
+    file: Arc<str>,
 }
 
 /// One module's native code in the active code index, sorted by `start`.
@@ -130,6 +127,7 @@ fn function_range(info: &NativeFunction) -> FunctionRange {
         .map(|entry| LineLoc {
             line: entry.line,
             file_term: entry.file_term,
+            file: entry.file.clone(),
         })
         .collect();
     FunctionRange {
@@ -138,9 +136,6 @@ fn function_range(info: &NativeFunction) -> FunctionRange {
         module_atom: info.module_atom,
         function_atom: info.function_atom,
         arity: info.arity,
-        line: info.line,
-        file_term: info.file_term,
-        file: info.file.clone(),
         locs,
         line_addrs,
     }
@@ -310,20 +305,19 @@ fn frame_in(ranges: &[ModuleRange], address: usize) -> Option<NativeStackFrame> 
         .line_addrs
         .partition_point(|start| *start <= address)
         .checked_sub(1)
-        .and_then(|index| function.locs.get(index).copied())
+        .and_then(|index| function.locs.get(index))
         .filter(|entry| entry.line != 0);
-    let file_term = loc.and_then(|entry| entry.file_term).or(function.file_term);
+    let file_term = loc.as_ref().and_then(|entry| entry.file_term);
     // `fi->fname_ptr[file]` is a literal. The string is only needed when it is absent.
-    let file = if file_term.is_some() {
-        None
-    } else {
-        function.file.clone()
-    };
+    let file = loc
+        .as_ref()
+        .filter(|_| file_term.is_none())
+        .map(|entry| entry.file.clone());
     Some(NativeStackFrame {
         module_atom: function.module_atom,
         function_atom: function.function_atom,
         arity: function.arity,
-        line: loc.map(|entry| entry.line).or(function.line),
+        line: loc.map(|entry| entry.line),
         file_term,
         file,
     })
@@ -864,21 +858,16 @@ pub(crate) fn native_stack_frame_at(address: usize) -> Option<NativeStackFrame> 
         .checked_sub(1)
         .and_then(|index| function.line_table.get(index))
         .filter(|entry| entry.line != 0);
-    let file_term = line
-        .and_then(|entry| entry.file_term)
-        .or(function.file_term);
+    let file_term = line.and_then(|entry| entry.file_term);
     // `fi->fname_ptr[file]` is a literal. The string is only needed when it is absent.
-    let file = if file_term.is_some() {
-        None
-    } else {
-        line.map(|entry| Arc::clone(&entry.file))
-            .or_else(|| function.file.clone())
-    };
+    let file = line
+        .filter(|_| file_term.is_none())
+        .map(|entry| Arc::clone(&entry.file));
     Some(NativeStackFrame {
         module_atom: function.module_atom,
         function_atom: function.function_atom,
         arity: function.arity,
-        line: line.map(|entry| entry.line).or(function.line),
+        line: line.map(|entry| entry.line),
         file_term,
         file,
     })
